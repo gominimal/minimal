@@ -8,10 +8,11 @@
 //! destination peer's tunnel sink.
 //!
 //! It is `#[ignore]` and gated on `MINIMALD_NETNS_TEST=1`: it needs root (to
-//! create namespaces and a veth pair, and to `setns`), so it runs only in the
-//! privileged netns CI lane (`ci-netns.yml`), never in the default
-//! `cargo test` gate. The whole file compiles to nothing unless the
-//! `networking-wg` feature is enabled.
+//! create namespaces and a veth pair, and to `setns`), and never runs in the
+//! default `cargo test` gate. MOTHBALLED: no CI lane runs it either (the
+//! former ci-netns.yml was retired, #687); run the binary under sudo locally.
+//! The whole file compiles to nothing unless the `networking-wg` feature is
+//! enabled.
 //!
 //! Scope note: this harness exercises the mesh tunnel data path end-to-end
 //! across two real network namespaces — the transport that carries UC7. Wiring

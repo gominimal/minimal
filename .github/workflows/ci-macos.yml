@@ -146,9 +146,10 @@ jobs:
         # boots the same kernel/rootfs/initramfs through the same HVF path as the
         # retired standalone boot test and goes further (russh auth + exec,
         # stdout + exit status), so a passing session gates the boot. The
-        # Auto-spawn step then covers the R4.5 CLI proof: from a clean state
-        # `minimal ls` must auto-spawn minvmd end to end — the macOS integration
-        # gate that no unit test can cover.
+        # unified session e2e (scripts/session-e2e.sh) then covers the R4.5
+        # CLI proof and more: from a clean state `minimal activate` must
+        # auto-spawn minvmd and a real session exec must round-trip — the
+        # macOS integration gate that no unit test can cover.
         if: ${{ vars.RUN_MACOS_CI != 'false' }}
         needs: [artifacts]
         runs-on: [self-hosted, macOS, ARM64]
@@ -249,97 +250,47 @@ jobs:
                   MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio" \
                   MINVMD_BOOT_LOG="$RUNNER_TEMP/boot.log" \
                     "$testbin" --include-ignored --nocapture --exact minimald_exec_over_bridge
-            - name: Reap Session-E2E leftovers before auto-spawn
+            - name: Reap Session-E2E leftovers before the CLI e2e
               # The session harness (Guest::drop) kills its minvmd but not the
               # rest of the process tree it spawned: the detached `__krun-vmm`
               # grandchild AND the host gvproxy switch minvmd owns. Either
               # leftover wedges the host→guest bridge over libkrun's vsock
               # (#588) — a healthy guest accept loop that never receives the
-              # bridged connection — so the cold `minimal ls` dies with `ssh
-              # connect: Disconnected`. The `__krun-vmm`-only reap proved
+              # bridged connection — so the CLI e2e's cold activate dies with
+              # `ssh connect: Disconnected`. The `__krun-vmm`-only reap proved
               # insufficient: main run 29032763009 (on the commit that added
               # it) failed exactly this way, with the new VM's proxy-publish
               # WARN pointing at a lingering gvproxy. Reap the whole tree —
               # any stray minvmd first (so nothing respawns), then the VMM and
-              # gvproxy — so Auto-spawn starts from the single-VM state it had
-              # when it was its own job. The proper fix (harness reaps its own
+              # gvproxy — so the CLI e2e starts from the single-VM state it
+              # had when it was its own job. The proper fix (harness reaps its own
               # process group) is tracked under #588.
               run: |
                   pkill -x minvmd 2>/dev/null || true
                   pkill -f '__krun-vmm' 2>/dev/null || true
                   pkill -f gvproxy 2>/dev/null || true
                   sleep 1
-            - name: Auto-spawn E2E (minimal ls cold/warm, R4.5)
-              # The R4.5 CLI proof artifact, on real hardware. From a clean state
-              # `minimal ls` must auto-spawn minvmd and return within 8 s;
-              # `minvmd status` must then report running; a second `minimal ls` must
-              # complete in < 500 ms (warm reuse). This exercises the real
-              # minimal -> `minvmd run --detach` -> VM boot -> initramfs minimald
-              # session path end to end.
-              # Run the prebuilt binaries directly (never `cargo run`, which would
-              # relink and unsign minvmd). minimal finds `minvmd` via PATH; all three
-              # of MINVMD_KERNEL_PATH / MINVMD_ROOTFS_PATH / MINVMD_INITRAMFS propagate
-              # through the `minvmd run --detach` re-exec. A fresh XDG_STATE_HOME
-              # guarantees the clean (no-daemon) starting state.
+            - name: Session e2e via the CLI (activate/exec/destroy; autospawns minvmd)
+              # The unified session e2e (scripts/session-e2e.sh — the SAME
+              # proof every target lane runs), here against the VM-backed
+              # daemon: from a clean state, `minimal activate` must auto-spawn
+              # minvmd (found by name on PATH; the MINVMD_* env propagates
+              # through the `minvmd run --detach` re-exec), boot the guest,
+              # create a session, and `minimal attach --command` must exec in
+              # it over the vsock bridge. Replaces the old autospawn step,
+              # which only proved `minimal ls` cold/warm — this proves the
+              # full user path and subsumes it (the cold activate IS the
+              # autospawn). Runs the prebuilt binaries directly (never
+              # `cargo run`, which would relink and unsign minvmd).
+              # E2E_PROJECT_DIR=/tmp: the guest sees no host project dir yet
+              # (no project sync), and /tmp exists in the guest image.
               run: |
-                  set -uo pipefail   # not -e: capture failures so we can dump diagnostics
                   export PATH="$PWD/target/debug:$PATH"
                   export MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz"
                   export MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img"
                   export MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio"
-                  # Capture the guest console; this env var propagates through the
-                  # minimal -> `minvmd run --detach` -> `minvmd run` -> __krun-vmm chain,
-                  # so the silent detached supervisor's boot is still observable here.
-                  export MINVMD_BOOT_LOG="$RUNNER_TEMP/autospawn-boot.log"
-                  # All state (minvmd.toml, locks, the bridge socket) lives under
-                  # $XDG_STATE_HOME/minimal/providers/local-0; a fresh dir gives a
-                  # genuinely clean (NotProvisioned) state on the persistent runner.
-                  # Under /tmp, not $TMPDIR: macOS's deep $TMPDIR would push the
-                  # socket paths past the 104-byte sun_path limit.
-                  export XDG_STATE_HOME="$(mktemp -d /tmp/mnl.XXXXXX)"
-
-                  # macOS `date` has no %N; use perl's high-resolution clock for ms.
-                  now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time()*1000'; }
-
-                  # On any failure, dump what the silent detach hides — minimal's own
-                  # error, the persisted state, and the guest boot console — then stop
-                  # the supervisor and fail. An empty boot log means the VM never
-                  # started (supervisor died before krun_start_enter); kernel output
-                  # without a full boot means a stuck boot; a full boot points at a
-                  # UDS/timing issue.
-                  fail() {
-                    echo "::group::autospawn-e2e diagnostics"
-                    echo "--- minimal ls stderr ---"; cat "$RUNNER_TEMP/ls.err" 2>/dev/null || true
-                    echo "--- minvmd.toml ---"; cat "$XDG_STATE_HOME/minimal/providers/local-0/minvmd.toml" 2>/dev/null || echo "(none)"
-                    echo "--- guest boot console (tail) ---"; tail -80 "$MINVMD_BOOT_LOG" 2>/dev/null || echo "(no boot log — VM never started)"
-                    echo "::endgroup::"
-                    minvmd stop >/dev/null 2>&1 || true
-                    exit 1
-                  }
-                  trap 'minvmd stop >/dev/null 2>&1 || true' EXIT
-
-                  # Cold: must auto-spawn minvmd and return within 8 s.
-                  t0=$(now_ms)
-                  minimal ls 2>"$RUNNER_TEMP/ls.err" || { echo "::error::cold 'minimal ls' failed to auto-spawn minvmd"; fail; }
-                  t1=$(now_ms); cold=$(( t1 - t0 ))
-                  echo "cold 'minimal ls': ${cold}ms"
-                  [ "$cold" -lt 8000 ] || { echo "::error::cold 'minimal ls' took ${cold}ms (>= 8000ms)"; fail; }
-
-                  # minvmd must now report running (exit 0). Poll briefly to absorb the
-                  # gap between the host UDS accepting and the Running state persisting.
-                  running=0
-                  for _ in $(seq 1 50); do
-                    if minvmd status >/dev/null 2>&1; then running=1; break; fi
-                    sleep 0.1
-                  done
-                  [ "$running" = 1 ] || { echo "::error::minvmd did not report running after auto-spawn"; fail; }
-
-                  # Warm: minvmd already running, must return in < 500 ms.
-                  t0=$(now_ms)
-                  minimal ls >/dev/null 2>"$RUNNER_TEMP/ls.err" || { echo "::error::warm 'minimal ls' failed"; fail; }
-                  t1=$(now_ms); warm=$(( t1 - t0 ))
-                  echo "warm 'minimal ls': ${warm}ms"
-                  [ "$warm" -lt 500 ] || { echo "::error::warm 'minimal ls' took ${warm}ms (>= 500ms)"; fail; }
+                  export MINVMD_BOOT_LOG="$RUNNER_TEMP/cli-e2e-boot.log"
+                  E2E_VM=1 E2E_PROJECT_DIR=/tmp ./scripts/session-e2e.sh
             - name: Upload guest boot console logs
               # Capture hvc0 output for diagnosing a stuck/failed boot (e.g. a missing
               # virtio driver in the kernel). Always runs so a red boot is debuggable.
@@ -349,7 +300,7 @@ jobs:
                   name: minvmd-boot-logs
                   path: |
                       ${{ runner.temp }}/boot.log
-                      ${{ runner.temp }}/autospawn-boot.log
+                      ${{ runner.temp }}/cli-e2e-boot.log
                   if-no-files-found: ignore
 
     unit:

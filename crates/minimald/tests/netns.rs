@@ -17,12 +17,10 @@
 //!
 //! Both tests are `#[ignore]` and additionally early-return unless
 //! `MINIMALD_NETNS_TEST` is set, and read the gvproxy binary from `GVPROXY_BIN`.
-//! They run only in `.github/workflows/ci-netns.yml`, which provisions a
-//! netns-capable runner (unprivileged userns + passwordless sudo) and the
-//! pinned gvproxy binary. The function names contain `netns` so that job's
-//! `cargo test ... netns` filter selects them. This sandbox cannot create
-//! privileged network namespaces, so these proofs are authored here and
-//! executed by CI, not locally.
+//! MOTHBALLED: no CI lane runs them (the former ci-netns.yml was retired,
+//! #687). To run locally you need a netns-capable host (unprivileged userns +
+//! sudo) and a pinned gvproxy (scripts/fetch-gvproxy.sh):
+//! `MINIMALD_NETNS_TEST=1 GVPROXY_BIN=... cargo test -p minimald netns -- --include-ignored`
 #![cfg(target_os = "linux")]
 
 use std::path::PathBuf;
@@ -78,7 +76,7 @@ fn sudo_ok(label: &str, args: &[&str]) {
 /// the `isolates_network` assertion would no longer match the actual namespacing
 /// behaviour; the `unshare --net` egress test guards the OS-level contract.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs a network namespace; gated on MINIMALD_NETNS_TEST, run by ci-netns.yml"]
+#[ignore = "needs a network namespace; gated on MINIMALD_NETNS_TEST; mothballed, no CI lane"]
 async fn netns_uc1_nonet_refuses_egress() {
     if !gated() {
         return;
@@ -114,7 +112,7 @@ async fn netns_uc1_nonet_refuses_egress() {
 /// tap creation ([`open_tap`]) and switch relay ([`attach_to_switch`]); none of
 /// these exist on the base branch, so the proof cannot pass against an empty PR.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs netns + gvproxy; gated on MINIMALD_NETNS_TEST, run by ci-netns.yml"]
+#[ignore = "needs netns + gvproxy; gated on MINIMALD_NETNS_TEST; mothballed, no CI lane"]
 async fn netns_uc6_ownip_ptask_to_ptask() {
     if !gated() {
         return;
@@ -190,7 +188,7 @@ async fn netns_uc6_ownip_ptask_to_ptask() {
 /// gvproxy switch; neither exists on the base branch, so this cannot pass
 /// against an empty PR.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs netns + gvproxy; gated on MINIMALD_NETNS_TEST, run by ci-netns.yml"]
+#[ignore = "needs netns + gvproxy; gated on MINIMALD_NETNS_TEST; mothballed, no CI lane"]
 async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
     if !gated() {
         return;
