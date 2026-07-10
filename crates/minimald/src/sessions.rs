@@ -894,6 +894,11 @@ impl<L: Loader> Manager<L> {
                     // against a not-yet-existing "restart in place"
                     // flow.
                     self.compositions.clear();
+                    // Release the cache's held-open alog fd: it lives on the
+                    // state volume, and a surviving write-open fd there makes
+                    // the post-drain quiesce (R2.1 syncfs + unmount) fail
+                    // EBUSY, leaving the ext4 journal dirty on clean stops.
+                    self.daemon_ctx.release_cache_read_tracker();
                     Ok(Ok(()))
                 })
                 .await

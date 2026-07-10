@@ -21,6 +21,13 @@
 # --force (remove modified files too), --purge (also delete the minimal data/
 # state/cache trees), and --dry-run. See Units 7–8 of the spec.
 #
+# After the files are placed, the installer wires up shell integration (Unit 9):
+# it generates per-shell init files that prepend the bin dir to PATH, installs
+# tab completions for `min` by running the freshly-installed binary, and adds a
+# marker-fenced source line to the current shell's rc file. Uninstall undoes all
+# of it (the generated files are ordinary install-record rows; the rc block is
+# stripped by its markers).
+#
 # The script targets strict POSIX `sh` (not bash): it runs identically under
 # dash, macOS's frozen bash 3.2, busybox, and zsh-invoked-sh. It depends only on
 # tooling present by default on every target: a downloader (curl or wget), a
@@ -148,6 +155,41 @@ resolve_prefix() {
     esac
 }
 
+# --- Unit 9: shared shell-integration paths and markers ---------------------
+
+# Where the generated (not downloaded) shell-integration files live. Init
+# scripts sit under the minimal-owned data prefix; completions go to each
+# shell's standard user-level lookup dir. Shared by install (write/record) and
+# uninstall (strip/prune). The rc files themselves are the user's; the
+# installer only ever appends/removes one marker-fenced block (R9.2).
+init_dir="$(resolve_prefix data)/shell-init"
+bash_comp_dir="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"
+zsh_comp_dir="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/completions"
+fish_comp_dir="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"
+fish_config="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
+zshrc="${ZDOTDIR:-$HOME}/.zshrc"
+
+marker_start='# >>> minimal >>>'
+marker_end='# <<< minimal <<<'
+
+# Remove the marker-fenced block (R9.2) from rc file $1. Rewrites via a temp
+# sibling + atomic mv — `sed -i` is not portable across BSD/GNU. A file without
+# the start marker is never rewritten (or even opened for write).
+strip_rc_block() {
+    [ -f "$1" ] || return 0
+    grep -q '>>> minimal >>>' "$1" 2>/dev/null || return 0
+    if [ "$dry_run" -eq 1 ]; then
+        say "  would remove shell-init block from $1"
+        return 0
+    fi
+    _tmp="$1.tmp.$$"
+    awk -v s="$marker_start" -v e="$marker_end" \
+        '$0==s {skip=1; next} $0==e {skip=0; next} !skip' "$1" >"$_tmp" \
+        || { rm -f "$_tmp"; die "failed to rewrite $1"; }
+    mv -f "$_tmp" "$1"
+    say "  removed shell-init block from $1"
+}
+
 # --- Units 7+8: uninstall (walk the install record and undo it) ------------
 
 # Offline teardown driven solely by the local install record (R6.1). The record
@@ -227,6 +269,15 @@ do_uninstall() {
         rm -f "$record"
     fi
 
+    # R9.4 — strip the marker-fenced shell-init block from every rc file the
+    # installer may have edited (which shell's rc got it depends on $SHELL at
+    # install time, so try them all — a file without markers is untouched).
+    # The generated init/completion files themselves are ordinary record rows,
+    # already handled by the walk above.
+    for _rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$zshrc" "$fish_config" "$HOME/.profile"; do
+        strip_rc_block "$_rc"
+    done
+
     # R8.2 — --purge additionally deletes the minimal-owned trees wholesale (build
     # cache included); they live at fixed .../minimal paths the tool owns. It
     # never removes files outside those roots.
@@ -248,6 +299,18 @@ do_uninstall() {
     # lib (~/.local/lib) is shared like bin, so it is only ever rmdir'd-if-empty,
     # never purged.
     if [ "$dry_run" -eq 0 ]; then
+        # Shell-integration dirs first (R9.4): the init dir must empty out
+        # before the data prefix can, and the completion dirs (plus their
+        # parents, which the installer may have created) are shared with other
+        # tools so, like bin, they are only ever rmdir'd-if-empty.
+        for d in "$init_dir" \
+                 "$bash_comp_dir" "${bash_comp_dir%/*}" \
+                 "$zsh_comp_dir" "${zsh_comp_dir%/*}" \
+                 "$fish_comp_dir"; do
+            if [ -d "$d" ]; then
+                rmdir "$d" 2>/dev/null || true
+            fi
+        done
         for p in bin lib data state cache; do
             d="$(resolve_prefix "$p")"
             if [ -d "$d" ]; then
@@ -410,6 +473,106 @@ while read -r comp _ _ _ want kind dest src; do
     printf '%s\t%s\t%s\t%s\n' "$comp" "$target_file" "$want" "$(sha256 "$target_file")" >>"$records"
 done <"$applicable"
 
+# --- Unit 9a: generated shell-init files and completions -------------------
+
+bindir="$(resolve_prefix bin)"
+
+# Append a generated file to this run's install record so a later run and
+# `--uninstall` treat it exactly like a downloaded component (R9.1/R9.3). No
+# manifest hash exists for generated content, so both hash columns carry the
+# on-disk digest.
+record_generated() {
+    _h="$(sha256 "$2")"
+    printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$_h" "$_h" >>"$records"
+}
+
+# R9.1 — per-shell init files, regenerated on every run. Each embeds the bin
+# dir as resolved NOW and guards at shell startup (dir exists, not already on
+# PATH), so sourcing is idempotent and a no-op once the user manages PATH
+# themselves. Only shell-runtime variables are escaped in the heredocs; the
+# unescaped $bindir/$zsh_comp_dir/$fish_comp_dir expand at generation time.
+mkdir -p "$init_dir"
+
+cat >"$init_dir/bash.sh" <<EOF
+# minimal shell init for bash
+# Completions are auto-loaded from $bash_comp_dir/
+
+if [ -d "$bindir" ]; then
+    case ":\${PATH}:" in
+        *":$bindir:"*) ;;
+        *) export PATH="$bindir:\$PATH" ;;
+    esac
+fi
+EOF
+record_generated shell-init-bash "$init_dir/bash.sh"
+
+cat >"$init_dir/zsh.sh" <<EOF
+# minimal shell init for zsh
+# Adds the completions dir to fpath before compinit.
+
+if [ -d "$bindir" ]; then
+    case ":\${PATH}:" in
+        *":$bindir:"*) ;;
+        *) export PATH="$bindir:\$PATH" ;;
+    esac
+fi
+
+# Completions
+if [ -d "$zsh_comp_dir" ]; then
+    fpath=("$zsh_comp_dir" \$fpath)
+    autoload -Uz compinit
+    compinit
+fi
+EOF
+record_generated shell-init-zsh "$init_dir/zsh.sh"
+
+cat >"$init_dir/fish.fish" <<EOF
+# minimal shell init for fish
+# Completions are auto-loaded from $fish_comp_dir/
+
+if test -d "$bindir"
+    fish_add_path --prepend "$bindir"
+end
+EOF
+record_generated shell-init-fish "$init_dir/fish.fish"
+
+# R9.3 — tab completions, generated by the just-installed binary itself so
+# they always match the installed version, written atomically like any other
+# install. A failure here is a warning, not an error: the binaries are already
+# correctly installed, and completions regenerate on the next run.
+gen_completions() {
+    _dir="${2%/*}"
+    _tmp="$2.tmp.$$"
+    # Probe that the dir exists and is writable BEFORE generating, inside a
+    # subshell with stderr nulled: the completion dirs are shared, user-owned
+    # locations that can pre-exist unwritable (e.g. a root-owned
+    # ~/.config/fish/completions), and a redirection error is reported by the
+    # shell itself — a plain `2>/dev/null` on the command cannot silence it,
+    # only the subshell wrapper can. Non-fatal either way: the binaries are
+    # already correctly installed.
+    if ! ( mkdir -p "$_dir" && : >"$_tmp" ) 2>/dev/null; then
+        say "  completions: warning: failed to install $1 completions ($_dir is not writable)"
+        return 0
+    fi
+    if ( "$bindir/min" completions "$1" >"$_tmp" ) 2>/dev/null \
+        && [ -s "$_tmp" ] \
+        && mv -f "$_tmp" "$2" 2>/dev/null; then
+        record_generated "completions-$1" "$2"
+    else
+        rm -f "$_tmp" 2>/dev/null || true
+        say "  completions: warning: could not generate $1 completions (non-fatal)"
+    fi
+}
+
+if [ -x "$bindir/min" ]; then
+    say "  completions: generating for bash, zsh, fish"
+    gen_completions bash "$bash_comp_dir/min"
+    gen_completions zsh  "$zsh_comp_dir/_min"
+    gen_completions fish "$fish_comp_dir/min.fish"
+else
+    say "  completions: skipped ($bindir/min not present)"
+fi
+
 # --- Unit 6: install record and PATH advisory ------------------------------
 
 # R6.1 — persist the resolved (component, dest, installed-hash) rows for this
@@ -420,11 +583,68 @@ mv -f "$records" "$prev_record"
 
 say "install: $installed installed, $skipped up to date -> record at $prev_record"
 
-# R6.2 — if the bin prefix is not on PATH, advise the user; never edit an rc file.
-bindir="$(resolve_prefix bin)"
+# --- Unit 9b: hook the current shell's rc file ------------------------------
+
+# R9.2 — append one marker-fenced block sourcing the matching init file to the
+# rc of the user's login shell ($SHELL). Idempotent: a file already carrying
+# the markers is never touched again, so reruns and upgrades add nothing. The
+# markers are also what --uninstall strips (strip_rc_block).
+add_rc_block() {
+    if grep -q '>>> minimal >>>' "$1" 2>/dev/null; then
+        return 0
+    fi
+    # Non-fatal: by this point the binaries are correctly installed, so an
+    # unwritable rc file must not turn a successful install into a failure.
+    # Warn, tell the user what to add by hand, and keep going (the R6.2 PATH
+    # advisory below still fires).
+    # The subshell wrapper (not just 2>/dev/null on the command) is what keeps
+    # a redirection failure quiet: that error is printed by the shell itself,
+    # before the command-level stderr redirect is in effect.
+    if ! ( mkdir -p "${1%/*}" \
+            && printf '\n%s\n%s\n%s\n' "$marker_start" "$2" "$marker_end" >>"$1" ) 2>/dev/null; then
+        say "  warning: failed to hook minimal shell support ($1 is not writable)"
+        say "  to enable it yourself, add this line to your shell rc:"
+        say "      $2"
+        return 0
+    fi
+    say "  shell-init: added block to $1"
+}
+
+posix_line="[ -f \"$init_dir/bash.sh\" ] && . \"$init_dir/bash.sh\""
+shell_name="${SHELL:-/bin/sh}"
+shell_name="${shell_name##*/}"
+case "$shell_name" in
+    bash)
+        # Append to whichever bash rc files exist (a login-shell-only
+        # .bash_profile must also see PATH); with neither present, create
+        # .bashrc so a fresh machine still gets wired up.
+        if [ -f "$HOME/.bashrc" ] || [ -f "$HOME/.bash_profile" ]; then
+            for _rc in "$HOME/.bashrc" "$HOME/.bash_profile"; do
+                if [ -f "$_rc" ]; then
+                    add_rc_block "$_rc" "$posix_line"
+                fi
+            done
+        else
+            add_rc_block "$HOME/.bashrc" "$posix_line"
+        fi
+        ;;
+    zsh)
+        add_rc_block "$zshrc" "[ -f \"$init_dir/zsh.sh\" ] && . \"$init_dir/zsh.sh\""
+        ;;
+    fish)
+        add_rc_block "$fish_config" "if test -f \"$init_dir/fish.fish\"; source \"$init_dir/fish.fish\"; end"
+        ;;
+    *)
+        # Unknown or unset shell: .profile is the POSIX login-shell rc.
+        add_rc_block "$HOME/.profile" "$posix_line"
+        ;;
+esac
+
+# R6.2 — if the bin prefix is not on PATH in THIS session, say so: the rc hook
+# above only takes effect in new shells.
 case ":${PATH:-}:" in
     *":$bindir:"*) ;;
     *) say ""
-       say "note: $bindir is not on your PATH."
-       say "  add it, e.g.:  export PATH=\"$bindir:\$PATH\"" ;;
+       say "note: $bindir is not on your PATH yet."
+       say "  restart your shell, or add it now:  export PATH=\"$bindir:\$PATH\"" ;;
 esac

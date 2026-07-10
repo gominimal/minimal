@@ -45,3 +45,4 @@ paths.workspace = true
 serial_test.workspace = true
 tempfile.workspace = true
 sessions.workspace = true
+russh-sftp.workspace = true

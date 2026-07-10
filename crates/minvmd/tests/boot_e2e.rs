@@ -63,6 +63,10 @@ fn boot_e2e_ready_marker_round_trip() {
     let exe = minvmd_bin();
     let mut child = Command::new(exe)
         .args(["boot", "--foreground"])
+        // HOME too, not just XDG_STATE_HOME, as belt-and-braces: any
+        // `dirs`-based fallback that ignores XDG on macOS must also land in
+        // the tempdir, never the developer's real state dir.
+        .env("HOME", state_dir.path())
         .env("XDG_STATE_HOME", state_dir.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

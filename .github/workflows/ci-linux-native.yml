@@ -8,7 +8,7 @@ name: CI (Linux native)
 # (dorny/paths-filter) gates the expensive jobs, and the `if: always()`
 # aggregator reports success even when they were path-skipped. This is the
 # lane pattern that will replace the ci-docs-skip.yml inverse-path hack once
-# the aggregators become the required checks (#687): a required context that
+# the aggregators become the required checks: a required context that
 # a trigger-level path filter skips stays "Expected" forever and wedges the
 # PR, while a skipped in-workflow job just reports `skipped`, which the
 # aggregator treats as pass. Do NOT add trigger-level `paths:` here.
@@ -48,8 +48,13 @@ jobs:
           persist-credentials: false
       - name: Detect relevant changes
         id: filter
-        # v3.0.2, SHA-pinned. On workflow_dispatch there is no diff to filter;
-        # the downstream `if` treats dispatch as "run everything".
+        # v3.0.2, SHA-pinned. Runs ONLY on pull_request, where dorny reads
+        # the PR file list via the API. On push it would need a local diff
+        # against event.before, which our shallow, credential-free checkout
+        # (persist-credentials: false) cannot provide — and pushes to main
+        # SHOULD run everything anyway: they write the main-only caches and
+        # provide the soak signal. Dispatch likewise runs everything.
+        if: github.event_name == 'pull_request'
         uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
         with:
           filters: |
@@ -59,6 +64,8 @@ jobs:
               - "Cargo.lock"
               # The toolchain pin: a rustc bump must re-run the Rust lanes.
               - "rust-toolchain.toml"
+              # Nextest profiles change how this lane's tests run.
+              - ".config/nextest.toml"
               - "scripts/**"
               - ".minimal/**"
               - ".github/actions/setup-rust/**"
@@ -68,16 +75,16 @@ jobs:
   tests:
     # Core workspace suite (nextest + doctests), taking over ci.yml's `test`
     # job for this lane; ci.yml keeps its copy until the ruleset requires
-    # this lane's aggregator (#687), then drops it.
+    # this lane's aggregator, then drops it.
     #
-    # MOTHBALLED, deliberately absent (owner decision, #687): the
+    # MOTHBALLED, deliberately absent (owner decision): the
     # `--features networking-proxy` (mTLS reverse proxy) and `--features
     # networking-wg` (WireGuard mesh) test steps that ci.yml's `test` job
     # still carries, and the netns/mesh namespace proofs that ci-netns.yml
     # ran (crates/minimald/tests/netns.rs, mesh_uc7.rs). The code and tests
     # stay in-tree and runnable locally; they are just not CI-covered.
     needs: [changes]
-    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.native == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -96,7 +103,7 @@ jobs:
     # ran the daemon natively at all. The native target needs no E2E_* knobs:
     # host daemon, repo as the project.
     needs: [changes]
-    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.native == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -104,6 +111,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
+        with:
+          # `-p` builds unify features differently than the workspace test
+          # suite — own cache class.
+          shared-key: native-e2e
       - name: Enable unprivileged user namespaces
         # The session sandbox (hakoniwa) needs userns; Ubuntu 24.04 restricts
         # them via AppArmor by default.
@@ -120,7 +131,7 @@ jobs:
           key: native-e2e-minimal-cache-${{ hashFiles('.minimal/minimal.toml') }}
           restore-keys: native-e2e-minimal-cache-
       - name: Build minimal + minimald
-        run: cargo build -p minimald --bin minimald -p minimal --bin minimal
+        run: cargo build -p minimald --bin minimald -p minimal --bin minimal --locked
       - name: Session e2e (native minimald)
         run: |
           export PATH="$PWD/target/debug:$PATH"

@@ -37,3 +37,16 @@ runs:
           echo "LIBKRUN_PREFIX=$prefix"
           echo "LD_LIBRARY_PATH=$prefix${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         } >> "$GITHUB_ENV"
+    - name: Verify libkrun exports krun_add_disk3 (>= 1.19.0)
+      # Early, actionable failure if the materialized prefix is too old for
+      # krun_add_disk3 (the /dev/vdb attach) — at the point every consumer of
+      # this composite links it, instead of a cryptic runtime error at VM
+      # boot. minvmd's compile-time link is the real backstop; this mirrors
+      # the export check the macOS composite performs on its built dylib.
+      shell: bash
+      run: |
+        so="$(ls "$HOME/.krun"/libkrun.so* 2>/dev/null | head -1)"
+        test -n "$so" || { echo "::error::no libkrun.so under $HOME/.krun"; exit 1; }
+        nm -D "$so" 2>/dev/null | grep -q krun_add_disk3 \
+          || { echo "::error::materialized libkrun ($so) does not export krun_add_disk3; need >= 1.19.0"; exit 1; }
+        echo "libkrun OK: $so exports krun_add_disk3"

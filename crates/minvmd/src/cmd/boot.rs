@@ -98,6 +98,13 @@ fn run_boot(foreground: bool) -> Result<()> {
         .set_nonblocking(false)
         .context("setting listener to blocking")?;
 
+    // R2.5: record whether the data volume image pre-exists this boot, before
+    // the VMM child provisions it — a later boot failure is fatal for a
+    // pre-existing image (may hold session data) and recoverable for a blank
+    // one freshly created by this boot.
+    let volume_path = crate::volume::resolve_data_volume_path();
+    let volume_preexisted = crate::cmd::volume_preexists(&volume_path);
+
     // Spawn `minvmd __krun-vmm` — the VMM child that calls krun_start_enter.
     let exe = std::env::current_exe().context("resolving current executable path")?;
     let mut cmd = std::process::Command::new(&exe);
@@ -124,10 +131,10 @@ fn run_boot(foreground: bool) -> Result<()> {
 
     // Run the accept loop in a separate thread so we can apply a wall-clock
     // timeout without platform-specific socket options.
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<crate::cmd::BootBeacon, String>>();
     let sock_path_clone = marker_sock_path.clone();
     std::thread::spawn(move || {
-        let result = (|| -> Result<(), String> {
+        let result = (|| -> Result<crate::cmd::BootBeacon, String> {
             let (stream, _) = listener
                 .accept()
                 .map_err(|e| format!("accept on READY-marker socket: {e}"))?;
@@ -139,7 +146,7 @@ fn run_boot(foreground: bool) -> Result<()> {
     });
 
     match rx.recv_timeout(ready_timeout) {
-        Ok(Ok(())) => {
+        Ok(Ok(crate::cmd::BootBeacon::Ready)) => {
             println!("vm-up");
             // R3.2: by the time READY arrives, libkrun has created and is
             // listening on the minimald bridge socket. libkrun creates it with
@@ -165,16 +172,29 @@ fn run_boot(foreground: bool) -> Result<()> {
                 }
             }
         }
+        Ok(Ok(crate::cmd::BootBeacon::MountFailed { reason })) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&marker_sock_path);
+            crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
+            return Err(crate::cmd::mount_failed_error(
+                &reason,
+                &volume_path,
+                volume_preexisted,
+            ));
+        }
         Ok(Err(e)) => {
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_file(&marker_sock_path);
+            crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
             bail!("boot failed: {e}");
         }
         Err(_timeout) => {
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_file(&marker_sock_path);
+            crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
             bail!(
                 "boot timed out waiting for READY marker after {} s (raise {} to wait longer)",
                 ready_timeout.as_secs(),

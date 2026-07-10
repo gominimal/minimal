@@ -47,6 +47,7 @@ vt100-ctt.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 
 # WireGuard mesh peer (Unit 4, R4.1/R4.7): compiled only under `networking-wg`.

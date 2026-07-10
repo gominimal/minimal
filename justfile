@@ -118,6 +118,19 @@ minvmd-build: libkrun
 minimal-cli:
     cargo build -p minimal
 
+# Run the `minimal` CLI against the workspace's own debug build. Prepends
+# `target/debug/` to `$PATH` so `minimal`'s auto-spawn can find the sibling
+# `minimald` binary (it invokes it by name). Arguments after `just min` are
+# forwarded verbatim.
+#
+# Example:
+#   just min activate --loadout helix --attach
+#   just min loadout list
+#   just min dirs
+min *args:
+    cargo build -p minimal -p minimald
+    PATH="{{justfile_directory()}}/target/debug:$PATH" "{{minimal}}" {{args}}
+
 # minimal auto-spawns `minvmd run --detach`, so minvmd must be on PATH and the
 # MINVMD_* artifact paths exported; both are set here and inherited by the
 # detached supervisor. On Linux LD_LIBRARY_PATH is also inherited so libkrun can

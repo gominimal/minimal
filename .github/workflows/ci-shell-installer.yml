@@ -6,19 +6,15 @@ name: CI shell installer
 # (§1), and the unit-test harness run under dash and — critically — macOS's
 # frozen /bin/sh (§2/§3), where the installer takes its BSD mktemp and `shasum`
 # (no sha256sum) code paths. No network: the harness stubs the bucket.
+#
+# ALWAYS-TRIGGERED, path-scoped INSIDE the workflow (the `changes` job), so
+# the `if: always()` aggregator can join the required checks. Do NOT add
+# trigger-level `paths:` — a path-skipped required context wedges the PR.
 on:
   pull_request:
     branches: ["main"]
-    paths:
-      - "scripts/install.sh"
-      - "scripts/install_test.sh"
-      - ".github/workflows/ci-shell-installer.yml"
   push:
     branches: ["main"]
-    paths:
-      - "scripts/install.sh"
-      - "scripts/install_test.sh"
-      - ".github/workflows/ci-shell-installer.yml"
   workflow_dispatch:
 
 # Cancel superseded runs on a branch; never cancel a run on main.
@@ -28,19 +24,51 @@ concurrency:
 
 permissions:
   contents: read
+  # dorny/paths-filter reads the PR file list on pull_request events.
+  pull-requests: read
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      installer: ${{ steps.filter.outputs.installer }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Detect installer changes
+        id: filter
+        # v3.0.2, SHA-pinned. Runs ONLY on pull_request, where dorny reads
+        # the PR file list via the API (a push would need a local diff our
+        # shallow, credential-free checkout cannot provide) — and pushes to
+        # main / dispatches run everything regardless.
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
+        with:
+          filters: |
+            installer:
+              - "scripts/install.sh"
+              - "scripts/install_test.sh"
+              - ".github/workflows/ci-shell-installer.yml"
+
   shellcheck:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.installer == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: shellcheck --shell=sh (no warnings)
         # shellcheck is preinstalled on the ubuntu-latest runner image.
         run: shellcheck --shell=sh scripts/install.sh scripts/install_test.sh
 
   test:
     name: test (${{ matrix.os }} / ${{ matrix.shell }})
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.installer == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
@@ -56,18 +84,21 @@ jobs:
             shell: sh # macOS frozen bash 3.2 as /bin/sh
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Run installer test harness under ${{ matrix.shell }}
         run: SH='${{ matrix.shell }}' '${{ matrix.shell }}' scripts/install_test.sh
 
-  # Single stable status for branch protection: green only when shellcheck and
-  # every test lane succeed (the matrix lanes have dynamic names).
+  # Single stable status for branch protection: green when shellcheck and
+  # every test lane succeeded OR were path-skipped (the matrix lanes have
+  # dynamic names); red only on failure/cancellation.
   ci-shell-installer-success:
     if: always()
-    needs: [shellcheck, test]
+    needs: [changes, shellcheck, test]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Verify all gating jobs succeeded
+      - name: Verify all gating jobs succeeded or were skipped
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         run: exit 1
       - run: echo "installer shellcheck + tests passed"

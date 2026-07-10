@@ -245,6 +245,12 @@ async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) {
             let mngr = s.sessions_manager().await;
             Ok(match mngr.shutdown(req.force).await {
                 Ok(()) => {
+                    // R2.1/R2.2: with the sessions drained, quiesce the state
+                    // volume (syncfs + detach) before acknowledging, so a
+                    // caller-driven VMM teardown right after the ack leaves a
+                    // clean ext4 journal. Best-effort with a bounded wait; the
+                    // journal replay backstop covers every failure arm.
+                    quiesce_state_volume_if_mounted(&s).await;
                     // Manager is down; tell the accept loop to stop and drain
                     // so the process can exit. Firing before the response is
                     // written is safe: the drain waits out the grace period,
@@ -260,6 +266,39 @@ async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) {
         tracing::warn!("RPC handler for {} failed: {}", Shutdown::NAME, e);
     }
 }
+
+/// Quiesce the guest state volume during shutdown (R2.2). No-op unless the
+/// boot path actually mounted the data volume at the state dir — a native
+/// daemon's host directory, or a microVM running without a volume, must
+/// never be synced-and-unmounted out from under the host. `syncfs` is
+/// blocking, so it runs on the blocking pool with a 10 s ceiling; the
+/// handler proceeds regardless of the outcome. Note the ceiling's residual
+/// risk: a timed-out `syncfs` keeps running detached while the handler acks,
+/// so a very large dirty set can still be mid-flush when the caller tears
+/// the VM down — bounded, as ever, by the ext4 journal replay backstop.
+#[cfg(target_os = "linux")]
+async fn quiesce_state_volume_if_mounted(s: &ServerStateHandle) {
+    const QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    if !s.state_volume_mounted().await {
+        return;
+    }
+    let mountpoint = s.minimal_state_dir().await;
+    let quiesce = tokio::task::spawn_blocking(move || {
+        crate::guest::quiesce_state_volume(mountpoint.as_utf8_path().as_str())
+    });
+    match tokio::time::timeout(QUIESCE_TIMEOUT, quiesce).await {
+        Ok(Ok(Ok(()))) => tracing::info!("state volume quiesced for shutdown"),
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(error = %e, "state volume quiesce failed; ext4 journal replay will recover")
+        }
+        Ok(Err(join)) => tracing::warn!(error = %join, "state volume quiesce task panicked"),
+        Err(_) => tracing::warn!("state volume quiesce timed out after 10s; proceeding"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn quiesce_state_volume_if_mounted(_s: &ServerStateHandle) {}
 
 /// `AbortSession`: drop a `Pending` session's stash entry and delete
 /// its on-disk record. See the manager arm for the actor-side rules

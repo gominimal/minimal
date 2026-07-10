@@ -19,6 +19,11 @@ use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
 #[cfg(target_os = "linux")]
 const DEFAULT_VSOCK_PORT_BASE: u32 = 2222;
 
+/// Env var `spawn_detached` sets on the child so `async_main` knows
+/// its stdio has been redirected to `/dev/null` and needs to swap
+/// the tracing writer over to a rolling log file.
+const DETACHED_ENV: &str = "MINIMALD_DETACHED";
+
 #[derive(Parser)]
 #[command(name = "minimald", version = env!("CARGO_PKG_VERSION"), long_version = env!("LONG_VERSION"))]
 #[command(about = "The Minimal daemon")]
@@ -247,7 +252,10 @@ fn spawn_detached(cli: &Cli) -> Result<(), MainError> {
     cmd.args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::null())
+        // Mark the child so `async_main` knows its stdio has been
+        // null'd and can route tracing output to a log file instead.
+        .env(DETACHED_ENV, "1");
     // SAFETY: setsid() is async-signal-safe. In the child it starts a new
     // session so the daemon outlives the CLI and is unaffected by SIGHUP when
     // the invoking shell exits.
@@ -313,18 +321,67 @@ fn lock_held(path: &std::path::Path) -> std::io::Result<bool> {
     }
 }
 
-async fn async_main() -> Result<(), MainError> {
+/// Install the tracing subscriber. Foreground processes log to
+/// stdout; detached daemons (marked by [`DETACHED_ENV`]) write to
+/// `<state_dir>/logs/minimald.log`, daily-rotated. The returned
+/// [`WorkerGuard`] must outlive the process — dropping it flushes
+/// pending records and terminates the appender's worker thread.
+///
+/// [`WorkerGuard`]: tracing_appender::non_blocking::WorkerGuard
+fn init_tracing(
+    cli: &Cli,
+) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>, MainError> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("info")
             .add_directive("topiary=off".parse().unwrap())
             .add_directive("libcgroups=off".parse().unwrap())
     });
 
+    let detached = std::env::var_os(DETACHED_ENV).is_some();
+    if !detached {
+        tracing_subscriber::registry()
+            .with(fmt::layer().with_writer(ot::StdoutWriter::new))
+            .with(filter)
+            .init();
+        return Ok(None);
+    }
+
+    // Under `<state_dir>/logs/` so `<state_dir>` itself stays
+    // dominated by the sockets, sessions, and providers it already
+    // owns. `create_dir_all` is idempotent — subsequent daemon
+    // starts don't churn.
+    let log_dir = cli
+        .minimal_state_dir()
+        .as_utf8_path()
+        .as_std_path()
+        .join("logs");
+    std::fs::create_dir_all(&log_dir)
+        .map_err(|e| MainError::IO(e, "creating minimald log directory"))?;
+    // Cap retained files so a long-running daemon doesn't accumulate
+    // logs indefinitely. Two weeks is comfortably longer than the
+    // usual "look at what happened yesterday" window and short enough
+    // that the on-disk footprint stays bounded.
+    let appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("minimald.log")
+        .max_log_files(14)
+        .build(&log_dir)
+        .map_err(|e| MainError::IO(std::io::Error::other(e), "building rolling log appender"))?;
+    let (writer, guard) = tracing_appender::non_blocking(appender);
     tracing_subscriber::registry()
-        .with(fmt::layer().with_writer(ot::StdoutWriter::new))
+        // ANSI colors only make sense on a terminal; a file logger
+        // just gets noise from the escape sequences.
+        .with(fmt::layer().with_ansi(false).with_writer(writer))
         .with(filter)
         .init();
+    tracing::info!(
+        log_dir = %log_dir.display(),
+        "detached minimald: routing tracing output to daily-rotated log file",
+    );
+    Ok(Some(guard))
+}
 
+async fn async_main() -> Result<(), MainError> {
     // With `networking-proxy` on, both the `ring` (workspace rustls) and the
     // `aws-lc-rs` (google-cloud) providers are compiled in, so rustls cannot
     // auto-pick one and panics ("no process-level CryptoProvider") the first time
@@ -373,6 +430,16 @@ async fn async_main() -> Result<(), MainError> {
         return Ok(());
     }
 
+    // Initialize tracing. Foreground runs (or the parent-side of a
+    // `--detach` re-exec) log to stdout. A child spawned by
+    // `spawn_detached` has its stdio null'd — detectable via the
+    // `MINIMALD_DETACHED` env var — so it routes tracing to a daily-
+    // rotated log file under the state directory instead. `_log_guard`
+    // is bound at function scope so the non-blocking appender's
+    // worker survives for the daemon's entire lifetime; dropping it
+    // would flush and terminate the appender prematurely.
+    let _log_guard = init_tracing(&cli)?;
+
     let listen_args = cli.listen_args().unwrap();
 
     // Daemonize before doing any work: re-exec ourselves in a new session and
@@ -412,23 +479,50 @@ async fn async_main() -> Result<(), MainError> {
     // relocate cache + state onto it so builds hardlinking from the cache stay on
     // one filesystem (the EXDEV fix). Relocation is gated on the mount succeeding:
     // pointing state at an unmounted /var/lib/minimal would land it on the
-    // read-only rootfs. When no volume is requested (the transitional case), state
-    // stays on the tmpfs default. Unit 2 (R2.4/R2.5) makes a failed mount loud and
-    // removes the silent-fallback path.
+    // read-only rootfs.
+    //
+    // R2.4/R2.5: a mount failure is loud and terminal — emit MOUNT_FAILED
+    // instead of READY and park. No code path substitutes the /run/minimal
+    // tmpfs: session state is user data with no host copy, so a silent fallback
+    // would serve a ghost READY over a VM that quietly loses everything on stop.
+    let mut state_volume_mounted = false;
     if let Some(dev) = cli.listen_args().unwrap().mk_mount_state_volume.clone() {
-        match guest::mount_state_volume(&dev, "/var/lib/minimal") {
-            Ok(true) => {
-                cli.global_args.minimal_state_dir =
-                    Some(DaemonAbsPath::try_new("/var/lib/minimal").unwrap().into());
-                cli.global_args.minimal_cache_dir = Some(
-                    DaemonAbsPath::try_new("/var/lib/minimal/cache")
+        match guest::mount_state_volume(&dev, guest::STATE_VOLUME_MOUNTPOINT) {
+            Ok(()) => {
+                cli.global_args.minimal_state_dir = Some(
+                    DaemonAbsPath::try_new(guest::STATE_VOLUME_MOUNTPOINT)
                         .unwrap()
                         .into(),
                 );
+                cli.global_args.minimal_cache_dir = Some(
+                    DaemonAbsPath::try_new(format!("{}/cache", guest::STATE_VOLUME_MOUNTPOINT))
+                        .unwrap()
+                        .into(),
+                );
+                state_volume_mounted = true;
                 tracing::info!(device = %dev, "cache + state relocated onto the data volume (/var/lib/minimal)");
             }
-            Ok(false) => {}
-            Err(e) => tracing::error!(error = %e, device = %dev, "mounting data volume"),
+            // The MOUNT_FAILED beacon + park contract only makes sense with a
+            // minvmd host watching the marker socket (the vsock transport);
+            // a native daemon handed --mk-mount-state-volume must fail like
+            // any other startup error instead of hanging forever.
+            Err(e) if cli.listen_args().unwrap().vsock => {
+                tracing::error!(error = %e, device = %dev, "data volume mount failed; refusing READY (R2.4)");
+                if let Err(emit) = guest::emit_mount_failed_marker(&e.to_string()).await {
+                    // The host will still fail this boot via its READY
+                    // timeout; it just loses the mount-failure diagnosis.
+                    tracing::error!(error = %emit, "emitting MOUNT_FAILED marker failed; host will see a READY timeout");
+                }
+                // Park like the no-rootfs degraded path above: exiting pid-1
+                // tears the VMM down racing the host's marker read; the host
+                // kills the child once it has consumed MOUNT_FAILED.
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                }
+            }
+            Err(e) => {
+                return Err(MainError::IO(e, "mounting the state volume"));
+            }
         }
     }
 
@@ -449,12 +543,26 @@ async fn async_main() -> Result<(), MainError> {
     // Single-instance guard, held for the daemon's lifetime (the kernel
     // releases it on death): a second minimald must not steal this
     // instance's socket.
+    //
+    // As the microVM's pid-1 the lock lives on the /run tmpfs, not the
+    // provider dir: the provider dir sits on the persistent data volume, and
+    // a lifetime-held write fd there pins the volume busy through the
+    // shutdown quiesce (R2.1), leaving a dirty ext4 journal on every clean
+    // stop. Nothing outside this boot reads the guest's lock (the host probes
+    // its own provider dir), so boot-ephemeral tmpfs is the honest home for
+    // it. Keyed on being the VM init — pid-1 owns its /run — NOT on the
+    // `--vsock` flag: a native (possibly non-root) `--vsock` daemon may not
+    // be able to write /run at all and keeps the provider-dir lock.
+    let instance_lock_path = if is_minimal_microvm() {
+        DaemonAbsPath::try_new(format!("/run/minimald-local-{}.lock", cli.instance_num()))
+            .expect("static /run lock path is absolute")
+    } else {
+        cli.client_instance_dir()
+            .sub_path_unchecked(paths::MINIMALD_LOCK_FILE)
+    };
     let mut instance_lock = fd_lock::RwLock::new(
-        open_lock_file(
-            cli.client_instance_dir()
-                .sub_path_unchecked(paths::MINIMALD_LOCK_FILE),
-        )
-        .map_err(|e| MainError::IO(e, "opening instance lock"))?,
+        open_lock_file(instance_lock_path)
+            .map_err(|e| MainError::IO(e, "opening instance lock"))?,
     );
     let instance_guard = match instance_lock.try_write() {
         Ok(guard) => guard,
@@ -504,6 +612,7 @@ async fn async_main() -> Result<(), MainError> {
         // `OwnIp` PTask must attach to the host gvproxy over the vsock shuttle,
         // not spawn gvproxy in-guest. The UDS path is DM2.
         in_microvm: cli.listen_args().unwrap().vsock,
+        state_volume_mounted,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
