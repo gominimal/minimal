@@ -57,6 +57,8 @@ jobs:
               - "crates/**"
               - "Cargo.toml"
               - "Cargo.lock"
+              # Nextest profiles change how this lane's tests run.
+              - ".config/nextest.toml"
               - "scripts/**"
               - ".minimal/**"
               - ".github/actions/setup-rust/**"
