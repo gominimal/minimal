@@ -48,8 +48,13 @@ jobs:
           persist-credentials: false
       - name: Detect relevant changes
         id: filter
-        # v3.0.2, SHA-pinned. On workflow_dispatch there is no diff to filter;
-        # the downstream `if` treats dispatch as "run everything".
+        # v3.0.2, SHA-pinned. Runs ONLY on pull_request, where dorny reads
+        # the PR file list via the API. On push it would need a local diff
+        # against event.before, which our shallow, credential-free checkout
+        # (persist-credentials: false) cannot provide — and pushes to main
+        # SHOULD run everything anyway: they write the main-only caches and
+        # provide the soak signal. Dispatch likewise runs everything.
+        if: github.event_name == 'pull_request'
         uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
         with:
           filters: |
@@ -79,7 +84,7 @@ jobs:
     # ran (crates/minimald/tests/netns.rs, mesh_uc7.rs). The code and tests
     # stay in-tree and runnable locally; they are just not CI-covered.
     needs: [changes]
-    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.native == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -98,7 +103,7 @@ jobs:
     # ran the daemon natively at all. The native target needs no E2E_* knobs:
     # host daemon, repo as the project.
     needs: [changes]
-    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.native == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
