@@ -527,6 +527,16 @@ async fn async_main() -> Result<(), MainError> {
                 );
                 state_volume_mounted = true;
                 tracing::info!(device = %dev, "cache + state relocated onto the data volume (/var/lib/minimal)");
+                // R3.2: provider registrations (host keys, known_hosts,
+                // socket paths) are boot-ephemeral; before the persistent
+                // volume they died with the tmpfs. Reset them here — before
+                // `client_instance_dir` below recreates a fresh one — while
+                // `sessions/` and `cache/` stay untouched.
+                if let Err(e) =
+                    guest::reset_providers_dir(std::path::Path::new(guest::STATE_VOLUME_MOUNTPOINT))
+                {
+                    tracing::warn!(error = %e, "resetting providers dir on boot");
+                }
             }
             // The MOUNT_FAILED beacon + park contract only makes sense with a
             // minvmd host watching the marker socket (the vsock transport);

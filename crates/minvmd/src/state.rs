@@ -130,6 +130,11 @@ impl StateDir {
         self.dir.join(paths::MINVMD_LOCK_FILE)
     }
 
+    /// Path to `session_index.json` (the session → volume image map, R3.4).
+    pub fn session_index_path(&self) -> PathBuf {
+        self.dir.join("session_index.json")
+    }
+
     /// Read the current state from `minvmd.toml`.
     ///
     /// Returns `State { lifecycle: NotProvisioned, .. }` when the file does

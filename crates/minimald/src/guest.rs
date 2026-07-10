@@ -589,6 +589,41 @@ pub fn shut_down_vm() -> std::io::Error {
     std::io::Error::last_os_error()
 }
 
+/// Reset the boot-ephemeral `providers/` directory under the (now persistent)
+/// state dir, returning the number of entries removed (R3.2).
+///
+/// Provider registrations — per-instance host keys, known_hosts, socket
+/// paths — are ephemeral per boot; before the persistent volume they died
+/// with the tmpfs. `sessions/` and `cache/` are the durable state and are
+/// untouchable by construction here: only entries *inside* `providers/` are
+/// removed, never a glob over the state root. A missing `providers/` is not
+/// an error (first boot).
+pub fn reset_providers_dir(state_dir: &std::path::Path) -> std::io::Result<usize> {
+    let providers = state_dir.join("providers");
+    let entries = match std::fs::read_dir(&providers) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut removed = 0usize;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+        removed += 1;
+    }
+    tracing::info!(
+        dir = %providers.display(),
+        removed,
+        "reset boot-ephemeral directory"
+    );
+    Ok(removed)
+}
+
 /// Enumerate open fds (and cwds) under `mountpoint` across all processes, for
 /// the EBUSY diagnostics in [`quiesce_state_volume`] — an unmountable volume
 /// is invisible without knowing who holds it. Best-effort `/proc` scan.
@@ -985,6 +1020,36 @@ mod tests {
             format!("READY\n{expected_openssh}\n"),
             "beacon must be READY\\n<openssh-pubkey>\\n"
         );
+    }
+
+    #[test]
+    fn reset_providers_dir_clears_providers_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        std::fs::create_dir_all(state.join("providers/local-0")).unwrap();
+        std::fs::write(state.join("providers/local-0/key"), b"k").unwrap();
+        std::fs::write(state.join("providers/stray-file"), b"s").unwrap();
+        std::fs::create_dir_all(state.join("sessions/abcde")).unwrap();
+        std::fs::write(state.join("sessions/abcde/record.json"), b"{}").unwrap();
+        std::fs::create_dir_all(state.join("cache")).unwrap();
+        std::fs::write(state.join("cache/x"), b"x").unwrap();
+
+        let removed = reset_providers_dir(state).unwrap();
+
+        assert_eq!(removed, 2, "one dir + one stray file");
+        assert!(
+            std::fs::read_dir(state.join("providers")).unwrap().count() == 0,
+            "providers/ must be emptied"
+        );
+        assert!(
+            state.join("sessions/abcde/record.json").exists(),
+            "sessions/ must be preserved"
+        );
+        assert!(state.join("cache/x").exists(), "cache/ must be preserved");
+
+        // Missing providers/ (first boot) is not an error.
+        let fresh = tempfile::tempdir().unwrap();
+        assert_eq!(reset_providers_dir(fresh.path()).unwrap(), 0);
     }
 
     #[test]

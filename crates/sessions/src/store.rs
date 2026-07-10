@@ -355,19 +355,47 @@ impl DiskLoader {
     /// # Errors
     ///
     /// I/O error if the sessions directory can't be created or
-    /// `index.json` can't be read.
+    /// `index.json` can't be read. A *corrupt* `index.json` is not an
+    /// error: the index is derived state, so it is rebuilt from the
+    /// per-session `record.json` files instead of failing startup
+    /// (R3.1 — with the state dir on the persistent volume, a torn
+    /// index write now survives restarts).
     pub fn new(minimal_dir: DaemonAbsPath) -> Result<Self, std::io::Error> {
         std::fs::create_dir_all(minimal_dir.as_utf8_path().join("sessions"))?;
         let index_file = minimal_dir.as_utf8_path().join("sessions/index.json");
+        let mut recovered_from_corrupt = false;
         let index = if std::fs::exists(&index_file)? {
-            serde_json::from_reader(std::fs::File::open(index_file)?)?
+            // Same split as `classify_record_for_reconcile`: an I/O error is
+            // transient (hard-fail, retry next startup); anything else is
+            // data corruption (definitive — rebuild below).
+            match serde_json::from_reader(std::fs::File::open(&index_file)?) {
+                Ok(index) => index,
+                Err(e) if e.is_io() => return Err(e.into()),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        path = %index_file,
+                        "corrupt sessions index.json; rebuilding from per-session records",
+                    );
+                    recovered_from_corrupt = true;
+                    Index::default()
+                }
+            }
         } else {
             Index::default()
         };
 
         let mut this = Self { minimal_dir, index };
-        if this.self_heal()? {
+        // Flush even when self-heal found nothing to re-index: the corrupt
+        // file itself must be replaced with a valid (possibly empty) index.
+        if this.self_heal()? || recovered_from_corrupt {
             this.flush_index()?;
+        }
+        if recovered_from_corrupt {
+            tracing::warn!(
+                sessions_recovered = this.index.short_to_id.len(),
+                "session index rebuilt after corruption",
+            );
         }
         Ok(this)
     }
@@ -1837,5 +1865,85 @@ mod tests {
         );
         assert_eq!(loader.find_by_id(key_a.id()).unwrap(), None);
         assert_eq!(loader.find_by_id(key_b.id()).unwrap(), None);
+    }
+
+    // =================================================================
+    // corrupt index.json recovery (R3.1)
+    // =================================================================
+
+    fn index_path(loader_root: &DaemonAbsPath) -> std::path::PathBuf {
+        loader_root
+            .as_utf8_path()
+            .join("sessions/index.json")
+            .as_std_path()
+            .to_path_buf()
+    }
+
+    /// A syntactically corrupt index must not fail startup: the index
+    /// is rebuilt from the per-session `record.json` files and a valid
+    /// index is flushed back.
+    #[test]
+    fn corrupt_index_rebuilds_from_records() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key_a = loader.create(sample_record()).unwrap();
+        let key_b = loader
+            .create({
+                let mut r = sample_record();
+                r.name = Some("other".into());
+                r
+            })
+            .unwrap();
+        drop(loader);
+
+        // Simulate a torn index write on the persistent volume.
+        std::fs::write(index_path(&root), b"{ not json").unwrap();
+
+        let loader = DiskLoader::new(root.clone()).unwrap();
+        assert_eq!(loader.find_by_id(key_a.id()).unwrap(), Some(key_a));
+        assert_eq!(loader.find_by_id(key_b.id()).unwrap(), Some(key_b));
+        assert!(loader.find_by_name("my-session").unwrap().is_some());
+        assert!(loader.find_by_name("other").unwrap().is_some());
+
+        // The corrupt file was replaced with a valid one.
+        let reread: serde_json::Value =
+            serde_json::from_slice(&read_index_bytes(&root)).expect("index.json must parse again");
+        drop(reread);
+    }
+
+    /// Valid JSON of the wrong shape is corruption too, not an error.
+    #[test]
+    fn wrong_shape_index_rebuilds_from_records() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        drop(loader);
+
+        std::fs::write(index_path(&root), b"[]").unwrap();
+
+        let loader = DiskLoader::new(root).unwrap();
+        assert_eq!(loader.find_by_id(key.id()).unwrap(), Some(key));
+    }
+
+    /// A corrupt index with no session records recovers to an empty
+    /// store and rewrites a valid (empty) index.
+    #[test]
+    fn corrupt_index_with_no_records_recovers_empty() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        // Initialize the layout, then corrupt the (empty) index.
+        drop(DiskLoader::new(root.clone()).unwrap());
+        std::fs::write(index_path(&root), b"garbage").unwrap();
+
+        let loader = DiskLoader::new(root.clone()).unwrap();
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+        let reread: serde_json::Value =
+            serde_json::from_slice(&read_index_bytes(&root)).expect("index.json must parse again");
+        drop(reread);
     }
 }
