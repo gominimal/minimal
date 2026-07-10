@@ -39,8 +39,11 @@ jobs:
           persist-credentials: false
       - name: Detect installer changes
         id: filter
-        # v3.0.2, SHA-pinned. On workflow_dispatch there is no diff to filter;
-        # the downstream `if` treats dispatch as "run everything".
+        # v3.0.2, SHA-pinned. Runs ONLY on pull_request, where dorny reads
+        # the PR file list via the API (a push would need a local diff our
+        # shallow, credential-free checkout cannot provide) — and pushes to
+        # main / dispatches run everything regardless.
+        if: github.event_name == 'pull_request'
         uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
         with:
           filters: |
@@ -51,7 +54,7 @@ jobs:
 
   shellcheck:
     needs: [changes]
-    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.installer == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.installer == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -63,7 +66,7 @@ jobs:
   test:
     name: test (${{ matrix.os }} / ${{ matrix.shell }})
     needs: [changes]
-    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.installer == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.installer == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:

@@ -40,10 +40,13 @@ jobs:
                   persist-credentials: false
             - name: Detect non-docs changes
               id: filter
-              # v3.0.2, SHA-pinned. On workflow_dispatch there is no diff to
-              # filter; the downstream `if` treats dispatch as "run everything".
+              # v3.0.2, SHA-pinned. Runs ONLY on pull_request, where dorny
+              # reads the PR file list via the API (a push would need a local
+              # diff our shallow, credential-free checkout cannot provide) —
+              # and pushes to main / dispatches run everything regardless.
               # `code` = anything that is not documentation; the negations
               # mirror the old paths-ignore list.
+              if: github.event_name == 'pull_request'
               uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
               with:
                   filters: |
@@ -57,7 +60,7 @@ jobs:
 
     fmt:
         needs: [changes]
-        if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true'
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:
@@ -67,7 +70,7 @@ jobs:
 
     clippy:
         needs: [changes]
-        if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true'
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 30
         steps:
@@ -81,7 +84,7 @@ jobs:
 
     test:
         needs: [changes]
-        if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true'
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 40
         steps:
@@ -104,7 +107,7 @@ jobs:
 
     dogfood:
         needs: [changes]
-        if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true'
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 20
         steps:
@@ -129,7 +132,7 @@ jobs:
 
     cargo-deny:
         needs: [changes]
-        if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true'
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:
@@ -138,7 +141,7 @@ jobs:
 
     minimal-check:
         needs: [changes]
-        if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true'
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:
