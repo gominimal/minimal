@@ -227,7 +227,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                 );
             }
         } else {
-            panic!("prebuilt input was not source: {:?}", &build.build_deps[0]);
+            panic!("prebuilt input was not source: {:?}", build.build_deps[0]);
         }
     }
 }
