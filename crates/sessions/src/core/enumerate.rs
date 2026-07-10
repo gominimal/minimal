@@ -73,11 +73,13 @@ pub(crate) struct ExpandedProvenancedPatch {
 /// can't appear in the walk root or yielded paths. A non-existent
 /// walk root surfaces as a walkdir error on first iteration.
 ///
-/// All errors across every patch are accumulated — a permission-denied
-/// subtree under one patch doesn't hide an unwalkable pattern in
-/// another. If any error occurred, they surface together as
-/// [`ComposeError::PatchWalk`]; otherwise the file list is returned
-/// cleanly.
+/// A patch whose walk root doesn't exist is *not* a hard error —
+/// a `tracing::warn!` names the missing path and the patch is
+/// dropped, so a loadout that opportunistically patches something
+/// like `~/dotfiles/helix/` doesn't fail activation on a host that
+/// doesn't have that dotfile tree. Other walk failures (permission
+/// denied, non-UTF-8 paths, etc.) still accumulate and surface as
+/// [`ComposeError::PatchWalk`].
 pub(crate) fn enumerate_patch_files(
     items: Vec<ExpandedProvenancedPatch>,
     follow_symlinks: bool,
@@ -99,6 +101,28 @@ pub(crate) fn enumerate_patch_files(
             let entry = match entry_result {
                 Ok(entry) => entry,
                 Err(source) => {
+                    // `NotFound` is treated as "user doesn't have
+                    // this on their host" — warn and move on.
+                    // `walkdir::Error::path()` reports the specific
+                    // item that failed, which is either the walk
+                    // root itself (the common case) or a subitem
+                    // that vanished mid-walk (the race). Log both
+                    // the pattern's declared root and the failing
+                    // path so operators can distinguish. `.io_error()`
+                    // returns `None` for the loop-detection variant;
+                    // those still fail hard.
+                    if source
+                        .io_error()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        tracing::warn!(
+                            source_pattern = %pp.source.pattern(),
+                            walk_root = %walk_root_path,
+                            missing_path = ?source.path(),
+                            "patch source not found on host filesystem; dropping"
+                        );
+                        continue;
+                    }
                     accumulated_errors.push(PatchError::WalkFailure {
                         root: walk_root_path.clone(),
                         source,

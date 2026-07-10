@@ -155,6 +155,115 @@ impl Pty {
     }
 }
 
+/// Emit one `tracing::info!` per item the launcher folds into the
+/// session — packages, vars, patches, and lifecycle hooks —
+/// tagging each with its provenance so an operator can trace
+/// "where did `EDITOR=hx` come from?" back to the loadout /
+/// project / package that contributed it.
+///
+/// Baseline items (the launcher-defaults `PS1`, `base`, `coreutils`,
+/// `socat`) log with `source = "launcher-baseline"` so they can be
+/// distinguished from composition contributions. Patches and hooks
+/// still log even though the launcher can't act on them yet — an
+/// operator inspecting a session should see the intent even when
+/// the plumbing is deferred.
+///
+/// Var values are logged at `debug` (separate call) rather than
+/// `info` so an accidentally-inherited secret doesn't sit in the
+/// default log stream.
+#[cfg(not(test))]
+fn log_session_contents(
+    session_name: &str,
+    baseline_packages: &[&str],
+    baseline_var_names: &[&str],
+    composition: Option<&sessions::core::compose::Composition>,
+) {
+    for p in baseline_packages {
+        tracing::info!(
+            session = session_name,
+            domain = "package",
+            name = p,
+            source = "launcher-baseline",
+            "session content",
+        );
+    }
+    for k in baseline_var_names {
+        tracing::info!(
+            session = session_name,
+            domain = "var",
+            name = k,
+            source = "launcher-baseline",
+            "session content",
+        );
+    }
+    let Some(comp) = composition else {
+        return;
+    };
+    for p in comp.packages() {
+        tracing::info!(
+            session = session_name,
+            domain = "package",
+            name = %p.package(),
+            source = ?sessions::core::source::Provenanced::source(p),
+            "session content",
+        );
+    }
+    for v in comp.vars() {
+        let var = v.var();
+        tracing::info!(
+            session = session_name,
+            domain = "var",
+            name = %var.name(),
+            source = ?sessions::core::source::Provenanced::source(v),
+            "session content",
+        );
+        tracing::debug!(
+            session = session_name,
+            name = %var.name(),
+            value = %var.value(),
+            "session var value",
+        );
+    }
+    for sp in comp.patches() {
+        let patch = sp.patch();
+        tracing::info!(
+            session = session_name,
+            domain = "patch",
+            host_source = %patch.host_path(),
+            sandbox_dest = %patch.destination(),
+            source = ?sessions::core::source::Provenanced::source(sp),
+            deferred = true,
+            "session content (patch: file-upload plumbing deferred)",
+        );
+    }
+    for h in comp.lifecycle_hooks() {
+        let src = sessions::core::source::Provenanced::source(h);
+        let hook = h.hook();
+        [
+            ("on_activate", hook.on_activate()),
+            ("on_destroy", hook.on_destroy()),
+            ("on_failure", hook.on_failure()),
+        ]
+        .into_iter()
+        .filter_map(|(event, script)| script.map(|s| (event, s)))
+        .for_each(|(event, script)| {
+            let kind = match script {
+                sessions::core::lifecyclehook::HookScript::Inline(_) => "inline",
+                sessions::core::lifecyclehook::HookScript::External(_) => "external",
+            };
+            tracing::info!(
+                session = session_name,
+                domain = "lifecycle_hook",
+                event = event,
+                script_kind = kind,
+                source = ?src,
+                deferred = true,
+                "session content (lifecycle hook: exec plumbing deferred)",
+            );
+        });
+    }
+}
+
 /// Duplicate `fd` into a new close-on-exec `OwnedFd` via
 /// `F_DUPFD_CLOEXEC`, so a concurrent `fork` can't inherit and hold
 /// the pty open past our child's exit.
@@ -271,6 +380,13 @@ impl Binding {
                                     modes: terminal_modes.to_vec(),
                                 })).await;
                             },
+                            // Flow-control window updates fire on every
+                            // burst of bytes forwarded through the
+                            // channel — routine, not a fault. Debug
+                            // keeps them out of the default log stream.
+                            russh::ChannelMsg::WindowAdjusted { .. } => {
+                                tracing::debug!("skipping msg: {:?}", msg);
+                            }
                             _ => tracing::warn!("skipping msg: {:?}", msg),
                         };
                     }
@@ -591,6 +707,23 @@ impl SessionProcess for SandboxProcess {
     }
 }
 
+/// Packages every session sandbox gets unconditionally, regardless of
+/// the client's contribution: `base` for the shell, `coreutils` for
+/// `ls`/`cat`/etc, and `socat` for the `min` command bridge (the
+/// helper installed at `/usr/bin/min` speaks to `/run/minenv_sock`
+/// via `socat`).
+#[cfg(not(test))]
+const BASELINE_PACKAGES: &[&str] = &["base", "coreutils", "socat"];
+
+/// Env vars every session sandbox gets unconditionally, regardless of
+/// the client's contribution. `PS1` is here so the shell prompt is
+/// styled the same whether a composition sets it or not.
+#[cfg(not(test))]
+const BASELINE_VARS: &[(&str, &str)] = &[(
+    "PS1",
+    r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ ",
+)];
+
 /// The real [`SessionLauncher`]: evaluates a minimal context into a graph,
 /// builds a sandboxed `/bin/bash`, and wires it to a freshly opened PTY.
 #[cfg(not(test))]
@@ -759,7 +892,6 @@ impl SessionLauncher for SandboxLauncher {
         // are not applied yet (the file-upload path and in-sandbox
         // exec plumbing that they need aren't wired), so they pass
         // through this stage untouched.
-        let baseline_packages = ["base", "coreutils", "socat"];
         // A shadow set tracks membership so the composition-union
         // pass below stays O(n) instead of the naive
         // `Vec::contains` per iteration (see clippy's O(n²) hint).
@@ -768,13 +900,13 @@ impl SessionLauncher for SandboxLauncher {
         // strings and `String::clone` is a deep copy. Trivial cost
         // for a three-element baseline.
         let mut packages: Vec<String> =
-            baseline_packages.iter().map(|s| (*s).to_string()).collect();
+            BASELINE_PACKAGES.iter().map(|s| (*s).to_string()).collect();
         let mut package_set: std::collections::HashSet<String> =
-            baseline_packages.iter().map(|s| (*s).to_string()).collect();
-        let mut env_vars: HashMap<String, String> = HashMap::from([(
-            "PS1".to_string(),
-            r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ ".to_string(),
-        )]);
+            BASELINE_PACKAGES.iter().map(|s| (*s).to_string()).collect();
+        let mut env_vars: HashMap<String, String> = BASELINE_VARS
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
         if let Some(comp) = &composition {
             for p in comp.packages() {
                 let name = p.package();
@@ -787,6 +919,17 @@ impl SessionLauncher for SandboxLauncher {
                 env_vars.insert(var.name().to_string(), var.value().to_string());
             }
         }
+        // Log every item that will (or would) end up in the session,
+        // tagged with its provenance. Patches and lifecycle hooks are
+        // included even though the launcher can't act on them yet —
+        // an operator inspecting logs should see the intent.
+        let baseline_var_names: Vec<&str> = BASELINE_VARS.iter().map(|(k, _)| *k).collect();
+        log_session_contents(
+            &name,
+            BASELINE_PACKAGES,
+            &baseline_var_names,
+            composition.as_deref(),
+        );
 
         // Build the env + container and spawn the process. Any failure here (env
         // build, container build, spawn) leaves no process to reap; the phase-1

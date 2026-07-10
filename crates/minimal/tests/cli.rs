@@ -28,6 +28,7 @@ async fn version_succeeds_without_daemon() {
     let args = GlobalArgs {
         repo_dir: None,
         minimal_dir: Some(std::path::PathBuf::from("/nonexistent")),
+        config_dir: None,
         minvmd: false,
     };
     // Should print client version and note daemon is unreachable, but return Ok.
@@ -173,6 +174,8 @@ async fn activate_creates_session() {
         path: ".".to_string(),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        loadout: vec![],
+        no_loadouts: false,
         attach: false,
     };
     cmd_activate(&args, activate_args).await.unwrap();

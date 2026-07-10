@@ -162,6 +162,34 @@ pub fn provider_instance_dir(state_dir: &DaemonAbsPath, instance: u32) -> Daemon
     sub_path!(state_dir, "providers").sub_path_unchecked(&format!("local-{instance}"))
 }
 
+/// Returns minimal's default config directory, `<config>/minimal`.
+///
+/// The base is `$XDG_CONFIG_HOME` when set to an absolute path, otherwise
+/// `~/.config` on every platform. Deliberately does not use
+/// [`dirs::config_dir`]: on macOS that would produce
+/// `~/Library/Application Support`, diverging from how the rest of minimal's
+/// on-disk state is laid out ([`minimal_state_dir`] already falls through to
+/// `~/.local/state`). One layout everywhere is easier to document, and users
+/// who genuinely want the platform-native location can override with the
+/// CLI's `--config-dir` flag.
+///
+/// # Panics
+///
+/// Panics if neither `$XDG_CONFIG_HOME` nor a home directory can be
+/// resolved, or if the resulting path is not valid UTF-8.
+pub fn minimal_config_dir() -> DaemonAbsPath {
+    default_dir(xdg_config_home, ".config")
+}
+
+/// Return `$XDG_CONFIG_HOME` if it's set to an absolute path. Matches the
+/// spec: [XDG Base Directory Specification, "XDG_CONFIG_HOME"](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
+/// says relative paths are invalid and should be ignored.
+fn xdg_config_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
 /// Computes `<base>/minimal`, where `base` comes from `base_dir` or, failing
 /// that, `~/<home_fallback>`.
 fn default_dir(
@@ -1483,5 +1511,41 @@ mod tests {
             sub_path!(p, "moose"),
             HostRelPath::try_new("silly/moose").unwrap()
         );
+    }
+
+    /// Shared lock for every test in this file that mutates
+    /// `std::env`. Cargo runs `#[test]`s in parallel, and every
+    /// test in the process shares one process env — a second env-
+    /// touching test added anywhere in this crate must acquire this
+    /// lock too, or the runs will race. `Mutex` (not `PoisonError`-
+    /// aware) is fine because a panicking test would poison it and
+    /// downstream env tests would fail with a clear error, which is
+    /// what we want.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `xdg_config_home` reflects `$XDG_CONFIG_HOME` when it's an
+    /// absolute path (per the XDG spec) and yields `None` otherwise,
+    /// so the caller can fall through to `$HOME/.config`. Three
+    /// assertions kept in one test to minimize env-lock contention.
+    #[test]
+    fn xdg_config_home_resolution() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // SAFETY: `ENV_LOCK` serializes every env-touching test in
+        // this crate; the block runs single-threaded w.r.t. any
+        // sibling test that might read or write these vars.
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        assert_eq!(xdg_config_home(), None, "unset → None");
+
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", "not/absolute") };
+        assert_eq!(xdg_config_home(), None, "relative → ignored per spec");
+
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", "/some/absolute/xdg") };
+        assert_eq!(
+            xdg_config_home(),
+            Some(std::path::PathBuf::from("/some/absolute/xdg")),
+            "absolute → returned verbatim",
+        );
+
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 }
