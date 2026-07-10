@@ -38,7 +38,7 @@ pub use scaffold::scaffold_default_mfile;
 mod project_setup;
 pub use project_setup::ProjectSetup;
 
-pub use env::Env;
+pub use env::{Env, interpolate_task_strings};
 use tokio::sync::Semaphore;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
 
