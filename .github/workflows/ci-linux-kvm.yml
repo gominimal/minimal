@@ -68,6 +68,10 @@ jobs:
               # it post-merge.
               - ".github/actions/setup-libkrun-linux/**"
               - ".github/actions/materialize/**"
+              # The gvproxy pin: point-of-use verification (fetch-gvproxy.sh
+              # SHA-checks it in this lane) replaced the retired ci-gvproxy.yml
+              # workflow, so a pin bump must re-run this lane.
+              - "vendor/gvproxy/**"
 
   build-linux:
     # BUILD phase: compile everything the KVM tests need and ship it as one
