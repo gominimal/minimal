@@ -64,7 +64,7 @@ fn print_tasks(
                     .replace("\n", "\n    ");
                 writeln!(writer, "{}", usage).unwrap();
             } else {
-                writeln!(writer, "{}", &name).unwrap();
+                writeln!(writer, "{name}").unwrap();
             }
 
             writer.set_color(ColorSpec::new().set_fg(None)).unwrap();
