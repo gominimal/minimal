@@ -20,3 +20,15 @@ retries = 0
 slow-timeout = { period = "60s", terminate-after = 5 }
 leak-timeout = "1s"
 final-status-level = "slow"
+
+[profile.vm]
+# Prebuilt-harness VM runs (the KVM lane's archived e2e tests). One VM at a
+# time on a 2-vCPU runner; boots are legitimately slow, so the slow period is
+# generous — but a hung boot dies at 6 minutes instead of burning the job
+# timeout. The vmm/gvproxy children linger briefly at teardown by design,
+# hence the longer leak window.
+test-threads = 1
+retries = 0
+fail-fast = true
+slow-timeout = { period = "120s", terminate-after = 3 }
+leak-timeout = "5s"
