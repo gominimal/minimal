@@ -135,10 +135,10 @@ jobs:
     e2e:
         # Hypervisor E2E on real hardware, using the cache-pulled kernel + rootfs
         # ext4 image and the built initramfs (all from the `artifacts` job). One
-        # job (formerly boot-e2e + autospawn-e2e) so the single shared runner
-        # checks out, builds, and codesigns exactly once per run. Separate from
-        # build-macos so an artifact-fetch hiccup never blocks the always-green
-        # clippy/test/smoke checks.
+        # job (formerly boot-e2e + autospawn-e2e + build-macos's FFI smoke) so
+        # the single shared runner checks out, builds, and codesigns exactly
+        # once per run — everything that does NOT need the hypervisor lives in
+        # the GitHub-hosted `unit` job, keeping this runner free.
         #
         # GATING: green on the runner — raw kernel load (KRUN_KERNEL_FORMAT_RAW),
         # initramfs boot (minimald as `/init`, pid-1), minimald mounting the ext4
@@ -148,9 +148,10 @@ jobs:
         # boots the same kernel/rootfs/initramfs through the same HVF path as the
         # retired standalone boot test and goes further (russh auth + exec,
         # stdout + exit status), so a passing session gates the boot. The
-        # Auto-spawn step then covers the R4.5 CLI proof: from a clean state
-        # `minimal ls` must auto-spawn minvmd end to end — the macOS integration
-        # gate that no unit test can cover.
+        # unified session e2e (scripts/session-e2e.sh) then covers the R4.5
+        # CLI proof and more: from a clean state `minimal activate` must
+        # auto-spawn minvmd and a real session exec must round-trip — the
+        # macOS integration gate that no unit test can cover.
         if: ${{ vars.RUN_MACOS_CI != 'false' }}
         needs: [artifacts]
         runs-on: [self-hosted, macOS, ARM64]
@@ -178,14 +179,17 @@ jobs:
               with:
                   name: minimald-initramfs-aarch64
                   path: ${{ runner.temp }}/initramfs
-            - name: Build session harness + minvmd + minimal (no run)
+            - name: Build test harnesses + minvmd + minimal (no run)
               # Build EVERYTHING before the single codesign, then run the test
               # BINARIES DIRECTLY (below). Any cargo invocation after signing
               # relinks (and unsigns) target/debug/minvmd, so krun_start_enter
               # fails with EINVAL. minimal spawns `minvmd` by name from PATH; only
-              # minvmd needs the hypervisor entitlement.
+              # minvmd needs the hypervisor entitlement. Building the krun_smoke
+              # harness also builds its krun_smoke_child helper bin (cargo builds
+              # package bins for integration tests) and bakes its absolute
+              # CARGO_BIN_EXE path — same-machine build+run, so it resolves.
               run: |
-                  cargo test -p minvmd --test minimald_session_e2e --no-run
+                  cargo test -p minvmd --test krun_smoke --test minimald_session_e2e --no-run
                   cargo build -p minvmd --bin minvmd
                   # SEPARATE invocation for the CLI (mirrors release.yml): built
                   # together, cargo unifies minvmd's default `libkrun` feature
@@ -209,6 +213,26 @@ jobs:
                   fi
             - name: Codesign minvmd (hypervisor entitlement, R1.4)
               run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
+            - name: Production linkage static check (rewrite on a copy)
+              # Run the release pipeline's @rpath rewrite + verification against a
+              # THROWAWAY COPY of the just-built minvmd, so a change that would
+              # break the shipped bin/../lib layout (a lost @rpath load command, a
+              # leaked non-system dylib) reds the PR instead of the next release.
+              # The copy keeps the e2e binaries untouched (the rewrite invalidates
+              # the signature; the copy is never executed).
+              run: |
+                  cp target/debug/minvmd "$RUNNER_TEMP/minvmd-linkage-check"
+                  scripts/rewrite-macos-linkage.sh "$RUNNER_TEMP/minvmd-linkage-check"
+            - name: FFI smoke against real libkrun (no VM boot)
+              # Exercises create_ctx -> set_vm_config -> set_exec through the safe
+              # wrappers via the krun_smoke_child helper. No kernel/rootfs env is
+              # set, so it takes the bring-up-only path: no krun_start_enter, no
+              # codesigned entitlement needed. Direct-binary run (never `cargo
+              # test`, which would relink and unsign minvmd).
+              run: |
+                  testbin="$(ls -1t target/debug/deps/krun_smoke-* | grep -v '\.d$' | head -1)"
+                  test -x "$testbin" || { echo "::error::krun_smoke test binary not found"; exit 1; }
+                  MINVMD_E2E=1 "$testbin" --include-ignored --nocapture
             - name: Session E2E (boot + full session over the bridge)
               # Gating: boots the GENERIC upstream rootfs with minimald shipped as the
               # initramfs /init; a russh client over the bridge authenticates, creates
@@ -228,97 +252,47 @@ jobs:
                   MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio" \
                   MINVMD_BOOT_LOG="$RUNNER_TEMP/boot.log" \
                     "$testbin" --include-ignored --nocapture --exact minimald_exec_over_bridge
-            - name: Reap Session-E2E leftovers before auto-spawn
+            - name: Reap Session-E2E leftovers before the CLI e2e
               # The session harness (Guest::drop) kills its minvmd but not the
               # rest of the process tree it spawned: the detached `__krun-vmm`
               # grandchild AND the host gvproxy switch minvmd owns. Either
               # leftover wedges the host→guest bridge over libkrun's vsock
               # (#588) — a healthy guest accept loop that never receives the
-              # bridged connection — so the cold `minimal ls` dies with `ssh
-              # connect: Disconnected`. The `__krun-vmm`-only reap proved
+              # bridged connection — so the CLI e2e's cold activate dies with
+              # `ssh connect: Disconnected`. The `__krun-vmm`-only reap proved
               # insufficient: main run 29032763009 (on the commit that added
               # it) failed exactly this way, with the new VM's proxy-publish
               # WARN pointing at a lingering gvproxy. Reap the whole tree —
               # any stray minvmd first (so nothing respawns), then the VMM and
-              # gvproxy — so Auto-spawn starts from the single-VM state it had
-              # when it was its own job. The proper fix (harness reaps its own
+              # gvproxy — so the CLI e2e starts from the single-VM state it
+              # had when it was its own job. The proper fix (harness reaps its own
               # process group) is tracked under #588.
               run: |
                   pkill -x minvmd 2>/dev/null || true
                   pkill -f '__krun-vmm' 2>/dev/null || true
                   pkill -f gvproxy 2>/dev/null || true
                   sleep 1
-            - name: Auto-spawn E2E (minimal ls cold/warm, R4.5)
-              # The R4.5 CLI proof artifact, on real hardware. From a clean state
-              # `minimal ls` must auto-spawn minvmd and return within 8 s;
-              # `minvmd status` must then report running; a second `minimal ls` must
-              # complete in < 500 ms (warm reuse). This exercises the real
-              # minimal -> `minvmd run --detach` -> VM boot -> initramfs minimald
-              # session path end to end.
-              # Run the prebuilt binaries directly (never `cargo run`, which would
-              # relink and unsign minvmd). minimal finds `minvmd` via PATH; all three
-              # of MINVMD_KERNEL_PATH / MINVMD_ROOTFS_PATH / MINVMD_INITRAMFS propagate
-              # through the `minvmd run --detach` re-exec. A fresh XDG_STATE_HOME
-              # guarantees the clean (no-daemon) starting state.
+            - name: Session e2e via the CLI (activate/exec/destroy; autospawns minvmd)
+              # The unified session e2e (scripts/session-e2e.sh — the SAME
+              # proof every target lane runs), here against the VM-backed
+              # daemon: from a clean state, `minimal activate` must auto-spawn
+              # minvmd (found by name on PATH; the MINVMD_* env propagates
+              # through the `minvmd run --detach` re-exec), boot the guest,
+              # create a session, and `minimal attach --command` must exec in
+              # it over the vsock bridge. Replaces the old autospawn step,
+              # which only proved `minimal ls` cold/warm — this proves the
+              # full user path and subsumes it (the cold activate IS the
+              # autospawn). Runs the prebuilt binaries directly (never
+              # `cargo run`, which would relink and unsign minvmd).
+              # E2E_PROJECT_DIR=/tmp: the guest sees no host project dir yet
+              # (no project sync), and /tmp exists in the guest image.
               run: |
-                  set -uo pipefail   # not -e: capture failures so we can dump diagnostics
                   export PATH="$PWD/target/debug:$PATH"
                   export MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz"
                   export MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img"
                   export MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio"
-                  # Capture the guest console; this env var propagates through the
-                  # minimal -> `minvmd run --detach` -> `minvmd run` -> __krun-vmm chain,
-                  # so the silent detached supervisor's boot is still observable here.
-                  export MINVMD_BOOT_LOG="$RUNNER_TEMP/autospawn-boot.log"
-                  # All state (minvmd.toml, locks, the bridge socket) lives under
-                  # $XDG_STATE_HOME/minimal/providers/local-0; a fresh dir gives a
-                  # genuinely clean (NotProvisioned) state on the persistent runner.
-                  # Under /tmp, not $TMPDIR: macOS's deep $TMPDIR would push the
-                  # socket paths past the 104-byte sun_path limit.
-                  export XDG_STATE_HOME="$(mktemp -d /tmp/mnl.XXXXXX)"
-
-                  # macOS `date` has no %N; use perl's high-resolution clock for ms.
-                  now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time()*1000'; }
-
-                  # On any failure, dump what the silent detach hides — minimal's own
-                  # error, the persisted state, and the guest boot console — then stop
-                  # the supervisor and fail. An empty boot log means the VM never
-                  # started (supervisor died before krun_start_enter); kernel output
-                  # without a full boot means a stuck boot; a full boot points at a
-                  # UDS/timing issue.
-                  fail() {
-                    echo "::group::autospawn-e2e diagnostics"
-                    echo "--- minimal ls stderr ---"; cat "$RUNNER_TEMP/ls.err" 2>/dev/null || true
-                    echo "--- minvmd.toml ---"; cat "$XDG_STATE_HOME/minimal/providers/local-0/minvmd.toml" 2>/dev/null || echo "(none)"
-                    echo "--- guest boot console (tail) ---"; tail -80 "$MINVMD_BOOT_LOG" 2>/dev/null || echo "(no boot log — VM never started)"
-                    echo "::endgroup::"
-                    minvmd stop >/dev/null 2>&1 || true
-                    exit 1
-                  }
-                  trap 'minvmd stop >/dev/null 2>&1 || true' EXIT
-
-                  # Cold: must auto-spawn minvmd and return within 8 s.
-                  t0=$(now_ms)
-                  minimal ls 2>"$RUNNER_TEMP/ls.err" || { echo "::error::cold 'minimal ls' failed to auto-spawn minvmd"; fail; }
-                  t1=$(now_ms); cold=$(( t1 - t0 ))
-                  echo "cold 'minimal ls': ${cold}ms"
-                  [ "$cold" -lt 8000 ] || { echo "::error::cold 'minimal ls' took ${cold}ms (>= 8000ms)"; fail; }
-
-                  # minvmd must now report running (exit 0). Poll briefly to absorb the
-                  # gap between the host UDS accepting and the Running state persisting.
-                  running=0
-                  for _ in $(seq 1 50); do
-                    if minvmd status >/dev/null 2>&1; then running=1; break; fi
-                    sleep 0.1
-                  done
-                  [ "$running" = 1 ] || { echo "::error::minvmd did not report running after auto-spawn"; fail; }
-
-                  # Warm: minvmd already running, must return in < 500 ms.
-                  t0=$(now_ms)
-                  minimal ls >/dev/null 2>"$RUNNER_TEMP/ls.err" || { echo "::error::warm 'minimal ls' failed"; fail; }
-                  t1=$(now_ms); warm=$(( t1 - t0 ))
-                  echo "warm 'minimal ls': ${warm}ms"
-                  [ "$warm" -lt 500 ] || { echo "::error::warm 'minimal ls' took ${warm}ms (>= 500ms)"; fail; }
+                  export MINVMD_BOOT_LOG="$RUNNER_TEMP/cli-e2e-boot.log"
+                  E2E_VM=1 E2E_PROJECT_DIR=/tmp ./scripts/session-e2e.sh
             - name: Upload guest boot console logs
               # Capture hvc0 output for diagnosing a stuck/failed boot (e.g. a missing
               # virtio driver in the kernel). Always runs so a red boot is debuggable.
@@ -328,31 +302,30 @@ jobs:
                   name: minvmd-boot-logs
                   path: |
                       ${{ runner.temp }}/boot.log
-                      ${{ runner.temp }}/autospawn-boot.log
+                      ${{ runner.temp }}/cli-e2e-boot.log
                   if-no-files-found: ignore
 
-    build-macos:
-        # Self-hosted Apple Silicon runner. minvmd links libkrun
-        # (`#[link(name = "krun")]`) and only compiles on macOS — the Linux CI
-        # builds it as a stub. Real hardware, so the hypervisor-backed FFI smoke
-        # runs here; GitHub-hosted macOS VMs can't. Scoped to minvmd, the only
-        # macOS-gated crate; widen to --workspace once the tree is mac-buildable.
-        #
-        # Gated on the RUN_MACOS_CI repo variable (defaults to enabled when unset).
-        # `timeout-minutes` counts time queued for a runner, so set
-        # RUN_MACOS_CI=false to skip while the runner is offline.
-        if: ${{ vars.RUN_MACOS_CI != 'false' }}
-        runs-on: [self-hosted, macOS, ARM64]
-        timeout-minutes: 30
+    unit:
+        # GitHub-hosted Apple Silicon (macos-latest is arm64). minvmd links
+        # libkrun (`#[link(name = "krun")]`) and only compiles the real impl on
+        # macOS — the Linux CI builds it as a stub — so its clippy/unit tier
+        # needs a mac, but NOT the hypervisor: everything hypervisor-backed
+        # (the krun_smoke FFI smoke, VM boots) lives in the `e2e` job on the
+        # self-hosted runner, which this job frees up for exactly that. Scoped
+        # to the macOS-sensitive crates; widen to --workspace once the tree is
+        # mac-buildable. Kept lean (private repo: macOS minutes bill at 10x).
+        runs-on: macos-latest
+        timeout-minutes: 45
         steps:
             - uses: actions/checkout@v7
               with:
-                  # Don't leave git credentials on the persistent self-hosted runner.
                   persist-credentials: false
             - name: Toolchain
               uses: dtolnay/rust-toolchain@stable
               with:
                   components: clippy
+            - name: Cache cargo registry and build artifacts
+              uses: Swatinem/rust-cache@v2
             - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Clippy (minvmd)
@@ -362,11 +335,12 @@ jobs:
             - name: Test (sessions)
               # Platform-sensitive surface: std::fs::canonicalize behavior on
               # prefix-symlinked roots (/tmp → /private/tmp on macOS) and the
-              # follow_symlinks dual-path policy logic. Reuses the build
-              # cache from the minvmd job above.
+              # follow_symlinks dual-path policy logic.
+              #
+              # NOTE: `cargo test -p minimal` is deliberately absent — the CLI's
+              # dev-dependencies pull minimald (test-support), whose ungated
+              # hakoniwa -> libcgroups -> procfs chain does not build on macOS.
+              # (`cargo build -p minimal` is fine: no dev-deps.) The CLI's macOS
+              # coverage stays the autospawn e2e until minimald's sandbox deps
+              # are cfg(linux)-gated.
               run: cargo test -p sessions
-            - name: FFI smoke against real libkrun (no VM boot)
-              # Exercises create_ctx -> set_vm_config -> set_exec through the safe
-              # wrappers. Skips krun_start_enter (no kernel/rootfs), so it needs no
-              # codesigned hypervisor entitlement.
-              run: MINVMD_E2E=1 cargo test -p minvmd --test krun_smoke -- --include-ignored

@@ -130,7 +130,8 @@ pub fn open_tap(name: &str) -> io::Result<OwnedFd> {
 /// Each command is returned as an argv vector rather than executed, so the two
 /// callers can run them under the privileges they have: the daemon
 /// ([`move_tap_into_netns`]) execs them directly with `CAP_NET_ADMIN`, while the
-/// unprivileged `ci-netns.yml` proof wraps each in `sudo`. Single-sourcing the
+/// unprivileged netns proof (tests/netns.rs, mothballed) wraps each in `sudo`.
+/// Single-sourcing the
 /// command construction keeps the proof driving the same wiring the daemon does.
 ///
 /// The namespace is identified by PID, addressing `/proc/<pid>/ns/net` — the
