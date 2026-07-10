@@ -309,9 +309,16 @@ fn enumerate_and_classify_patches(
         let provenance: Source = p.source.into();
         let dest = PatchDest::try_new(p.destination.as_utf8_path().to_path_buf())
             .map_err(|source| ComposeError::InvalidPendingPatchDest { source })?;
+        // Client-response path handles daemon-side patches (Package /
+        // Project) — user loadouts never reach this path (see
+        // `daemon::composer`, which only accepts non-loadout
+        // Composables). `ProvenancedPatch::new` stamps
+        // `follow_symlinks: None`, which resolves to the compose
+        // default at expand time.
         let pp = ProvenancedPatch::new(Patch::new(p.source_pattern, dest), provenance);
-        let expanded = expand_patch_sources(vec![pp], combined_vars, home_fallback)?;
-        let files = enumerate_patch_files(expanded, follow_symlinks)?;
+        let expanded =
+            expand_patch_sources(vec![pp], combined_vars, home_fallback, follow_symlinks)?;
+        let files = enumerate_patch_files(expanded)?;
         for pf in files {
             match classify_patch_file(policy, PendingPatchFile::new(id, pf)) {
                 PatchClassification::Decided(verdict) => verdicts.push(verdict),
