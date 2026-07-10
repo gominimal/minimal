@@ -257,6 +257,8 @@ impl VmConfig {
         // listening on vsock VSOCK_BRIDGE_PORT.
         let uds_path = crate::sock::resolve_uds_path()
             .map_err(|source| crate::error::VmError::Io { source })?;
+        crate::sock::check_uds_path_len(&uds_path)
+            .map_err(|source| crate::error::VmError::Io { source })?;
         crate::sock::prepare_socket_dir(&uds_path)
             .map_err(|source| crate::error::VmError::Io { source })?;
         // Drop a stale socket from a prior run; libkrun's listen-bind fails
@@ -280,6 +282,8 @@ impl VmConfig {
         // If the host gvproxy did not come up, the guest's connect simply fails
         // and the relay reports no egress — boot is unaffected.
         let switch_sock = crate::net::resolve_switch_sock()
+            .map_err(|source| crate::error::VmError::Io { source })?;
+        crate::sock::check_uds_path_len(&switch_sock)
             .map_err(|source| crate::error::VmError::Io { source })?;
         ctx.add_vsock_port2(crate::net::VSOCK_GVPROXY_SHUTTLE_PORT, &switch_sock, false)?;
         tracing::info!(

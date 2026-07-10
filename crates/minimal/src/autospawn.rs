@@ -1,6 +1,6 @@
 //! Auto-spawn logic for minvmd (R4.5).
 //!
-//! Before connecting to the minvmd UDS, the CLI reads `state.toml`. If minvmd is
+//! Before connecting to the minvmd UDS, the CLI reads the minvmd state. If it is
 //! not running it spawns `minvmd run --detach` and waits (with a timeout) for the
 //! UDS to become available. This runs on both macOS (Hypervisor.framework) and
 //! Linux (KVM); on any other target it is a no-op.
@@ -54,7 +54,7 @@ const STOPPING_POLL_MS: u64 = 100;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const STOPPING_WAIT_SECS: u64 = 6;
 
-/// What to do given the lifecycle read from `state.toml`.
+/// What to do given the lifecycle read from the minvmd state.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Debug, PartialEq, Eq)]
 enum Decision {
@@ -81,18 +81,19 @@ fn classify(lifecycle: Lifecycle) -> Decision {
 
 /// Check whether minvmd needs to be spawned, and spawn it if necessary (R4.5).
 ///
-/// - Reads the minvmd state from `state.toml`.
+/// - Reads the minvmd state from `minvmd.toml`, via `effective_state` so a
+///   dead daemon's leftovers read as `Stopped` rather than wedging the CLI.
 /// - If already running/starting, returns immediately.
 /// - If stopping, waits for the shutdown to finish, then spawns.
 /// - Otherwise spawns `minvmd run --detach` with a timeout.
 ///
 /// On targets with no minvmd backend this is a no-op (see below).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub fn ensure_minvmd_running() -> io::Result<()> {
-    let state_dir = minvmd::state::StateDir::new(minvmd::state::StateDir::default_path())?;
+pub fn ensure_minvmd_running(minimal_dir: Option<&Path>) -> io::Result<()> {
+    let provider_dir = crate::client::resolve_provider_dir(minimal_dir)?;
+    let state_dir = minvmd::state::StateDir::new(provider_dir)?;
 
-    // Read current state (R4.5: check state.toml before connecting).
-    match classify(state_dir.read_state()?.lifecycle) {
+    match classify(state_dir.effective_state()?.lifecycle) {
         Decision::AlreadyRunning => {
             tracing::debug!("minvmd already running or starting");
             return Ok(());
@@ -107,7 +108,7 @@ pub fn ensure_minvmd_running() -> io::Result<()> {
             let deadline = Instant::now() + Duration::from_secs(STOPPING_WAIT_SECS);
             loop {
                 thread::sleep(Duration::from_millis(STOPPING_POLL_MS));
-                match classify(state_dir.read_state()?.lifecycle) {
+                match classify(state_dir.effective_state()?.lifecycle) {
                     // Something else restarted it in the meantime.
                     Decision::AlreadyRunning => return Ok(()),
                     // Shutdown completed; fall through to spawn.
@@ -130,7 +131,13 @@ pub fn ensure_minvmd_running() -> io::Result<()> {
     // Not running; spawn minvmd run --detach with timeout (R4.5).
     let timeout_secs = spawn_timeout_secs();
     tracing::info!("spawning minvmd run --detach with timeout {timeout_secs}");
-    let output = Command::new("minvmd")
+    let mut cmd = Command::new("minvmd");
+    // Forward the state-dir override so the daemon binds the socket where
+    // this client will look for it.
+    if let Some(dir) = minimal_dir {
+        cmd.arg("--minimal-state-dir").arg(dir);
+    }
+    let output = cmd
         .arg("run")
         .arg("--detach")
         .arg("--timeout")
@@ -152,7 +159,7 @@ pub fn ensure_minvmd_running() -> io::Result<()> {
 
 /// On targets without a minvmd backend (e.g. Windows), auto-spawn is a no-op.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn ensure_minvmd_running() -> io::Result<()> {
+pub fn ensure_minvmd_running(_minimal_dir: Option<&Path>) -> io::Result<()> {
     tracing::debug!("ensure_minvmd_running is a no-op on this platform");
     Ok(())
 }
@@ -166,16 +173,16 @@ pub fn ensure_minvmd_running() -> io::Result<()> {
 ///   (DM1) when `use_minvmd` is set.
 #[cfg(target_os = "macos")]
 pub fn ensure_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Result<()> {
-    let _ = (use_minvmd, minimal_dir);
-    ensure_minvmd_running()
+    let _ = use_minvmd;
+    ensure_minvmd_running(minimal_dir)
 }
 
 #[cfg(target_os = "linux")]
 pub fn ensure_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Result<()> {
     if use_minvmd {
-        return ensure_minvmd_running();
+        return ensure_minvmd_running(minimal_dir);
     }
-    let sock = crate::client::resolve_socket_path(minimal_dir, false)
+    let sock = crate::client::resolve_socket_path(minimal_dir)
         .map_err(|e| io::Error::other(format!("resolving native minimald socket path: {e}")))?;
     ensure_minimald_running(&sock, minimal_dir)
 }

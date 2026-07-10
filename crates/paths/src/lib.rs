@@ -132,16 +132,34 @@ pub fn minimal_cache_dir() -> DaemonAbsPath {
 
 /// Returns minimal's default state directory, `<state>/minimal`.
 ///
-/// The base is the platform state directory (e.g. `$XDG_STATE_HOME` or
-/// `~/.local/state` on Linux), falling back to `~/.local/state` when it cannot
-/// be determined.
+/// The base is `$XDG_STATE_HOME` when set (honored on all platforms;
+/// `dirs::state_dir` ignores it on macOS), else the platform state directory,
+/// else `~/.local/state`.
 ///
 /// # Panics
 ///
 /// Panics if neither a state directory nor a home directory can be resolved,
 /// or if the resulting path is not valid UTF-8.
 pub fn minimal_state_dir() -> DaemonAbsPath {
-    default_dir(dirs::state_dir, ".local/state")
+    let explicit = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute());
+    default_dir(|| explicit.or_else(dirs::state_dir), ".local/state")
+}
+
+/// File name of the daemon SSH socket in a provider instance dir. Served by
+/// native minimald or by the minvmd host↔guest bridge — one endpoint either way.
+pub const SSH_SOCK_FILE: &str = "ssh.sock";
+/// Native minimald's single-instance lock, held for the daemon's lifetime.
+pub const MINIMALD_LOCK_FILE: &str = "minimald.lock";
+/// The minvmd supervisor's alive lock, held for the daemon's lifetime.
+pub const MINVMD_LOCK_FILE: &str = "minvmd.lock";
+
+/// `<state_dir>/providers/local-<instance>` — the directory holding the
+/// sockets, locks, and state files a client needs to reach one local daemon
+/// instance.
+pub fn provider_instance_dir(state_dir: &DaemonAbsPath, instance: u32) -> DaemonAbsPath {
+    sub_path!(state_dir, "providers").sub_path_unchecked(&format!("local-{instance}"))
 }
 
 /// Computes `<base>/minimal`, where `base` comes from `base_dir` or, failing
@@ -1421,6 +1439,33 @@ mod tests {
     fn cwd_relative_debug_includes_realm_tag() {
         let p: CwdRelative<Host> = "/x".parse().unwrap();
         assert_eq!(format!("{p:?}"), "CwdRelative<host>(/x)");
+    }
+
+    #[test]
+    fn provider_instance_dir_layout() {
+        let state = DaemonAbsPath::try_new("/state/minimal").unwrap();
+        assert_eq!(
+            provider_instance_dir(&state, 0).as_str(),
+            "/state/minimal/providers/local-0",
+        );
+        assert_eq!(
+            provider_instance_dir(&state, 3).as_str(),
+            "/state/minimal/providers/local-3",
+        );
+    }
+
+    #[test]
+    fn minimal_state_dir_honors_xdg_state_home() {
+        // Only this test reads XDG_STATE_HOME; restore to avoid surprising a
+        // developer's environment leaking into other assertions.
+        let prev = std::env::var_os("XDG_STATE_HOME");
+        unsafe { std::env::set_var("XDG_STATE_HOME", "/custom/state") };
+        let dir = minimal_state_dir();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
+        assert_eq!(dir.as_str(), "/custom/state/minimal");
     }
 
     #[test]

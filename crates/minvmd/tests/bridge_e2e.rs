@@ -15,8 +15,9 @@
 //! exactly that many bytes (via `read_exact`). All 5 must succeed (R3.3, R3.4).
 //!
 //! The UDS is isolated per-run via a `tempfile::TempDir` set as
-//! `XDG_RUNTIME_DIR`, so concurrent test runs on the same machine don't share
-//! a socket path.
+//! `XDG_STATE_HOME` (the bridge socket lives in the provider-instance dir
+//! under the state dir), so concurrent test runs on the same machine don't
+//! share a socket path.
 
 #![cfg(minvmd_libkrun)]
 
@@ -25,6 +26,15 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+/// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
+/// `<tempdir>/minimal/providers/local-0/*.sock` would overflow sun_path (104).
+fn short_state_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("mnl")
+        .tempdir_in("/tmp")
+        .expect("creating isolated state dir")
+}
 
 const CONCURRENT: usize = 5;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -46,14 +56,12 @@ fn bridge_e2e_concurrent_round_trip() {
         );
     }
 
-    let runtime_dir = tempfile::TempDir::new().expect("creating isolated runtime dir");
-    let state_dir = tempfile::TempDir::new().expect("creating isolated state dir");
-    let sock_path = runtime_dir.path().join("minimal/minimald.sock");
+    let state_dir = short_state_dir();
+    let sock_path = state_dir.path().join("minimal/providers/local-0/ssh.sock");
 
     let exe = env!("CARGO_BIN_EXE_minvmd");
     let mut child = Command::new(exe)
         .args(["boot", "--foreground"])
-        .env("XDG_RUNTIME_DIR", runtime_dir.path())
         .env("XDG_STATE_HOME", state_dir.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
