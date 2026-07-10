@@ -40,7 +40,7 @@ permissions:
 
 jobs:
   distillery-sync:
-    uses: norrietaylor/spectacles/.github/workflows/distillery-sync.lock.yml@v0.3.0
+    uses: norrietaylor/spectacles/.github/workflows/distillery-sync.lock.yml@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
     # Thread the consumer's DISTILLERY_DOC_GLOBS variable into the reusable
     # workflow as an input. A repo variable cannot be read inside the agent
     # prompt (`vars.*` is not an allowed gh-aw body expression), but a

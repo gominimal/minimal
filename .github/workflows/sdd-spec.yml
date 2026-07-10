@@ -101,7 +101,7 @@ jobs:
     steps:
       - name: Decide whether to run and build aw_context
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-spec@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-spec@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           github-token: ${{ github.token }}
 
@@ -135,14 +135,14 @@ jobs:
     steps:
       - name: Mint App token
         id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
       - name: Record approval or dispatch sdd-execute-{tier}
-        uses: norrietaylor/spectacles/.github/actions/sdd-fastpath-approve@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-fastpath-approve@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           github-token: ${{ steps.app.outputs.token }}
           tracking: ${{ needs.route.outputs.fastpath_tracking }}
@@ -166,14 +166,14 @@ jobs:
     steps:
       - name: Mint App token
         id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
       - name: Dispatch sdd-execute-{tier} for the approved merged spec PR
-        uses: norrietaylor/spectacles/.github/actions/sdd-fastpath-approve@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-fastpath-approve@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           github-token: ${{ steps.app.outputs.token }}
           tracking: ${{ needs.route.outputs.approved_tracking }}
@@ -193,14 +193,14 @@ jobs:
     steps:
       - name: Mint App token
         id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
       - name: Clear the stale sdd:approved marker
-        uses: norrietaylor/spectacles/.github/actions/sdd-fastpath-approve@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-fastpath-approve@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           github-token: ${{ steps.app.outputs.token }}
           tracking: ${{ needs.route.outputs.approved_tracking }}
@@ -209,7 +209,7 @@ jobs:
   sdd-spec:
     needs: route
     if: needs.route.outputs.should_run == 'true'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-spec.lock.yml@v0.3.0
+    uses: norrietaylor/spectacles/.github/workflows/sdd-spec.lock.yml@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
       # Single-PR classifier diff ceiling (ADR 0024). Maps the consumer's
@@ -271,14 +271,14 @@ jobs:
     steps:
       - name: Mint App token
         id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
       - name: Post failure hand-off to tracking issue
-        uses: norrietaylor/spectacles/.github/actions/sdd-spec-failure-handoff@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-spec-failure-handoff@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           github-token: ${{ steps.app.outputs.token }}
           aw-context: ${{ needs.route.outputs.aw_context }}
@@ -300,7 +300,7 @@ jobs:
     steps:
       - name: Mint App token
         id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -310,7 +310,7 @@ jobs:
           permission-pull-requests: write
       - name: Ack the command with 👀
         id: ack
-        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           github-token: ${{ steps.app.outputs.token }}
           mode: ack
@@ -330,7 +330,7 @@ jobs:
     steps:
       - name: Mint App token
         id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -339,7 +339,7 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
       - name: Replace 👀 with the run outcome
-        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           github-token: ${{ steps.app.outputs.token }}
           mode: terminal

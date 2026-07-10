@@ -86,7 +86,7 @@ jobs:
     steps:
       - name: Decide whether to run and build aw_context
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-triage@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-triage@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           github-token: ${{ github.token }}
 
@@ -102,7 +102,7 @@ jobs:
   arch:
     needs: route
     if: needs.route.outputs.should_run == 'true' && needs.route.outputs.target == 'arch'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-triage-arch.lock.yml@v0.3.0
+    uses: norrietaylor/spectacles/.github/workflows/sdd-triage-arch.lock.yml@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
       min_task: ${{ vars.SDD_TRIAGE_MIN_TASK }}
@@ -128,7 +128,7 @@ jobs:
   plan:
     needs: route
     if: needs.route.outputs.should_run == 'true' && needs.route.outputs.target == 'plan'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-triage-plan.lock.yml@v0.3.0
+    uses: norrietaylor/spectacles/.github/workflows/sdd-triage-plan.lock.yml@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
       min_task: ${{ vars.SDD_TRIAGE_MIN_TASK }}
@@ -152,7 +152,7 @@ jobs:
   materialize:
     needs: route
     if: needs.route.outputs.should_run == 'true' && needs.route.outputs.target == 'materialize'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-triage-materialize.lock.yml@v0.3.0
+    uses: norrietaylor/spectacles/.github/workflows/sdd-triage-materialize.lock.yml@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
       # Task-bundling diff floor (ADR 0022). Maps the consumer's optional
@@ -204,7 +204,7 @@ jobs:
     steps:
       - name: Detect a dependency cycle in the materialized tree
         id: detect
-        uses: norrietaylor/spectacles/.github/actions/sdd-cycle-detect@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-cycle-detect@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           tracking-issue: ${{ needs.route.outputs.item_number }}
           github-token: ${{ github.token }}
@@ -215,7 +215,7 @@ jobs:
       - name: Mint App token
         id: app
         if: steps.detect.outputs.cycle == 'true' || steps.detect.outputs.tree_incomplete == 'true'
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -293,7 +293,7 @@ jobs:
     steps:
       - name: Mint App token
         id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -303,7 +303,7 @@ jobs:
           permission-pull-requests: write
       - name: Ack the command with 👀
         id: ack
-        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           github-token: ${{ steps.app.outputs.token }}
           mode: ack
@@ -323,7 +323,7 @@ jobs:
     steps:
       - name: Mint App token
         id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -332,7 +332,7 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
       - name: Replace 👀 with the run outcome
-        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           github-token: ${{ steps.app.outputs.token }}
           mode: terminal
