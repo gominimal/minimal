@@ -59,6 +59,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: shellcheck --shell=sh (no warnings)
         # shellcheck is preinstalled on the ubuntu-latest runner image.
         run: shellcheck --shell=sh scripts/install.sh scripts/install_test.sh
@@ -82,6 +84,8 @@ jobs:
             shell: sh # macOS frozen bash 3.2 as /bin/sh
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Run installer test harness under ${{ matrix.shell }}
         run: SH='${{ matrix.shell }}' '${{ matrix.shell }}' scripts/install_test.sh
 

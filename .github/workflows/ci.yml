@@ -65,6 +65,8 @@ jobs:
         timeout-minutes: 10
         steps:
             - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
             - name: Run rustfmt
               run: cargo fmt --all -- --check
 
@@ -75,6 +77,8 @@ jobs:
         timeout-minutes: 30
         steps:
             - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
             - uses: ./.github/actions/setup-rust
               with:
                   # check artifacts, not build artifacts — own cache class
@@ -89,6 +93,8 @@ jobs:
         timeout-minutes: 40
         steps:
             - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
             - name: Run core workspace tests
               uses: ./.github/actions/core-tests
             - name: Run HTTPS/mTLS proxy tests
@@ -118,6 +124,8 @@ jobs:
                   remove_dotnet: true
                   remove_haskell: true
             - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
             - name: Cache Cargo state
               uses: actions/cache@v5
               with:
@@ -137,6 +145,8 @@ jobs:
         timeout-minutes: 10
         steps:
             - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
             - uses: EmbarkStudios/cargo-deny-action@v2
 
     minimal-check:
@@ -146,6 +156,8 @@ jobs:
         timeout-minutes: 10
         steps:
             - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
             - uses: ./.github/actions/setup-minimal
             - name: Check
               run: minimal --no-fetch check
