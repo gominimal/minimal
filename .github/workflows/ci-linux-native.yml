@@ -8,7 +8,7 @@ name: CI (Linux native)
 # (dorny/paths-filter) gates the expensive jobs, and the `if: always()`
 # aggregator reports success even when they were path-skipped. This is the
 # lane pattern that will replace the ci-docs-skip.yml inverse-path hack once
-# the aggregators become the required checks (#687): a required context that
+# the aggregators become the required checks: a required context that
 # a trigger-level path filter skips stays "Expected" forever and wedges the
 # PR, while a skipped in-workflow job just reports `skipped`, which the
 # aggregator treats as pass. Do NOT add trigger-level `paths:` here.
@@ -75,9 +75,9 @@ jobs:
   tests:
     # Core workspace suite (nextest + doctests), taking over ci.yml's `test`
     # job for this lane; ci.yml keeps its copy until the ruleset requires
-    # this lane's aggregator (#687), then drops it.
+    # this lane's aggregator, then drops it.
     #
-    # MOTHBALLED, deliberately absent (owner decision, #687): the
+    # MOTHBALLED, deliberately absent (owner decision): the
     # `--features networking-proxy` (mTLS reverse proxy) and `--features
     # networking-wg` (WireGuard mesh) test steps that ci.yml's `test` job
     # still carries, and the netns/mesh namespace proofs that ci-netns.yml

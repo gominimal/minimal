@@ -1,18 +1,17 @@
 name: CI
 
+# ALWAYS-TRIGGERED, path-scoped INSIDE the workflow: the `changes` job gates
+# the expensive jobs on non-docs changes, and the `if: always()` aggregator
+# (ci-success) reports success even when they were path-skipped. This replaces
+# the old paths-ignore + ci-docs-skip.yml inverse-path pair: a required
+# context that a trigger-level path filter skips stays "Expected" forever and
+# wedges the PR, while a skipped in-workflow job reports `skipped`, which the
+# aggregator treats as pass. Do NOT add trigger-level `paths:` here.
 on:
     push:
         branches: ["main"]
-        paths-ignore:
-            - "**.md"
-            - "docs/**"
-            - "LICENSE"
     pull_request:
         branches: ["main"]
-        paths-ignore:
-            - "**.md"
-            - "docs/**"
-            - "LICENSE"
     workflow_dispatch:
 
 env:
@@ -26,21 +25,60 @@ concurrency:
 
 permissions:
     contents: read
+    # dorny/paths-filter reads the PR file list on pull_request events.
+    pull-requests: read
 
 jobs:
+    changes:
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        outputs:
+            code: ${{ steps.filter.outputs.code }}
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
+            - name: Detect non-docs changes
+              id: filter
+              # v3.0.2, SHA-pinned. Runs ONLY on pull_request, where dorny
+              # reads the PR file list via the API (a push would need a local
+              # diff our shallow, credential-free checkout cannot provide) —
+              # and pushes to main / dispatches run everything regardless.
+              # `code` = anything that is not documentation; the negations
+              # mirror the old paths-ignore list.
+              if: github.event_name == 'pull_request'
+              uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
+              with:
+                  filters: |
+                      code:
+                        - "**"
+                        - ".github/**"
+                        - "!*.md"
+                        - "!**/*.md"
+                        - "!docs/**"
+                        - "!LICENSE"
+
     fmt:
+        needs: [changes]
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:
             - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
             - name: Run rustfmt
               run: cargo fmt --all -- --check
 
     clippy:
+        needs: [changes]
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 30
         steps:
             - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
             - uses: ./.github/actions/setup-rust
               with:
                   # check artifacts, not build artifacts — own cache class
@@ -49,27 +87,33 @@ jobs:
               run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
     test:
+        needs: [changes]
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 40
         steps:
             - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
             - name: Run core workspace tests
               uses: ./.github/actions/core-tests
             - name: Run HTTPS/mTLS proxy tests
               # The mTLS reverse proxy is behind the non-default `networking-proxy`
-              # feature, so the core-tests `--workspace` run does not compile or run
-              # its proofs (R4.5 mtls_missing_cert_returns_401_with_no_topology, UC2b
+              # feature, so the core-tests `--workspace` run does not compile or
+              # run its proofs (mtls_missing_cert_returns_401_with_no_topology,
               # mtls_valid_cert_routes_to_backend). Exercise them explicitly.
               run: cargo nextest run -p minimald --features networking-proxy --locked
             - name: Run WireGuard mesh tests
               # The WireGuard mesh peer is behind the non-default `networking-wg`
-              # feature, so the core-tests `--workspace` run does not compile or run
-              # its proofs. Exercise them explicitly (R-WG:
-              # two_meshes_handshake_and_relay_a_packet, rpc get_mesh_status). The
-              # `#[ignore]` two-namespace mesh_uc7 proof runs in the netns lane.
+              # feature, so the core-tests `--workspace` run does not compile or
+              # run its proofs (two_meshes_handshake_and_relay_a_packet, rpc
+              # get_mesh_status). Exercise them explicitly. The `#[ignore]`
+              # two-namespace mesh_uc7 proof is mothballed with no CI lane.
               run: cargo test -p minimald --features networking-wg --locked
 
     dogfood:
+        needs: [changes]
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 20
         steps:
@@ -80,6 +124,8 @@ jobs:
                   remove_dotnet: true
                   remove_haskell: true
             - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
             - name: Cache Cargo state
               uses: actions/cache@v5
               with:
@@ -93,30 +139,39 @@ jobs:
                   task: build-smoke
 
     cargo-deny:
+        needs: [changes]
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:
             - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
             - uses: EmbarkStudios/cargo-deny-action@v2
 
     minimal-check:
+        needs: [changes]
+        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:
             - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
             - uses: ./.github/actions/setup-minimal
             - name: Check
               run: minimal --no-fetch check
 
-    # Single required status check for branch protection. Stays green only when
-    # every gating job below succeeds.
+    # Single required status check for branch protection. Green when every
+    # gating job succeeded OR was path-skipped (docs-only changes); red only
+    # on failure/cancellation.
     ci-success:
         if: always()
-        needs: [fmt, clippy, test, dogfood, cargo-deny, minimal-check]
+        needs: [changes, fmt, clippy, test, dogfood, cargo-deny, minimal-check]
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:
-            - name: Verify all gating jobs succeeded
+            - name: Verify all gating jobs succeeded or were skipped
               if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
               run: exit 1
             - run: echo "All CI gates passed"
