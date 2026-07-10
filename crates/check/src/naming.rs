@@ -117,7 +117,7 @@ impl crate::GraphBasedChecker for CycleBreakerNaming {
 
         result.verdict = if let Some(replace_on_cycle) = build.replace_on_cycle {
             let cycle_breaker = graph.get(&replace_on_cycle).unwrap();
-            if cycle_breaker.name != format!("{} (prebuilt)", &pkg) {
+            if cycle_breaker.name != format!("{pkg} (prebuilt)") {
                 result.err.push(format!(
                     "cycle breaker should be named '{} (prebuilt)' instead if '{}'",
                     pkg, cycle_breaker.name

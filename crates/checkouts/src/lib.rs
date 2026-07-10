@@ -284,7 +284,7 @@ impl Manager {
             return Err(Error::OfflineCacheMiss { remote });
         }
         let checkouts_dir = self.git_checkouts_dir();
-        for (_remote, id) in self.state.git_remotes.iter_mut() {
+        for id in self.state.git_remotes.values_mut() {
             let repo = self.repos.get_mut(id).unwrap();
             trace!("updating repo {}", repo.url());
             repo.fetch()?;

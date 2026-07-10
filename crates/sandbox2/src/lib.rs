@@ -779,7 +779,7 @@ impl<C: Channel> Sandbox<C> {
             .unwrap()
             && fs::exists(rootfs.join("usr/bin").join(&program)).unwrap()
         {
-            program = format!("/usr/bin/{}", &program);
+            program = format!("/usr/bin/{program}");
         }
 
         container.command_inner(self, &program, args, env_vars)

@@ -898,7 +898,7 @@ impl Context {
         let mut out = std::collections::HashSet::new();
         let mut graph = self.graph_from_all_packages()?;
         let mfile = self.minimal_file().clone();
-        for (name, _) in mfile.tasks.iter() {
+        for name in mfile.tasks.keys() {
             let res = self.task(graph, name)?.unwrap();
             let task = res.0;
             graph = res.1;
