@@ -44,6 +44,12 @@ export XDG_STATE_HOME="$WORK/state"
 mkdir -p "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME"
 chmod 700 "$XDG_RUNTIME_DIR"
 
+# The CLI's tracing layer writes to STDOUT (ot::StdoutWriter, minimal/src/
+# main.rs), so at the default level the autospawn INFO lines interleave with
+# the session id `activate` prints for piping. Quiet the logs; the last-line
+# extraction below stays defensive in case a level sneaks through.
+export RUST_LOG="${RUST_LOG:-warn}"
+
 now_ms() { date +%s%3N; }
 
 # On any failure, dump what the detached daemon hides — the CLI's own
@@ -65,18 +71,25 @@ trap 'minimal stop --force >/dev/null 2>&1 || true' EXIT
 
 # Cold: `minimal activate` must auto-spawn the native minimald and print the
 # new session id on stdout. Word-splitting of E2E_ACTIVATE_ARGS is intended.
+# The id is the LAST stdout line (any log lines that slip through the RUST_LOG
+# filter precede it), validated as a UUID before use.
 echo "::group::cold activate (auto-spawns native minimald)"
 t0=$(now_ms)
 # shellcheck disable=SC2086
-sid="$(cd "$PROJECT_DIR" && minimal activate . ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/activate.err")" \
+activate_out="$(cd "$PROJECT_DIR" && minimal activate . ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/activate.err")" \
   || { echo "::error::cold 'minimal activate' failed to auto-spawn minimald / create a session"; fail; }
 t1=$(now_ms)
+sid="$(printf '%s\n' "$activate_out" | tail -n1 | tr -d '\r')"
 echo "session: $sid (cold activate: $((t1 - t0))ms)"
-[ -n "$sid" ] || { echo "::error::activate printed no session id"; fail; }
+if ! printf '%s' "$sid" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+  echo "::error::activate's last stdout line is not a session UUID: '$sid'"
+  echo "--- full activate stdout ---"; printf '%s\n' "$activate_out"
+  fail
+fi
 echo "::endgroup::"
 
 # The session must be listed.
-minimal ls --raw 2>/dev/null | grep -qx "$sid" \
+minimal ls --raw 2>/dev/null | grep -Fqx "$sid" \
   || { echo "::error::'minimal ls --raw' does not list new session $sid"; fail; }
 
 # Exec a command in the session (non-interactive attach) and assert its
@@ -105,7 +118,7 @@ echo "warm 'minimal ls': $((t1 - t0))ms"
 # Destroy the session; it must drop out of the listing.
 minimal destroy "$sid" >/dev/null 2>&1 \
   || { echo "::error::'minimal destroy $sid' failed"; fail; }
-if minimal ls --raw 2>/dev/null | grep -qx "$sid"; then
+if minimal ls --raw 2>/dev/null | grep -Fqx "$sid"; then
   echo "::error::session $sid still listed after destroy"; fail
 fi
 
