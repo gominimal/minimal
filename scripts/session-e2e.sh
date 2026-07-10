@@ -9,10 +9,16 @@
 # (DM numbers are the deployment models in docs/specs/03-spec-networking.)
 #
 # Flow: from a guaranteed-clean state, `minimal activate` must auto-spawn the
-# target's daemon and create a session; `minimal attach --command` execs in
-# the session over the daemon's SSH surface (native UDS / vsock bridge),
-# asserting stdout + exit status; then list, warm-call, destroy (verified
-# delisted), and a clean `minimal stop`. Timing is reported but NOT asserted.
+# target's daemon and create a session; then list, warm-call, destroy
+# (verified delisted), and a clean `minimal stop`. Timing is reported but NOT
+# asserted.
+#
+# In-session exec over the daemon's SSH surface is NOT exercised here: only
+# `min run <task>` is accepted (arbitrary exec was removed), and a task needs
+# a `minimal.toml` in the otherwise-empty session workspace — which this shell
+# harness cannot seed on the VM lanes (the workspace lives inside the guest).
+# That path is proven in Rust instead: `exec::tests::end_to_end::exec_runs_echo_task`
+# (host daemon) and `minimald_exec_over_bridge` (over the libkrun bridge).
 #
 # VM targets (E2E_VM=1) additionally need, from the caller:
 #   - a codesigned/linkable `minvmd` on PATH (minimal spawns it by name)
@@ -20,9 +26,7 @@
 #     (propagate through the `minvmd run --detach` re-exec)
 #   - MINVMD_BOOT_LOG (optional) to capture the guest console
 #   The guest sees no host project dir yet (no project sync), so VM lanes
-#   pass E2E_PROJECT_DIR=/tmp — a path that exists in the guest image. In
-#   every target the session runs in a Linux environment, so the in-session
-#   `uname -s` assertion is `Linux` everywhere, including macOS hosts.
+#   pass E2E_PROJECT_DIR=/tmp — a path that exists in the guest image.
 #
 # Environment:
 #   E2E_MINIMAL_ARGS    global args for every `minimal` call (e.g. --minvmd)
@@ -86,7 +90,6 @@ trap teardown EXIT
 fail() {
   echo "::group::session-e2e diagnostics"
   echo "--- activate stderr ---"; cat "$WORK/activate.err" 2>/dev/null || true
-  echo "--- attach stderr ---"; cat "$WORK/attach.err" 2>/dev/null || true
   echo "--- minimal ls ---"; mnl ls 2>&1 || true
   echo "--- state dir ---"; find "$XDG_STATE_HOME" -type f 2>/dev/null | head -50
   find "$XDG_STATE_HOME" -type f \( -name '*.log' -o -name '*.toml' -o -name '*.json' \) 2>/dev/null \
@@ -121,25 +124,6 @@ echo "::endgroup::"
 # The session must be listed.
 mnl ls --raw 2>/dev/null | grep -Fqx "$sid" \
   || { echo "::error::'minimal ls --raw' does not list new session $sid"; fail; }
-
-# Exec a command in the session (non-interactive attach) and assert its
-# stdout and exit status — the full CLI -> daemon -> session path (UDS to a
-# native minimald; the vsock bridge into the guest on VM targets). Sessions
-# are Linux environments on every target, macOS hosts included.
-echo "::group::exec in session"
-marker="session-e2e-$$"
-out="$(mnl attach "$sid" --command "echo $marker && uname -s" 2>"$WORK/attach.err")" \
-  || { echo "::error::'minimal attach --command' exited non-zero"; fail; }
-echo "$out"
-case "$out" in
-  *"$marker"*) ;;
-  *) echo "::error::session exec output missing marker '$marker'"; fail ;;
-esac
-case "$out" in
-  *Linux*) ;;
-  *) echo "::error::session exec output missing 'Linux' (uname -s inside the session)"; fail ;;
-esac
-echo "::endgroup::"
 
 # Warm: the daemon is up; a second CLI call must succeed without respawning.
 t0=$(now_ms)

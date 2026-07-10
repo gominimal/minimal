@@ -60,6 +60,7 @@ impl Task {
                 v.iter().map(|s| f(s)).collect::<Result<Vec<_>, _>>()?,
             )),
             TaskAction::Bash(cmd) => TaskAction::Bash(f(cmd)?),
+            TaskAction::Echo(s) => TaskAction::Echo(f(s)?),
             TaskAction::CmdCmd(argv) => {
                 TaskAction::CmdCmd(argv.iter().map(|s| f(s)).collect::<Result<Vec<_>, _>>()?)
             }
@@ -101,6 +102,7 @@ impl Task {
             TaskAction::Bash(cmd) => {
                 Some(("/bin/bash".to_string(), vec!["-c".to_string(), cmd.clone()]))
             }
+            TaskAction::Echo(s) => Some(("/bin/echo".to_string(), vec![s.clone()])),
             TaskAction::CmdCmd(_) => None,
         }
     }
@@ -120,6 +122,8 @@ pub enum TaskAction {
     /// The invoked program should return each command to run on stdout,
     /// one invocation per line.
     CmdCmd(Vec<String>),
+    /// Echo's the given string.
+    Echo(String),
 }
 
 impl Default for TaskAction {
@@ -132,6 +136,19 @@ impl TaskAction {
     /// Constructs a [TaskAction] that represents the execve of the given string.
     pub fn exec_from_str(s: &str) -> Self {
         Self::Exec(StrOrList::Single(s.to_string()))
+    }
+
+    /// Returns the text to emit if this is an [TaskAction::Echo], else `None`.
+    ///
+    /// Callers that can service an echo without a sandbox (the ssh and
+    /// env-socket `min run` paths) branch on this to short-circuit the
+    /// package/graph machinery entirely. The returned string may still
+    /// contain interpolations that need resolving.
+    pub fn as_echo(&self) -> Option<&str> {
+        match self {
+            TaskAction::Echo(s) => Some(s),
+            _ => None,
+        }
     }
 }
 
@@ -188,6 +205,18 @@ mod tests {
                 vec!["-c".to_string(), "go test ./... || echo failed".to_string()]
             ))
         );
+    }
+
+    #[test]
+    fn echo_str() {
+        let t: Task = toml::from_str(indoc! {
+            r#"
+            echo = "hello world"
+            "#
+        })
+        .unwrap();
+        assert_eq!(t.action, TaskAction::Echo("hello world".to_string()));
+        assert_eq!(t.action.as_echo(), Some("hello world"));
     }
 
     #[test]

@@ -3697,6 +3697,7 @@ dependencies = [
  "minimald-rpc",
  "paths",
  "russh",
+ "russh-sftp",
  "serde",
  "serde_json",
  "serial_test",
