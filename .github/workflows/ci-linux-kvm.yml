@@ -50,8 +50,13 @@ jobs:
           persist-credentials: false
       - name: Detect relevant changes
         id: filter
-        # v3.0.2, SHA-pinned. On workflow_dispatch there is no diff to filter;
-        # the downstream `if` treats dispatch as "run everything".
+        # v3.0.2, SHA-pinned. Runs ONLY on pull_request, where dorny reads
+        # the PR file list via the API. On push it would need a local diff
+        # against event.before, which our shallow, credential-free checkout
+        # (persist-credentials: false) cannot provide — and pushes to main
+        # SHOULD run everything anyway: they write the main-only caches and
+        # provide the soak signal. Dispatch likewise runs everything.
+        if: github.event_name == 'pull_request'
         uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
         with:
           filters: |
@@ -70,13 +75,17 @@ jobs:
               # it post-merge.
               - ".github/actions/setup-libkrun-linux/**"
               - ".github/actions/materialize/**"
+              # The gvproxy pin: point-of-use verification (fetch-gvproxy.sh
+              # SHA-checks it in this lane) replaced the retired ci-gvproxy.yml
+              # workflow, so a pin bump must re-run this lane.
+              - "vendor/gvproxy/**"
 
   build-linux:
     # BUILD phase: compile everything the KVM tests need and ship it as one
     # artifact, so a flaky e2e rerun replays only the ~15-minute test job
     # instead of this full build. No /dev/kvm needed here.
     needs: [changes]
-    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.kvm == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.kvm == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -204,7 +213,7 @@ jobs:
     # standalone cargo-nextest binary. A flake rerun of this job alone costs
     # ~15 minutes instead of the old 60-minute build+test monolith.
     needs: [changes, build-linux]
-    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.kvm == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.kvm == 'true'
     runs-on: ubuntu-latest # x86_64; KVM-capable
     timeout-minutes: 30
     steps:

@@ -2,7 +2,7 @@
 #
 # install_test.sh — POSIX-sh test harness for scripts/install.sh.
 #
-# Exercises Units 1–6 of docs/specs/07-spec-installer against a local mock
+# Exercises Units 1–9 of docs/specs/07-spec-installer against a local mock
 # bucket and a stubbed downloader, then asserts the spec's proof artifacts.
 #
 # The downloader is stubbed by prepending a temp dir to PATH containing a fake
@@ -60,11 +60,26 @@ BUCKET_HOST="https://mock.invalid/minimal-one"
 mock="$root/bucket"
 mkdir -p "$mock/versions/v1"
 
-# Two platform-diverse artifacts with padded columns and comment/blank lines, to
-# prove awk field-splitting survives padding (R3.1/R3.3).
+# Platform-diverse artifacts with padded columns and comment/blank lines, to
+# prove awk field-splitting survives padding (R3.1/R3.3). The `minimal` CLI
+# artifacts are runnable sh scripts that answer `completions <shell>`, because
+# the installer generates completions by executing the installed bin/min
+# (R9.3); the other artifacts stay opaque bodies.
 printf 'linux-amd64-minimald-body\n'  >"$mock/versions/v1/minimald-linux-amd64"
-printf 'linux-amd64-minimal-body\n'   >"$mock/versions/v1/minimal-linux-amd64"
-printf 'darwin-arm64-minimal-body\n'  >"$mock/versions/v1/minimal-darwin-arm64"
+cat >"$mock/versions/v1/minimal-linux-amd64" <<'EOF'
+#!/bin/sh
+# mock min (linux-amd64)
+case "${1:-}" in
+    completions) printf '# mock min completions for %s\n' "$2" ;;
+esac
+EOF
+cat >"$mock/versions/v1/minimal-darwin-arm64" <<'EOF'
+#!/bin/sh
+# mock min (darwin-arm64)
+case "${1:-}" in
+    completions) printf '# mock min completions for %s\n' "$2" ;;
+esac
+EOF
 printf 'darwin-arm64-rootfs-body\n'   >"$mock/versions/v1/rootfs-arm64.img"
 
 h_minimald="$(hash_file "$mock/versions/v1/minimald-linux-amd64")"
@@ -83,9 +98,9 @@ write_manifest() {
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minimald linux amd64 v1 "$h_minimald" file bin/minimald versions/v1/minimald-linux-amd64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            minimal linux amd64 v1 "$h_minimal" file bin/minimal versions/v1/minimal-linux-amd64
+            minimal linux amd64 v1 "$h_minimal" file bin/min versions/v1/minimal-linux-amd64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            minimal darwin arm64 v1 "$h_dmin" file bin/minimal versions/v1/minimal-darwin-arm64
+            minimal darwin arm64 v1 "$h_dmin" file bin/min versions/v1/minimal-darwin-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             rootfs darwin arm64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-arm64.img
     } >"$mock/versions/v1/components"
@@ -161,6 +176,11 @@ reset_dl()  { : >"$dlcount"; }
 PLAT_S=Linux
 PLAT_M=x86_64
 
+# The login shell the installer sees ($SHELL drives the rc-hook branch, R9.2).
+# Scenarios set TEST_SHELL around their runs; empty means /bin/sh (the
+# unknown-shell fallback branch).
+TEST_SHELL=
+
 # run <label> <homeprefix> [args...] ; sets rc, captures combined output in $OUT.
 OUT=
 run() {
@@ -170,10 +190,12 @@ run() {
     env -i \
         PATH="$stubbin:/usr/bin:/bin" \
         HOME="$hp" \
+        SHELL="${TEST_SHELL:-/bin/sh}" \
         MINIMAL_BIN="$hp/bin" \
         XDG_DATA_HOME="$hp/xdg-data" \
         XDG_STATE_HOME="$hp/xdg-state" \
         XDG_CACHE_HOME="$hp/xdg-cache" \
+        XDG_CONFIG_HOME="$hp/xdg-config" \
         MINIMAL_OVERRIDE_INSTALLER_BUCKET="$BUCKET_HOST" \
         STUB_UNAME_S="$PLAT_S" \
         STUB_UNAME_M="$PLAT_M" \
@@ -220,8 +242,8 @@ reset_dl
 run mismatch "$H2"
 check 1 "$rc" "checksum mismatch exits non-zero (R5.3)"
 want_ok "mismatch names the failure" grep -q "checksum mismatch" "$OUT"
-want_err "no file installed on mismatch" test -e "$H2/bin/minimal"
-if ls "$H2/bin/"minimal.tmp.* >/dev/null 2>&1
+want_err "no file installed on mismatch" test -e "$H2/bin/min"
+if ls "$H2/bin/"min.tmp.* >/dev/null 2>&1
 then bad "temp file left behind"; else ok "no .tmp file left (R5.3)"; fi
 cp "$root/good-components" "$mock/versions/v1/components"   # restore
 
@@ -326,6 +348,119 @@ env -i PATH="$stubbin:$H1/bin:/usr/bin:/bin" HOME="$H1" MINIMAL_BIN="$H1/bin" \
 set -e
 want_err "PATH advisory suppressed when bin present (R6.2)" grep -q "is not on your PATH" "$OUT"
 
+# --- Unit 9: shell-init files, rc hook, completions (R9.1-R9.3) -------------
+# A bash-login-shell install generates the three init files, hooks .bashrc
+# (creating it, since none exists in the fresh home), and produces completions
+# by running the installed bin/min itself.
+H7="$root/h7"; mkdir -p "$H7"
+TEST_SHELL=/bin/bash
+run shellinit "$H7"
+check 0 "$rc" "shell-init install exits 0"
+init7="$H7/xdg-data/minimal/shell-init"
+for f in bash.sh zsh.sh fish.fish; do
+    want_ok "init file $f generated (R9.1)" test -f "$init7/$f"
+done
+want_ok "init embeds the resolved bin dir (R9.1)" grep -q "$H7/bin" "$init7/bash.sh"
+want_ok "record lists the generated init files (R9.1/R6.1)" \
+    grep -q "shell-init-bash" "$H7/xdg-state/minimal/installed"
+
+# Sourcing the init under plain sh prepends bin to PATH exactly once.
+p1="$(env -i PATH=/usr/bin:/bin HOME="$H7" sh -c ". '$init7/bash.sh'; printf %s \"\$PATH\"")"
+check "$H7/bin:/usr/bin:/bin" "$p1" "sourcing the init prepends bin to PATH (R9.1)"
+p2="$(env -i PATH="$H7/bin:/usr/bin:/bin" HOME="$H7" sh -c ". '$init7/bash.sh'; printf %s \"\$PATH\"")"
+check "$H7/bin:/usr/bin:/bin" "$p2" "init never duplicates an existing PATH entry (R9.1)"
+
+# rc hook: created .bashrc carries exactly one marker-fenced block sourcing the
+# bash init; a rerun adds nothing (R9.2 idempotence).
+want_ok ".bashrc created with the marker block (R9.2)" grep -q '>>> minimal >>>' "$H7/.bashrc"
+want_ok "rc block sources the bash init (R9.2)" grep -q "shell-init/bash.sh" "$H7/.bashrc"
+run shellinit2 "$H7"
+check 0 "$rc" "shell-init rerun exits 0"
+check 1 "$(grep -c '>>> minimal >>>' "$H7/.bashrc")" "rerun adds no second rc block (R9.2)"
+
+# Completions, generated by executing the installed mock min (R9.3).
+want_ok "bash completions written for min (R9.3)" \
+    grep -q "mock min completions for bash" "$H7/xdg-data/bash-completion/completions/min"
+want_ok "zsh completions written as _min (R9.3)" \
+    grep -q "mock min completions for zsh" "$H7/xdg-data/zsh/completions/_min"
+want_ok "fish completions written (R9.3)" \
+    grep -q "mock min completions for fish" "$H7/xdg-config/fish/completions/min.fish"
+want_ok "record lists the generated completions (R9.3/R6.1)" \
+    grep -q "completions-zsh" "$H7/xdg-state/minimal/installed"
+
+# Both existing bash rc files are hooked, and user content is preserved.
+H8="$root/h8"; mkdir -p "$H8"
+printf '# my bashrc\n' >"$H8/.bashrc"
+printf '# my bash_profile\n' >"$H8/.bash_profile"
+run bashboth "$H8"
+want_ok "existing .bashrc hooked (R9.2)" grep -q '>>> minimal >>>' "$H8/.bashrc"
+want_ok "existing .bash_profile hooked too (R9.2)" grep -q '>>> minimal >>>' "$H8/.bash_profile"
+want_ok "user rc content preserved (R9.2)" grep -q '# my bashrc' "$H8/.bashrc"
+
+# zsh and fish get their own rc files (created when missing); an unknown shell
+# falls back to .profile with the POSIX init.
+H9="$root/h9"; mkdir -p "$H9"
+TEST_SHELL=/usr/bin/zsh
+run zshinit "$H9"
+want_ok ".zshrc created and hooked (R9.2)" grep -q "shell-init/zsh.sh" "$H9/.zshrc"
+want_ok "zsh init wires fpath completions (R9.1)" \
+    grep -q "fpath=" "$H9/xdg-data/minimal/shell-init/zsh.sh"
+H10="$root/h10"; mkdir -p "$H10"
+TEST_SHELL=/usr/bin/fish
+run fishinit "$H10"
+want_ok "config.fish created and hooked (R9.2)" \
+    grep -q "shell-init/fish.fish" "$H10/xdg-config/fish/config.fish"
+H11="$root/h11"; mkdir -p "$H11"
+TEST_SHELL=/bin/ksh
+run kshinit "$H11"
+want_ok "unknown shell falls back to .profile (R9.2)" grep -q "shell-init/bash.sh" "$H11/.profile"
+TEST_SHELL=
+
+# A manifest without the min CLI (data-only) skips completions, non-fatally.
+want_ok "completions skipped when min absent (R9.3)" \
+    grep -q "completions: skipped" "$root/out.datadest"
+
+# A read-only rc file degrades to a warning: the install itself already
+# succeeded and must still exit 0, with the PATH advisory still printed.
+# (Root ignores file modes, so the scenario can't be staged there.)
+if [ "$(id -u)" -ne 0 ]; then
+    H12="$root/h12"; mkdir -p "$H12"
+    printf '# locked down\n' >"$H12/.bashrc"
+    chmod 444 "$H12/.bashrc"
+    TEST_SHELL=/bin/bash
+    run rcreadonly "$H12"
+    check 0 "$rc" "unwritable rc is non-fatal (R9.2)"
+    want_ok "warning names the unwritable rc (R9.2)" \
+        grep -q "failed to hook minimal shell support" "$OUT"
+    want_ok "warning shows the line to add by hand (R9.2)" \
+        grep -q "shell-init/bash.sh" "$OUT"
+    want_err "read-only rc left untouched (R9.2)" grep -q '>>> minimal >>>' "$H12/.bashrc"
+    want_ok "binaries still installed despite rc failure (R9.2)" test -x "$H12/bin/min"
+    want_ok "PATH advisory still printed after rc failure (R6.2)" \
+        grep -q "is not on your PATH" "$OUT"
+    want_err "no raw shell error leaks on rc failure (R9.2)" \
+        grep -qi "permission denied" "$OUT"
+    TEST_SHELL=
+
+    # An unwritable completion dir (e.g. a root-owned ~/.config/fish/completions
+    # left by another tool) degrades to a warning naming the dir: the install
+    # still exits 0, the other shells' completions still land, and the shell's
+    # own redirection error is not leaked to the user.
+    H13="$root/h13"; mkdir -p "$H13/xdg-config/fish/completions"
+    chmod 555 "$H13/xdg-config/fish/completions"
+    run compreadonly "$H13"
+    chmod 755 "$H13/xdg-config/fish/completions"   # restore for later cleanup
+    check 0 "$rc" "unwritable completion dir is non-fatal (R9.3)"
+    want_ok "warning names the unwritable completion dir (R9.3)" \
+        grep -q "failed to install fish completions" "$OUT"
+    want_err "no raw shell error leaks on completion failure (R9.3)" \
+        grep -qi "permission denied" "$OUT"
+    want_ok "other shells' completions still installed (R9.3)" \
+        test -f "$H13/xdg-data/bash-completion/completions/min"
+    want_err "nothing written into the unwritable dir (R9.3)" \
+        ls "$H13/xdg-config/fish/completions/"* 2>/dev/null
+fi
+
 # --- Unit 5 (darwin): dequarantine Mach-O bin/lib components ---------------
 # Force a darwin/arm64 platform (via the uname stub) so this runs on every lane.
 # The applicable rows are then `minimal` (bin) and `rootfs` (data). A bin file
@@ -339,8 +474,8 @@ HD="$root/hd"; mkdir -p "$HD"
 reset_dl
 run darwin1 "$HD"
 check 0 "$rc" "darwin install exits 0"
-want_ok "darwin bin component installed" test -f "$HD/bin/minimal"
-want_ok "quarantine stripped from bin (xattr)" grep -q "/bin/minimal" "$root/xattr.calls"
+want_ok "darwin bin component installed" test -f "$HD/bin/min"
+want_ok "quarantine stripped from bin (xattr)" grep -q "/bin/min\.tmp" "$root/xattr.calls"
 want_err "data component not dequarantined" grep -q "rootfs" "$root/xattr.calls"
 
 # A darwin `lib` dylib gets the SAME dequarantine treatment as a bin file so the
@@ -383,6 +518,10 @@ reset_dl
 run darwin3 "$HD"
 check 0 "$rc" "darwin new-version rerun exits 0"
 check 1 "$(downloads)" "new manifest hash re-downloads the darwin bin"
+# The v2 artifact is an opaque body, not a runnable script: completion
+# generation must degrade to a warning, not fail the install (R9.3).
+want_ok "unrunnable min degrades to a completions warning (R9.3)" \
+    grep -q "could not generate" "$OUT"
 cp "$root/good-components" "$mock/versions/v1/components"   # restore
 PLAT_S=Linux
 PLAT_M=x86_64
@@ -402,7 +541,7 @@ want_ok "uninstall: seed wrote the record" test -f "$urec"
 run u_basic "$HU" --uninstall
 check 0 "$rc" "uninstall exits 0 (R8.4)"
 want_err "uninstall removed minimald (R7.3)" test -e "$HU/bin/minimald"
-want_err "uninstall removed minimal (R7.3)" test -e "$HU/bin/minimal"
+want_err "uninstall removed min (R7.3)" test -e "$HU/bin/min"
 want_err "uninstall removed the record (R8.1)" test -e "$urec"
 want_ok "uninstall prints a summary" grep -q "uninstall:" "$OUT"
 want_err "empty bin dir pruned (R8.1)" test -d "$HU/bin"
@@ -422,7 +561,7 @@ run u2_keep "$HU2" --uninstall
 check 0 "$rc" "uninstall with a modified file exits 0 (R8.4)"
 want_ok "modified file kept (R7.3)" test -f "$HU2/bin/minimald"
 want_ok "keep is reported (R7.3)" grep -q "kept (modified" "$OUT"
-want_err "unmodified sibling still removed (R7.3)" test -e "$HU2/bin/minimal"
+want_err "unmodified sibling still removed (R7.3)" test -e "$HU2/bin/min"
 want_ok "record retained while entries remain (R8.1)" test -f "$urec2"
 # --force then removes the modified file and, footprint clear, drops the record.
 run u2_force "$HU2" --uninstall --force
@@ -472,6 +611,28 @@ check 0 "$rc" "uninstall over a non-regular path exits 0 (R7.3)"
 want_ok "directory at a recorded path is left alone (R7.3)" test -d "$HU6/bin/minimald"
 want_ok "foreign entry is reported (R7.3)" grep -q "not a regular file" "$OUT"
 want_ok "record retained due to the foreign entry (R8.1)" test -f "$urec6"
+
+# R9.4 — uninstall removes the generated init/completion files (they are plain
+# record rows), strips the marker block from the rc file, prunes the emptied
+# completion dirs, and leaves the user's own rc content untouched.
+HU7="$root/hu7"; mkdir -p "$HU7"
+printf '# keep me\n' >"$HU7/.bashrc"
+TEST_SHELL=/bin/bash
+run u7_install "$HU7"
+check 0 "$rc" "shell-integration seed install exits 0"
+run u7_dry "$HU7" --uninstall --dry-run
+want_ok "dry-run announces the rc strip without editing (R9.4/R8.3)" \
+    grep -q "would remove shell-init block" "$OUT"
+want_ok "dry-run leaves the rc block (R8.3)" grep -q '>>> minimal >>>' "$HU7/.bashrc"
+run u7_un "$HU7" --uninstall
+check 0 "$rc" "uninstall with shell integration exits 0"
+want_err "completions removed (R9.4)" test -e "$HU7/xdg-data/bash-completion/completions/min"
+want_err "init files removed (R9.4)" test -e "$HU7/xdg-data/minimal/shell-init"
+want_err "emptied completion dirs pruned (R9.4)" test -d "$HU7/xdg-data/bash-completion"
+want_err "emptied data dir pruned (R9.4)" test -d "$HU7/xdg-data/minimal"
+want_err "rc block stripped (R9.4)" grep -q '>>> minimal >>>' "$HU7/.bashrc"
+want_ok "user rc content survives the strip (R9.4)" grep -q '# keep me' "$HU7/.bashrc"
+TEST_SHELL=
 
 # ===========================================================================
 echo "# ---"

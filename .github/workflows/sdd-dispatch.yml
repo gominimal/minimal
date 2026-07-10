@@ -100,7 +100,7 @@ jobs:
     steps:
       - name: Decide whether to run, and find the tracking issue
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-dispatch@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-dispatch@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           app-id: ${{ vars.APP_ID }}
           github-token: ${{ github.token }}
@@ -138,7 +138,7 @@ jobs:
     steps:
       - name: Compute ready set and precondition state
         id: compute
-        uses: norrietaylor/spectacles/.github/actions/sdd-dispatch-compute@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-dispatch-compute@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           tracking-issue: ${{ needs.route.outputs.tracking_issue }}
           trigger-kind: ${{ needs.route.outputs.trigger_kind }}
@@ -183,7 +183,7 @@ jobs:
       # cascade to its agent.
       - name: Mint App token
         id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -297,7 +297,7 @@ jobs:
     steps:
       - name: Mint App token
         id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -525,7 +525,7 @@ jobs:
     steps:
       - name: Mint App token
         id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -599,7 +599,7 @@ jobs:
     steps:
       - name: Mint App token
         id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -649,7 +649,7 @@ jobs:
     steps:
       - name: Mint App token
         id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -659,7 +659,7 @@ jobs:
           permission-pull-requests: write
       - name: Ack the command with 👀
         id: ack
-        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           github-token: ${{ steps.app.outputs.token }}
           mode: ack
@@ -679,7 +679,7 @@ jobs:
     steps:
       - name: Mint App token
         id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -688,7 +688,7 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
       - name: Replace 👀 with the run outcome
-        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-ack-reaction@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           github-token: ${{ steps.app.outputs.token }}
           mode: terminal

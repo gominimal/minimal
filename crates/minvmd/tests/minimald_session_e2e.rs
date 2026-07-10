@@ -6,10 +6,13 @@
 //!
 //! `minimald_exec_over_bridge` drives a real russh client over a `UnixStream`
 //! to the bridge UDS: it authenticates, creates a session (`CreateSession` RPC
-//! over an SSH subsystem), execs a command in that session, and asserts the
+//! over an SSH subsystem), uploads a task-only `minimal.toml` into the session
+//! workspace over SFTP, runs `min run echo_ok` in that session, and asserts the
 //! stdout + exit status that come back — proving the full path host UDS →
 //! libkrun bridge → guest vsock → minimald SSH (`run_on_vsock`, direct, no socat
-//! relay) → session exec. Requires libkrun >= 1.19.0 on the host.
+//! relay) → session task exec. The `echo` task is serviced without a package
+//! graph or sandbox, so the guest needs no network. Requires libkrun >= 1.19.0
+//! on the host.
 //!
 //! Gates:
 //! - `#[cfg(minvmd_libkrun)]`: needs libkrun (macOS, or Linux with libkrun).
@@ -161,12 +164,17 @@ async fn minimald_exec_over_bridge() {
     }
     let guest = Guest::boot();
     let sentinel = "MINIMALD_SESSION_OK";
+    // A task-only `minimal.toml` uploaded into the session workspace over
+    // SFTP. `min run echo_ok` is serviced straight from this declaration —
+    // no `[upstream]`, package graph, or sandbox — so the guest needs no
+    // network and nothing baked into the rootfs beyond minimald itself.
+    let mfile = format!("[tasks.echo_ok]\necho = \"{sentinel}\"\n");
 
     // Retry the whole session to absorb the post-READY startup race.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let mut result = Err("not attempted".to_string());
     for attempt in 1..=6 {
-        result = run_session_exec(&guest.sock_path, &format!("echo {sentinel}")).await;
+        result = run_session_exec(&guest.sock_path, Some(&mfile), "min run echo_ok").await;
         if result.is_ok() {
             break;
         }
@@ -184,9 +192,11 @@ async fn minimald_exec_over_bridge() {
 }
 
 /// Open a russh client over the bridge UDS, authenticate, create a session,
-/// and exec `command` in it. Returns `(stdout, exit_status)`.
+/// optionally upload a `minimal.toml` into its workspace over SFTP, then exec
+/// `command` in it. Returns `(stdout, exit_status)`.
 async fn run_session_exec(
     sock_path: &Path,
+    mfile: Option<&str>,
     command: &str,
 ) -> Result<(String, Option<u32>), String> {
     use minimald_rpc::{CreateSession, CreateSessionRequest, OneshotSshRpc};
@@ -283,6 +293,42 @@ async fn run_session_exec(
             }
         }
     };
+
+    // Upload the project's `minimal.toml` into the session workspace over
+    // SFTP (the subsystem scopes the client's `/` to the workspace root and
+    // reads the same session-id env the exec path does).
+    if let Some(contents) = mfile {
+        let channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("open sftp channel: {e}"))?;
+        channel
+            .set_env(true, MINIMAL_SESSION_ID_ENV, session_id.to_string())
+            .await
+            .map_err(|e| format!("sftp set_env: {e}"))?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|e| format!("request sftp subsystem: {e}"))?;
+        let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
+            .await
+            .map_err(|e| format!("open sftp session: {e}"))?;
+        // `create` (CREATE|WRITE|TRUNCATE), not the high-level `write` helper —
+        // the latter opens WRITE-only and so fails on a not-yet-existing file.
+        let mut file = sftp
+            .create("/minimal.toml")
+            .await
+            .map_err(|e| format!("sftp create minimal.toml: {e}"))?;
+        file.write_all(contents.as_bytes())
+            .await
+            .map_err(|e| format!("sftp write minimal.toml: {e}"))?;
+        file.shutdown()
+            .await
+            .map_err(|e| format!("sftp close minimal.toml: {e}"))?;
+        sftp.close()
+            .await
+            .map_err(|e| format!("close sftp session: {e}"))?;
+    }
 
     // Exec the command in that session.
     let mut channel = handle

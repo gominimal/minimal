@@ -69,7 +69,7 @@ jobs:
     steps:
       - name: Resolve the tracking issue and the drain state
         id: tree
-        uses: norrietaylor/spectacles/.github/actions/sdd-spike-tree@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-spike-tree@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           mode: reentry
           spike-issue: ${{ github.event.issue.number }}
@@ -94,7 +94,7 @@ jobs:
     steps:
       - name: Build the phase-B re-entry context
         id: decide
-        uses: norrietaylor/spectacles/.github/actions/sdd-route-triage@v0.3.0
+        uses: norrietaylor/spectacles/.github/actions/sdd-route-triage@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
         with:
           github-token: ${{ github.token }}
           reentry-tracking-issue: ${{ needs.walk.outputs.tracking_issue }}
@@ -108,7 +108,7 @@ jobs:
   sdd-triage:
     needs: route
     if: needs.route.outputs.should_run == 'true'
-    uses: norrietaylor/spectacles/.github/workflows/sdd-triage-plan.lock.yml@v0.3.0
+    uses: norrietaylor/spectacles/.github/workflows/sdd-triage-plan.lock.yml@d928c5f2b9bb6de73f80e5742799eb5e02387652 # v0.3.0
     with:
       aw_context: ${{ needs.route.outputs.aw_context }}
       min_task: ${{ vars.SDD_TRIAGE_MIN_TASK }}

@@ -15,7 +15,7 @@ pub mod dirs;
 pub mod loadouts;
 
 #[derive(Parser)]
-#[command(name = "minimal", version = env!("CARGO_PKG_VERSION"), long_version = env!("LONG_VERSION"))]
+#[command(name = "min", version = env!("CARGO_PKG_VERSION"), long_version = env!("LONG_VERSION"))]
 #[command(about = "The Minimal CLI")]
 pub struct Cli {
     #[command(subcommand)]
@@ -98,7 +98,7 @@ pub enum Command {
     Version,
     /// Generate shell completion script
     #[command(
-        long_about = "Generate a shell tab-completion script for the minimal CLI.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(minimal completions bash)"
+        long_about = "Generate a shell tab-completion script for the minimal CLI.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(min completions bash)"
     )]
     Completions(CompletionsArgs),
 }

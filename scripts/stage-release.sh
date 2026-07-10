@@ -97,6 +97,9 @@ fi
 #     ~/.local/share/minimal, and marks anything under `bin` +x.
 #   - artifact-basename is the file's name inside ARTIFACTS_DIR (the release
 #     workflow's merge-multiple flattens every upload to its basename).
+#   - the `minimal` CLI installs as `bin/min`: the user-facing command is `min`
+#     (the installer's completion generation runs `<bin>/min`, spec R9.3), while
+#     the component and artifact names keep the crate name.
 #
 # Linux hosts install just the three self-contained musl binaries. macOS hosts
 # additionally need minvmd + gvproxy and the guest microVM payload (kernel,
@@ -106,13 +109,13 @@ COMPONENTS=(
     # Linux amd64
     "minimald|linux|amd64|file|bin/minimald|minimald-linux-amd64"
     "mip|linux|amd64|file|bin/mip|mip-linux-amd64"
-    "minimal|linux|amd64|file|bin/minimal|minimal-linux-amd64"
+    "minimal|linux|amd64|file|bin/min|minimal-linux-amd64"
     # Linux arm64
     "minimald|linux|arm64|file|bin/minimald|minimald-linux-arm64"
     "mip|linux|arm64|file|bin/mip|mip-linux-arm64"
-    "minimal|linux|arm64|file|bin/minimal|minimal-linux-arm64"
+    "minimal|linux|arm64|file|bin/min|minimal-linux-arm64"
     # macOS arm64 (darwin)
-    "minimal|darwin|arm64|file|bin/minimal|minimal-macos-arm64"
+    "minimal|darwin|arm64|file|bin/min|minimal-macos-arm64"
     "minvmd|darwin|arm64|file|bin/minvmd|minvmd-macos-arm64"
     # The trimmed libkrun minvmd links against (built by the release workflow's
     # build-libkrun-macos-arm64 job), staged into lib/ (ie: minvmd/../lib).
