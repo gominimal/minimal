@@ -16,6 +16,6 @@ runs:
         remove_tool_cache: true
     - name: Install protoc
       shell: bash
-      run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      run: sudo sh -c 'apt-get update && apt-get install -y protobuf-compiler'
     - name: Cache cargo registry and build artifacts
       uses: Swatinem/rust-cache@v2
