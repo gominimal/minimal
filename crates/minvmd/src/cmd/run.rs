@@ -70,9 +70,18 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     if let Some(dir) = crate::state::state_dir_override() {
         cmd.args(["--minimal-state-dir", dir.as_str()]);
     }
+    // The supervisor's stderr goes to a log file, not /dev/null: it carries
+    // the boot-failure diagnosis (the guest's mount-failure reason, image
+    // disposition, repair guidance), and the failure messages below point at
+    // it. Truncated per attempt so it holds exactly this boot's story.
+    let state_dir = crate::state::StateDir::new(crate::state::StateDir::default_path())
+        .context("opening state dir")?;
+    let log_path = state_dir.dir().join("run.log");
+    let log = std::fs::File::create(&log_path)
+        .with_context(|| format!("creating supervisor log at {}", log_path.display()))?;
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::from(log));
 
     // SAFETY: setsid() is async-signal-safe. In the child, it creates a new
     // session so the supervisor is detached from the caller's controlling
@@ -100,14 +109,13 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     // marker, which follows its vsock bind. A child exit surfaces as an error
     // instead of a silent timeout.
     let uds_path = crate::sock::resolve_uds_path().context("resolving host UDS path")?;
-    let state_dir = crate::state::StateDir::new(crate::state::StateDir::default_path())
-        .context("opening state dir")?;
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         if let Some(status) = child.try_wait().context("polling supervisor child")? {
             bail!(
                 "the detached supervisor exited during startup ({status}); \
-                 run `minvmd run` in the foreground to see the error"
+                 see {} for its error output",
+                log_path.display()
             );
         }
         if std::os::unix::net::UnixStream::connect(&uds_path).is_ok()
@@ -119,8 +127,10 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
         }
         if std::time::Instant::now() >= deadline {
             bail!(
-                "timed out after {timeout_secs}s waiting for minvmd to become ready on {}",
-                uds_path.display()
+                "timed out after {timeout_secs}s waiting for minvmd to become ready on {} \
+                 (supervisor log: {})",
+                uds_path.display(),
+                log_path.display()
             );
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -296,6 +306,13 @@ fn run_foreground() -> Result<()> {
         }
     };
 
+    // R2.5: record whether the data volume image pre-exists this boot, before
+    // the VMM child provisions it — a later boot failure is fatal for a
+    // pre-existing image (may hold session data) and recoverable for a blank
+    // one freshly created by this boot.
+    let volume_path = crate::volume::resolve_data_volume_path();
+    let volume_preexisted = crate::cmd::volume_preexists(&volume_path);
+
     let exe = std::env::current_exe().context("resolving current executable path")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("__krun-vmm");
@@ -342,10 +359,10 @@ fn run_foreground() -> Result<()> {
     // take ~20s+ to reach userspace, so a fixed 5s was too short.
     let ready_timeout: Duration = crate::cmd::ready_timeout();
     let known_hosts_path = crate::cmd::default_vm_known_hosts_path();
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<crate::cmd::BootBeacon, String>>();
     let sock_clone = marker_sock_path.clone();
     std::thread::spawn(move || {
-        let result = (|| -> Result<(), String> {
+        let result = (|| -> Result<crate::cmd::BootBeacon, String> {
             let (stream, _) = listener
                 .accept()
                 .map_err(|e| format!("accept on READY-marker socket: {e}"))?;
@@ -357,7 +374,10 @@ fn run_foreground() -> Result<()> {
     });
 
     let boot_result = match rx.recv_timeout(ready_timeout) {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(crate::cmd::BootBeacon::Ready)) => Ok(()),
+        Ok(Ok(crate::cmd::BootBeacon::MountFailed { reason })) => Err(
+            crate::cmd::mount_failed_error(&reason, &volume_path, volume_preexisted),
+        ),
         Ok(Err(e)) => Err(anyhow::anyhow!("boot failed: {e}")),
         Err(_) => Err(anyhow::anyhow!(
             "boot timed out waiting for READY marker after {} s (raise {} to wait longer)",
@@ -370,6 +390,7 @@ fn run_foreground() -> Result<()> {
         let _ = child.kill();
         let _ = child.wait();
         let _ = std::fs::remove_file(&marker_sock_path);
+        crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
         return Err(e);
         // guard drops here → StartingGuard resets state to Stopped (R4.6)
     }

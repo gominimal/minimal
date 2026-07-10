@@ -48,7 +48,9 @@ pub(crate) async fn write_ready_beacon<W: tokio::io::AsyncWrite + Unpin>(
 /// after boot, so connection attempts are retried with a short backoff before
 /// giving up.
 pub async fn emit_ready_marker(pubkey: &PublicKey) -> std::io::Result<()> {
-    emit_marker(Some(pubkey)).await
+    let mut payload = Vec::new();
+    write_ready_beacon(&mut payload, pubkey).await?;
+    emit_marker(&payload, "READY").await
 }
 
 /// Emits the one-shot boot marker to the host (simple form: no host key).
@@ -57,10 +59,39 @@ pub async fn emit_ready_marker(pubkey: &PublicKey) -> std::io::Result<()> {
 /// and no SSH server is running. The host-side beacon reader handles a missing
 /// second line gracefully (R2.3).
 pub async fn emit_simple_ready_marker() -> std::io::Result<()> {
-    emit_marker(None).await
+    emit_marker(b"READY\n", "READY (simple)").await
 }
 
-async fn emit_marker(pubkey: Option<&PublicKey>) -> std::io::Result<()> {
+/// Emits the loud mount-failure marker instead of READY (spec R2.5): the data
+/// volume is attached but could not be mounted, so the guest must not appear
+/// healthy. The host beacon reader surfaces the reason to the user and decides
+/// fatality (fatal when a prior volume image exists).
+pub async fn emit_mount_failed_marker(reason: &str) -> std::io::Result<()> {
+    emit_marker(&mount_failed_beacon(reason), "MOUNT_FAILED").await
+}
+
+/// Maximum bytes of failure reason carried in the `MOUNT_FAILED` beacon. The
+/// host reads the reason with a capped line reader, so longer text is cut here
+/// rather than truncated mid-protocol on the host side.
+const MOUNT_FAILED_REASON_MAX_BYTES: usize = 512;
+
+/// Builds the two-line `MOUNT_FAILED\n<one-line reason>\n` beacon payload.
+/// The reason is flattened to a single line and capped at
+/// [`MOUNT_FAILED_REASON_MAX_BYTES`] (on a char boundary).
+pub(crate) fn mount_failed_beacon(reason: &str) -> Vec<u8> {
+    let mut reason: String = reason
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let mut cut = MOUNT_FAILED_REASON_MAX_BYTES.min(reason.len());
+    while !reason.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    reason.truncate(cut);
+    format!("MOUNT_FAILED\n{reason}\n").into_bytes()
+}
+
+async fn emit_marker(payload: &[u8], label: &str) -> std::io::Result<()> {
     const MAX_ATTEMPTS: u32 = 50;
     const BACKOFF: Duration = Duration::from_millis(100);
 
@@ -69,16 +100,9 @@ async fn emit_marker(pubkey: Option<&PublicKey>) -> std::io::Result<()> {
     for attempt in 1..=MAX_ATTEMPTS {
         match VsockStream::connect(addr).await {
             Ok(mut stream) => {
-                match pubkey {
-                    Some(pk) => write_ready_beacon(&mut stream, pk).await?,
-                    None => stream.write_all(b"READY\n").await?,
-                }
+                stream.write_all(payload).await?;
                 AsyncWriteExt::shutdown(&mut stream).await?;
-                tracing::info!(
-                    attempt,
-                    simple = pubkey.is_none(),
-                    "emitted boot READY marker"
-                );
+                tracing::info!(attempt, marker = label, "emitted boot marker");
                 return Ok(());
             }
             Err(e) => {
@@ -94,9 +118,10 @@ async fn emit_marker(pubkey: Option<&PublicKey>) -> std::io::Result<()> {
     }))
 }
 
-/// `mount(2)` with explicit flags. `EBUSY` (already mounted) is treated as
-/// success.
-fn raw_mount(
+/// `mount(2)` with explicit flags, returning the raw error — including
+/// `EBUSY`. Callers that mount idempotent pseudo-filesystems want
+/// [`raw_mount`]'s EBUSY tolerance instead.
+fn mount_syscall(
     source: &str,
     target: &str,
     fstype: &str,
@@ -118,13 +143,24 @@ fn raw_mount(
         )
     };
     if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EBUSY) {
-            return Ok(());
-        }
-        return Err(err);
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// `mount(2)` with explicit flags. `EBUSY` (already mounted) is treated as
+/// success — right for the idempotent pseudo-fs mounts on the boot path,
+/// wrong for the data volume (see [`mount_state_volume`]).
+fn raw_mount(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: libc::c_ulong,
+) -> std::io::Result<()> {
+    match mount_syscall(source, target, fstype, flags) {
+        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => Ok(()),
+        other => other,
+    }
 }
 
 /// Enter the generic upstream guest rootfs from the initramfs. Mounts the rootfs
@@ -355,7 +391,27 @@ fn run_mkfs_ext4(device: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Mount the per-VM writable data volume (spec R1.5).
+/// Mountpoint of the per-VM writable data volume inside the guest (spec R1.5).
+/// The state and cache dirs relocate here once [`mount_state_volume`] succeeds.
+pub const STATE_VOLUME_MOUNTPOINT: &str = "/var/lib/minimal";
+
+/// Repair `device` with `e2fsck -p` (preen: fix what is safe without asking).
+/// Exit codes 0–2 mean no errors / errors corrected; ≥ 4 means uncorrected
+/// problems remain, which is an error here.
+fn run_e2fsck(device: &str) -> std::io::Result<()> {
+    let status = std::process::Command::new("e2fsck")
+        .arg("-p")
+        .arg(device)
+        .status()?;
+    match status.code() {
+        Some(code) if code < 4 => Ok(()),
+        _ => Err(std::io::Error::other(format!(
+            "e2fsck -p {device} left uncorrected errors: {status}"
+        ))),
+    }
+}
+
+/// Mount the per-VM writable data volume (spec R1.5, fail-closed per R2.4/R2.5).
 ///
 /// Runs **after** [`enter_rootfs`] has chrooted into the rootfs, so `mkfs.ext4`
 /// resolves against the rootfs userland (the initramfs has no e2fsprogs) and the
@@ -363,29 +419,176 @@ fn run_mkfs_ext4(device: &str) -> std::io::Result<()> {
 /// (superblock-gated, idempotent) and mounts it read-write at `mountpoint` with
 /// `MS_NOATIME`.
 ///
-/// Returns `Ok(true)` when the volume was mounted, `Ok(false)` when `device` is
-/// absent — the transitional legacy case where no data volume is attached and
-/// the caller keeps the tmpfs state dir. Unit 2 (R2.4/R2.5) makes an *attached*
-/// volume that fails to mount fatal; this Unit-1 form only reports the outcome.
-pub fn mount_state_volume(device: &str, mountpoint: &str) -> std::io::Result<bool> {
-    // `try_exists` distinguishes "absent" (Ok(false)) from a stat error (Err):
-    // a plain `exists()` reports a transiently-unstattable but attached device as
-    // absent, silently dropping to the ephemeral tmpfs and losing the volume.
-    if !std::path::Path::new(device).try_exists()? {
-        tracing::info!(device, "no data volume attached; keeping tmpfs state dir");
-        return Ok(false);
+/// Any failure — including an absent `device`, since minvmd attaches the volume
+/// on every boot (R1.4) — is an error; the caller emits `MOUNT_FAILED` instead
+/// of READY (R2.5). When a formatted volume fails to mount, one `e2fsck -p`
+/// repair + mount retry is attempted before failing closed; the volume is never
+/// reformatted once a superblock exists.
+pub fn mount_state_volume(device: &str, mountpoint: &str) -> std::io::Result<()> {
+    // Every error here becomes the MOUNT_FAILED reason shown to the user on
+    // the host, so each failing operation names itself — a bare
+    // "Read-only file system (os error 30)" would send them to fsck a
+    // healthy image when the real fault is e.g. a pre-R1.7 rootfs.
+    let with_context =
+        |op: String| move |e: std::io::Error| std::io::Error::new(e.kind(), format!("{op}: {e}"));
+    // The data volume mount uses the strict `mount_syscall`, not the
+    // EBUSY-tolerant `raw_mount`: an EBUSY here is a real failure (the device
+    // is held elsewhere), and reporting it as success would relocate state
+    // onto an unmounted read-only mountpoint.
+    let mount = || {
+        mount_syscall(device, mountpoint, "ext4", libc::MS_NOATIME)
+            .map_err(with_context(format!("mounting {device} at {mountpoint}")))
+    };
+
+    // `try_exists` distinguishes "absent" from a stat error (Err) so the failure
+    // reason carried in the MOUNT_FAILED beacon names the right cause.
+    if !std::path::Path::new(device)
+        .try_exists()
+        .map_err(with_context(format!("probing device {device}")))?
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("data volume device {device} is not attached"),
+        ));
     }
     // Ensure the mountpoint exists before formatting: it must be present on the
     // read-only rootfs (spec R1.7), so on a rootfs that predates R1.7 this fails
     // with EROFS — better to surface that here than after a needless mkfs.
-    std::fs::create_dir_all(mountpoint)?;
-    if !has_ext4_superblock(device)? {
+    std::fs::create_dir_all(mountpoint).map_err(with_context(format!(
+        "creating mountpoint {mountpoint} (rootfs predating R1.7?)"
+    )))?;
+    if has_ext4_superblock(device)
+        .map_err(with_context(format!("probing ext4 superblock on {device}")))?
+    {
+        // Existing filesystem: the ext4 journal replays any unclean-shutdown
+        // state on mount. On failure, repair once and retry; then fail closed
+        // rather than reformatting user data away.
+        if let Err(e) = mount() {
+            tracing::warn!(device, error = %e, "mounting data volume failed; attempting e2fsck -p repair");
+            run_e2fsck(device)?;
+            mount()?;
+        }
+    } else {
         tracing::info!(device, "no ext4 superblock; formatting data volume");
         run_mkfs_ext4(device)?;
+        mount()?;
     }
-    raw_mount(device, mountpoint, "ext4", libc::MS_NOATIME)?;
     tracing::info!(device, mountpoint, "mounted writable state volume");
-    Ok(true)
+    Ok(())
+}
+
+/// Quiesce the state volume before VMM teardown (spec R2.1): `syncfs(2)` the
+/// mount to flush all pending writes and the ext4 journal to the block device,
+/// then best-effort lazy-detach the mount so a clean stop leaves the journal
+/// closed. A syncfs error propagates; an unmount failure is logged and
+/// swallowed — the data is already synced, so the worst case is a journal
+/// replay on the next boot.
+pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let dir = std::fs::File::open(mountpoint)?;
+    // SAFETY: `syncfs(2)` on a valid open fd; blocks until all dirty pages and
+    // journal entries of the containing filesystem reach the block device.
+    if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    drop(dir);
+
+    let c_mountpoint = CString::new(mountpoint)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in mountpoint"))?;
+    // Try a plain unmount first: a full unmount closes the ext4 journal and
+    // marks the superblock clean. It fails EBUSY while anything holds an fd
+    // under the mount (e.g. the gvproxy switch socket in the state dir), so
+    // fall back to remounting read-only — ext4 marks recovery complete on
+    // the ro transition (clearing `INCOMPAT_RECOVER`) despite read-open fds
+    // and bound sockets. A *write*-open fd (e.g. a session-spawned process
+    // that outlived the drain, reparented to pid-1) defeats the remount too;
+    // then only the lazy detach runs and the journal stays dirty — logged
+    // with the holders below, bounded by the replay backstop. Every failure
+    // arm is logged and swallowed: the data is already synced, so the worst
+    // case is a journal replay on the next boot.
+    //
+    // SAFETY: `umount2(2)`/`mount(2)` with valid, call-lifetime C strings;
+    // MS_REMOUNT|MS_RDONLY takes no source/fstype/data; MNT_DETACH is lazy
+    // (succeeds with busy fds; the fs finishes when they drop).
+    if unsafe { libc::umount2(c_mountpoint.as_ptr(), 0) } == 0 {
+        tracing::info!(mountpoint, "state volume quiesced and unmounted");
+        return Ok(());
+    }
+    let remount_ro = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            c_mountpoint.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOATIME,
+            std::ptr::null(),
+        )
+    };
+    if remount_ro != 0 {
+        tracing::warn!(
+            mountpoint,
+            error = %std::io::Error::last_os_error(),
+            holders = %fd_holders_under(mountpoint),
+            "remounting state volume read-only (best-effort; already synced)"
+        );
+    }
+    if unsafe { libc::umount2(c_mountpoint.as_ptr(), libc::MNT_DETACH) } != 0 {
+        tracing::warn!(
+            mountpoint,
+            error = %std::io::Error::last_os_error(),
+            "detaching state volume (best-effort; already synced)"
+        );
+    } else {
+        tracing::info!(
+            mountpoint,
+            remounted_ro = remount_ro == 0,
+            "state volume quiesced and lazily detached"
+        );
+    }
+    Ok(())
+}
+
+/// Enumerate open fds (and cwds) under `mountpoint` across all processes, for
+/// the EBUSY diagnostics in [`quiesce_state_volume`] — an unmountable volume
+/// is invisible without knowing who holds it. Best-effort `/proc` scan.
+fn fd_holders_under(mountpoint: &str) -> String {
+    let prefix = format!("{mountpoint}/");
+    let mut holders = Vec::new();
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return "<no /proc>".to_string();
+    };
+    for proc_entry in procs.flatten() {
+        let Some(pid) = proc_entry
+            .file_name()
+            .to_str()
+            .filter(|n| n.chars().all(|c| c.is_ascii_digit()))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let base = proc_entry.path();
+        if let Ok(cwd) = std::fs::read_link(base.join("cwd"))
+            && (cwd.starts_with(mountpoint) || cwd.to_string_lossy().starts_with(&prefix))
+        {
+            holders.push(format!("pid {pid} cwd {}", cwd.display()));
+        }
+        let Ok(fds) = std::fs::read_dir(base.join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            if let Ok(target) = std::fs::read_link(fd.path()) {
+                let t = target.to_string_lossy();
+                if t.starts_with(&prefix) || t == mountpoint {
+                    holders.push(format!("pid {pid} fd {t}"));
+                }
+            }
+        }
+    }
+    if holders.is_empty() {
+        "<none found>".to_string()
+    } else {
+        holders.join(", ")
+    }
 }
 
 /// Mounts `/proc` and `/sys` if they are not already present.
@@ -742,5 +945,27 @@ mod tests {
             format!("READY\n{expected_openssh}\n"),
             "beacon must be READY\\n<openssh-pubkey>\\n"
         );
+    }
+
+    #[test]
+    fn mount_failed_beacon_is_two_lines_flattened_and_capped() {
+        // Multi-line reasons are flattened to one line.
+        let payload = mount_failed_beacon("mount failed:\r\nEIO on /dev/vdb");
+        assert_eq!(
+            String::from_utf8(payload).unwrap(),
+            "MOUNT_FAILED\nmount failed:  EIO on /dev/vdb\n"
+        );
+
+        // Oversized reasons are capped on a char boundary; the payload stays
+        // two-line and well-formed.
+        let long = "é".repeat(MOUNT_FAILED_REASON_MAX_BYTES); // 2 bytes per char
+        let payload = String::from_utf8(mount_failed_beacon(&long)).unwrap();
+        let reason = payload
+            .strip_prefix("MOUNT_FAILED\n")
+            .unwrap()
+            .strip_suffix('\n')
+            .unwrap();
+        assert!(reason.len() <= MOUNT_FAILED_REASON_MAX_BYTES);
+        assert!(reason.chars().all(|c| c == 'é'));
     }
 }

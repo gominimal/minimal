@@ -50,6 +50,13 @@ pub struct Config {
     /// `false` (DM2, native Linux) keeps the local-spawn + tap relay path.
     #[serde(default)]
     pub in_microvm: bool,
+    /// Whether the guest boot path actually mounted the writable data volume
+    /// at `minimal_state_dir`. Gates the shutdown quiesce (R2.1/R2.2): only a
+    /// filesystem this daemon mounted may be synced and unmounted — the vsock
+    /// transport alone doesn't imply one (a native `--vsock` daemon, or a
+    /// microVM booted without a data volume, must never unmount its state dir).
+    #[serde(default)]
+    pub state_volume_mounted: bool,
 }
 
 impl Config {
@@ -227,6 +234,20 @@ impl ServerStateHandle {
     /// Idempotent: repeated calls (e.g. two `Shutdown` RPCs) are harmless.
     pub(crate) async fn trigger_shutdown(&self) {
         self.0.lock().await.shutdown.cancel();
+    }
+
+    /// Whether the boot path mounted the writable data volume at the state
+    /// dir. The `Shutdown` RPC handler quiesces (syncs + unmounts) the state
+    /// dir only when this daemon mounted it — never a host directory or a
+    /// tmpfs it merely uses.
+    pub(crate) async fn state_volume_mounted(&self) -> bool {
+        self.0.lock().await.config.state_volume_mounted
+    }
+
+    /// The configured state dir (the quiesce target when in a microVM).
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn minimal_state_dir(&self) -> DaemonAbsPath {
+        self.0.lock().await.config.minimal_state_dir.clone()
     }
 
     /// Returns the daemon's TLS certificate authority (only with
@@ -600,6 +621,7 @@ mod tests {
             minimal_cache_dir: DaemonAbsPath::try_new(path).unwrap(),
             gvproxy_bin: None,
             in_microvm: false,
+            state_volume_mounted: false,
         }
     }
 
