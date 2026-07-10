@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# The ONE session e2e, invoked by every target lane. Drives the real user
+# path through the `minimal` CLI — which abstracts where the daemon lives —
+# so the identical proof runs against all three deployment targets:
+#
+#   Linux native (DM2)   minimald on the host          (no extra env)
+#   Linux KVM    (DM1)   minimald in a minvmd microVM  E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd
+#   macOS HVF            minimald in a minvmd microVM  E2E_VM=1 (macOS is always VM-backed)
+#
+# Flow: from a guaranteed-clean state, `minimal activate` must auto-spawn the
+# target's daemon and create a session; `minimal attach --command` execs in
+# the session over the daemon's SSH surface (native UDS / vsock bridge),
+# asserting stdout + exit status; then list, warm-call, destroy (verified
+# delisted), and a clean `minimal stop`. Timing is reported but NOT asserted.
+#
+# VM targets (E2E_VM=1) additionally need, from the caller:
+#   - a codesigned/linkable `minvmd` on PATH (minimal spawns it by name)
+#   - MINVMD_KERNEL_PATH / MINVMD_ROOTFS_PATH / MINVMD_INITRAMFS
+#     (propagate through the `minvmd run --detach` re-exec)
+#   - MINVMD_BOOT_LOG (optional) to capture the guest console
+#   The guest sees no host project dir yet (no project sync), so VM lanes
+#   pass E2E_PROJECT_DIR=/tmp — a path that exists in the guest image. In
+#   every target the session runs in a Linux environment, so the in-session
+#   `uname -s` assertion is `Linux` everywhere, including macOS hosts.
+#
+# Environment:
+#   E2E_MINIMAL_ARGS    global args for every `minimal` call (e.g. --minvmd)
+#   E2E_PROJECT_DIR     project to activate (default: repo root)
+#   E2E_ACTIVATE_ARGS   extra args for `minimal activate` (e.g. a future
+#                       `--loadout dev` once the loadouts CLI lands, #686)
+#   E2E_VM              set to 1 for VM-backed targets (extra teardown +
+#                       diagnostics: minvmd stop, guest boot log)
+#
+# Usage: scripts/session-e2e.sh
+set -uo pipefail # not -e: capture failures so we can dump diagnostics
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_DIR="${E2E_PROJECT_DIR:-$ROOT}"
+E2E_VM="${E2E_VM:-}"
+
+# Fresh state under /tmp — NOT $TMPDIR: macOS's deep $TMPDIR would push
+# `.../minimal/providers/local-0/*.sock` past the 104-byte sun_path limit.
+# Post-#690, all daemon state (minvmd.toml, locks, the bridge socket) lives
+# under $XDG_STATE_HOME/minimal/providers/local-0 on every platform, so a
+# fresh dir guarantees the clean (no-daemon) cold-start on persistent
+# runners. XDG_CACHE_HOME is deliberately left alone so package pulls reuse
+# the host/CI cache across runs.
+WORK="$(mktemp -d /tmp/mnl-e2e.XXXXXX)"
+export XDG_RUNTIME_DIR="$WORK/runtime"
+export XDG_STATE_HOME="$WORK/state"
+mkdir -p "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME"
+chmod 700 "$XDG_RUNTIME_DIR"
+
+# The CLI's tracing layer writes to STDOUT (ot::StdoutWriter, minimal/src/
+# main.rs), so at the default level the autospawn INFO lines interleave with
+# the session id `activate` prints for piping. Quiet the logs; the last-line
+# extraction below stays defensive in case a level sneaks through.
+export RUST_LOG="${RUST_LOG:-warn}"
+
+# Millisecond clock: GNU date on Linux; macOS `date` has no %N, use perl.
+if [ -z "$(date +%s%3N | tr -d '0-9')" ]; then
+  now_ms() { date +%s%3N; }
+else
+  now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time()*1000'; }
+fi
+
+# Every CLI call goes through this so E2E_MINIMAL_ARGS applies uniformly.
+# Word-splitting of the args is intended.
+mnl() {
+  # shellcheck disable=SC2086
+  minimal ${E2E_MINIMAL_ARGS:-} "$@"
+}
+
+teardown() {
+  mnl stop --force >/dev/null 2>&1 || true
+  if [ -n "$E2E_VM" ]; then
+    minvmd stop >/dev/null 2>&1 || true
+  fi
+}
+trap teardown EXIT
+
+# On any failure, dump what a detached daemon hides — the CLI's own stderr,
+# the daemon's state/log files (and, on VM targets, the guest boot console)
+# — then stop everything and fail.
+fail() {
+  echo "::group::session-e2e diagnostics"
+  echo "--- activate stderr ---"; cat "$WORK/activate.err" 2>/dev/null || true
+  echo "--- attach stderr ---"; cat "$WORK/attach.err" 2>/dev/null || true
+  echo "--- minimal ls ---"; mnl ls 2>&1 || true
+  echo "--- state dir ---"; find "$XDG_STATE_HOME" -type f 2>/dev/null | head -50
+  find "$XDG_STATE_HOME" -type f \( -name '*.log' -o -name '*.toml' -o -name '*.json' \) 2>/dev/null \
+    | while read -r f; do echo "--- $f (tail) ---"; tail -40 "$f"; done
+  if [ -n "$E2E_VM" ]; then
+    echo "--- guest boot console (tail) ---"
+    tail -80 "${MINVMD_BOOT_LOG:-/nonexistent}" 2>/dev/null || echo "(no boot log — VM never started)"
+  fi
+  echo "::endgroup::"
+  teardown
+  exit 1
+}
+
+# Cold: `minimal activate` must auto-spawn the target's daemon and print the
+# new session id on stdout. The id is the LAST stdout line (any log lines
+# that slip through the RUST_LOG filter precede it), validated as a UUID.
+echo "::group::cold activate (auto-spawns the daemon)"
+t0=$(now_ms)
+# shellcheck disable=SC2086
+activate_out="$(cd "$PROJECT_DIR" && mnl activate . ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/activate.err")" \
+  || { echo "::error::cold 'minimal activate' failed to auto-spawn the daemon / create a session"; fail; }
+t1=$(now_ms)
+sid="$(printf '%s\n' "$activate_out" | tail -n1 | tr -d '\r')"
+echo "session: $sid (cold activate: $((t1 - t0))ms)"
+if ! printf '%s' "$sid" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+  echo "::error::activate's last stdout line is not a session UUID: '$sid'"
+  echo "--- full activate stdout ---"; printf '%s\n' "$activate_out"
+  fail
+fi
+echo "::endgroup::"
+
+# The session must be listed.
+mnl ls --raw 2>/dev/null | grep -Fqx "$sid" \
+  || { echo "::error::'minimal ls --raw' does not list new session $sid"; fail; }
+
+# Exec a command in the session (non-interactive attach) and assert its
+# stdout and exit status — the full CLI -> daemon -> session path (UDS to a
+# native minimald; the vsock bridge into the guest on VM targets). Sessions
+# are Linux environments on every target, macOS hosts included.
+echo "::group::exec in session"
+marker="session-e2e-$$"
+out="$(mnl attach "$sid" --command "echo $marker && uname -s" 2>"$WORK/attach.err")" \
+  || { echo "::error::'minimal attach --command' exited non-zero"; fail; }
+echo "$out"
+case "$out" in
+  *"$marker"*) ;;
+  *) echo "::error::session exec output missing marker '$marker'"; fail ;;
+esac
+case "$out" in
+  *Linux*) ;;
+  *) echo "::error::session exec output missing 'Linux' (uname -s inside the session)"; fail ;;
+esac
+echo "::endgroup::"
+
+# Warm: the daemon is up; a second CLI call must succeed without respawning.
+t0=$(now_ms)
+mnl ls >/dev/null 2>&1 || { echo "::error::warm 'minimal ls' failed"; fail; }
+t1=$(now_ms)
+echo "warm 'minimal ls': $((t1 - t0))ms"
+
+# Destroy the session; it must drop out of the listing.
+mnl destroy "$sid" >/dev/null 2>&1 \
+  || { echo "::error::'minimal destroy $sid' failed"; fail; }
+if mnl ls --raw 2>/dev/null | grep -Fqx "$sid"; then
+  echo "::error::session $sid still listed after destroy"; fail
+fi
+
+# Shut the daemon down; it must not survive.
+mnl stop >/dev/null 2>&1 || { echo "::error::'minimal stop' failed"; fail; }
+
+echo "session e2e OK"

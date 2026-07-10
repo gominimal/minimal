@@ -86,12 +86,13 @@ jobs:
         uses: ./.github/actions/core-tests
 
   native-daemon-e2e:
-    # Boot the NATIVE minimald on the host and drive a real session through
-    # it: `minimal activate` auto-spawns `minimald run --detach` (DM2),
-    # creates a session for this repo's own project, `minimal attach
-    # --command` execs in the sandbox asserting stdout + exit status, then
-    # list/destroy/stop. The Linux twin of the macOS autospawn e2e — before
-    # this job, no CI ran the daemon natively at all.
+    # The unified session e2e (scripts/session-e2e.sh — the SAME proof every
+    # target lane runs) against the NATIVE minimald (DM2): `minimal activate`
+    # auto-spawns `minimald run --detach`, creates a session for this repo's
+    # own project, `minimal attach --command` execs in the sandbox asserting
+    # stdout + exit status, then list/destroy/stop. Before this job, no CI
+    # ran the daemon natively at all. The native target needs no E2E_* knobs:
+    # host daemon, repo as the project.
     needs: [changes]
     if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
@@ -118,10 +119,10 @@ jobs:
           restore-keys: native-e2e-minimal-cache-
       - name: Build minimal + minimald
         run: cargo build -p minimald --bin minimald -p minimal --bin minimal
-      - name: Native daemon e2e
+      - name: Session e2e (native minimald)
         run: |
           export PATH="$PWD/target/debug:$PATH"
-          ./scripts/native-daemon-e2e.sh
+          ./scripts/session-e2e.sh
 
   # Single required status check for this lane (branch-protection context:
   # ci-linux-native-success). Green when every gating job succeeded OR was
