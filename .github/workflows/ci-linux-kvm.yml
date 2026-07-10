@@ -61,6 +61,8 @@ jobs:
               - "scripts/**"
               - "Cargo.toml"
               - "Cargo.lock"
+              # The toolchain pin: a rustc bump must re-run the Rust lanes.
+              - "rust-toolchain.toml"
               - ".minimal/minimal.toml"
               - ".github/workflows/ci-linux-kvm.yml"
               # Composite actions this lane's setup runs through — without
