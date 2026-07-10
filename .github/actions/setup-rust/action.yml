@@ -15,9 +15,7 @@ runs:
         remove_haskell: true
         remove_tool_cache: true
     - name: Install protoc
-      # Retried: apt installs are the one step class with recorded transient
-      # failures in lane history (see scripts/ci/retry.sh).
       shell: bash
-      run: ./scripts/ci/retry.sh 3 10 sudo sh -c 'apt-get update && apt-get install -y protobuf-compiler'
+      run: sudo sh -c 'apt-get update && apt-get install -y protobuf-compiler'
     - name: Cache cargo registry and build artifacts
       uses: Swatinem/rust-cache@v2

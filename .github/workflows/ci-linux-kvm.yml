@@ -103,11 +103,8 @@ jobs:
         # explicitly since we use --no-install-recommends. cpio: packs the
         # guest initramfs (scripts/build-initramfs.sh). git: source fetches
         # during the CLI build.
-        #
-        # Retried: apt is the one step class with recorded transient failures
-        # in this lane's history (see scripts/ci/retry.sh).
         run: |
-          ./scripts/ci/retry.sh 3 10 sudo sh -c \
+          sudo sh -c \
             'apt-get update && apt-get install -y --no-install-recommends \
                protobuf-compiler libprotobuf-dev cpio git'
 
