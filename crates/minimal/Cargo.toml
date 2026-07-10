@@ -4,6 +4,12 @@ version = "0.0.1"
 edition.workspace = true
 publish.workspace = true
 
+[features]
+# Off by default: gates the `mesh` and `ssh-forward` CLI subcommands. WireGuard
+# mesh (UC7 / UC2b-A) and the SSH port-forward fallback are deferred for now; the
+# daemon-side `direct-tcpip` handler is behind minimald's `ssh-forward` feature.
+remote-access = []
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

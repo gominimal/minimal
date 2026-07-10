@@ -37,6 +37,7 @@ pub enum Command {
     /// Session inspection subcommands
     Session(SessionArgs),
     /// WireGuard mesh: join, leave, and inspect remote-access state
+    #[cfg(feature = "remote-access")]
     Mesh(MeshArgs),
     /// Proxy stdio to a daemon UDS socket (used as an SSH ProxyCommand).
     #[command(hide = true)]
@@ -57,6 +58,7 @@ pub enum Command {
     ///
     ///   # Then access it from the host:
     ///   curl http://localhost:18080/
+    #[cfg(feature = "remote-access")]
     #[command(name = "ssh-forward", visible_alias = "forward")]
     SshForward(SshForwardArgs),
     /// Obtain an mTLS client certificate from minimald for use with the HTTPS
@@ -117,12 +119,14 @@ pub struct PolicyArgs {
 /// WireGuard mesh subcommands for authenticated remote PTask access (UC7 /
 /// UC2b). The mesh lets a laptop, or another host's PTasks, reach this host's
 /// PTasks over an encrypted tunnel.
+#[cfg(feature = "remote-access")]
 #[derive(Debug, Args)]
 pub struct MeshArgs {
     #[command(subcommand)]
     pub command: MeshCommand,
 }
 
+#[cfg(feature = "remote-access")]
 #[derive(Debug, Subcommand)]
 pub enum MeshCommand {
     /// Enrol this machine into a remote minimald's WireGuard mesh
@@ -158,6 +162,7 @@ pub enum MeshCommand {
     Status,
 }
 
+#[cfg(feature = "remote-access")]
 #[derive(Debug, Args)]
 pub struct MeshJoinArgs {
     /// Address of the remote minimald exposing the mesh (`host:port`)
@@ -340,6 +345,7 @@ pub struct ProxyArgs {
 }
 
 /// Arguments for `minimal ssh-forward`.
+#[cfg(feature = "remote-access")]
 #[derive(Debug, Args)]
 pub struct SshForwardArgs {
     /// Session identifier (UUID or session name)
@@ -378,12 +384,14 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
         Command::Session(SessionArgs {
             command: SessionCommand::Policy(args),
         }) => cmd_session_policy(&cli.global_args, args).await,
+        #[cfg(feature = "remote-access")]
         Command::Mesh(MeshArgs { command }) => match command {
             MeshCommand::Status => cmd_mesh_status(&cli.global_args).await,
             MeshCommand::Join(args) => cmd_mesh_join(&cli.global_args, args),
             MeshCommand::Leave => cmd_mesh_leave(&cli.global_args),
         },
         Command::Proxy(args) => cmd_proxy(args).await,
+        #[cfg(feature = "remote-access")]
         Command::SshForward(args) => cmd_ssh_forward(&cli.global_args, args).await,
         Command::Login(args) => cmd_login(&cli.global_args, args).await,
         Command::Version => cmd_version(&cli.global_args).await,
@@ -904,6 +912,7 @@ pub async fn cmd_session_policy(
 
 /// The local mesh-enrolment record path. Honors `--minimal-dir`, else falls
 /// back to the user config dir.
+#[cfg(feature = "remote-access")]
 pub fn mesh_enrolment_path(global: &GlobalArgs) -> Result<PathBuf, anyhow::Error> {
     let base = match &global.minimal_dir {
         Some(dir) => dir.clone(),
@@ -916,6 +925,7 @@ pub fn mesh_enrolment_path(global: &GlobalArgs) -> Result<PathBuf, anyhow::Error
 
 /// Show this minimald's WireGuard mesh status (R4.6): own public key, the
 /// switch subnets it advertises, and each peer's last handshake.
+#[cfg(feature = "remote-access")]
 pub async fn cmd_mesh_status(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
 
@@ -962,6 +972,7 @@ pub async fn cmd_mesh_status(global: &GlobalArgs) -> Result<(), anyhow::Error> {
 
 /// Record this machine's enrolment into a remote minimald's mesh (R4.3, v1
 /// manual key exchange) and print the steps to complete the key swap.
+#[cfg(feature = "remote-access")]
 pub fn cmd_mesh_join(global: &GlobalArgs, args: MeshJoinArgs) -> Result<(), anyhow::Error> {
     // Validate the endpoint at the point of entry so a typo never lands a bad
     // enrolment on disk for a later consumer to choke on. The CLI contract is
@@ -996,6 +1007,7 @@ pub fn cmd_mesh_join(global: &GlobalArgs, args: MeshJoinArgs) -> Result<(), anyh
 
 /// Drop this machine's local mesh enrolment (R4.3). Remote peer entries are
 /// removed on the remote host (manual v1).
+#[cfg(feature = "remote-access")]
 pub fn cmd_mesh_leave(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     let path = mesh_enrolment_path(global)?;
     match std::fs::remove_file(&path) {
@@ -1105,6 +1117,7 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
 /// command shells out to `ssh -L` (the same mechanism as `cmd_attach`).
 /// The `-N` flag keeps the tunnel alive without opening an interactive
 /// shell.
+#[cfg(feature = "remote-access")]
 pub async fn cmd_ssh_forward(
     global: &GlobalArgs,
     args: SshForwardArgs,
