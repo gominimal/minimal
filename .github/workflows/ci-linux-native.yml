@@ -57,6 +57,8 @@ jobs:
               - "crates/**"
               - "Cargo.toml"
               - "Cargo.lock"
+              # The toolchain pin: a rustc bump must re-run the Rust lanes.
+              - "rust-toolchain.toml"
               - "scripts/**"
               - ".minimal/**"
               - ".github/actions/setup-rust/**"
