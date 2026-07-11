@@ -274,6 +274,7 @@ impl From<sandbox2::Error> for Error {
                     stderr,
                     stdout,
                 },
+                #[cfg(target_os = "linux")]
                 sandbox2::error::ExecutionError::SpawnFailed(e) => {
                     Self::Other(anyhow::anyhow!("spawn failed: {}", e))
                 }

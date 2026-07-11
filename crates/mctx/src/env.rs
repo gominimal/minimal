@@ -708,18 +708,20 @@ impl<'a> Env<'a> {
         ))
     }
 
+    #[cfg(target_os = "linux")]
     pub fn container(&mut self) -> Result<Container, Error> {
         self.sandbox
             .new_container()
             .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
     }
 
+    #[cfg(target_os = "linux")]
     pub fn command<I, S>(
         &mut self,
         container: &Container,
         program: &str,
         args: I,
-    ) -> Result<hakoniwa::Command, Error>
+    ) -> Result<sandbox2::Command, Error>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,

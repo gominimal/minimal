@@ -69,6 +69,7 @@ pub enum ExecutionError {
         /// 2>/dev/null || true`) still leave a diagnostic trail.
         stdout: String,
     },
+    #[cfg(target_os = "linux")]
     SpawnFailed(hakoniwa::Error),
     MountError {
         msg: &'static str,
@@ -107,6 +108,7 @@ impl fmt::Display for ExecutionError {
                 }
                 Ok(())
             }
+            #[cfg(target_os = "linux")]
             Self::SpawnFailed(e) => {
                 write!(f, "Invocation spawn failed: {}", e)
             }
@@ -131,6 +133,7 @@ impl std::error::Error for ExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvocationFailed { .. } => None,
+            #[cfg(target_os = "linux")]
             Self::SpawnFailed(e) => Some(e),
             Self::MountError { .. } => None,
             Self::NetworkIsolationUnavailable { .. } => None,

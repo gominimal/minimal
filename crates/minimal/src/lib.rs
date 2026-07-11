@@ -88,13 +88,10 @@ pub enum Command {
     /// Rename an existing session
     Rename(RenameArgs),
     /// Automatically initialize minimal configuration based on your source tree
-    #[cfg(target_os = "linux")]
     Init(InitArgs),
     /// Add a new tool or dependency
-    #[cfg(target_os = "linux")]
     Add(AddArgs),
     /// Refresh local checkouts of upstream packages & the standard library
-    #[cfg(target_os = "linux")]
     Update(UpdateArgs),
     /// Print CLI and daemon version information
     Version,
@@ -345,7 +342,6 @@ pub struct RenameArgs {
 }
 
 #[derive(Debug, Args)]
-#[cfg(target_os = "linux")]
 pub struct InitArgs {
     /// Skip confirmation, writing configuration based on auto-detection
     #[arg(long, short, default_value_t = false)]
@@ -353,7 +349,6 @@ pub struct InitArgs {
 }
 
 #[derive(Debug, Args)]
-#[cfg(target_os = "linux")]
 pub struct AddArgs {
     #[command(flatten)]
     pub kind: AddKind,
@@ -365,7 +360,6 @@ pub struct AddArgs {
 
 #[derive(Debug, Args)]
 #[group(required = true, multiple = false)]
-#[cfg(target_os = "linux")]
 pub struct AddKind {
     /// Add as a runtime dependency
     #[arg(long)]
@@ -379,7 +373,6 @@ pub struct AddKind {
 }
 
 #[derive(Debug, Args)]
-#[cfg(target_os = "linux")]
 pub struct UpdateArgs {}
 
 #[derive(Debug, Args)]
@@ -445,15 +438,12 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
         Command::Login(args) => cmd_login(&cli.global_args, args).await,
         Command::Version => cmd_version(&cli.global_args).await,
         Command::Rename(args) => cmd_rename(&cli.global_args, args).await,
-        #[cfg(target_os = "linux")]
         Command::Init(args) => cmd_init(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
-        #[cfg(target_os = "linux")]
         Command::Add(args) => cmd_add(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
-        #[cfg(target_os = "linux")]
         Command::Update(args) => cmd_update(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
@@ -1349,7 +1339,6 @@ pub async fn cmd_login(global: &GlobalArgs, args: LoginArgs) -> Result<(), anyho
 // -----------------------------------------------------------------------
 
 /// Build an `mctx::Config` from the shared global args.
-#[cfg(target_os = "linux")]
 pub fn build_config(global: &GlobalArgs) -> Result<mctx::Config, mctx::Error> {
     let mut builder = mctx::ConfigBuilder::new();
     if let Some(dir) = &global.minimal_dir {
@@ -1362,7 +1351,6 @@ pub fn build_config(global: &GlobalArgs) -> Result<mctx::Config, mctx::Error> {
 }
 
 /// Initialize a `minimal.toml` based on the source tree.
-#[cfg(target_os = "linux")]
 pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::Error> {
     use op::ProjectOp as _;
     let config = build_config(global)?;
@@ -1413,7 +1401,6 @@ pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::E
 }
 
 /// Add packages as dependencies to the project's `minimal.toml`.
-#[cfg(target_os = "linux")]
 pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Error> {
     let config = build_config(global)?;
     let mut ctx = mctx::Context::new(config)?;
@@ -1448,7 +1435,6 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
 }
 
 /// Refresh local checkouts of upstream packages & the standard library.
-#[cfg(target_os = "linux")]
 pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mctx::Error> {
     use op::ProjectOp as _;
     let config = build_config(global)?;
