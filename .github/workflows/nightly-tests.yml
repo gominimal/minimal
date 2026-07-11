@@ -218,12 +218,17 @@ jobs:
         with:
           tool: cargo-machete,zizmor
       - name: actionlint (workflow lint)
-        # Pinned official image; no toolchain needed and it auto-discovers
-        # .github/workflows. Docker is preinstalled on ubuntu-latest.
+        # `if: always()` so a failed install (or an earlier failing check)
+        # doesn't skip the remaining hygiene checks — each should report on its
+        # own. actionlint itself needs no install (pinned official image; it
+        # auto-discovers .github/workflows; Docker is preinstalled).
+        if: always()
         run: docker run --rm -v "$PWD":/repo -w /repo rhysd/actionlint:1.7.12 -color
       - name: cargo-machete (unused deps)
+        if: always()
         run: cargo machete
       - name: zizmor (workflow security)
+        if: always()
         run: zizmor .github/workflows/
 
   notify:
@@ -260,7 +265,10 @@ jobs:
           # would let back-to-back failing runs open duplicate issues.
           gh label create ci-nightly --repo "$GITHUB_REPOSITORY" \
             --color B60205 --description "Nightly test-tier failure" 2>/dev/null || true
-          body="$(printf 'A nightly-tests run failed.\n\n- advisories: %s\n- session-e2e-soak: %s\n- installer: %s\n\nRun: %s' \
+          # The trigger condition fires on both failure and cancellation (a
+          # timeout reports 'failure'); the per-job lines below carry the exact
+          # result, so keep the lead line accurate for either outcome.
+          body="$(printf 'A nightly-tests run failed or was cancelled.\n\n- advisories: %s\n- session-e2e-soak: %s\n- installer: %s\n\nRun: %s' \
             "$ADV" "$SOAK" "$INSTALLER" "$RUN_URL")"
           existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --label ci-nightly --json number --jq '.[0].number // empty')"
