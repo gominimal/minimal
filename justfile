@@ -30,7 +30,8 @@ codesign-minvmd:
 
 # ── minimal → minvmd → minimald bring-up (macOS/HVF or Linux/KVM) ───────────
 #
-# `just up` brings the whole stack up with full guest networking:
+# `just dm1` (macOS/HVF) and `just dm3` (Linux/KVM) bring the whole stack up
+# with full guest networking:
 #   1. materialize the guest kernel + generic rootfs into .scratch
 #   2. cross-compile minimald → initramfs /init WITH the networking features
 #   3. build minvmd (codesign on macOS), build the `minimal` CLI
@@ -42,7 +43,7 @@ codesign-minvmd:
 #   macOS  — `brew install slp/krun/libkrun`; the `minimal` shim on PATH.
 #   Linux  — a KVM host; durable `kvm` group membership (`sudo usermod -aG kvm
 #            $USER`, then re-login) so the autospawned minvmd can open /dev/kvm;
-#            a Rust toolchain + protoc + jq + cpio. libkrun is fetched by `up`.
+#            a Rust toolchain + protoc + jq + cpio. libkrun is fetched by `dm3`.
 # See crates/minvmd/README.md for the manual equivalent.
 
 # macOS: via the `minimal` shim (runs in a VM; --output must stay under the repo).
@@ -143,30 +144,8 @@ min *args:
     cargo build -p minimal -p minimald
     PATH="{{justfile_directory()}}/target/debug:$PATH" "{{minimal}}" {{args}}
 
-# minimal auto-spawns `minvmd run --detach`, so minvmd must be on PATH and the
-# MINVMD_* artifact paths exported; both are set here and inherited by the
-# detached supervisor. On Linux LD_LIBRARY_PATH is also inherited so libkrun can
-# dlopen libkrunfw at runtime.
-
-# Bring the full stack up and list sessions.
-up: artifacts gvproxy initramfs minvmd-build minimal-cli
-    #!/usr/bin/env sh
-    set -eu
-    export MINVMD_KERNEL_PATH="{{kernel}}"
-    export MINVMD_ROOTFS_PATH="{{rootfs}}"
-    export MINVMD_INITRAMFS="{{initramfs}}"
-    export MINVMD_BOOT_LOG="{{scratch}}/boot.log"
-    # Host gvproxy switch: minvmd spawns it for guest egress (root netns + own-IP
-    # PTasks). Best-effort — skipped if the binary is absent.
-    export MINVMD_GVPROXY_BIN="{{gvproxy}}"
-    export PATH="{{justfile_directory()}}/target/debug:$PATH"
-    case "$(uname -s)" in
-      Linux) export LD_LIBRARY_PATH="{{krun-prefix}}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
-    esac
-    "{{minimal}}" ls
-
 # Print `export` lines wiring the dev-built binaries and guest artifacts into
-# the environment — the same setup `up`/`dm3` do internally, for running
+# the environment — the same setup `dm1`/`dm3` do internally, for running
 # `minimal`/`minvmd` by hand against the built stack. Load into the current
 # shell with:  eval "$(just env)"
 env:
@@ -225,8 +204,8 @@ test-installer:
 # ── DM1 / DM2 / DM3 deployment-model bring-up ────────────────────────────────
 #
 # DM1: macOS (Apple Silicon) host + Linux VM(s) over Hypervisor.framework. This
-#      is the `up` path on macOS; on Linux it is a clean SKIP (use `dm3` for the
-#      native-Linux + VM equivalent over KVM).
+#      is the primary bring-up on macOS; on Linux it is a clean SKIP (use `dm3`
+#      for the native-Linux + VM equivalent over KVM).
 # DM2: native Linux, a host-native `minimald` (no VM), reachable over UDS at
 #      providers/local-0/ssh.sock — the same path the `minimal` CLI dials, so no
 #      bridge is needed. Own-IP is rootless (hakoniwa RustSlirp builds the tap
@@ -236,7 +215,11 @@ test-installer:
 #      at $XDG_RUNTIME_DIR/minimal/minimald.sock, so `dm3` symlinks the former to
 #      the latter. Run under `sg kvm` if the shell lacks the kvm group.
 
-# DM1 — macOS host + Linux VM over Hypervisor.framework (the `up` path on macOS).
+# On Linux this is a clean SKIP (use `dm3`). minimal auto-spawns `minvmd run
+# --detach`, so minvmd must be on PATH and the MINVMD_* artifact paths exported —
+# both are set here and inherited by the detached supervisor.
+
+# DM1 — macOS host + Linux VM over Hypervisor.framework: bring the full stack up.
 dm1:
     #!/usr/bin/env sh
     set -eu
@@ -245,7 +228,16 @@ dm1:
       *) echo "DM1 needs macOS (Hypervisor.framework). SKIP on $(uname -s); use 'just dm3' for native Linux + VM over KVM." ; exit 0 ;;
     esac
     echo "DM1 (macOS + Linux VM over HVF): bringing the stack up."
-    just up
+    just artifacts gvproxy initramfs minvmd-build minimal-cli
+    export MINVMD_KERNEL_PATH="{{kernel}}"
+    export MINVMD_ROOTFS_PATH="{{rootfs}}"
+    export MINVMD_INITRAMFS="{{initramfs}}"
+    export MINVMD_BOOT_LOG="{{scratch}}/boot.log"
+    # Host gvproxy switch: minvmd spawns it for guest egress (root netns + own-IP
+    # PTasks). Best-effort — skipped if the binary is absent.
+    export MINVMD_GVPROXY_BIN="{{gvproxy}}"
+    export PATH="{{justfile_directory()}}/target/debug:$PATH"
+    "{{minimal}}" ls
 
 # Build a host-native (glibc) minimald WITH the networking features, for DM2.
 minimald-build:
