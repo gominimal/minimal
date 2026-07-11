@@ -91,7 +91,7 @@ on_activate = {{ type = "inline", value = "echo activated" }}
     let loadout: Loadout = toml::from_str(&src).expect("loadout deserialize");
     let mut composer = UserComposer::new().with_env(pinned_env(&[]));
     composer.add(loadout).unwrap();
-    let wire = composer
+    let (wire, _) = composer
         .compose(UserPolicy::empty(), ComposeOptions::default())
         .unwrap();
 
@@ -140,7 +140,7 @@ LANG = "sjn_IV"
 
     let mut composer = UserComposer::new().with_env(pinned_env(&[]));
     composer.add_all([l1, l2]).unwrap();
-    let wire = composer
+    let (wire, _) = composer
         .compose(UserPolicy::empty(), ComposeOptions::default())
         .unwrap();
 
@@ -185,7 +185,7 @@ TERM = { inherit = true, default = "xterm-256color" }
     let env = pinned_env(&[("LANG", "sjn_IV"), ("TERM", "wezterm")]);
     let mut composer = UserComposer::new().with_env(env);
     composer.add(loadout).unwrap();
-    let wire = composer
+    let (wire, _) = composer
         .compose(UserPolicy::empty(), ComposeOptions::default())
         .unwrap();
 
@@ -214,7 +214,7 @@ LANG = { inherit = true, default = "sjn_IV" }
     let env = pinned_env(&[]); // LANG deliberately absent
     let mut composer = UserComposer::new().with_env(env);
     composer.add(loadout).unwrap();
-    let wire = composer
+    let (wire, _) = composer
         .compose(UserPolicy::empty(), ComposeOptions::default())
         .unwrap();
     assert_eq!(wire.vars.len(), 1);
@@ -243,7 +243,7 @@ source = "~/dotfiles/helix/config.toml"
     let env = pinned_env(&[("HOME", root.as_str())]);
     let mut composer = UserComposer::new().with_env(env);
     composer.add(loadout).unwrap();
-    let wire = composer
+    let (wire, _) = composer
         .compose(UserPolicy::empty(), ComposeOptions::default())
         .unwrap();
     assert_eq!(wire.patches.len(), 1);
@@ -291,7 +291,7 @@ source = "{root}/dotfiles/helix/themes/**/*.toml"
     let loadout: Loadout = toml::from_str(&src).unwrap();
     let mut composer = UserComposer::new().with_env(pinned_env(&[]));
     composer.add(loadout).unwrap();
-    let mut wire = composer
+    let (mut wire, _) = composer
         .compose(UserPolicy::empty(), ComposeOptions::default())
         .unwrap();
 
@@ -321,22 +321,28 @@ source = "{root}/dotfiles/helix/themes/**/*.toml"
 
 /// User policy's `ignore` rule drops a matching var even though the
 /// item is user-origin. Regression on the gate-precedence change.
+///
+/// Both vars use `inherit = true` so `ResolvedVar::carries_user_data`
+/// is true — the policy gate skips vars that don't pull env data
+/// (nothing to leak), and this test needs both vars to reach the
+/// gate for the ignore rule to have anything to fire on.
 #[test]
 fn ignore_filters_user_var() {
     let loadout: Loadout = toml::from_str(
         r#"name = "dev"
 [vars]
-EDITOR = "hx"
-_TMP = "skip"
+EDITOR = { inherit = true }
+_TMP = { inherit = true }
 "#,
     )
     .unwrap();
 
     let vars_policy = VarsPolicy::empty().try_with_ignore(["_*"]).unwrap();
     let policy = UserPolicy::empty().with_vars(vars_policy);
-    let mut composer = UserComposer::new().with_env(pinned_env(&[]));
+    let mut composer =
+        UserComposer::new().with_env(pinned_env(&[("EDITOR", "hx"), ("_TMP", "skip")]));
     composer.add(loadout).unwrap();
-    let wire = composer.compose(policy, ComposeOptions::default()).unwrap();
+    let (wire, _) = composer.compose(policy, ComposeOptions::default()).unwrap();
 
     let names: Vec<&str> = wire.vars.iter().map(|sv| sv.var.name.as_str()).collect();
     assert_eq!(names, ["EDITOR"]);
@@ -378,7 +384,7 @@ source = "{root}/dotfiles/helix/themes/**/*"
     let policy = UserPolicy::empty().with_patches(patch_policy);
     let mut composer = UserComposer::new().with_env(pinned_env(&[]));
     composer.add(loadout).unwrap();
-    let wire = composer.compose(policy, ComposeOptions::default()).unwrap();
+    let (wire, _) = composer.compose(policy, ComposeOptions::default()).unwrap();
 
     assert_eq!(wire.patches.len(), 1);
     let host_path = wire.patches[0].patch.host_path.as_str();
@@ -435,13 +441,16 @@ source = "{root}/dotfiles/secrets/id_rsa"
 }
 
 /// User policy's `deny` rule rejects a matching user-origin var.
-/// Locks the "deny applies to user loadouts" behavior.
+/// Locks the "deny applies to user loadouts" behavior. Uses
+/// `inherit = true` so `carries_user_data` is true — the policy
+/// only fires on env-derived vars, which is the whole point of a
+/// deny rule (block leakage of user env into the sandbox).
 #[test]
 fn deny_rejects_user_var() {
     let loadout: Loadout = toml::from_str(
         r#"name = "dev"
 [vars]
-AWS_KEY = "leaked"
+AWS_KEY = { inherit = true }
 "#,
     )
     .unwrap();
@@ -449,7 +458,7 @@ AWS_KEY = "leaked"
     let vars_policy = VarsPolicy::empty().try_with_deny(["AWS_*"]).unwrap();
     let policy = UserPolicy::empty().with_vars(vars_policy);
 
-    let mut composer = UserComposer::new().with_env(pinned_env(&[]));
+    let mut composer = UserComposer::new().with_env(pinned_env(&[("AWS_KEY", "leaked")]));
     composer.add(loadout).unwrap();
     let err = composer
         .compose(policy, ComposeOptions::default())
@@ -494,7 +503,7 @@ on_activate = {{ type = "inline", value = "echo activated" }}
     let loadout: Loadout = toml::from_str(&src).unwrap();
     let mut composer = UserComposer::new().with_env(pinned_env(&[]));
     composer.add(loadout).unwrap();
-    let contribution = composer
+    let (contribution, _) = composer
         .compose(UserPolicy::empty(), ComposeOptions::default())
         .unwrap();
 

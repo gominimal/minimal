@@ -286,8 +286,9 @@ impl Manager {
     }
 
     /// Allocate a session's record and bring its actor up. The session is
-    /// live but unconfigured: `ConfigureLoadout` against the returned id
-    /// composes its loadout and finalizes it.
+    /// live but unconfigured — the RPC handler follows this up with an
+    /// inline `configure_loadout` on the returned actor to compose the
+    /// loadout and finalize it.
     ///
     /// If the actor can't be spawned the record is rolled back — the caller
     /// never received an id, so nothing else could ever reach the session to
@@ -373,9 +374,11 @@ impl Manager {
                 r.handle(self.resolve_session(pred)).await;
             }
             // Create a session: allocate the record (as `Pending`) and spawn
-            // the session actor. The rest of the create flow — composing the
-            // loadout, promoting the record — belongs to the actor, driven
-            // by the `ConfigureLoadout` that follows.
+            // the session actor. Composing the loadout and promoting the
+            // record still belong to the actor; the RPC handler drives that
+            // step inline against the freshly-spawned actor, so the client
+            // sees the composition outcome in the same `CreateSession`
+            // response rather than a separate round-trip.
             ManagerMessage::CreateSession(msg) => {
                 let CreateSessionMsg {
                     config,
@@ -698,15 +701,12 @@ mod tests {
             .expect("session resolves")
     }
 
-    /// Seeds `contents` as the project mfile in the session's daemon-side
-    /// workspace, standing in for the client's workspace upload.
-    ///
-    /// The composer reads a session's project config out of its workspace,
-    /// never from the record's `project_path` — that's a path on the
-    /// *client's* machine, which the daemon generally can't read. So a test
-    /// that wants `configure_loadout` to see a project seeds it here, after
-    /// `create_session` and before configuring, exactly where a real client
-    /// streams its files up.
+    /// Writes `contents` as the project mfile in the session's daemon-side
+    /// workspace, standing in for the client's `WorkspaceFilesTarZst`
+    /// upload. The compose path reads the mfile off that workspace, so
+    /// tests that want `configure_loadout` to see a project seed it here
+    /// between `create_session` and `configure_loadout` — exactly the
+    /// spot a real client's upload lands in.
     async fn seed_workspace_mfile(mngr: &ManagerHandle, id: SessionId, contents: &str) {
         let paths = session(mngr, id).await.paths().await.unwrap();
         tokio::fs::write(
@@ -718,8 +718,8 @@ mod tests {
     }
 
     /// Creates a session, seeds `mfile` into its workspace, and configures
-    /// its loadout with an empty client contribution — the whole create flow
-    /// a client drives, in one call. Returns the manager and the id
+    /// its loadout with an empty client contribution — the whole create
+    /// flow a client drives, in one call. Returns the manager and the id
     /// alongside the compose outcome.
     async fn create_and_configure(
         mfile: &str,
@@ -776,6 +776,7 @@ mod tests {
                     value: sessions::wire::primitives::WireResolvedVar {
                         name: pv.name.clone(),
                         value: "info".into(),
+                        carries_user_data: true,
                     },
                 })
                 .collect(),
@@ -927,6 +928,7 @@ mod tests {
             var: WireResolvedVar {
                 name: "EDITOR".into(),
                 value: "hx".into(),
+                carries_user_data: true,
             },
             source: WireSource::from(Source::UserLoadout {
                 name: "test".into(),
@@ -1310,7 +1312,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn configure_loadout_with_missing_mfile_still_succeeds() {
         let (_state, _cache, mngr) = manager().await;
-        // No `seed_workspace_mfile`: the workspace stays empty.
+        // No `seed_workspace_mfile`: the workspace stays empty, mirroring
+        // an activation against a directory with no `minimal.toml`.
         let id = mngr.create_session(sample_config(), None).await.unwrap();
         let response = session(&mngr, id)
             .await

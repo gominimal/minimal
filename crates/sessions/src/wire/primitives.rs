@@ -37,6 +37,18 @@ pub struct WireResolvedVar {
     pub name: String,
     /// Resolved value.
     pub value: String,
+    /// Whether the resolved value carries data pulled from the
+    /// caller's environment. Preserved across the wire so downstream
+    /// consumers (audit logs, telemetry, future secret-scrubbing
+    /// heuristics) can distinguish an env-derived value from a
+    /// hardcoded literal. Not a gate signal — the policy check ran
+    /// on the client before this ever hit the wire — so a peer that
+    /// omits the field defaults to `false`, matching the safer
+    /// assumption for provenance-tracking consumers (a literal
+    /// treated as a literal, rather than a literal spuriously tagged
+    /// as env-derived).
+    #[serde(default)]
+    pub carries_user_data: bool,
 }
 
 /// How a variable should resolve. Mirrors
@@ -185,6 +197,16 @@ pub struct WirePendingVar {
     pub spec: WireVarSpec,
     /// Where it came from.
     pub source: WireSource,
+    /// Whether the value the client will end up with was originally
+    /// pulled from a host environment lookup rather than a hardcoded
+    /// literal or a fallback default. Set by
+    /// `contribution_to_pending` on the daemon side from the
+    /// daemon-resolved `ResolvedVar::carries_user_data`; consumed by
+    /// the client's `classify_var` to decide whether the policy gate
+    /// applies. Defaults to `false` for wire messages emitted before
+    /// this field existed (backward-compatible).
+    #[serde(default)]
+    pub carries_user_data: bool,
 }
 
 /// Daemon → Client: a patch from a package or the project that the
@@ -227,8 +249,12 @@ impl From<crate::core::source::Source> for WireSource {
 
 impl From<crate::core::primitives::ResolvedVar> for WireResolvedVar {
     fn from(v: crate::core::primitives::ResolvedVar) -> Self {
-        let (name, value) = v.into_parts();
-        Self { name, value }
+        let (name, value, carries_user_data) = v.into_parts_with_provenance();
+        Self {
+            name,
+            value,
+            carries_user_data,
+        }
     }
 }
 
@@ -366,8 +392,22 @@ mod tests {
         let v = WireResolvedVar {
             name: "EDITOR".into(),
             value: "hx".into(),
+            carries_user_data: true,
         };
         assert_eq!(round_trip(&v), v);
+    }
+
+    /// `carries_user_data` defaults to `false` on deserialization so
+    /// an older peer that omits the field doesn't fail to parse; a
+    /// value present in the wire round-trips verbatim.
+    #[test]
+    fn resolved_var_default_carries_user_data_is_false() {
+        let raw = serde_json::json!({
+            "name": "EDITOR",
+            "value": "hx",
+        });
+        let v: WireResolvedVar = serde_json::from_value(raw).expect("deserialize");
+        assert!(!v.carries_user_data);
     }
 
     #[test]
@@ -385,6 +425,7 @@ mod tests {
             var: WireResolvedVar {
                 name: "EDITOR".into(),
                 value: "hx".into(),
+                carries_user_data: true,
             },
             source: user_source(),
         };
@@ -483,6 +524,7 @@ mod tests {
             source: WireSource::Package {
                 name: "rust-toolchain".into(),
             },
+            carries_user_data: true,
         };
         assert_eq!(round_trip(&v), v);
     }
