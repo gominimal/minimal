@@ -54,10 +54,23 @@ artifacts:
     #!/usr/bin/env sh
     set -eu
     mkdir -p {{scratch}}
+    # `minimal materialize` runs in a VM via the shim; on a cold cache its
+    # overlay-sync can transiently drop the output ("copying output file I/O
+    # error … No such file or directory"). Retry a few times before failing.
+    materialize() {
+      n=0
+      until minimal materialize --output "$1" --arch "$2" "$3"; do
+        n=$((n + 1))
+        [ "$n" -ge 3 ] && { echo "materialize $3 failed after $n attempts" >&2; return 1; }
+        echo "materialize $3 failed (attempt $n); retrying…" >&2
+        rm -f "$1"
+        sleep 2
+      done
+    }
     case "$(uname -s)" in
       Darwin)
-        [ -f {{kernel}} ] || minimal materialize --output {{kernel}} --arch {{arch}} virtio-kernel
-        [ -f {{rootfs}} ] || minimal materialize --output {{rootfs}} --arch {{arch}} minvmd-rootfs
+        [ -f {{kernel}} ] || materialize {{kernel}} {{arch}} virtio-kernel
+        [ -f {{rootfs}} ] || materialize {{rootfs}} {{arch}} minvmd-rootfs
         ;;
       Linux)
         [ -f {{kernel}} ] || scripts/fetch-artifact.sh virtio-kernel {{kernel}} {{arch}}
