@@ -553,6 +553,22 @@ fn ensure_daemon(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         .context("Failed to ensure the minimald daemon is running")
 }
 
+/// Prompt the user with a yes/no question on stderr. Defaults to yes
+/// (empty input or Y/y/yes returns true; anything else returns false).
+fn confirm(question: &str) -> Result<bool, anyhow::Error> {
+    eprint!("{question} [Y/n] ");
+    std::io::stderr().flush().ok();
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .context("reading stdin")?;
+    let trimmed = input.trim();
+    Ok(trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("y")
+        || trimmed.eq_ignore_ascii_case("yes"))
+}
+
 /// List sessions via the `ListSessions` RPC.
 pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
@@ -783,18 +799,7 @@ fn ensure_mfile_or_prompt(
     }
 
     eprintln!("\nNo {} found at {}.", mfile::MFILE_NAME, project_path);
-    eprint!("Would you like to create one? [Y/n] ");
-    std::io::stderr().flush().ok();
-
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("reading stdin")?;
-    let trimmed = input.trim();
-    if !(trimmed.eq_ignore_ascii_case("y")
-        || trimmed.eq_ignore_ascii_case("yes")
-        || trimmed.is_empty())
-    {
+    if !confirm("Would you like to create one?")? {
         bail!(
             "No {} found. Run 'minimal init' to create one.",
             mfile::MFILE_NAME
@@ -1413,18 +1418,7 @@ fn run_init_flow(config: mctx::Config, skip_confirm: bool) -> Result<(), anyhow:
         eprint!("{}", plan.content);
         eprintln!("---");
         eprintln!();
-        eprint!("Continue? [Y/n] ");
-        std::io::stderr().flush().ok();
-
-        let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .context("reading stdin")?;
-        let trimmed = input.trim();
-        if !(trimmed.eq_ignore_ascii_case("y")
-            || trimmed.eq_ignore_ascii_case("yes")
-            || trimmed.is_empty())
-        {
+        if !confirm("Continue?")? {
             eprintln!("Aborted.");
             return Ok(());
         }
