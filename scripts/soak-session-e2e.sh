@@ -28,6 +28,12 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Reap leftovers a failed boot may strand (the detached __krun-vmm grandchild
 # and the gvproxy switch can linger and wedge the next iteration's bridge).
 reap() { "$ROOT/scripts/reap-vms.sh"; }
+# Reap on any exit, including a mid-run cancel (a cancelled CI job sends TERM,
+# an interactive Ctrl-C sends INT), so orphaned VM processes never outlive the
+# harness. The EXIT trap preserves the script's own exit status.
+trap 'reap' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 pass=0
 fail=0
@@ -43,7 +49,7 @@ for i in $(seq 1 "$ITER"); do
   fi
   echo "::endgroup::"
 done
-reap
+# Final reap is handled by the EXIT trap.
 
 echo "soak complete: $pass passed, $fail failed (of $ITER)"
 # Require every iteration to have run AND passed — a short-circuited loop that
