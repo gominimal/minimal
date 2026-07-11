@@ -631,8 +631,6 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     let gateway = DEFAULT_SUBNET.gateway();
     let cidr = format!("{ip}/{}", DEFAULT_SUBNET.prefix());
 
-    let _ = &cidr; // (kept for log context below)
-
     // Open the tap in the current (root) netns; the OwnedFd keeps it alive.
     let tap_fd = switch::open_tap(TAP).map_err(|e| {
         std::io::Error::new(e.kind(), format!("open_tap({TAP}) [/dev/net/tun]: {e}"))

@@ -24,8 +24,6 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::RequestedPty;
-#[cfg(not(test))]
-use crate::session::SessionHandle;
 use crate::session::SessionPaths;
 #[cfg(not(test))]
 use sessions::NetworkMode;
@@ -729,8 +727,6 @@ const BASELINE_VARS: &[(&str, &str)] = &[(
 #[cfg(not(test))]
 pub(crate) struct SandboxLauncher {
     pub(crate) ctx: mctx::Context,
-    #[allow(dead_code)]
-    pub(crate) session: SessionHandle,
     pub(crate) network_mode: NetworkMode,
     /// Shared per-host gvproxy switch. Used only for
     /// [`NetworkMode::OwnIp`] launches.

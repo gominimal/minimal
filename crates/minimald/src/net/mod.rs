@@ -46,8 +46,8 @@ use tokio::sync::watch;
 // `::switch` (leading `::`) is the extern crate, disambiguated from the sibling
 // `crate::net::switch` relay module.
 pub use ::switch::{
-    DEFAULT_MTU, DEFAULT_SUBNET, GATEWAY_MAC, InvalidPrefix, MacAddr, SwitchSubnet,
-    VSOCK_GVPROXY_SHUTTLE_PORT, VSOCK_HOST_CID, render_gvproxy_config,
+    DEFAULT_MTU, DEFAULT_SUBNET, InvalidPrefix, MacAddr, SwitchSubnet, VSOCK_GVPROXY_SHUTTLE_PORT,
+    VSOCK_HOST_CID, render_gvproxy_config,
 };
 
 /// How the per-host gvproxy switch is reached, selected by deployment model.
