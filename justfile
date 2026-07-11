@@ -211,9 +211,9 @@ test-installer:
 #      bridge is needed. Own-IP is rootless (hakoniwa RustSlirp builds the tap
 #      inside the sandbox's own user+net namespace — no setcap).
 # DM3: native Linux + one Linux VM (minimald as initramfs pid-1 in libkrun). The
-#      Linux CLI dials providers/local-0/ssh.sock, but minvmd bridges the guest
-#      at $XDG_RUNTIME_DIR/minimal/minimald.sock, so `dm3` symlinks the former to
-#      the latter. Run under `sg kvm` if the shell lacks the kvm group.
+#      Linux CLI dials providers/local-0/ssh.sock, which minvmd binds directly
+#      (the socket/path coordination fix, #690) — no bridge/symlink needed. Run
+#      under `sg kvm` if the shell lacks the kvm group.
 
 # On Linux this is a clean SKIP (use `dm3`). minimal auto-spawns `minvmd run
 # --detach`, so minvmd must be on PATH and the MINVMD_* artifact paths exported —
@@ -243,7 +243,7 @@ dm1:
 minimald-build:
     cargo build -p minimald --features {{features}}
 
-# DM3 — native Linux + one Linux VM. Boots the VM, then bridges the CLI socket.
+# DM3 — native Linux + one Linux VM. Boots the VM; minvmd binds the CLI socket.
 dm3: artifacts gvproxy initramfs minvmd-build minimal-cli
     #!/usr/bin/env sh
     set -eu
@@ -254,18 +254,18 @@ dm3: artifacts gvproxy initramfs minvmd-build minimal-cli
     export MINVMD_GVPROXY_BIN="{{gvproxy}}"
     export PATH="{{justfile_directory()}}/target/debug:$PATH"
     export LD_LIBRARY_PATH="{{krun-prefix}}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    # Boot the VM explicitly (the CLI's autospawn would also work, but booting
-    # here keeps the F1 bridge ordering clear). The configurable READY/UDS
-    # timeouts cover the ~20-30s cold boot.
+    # Boot the VM explicitly (the CLI's autospawn would also work, but an
+    # explicit boot keeps ordering clear and lets us raise the READY timeout).
+    # The generic guest kernel can spend 40-50s probing hardware before pid-1
+    # (minimald) even starts, which overruns minvmd's 60s READY default on a
+    # cold boot; give it headroom (overridable by the caller).
+    export MINVMD_READY_TIMEOUT_SECS="${MINVMD_READY_TIMEOUT_SECS:-150}"
     "{{minvmd-bin}}" run --detach --timeout 75
-    # F1 bridge: the Linux CLI dials <state>/providers/local-0/ssh.sock, but the
-    # guest is reached via minvmd's <runtime>/minimal/minimald.sock — link them.
-    runtime="${XDG_RUNTIME_DIR:-$HOME/.minimal/local}"
-    state="${XDG_STATE_HOME:-$HOME/.local/state}"
-    cli="$state/minimal/providers/local-0/ssh.sock"
-    mkdir -p "$(dirname "$cli")"
-    ln -sf "$runtime/minimal/minimald.sock" "$cli"
-    echo "DM3 up: VM booted; CLI socket bridged -> $runtime/minimal/minimald.sock"
+    # No socket bridge: since the socket/path coordination fix (#690) minvmd binds
+    # the CLI-facing <state>/providers/local-0/ssh.sock directly — exactly the path
+    # the `minimal` CLI dials. (The old `ln -sf` from a runtime-dir socket clobbered
+    # minvmd's own live socket, so every dial fell through to a failing autospawn.)
+    echo "DM3 up: VM booted; minimald reachable at providers/local-0/ssh.sock"
     # The guest SSH server can reset the very first connect right after boot, so
     # retry briefly rather than fail the recipe on that one-shot race.
     ok=0
