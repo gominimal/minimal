@@ -3765,7 +3765,6 @@ dependencies = [
  "smallvec",
  "tokio",
  "tokio-util",
- "toml_edit",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4251,7 +4250,6 @@ dependencies = [
  "either",
  "futures",
  "generational-arena",
- "google-cloud-storage",
  "graph",
  "indoc",
  "lcache",
