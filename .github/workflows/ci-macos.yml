@@ -178,7 +178,7 @@ jobs:
         # retired standalone boot test and goes further (russh auth + exec,
         # stdout + exit status), so a passing session gates the boot. The
         # unified session e2e (scripts/session-e2e.sh) then covers the
-        # CLI proof and more: from a clean state `minimal activate` must
+        # CLI proof and more: from a clean state `min activate` must
         # auto-spawn minvmd and a real session exec must round-trip — the
         # macOS integration gate that no unit test can cover.
         # RUN_MACOS_CI is the kill-switch repo variable for taking the mini
@@ -234,13 +234,13 @@ jobs:
                   # name loaded from anywhere); our @rpath dylib turns it into
                   # dyld "Library not loaded" at autospawn, since minimal bakes
                   # no rpaths.
-                  cargo build -p minimal --bin minimal --locked
+                  cargo build -p minimal --bin min --locked
             - name: Verify minimal links only system libraries
               # The CLI spawns minvmd as a subprocess and calls no libkrun; a
               # krun load command means the feature unification above regressed.
               # Catch it here with a clear message, not as a dyld error mid-e2e.
               run: |
-                  bad="$(otool -L target/debug/minimal | tail -n +2 | awk '{print $1}' \
+                  bad="$(otool -L target/debug/min | tail -n +2 | awk '{print $1}' \
                     | grep -vE '^(/usr/lib/|/System/)' || true)"
                   if [ -n "$bad" ]; then
                     echo "::error::minimal links non-system libraries (feature unification with minvmd's libkrun?):" >&2
@@ -310,12 +310,12 @@ jobs:
             - name: Session e2e via the CLI (activate/exec/destroy; autospawns minvmd)
               # The unified session e2e (scripts/session-e2e.sh — the SAME
               # proof every target lane runs), here against the VM-backed
-              # daemon: from a clean state, `minimal activate` must auto-spawn
+              # daemon: from a clean state, `min activate` must auto-spawn
               # minvmd (found by name on PATH; the MINVMD_* env propagates
               # through the `minvmd run --detach` re-exec), boot the guest,
-              # create a session, and `minimal attach --command` must exec in
+              # create a session, and `min attach --command` must exec in
               # it over the vsock bridge. Replaces the old autospawn step,
-              # which only proved `minimal ls` cold/warm — this proves the
+              # which only proved `min ls` cold/warm — this proves the
               # full user path and subsumes it (the cold activate IS the
               # autospawn). Runs the prebuilt binaries directly (never
               # `cargo run`, which would relink and unsign minvmd).

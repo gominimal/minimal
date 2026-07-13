@@ -18,7 +18,9 @@ rootfs      := scratch / "rootfs.img"
 initramfs   := scratch / "initramfs.cpio"
 gvproxy     := scratch / "gvproxy"
 minvmd-bin  := justfile_directory() / "target/debug/minvmd"
-minimal     := justfile_directory() / "target/debug/minimal"
+# The CLI's binary target is `min` (crates/minimal/Cargo.toml [[bin]]); the
+# crate it comes from is still `minimal`, hence `cargo build -p minimal`.
+min-bin     := justfile_directory() / "target/debug/min"
 
 # Re-run any time the entitlements file or binary changes. Ad-hoc signing
 # (`-s -`) requires no Apple Developer membership; the binary only runs on the
@@ -34,8 +36,8 @@ codesign-minvmd:
 # `just up` brings the whole stack up with full guest networking:
 #   1. materialize the guest kernel + generic rootfs into .scratch
 #   2. cross-compile minimald → initramfs /init WITH the networking features
-#   3. build minvmd (codesign on macOS), build the `minimal` CLI
-#   4. run `minimal ls`, which auto-spawns `minvmd run --detach`; minvmd boots
+#   3. build minvmd (codesign on macOS), build the `min` CLI
+#   4. run `min ls`, which auto-spawns `minvmd run --detach`; minvmd boots
 #      the microVM whose initramfs pid-1 is minimald, which serves the session
 #      over the host UDS bridge.
 #
@@ -46,8 +48,9 @@ codesign-minvmd:
 #            a Rust toolchain + protoc + jq + cpio. libkrun is fetched by `up`.
 # See crates/minvmd/README.md for the manual equivalent.
 
-# macOS: via the `minimal` shim (runs in a VM; --output must stay under the repo).
-# Linux: via fetch-artifact.sh (builds `minimal` from source, materializes natively).
+# macOS: via the `minimal` SHIM (~/.minimal/shim/bin/minimal — runs the CLI in a
+# VM; --output must stay under the repo). Distinct from the `min` binary this
+# repo builds. Linux: via fetch-artifact.sh (builds `mip` from source).
 
 # Materialize the guest kernel + generic rootfs into .scratch. Skips a fetch when
 # the artifact already exists; `just clean` first to force a refresh.
@@ -114,12 +117,12 @@ minvmd-build: libkrun
       *) echo "unsupported host $(uname -s)" >&2; exit 1 ;;
     esac
 
-# Build the `minimal` CLI (minimal crate).
+# Build the `min` CLI (from the `minimal` crate; its [[bin]] target is `min`).
 minimal-cli:
     cargo build -p minimal
 
-# Run the `minimal` CLI against the workspace's own debug build. Prepends
-# `target/debug/` to `$PATH` so `minimal`'s auto-spawn can find the sibling
+# Run the `min` CLI against the workspace's own debug build. Prepends
+# `target/debug/` to `$PATH` so `min`'s auto-spawn can find the sibling
 # `minimald` binary (it invokes it by name). Arguments after `just min` are
 # forwarded verbatim.
 #
@@ -129,9 +132,9 @@ minimal-cli:
 #   just min dirs
 min *args:
     cargo build -p minimal -p minimald
-    PATH="{{justfile_directory()}}/target/debug:$PATH" "{{minimal}}" {{args}}
+    PATH="{{justfile_directory()}}/target/debug:$PATH" "{{min-bin}}" {{args}}
 
-# minimal auto-spawns `minvmd run --detach`, so minvmd must be on PATH and the
+# min auto-spawns `minvmd run --detach`, so minvmd must be on PATH and the
 # MINVMD_* artifact paths exported; both are set here and inherited by the
 # detached supervisor. On Linux LD_LIBRARY_PATH is also inherited so libkrun can
 # dlopen libkrunfw at runtime.
@@ -151,11 +154,11 @@ up: artifacts gvproxy initramfs minvmd-build minimal-cli
     case "$(uname -s)" in
       Linux) export LD_LIBRARY_PATH="{{krun-prefix}}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
     esac
-    "{{minimal}}" ls
+    "{{min-bin}}" ls
 
 # Print `export` lines wiring the dev-built binaries and guest artifacts into
 # the environment — the same setup `up`/`dm3` do internally, for running
-# `minimal`/`minvmd` by hand against the built stack. Load into the current
+# `min`/`minvmd` by hand against the built stack. Load into the current
 # shell with:  eval "$(just env)"
 env:
     #!/usr/bin/env sh
@@ -216,7 +219,7 @@ test-installer:
 #      is the `up` path on macOS; on Linux it is a clean SKIP (use `dm3` for the
 #      native-Linux + VM equivalent over KVM).
 # DM2: native Linux, a host-native `minimald` (no VM), reachable over UDS at
-#      providers/local-0/ssh.sock — the same path the `minimal` CLI dials, so no
+#      providers/local-0/ssh.sock — the same path the `min` CLI dials, so no
 #      bridge is needed. Own-IP is rootless (hakoniwa RustSlirp builds the tap
 #      inside the sandbox's own user+net namespace — no setcap).
 # DM3: native Linux + one Linux VM (minimald as initramfs pid-1 in libkrun). The
@@ -266,10 +269,10 @@ dm3: artifacts gvproxy initramfs minvmd-build minimal-cli
     # retry briefly rather than fail the recipe on that one-shot race.
     ok=0
     for _ in $(seq 1 5); do
-      if "{{minimal}}" ls; then ok=1; break; fi
+      if "{{min-bin}}" ls; then ok=1; break; fi
       sleep 2
     done
-    [ "$ok" = 1 ] || { echo "DM3: minimal ls failed after retries" >&2; exit 1; }
+    [ "$ok" = 1 ] || { echo "DM3: min ls failed after retries" >&2; exit 1; }
 
 # DM2 — native Linux, host-native minimald (no VM) over UDS. Runs minimald under
 # a dedicated state dir; the CLI reaches it with `--minimal-dir`, which (via the
@@ -298,9 +301,9 @@ dm2: minimald-build minimal-cli gvproxy
     fi
     [ -S "$sock" ] || { echo "DM2 minimald failed to bind $sock; see {{scratch}}/dm2-minimald.log" >&2; exit 1; }
     echo "DM2 up: host-native minimald at $sock (pid $(cat "$pidf"))"
-    echo "  own-IP: {{minimal}} --minimal-dir $dir activate -n net1 --network own-ip . && \\"
-    echo "          {{minimal}} --minimal-dir $dir attach net1   # curl http://example.com -> 200"
-    "{{minimal}}" --minimal-dir "$dir" ls
+    echo "  own-IP: {{min-bin}} --minimal-dir $dir activate -n net1 --network own-ip . && \\"
+    echo "          {{min-bin}} --minimal-dir $dir attach net1   # curl http://example.com -> 200"
+    "{{min-bin}}" --minimal-dir "$dir" ls
 
 # Stop the DM2 host-native minimald.
 dm2-down:

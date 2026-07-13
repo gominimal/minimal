@@ -103,7 +103,7 @@ jobs:
         # the CLI (the regression the macOS lane guards).
         run: |
           cargo build -p minvmd --bin minvmd --locked
-          cargo build -p minimal --bin minimal --locked
+          cargo build -p minimal --bin min --locked
       - name: Materialize guest kernel (raw Image)
         uses: ./.github/actions/materialize
         with:
