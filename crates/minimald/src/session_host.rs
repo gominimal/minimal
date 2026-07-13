@@ -316,7 +316,12 @@ fn set_winsize(fd: RawFd, size: WinSize) -> io::Result<()> {
 
 enum BindingMsg {
     Stdin(Vec<u8>),
-    TeardownDueToStdoutErr(std::io::Error),
+    /// The session process ended, so the binding should tear down and raise the
+    /// shell-exit prompt. Carries the pty error when teardown was triggered by
+    /// an *unexpected* master read/write failure (surfaced to the user); `None`
+    /// when the process was reaped cleanly or the master reported the expected
+    /// `EIO`-on-exit.
+    TeardownDueToProcessExit(Option<std::io::Error>),
     TeardownDueToSuperceded(Vec<u8>),
     TeardownDueToDetach(Vec<u8>),
 }
@@ -368,7 +373,7 @@ impl Binding {
             HostGone,
             Detach,
             Superceded,
-            StdoutErr,
+            ProcessExited,
         }
 
         // Reading from the remote stops once it sends EOF;
@@ -417,11 +422,16 @@ impl Binding {
                         BindingMsg::Stdin(b) => {
                             let _ = w.write_all(&b).await;
                         },
-                        BindingMsg::TeardownDueToStdoutErr(e) => {
-                            if e.raw_os_error() != Some(5) {
+                        BindingMsg::TeardownDueToProcessExit(err) => {
+                            // Surface only a genuine, unexpected master error; the
+                            // expected `EIO`-on-exit (os error 5) and clean reaps
+                            // stay silent — the shell-exit prompt speaks for them.
+                            if let Some(e) = err
+                                && e.raw_os_error() != Some(5)
+                            {
                                 let _ = w.write_all(format!("Error reading stdout: {e}\n").as_bytes()).await;
                             }
-                            break MainloopExitReason::StdoutErr;
+                            break MainloopExitReason::ProcessExited;
                         }
                         BindingMsg::TeardownDueToSuperceded(unwind_codes) => {
                             let _ = w.write_all(&unwind_codes).await;
@@ -441,7 +451,7 @@ impl Binding {
 
         tracing::debug!("Binding leaving mainloop due to {:?}", exit_reason);
 
-        if exit_reason == MainloopExitReason::StdoutErr {
+        if exit_reason == MainloopExitReason::ProcessExited {
             // The shell process exited. For a bash shell, this usually meant someone pressed ctrl-d absent-mindedly.
             // We presume they didnt want to completely destroy the session, perhaps just detach, but lets prompt
             // to see where they wanted to go from here.
@@ -463,7 +473,7 @@ impl Binding {
                 // session down (kill the host, remove the on-disk record) before
                 // we close the channel. Awaiting is deadlock-free here — the
                 // destroy cascade waits on the host runtime loop (already exiting
-                // after this StdoutErr), never on this binding task.
+                // now that the process has ended), never on this binding task.
                 Ok(Selection::At(1)) => match &self.control {
                     Some(control) => {
                         let _ = w.write_all(b"\r\nDeleting session...\r\n").await;
@@ -1315,6 +1325,14 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                     // `try_wait` already warns on a non-zero exit with the richer
                     // hakoniwa diagnostics; keep this routine and unconditional.
                     tracing::debug!(exit_code, "session process exited");
+                    // The process was reaped here before the pty surfaced its
+                    // death as an `EIO`. Still notify the attached binding so the
+                    // shell-exit prompt renders (and a "delete" choice can tear
+                    // the session down); otherwise the binding only observes the
+                    // host drop and silently detaches. Without this the prompt is
+                    // lost whenever `try_wait` wins the race against the master's
+                    // `EIO` — a flaky detach under CPU load.
+                    self.notify_remote_process_exit();
                     break Ok(exit_code);
                 }
                 Ok(None) => {}
@@ -1354,7 +1372,24 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     async fn notify_remote_pty_err(&mut self, e: std::io::Error) {
         tracing::warn!(error = %e, "pty master error; tearing down host");
         if let Some((tx, _hnd)) = self.remote.as_mut() {
-            let _ = tx.try_send(BindingMsg::TeardownDueToStdoutErr(e));
+            let _ = tx.try_send(BindingMsg::TeardownDueToProcessExit(Some(e)));
+        }
+    }
+
+    /// Notifies the attached binding that the session process has been reaped,
+    /// so it tears down and raises the shell-exit prompt. Unlike
+    /// [`Self::notify_remote_pty_err`] there is no error to surface — the process
+    /// simply exited, and the pty may never report the death (the reap can win
+    /// the race against the master's `EIO`).
+    ///
+    /// Best-effort `try_send` for the same reason as `notify_remote_pty_err`: the
+    /// notice is never awaited, so a full queue can't wedge teardown. The message
+    /// stays buffered even as this host drops, and an mpsc receiver drains its
+    /// buffer before observing the closed sender — so the binding sees the exit
+    /// before it would fall through to `HostGone`.
+    fn notify_remote_process_exit(&mut self) {
+        if let Some((tx, _hnd)) = self.remote.as_mut() {
+            let _ = tx.try_send(BindingMsg::TeardownDueToProcessExit(None));
         }
     }
 
