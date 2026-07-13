@@ -13,11 +13,13 @@ name: CI (Linux native)
 # PR, while a skipped in-workflow job just reports `skipped`, which the
 # aggregator treats as pass. Do NOT add trigger-level `paths:` here.
 #
-# minimald's root end-to-end proofs (currently the netns UC1/UC4/UC6 namespace
-# proofs) run here in the `minimald-root-e2e` job (sudo + a userspace gvproxy
-# switch, no KVM), auto-discovered by the `_root_e2e` binary-name convention.
-# The `networking-proxy` (mTLS) feature tests and the mesh UC7 / `networking-wg`
-# proofs are deliberately NOT run in this lane — see the note on the tests job.
+# minimald's root end-to-end proofs (the network-namespace proofs — no-network
+# egress isolation, static ingress port mapping, and task-to-task connectivity
+# over the gvproxy switch) run here in the `minimald-root-e2e` job (sudo + a
+# userspace gvproxy switch, no KVM), auto-discovered by the `_root_e2e`
+# binary-name convention. The `networking-proxy` (mTLS reverse proxy) feature
+# tests and the WireGuard mesh (`networking-wg`) proof are deliberately NOT run
+# in this lane — see the note on the tests job.
 on:
   push:
     branches: ["main"]
@@ -84,8 +86,8 @@ jobs:
     #
     # Deliberately absent (owner decision): the `--features networking-proxy`
     # (mTLS reverse proxy) and `--features networking-wg` (WireGuard mesh) test
-    # steps that ci.yml's `test` job still carries, and the mesh UC7 namespace
-    # proof (crates/minimald/tests/mesh_uc7.rs). The netns UC1/UC4/UC6 proofs
+    # steps that ci.yml's `test` job still carries, and the WireGuard mesh
+    # proof (crates/minimald/tests/mesh_uc7.rs). The network-namespace proofs
     # (crates/minimald/tests/netns_root_e2e.rs) run in the `minimald-root-e2e`
     # job below. The rest stay in-tree and runnable locally, just not CI-covered.
     needs: [changes]
@@ -145,14 +147,16 @@ jobs:
   minimald-root-e2e:
     # minimald's root end-to-end proofs, auto-discovered by the `_root_e2e`
     # binary-name convention — a new crates/minimald/tests/*_root_e2e.rs runs
-    # here with no workflow edit. Today that is netns_root_e2e: the UC1 (no-net)
-    # / UC4 (static ingress) / UC6 (PTask<->PTask over the gvproxy switch)
-    # namespace proofs — two own-ip PTasks on a real gvproxy switch, driving the
-    # PRODUCTION switch-attach wiring. #[ignore] + gated on MINIMALD_NETNS_TEST
-    # so they run only here. Needs unprivileged userns + sudo (tap/netns) and a
-    # userspace gvproxy — no KVM. The mesh UC7 proof (networking-wg) stays out:
-    # its feature is off, so it compiles to nothing and its file name does not
-    # match the convention.
+    # here with no workflow edit. Today that is netns_root_e2e: the
+    # network-namespace proofs — a no-network task can't reach the internet, a
+    # static ingress mapping exposes then removes a task's port, and two own-IP
+    # tasks reach each other — on a real gvproxy switch, driving the PRODUCTION
+    # switch-attach wiring. They create tap devices and configure network
+    # namespaces, which needs CAP_NET_ADMIN, so they run under sudo; #[ignore] +
+    # gated on MINIMALD_NETNS_TEST so they run only here. Needs unprivileged
+    # userns + sudo (tap/netns) and a userspace gvproxy — no KVM. The WireGuard
+    # mesh proof (networking-wg) stays out: its feature is off, so it compiles to
+    # nothing and its file name does not match the convention.
     needs: [changes]
     if: github.event_name != 'pull_request' || needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest

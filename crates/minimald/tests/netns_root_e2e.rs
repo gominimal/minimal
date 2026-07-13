@@ -1,19 +1,24 @@
 //! Network-namespace integration proofs for the minimald networking stack
-//! (Unit 1, issue #496).
+//! (issue #496).
 //!
-//! * `netns_uc1_nonet_refuses_egress` — UC1: a `NoNet` PTask, isolated in its
-//!   own empty network namespace, cannot reach the internet.
-//! * `netns_uc6_ownip_ptask_to_ptask` — UC6: two `OwnIp` PTasks on the same
-//!   host, each with a tap bridged onto the shared gvproxy switch, can open a
-//!   TCP connection to each other over their switch addresses.
+//! * `netns_nonet_refuses_egress` — a no-network task, isolated in its own
+//!   empty network namespace, cannot reach the internet.
+//! * `netns_ownip_ptask_to_ptask` — two own-IP tasks on the same host, each
+//!   with a tap bridged onto the shared gvproxy switch, can open a TCP
+//!   connection to each other over their switch addresses.
+//! * `netns_ingress_static_port_mapping_exposes_then_unexposes` — a static
+//!   ingress mapping makes a listener inside an own-IP task reachable from the
+//!   host, then removes it on exit.
 //!
-//! UC6 drives the **production** switch-attach wiring rather than a hand-rolled
-//! `ip netns` sequence: each PTask's namespace is created by the same
-//! `CLONE_NEWNET` `unshare` that `sandbox2::new_container` performs for `OwnIp`,
-//! identified by the holder process's PID exactly as the live launcher
+//! The own-IP proofs drive the **production** switch-attach wiring rather than a
+//! hand-rolled `ip netns` sequence: each task's namespace is created by the same
+//! `CLONE_NEWNET` `unshare` that `sandbox2::new_container` performs for own-IP
+//! tasks, identified by the holder process's PID exactly as the live launcher
 //! identifies a sandbox child's netns, and the tap is moved+configured by the
-//! production [`minimald::net::switch::tap_netns_commands`] (the same commands
-//! `SandboxLauncher` runs, here wrapped in `sudo` for the unprivileged runner).
+//! production [`minimald::net::switch::tap_netns_commands`]. Those commands
+//! create a tap device and configure interfaces/routes inside the namespace,
+//! which needs `CAP_NET_ADMIN`; the daemon holds it in production, so the proof
+//! wraps each command in `sudo` on the unprivileged CI runner.
 //!
 //! Both tests are `#[ignore]` and additionally early-return unless
 //! `MINIMALD_NETNS_TEST` is set, and read the gvproxy binary from `GVPROXY_BIN`.
@@ -71,7 +76,7 @@ fn sudo_ok(label: &str, args: &[&str]) {
     );
 }
 
-/// UC1 — a `NoNet` PTask cannot egress.
+/// A no-network task cannot reach the internet.
 ///
 /// Drives the egress attempt through `unshare --net`, which calls the same
 /// `CLONE_NEWNET` syscall that `sandbox2::new_container` calls for
@@ -80,7 +85,7 @@ fn sudo_ok(label: &str, args: &[&str]) {
 /// behaviour; the `unshare --net` egress test guards the OS-level contract.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs a network namespace; gated on MINIMALD_NETNS_TEST; runs in the ci-linux-native netns job"]
-async fn netns_uc1_nonet_refuses_egress() {
+async fn netns_nonet_refuses_egress() {
     if !gated() {
         return;
     }
@@ -109,14 +114,14 @@ async fn netns_uc1_nonet_refuses_egress() {
     );
 }
 
-/// UC6 — two `OwnIp` PTasks talk to each other over the gvproxy switch.
+/// Two own-IP tasks reach each other over the gvproxy switch.
 ///
 /// Drives the real switch lifecycle ([`SwitchClient`]), address allocation,
 /// tap creation ([`open_tap`]) and switch relay ([`attach_to_switch`]); none of
 /// these exist on the base branch, so the proof cannot pass against an empty PR.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs netns + gvproxy; gated on MINIMALD_NETNS_TEST; runs in the ci-linux-native netns job"]
-async fn netns_uc6_ownip_ptask_to_ptask() {
+async fn netns_ownip_ptask_to_ptask() {
     if !gated() {
         return;
     }
@@ -134,8 +139,8 @@ async fn netns_uc6_ownip_ptask_to_ptask() {
     assert_ne!(lease_a.ip, lease_b.ip);
     let sock = switch.control_socket();
 
-    let mut a = Ptask::provision("uc6a", lease_a, subnet, &sock).await;
-    let mut b = Ptask::provision("uc6b", lease_b, subnet, &sock).await;
+    let mut a = Ptask::provision("peer-a", lease_a, subnet, &sock).await;
+    let mut b = Ptask::provision("peer-b", lease_b, subnet, &sock).await;
 
     // PTask B listens on its switch address; PTask A connects to it. The traffic
     // crosses the gvproxy L2 switch entirely in userspace.

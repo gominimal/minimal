@@ -49,7 +49,7 @@ mod e2e_naming_convention {
     //! job; this unit test (runs in `core-tests`) fails loudly instead.
 
     /// Files intentionally NOT auto-discovered: `mesh_uc7` is the mothballed
-    /// WireGuard UC7 proof (feature `networking-wg`, off by default, no CI lane
+    /// WireGuard mesh proof (feature `networking-wg`, off by default, no CI lane
     /// runs it), so it deliberately keeps a non-convention name.
     const ALLOWLIST: &[&str] = &["mesh_uc7.rs"];
 
