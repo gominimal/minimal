@@ -16,6 +16,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const CONNECT_RETRIES: u32 = 20;
 /// Delay between connection retries.
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// Deadline for the SSH handshake + auth once the socket has accepted.
+///
+/// A connect is not proof of a live daemon: on the VM backend the socket is
+/// libkrun's bridge, which accepts even when the guest behind it is wedged, so
+/// only a completed handshake proves anyone is home. Without a deadline the CLI
+/// blocks there forever (#730). Generous — a live daemon answers in
+/// milliseconds, so this only bounds the pathological case. Mirrors `minvmd`'s
+/// own client, which guards the same bridge.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// russh client handler that accepts any ephemeral host key.
 ///
@@ -45,7 +54,8 @@ impl Client {
     ///
     /// Retries the UDS connect for up to ~2 seconds to absorb the post-boot
     /// race on macOS where the libkrun bridge UDS appears slightly after the
-    /// `vm-up` line.
+    /// `vm-up` line, and bounds the handshake by [`HANDSHAKE_TIMEOUT`] so a
+    /// wedged daemon behind an accepting socket fails instead of hanging.
     pub async fn connect(sock_path: &Path) -> Result<Self, anyhow::Error> {
         let stream = {
             let mut conn = None;
@@ -72,18 +82,30 @@ impl Client {
         };
 
         let config = Arc::new(russh::client::Config::default());
-        let mut handle = russh::client::connect_stream(config, stream, MinimalClientHandler)
-            .await
-            .context("ssh connect")?;
+        let handshake = async {
+            let mut handle = russh::client::connect_stream(config, stream, MinimalClientHandler)
+                .await
+                .context("ssh connect")?;
 
-        let auth = handle
-            .authenticate_none("minimal-cli")
-            .await
-            .context("authenticate")?;
+            let auth = handle
+                .authenticate_none("minimal-cli")
+                .await
+                .context("authenticate")?;
 
-        if !auth.success() {
-            return Err(anyhow::anyhow!("authentication rejected by daemon"));
-        }
+            if !auth.success() {
+                return Err(anyhow::anyhow!("authentication rejected by daemon"));
+            }
+            Ok(handle)
+        };
+
+        let handle = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "no live daemon behind {} after {HANDSHAKE_TIMEOUT:?}",
+                    sock_path.display()
+                )
+            })??;
 
         Ok(Client { handle })
     }
@@ -160,7 +182,7 @@ pub fn resolve_socket_path(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_socket_path;
+    use super::{Client, resolve_socket_path};
     use std::path::Path;
 
     #[test]
@@ -169,6 +191,24 @@ mod tests {
         assert_eq!(
             sock,
             Path::new("/tmp/minimal-test/providers/local-0/ssh.sock")
+        );
+    }
+
+    /// A socket that accepts but never speaks SSH — a wedged guest behind
+    /// libkrun's always-accepting bridge — must fail at the handshake deadline
+    /// instead of blocking the CLI forever (#730).
+    #[tokio::test(start_paused = true)]
+    async fn connect_fails_at_the_handshake_deadline_on_a_mute_listener() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("mute.sock");
+        let _listener = tokio::net::UnixListener::bind(&sock).unwrap();
+
+        // `start_paused` auto-advances time while nothing is runnable, so the
+        // deadline elapses in virtual time — the test does not wait it out.
+        let err = Client::connect(&sock).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no live daemon"),
+            "expected a handshake-deadline error, got: {err:#}"
         );
     }
 }

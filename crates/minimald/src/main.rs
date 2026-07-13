@@ -230,7 +230,23 @@ fn main() -> Result<(), MainError> {
         .enable_all()
         .build()
         .unwrap();
-    runtime.block_on(async_main())
+    let result = runtime.block_on(async_main());
+
+    // As the microVM's pid-1 we must not return: exiting init panics the guest
+    // kernel and wedges the VM (#730). Power the VM off instead — a clean
+    // shutdown (the `Shutdown` RPC drained the server) and a failed one alike,
+    // since either way there is no init left to run. Diverges on success.
+    #[cfg(target_os = "linux")]
+    if is_minimal_microvm() {
+        match &result {
+            Ok(()) => tracing::info!("microVM init finished; powering the VM off"),
+            Err(e) => tracing::error!(error = ?e, "microVM init failed; powering the VM off"),
+        }
+        let error = minimald::guest::power_off();
+        tracing::error!(%error, "powering the VM off failed; exiting init will panic the guest");
+    }
+
+    result
 }
 
 /// Re-exec this binary in a new session (`setsid`) with `--detach` stripped, so

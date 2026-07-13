@@ -54,6 +54,12 @@ const STOPPING_POLL_MS: u64 = 100;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const STOPPING_WAIT_SECS: u64 = 6;
 
+/// Max time to wait, after the daemon acknowledges a `Shutdown`, for the VM to
+/// finish going down. Covers the guest's connection drain (5 s grace), its
+/// poweroff, and the supervisor's state write.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const STOPPED_WAIT_SECS: u64 = 20;
+
 /// What to do given the lifecycle read from the minvmd state.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Debug, PartialEq, Eq)]
@@ -164,6 +170,61 @@ pub fn ensure_minvmd_running(_minimal_dir: Option<&Path>) -> io::Result<()> {
     Ok(())
 }
 
+/// Wait for a shutting-down minvmd to reach a terminal lifecycle state.
+///
+/// The `Shutdown` RPC is acknowledged when the guest *starts* going down: the
+/// daemon still has to drain its connections and power the VM off, and the
+/// supervisor has to reap the VMM child, before the state file reads `Stopped`.
+/// Returning to the user before then hands the next command a `Running` state
+/// whose VM is already gone — it would connect to a dead bridge socket instead
+/// of spawning a fresh VM (#730).
+///
+/// Reads via `effective_state`, so a supervisor that died without writing
+/// `Stopped` still resolves rather than pinning the wait to its deadline.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn wait_for_minvmd_stopped(minimal_dir: Option<&Path>) -> io::Result<()> {
+    let provider_dir = crate::client::resolve_provider_dir(minimal_dir)?;
+    let state_dir = minvmd::state::StateDir::new(provider_dir)?;
+
+    let deadline = Instant::now() + Duration::from_secs(STOPPED_WAIT_SECS);
+    loop {
+        if !state_dir.effective_state()?.lifecycle.is_active() {
+            tracing::debug!("minvmd has stopped");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "the VM is still shutting down after {STOPPED_WAIT_SECS}s; \
+                 run `minvmd stop` to force it down"
+            )));
+        }
+        thread::sleep(Duration::from_millis(STOPPING_POLL_MS));
+    }
+}
+
+/// Wait for the daemon the CLI talks to to finish shutting down. Only the
+/// minvmd backend has a VM to tear down (and lifecycle state to observe); a
+/// native minimald just exits, so there is nothing to wait for.
+#[cfg(target_os = "macos")]
+pub fn wait_for_daemon_stopped(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Result<()> {
+    let _ = use_minvmd;
+    wait_for_minvmd_stopped(minimal_dir)
+}
+
+#[cfg(target_os = "linux")]
+pub fn wait_for_daemon_stopped(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Result<()> {
+    if use_minvmd {
+        return wait_for_minvmd_stopped(minimal_dir);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn wait_for_daemon_stopped(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Result<()> {
+    let _ = (use_minvmd, minimal_dir);
+    Ok(())
+}
+
 /// Ensure the daemon the CLI will talk to is running, spawning it if needed.
 ///
 /// Backend selection:
@@ -234,8 +295,9 @@ fn ensure_minimald_running(socket_path: &Path, minimal_dir: Option<&Path>) -> io
 #[cfg(test)]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod tests {
-    use super::{Decision, classify};
+    use super::{Decision, classify, wait_for_minvmd_stopped};
     use minvmd::lifecycle::Lifecycle;
+    use minvmd::state::{State, StateDir};
 
     #[test]
     fn running_or_starting_needs_no_spawn() {
@@ -252,5 +314,40 @@ mod tests {
     #[test]
     fn stopping_waits_for_terminal_state() {
         assert_eq!(classify(Lifecycle::Stopping), Decision::WaitForStopping);
+    }
+
+    /// The state dir a `--minimal-dir` override resolves to.
+    fn state_dir_for(minimal_dir: &std::path::Path) -> StateDir {
+        StateDir::new(crate::client::resolve_provider_dir(Some(minimal_dir)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn wait_returns_at_once_when_already_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        state_dir_for(tmp.path())
+            .write_state(&State::stopped())
+            .unwrap();
+        wait_for_minvmd_stopped(Some(tmp.path())).expect("a stopped VM needs no waiting");
+    }
+
+    /// A supervisor that died without writing `Stopped` leaves `Running` behind
+    /// but drops the alive lock. That is a stopped VM, not one still going down:
+    /// the wait must resolve it, not sit out its deadline.
+    #[test]
+    fn wait_resolves_stale_running_state_from_a_dead_supervisor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = state_dir_for(tmp.path());
+        state_dir
+            .write_state(&State {
+                lifecycle: Lifecycle::Running,
+                vmm_pid: Some(999_999_999),
+                started_at: Some(0),
+            })
+            .unwrap();
+        wait_for_minvmd_stopped(Some(tmp.path())).expect("stale Running must resolve as stopped");
+        assert_eq!(
+            state_dir.read_state().unwrap().lifecycle,
+            Lifecycle::Stopped
+        );
     }
 }

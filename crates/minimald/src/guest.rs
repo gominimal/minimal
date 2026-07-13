@@ -548,6 +548,33 @@ pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Power the microVM off. Does not return on success: the kernel halts the
+/// guest and libkrun's VMM exits with it. On failure it returns the `reboot(2)`
+/// error.
+///
+/// This is how the guest ends. As pid-1 minimald has nothing to return to:
+/// letting `main` exit kills init, which panics the kernel ("Attempted to kill
+/// init!") — and with no `panic=` on the cmdline the kernel then spins in the
+/// panic handler forever. The VMM stays alive on a dead guest, the host keeps
+/// reporting the VM as `Running`, and every later CLI command blocks on a
+/// bridge socket nothing is behind (#730). Powering off instead lets the
+/// supervisor reap the VMM child and mark the VM `Stopped`, so the next command
+/// boots a fresh one.
+///
+/// `sync(2)` first: `reboot(2)` does not flush filesystems, and this also runs
+/// on the paths that never reached the shutdown quiesce (a failed
+/// `Server::run`).
+pub fn power_off() -> std::io::Error {
+    // SAFETY: neither call takes pointers. `reboot(2)` needs CAP_SYS_BOOT,
+    // which the microVM's pid-1 has, and does not return on success; on failure
+    // it returns -1 with errno set, which the caller surfaces.
+    unsafe {
+        libc::sync();
+        libc::reboot(libc::RB_POWER_OFF);
+    }
+    std::io::Error::last_os_error()
+}
+
 /// Enumerate open fds (and cwds) under `mountpoint` across all processes, for
 /// the EBUSY diagnostics in [`quiesce_state_volume`] — an unmountable volume
 /// is invisible without knowing who holds it. Best-effort `/proc` scan.

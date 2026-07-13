@@ -1131,7 +1131,13 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
 
     match resp {
         ShutdownResponse::ShuttingDown => {
+            // Drop our connection before waiting: the daemon holds the shutdown
+            // open for its drain grace period while a client is still attached,
+            // and we are that client.
+            drop(client);
             println!("Daemon is shutting down.");
+            autospawn::wait_for_daemon_stopped(global.minvmd, global.minimal_dir.as_deref())
+                .context("Failed while waiting for the daemon to stop")?;
             Ok(())
         }
         ShutdownResponse::SessionsLive => {
