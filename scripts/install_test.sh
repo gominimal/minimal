@@ -416,6 +416,65 @@ run kshinit "$H11"
 want_ok "unknown shell falls back to .profile (R9.2)" grep -q "shell-init/bash.sh" "$H11/.profile"
 TEST_SHELL=
 
+# Upgrade from the pre-rewrite installer: its rc block used the same markers
+# but sources ~/.minimal/shim/shell-init, so an unreplaced block leaves PATH
+# and completions silently dead. The markers are ours to own (R9.2): a stale
+# block is swapped for the current one, exactly once, preserving the user's
+# own rc content on both sides of it.
+H14="$root/h14"; mkdir -p "$H14"
+{
+    printf '# my zshrc\n'
+    printf '\n# >>> minimal >>>\n'
+    # The old installer wrote a literal $HOME, hence the single quotes.
+    # shellcheck disable=SC2016
+    printf '[ -f "$HOME/.minimal/shim/shell-init/zsh.sh" ] && . "$HOME/.minimal/shim/shell-init/zsh.sh"\n'
+    printf '# <<< minimal <<<\n'
+    printf '\n# added after the old install\n'
+} >"$H14/.zshrc"
+TEST_SHELL=/usr/bin/zsh
+run oldblock "$H14"
+check 0 "$rc" "upgrade over old rc block exits 0"
+want_ok "stale block replacement announced (R9.2)" grep -q "replaced stale block" "$OUT"
+check 1 "$(grep -c '>>> minimal >>>' "$H14/.zshrc")" "exactly one marker block after upgrade (R9.2)"
+want_ok "block now sources the current zsh init (R9.2)" grep -q "shell-init/zsh.sh" "$H14/.zshrc"
+want_err "no reference to the old shim path remains (R9.2)" grep -q '\.minimal/shim' "$H14/.zshrc"
+want_ok "user content before the old block preserved (R9.2)" grep -q '# my zshrc' "$H14/.zshrc"
+want_ok "user content after the old block preserved (R9.2)" \
+    grep -q '# added after the old install' "$H14/.zshrc"
+run oldblock2 "$H14"
+check 0 "$rc" "rerun after replacement exits 0"
+want_err "rerun rewrites nothing (R9.2)" grep -qE "shell-init: (added|replaced)" "$OUT"
+check 1 "$(grep -c '>>> minimal >>>' "$H14/.zshrc")" "rerun keeps a single marker block (R9.2)"
+TEST_SHELL=
+
+# A start marker whose end marker was lost to a hand edit must never cost the
+# user the tail of their rc file: the strip refuses (the naive filter would
+# drop everything from the marker to EOF), the install warns with the manual
+# line, appends nothing, and still exits 0. Uninstall likewise keeps the file.
+H15="$root/h15"; mkdir -p "$H15"
+{
+    printf '# my zshrc\n'
+    printf '# >>> minimal >>>\n'
+    printf '# end marker lost in a hand edit\n'
+    printf 'alias important=stuff\n'
+} >"$H15/.zshrc"
+TEST_SHELL=/usr/bin/zsh
+run unterminated "$H15"
+check 0 "$rc" "unterminated marker block is non-fatal on install (R9.2)"
+want_ok "warning names the broken block (R9.2)" \
+    grep -q "unterminated minimal block" "$OUT"
+want_ok "manual line still offered (R9.2)" grep -q "shell-init/zsh.sh" "$OUT"
+want_err "nothing appended after the stray marker (R9.2)" \
+    grep -q "shell-init/zsh.sh" "$H15/.zshrc"
+want_ok "rc tail survives (R9.2)" grep -q "alias important=stuff" "$H15/.zshrc"
+want_ok "binaries still installed (R9.2)" test -x "$H15/bin/min"
+run untermuninst "$H15" --uninstall
+check 0 "$rc" "uninstall over unterminated block exits 0 (R9.4)"
+want_ok "uninstall warns about the broken block (R9.4)" \
+    grep -q "unterminated minimal block" "$OUT"
+want_ok "uninstall keeps the rc tail (R9.4)" grep -q "alias important=stuff" "$H15/.zshrc"
+TEST_SHELL=
+
 # A manifest without the min CLI (data-only) skips completions, non-fatally.
 want_ok "completions skipped when min absent (R9.3)" \
     grep -q "completions: skipped" "$root/out.datadest"
