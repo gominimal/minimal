@@ -18,10 +18,10 @@ const CONNECT_RETRIES: u32 = 20;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// Deadline for the SSH handshake + auth once the socket has accepted.
 ///
-/// A connect is not proof of a live daemon: on the VM backend the socket is
+/// A connect is not proof that anyone is home: on the VM backend the socket is
 /// libkrun's bridge, which accepts even when the guest behind it is wedged, so
-/// only a completed handshake proves anyone is home. Without a deadline the CLI
-/// blocks there forever (#730). Generous — a live daemon answers in
+/// only a completed handshake proves there is a live server. Without a deadline
+/// the CLI blocks there forever (#730). Generous — a healthy endpoint answers in
 /// milliseconds, so this only bounds the pathological case. Mirrors `minvmd`'s
 /// own client, which guards the same bridge.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -102,7 +102,7 @@ impl Client {
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "no live daemon behind {} after {HANDSHAKE_TIMEOUT:?}",
+                    "connect to {}: SSH handshake timed out after {HANDSHAKE_TIMEOUT:?}",
                     sock_path.display()
                 )
             })??;
@@ -207,7 +207,7 @@ mod tests {
         // deadline elapses in virtual time — the test does not wait it out.
         let err = Client::connect(&sock).await.map(|_| ()).unwrap_err();
         assert!(
-            err.to_string().contains("no live daemon"),
+            err.to_string().contains("SSH handshake timed out"),
             "expected a handshake-deadline error, got: {err:#}"
         );
     }

@@ -142,15 +142,25 @@ fi
 mnl stop >/dev/null 2>&1 || { echo "::error::'minimal stop' failed"; fail; }
 
 # On VM targets the daemon IS the guest's pid-1, so stopping it must take the
-# VM down with it: the guest powers off, the supervisor reaps the VMM child and
+# VM down with it: the guest resets, the supervisor reaps the VMM child and
 # writes Stopped. A guest that instead exits init panics the kernel, leaving the
 # VM "running" behind a bridge socket nothing answers on (#730). `minvmd status`
-# exits 0 when running, 1 when stopped.
+# exits 0 when running, 1 when stopped, 2 on lock contention — so match the code
+# exactly rather than treating every non-zero exit as proof of a stopped VM.
 if [ -n "$E2E_VM" ]; then
-  if minvmd status >/dev/null 2>&1; then
-    echo "::error::VM is still running after 'minimal stop' (guest did not power off)"
-    fail
-  fi
+  minvmd status >/dev/null 2>&1
+  rc=$?
+  case "$rc" in
+    1) ;; # stopped: what a clean `min stop` must leave behind
+    0)
+      echo "::error::VM is still running after 'minimal stop' (the guest did not take it down)"
+      fail
+      ;;
+    *)
+      echo "::error::'minvmd status' failed with exit $rc (expected 0=running or 1=stopped)"
+      fail
+      ;;
+  esac
 fi
 
 # And the daemon must come back: the next command autospawns a fresh one rather
