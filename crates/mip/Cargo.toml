@@ -40,8 +40,6 @@ futures.workspace = true
 
 anyhow.workspace = true
 
-toml_edit.workspace = true
-
 petgraph.workspace = true
 smallvec.workspace = true
 
