@@ -235,6 +235,8 @@ establish the Linux/KVM baseline.
   requirement as macOS).
 - **R3.3**: `tests/bridge_e2e.rs` shall be un-gated from macOS in the same
   way. The 5-concurrent-connection multiplexing test shall run on Linux.
+  (`bridge_e2e.rs` was later removed in the auto-discovery migration —
+  superseded by `minimald_session_e2e.rs`.)
 - **R3.4**: The CI configuration shall add a Linux KVM e2e job. The job runs
   on a self-hosted Linux runner with `/dev/kvm` access (GCP nested-virt or
   equivalent). It provisions libkrun ≥ 1.19.0, materializes the kernel +

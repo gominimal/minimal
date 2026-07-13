@@ -17,7 +17,7 @@ VMM child and boot command paths each gain a `run_linux()` function
 mirroring the existing `run_macos()` with two omissions: no code-signing
 step and no Hypervisor.framework check; instead, a `/dev/kvm` file-access
 check gates the daemon start. The existing macOS e2e test files (`boot_e2e.rs`,
-`minimald_session_e2e.rs`, `bridge_e2e.rs`) drop their
+`minimald_session_e2e.rs`, and the since-removed `bridge_e2e.rs`) drop their
 `#[cfg(target_os = "macos")]` file-level attribute and gain a CI job on
 a KVM-capable Linux runner.
 
@@ -154,7 +154,9 @@ host daemon". macOS-specific subcommand messaging removed.
 
 `#![cfg(target_os = "macos")]` file-level attribute removed. Each test
 remains `#[ignore]` by default; the `MINVMD_E2E=1` + env-var gate is
-unchanged. The test bodies require no change.
+unchanged. The test bodies require no change. (`bridge_e2e.rs` was later
+removed in the auto-discovery migration — superseded by
+`minimald_session_e2e.rs`.)
 
 ### `.github/workflows/` (new CI job)
 
