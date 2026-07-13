@@ -178,6 +178,17 @@ marker_end='# <<< minimal <<<'
 strip_rc_block() {
     [ -f "$1" ] || return 0
     grep -q '>>> minimal >>>' "$1" 2>/dev/null || return 0
+    # Refuse a file whose start marker has no matching end marker (hand edits
+    # happen): the filter below would otherwise silently drop everything from
+    # that marker to EOF — the strip must never cost the user their rc tail.
+    # Distinct exit code so add_rc_block can tell "markers are broken" from
+    # "file not writable". Checked before the dry-run branch so a dry run
+    # predicts the real outcome.
+    if ! awk -v s="$marker_start" -v e="$marker_end" \
+            '$0==s {open=1} $0==e {open=0} END {exit open}' "$1"; then
+        say "  warning: unterminated minimal block in $1, left untouched"
+        return 2
+    fi
     if [ "$dry_run" -eq 1 ]; then
         say "  would remove shell-init block from $1"
         return 0
@@ -275,7 +286,9 @@ do_uninstall() {
     # The generated init/completion files themselves are ordinary record rows,
     # already handled by the walk above.
     for _rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$zshrc" "$fish_config" "$HOME/.profile"; do
-        strip_rc_block "$_rc"
+        # An unterminated block returns non-zero (file kept, warning printed);
+        # that must not abort the walk over the remaining rc candidates.
+        strip_rc_block "$_rc" || true
     done
 
     # R8.2 — --purge additionally deletes the minimal-owned trees wholesale (build
@@ -586,12 +599,34 @@ say "install: $installed installed, $skipped up to date -> record at $prev_recor
 # --- Unit 9b: hook the current shell's rc file ------------------------------
 
 # R9.2 — append one marker-fenced block sourcing the matching init file to the
-# rc of the user's login shell ($SHELL). Idempotent: a file already carrying
-# the markers is never touched again, so reruns and upgrades add nothing. The
-# markers are also what --uninstall strips (strip_rc_block).
+# rc of the user's login shell ($SHELL). The markers are ours to own: a block
+# already sourcing the current init file is left alone (reruns add nothing),
+# but a marker block with any other content is stale — e.g. the pre-rewrite
+# installer's, sourcing ~/.minimal/shim/shell-init — and is replaced, or PATH
+# and completions silently break on upgraded machines. The markers are also
+# what --uninstall strips (strip_rc_block).
 add_rc_block() {
+    _verb="added block to"
+    _hook_ok=1
     if grep -q '>>> minimal >>>' "$1" 2>/dev/null; then
-        return 0
+        if grep -qxF "$2" "$1" 2>/dev/null; then
+            return 0
+        fi
+        # Subshell: strip_rc_block dies on a failed rewrite, which must stay
+        # non-fatal (and quiet) here; only the subshell exits. Exit 2 means an
+        # unterminated marker block: never append after a stray start marker —
+        # a later strip would then eat everything between it and our end
+        # marker, the exact truncation the strip guard exists to prevent.
+        _strip_rc=0
+        ( strip_rc_block "$1" ) >/dev/null 2>&1 || _strip_rc=$?
+        if [ "$_strip_rc" -eq 2 ]; then
+            say "  warning: cannot hook minimal shell support: unterminated minimal block in $1"
+            say "  fix or remove its '# >>> minimal >>>' block, or add this line yourself:"
+            say "      $2"
+            return 0
+        fi
+        [ "$_strip_rc" -eq 0 ] || _hook_ok=0
+        _verb="replaced stale block in"
     fi
     # Non-fatal: by this point the binaries are correctly installed, so an
     # unwritable rc file must not turn a successful install into a failure.
@@ -600,14 +635,18 @@ add_rc_block() {
     # The subshell wrapper (not just 2>/dev/null on the command) is what keeps
     # a redirection failure quiet: that error is printed by the shell itself,
     # before the command-level stderr redirect is in effect.
-    if ! ( mkdir -p "${1%/*}" \
-            && printf '\n%s\n%s\n%s\n' "$marker_start" "$2" "$marker_end" >>"$1" ) 2>/dev/null; then
+    if [ "$_hook_ok" -eq 1 ]; then
+        ( mkdir -p "${1%/*}" \
+            && printf '\n%s\n%s\n%s\n' "$marker_start" "$2" "$marker_end" >>"$1" ) 2>/dev/null \
+            || _hook_ok=0
+    fi
+    if [ "$_hook_ok" -eq 0 ]; then
         say "  warning: failed to hook minimal shell support ($1 is not writable)"
         say "  to enable it yourself, add this line to your shell rc:"
         say "      $2"
         return 0
     fi
-    say "  shell-init: added block to $1"
+    say "  shell-init: $_verb $1"
 }
 
 posix_line="[ -f \"$init_dir/bash.sh\" ] && . \"$init_dir/bash.sh\""

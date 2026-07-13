@@ -326,10 +326,22 @@ the exact markers `# >>> minimal >>>` / `# <<< minimal <<<`:
 | `fish`  | `${XDG_CONFIG_HOME:-~/.config}/fish/config.fish`, created if missing |
 | other   | `~/.profile` (the POSIX login rc), with the `bash.sh` (POSIX) init |
 
-The edit is idempotent — a file already containing the start marker is never
-touched again — and always announced, never silent. The sourced line itself is
-guarded (`[ -f … ] && . …` / `if test -f …`), so an rc file that outlives an
-uninstall stays harmless.
+The markers are the installer's to **own**, not merely to detect: a file whose
+marker block already sources the current init file is never touched again
+(reruns add nothing), but a marker block with any other content is *stale* —
+notably the pre-rewrite installer's, which used the same markers around a line
+sourcing `~/.minimal/shim/shell-init/…` — and is replaced (stripped via the
+R9.4 filter, then re-appended), or PATH and completions silently break on every
+upgraded machine. Either edit is always announced, never silent, and the result
+always carries exactly one marker block. The sourced line itself is guarded
+(`[ -f … ] && . …` / `if test -f …`), so an rc file that outlives an uninstall
+stays harmless.
+
+A *malformed* block — a start marker with no matching end marker, i.e. a hand
+edit — is never repaired by force: stripping it would truncate everything from
+the marker to end-of-file, and appending after it would set up exactly that
+truncation for a later strip. The file is left byte-for-byte untouched and the
+installer warns, naming the file and printing the line to add by hand.
 
 The hook is **best-effort and non-fatal**: by the time it runs, the binaries
 are already correctly installed, so an rc file that cannot be appended (or a
@@ -371,7 +383,10 @@ installed, and completions regenerate on the next run. Specifically:
 - the marker-fenced block is stripped from every rc file the installer may
   have edited (all candidates from the R9.2 table are tried — `$SHELL` may have
   changed since install; a file without markers is never rewritten), via an
-  awk filter to a temp sibling + atomic `mv` (`sed -i` is not portable);
+  awk filter to a temp sibling + atomic `mv` (`sed -i` is not portable); a file
+  whose start marker lacks its end marker is kept untouched with a warning
+  (the filter would otherwise drop everything from the marker to end-of-file),
+  and the walk continues to the remaining candidates;
 - the emptied `shell-init` and completion dirs (and their possibly
   installer-created parents) are pruned with the same `rmdir`-only discipline
   as R8.1 — they are shared locations, never `rm -rf`ed;
@@ -389,6 +404,14 @@ installed, and completions regenerate on the next run. Specifically:
   `~/.bash_profile` pre-existing, both are hooked and user content is preserved.
 - **Test**: `SHELL=…/zsh` hooks (and creates) `.zshrc`; `…/fish` hooks
   `config.fish`; an unrecognized shell falls back to `~/.profile`.
+- **Test**: an rc file carrying the pre-rewrite installer's marker block
+  (sourcing `~/.minimal/shim/shell-init/…`) has it replaced — the run announces
+  the replacement, exactly one marker block remains, it sources the current
+  init file, no shim reference survives, and user content on both sides of the
+  old block is preserved; a rerun then rewrites nothing.
+- **Test**: an rc file with a start marker but no end marker is left untouched
+  by both install and uninstall — each warns naming the file, appends nothing,
+  preserves the content after the stray marker, and exits 0.
 - **Test**: with a read-only `~/.bashrc`, the install still exits 0, prints the
   `failed to hook minimal shell support` warning and the manual line, leaves
   the rc file untouched, and still prints the R6.2 PATH advisory.
