@@ -277,9 +277,9 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Materialize gvproxy switch binary
-        # The gvproxy relay e2e (vsock_relay_e2e) spawns this per-host switch
-        # binary; pin-verified, no Go toolchain. Publish its path for the gated
-        # step below.
+        # The gvproxy relay e2e (vsock_relay_root_e2e) spawns this per-host
+        # switch binary; pin-verified, no Go toolchain. Publish its path for the
+        # root harness step below.
         run: |
           ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
           echo "MINVMD_GVPROXY_BIN=$RUNNER_TEMP/gvproxy" >> "$GITHUB_ENV"
@@ -300,42 +300,43 @@ jobs:
           arch: x86_64
           channel: unstable
 
-      - name: Boot E2E (READY round-trip)
+      - name: VM e2e harnesses (non-root, auto-discovered)
+        # Convention over enumeration: run every non-root harness the archive
+        # carries — `binary(/_e2e$/)` minus the `_root_e2e` root harnesses —
+        # so a new crates/minvmd/tests/*_e2e.rs file is picked up here with
+        # zero workflow edit (the N7 auto-discovery contract; a normal unit
+        # test in minvmd guards the suffix). `--run-ignored all` runs the
+        # `#[ignore]`-gated bodies; `--no-tests=fail` reds the job if the
+        # filterset ever matches nothing. MINVMD_E2E=1 is set job-wide; profile
+        # vm is serial with fail-fast, so a failure preserves its own boot.log.
         env:
           MINVMD_BOOT_LOG: ${{ runner.temp }}/boot.log
         run: |
           cargo-nextest nextest run --archive-file "$TESTBED/nextest-archive.tar.zst" \
             --workspace-remap "$GITHUB_WORKSPACE" --profile vm \
-            --run-ignored all --no-tests=fail -E 'binary(boot_e2e)'
-
-      - name: Session E2E (full minimald session over the bridge)
-        run: |
-          cargo-nextest nextest run --archive-file "$TESTBED/nextest-archive.tar.zst" \
-            --workspace-remap "$GITHUB_WORKSPACE" --profile vm \
             --run-ignored all --no-tests=fail \
-            -E 'binary(minimald_session_e2e) and test(=minimald_exec_over_bridge)'
+            -E 'binary(/_e2e$/) and not binary(/_root_e2e$/)'
 
-      - name: Gvproxy relay E2E (OwnIp PTask gets a switch IP)
-        # Boots an OwnIp VM and asserts its netns receives a 100.64.0.0/16 switch
-        # IP via the async TAP↔gvproxy relay, with frames traversing the switch.
-        # Needs /dev/kvm, the gvproxy binary, and CAP_NET_ADMIN (tap + netns), so
-        # it is `#[ignore]`-gated and only runs here with the env gate set.
-        # `sudo -E` preserves the testbed env while granting the tap/netns
-        # capabilities the relay requires.
+      - name: VM e2e harnesses (root, auto-discovered)
+        # The `_root_e2e` harnesses (currently the gvproxy relay proof) boot an
+        # OwnIp VM and need CAP_NET_ADMIN (tap + netns) on top of /dev/kvm and
+        # the gvproxy binary, so they run under `sudo -E` — which preserves the
+        # testbed env while granting the capabilities. Selected by suffix, so a
+        # new *_root_e2e.rs file joins this step with no workflow edit.
+        # MINVMD_INTEGRATION_TEST gates the relay body's VM boot / tun access.
         env:
           MINVMD_INTEGRATION_TEST: "1"
         run: |
           sudo -E env "PATH=$PATH" "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" \
             cargo-nextest nextest run --archive-file "$TESTBED/nextest-archive.tar.zst" \
               --workspace-remap "$GITHUB_WORKSPACE" --profile vm \
-              --run-ignored all --no-tests=fail -E 'binary(vsock_relay_e2e)'
+              --run-ignored all --no-tests=fail -E 'binary(/_root_e2e$/)'
 
-      # NOTE: bridge_e2e is intentionally NOT run here. It targets the Stage-1
+      # NOTE: bridge_e2e was removed (N7) — it targeted the retired Stage-1
       # guest "vsock stub" (a socat/cat echo on port 2222) that minimald-as-pid1
-      # replaced with a direct SSH session server, so it now reads back the SSH
-      # banner instead of its echo payload. The macOS lane likewise runs only
-      # minimald_session_e2e; session coverage of the bridge is provided by
-      # Session E2E above plus the daemon lifecycle step below.
+      # superseded with a direct SSH session server. Session coverage of the
+      # bridge is provided by minimald_session_e2e (in the non-root step above)
+      # plus the daemon lifecycle step below.
 
       - name: Reap leftover VM processes
         # The harness runs above can leak __krun-vmm / gvproxy children on

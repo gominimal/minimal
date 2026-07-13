@@ -220,12 +220,13 @@ jobs:
               # BINARIES DIRECTLY (below). Any cargo invocation after signing
               # relinks (and unsigns) target/debug/minvmd, so krun_start_enter
               # fails with EINVAL. minimal spawns `minvmd` by name from PATH; only
-              # minvmd needs the hypervisor entitlement. Building the krun_smoke
-              # harness also builds its krun_smoke_child helper bin (cargo builds
-              # package bins for integration tests) and bakes its absolute
-              # CARGO_BIN_EXE path — same-machine build+run, so it resolves.
+              # minvmd needs the hypervisor entitlement. Building the
+              # krun_smoke_e2e harness also builds its krun_smoke_child helper
+              # bin (cargo builds package bins for integration tests) and bakes
+              # its absolute CARGO_BIN_EXE path — same-machine build+run, so it
+              # resolves.
               run: |
-                  cargo test -p minvmd --test krun_smoke --test minimald_session_e2e --no-run --locked
+                  cargo test -p minvmd --test krun_smoke_e2e --test minimald_session_e2e --no-run --locked
                   cargo build -p minvmd --bin minvmd --locked
                   # SEPARATE invocation for the CLI (mirrors release.yml): built
                   # together, cargo unifies minvmd's default `libkrun` feature
@@ -266,8 +267,8 @@ jobs:
               # codesigned entitlement needed. Direct-binary run (never `cargo
               # test`, which would relink and unsign minvmd).
               run: |
-                  testbin="$(ls -1t target/debug/deps/krun_smoke-* | grep -v '\.d$' | head -1)"
-                  test -x "$testbin" || { echo "::error::krun_smoke test binary not found"; exit 1; }
+                  testbin="$(ls -1t target/debug/deps/krun_smoke_e2e-* | grep -v '\.d$' | head -1)"
+                  test -x "$testbin" || { echo "::error::krun_smoke_e2e test binary not found"; exit 1; }
                   MINVMD_E2E=1 "$testbin" --include-ignored --nocapture
             - name: Session E2E (boot + full session over the bridge)
               # Gating: boots the GENERIC upstream rootfs with minimald shipped as the

@@ -1,14 +1,16 @@
-//! DM1 gvproxy relay end-to-end proof (R1.4, R1.5, R1.7).
+//! gvproxy relay end-to-end proof (R1.4, R1.5, R1.7).
 //!
 //! Boots a libkrun VM with an `OwnIp` PTask and asserts its network namespace
 //! receives a `100.64.0.0/16` switch IP via the async TAP↔gvproxy relay, with
-//! frames traversing the switch. This is the DM1 hardware proof: it needs
+//! frames traversing the switch. This exercises the gvproxy relay mechanism
+//! (the userspace-networking path DM1 relies on) end to end: it needs
 //! `/dev/kvm`, a real gvproxy binary, `CAP_NET_ADMIN` (tap + netns), the guest
 //! kernel/rootfs/initramfs, and the libkrun runtime — none of which exist on a
-//! stock dev machine. It is therefore validated on CI only.
+//! stock dev machine, so it is validated on CI's Linux+VM (DM3) hardware only.
 //!
-//! Test name contains `vsock` so CI selects it with
-//! `cargo test -p minvmd vsock -- --include-ignored`.
+//! Auto-discovered by the VM lanes via its `_root_e2e` binary suffix: the KVM
+//! lane's root filterset (`-E 'binary(/_root_e2e$/)'`, run under `sudo -E` for
+//! the CAP_NET_ADMIN it needs) selects it — no per-test wiring in the workflow.
 //!
 //! Gates (mirroring the `MINVMD_E2E` pattern):
 //! - `#[cfg(minvmd_libkrun)]`: needs the libkrun-linking build.
@@ -20,7 +22,7 @@
 //!   `MINVMD_GVPROXY_BIN` must point at the guest artifacts and the gvproxy
 //!   binary.
 
-// The DM1 relay proof needs `/dev/net/tun` + netns (Linux) on top of libkrun.
+// The gvproxy relay proof needs `/dev/net/tun` + netns (Linux) on top of libkrun.
 // `open_tap`/`attach_to_switch` are Linux-only, so gate the whole test on both.
 #![cfg(all(minvmd_libkrun, target_os = "linux"))]
 
@@ -35,7 +37,7 @@ use serial_test::serial;
 #[ignore = "gated MINVMD_INTEGRATION_TEST=1; requires /dev/kvm, gvproxy, CAP_NET_ADMIN"]
 fn own_ip_ptask_gets_switch_ip_via_vsock_relay() {
     if std::env::var("MINVMD_INTEGRATION_TEST").as_deref() != Ok("1") {
-        eprintln!("vsock_relay_e2e: MINVMD_INTEGRATION_TEST != 1, skipping");
+        eprintln!("vsock_relay_root_e2e: MINVMD_INTEGRATION_TEST != 1, skipping");
         return;
     }
 
@@ -47,7 +49,7 @@ fn own_ip_ptask_gets_switch_ip_via_vsock_relay() {
     ] {
         assert!(
             std::env::var(var).is_ok(),
-            "vsock_relay_e2e: {var} must be set when MINVMD_INTEGRATION_TEST=1"
+            "vsock_relay_root_e2e: {var} must be set when MINVMD_INTEGRATION_TEST=1"
         );
     }
 
