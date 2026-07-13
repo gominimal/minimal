@@ -309,7 +309,7 @@ impl<S: SessionObject> Session<S> {
     #[cfg(not(test))]
     fn session_launcher(
         &mut self,
-        session: SessionHandle,
+        _session: SessionHandle,
     ) -> Result<session_host::SandboxLauncher, AttachError> {
         let record = self.session.record();
         // R2.1: reject a policy that is incompatible with the network mode
@@ -327,7 +327,6 @@ impl<S: SessionObject> Session<S> {
             network_mode,
             net_switch: Arc::clone(&self.net_switch),
             ingress,
-            session,
             composition: self.composition.clone(),
         })
     }

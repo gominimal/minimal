@@ -13,9 +13,10 @@ name: CI (Linux native)
 # PR, while a skipped in-workflow job just reports `skipped`, which the
 # aggregator treats as pass. Do NOT add trigger-level `paths:` here.
 #
-# The mothballed networking proofs (netns UC1/UC6, mesh UC7, and the
-# networking-proxy / networking-wg feature tests) are deliberately NOT run
-# in this lane — see the note on the tests job.
+# The netns namespace proofs (UC1/UC4/UC6) run here in the `netns-integration`
+# job (sudo + a userspace gvproxy switch, no KVM). The `networking-proxy` (mTLS)
+# feature tests and the mesh UC7 / `networking-wg` proofs are deliberately NOT
+# run in this lane — see the note on the tests job.
 on:
   push:
     branches: ["main"]
@@ -68,6 +69,9 @@ jobs:
               - ".config/nextest.toml"
               - "scripts/**"
               - ".minimal/**"
+              # The gvproxy pin: the netns job fetches + SHA-checks it, so a pin
+              # bump must re-run this lane.
+              - "vendor/gvproxy/**"
               - ".github/actions/setup-rust/**"
               - ".github/actions/core-tests/**"
               - ".github/workflows/ci-linux-native.yml"
@@ -77,12 +81,12 @@ jobs:
     # job for this lane; ci.yml keeps its copy until the ruleset requires
     # this lane's aggregator, then drops it.
     #
-    # MOTHBALLED, deliberately absent (owner decision): the
-    # `--features networking-proxy` (mTLS reverse proxy) and `--features
-    # networking-wg` (WireGuard mesh) test steps that ci.yml's `test` job
-    # still carries, and the netns/mesh namespace proofs that ci-netns.yml
-    # ran (crates/minimald/tests/netns.rs, mesh_uc7.rs). The code and tests
-    # stay in-tree and runnable locally; they are just not CI-covered.
+    # Deliberately absent (owner decision): the `--features networking-proxy`
+    # (mTLS reverse proxy) and `--features networking-wg` (WireGuard mesh) test
+    # steps that ci.yml's `test` job still carries, and the mesh UC7 namespace
+    # proof (crates/minimald/tests/mesh_uc7.rs). The netns UC1/UC4/UC6 proofs
+    # (crates/minimald/tests/netns.rs) run in the `netns-integration` job below.
+    # The rest stay in-tree and runnable locally, just not CI-covered.
     needs: [changes]
     if: github.event_name != 'pull_request' || needs.changes.outputs.native == 'true'
     runs-on: ubuntu-latest
@@ -137,12 +141,56 @@ jobs:
           export PATH="$PWD/target/debug:$PATH"
           ./scripts/session-e2e.sh
 
+  netns-integration:
+    # The UC1 (no-net) / UC4 (static ingress) / UC6 (PTask<->PTask over the
+    # gvproxy switch) network-namespace proofs (crates/minimald/tests/netns.rs):
+    # two own-ip PTasks on a real gvproxy switch, driving the PRODUCTION
+    # switch-attach wiring. #[ignore] + gated on MINIMALD_NETNS_TEST so they run
+    # only here. Needs unprivileged userns + sudo (tap/netns) and a userspace
+    # gvproxy — no KVM. The mesh UC7 proof (networking-wg) is intentionally
+    # absent (feature disabled).
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.native == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          # Builds the `netns` integration target, not the workspace suite.
+          shared-key: netns
+      - name: Enable unprivileged user namespaces
+        # The PTask namespaces (hakoniwa/unshare) need userns; Ubuntu 24.04
+        # restricts them via AppArmor by default.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Fetch pinned gvproxy switch binary
+        run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
+      - name: Confirm netns capability
+        # Fail fast with a clear message if the runner image ever drops userns,
+        # rather than letting every gated test mis-skip into a false green.
+        run: |
+          if ! unshare --user --net true 2>/dev/null && ! sudo ip netns add _ci_probe; then
+            echo "::error::runner cannot create a network namespace (no userns and no sudo netns)" >&2
+            exit 1
+          fi
+          sudo ip netns del _ci_probe 2>/dev/null || true
+          echo "netns capability: OK"
+      - name: Run netns proofs (UC1 no-net, UC4 ingress, UC6 PTask-to-PTask)
+        env:
+          MINIMALD_NETNS_TEST: "1"
+          GVPROXY_BIN: ${{ runner.temp }}/gvproxy
+        # --include-ignored exercises the #[ignore] proofs; the env gate flips
+        # them from early-return to run. The tap/netns commands sudo themselves.
+        run: cargo test -p minimald --test netns -- --include-ignored --nocapture
+
   # Single required status check for this lane (branch-protection context:
   # ci-linux-native-success). Green when every gating job succeeded OR was
   # path-skipped; red only on failure/cancellation.
   ci-linux-native-success:
     if: always()
-    needs: [changes, tests, native-daemon-e2e]
+    needs: [changes, tests, native-daemon-e2e, netns-integration]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
