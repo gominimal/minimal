@@ -31,7 +31,8 @@ codesign-minvmd:
 
 # ── minimal → minvmd → minimald bring-up (macOS/HVF or Linux/KVM) ───────────
 #
-# `just up` brings the whole stack up with full guest networking:
+# `just dm1` (macOS/HVF) and `just dm3` (Linux/KVM) bring the whole stack up
+# with full guest networking:
 #   1. materialize the guest kernel + generic rootfs into .scratch
 #   2. cross-compile minimald → initramfs /init WITH the networking features
 #   3. build minvmd (codesign on macOS), build the `minimal` CLI
@@ -43,7 +44,7 @@ codesign-minvmd:
 #   macOS  — `brew install slp/krun/libkrun`; the `minimal` shim on PATH.
 #   Linux  — a KVM host; durable `kvm` group membership (`sudo usermod -aG kvm
 #            $USER`, then re-login) so the autospawned minvmd can open /dev/kvm;
-#            a Rust toolchain + protoc + jq + cpio. libkrun is fetched by `up`.
+#            a Rust toolchain + protoc + jq + cpio. libkrun is fetched by `dm3`.
 # See crates/minvmd/README.md for the manual equivalent.
 
 # macOS: via the `minimal` shim (runs in a VM; --output must stay under the repo).
@@ -55,10 +56,23 @@ artifacts:
     #!/usr/bin/env sh
     set -eu
     mkdir -p {{scratch}}
+    # `minimal materialize` runs in a VM via the shim; on a cold cache its
+    # overlay-sync can transiently drop the output ("copying output file I/O
+    # error … No such file or directory"). Retry a few times before failing.
+    materialize() {
+      n=0
+      until minimal materialize --output "$1" --arch "$2" "$3"; do
+        n=$((n + 1))
+        [ "$n" -ge 3 ] && { echo "materialize $3 failed after $n attempts" >&2; return 1; }
+        echo "materialize $3 failed (attempt $n); retrying…" >&2
+        rm -f "$1"
+        sleep 2
+      done
+    }
     case "$(uname -s)" in
       Darwin)
-        [ -f {{kernel}} ] || minimal materialize --output {{kernel}} --arch {{arch}} virtio-kernel
-        [ -f {{rootfs}} ] || minimal materialize --output {{rootfs}} --arch {{arch}} minvmd-rootfs
+        [ -f {{kernel}} ] || materialize {{kernel}} {{arch}} virtio-kernel
+        [ -f {{rootfs}} ] || materialize {{rootfs}} {{arch}} minvmd-rootfs
         ;;
       Linux)
         [ -f {{kernel}} ] || scripts/fetch-artifact.sh virtio-kernel {{kernel}} {{arch}}
@@ -131,30 +145,8 @@ min *args:
     cargo build -p minimal -p minimald
     PATH="{{justfile_directory()}}/target/debug:$PATH" "{{minimal}}" {{args}}
 
-# minimal auto-spawns `minvmd run --detach`, so minvmd must be on PATH and the
-# MINVMD_* artifact paths exported; both are set here and inherited by the
-# detached supervisor. On Linux LD_LIBRARY_PATH is also inherited so libkrun can
-# dlopen libkrunfw at runtime.
-
-# Bring the full stack up and list sessions.
-up: artifacts gvproxy initramfs minvmd-build minimal-cli
-    #!/usr/bin/env sh
-    set -eu
-    export MINVMD_KERNEL_PATH="{{kernel}}"
-    export MINVMD_ROOTFS_PATH="{{rootfs}}"
-    export MINVMD_INITRAMFS="{{initramfs}}"
-    export MINVMD_BOOT_LOG="{{scratch}}/boot.log"
-    # Host gvproxy switch: minvmd spawns it for guest egress (root netns + own-IP
-    # PTasks). Best-effort — skipped if the binary is absent.
-    export MINVMD_GVPROXY_BIN="{{gvproxy}}"
-    export PATH="{{justfile_directory()}}/target/debug:$PATH"
-    case "$(uname -s)" in
-      Linux) export LD_LIBRARY_PATH="{{krun-prefix}}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
-    esac
-    "{{minimal}}" ls
-
 # Print `export` lines wiring the dev-built binaries and guest artifacts into
-# the environment — the same setup `up`/`dm3` do internally, for running
+# the environment — the same setup `dm1`/`dm3` do internally, for running
 # `minimal`/`minvmd` by hand against the built stack. Load into the current
 # shell with:  eval "$(just env)"
 env:
@@ -213,18 +205,22 @@ test-installer:
 # ── DM1 / DM2 / DM3 deployment-model bring-up ────────────────────────────────
 #
 # DM1: macOS (Apple Silicon) host + Linux VM(s) over Hypervisor.framework. This
-#      is the `up` path on macOS; on Linux it is a clean SKIP (use `dm3` for the
-#      native-Linux + VM equivalent over KVM).
+#      is the primary bring-up on macOS; on Linux it is a clean SKIP (use `dm3`
+#      for the native-Linux + VM equivalent over KVM).
 # DM2: native Linux, a host-native `minimald` (no VM), reachable over UDS at
 #      providers/local-0/ssh.sock — the same path the `minimal` CLI dials, so no
 #      bridge is needed. Own-IP is rootless (hakoniwa RustSlirp builds the tap
 #      inside the sandbox's own user+net namespace — no setcap).
 # DM3: native Linux + one Linux VM (minimald as initramfs pid-1 in libkrun). The
-#      Linux CLI dials providers/local-0/ssh.sock, but minvmd bridges the guest
-#      at $XDG_RUNTIME_DIR/minimal/minimald.sock, so `dm3` symlinks the former to
-#      the latter. Run under `sg kvm` if the shell lacks the kvm group.
+#      Linux CLI dials providers/local-0/ssh.sock, which minvmd binds directly
+#      (the socket/path coordination fix, #690) — no bridge/symlink needed. Run
+#      under `sg kvm` if the shell lacks the kvm group.
 
-# DM1 — macOS host + Linux VM over Hypervisor.framework (the `up` path on macOS).
+# On Linux this is a clean SKIP (use `dm3`). minimal auto-spawns `minvmd run
+# --detach`, so minvmd must be on PATH and the MINVMD_* artifact paths exported —
+# both are set here and inherited by the detached supervisor.
+
+# DM1 — macOS host + Linux VM over Hypervisor.framework: bring the full stack up.
 dm1:
     #!/usr/bin/env sh
     set -eu
@@ -233,13 +229,22 @@ dm1:
       *) echo "DM1 needs macOS (Hypervisor.framework). SKIP on $(uname -s); use 'just dm3' for native Linux + VM over KVM." ; exit 0 ;;
     esac
     echo "DM1 (macOS + Linux VM over HVF): bringing the stack up."
-    just up
+    just artifacts gvproxy initramfs minvmd-build minimal-cli
+    export MINVMD_KERNEL_PATH="{{kernel}}"
+    export MINVMD_ROOTFS_PATH="{{rootfs}}"
+    export MINVMD_INITRAMFS="{{initramfs}}"
+    export MINVMD_BOOT_LOG="{{scratch}}/boot.log"
+    # Host gvproxy switch: minvmd spawns it for guest egress (root netns + own-IP
+    # PTasks). Best-effort — skipped if the binary is absent.
+    export MINVMD_GVPROXY_BIN="{{gvproxy}}"
+    export PATH="{{justfile_directory()}}/target/debug:$PATH"
+    "{{minimal}}" ls
 
 # Build a host-native (glibc) minimald WITH the networking features, for DM2.
 minimald-build:
     cargo build -p minimald --features {{features}}
 
-# DM3 — native Linux + one Linux VM. Boots the VM, then bridges the CLI socket.
+# DM3 — native Linux + one Linux VM. Boots the VM; minvmd binds the CLI socket.
 dm3: artifacts gvproxy initramfs minvmd-build minimal-cli
     #!/usr/bin/env sh
     set -eu
@@ -250,18 +255,18 @@ dm3: artifacts gvproxy initramfs minvmd-build minimal-cli
     export MINVMD_GVPROXY_BIN="{{gvproxy}}"
     export PATH="{{justfile_directory()}}/target/debug:$PATH"
     export LD_LIBRARY_PATH="{{krun-prefix}}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    # Boot the VM explicitly (the CLI's autospawn would also work, but booting
-    # here keeps the F1 bridge ordering clear). The configurable READY/UDS
-    # timeouts cover the ~20-30s cold boot.
+    # Boot the VM explicitly (the CLI's autospawn would also work, but an
+    # explicit boot keeps ordering clear and lets us raise the READY timeout).
+    # The generic guest kernel can spend 40-50s probing hardware before pid-1
+    # (minimald) even starts, which overruns minvmd's 60s READY default on a
+    # cold boot; give it headroom (overridable by the caller).
+    export MINVMD_READY_TIMEOUT_SECS="${MINVMD_READY_TIMEOUT_SECS:-150}"
     "{{minvmd-bin}}" run --detach --timeout 75
-    # F1 bridge: the Linux CLI dials <state>/providers/local-0/ssh.sock, but the
-    # guest is reached via minvmd's <runtime>/minimal/minimald.sock — link them.
-    runtime="${XDG_RUNTIME_DIR:-$HOME/.minimal/local}"
-    state="${XDG_STATE_HOME:-$HOME/.local/state}"
-    cli="$state/minimal/providers/local-0/ssh.sock"
-    mkdir -p "$(dirname "$cli")"
-    ln -sf "$runtime/minimal/minimald.sock" "$cli"
-    echo "DM3 up: VM booted; CLI socket bridged -> $runtime/minimal/minimald.sock"
+    # No socket bridge: since the socket/path coordination fix (#690) minvmd binds
+    # the CLI-facing <state>/providers/local-0/ssh.sock directly — exactly the path
+    # the `minimal` CLI dials. (The old `ln -sf` from a runtime-dir socket clobbered
+    # minvmd's own live socket, so every dial fell through to a failing autospawn.)
+    echo "DM3 up: VM booted; minimald reachable at providers/local-0/ssh.sock"
     # The guest SSH server can reset the very first connect right after boot, so
     # retry briefly rather than fail the recipe on that one-shot race.
     ok=0
