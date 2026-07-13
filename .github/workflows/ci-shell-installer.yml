@@ -1,5 +1,8 @@
 name: CI shell installer
 
+# Also static-analyses the AppArmor profile installer (the `apparmor` job at the
+# bottom) — same shape of artifact: a shell script plus the policy it ships.
+#
 # Static-analyses and tests the curl|sh fallback installer
 # (docs/specs/07-spec-installer). The installer targets strict POSIX sh, so this
 # gate enforces its Verification section: shellcheck --shell=sh with no warnings
@@ -36,6 +39,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       installer: ${{ steps.filter.outputs.installer }}
+      apparmor: ${{ steps.filter.outputs.apparmor }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -53,6 +57,10 @@ jobs:
             installer:
               - "scripts/install.sh"
               - "scripts/install_test.sh"
+              - ".github/workflows/ci-shell-installer.yml"
+            apparmor:
+              - "scripts/install-apparmor-profile.sh"
+              - "packaging/apparmor/**"
               - ".github/workflows/ci-shell-installer.yml"
 
   shellcheck:
@@ -92,16 +100,39 @@ jobs:
       - name: Run installer test harness under ${{ matrix.shell }}
         run: SH='${{ matrix.shell }}' '${{ matrix.shell }}' scripts/install_test.sh
 
+  # The AppArmor profile that grants minimald `userns` on Ubuntu 24.04+
+  # (docs/reference/linux-host-setup.md). A malformed profile is silently
+  # inert — apparmor_parser rejects it and every session then dies at
+  # uid_map — so parse it on every change. `--check` neither loads the
+  # policy nor writes the cache, hence no root.
+  apparmor:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.apparmor == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Ensure apparmor_parser is present
+        # Stock on the Ubuntu runner image, but the check is worthless if it
+        # silently isn't — install rather than skip.
+        run: command -v apparmor_parser || sudo apt-get install -y --no-install-recommends apparmor
+      - name: shellcheck the profile installer
+        run: shellcheck scripts/install-apparmor-profile.sh
+      - name: Profile parses (apparmor_parser)
+        run: ./scripts/install-apparmor-profile.sh --check
+
   # Single stable status for branch protection: green when shellcheck and
   # every test lane succeeded OR were path-skipped (the matrix lanes have
   # dynamic names); red only on failure/cancellation.
   ci-shell-installer-success:
     if: always()
-    needs: [changes, shellcheck, test]
+    needs: [changes, shellcheck, test, apparmor]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Verify all gating jobs succeeded or were skipped
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         run: exit 1
-      - run: echo "installer shellcheck + tests passed"
+      - run: echo "installer shellcheck + tests and apparmor profile checks passed"

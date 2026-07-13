@@ -11,6 +11,20 @@ The "minimal" CLI tool runs on amd64 and aarch64 Linux.
 ### Building the binary
 Either: `cargo build` for debug (faster build) and `cargo build --release` (slower build, faster execution)
 
+### Ubuntu 24.04+ hosts
+
+Sessions run in an unprivileged user namespace, which Ubuntu 24.04 blocks by
+default (`kernel.apparmor_restrict_unprivileged_userns=1`) — every session dies
+at `uid_map` with `Operation not permitted`. Install the AppArmor profile that
+grants `minimald` the `userns` permission:
+
+```shell
+$> sudo scripts/install-apparmor-profile.sh              # installed binary
+$> sudo scripts/install-apparmor-profile.sh --path "$PWD/target/debug/minimald"   # dev build
+```
+
+See [docs/reference/linux-host-setup.md](docs/reference/linux-host-setup.md).
+
 ## Using minimal
 
 You can run minimal either via the build binary in `target/{debug,release}/minimal` or using cargo (which will auto-rebuild as you change rust sauce):
