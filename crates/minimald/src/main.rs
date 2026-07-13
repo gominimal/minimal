@@ -230,7 +230,33 @@ fn main() -> Result<(), MainError> {
         .enable_all()
         .build()
         .unwrap();
-    runtime.block_on(async_main())
+    let result = runtime.block_on(async_main());
+
+    // As the microVM's pid-1 we must not return: exiting init panics the guest
+    // kernel and wedges the VM (#730). Take the VM down instead — a clean
+    // shutdown (the `Shutdown` RPC drained the server) and a failed one alike,
+    // since either way there is no init left to run. Diverges on success.
+    #[cfg(target_os = "linux")]
+    if is_minimal_microvm() {
+        match &result {
+            Ok(()) => tracing::info!("microVM init finished; shutting the VM down"),
+            Err(e) => tracing::error!(error = ?e, "microVM init failed; shutting the VM down"),
+        }
+        let error = minimald::guest::shut_down_vm();
+        // Unreachable in practice — `reboot(2)` only fails for a caller without
+        // CAP_SYS_BOOT, and the microVM's pid-1 has it. But falling through to
+        // `return result` would exit init and panic the guest kernel, which is
+        // the wedge #730 is about; never trade one wedge for another. Park
+        // instead, as the boot path's degraded arms do: the kernel stays alive
+        // and idle (no panic-handler spin), the console keeps working, and
+        // `minvmd stop`'s SIGTERM can still reap the VMM.
+        tracing::error!(%error, "shutting the VM down failed; parking pid-1 (exiting it would panic the guest kernel)");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
+
+    result
 }
 
 /// Re-exec this binary in a new session (`setsid`) with `--detach` stripped, so
@@ -689,9 +715,54 @@ async fn async_main() -> Result<(), MainError> {
     }
 }
 
+/// Whether this process is the microVM's init: the kernel runs the initramfs
+/// `/init` (this binary) as pid-1.
+///
+/// Both halves are load-bearing, because this now also gates `reboot(2)` (see
+/// [`minimald::guest::shut_down_vm`]). `argv[0]` is caller-controlled — a host
+/// could run `exec -a init minimald`, and with `CAP_SYS_BOOT` that would reset
+/// the machine on exit — so it cannot be trusted alone. pid-1 cannot be spoofed
+/// from userspace, but a native daemon running as a container's init would
+/// satisfy it, so it is not sufficient alone either. Only the microVM's init
+/// satisfies both.
 fn is_minimal_microvm() -> bool {
-    std::env::args_os()
-        .next()
-        .map(|a0| std::path::Path::new(&a0).file_name() == Some(std::ffi::OsStr::new("init")))
-        .unwrap_or(false)
+    is_microvm_init(std::process::id(), std::env::args_os().next().as_deref())
+}
+
+/// Pure form of [`is_minimal_microvm`], so the spoofing cases are testable —
+/// neither a process's pid nor its `argv[0]` can be set from within a test.
+fn is_microvm_init(pid: u32, argv0: Option<&std::ffi::OsStr>) -> bool {
+    pid == 1
+        && argv0
+            .map(|a0| std::path::Path::new(a0).file_name() == Some(std::ffi::OsStr::new("init")))
+            .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_microvm_init;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn the_microvm_init_is_pid_1_named_init() {
+        assert!(is_microvm_init(1, Some(OsStr::new("/init"))));
+        assert!(is_microvm_init(1, Some(OsStr::new("init"))));
+    }
+
+    /// The guard gates `reboot(2)`: a host process that merely *claims* to be
+    /// init (`exec -a init minimald`) must not reach it.
+    #[test]
+    fn a_spoofed_argv0_on_the_host_is_not_the_microvm_init() {
+        assert!(!is_microvm_init(4242, Some(OsStr::new("/init"))));
+        assert!(!is_microvm_init(4242, Some(OsStr::new("init"))));
+    }
+
+    /// pid-1 alone is not enough either: a native daemon can be a container's
+    /// init, and it must keep exiting normally rather than resetting the box.
+    #[test]
+    fn pid_1_under_another_name_is_not_the_microvm_init() {
+        assert!(!is_microvm_init(1, Some(OsStr::new("/usr/bin/minimald"))));
+        assert!(!is_microvm_init(1, Some(OsStr::new("minimald"))));
+        assert!(!is_microvm_init(1, None));
+    }
 }

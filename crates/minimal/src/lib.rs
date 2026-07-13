@@ -1131,7 +1131,21 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
 
     match resp {
         ShutdownResponse::ShuttingDown => {
+            // Drop our connection before waiting: the daemon holds the shutdown
+            // open for its drain grace period while a client is still attached,
+            // and we are that client.
+            drop(client);
             println!("Daemon is shutting down.");
+            // The wait polls the lifecycle file on a sleep loop, so it goes on
+            // the blocking pool rather than stalling an async worker for up to
+            // 20s (rust-coding-standards: no blocking in an async context).
+            let (use_minvmd, minimal_dir) = (global.minvmd, global.minimal_dir.clone());
+            tokio::task::spawn_blocking(move || {
+                autospawn::wait_for_daemon_stopped(use_minvmd, minimal_dir.as_deref())
+            })
+            .await
+            .context("The wait for the daemon to stop panicked")?
+            .context("Failed while waiting for the daemon to stop")?;
             Ok(())
         }
         ShutdownResponse::SessionsLive => {
