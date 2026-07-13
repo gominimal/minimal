@@ -75,10 +75,6 @@ jobs:
               # it post-merge.
               - ".github/actions/setup-libkrun-linux/**"
               - ".github/actions/materialize/**"
-              # The gvproxy pin: point-of-use verification (fetch-gvproxy.sh
-              # SHA-checks it in this lane) replaced the retired ci-gvproxy.yml
-              # workflow, so a pin bump must re-run this lane.
-              - "vendor/gvproxy/**"
 
   build-linux:
     # BUILD phase: compile everything the KVM tests need and ship it as one
@@ -276,14 +272,6 @@ jobs:
             echo "MINVMD_INITRAMFS=$TESTBED/initramfs.cpio"
           } >> "$GITHUB_ENV"
 
-      - name: Materialize gvproxy switch binary
-        # The gvproxy relay e2e (vsock_relay_root_e2e) spawns this per-host
-        # switch binary; pin-verified, no Go toolchain. Publish its path for the
-        # root harness step below.
-        run: |
-          ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
-          echo "MINVMD_GVPROXY_BIN=$RUNNER_TEMP/gvproxy" >> "$GITHUB_ENV"
-
       - name: Materialize guest kernel (raw Image)
         uses: ./.github/actions/materialize
         with:
@@ -300,15 +288,18 @@ jobs:
           arch: x86_64
           channel: unstable
 
-      - name: VM e2e harnesses (non-root, auto-discovered)
-        # Convention over enumeration: run every non-root harness the archive
-        # carries — `binary(/_e2e$/)` minus the `_root_e2e` root harnesses —
-        # so a new crates/minvmd/tests/*_e2e.rs file is picked up here with
-        # zero workflow edit (the N7 auto-discovery contract; a normal unit
-        # test in minvmd guards the suffix). `--run-ignored all` runs the
-        # `#[ignore]`-gated bodies; `--no-tests=fail` reds the job if the
+      - name: VM e2e harnesses (auto-discovered)
+        # Convention over enumeration: run every harness the archive carries by
+        # the `_e2e` suffix, so a new crates/minvmd/tests/*_e2e.rs file is picked
+        # up here with zero workflow edit (the N7 auto-discovery contract; a
+        # normal unit test in minvmd guards the suffix). `--run-ignored all` runs
+        # the `#[ignore]`-gated bodies; `--no-tests=fail` reds the job if the
         # filterset ever matches nothing. MINVMD_E2E=1 is set job-wide; profile
         # vm is serial with fail-fast, so a failure preserves its own boot.log.
+        # The `not binary(/_root_e2e$/)` guard is defensive: minvmd has no root
+        # harness today (its host-side tap relay moved into the guest minimald),
+        # so if one is ever added it must get its own sudo-wrapped step rather
+        # than run unprivileged here.
         env:
           MINVMD_BOOT_LOG: ${{ runner.temp }}/boot.log
         run: |
@@ -317,39 +308,23 @@ jobs:
             --run-ignored all --no-tests=fail \
             -E 'binary(/_e2e$/) and not binary(/_root_e2e$/)'
 
-      - name: VM e2e harnesses (root, auto-discovered)
-        # The `_root_e2e` harnesses (currently the gvproxy relay proof) boot an
-        # OwnIp VM and need CAP_NET_ADMIN (tap + netns) on top of /dev/kvm and
-        # the gvproxy binary, so they run under `sudo -E` — which preserves the
-        # testbed env while granting the capabilities. Selected by suffix, so a
-        # new *_root_e2e.rs file joins this step with no workflow edit.
-        # MINVMD_INTEGRATION_TEST gates the relay body's VM boot / tun access.
-        env:
-          MINVMD_INTEGRATION_TEST: "1"
-        run: |
-          sudo -E env "PATH=$PATH" "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" \
-            cargo-nextest nextest run --archive-file "$TESTBED/nextest-archive.tar.zst" \
-              --workspace-remap "$GITHUB_WORKSPACE" --profile vm \
-              --run-ignored all --no-tests=fail -E 'binary(/_root_e2e$/)'
-
       # NOTE: bridge_e2e was removed (N7) — it targeted the retired Stage-1
       # guest "vsock stub" (a socat/cat echo on port 2222) that minimald-as-pid1
       # superseded with a direct SSH session server. Session coverage of the
-      # bridge is provided by minimald_session_e2e (in the non-root step above)
+      # bridge is provided by minimald_session_e2e (in the harness step above)
       # plus the daemon lifecycle step below.
 
       - name: Reap leftover VM processes
-        # The harness runs above can leak __krun-vmm / gvproxy children on
-        # failure (Guest::drop kills only its own minvmd), and a leftover
-        # wedges the vsock bridge for the fresh daemons the next two steps
-        # spawn (lifecycle, then the CLI session e2e). Root-owned leftovers
-        # are possible here (the relay e2e runs under sudo), hence sudo.
-        # Ported from the macOS lane; the proper fix is for the harness to
-        # reap its own process group, tracked separately.
+        # The harness runs above can leak __krun-vmm children on failure
+        # (Guest::drop kills only its own minvmd), and a leftover wedges the
+        # vsock bridge for the fresh daemons the next two steps spawn
+        # (lifecycle, then the CLI session e2e). The harnesses run as the
+        # runner, so leftovers are runner-owned; sudo is kept as a defensive
+        # backstop. Ported from the macOS lane; the proper fix is for the
+        # harness to reap its own process group, tracked separately.
         run: |
           sudo pkill -x minvmd || true
           sudo pkill -f __krun-vmm || true
-          sudo pkill -f gvproxy || true
 
       - name: Daemon lifecycle (run --detach → status → stop)
         # Exercises the supervised daemon path that manages the lifecycle
