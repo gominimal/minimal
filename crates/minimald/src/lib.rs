@@ -40,13 +40,16 @@ pub struct ChannelConfig {
 }
 
 #[cfg(test)]
-mod e2e_naming_convention {
-    //! Guards the root-e2e auto-discovery contract. The native lane's
-    //! `minimald-root-e2e` job selects harnesses by binary-name suffix
-    //! (`-E 'binary(/_root_e2e$/)'`) instead of a hardcoded `--test` list, so a
-    //! new `crates/minimald/tests/*_root_e2e.rs` runs with no workflow edit. A
-    //! root harness whose name lacks the suffix would silently drop out of that
-    //! job; this unit test (runs in `core-tests`) fails loudly instead.
+mod integration_naming_convention {
+    //! Guards the integration-test auto-discovery contract (root variant). The
+    //! native lane's `minimald-root-integration` job selects harnesses by
+    //! binary-name suffix (`-E 'binary(/_root_integration$/)'`) instead of a
+    //! hardcoded `--test` list, so a new
+    //! `crates/minimald/tests/*_root_integration.rs` runs with no workflow edit.
+    //! A root harness whose name lacks the suffix would silently drop out of that
+    //! job; this unit test (runs in `core-tests`) fails loudly instead. See
+    //! `minvmd`'s guard for when to add an integration harness vs. a full-system
+    //! e2e script.
 
     /// Files intentionally NOT auto-discovered: `mesh_uc7` is the mothballed
     /// WireGuard mesh proof (feature `networking-wg`, off by default, no CI lane
@@ -54,7 +57,7 @@ mod e2e_naming_convention {
     const ALLOWLIST: &[&str] = &["mesh_uc7.rs"];
 
     #[test]
-    fn every_integration_test_binary_ends_in_e2e() {
+    fn every_integration_test_binary_ends_in_integration() {
         let tests_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
         let offenders: Vec<String> = std::fs::read_dir(&tests_dir)
             .expect("minimald/tests directory must exist")
@@ -62,13 +65,15 @@ mod e2e_naming_convention {
             .map(|entry| entry.path())
             .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "rs"))
             .filter_map(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
-            // `_root_e2e.rs` also ends in `_e2e.rs`, so both variants pass.
-            .filter(|name| !name.ends_with("_e2e.rs") && !ALLOWLIST.contains(&name.as_str()))
+            // `_root_integration.rs` also ends in `_integration.rs`, so both variants pass.
+            .filter(|name| {
+                !name.ends_with("_integration.rs") && !ALLOWLIST.contains(&name.as_str())
+            })
             .collect();
         assert!(
             offenders.is_empty(),
-            "every integration test in crates/minimald/tests/ must end in `_e2e.rs` \
-             (root harnesses in `_root_e2e.rs`) so the native lane auto-discovers it, \
+            "every integration test in crates/minimald/tests/ must end in `_integration.rs` \
+             (root harnesses in `_root_integration.rs`) so the native lane auto-discovers it, \
              or be added to ALLOWLIST if deliberately un-run; offenders: {offenders:?}"
         );
     }

@@ -22,13 +22,13 @@
 //!
 //! Both tests are `#[ignore]` and additionally early-return unless
 //! `MINIMALD_NETNS_TEST` is set, and read the gvproxy binary from `GVPROXY_BIN`.
-//! Auto-discovered by the native lane's `minimald-root-e2e` job via its
-//! `_root_e2e` binary-name suffix (`-E 'binary(/_root_e2e$/)'`) — ubuntu-latest
+//! Auto-discovered by the native lane's `minimald-root-integration` job via its
+//! `_root_integration` binary-name suffix (`-E 'binary(/_root_integration$/)'`) — ubuntu-latest
 //! with unprivileged userns + sudo for netns/tap and a userspace gvproxy switch,
-//! no KVM; a new `crates/minimald/tests/*_root_e2e.rs` joins that job with no
+//! no KVM; a new `crates/minimald/tests/*_root_integration.rs` joins that job with no
 //! workflow edit. To run locally you need a netns-capable host (unprivileged
 //! userns + sudo) and a pinned gvproxy (scripts/fetch-gvproxy.sh):
-//! `MINIMALD_NETNS_TEST=1 GVPROXY_BIN=... cargo test -p minimald --test netns_root_e2e -- --include-ignored`
+//! `MINIMALD_NETNS_TEST=1 GVPROXY_BIN=... cargo test -p minimald --test netns_root_integration -- --include-ignored`
 #![cfg(target_os = "linux")]
 
 use std::path::PathBuf;

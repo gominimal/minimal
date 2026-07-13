@@ -13,10 +13,10 @@ name: CI (Linux native)
 # PR, while a skipped in-workflow job just reports `skipped`, which the
 # aggregator treats as pass. Do NOT add trigger-level `paths:` here.
 #
-# minimald's root end-to-end proofs (the network-namespace proofs — no-network
+# minimald's root integration proofs (the network-namespace proofs — no-network
 # egress isolation, static ingress port mapping, and task-to-task connectivity
-# over the gvproxy switch) run here in the `minimald-root-e2e` job (sudo + a
-# userspace gvproxy switch, no KVM), auto-discovered by the `_root_e2e`
+# over the gvproxy switch) run here in the `minimald-root-integration` job (sudo + a
+# userspace gvproxy switch, no KVM), auto-discovered by the `_root_integration`
 # binary-name convention. The `networking-proxy` (mTLS reverse proxy) feature
 # tests and the WireGuard mesh (`networking-wg`) proof are deliberately NOT run
 # in this lane — see the note on the tests job.
@@ -88,7 +88,7 @@ jobs:
     # (mTLS reverse proxy) and `--features networking-wg` (WireGuard mesh) test
     # steps that ci.yml's `test` job still carries, and the WireGuard mesh
     # proof (crates/minimald/tests/mesh_uc7.rs). The network-namespace proofs
-    # (crates/minimald/tests/netns_root_e2e.rs) run in the `minimald-root-e2e`
+    # (crates/minimald/tests/netns_root_integration.rs) run in the `minimald-root-integration`
     # job below. The rest stay in-tree and runnable locally, just not CI-covered.
     needs: [changes]
     if: github.event_name != 'pull_request' || needs.changes.outputs.native == 'true'
@@ -144,10 +144,10 @@ jobs:
           export PATH="$PWD/target/debug:$PATH"
           ./scripts/session-e2e.sh
 
-  minimald-root-e2e:
-    # minimald's root end-to-end proofs, auto-discovered by the `_root_e2e`
-    # binary-name convention — a new crates/minimald/tests/*_root_e2e.rs runs
-    # here with no workflow edit. Today that is netns_root_e2e: the
+  minimald-root-integration:
+    # minimald's root integration proofs, auto-discovered by the `_root_integration`
+    # binary-name convention — a new crates/minimald/tests/*_root_integration.rs runs
+    # here with no workflow edit. Today that is netns_root_integration: the
     # network-namespace proofs — a no-network task can't reach the internet, a
     # static ingress mapping exposes then removes a task's port, and two own-IP
     # tasks reach each other — on a real gvproxy switch, driving the PRODUCTION
@@ -170,7 +170,7 @@ jobs:
           # Builds minimald's integration targets, not the workspace suite.
           shared-key: netns
       - name: Install nextest
-        # Convention selection is a nextest filterset (binary(/_root_e2e$/));
+        # Convention selection is a nextest filterset (binary(/_root_integration$/));
         # cargo test cannot select test targets by pattern.
         uses: taiki-e/install-action@v2
         with:
@@ -191,24 +191,24 @@ jobs:
           fi
           sudo ip netns del _ci_probe 2>/dev/null || true
           echo "netns capability: OK"
-      - name: Run minimald root e2e proofs (auto-discovered)
+      - name: Run minimald root integration proofs (auto-discovered)
         env:
           MINIMALD_NETNS_TEST: "1"
           GVPROXY_BIN: ${{ runner.temp }}/gvproxy
-        # `binary(/_root_e2e$/)` selects every root harness by suffix;
+        # `binary(/_root_integration$/)` selects every root harness by suffix;
         # `--run-ignored all` flips the #[ignore] proofs from early-return to
         # run; `--no-tests=fail` reds the job if the convention ever matches
         # nothing. The tap/netns commands sudo themselves.
         run: |
           cargo nextest run -p minimald --profile ci \
-            --run-ignored all --no-tests=fail -E 'binary(/_root_e2e$/)'
+            --run-ignored all --no-tests=fail -E 'binary(/_root_integration$/)'
 
   # Single required status check for this lane (branch-protection context:
   # ci-linux-native-success). Green when every gating job succeeded OR was
   # path-skipped; red only on failure/cancellation.
   ci-linux-native-success:
     if: always()
-    needs: [changes, tests, native-daemon-e2e, minimald-root-e2e]
+    needs: [changes, tests, native-daemon-e2e, minimald-root-integration]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

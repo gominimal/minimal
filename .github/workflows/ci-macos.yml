@@ -164,7 +164,7 @@ jobs:
     e2e:
         # Hypervisor E2E on real hardware, using the cache-pulled kernel + rootfs
         # ext4 image and the built initramfs (all from the `artifacts` job). One
-        # job (formerly boot-e2e + autospawn-e2e + build-macos's FFI smoke) so
+        # job (formerly separate boot, autospawn, and FFI-smoke jobs) so
         # the single shared runner checks out, builds, and codesigns exactly
         # once per run — everything that does NOT need the hypervisor lives in
         # the GitHub-hosted `unit` job, keeping this runner free.
@@ -226,8 +226,8 @@ jobs:
               # krun_start_enter fails with EINVAL; `nextest run --archive-file`
               # is offline (no rebuild), so the signature survives. The archive
               # carries every minvmd test binary, so the harnesses are selected
-              # by the `_e2e` convention below with no per-test list — a new
-              # crates/minvmd/tests/*_e2e.rs is picked up with no yaml. The
+              # by the `_integration` convention below with no per-test list — a new
+              # crates/minvmd/tests/*_integration.rs is picked up with no yaml. The
               # full-boot harnesses spawn minvmd as a subprocess (resolved via
               # MINVMD_BIN to the codesigned bin); minimal spawns minvmd by name
               # from PATH. The archive step also leaves the per-test binaries in
@@ -274,21 +274,21 @@ jobs:
               # set, so it takes the bring-up-only path: no krun_start_enter, no
               # codesigned entitlement needed. Run directly from the built test
               # binary (never `cargo test`, which would relink and unsign
-              # minvmd). krun_smoke_e2e is EXCLUDED from the archive run below:
+              # minvmd). krun_smoke_integration is EXCLUDED from the archive run below:
               # unlike the full-boot harnesses (which boot via the codesigned
               # minvmd subprocess), it boots in-process through krun_smoke_child,
               # which cannot take the hypervisor entitlement from within the
               # archive — so it runs here, kernel-less, instead.
               run: |
-                  testbin="$(ls -1t target/debug/deps/krun_smoke_e2e-* | grep -v '\.d$' | head -1)"
-                  test -x "$testbin" || { echo "::error::krun_smoke_e2e test binary not found"; exit 1; }
+                  testbin="$(ls -1t target/debug/deps/krun_smoke_integration-* | grep -v '\.d$' | head -1)"
+                  test -x "$testbin" || { echo "::error::krun_smoke_integration test binary not found"; exit 1; }
                   MINVMD_E2E=1 "$testbin" --include-ignored --nocapture
-            - name: VM e2e harnesses (auto-discovered from the archive)
-              # Run every full-boot harness the archive carries by the `_e2e`
-              # convention — `binary(/_e2e$/)` minus the `_root_e2e` harnesses
-              # (Linux-only; empty here) and minus krun_smoke_e2e (the kernel-less
-              # FFI smoke run above). Currently boot_e2e, minimald_session_e2e,
-              # and volume_quiesce_e2e; a new *_e2e.rs joins with no yaml. Each
+            - name: VM integration harnesses (auto-discovered from the archive)
+              # Run every full-boot harness the archive carries by the `_integration`
+              # convention — `binary(/_integration$/)` minus the `_root_integration` harnesses
+              # (Linux-only; empty here) and minus krun_smoke_integration (the kernel-less
+              # FFI smoke run above). Currently boot_integration, minimald_session_integration,
+              # and volume_quiesce_integration; a new *_integration.rs joins with no yaml. Each
               # boots the GENERIC upstream rootfs with minimald as the initramfs
               # /init and drives the full Stage-2 path (russh client -> bridge ->
               # guest vsock -> minimald, no socat relay) over the codesigned
@@ -308,7 +308,7 @@ jobs:
                     --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" \
                     --workspace-remap "$GITHUB_WORKSPACE" --profile vm \
                     --run-ignored all --no-tests=fail \
-                    -E 'binary(/_e2e$/) and not binary(/_root_e2e$/) and not binary(krun_smoke_e2e)'
+                    -E 'binary(/_integration$/) and not binary(/_root_integration$/) and not binary(krun_smoke_integration)'
             - name: Reap Session-E2E leftovers before the CLI e2e
               # The session harness (Guest::drop) kills its minvmd but not the
               # rest of the process tree it spawned: the detached `__krun-vmm`
