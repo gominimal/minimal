@@ -10,6 +10,13 @@ inputs:
     description: rust-cache shared-key, forwarded to setup-rust.
     required: false
     default: tests
+  save-if:
+    description: >
+      Whether this job may write the cache, forwarded to setup-rust. Nightly
+      canaries pass "false" so a throwaway beta/updated-deps build never
+      consumes the shared pool the real lanes restore from.
+    required: false
+    default: ${{ github.ref == 'refs/heads/main' }}
 
 runs:
   using: composite
@@ -18,6 +25,7 @@ runs:
       uses: ./.github/actions/setup-rust
       with:
         shared-key: ${{ inputs.shared-key }}
+        save-if: ${{ inputs.save-if }}
     - name: Install nextest
       uses: taiki-e/install-action@v2
       with:

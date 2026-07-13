@@ -16,6 +16,9 @@ on:
   push:
     branches: ["main"]
   workflow_dispatch:
+  # Reused by nightly-tests.yml to re-run the suite against a fresh runner
+  # image even when install.sh is untouched (runner-image shell drift).
+  workflow_call:
 
 # Cancel superseded runs on a branch; never cancel a run on main.
 concurrency:

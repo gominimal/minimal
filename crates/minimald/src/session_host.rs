@@ -24,8 +24,6 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::RequestedPty;
-#[cfg(not(test))]
-use crate::session::SessionHandle;
 use crate::session::SessionPaths;
 #[cfg(not(test))]
 use sessions::NetworkMode;
@@ -729,8 +727,6 @@ const BASELINE_VARS: &[(&str, &str)] = &[(
 #[cfg(not(test))]
 pub(crate) struct SandboxLauncher {
     pub(crate) ctx: mctx::Context,
-    #[allow(dead_code)]
-    pub(crate) session: SessionHandle,
     pub(crate) network_mode: NetworkMode,
     /// Shared per-host gvproxy switch. Used only for
     /// [`NetworkMode::OwnIp`] launches.
@@ -809,6 +805,10 @@ impl SessionLauncher for SandboxLauncher {
         let ingress = self.ingress;
         let network_mode = self.network_mode;
         let net_switch = self.net_switch;
+        // The session name, registered as this PTask's `*.min.internal` hostname on
+        // an own-IP attach (finding #3 / UC6); cloned because `name` is consumed by
+        // the sandbox env below.
+        let session_name = name.clone();
         let composition = self.composition;
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
@@ -1034,6 +1034,7 @@ impl SessionLauncher for SandboxLauncher {
                     tap_fd,
                     sock,
                     lease_ip,
+                    &session_name,
                     ingress.as_ref(),
                 )
                 .await
@@ -1057,6 +1058,7 @@ impl SessionLauncher for SandboxLauncher {
             } else if matches!(network_mode, NetworkMode::OwnIp) {
                 let network = crate::net::gvproxy_network::GvproxyNetwork::new(
                     std::sync::Arc::clone(&net_switch),
+                    session_name,
                     ingress,
                 );
                 match network.attach(process.id()).await {

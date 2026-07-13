@@ -32,6 +32,9 @@ use crate::net::switch::SwitchRelay;
 pub(crate) struct GvproxyNetwork {
     /// The shared per-host switch (the daemon-scoped process owner / refcounter).
     switch: Arc<Mutex<SwitchClient>>,
+    /// The session name, registered as this PTask's `*.min.internal` hostname on
+    /// attach so peers can resolve it (finding #3 / UC6).
+    session_name: String,
     /// Static ingress port mappings to apply once attached; `None`/empty for none.
     ingress: Option<sessions::IngressPolicy>,
 }
@@ -39,9 +42,14 @@ pub(crate) struct GvproxyNetwork {
 impl GvproxyNetwork {
     pub(crate) fn new(
         switch: Arc<Mutex<SwitchClient>>,
+        session_name: String,
         ingress: Option<sessions::IngressPolicy>,
     ) -> Self {
-        Self { switch, ingress }
+        Self {
+            switch,
+            session_name,
+            ingress,
+        }
     }
 }
 
@@ -60,9 +68,14 @@ impl Network for GvproxyNetwork {
 
     fn attach(&self, netns_pid: u32) -> AttachFuture<'_> {
         Box::pin(async move {
-            let guard = attach_own_ip(&self.switch, netns_pid, self.ingress.as_ref())
-                .await
-                .map_err(NetworkError::new)?;
+            let guard = attach_own_ip(
+                &self.switch,
+                netns_pid,
+                &self.session_name,
+                self.ingress.as_ref(),
+            )
+            .await
+            .map_err(NetworkError::new)?;
             Ok(Box::new(guard) as Box<dyn NetGuard>)
         })
     }
@@ -119,6 +132,7 @@ impl NetGuard for OwnIpGuard {
 async fn attach_own_ip(
     switch: &Arc<Mutex<SwitchClient>>,
     netns_pid: u32,
+    session_name: &str,
     ingress: Option<&sessions::IngressPolicy>,
 ) -> io::Result<OwnIpGuard> {
     use crate::net::SwitchTransport;
@@ -154,11 +168,13 @@ async fn attach_own_ip(
 
     // On any failure after the switch attach succeeded, roll the attach back so
     // gvproxy's refcount stays accurate (a leaked count would keep it running).
+    let gate = crate::net::switch::IngressGate::for_session(lease.ip.to_string(), ingress);
     let relay = match async {
         let tap_fd = open_tap(&tap)?;
         move_tap_into_netns(&tap, netns_pid, lease, subnet).await?;
-        // Relay the tap's raw frames over vsock to the host gvproxy `minvmd` owns.
-        attach_to_switch_vsock(tap_fd, cid, port).await
+        // Relay the tap's raw frames over vsock to the host gvproxy `minvmd` owns,
+        // gating inbound traffic by this PTask's ingress policy (finding #2).
+        attach_to_switch_vsock(tap_fd, cid, port, Some(gate)).await
     }
     .await
     {
@@ -174,7 +190,7 @@ async fn attach_own_ip(
     // This path owns its own rollback (no session-host guard), so detach if the
     // ingress-applying tail fails.
     let control = ControlChannel::Vsock { cid, port };
-    match finish_own_ip_attach(switch, relay, control, lease.ip, ingress).await {
+    match finish_own_ip_attach(switch, relay, control, lease.ip, session_name, ingress).await {
         Ok(guard) => Ok(guard),
         Err(e) => {
             let _ = switch.lock().await.detach().await;
@@ -198,14 +214,16 @@ pub(crate) async fn complete_local_own_ip_attach(
     tap_fd: OwnedFd,
     sock: PathBuf,
     lease_ip: Ipv4Addr,
+    session_name: &str,
     ingress: Option<&sessions::IngressPolicy>,
 ) -> io::Result<OwnIpGuard> {
     // Rollback of the pre-spawn phase-1 attach is owned by the session host's
     // launch guard (which also covers a cancelled launch), so a failure here just
     // propagates — detaching would double-decrement gvproxy's attach count.
-    let relay = crate::net::switch::attach_to_switch(tap_fd, &sock).await?;
+    let gate = crate::net::switch::IngressGate::for_session(lease_ip.to_string(), ingress);
+    let relay = crate::net::switch::attach_to_switch(tap_fd, &sock, Some(gate)).await?;
     let control = ControlChannel::Unix(sock);
-    finish_own_ip_attach(switch, relay, control, lease_ip, ingress).await
+    finish_own_ip_attach(switch, relay, control, lease_ip, session_name, ingress).await
 }
 
 /// Shared tail of both own-IP attach paths: apply static ingress forwards (R2.3)
@@ -219,6 +237,7 @@ async fn finish_own_ip_attach(
     relay: SwitchRelay,
     control: ControlChannel,
     lease_ip: Ipv4Addr,
+    session_name: &str,
     ingress: Option<&sessions::IngressPolicy>,
 ) -> io::Result<OwnIpGuard> {
     let exposed = match ingress {
@@ -233,6 +252,22 @@ async fn finish_own_ip_attach(
         }
         _ => Vec::new(),
     };
+
+    // Register this PTask's `<name>.<host-id>.min.internal` → its current lease so
+    // peer sessions can resolve it (finding #3 / UC6). Done for *every* own-IP
+    // PTask, even with no ingress: resolvable names are how peers find each other,
+    // and the ingress gate independently governs reachability. Best-effort — a DNS
+    // hiccup must not fail an otherwise-working attach.
+    if let Err(e) = crate::net::policy::register_dns_name(
+        &control,
+        crate::net::dns::DEFAULT_HOST_ID,
+        session_name,
+        lease_ip,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, session = session_name, "registering *.min.internal name on gvproxy");
+    }
 
     Ok(OwnIpGuard {
         _relay: relay,

@@ -94,7 +94,7 @@ nix = { version = "0.31", features = ["fs"] }
 nutype = { version = "0.7", features = ["serde"] }
 object = { version = "0.39", default-features = false, features = ["archive", "elf", "read_core", "std"] }
 oci-spec = "0.10"
-path-absolutize = "3.1"
+path-absolutize = "4.0"
 rand = "0.10"
 # rand_core 0.6 (not 0.10) to match boringtun/x25519-dalek's RNG traits for
 # WireGuard keypair generation (`networking-wg`).

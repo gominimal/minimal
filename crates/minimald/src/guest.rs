@@ -631,8 +631,6 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     let gateway = DEFAULT_SUBNET.gateway();
     let cidr = format!("{ip}/{}", DEFAULT_SUBNET.prefix());
 
-    let _ = &cidr; // (kept for log context below)
-
     // Open the tap in the current (root) netns; the OwnedFd keeps it alive.
     let tap_fd = switch::open_tap(TAP).map_err(|e| {
         std::io::Error::new(e.kind(), format!("open_tap({TAP}) [/dev/net/tun]: {e}"))
@@ -654,7 +652,8 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
 
     // Relay the tap to the host gvproxy over the vsock shuttle (CID 2).
     let relay =
-        switch::attach_to_switch_vsock(tap_fd, VSOCK_HOST_CID, VSOCK_GVPROXY_SHUTTLE_PORT).await?;
+        switch::attach_to_switch_vsock(tap_fd, VSOCK_HOST_CID, VSOCK_GVPROXY_SHUTTLE_PORT, None)
+            .await?;
     tracing::info!(%cidr, %gateway, "guest root egress up via host gvproxy shuttle");
     Ok(relay)
 }

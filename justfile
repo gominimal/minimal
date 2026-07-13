@@ -10,8 +10,9 @@ musl-target := arch + "-unknown-linux-musl"
 # Flat libkrun link/runtime prefix (Linux only; macOS uses the Homebrew install).
 krun-prefix := env_var('HOME') / ".krun"
 # Guest minimald networking features baked into the initramfs (R4.x): the HTTPS
-# reverse proxy (mTLS) and the WireGuard mesh peer.
-features    := "networking-proxy,networking-wg"
+# reverse proxy (mTLS). The WireGuard mesh peer (networking-wg) is disabled for
+# now (UC7 / UC2b-A deferred).
+features    := "networking-proxy"
 kernel      := scratch / "vmlinuz"
 rootfs      := scratch / "rootfs.img"
 initramfs   := scratch / "initramfs.cpio"
