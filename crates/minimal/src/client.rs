@@ -205,7 +205,7 @@ mod tests {
 
         // `start_paused` auto-advances time while nothing is runnable, so the
         // deadline elapses in virtual time — the test does not wait it out.
-        let err = Client::connect(&sock).await.unwrap_err();
+        let err = Client::connect(&sock).await.map(|_| ()).unwrap_err();
         assert!(
             err.to_string().contains("no live daemon"),
             "expected a handshake-deadline error, got: {err:#}"
