@@ -233,17 +233,17 @@ fn main() -> Result<(), MainError> {
     let result = runtime.block_on(async_main());
 
     // As the microVM's pid-1 we must not return: exiting init panics the guest
-    // kernel and wedges the VM (#730). Power the VM off instead — a clean
+    // kernel and wedges the VM (#730). Take the VM down instead — a clean
     // shutdown (the `Shutdown` RPC drained the server) and a failed one alike,
     // since either way there is no init left to run. Diverges on success.
     #[cfg(target_os = "linux")]
     if is_minimal_microvm() {
         match &result {
-            Ok(()) => tracing::info!("microVM init finished; powering the VM off"),
-            Err(e) => tracing::error!(error = ?e, "microVM init failed; powering the VM off"),
+            Ok(()) => tracing::info!("microVM init finished; shutting the VM down"),
+            Err(e) => tracing::error!(error = ?e, "microVM init failed; shutting the VM down"),
         }
-        let error = minimald::guest::power_off();
-        tracing::error!(%error, "powering the VM off failed; exiting init will panic the guest");
+        let error = minimald::guest::shut_down_vm();
+        tracing::error!(%error, "shutting the VM down failed; exiting init will panic the guest");
     }
 
     result

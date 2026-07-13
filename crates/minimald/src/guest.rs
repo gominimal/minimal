@@ -548,29 +548,43 @@ pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Power the microVM off. Does not return on success: the kernel halts the
-/// guest and libkrun's VMM exits with it. On failure it returns the `reboot(2)`
-/// error.
+/// Take the microVM down, by resetting it. Does not return on success: the
+/// guest resets, and libkrun's VMM exits with it. On failure it returns the
+/// `reboot(2)` error.
+///
+/// ONLY call this as the microVM's pid-1 (guard with [`is_minimal_microvm`]):
+/// on an ordinary host it reboots the machine.
 ///
 /// This is how the guest ends. As pid-1 minimald has nothing to return to:
 /// letting `main` exit kills init, which panics the kernel ("Attempted to kill
 /// init!") — and with no `panic=` on the cmdline the kernel then spins in the
 /// panic handler forever. The VMM stays alive on a dead guest, the host keeps
 /// reporting the VM as `Running`, and every later CLI command blocks on a
-/// bridge socket nothing is behind (#730). Powering off instead lets the
-/// supervisor reap the VMM child and mark the VM `Stopped`, so the next command
+/// bridge socket nothing is behind (#730). Taking the VM down instead lets the
+/// supervisor reap the VMM child and mark it `Stopped`, so the next command
 /// boots a fresh one.
+///
+/// Reset (`RB_AUTOBOOT`), not power-off: a guest-initiated reset is what makes
+/// a firecracker-family VMM exit, and it is the only mechanism that works on
+/// both arches. `RB_POWER_OFF` needs a `pm_power_off` handler, which the x86_64
+/// guest kernel does not have — there the kernel logs "Power off not available:
+/// System halted instead" and halts the vCPU with the VMM still alive, which is
+/// #730 all over again. (aarch64 does have one, via PSCI `SYSTEM_OFF`, which is
+/// what hid the gap until CI's x86_64 KVM lane.) Reset reaches
+/// `KVM_EXIT_SHUTDOWN` on both: PSCI `SYSTEM_RESET` on aarch64, i8042 reset /
+/// triple fault on x86_64. libkrun exits on it rather than restarting the
+/// guest, so this ends the VM despite the name.
 ///
 /// `sync(2)` first: `reboot(2)` does not flush filesystems, and this also runs
 /// on the paths that never reached the shutdown quiesce (a failed
 /// `Server::run`).
-pub fn power_off() -> std::io::Error {
+pub fn shut_down_vm() -> std::io::Error {
     // SAFETY: neither call takes pointers. `reboot(2)` needs CAP_SYS_BOOT,
     // which the microVM's pid-1 has, and does not return on success; on failure
     // it returns -1 with errno set, which the caller surfaces.
     unsafe {
         libc::sync();
-        libc::reboot(libc::RB_POWER_OFF);
+        libc::reboot(libc::RB_AUTOBOOT);
     }
     std::io::Error::last_os_error()
 }
