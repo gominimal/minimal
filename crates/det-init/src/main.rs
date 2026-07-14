@@ -291,8 +291,20 @@ async fn async_main() -> Result<(), MainError> {
     // Fork-and-reap (not exec): keep pid-1 alive so we can drain the observer
     // after the sample exits, before `main` takes the VM down. The sample never
     // receives the nonce env (it was only ever set on the observer's Command).
-    // The sample's stdout is the console (debug) — the event feed is the file +
-    // vsock, a separate channel, so there is nothing to corrupt.
+    //
+    // SECURITY — the sample's stdio is NULLED, not inherited. det-init emits the
+    // drained JSONL feed on the guest console (hvc0) and the host worker collects
+    // the feed by scanning that console for `{`-lines. If the untrusted `nobody`
+    // sample's stdout/stderr were inherited onto the same console, it could print
+    // forged `{"event":…}` lines that the worker would accept as real events —
+    // voiding the core invariant "a `nobody` sample cannot write the feed" (e.g.
+    // a forged NetworkDns re-contextualizing a real C2 connect → a signed
+    // BLOCK→PASS). The console is root-owned; nulling the inherited fds removes
+    // the sample's only path to it, so the feed on the console is written solely
+    // by pid-1 (det-init) and stays trustworthy. (The observer's root-0400
+    // /run/det-events.jsonl — provably unwritable by uid 65534, see the
+    // uid-boundary self-check above — is the source of record; draining it fully
+    // out-of-band via /dev/vdb or a host vsock listener is the robust follow-up.)
     let mut sample = Command::new(DROPPRIV);
     sample
         .arg("/bin/sh")
@@ -300,8 +312,8 @@ async fn async_main() -> Result<(), MainError> {
         .arg(&sample_cmd)
         .env("HOME", HONEYTOKEN_HOME)
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut sample = sample
         .spawn()
         .map_err(|e| MainError::IO(e, "spawning the sample under droppriv"))?;
