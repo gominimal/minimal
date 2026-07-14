@@ -819,6 +819,7 @@ fn ensure_mfile_or_prompt(
             .map_err(|e| anyhow::anyhow!("{e}"))?
     };
     run_init_flow(config, false)
+}
 
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
