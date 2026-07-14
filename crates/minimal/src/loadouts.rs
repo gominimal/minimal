@@ -77,10 +77,15 @@ pub(crate) fn compose_options_from_config(
 }
 
 /// Compose the given loadouts into a [`sessions::wire::request::WireContribution`]
-/// under an empty [`UserPolicy`] (user-origin items auto-pass allow
-/// so no rules are needed at this stage).
+/// under the user's [`UserPolicy`] loaded from `user_policy.toml`.
+/// User-origin items auto-pass the allow step but the policy's
+/// `deny` / `ignore` rules still apply, so a loadout patch matching
+/// a deny rule fails the composition here rather than at the daemon.
+///
+/// [`UserPolicy`]: sessions::core::policy::UserPolicy
 pub(crate) fn compose_user_contribution(
     loadouts: Vec<sessions::core::loadout::Loadout>,
+    policy: sessions::core::policy::UserPolicy,
     options: sessions::core::compose::ComposeOptions,
 ) -> Result<sessions::wire::request::WireContribution, anyhow::Error> {
     let mut composer = sessions::client::composer::UserComposer::new();
@@ -88,7 +93,7 @@ pub(crate) fn compose_user_contribution(
         .add_all(loadouts)
         .map_err(|e| anyhow::anyhow!("composing loadouts: {e}"))?;
     composer
-        .compose(sessions::core::policy::UserPolicy::empty(), options)
+        .compose(policy, options)
         .map_err(|e| anyhow::anyhow!("composing loadouts: {e}"))
 }
 
