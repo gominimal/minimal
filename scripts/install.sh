@@ -168,6 +168,12 @@ zsh_comp_dir="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/completions"
 fish_comp_dir="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"
 fish_config="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
 zshrc="${ZDOTDIR:-$HOME}/.zshrc"
+# zsh's compinit caches completion registrations here, and its staleness check
+# is only (zsh version, completion-file count) — it cannot see `_min` appear,
+# change, or vanish when the count happens to stay equal. The dump is a pure,
+# regenerable cache: both install and uninstall drop it when they change the
+# zsh completions, forcing a real rescan on the next zsh startup.
+zcompdump="${ZDOTDIR:-$HOME}/.zcompdump"
 
 marker_start='# >>> minimal >>>'
 marker_end='# <<< minimal <<<'
@@ -227,13 +233,18 @@ do_uninstall() {
     # Tab, computed once, so rows are split on tab alone (R7.3): a dest under a
     # $HOME containing spaces must still parse as one field.
     tab="$(printf '\t')"
-    removed=0 absent=0 kept_modified=0 kept_foreign=0
+    removed=0 absent=0 kept_modified=0 kept_foreign=0 had_zsh_completions=0
 
     # `comp` is informational here and the manifest-hash column (`_`) is unused;
     # `dest`/`want` (the installed hash) drive removal. Read from the record via
     # redirection so the loop body runs in this shell (counters persist).
     while IFS="$tab" read -r comp dest _ want; do
         [ -n "$dest" ] || continue
+
+        # A completions-zsh row (whatever the file's fate below) means a
+        # compinit dump may hold a `min` registration; noted for the cache
+        # drop after the walk.
+        [ "$comp" = completions-zsh ] && had_zsh_completions=1
 
         # Already gone (not even a dangling symlink) — count and continue, which
         # is what makes an interrupted run re-runnable (R7.3).
@@ -290,6 +301,22 @@ do_uninstall() {
         # that must not abort the walk over the remaining rc candidates.
         strip_rc_block "$_rc" || true
     done
+
+    # R9.4 — the `min` registration also lives on inside zsh's compinit dump
+    # (see zcompdump above); left behind, the first `min <tab>` in every new
+    # zsh fails with "function definition file not found". Dropped only when
+    # the record shows zsh completions were installed: the dump belongs to
+    # the user, and an install that never touched zsh completions has no
+    # business clearing their cache.
+    if [ "$had_zsh_completions" -eq 1 ] && [ -f "$zcompdump" ]; then
+        if [ "$dry_run" -eq 1 ]; then
+            say "  would remove compinit dump cache $zcompdump"
+        elif rm -f "$zcompdump" 2>/dev/null; then
+            say "  removed compinit dump cache $zcompdump"
+        else
+            say "  warning: could not remove compinit dump cache $zcompdump"
+        fi
+    fi
 
     # R8.2 — --purge additionally deletes the minimal-owned trees wholesale (build
     # cache included); they live at fixed .../minimal paths the tool owns. It
@@ -535,6 +562,17 @@ if [ -d "$zsh_comp_dir" ]; then
     fpath=("$zsh_comp_dir" \$fpath)
     autoload -Uz compinit
     compinit
+    # compinit trusts a cached dump whenever its (zsh version, completion-file
+    # count) header matches — a check that misses real changes, e.g. one
+    # completions dir replacing another with the same file count. If min is
+    # still unregistered while its completion file exists, the dump lied:
+    # drop it and scan for real. The file-exists guard keeps this from
+    # rebuilding the dump on every startup when completions were never
+    # generated.
+    if [ -f "$zsh_comp_dir/_min" ] && [ -z "\${_comps[min]:-}" ]; then
+        rm -f "\${ZDOTDIR:-\$HOME}/.zcompdump"
+        compinit
+    fi
 fi
 EOF
 record_generated shell-init-zsh "$init_dir/zsh.sh"
@@ -571,6 +609,16 @@ gen_completions() {
         && [ -s "$_tmp" ] \
         && mv -f "$_tmp" "$2" 2>/dev/null; then
         record_generated "completions-$1" "$2"
+        # A pre-existing compinit dump can keep trusting its stale contents
+        # after the zsh completion file changes (see zcompdump above) — the
+        # upgrade path from the pre-rewrite installer hits exactly that, and
+        # "restart your shell" cannot fix it. Cheap rm, so unconditional on
+        # every (re)generation; failure is as non-fatal as the rest of R9.3.
+        if [ "$1" = zsh ] && [ -f "$zcompdump" ]; then
+            if rm -f "$zcompdump" 2>/dev/null; then
+                say "  completions: cleared compinit dump cache $zcompdump"
+            fi
+        fi
     else
         rm -f "$_tmp" 2>/dev/null || true
         say "  completions: warning: could not generate $1 completions (non-fatal)"

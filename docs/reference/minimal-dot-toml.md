@@ -1,5 +1,5 @@
 ---
-description: Schema reference for the minimal.toml configuration file — upstream, harness, defaults, tasks, and outputs sections.
+description: Schema reference for the minimal.toml configuration file — upstream, stack, defaults, tasks, and outputs sections.
 ---
 
 # `minimal.toml`
@@ -20,7 +20,7 @@ repo = "https://github.com/gominimal/pkgs"
 branch = "main"
 locked_commit = "d39aaaa581f983d6b3ba5eaaf383485a602f37f0"
 
-[harness]
+[stack]
 use = "pnpm"
 build_packages = ["railway"]
 
@@ -77,16 +77,19 @@ locked_commit = "<commit hash>" # Updated via `minimal update`
 Sideload repositories have the same layout as an upstream: that is having a `minimal.toml` file, and `packages/` / `harnesses/` / `profiles/`
 directories as needed.
 
-### `[harness]` - How to build code in your repo {#harness}
+### `[stack]` - How to build code in your repo {#harness}
 
 ```toml
-[harness]
+[stack]
 use = "<harness name>"
 build_packages = ["<additional build package>"]     # optional
 runtime_packages = ["<additional runtime package>"] # optional
 ```
 
-The `[harness]` section configures the [harness](/concepts/harnesses) to use for building code, if any.
+The `[stack]` section configures the [harness](/concepts/harnesses) to use for building code, if any.
+
+`[harness]` is accepted as a deprecated alias for `[stack]`, pending removal after
+July 2026; prefer `[stack]` in new configs.
 
 The environment variables and packages configured on a harness are inherited on all tasks in this repository.
 

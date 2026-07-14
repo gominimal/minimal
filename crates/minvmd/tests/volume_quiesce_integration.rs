@@ -8,7 +8,7 @@
 //!    no `vm-up`, non-zero exit — with fatality decided by whether the image
 //!    pre-existed (kept) or was freshly provisioned (removed).
 //!
-//! Gates match `boot_e2e.rs`: `#[cfg(minvmd_libkrun)]`, `#[ignore]`, and
+//! Gates match `boot_integration.rs`: `#[cfg(minvmd_libkrun)]`, `#[ignore]`, and
 //! `MINVMD_E2E=1` with `MINVMD_KERNEL_PATH`/`MINVMD_ROOTFS_PATH`/
 //! `MINVMD_INITRAMFS` set.
 
@@ -54,7 +54,7 @@ fn e2e_enabled(test: &str) -> bool {
 
 /// Isolated per-test environment: a fresh state dir (volume image, state file,
 /// locks, bridge socket) so tests never touch a real VM. Short `/tmp` paths,
-/// matching `boot_e2e::short_state_dir` — the bridge UDS lives inside the
+/// matching `boot_integration::short_state_dir` — the bridge UDS lives inside the
 /// state dir and must fit `sun_path`.
 struct TestEnv {
     _state: tempfile::TempDir,
@@ -148,7 +148,7 @@ impl Drop for StopOnDrop<'_> {
 #[serial]
 #[ignore = "gated MINVMD_E2E=1; requires Mac with libkrun, kernel, rootfs, initramfs"]
 fn stop_quiesces_volume_leaving_clean_ext4_journal() {
-    if !e2e_enabled("volume_quiesce_e2e") {
+    if !e2e_enabled("volume_quiesce_integration") {
         return;
     }
     let env = TestEnv::new();
@@ -199,7 +199,7 @@ fn stop_quiesces_volume_leaving_clean_ext4_journal() {
 #[serial]
 #[ignore = "gated MINVMD_E2E=1; requires Mac with libkrun, kernel, rootfs, initramfs"]
 fn boot_fails_loudly_on_unformattable_fresh_volume() {
-    if !e2e_enabled("volume_quiesce_e2e") {
+    if !e2e_enabled("volume_quiesce_integration") {
         return;
     }
     let env = TestEnv::new();
@@ -238,7 +238,7 @@ fn boot_fails_loudly_on_unformattable_fresh_volume() {
 #[serial]
 #[ignore = "gated MINVMD_E2E=1; requires Mac with libkrun, kernel, rootfs, initramfs"]
 fn boot_fails_fatally_on_unmountable_preexisting_volume() {
-    if !e2e_enabled("volume_quiesce_e2e") {
+    if !e2e_enabled("volume_quiesce_integration") {
         return;
     }
     let env = TestEnv::new();

@@ -198,6 +198,11 @@ jobs:
     # to it. Same definition, reused via workflow_call (no duplication).
     permissions:
       contents: read
+      # ci-shell-installer.yml declares pull-requests: read at the workflow
+      # level (dorny/paths-filter on its PR runs); a called reusable workflow
+      # cannot request a permission the caller withheld, so grant it here too
+      # or the whole nightly fails at startup. It is unused on this non-PR call.
+      pull-requests: read
     uses: ./.github/workflows/ci-shell-installer.yml
 
   hygiene:

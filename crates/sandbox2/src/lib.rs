@@ -25,6 +25,10 @@ pub mod error;
 use crate::config::{Invocation, WdSetup};
 use crate::error::ExecutionError;
 pub use error::Error;
+/// Re-export so downstream crates (e.g. `mctx`) can use the command type
+/// without depending on `hakoniwa` directly.
+#[cfg(target_os = "linux")]
+pub use hakoniwa::Command;
 
 mod listener;
 
@@ -311,16 +315,19 @@ impl<C: Channel> Sandbox<C> {
 }
 
 /// An initialized sandbox environment.
+#[cfg(target_os = "linux")]
 pub struct Container {
     container: hakoniwa::Container,
 }
 
+#[cfg(target_os = "linux")]
 impl AsRef<hakoniwa::Container> for Container {
     fn as_ref(&self) -> &hakoniwa::Container {
         &self.container
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Container {
     /// Instructs the container to perform the setsid() & associate controlling
     /// terminal dance.
@@ -435,12 +442,14 @@ impl Container {
 
 /// Options for [`Sandbox::bind_mount`].
 #[derive(Debug, Default, Clone, Copy)]
+#[cfg(target_os = "linux")]
 struct BindOpts {
     read_only: bool,
     recursive: bool,
 }
 
 // Sandbox usage
+#[cfg(target_os = "linux")]
 impl<C: Channel> Sandbox<C> {
     fn bind_mount(
         path: &Path,
@@ -477,6 +486,7 @@ impl<C: Channel> Sandbox<C> {
     /// on the calling thread and arms `PR_SET_PDEATHSIG(SIGKILL)`, tying the
     /// child's lifetime to that thread. See [`run_with_cancel`](Self::run_with_cancel)
     /// for the thread-affinity constraints this imposes on callers.
+    #[cfg(target_os = "linux")]
     pub fn new_container(&self) -> Result<Container, Error> {
         let mut container = hakoniwa::Container::new();
         container
@@ -749,6 +759,7 @@ impl<C: Channel> Sandbox<C> {
     }
 
     /// Initializes a hakoniwa command structure.
+    #[cfg(target_os = "linux")]
     pub fn command<I, ArgS, IE, EnvK, EnvV>(
         &mut self,
         container: &Container,
@@ -789,6 +800,7 @@ impl<C: Channel> Sandbox<C> {
     ///
     /// Delegates to [`run_with_cancel`](Self::run_with_cancel) — see its docs for
     /// the important thread-affinity constraint on the sandbox container.
+    #[cfg(target_os = "linux")]
     pub async fn run<W1, W2>(
         &mut self,
         invocations: Vec<Invocation>,
@@ -836,6 +848,7 @@ impl<C: Channel> Sandbox<C> {
     /// By contrast, purely-synchronous work that forks no container (e.g. staging
     /// the rootfs in `Sandbox::new`) carries none of this and could be offloaded
     /// to the blocking pool if it ever became hot enough to matter.
+    #[cfg(target_os = "linux")]
     pub async fn run_with_cancel<W1, W2>(
         &mut self,
         invocations: Vec<Invocation>,
@@ -1150,6 +1163,7 @@ impl Sandbox {
 
 // Matches the logic in the libcgroups crate. If we do not conditionally
 // set cpu resources, the underlying code in libcgroups will panic :(
+#[cfg(target_os = "linux")]
 fn booted_with_systemd() -> bool {
     std::fs::symlink_metadata("/run/systemd/system")
         .map(|p| p.is_dir())
@@ -1169,6 +1183,7 @@ fn hardlink_dir_contents(src_dir: &Path, dst_parent_dir: &Path) -> Result<(), Er
 /// hakoniwa, the remount succeeds even in nested sandboxes—without
 /// resorting to MountFallback (which can silently drop requested
 /// restrictions like RDONLY).
+#[cfg(target_os = "linux")]
 fn locked_mount_flags(path: &Path) -> hakoniwa::MountOptions {
     use nix::sys::statfs::statfs;
     use nix::sys::statvfs::FsFlags;
@@ -1242,6 +1257,7 @@ mod tests {
     // mapping and a nested sandbox would silently lose those locked flags
     // again. NOEXEC is also common but skipped here since it's not
     // universal.
+    #[cfg(target_os = "linux")]
     #[test]
     fn locked_mount_flags_reads_proc_flags() {
         let opts = locked_mount_flags(Path::new("/proc"));
@@ -1249,6 +1265,7 @@ mod tests {
         assert!(opts.contains(hakoniwa::MountOptions::NODEV));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn locked_mount_flags_empty_on_statfs_failure() {
         let opts = locked_mount_flags(Path::new("/nonexistent-path-for-statfs-test"));

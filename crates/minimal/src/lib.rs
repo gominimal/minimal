@@ -88,13 +88,10 @@ pub enum Command {
     /// Rename an existing session
     Rename(RenameArgs),
     /// Automatically initialize minimal configuration based on your source tree
-    #[cfg(target_os = "linux")]
     Init(InitArgs),
     /// Add a new tool or dependency
-    #[cfg(target_os = "linux")]
     Add(AddArgs),
     /// Refresh local checkouts of upstream packages & the standard library
-    #[cfg(target_os = "linux")]
     Update(UpdateArgs),
     /// Print CLI and daemon version information
     Version,
@@ -345,7 +342,6 @@ pub struct RenameArgs {
 }
 
 #[derive(Debug, Args)]
-#[cfg(target_os = "linux")]
 pub struct InitArgs {
     /// Skip confirmation, writing configuration based on auto-detection
     #[arg(long, short, default_value_t = false)]
@@ -353,7 +349,6 @@ pub struct InitArgs {
 }
 
 #[derive(Debug, Args)]
-#[cfg(target_os = "linux")]
 pub struct AddArgs {
     #[command(flatten)]
     pub kind: AddKind,
@@ -365,7 +360,6 @@ pub struct AddArgs {
 
 #[derive(Debug, Args)]
 #[group(required = true, multiple = false)]
-#[cfg(target_os = "linux")]
 pub struct AddKind {
     /// Add as a runtime dependency
     #[arg(long)]
@@ -379,7 +373,6 @@ pub struct AddKind {
 }
 
 #[derive(Debug, Args)]
-#[cfg(target_os = "linux")]
 pub struct UpdateArgs {}
 
 #[derive(Debug, Args)]
@@ -445,15 +438,12 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
         Command::Login(args) => cmd_login(&cli.global_args, args).await,
         Command::Version => cmd_version(&cli.global_args).await,
         Command::Rename(args) => cmd_rename(&cli.global_args, args).await,
-        #[cfg(target_os = "linux")]
         Command::Init(args) => cmd_init(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
-        #[cfg(target_os = "linux")]
         Command::Add(args) => cmd_add(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
-        #[cfg(target_os = "linux")]
         Command::Update(args) => cmd_update(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
@@ -561,6 +551,22 @@ pub async fn cmd_proxy(args: ProxyArgs) -> Result<(), anyhow::Error> {
 fn ensure_daemon(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref())
         .context("Failed to ensure the minimald daemon is running")
+}
+
+/// Prompt the user with a yes/no question on stderr. Defaults to yes
+/// (empty input or Y/y/yes returns true; anything else returns false).
+fn confirm(question: &str) -> Result<bool, anyhow::Error> {
+    eprint!("{question} [Y/n] ");
+    std::io::stderr().flush().ok();
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .context("reading stdin")?;
+    let trimmed = input.trim();
+    Ok(trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("y")
+        || trimmed.eq_ignore_ascii_case("yes"))
 }
 
 /// List sessions via the `ListSessions` RPC.
@@ -782,6 +788,39 @@ async fn send_abort(client: &mut client::Client, session_id: sessions::SessionId
     }
 }
 
+/// Check for a `minimal.toml` at the project path. If missing, prompt
+/// the user to initialize one before proceeding with activation.
+fn ensure_mfile_or_prompt(
+    project_path: &camino::Utf8Path,
+    global: &GlobalArgs,
+) -> Result<(), anyhow::Error> {
+    if project_path.join(mfile::MFILE_NAME).exists() {
+        return Ok(());
+    }
+
+    eprintln!("\nNo {} found at {}.", mfile::MFILE_NAME, project_path);
+    if !confirm("Would you like to create one?")? {
+        bail!(
+            "No {} found. Run 'minimal init' to create one.",
+            mfile::MFILE_NAME
+        );
+    }
+
+    let config = if global.repo_dir.is_some() {
+        build_config(global).map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        let mut builder = mctx::ConfigBuilder::new();
+        if let Some(dir) = &global.minimal_dir {
+            builder = builder.with_state_dir(dir).with_cache_dir(dir);
+        }
+        builder
+            .with_repo_dir(project_path.as_std_path())
+            .build()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+    };
+    run_init_flow(config, false)
+}
+
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
@@ -791,7 +830,10 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
 
     let utf8_path = camino::Utf8PathBuf::from_path_buf(project_path)
         .map_err(|_| anyhow::anyhow!("Project path is not valid UTF-8"))?;
-    let abs_path = paths::HostAbsPath::try_new(utf8_path).context("Invalid project path")?;
+    let abs_path =
+        paths::HostAbsPath::try_new(utf8_path.clone()).context("Invalid project path")?;
+
+    ensure_mfile_or_prompt(&utf8_path, global)?;
 
     let mut port_mappings = Vec::with_capacity(args.ingress.len());
     for spec in &args.ingress {
@@ -1349,7 +1391,6 @@ pub async fn cmd_login(global: &GlobalArgs, args: LoginArgs) -> Result<(), anyho
 // -----------------------------------------------------------------------
 
 /// Build an `mctx::Config` from the shared global args.
-#[cfg(target_os = "linux")]
 pub fn build_config(global: &GlobalArgs) -> Result<mctx::Config, mctx::Error> {
     let mut builder = mctx::ConfigBuilder::new();
     if let Some(dir) = &global.minimal_dir {
@@ -1361,44 +1402,31 @@ pub fn build_config(global: &GlobalArgs) -> Result<mctx::Config, mctx::Error> {
     Ok(builder.build()?)
 }
 
-/// Initialize a `minimal.toml` based on the source tree.
-#[cfg(target_os = "linux")]
-pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::Error> {
+/// Run the init flow for a given config: detect the project's stack,
+/// generate a `minimal.toml`, show the plan, prompt for confirmation,
+/// and write the file. Shared by `cmd_init` and the `cmd_activate`
+/// missing-mfile prompt.
+fn run_init_flow(config: mctx::Config, skip_confirm: bool) -> Result<(), anyhow::Error> {
     use op::ProjectOp as _;
-    let config = build_config(global)?;
-    let mut env = mctx::ProjectSetup::for_init(config)?;
-    let plan = op::InitProject.run(&mut env)?;
+    let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let plan = op::InitProject
+        .run(&mut env)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    if !args.yes {
+    if !skip_confirm {
         eprintln!("\nWill create {}:\n", plan.toml_path.display());
         eprintln!("---");
         eprint!("{}", plan.content);
         eprintln!("---");
         eprintln!();
-        eprint!("Continue? [Y/n] ");
-        std::io::stderr().flush().ok();
-
-        let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| mctx::Error::Other(anyhow::anyhow!("reading stdin: {}", e)))?;
-        let trimmed = input.trim();
-        if !(trimmed.eq_ignore_ascii_case("y")
-            || trimmed.eq_ignore_ascii_case("yes")
-            || trimmed.is_empty())
-        {
+        if !confirm("Continue?")? {
             eprintln!("Aborted.");
             return Ok(());
         }
     }
 
-    std::fs::write(&plan.toml_path, &plan.content).map_err(|e| {
-        mctx::Error::Other(anyhow::anyhow!(
-            "writing {}: {}",
-            plan.toml_path.display(),
-            e
-        ))
-    })?;
+    std::fs::write(&plan.toml_path, &plan.content)
+        .with_context(|| format!("writing {}", plan.toml_path.display()))?;
 
     eprintln!("Created {}", plan.toml_path.display());
     eprintln!();
@@ -1412,8 +1440,13 @@ pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::E
     Ok(())
 }
 
+/// Initialize a `minimal.toml` based on the source tree.
+pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::Error> {
+    let config = build_config(global)?;
+    run_init_flow(config, args.yes).map_err(mctx::Error::Other)
+}
+
 /// Add packages as dependencies to the project's `minimal.toml`.
-#[cfg(target_os = "linux")]
 pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Error> {
     let config = build_config(global)?;
     let mut ctx = mctx::Context::new(config)?;
@@ -1448,7 +1481,6 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
 }
 
 /// Refresh local checkouts of upstream packages & the standard library.
-#[cfg(target_os = "linux")]
 pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mctx::Error> {
     use op::ProjectOp as _;
     let config = build_config(global)?;

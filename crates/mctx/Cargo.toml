@@ -21,7 +21,6 @@ tracing.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
-hakoniwa.workspace = true
 sandbox2.workspace = true
 
 args.workspace = true

@@ -59,7 +59,7 @@ const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
 /// required env vars are present when so.
 fn e2e_enabled() -> bool {
     if std::env::var("MINVMD_E2E").as_deref() != Ok("1") {
-        eprintln!("minimald_session_e2e: MINVMD_E2E != 1, skipping");
+        eprintln!("minimald_session_integration: MINVMD_E2E != 1, skipping");
         return false;
     }
     for var in &[
@@ -69,7 +69,7 @@ fn e2e_enabled() -> bool {
     ] {
         assert!(
             std::env::var(var).is_ok(),
-            "minimald_session_e2e: {var} must be set when MINVMD_E2E=1"
+            "minimald_session_integration: {var} must be set when MINVMD_E2E=1"
         );
     }
     true
@@ -124,7 +124,7 @@ impl Guest {
             let _ = child.kill();
             let _ = child.wait();
             panic!(
-                "minimald_session_e2e: no 'vm-up' within {} s; are \
+                "minimald_session_integration: no 'vm-up' within {} s; are \
                  MINVMD_KERNEL_PATH/MINVMD_ROOTFS_PATH/MINVMD_INITRAMFS set correctly \
                  (and libkrun >= 1.19.0)?",
                 BOOT_TIMEOUT.as_secs(),
@@ -182,8 +182,8 @@ async fn minimald_exec_over_bridge() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    let (stdout, exit) = result.unwrap_or_else(|e| panic!("minimald_session_e2e: {e}"));
-    eprintln!("minimald_session_e2e: exec stdout={stdout:?} exit={exit:?}");
+    let (stdout, exit) = result.unwrap_or_else(|e| panic!("minimald_session_integration: {e}"));
+    eprintln!("minimald_session_integration: exec stdout={stdout:?} exit={exit:?}");
     assert!(
         stdout.trim() == sentinel,
         "expected stdout {sentinel:?}, got {stdout:?}"
