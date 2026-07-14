@@ -59,3 +59,11 @@ mod project;
 pub use project::{
     InitPlan, InitProject, ProjectEnv, ProjectOp, RevChange, UpdateProject, UpdateReport,
 };
+
+/// Constructs the "sandbox execution is only supported on Linux" error.
+#[cfg(not(target_os = "linux"))]
+pub fn sandbox_unsupported() -> Error {
+    Error::Other(anyhow::anyhow!(
+        "sandbox execution is only supported on Linux"
+    ))
+}
