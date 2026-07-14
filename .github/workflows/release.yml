@@ -29,8 +29,8 @@ jobs:
             - name: Run HTTPS/mTLS proxy tests
               # The mTLS reverse proxy is behind the non-default `networking-proxy`
               # feature, so the core-tests `--workspace` run does not compile or run
-              # its proofs (R4.5 mtls_missing_cert_returns_401_with_no_topology, UC2b
-              # mtls_valid_cert_routes_to_backend). Exercise them explicitly.
+              # its proofs (a missing client cert is rejected with 401; a valid
+              # cert routes to the backend). Exercise them explicitly.
               run: cargo nextest run -p minimald --features networking-proxy
 
     build-release-linux-amd64:
