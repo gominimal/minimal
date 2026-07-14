@@ -27,7 +27,10 @@ clap_complete.workspace = true
 camino.workspace = true
 chrono.workspace = true
 dirs.workspace = true
+mctx.workspace = true
+mfile.workspace = true
 minimald-rpc.workspace = true
+op.workspace = true
 paths.workspace = true
 russh.workspace = true
 serde.workspace = true
@@ -44,13 +47,9 @@ tracing-subscriber.workspace = true
 minvmd = { path = "../minvmd", default-features = false }
 ot.workspace = true
 
-# Build-system commands (init/add/update) use hakoniwa sandboxing and
-# mctx/op, which pull in procfs via libcgroups — Linux-only. Gating keeps
-# `minimal` buildable on macOS for the autospawn-e2e CI lane.
-[target.'cfg(target_os = "linux")'.dependencies]
-mctx.workspace = true
-op.workspace = true
-
 [dev-dependencies]
 minimald = { path = "../minimald", features = ["test-support"] }
 tempfile.workspace = true
+# `test-util` (not in tokio's `full`) for `#[tokio::test(start_paused = true)]`:
+# lets the client's handshake-deadline test elapse in virtual time.
+tokio = { workspace = true, features = ["test-util"] }

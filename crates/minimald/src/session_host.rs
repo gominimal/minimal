@@ -5,6 +5,7 @@
 //!
 //! The [`Host`] struct holds the running state of an active session.
 
+use async_dialog::Selection;
 use either::Either;
 use russh::Channel;
 use russh::server::Msg;
@@ -25,6 +26,7 @@ use tokio::task::JoinHandle;
 
 use crate::RequestedPty;
 use crate::session::SessionPaths;
+use crate::sessions::SessionControl;
 #[cfg(not(test))]
 use sessions::NetworkMode;
 
@@ -38,6 +40,12 @@ const CTRL_W_CSI_U: &[u8] = b"\x1b[119;5u";
 ///
 /// Corrsponds to: modifyOtherKeys: CSI 27 ; 5 ; 119 ~
 const CTRL_W_CSI_27: &[u8] = b"\x1b[27;5;119~";
+
+/// Header of the prompt shown over the channel when a session's shell process
+/// exits, offering to detach or delete. Exposed so tests can await its
+/// appearance in the channel output before answering.
+pub(crate) const SHELL_EXIT_PROMPT: &str =
+    "Session shell process exited. What would you like to do with this session?";
 
 /// The dimensions of a terminal.
 ///
@@ -308,7 +316,12 @@ fn set_winsize(fd: RawFd, size: WinSize) -> io::Result<()> {
 
 enum BindingMsg {
     Stdin(Vec<u8>),
-    TeardownDueToStdoutErr(std::io::Error),
+    /// The session process ended, so the binding should tear down and raise the
+    /// shell-exit prompt. Carries the pty error when teardown was triggered by
+    /// an *unexpected* master read/write failure (surfaced to the user); `None`
+    /// when the process was reaped cleanly or the master reported the expected
+    /// `EIO`-on-exit.
+    TeardownDueToProcessExit(Option<std::io::Error>),
     TeardownDueToSuperceded(Vec<u8>),
     TeardownDueToDetach(Vec<u8>),
 }
@@ -325,6 +338,10 @@ struct Binding {
     stdin_tx: mpsc::Sender<Either<bytes::Bytes, RequestedPty>>,
     /// Channel the [`Host`] uses to communicate with this [`Binding`].
     receiver: mpsc::Receiver<BindingMsg>,
+    /// Capability to destroy the owning session, exercised when the user picks
+    /// "delete" on the shell-exit prompt. `None` for hosts spawned without a
+    /// manager (the test harness), where "delete" degrades to a detach.
+    control: Option<SessionControl>,
 }
 
 impl Binding {
@@ -333,6 +350,7 @@ impl Binding {
     pub(crate) async fn spawn(
         channel: Channel<Msg>,
         stdin_tx: mpsc::Sender<Either<bytes::Bytes, RequestedPty>>,
+        control: Option<SessionControl>,
     ) -> (mpsc::Sender<BindingMsg>, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(4);
 
@@ -340,6 +358,7 @@ impl Binding {
             channel,
             stdin_tx,
             receiver: rx,
+            control,
         };
 
         (tx, tokio::spawn(binding.run()))
@@ -349,10 +368,18 @@ impl Binding {
         let (mut rs, ws) = self.channel.split();
         let mut w = ws.make_writer();
 
+        #[derive(Debug, PartialEq, Eq)]
+        enum MainloopExitReason {
+            HostGone,
+            Detach,
+            Superceded,
+            ProcessExited,
+        }
+
         // Reading from the remote stops once it sends EOF;
         // the loop lives on to keep forwarding stdout.
         let mut remote_open = true;
-        loop {
+        let exit_reason = loop {
             tokio::select! {
                 // Remote (ssh channel) => session stdin.
                 res = rs.wait(), if remote_open => match res {
@@ -380,11 +407,8 @@ impl Binding {
                             },
                             // Flow-control window updates fire on every
                             // burst of bytes forwarded through the
-                            // channel — routine, not a fault. Debug
-                            // keeps them out of the default log stream.
-                            russh::ChannelMsg::WindowAdjusted { .. } => {
-                                tracing::debug!("skipping msg: {:?}", msg);
-                            }
+                            // channel, v. noisy.
+                            russh::ChannelMsg::WindowAdjusted { .. } => {}
                             _ => tracing::warn!("skipping msg: {:?}", msg),
                         };
                     }
@@ -393,36 +417,83 @@ impl Binding {
                 // A closed channel means the host is gone;
                 // tear the attachment down.
                 msg = self.receiver.recv() => {
-                    let Some(msg) = msg else { break };
+                    let Some(msg) = msg else { break MainloopExitReason::HostGone; };
                     match msg {
                         BindingMsg::Stdin(b) => {
                             let _ = w.write_all(&b).await;
                         },
-                        BindingMsg::TeardownDueToStdoutErr(e) => {
-                            if e.raw_os_error() != Some(5) {
+                        BindingMsg::TeardownDueToProcessExit(err) => {
+                            // Surface only a genuine, unexpected master error; the
+                            // expected `EIO`-on-exit (os error 5) and clean reaps
+                            // stay silent — the shell-exit prompt speaks for them.
+                            if let Some(e) = err
+                                && e.raw_os_error() != Some(5)
+                            {
                                 let _ = w.write_all(format!("Error reading stdout: {e}\n").as_bytes()).await;
                             }
-                            break;
+                            break MainloopExitReason::ProcessExited;
                         }
                         BindingMsg::TeardownDueToSuperceded(unwind_codes) => {
                             let _ = w.write_all(&unwind_codes).await;
                             let _ = w.write_all(b"\r\nDisconnecting - session attached to from a different connection\r\n").await;
-                            break;
+                            break MainloopExitReason::Superceded;
                         }
                         BindingMsg::TeardownDueToDetach(unwind_codes) => {
                             let _ = w.write_all(&unwind_codes).await;
                             let _ = w.write_all(b"\r\nDetaching due to ctrl-w.\r\n").await;
-                            break;
+                            break MainloopExitReason::Detach;
                         }
                     };
 
                 }
             }
+        };
+
+        tracing::debug!("Binding leaving mainloop due to {:?}", exit_reason);
+
+        if exit_reason == MainloopExitReason::ProcessExited {
+            // The shell process exited. For a bash shell, this usually meant someone pressed ctrl-d absent-mindedly.
+            // We presume they didnt want to completely destroy the session, perhaps just detach, but lets prompt
+            // to see where they wanted to go from here.
+            let _ = w.write_all(b"\r\n").await;
+            match async_dialog::Select::new()
+                .with_prompt(SHELL_EXIT_PROMPT)
+                .items([
+                    "Detach, leaving the session running",
+                    "Delete, all in-session files permanently deleted",
+                ])
+                .interact(rs.make_reader(), &mut w)
+                .await
+            {
+                // User selected detach, keep going to disconnect
+                Ok(Selection::At(0)) => {}
+                // User cancelled selection, safest option is to detach
+                Ok(Selection::Cancelled) => {}
+                // User selected delete: ask the manager to tear the whole
+                // session down (kill the host, remove the on-disk record) before
+                // we close the channel. Awaiting is deadlock-free here — the
+                // destroy cascade waits on the host runtime loop (already exiting
+                // now that the process has ended), never on this binding task.
+                Ok(Selection::At(1)) => match &self.control {
+                    Some(control) => {
+                        let _ = w.write_all(b"\r\nDeleting session...\r\n").await;
+                        if let Err(e) = control.destroy().await {
+                            tracing::warn!(error = %e, "session delete failed");
+                            let _ = w
+                                .write_all(format!("Failed to delete session: {e}\r\n").as_bytes())
+                                .await;
+                        }
+                    }
+                    // No manager wired (test harness): degrade to a detach.
+                    None => tracing::warn!("delete selected but no session control available"),
+                },
+                Ok(Selection::At(_)) => unreachable!(),
+                Err(e) => tracing::warn!(error = %e, "session-exit prompt failed"),
+            }
         }
 
-        tracing::debug!("Binding shutting down");
         let _ = ws.eof().await;
-        let _ = ws.exit_status(0).await; // TODO: Only report this if process terminates
+        let _ = ws.exit_status(0).await;
         let _ = ws.close().await; // needed to release the remote
     }
 }
@@ -646,6 +717,11 @@ pub(crate) struct Host<P: SessionProcess, G: Send + 'static> {
     // down explicitly in `mainloop` when the session ends, before `_guard` (and
     // thus the sandbox files) is dropped. `None` for `HostNet`/`NoNet` and tests.
     net_guard: Option<Box<dyn sandbox2::NetGuard>>,
+
+    // Destroy capability handed to each binding this host spawns, so a
+    // shell-exit "delete" can tear the whole session down. `None` for hosts
+    // built without a manager (the test harness).
+    control: Option<SessionControl>,
 
     // Keeps launcher-owned resources (the session's `Env`, which owns the
     // sandbox files backing the running process's rootfs along with the context
@@ -1167,11 +1243,13 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
         paths: SessionPaths,
         sz: WinSize,
         channel: Option<Channel<Msg>>,
+        control: Option<SessionControl>,
     ) -> Result<(HostHandle, JoinHandle<Result<i32, std::io::Error>>), std::io::Error>
     where
         L: SessionLauncher<Process = P, Guard = G>,
     {
-        let (host, handle) = Self::build(launcher, name, username, paths, sz, channel).await?;
+        let (host, handle) =
+            Self::build(launcher, name, username, paths, sz, channel, control).await?;
         let task = tokio::spawn(host.mainloop());
         Ok((handle, task))
     }
@@ -1186,6 +1264,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
         paths: SessionPaths,
         sz: WinSize,
         channel: Option<Channel<Msg>>,
+        control: Option<SessionControl>,
     ) -> Result<(Self, HostHandle), std::io::Error>
     where
         L: SessionLauncher<Process = P, Guard = G>,
@@ -1228,6 +1307,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             stdout_buf: vec![0u8; 8 * 1024],
             stdin_buf: None,
             net_guard,
+            control,
             _guard: guard,
         };
 
@@ -1245,6 +1325,14 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                     // `try_wait` already warns on a non-zero exit with the richer
                     // hakoniwa diagnostics; keep this routine and unconditional.
                     tracing::debug!(exit_code, "session process exited");
+                    // The process was reaped here before the pty surfaced its
+                    // death as an `EIO`. Still notify the attached binding so the
+                    // shell-exit prompt renders (and a "delete" choice can tear
+                    // the session down); otherwise the binding only observes the
+                    // host drop and silently detaches. Without this the prompt is
+                    // lost whenever `try_wait` wins the race against the master's
+                    // `EIO` — a flaky detach under CPU load.
+                    self.notify_remote_process_exit();
                     break Ok(exit_code);
                 }
                 Ok(None) => {}
@@ -1284,7 +1372,24 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     async fn notify_remote_pty_err(&mut self, e: std::io::Error) {
         tracing::warn!(error = %e, "pty master error; tearing down host");
         if let Some((tx, _hnd)) = self.remote.as_mut() {
-            let _ = tx.try_send(BindingMsg::TeardownDueToStdoutErr(e));
+            let _ = tx.try_send(BindingMsg::TeardownDueToProcessExit(Some(e)));
+        }
+    }
+
+    /// Notifies the attached binding that the session process has been reaped,
+    /// so it tears down and raises the shell-exit prompt. Unlike
+    /// [`Self::notify_remote_pty_err`] there is no error to surface — the process
+    /// simply exited, and the pty may never report the death (the reap can win
+    /// the race against the master's `EIO`).
+    ///
+    /// Best-effort `try_send` for the same reason as `notify_remote_pty_err`: the
+    /// notice is never awaited, so a full queue can't wedge teardown. The message
+    /// stays buffered even as this host drops, and an mpsc receiver drains its
+    /// buffer before observing the closed sender — so the binding sees the exit
+    /// before it would fall through to `HostGone`.
+    fn notify_remote_process_exit(&mut self) {
+        if let Some((tx, _hnd)) = self.remote.as_mut() {
+            let _ = tx.try_send(BindingMsg::TeardownDueToProcessExit(None));
         }
     }
 
@@ -1441,7 +1546,8 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                 .write_all(&self.parser.screen().state_formatted())
                 .await;
         }
-        let new_binding = Binding::spawn(channel, self.remote_tx.clone()).await;
+        let new_binding =
+            Binding::spawn(channel, self.remote_tx.clone(), self.control.clone()).await;
 
         if let Some((old_tx, old_join_hnd)) = self.remote.replace(new_binding) {
             // If there was a binding we just swapped out, tell it to
@@ -1617,6 +1723,7 @@ mod tests {
             },
             DEFAULT_SIZE,
             None,
+            None,
         )
         .await
         .expect("failed to build host");
@@ -1681,6 +1788,7 @@ mod tests {
                 home: DaemonAbsPath::root(),
             },
             DEFAULT_SIZE,
+            None,
             None,
         )
         .await
@@ -1781,6 +1889,7 @@ mod tests {
             test_paths(),
             DEFAULT_SIZE,
             None,
+            None,
         )
         .await
         .expect("failed to build host");
@@ -1826,6 +1935,7 @@ mod tests {
             "user".to_string(),
             test_paths(),
             DEFAULT_SIZE,
+            None,
             None,
         )
         .await

@@ -10,18 +10,15 @@
 //! `dhcpStaticLeases` table; the guest assigns PTask IPs statically.
 //!
 //! The gvproxy v0.8.9 spike (`docs/spikes/2026-06-21-gvproxy-attachment.md`)
-//! established that the attachment is **not** an SCM_RIGHTS fd-pass. Instead
-//! `minvmd`:
-//!
-//! 1. writes a gvproxy `-config` YAML carrying the subnet, gateway, NAT alias,
-//!    and `dhcpStaticLeases` ([`render_gvproxy_config`]) — the subnet is
-//!    YAML-only (gvproxy v0.8.9 has no `-subnet` CLI flag);
-//! 2. opens a tap device in the host namespace ([`open_tap`]) and (the caller)
-//!    moves it into the PTask's netns and configures its MAC/IP/route there,
-//! 3. runs an async relay ([`attach_to_switch`]) that bridges the host-side tap
-//!    fd to gvproxy's control socket: a bare `POST /connect` HTTP upgrade, then
-//!    raw Ethernet frames framed with a 2-byte little-endian length prefix (the
-//!    HyperKit protocol).
+//! established that the attachment is **not** an SCM_RIGHTS fd-pass but a bare
+//! `POST /connect` HTTP upgrade on gvproxy's control socket followed by raw
+//! Ethernet frames framed with a 2-byte little-endian length prefix (the
+//! HyperKit protocol). `minvmd`'s role is to write the gvproxy `-config` YAML
+//! carrying the subnet, gateway, NAT alias, and `dhcpStaticLeases`
+//! ([`render_gvproxy_config`]) — the subnet is YAML-only (gvproxy v0.8.9 has no
+//! `-subnet` CLI flag). Opening the per-PTask tap and running the TAP↔gvproxy
+//! relay happen in the guest `minimald` over the vsock shuttle (see the
+//! `shuttle` module); this module owns only the switch process.
 //!
 //! The supervisor tears gvproxy down with the same SIGTERM → timeout → SIGKILL
 //! sequence the vmm child uses ([`GvproxySupervisor::stop`], R1.4) and runs a
@@ -52,11 +49,6 @@ use minimald_rpc::IpProto;
 pub use switch::{DEFAULT_MTU, MacAddr, SwitchSubnet, render_gvproxy_config};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
-
-#[cfg(target_os = "linux")]
-mod relay;
-#[cfg(target_os = "linux")]
-pub use relay::{SwitchRelay, attach_to_switch, open_tap};
 
 mod shuttle;
 pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_switch_sock};

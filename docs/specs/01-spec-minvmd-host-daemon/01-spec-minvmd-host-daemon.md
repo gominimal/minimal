@@ -111,7 +111,7 @@ with no rootfs work.
   `minvmd.entitlements` granting `com.apple.security.hypervisor` and
   nothing else; a `justfile` target shall reproduce the signing step
   locally. (translated from plan: step R1.4)
-- **R1.5**: A smoke test `tests/krun_smoke.rs` (gated on
+- **R1.5**: A smoke test `tests/krun_smoke_integration.rs` (gated on
   `MINVMD_E2E=1`, marked `#[ignore]` by default) shall create a
   libkrun context, configure 1 vcpu + 512 MiB, set `/bin/true` as
   exec, and confirm `krun_start_enter` exits cleanly.
@@ -123,7 +123,7 @@ with no rootfs work.
    for `krun_create_ctx`, `krun_set_vm_config`, `krun_set_exec`,
    `krun_start_enter`, `krun_free_ctx` with `// SAFETY:` comments —
    demonstrates the FFI scaffold and safety discipline.
-2. **CLI:** `MINVMD_E2E=1 cargo test -p minvmd --test krun_smoke -- --include-ignored`
+2. **CLI:** `MINVMD_E2E=1 cargo test -p minvmd --test krun_smoke_integration -- --include-ignored`
    exits 0 on a Mac with libkrun installed — demonstrates end-to-end
    FFI bring-up.
 
@@ -191,7 +191,7 @@ mounts `/proc`, `/sys`, `/dev`, and execs the workload set via
    boots and prints `vm-up` to stdout within 5 s, and a host-side reader
    on the vsock marker socket reads `READY` — demonstrates kernel+rootfs
    come up.
-2. **Test:** `tests/boot_e2e.rs` (gated `MINVMD_E2E=1`, `#[ignore]`)
+2. **Test:** `tests/boot_integration.rs` (gated `MINVMD_E2E=1`, `#[ignore]`)
    asserts the marker round-trip end-to-end — demonstrates automated
    boot verification.
 
@@ -247,7 +247,10 @@ permissions), guest-side vsock stub
    boots a VM whose guest listens on vsock `VSOCK_PORT`, opens 5
    concurrent host UDS connections, each writes a distinct payload and
    reads it back. All 5 succeed — demonstrates libkrun-multiplexed
-   bidirectional bridging.
+   bidirectional bridging. (Removed in the auto-discovery migration: it
+   bridged the Stage-1 socat-echo stub that minimald-as-pid1 replaced
+   with a direct SSH session server; session coverage of the bridge is
+   now `tests/minimald_session_integration.rs`.)
 2. **CLI:** With a stub `minimald` reachable on vsock `VSOCK_PORT`,
    running `nc -U $XDG_RUNTIME_DIR/minimal/minimald.sock` from the host
    yields the empty `list-sessions` response end-to-end — demonstrates

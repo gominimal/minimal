@@ -12,10 +12,9 @@ use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives, TransitivesDep};
 use mfile::{EnvPatches, EnvVarValue};
 use op::Runnable;
 use ot::OpTracker;
-use sandbox2::{
-    Container,
-    config::{Invocation, SandboxMapped},
-};
+#[cfg(target_os = "linux")]
+use sandbox2::Container;
+use sandbox2::config::{Invocation, SandboxMapped};
 use tempfile::TempDir;
 
 #[allow(dead_code)]
@@ -708,18 +707,20 @@ impl<'a> Env<'a> {
         ))
     }
 
+    #[cfg(target_os = "linux")]
     pub fn container(&mut self) -> Result<Container, Error> {
         self.sandbox
             .new_container()
             .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
     }
 
+    #[cfg(target_os = "linux")]
     pub fn command<I, S>(
         &mut self,
         container: &Container,
         program: &str,
         args: I,
-    ) -> Result<hakoniwa::Command, Error>
+    ) -> Result<sandbox2::Command, Error>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -741,10 +742,18 @@ impl<'a> Env<'a> {
         W1: tokio::io::AsyncWrite + Unpin + Send,
         W2: tokio::io::AsyncWrite + Unpin + Send,
     {
-        self.sandbox
-            .run(invocations, stdout_writer, stderr_writer)
-            .await
-            .map_err(Error::from)
+        #[cfg(target_os = "linux")]
+        {
+            self.sandbox
+                .run(invocations, stdout_writer, stderr_writer)
+                .await
+                .map_err(Error::from)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (invocations, stdout_writer, stderr_writer);
+            Err(op::sandbox_unsupported().into())
+        }
     }
 }
 

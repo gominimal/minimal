@@ -41,9 +41,9 @@ fn minvmd_bin() -> std::ffi::OsString {
 #[test]
 #[serial]
 #[ignore = "gated MINVMD_E2E=1; requires Mac with libkrun, kernel, and rootfs"]
-fn boot_e2e_ready_marker_round_trip() {
+fn boot_integration_ready_marker_round_trip() {
     if std::env::var("MINVMD_E2E").as_deref() != Ok("1") {
-        eprintln!("boot_e2e: MINVMD_E2E != 1, skipping");
+        eprintln!("boot_integration: MINVMD_E2E != 1, skipping");
         return;
     }
 
@@ -54,7 +54,7 @@ fn boot_e2e_ready_marker_round_trip() {
     ] {
         assert!(
             std::env::var(var).is_ok(),
-            "boot_e2e: {var} must be set when MINVMD_E2E=1"
+            "boot_integration: {var} must be set when MINVMD_E2E=1"
         );
     }
 
@@ -93,7 +93,7 @@ fn boot_e2e_ready_marker_round_trip() {
 
     assert!(
         got_vm_up,
-        "boot_e2e: did not receive 'vm-up' within 10 s; \
+        "boot_integration: did not receive 'vm-up' within 10 s; \
          check that the guest rootfs writes READY\\n to vsock port {}",
         minvmd::cmd::VSOCK_MARKER_PORT,
     );

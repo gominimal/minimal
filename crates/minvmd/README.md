@@ -132,21 +132,21 @@ sg kvm -c "env LD_LIBRARY_PATH=$KRUN_PREFIX \
   MINVMD_KERNEL_PATH=$PWD/.scratch/vmlinuz \
   MINVMD_ROOTFS_PATH=$PWD/.scratch/rootfs.img \
   MINVMD_INITRAMFS=$PWD/.scratch/initramfs.cpio \
-  cargo test -p minvmd --test boot_e2e -- --include-ignored --nocapture"
+  cargo test -p minvmd --test boot_integration -- --include-ignored --nocapture"
 
 sg kvm -c "env LD_LIBRARY_PATH=$KRUN_PREFIX \
   MINVMD_E2E=1 \
   MINVMD_KERNEL_PATH=$PWD/.scratch/vmlinuz \
   MINVMD_ROOTFS_PATH=$PWD/.scratch/rootfs.img \
   MINVMD_INITRAMFS=$PWD/.scratch/initramfs.cpio \
-  cargo test -p minvmd --test minimald_session_e2e \
+  cargo test -p minvmd --test minimald_session_integration \
     -- --include-ignored --nocapture --exact minimald_exec_over_bridge"
 ```
 
 (Two invocations, mirroring the CI lane's separate steps. `--exact` is passed to
 every selected `--test` binary, so combining both binaries under one
-`--exact minimald_exec_over_bridge` would run zero tests in `boot_e2e`. The
-`--exact` filter on `minimald_session_e2e` selects the bridge case; that binary
+`--exact minimald_exec_over_bridge` would run zero tests in `boot_integration`. The
+`--exact` filter on `minimald_session_integration` selects the bridge case; that binary
 has other, non-bridge cases. Drop it to run all of them.)
 
 `/dev/kvm` access: the device node is recreated on every VM teardown, which wipes
@@ -174,11 +174,11 @@ binaries directly — `cargo test` after signing relinks and unsigns `minvmd`. (
 Linux there is no signing step; see "E2E tests (Linux)" above.)
 
 ```sh
-cargo test -p minvmd --test boot_e2e --test minimald_session_e2e --no-run
+cargo test -p minvmd --test boot_integration --test minimald_session_integration --no-run
 codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
 
 # boot READY round-trip:
-testbin="$(ls -1t target/debug/deps/boot_e2e-* | grep -v '\.d$' | head -1)"
+testbin="$(ls -1t target/debug/deps/boot_integration-* | grep -v '\.d$' | head -1)"
 MINVMD_E2E=1 \
 MINVMD_KERNEL_PATH="$PWD/.scratch/vmlinuz" \
 MINVMD_ROOTFS_PATH="$PWD/.scratch/rootfs.img" \
@@ -186,7 +186,7 @@ MINVMD_INITRAMFS="$PWD/.scratch/initramfs.cpio" \
   "$testbin" --include-ignored --nocapture
 
 # full session (russh client → CreateSession → exec) over the bridge:
-testbin="$(ls -1t target/debug/deps/minimald_session_e2e-* | grep -v '\.d$' | head -1)"
+testbin="$(ls -1t target/debug/deps/minimald_session_integration-* | grep -v '\.d$' | head -1)"
 MINVMD_E2E=1 \
 MINVMD_KERNEL_PATH="$PWD/.scratch/vmlinuz" \
 MINVMD_ROOTFS_PATH="$PWD/.scratch/rootfs.img" \

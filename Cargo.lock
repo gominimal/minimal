@@ -253,6 +253,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-dialog"
+version = "0.0.1"
+dependencies = [
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "async-tar"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3454,7 +3462,6 @@ dependencies = [
  "google-cloud-auth",
  "google-cloud-storage",
  "graph",
- "hakoniwa",
  "indoc",
  "lcache",
  "mfile",
@@ -3587,6 +3594,7 @@ dependencies = [
  "clap_complete",
  "dirs",
  "mctx",
+ "mfile",
  "minimald",
  "minimald-rpc",
  "minvmd",
@@ -3615,6 +3623,7 @@ version = "0.0.1"
 dependencies = [
  "args",
  "async-compression",
+ "async-dialog",
  "async-tar",
  "base64",
  "boringtun",
@@ -3756,7 +3765,6 @@ dependencies = [
  "smallvec",
  "tokio",
  "tokio-util",
- "toml_edit",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4242,7 +4250,6 @@ dependencies = [
  "either",
  "futures",
  "generational-arena",
- "google-cloud-storage",
  "graph",
  "indoc",
  "lcache",
@@ -6276,7 +6283,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",

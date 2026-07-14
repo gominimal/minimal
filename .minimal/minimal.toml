@@ -103,6 +103,19 @@ inherit_cwd = true
 exec = "cargo clippy --all-targets -- -D warnings"
 inherit_cwd = true
 
+# Mutation-test the graph wire decoder. Runs in the Linux sandbox, where the
+# graph baseline test suite is green (the spec_hasher hash assertions that fail
+# on macOS pass here), which cargo-mutants requires. Scoped to wire.rs to keep
+# the run bounded; widen -f / drop it to cover more.
+[tasks.mutants]
+description = "Mutation-test the graph wire decoder with cargo-mutants"
+inherit_cwd = true
+bash = """
+set -e
+command -v cargo-mutants >/dev/null 2>&1 || cargo install cargo-mutants --locked
+cargo mutants -p graph -f wire.rs --timeout 120
+"""
+
 [tasks.arg-smoketest]
 args = {
     input_str = "string"

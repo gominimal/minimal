@@ -189,6 +189,15 @@ pub struct Manager<L: Loader = DiskLoader> {
     running: BTreeMap<L::Key, SessionHandle>,
     store: L,
 
+    /// A weak handle to this manager, handed down to each session it spawns so
+    /// a session's [`Binding`](crate::session_host) can ask the manager to
+    /// destroy it (the "delete" choice on the shell-exit prompt) without owning
+    /// the manager. It must be weak: a strong self-handle would keep the
+    /// manager's own `recv` loop from ever seeing all senders dropped (wedging
+    /// shutdown) and would close an ownership cycle
+    /// (manager → session → host → binding → manager).
+    weak_self: WeakManagerHandle,
+
     /// Per-session stash for in-flight `CreateSession` flows that
     /// reached [`ComposeOutcome::Pending`]. Keyed by the daemon's
     /// allocated [`SessionId`]; the matching `SubmitVerdict` pops
@@ -271,11 +280,20 @@ impl Manager {
         let hostnames = Arc::new(RwLock::new(crate::net::dns::HostnameRegistry::new(
             crate::net::dns::DEFAULT_HOST_ID,
         )));
+        let handle = ManagerHandle {
+            sender,
+            #[cfg(target_os = "linux")]
+            hostnames: Arc::clone(&hostnames),
+        };
+        // A non-owning path back to this actor, handed to each spawned session
+        // so its binding can request destruction (see `weak_self`).
+        let weak_self = handle.downgrade();
         let mngr = Self {
             in_shutdown: false,
             receiver,
             running,
             store: l,
+            weak_self,
             pending: BTreeMap::new(),
             compositions: BTreeMap::new(),
             daemon_ctx,
@@ -283,15 +301,11 @@ impl Manager {
             minimal_cache_dir,
             net_switch,
             #[cfg(target_os = "linux")]
-            hostnames: Arc::clone(&hostnames),
+            hostnames,
         };
 
         tokio::spawn(mngr.mainloop());
-        Ok(ManagerHandle {
-            sender,
-            #[cfg(target_os = "linux")]
-            hostnames,
-        })
+        Ok(handle)
     }
 }
 
@@ -459,6 +473,7 @@ impl<L: Loader> Manager<L> {
                                         obj,
                                         Arc::clone(&self.net_switch),
                                         composition,
+                                        self.weak_self.clone(),
                                     )
                                     .await?;
                                     // Spawn succeeded — safe to drain the
@@ -928,7 +943,79 @@ pub struct ManagerHandle {
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
 }
 
+/// A non-owning handle to the [`Manager`] actor.
+///
+/// Held by per-session machinery that must be able to reach the manager
+/// (notably a session's [`Binding`](crate::session_host), to request its own
+/// destruction) without keeping the actor alive. See [`Manager::weak_self`] for
+/// why the path back to the manager must be weak.
+#[derive(Debug, Clone)]
+pub struct WeakManagerHandle {
+    sender: mpsc::WeakSender<ManagerMessage>,
+    /// Mirrors [`ManagerHandle::hostnames`]; the registry `Arc` is held so an
+    /// [`upgrade`](Self::upgrade) can reconstruct a full handle. This does not
+    /// keep the actor alive (only live senders do).
+    #[cfg(target_os = "linux")]
+    hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+}
+
+impl WeakManagerHandle {
+    /// Promotes to a strong [`ManagerHandle`], or `None` if the manager actor
+    /// has already shut down (all strong senders dropped).
+    #[must_use]
+    pub fn upgrade(&self) -> Option<ManagerHandle> {
+        Some(ManagerHandle {
+            sender: self.sender.upgrade()?,
+            #[cfg(target_os = "linux")]
+            hostnames: Arc::clone(&self.hostnames),
+        })
+    }
+}
+
+/// The capability handed to a session's [`Binding`](crate::session_host) to
+/// tear its own session down — the "delete" choice on the shell-exit prompt.
+///
+/// Bundles a [`WeakManagerHandle`] with the [`SessionId`] to destroy, so the
+/// binding neither owns the manager nor needs to know how destruction is
+/// carried out.
+#[derive(Debug, Clone)]
+pub struct SessionControl {
+    manager: WeakManagerHandle,
+    id: SessionId,
+}
+
+impl SessionControl {
+    /// Binds the destroy capability to a specific session.
+    #[must_use]
+    pub fn new(manager: WeakManagerHandle, id: SessionId) -> Self {
+        Self { manager, id }
+    }
+
+    /// Requests the manager destroy this session: kills the host and removes the
+    /// on-disk record. Errors if the manager has already shut down, or if the
+    /// destroy itself fails (e.g. the manager is mid-shutdown).
+    pub async fn destroy(&self) -> Result<(), SessionsError> {
+        match self.manager.upgrade() {
+            Some(mngr) => mngr.destroy_session(self.id).await,
+            None => Err(SessionsError::new(
+                std::io::ErrorKind::NotConnected,
+                "sessions manager is gone",
+            )),
+        }
+    }
+}
+
 impl ManagerHandle {
+    /// Returns a non-owning handle to this manager.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakManagerHandle {
+        WeakManagerHandle {
+            sender: self.sender.downgrade(),
+            #[cfg(target_os = "linux")]
+            hostnames: Arc::clone(&self.hostnames),
+        }
+    }
+
     /// Returns a shared handle to the in-memory PTask hostname registry, for the
     /// daemon's host-side proxies ([`crate::net::proxy`]) to route by `Host:`
     /// header.
