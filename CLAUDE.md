@@ -24,3 +24,10 @@ This repository follows Conventional Commits. Every commit message must conform.
 ## Rust Coding Standards
 
 @docs/rust-coding-standards.md
+
+## CI
+
+Do NOT edit `.github/workflows/` — the CI layer is frozen and CODEOWNER-gated.
+Extend coverage through convention-discovered tests, `scripts/`, and the
+`justfile`, per the contract in [CONTRIBUTING.md](CONTRIBUTING.md) and the
+design in [docs/ci-strategy.md](docs/ci-strategy.md).

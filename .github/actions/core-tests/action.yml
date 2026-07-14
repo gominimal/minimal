@@ -41,3 +41,21 @@ runs:
     - name: Run doctests
       shell: bash
       run: cargo test --workspace --doc --locked
+    - name: Publish test summary
+      # Surface the nextest JUnit counts on the run page so per-PR test
+      # evidence is visible without downloading artifacts. `always()` so a
+      # failing run still reports. Best-effort parse of the testsuites root.
+      if: always()
+      shell: bash
+      run: |
+        junit="target/nextest/ci/junit.xml"
+        [ -f "$junit" ] || exit 0
+        line="$(grep -m1 '<testsuites' "$junit" || true)"
+        attr() { printf '%s' "$line" | grep -oE "$1=\"[0-9.]+\"" | head -1 | grep -oE '[0-9.]+'; }
+        {
+          echo "### Workspace tests (nextest, profile ci)"
+          echo ""
+          echo "| tests | failures | errors | time |"
+          echo "|---|---|---|---|"
+          echo "| $(attr tests) | $(attr failures) | $(attr errors) | $(attr time)s |"
+        } >> "$GITHUB_STEP_SUMMARY"
