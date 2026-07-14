@@ -86,23 +86,12 @@ jobs:
             - name: Run Clippy
               run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-    test:
-        needs: [changes]
-        if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
-        runs-on: ubuntu-latest
-        timeout-minutes: 40
-        steps:
-            - uses: actions/checkout@v7
-              with:
-                  persist-credentials: false
-            - name: Run core workspace tests
-              uses: ./.github/actions/core-tests
-            - name: Run HTTPS/mTLS proxy tests
-              # The mTLS reverse proxy is behind the non-default `networking-proxy`
-              # feature, so the core-tests `--workspace` run does not compile or
-              # run its proofs (mtls_missing_cert_returns_401_with_no_topology,
-              # mtls_valid_cert_routes_to_backend). Exercise them explicitly.
-              run: cargo nextest run -p minimald --features networking-proxy --locked
+    # NOTE: the workspace test job was removed once ci-linux-native.yml's
+    # required `tests` job (the same `core-tests` composite) covered it — the two
+    # ran the identical suite. The mTLS reverse-proxy step it also carried
+    # (`--features networking-proxy`) was mothballed from per-PR CI by owner
+    # decision; that coverage now runs in release.yml. See the note in the
+    # ci-linux-native `tests` job.
 
     dogfood:
         needs: [changes]
@@ -160,7 +149,7 @@ jobs:
     # on failure/cancellation.
     ci-success:
         if: always()
-        needs: [changes, fmt, clippy, test, dogfood, cargo-deny, minimal-check]
+        needs: [changes, fmt, clippy, dogfood, cargo-deny, minimal-check]
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:

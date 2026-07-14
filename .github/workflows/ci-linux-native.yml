@@ -66,6 +66,11 @@ jobs:
               - "crates/**"
               - "Cargo.toml"
               - "Cargo.lock"
+              # Registry/build config (e.g. the buf codegen registry) affects
+              # what the workspace suite compiles. This lane is the sole per-PR
+              # gate for `core-tests` since ci.yml's redundant `test` job was
+              # removed, so a build-config change must re-run it.
+              - ".cargo/**"
               # The toolchain pin: a rustc bump must re-run the Rust lanes.
               - "rust-toolchain.toml"
               # Nextest profiles change how this lane's tests run.
