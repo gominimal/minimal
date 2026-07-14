@@ -84,7 +84,7 @@ fn add_dir_entries_inner<'a>(
                 tar.append_data(&mut header, &archive_path, &[][..])
                     .await
                     .with_context(|| format!("adding symlink {archive_path}"))?;
-            } else {
+            } else if file_type.is_file() {
                 let mut file = fs::File::open(&entry_path)
                     .await
                     .with_context(|| format!("opening {}", entry_path.display()))?;
@@ -101,6 +101,7 @@ fn add_dir_entries_inner<'a>(
                     .await
                     .with_context(|| format!("adding file {archive_path}"))?;
             }
+            // Skip sockets, FIFOs, block/char devices, etc.
         }
 
         Ok(())
