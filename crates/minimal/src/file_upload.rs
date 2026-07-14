@@ -9,12 +9,12 @@ use tokio::fs;
 /// Builds an in-memory tar archive of `dir`, preserving relative paths.
 ///
 /// Symlinks are stored as symlinks. Directory entries are included so
-/// empty directories survive the round-trip.
+/// empty directories survive the round-trip. Unreadable directories
+/// and non-regular files (sockets, FIFOs, devices) are silently skipped.
 pub async fn tar_directory(dir: &Path) -> Result<Vec<u8>, anyhow::Error> {
     let mut tar = Builder::new(Vec::new());
     let result = add_dir_entries(&mut tar, dir, "").await;
     if let Err(e) = result {
-        // Finalize the builder to avoid the async-tar drop panic.
         let _ = tar.into_inner().await;
         return Err(e);
     }
@@ -35,15 +35,30 @@ fn add_dir_entries_inner<'a>(
     prefix: &'a str,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'a>> {
     Box::pin(async move {
-        let mut entries = fs::read_dir(root)
-            .await
-            .with_context(|| format!("reading directory {}", root.display()))?;
+        let mut entries = match fs::read_dir(root).await {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::warn!("skipping unreadable directory: {}", root.display());
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(
+                    anyhow::Error::from(e).context(format!("reading directory {}", root.display()))
+                );
+            }
+        };
 
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .context("reading directory entry")?
-        {
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(e)) => e,
+                Ok(None) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    tracing::warn!("skipping unreadable entry in {}", root.display());
+                    continue;
+                }
+                Err(e) => return Err(anyhow::Error::from(e).context("reading directory entry")),
+            };
+
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             let entry_path = entry.path();
@@ -53,10 +68,17 @@ fn add_dir_entries_inner<'a>(
                 format!("{prefix}/{name_str}")
             };
 
-            let file_type = entry
-                .file_type()
-                .await
-                .with_context(|| format!("getting file type for {}", entry_path.display()))?;
+            let file_type = match entry.file_type().await {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    tracing::warn!("skipping unreadable entry: {}", entry_path.display());
+                    continue;
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::from(e)
+                        .context(format!("getting file type for {}", entry_path.display())));
+                }
+            };
 
             if file_type.is_dir() {
                 let mut header = async_tar::Header::new_gnu();
@@ -85,9 +107,17 @@ fn add_dir_entries_inner<'a>(
                     .await
                     .with_context(|| format!("adding symlink {archive_path}"))?;
             } else if file_type.is_file() {
-                let mut file = fs::File::open(&entry_path)
-                    .await
-                    .with_context(|| format!("opening {}", entry_path.display()))?;
+                let mut file = match fs::File::open(&entry_path).await {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        tracing::warn!("skipping unreadable file: {}", entry_path.display());
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(anyhow::Error::from(e)
+                            .context(format!("opening {}", entry_path.display())));
+                    }
+                };
                 let metadata = file
                     .metadata()
                     .await
