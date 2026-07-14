@@ -405,6 +405,8 @@ run zshinit "$H9"
 want_ok ".zshrc created and hooked (R9.2)" grep -q "shell-init/zsh.sh" "$H9/.zshrc"
 want_ok "zsh init wires fpath completions (R9.1)" \
     grep -q "fpath=" "$H9/xdg-data/minimal/shell-init/zsh.sh"
+want_ok "zsh init self-heals a stale compinit dump (R9.1)" \
+    grep -q '_comps\[min\]' "$H9/xdg-data/minimal/shell-init/zsh.sh"
 H10="$root/h10"; mkdir -p "$H10"
 TEST_SHELL=/usr/bin/fish
 run fishinit "$H10"
@@ -431,9 +433,16 @@ H14="$root/h14"; mkdir -p "$H14"
     printf '# <<< minimal <<<\n'
     printf '\n# added after the old install\n'
 } >"$H14/.zshrc"
+# A compinit dump from the old install: its (version, file count) header can
+# keep matching after the completions-dir swap, so compinit would trust it and
+# never see the new _min. The install must drop it when it (re)writes the zsh
+# completions.
+printf '#files: 1 version: 5.9\n' >"$H14/.zcompdump"
 TEST_SHELL=/usr/bin/zsh
 run oldblock "$H14"
 check 0 "$rc" "upgrade over old rc block exits 0"
+want_err "stale compinit dump dropped on upgrade (R9.3)" test -e "$H14/.zcompdump"
+want_ok "dump drop announced (R9.3)" grep -q "cleared compinit dump cache" "$OUT"
 want_ok "stale block replacement announced (R9.2)" grep -q "replaced stale block" "$OUT"
 check 1 "$(grep -c '>>> minimal >>>' "$H14/.zshrc")" "exactly one marker block after upgrade (R9.2)"
 want_ok "block now sources the current zsh init (R9.2)" grep -q "shell-init/zsh.sh" "$H14/.zshrc"
@@ -445,6 +454,8 @@ run oldblock2 "$H14"
 check 0 "$rc" "rerun after replacement exits 0"
 want_err "rerun rewrites nothing (R9.2)" grep -qE "shell-init: (added|replaced)" "$OUT"
 check 1 "$(grep -c '>>> minimal >>>' "$H14/.zshrc")" "rerun keeps a single marker block (R9.2)"
+want_err "no dump means no drop announcement on rerun (R9.3)" \
+    grep -q "cleared compinit dump cache" "$OUT"
 TEST_SHELL=
 
 # A start marker whose end marker was lost to a hand edit must never cost the
@@ -679,12 +690,19 @@ printf '# keep me\n' >"$HU7/.bashrc"
 TEST_SHELL=/bin/bash
 run u7_install "$HU7"
 check 0 "$rc" "shell-integration seed install exits 0"
+# A dump written after the install (by the user's shells) still holds the min
+# registration; uninstall must drop it or the next `min <tab>` autoload fails.
+printf '#files: 1 version: 5.9\n' >"$HU7/.zcompdump"
 run u7_dry "$HU7" --uninstall --dry-run
 want_ok "dry-run announces the rc strip without editing (R9.4/R8.3)" \
     grep -q "would remove shell-init block" "$OUT"
 want_ok "dry-run leaves the rc block (R8.3)" grep -q '>>> minimal >>>' "$HU7/.bashrc"
+want_ok "dry-run announces the compinit dump drop (R9.4/R8.3)" \
+    grep -q "would remove compinit dump cache" "$OUT"
+want_ok "dry-run leaves the compinit dump (R8.3)" test -f "$HU7/.zcompdump"
 run u7_un "$HU7" --uninstall
 check 0 "$rc" "uninstall with shell integration exits 0"
+want_err "compinit dump dropped (R9.4)" test -e "$HU7/.zcompdump"
 want_err "completions removed (R9.4)" test -e "$HU7/xdg-data/bash-completion/completions/min"
 want_err "init files removed (R9.4)" test -e "$HU7/xdg-data/minimal/shell-init"
 want_err "emptied completion dirs pruned (R9.4)" test -d "$HU7/xdg-data/bash-completion"
@@ -692,6 +710,15 @@ want_err "emptied data dir pruned (R9.4)" test -d "$HU7/xdg-data/minimal"
 want_err "rc block stripped (R9.4)" grep -q '>>> minimal >>>' "$HU7/.bashrc"
 want_ok "user rc content survives the strip (R9.4)" grep -q '# keep me' "$HU7/.bashrc"
 TEST_SHELL=
+
+# R9.4 — a record without a completions-zsh row (the data-only install above)
+# must NOT cost the user their compinit dump: the cache is only cleared when
+# the installer actually put min into it.
+printf '# untouched user cache\n' >"$H5/.zcompdump"
+run u_datadump "$H5" --uninstall
+check 0 "$rc" "data-only uninstall exits 0"
+want_ok "dump kept when no zsh completions were installed (R9.4)" \
+    grep -q '# untouched user cache' "$H5/.zcompdump"
 
 # ===========================================================================
 echo "# ---"
