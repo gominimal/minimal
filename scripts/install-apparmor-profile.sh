@@ -20,7 +20,8 @@ set -euo pipefail
 
 readonly PROFILE_NAME=minimald
 readonly APPARMOR_D=/etc/apparmor.d
-readonly SRC_DIR="$(cd "$(dirname "$0")/../packaging/apparmor" && pwd)"
+SRC_DIR="$(cd "$(dirname "$0")/../packaging/apparmor" && pwd)"
+readonly SRC_DIR
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
