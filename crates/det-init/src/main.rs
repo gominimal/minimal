@@ -488,27 +488,17 @@ fn read_nameserver() -> Option<String> {
     None
 }
 
-/// Repoint `/etc/resolv.conf` at the loopback collector (127.0.0.1). The rootfs is
-/// read-only, so write to the `/run` tmpfs and bind-mount it over the target (the
-/// same trick `minimald::guest::install_resolv_conf` uses for the gvproxy DNS).
+/// Repoint `/etc/resolv.conf` at the loopback collector (127.0.0.1) with a plain
+/// WRITE — deliberately NOT a bind-mount. A bind-mount by pid-1 shows up as an
+/// `sb_mount` event the verdict reads as a container-escape signal: a false
+/// positive, since det-init's own infrastructure is not sample behaviour. On a
+/// read-only rootfs the write fails (EROFS) and the caller degrades to "DNS names
+/// unobserved", matching the legacy `detonate.sh` runner. (Full DNS-name capture
+/// on a RO rootfs — a writable `/etc` overlay — is a networked-detonation
+/// follow-up; the robust fix is verdict-side process-subtree scoping so pid-1
+/// infra never counts toward the sample verdict.)
 fn install_local_resolver() -> std::io::Result<()> {
-    std::fs::write("/run/det-resolv.conf", "nameserver 127.0.0.1\n")?;
-    let src = c"/run/det-resolv.conf";
-    let dst = c"/etc/resolv.conf";
-    // SAFETY: bind-mount with valid C paths, MS_BIND, and no fs-type/data.
-    let rc = unsafe {
-        libc::mount(
-            src.as_ptr(),
-            dst.as_ptr(),
-            std::ptr::null(),
-            libc::MS_BIND,
-            std::ptr::null(),
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    std::fs::write("/etc/resolv.conf", "nameserver 127.0.0.1\n")
 }
 
 /// Run `sh -c <cmd>` as unprivileged `nobody` via `droppriv`, returning the exit
