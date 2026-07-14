@@ -126,6 +126,49 @@ impl<'a> StandaloneTest<'a> {
             })
             .collect())
     }
+
+    /// Runs the test invocations in the sandbox.
+    #[cfg(target_os = "linux")]
+    async fn execute_in_sandbox(
+        &mut self,
+        sandbox: &mut sandbox2::Sandbox<()>,
+        test: &SpecTest,
+    ) -> Result<Vec<StandaloneTestError>, Error> {
+        let invocations = self.invocations(test)?;
+        match sandbox
+            .run(
+                invocations.clone(),
+                self.stdout_writer.take(),
+                self.stderr_writer.take(),
+            )
+            .await
+        {
+            Ok(()) => Ok(vec![]),
+            Err(sandbox2::Error::Execution(
+                sandbox2::error::ExecutionError::InvocationFailed { idx, code, .. },
+            )) => {
+                let inv = &invocations[idx];
+                Ok(vec![StandaloneTestError {
+                    program: inv.executable.clone(),
+                    args: inv.args.clone(),
+                    exit_code: code,
+                }])
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Sandbox execution is only available on Linux (hakoniwa).
+    #[cfg(not(target_os = "linux"))]
+    async fn execute_in_sandbox(
+        &mut self,
+        _sandbox: &mut sandbox2::Sandbox<()>,
+        _test: &SpecTest,
+    ) -> Result<Vec<StandaloneTestError>, Error> {
+        Err(Error::Other(anyhow!(
+            "sandbox execution is only supported on Linux"
+        )))
+    }
 }
 
 impl<'a> Runnable for StandaloneTest<'a> {
@@ -167,27 +210,6 @@ impl<'a> Runnable for StandaloneTest<'a> {
             .with_env_var("HOME", "/tmp");
         let mut sandbox = config.build(&opts.exec_base, ()).await?;
 
-        let invocations = self.invocations(test)?;
-        match sandbox
-            .run(
-                invocations.clone(),
-                self.stdout_writer.take(),
-                self.stderr_writer.take(),
-            )
-            .await
-        {
-            Ok(()) => Ok(vec![]),
-            Err(sandbox2::Error::Execution(
-                sandbox2::error::ExecutionError::InvocationFailed { idx, code, .. },
-            )) => {
-                let inv = &invocations[idx];
-                Ok(vec![StandaloneTestError {
-                    program: inv.executable.clone(),
-                    args: inv.args.clone(),
-                    exit_code: code,
-                }])
-            }
-            Err(e) => Err(e.into()),
-        }
+        self.execute_in_sandbox(&mut sandbox, test).await
     }
 }

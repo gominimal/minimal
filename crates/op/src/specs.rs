@@ -195,6 +195,43 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
             .collect())
     }
 
+    /// Runs the build invocations in the sandbox.
+    #[cfg(target_os = "linux")]
+    async fn execute_in_sandbox(
+        &mut self,
+        sandbox: &mut sandbox2::Sandbox<()>,
+        build: &BuildSpec,
+    ) -> Result<(), Error> {
+        sandbox
+            .run_with_cancel(
+                self.invocations(build)?
+                    .into_iter()
+                    .map(|(program, args)| sandbox2::config::Invocation {
+                        executable: program,
+                        args,
+                        envs: Default::default(),
+                    })
+                    .collect(),
+                self.stdout_writer.take(),
+                self.stderr_writer.take(),
+                self.cancel.clone(),
+            )
+            .await
+            .map_err(Error::from)
+    }
+
+    /// Sandbox execution is only available on Linux (hakoniwa).
+    #[cfg(not(target_os = "linux"))]
+    async fn execute_in_sandbox(
+        &mut self,
+        _sandbox: &mut sandbox2::Sandbox<()>,
+        _build: &BuildSpec,
+    ) -> Result<(), Error> {
+        Err(Error::Other(anyhow!(
+            "sandbox execution is only supported on Linux"
+        )))
+    }
+
     async fn materialize_prebuilt<'b>(
         &mut self,
         opts: &Options<'b>,
@@ -286,21 +323,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
 
         info!("Building package: {}", build.name);
         let start = Instant::now();
-        sandbox
-            .run_with_cancel(
-                self.invocations(build)?
-                    .into_iter()
-                    .map(|(program, args)| sandbox2::config::Invocation {
-                        executable: program,
-                        args,
-                        envs: Default::default(),
-                    })
-                    .collect(),
-                self.stdout_writer.take(),
-                self.stderr_writer.take(),
-                self.cancel.clone(),
-            )
-            .await?;
+        self.execute_in_sandbox(&mut sandbox, build).await?;
         let build_ms = Instant::now().duration_since(start).as_millis() as usize;
 
         let out_dir = opts

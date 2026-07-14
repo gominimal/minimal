@@ -743,10 +743,20 @@ impl<'a> Env<'a> {
         W1: tokio::io::AsyncWrite + Unpin + Send,
         W2: tokio::io::AsyncWrite + Unpin + Send,
     {
-        self.sandbox
-            .run(invocations, stdout_writer, stderr_writer)
-            .await
-            .map_err(Error::from)
+        #[cfg(target_os = "linux")]
+        {
+            self.sandbox
+                .run(invocations, stdout_writer, stderr_writer)
+                .await
+                .map_err(Error::from)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (invocations, stdout_writer, stderr_writer);
+            Err(Error::Other(anyhow::anyhow!(
+                "sandbox execution is only supported on Linux"
+            )))
+        }
     }
 }
 

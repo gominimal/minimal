@@ -39,36 +39,7 @@ impl<C: sandbox2::Channel> TaskEnv<'_, C> {
                 envs: Default::default(),
             }])
         } else if let TaskAction::CmdCmd(argv) = &self.task.action {
-            // Phase 1: run the meta-command, capturing its stdout.
-            let (capture, buf) = CaptureWriter::new();
-            self.sandbox
-                .run(
-                    vec![Invocation {
-                        executable: argv[0].clone(),
-                        args: argv[1..].to_vec(),
-                        envs: Default::default(),
-                    }],
-                    Some(capture),
-                    Some(tokio::io::stderr()),
-                )
-                .await?;
-
-            // Phase 2: parse each stdout line as a shell command.
-            let stdout = buf.lock().unwrap().clone();
-            let mut invocations = Vec::new();
-            for line_result in std::io::Cursor::new(stdout).lines() {
-                let line = line_result.map_err(Error::IO)?;
-                let mut lexer = Shlex::new(&line);
-                let Some(prog) = lexer.next() else {
-                    continue;
-                };
-                invocations.push(Invocation {
-                    executable: prog,
-                    args: lexer.collect(),
-                    envs: Default::default(),
-                });
-            }
-            Ok(invocations)
+            self.resolve_cmdcmd(argv).await
         } else {
             Err(Error::Other(anyhow::anyhow!(
                 "task has no executable action"
@@ -82,6 +53,50 @@ impl<C: sandbox2::Channel> Runnable for TaskEnv<'_, C> {
 
     async fn run(&mut self, _opts: &Options<'_>) -> Result<Self::Result, Error> {
         self.resolve().await
+    }
+}
+
+impl<C: sandbox2::Channel> TaskEnv<'_, C> {
+    /// Runs the meta-command in the sandbox and parses its stdout into
+    /// invocations.
+    #[cfg(target_os = "linux")]
+    async fn resolve_cmdcmd(&mut self, argv: &[String]) -> Result<Vec<Invocation>, Error> {
+        let (capture, buf) = CaptureWriter::new();
+        self.sandbox
+            .run(
+                vec![Invocation {
+                    executable: argv[0].clone(),
+                    args: argv[1..].to_vec(),
+                    envs: Default::default(),
+                }],
+                Some(capture),
+                Some(tokio::io::stderr()),
+            )
+            .await?;
+
+        let stdout = buf.lock().unwrap().clone();
+        let mut invocations = Vec::new();
+        for line_result in std::io::Cursor::new(stdout).lines() {
+            let line = line_result.map_err(Error::IO)?;
+            let mut lexer = Shlex::new(&line);
+            let Some(prog) = lexer.next() else {
+                continue;
+            };
+            invocations.push(Invocation {
+                executable: prog,
+                args: lexer.collect(),
+                envs: Default::default(),
+            });
+        }
+        Ok(invocations)
+    }
+
+    /// Sandbox execution is only available on Linux (hakoniwa).
+    #[cfg(not(target_os = "linux"))]
+    async fn resolve_cmdcmd(&mut self, _argv: &[String]) -> Result<Vec<Invocation>, Error> {
+        Err(Error::Other(anyhow::anyhow!(
+            "sandbox execution is only supported on Linux"
+        )))
     }
 }
 
