@@ -2,9 +2,25 @@ name: Release
 
 on:
     workflow_dispatch:
+        inputs:
+            dry_run:
+                description: "Build, sign, and assemble everything but publish nothing (no GCS upload, no GitHub release, no installer-bucket write, no channel advance)."
+                type: boolean
+                default: false
+            skip_ci_verify:
+                description: "Bypass the verify-ci gate that requires this commit's five lane aggregators to be green. Admin override for a commit whose checks are known-good but unreported."
+                type: boolean
+                default: false
     # Invoked by nightly.yml, which depends on this run completing before it
-    # flips the `nightly` channel. No behavior change for manual dispatch.
+    # flips the `nightly` channel. Inputs default to a real, verified release.
     workflow_call:
+        inputs:
+            dry_run:
+                type: boolean
+                default: false
+            skip_ci_verify:
+                type: boolean
+                default: false
 
 env:
     CARGO_TERM_COLOR: always
@@ -19,19 +35,48 @@ permissions:
     contents: read
 
 jobs:
-    test:
+    verify-ci:
+        # Gate the release on the required CI checks having passed for the EXACT
+        # commit being released, instead of re-running the workspace suite here
+        # (the old `test` job duplicated ci-linux-native's `core-tests`). The five
+        # lane aggregators are the required checks on `main` (ruleset 14240442);
+        # assert each reported success on HEAD. The job always runs so `release`'s
+        # `needs` is satisfied; `skip_ci_verify` short-circuits it to a pass for a
+        # commit whose checks are green but unreported (admin override).
         runs-on: ubuntu-latest
-        timeout-minutes: 40
+        timeout-minutes: 10
+        permissions:
+            contents: read
+            checks: read
         steps:
             - uses: actions/checkout@v7
-            - name: Run core workspace tests
-              uses: ./.github/actions/core-tests
-            - name: Run HTTPS/mTLS proxy tests
-              # The mTLS reverse proxy is behind the non-default `networking-proxy`
-              # feature, so the core-tests `--workspace` run does not compile or run
-              # its proofs (a missing client cert is rejected with 401; a valid
-              # cert routes to the backend). Exercise them explicitly.
-              run: cargo nextest run -p minimald --features networking-proxy
+              with:
+                  persist-credentials: false
+            - name: Verify required checks are green on this commit
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  SKIP: ${{ inputs.skip_ci_verify }}
+              run: |
+                  set -euo pipefail
+                  if [ "$SKIP" = "true" ]; then
+                    echo "::warning::skip_ci_verify set — bypassing the required-checks gate"
+                    exit 0
+                  fi
+                  required="ci-success ci-linux-native-success ci-linux-kvm-success ci-macos-success ci-shell-installer-success"
+                  sha="$(git rev-parse HEAD)"
+                  # Latest conclusion per check-run name for this commit.
+                  runs="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs" --paginate \
+                    --jq '.check_runs[] | "\(.name)\t\(.conclusion)"')"
+                  fail=0
+                  for name in $required; do
+                    c="$(printf '%s\n' "$runs" | awk -F'\t' -v n="$name" '$1==n {print $2}' | tail -1)"
+                    if [ "$c" != "success" ]; then
+                      echo "::error::required check '$name' is '${c:-missing}' on $sha (need success)"
+                      fail=1
+                    fi
+                  done
+                  [ "$fail" -eq 0 ] && echo "all five required checks are green on $sha"
+                  exit "$fail"
 
     build-release-linux-amd64:
         runs-on: ubuntu-latest
@@ -72,7 +117,7 @@ jobs:
                   restore-keys: ${{ runner.os }}-amd64-cargo-release-
             - name: Build static release binaries
               run: |
-                  cargo build --release --target x86_64-unknown-linux-musl \
+                  cargo build --release --locked --target x86_64-unknown-linux-musl \
                      --package mip \
                      --package minimal \
                      --package minimald
@@ -122,7 +167,7 @@ jobs:
               # by the setup-libkrun-linux composite above — drives the build.rs link
               # search and the `minvmd_libkrun` cfg (real, non-stub impl).
               run: |
-                  cargo build --release -p minvmd --bin minvmd
+                  cargo build --release --locked -p minvmd --bin minvmd
                   mv target/release/minvmd target/release/minvmd-linux-amd64
             - name: Upload binary (minvmd)
               uses: actions/upload-artifact@v7
@@ -133,7 +178,9 @@ jobs:
 
     build-release-linux-arm64:
         runs-on: ubuntu-latest
-        timeout-minutes: 90
+        # One combined cross build (was three sequential single-package builds);
+        # right-sized from the padded 90 the split required.
+        timeout-minutes: 60
         steps:
             - uses: actions/checkout@v7
             - name: Install cross
@@ -150,41 +197,35 @@ jobs:
                       target/
                   key: ${{ runner.os }}-arm64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
                   restore-keys: ${{ runner.os }}-arm64-cargo-release-
-            - name: Build static minimal binary
-              # Rename with a platform suffix so download-artifact's merge-multiple
-              # flatten does not collide with the amd64 build's basename.
+            - name: Build static release binaries
+              # One build of all three packages (mirrors the amd64 job) instead of
+              # three separate cross invocations resolving the graph three times.
               run: |
-                  cross build --release \
+                  cross build --release --locked \
+                     --target aarch64-unknown-linux-musl \
                      --package minimal \
-                     --target aarch64-unknown-linux-musl
-                  mv target/aarch64-unknown-linux-musl/release/min \
-                     target/aarch64-unknown-linux-musl/release/minimal-linux-arm64
+                     --package mip \
+                     --package minimald
+            - name: Rename binaries with platform suffix
+              # Platform-suffixed so download-artifact's merge-multiple basename
+              # flatten does not collide with the amd64 build.
+              run: |
+                  cd target/aarch64-unknown-linux-musl/release
+                  mv min minimal-linux-arm64
+                  mv mip mip-linux-arm64
+                  mv minimald minimald-linux-arm64
             - name: Upload binary (minimal)
               uses: actions/upload-artifact@v7
               with:
                   name: minimal-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/minimal-linux-arm64
                   retention-days: 7
-            - name: Build static mip binary
-              run: |
-                  cross build --release \
-                     --package mip \
-                     --target aarch64-unknown-linux-musl
-                  mv target/aarch64-unknown-linux-musl/release/mip \
-                     target/aarch64-unknown-linux-musl/release/mip-linux-arm64
             - name: Upload binary (mip)
               uses: actions/upload-artifact@v7
               with:
                   name: mip-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/mip-linux-arm64
                   retention-days: 7
-            - name: Build static minimald binary
-              run: |
-                  cross build --release \
-                     --package minimald \
-                     --target aarch64-unknown-linux-musl
-                  mv target/aarch64-unknown-linux-musl/release/minimald \
-                     target/aarch64-unknown-linux-musl/release/minimald-linux-arm64
             - name: Upload binary (minimald)
               uses: actions/upload-artifact@v7
               with:
@@ -213,7 +254,7 @@ jobs:
             - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Build release minvmd binary
-              run: cargo build --release -p minvmd --bin minvmd
+              run: cargo build --release --locked -p minvmd --bin minvmd
             - name: Rewrite + verify minvmd libkrun linkage (@rpath)
               # Retarget Homebrew's absolute libkrun install name to the shipped
               # bin/../lib layout and verify the result (rpath entries, no
@@ -226,7 +267,7 @@ jobs:
               # Separate cargo invocation from minvmd above, so its default
               # `libkrun` feature can't unify into the CLI (which opts out via
               # default-features = false). Gated next.
-              run: cargo build --release -p minimal --bin min
+              run: cargo build --release --locked -p minimal --bin min
             - name: Verify minimal links only system libraries
               # The CLI calls no libkrun (it spawns minvmd as a subprocess), so
               # every dependency must be under /usr/lib or /System. A krun line
@@ -550,7 +591,7 @@ jobs:
         timeout-minutes: 30
         needs:
             [
-                test,
+                verify-ci,
                 build-release-linux-amd64,
                 build-release-linux-arm64,
                 build-release-macos-arm64,
@@ -598,18 +639,28 @@ jobs:
                   project_id: "289724348228"
                   workload_identity_provider: "projects/289724348228/locations/global/workloadIdentityPools/github/providers/gominimal"
             - name: Package and upload archive to GCS
+              env:
+                  DRY_RUN: ${{ inputs.dry_run }}
               run: |
                   SHA=$(git rev-parse --short=8 HEAD)
                   tar --zstd -cf "minimalone-${SHA}.tar.zst" -C artifacts .
-
+                  if [ "$DRY_RUN" = "true" ]; then
+                    echo "::notice::dry_run — packaged minimalone-${SHA}.tar.zst but skipping GCS upload"
+                    exit 0
+                  fi
                   gcloud storage cp \
                     --cache-control="public, max-age=31536000, immutable" \
                     "minimalone-${SHA}.tar.zst" gs://minimal-shim/archives/
             - name: Create Release
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  DRY_RUN: ${{ inputs.dry_run }}
               run: |
                   tar -C artifacts/completions -czf artifacts/completions.tar.gz .
+                  if [ "$DRY_RUN" = "true" ]; then
+                    echo "::notice::dry_run — assembled release artifacts but skipping GitHub release create"
+                    exit 0
+                  fi
                   cd artifacts/
                   gh release create "${{ steps.release_info.outputs.tag }}" \
                     $(find . -maxdepth 1 -type f) \
@@ -619,10 +670,12 @@ jobs:
     stage-installer:
         # Publish the release into gs://minimal-one in the layout the curl|bash
         # installer reads (docs/specs/07-spec-installer). It re-fetches the same
-        # build artifacts and touches only gs://minimal-one.
+        # build artifacts and touches only gs://minimal-one. Wholly a publish
+        # step, so it is skipped entirely on a dry run.
         runs-on: ubuntu-latest
         timeout-minutes: 20
         needs: [release]
+        if: ${{ !inputs.dry_run }}
         permissions:
             contents: read
             id-token: write
