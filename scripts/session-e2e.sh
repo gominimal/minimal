@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The ONE session e2e, invoked by every target lane. Drives the real user
-# path through the `minimal` CLI — which abstracts where the daemon lives —
+# path through the `min` CLI — which abstracts where the daemon lives —
 # so the identical proof runs against all three deployment targets:
 #
 #   Linux native (DM2)   minimald on the host          (no extra env)
@@ -8,9 +8,9 @@
 #   macOS HVF    (DM1)   minimald in a minvmd microVM  E2E_VM=1 (macOS is always VM-backed)
 # (DM numbers are the deployment models in docs/specs/03-spec-networking.)
 #
-# Flow: from a guaranteed-clean state, `minimal activate` must auto-spawn the
+# Flow: from a guaranteed-clean state, `min activate` must auto-spawn the
 # target's daemon and create a session; then list, warm-call, destroy
-# (verified delisted), and a clean `minimal stop`. Timing is reported but NOT
+# (verified delisted), and a clean `min stop`. Timing is reported but NOT
 # asserted.
 #
 # In-session exec over the daemon's SSH surface is NOT exercised here: only
@@ -21,7 +21,7 @@
 # (host daemon) and `minimald_exec_over_bridge` (over the libkrun bridge).
 #
 # VM targets (E2E_VM=1) additionally need, from the caller:
-#   - a codesigned/linkable `minvmd` on PATH (minimal spawns it by name)
+#   - a codesigned/linkable `minvmd` on PATH (min spawns it by name)
 #   - MINVMD_KERNEL_PATH / MINVMD_ROOTFS_PATH / MINVMD_INITRAMFS
 #     (propagate through the `minvmd run --detach` re-exec)
 #   - MINVMD_BOOT_LOG (optional) to capture the guest console
@@ -29,9 +29,9 @@
 #   pass E2E_PROJECT_DIR=/tmp — a path that exists in the guest image.
 #
 # Environment:
-#   E2E_MINIMAL_ARGS    global args for every `minimal` call (e.g. --minvmd)
+#   E2E_MINIMAL_ARGS    global args for every `min` call (e.g. --minvmd)
 #   E2E_PROJECT_DIR     project to activate (default: repo root)
-#   E2E_ACTIVATE_ARGS   extra args for `minimal activate` (e.g. a future
+#   E2E_ACTIVATE_ARGS   extra args for `min activate` (e.g. a future
 #                       `--loadout dev` once the loadouts CLI lands, #686)
 #   E2E_VM              set to 1 for VM-backed targets (extra teardown +
 #                       diagnostics: minvmd stop, guest boot log)
@@ -73,7 +73,7 @@ fi
 # Word-splitting of the args is intended.
 mnl() {
   # shellcheck disable=SC2086
-  minimal ${E2E_MINIMAL_ARGS:-} "$@"
+  min ${E2E_MINIMAL_ARGS:-} "$@"
 }
 
 teardown() {
@@ -90,7 +90,7 @@ trap teardown EXIT
 fail() {
   echo "::group::session-e2e diagnostics"
   echo "--- activate stderr ---"; cat "$WORK/activate.err" 2>/dev/null || true
-  echo "--- minimal ls ---"; mnl ls 2>&1 || true
+  echo "--- min ls ---"; mnl ls 2>&1 || true
   echo "--- state dir ---"; find "$XDG_STATE_HOME" -type f 2>/dev/null | head -50
   find "$XDG_STATE_HOME" -type f \( -name '*.log' -o -name '*.toml' -o -name '*.json' \) 2>/dev/null \
     | while read -r f; do echo "--- $f (tail) ---"; tail -40 "$f"; done
@@ -103,14 +103,14 @@ fail() {
   exit 1
 }
 
-# Cold: `minimal activate` must auto-spawn the target's daemon and print the
+# Cold: `min activate` must auto-spawn the target's daemon and print the
 # new session id on stdout. The id is the LAST stdout line (any log lines
 # that slip through the RUST_LOG filter precede it), validated as a UUID.
 echo "::group::cold activate (auto-spawns the daemon)"
 t0=$(now_ms)
 # shellcheck disable=SC2086
 activate_out="$(cd "$PROJECT_DIR" && mnl activate . ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/activate.err")" \
-  || { echo "::error::cold 'minimal activate' failed to auto-spawn the daemon / create a session"; fail; }
+  || { echo "::error::cold 'min activate' failed to auto-spawn the daemon / create a session"; fail; }
 t1=$(now_ms)
 sid="$(printf '%s\n' "$activate_out" | tail -n1 | tr -d '\r')"
 echo "session: $sid (cold activate: $((t1 - t0))ms)"
@@ -123,23 +123,23 @@ echo "::endgroup::"
 
 # The session must be listed.
 mnl ls --raw 2>/dev/null | grep -Fqx "$sid" \
-  || { echo "::error::'minimal ls --raw' does not list new session $sid"; fail; }
+  || { echo "::error::'min ls --raw' does not list new session $sid"; fail; }
 
 # Warm: the daemon is up; a second CLI call must succeed without respawning.
 t0=$(now_ms)
-mnl ls >/dev/null 2>&1 || { echo "::error::warm 'minimal ls' failed"; fail; }
+mnl ls >/dev/null 2>&1 || { echo "::error::warm 'min ls' failed"; fail; }
 t1=$(now_ms)
-echo "warm 'minimal ls': $((t1 - t0))ms"
+echo "warm 'min ls': $((t1 - t0))ms"
 
 # Destroy the session; it must drop out of the listing.
 mnl destroy "$sid" >/dev/null 2>&1 \
-  || { echo "::error::'minimal destroy $sid' failed"; fail; }
+  || { echo "::error::'min destroy $sid' failed"; fail; }
 if mnl ls --raw 2>/dev/null | grep -Fqx "$sid"; then
   echo "::error::session $sid still listed after destroy"; fail
 fi
 
 # Shut the daemon down; it must not survive.
-mnl stop >/dev/null 2>&1 || { echo "::error::'minimal stop' failed"; fail; }
+mnl stop >/dev/null 2>&1 || { echo "::error::'min stop' failed"; fail; }
 
 # On VM targets the daemon IS the guest's pid-1, so stopping it must take the
 # VM down with it: the guest resets, the supervisor reaps the VMM child and

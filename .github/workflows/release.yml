@@ -84,7 +84,7 @@ jobs:
               run: |
                   cd target/x86_64-unknown-linux-musl/release
                   mv mip mip-linux-amd64
-                  mv minimal minimal-linux-amd64
+                  mv min minimal-linux-amd64
                   mv minimald minimald-linux-amd64
             - name: Upload binary (mip)
               uses: actions/upload-artifact@v7
@@ -157,7 +157,7 @@ jobs:
                   cross build --release \
                      --package minimal \
                      --target aarch64-unknown-linux-musl
-                  mv target/aarch64-unknown-linux-musl/release/minimal \
+                  mv target/aarch64-unknown-linux-musl/release/min \
                      target/aarch64-unknown-linux-musl/release/minimal-linux-arm64
             - name: Upload binary (minimal)
               uses: actions/upload-artifact@v7
@@ -226,14 +226,14 @@ jobs:
               # Separate cargo invocation from minvmd above, so its default
               # `libkrun` feature can't unify into the CLI (which opts out via
               # default-features = false). Gated next.
-              run: cargo build --release -p minimal --bin minimal
+              run: cargo build --release -p minimal --bin min
             - name: Verify minimal links only system libraries
               # The CLI calls no libkrun (it spawns minvmd as a subprocess), so
               # every dependency must be under /usr/lib or /System. A krun line
               # means the default-features = false opt-out regressed.
               run: |
-                  otool -L target/release/minimal
-                  bad="$(otool -L target/release/minimal | tail -n +2 | awk '{print $1}' \
+                  otool -L target/release/min
+                  bad="$(otool -L target/release/min | tail -n +2 | awk '{print $1}' \
                     | grep -vE '^(/usr/lib/|/System/)' || true)"
                   if [ -n "$bad" ]; then
                     echo "::error::minimal links non-system libraries (allowed: /usr/lib, /System):" >&2
@@ -245,7 +245,7 @@ jobs:
               # file must already carry the platform-suffixed name the release job expects.
               run: |
                   mv target/release/minvmd target/release/minvmd-macos-arm64
-                  mv target/release/minimal target/release/minimal-macos-arm64
+                  mv target/release/min target/release/minimal-macos-arm64
             - name: Codesign binaries with Developer ID
               # Sign the two shipped Mach-O binaries with the Developer ID
               # Application identity held in the runner's signing keychain. This

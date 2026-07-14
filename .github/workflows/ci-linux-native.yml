@@ -66,6 +66,11 @@ jobs:
               - "crates/**"
               - "Cargo.toml"
               - "Cargo.lock"
+              # Registry/build config (e.g. the buf codegen registry) affects
+              # what the workspace suite compiles. This lane is the sole per-PR
+              # gate for `core-tests` since ci.yml's redundant `test` job was
+              # removed, so a build-config change must re-run it.
+              - ".cargo/**"
               # The toolchain pin: a rustc bump must re-run the Rust lanes.
               - "rust-toolchain.toml"
               # Nextest profiles change how this lane's tests run.
@@ -103,9 +108,9 @@ jobs:
 
   native-daemon-e2e:
     # The unified session e2e (scripts/session-e2e.sh — the SAME proof every
-    # target lane runs) against the NATIVE minimald (DM2): `minimal activate`
+    # target lane runs) against the NATIVE minimald (DM2): `min activate`
     # auto-spawns `minimald run --detach`, creates a session for this repo's
-    # own project, `minimal attach --command` execs in the sandbox asserting
+    # own project, `min attach --command` execs in the sandbox asserting
     # stdout + exit status, then list/destroy/stop. Before this job, no CI
     # ran the daemon natively at all. The native target needs no E2E_* knobs:
     # host daemon, repo as the project.
@@ -138,7 +143,7 @@ jobs:
           key: native-e2e-minimal-cache-${{ hashFiles('.minimal/minimal.toml') }}
           restore-keys: native-e2e-minimal-cache-
       - name: Build minimal + minimald
-        run: cargo build -p minimald --bin minimald -p minimal --bin minimal --locked
+        run: cargo build -p minimald --bin minimald -p minimal --bin min --locked
       - name: Session e2e (native minimald)
         run: |
           export PATH="$PWD/target/debug:$PATH"

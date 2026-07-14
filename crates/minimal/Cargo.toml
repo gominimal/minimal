@@ -4,6 +4,16 @@ version = "0.0.1"
 edition.workspace = true
 publish.workspace = true
 
+# The user-facing command is `min` — clap has said so since the CLI was named
+# (`#[command(name = "min")]`), and the installer lays the binary down as
+# `bin/min`. Name the binary target to match so the dev build agrees with what
+# ships, instead of leaving `min` to be conjured by a rename at release time.
+# Declaring a [[bin]] disables autodiscovery, so `src/main.rs` is now built
+# ONLY as `min`; the `minimal` lib target is unaffected.
+[[bin]]
+name = "min"
+path = "src/main.rs"
+
 [features]
 # Off by default: gates the `mesh` and `ssh-forward` CLI subcommands. WireGuard
 # mesh (UC7 / UC2b-A) and the SSH port-forward fallback are deferred for now; the

@@ -2219,8 +2219,11 @@ mod tests {
             );
         }
 
+        /// `~someuser/…` (per-user tilde) is rejected at expansion —
+        /// only bare `~` and `~/…` are supported. Silent noop
+        /// otherwise: the pattern would be literal and never match.
         #[test]
-        fn user_prefixed_tilde_is_rejected_as_relative() {
+        fn user_prefixed_tilde_is_rejected() {
             let (_tmp, patch) = single_file_patch("conf.toml", "conf");
             let pp = ProvenancedPatch::new(patch, user_source());
             let policy = PatchPolicy::empty().with_deny(["~someuser/.ssh/**"]);
@@ -2237,7 +2240,7 @@ mod tests {
                 matches!(
                     err,
                     ComposeError::Expansion(
-                        crate::core::expansion::ExpandError::NotAbsolute { .. }
+                        crate::core::expansion::ExpandError::UnsupportedTildeUser { .. }
                     )
                 ),
                 "got: {err:?}",
