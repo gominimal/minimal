@@ -161,7 +161,7 @@ jobs:
         # into the CLI's default-features=false opt-out, linking libkrun into
         # `minimal` (the regression the macOS lane hit and now guards). The
         # CLI drives the unified session e2e in the test job.
-        run: cargo build -p minimal --bin minimal --locked
+        run: cargo build -p minimal --bin min --locked
 
       - name: Archive integration harnesses + stage the testbed
         # `cargo nextest archive` replaces the hand-rolled testbins.json
@@ -176,7 +176,7 @@ jobs:
           mkdir -p testbed
           cargo nextest archive -p minvmd --locked --archive-file testbed/nextest-archive.tar.zst
           cp target/debug/minvmd testbed/minvmd
-          cp target/debug/minimal testbed/minimal
+          cp target/debug/min testbed/min
           cp "$RUNNER_TEMP/initramfs.cpio" testbed/initramfs.cpio
           # Ship the exact libkrun prefix the binaries were linked against.
           tar czf testbed/libkrun-prefix.tgz -C "$LIBKRUN_PREFIX" .
@@ -257,7 +257,7 @@ jobs:
         run: |
           set -euo pipefail
           TESTBED="$RUNNER_TEMP/testbed"
-          chmod +x "$TESTBED/minvmd" "$TESTBED/minimal"
+          chmod +x "$TESTBED/minvmd" "$TESTBED/min"
           mkdir -p "$HOME/.krun"
           tar xzf "$TESTBED/libkrun-prefix.tgz" -C "$HOME/.krun"
           echo "$TESTBED" >> "$GITHUB_PATH"
