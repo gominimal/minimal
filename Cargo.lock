@@ -3588,10 +3588,13 @@ name = "minimal"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-compression",
+ "async-tar",
  "camino",
  "chrono",
  "clap",
  "clap_complete",
+ "constcat",
  "dirs",
  "mctx",
  "mfile",

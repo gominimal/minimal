@@ -147,6 +147,65 @@ impl Client {
         serde_json::from_slice(&resp_buf)
             .with_context(|| format!("decode response for {}", R::NAME))
     }
+
+    /// Stream a zstd-compressed tarball of `dir` to the daemon's
+    /// `WorkspaceFilesTarZst` subsystem, which unpacks it into the
+    /// session's workspace directory.
+    ///
+    /// `session_id` is set as the `MINIMAL_SESSION_ID` env var on the
+    /// channel so the daemon can scope the upload to the correct session.
+    pub async fn upload_workspace_files(
+        &mut self,
+        session_id: sessions::SessionId,
+        dir: &Path,
+    ) -> Result<(), anyhow::Error> {
+        let subsystem =
+            constcat::concat!(minimald_rpc::RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
+
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .context("open channel for workspace file upload")?;
+
+        channel
+            .set_env(true, "MINIMAL_SESSION_ID", session_id.to_string())
+            .await
+            .context("set MINIMAL_SESSION_ID env")?;
+
+        channel
+            .request_subsystem(true, subsystem)
+            .await
+            .context("request WorkspaceFilesTarZst subsystem")?;
+
+        let mut stream = channel.into_stream();
+
+        // Build a tar archive of the directory, zstd-compress it, and
+        // stream it over the channel.
+        let tar = crate::file_upload::tar_directory(dir).await?;
+        let mut encoder = async_compression::tokio::write::ZstdEncoder::new(Vec::new());
+        encoder
+            .write_all(&tar)
+            .await
+            .context("zstd-compressing workspace tarball")?;
+        encoder.shutdown().await.context("flushing zstd encoder")?;
+        let compressed = encoder.into_inner();
+
+        stream
+            .write_all(&compressed)
+            .await
+            .context("writing workspace tarball to daemon")?;
+        stream
+            .shutdown()
+            .await
+            .context("shutting down upload stream")?;
+
+        // Drain any response (the daemon sends extended-data on error,
+        // or closes the channel on success).
+        stream.read_to_end(&mut Vec::new()).await.ok();
+
+        Ok(())
+    }
 }
 
 /// Resolve the provider-instance dir (`<state dir>/providers/local-0`) the

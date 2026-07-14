@@ -12,10 +12,13 @@ remote-access = []
 
 [dependencies]
 anyhow.workspace = true
+async-compression.workspace = true
+async-tar.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 camino.workspace = true
 chrono.workspace = true
+constcat.workspace = true
 dirs.workspace = true
 mctx.workspace = true
 mfile.workspace = true
