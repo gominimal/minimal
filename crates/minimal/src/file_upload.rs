@@ -12,12 +12,24 @@ use tokio::fs;
 /// empty directories survive the round-trip.
 pub async fn tar_directory(dir: &Path) -> Result<Vec<u8>, anyhow::Error> {
     let mut tar = Builder::new(Vec::new());
-    add_dir_entries(&mut tar, dir, "").await?;
-    let bytes = tar.into_inner().await.context("finalizing tar archive")?;
-    Ok(bytes)
+    let result = add_dir_entries(&mut tar, dir, "").await;
+    if let Err(e) = result {
+        // Finalize the builder to avoid the async-tar drop panic.
+        let _ = tar.into_inner().await;
+        return Err(e);
+    }
+    tar.into_inner().await.context("finalizing tar archive")
 }
 
-fn add_dir_entries<'a>(
+async fn add_dir_entries(
+    tar: &mut Builder<Vec<u8>>,
+    root: &Path,
+    prefix: &str,
+) -> Result<(), anyhow::Error> {
+    add_dir_entries_inner(tar, root, prefix).await
+}
+
+fn add_dir_entries_inner<'a>(
     tar: &'a mut Builder<Vec<u8>>,
     root: &'a Path,
     prefix: &'a str,
@@ -56,7 +68,7 @@ fn add_dir_entries<'a>(
                     .await
                     .with_context(|| format!("adding directory {archive_path}"))?;
 
-                add_dir_entries(tar, &entry_path, &archive_path).await?;
+                add_dir_entries_inner(tar, &entry_path, &archive_path).await?;
             } else if file_type.is_symlink() {
                 let target = fs::read_link(&entry_path)
                     .await
