@@ -35,6 +35,13 @@ let source_provenance_website = {
     downloads_page | String | optional | doc "The web page linking to the latest release or enumerating releases.",
 }
 in
+let source_provenance_gitlab = {
+    category = 'Gitlab,
+    host | String | doc "GitLab instance host, e.g. \"gitlab.com\" or \"gitlab.inria.fr\". GitLab is federated, so the host disambiguates the project (the same owner/repo on two instances are different projects).",
+    owner | String | doc "The group/user that owns the project — the path segment before the repo.",
+    repo | String | doc "The project (repository) name.",
+}
+in
 let PURL = std.contract.custom (fun _label value =>
     if std.typeof value != 'String then
         'Error { message = "PURLs must be a string" }
@@ -134,6 +141,7 @@ in
                 {category = 'GithubRepo, ..} => std.contract.check source_provenance_github label value,
                 {category = 'Sourceforge, ..} => std.contract.check source_provenance_sourceforge label value,
                 {category = 'Website, ..} => std.contract.check source_provenance_website label value,
+                {category = 'Gitlab, ..} => std.contract.check source_provenance_gitlab label value,
                     _ => 'Error {
                         message = "source_provenance value had invalid/unknown category",
                     },
