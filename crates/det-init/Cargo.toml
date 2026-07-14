@@ -1,0 +1,24 @@
+[package]
+name = "det-init"
+version = "0.0.1"
+edition.workspace = true
+publish.workspace = true
+
+# `det-init` is the minimal-detonation guest pid-1 (`/init`). It reuses
+# `minimald`'s public guest-boot library (mounts, rootfs entry, root egress,
+# VM shutdown) instead of forking minimald, then stands up the in-guest
+# BPF-LSM observer and runs the untrusted sample as `nobody` under it. It does
+# NOT run minimald's SSH server: a detonation is a one-shot, so the sample is
+# executed directly and the observer streams the event feed out. See
+# gominimal/minimal-detonation#194.
+
+[[bin]]
+name = "det-init"
+path = "src/main.rs"
+
+[dependencies]
+minimald = { version = "0.0.1", path = "../minimald" }
+tokio.workspace = true
+libc.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
