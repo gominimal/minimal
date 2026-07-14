@@ -19,4 +19,4 @@ mod ctx;
 mod raw;
 
 pub use ctx::Context;
-pub use raw::{DiskFormat, KernelFormat};
+pub use raw::{DiskFormat, KernelFormat, LogLevel, SyncMode};

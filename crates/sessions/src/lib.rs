@@ -264,8 +264,42 @@ impl fmt::Display for SessionId {
     }
 }
 
+/// Lifecycle status of a [`Record`].
+///
+/// `Pending` covers a session whose composition is still in flight —
+/// an id has been allocated and a stub record persisted, but the
+/// composition pipeline hasn't yet produced a finalized
+/// `Composition`. Mirrors the wire word
+/// [`CreateSessionResponse::Pending`] the daemon returns when the
+/// client must gate items before composition completes. `Active`
+/// is the finalized, ready-to-use state.
+///
+/// Defaults to `Active` so on-disk records predating this field
+/// (which were always finalized at create time) deserialize
+/// correctly.
+///
+/// The store records the status verbatim; state-machine transitions
+/// (e.g. `Pending → Active`) are enforced by the manager actor,
+/// not here. Prefer `match` arms over `status == Active` equality
+/// so new variants surface as compile errors.
+///
+/// [`CreateSessionResponse::Pending`]: ../minimald_rpc/enum.CreateSessionResponse.html#variant.Pending
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    /// Composition is in flight; the record is a stub awaiting the
+    /// `SubmitVerdict` round-trip to finalize. Accepts the legacy
+    /// on-disk spelling `"draft"` so records written before the
+    /// rename continue to load.
+    #[serde(alias = "draft")]
+    Pending,
+    /// Composition complete; the record is ready to apply.
+    #[default]
+    Active,
+}
+
 /// The on-disk row/record pertaining to a session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     /// Unique ID describing this session.
     #[serde(default = "SessionId::nil")]
@@ -294,6 +328,12 @@ pub struct Record {
     /// predate this field or specify none.
     #[serde(default)]
     pub policy: SessionPolicy,
+
+    /// Lifecycle status. Defaults to [`SessionStatus::Active`] for
+    /// on-disk records predating this field — those records were
+    /// always finalized at create time.
+    #[serde(default)]
+    pub status: SessionStatus,
 
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
@@ -410,6 +450,7 @@ mod tests {
             project_path: HostAbsPath::try_new("/p").unwrap(),
             network,
             policy,
+            status: SessionStatus::default(),
             attrs: BTreeMap::new(),
         }
     }
@@ -672,5 +713,47 @@ mod tests {
             SessionPolicy::new(None, Some(IngressPolicy::default())),
         );
         assert!(record.validate_policy().is_ok());
+    }
+
+    /// On-disk records that predate the `status` field must
+    /// deserialize as `Active`. This guarantees existing session
+    /// stores keep working after the schema change.
+    #[test]
+    fn record_without_status_field_deserializes_as_active() {
+        // Build a JSON document deliberately missing the `status`
+        // field, with the rest of the fields set to plausible values.
+        let raw = serde_json::json!({
+            "id": SessionId::nil(),
+            "name": null,
+            "username": null,
+            "project_path": "/p",
+            "attrs": {},
+        });
+        let parsed: Record = serde_json::from_value(raw).expect("deserialize");
+        assert_eq!(parsed.status, SessionStatus::Active);
+    }
+
+    #[test]
+    fn session_status_default_is_active() {
+        assert_eq!(SessionStatus::default(), SessionStatus::Active);
+    }
+
+    /// Records persisted before the `Draft` → `Pending` rename used
+    /// the string `"draft"`. The serde alias keeps those records
+    /// readable; regression guard for accidentally dropping the
+    /// alias on a future rename.
+    #[test]
+    fn legacy_draft_string_deserializes_as_pending() {
+        let parsed: SessionStatus =
+            serde_json::from_value(serde_json::json!("draft")).expect("deserialize");
+        assert_eq!(parsed, SessionStatus::Pending);
+    }
+
+    /// The canonical serialized form is `"pending"`; the alias is
+    /// read-only.
+    #[test]
+    fn pending_serializes_as_pending_not_draft() {
+        let s = serde_json::to_string(&SessionStatus::Pending).expect("serialize");
+        assert_eq!(s, "\"pending\"");
     }
 }

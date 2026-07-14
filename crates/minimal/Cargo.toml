@@ -1,50 +1,55 @@
 [package]
 name = "minimal"
-version = "0.4.1"
+version = "0.0.1"
 edition.workspace = true
 publish.workspace = true
 
+# The user-facing command is `min` — clap has said so since the CLI was named
+# (`#[command(name = "min")]`), and the installer lays the binary down as
+# `bin/min`. Name the binary target to match so the dev build agrees with what
+# ships, instead of leaving `min` to be conjured by a rename at release time.
+# Declaring a [[bin]] disables autodiscovery, so `src/main.rs` is now built
+# ONLY as `min`; the `minimal` lib target is unaffected.
+[[bin]]
+name = "min"
+path = "src/main.rs"
+
+[features]
+# Off by default: gates the `mesh` and `ssh-forward` CLI subcommands. WireGuard
+# mesh (UC7 / UC2b-A) and the SSH port-forward fallback are deferred for now; the
+# daemon-side `direct-tcpip` handler is behind minimald's `ssh-forward` feature.
+remote-access = []
+
 [dependencies]
-args.workspace = true
-graph.workspace = true
-lcache.workspace = true
-rcache.workspace = true
-check.workspace = true
-common.workspace = true
-checkouts.workspace = true
-decode.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+camino.workspace = true
+chrono.workspace = true
+dirs.workspace = true
 mctx.workspace = true
 mfile.workspace = true
+minimald-rpc.workspace = true
 op.workspace = true
-ot.workspace = true
-orchestrator.workspace = true
-remote-client.workspace = true
-
-nickel-lang-core.workspace = true
-codespan-reporting.workspace = true
-
+paths.workspace = true
+russh.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sessions.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-clap.workspace = true
-clap_complete.workspace = true
-dirs.workspace = true
-blake3.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-
-rayon.workspace = true
-tokio.workspace = true
-tokio-util.workspace = true
-futures.workspace = true
-
-anyhow.workspace = true
-
-toml_edit.workspace = true
-
-petgraph.workspace = true
-smallvec.workspace = true
+# default-features = false drops minvmd's `libkrun` feature: the CLI only uses
+# the client helpers (sock/lifecycle) and calls no krun code, so it must not
+# inherit libkrun's `#[link]` load command (would make it unloadable without
+# libkrun).
+minvmd = { path = "../minvmd", default-features = false }
+ot.workspace = true
 
 [dev-dependencies]
-serial_test.workspace = true
-
+minimald = { path = "../minimald", features = ["test-support"] }
+tempfile.workspace = true
+# `test-util` (not in tokio's `full`) for `#[tokio::test(start_paused = true)]`:
+# lets the client's handshake-deadline test elapse in virtual time.
+tokio = { workspace = true, features = ["test-util"] }

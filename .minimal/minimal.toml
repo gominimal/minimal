@@ -1,7 +1,7 @@
 [upstream] # Source of software & tooling
 repo = "https://github.com/gominimal/pkgs"
 branch = "main"
-locked_commit = "087287e4b6f448eaf3d0ca7198dad384a0778b6d"
+locked_commit = "12f324d8f436bd014e54269b3ff412390d4040d5"
 
 [stack]
 use = "rust"
@@ -21,8 +21,8 @@ exec = "cargo build --verbose"
 inherit_cwd = true
 
 [tasks.build-smoke]
-description = "Smoke-test that `minimal run` can build the CLI"
-exec = "cargo build -p minimal"
+description = "Smoke-test that `mip run` can build the CLI"
+exec = "cargo build -p mip"
 inherit_cwd = true
 
 [tasks.test]
@@ -102,6 +102,19 @@ inherit_cwd = true
 [tasks.clippy]
 exec = "cargo clippy --all-targets -- -D warnings"
 inherit_cwd = true
+
+# Mutation-test the graph wire decoder. Runs in the Linux sandbox, where the
+# graph baseline test suite is green (the spec_hasher hash assertions that fail
+# on macOS pass here), which cargo-mutants requires. Scoped to wire.rs to keep
+# the run bounded; widen -f / drop it to cover more.
+[tasks.mutants]
+description = "Mutation-test the graph wire decoder with cargo-mutants"
+inherit_cwd = true
+bash = """
+set -e
+command -v cargo-mutants >/dev/null 2>&1 || cargo install cargo-mutants --locked
+cargo mutants -p graph -f wire.rs --timeout 120
+"""
 
 [tasks.arg-smoketest]
 args = {

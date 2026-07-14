@@ -10,7 +10,6 @@ publish.workspace = true
 anyhow.workspace = true
 check.workspace = true
 codespan-reporting.workspace = true
-dirs.workspace = true
 google-cloud-auth.workspace = true
 google-cloud-storage.workspace = true
 toml.workspace = true
@@ -22,7 +21,6 @@ tracing.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
-hakoniwa.workspace = true
 sandbox2.workspace = true
 
 args.workspace = true
@@ -34,6 +32,7 @@ graph.workspace = true
 mfile.workspace = true
 op.workspace = true
 ot.workspace = true
+paths.workspace = true
 orchestrator.workspace = true
 stdlib.workspace = true
 

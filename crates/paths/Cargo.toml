@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 camino.workspace = true
+dirs.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

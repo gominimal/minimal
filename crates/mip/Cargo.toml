@@ -1,0 +1,47 @@
+[package]
+name = "mip"
+version = "0.4.1"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+args.workspace = true
+graph.workspace = true
+lcache.workspace = true
+rcache.workspace = true
+check.workspace = true
+common.workspace = true
+checkouts.workspace = true
+decode.workspace = true
+mctx.workspace = true
+mfile.workspace = true
+op.workspace = true
+ot.workspace = true
+orchestrator.workspace = true
+remote-client.workspace = true
+
+nickel-lang-core.workspace = true
+codespan-reporting.workspace = true
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+clap.workspace = true
+clap_complete.workspace = true
+dirs.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+rayon.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+
+anyhow.workspace = true
+
+petgraph.workspace = true
+smallvec.workspace = true
+
+[dev-dependencies]
+serial_test.workspace = true

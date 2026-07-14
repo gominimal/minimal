@@ -16,8 +16,8 @@ link directives, `image::kernel_format()`, and `VmConfig::apply()`. The
 VMM child and boot command paths each gain a `run_linux()` function
 mirroring the existing `run_macos()` with two omissions: no code-signing
 step and no Hypervisor.framework check; instead, a `/dev/kvm` file-access
-check gates the daemon start. The existing macOS e2e test files (`boot_e2e.rs`,
-`minimald_session_e2e.rs`, `bridge_e2e.rs`) drop their
+check gates the daemon start. The existing macOS e2e test files (`boot_integration.rs`,
+`minimald_session_integration.rs`, and the since-removed `bridge_e2e.rs`) drop their
 `#[cfg(target_os = "macos")]` file-level attribute and gain a CI job on
 a KVM-capable Linux runner.
 
@@ -150,11 +150,13 @@ needed beyond removing the bail.
 Crate description updated from "macOS-only host daemon" to "VM provider
 host daemon". macOS-specific subcommand messaging removed.
 
-### `crates/minvmd/tests/{boot_e2e,minimald_session_e2e,bridge_e2e}.rs`
+### `crates/minvmd/tests/{boot_integration,minimald_session_integration,bridge_e2e}.rs`
 
 `#![cfg(target_os = "macos")]` file-level attribute removed. Each test
 remains `#[ignore]` by default; the `MINVMD_E2E=1` + env-var gate is
-unchanged. The test bodies require no change.
+unchanged. The test bodies require no change. (`bridge_e2e.rs` was later
+removed in the auto-discovery migration — superseded by
+`minimald_session_integration.rs`.)
 
 ### `.github/workflows/` (new CI job)
 

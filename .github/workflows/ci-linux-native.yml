@@ -1,0 +1,223 @@
+name: CI (Linux native)
+
+# The "Linux with native minimald" target lane: workspace tests plus a real
+# daemon e2e (DM2 — minimald natively on the host, no VM), which nothing
+# covered before this lane existed.
+#
+# ALWAYS-TRIGGERED, path-scoped INSIDE the workflow: the `changes` job
+# (dorny/paths-filter) gates the expensive jobs, and the `if: always()`
+# aggregator reports success even when they were path-skipped. This is the
+# lane pattern that will replace the ci-docs-skip.yml inverse-path hack once
+# the aggregators become the required checks: a required context that
+# a trigger-level path filter skips stays "Expected" forever and wedges the
+# PR, while a skipped in-workflow job just reports `skipped`, which the
+# aggregator treats as pass. Do NOT add trigger-level `paths:` here.
+#
+# minimald's root integration proofs (the network-namespace proofs — no-network
+# egress isolation, static ingress port mapping, and task-to-task connectivity
+# over the gvproxy switch) run here in the `minimald-root-integration` job (sudo + a
+# userspace gvproxy switch, no KVM), auto-discovered by the `_root_integration`
+# binary-name convention. The `networking-proxy` (mTLS reverse proxy) feature
+# tests and the WireGuard mesh (`networking-wg`) proof are deliberately NOT run
+# in this lane — see the note on the tests job.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Cancel superseded runs on a branch; never cancel a run on main.
+concurrency:
+  group: ci-linux-native-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+  # dorny/paths-filter reads the PR file list on pull_request events.
+  pull-requests: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      native: ${{ steps.filter.outputs.native }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Detect relevant changes
+        id: filter
+        # v3.0.2, SHA-pinned. Runs ONLY on pull_request, where dorny reads
+        # the PR file list via the API. On push it would need a local diff
+        # against event.before, which our shallow, credential-free checkout
+        # (persist-credentials: false) cannot provide — and pushes to main
+        # SHOULD run everything anyway: they write the main-only caches and
+        # provide the soak signal. Dispatch likewise runs everything.
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
+        with:
+          filters: |
+            native:
+              - "crates/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              # Registry/build config (e.g. the buf codegen registry) affects
+              # what the workspace suite compiles. This lane is the sole per-PR
+              # gate for `core-tests` since ci.yml's redundant `test` job was
+              # removed, so a build-config change must re-run it.
+              - ".cargo/**"
+              # The toolchain pin: a rustc bump must re-run the Rust lanes.
+              - "rust-toolchain.toml"
+              # Nextest profiles change how this lane's tests run.
+              - ".config/nextest.toml"
+              - "scripts/**"
+              - ".minimal/**"
+              # The gvproxy pin: the netns job fetches + SHA-checks it, so a pin
+              # bump must re-run this lane.
+              - "vendor/gvproxy/**"
+              - ".github/actions/setup-rust/**"
+              - ".github/actions/core-tests/**"
+              - ".github/workflows/ci-linux-native.yml"
+
+  tests:
+    # Core workspace suite (nextest + doctests), taking over ci.yml's `test`
+    # job for this lane; ci.yml keeps its copy until the ruleset requires
+    # this lane's aggregator, then drops it.
+    #
+    # Deliberately absent (owner decision): the `--features networking-proxy`
+    # (mTLS reverse proxy) and `--features networking-wg` (WireGuard mesh) test
+    # steps that ci.yml's `test` job still carries, and the WireGuard mesh
+    # proof (crates/minimald/tests/mesh_uc7.rs). The network-namespace proofs
+    # (crates/minimald/tests/netns_root_integration.rs) run in the `minimald-root-integration`
+    # job below. The rest stay in-tree and runnable locally, just not CI-covered.
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.native == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Run core workspace tests
+        uses: ./.github/actions/core-tests
+
+  native-daemon-e2e:
+    # The unified session e2e (scripts/session-e2e.sh — the SAME proof every
+    # target lane runs) against the NATIVE minimald (DM2): `min activate`
+    # auto-spawns `minimald run --detach`, creates a session for this repo's
+    # own project, `min attach --command` execs in the sandbox asserting
+    # stdout + exit status, then list/destroy/stop. Before this job, no CI
+    # ran the daemon natively at all. The native target needs no E2E_* knobs:
+    # host daemon, repo as the project.
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.native == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          # `-p` builds unify features differently than the workspace test
+          # suite — own cache class.
+          shared-key: native-e2e
+      - name: Enable unprivileged user namespaces
+        # The session sandbox (hakoniwa) needs userns; Ubuntu 24.04 restricts
+        # them via AppArmor by default.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Cache minimal package cache
+        # Session creation materializes the project's stack (rust + socat)
+        # into ~/.cache/minimal via cache pulls keyed by the pinned upstream
+        # commit; carry it across runs so the e2e isn't dominated by pulls.
+        # The e2e script resets XDG_STATE_HOME/XDG_RUNTIME_DIR but leaves
+        # XDG_CACHE_HOME alone for exactly this reason.
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/minimal
+          key: native-e2e-minimal-cache-${{ hashFiles('.minimal/minimal.toml') }}
+          restore-keys: native-e2e-minimal-cache-
+      - name: Build minimal + minimald
+        run: cargo build -p minimald --bin minimald -p minimal --bin min --locked
+      - name: Session e2e (native minimald)
+        run: |
+          export PATH="$PWD/target/debug:$PATH"
+          ./scripts/session-e2e.sh
+
+  minimald-root-integration:
+    # minimald's root integration proofs, auto-discovered by the `_root_integration`
+    # binary-name convention — a new crates/minimald/tests/*_root_integration.rs runs
+    # here with no workflow edit. Today that is netns_root_integration: the
+    # network-namespace proofs — a no-network task can't reach the internet, a
+    # static ingress mapping exposes then removes a task's port, and two own-IP
+    # tasks reach each other — on a real gvproxy switch, driving the PRODUCTION
+    # switch-attach wiring. They create tap devices and configure network
+    # namespaces, which needs CAP_NET_ADMIN, so they run under sudo; #[ignore] +
+    # gated on MINIMALD_NETNS_TEST so they run only here. Needs unprivileged
+    # userns + sudo (tap/netns) and a userspace gvproxy — no KVM. The WireGuard
+    # mesh proof (networking-wg) stays out: its feature is off, so it compiles to
+    # nothing and its file name does not match the convention.
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.native == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          # Builds minimald's integration targets, not the workspace suite.
+          shared-key: netns
+      - name: Install nextest
+        # Convention selection is a nextest filterset (binary(/_root_integration$/));
+        # cargo test cannot select test targets by pattern.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Enable unprivileged user namespaces
+        # The PTask namespaces (hakoniwa/unshare) need userns; Ubuntu 24.04
+        # restricts them via AppArmor by default.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Fetch pinned gvproxy switch binary
+        run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
+      - name: Confirm netns capability
+        # Fail fast with a clear message if the runner image ever drops userns,
+        # rather than letting every gated test mis-skip into a false green.
+        run: |
+          if ! unshare --user --net true 2>/dev/null && ! sudo ip netns add _ci_probe; then
+            echo "::error::runner cannot create a network namespace (no userns and no sudo netns)" >&2
+            exit 1
+          fi
+          sudo ip netns del _ci_probe 2>/dev/null || true
+          echo "netns capability: OK"
+      - name: Run minimald root integration proofs (auto-discovered)
+        env:
+          MINIMALD_NETNS_TEST: "1"
+          GVPROXY_BIN: ${{ runner.temp }}/gvproxy
+        # `binary(/_root_integration$/)` selects every root harness by suffix;
+        # `--run-ignored all` flips the #[ignore] proofs from early-return to
+        # run; `--no-tests=fail` reds the job if the convention ever matches
+        # nothing. The tap/netns commands sudo themselves.
+        run: |
+          cargo nextest run -p minimald --profile ci \
+            --run-ignored all --no-tests=fail -E 'binary(/_root_integration$/)'
+
+  # Single required status check for this lane (branch-protection context:
+  # ci-linux-native-success). Green when every gating job succeeded OR was
+  # path-skipped; red only on failure/cancellation.
+  ci-linux-native-success:
+    if: always()
+    needs: [changes, tests, native-daemon-e2e, minimald-root-integration]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify all gating jobs succeeded or were skipped
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - run: echo "Linux-native lane green"

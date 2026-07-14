@@ -12,6 +12,15 @@ networking-proxy = ["dep:rcgen", "dep:rustls", "dep:tokio-rustls"]
 # default `minimald` build pulls in no WireGuard code and pays no binary-size or
 # startup cost (R4.7); enable with `--features networking-wg`.
 networking-wg = ["dep:boringtun", "dep:base64", "dep:rand_core"]
+# Enables the SSH `direct-tcpip` (LocalForward) handler for `minimal ssh-forward`
+# (R4.8/R4.9). Off by default so port-forwarding is compiled out and every
+# `direct-tcpip` channel is rejected fail-closed; deferred for now (finding #4).
+ssh-forward = []
+# Exposes the in-process test harness (TestServer/TestClient) so external
+# crates — notably `minimal`'s integration tests — can spin up a real
+# minimald server over an in-memory or UDS transport without a separate
+# binary. No production code should depend on this.
+test-support = []
 
 [dependencies]
 async-compression.workspace = true
@@ -21,9 +30,8 @@ camino.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 constcat.workspace = true
-chrono.workspace = true
-dirs.workspace = true
 either.workspace = true
+fd-lock.workspace = true
 futures.workspace = true
 hakoniwa.workspace = true
 libc.workspace = true
@@ -37,7 +45,9 @@ thiserror.workspace = true
 vt100-ctt.workspace = true
 
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
+tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 
 # WireGuard mesh peer (Unit 4, R4.1/R4.7): compiled only under `networking-wg`.
@@ -46,6 +56,7 @@ boringtun = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
 
 args.workspace = true
+async-dialog.workspace = true
 check.workspace = true
 common.workspace = true
 graph.workspace = true
@@ -57,6 +68,7 @@ ot.workspace = true
 paths.workspace = true
 sandbox2.workspace = true
 sessions.workspace = true
+switch.workspace = true
 stdlib.workspace = true
 
 rcgen = { workspace = true, optional = true }
@@ -68,6 +80,10 @@ tokio-rustls = { workspace = true, optional = true }
 # tokio runtime and `setns(2)` directly.
 libc.workspace = true
 tokio.workspace = true
+# Parity test in `sessions/composables.rs` compares `SetupForPackages` output
+# to the composition-only path from a nickel-declared BuildSpec.
+decode.workspace = true
+indoc.workspace = true
 
 # The guest (initramfs pid-1) boot path is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]

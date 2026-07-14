@@ -88,7 +88,7 @@ pub struct TaskExec {
 }
 
 impl Exec for TaskExec {
-    type Process = HakoniwaProcess;
+    type Process = TaskProcess;
 
     fn exec(self, session: SessionHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         // 1-slot request/response channels: the producer only spawns
@@ -96,7 +96,7 @@ impl Exec for TaskExec {
         // `HakoniwaProcess` orphans the child, so we don't want to
         // spawn one we may never deliver.
         let (req_tx, req_rx) = mpsc::channel::<()>(1);
-        let (proc_tx, proc_rx) = mpsc::channel::<io::Result<HakoniwaProcess>>(1);
+        let (proc_tx, proc_rx) = mpsc::channel::<io::Result<TaskProcess>>(1);
 
         // Producer task: holds `env`, `container`, and the invocation
         // list on its stack frame. `env` owns the temp dirs and the
@@ -126,13 +126,35 @@ async fn task_producer(
     exec: TaskExec,
     session: SessionHandle,
     mut req_rx: mpsc::Receiver<()>,
-    proc_tx: mpsc::Sender<io::Result<HakoniwaProcess>>,
+    proc_tx: mpsc::Sender<io::Result<TaskProcess>>,
 ) {
     // Wrap the whole body in a fallible async block so setup errors
     // short-circuit with `?`. An `Err` outcome triggers the
     // "wait for the first request, deliver error, exit" branch below.
     let outcome: io::Result<()> = async {
         let mut ctx = session.context().await.map_err(io::Error::other)?;
+
+        // An `echo` task's output lives entirely in its declaration, so it
+        // needs no package graph or sandbox: emit it straight from the
+        // daemon and skip the heavy path below. Only mfile-local tasks are
+        // matched; a stack-provided echo task falls through to the sandbox.
+        if let Some(task) = ctx.minimal_file().task(&exec.task)
+            && task.action.as_echo().is_some()
+        {
+            let task = mctx::interpolate_task_strings(&task, exec.args.as_ref())
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let text = task.action.as_echo().unwrap_or_default().to_string();
+            if req_rx.recv().await.is_some() {
+                let _ = proc_tx
+                    .send(Ok(TaskProcess::Echo(EchoProcess::new(&text))))
+                    .await;
+            }
+            // Park until the consumer drops the stream, mirroring the
+            // sandbox path's tail so the bridge sees a clean end-of-stream.
+            let _ = req_rx.recv().await;
+            return Ok(());
+        }
+
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
         // doesn't stall the async executor.
@@ -147,8 +169,25 @@ async fn task_producer(
             .task(graph, &exec.task)
             .map_err(|e| io::Error::other(e.to_string()))?
             .ok_or_else(|| io::Error::other(format!("No such task: {}", exec.task)))?;
+        // A task inherits its session's network isolation, through the same
+        // sandbox2 `Network` seam the interactive session uses, rather than the
+        // old hardcoded `HostNet` (which leaked host egress to a no-net
+        // session's tasks). `NoNet`/`HostNet` are fully handled by sandbox2's
+        // netns decision. `OwnIp` additionally needs the per-PTask tap/switch
+        // attach (as `attach_own_ip` does for sessions); wiring that into the
+        // task-exec producer/consumer is a follow-up (and is blocked by the
+        // guest rootfs lacking `ip`/`nsenter`), so an `OwnIp` session's task
+        // falls back to `HostNet` here instead of running in an empty,
+        // egress-less netns.
+        let network_mode = match session.record().await.network {
+            m @ (sandbox2::NetworkMode::HostNet | sandbox2::NetworkMode::NoNet) => m,
+            // OwnIp falls back to HostNet (the per-PTask tap/switch attach for the
+            // task producer is a follow-up); `NetworkMode` is #[non_exhaustive],
+            // so any future mode also takes the safe HostNet default.
+            _ => sandbox2::NetworkMode::HostNet,
+        };
         let mut env = ctx
-            .make_env(
+            .make_env_with_network(
                 &exec.task,
                 &mut graph,
                 None,
@@ -156,6 +195,7 @@ async fn task_producer(
                 Some(&task.patch),
                 Some(&task.vars),
                 task.packages.clone(),
+                network_mode,
             )
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -173,7 +213,7 @@ async fn task_producer(
             if req_rx.recv().await.is_none() {
                 return Ok(());
             }
-            let result = (|| -> io::Result<HakoniwaProcess> {
+            let result = (|| -> io::Result<TaskProcess> {
                 let mut cmd = env
                     .command(&container, &inv.executable, inv.args.iter())
                     .map_err(|e| io::Error::other(format!("building command failed: {}", e)))?;
@@ -183,7 +223,7 @@ async fn task_producer(
                 let child = cmd
                     .spawn()
                     .map_err(|e| io::Error::other(format!("command launch failed: {}", e)))?;
-                Ok(HakoniwaProcess::new(child))
+                Ok(TaskProcess::Sandbox(HakoniwaProcess::new(child)))
             })();
             if let Err(send_err) = proc_tx.send(result).await {
                 // Receiver dropped between our `recv` returning `Some`
@@ -318,9 +358,92 @@ impl Process for HakoniwaProcess {
     }
 }
 
-/// Production [`Exec`]: runs the SSH `exec_request` argv through
-/// `/bin/sh -c`, matching what OpenSSH would do for the same request.
-/// Always produces a single process.
+/// The [`Process`] produced by a [`TaskExec`]: either a real sandboxed child
+/// ([`HakoniwaProcess`]) or a synthetic [`EchoProcess`] for `echo` tasks.
+///
+/// Stdio is boxed so the two variants' differing handle types unify behind
+/// one associated type; the bridge only ever sees `dyn AsyncRead`/`AsyncWrite`.
+pub enum TaskProcess {
+    Sandbox(HakoniwaProcess),
+    Echo(EchoProcess),
+}
+
+impl Process for TaskProcess {
+    type Stdin = std::pin::Pin<Box<dyn AsyncWrite + Send + Unpin>>;
+    type Stdout = std::pin::Pin<Box<dyn AsyncRead + Send + Unpin>>;
+    type Stderr = std::pin::Pin<Box<dyn AsyncRead + Send + Unpin>>;
+
+    fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
+        match self {
+            TaskProcess::Sandbox(p) => {
+                let (i, o, e) = p.take_stdio()?;
+                Some((Box::pin(i), Box::pin(o), Box::pin(e)))
+            }
+            TaskProcess::Echo(p) => p.take_stdio(),
+        }
+    }
+
+    async fn wait(&mut self) -> io::Result<Option<i32>> {
+        match self {
+            TaskProcess::Sandbox(p) => p.wait().await,
+            TaskProcess::Echo(p) => p.wait().await,
+        }
+    }
+
+    fn start_kill(&mut self) -> io::Result<()> {
+        match self {
+            TaskProcess::Sandbox(p) => p.start_kill(),
+            TaskProcess::Echo(p) => p.start_kill(),
+        }
+    }
+}
+
+/// A synthetic [`Process`] that emits a fixed string on stdout and exits 0,
+/// without spawning anything. Backs `echo` tasks, whose entire output is
+/// known from the task declaration — so no package graph or sandbox is built.
+///
+/// The stdout carries `text` plus a trailing newline, matching what
+/// `/bin/echo "text"` would produce.
+pub struct EchoProcess {
+    /// `Some` until `take_stdio` hands the streams out; `None` thereafter.
+    stdout: Option<Vec<u8>>,
+}
+
+impl EchoProcess {
+    fn new(text: &str) -> Self {
+        Self {
+            stdout: Some(format!("{text}\n").into_bytes()),
+        }
+    }
+}
+
+impl Process for EchoProcess {
+    type Stdin = std::pin::Pin<Box<dyn AsyncWrite + Send + Unpin>>;
+    type Stdout = std::pin::Pin<Box<dyn AsyncRead + Send + Unpin>>;
+    type Stderr = std::pin::Pin<Box<dyn AsyncRead + Send + Unpin>>;
+
+    fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
+        let bytes = self.stdout.take()?;
+        Some((
+            // Client stdin is accepted and discarded, as a real fast-exiting
+            // process would leave it unread.
+            Box::pin(tokio::io::sink()),
+            Box::pin(std::io::Cursor::new(bytes)),
+            Box::pin(tokio::io::empty()),
+        ))
+    }
+
+    async fn wait(&mut self) -> io::Result<Option<i32>> {
+        Ok(Some(0))
+    }
+
+    fn start_kill(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Runs an unsandboxed process to service an ssh execution. See [`TaskExec`],
+/// this must only be used to service specific safe invocations like `git recieve-pack`.
 #[derive(Debug, Clone)]
 pub struct TokioExec {
     pub argv: String,
@@ -684,36 +807,28 @@ pub(crate) async fn handle_exec(
         }
     };
 
+    let task = match argv.strip_prefix("min run ") {
+        None => {
+            tracing::warn!(%session_id, "execution request rejected: expected `min run <task name>`");
+            session.channel_failure(id)?;
+            return Ok(());
+        }
+        Some(t) => t,
+    }.to_string();
     session.channel_success(id)?;
 
     spawn(async move {
-        if let Some(task) = argv.strip_prefix("min run ") {
-            let exec_task = ExecTask {
-                conn,
-                serv,
-                session: session_handle,
-                channel_id: id,
-                exec: TaskExec {
-                    args: None,
-                    task: task.to_string(),
-                },
-            };
-            exec_task.run(channel).await;
-        } else {
-            let paths = session_handle.paths().await;
-            let exec_task = ExecTask {
-                conn,
-                serv,
-                session: session_handle,
-                channel_id: id,
-                exec: TokioExec {
-                    argv,
-                    cwd: paths.working,
-                    env: config.env_vars,
-                },
-            };
-            exec_task.run(channel).await;
+        let exec_task = ExecTask {
+            conn,
+            serv,
+            session: session_handle,
+            channel_id: id,
+            exec: TaskExec {
+                args: None,
+                task: task.to_string(),
+            },
         };
+        exec_task.run(channel).await;
     });
 
     Ok(())
@@ -1198,124 +1313,142 @@ mod tests {
         assert_eq!(out, b"AAABBB");
     }
 
+    /// An `EchoProcess` drives through the bridge as a zero-cost stand-in
+    /// for a spawned child: its text (plus a trailing newline, matching
+    /// `/bin/echo`) reaches the SSH stdout stream, stderr stays empty, and
+    /// it reports exit 0 — no sandbox involved.
+    #[tokio::test]
+    async fn echo_process_writes_text_and_exits_zero() {
+        use futures::stream::{self, StreamExt};
+
+        use super::{EchoProcess, TaskProcess};
+
+        let echo = TaskProcess::Echo(EchoProcess::new("MINIMALD_SESSION_OK"));
+        let mut echo_stream = stream::iter(vec![Ok(echo)]).boxed();
+
+        // SSH stdin closed: bridge sees EOF immediately.
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (mut client_stdout, mut bridge_stdout) = duplex(64 * 1024);
+        let (mut client_stderr, mut bridge_stderr) = duplex(64 * 1024);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                &mut echo_stream,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+            )
+            .await
+        });
+
+        let exit = bridge_task.await.unwrap();
+        assert_eq!(exit, 0);
+
+        let mut out = Vec::new();
+        client_stdout.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"MINIMALD_SESSION_OK\n");
+
+        let mut err = Vec::new();
+        client_stderr.read_to_end(&mut err).await.unwrap();
+        assert!(err.is_empty(), "echo should produce no stderr: {err:?}");
+    }
+
     mod end_to_end {
         //! Tests that exercise the full ssh-exec stack against a real
         //! `TestServer`: russh transport, `ConnectionHandler` dispatch,
-        //! `handle_exec`, and a real `/bin/sh -c` child.
-        use paths::HostAbsPath;
+        //! and `handle_exec` request routing.
         use sessions::SessionId;
 
-        use minimald_rpc::{CreateSession, CreateSessionRequest};
+        use minimald_rpc::CreateSession;
 
         use crate::MINIMAL_SESSION_ID_ENV;
         use crate::sessions::SessionKeyPredicate;
-        use crate::test_harness::{TestClient, TestServer};
+        use crate::test_harness::{TestClient, TestServer, create_session_req, unwrap_ready};
 
         /// Creates a fresh session through the public CreateSession RPC
         /// and returns its id, mirroring how a real client sets up state
         /// before running commands against the session.
         async fn fresh_session(client: &mut TestClient) -> SessionId {
-            client
-                .call::<CreateSession>(&CreateSessionRequest {
-                    record: sessions::Record {
-                        id: SessionId::nil(),
-                        name: Some("exec-test".to_string()),
-                        username: None,
-                        project_path: HostAbsPath::try_new("/tmp").unwrap(),
-                        network: sessions::NetworkMode::default(),
-                        policy: Default::default(),
-                        attrs: Default::default(),
-                    },
-                })
-                .await
-                .unwrap()
-                .id
+            unwrap_ready(
+                client
+                    .call::<CreateSession>(&create_session_req("exec-test", "/tmp"))
+                    .await
+                    .unwrap(),
+            )
         }
 
+        /// An exec request that isn't `min run <task>` must be refused
+        /// before any process starts: the daemon only services specific
+        /// safe invocations, never arbitrary client-supplied commands.
         #[tokio::test]
-        async fn exec_round_trips_stdout_stderr_and_exit_code() {
+        async fn exec_rejects_arbitrary_command() {
             let server = TestServer::new().await;
             let mut client = server.connect().await;
             let session_id = fresh_session(&mut client).await;
             let session_str = session_id.to_string();
 
-            let out = client
+            let result = client
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    "printf out; printf err 1>&2; exit 7",
+                    "printf pwned",
                     &[],
                 )
-                .await
-                .expect("exec request should be accepted");
+                .await;
 
-            assert_eq!(out.stdout, b"out");
-            assert_eq!(out.stderr, b"err");
-            assert_eq!(out.exit_status, Some(7));
-        }
-
-        #[tokio::test]
-        async fn exec_pipes_stdin_to_child() {
-            let server = TestServer::new().await;
-            let mut client = server.connect().await;
-            let session_id = fresh_session(&mut client).await;
-            let session_str = session_id.to_string();
-
-            let payload: &[u8] = b"hello from stdin\n";
-            let out = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    "cat",
-                    payload,
-                )
-                .await
-                .expect("exec request should be accepted");
-
-            assert_eq!(out.stdout, payload);
-            assert_eq!(out.exit_status, Some(0));
             assert!(
-                out.stderr.is_empty(),
-                "unexpected stderr from cat: {:?}",
-                out.stderr,
+                result.is_err(),
+                "arbitrary command should be rejected, got {result:?}",
             );
         }
 
+        /// End-to-end happy path for `min run <task>`: an `echo` task is
+        /// serviced straight from the workspace `minimal.toml` — no
+        /// package graph, upstream, or sandbox — and its text (plus a
+        /// trailing newline) round-trips over the channel with exit 0.
         #[tokio::test]
-        async fn exec_runs_in_session_workspace() {
+        async fn exec_runs_echo_task() {
             let server = TestServer::new().await;
             let mut client = server.connect().await;
             let session_id = fresh_session(&mut client).await;
             let session_str = session_id.to_string();
 
-            // Fetch the workspace path the server will hand to the
-            // child, so we can compare with what `pwd` reports.
+            // Drop a task-only `minimal.toml` into the session workspace.
+            // No `[upstream]`: the echo short-circuit never builds a graph,
+            // so nothing here reaches the (network-bound) package machinery.
             let mngr = server.state.sessions_manager().await;
             let session_handle = mngr
                 .get_session(SessionKeyPredicate::Id(session_id))
                 .await
                 .unwrap()
                 .expect("freshly-created session should be retrievable");
-            let paths = session_handle.paths().await;
-            // getcwd resolves symlinks (e.g. /tmp -> /private/tmp on some
-            // platforms); canonicalize both sides so the comparison is
-            // about the same inode rather than spelling.
-            let expected = std::fs::canonicalize(paths.working.as_str()).unwrap();
+            let workspace = session_handle.paths().await.working;
+            tokio::fs::write(
+                workspace.as_utf8_path().join(mfile::MFILE_NAME),
+                "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n",
+            )
+            .await
+            .unwrap();
 
             let out = client
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    "pwd",
+                    "min run echo_ok",
                     &[],
                 )
                 .await
-                .expect("exec request should be accepted");
+                .expect("min run echo_ok should be accepted");
 
+            assert_eq!(out.stdout, b"MINIMALD_SESSION_OK\n");
             assert_eq!(out.exit_status, Some(0));
-            let observed = String::from_utf8(out.stdout).unwrap();
-            let observed = std::path::PathBuf::from(observed.trim_end());
-            assert_eq!(observed, expected);
+            assert!(
+                out.stderr.is_empty(),
+                "echo task should produce no stderr: {:?}",
+                out.stderr,
+            );
         }
 
         /// End-to-end: `git push min://<session-id>` driven by an

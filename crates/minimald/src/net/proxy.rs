@@ -26,9 +26,17 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::dns::HostnameRegistry;
 
+/// Port the B5 host-side egress/DNS proxy listens on (TC3). Clients reach it
+/// via `HTTP(S)_PROXY`.
+pub const EGRESS_PROXY_PORT: u16 = 7654;
+
+/// Port the B8 mTLS reverse proxy listens on (TC7).
+pub const HTTPS_PROXY_PORT: u16 = 7655;
+
 /// Default address the egress proxy listens on: loopback, where every
 /// `*.min.internal` name is reachable. Clients reach it via `HTTP(S)_PROXY`.
-pub const DEFAULT_PROXY_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7654);
+pub const DEFAULT_PROXY_ADDR: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), EGRESS_PROXY_PORT);
 
 /// Upstream port used when a routed authority carries no explicit `:port`.
 const DEFAULT_UPSTREAM_PORT: u16 = 80;
@@ -58,6 +66,23 @@ pub trait HostRoute: Send + Sync + 'static {
 impl HostRoute for HostnameRegistry {
     fn resolve_host(&self, host: &str) -> Option<IpAddr> {
         self.resolve(host)
+    }
+}
+
+// The daemon shares its live registry behind an `RwLock` (the sessions manager
+// mutates it under `&mut self`; the proxy only reads it, synchronously, with no
+// `.await` held). This lets `Router::new(Arc<RwLock<HostnameRegistry>>)` route
+// against the same table the manager registers PTasks into.
+impl HostRoute for std::sync::RwLock<HostnameRegistry> {
+    fn resolve_host(&self, host: &str) -> Option<IpAddr> {
+        // Recover from a poisoned lock rather than mapping it to `None`: the
+        // registry is two HashMaps with no cross-field invariant a panicked
+        // writer could half-break, and silently returning `None` would make
+        // every `*.min.internal` request 502 forever with no signal.
+        match self.read() {
+            Ok(guard) => guard.resolve(host),
+            Err(poisoned) => poisoned.into_inner().resolve(host),
+        }
     }
 }
 
@@ -334,10 +359,9 @@ pub struct CertAuthority {
     pub server_cert_der: rustls::pki_types::CertificateDer<'static>,
     /// Raw PKCS#8 bytes of the server's private key.
     server_key_bytes: Vec<u8>,
-    /// The rcgen CA certificate, kept for signing client certificates.
-    ca_cert: rcgen::Certificate,
-    /// The rcgen CA key pair, kept for signing client certificates.
-    ca_key: rcgen::KeyPair,
+    /// The CA issuer (parameters plus key pair), kept for signing server and
+    /// client certificates.
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
 }
 
 #[cfg(feature = "networking-proxy")]
@@ -372,11 +396,13 @@ impl CertAuthority {
         let ca_cert = ca_params.self_signed(&ca_key)?;
         let ca_cert_der = rustls::pki_types::CertificateDer::from(ca_cert.der().to_vec());
         let ca_cert_pem = ca_cert.pem();
+        // Retain the CA as an issuer so it can sign server and client certs.
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
 
         // Server certificate signed by the CA.
         let server_key = rcgen::KeyPair::generate()?;
         let server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()])?;
-        let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key)?;
+        let server_cert = server_params.signed_by(&server_key, &issuer)?;
         let server_cert_der = rustls::pki_types::CertificateDer::from(server_cert.der().to_vec());
         let server_key_bytes = server_key.serialize_der();
 
@@ -385,8 +411,7 @@ impl CertAuthority {
             ca_cert_pem,
             server_cert_der,
             server_key_bytes,
-            ca_cert,
-            ca_key,
+            issuer,
         })
     }
 
@@ -412,7 +437,7 @@ impl CertAuthority {
         client_dn.push(rcgen::DnType::CommonName, subject_cn);
         client_params.distinguished_name = client_dn;
         client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-        let client_cert = client_params.signed_by(&client_key, &self.ca_cert, &self.ca_key)?;
+        let client_cert = client_params.signed_by(&client_key, &self.issuer)?;
         Ok((client_cert.pem(), client_key.serialize_pem()))
     }
 
@@ -438,7 +463,7 @@ impl CertAuthority {
         client_dn.push(rcgen::DnType::CommonName, subject_cn);
         client_params.distinguished_name = client_dn;
         client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-        let client_cert = client_params.signed_by(&client_key, &self.ca_cert, &self.ca_key)?;
+        let client_cert = client_params.signed_by(&client_key, &self.issuer)?;
         let cert_der = rustls::pki_types::CertificateDer::from(client_cert.der().to_vec());
         let key_bytes = client_key.serialize_der();
         Ok((cert_der, key_bytes))
@@ -597,20 +622,6 @@ mod tests {
         }
     }
 
-    /// A registry behind an `RwLock` so a test can mutate it while the proxy
-    /// serves. The proxy only ever reads it (synchronously, no `.await` held),
-    /// so a plain `RwLock` is the right shared-read primitive.
-    struct Shared(RwLock<HostnameRegistry>);
-
-    impl HostRoute for Shared {
-        fn resolve_host(&self, host: &str) -> Option<IpAddr> {
-            self.0
-                .read()
-                .expect("registry lock is never held across a panic")
-                .resolve(host)
-        }
-    }
-
     /// Spawns a one-shot loopback backend that answers every connection with a
     /// fixed `200 OK` and closes, returning the port it listens on.
     async fn spawn_backend() -> u16 {
@@ -653,9 +664,8 @@ mod tests {
 
         // `myservice.dev.min.internal` → 127.0.0.1 (HostNet, R3.6); the client's
         // `:port` selects the upstream port, so it reaches the backend.
-        let shared = Arc::new(Shared(RwLock::new(HostnameRegistry::new("dev"))));
+        let shared = Arc::new(RwLock::new(HostnameRegistry::new("dev")));
         shared
-            .0
             .write()
             .unwrap()
             .register_host_net(SessionId::nil(), "myservice");
@@ -674,7 +684,7 @@ mod tests {
 
         // After the session exits the route is withdrawn: the proxy no longer
         // forwards the hostname.
-        shared.0.write().unwrap().deregister("myservice");
+        shared.write().unwrap().deregister("myservice");
         let not_found = proxy_get(proxy_addr, &authority).await;
         assert!(
             not_found.contains("502 Bad Gateway"),
@@ -682,25 +692,28 @@ mod tests {
         );
     }
 
-    /// Proof artifact 2 (OwnIp routing): a registered `OwnIp` PTask routes
-    /// through to its gvproxy switch IP. This is the routing-core contract the
-    /// proxy reaches via the switch relay; the privileged netns leg defers to
-    /// `ci-netns.yml`.
+    /// Proof artifact 2 (OwnIp routing): under the published-loopback model a
+    /// registered `OwnIp` PTask routes to `127.0.0.1` (its gvproxy-published
+    /// forwarder port), not to the switch IP — the daemon is never on the switch
+    /// (`networking-with-diagrams.md` DM2 topology). The client selects the
+    /// published external port in the authority.
     #[test]
-    fn own_ip_routes_to_its_switch_ip() {
-        let switch_ip = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 5));
+    fn own_ip_routes_to_its_published_loopback_port() {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let mut reg = HostnameRegistry::new("dev");
-        reg.register(SessionId::nil(), "web", switch_ip);
+        reg.register_own_ip(SessionId::nil(), "web");
         let router = Router::new(Arc::new(reg));
 
+        // The published external port (e.g. an ingress 18080:8080 forward) is
+        // carried in the authority and reached on loopback.
         assert_eq!(
-            router.route("web.dev.min.internal:8080"),
-            Some(SocketAddr::new(switch_ip, 8080))
+            router.route("web.dev.min.internal:18080"),
+            Some(SocketAddr::new(loopback, 18080))
         );
         // Absent an explicit port the default upstream port is used.
         assert_eq!(
             router.route("web.dev.min.internal"),
-            Some(SocketAddr::new(switch_ip, DEFAULT_UPSTREAM_PORT))
+            Some(SocketAddr::new(loopback, DEFAULT_UPSTREAM_PORT))
         );
         // An unregistered host does not route.
         assert_eq!(router.route("ghost.dev.min.internal"), None);

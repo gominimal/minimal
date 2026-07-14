@@ -1,0 +1,39 @@
+# Nextest configuration. CI lanes select a profile explicitly (--profile ci);
+# local `cargo nextest run` uses profile.default.
+#
+# No retries anywhere: there is no recorded flakiness in the workspace suite,
+# and for VM boot tests a same-invocation retry runs against the leaked
+# __krun-vmm/gvproxy processes of the failed attempt (#588) — the lane reap
+# steps plus slow-timeout terminate-after are the mitigation. Revisit once the
+# harness reaps its own process group.
+
+[profile.default]
+# Local runs: surface slow tests, never kill them.
+slow-timeout = "60s"
+
+[profile.ci]
+# Workspace suite (core-tests composite). A per-test override with a larger
+# slow-timeout is the escape hatch for a legitimately slow test — not raising
+# the cap.
+fail-fast = false
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 5 }
+leak-timeout = "1s"
+final-status-level = "slow"
+
+[profile.ci.junit]
+# Written to target/nextest/ci/junit.xml; core-tests reads it to publish a
+# pass/fail summary to $GITHUB_STEP_SUMMARY.
+path = "junit.xml"
+
+[profile.vm]
+# Prebuilt-harness VM runs (the KVM lane's archived e2e tests). One VM at a
+# time on a 2-vCPU runner; boots are legitimately slow, so the slow period is
+# generous — but a hung boot dies at 6 minutes instead of burning the job
+# timeout. The vmm/gvproxy children linger briefly at teardown by design,
+# hence the longer leak window.
+test-threads = 1
+retries = 0
+fail-fast = true
+slow-timeout = { period = "120s", terminate-after = 3 }
+leak-timeout = "5s"

@@ -37,6 +37,32 @@ const TAG_STACK: u8 = 0x06;
 const TAG_SUPPLY_CHAIN: u8 = 0x07;
 const TAG_FOOTER: u8 = 0xFF;
 
+/// Upper bound on a single framed record's payload length. A malformed stream
+/// can declare an arbitrary varint length; without this cap the decoder would
+/// `vec![0u8; len]` and abort the process on a multi-gigabyte allocation from a
+/// few bytes of input. 512 MiB comfortably exceeds any real build-spec or
+/// inlined local-file record.
+const MAX_RECORD_LEN: u64 = 512 * 1024 * 1024;
+
+/// Upper bound on the arena/map capacity pre-sized from the header's
+/// (untrusted) `build_count`. The collections still grow to hold every spec
+/// actually decoded; this only stops a malformed count from pre-allocating
+/// gigabytes before a single spec record is read.
+const MAX_PREALLOC_BUILDS: usize = 4096;
+
+/// Rejects a framed record whose declared length exceeds [`MAX_RECORD_LEN`], so
+/// a malformed varint cannot drive an unbounded `vec![0u8; len]` allocation.
+/// Shared by the sync and async readers to keep them in lock-step.
+fn check_record_len(len: u64) -> Result<(), WireError> {
+    if len > MAX_RECORD_LEN {
+        return Err(WireError::RecordTooLarge {
+            len,
+            max: MAX_RECORD_LEN,
+        });
+    }
+    Ok(())
+}
+
 // ── WireError ────────────────────────────────────────────────────────────────
 
 /// Errors that can occur during wire-format (de)serialization.
@@ -50,6 +76,7 @@ pub enum WireError {
     ChecksumMismatch,
     UnsupportedVersion(u32),
     FileHashMismatch { filename: String },
+    RecordTooLarge { len: u64, max: u64 },
 }
 
 impl From<io::Error> for WireError {
@@ -80,6 +107,9 @@ impl fmt::Display for WireError {
             Self::UnsupportedVersion(v) => write!(f, "unsupported stream version {v}"),
             Self::FileHashMismatch { filename } => {
                 write!(f, "blake3 hash mismatch for file {filename:?}")
+            }
+            Self::RecordTooLarge { len, max } => {
+                write!(f, "record length {len} exceeds maximum {max}")
             }
         }
     }
@@ -399,6 +429,7 @@ impl<R: Read> GraphReader<R> {
         };
 
         // Read payload
+        check_record_len(len)?;
         let mut payload = vec![0u8; len as usize];
         self.reader.read_exact(&mut payload)?;
 
@@ -432,8 +463,9 @@ impl<R: Read> GraphReader<R> {
         }
         let target = header.target.unwrap_or_default();
 
-        let mut arena: Arena<BuildSpec> = Arena::with_capacity(header.build_count);
-        let mut remap: HashMap<Index, BuildSpecRef> = HashMap::with_capacity(header.build_count);
+        let prealloc = header.build_count.min(MAX_PREALLOC_BUILDS);
+        let mut arena: Arena<BuildSpec> = Arena::with_capacity(prealloc);
+        let mut remap: HashMap<Index, BuildSpecRef> = HashMap::with_capacity(prealloc);
         let mut temp_dir: Option<tempfile::TempDir> = None;
         let mut file_counter: usize = 0;
 
@@ -571,9 +603,29 @@ fn materialize_local_file(
     let header_len = decode_varint(&mut cursor)? as usize;
     let pos = cursor.position() as usize;
 
-    let file_header: LocalFileHeader = serde_json::from_slice(&payload[pos..pos + header_len])?;
-    let data_start = pos + header_len;
-    let data_end = data_start + file_header.data_len as usize;
+    // Every offset below is attacker-controlled (the varint header_len and the
+    // JSON data_len); validate each slice stays within `payload` so a malformed
+    // record returns an error instead of panicking on an out-of-bounds slice.
+    let header_end = pos
+        .checked_add(header_len)
+        .filter(|&end| end <= payload.len())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "local file header exceeds payload",
+            )
+        })?;
+    let file_header: LocalFileHeader = serde_json::from_slice(&payload[pos..header_end])?;
+    let data_start = header_end;
+    let data_end = data_start
+        .checked_add(file_header.data_len as usize)
+        .filter(|&end| end <= payload.len())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "local file data exceeds payload",
+            )
+        })?;
     let file_data = &payload[data_start..data_end];
 
     // Verify hash
@@ -597,6 +649,21 @@ fn materialize_local_file(
     let subdir = td.path().join(file_counter.to_string());
     std::fs::create_dir_all(&subdir)?;
     *file_counter += 1;
+    // The filename is wire-controlled; reject absolute paths and `..`/root
+    // components so it cannot escape the per-file subdir.
+    let fname = std::path::Path::new(&file_header.filename);
+    if fname.is_absolute()
+        || fname.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "unsafe local file name").into());
+    }
     let dest = subdir.join(&file_header.filename);
     std::fs::write(&dest, file_data)?;
     std::fs::set_permissions(
@@ -854,6 +921,7 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
             result
         };
 
+        check_record_len(len)?;
         let mut payload = vec![0u8; len as usize];
         self.reader.read_exact(&mut payload).await?;
 
@@ -881,8 +949,9 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
         }
         let target = header.target.unwrap_or_default();
 
-        let mut arena: Arena<BuildSpec> = Arena::with_capacity(header.build_count);
-        let mut remap: HashMap<Index, BuildSpecRef> = HashMap::with_capacity(header.build_count);
+        let prealloc = header.build_count.min(MAX_PREALLOC_BUILDS);
+        let mut arena: Arena<BuildSpec> = Arena::with_capacity(prealloc);
+        let mut remap: HashMap<Index, BuildSpecRef> = HashMap::with_capacity(prealloc);
         let mut temp_dir: Option<tempfile::TempDir> = None;
         let mut file_counter: usize = 0;
 
@@ -1027,6 +1096,33 @@ mod tests {
     }
 
     #[test]
+    fn oversized_build_count_is_not_preallocated() {
+        // Regression for a second fuzzer-found OOM: a 35-byte input whose
+        // header declares build_count ~97M drove Arena/HashMap::with_capacity
+        // to a ~280 GiB allocation. The count is now a capped hint, so decode
+        // proceeds and fails cleanly on the truncated stream instead of OOMing.
+        let malicious = [
+            0x01, 0x12, 0x5b, 0x31, 0x0d, 0x0d, 0x0d, 0x2c, 0x39, 0x37, 0x35, 0x32, 0x34, 0x32,
+            0x30, 0x37, 0x5d, 0x0d, 0x0a, 0x0d, 0x06, 0x0d, 0x27, 0x0d, 0xff, 0xff, 0xff, 0x0d,
+            0x0d, 0xff, 0xff, 0xff, 0xff, 0xff, 0x8a,
+        ];
+        assert!(Graph::from_bytes(&malicious).is_err());
+    }
+
+    #[test]
+    fn oversized_record_length_is_rejected_not_allocated() {
+        // Regression for a fuzzer-found OOM: a 6-byte input whose first record
+        // declares a ~2.8 GiB payload used to reach `vec![0u8; len]` and abort
+        // the process. It must now surface as a clean WireError instead.
+        let malicious = [0x03, 0xad, 0xad, 0xad, 0xad, 0x0a];
+        let err = Graph::from_bytes(&malicious).unwrap_err();
+        assert!(
+            matches!(err, WireError::RecordTooLarge { .. }),
+            "expected RecordTooLarge, got {err:?}"
+        );
+    }
+
+    #[test]
     fn basic_roundtrip() {
         // Build a small graph by hand.
         let mut graph = Graph::new();
@@ -1073,6 +1169,37 @@ mod tests {
 
         // Top-levels length preserved
         assert_eq!(restored.top_levels.len(), 1);
+    }
+
+    #[test]
+    fn local_file_header_length_is_bounds_checked() {
+        // Regression for a fuzzer-found panic: header_len claims more bytes than
+        // the payload holds, which used to slice out of bounds.
+        let mut payload = Vec::new();
+        encode_varint(200, &mut payload);
+        payload.extend_from_slice(b"{}");
+        let mut td = None;
+        let mut counter = 0;
+        assert!(materialize_local_file(&payload, &mut td, &mut counter, None).is_err());
+    }
+
+    #[test]
+    fn local_file_name_traversal_is_rejected() {
+        let data = b"x";
+        let header = serde_json::to_vec(&LocalFileHeader {
+            filename: "../escape".into(),
+            file_hash: blake3::hash(data),
+            data_len: data.len() as u64,
+            file_mode: 0o644,
+        })
+        .unwrap();
+        let mut payload = Vec::new();
+        encode_varint(header.len() as u64, &mut payload);
+        payload.extend_from_slice(&header);
+        payload.extend_from_slice(data);
+        let mut td = None;
+        let mut counter = 0;
+        assert!(materialize_local_file(&payload, &mut td, &mut counter, None).is_err());
     }
 
     #[test]

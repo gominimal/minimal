@@ -13,6 +13,8 @@
 pub mod config;
 use config::Config;
 pub use config::NetworkMode;
+pub mod network;
+pub use network::{AttachFuture, HostNet, NetGuard, Network, NetworkError, NoNet};
 use std::fs::{self, Permissions};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -23,6 +25,10 @@ pub mod error;
 use crate::config::{Invocation, WdSetup};
 use crate::error::ExecutionError;
 pub use error::Error;
+/// Re-export so downstream crates (e.g. `mctx`) can use the command type
+/// without depending on `hakoniwa` directly.
+#[cfg(target_os = "linux")]
+pub use hakoniwa::Command;
 
 mod listener;
 
@@ -309,16 +315,19 @@ impl<C: Channel> Sandbox<C> {
 }
 
 /// An initialized sandbox environment.
+#[cfg(target_os = "linux")]
 pub struct Container {
     container: hakoniwa::Container,
 }
 
+#[cfg(target_os = "linux")]
 impl AsRef<hakoniwa::Container> for Container {
     fn as_ref(&self) -> &hakoniwa::Container {
         &self.container
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Container {
     /// Instructs the container to perform the setsid() & associate controlling
     /// terminal dance.
@@ -433,12 +442,14 @@ impl Container {
 
 /// Options for [`Sandbox::bind_mount`].
 #[derive(Debug, Default, Clone, Copy)]
+#[cfg(target_os = "linux")]
 struct BindOpts {
     read_only: bool,
     recursive: bool,
 }
 
 // Sandbox usage
+#[cfg(target_os = "linux")]
 impl<C: Channel> Sandbox<C> {
     fn bind_mount(
         path: &Path,
@@ -469,6 +480,13 @@ impl<C: Channel> Sandbox<C> {
         Ok(())
     }
 
+    /// Builds the hakoniwa [`Container`] for this sandbox.
+    ///
+    /// Spawning this container (`Command::spawn`) does a bare in-process `fork()`
+    /// on the calling thread and arms `PR_SET_PDEATHSIG(SIGKILL)`, tying the
+    /// child's lifetime to that thread. See [`run_with_cancel`](Self::run_with_cancel)
+    /// for the thread-affinity constraints this imposes on callers.
+    #[cfg(target_os = "linux")]
     pub fn new_container(&self) -> Result<Container, Error> {
         let mut container = hakoniwa::Container::new();
         container
@@ -496,7 +514,14 @@ impl<C: Channel> Sandbox<C> {
         // `NoNet`/`OwnIp` but this host cannot create a network namespace, we
         // fail closed rather than silently hand back full host networking, which
         // would void the isolation the mode promises (spec R1.2).
-        if isolates_network(self.config.network_mode) {
+        // A custom `Network` decides isolation; otherwise fall back to the
+        // built-in `network_mode` mapping. Phase-B wiring (own-IP tap/switch) is
+        // applied post-spawn via `attach_network`, never here.
+        let isolate = match self.config.network.as_deref() {
+            Some(net) => net.isolate_netns(),
+            None => isolates_network(self.config.network_mode),
+        };
+        if isolate {
             if network_namespaces_available() {
                 container.unshare(hakoniwa::Namespace::Network);
             } else {
@@ -506,6 +531,39 @@ impl<C: Channel> Sandbox<C> {
                     },
                 ));
             }
+        }
+
+        // Own-IP (native/DM2): have hakoniwa create + configure the TAP inside the
+        // sandbox's user+net namespace (rootless — it enters the namespace as its
+        // container-root and needs no host `CAP_NET_ADMIN`). The tap fd comes back
+        // out post-spawn via `Child.rustslirp_tapfd` for the caller to relay to the
+        // gvproxy switch. `network()` does not imply the netns unshare, so it must
+        // follow the `unshare(Namespace::Network)` above (which `isolate` did).
+        if let Some(tap) = self.config.own_ip_tap {
+            // The tap only makes sense in an unshared netns: RustSlirp enters the
+            // sandbox's own network namespace to build it, and hakoniwa skips the
+            // setup entirely (leaving no tap fd) unless `Namespace::Network` was
+            // unshared. Configuring it against a shared netns would silently no-op,
+            // so reject the combination rather than hand back a sandbox with no tap.
+            if !isolate {
+                return Err(Error::Execution(
+                    ExecutionError::NetworkIsolationUnavailable {
+                        mode: self.config.network_mode,
+                    },
+                ));
+            }
+            container.network(
+                hakoniwa::RustSlirp::default()
+                    // L2: the gvproxy relay is HyperKit-framed Ethernet, not L3.
+                    .mode(hakoniwa::RustSlirpMode::TAP)
+                    .address(tap.address)
+                    .netmask(tap.netmask)
+                    // Next-hop default route (`0.0.0.0/0 via gateway`); gvproxy is a
+                    // real gateway and does not proxy-ARP, so an on-link route fails.
+                    .gateway(hakoniwa::RustSlirpGateway::IfaceWithAddr(tap.gateway))
+                    .mtu(tap.mtu)
+                    .clone(),
+            );
         }
 
         let rec = BindOpts {
@@ -665,6 +723,24 @@ impl<C: Channel> Sandbox<C> {
             container.unshare(hakoniwa::Namespace::Uts);
             container.hostname(hn);
         }
+
+        // An own-IP sandbox runs in a fresh netns where the synth rootfs's host
+        // stub resolver (`127.0.0.53`) is unreachable, so point `/etc/resolv.conf`
+        // at the switch's DNS server (gvproxy, at the gateway) instead. Sourced
+        // from `own_ip_dns` — set for *every* own-IP sandbox, both the DM2 tap
+        // path and the DM1/3/4 shuttle path (which has no `own_ip_tap`) — so DNS
+        // is not tied to tap params. Written to the rootfs before spawn, like
+        // `/etc/hostname` above: hakoniwa binds `/etc` read-only from
+        // `<rootfs>/etc`, so an in-sandbox write would hit a read-only fs.
+        // Overwrites unconditionally — `synth_dns_config` already populated it
+        // with the host resolver, so a create-only guard would leave the (dead)
+        // host stub in place.
+        if let Some(dns) = self.config.own_ip_dns {
+            let etc_resolv = self.rootfs().join("etc").join("resolv.conf");
+            std::fs::write(&etc_resolv, format!("nameserver {dns}\n"))
+                .map_err(|e| Error::IO("writing /etc/resolv.conf", etc_resolv.clone(), e))?;
+        }
+
         if let Some(s) = &self.config.cpu_weight
             && booted_with_systemd()
         {
@@ -683,6 +759,7 @@ impl<C: Channel> Sandbox<C> {
     }
 
     /// Initializes a hakoniwa command structure.
+    #[cfg(target_os = "linux")]
     pub fn command<I, ArgS, IE, EnvK, EnvV>(
         &mut self,
         container: &Container,
@@ -713,12 +790,17 @@ impl<C: Channel> Sandbox<C> {
             .unwrap()
             && fs::exists(rootfs.join("usr/bin").join(&program)).unwrap()
         {
-            program = format!("/usr/bin/{}", &program);
+            program = format!("/usr/bin/{program}");
         }
 
         container.command_inner(self, &program, args, env_vars)
     }
 
+    /// Runs the invocations in the sandbox to completion.
+    ///
+    /// Delegates to [`run_with_cancel`](Self::run_with_cancel) — see its docs for
+    /// the important thread-affinity constraint on the sandbox container.
+    #[cfg(target_os = "linux")]
     pub async fn run<W1, W2>(
         &mut self,
         invocations: Vec<Invocation>,
@@ -738,6 +820,35 @@ impl<C: Channel> Sandbox<C> {
         .await
     }
 
+    /// Runs the invocations in the sandbox, killing the container if `cancel`
+    /// fires.
+    ///
+    /// # Thread-affinity footgun (hakoniwa `PR_SET_PDEATHSIG`)
+    ///
+    /// This forks the sandbox container **in-process, on the calling thread**
+    /// (via [`new_container`](Self::new_container) → hakoniwa's `Command::spawn`,
+    /// a bare `fork()`). The forked container arms `PR_SET_PDEATHSIG(SIGKILL)`
+    /// ("die with parent") — and on Linux that signal is delivered when the
+    /// **parent *thread*** terminates, not the parent *process*. Nothing ever
+    /// clears it, so the container stays bound to the exact thread that forked it
+    /// for its whole life.
+    ///
+    /// Consequences for callers:
+    ///
+    /// * The forking thread MUST outlive the container. This future is fine on a
+    ///   normal multi-thread runtime worker (they're stable), but the container
+    ///   dies with a spurious SIGKILL — surfacing as `InvocationFailed` — if that
+    ///   thread is retired while the container runs.
+    /// * NEVER drive this under [`tokio::task::block_in_place`]: it churns/retires
+    ///   worker threads, which SIGKILLs containers forked on them — including
+    ///   those of *unrelated* concurrent builds.
+    /// * NEVER run this on a [`tokio::task::spawn_blocking`] pool thread: those
+    ///   are reaped after an idle keep-alive, again killing the container.
+    ///
+    /// By contrast, purely-synchronous work that forks no container (e.g. staging
+    /// the rootfs in `Sandbox::new`) carries none of this and could be offloaded
+    /// to the blocking pool if it ever became hot enough to matter.
+    #[cfg(target_os = "linux")]
     pub async fn run_with_cancel<W1, W2>(
         &mut self,
         invocations: Vec<Invocation>,
@@ -763,6 +874,31 @@ impl<C: Channel> Sandbox<C> {
             let mut child = cmd
                 .spawn()
                 .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
+
+            // Apply the configured per-sandbox network to this invocation's
+            // freshly-unshared netns (own-IP switch attach). No-op for
+            // HostNet/NoNet and when no custom `Network` is set, so existing
+            // build/task consumers are unaffected — this is what lets tasks, not
+            // just minimald sessions, get networking through the abstraction.
+            // Torn down explicitly once the invocation completes (both arms).
+            // Borrow only the `Network` (which is `Send + Sync`) across the await,
+            // not the whole `Sandbox<C>`, so this doesn't impose `C: Sync` on the
+            // run future.
+            let net_guard = match self.config.network.as_deref() {
+                Some(net) => match net.attach(child.id()).await {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        // Attach failed after spawn: kill+reap the child so it
+                        // doesn't outlive its sandbox (a `hakoniwa::Child` does
+                        // not terminate on drop). `wait` runs regardless of
+                        // `kill` (the process may have already exited).
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(Error::Network(e));
+                    }
+                },
+                None => network::noop_guard(),
+            };
 
             // Take pipes from the child so threads can stream them into the stdout/stderr
             // files, as well as to the caller-provided writers if applicable.
@@ -894,42 +1030,55 @@ impl<C: Channel> Sandbox<C> {
                         self.stderr = f;
                     }
 
-                    // Reap the child process.
+                    // Reap the child process, then tear down its network.
                     let _ = child.wait();
+                    net_guard.teardown().await;
                     return Err(Error::Execution(ExecutionError::Cancelled));
                 }
                 (stdout_fwd_res, stderr_fwd_res) = async { tokio::join!(stdout_fwd, stderr_fwd) } => {
-                    // Collect results from the reader threads.
-                    let (stdout_file, stdout_tail) = stdout_thread
-                        .join()
-                        .expect("stdout reader thread panicked")?;
-                    let (stderr_file, stderr_tail) = stderr_thread
-                        .join()
-                        .expect("stderr reader thread panicked")?;
+                    // Compute the invocation outcome with a closure so every
+                    // failure path (reader-thread error, async writer error, wait
+                    // error, non-zero exit) funnels through one point; then tear
+                    // the network down unconditionally *before* propagating, so a
+                    // switch attachment is never leaked on an error return.
+                    let outcome: Result<(), Error> = (|| {
+                        let (stdout_file, stdout_tail) = stdout_thread
+                            .join()
+                            .expect("stdout reader thread panicked")?;
+                        let (stderr_file, stderr_tail) = stderr_thread
+                            .join()
+                            .expect("stderr reader thread panicked")?;
 
-                    self.stdout = stdout_file;
-                    self.stderr = stderr_file;
+                        self.stdout = stdout_file;
+                        self.stderr = stderr_file;
 
-                    // Propagate any async writer errors.
-                    stdout_fwd_res?;
-                    stderr_fwd_res?;
+                        // Propagate any async writer errors.
+                        stdout_fwd_res?;
+                        stderr_fwd_res?;
 
-                    // The pipes are drained, so the child should have exited.
-                    let status = child
-                        .wait()
-                        .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
+                        // The pipes are drained, so the child should have exited.
+                        let status = child
+                            .wait()
+                            .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
 
-                    if !status.success() {
-                        let stderr_str = String::from_utf8_lossy(&stderr_tail).into_owned();
-                        let stdout_str = String::from_utf8_lossy(&stdout_tail).into_owned();
-                        return Err(Error::Execution(ExecutionError::InvocationFailed {
-                            idx: i,
-                            code: status.code,
-                            reason: status.reason.clone(),
-                            stderr: stderr_str,
-                            stdout: stdout_str,
-                        }));
-                    }
+                        if !status.success() {
+                            let stderr_str = String::from_utf8_lossy(&stderr_tail).into_owned();
+                            let stdout_str = String::from_utf8_lossy(&stdout_tail).into_owned();
+                            return Err(Error::Execution(ExecutionError::InvocationFailed {
+                                idx: i,
+                                code: status.code,
+                                reason: status.reason.clone(),
+                                stderr: stderr_str,
+                                stdout: stdout_str,
+                            }));
+                        }
+                        Ok(())
+                    })();
+
+                    // The invocation's process has exited; tear down its network
+                    // before propagating any error.
+                    net_guard.teardown().await;
+                    outcome?;
                 }
             }
         }
@@ -1014,6 +1163,7 @@ impl Sandbox {
 
 // Matches the logic in the libcgroups crate. If we do not conditionally
 // set cpu resources, the underlying code in libcgroups will panic :(
+#[cfg(target_os = "linux")]
 fn booted_with_systemd() -> bool {
     std::fs::symlink_metadata("/run/systemd/system")
         .map(|p| p.is_dir())
@@ -1033,6 +1183,7 @@ fn hardlink_dir_contents(src_dir: &Path, dst_parent_dir: &Path) -> Result<(), Er
 /// hakoniwa, the remount succeeds even in nested sandboxes—without
 /// resorting to MountFallback (which can silently drop requested
 /// restrictions like RDONLY).
+#[cfg(target_os = "linux")]
 fn locked_mount_flags(path: &Path) -> hakoniwa::MountOptions {
     use nix::sys::statfs::statfs;
     use nix::sys::statvfs::FsFlags;
@@ -1106,6 +1257,7 @@ mod tests {
     // mapping and a nested sandbox would silently lose those locked flags
     // again. NOEXEC is also common but skipped here since it's not
     // universal.
+    #[cfg(target_os = "linux")]
     #[test]
     fn locked_mount_flags_reads_proc_flags() {
         let opts = locked_mount_flags(Path::new("/proc"));
@@ -1113,6 +1265,7 @@ mod tests {
         assert!(opts.contains(hakoniwa::MountOptions::NODEV));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn locked_mount_flags_empty_on_statfs_failure() {
         let opts = locked_mount_flags(Path::new("/nonexistent-path-for-statfs-test"));

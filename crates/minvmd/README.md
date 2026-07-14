@@ -132,21 +132,21 @@ sg kvm -c "env LD_LIBRARY_PATH=$KRUN_PREFIX \
   MINVMD_KERNEL_PATH=$PWD/.scratch/vmlinuz \
   MINVMD_ROOTFS_PATH=$PWD/.scratch/rootfs.img \
   MINVMD_INITRAMFS=$PWD/.scratch/initramfs.cpio \
-  cargo test -p minvmd --test boot_e2e -- --include-ignored --nocapture"
+  cargo test -p minvmd --test boot_integration -- --include-ignored --nocapture"
 
 sg kvm -c "env LD_LIBRARY_PATH=$KRUN_PREFIX \
   MINVMD_E2E=1 \
   MINVMD_KERNEL_PATH=$PWD/.scratch/vmlinuz \
   MINVMD_ROOTFS_PATH=$PWD/.scratch/rootfs.img \
   MINVMD_INITRAMFS=$PWD/.scratch/initramfs.cpio \
-  cargo test -p minvmd --test minimald_session_e2e \
+  cargo test -p minvmd --test minimald_session_integration \
     -- --include-ignored --nocapture --exact minimald_exec_over_bridge"
 ```
 
 (Two invocations, mirroring the CI lane's separate steps. `--exact` is passed to
 every selected `--test` binary, so combining both binaries under one
-`--exact minimald_exec_over_bridge` would run zero tests in `boot_e2e`. The
-`--exact` filter on `minimald_session_e2e` selects the bridge case; that binary
+`--exact minimald_exec_over_bridge` would run zero tests in `boot_integration`. The
+`--exact` filter on `minimald_session_integration` selects the bridge case; that binary
 has other, non-bridge cases. Drop it to run all of them.)
 
 `/dev/kvm` access: the device node is recreated on every VM teardown, which wipes
@@ -159,9 +159,9 @@ sudo usermod -aG kvm "$USER"   # one-time
 ```
 
 Gotchas:
-- `minvmd boot` is the raw boot primitive and does **not** update `state.toml`,
+- `minvmd boot` is the raw boot primitive and does **not** update `minvmd.toml`,
   so `minvmd status`/`stop` report "stopped"/"not running" even while the VM is
-  up. The lifecycle (`state.toml`) is the supervisor's job — use `minvmd run
+  up. The lifecycle (`minvmd.toml`) is the supervisor's job — use `minvmd run
   --detach` / `status` / `stop` to exercise it. Kill a stray `boot` VM by PID
   (the `boot` parent + its hidden `__krun-vmm` child).
 - **Requires libkrun >= 1.19.0** (BLK=1 for `krun_add_disk2`, plus the vsock
@@ -174,11 +174,11 @@ binaries directly — `cargo test` after signing relinks and unsigns `minvmd`. (
 Linux there is no signing step; see "E2E tests (Linux)" above.)
 
 ```sh
-cargo test -p minvmd --test boot_e2e --test minimald_session_e2e --no-run
+cargo test -p minvmd --test boot_integration --test minimald_session_integration --no-run
 codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
 
 # boot READY round-trip:
-testbin="$(ls -1t target/debug/deps/boot_e2e-* | grep -v '\.d$' | head -1)"
+testbin="$(ls -1t target/debug/deps/boot_integration-* | grep -v '\.d$' | head -1)"
 MINVMD_E2E=1 \
 MINVMD_KERNEL_PATH="$PWD/.scratch/vmlinuz" \
 MINVMD_ROOTFS_PATH="$PWD/.scratch/rootfs.img" \
@@ -186,7 +186,7 @@ MINVMD_INITRAMFS="$PWD/.scratch/initramfs.cpio" \
   "$testbin" --include-ignored --nocapture
 
 # full session (russh client → CreateSession → exec) over the bridge:
-testbin="$(ls -1t target/debug/deps/minimald_session_e2e-* | grep -v '\.d$' | head -1)"
+testbin="$(ls -1t target/debug/deps/minimald_session_integration-* | grep -v '\.d$' | head -1)"
 MINVMD_E2E=1 \
 MINVMD_KERNEL_PATH="$PWD/.scratch/vmlinuz" \
 MINVMD_ROOTFS_PATH="$PWD/.scratch/rootfs.img" \

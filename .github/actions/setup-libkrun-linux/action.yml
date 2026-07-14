@@ -1,0 +1,52 @@
+name: Setup libkrun (Linux)
+description: >
+  Materialize the upstream libkrun package (libkrun.so + libkrunfw.so.5) into
+  a flat prefix at ~/.krun via scripts/fetch-libkrun.sh — a cache fetch keyed
+  by the pinned upstream commit, NOT a from-source build — and publish
+  LIBKRUN_PREFIX (minvmd build.rs link search + rpath) and LD_LIBRARY_PATH
+  (libkrun.so -> libkrunfw.so.5 at runtime) to GITHUB_ENV for later steps.
+  The job-wide LD_LIBRARY_PATH is safe to persist: fetch-libkrun.sh strips
+  the package's glibc/libgcc layers, so the prefix holds only the libkrun
+  libraries and shadows nothing. Assumes the repository is checked out and
+  any cargo cache restore has already happened (without a prebuilt mip the
+  fetch builds the mip CLI).
+
+inputs:
+  arch:
+    description: Kernel-style arch (x86_64 or aarch64)
+    required: true
+  mip:
+    description: >
+      Optional path to a prebuilt mip binary; skips compiling a debug mip
+      just to drive the cache fetch.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Materialize libkrun prefix (upstream package)
+      shell: bash
+      env:
+        ARCH: ${{ inputs.arch }}
+        MIP: ${{ inputs.mip }}
+      run: |
+        prefix="$HOME/.krun"
+        ./scripts/fetch-libkrun.sh "$prefix" "$ARCH"
+        {
+          echo "LIBKRUN_PREFIX=$prefix"
+          echo "LD_LIBRARY_PATH=$prefix${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        } >> "$GITHUB_ENV"
+    - name: Verify libkrun exports krun_add_disk3 (>= 1.19.0)
+      # Early, actionable failure if the materialized prefix is too old for
+      # krun_add_disk3 (the /dev/vdb attach) — at the point every consumer of
+      # this composite links it, instead of a cryptic runtime error at VM
+      # boot. minvmd's compile-time link is the real backstop; this mirrors
+      # the export check the macOS composite performs on its built dylib.
+      shell: bash
+      run: |
+        so="$(ls "$HOME/.krun"/libkrun.so* 2>/dev/null | head -1)"
+        test -n "$so" || { echo "::error::no libkrun.so under $HOME/.krun"; exit 1; }
+        nm -D "$so" 2>/dev/null | grep -q krun_add_disk3 \
+          || { echo "::error::materialized libkrun ($so) does not export krun_add_disk3; need >= 1.19.0"; exit 1; }
+        echo "libkrun OK: $so exports krun_add_disk3"

@@ -15,7 +15,12 @@
 # On macOS the CLI runs inside a VM and only the project dir syncs to the host;
 # use the local dev flow in crates/minvmd/README.md instead.
 #
-# Requires: a Rust toolchain + protoc on the host (the CI job installs them).
+# Set MIP to a prebuilt mip binary to run it directly and skip the compile — e.g.
+# the release pipeline reuses the static mip it already built rather than
+# recompiling a debug one just to drive the cache fetch.
+#
+# Requires: a Rust toolchain + protoc on the host, unless MIP is supplied (the CI
+# job installs them).
 #
 # Usage: scripts/fetch-artifact.sh <output-name> <dest-path> [arch]
 #   arch defaults to aarch64 (the boot runner is Apple Silicon).
@@ -33,11 +38,16 @@ esac
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# Build the CLI from source (debug: this drives a cache fetch, so CLI CPU is not
-# the bottleneck). Incremental, so a second invocation in the same job is cheap.
-cargo build -p minimal
-MINIMAL="$ROOT/target/debug/minimal"
+# Use a prebuilt mip if provided, else build the CLI from source (debug: this
+# drives a cache fetch, so CLI CPU is not the bottleneck; incremental, so a
+# second invocation in the same job is cheap).
+if [ -n "${MIP:-}" ]; then
+  [ -x "$MIP" ] || { echo "MIP not an executable file: $MIP" >&2; exit 1; }
+else
+  cargo build -p mip
+  MIP="$ROOT/target/debug/mip"
+fi
 
 mkdir -p "$(dirname "$DEST")"
-"$MINIMAL" materialize --output "$DEST" --arch "$ARCH" "$OUTPUT"
+"$MIP" materialize --output "$DEST" --arch "$ARCH" "$OUTPUT"
 echo "fetched $OUTPUT -> $DEST ($(wc -c < "$DEST" | tr -d ' ') bytes)"

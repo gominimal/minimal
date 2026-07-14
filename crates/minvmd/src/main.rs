@@ -13,6 +13,11 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// Override the state dir base (default: $XDG_STATE_HOME/minimal).
+    /// Runtime files live under `<dir>/providers/local-0/`.
+    #[arg(long, global = true)]
+    minimal_state_dir: Option<paths::CwdRelative<paths::Daemon>>,
 }
 
 #[derive(Subcommand)]
@@ -59,6 +64,13 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    if let Some(dir) = &cli.minimal_state_dir {
+        let dir = dir
+            .resolve()
+            .map_err(|e| anyhow::anyhow!("resolving --minimal-state-dir: {e}"))?;
+        minvmd::state::set_state_dir_override(dir);
+    }
 
     match cli.command {
         Command::Boot { foreground } => minvmd::cmd::boot::run(foreground),

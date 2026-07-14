@@ -1,6 +1,6 @@
 //! `minvmd status` subcommand (R4.3).
 //!
-//! Reads `state.toml` from the state directory and prints the daemon status.
+//! Reads the daemon state and prints it.
 //! A non-blocking advisory read lock is attempted on `lifecycle.lock` to detect
 //! concurrent lifecycle transitions; if the lock cannot be acquired the command
 //! exits with code 2 (lock contention).
@@ -48,15 +48,18 @@ fn run_with_state_dir(json: bool, dir: std::path::PathBuf) -> Result<StatusExit>
     let state_dir = StateDir::new(dir).context("opening state dir")?;
 
     // Non-blocking read lock: detect concurrent state transitions (R4.3).
-    let rw = state_dir
-        .lifecycle_lock()
-        .context("opening lifecycle lock")?;
-    let _guard = match rw.try_read() {
-        Ok(g) => g,
-        Err(_) => return Ok(StatusExit::LockContention),
-    };
+    // Dropped before effective_state, which may take the write lock to repair
+    // stale state (same-process fds would deadlock otherwise).
+    {
+        let rw = state_dir
+            .lifecycle_lock()
+            .context("opening lifecycle lock")?;
+        if rw.try_read().is_err() {
+            return Ok(StatusExit::LockContention);
+        }
+    }
 
-    let state = state_dir.read_state().context("reading state")?;
+    let state = state_dir.effective_state().context("reading state")?;
 
     let uptime_seconds = state.started_at.and_then(|started| {
         let now = std::time::SystemTime::now()
@@ -88,15 +91,16 @@ fn lifecycle_state_str(lc: Lifecycle) -> &'static str {
 }
 
 fn print_json(state: &State, uptime_seconds: Option<u64>) -> Result<()> {
-    // Constant vcpus and ram_mib reflect the VmConfig::new(2, 1024, ..) values
-    // used by the VMM child. A future change that stores these in state.toml can
-    // remove these literals.
+    // vcpus is the constant the VMM child uses; ram_mib mirrors the same
+    // env-overridable resolution (`crate::cmd::vm_ram_mib()`) so `status`
+    // reports the size the next boot would use. A future change that stores
+    // these in minvmd.toml can report the live VM's actual values.
     let json = serde_json::json!({
         "state": lifecycle_state_str(state.lifecycle),
         "vmm_pid": state.vmm_pid,
         "uptime_seconds": uptime_seconds,
         "vcpus": 2u8,
-        "ram_mib": 1024u32,
+        "ram_mib": crate::cmd::vm_ram_mib(),
     });
     println!("{json}");
     Ok(())
@@ -154,8 +158,25 @@ mod tests {
             started_at: Some(1_700_000_000),
         })
         .unwrap();
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
         let exit = run_with_state_dir(false, tmp.path().to_path_buf()).unwrap();
         assert_eq!(exit, StatusExit::Running);
+    }
+
+    #[test]
+    fn stale_running_state_exits_stopped_and_repairs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = make_state_dir(&tmp);
+        // Running per the state file, but no alive-lock holder.
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Running,
+            vmm_pid: Some(12345),
+            started_at: Some(1_700_000_000),
+        })
+        .unwrap();
+        let exit = run_with_state_dir(false, tmp.path().to_path_buf()).unwrap();
+        assert_eq!(exit, StatusExit::Stopped);
+        assert_eq!(sd.read_state().unwrap().lifecycle, Lifecycle::Stopped);
     }
 
     #[test]
@@ -168,6 +189,7 @@ mod tests {
             started_at: None,
         })
         .unwrap();
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
         let exit = run_with_state_dir(false, tmp.path().to_path_buf()).unwrap();
         assert_eq!(exit, StatusExit::Stopped);
     }
@@ -182,6 +204,7 @@ mod tests {
             started_at: Some(0),
         })
         .unwrap();
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
         // run_with_state_dir prints to stdout; verify the exit code at minimum.
         let exit = run_with_state_dir(true, tmp.path().to_path_buf()).unwrap();
         assert_eq!(exit, StatusExit::Running);

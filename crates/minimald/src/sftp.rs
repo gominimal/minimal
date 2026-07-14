@@ -461,13 +461,12 @@ pub(crate) async fn handle_sftp_subsystem(
 
 #[cfg(test)]
 mod tests {
-    use paths::HostAbsPath;
     use russh_sftp::client::error::Error as SftpClientError;
     use russh_sftp::protocol::{OpenFlags, StatusCode};
     use sessions::SessionId;
     use tokio::io::AsyncWriteExt;
 
-    use minimald_rpc::{CreateSession, CreateSessionRequest};
+    use minimald_rpc::CreateSession;
 
     use crate::test_harness::TestServer;
 
@@ -475,21 +474,13 @@ mod tests {
     /// returns its uuid, mirroring how a real client would set things up
     /// before opening an SFTP channel.
     async fn fresh_session(client: &mut crate::test_harness::TestClient) -> SessionId {
-        client
-            .call::<CreateSession>(&CreateSessionRequest {
-                record: sessions::Record {
-                    id: SessionId::nil(),
-                    name: Some("sftp-test".to_string()),
-                    username: None,
-                    project_path: HostAbsPath::try_new("/tmp").unwrap(),
-                    network: sessions::NetworkMode::default(),
-                    policy: Default::default(),
-                    attrs: Default::default(),
-                },
-            })
-            .await
-            .unwrap()
-            .id
+        use crate::test_harness::{create_session_req, unwrap_ready};
+        unwrap_ready(
+            client
+                .call::<CreateSession>(&create_session_req("sftp-test", "/tmp"))
+                .await
+                .unwrap(),
+        )
     }
 
     #[tokio::test]

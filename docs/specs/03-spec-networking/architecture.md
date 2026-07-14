@@ -197,7 +197,7 @@ switch for all PTask attachments inside that VM.
 New `net.rs`: `NetworkMode`, `spawn_gvproxy`, `VmEgressPolicy` — aligned with
 the stub design from spec #404 but extended for the full switch role.
 
-### `crates/minimal2/src/`
+### `crates/minimal/src/`
 
 New subcommand group `mesh`: `join`, `leave`, `status` (Unit 4).
 New subcommand `ssh-forward` (Unit 4).

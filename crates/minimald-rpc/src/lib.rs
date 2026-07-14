@@ -172,19 +172,86 @@ impl OneshotSshRpc for GetSessionRecord {
     type Response = GetSessionRecordResponse;
 }
 
-/// An RPC to create a new session based on the given record.
+/// An RPC to create a new session.
+///
+/// Carries two parts: a [`SessionConfig`] (everything that doesn't
+/// fit in a [`WireContribution`] — name, network, policy, attrs)
+/// plus the client's Phase 1 [`WireContribution`]. Callers that
+/// don't go through the composition pipeline (sftp / exec /
+/// session-recovery) send `WireContribution::default()`.
 pub struct CreateSession;
 
+/// Session configuration that lives outside the composable
+/// [`WireContribution`] — the user-supplied `name`, the project
+/// path the session is built from, the network isolation mode, the
+/// per-session networking policy, and free-form attrs.
+///
+/// `username` is deliberately *not* here: it comes from the SSH
+/// connection context on the daemon side, never from the caller.
+/// `id` and `status` are also out: id is allocated by the store,
+/// status is managed by the manager actor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionConfig {
+    /// User-supplied name. `None` is anonymous; the daemon may render
+    /// a short display name (e.g. `<user>-<project>-<uuid-suffix>`).
+    pub name: Option<String>,
+    /// Absolute host path the session is built from.
+    pub project_path: paths::HostAbsPath,
+    /// Network isolation mode.
+    #[serde(default)]
+    pub network: NetworkMode,
+    /// Per-session networking policy (egress + ingress).
+    #[serde(default)]
+    pub policy: SessionPolicy,
+    /// Free-form attributes (typed by the caller).
+    #[serde(default)]
+    pub attrs: std::collections::BTreeMap<String, String>,
+}
+
 /// The request for a [`CreateSession`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateSessionRequest {
-    pub record: sessions::Record,
+    /// Out-of-band session config.
+    pub config: SessionConfig,
+    /// Client-side Phase 1 contribution. Defaulted (empty) by
+    /// internal callers that aren't composing a session — e.g. sftp,
+    /// exec, session-recovery — so the daemon takes the empty-
+    /// contribution fast path and returns [`CreateSessionResponse::Ready`]
+    /// immediately.
+    #[serde(default)]
+    pub contribution: sessions::wire::request::WireContribution,
 }
 
 /// The response for a [`CreateSession`] RPC.
+///
+/// Both variants are part of the Phase 2 flow and reachable on the
+/// wire: `Ready` when the daemon's composer finalizes in one shot,
+/// `Pending` when it collects items the client must gate before
+/// composition completes (the client follows up via `SubmitVerdict`).
+///
+/// In practice today every caller still takes the `Ready` path — no
+/// daemon-side contributors (project / package `Composable`s) are
+/// wired into the manager yet, so the composer never has anything to
+/// route back for gating. `Pending` lights up automatically once
+/// those contributors land.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CreateSessionResponse {
-    pub id: SessionId,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CreateSessionResponse {
+    /// No items need user gating. The session id is the finalized
+    /// session — callers can immediately use it.
+    Ready {
+        /// Daemon-assigned session id.
+        id: SessionId,
+    },
+    /// Items need client-side gating. The session id is allocated
+    /// and the session is persisted (status reflects "in flight").
+    /// Client follows up with `SubmitVerdict` carrying the same id.
+    Pending {
+        /// Daemon-assigned session id; also embedded in `response`.
+        id: SessionId,
+        /// Pending items the client must gate.
+        response: sessions::wire::request::ContributionResponse,
+    },
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -232,34 +299,48 @@ impl OneshotSshRpc for DestroySession {
     type Response = Errorable<DestroySessionResponse>;
 }
 
-// ---------------------------------------------------------------------------
-// Session-creation flow (multi-round contribution composition).
-//
-// Distinct from the simpler [`CreateSession`] above: that one takes a
-// fully-formed [`sessions::Record`]; the flow below composes the record
-// by walking client contributions and daemon-side closures across one or
-// more rounds. Each call returns a [`SessionStep`]: either the next round
-// of pending items or a protocol-level fault.
-//
-// TODO: these three RPCs are the building blocks for what is eventually
-// going to subsume `CreateSession` — once the multi-round flow lands on
-// the daemon, the terminal `SessionStep` will assemble a `sessions::Record`
-// and the single-shot `CreateSession` becomes redundant. Keeping them
-// separate for now so the existing `CreateSession` callers stay working
-// while the contribution flow is built out.
+/// An RPC asking the daemon to shut down its session manager so the process
+/// can terminate gracefully.
+pub struct Shutdown;
 
-/// An RPC to open a new session and receive the first round of items
-/// the client must resolve.
-pub struct SessionCreate;
-
-impl OneshotSshRpc for SessionCreate {
-    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "SessionCreate");
-    type Request<'a> = sessions::wire::request::SessionCreateRequest;
-    type Response = Errorable<sessions::wire::request::SessionStep>;
+/// The request for a [`Shutdown`] RPC.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShutdownRequest {
+    /// When `true`, live sessions are destroyed and the daemon shuts down
+    /// regardless. When `false`, the daemon refuses to shut down if any
+    /// session is still live, answering with [`ShutdownResponse::SessionsLive`].
+    #[serde(default)]
+    pub force: bool,
 }
 
-/// An RPC to submit the client's verdicts for one round and receive the
-/// next round (or a `complete` signal in [`sessions::wire::request::ContributionResponse`]).
+/// The response for a [`Shutdown`] RPC.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShutdownResponse {
+    /// The daemon accepted the request: the session manager is shutting down
+    /// and rejecting further work.
+    ShuttingDown,
+    /// The daemon refused: live sessions exist and `force` was not set. No
+    /// state changed; the caller may retry with `force = true`.
+    SessionsLive,
+}
+
+impl OneshotSshRpc for Shutdown {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "Shutdown");
+    type Request<'a> = ShutdownRequest;
+    type Response = ShutdownResponse;
+}
+
+/// Resume a `Pending` session with the client's per-item
+/// [`ContributionVerdict`]. Terminal — the daemon promotes the
+/// record `Pending → Active` and replies with
+/// [`SessionStep::Active`](sessions::wire::request::SessionStep::Active).
+/// A `Fault` reply carries a structured
+/// [`WireError`](sessions::wire::errors::WireError) —
+/// `UnknownSessionId` for a verdict against no stashed session,
+/// `WrongState` if the record isn't `Pending`, or an
+/// `InvalidContribution` / `Internal` reflecting a failed
+/// `resume_from_verdict`.
 pub struct SubmitVerdict;
 
 impl OneshotSshRpc for SubmitVerdict {
@@ -268,13 +349,33 @@ impl OneshotSshRpc for SubmitVerdict {
     type Response = Errorable<sessions::wire::request::SessionStep>;
 }
 
-/// An RPC to abort an in-flight session-creation flow.
-pub struct SessionAbort;
+/// Abort a `Pending` session before its `SubmitVerdict`.
+///
+/// Called by the client when its Phase 3 gating produces no verdict —
+/// user cancelled at a prompt, policy hooks returned `Abort`, or an
+/// upstream resolution / expansion failed. Drops the daemon's stash
+/// entry and deletes the on-disk `Pending` record so the session name
+/// is freed and the stash slot isn't burned.
+///
+/// Refuses non-`Pending` records: an unknown id or a record already
+/// promoted to `Active` (destroy that via [`DestroySession`]) surfaces
+/// as an `Errorable::Err`.
+pub struct AbortSession;
 
-impl OneshotSshRpc for SessionAbort {
-    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "SessionAbort");
-    type Request<'a> = sessions::wire::request::Abort;
-    type Response = Errorable<()>;
+/// The request for an [`AbortSession`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbortSessionRequest {
+    pub id: SessionId,
+}
+
+/// The response for an [`AbortSession`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AbortSessionResponse;
+
+impl OneshotSshRpc for AbortSession {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "AbortSession");
+    type Request<'a> = AbortSessionRequest;
+    type Response = Errorable<AbortSessionResponse>;
 }
 
 // ---------------------------------------------------------------------------
@@ -480,6 +581,7 @@ impl OneshotSshRpc for GetMeshStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sessions::wire::request::{ContributionResponse, WireContribution};
 
     #[test]
     fn policy_types_are_present_and_serializable() {
@@ -519,5 +621,73 @@ mod tests {
             json.contains("\"dynamic_allowed_range\":null"),
             "got: {json}"
         );
+    }
+
+    fn round_trip<T>(value: &T) -> T
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let json = serde_json::to_string(value).expect("serialize");
+        serde_json::from_str(&json).expect("deserialize")
+    }
+
+    #[test]
+    fn create_session_request_round_trips_with_explicit_contribution() {
+        let req = CreateSessionRequest {
+            config: SessionConfig {
+                name: Some("my-session".into()),
+                project_path: paths::HostAbsPath::try_new("/home/u/proj").unwrap(),
+                network: NetworkMode::OwnIp,
+                policy: SessionPolicy::default(),
+                attrs: [("color".to_string(), "blue".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+            contribution: WireContribution::default(),
+        };
+        assert_eq!(round_trip(&req), req);
+    }
+
+    #[test]
+    fn create_session_request_accepts_missing_contribution_field() {
+        // Wire payload from an internal caller that doesn't know about
+        // the composition pipeline: only `config` is set.
+        let raw = serde_json::json!({
+            "config": {
+                "name": null,
+                "project_path": "/proj",
+                "network": "host_net",
+                "policy": { "egress": null, "ingress": null },
+                "attrs": {},
+            },
+        });
+        let req: CreateSessionRequest = serde_json::from_value(raw).expect("deserialize");
+        assert_eq!(req.contribution, WireContribution::default());
+    }
+
+    #[test]
+    fn create_session_response_ready_round_trips() {
+        let id = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let resp = CreateSessionResponse::Ready { id };
+        assert_eq!(round_trip(&resp), resp);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""kind":"ready""#), "got: {json}");
+    }
+
+    #[test]
+    fn create_session_response_pending_round_trips() {
+        let id = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let resp = CreateSessionResponse::Pending {
+            id,
+            response: ContributionResponse {
+                session_id: id,
+                vars: vec![],
+                patches: vec![],
+                lifecycle_hooks: vec![],
+            },
+        };
+        assert_eq!(round_trip(&resp), resp);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""kind":"pending""#), "got: {json}");
     }
 }

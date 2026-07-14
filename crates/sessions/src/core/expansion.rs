@@ -96,21 +96,33 @@ pub enum ExpandError {
          use `~/...` or an explicit `$HOME` reference for home-relative paths"
     )]
     NotAbsolute { pattern: String },
+
+    /// A leading `~name/...` form (per-user tilde) was used. Only
+    /// bare `~` and `~/…` (the current user's home) are expanded;
+    /// `~someuser/` would silently be treated as literal, producing
+    /// an inert pattern that never matches an absolute path.
+    /// Rejecting it up front turns a silent-noop policy rule into a
+    /// loud error, since that's almost never what the user intended.
+    #[error(
+        "pattern `{pattern}` uses `~name/` form; only `~/...` is expanded — \
+         use `$HOME/...` or an explicit path"
+    )]
+    UnsupportedTildeUser { pattern: String },
 }
 
 /// Expand `raw` against `resolved_vars` and parse the result as a
-/// [`FileSet`].
+/// [`FileSet`] intended as a **patch source pattern** — the input
+/// to the walker. The result must be absolute so the walker has a
+/// concrete starting point.
 ///
-/// `home_fallback` is consulted **only for the tilde prefix** (`~` or
-/// `~/...`) when `HOME` is not in `resolved_vars`. Explicit `$HOME`
-/// and `${HOME}` references stay strict — they require an explicit
-/// `HOME` declaration in the loadout, no fallback.
+/// `home_fallback` applies only to the `~` / `~/…` prefix when
+/// `HOME` isn't in `resolved_vars`. Explicit `$HOME` / `${HOME}`
+/// references stay strict.
 ///
-/// The asymmetry is deliberate. Tilde is path syntax that users
-/// reasonably expect to "just work" — requiring every loadout to
-/// declare `HOME = { inherit = true }` to use `~/foo` is friction
-/// for no clear benefit. `$HOME` and `${HOME}` are explicit
-/// references and stay declaration-required.
+/// See [`expand_policy_pattern`] for the matcher-side variant that
+/// drops the "must be absolute" requirement — policy patterns are
+/// used to check paths, not to seed a walk, so a pattern like
+/// `**/*.pem` is meaningful there.
 ///
 /// # Errors
 ///
@@ -118,14 +130,51 @@ pub enum ExpandError {
 ///
 /// # Panics
 ///
-/// Cannot panic in practice. The body contains one `expect` covering
-/// a logically unreachable case — the loop guard `i < bytes.len()`
-/// guarantees the next character exists. The `expect` is there to
-/// document the invariant, not because it can fire.
+/// Cannot panic in practice; the loop's bounds guarantee the inner
+/// `expect` never fires.
 pub fn expand_source(
     raw: &str,
     resolved_vars: &(impl VarLookup + ?Sized),
     home_fallback: Option<&str>,
+) -> Result<FileSet, ExpandError> {
+    expand_pattern(raw, resolved_vars, home_fallback, RequireAbsolute::Yes)
+}
+
+/// Expand `raw` against `resolved_vars` and parse the result as a
+/// [`FileSet`] intended as a **policy pattern** — checked against
+/// paths that other patches produce.
+///
+/// Same substitution and normalization as [`expand_source`], but
+/// the result does not have to be absolute: a policy pattern like
+/// `**/*.pem` is a legitimate matcher for "any `.pem` at any depth"
+/// and doesn't need to point at a walk root.
+///
+/// # Errors
+///
+/// See [`ExpandError`]. [`ExpandError::NotAbsolute`] cannot be
+/// returned from this function.
+pub fn expand_policy_pattern(
+    raw: &str,
+    resolved_vars: &(impl VarLookup + ?Sized),
+    home_fallback: Option<&str>,
+) -> Result<FileSet, ExpandError> {
+    expand_pattern(raw, resolved_vars, home_fallback, RequireAbsolute::No)
+}
+
+/// Whether the expander enforces "result must be absolute." Kept
+/// internal so the two public entry points expose their intent via
+/// their name rather than a caller-visible bool.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum RequireAbsolute {
+    Yes,
+    No,
+}
+
+fn expand_pattern(
+    raw: &str,
+    resolved_vars: &(impl VarLookup + ?Sized),
+    home_fallback: Option<&str>,
+    require_absolute: RequireAbsolute,
 ) -> Result<FileSet, ExpandError> {
     let mut out = String::with_capacity(raw.len());
     let bytes = raw.as_bytes();
@@ -142,6 +191,14 @@ pub fn expand_source(
             })?;
         escape_glob_metas(home, &mut out);
         i = 1;
+    } else if bytes.first() == Some(&b'~') {
+        // `~name/...`: we don't support per-user tilde expansion.
+        // Left literal, it would be an inert pattern that silently
+        // never matches — a footgun. Reject it here so both the
+        // walker and policy paths surface the mistake loudly.
+        return Err(ExpandError::UnsupportedTildeUser {
+            pattern: raw.to_owned(),
+        });
     }
 
     while i < bytes.len() {
@@ -178,7 +235,7 @@ pub fn expand_source(
     }
 
     let normalized = normalize_path(&out)?;
-    if !normalized.starts_with('/') {
+    if require_absolute == RequireAbsolute::Yes && !normalized.starts_with('/') {
         return Err(ExpandError::NotAbsolute {
             pattern: normalized,
         });
@@ -410,15 +467,17 @@ mod tests {
         assert_eq!(expand("~", &vars).unwrap(), "/home/u");
     }
 
+    /// `~foo` isn't `~/`, so it's not tilde-expanded. Left literal,
+    /// it would be an inert glob that never matches an absolute
+    /// path (the walker's inputs) and never matches a real host
+    /// path (a policy's inputs). Reject up front — this is almost
+    /// always a user mistake for `~/foo` or an explicit path.
     #[test]
-    fn tilde_user_passes_through_literally_but_rejected_as_relative() {
-        // `~foo` isn't `~/` so it stays as-is. The glob parser would
-        // treat it as a literal directory name — but the absoluteness
-        // check rejects it first since it doesn't start with `/`.
+    fn tilde_user_form_is_rejected_up_front() {
         let vars = [];
         let err = expand("~root/x", &vars).unwrap_err();
         assert!(
-            matches!(err, ExpandError::NotAbsolute { ref pattern } if pattern == "~root/x"),
+            matches!(err, ExpandError::UnsupportedTildeUser { ref pattern } if pattern == "~root/x"),
             "got: {err:?}",
         );
     }
@@ -719,6 +778,40 @@ mod tests {
         let err = expand("~/foo", &vars).unwrap_err();
         assert!(
             matches!(err, ExpandError::NotAbsolute { .. }),
+            "got: {err:?}",
+        );
+    }
+
+    // ---- expand_policy_pattern ----
+
+    /// `expand_policy_pattern` accepts a non-absolute pattern — the
+    /// whole point of the split from `expand_source`. `**/*.pem`
+    /// means "any `.pem` at any depth" for matching purposes and
+    /// never gets walked, so it doesn't need a root.
+    #[test]
+    fn policy_pattern_accepts_non_absolute_glob() {
+        let vars: [ResolvedVar; 0] = [];
+        let fs = expand_policy_pattern("**/*.pem", vars.as_slice(), None).unwrap();
+        assert_eq!(fs.pattern(), "**/*.pem");
+    }
+
+    /// A `~/…` policy pattern still tilde-expands normally — matching
+    /// user-owned paths is the common case.
+    #[test]
+    fn policy_pattern_expands_tilde() {
+        let vars = [sv("HOME", "/home/u")];
+        let fs = expand_policy_pattern("~/.ssh/**", vars.as_slice(), None).unwrap();
+        assert_eq!(fs.pattern(), "/home/u/.ssh/**");
+    }
+
+    /// Substitution and `..` normalization still apply — dropping
+    /// the absoluteness check is the only relaxation.
+    #[test]
+    fn policy_pattern_still_rejects_parent_traversal() {
+        let vars: [ResolvedVar; 0] = [];
+        let err = expand_policy_pattern("a/../b/*.pem", vars.as_slice(), None).unwrap_err();
+        assert!(
+            matches!(err, ExpandError::PathTraversal { .. }),
             "got: {err:?}",
         );
     }

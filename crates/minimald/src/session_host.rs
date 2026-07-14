@@ -5,11 +5,14 @@
 //!
 //! The [`Host`] struct holds the running state of an active session.
 
+use async_dialog::Selection;
 use either::Either;
-#[cfg(not(test))]
-use mfile::EnvVarValue;
 use russh::Channel;
 use russh::server::Msg;
+#[cfg(not(test))]
+use sandbox2::Network;
+#[cfg(not(test))]
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::io::{Read, Write};
@@ -22,9 +25,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::RequestedPty;
-#[cfg(not(test))]
-use crate::session::SessionHandle;
 use crate::session::SessionPaths;
+use crate::sessions::SessionControl;
 #[cfg(not(test))]
 use sessions::NetworkMode;
 
@@ -38,6 +40,12 @@ const CTRL_W_CSI_U: &[u8] = b"\x1b[119;5u";
 ///
 /// Corrsponds to: modifyOtherKeys: CSI 27 ; 5 ; 119 ~
 const CTRL_W_CSI_27: &[u8] = b"\x1b[27;5;119~";
+
+/// Header of the prompt shown over the channel when a session's shell process
+/// exits, offering to detach or delete. Exposed so tests can await its
+/// appearance in the channel output before answering.
+pub(crate) const SHELL_EXIT_PROMPT: &str =
+    "Session shell process exited. What would you like to do with this session?";
 
 /// The dimensions of a terminal.
 ///
@@ -53,16 +61,17 @@ pub struct WinSize {
 }
 
 impl From<&RequestedPty> for WinSize {
-    /// Extracts the terminal dimensions, ignoring `term` and modes.
-    ///
-    /// SSH carries sizes as `u32`; terminal dimensions never exceed `u16`, so
-    /// out-of-range values are clamped rather than wrapped.
+    /// Extracts the terminal dimensions, clamping SSH's `u32` to
+    /// `u16` and replacing any zero dimension with a 24×80 default
+    /// (avoids a vt100 panic on unprobed clients).
     fn from(pty: &RequestedPty) -> Self {
         let (cols, rows) = pty.char_sizes;
         let (xpixel, ypixel) = pty.pixel_sizes;
+        let rows = rows.min(u16::MAX as u32) as u16;
+        let cols = cols.min(u16::MAX as u32) as u16;
         Self {
-            rows: rows.min(u16::MAX as u32) as u16,
-            cols: cols.min(u16::MAX as u32) as u16,
+            rows: if rows == 0 { 24 } else { rows },
+            cols: if cols == 0 { 80 } else { cols },
             xpixel: xpixel.min(u16::MAX as u32) as u16,
             ypixel: ypixel.min(u16::MAX as u32) as u16,
         }
@@ -152,12 +161,118 @@ impl Pty {
     }
 }
 
-/// Duplicates an `OwnedFd` into a new, independent close-on-exec `OwnedFd`.
+/// Emit one `tracing::info!` per item the launcher folds into the
+/// session — packages, vars, patches, and lifecycle hooks —
+/// tagging each with its provenance so an operator can trace
+/// "where did `EDITOR=hx` come from?" back to the loadout /
+/// project / package that contributed it.
 ///
-/// Uses `F_DUPFD_CLOEXEC` rather than `dup(2)` so the duplicate is born
-/// close-on-exec — otherwise a slave dup awaiting a `spawn` could be inherited
-/// by an unrelated child `fork`ed concurrently and keep the pty open past our
-/// own child's exit.
+/// Baseline items (the launcher-defaults `PS1`, `base`, `coreutils`,
+/// `socat`) log with `source = "launcher-baseline"` so they can be
+/// distinguished from composition contributions. Patches and hooks
+/// still log even though the launcher can't act on them yet — an
+/// operator inspecting a session should see the intent even when
+/// the plumbing is deferred.
+///
+/// Var values are logged at `debug` (separate call) rather than
+/// `info` so an accidentally-inherited secret doesn't sit in the
+/// default log stream.
+#[cfg(not(test))]
+fn log_session_contents(
+    session_name: &str,
+    baseline_packages: &[&str],
+    baseline_var_names: &[&str],
+    composition: Option<&sessions::core::compose::Composition>,
+) {
+    for p in baseline_packages {
+        tracing::info!(
+            session = session_name,
+            domain = "package",
+            name = p,
+            source = "launcher-baseline",
+            "session content",
+        );
+    }
+    for k in baseline_var_names {
+        tracing::info!(
+            session = session_name,
+            domain = "var",
+            name = k,
+            source = "launcher-baseline",
+            "session content",
+        );
+    }
+    let Some(comp) = composition else {
+        return;
+    };
+    for p in comp.packages() {
+        tracing::info!(
+            session = session_name,
+            domain = "package",
+            name = %p.package(),
+            source = ?sessions::core::source::Provenanced::source(p),
+            "session content",
+        );
+    }
+    for v in comp.vars() {
+        let var = v.var();
+        tracing::info!(
+            session = session_name,
+            domain = "var",
+            name = %var.name(),
+            source = ?sessions::core::source::Provenanced::source(v),
+            "session content",
+        );
+        tracing::debug!(
+            session = session_name,
+            name = %var.name(),
+            value = %var.value(),
+            "session var value",
+        );
+    }
+    for sp in comp.patches() {
+        let patch = sp.patch();
+        tracing::info!(
+            session = session_name,
+            domain = "patch",
+            host_source = %patch.host_path(),
+            sandbox_dest = %patch.destination(),
+            source = ?sessions::core::source::Provenanced::source(sp),
+            deferred = true,
+            "session content (patch: file-upload plumbing deferred)",
+        );
+    }
+    for h in comp.lifecycle_hooks() {
+        let src = sessions::core::source::Provenanced::source(h);
+        let hook = h.hook();
+        [
+            ("on_activate", hook.on_activate()),
+            ("on_destroy", hook.on_destroy()),
+            ("on_failure", hook.on_failure()),
+        ]
+        .into_iter()
+        .filter_map(|(event, script)| script.map(|s| (event, s)))
+        .for_each(|(event, script)| {
+            let kind = match script {
+                sessions::core::lifecyclehook::HookScript::Inline(_) => "inline",
+                sessions::core::lifecyclehook::HookScript::External(_) => "external",
+            };
+            tracing::info!(
+                session = session_name,
+                domain = "lifecycle_hook",
+                event = event,
+                script_kind = kind,
+                source = ?src,
+                deferred = true,
+                "session content (lifecycle hook: exec plumbing deferred)",
+            );
+        });
+    }
+}
+
+/// Duplicate `fd` into a new close-on-exec `OwnedFd` via
+/// `F_DUPFD_CLOEXEC`, so a concurrent `fork` can't inherit and hold
+/// the pty open past our child's exit.
 fn dup_fd(fd: &OwnedFd) -> io::Result<OwnedFd> {
     let raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if raw < 0 {
@@ -201,7 +316,12 @@ fn set_winsize(fd: RawFd, size: WinSize) -> io::Result<()> {
 
 enum BindingMsg {
     Stdin(Vec<u8>),
-    TeardownDueToStdoutErr(std::io::Error),
+    /// The session process ended, so the binding should tear down and raise the
+    /// shell-exit prompt. Carries the pty error when teardown was triggered by
+    /// an *unexpected* master read/write failure (surfaced to the user); `None`
+    /// when the process was reaped cleanly or the master reported the expected
+    /// `EIO`-on-exit.
+    TeardownDueToProcessExit(Option<std::io::Error>),
     TeardownDueToSuperceded(Vec<u8>),
     TeardownDueToDetach(Vec<u8>),
 }
@@ -218,6 +338,10 @@ struct Binding {
     stdin_tx: mpsc::Sender<Either<bytes::Bytes, RequestedPty>>,
     /// Channel the [`Host`] uses to communicate with this [`Binding`].
     receiver: mpsc::Receiver<BindingMsg>,
+    /// Capability to destroy the owning session, exercised when the user picks
+    /// "delete" on the shell-exit prompt. `None` for hosts spawned without a
+    /// manager (the test harness), where "delete" degrades to a detach.
+    control: Option<SessionControl>,
 }
 
 impl Binding {
@@ -226,6 +350,7 @@ impl Binding {
     pub(crate) async fn spawn(
         channel: Channel<Msg>,
         stdin_tx: mpsc::Sender<Either<bytes::Bytes, RequestedPty>>,
+        control: Option<SessionControl>,
     ) -> (mpsc::Sender<BindingMsg>, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(4);
 
@@ -233,6 +358,7 @@ impl Binding {
             channel,
             stdin_tx,
             receiver: rx,
+            control,
         };
 
         (tx, tokio::spawn(binding.run()))
@@ -242,10 +368,18 @@ impl Binding {
         let (mut rs, ws) = self.channel.split();
         let mut w = ws.make_writer();
 
+        #[derive(Debug, PartialEq, Eq)]
+        enum MainloopExitReason {
+            HostGone,
+            Detach,
+            Superceded,
+            ProcessExited,
+        }
+
         // Reading from the remote stops once it sends EOF;
         // the loop lives on to keep forwarding stdout.
         let mut remote_open = true;
-        loop {
+        let exit_reason = loop {
             tokio::select! {
                 // Remote (ssh channel) => session stdin.
                 res = rs.wait(), if remote_open => match res {
@@ -271,6 +405,10 @@ impl Binding {
                                     modes: terminal_modes.to_vec(),
                                 })).await;
                             },
+                            // Flow-control window updates fire on every
+                            // burst of bytes forwarded through the
+                            // channel, v. noisy.
+                            russh::ChannelMsg::WindowAdjusted { .. } => {}
                             _ => tracing::warn!("skipping msg: {:?}", msg),
                         };
                     }
@@ -279,36 +417,83 @@ impl Binding {
                 // A closed channel means the host is gone;
                 // tear the attachment down.
                 msg = self.receiver.recv() => {
-                    let Some(msg) = msg else { break };
+                    let Some(msg) = msg else { break MainloopExitReason::HostGone; };
                     match msg {
                         BindingMsg::Stdin(b) => {
                             let _ = w.write_all(&b).await;
                         },
-                        BindingMsg::TeardownDueToStdoutErr(e) => {
-                            if e.raw_os_error() != Some(5) {
+                        BindingMsg::TeardownDueToProcessExit(err) => {
+                            // Surface only a genuine, unexpected master error; the
+                            // expected `EIO`-on-exit (os error 5) and clean reaps
+                            // stay silent — the shell-exit prompt speaks for them.
+                            if let Some(e) = err
+                                && e.raw_os_error() != Some(5)
+                            {
                                 let _ = w.write_all(format!("Error reading stdout: {e}\n").as_bytes()).await;
                             }
-                            break;
+                            break MainloopExitReason::ProcessExited;
                         }
                         BindingMsg::TeardownDueToSuperceded(unwind_codes) => {
                             let _ = w.write_all(&unwind_codes).await;
                             let _ = w.write_all(b"\r\nDisconnecting - session attached to from a different connection\r\n").await;
-                            break;
+                            break MainloopExitReason::Superceded;
                         }
                         BindingMsg::TeardownDueToDetach(unwind_codes) => {
                             let _ = w.write_all(&unwind_codes).await;
                             let _ = w.write_all(b"\r\nDetaching due to ctrl-w.\r\n").await;
-                            break;
+                            break MainloopExitReason::Detach;
                         }
                     };
 
                 }
             }
+        };
+
+        tracing::debug!("Binding leaving mainloop due to {:?}", exit_reason);
+
+        if exit_reason == MainloopExitReason::ProcessExited {
+            // The shell process exited. For a bash shell, this usually meant someone pressed ctrl-d absent-mindedly.
+            // We presume they didnt want to completely destroy the session, perhaps just detach, but lets prompt
+            // to see where they wanted to go from here.
+            let _ = w.write_all(b"\r\n").await;
+            match async_dialog::Select::new()
+                .with_prompt(SHELL_EXIT_PROMPT)
+                .items([
+                    "Detach, leaving the session running",
+                    "Delete, all in-session files permanently deleted",
+                ])
+                .interact(rs.make_reader(), &mut w)
+                .await
+            {
+                // User selected detach, keep going to disconnect
+                Ok(Selection::At(0)) => {}
+                // User cancelled selection, safest option is to detach
+                Ok(Selection::Cancelled) => {}
+                // User selected delete: ask the manager to tear the whole
+                // session down (kill the host, remove the on-disk record) before
+                // we close the channel. Awaiting is deadlock-free here — the
+                // destroy cascade waits on the host runtime loop (already exiting
+                // now that the process has ended), never on this binding task.
+                Ok(Selection::At(1)) => match &self.control {
+                    Some(control) => {
+                        let _ = w.write_all(b"\r\nDeleting session...\r\n").await;
+                        if let Err(e) = control.destroy().await {
+                            tracing::warn!(error = %e, "session delete failed");
+                            let _ = w
+                                .write_all(format!("Failed to delete session: {e}\r\n").as_bytes())
+                                .await;
+                        }
+                    }
+                    // No manager wired (test harness): degrade to a detach.
+                    None => tracing::warn!("delete selected but no session control available"),
+                },
+                Ok(Selection::At(_)) => unreachable!(),
+                Err(e) => tracing::warn!(error = %e, "session-exit prompt failed"),
+            }
         }
 
-        tracing::debug!("Binding shutting down");
         let _ = ws.eof().await;
-        let _ = ws.exit_status(0).await; // TODO: Only report this if process terminates
+        let _ = ws.exit_status(0).await;
         let _ = ws.close().await; // needed to release the remote
     }
 }
@@ -327,14 +512,10 @@ pub(crate) trait SessionProcess: Send + 'static {
     fn kill(&mut self) -> io::Result<()>;
 }
 
-/// Opens a PTY of the requested size, launches the session process wired to the
-/// slave side, and yields the master side plus a handle to the process.
-///
-/// This is the seam between the generic [`Host`] runtime and the backend that
-/// actually creates a process (building the context/graph/env/container and the
-/// launch command). The launcher owns PTY creation because the slave side is
-/// consumed differently per backend — duplicated into the process's
-/// stdin/stdout/stderr for the real sandbox, or retained for a test double.
+/// Opens a PTY of the requested size, launches the session process
+/// wired to the slave side, and yields the master side plus a
+/// handle to the process. The seam between the generic [`Host`]
+/// runtime and the process-creation backend.
 pub(crate) trait SessionLauncher {
     /// The running-process handle this launcher produces.
     type Process: SessionProcess;
@@ -361,6 +542,10 @@ pub(crate) struct Launched<P, G> {
     process: P,
     /// Kept alive for the session; see [`SessionLauncher::Guard`].
     guard: G,
+    /// The per-sandbox network attachment (own-IP switch wiring), if any. Torn
+    /// down explicitly via [`sandbox2::NetGuard::teardown`] at session end.
+    /// `None` for `HostNet`/`NoNet` and for the mock launcher.
+    net_guard: Option<Box<dyn sandbox2::NetGuard>>,
 }
 
 /// Actor messages to a [`Host`].
@@ -528,6 +713,16 @@ pub(crate) struct Host<P: SessionProcess, G: Send + 'static> {
     // (<buffer>, <number of bytes from buffer already written>)
     stdin_buf: Option<(bytes::Bytes, usize)>,
 
+    // The per-sandbox network attachment (own-IP switch wiring), if any. Torn
+    // down explicitly in `mainloop` when the session ends, before `_guard` (and
+    // thus the sandbox files) is dropped. `None` for `HostNet`/`NoNet` and tests.
+    net_guard: Option<Box<dyn sandbox2::NetGuard>>,
+
+    // Destroy capability handed to each binding this host spawns, so a
+    // shell-exit "delete" can tear the whole session down. `None` for hosts
+    // built without a manager (the test harness).
+    control: Option<SessionControl>,
+
     // Keeps launcher-owned resources (the session's `Env`, which owns the
     // sandbox files backing the running process's rootfs along with the context
     // and graph) alive for as long as this host (and thus the session process)
@@ -546,14 +741,36 @@ impl SessionProcess for SandboxProcess {
     fn try_wait(&mut self) -> io::Result<Option<i32>> {
         self.0
             .try_wait()
-            .map(|status| status.map(|s| s.code))
+            .map(|status| {
+                status.map(|s| {
+                    if s.code != 0 {
+                        tracing::warn!(
+                            code = s.code,
+                            exit_code = ?s.exit_code,
+                            reason = %s.reason,
+                            "DIAG hakoniwa container/process exited non-zero"
+                        );
+                    }
+                    s.code
+                })
+            })
             .map_err(|e| io::Error::other(format!("wait failed: {e}")))
     }
 
     fn wait(&mut self) -> io::Result<i32> {
         self.0
             .wait()
-            .map(|s| s.code)
+            .map(|s| {
+                if s.code != 0 {
+                    tracing::warn!(
+                        code = s.code,
+                        exit_code = ?s.exit_code,
+                        reason = %s.reason,
+                        "DIAG hakoniwa container/process exited non-zero"
+                    );
+                }
+                s.code
+            })
             .map_err(|e| io::Error::other(format!("wait failed: {e}")))
     }
 
@@ -564,173 +781,92 @@ impl SessionProcess for SandboxProcess {
     }
 }
 
+/// Packages every session sandbox gets unconditionally, regardless of
+/// the client's contribution: `base` for the shell, `coreutils` for
+/// `ls`/`cat`/etc, and `socat` for the `min` command bridge (the
+/// helper installed at `/usr/bin/min` speaks to `/run/minenv_sock`
+/// via `socat`).
+#[cfg(not(test))]
+const BASELINE_PACKAGES: &[&str] = &["base", "coreutils", "socat"];
+
+/// Env vars every session sandbox gets unconditionally, regardless of
+/// the client's contribution. `PS1` is here so the shell prompt is
+/// styled the same whether a composition sets it or not.
+#[cfg(not(test))]
+const BASELINE_VARS: &[(&str, &str)] = &[(
+    "PS1",
+    r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ ",
+)];
+
 /// The real [`SessionLauncher`]: evaluates a minimal context into a graph,
 /// builds a sandboxed `/bin/bash`, and wires it to a freshly opened PTY.
 #[cfg(not(test))]
 pub(crate) struct SandboxLauncher {
     pub(crate) ctx: mctx::Context,
-    // The session this host belongs to. Not yet read, but retained so the
-    // launcher carries the full session identity for future use (and to mirror
-    // the prior `Host::spawn` signature).
-    #[allow(dead_code)]
-    pub(crate) session: SessionHandle,
     pub(crate) network_mode: NetworkMode,
-    /// The shared per-host gvproxy switch, used to attach this launch when it
-    /// runs in [`NetworkMode::OwnIp`] (R1.5). Ignored for `HostNet`/`NoNet`.
-    pub(crate) net_switch: std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
-    /// Static ingress port mappings to apply on the switch once this `OwnIp`
-    /// PTask is attached (R2.3/R2.4-static), removed when it exits. `None` (or
-    /// empty) for non-`OwnIp` launches; `session.rs` has already rejected
-    /// ingress configured on any other mode (R2.1).
+    /// Shared per-host gvproxy switch. Used only for
+    /// [`NetworkMode::OwnIp`] launches.
+    pub(crate) net_switch: std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
+    /// Static ingress port mappings applied on the switch once this
+    /// `OwnIp` PTask attaches, removed on exit. `None` for other
+    /// network modes.
     pub(crate) ingress: Option<sessions::IngressPolicy>,
+    /// Composition to merge into the launcher's baseline packages and
+    /// vars. Patches and lifecycle hooks are ignored today.
+    pub(crate) composition: Option<std::sync::Arc<sessions::core::compose::Composition>>,
 }
 
-/// Holds an `OwnIp` PTask's switch attachment for the session's lifetime.
+/// Rolls back a native-own-IP phase-1 switch attach if the launch is abandoned
+/// before the attach is handed off to an [`OwnIpGuard`].
 ///
-/// Dropping it tears down the data-plane relay (detaching the tap) and schedules
-/// a [`detach`](crate::net::GvproxySwitch::detach) on the shared switch, which
-/// decrements its refcount and stops gvproxy once the last `OwnIp` PTask leaves.
-///
-/// Because that `detach` is scheduled on the tokio runtime (see the `Drop`
-/// impl), correct shutdown requires that every `OwnIpAttachment` is dropped —
-/// i.e. all sessions are drained — *before* the runtime is stopped. If the
-/// runtime is torn down first, a pending `detach` never runs and the switch
-/// refcount stays elevated, so gvproxy is only reaped when the daemon process
-/// itself exits.
+/// Phase 1 (`SwitchClient::attach`) bumps gvproxy's attach count before the slow
+/// env build + spawn, so an early `Err` return *or* a dropped/cancelled launch
+/// future (e.g. the client disconnects mid-build) would otherwise leak the count
+/// and keep gvproxy running. The existing `Err` arms are covered, but `Drop` is
+/// what catches cancellation. `SwitchClient::detach` is async and `Drop` cannot
+/// await, so an armed drop spawns the detach on the current runtime; on the
+/// success path the guard is disarmed and `OwnIpGuard` owns teardown instead.
 #[cfg(not(test))]
-pub(crate) struct OwnIpAttachment {
-    /// Held only for its `Drop`, which aborts the relay tasks; never read.
-    _relay: crate::net::switch::SwitchRelay,
-    /// The shared switch, locked on drop to detach this PTask.
-    switch: std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
-    /// gvproxy's control socket, used on drop to remove this PTask's ingress
-    /// forwards before detaching.
-    control_sock: std::path::PathBuf,
-    /// The static ingress forwards exposed for this PTask (R2.3), removed from
-    /// the switch on drop. Empty when no ingress was configured.
-    exposed: Vec<crate::net::policy::ExposedMapping>,
+struct PhaseOneAttachGuard {
+    switch: std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
+    armed: bool,
 }
 
 #[cfg(not(test))]
-impl Drop for OwnIpAttachment {
+impl PhaseOneAttachGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for PhaseOneAttachGuard {
     fn drop(&mut self) {
-        // `detach` and ingress removal are async and `Drop` cannot await, so
-        // schedule them on the current runtime. The session host always drops
-        // within the daemon's tokio context; if somehow not, log rather than
-        // block.
+        if !self.armed {
+            return;
+        }
         let switch = std::sync::Arc::clone(&self.switch);
-        let control_sock = std::mem::take(&mut self.control_sock);
-        let exposed = std::mem::take(&mut self.exposed);
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    // Remove ingress forwards (R2.3 teardown) before detaching:
-                    // detach may stop gvproxy once the last PTask leaves, so the
-                    // unexpose must reach a still-running switch first.
-                    if !exposed.is_empty() {
-                        crate::net::policy::remove_ingress(&control_sock, &exposed).await;
-                    }
-                    if let Err(e) = switch.lock().await.detach().await {
-                        tracing::warn!(error = %e, "detaching OwnIp PTask from switch on session end");
-                    }
-                });
-            }
-            Err(_) => {
-                tracing::warn!("no tokio runtime at OwnIp guard drop; switch left attached");
-            }
-        }
-    }
-}
-
-/// Attaches an `OwnIp` PTask (identified by its sandbox process's netns-holding
-/// PID) to the shared gvproxy switch: allocate a lease and ensure gvproxy is up,
-/// open a host-side tap, move it into the PTask's network namespace and
-/// configure its switch address there, then start the frame relay. All
-/// `minimald::net` calls live here (the `minimald` side); `sandbox2` only
-/// unshared the namespace and surfaced the PID (no dependency cycle).
-#[cfg(not(test))]
-async fn attach_own_ip(
-    switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::GvproxySwitch>>,
-    netns_pid: u32,
-    ingress: Option<&sessions::IngressPolicy>,
-) -> io::Result<OwnIpAttachment> {
-    use crate::net::switch::{attach_to_switch, move_tap_into_netns, open_tap};
-
-    // Allocate a lease and ensure gvproxy is running, snapshotting the control
-    // socket and subnet under one lock; the slow tap/relay work runs unlocked so
-    // concurrent attaches don't serialize on the namespace plumbing.
-    let (lease, sock, subnet) = {
-        let mut s = switch.lock().await;
-        let attach = s
-            .attach()
-            .await
-            .map_err(|e| io::Error::other(format!("attaching OwnIp PTask to switch: {e}")))?;
-        // gvproxy's unexpected-exit closes the control socket, which ends the
-        // relay's switch-side read on its own, so the relay self-terminates; we
-        // do not additionally watch `attach.exit_signal` here.
-        (attach.lease, s.control_socket(), s.subnet())
-    };
-
-    // A locally-administered tap name unique within the switch /16 (its low two
-    // octets distinguish every PTask address) and within the 15-char `IFNAMSIZ`
-    // limit (`mtapNNN_NNN` is at most 11 chars).
-    let o = lease.ip.octets();
-    let tap = format!("mtap{}_{}", o[2], o[3]);
-
-    // On any failure after the switch attach succeeded, roll the attach back so
-    // gvproxy's refcount stays accurate (a leaked count would keep it running).
-    let relay = match async {
-        let tap_fd = open_tap(&tap)?;
-        move_tap_into_netns(&tap, netns_pid, lease, subnet).await?;
-        attach_to_switch(tap_fd, &sock).await
-    }
-    .await
-    {
-        Ok(relay) => relay,
-        Err(e) => {
-            let _ = switch.lock().await.detach().await;
-            return Err(e);
-        }
-    };
-
-    // R2.3/R2.4-static: with the PTask attached, apply its static ingress
-    // forwards on the switch control socket, retaining handles to remove on
-    // exit. A failure here rolls the whole attach back (drop the relay, then
-    // detach) so a half-configured PTask is never left running.
-    let exposed = match ingress {
-        Some(ingress) if !ingress.port_mappings.is_empty() => {
-            match crate::net::policy::apply_ingress(&sock, lease.ip, ingress).await {
-                Ok(exposed) => exposed,
-                Err(e) => {
-                    drop(relay);
-                    if let Err(det_err) = switch.lock().await.detach().await {
-                        tracing::warn!(
-                            error = %det_err,
-                            ingress_err = %e,
-                            "detaching OwnIp PTask from switch during ingress-apply rollback"
-                        );
-                    }
-                    return Err(e);
+        // Detach off the current runtime — `Drop` cannot `.await`. If no runtime
+        // is running (the daemon is shutting down) the refcount no longer matters,
+        // so a failed spawn is harmless.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = switch.lock().await.detach().await {
+                    tracing::warn!(error = %e, "detaching OwnIp PTask after launch was abandoned");
                 }
-            }
+            });
         }
-        _ => Vec::new(),
-    };
-
-    Ok(OwnIpAttachment {
-        _relay: relay,
-        switch: std::sync::Arc::clone(switch),
-        control_sock: sock,
-        exposed,
-    })
+    }
 }
 
 #[cfg(not(test))]
 impl SessionLauncher for SandboxLauncher {
     type Process = SandboxProcess;
-    // The session env plus, for an `OwnIp` launch, the switch attachment held
-    // for the session lifetime (its `Drop` detaches the PTask from the switch).
-    type Guard = (crate::env::Env, Option<OwnIpAttachment>);
+    // The session env, kept alive for the session's lifetime (it owns the
+    // sandbox files backing the running process's rootfs). The own-IP switch
+    // attachment, when present, travels separately as `Launched::net_guard` and
+    // is torn down explicitly at session end.
+    type Guard = crate::env::Env;
 
     async fn launch(
         self,
@@ -743,6 +879,13 @@ impl SessionLauncher for SandboxLauncher {
         // Move the ingress policy out of `self` up front so it can be applied
         // after the switch attach below (the rest of `self` is consumed first).
         let ingress = self.ingress;
+        let network_mode = self.network_mode;
+        let net_switch = self.net_switch;
+        // The session name, registered as this PTask's `*.min.internal` hostname on
+        // an own-IP attach (finding #3 / UC6); cloned because `name` is consumed by
+        // the sandbox env below.
+        let session_name = name.clone();
+        let composition = self.composition;
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
         // doesn't stall the async executor.
@@ -755,98 +898,261 @@ impl SessionLauncher for SandboxLauncher {
         .map_err(io::Error::other)?;
         let graph = graph_result.map_err(io::Error::other)?;
 
-        // The env owns the context, graph and the sandbox files backing the
-        // running process's rootfs, so it is `Send + 'static` and can be moved
-        // into the host as the guard that keeps those files alive — no leaking
-        // or self-referential borrows required.
-        let mut env = crate::env::Env::build(
-            ctx,
-            graph,
-            crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache)
-                .with_packages(["base", "bash", "socat", "coreutils", "claude-code"])
-                .with_env_vars(
-                    [(
-                        "PS1".to_string(),
-                        EnvVarValue::Value(
-                            r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "
-                                .to_string(),
-                        ),
-                    )]
-                    .into(),
-                )
-                .with_network_mode(self.network_mode)
-                .with_username(username),
-        )
-        .await?;
+        // Phase 1 (pre-spawn): for own-IP, snapshot the switch's DNS server from
+        // its live subnet (needed by *every* own-IP sandbox — both transports).
+        // A native (DM2/`LocalSpawn`) PTask must additionally allocate its lease
+        // and ensure gvproxy is up *now*, because hakoniwa builds the tap (and
+        // assigns its address) inside the sandbox namespace before the process is
+        // spawned; we snapshot the lease IP + control socket for the post-spawn
+        // relay and the tap params for the sandbox to configure. DM1/3/4
+        // (`HostShuttle`, root-in-VM) keep the post-spawn open-tap-then-move-into-
+        // netns path and allocate their lease there, so `own_ip_tap`/
+        // `local_own_ip` stay `None` — but `own_ip_dns` is still set for them.
+        let mut local_own_ip: Option<(std::net::Ipv4Addr, std::path::PathBuf)> = None;
+        let mut own_ip_tap: Option<sandbox2::config::OwnIpTap> = None;
+        let mut own_ip_dns: Option<std::net::Ipv4Addr> = None;
+        if matches!(network_mode, NetworkMode::OwnIp) {
+            let mut s = net_switch.lock().await;
+            let subnet = s.subnet();
+            own_ip_dns = Some(subnet.dns_server());
+            if matches!(s.transport(), crate::net::SwitchTransport::LocalSpawn) {
+                let attach = s.attach().await.map_err(|e| {
+                    io::Error::other(format!("attaching OwnIp PTask to switch: {e}"))
+                })?;
+                let sock = s.control_socket();
+                let prefix = subnet.prefix();
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix)
+                };
+                own_ip_tap = Some(sandbox2::config::OwnIpTap {
+                    address: attach.lease.ip,
+                    netmask: std::net::Ipv4Addr::from(mask),
+                    gateway: subnet.gateway(),
+                    mtu: crate::net::DEFAULT_MTU,
+                });
+                local_own_ip = Some((attach.lease.ip, sock));
+            }
+        }
 
-        let mut container = env.container()?;
-        container.set_session_leader();
+        // Guard the phase-1 attach for the whole window until it is handed to an
+        // `OwnIpGuard`: an early `Err` return *or* a cancelled launch future now
+        // rolls the gvproxy attach count back (see `PhaseOneAttachGuard`). Armed
+        // only on the LocalSpawn path that did a pre-spawn attach; disarmed on the
+        // success handoff below.
+        let mut attach_guard = local_own_ip.as_ref().map(|_| PhaseOneAttachGuard {
+            switch: std::sync::Arc::clone(&net_switch),
+            armed: true,
+        });
 
-        let pty = Pty::open(sz)?;
-        let mut command = env.command(&container, "/bin/bash", ["--noprofile", "-l"])?;
-        command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
-        command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
-        let (master, slave) = pty.into_fds();
-        command.stderr(hakoniwa::Stdio::from(slave));
-
-        let mut process = command
-            .spawn()
-            .map_err(|e| io::Error::other(format!("exec failed: {}", e)))?;
-        // `command`/`container` no longer borrow `env`, so it can be moved into
-        // the host to keep its backing files alive.
-        drop(container);
-
-        // For an `OwnIp` PTask, wire its freshly-unshared network namespace onto
-        // the per-host gvproxy switch. `sandbox2` created the empty namespace;
-        // the launched `hakoniwa::Child`'s PID (`id()`) holds it
-        // (`/proc/<pid>/ns/net`), so the attach targets it from the `minimald`
-        // side. `HostNet`/`NoNet` skip this entirely.
+        // Package + env-var union of the launcher baseline and every
+        // contribution the composer collected. Packages: baseline set
+        // (required for a usable interactive shell) unioned with
+        // everything the composition asks for, dedup-preserving-order
+        // so the base packages install first. Env vars: baseline
+        // `PS1` first, composition vars overwrite on the same key.
         //
-        // Until this attach returns, the PTask's namespace is empty (`lo` is
-        // down and no tap exists): `sandbox2` unshared `CLONE_NEWNET` but has
-        // not yet been handed an interface. A shell PTask never probes the
-        // network in this window — the SSH layer only dispatches commands after
-        // `Launched` is returned — but a future non-shell PTask that touches
-        // the network before its first channel message could see transient
-        // `ENETUNREACH` until the tap is in place.
-        let own_ip = if matches!(self.network_mode, NetworkMode::OwnIp) {
-            match attach_own_ip(&self.net_switch, process.id(), ingress.as_ref()).await {
-                Ok(attachment) => Some(attachment),
-                Err(e) => {
-                    // The attach failed, so this launch is aborting. A
-                    // `hakoniwa::Child` does not terminate when dropped — it
-                    // would orphan the sandbox process (the same hazard the
-                    // `kill_on_drop(true)` calls in `exec.rs`/`net/mod.rs` guard
-                    // against) — so kill and reap it explicitly before
-                    // propagating the error.
-                    // `kill` and `wait` are independent: when `kill` fails with
-                    // `ESRCH` because the process already exited during the
-                    // attach window, the child still needs reaping, so `wait`
-                    // must run regardless of `kill`'s result (the standard
-                    // `SIGKILL`-then-`waitpid` idiom).
-                    if let Err(kill_err) = process.kill() {
-                        tracing::warn!(
-                            error = %kill_err,
-                            "killing sandbox process after OwnIp attach failure"
-                        );
-                    }
-                    if let Err(wait_err) = process.wait() {
-                        tracing::warn!(
-                            error = %wait_err,
-                            "reaping sandbox process after OwnIp attach failure"
-                        );
-                    }
-                    return Err(e);
+        // Baseline is intentionally minimal: `base` for the shell,
+        // `coreutils` for `ls`/`cat`/etc, and `socat` for the
+        // in-sandbox `min` helper's UDS relay to the daemon. `bash`
+        // is unconditionally added as a helper dep by
+        // `crate::env::Env::build`, so listing it here would just
+        // duplicate the entry — `socat` is added there too but is
+        // named explicitly so the baseline reads as self-contained.
+        //
+        // Both maps carry only resolved values, so the composition-
+        // vars merge doesn't need `EnvVarValue::Value(...)` at
+        // each insert: `EnvArgs::with_resolved_env_vars` wraps once
+        // at the boundary. Composition patches and lifecycle hooks
+        // are not applied yet (the file-upload path and in-sandbox
+        // exec plumbing that they need aren't wired), so they pass
+        // through this stage untouched.
+        // A shadow set tracks membership so the composition-union
+        // pass below stays O(n) instead of the naive
+        // `Vec::contains` per iteration (see clippy's O(n²) hint).
+        // Two `String` allocs per baseline entry (one for the vec,
+        // one for the set) — intrinsic given both need owned
+        // strings and `String::clone` is a deep copy. Trivial cost
+        // for a three-element baseline.
+        let mut packages: Vec<String> =
+            BASELINE_PACKAGES.iter().map(|s| (*s).to_string()).collect();
+        let mut package_set: std::collections::HashSet<String> =
+            BASELINE_PACKAGES.iter().map(|s| (*s).to_string()).collect();
+        let mut env_vars: HashMap<String, String> = BASELINE_VARS
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        if let Some(comp) = &composition {
+            for p in comp.packages() {
+                let name = p.package();
+                if package_set.insert(name.to_string()) {
+                    packages.push(name.to_string());
                 }
             }
-        } else {
-            None
+            for v in comp.vars() {
+                let var = v.var();
+                env_vars.insert(var.name().to_string(), var.value().to_string());
+            }
+        }
+        // Log every item that will (or would) end up in the session,
+        // tagged with its provenance. Patches and lifecycle hooks are
+        // included even though the launcher can't act on them yet —
+        // an operator inspecting logs should see the intent.
+        let baseline_var_names: Vec<&str> = BASELINE_VARS.iter().map(|(k, _)| *k).collect();
+        log_session_contents(
+            &name,
+            BASELINE_PACKAGES,
+            &baseline_var_names,
+            composition.as_deref(),
+        );
+
+        // Build the env + container and spawn the process. Any failure here (env
+        // build, container build, spawn) leaves no process to reap; the phase-1
+        // attach, if any, is rolled back by `attach_guard` on the `Err` return.
+        let build_and_spawn = async {
+            // The env owns the context, graph and the sandbox files backing the
+            // running process's rootfs, so it is `Send + 'static` and can be moved
+            // into the host as the guard that keeps those files alive.
+            let mut env = crate::env::Env::build(
+                ctx,
+                graph,
+                crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache)
+                    .with_packages(packages)
+                    .with_resolved_env_vars(env_vars)
+                    // Session envs source package attrs (env_state_wiring,
+                    // env_dir/file_mappings) exclusively through the
+                    // composer so they're subject to user policy. Task-run
+                    // uses a different `Env::build` (mctx::env::Env) and
+                    // keeps the legacy un-gated wiring for now.
+                    .without_package_attr_wiring()
+                    .with_network_mode(network_mode)
+                    .with_own_ip_tap(own_ip_tap)
+                    .with_own_ip_dns(own_ip_dns)
+                    .with_username(username),
+            )
+            .await?;
+
+            let mut container = env
+                .container()
+                .map_err(|e| io::Error::other(format!("container build: {e}")))?;
+            container.set_session_leader();
+
+            let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
+            // The `bash` package installs to `/usr/bin/bash` (--prefix=/usr) and
+            // the generic rootfs has no `/bin/bash`, so exec the absolute path
+            // that exists rather than `/bin/bash` (which fails with ENOENT).
+            let mut command = env
+                .command(&container, "/usr/bin/bash", ["--noprofile", "-l"])
+                .map_err(|e| io::Error::other(format!("build command: {e}")))?;
+            command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
+            command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
+            let (master, slave) = pty.into_fds();
+            command.stderr(hakoniwa::Stdio::from(slave));
+
+            let process = command
+                .spawn()
+                .map_err(|e| io::Error::other(format!("exec failed: {e}")))?;
+            // `command`/`container` no longer borrow `env`, so it can be moved
+            // into the host to keep its backing files alive.
+            drop(container);
+            Ok::<_, io::Error>((env, master, process))
+        }
+        .await;
+
+        let (env, master, mut process) = match build_and_spawn {
+            // `attach_guard` (if armed) rolls the phase-1 attach back on this
+            // `Err` return when it drops.
+            Ok(parts) => parts,
+            Err(e) => return Err(e),
         };
+
+        // Reap a sandbox process whose own-IP attach failed. A `hakoniwa::Child`
+        // does not terminate when dropped — it would orphan the sandbox process —
+        // so kill and reap it explicitly. `kill` and `wait` are independent: when
+        // `kill` fails with `ESRCH` because the process already exited during the
+        // attach window, the child still needs reaping, so `wait` runs regardless.
+        let reap = |process: &mut hakoniwa::Child| {
+            if let Err(kill_err) = process.kill() {
+                tracing::warn!(error = %kill_err, "killing sandbox process after OwnIp attach failure");
+            }
+            if let Err(wait_err) = process.wait() {
+                tracing::warn!(error = %wait_err, "reaping sandbox process after OwnIp attach failure");
+            }
+        };
+
+        // Phase 2 (post-spawn): wire the freshly-unshared netns onto the switch.
+        // Native (DM2): hakoniwa already built + configured the tap in-namespace
+        // (rootless), so we only relay its fd. DM1/3/4: the post-spawn open-tap +
+        // move-into-netns + vsock relay behind the `GvproxyNetwork` abstraction.
+        //
+        // Until this returns, an own-IP PTask's egress isn't up yet, but a shell
+        // PTask never probes the network in this window (the SSH layer dispatches
+        // commands only after `Launched` is returned).
+        let net_guard: Option<Box<dyn sandbox2::NetGuard>> =
+            if let Some((lease_ip, sock)) = local_own_ip {
+                // hakoniwa hands us ownership of the tap fd (its `Child` has no
+                // `Drop`, so it never closes it); a missing fd means the in-VM
+                // RustSlirp setup did not run — `attach_guard` rolls the phase-1
+                // attach back on the `Err` return.
+                let Some(raw) = process.rustslirp_tapfd else {
+                    reap(&mut process);
+                    return Err(io::Error::other(
+                        "own-IP sandbox produced no in-namespace tap fd",
+                    ));
+                };
+                // SAFETY: `raw` is a live, owned tap fd handed out exactly once by
+                // hakoniwa; wrapping it transfers ownership to the relay, which
+                // closes it on teardown.
+                let tap_fd = unsafe { OwnedFd::from_raw_fd(raw) };
+                match crate::net::gvproxy_network::complete_local_own_ip_attach(
+                    &net_switch,
+                    tap_fd,
+                    sock,
+                    lease_ip,
+                    &session_name,
+                    ingress.as_ref(),
+                )
+                .await
+                {
+                    Ok(guard) => {
+                        // Ownership of the attach now lives in `OwnIpGuard`, which
+                        // detaches at session end — disarm so the guard doesn't
+                        // also roll it back.
+                        if let Some(g) = attach_guard.as_mut() {
+                            g.disarm();
+                        }
+                        Some(Box::new(guard) as Box<dyn sandbox2::NetGuard>)
+                    }
+                    // `complete_local_own_ip_attach` leaves rollback to
+                    // `attach_guard` (this `Err` return), so only reap the process.
+                    Err(e) => {
+                        reap(&mut process);
+                        return Err(io::Error::other(e));
+                    }
+                }
+            } else if matches!(network_mode, NetworkMode::OwnIp) {
+                let network = crate::net::gvproxy_network::GvproxyNetwork::new(
+                    std::sync::Arc::clone(&net_switch),
+                    session_name,
+                    ingress,
+                );
+                match network.attach(process.id()).await {
+                    Ok(guard) => Some(guard),
+                    Err(e) => {
+                        reap(&mut process);
+                        return Err(io::Error::other(e));
+                    }
+                }
+            } else {
+                None
+            };
 
         Ok(Launched {
             master,
             process: SandboxProcess(process),
-            guard: (env, own_ip),
+            guard: env,
+            net_guard,
         })
     }
 }
@@ -918,6 +1224,7 @@ impl SessionLauncher for MockLauncher {
             master,
             process: MockProcess(process),
             guard: (),
+            net_guard: None,
         })
     }
 }
@@ -936,11 +1243,13 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
         paths: SessionPaths,
         sz: WinSize,
         channel: Option<Channel<Msg>>,
+        control: Option<SessionControl>,
     ) -> Result<(HostHandle, JoinHandle<Result<i32, std::io::Error>>), std::io::Error>
     where
         L: SessionLauncher<Process = P, Guard = G>,
     {
-        let (host, handle) = Self::build(launcher, name, username, paths, sz, channel).await?;
+        let (host, handle) =
+            Self::build(launcher, name, username, paths, sz, channel, control).await?;
         let task = tokio::spawn(host.mainloop());
         Ok((handle, task))
     }
@@ -955,6 +1264,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
         paths: SessionPaths,
         sz: WinSize,
         channel: Option<Channel<Msg>>,
+        control: Option<SessionControl>,
     ) -> Result<(Self, HostHandle), std::io::Error>
     where
         L: SessionLauncher<Process = P, Guard = G>,
@@ -963,6 +1273,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             master,
             process,
             guard,
+            net_guard,
         } = launcher.launch(name, username, paths, sz).await?;
 
         let (sender, receiver) = mpsc::channel(8);
@@ -995,6 +1306,8 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             remote_rx,
             stdout_buf: vec![0u8; 8 * 1024],
             stdin_buf: None,
+            net_guard,
+            control,
             _guard: guard,
         };
 
@@ -1006,15 +1319,41 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     }
 
     pub async fn mainloop(mut self) -> Result<i32, std::io::Error> {
-        loop {
-            if let Some(exit_code) = self.process.try_wait()? {
-                return Ok(exit_code);
+        let result = loop {
+            match self.process.try_wait() {
+                Ok(Some(exit_code)) => {
+                    // `try_wait` already warns on a non-zero exit with the richer
+                    // hakoniwa diagnostics; keep this routine and unconditional.
+                    tracing::debug!(exit_code, "session process exited");
+                    // The process was reaped here before the pty surfaced its
+                    // death as an `EIO`. Still notify the attached binding so the
+                    // shell-exit prompt renders (and a "delete" choice can tear
+                    // the session down); otherwise the binding only observes the
+                    // host drop and silently detaches. Without this the prompt is
+                    // lost whenever `try_wait` wins the race against the master's
+                    // `EIO` — a flaky detach under CPU load.
+                    self.notify_remote_process_exit();
+                    break Ok(exit_code);
+                }
+                Ok(None) => {}
+                Err(e) => break Err(e),
             }
 
             if self.step().await.is_err() {
-                return self.process.wait();
+                let code = self.process.wait();
+                tracing::warn!(?code, "session process reaped after pty/step error");
+                break code;
             }
+        };
+
+        // Tear down the per-sandbox network attachment explicitly (own-IP switch
+        // detach + ingress removal) on this live runtime, before `_guard` drops
+        // the sandbox files. No-op for `HostNet`/`NoNet` and the mock launcher.
+        if let Some(net_guard) = self.net_guard.take() {
+            net_guard.teardown().await;
         }
+
+        result
     }
 
     /// Notifies the attached binding (if any) that the pty master has errored,
@@ -1033,7 +1372,24 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     async fn notify_remote_pty_err(&mut self, e: std::io::Error) {
         tracing::warn!(error = %e, "pty master error; tearing down host");
         if let Some((tx, _hnd)) = self.remote.as_mut() {
-            let _ = tx.try_send(BindingMsg::TeardownDueToStdoutErr(e));
+            let _ = tx.try_send(BindingMsg::TeardownDueToProcessExit(Some(e)));
+        }
+    }
+
+    /// Notifies the attached binding that the session process has been reaped,
+    /// so it tears down and raises the shell-exit prompt. Unlike
+    /// [`Self::notify_remote_pty_err`] there is no error to surface — the process
+    /// simply exited, and the pty may never report the death (the reap can win
+    /// the race against the master's `EIO`).
+    ///
+    /// Best-effort `try_send` for the same reason as `notify_remote_pty_err`: the
+    /// notice is never awaited, so a full queue can't wedge teardown. The message
+    /// stays buffered even as this host drops, and an mpsc receiver drains its
+    /// buffer before observing the closed sender — so the binding sees the exit
+    /// before it would fall through to `HostGone`.
+    fn notify_remote_process_exit(&mut self) {
+        if let Some((tx, _hnd)) = self.remote.as_mut() {
+            let _ = tx.try_send(BindingMsg::TeardownDueToProcessExit(None));
         }
     }
 
@@ -1190,7 +1546,8 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                 .write_all(&self.parser.screen().state_formatted())
                 .await;
         }
-        let new_binding = Binding::spawn(channel, self.remote_tx.clone()).await;
+        let new_binding =
+            Binding::spawn(channel, self.remote_tx.clone(), self.control.clone()).await;
 
         if let Some((old_tx, old_join_hnd)) = self.remote.replace(new_binding) {
             // If there was a binding we just swapped out, tell it to
@@ -1366,6 +1723,7 @@ mod tests {
             },
             DEFAULT_SIZE,
             None,
+            None,
         )
         .await
         .expect("failed to build host");
@@ -1431,6 +1789,7 @@ mod tests {
             },
             DEFAULT_SIZE,
             None,
+            None,
         )
         .await
         .expect("failed to build host");
@@ -1447,6 +1806,183 @@ mod tests {
         assert!(
             outcome.is_ok(),
             "mainloop should return the reaped exit status, got: {outcome:?}",
+        );
+    }
+
+    /// A [`sandbox2::NetGuard`] that records whether its teardown ran, so a test
+    /// can assert the session's network is released exactly when the shell
+    /// process ends — and left up while it is merely detached.
+    struct RecordingNetGuard {
+        torn_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl sandbox2::NetGuard for RecordingNetGuard {
+        fn teardown(
+            self: Box<Self>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            self.torn_down
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {})
+        }
+    }
+
+    /// Like [`MockLauncher`], but attaches a [`RecordingNetGuard`] so a test can
+    /// observe network teardown. The shared `torn_down` flag lets the test assert
+    /// when the network is released relative to detach vs. exit.
+    struct MockLauncherWithNet {
+        torn_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl SessionLauncher for MockLauncherWithNet {
+        type Process = MockProcess;
+        type Guard = ();
+
+        async fn launch(
+            self,
+            _name: String,
+            _username: String,
+            _paths: SessionPaths,
+            sz: WinSize,
+        ) -> std::io::Result<Launched<MockProcess, ()>> {
+            let pty = Pty::open(sz)?;
+            let script = format!(
+                r#"while read line; do [ "$line" = {MOCK_EXIT_LINE} ] && exit 0; printf 'got:%s\n' "$line"; done"#
+            );
+            let mut command = std::process::Command::new("/bin/sh");
+            command.arg("-c").arg(&script);
+            command.stdin(std::process::Stdio::from(pty.dup_slave_fd()?));
+            command.stdout(std::process::Stdio::from(pty.dup_slave_fd()?));
+            let (master, slave) = pty.into_fds();
+            command.stderr(std::process::Stdio::from(slave));
+            let process = command.spawn()?;
+            Ok(Launched {
+                master,
+                process: MockProcess(process),
+                guard: (),
+                net_guard: Some(Box::new(RecordingNetGuard {
+                    torn_down: self.torn_down,
+                })),
+            })
+        }
+    }
+
+    fn test_paths() -> SessionPaths {
+        SessionPaths {
+            working: DaemonAbsPath::root(),
+            cache: DaemonAbsPath::root(),
+            home: DaemonAbsPath::root(),
+        }
+    }
+
+    /// The load-bearing half of "detach != exit": when the shell process exits,
+    /// the session network is torn down. Pins the teardown in `mainloop` so a
+    /// refactor cannot silently leave a lease/switch attachment leaked after exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exit_releases_the_network() {
+        let torn_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (host, _handle) = Host::build(
+            MockLauncherWithNet {
+                torn_down: torn_down.clone(),
+            },
+            "test-session".to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+            None,
+            None,
+        )
+        .await
+        .expect("failed to build host");
+        let stdin = host.remote_tx.clone();
+        let task = tokio::spawn(host.mainloop());
+
+        // While the shell is alive the network must stay up.
+        assert!(
+            !torn_down.load(std::sync::atomic::Ordering::SeqCst),
+            "network must not be torn down while the shell is running",
+        );
+
+        // Make the shell exit; the network must then be released.
+        stdin
+            .send(Either::Left(bytes::Bytes::from(
+                format!("{MOCK_EXIT_LINE}\n").into_bytes(),
+            )))
+            .await
+            .expect("failed to send exit line");
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("mainloop should terminate after the shell exits")
+            .expect("host task should not panic during teardown")
+            .expect("mainloop should return the reaped exit status");
+        assert!(
+            torn_down.load(std::sync::atomic::Ordering::SeqCst),
+            "network must be torn down once the shell exits",
+        );
+    }
+
+    /// The other half of "detach != exit": a ctrl-w (detach) keystroke is
+    /// swallowed as a detach signal — never forwarded to the shell — and does not
+    /// end the session or release the network. The shell keeps running (a later
+    /// line still round-trips) and only an explicit kill/exit releases the network.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detach_keystroke_holds_the_session_and_network() {
+        let torn_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (host, handle) = Host::build(
+            MockLauncherWithNet {
+                torn_down: torn_down.clone(),
+            },
+            "test-session".to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+            None,
+            None,
+        )
+        .await
+        .expect("failed to build host");
+        let stdin = host.remote_tx.clone();
+        let task = tokio::spawn(host.mainloop());
+
+        // A bare ctrl-w (0x17) is the detach chord. It must be consumed as a
+        // detach signal rather than written to the pty.
+        stdin
+            .send(Either::Left(bytes::Bytes::from(vec![0x17])))
+            .await
+            .expect("failed to send ctrl-w");
+
+        // The shell survived the detach: a normal line still echoes back, which
+        // stamps stdout activity. (If ctrl-w had been forwarded or had killed the
+        // process, no echo would ever arrive.)
+        stdin
+            .send(Either::Left(bytes::Bytes::from(b"ping\n".to_vec())))
+            .await
+            .expect("failed to send line after detach");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let attrs = handle.get_attrs().await.unwrap();
+                if attrs.stdout_last.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("echo should arrive, proving the shell survived the detach keystroke");
+        assert!(
+            !torn_down.load(std::sync::atomic::Ordering::SeqCst),
+            "detach must not tear down the network while the shell is still running",
+        );
+
+        // Only now, on an explicit kill (destroy), is the network released.
+        handle.kill().await.expect("kill should reach the host");
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("mainloop should terminate after kill")
+            .expect("host task should not panic during teardown")
+            .expect("mainloop should return the reaped exit status");
+        assert!(
+            torn_down.load(std::sync::atomic::Ordering::SeqCst),
+            "kill/destroy must release the network",
         );
     }
 }

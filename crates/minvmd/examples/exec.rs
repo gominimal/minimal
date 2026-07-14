@@ -27,21 +27,13 @@ use std::time::Duration;
 use russh::ChannelMsg;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use minimald_rpc::{CreateSessionRequest, CreateSessionResponse, SessionConfig};
+
 /// SSH subsystem for the CreateSession RPC (mirrors minimald's
 /// `RPC_SUBSYSTEM_PREFIX` + "CreateSession").
 const CREATE_SESSION_SUBSYSTEM: &str = "minimald-v1-CreateSession";
 /// Env var minimald reads to scope an exec to a session.
 const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
-
-#[derive(serde::Serialize)]
-struct CreateSessionRequest {
-    record: sessions::Record,
-}
-
-#[derive(serde::Deserialize)]
-struct CreateSessionResponse {
-    id: sessions::SessionId,
-}
 
 /// russh client handler: accept the guest's ephemeral host key.
 struct ClientHandler;
@@ -164,16 +156,15 @@ async fn run_session_exec(
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let req = CreateSessionRequest {
-            record: sessions::Record {
-                id: sessions::SessionId::nil(),
+            config: SessionConfig {
                 name: Some(format!("minvmd-demo-{uniq:x}")),
-                username: None,
                 project_path: paths::HostAbsPath::try_new("/tmp")
                     .map_err(|e| format!("project_path: {e}"))?,
                 network: sessions::NetworkMode::default(),
                 policy: Default::default(),
                 attrs: Default::default(),
             },
+            contribution: Default::default(),
         };
         let body = serde_json::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
 
@@ -190,7 +181,14 @@ async fn run_session_exec(
             .map_err(|e| format!("read response: {e}"))?;
         let resp: CreateSessionResponse =
             serde_json::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
-        resp.id
+        match resp {
+            CreateSessionResponse::Ready { id } => id,
+            CreateSessionResponse::Pending { .. } => {
+                return Err("CreateSession returned Pending; \
+                            this example only handles Ready"
+                    .to_string());
+            }
+        }
     };
 
     // Exec the command in that session.

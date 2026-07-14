@@ -1,6 +1,7 @@
 //! Implementations of the local cache: storing artifacts keyed by [SpecHash].
 
 use common::SpecHash;
+#[cfg(target_os = "linux")]
 use common::renameat2::{AT_FDCWD, RENAME_EXCHANGE, renameat2};
 
 use std::io;
@@ -99,9 +100,19 @@ impl PendingDir {
         let (from, to) = (self.tempdir.keep(), st.path());
         let from_path = from.as_path();
 
-        // use our direct syscall impl
-        renameat2(AT_FDCWD, from_path, AT_FDCWD, to, RENAME_EXCHANGE).map_err(CacheErr::IO)?;
-        std::fs::remove_dir_all(from)?;
+        #[cfg(target_os = "linux")]
+        {
+            // use our direct syscall impl
+            renameat2(AT_FDCWD, from_path, AT_FDCWD, to, RENAME_EXCHANGE).map_err(CacheErr::IO)?;
+            std::fs::remove_dir_all(from)?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if to.exists() {
+                std::fs::remove_dir_all(to).map_err(CacheErr::IO)?;
+            }
+            std::fs::rename(from_path, to).map_err(CacheErr::IO)?;
+        }
 
         drop(st);
 
@@ -354,6 +365,16 @@ impl<FS: FileSystem> Cache<FS> {
     fn with_inner<T>(&self, f: impl FnOnce(&CacheInner<FS>) -> T) -> T {
         let guard = self.inner.lock().unwrap();
         f(&*guard)
+    }
+
+    /// Releases the read tracker, closing its locked `alog/<n>.v1` file.
+    ///
+    /// Read trackers aren't essential to operation (see construction); a
+    /// daemon about to unmount the filesystem holding the cache calls this so
+    /// the tracker's held-open fd doesn't pin the mount busy. Subsequent
+    /// reads simply stop being recorded.
+    pub fn release_read_tracker(&self) {
+        self.inner().read_tracker = None;
     }
 
     /// Reads a directory cached as the given spec hash.

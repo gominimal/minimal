@@ -5,16 +5,15 @@ use crate::{
     SharedHandle, StateHandle,
 };
 use common::SpecHash;
+use common::fetchers::AnyBackend;
 use either::Either;
 use futures::channel::mpsc;
-use google_cloud_storage::client::Storage as GcsStorage;
 use graph::{BinProvider, BuildSpecRef, Graph, SubsetInput};
 use lcache::{Cache, CacheErr, DirCacheEntry, EntryMeta, LocalDir, MetaInner, PendingDir};
 use op::{Runnable, SourceFetcher};
 use ot::OpTracker;
 use rcache::RemoteCache;
 use tokio::sync::Semaphore;
-use tokio::task::spawn_blocking;
 
 use crate::Error;
 
@@ -132,7 +131,7 @@ impl Drop for SinkWriter {
 pub struct LocalBackend<SF: SourceFetcher + 'static> {
     pub(crate) sf: SF,
     pub(crate) output_base: PathBuf,
-    pub(crate) remote_cache: Option<RemoteCache<GcsStorage>>,
+    pub(crate) remote_cache: Option<RemoteCache<AnyBackend>>,
     pub(crate) build_semaphore: Semaphore,
     pub(crate) num_concurrent_builds: usize,
     pub(crate) log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
@@ -183,7 +182,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
         };
 
         let shared_hnd2 = shared_hnd.clone();
-        let artifact = spawn_blocking(async move || {
+        let artifact = async move {
             let shared = shared_hnd2.inner().read().await;
             let permit = shared
                 .backend
@@ -242,9 +241,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
             drop(permit);
             drop(shared);
             res
-        })
-        .await
-        .unwrap()
+        }
         .await?;
 
         {
@@ -281,7 +278,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
         }
 
         let shared_hnd2 = shared_hnd.clone();
-        spawn_blocking(async move || {
+        async move {
             let shared = shared_hnd2.inner().read().await;
             let sema = shared.fetch_semaphore.acquire().await;
             let res = if let Some(remote_cache) = shared.backend.remote_cache.as_ref() {
@@ -320,9 +317,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
             drop(sema);
             drop(shared);
             res
-        })
-        .await
-        .unwrap()
+        }
         .await
     }
 
@@ -355,7 +350,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
 
         let shared_hnd2 = shared_hnd.clone();
         let subset2 = subset.clone();
-        let pending_dir = spawn_blocking(async move || {
+        let pending_dir = async move {
             let shared = shared_hnd2.inner().read().await;
             let res = op::SubsetBuild {
                 from_dir: Some(build_dir),
@@ -370,9 +365,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
             .await;
             drop(shared);
             res
-        })
-        .await
-        .unwrap()
+        }
         .await?;
 
         let shared = shared_hnd.inner().read().await;
@@ -396,7 +389,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
     #[allow(clippy::too_many_arguments)]
     pub fn new_orchestrator(
         output_base: PathBuf,
-        remote_cache: Option<RemoteCache<GcsStorage>>,
+        remote_cache: Option<RemoteCache<AnyBackend>>,
         sf: SF,
         num_concurrent_builds: usize,
         graph: Graph,

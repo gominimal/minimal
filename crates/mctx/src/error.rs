@@ -217,6 +217,16 @@ impl From<graph::Error> for Error {
     }
 }
 
+impl From<op::Error> for Error {
+    fn from(value: op::Error) -> Self {
+        match value {
+            op::Error::IO(e) => Self::IO("op", PathBuf::new(), e),
+            op::Error::Plan(graph, e) => Self::Plan(Box::new((graph, e))),
+            other => Self::Other(anyhow::anyhow!("{}", other)),
+        }
+    }
+}
+
 impl From<super::ConfigError> for Error {
     fn from(value: super::ConfigError) -> Self {
         Error::Config(value)
@@ -264,6 +274,7 @@ impl From<sandbox2::Error> for Error {
                     stderr,
                     stdout,
                 },
+                #[cfg(target_os = "linux")]
                 sandbox2::error::ExecutionError::SpawnFailed(e) => {
                     Self::Other(anyhow::anyhow!("spawn failed: {}", e))
                 }
@@ -282,6 +293,7 @@ impl From<sandbox2::Error> for Error {
                 "internal: file {} mapped to rootfs",
                 p.display()
             )),
+            sandbox2::Error::Network(e) => Self::Other(anyhow::anyhow!(e.to_string())),
         }
     }
 }

@@ -191,14 +191,16 @@ impl<'de> serde::Deserialize<'de> for VarNameGlobs {
 /// Policy gating which variable declarations are honored.
 ///
 /// Applied at the session-construction layer. Precedence is the same
-/// for every origin: `ignore` first (silent), then `deny` (reject),
-/// then origin-aware allow (auto-allow for user-origin, otherwise
-/// require an `allow` match or prompt).
+/// for every origin: `deny` first (reject, emergency-stop), then
+/// `ignore` (silent drop), then origin-aware allow (auto-allow for
+/// user-origin, otherwise require an `allow` match or prompt).
+/// Overlapping deny+ignore rules resolve as denied so a would-be
+/// rejection isn't hidden behind an ignore glob.
 ///
 /// - **User-origin** (variables coming from a [`Loadout`]):
-///   `ignore` drops, `deny` rejects, otherwise auto-allowed. The
+///   `deny` rejects, `ignore` drops, otherwise auto-allowed. The
 ///   user doesn't need to `allow`-list their own loadout items.
-/// - **Project- and Package-origin**: `ignore` drops, `deny` rejects,
+/// - **Project- and Package-origin**: `deny` rejects, `ignore` drops,
 ///   then `allow` must match or the item prompts.
 ///
 /// [`Loadout`]: crate::core::loadout::Loadout
@@ -308,12 +310,14 @@ impl VarsPolicy {
 
     /// Categorize a single variable against this policy.
     ///
-    /// Precedence: `ignore` first (silent drop), then `deny` (reject
-    /// regardless of origin), then the origin-aware allow step. For
-    /// user-origin items ([`Source::UserLoadout`]), the allow step
-    /// auto-passes — the user doesn't need to allow-list their own
-    /// loadout entries. For every other source, `allow` must match
-    /// or the item routes to `NeedsApproval`.
+    /// Precedence: `deny` first (reject regardless of origin, the
+    /// emergency stop), then `ignore` (silent drop), then the
+    /// origin-aware allow step. Overlapping deny+ignore rules
+    /// resolve as denied. For user-origin items
+    /// ([`Source::UserLoadout`]), the allow step auto-passes — the
+    /// user doesn't need to allow-list their own loadout entries.
+    /// For every other source, `allow` must match or the item routes
+    /// to `NeedsApproval`.
     ///
     /// `item` reports its provenance via [`Provenanced`]; the composer
     /// constructs `T` types that carry their own source, so the caller
@@ -326,11 +330,17 @@ impl VarsPolicy {
     /// [`Provenanced`]: crate::core::source::Provenanced
     #[must_use]
     pub fn check<T: Provenanced>(&self, name: &str, item: T) -> CheckOutcome<T> {
-        if self.ignore.is_match(name) {
-            return CheckOutcome::Decided(Decision::Ignored);
-        }
+        // Deny wins over everything, including ignore. `deny` is the
+        // user's emergency stop: if a rule matches, the composition
+        // must fail loudly, not silently drop the item. Overlapping
+        // deny+ignore rules resolve as denied so an operator can't
+        // accidentally hide a would-be-rejected value behind an
+        // ignore glob.
         if self.deny.is_match(name) {
             return CheckOutcome::Decided(Decision::Denied(item));
+        }
+        if self.ignore.is_match(name) {
+            return CheckOutcome::Decided(Decision::Ignored);
         }
         if matches!(item.source(), Source::UserLoadout { .. }) {
             return CheckOutcome::Decided(Decision::Allowed(item));
@@ -347,33 +357,23 @@ impl VarsPolicy {
 // PatchPolicy
 // =====================================================================
 
-/// Policy gating which patches are honored.
+/// Policy gating which patches are honored, checked per source file
+/// after the patch's [`FileSet`] is walked. The patch's `dest` is
+/// not matched; only the enumerated source paths are.
 ///
-/// Patches are checked **per source file** after the patch's
-/// [`FileSet`] is walked on the host filesystem. Each enumerated source
-/// path runs through this policy; the patch's `dest` is *not* matched.
-///
-/// - **User-origin patches** (from a [`Loadout`]): `ignore` drops,
-///   `deny` rejects, otherwise auto-allowed. The user doesn't need
-///   to `allow`-list their own loadout patches.
-/// - **Project- and Package-origin patches**: `ignore` drops, `deny`
-///   rejects, then `allow` must match or the file routes to a
+/// - **User-origin patches** (from a [`Loadout`]): `deny` rejects,
+///   `ignore` drops, otherwise auto-allowed.
+/// - **Project- and Package-origin patches**: `deny` rejects,
+///   `ignore` drops, then `allow` must match — otherwise routes to a
 ///   prompt via [`PolicyHooks`](crate::core::hooks::PolicyHooks).
 ///
-/// Precedence: `ignore` first (silent), then `deny` (reject), then
-/// origin-aware `allow`. Anything not matched by any of those
-/// (project/package origin) prompts.
-///
-/// # `~/` and `$VAR` expansion
-///
-/// Policy patterns are stored as raw strings, so they may contain
-/// `~/` prefixes or `$VAR` / `${VAR}` references. Expansion happens
-/// at session-construction time, against the session's resolved
-/// variables (see
-/// [`crate::core::expansion::expand_source`]). Patterns retain their raw
-/// form in the policy returned from
-/// the composition pipeline (see [`crate::core::compose`]), so the
-/// policy round-trips losslessly across save / load.
+/// Precedence: `deny` first (emergency stop), then `ignore` (silent
+/// drop), then origin-aware `allow`. Overlapping deny+ignore rules
+/// resolve as denied so a would-be rejection isn't hidden behind an
+/// ignore glob. Patterns may contain `~/` or `$VAR`; expansion
+/// happens at session construction (see [`crate::core::expansion`])
+/// and stored patterns retain their raw form so the policy
+/// round-trips losslessly.
 ///
 /// [`Loadout`]: crate::core::loadout::Loadout
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -503,8 +503,19 @@ impl PatchPolicy {
     ) -> Result<ExpandedPatchPolicy, crate::core::expansion::ExpandError> {
         let expand_one =
             |raws: &[String]| -> Result<Vec<FileSet>, crate::core::expansion::ExpandError> {
+                // Policy patterns are matchers, not walk seeds — they
+                // check paths another patch produced. A bare glob
+                // like `**/*.pem` should mean "any `.pem` anywhere,"
+                // so we skip the "must be absolute" check that
+                // `expand_source` enforces for walker inputs.
                 raws.iter()
-                    .map(|r| crate::core::expansion::expand_source(r, resolved_vars, home_fallback))
+                    .map(|r| {
+                        crate::core::expansion::expand_policy_pattern(
+                            r,
+                            resolved_vars,
+                            home_fallback,
+                        )
+                    })
                     .collect()
             };
         let allow = expand_one(&self.allow)?;
@@ -609,21 +620,9 @@ pub struct ExpandedPatchPolicy {
 }
 
 impl ExpandedPatchPolicy {
-    /// Construct an `ExpandedPatchPolicy` directly from already-expanded
-    /// pattern lists.
-    ///
-    /// This constructor is `pub(crate)` because the only legitimate
-    /// way to produce an [`ExpandedPatchPolicy`] from outside this
-    /// crate is via [`PatchPolicy::expand_with`] — the
-    /// type's whole job is to be the validated-and-expanded form of a
-    /// raw policy. Exposing a public constructor (or `with_*` setters)
-    /// would let callers smuggle arbitrary `FileSet`s past the
-    /// expansion step and bypass the round-trip guarantee documented
-    /// on [`PatchPolicy`].
-    ///
-    /// Order is positional. Inside this crate the only caller is
-    /// `expand_with`, which threads each list explicitly; if more
-    /// callers appear, switch back to a builder.
+    /// Construct an `ExpandedPatchPolicy` from already-expanded
+    /// lists. Crate-internal so external callers must go through
+    /// [`PatchPolicy::expand_with`] and can't bypass expansion.
     pub(crate) fn from_expanded(
         allow: Vec<FileSet>,
         deny: Vec<FileSet>,
@@ -662,9 +661,10 @@ impl ExpandedPatchPolicy {
     /// traversed an actual symlink. Both forms are checked
     /// independently and the outcomes are combined.
     ///
-    /// **Precedence within one path:** `ignore` first (silent drop),
-    /// then `deny` (reject regardless of origin), then the
-    /// origin-aware allow step. For user-origin items
+    /// **Precedence within one path:** `deny` first (reject
+    /// regardless of origin, the emergency stop), then `ignore`
+    /// (silent drop), then the origin-aware allow step. Overlapping
+    /// deny+ignore rules resolve as denied. For user-origin items
     /// ([`Source::UserLoadout`]) the allow step auto-passes; for
     /// every other source `allow` must match or the path routes to
     /// `NeedsApproval`.
@@ -699,11 +699,15 @@ impl ExpandedPatchPolicy {
     /// helper used by both [`check`](Self::check) and
     /// [`check_dual`](Self::check_dual).
     fn decide(&self, path: &camino::Utf8Path, source: &Source) -> PathDecision {
-        if filesets_match(&self.ignore, path) {
-            return PathDecision::Ignored;
-        }
+        // Deny wins over everything, including ignore. `deny` is the
+        // user's emergency stop: overlapping deny+ignore rules must
+        // resolve as denied so an operator can't accidentally hide a
+        // would-be-rejected patch behind an ignore glob.
         if filesets_match(&self.deny, path) {
             return PathDecision::Denied;
+        }
+        if filesets_match(&self.ignore, path) {
+            return PathDecision::Ignored;
         }
         if matches!(source, Source::UserLoadout { .. }) {
             return PathDecision::Allowed;
@@ -758,6 +762,75 @@ fn attach_decision<T>(decision: PathDecision, item: T) -> CheckOutcome<T> {
 
 fn filesets_match(sets: &[FileSet], path: &camino::Utf8Path) -> bool {
     sets.iter().any(|fs| fs.is_match(path))
+}
+
+// =====================================================================
+// user_policy.toml loading
+// =====================================================================
+
+/// Failure loading `user_policy.toml`.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum UserPolicyError {
+    /// The file couldn't be read.
+    #[error("read `{path}`: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The file wasn't valid TOML or didn't match the [`UserPolicy`]
+    /// schema.
+    #[error("parse `{path}`: {source}")]
+    Parse {
+        path: std::path::PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+}
+
+/// Parse the user policy at `path`.
+///
+/// The file sits beside `config.toml` at
+/// `<config>/minimal/user_policy.toml` and deserializes into
+/// [`UserPolicy`] — the same type the composer consumes at gate
+/// time.
+///
+/// # Errors
+///
+/// See [`UserPolicyError`]. A missing file returns
+/// [`UserPolicyError::Io`] — use [`read_user_policy_or_default`] if
+/// you want an empty policy in that case.
+pub fn read_user_policy_file(path: &std::path::Path) -> Result<UserPolicy, UserPolicyError> {
+    let contents = std::fs::read_to_string(path).map_err(|source| UserPolicyError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    toml::from_str(&contents).map_err(|source| UserPolicyError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Parse the user policy at `path`, or return [`UserPolicy::empty`]
+/// when the file doesn't exist. Any other read or parse failure
+/// propagates as [`UserPolicyError`].
+///
+/// # Errors
+///
+/// See [`UserPolicyError`]. `NotFound` is folded into
+/// `Ok(UserPolicy::empty())`; permission or parse failures still
+/// surface.
+pub fn read_user_policy_or_default(path: &std::path::Path) -> Result<UserPolicy, UserPolicyError> {
+    match read_user_policy_file(path) {
+        Ok(p) => Ok(p),
+        Err(UserPolicyError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(UserPolicy::empty())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // =====================================================================
@@ -877,6 +950,36 @@ mod tests {
     fn vars_policy_try_with_allow_propagates_invalid_glob() {
         let err = VarsPolicy::empty().try_with_allow(["[bad"]).unwrap_err();
         assert!(matches!(err, VarError::InvalidGlob { .. }), "got: {err:?}");
+    }
+
+    /// Deny wins when a name matches both `deny` and `ignore`. The
+    /// user's intent with `deny` is an emergency stop; an ignore
+    /// glob must never silently hide a would-be rejection.
+    #[test]
+    fn vars_policy_check_deny_wins_over_ignore_on_overlap() {
+        struct Item {
+            source: Source,
+        }
+        impl Provenanced for Item {
+            fn source(&self) -> &Source {
+                &self.source
+            }
+        }
+        let policy = VarsPolicy::empty()
+            .try_with_deny(["DIAGRAM"])
+            .unwrap()
+            .try_with_ignore(["DIAGRAM"])
+            .unwrap();
+        let item = Item {
+            source: Source::UserLoadout {
+                name: "test".to_string(),
+            },
+        };
+        let outcome = policy.check("DIAGRAM", item);
+        assert!(
+            matches!(outcome, CheckOutcome::Decided(Decision::Denied(_))),
+            "overlapping deny+ignore must resolve as denied",
+        );
     }
 
     // =================================================================
@@ -1008,6 +1111,69 @@ mod tests {
         assert_eq!(expanded.ignore().len(), 1);
     }
 
+    /// Deny wins when a path matches both `deny` and `ignore`. Same
+    /// invariant as [`vars_policy_check_deny_wins_over_ignore_on_overlap`],
+    /// on the patch-side gate. Goes through
+    /// [`ExpandedPatchPolicy::check`] with a `link` of `None` so only
+    /// the single-path `decide` codepath is exercised.
+    #[test]
+    fn patch_policy_check_deny_wins_over_ignore_on_overlap() {
+        struct Item {
+            source: Source,
+        }
+        impl Provenanced for Item {
+            fn source(&self) -> &Source {
+                &self.source
+            }
+        }
+        let policy = PatchPolicy::empty()
+            .with_deny(["/etc/secret/**"])
+            .with_ignore(["/etc/secret/**"]);
+        let vars: [crate::core::primitives::ResolvedVar; 0] = [];
+        let expanded = policy.expand_with(vars.as_slice(), None).unwrap();
+        let target = camino::Utf8Path::new("/etc/secret/token");
+        let item = Item {
+            source: Source::UserLoadout {
+                name: "test".to_string(),
+            },
+        };
+        let outcome = expanded.check(None, target, item);
+        assert!(
+            matches!(outcome, CheckOutcome::Decided(Decision::Denied(_))),
+            "overlapping deny+ignore must resolve as denied",
+        );
+    }
+
+    /// Non-absolute policy patterns are legal now — they're matchers,
+    /// not walk seeds. `**/*.pem` should expand cleanly and actually
+    /// deny a real `.pem` path at check time.
+    #[test]
+    fn patch_policy_expand_accepts_non_absolute_glob_and_matches() {
+        struct Item {
+            source: Source,
+        }
+        impl Provenanced for Item {
+            fn source(&self) -> &Source {
+                &self.source
+            }
+        }
+        let policy = PatchPolicy::empty().with_deny(["**/*.pem"]);
+        let vars: [crate::core::primitives::ResolvedVar; 0] = [];
+        let expanded = policy
+            .expand_with(vars.as_slice(), None)
+            .expect("non-absolute policy pattern must expand");
+        let item = Item {
+            source: Source::UserLoadout {
+                name: "dev".to_string(),
+            },
+        };
+        let outcome = expanded.check(None, camino::Utf8Path::new("/etc/ssl/private.pem"), item);
+        assert!(
+            matches!(outcome, CheckOutcome::Decided(Decision::Denied(_))),
+            "non-absolute deny pattern must still match at check time",
+        );
+    }
+
     // =================================================================
     // UserPolicy tests
     // =================================================================
@@ -1099,6 +1265,94 @@ mod tests {
         #[test]
         fn both_allowed_is_allowed() {
             assert_eq!(Allowed.combine(Allowed), Allowed);
+        }
+    }
+
+    // =================================================================
+    // user_policy.toml loading
+    // =================================================================
+
+    mod user_policy_toml {
+        use super::*;
+        use std::io::Write;
+        use std::path::{Path, PathBuf};
+        use tempfile::TempDir;
+
+        fn write_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
+            let path = dir.join(name);
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(contents.as_bytes()).unwrap();
+            path
+        }
+
+        /// A well-formed policy with a vars allow list round-trips
+        /// through the parser.
+        #[test]
+        fn read_user_policy_file_ok() {
+            let dir = TempDir::new().unwrap();
+            let path = write_file(
+                dir.path(),
+                "user_policy.toml",
+                indoc::indoc! {r#"
+                    [vars]
+                    allow = ["MY_APP_*"]
+                "#},
+            );
+            let policy = read_user_policy_file(&path).unwrap();
+            assert_eq!(policy.vars().allow().raw_patterns(), &["MY_APP_*"]);
+        }
+
+        /// An empty file parses to `UserPolicy::empty()`.
+        #[test]
+        fn read_user_policy_file_empty_is_empty_policy() {
+            let dir = TempDir::new().unwrap();
+            let path = write_file(dir.path(), "user_policy.toml", "");
+            let policy = read_user_policy_file(&path).unwrap();
+            assert_eq!(policy, UserPolicy::empty());
+        }
+
+        /// A missing file folds into `UserPolicy::empty()` via
+        /// `read_user_policy_or_default`.
+        #[test]
+        fn read_user_policy_or_default_missing_returns_empty() {
+            let dir = TempDir::new().unwrap();
+            let missing = dir.path().join("does-not-exist.toml");
+            let policy = read_user_policy_or_default(&missing).unwrap();
+            assert_eq!(policy, UserPolicy::empty());
+        }
+
+        /// A malformed file still errors under
+        /// `read_user_policy_or_default` — only `NotFound` is silenced.
+        #[test]
+        fn read_user_policy_or_default_malformed_still_errors() {
+            let dir = TempDir::new().unwrap();
+            let path = write_file(dir.path(), "user_policy.toml", "= not = toml =");
+            let err = read_user_policy_or_default(&path).unwrap_err();
+            assert!(matches!(err, UserPolicyError::Parse { .. }));
+        }
+
+        /// Both narrow policies round-trip together — the shape an
+        /// operator would actually write.
+        #[test]
+        fn read_user_policy_file_both_sections() {
+            let dir = TempDir::new().unwrap();
+            let path = write_file(
+                dir.path(),
+                "user_policy.toml",
+                indoc::indoc! {r#"
+                    [vars]
+                    allow = ["MY_APP_*"]
+                    deny  = ["SECRET_*"]
+
+                    [patches]
+                    allow = ["~/dotfiles/**"]
+                "#},
+            );
+            let policy = read_user_policy_file(&path).unwrap();
+            let expected_vars = VarsPolicy::empty()
+                .with_allow(VarNameGlobs::try_new(["MY_APP_*"]).unwrap())
+                .with_deny(VarNameGlobs::try_new(["SECRET_*"]).unwrap());
+            assert_eq!(policy.vars(), &expected_vars);
         }
     }
 }

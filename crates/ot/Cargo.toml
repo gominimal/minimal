@@ -8,13 +8,18 @@ publish.workspace = true
 
 [features]
 default = ["indicatif"]
-# The indicatif renderer (legacy single-terminal CLI path). Disable to build the
-# pure operation-tracking core with no rendering dependency.
-indicatif = ["dep:indicatif", "tokio/rt"]
+# The indicatif renderer (legacy single-terminal CLI path) and the scoped
+# per-sink renderer. Disable to build the pure operation-tracking core with no
+# rendering dependency.
+indicatif = ["dep:indicatif", "tokio/rt", "tokio/macros", "tokio/io-util"]
 
 [dependencies]
 indicatif = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["sync"] }
 
+# `rt-multi-thread` is test-only: `render_operations_while`'s integration test
+# runs on a `#[tokio::test(flavor = "multi_thread")]` runtime so its pump task
+# drains concurrently with the driven future. Production code needs only `rt`
+# (see the `indicatif` feature), so this stays out of the production deps.
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

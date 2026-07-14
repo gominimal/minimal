@@ -1,35 +1,19 @@
 //! Client-side handler for the daemon's [`ContributionResponse`].
 //!
-//! Sits between the initial [`UserComposer`] phase and the daemon's
-//! final assembly (see `docs/COMPOSITION.md` for the full picture):
-//! the daemon has emitted pending items the client must gate against
-//! the user's policy. This module turns the pending batch into a
-//! [`ContributionVerdict`] to ship back via `SubmitVerdict`.
+//! Gates each pending var and patch against the user's policy and
+//! emits a [`ContributionVerdict`] to ship back via `SubmitVerdict`.
+//! Vars are gated first: any that get approved join the loadout's
+//! gated vars in the expansion context used to resolve patch source
+//! patterns in the same call, so a patch declared with
+//! `~/${PROJECT_ROOT}` can reference a `PROJECT_ROOT` approved
+//! moments earlier in the same response.
 //!
-//! For each pending var: build a [`PendingVar`] (resolving the spec
-//! against the env closure), then run the user's [`VarsPolicy`]
-//! check. Approved vars are added to the var-expansion context for
-//! subsequent patch processing in the same call.
+//! Lifecycle hooks are pass-through — no per-hook policy exists, so
+//! rejecting a hook means aborting the session.
 //!
-//! For each pending patch: expand the source pattern against the
-//! gated vars (from the loadout phase) combined with this batch's
-//! newly approved pending vars, walk the filesystem, and check each
-//! matched file against the user's [`PatchPolicy`]. One
-//! [`WirePatchVerdict`] is emitted per matched file.
-//!
-//! Lifecycle hooks in the response are dropped — there is no
-//! per-hook policy, so the verdict schema has no slot for them. The
-//! daemon will install them as the source declared. To reject a
-//! hook the user aborts the whole session.
-//!
-//! **Verdict ordering.** Per-domain verdicts are *not* emitted in
-//! the order pending items arrived: items the policy can auto-decide
-//! are emitted in input order, but anything routed through the hook
-//! lands at the end. The daemon must correlate by `id`, not slice
-//! position.
-//!
-//! [`UserComposer`]: crate::client::composer::UserComposer
-//! [`PendingVar`]: crate::core::compose::PendingVar
+//! Per-domain verdicts are correlated by `id`, not slice position:
+//! auto-decided items come out in input order but hook-routed items
+//! land at the end.
 
 use crate::core::compose::{
     ComposeError, ComposeOptions, HookDomain, PendingPatchFile, PendingVar, SessionVar,
@@ -47,26 +31,18 @@ use crate::wire::request::{ContributionResponse, ContributionVerdict};
 
 /// Gate the daemon's pending items against `policy`, prompting via
 /// `hooks` for anything the policy can't auto-decide, and emit a
-/// [`ContributionVerdict`] to ship back.
+/// [`ContributionVerdict`] to ship back to the daemon.
 ///
 /// `gated_vars` is the client's already-gated var set from the
-/// loadout phase; pending patch sources reference both those and any
-/// vars approved in this same response.
+/// loadout phase; pending patch sources may reference both those
+/// and any vars approved in this response.
 ///
 /// # Errors
 ///
-/// See [`ComposeError`]. In particular:
-/// - [`ComposeError::Aborted`] when a hook returns
-///   [`HookResult::Abort`]; the caller should send a `SessionAbort`
-///   RPC with [`AbortReason::UserCancelled`](crate::wire::request::AbortReason::UserCancelled).
-/// - [`ComposeError::VarResolution`] when an `Inherit`-shaped
-///   pending var can't be resolved against the env.
-/// - [`ComposeError::Expansion`] / [`ComposeError::PatchWalk`] for
-///   pattern / filesystem failures.
-/// - [`ComposeError::InvalidPendingPatchDest`] when a pending
-///   patch's destination violates `PatchDest` invariants.
-/// - [`ComposeError::HookContract`] when the hook returns
-///   ill-formed decisions.
+/// See [`ComposeError`]. On [`ComposeError::Aborted`] (a hook
+/// returned [`HookResult::Abort`]) the caller should skip
+/// `SubmitVerdict` and send `AbortSession` instead so the daemon
+/// releases its pending stash entry.
 ///
 /// [`HookResult::Abort`]: crate::core::hooks::HookResult::Abort
 pub fn handle_response(
@@ -333,9 +309,16 @@ fn enumerate_and_classify_patches(
         let provenance: Source = p.source.into();
         let dest = PatchDest::try_new(p.destination.as_utf8_path().to_path_buf())
             .map_err(|source| ComposeError::InvalidPendingPatchDest { source })?;
+        // Client-response path handles daemon-side patches (Package /
+        // Project) — user loadouts never reach this path (see
+        // `daemon::composer`, which only accepts non-loadout
+        // Composables). `ProvenancedPatch::new` stamps
+        // `follow_symlinks: None`, which resolves to the compose
+        // default at expand time.
         let pp = ProvenancedPatch::new(Patch::new(p.source_pattern, dest), provenance);
-        let expanded = expand_patch_sources(vec![pp], combined_vars, home_fallback)?;
-        let files = enumerate_patch_files(expanded, follow_symlinks)?;
+        let expanded =
+            expand_patch_sources(vec![pp], combined_vars, home_fallback, follow_symlinks)?;
+        let files = enumerate_patch_files(expanded)?;
         for pf in files {
             match classify_patch_file(policy, PendingPatchFile::new(id, pf)) {
                 PatchClassification::Decided(verdict) => verdicts.push(verdict),

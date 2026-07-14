@@ -73,8 +73,7 @@ impl ProvenancedVar {
         &self.var
     }
 
-    /// Consume and return the inner var + source. Used by the composer
-    /// to destructure during the move-out phase.
+    /// Consume and return the inner var and source.
     #[must_use]
     pub fn into_parts(self) -> (ResolvedVar, Source) {
         (self.var, self.source)
@@ -88,18 +87,41 @@ impl Provenanced for ProvenancedVar {
 }
 
 /// A [`Patch`] tagged with its [`Source`] for the composer.
+///
+/// `follow_symlinks` overrides the compose-level default for this
+/// specific patch's walk. `None` means "use the compose default";
+/// `Some(v)` wins. Populated by [`Loadout::contribute`] from
+/// [`Loadout::follow_symlinks`]; non-loadout contributors emit
+/// `None` and inherit the default.
+///
+/// [`Loadout::contribute`]: crate::core::loadout::Loadout::contribute
+/// [`Loadout::follow_symlinks`]: crate::core::loadout::Loadout::follow_symlinks
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProvenancedPatch {
     patch: Patch,
     source: Source,
+    follow_symlinks: Option<bool>,
 }
 
 impl ProvenancedPatch {
-    /// Construct a [`ProvenancedPatch`] from a patch declaration and
-    /// its origin.
+    /// Construct a [`ProvenancedPatch`] with no per-item
+    /// follow-symlinks override; the walker uses the compose default.
     #[must_use]
     pub fn new(patch: Patch, source: Source) -> Self {
-        Self { patch, source }
+        Self {
+            patch,
+            source,
+            follow_symlinks: None,
+        }
+    }
+
+    /// Set the per-patch follow-symlinks override. Owned-builder
+    /// form so a caller building `ProvenancedPatch` inline reads
+    /// linearly.
+    #[must_use]
+    pub fn with_follow_symlinks(mut self, follow_symlinks: Option<bool>) -> Self {
+        self.follow_symlinks = follow_symlinks;
+        self
     }
 
     /// The wrapped [`Patch`].
@@ -108,11 +130,17 @@ impl ProvenancedPatch {
         &self.patch
     }
 
-    /// Consume and return the inner patch + source. Used by the
-    /// composer to destructure during the move-out phase.
+    /// The per-patch follow-symlinks override (`None` = inherit
+    /// the compose default).
     #[must_use]
-    pub fn into_parts(self) -> (Patch, Source) {
-        (self.patch, self.source)
+    pub fn follow_symlinks(&self) -> Option<bool> {
+        self.follow_symlinks
+    }
+
+    /// Consume and return the inner patch, source, and follow-symlinks override.
+    #[must_use]
+    pub fn into_parts(self) -> (Patch, Source, Option<bool>) {
+        (self.patch, self.source, self.follow_symlinks)
     }
 }
 

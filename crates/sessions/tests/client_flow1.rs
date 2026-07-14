@@ -1,6 +1,5 @@
 //! Integration tests for the client side of session creation, flow 1:
-//! TOML loadout → [`UserComposer`] → [`WireContribution`] →
-//! [`SessionCreateRequest`].
+//! TOML loadout → [`UserComposer`] → `WireContribution`.
 //!
 //! Each test exercises the crate's public surface only (this lives in
 //! `tests/`, not `src/`, so visibility leaks here mean we broke the
@@ -15,7 +14,6 @@ use sessions::core::loadout::Loadout;
 use sessions::core::policy::{PatchPolicy, UserPolicy, VarsPolicy};
 use sessions::core::source::Source;
 use sessions::wire::primitives::WireSource;
-use sessions::wire::request::SessionCreateRequest;
 
 // =====================================================================
 // Support
@@ -468,11 +466,12 @@ AWS_KEY = "leaked"
     }
 }
 
-/// The full `SessionCreateRequest` round-trips through JSON. Catches
-/// drift in any wire-form type without snapshotting against a fragile
-/// byte-for-byte fixture.
+/// The full `WireContribution` — the payload the client ships to
+/// the daemon inside `CreateSessionRequest` — round-trips through
+/// JSON. Catches drift in any wire-form type without snapshotting
+/// against a fragile byte-for-byte fixture.
 #[test]
-fn session_create_request_round_trips_through_json() {
+fn wire_contribution_round_trips_through_json() {
     let tmp = tempfile::tempdir().unwrap();
     let root = Utf8Path::from_path(tmp.path()).unwrap();
     fixture_tree(root, [("dotfiles/helix/config.toml", "theme = 'nord'\n")]);
@@ -498,20 +497,13 @@ on_activate = {{ type = "inline", value = "echo activated" }}
     let contribution = composer
         .compose(UserPolicy::empty(), ComposeOptions::default())
         .unwrap();
-    let req = SessionCreateRequest {
-        protocol_version: 1,
-        project_path: paths::HostAbsPath::try_new("/repo").unwrap(),
-        contribution,
-    };
 
-    let json = serde_json::to_string(&req).unwrap();
-    let decoded: SessionCreateRequest = serde_json::from_str(&json).unwrap();
+    let json = serde_json::to_string(&contribution).unwrap();
+    let decoded: sessions::wire::request::WireContribution = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(decoded.protocol_version, 1);
-    assert_eq!(decoded.project_path.as_str(), "/repo");
-    assert_eq!(decoded.contribution.vars.len(), 1);
-    assert_eq!(decoded.contribution.vars[0].var.value, "sjn_IV");
-    assert_eq!(decoded.contribution.patches.len(), 1);
-    assert_eq!(decoded.contribution.lifecycle_hooks.len(), 1);
-    assert_eq!(decoded.contribution.requested_packages.len(), 1);
+    assert_eq!(decoded.vars.len(), 1);
+    assert_eq!(decoded.vars[0].var.value, "sjn_IV");
+    assert_eq!(decoded.patches.len(), 1);
+    assert_eq!(decoded.lifecycle_hooks.len(), 1);
+    assert_eq!(decoded.requested_packages.len(), 1);
 }

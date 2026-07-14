@@ -29,7 +29,11 @@ pub fn parse_file<P: AsRef<Path>>(path: P, data: Vec<u8>) -> Result<Val, JqError
             relevant_file: Some(path.as_ref().to_str().unwrap().to_string()),
             relevant_jq: None,
         })?),
-        Some(Some("json")) => Ok(jaq_all::fmts::read::json::parse_single(&data).unwrap()),
+        Some(Some("json")) => jaq_all::fmts::read::json::parse_single(&data).map_err(|e| JqError {
+            err: e.to_string(),
+            relevant_file: Some(path.as_ref().to_str().unwrap().to_string()),
+            relevant_jq: None,
+        }),
         _ => Err(JqError {
             err: "cannot handle file extension".to_string(),
             relevant_file: Some(path.as_ref().to_str().unwrap().to_string()),
@@ -84,5 +88,23 @@ impl Expression {
                 relevant_jq: Some(self.raw.clone()),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_file_rejects_malformed_json_without_panicking() {
+        // Regression for a fuzzer-found panic: `parse_single(..).unwrap()` on
+        // malformed (or empty) JSON. Both must now return a `JqError`.
+        assert!(parse_file("x.json", Vec::new()).is_err());
+        assert!(parse_file("x.json", b"{not json".to_vec()).is_err());
+    }
+
+    #[test]
+    fn parse_file_accepts_valid_json() {
+        assert!(parse_file("x.json", b"{\"a\": 1}".to_vec()).is_ok());
     }
 }

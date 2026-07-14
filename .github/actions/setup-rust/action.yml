@@ -1,0 +1,48 @@
+name: Setup Rust
+description: >
+  Common Rust CI preamble for GitHub-hosted Ubuntu runners: free disk space,
+  install protoc, slim CI debug info, and restore the cargo registry/build
+  cache. Assumes the repository is already checked out.
+
+inputs:
+  shared-key:
+    description: >
+      rust-cache shared-key. One key per job CLASS that compiles the same
+      artifacts (same packages, features, profile); jobs that compile
+      differently must not share a key, or they thrash each other's cache.
+    required: false
+    default: workspace
+  save-if:
+    description: >
+      Whether this job may WRITE the cache. Defaults to main only: PR
+      branches restore but never save, so PR churn cannot LRU-evict the
+      main-branch caches every PR wants to restore from.
+    required: false
+    default: ${{ github.ref == 'refs/heads/main' }}
+
+runs:
+  using: composite
+  steps:
+    - name: Free Disk Space
+      uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+      with:
+        remove_android: true
+        remove_dotnet: true
+        remove_haskell: true
+        remove_tool_cache: true
+    - name: Install protoc
+      shell: bash
+      run: sudo sh -c 'apt-get update && apt-get install -y protobuf-compiler'
+    - name: Slim debug info for CI builds
+      # line-tables-only keeps usable backtraces while shrinking target/ (and
+      # every cache built from it) and speeding linking. An env var rather
+      # than a named Cargo profile: a profile would move output to
+      # target/<name>/ and break every hardcoded target/debug path (codesign
+      # steps, testbeds, PATH exports, justfile).
+      shell: bash
+      run: echo "CARGO_PROFILE_DEV_DEBUG=line-tables-only" >> "$GITHUB_ENV"
+    - name: Cache cargo registry and build artifacts
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.shared-key }}
+        save-if: ${{ inputs.save-if }}

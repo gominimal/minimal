@@ -1,0 +1,58 @@
+# A minimal.toml built for demoing `[session]` composition. The
+# `[session]` block contributes two packages and one project-level
+# var, giving a fresh attach three composed items to inspect —
+# each from a different source.
+#
+# Try it:
+#   cargo build -p minimal -p minimald
+#   ./target/debug/min activate crates/sessions/example_project --attach
+#
+# Then inside the session:
+#
+#   # Project-declared package (Source::Project):
+#   mermaid-ascii -f "$DIAGRAM"
+#
+#   # Project-declared var (Source::Project):
+#   echo "$DIAGRAM"
+#
+#   # Package-declared vars (Source::Package "go"): the `go`
+#   # package sets these via `env_state_wiring` — the composer
+#   # picked them up automatically without them being named in
+#   # this file.
+#   echo "$GOCACHE $GOMODCACHE"     # /state/gocache /state/gomodcache
+#
+# Demo punchline: comment out the `[session]` block, re-activate,
+# re-run — every command breaks. `mermaid-ascii` is `command not
+# found`; `$DIAGRAM`/`$GOCACHE`/`$GOMODCACHE` are all unset.
+# Composition is doing real work.
+
+[upstream]
+repo = "https://github.com/gominimal/pkgs"
+branch = "main"
+# Reused from the workspace's own `minimal.toml` — guaranteed to
+# resolve as long as that pin does.
+locked_commit = "23193970569b93e5e7a980aa598c3342c386d33f"
+
+[stack]
+use = "shell"
+
+[session]
+# Unioned with the launcher baseline (`base`, `coreutils`, `socat`)
+# and with anything a client loadout adds.
+#
+# `go` is included not because we run it here, but because it
+# declares two `env_state_wiring` entries (`GOCACHE`,
+# `GOMODCACHE`). Adding it demonstrates a package contributing
+# vars to the session automatically — the composer reads them off
+# the package's build attrs and routes them through the same
+# `PatchPolicy`/`VarsPolicy` gate every other contribution goes
+# through.
+packages = ["mermaid-ascii", "go"]
+
+[session.vars]
+# Referenced by the demo one-liner above. Specified rather than
+# inherited — every attach against this project should see the
+# same starting artifact. Reaches the sandbox environment via the
+# client's `ApproveProjectAndPackage` policy hook, which
+# auto-allows Project- and Package-sourced items.
+DIAGRAM = "arch.mmd"

@@ -1,11 +1,12 @@
 #[cfg(feature = "networking-proxy")]
 use minimald_rpc::IssueClientCertResponse;
 use minimald_rpc::{
-    CreateSession, CreateSessionResponse, DestroySession, DestroySessionResponse, Errorable,
-    GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
+    AbortSession, AbortSessionResponse, CreateSession, DestroySession, DestroySessionResponse,
+    Errorable, GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
     GetSessionRecordRequest, GetSessionRecordResponse, GetVersion, GetVersionResponse,
     IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse,
-    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse,
+    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, Shutdown,
+    ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -136,28 +137,67 @@ async fn serve_get_session_record(s: ServerStateHandle, c: RuChannel<Msg>) {
     }
 }
 
-async fn serve_create_session(s: ServerStateHandle, c: RuChannel<Msg>) {
+async fn serve_create_session(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+    ssh_username: Option<String>,
+) {
     let res = CreateSession
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
 
-            Ok(match mngr.create_session(req.record).await {
-                Ok(id) => Errorable::Ok(CreateSessionResponse { id }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
-                    error: "A session with that name already exists".to_string(),
+            Ok(
+                match mngr
+                    .create_session(req.config, ssh_username, req.contribution)
+                    .await
+                {
+                    Ok(resp) => Errorable::Ok(resp),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
+                        error: "A session with that name already exists".to_string(),
+                    },
+                    // R2.1: a policy/network-mode mismatch is rejected at
+                    // declaration time and surfaced as a clean typed error rather
+                    // than a transport failure.
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
+                        error: e.to_string(),
+                    },
+                    // The daemon's in-flight Pending stash is full
+                    // (see `MAX_PENDING_SESSIONS`). Surface as a clean
+                    // typed error so the client can retry rather than
+                    // treat it as a transport failure.
+                    Err(e) if e.kind() == std::io::ErrorKind::ResourceBusy => Errorable::Err {
+                        error: e.to_string(),
+                    },
+                    Err(e) => return Err(ConnectionError::Internal(e.to_string())),
                 },
-                // R2.1: a policy/network-mode mismatch is rejected at
-                // declaration time and surfaced as a clean typed error rather
-                // than a transport failure.
-                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
-                    error: e.to_string(),
-                },
-                Err(e) => return Err(ConnectionError::Internal(e.to_string())),
-            })
+            )
         })
         .await;
     if let Err(e) = res {
         tracing::warn!("RPC handler for {} failed: {}", CreateSession::NAME, e);
+    }
+}
+
+/// `SubmitVerdict`: the client's per-item decisions for a `Pending`
+/// session. Delegates to the manager actor, which pops the matching
+/// `PendingComposeState`, runs `resume_from_verdict`, and promotes
+/// the record `Pending → Active`. Replies with `Errorable::Ok(SessionStep)`
+/// where the `SessionStep` is `Active { id }` on success or
+/// `Fault { error }` for a structured failure (unknown id, wrong
+/// state, or a `ComposeError`-mapped `WireError`). Manager-side
+/// `io::Error`s bubble up as `ConnectionError::Internal`.
+async fn serve_submit_verdict(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = SubmitVerdict
+        .handle_channel(c, async |req| {
+            let mngr = s.sessions_manager().await;
+            match mngr.submit_verdict(req).await {
+                Ok(step) => Ok(Errorable::Ok(step)),
+                Err(e) => Err(ConnectionError::Internal(e.to_string())),
+            }
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", SubmitVerdict::NAME, e);
     }
 }
 
@@ -196,6 +236,87 @@ async fn serve_destroy_session(s: ServerStateHandle, c: RuChannel<Msg>) {
         .await;
     if let Err(e) = res {
         tracing::warn!("RPC handler for {} failed: {}", DestroySession::NAME, e);
+    }
+}
+
+async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = Shutdown
+        .handle_channel(c, async |req: ShutdownRequest| {
+            let mngr = s.sessions_manager().await;
+            Ok(match mngr.shutdown(req.force).await {
+                Ok(()) => {
+                    // R2.1/R2.2: with the sessions drained, quiesce the state
+                    // volume (syncfs + detach) before acknowledging, so a
+                    // caller-driven VMM teardown right after the ack leaves a
+                    // clean ext4 journal. Best-effort with a bounded wait; the
+                    // journal replay backstop covers every failure arm.
+                    quiesce_state_volume_if_mounted(&s).await;
+                    // Manager is down; tell the accept loop to stop and drain
+                    // so the process can exit. Firing before the response is
+                    // written is safe: the drain waits out the grace period,
+                    // so this reply still flushes to the client.
+                    s.trigger_shutdown().await;
+                    ShutdownResponse::ShuttingDown
+                }
+                Err(()) => ShutdownResponse::SessionsLive,
+            })
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", Shutdown::NAME, e);
+    }
+}
+
+/// Quiesce the guest state volume during shutdown (R2.2). No-op unless the
+/// boot path actually mounted the data volume at the state dir — a native
+/// daemon's host directory, or a microVM running without a volume, must
+/// never be synced-and-unmounted out from under the host. `syncfs` is
+/// blocking, so it runs on the blocking pool with a 10 s ceiling; the
+/// handler proceeds regardless of the outcome. Note the ceiling's residual
+/// risk: a timed-out `syncfs` keeps running detached while the handler acks,
+/// so a very large dirty set can still be mid-flush when the caller tears
+/// the VM down — bounded, as ever, by the ext4 journal replay backstop.
+#[cfg(target_os = "linux")]
+async fn quiesce_state_volume_if_mounted(s: &ServerStateHandle) {
+    const QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    if !s.state_volume_mounted().await {
+        return;
+    }
+    let mountpoint = s.minimal_state_dir().await;
+    let quiesce = tokio::task::spawn_blocking(move || {
+        crate::guest::quiesce_state_volume(mountpoint.as_utf8_path().as_str())
+    });
+    match tokio::time::timeout(QUIESCE_TIMEOUT, quiesce).await {
+        Ok(Ok(Ok(()))) => tracing::info!("state volume quiesced for shutdown"),
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(error = %e, "state volume quiesce failed; ext4 journal replay will recover")
+        }
+        Ok(Err(join)) => tracing::warn!(error = %join, "state volume quiesce task panicked"),
+        Err(_) => tracing::warn!("state volume quiesce timed out after 10s; proceeding"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn quiesce_state_volume_if_mounted(_s: &ServerStateHandle) {}
+
+/// `AbortSession`: drop a `Pending` session's stash entry and delete
+/// its on-disk record. See the manager arm for the actor-side rules
+/// (refuses `Active` records and unknown ids).
+async fn serve_abort_session(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = AbortSession
+        .handle_channel(c, async |req| {
+            let res = s.sessions_manager().await.abort_session(req.id).await;
+            match res {
+                Ok(()) => Ok(Errorable::Ok(AbortSessionResponse)),
+                Err(e) => Ok(Errorable::Err {
+                    error: e.to_string(),
+                }),
+            }
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", AbortSession::NAME, e);
     }
 }
 
@@ -347,13 +468,19 @@ pub async fn handle_ssh_rpc(
     session: &mut Session,
 ) -> Result<(), ConnectionError> {
     // Take the channel from connection state if its a known RPC.
+    // `ssh_username` is read out under the same lock so `serve_*`
+    // handlers that need the authenticated user (CreateSession) don't
+    // have to re-lock.
     let res = match name {
         GetVersion::NAME
         | ListSessions::NAME
         | GetSessionRecord::NAME
         | CreateSession::NAME
+        | SubmitVerdict::NAME
         | RenameSession::NAME
         | DestroySession::NAME
+        | Shutdown::NAME
+        | AbortSession::NAME
         | GetSessionPolicy::NAME
         | GetMeshStatus::NAME
         | STREAM_WORKSPACE_FILES
@@ -366,17 +493,18 @@ pub async fn handle_ssh_rpc(
                 }
                 Some((channel, config)) => (channel, config),
             };
+            let ssh_username = conn_lock.ssh_username.clone();
             drop(conn_lock);
             session.channel_success(id)?;
-            Some(c_hnd)
+            Some((c_hnd, ssh_username))
         }
         _ => {
             session.channel_failure(id)?;
             None
         }
     };
-    let (channel, config) = match res {
-        Some((channel, config)) => (channel, config),
+    let ((channel, config), ssh_username) = match res {
+        Some(v) => v,
         None => return Ok(()),
     };
 
@@ -385,9 +513,12 @@ pub async fn handle_ssh_rpc(
         GetVersion::NAME => drop(spawn(serve_get_version(channel))),
         ListSessions::NAME => drop(spawn(serve_list_sessions(s, channel))),
         GetSessionRecord::NAME => drop(spawn(serve_get_session_record(s, channel))),
-        CreateSession::NAME => drop(spawn(serve_create_session(s, channel))),
+        CreateSession::NAME => drop(spawn(serve_create_session(s, channel, ssh_username))),
+        SubmitVerdict::NAME => drop(spawn(serve_submit_verdict(s, channel))),
         RenameSession::NAME => drop(spawn(serve_rename_session(s, channel))),
         DestroySession::NAME => drop(spawn(serve_destroy_session(s, channel))),
+        Shutdown::NAME => drop(spawn(serve_shutdown(s, channel))),
+        AbortSession::NAME => drop(spawn(serve_abort_session(s, channel))),
         GetSessionPolicy::NAME => drop(spawn(serve_get_session_policy(s, channel))),
         GetMeshStatus::NAME => drop(spawn(serve_get_mesh_status(s, channel))),
         STREAM_WORKSPACE_FILES => drop(spawn(serve_stream_workspace_files(s, config, channel))),
@@ -414,7 +545,8 @@ pub async fn handle_ssh_rpc(
 mod tests {
     use minimald_rpc::{
         CreateSession, CreateSessionRequest, DestroySessionRequest, EgressPolicy, GetSessionPolicy,
-        GetSessionPolicyRequest, RenameSessionRequest, SessionPolicy,
+        GetSessionPolicyRequest, RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest,
+        ShutdownResponse,
     };
     use paths::HostAbsPath;
     use sessions::{NetworkMode, SessionId};
@@ -444,23 +576,16 @@ mod tests {
         encoder.into_inner()
     }
 
+    use crate::test_harness::{create_session_req as req, unwrap_ready};
+
     /// Creates a session through the public RPC and returns its id.
     async fn fresh_session(client: &mut TestClient) -> SessionId {
-        client
-            .call::<CreateSession>(&CreateSessionRequest {
-                record: sessions::Record {
-                    id: SessionId::nil(),
-                    name: Some("stream-test".to_string()),
-                    username: None,
-                    project_path: HostAbsPath::try_new("/tmp").unwrap(),
-                    network: sessions::NetworkMode::default(),
-                    policy: Default::default(),
-                    attrs: Default::default(),
-                },
-            })
-            .await
-            .unwrap()
-            .id
+        unwrap_ready(
+            client
+                .call::<CreateSession>(&req("stream-test", "/tmp"))
+                .await
+                .unwrap(),
+        )
     }
 
     #[tokio::test]
@@ -611,27 +736,18 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        let create_session = client
-            .call::<CreateSession>(&CreateSessionRequest {
-                record: sessions::Record {
-                    id: SessionId::nil(),
-                    name: Some("my session".to_string()),
-                    username: None,
-                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: sessions::NetworkMode::default(),
-                    policy: Default::default(),
-                    attrs: Default::default(),
-                },
-            })
-            .await
-            .unwrap();
-
-        assert!(create_session.id != SessionId::nil());
+        let id = unwrap_ready(
+            client
+                .call::<CreateSession>(&req("my session", "/uwu"))
+                .await
+                .unwrap(),
+        );
+        assert!(id != SessionId::nil());
 
         let get_session = client
-            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(create_session.id))
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(id))
             .await;
-        assert_eq!(get_session.record.as_ref().unwrap().id, create_session.id);
+        assert_eq!(get_session.record.as_ref().unwrap().id, id);
         assert_eq!(
             get_session.record.as_ref().unwrap().name,
             Some("my session".to_string())
@@ -645,7 +761,7 @@ mod tests {
         assert_eq!(
             list_sessions.sessions,
             vec![ListSessionsEntry {
-                id: create_session.id,
+                id,
                 name: Some("my session".to_string()),
                 attrs: None,
             }]
@@ -665,23 +781,24 @@ mod tests {
             allow_dns_hosts: None,
             allow_protocols: None,
         };
-        let created = client
-            .call::<CreateSession>(&CreateSessionRequest {
-                record: sessions::Record {
-                    id: SessionId::nil(),
-                    name: Some("policy-session".to_string()),
-                    username: None,
-                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: NetworkMode::OwnIp,
-                    policy: SessionPolicy::new(Some(egress.clone()), None),
-                    attrs: Default::default(),
-                },
-            })
-            .await
-            .unwrap();
+        let created_id = unwrap_ready(
+            client
+                .call::<CreateSession>(&CreateSessionRequest {
+                    config: minimald_rpc::SessionConfig {
+                        name: Some("policy-session".to_string()),
+                        project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                        network: NetworkMode::OwnIp,
+                        policy: SessionPolicy::new(Some(egress.clone()), None),
+                        attrs: Default::default(),
+                    },
+                    contribution: Default::default(),
+                })
+                .await
+                .unwrap(),
+        );
 
         let policy = client
-            .call::<GetSessionPolicy>(&GetSessionPolicyRequest::Id(created.id))
+            .call::<GetSessionPolicy>(&GetSessionPolicyRequest::Id(created_id))
             .await
             .unwrap();
         assert_eq!(policy.egress, Some(egress));
@@ -695,36 +812,17 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        let create_session = client
-            .call::<CreateSession>(&CreateSessionRequest {
-                record: sessions::Record {
-                    id: SessionId::nil(),
-                    name: Some("my session".to_string()),
-                    username: None,
-                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: sessions::NetworkMode::default(),
-                    policy: Default::default(),
-                    attrs: Default::default(),
-                },
-            })
-            .await
-            .unwrap();
-
-        assert!(create_session.id != SessionId::nil());
+        let id = unwrap_ready(
+            client
+                .call::<CreateSession>(&req("my session", "/uwu"))
+                .await
+                .unwrap(),
+        );
+        assert!(id != SessionId::nil());
 
         assert_eq!(
             client
-                .call::<CreateSession>(&CreateSessionRequest {
-                    record: sessions::Record {
-                        id: SessionId::nil(),
-                        name: Some("my session".to_string()),
-                        username: None,
-                        project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                        network: sessions::NetworkMode::default(),
-                        policy: Default::default(),
-                        attrs: Default::default(),
-                    },
-                })
+                .call::<CreateSession>(&req("my session", "/uwu"))
                 .await,
             Errorable::Err {
                 error: "A session with that name already exists".to_string()
@@ -746,15 +844,14 @@ mod tests {
         };
         let resp = client
             .call::<CreateSession>(&CreateSessionRequest {
-                record: sessions::Record {
-                    id: SessionId::nil(),
+                config: minimald_rpc::SessionConfig {
                     name: Some("bad-policy".to_string()),
-                    username: None,
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: NetworkMode::HostNet,
                     policy: SessionPolicy::new(Some(egress), None),
                     attrs: Default::default(),
                 },
+                contribution: Default::default(),
             })
             .await;
         assert_eq!(
@@ -866,6 +963,95 @@ mod tests {
         assert!(
             matches!(resp, Errorable::Err { error } if error.contains("no session with ID")),
             "expected an unknown-id error",
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_shutting_down_when_no_sessions_are_live() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let resp = client
+            .call::<Shutdown>(&ShutdownRequest { force: false })
+            .await;
+        assert_eq!(resp, ShutdownResponse::ShuttingDown);
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_further_session_work_once_shut_down() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let resp = client
+            .call::<Shutdown>(&ShutdownRequest { force: false })
+            .await;
+        assert_eq!(resp, ShutdownResponse::ShuttingDown);
+
+        // After shutdown the manager refuses to bring sessions up, so even a
+        // lookup for a well-formed id is rejected rather than answered.
+        let mngr = server.state.sessions_manager().await;
+        assert!(
+            mngr.get_session(SessionKeyPredicate::Id(SessionId::nil()))
+                .await
+                .is_err(),
+            "manager should reject session work while shutting down",
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_without_force_refuses_while_a_session_is_live() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        // A persisted session isn't "live" until it's brought up; do so, so the
+        // manager has a running actor that an unforced shutdown must protect.
+        let mngr = server.state.sessions_manager().await;
+        mngr.get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("freshly-created session should be retrievable");
+
+        let resp = client
+            .call::<Shutdown>(&ShutdownRequest { force: false })
+            .await;
+        assert_eq!(resp, ShutdownResponse::SessionsLive);
+
+        // The refusal left the daemon fully operational: the live session is
+        // still reachable and no shutdown flag was latched.
+        assert!(
+            mngr.get_session(SessionKeyPredicate::Id(session_id))
+                .await
+                .unwrap()
+                .is_some(),
+            "an unforced, refused shutdown must not tear down live sessions",
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_force_tears_down_live_sessions() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let mngr = server.state.sessions_manager().await;
+        mngr.get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("freshly-created session should be retrievable");
+
+        // `force` overrides the live-session guard: the daemon shuts down...
+        let resp = client
+            .call::<Shutdown>(&ShutdownRequest { force: true })
+            .await;
+        assert_eq!(resp, ShutdownResponse::ShuttingDown);
+
+        // ...and, being in shutdown, refuses to hand out sessions afterwards.
+        assert!(
+            mngr.get_session(SessionKeyPredicate::Id(session_id))
+                .await
+                .is_err(),
+            "a forced shutdown should leave the manager rejecting session work",
         );
     }
 

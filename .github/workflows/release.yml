@@ -1,0 +1,676 @@
+name: Release
+
+on:
+    workflow_dispatch:
+    # Invoked by nightly.yml, which depends on this run completing before it
+    # flips the `nightly` channel. No behavior change for manual dispatch.
+    workflow_call:
+
+env:
+    CARGO_TERM_COLOR: always
+
+# Serialize release runs so two manual dispatches can't race to cut a release
+# from different commits at the same time.
+concurrency:
+    group: release-${{ github.ref }}
+    cancel-in-progress: false
+
+permissions:
+    contents: read
+
+jobs:
+    test:
+        runs-on: ubuntu-latest
+        timeout-minutes: 40
+        steps:
+            - uses: actions/checkout@v7
+            - name: Run core workspace tests
+              uses: ./.github/actions/core-tests
+            - name: Run HTTPS/mTLS proxy tests
+              # The mTLS reverse proxy is behind the non-default `networking-proxy`
+              # feature, so the core-tests `--workspace` run does not compile or run
+              # its proofs (a missing client cert is rejected with 401; a valid
+              # cert routes to the backend). Exercise them explicitly.
+              run: cargo nextest run -p minimald --features networking-proxy
+
+    build-release-linux-amd64:
+        runs-on: ubuntu-latest
+        timeout-minutes: 60
+        steps:
+            - name: Free Disk Space
+              # Static release build of the full workspace; the cargo target dir
+              # is the largest in any of the linux jobs. `remove_tool_cache: true`
+              # is safe even without a `dtolnay/rust-toolchain` step — the
+              # pre-installed Rust toolchain on ubuntu-latest lives in
+              # `~/.rustup` + `~/.cargo`, not `/opt/hostedtoolcache`, so
+              # `rustup target add` below still resolves.
+              uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+              with:
+                  remove_android: true
+                  remove_dotnet: true
+                  remove_haskell: true
+                  remove_tool_cache: true
+            - uses: actions/checkout@v7
+            - name: Install dependencies
+              run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
+            - name: Add Rust target
+              run: rustup target add x86_64-unknown-linux-musl
+            - name: Configure musl linker
+              run: |
+                  echo '' >> .cargo/config.toml
+                  echo '[target.x86_64-unknown-linux-musl]' >> .cargo/config.toml
+                  echo 'linker = "musl-gcc"' >> .cargo/config.toml
+            - uses: actions/cache@v6
+              with:
+                  path: |
+                      ~/.cargo/bin/
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                      target/
+                  key: ${{ runner.os }}-amd64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: ${{ runner.os }}-amd64-cargo-release-
+            - name: Build static release binaries
+              run: |
+                  cargo build --release --target x86_64-unknown-linux-musl \
+                     --package mip \
+                     --package minimal \
+                     --package minimald
+            - name: Rename binaries with platform suffix
+              # download-artifact merge-multiple flattens every artifact into one
+              # directory using each file's basename, so the uploaded files must
+              # already carry a unique platform-suffixed name to avoid amd64/arm64
+              # collisions and to match the paths used by the release job.
+              run: |
+                  cd target/x86_64-unknown-linux-musl/release
+                  mv mip mip-linux-amd64
+                  mv min minimal-linux-amd64
+                  mv minimald minimald-linux-amd64
+            - name: Upload binary (mip)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: mip-linux-amd64
+                  path: target/x86_64-unknown-linux-musl/release/mip-linux-amd64
+                  retention-days: 7
+            - name: Upload binary (minimal)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimal-linux-amd64
+                  path: target/x86_64-unknown-linux-musl/release/minimal-linux-amd64
+                  retention-days: 7
+            - name: Upload binary (minimald)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimald-linux-amd64
+                  path: target/x86_64-unknown-linux-musl/release/minimald-linux-amd64
+                  retention-days: 7
+            - name: Materialize libkrun prefix (upstream package)
+              # minvmd links libkrun's KVM backend dynamically, so unlike the three
+              # binaries above it can't join the static-musl cross build — it needs a
+              # native glibc build against a real libkrun. Reuse the static mip built
+              # above (mip:) instead of letting the fetch compile a second, debug mip
+              # just to drive the cache fetch.
+              uses: ./.github/actions/setup-libkrun-linux
+              with:
+                  arch: x86_64
+                  mip: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/mip-linux-amd64
+            - name: Build native minvmd binary
+              # Native host target (x86_64-unknown-linux-gnu), NOT musl: the binary
+              # links libkrun.so (and libkrunfw.so.5 is dlopen'd at runtime), so unlike
+              # the three above it is not self-contained — running it still needs those
+              # .so's reachable via rpath/LD_LIBRARY_PATH. LIBKRUN_PREFIX — published
+              # by the setup-libkrun-linux composite above — drives the build.rs link
+              # search and the `minvmd_libkrun` cfg (real, non-stub impl).
+              run: |
+                  cargo build --release -p minvmd --bin minvmd
+                  mv target/release/minvmd target/release/minvmd-linux-amd64
+            - name: Upload binary (minvmd)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minvmd-linux-amd64
+                  path: target/release/minvmd-linux-amd64
+                  retention-days: 7
+
+    build-release-linux-arm64:
+        runs-on: ubuntu-latest
+        timeout-minutes: 90
+        steps:
+            - uses: actions/checkout@v7
+            - name: Install cross
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: cross
+            - uses: actions/cache@v6
+              with:
+                  path: |
+                      ~/.cargo/bin/
+                      ~/.cargo/registry/index/
+                      ~/.cargo/registry/cache/
+                      ~/.cargo/git/db/
+                      target/
+                  key: ${{ runner.os }}-arm64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: ${{ runner.os }}-arm64-cargo-release-
+            - name: Build static minimal binary
+              # Rename with a platform suffix so download-artifact's merge-multiple
+              # flatten does not collide with the amd64 build's basename.
+              run: |
+                  cross build --release \
+                     --package minimal \
+                     --target aarch64-unknown-linux-musl
+                  mv target/aarch64-unknown-linux-musl/release/min \
+                     target/aarch64-unknown-linux-musl/release/minimal-linux-arm64
+            - name: Upload binary (minimal)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimal-linux-arm64
+                  path: target/aarch64-unknown-linux-musl/release/minimal-linux-arm64
+                  retention-days: 7
+            - name: Build static mip binary
+              run: |
+                  cross build --release \
+                     --package mip \
+                     --target aarch64-unknown-linux-musl
+                  mv target/aarch64-unknown-linux-musl/release/mip \
+                     target/aarch64-unknown-linux-musl/release/mip-linux-arm64
+            - name: Upload binary (mip)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: mip-linux-arm64
+                  path: target/aarch64-unknown-linux-musl/release/mip-linux-arm64
+                  retention-days: 7
+            - name: Build static minimald binary
+              run: |
+                  cross build --release \
+                     --package minimald \
+                     --target aarch64-unknown-linux-musl
+                  mv target/aarch64-unknown-linux-musl/release/minimald \
+                     target/aarch64-unknown-linux-musl/release/minimald-linux-arm64
+            - name: Upload binary (minimald)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimald-linux-arm64
+                  path: target/aarch64-unknown-linux-musl/release/minimald-linux-arm64
+                  retention-days: 7
+
+    build-release-macos-arm64:
+        # Self-hosted Apple Silicon runner. minvmd links libkrun (Hypervisor.framework
+        # backend) via `#[link(name = "krun")]` and builds the real (non-stub) impl
+        # only on macOS against a provisioned libkrun — it can't join the static-musl
+        # cross builds above, so it's built natively here (mirrors ci-macos.yml's
+        # build-macos). Gated on RUN_MACOS_CI so it's skipped while the single
+        # self-hosted runner is offline — a skip here also skips `release`, which
+        # needs it.
+        runs-on: [self-hosted, macOS, ARM64]
+        timeout-minutes: 45
+        if: vars.RUN_MACOS_CI != 'false'
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  # Don't leave git credentials on the persistent self-hosted runner.
+                  persist-credentials: false
+            - name: Toolchain
+              uses: dtolnay/rust-toolchain@stable
+            - name: Provision libkrun (pinned own build)
+              uses: ./.github/actions/setup-libkrun-macos
+            - name: Build release minvmd binary
+              run: cargo build --release -p minvmd --bin minvmd
+            - name: Rewrite + verify minvmd libkrun linkage (@rpath)
+              # Retarget Homebrew's absolute libkrun install name to the shipped
+              # bin/../lib layout and verify the result (rpath entries, no
+              # non-system deps). Extracted to scripts/ so a future CI lane can
+              # exercise the production rewrite per-PR; release is currently its
+              # only consumer. Signing happens below, as the last mutation
+              # before upload.
+              run: scripts/rewrite-macos-linkage.sh target/release/minvmd
+            - name: Build release minimal binary
+              # Separate cargo invocation from minvmd above, so its default
+              # `libkrun` feature can't unify into the CLI (which opts out via
+              # default-features = false). Gated next.
+              run: cargo build --release -p minimal --bin min
+            - name: Verify minimal links only system libraries
+              # The CLI calls no libkrun (it spawns minvmd as a subprocess), so
+              # every dependency must be under /usr/lib or /System. A krun line
+              # means the default-features = false opt-out regressed.
+              run: |
+                  otool -L target/release/min
+                  bad="$(otool -L target/release/min | tail -n +2 | awk '{print $1}' \
+                    | grep -vE '^(/usr/lib/|/System/)' || true)"
+                  if [ -n "$bad" ]; then
+                    echo "::error::minimal links non-system libraries (allowed: /usr/lib, /System):" >&2
+                    printf '%s\n' "$bad" >&2
+                    exit 1
+                  fi
+            - name: Rename binaries with platform suffix
+              # download-artifact merge-multiple flattens on basename, so the uploaded
+              # file must already carry the platform-suffixed name the release job expects.
+              run: |
+                  mv target/release/minvmd target/release/minvmd-macos-arm64
+                  mv target/release/min target/release/minimal-macos-arm64
+            - name: Codesign binaries with Developer ID
+              # Sign the two shipped Mach-O binaries with the Developer ID
+              # Application identity held in the runner's signing keychain. This
+              # is the LAST mutation before upload.
+              # Hardened runtime (--options runtime) + a secure --timestamp so the
+              # artifacts are notarization-ready.
+              env:
+                  KC_PW: ${{ secrets.KC_PW }}
+              run: |
+                  KC=minimal-signing.keychain-db
+                  IDENTITY="Developer ID Application: Minimal Software Research Ltd. (3G47C5HY64)"
+
+                  # Unlock the signing keychain and put it on the search list so
+                  # codesign can resolve the identity by name.
+                  security unlock-keychain -p "$KC_PW" "$KC"
+                  security list-keychains -d user -s "$KC" login.keychain-db
+
+                  codesign --force --timestamp --options runtime \
+                    --sign "$IDENTITY" \
+                    --entitlements crates/minvmd/minvmd.entitlements \
+                    target/release/minvmd-macos-arm64
+                  codesign --force --timestamp --options runtime \
+                    --sign "$IDENTITY" \
+                    target/release/minimal-macos-arm64
+
+                  codesign --verify --strict --verbose=2 target/release/minvmd-macos-arm64
+                  codesign --verify --strict --verbose=2 target/release/minimal-macos-arm64
+            - name: Upload binary (minvmd)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minvmd-macos-arm64
+                  path: target/release/minvmd-macos-arm64
+                  retention-days: 7
+            - name: Upload binary (minimal)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimal-macos-arm64
+                  path: target/release/minimal-macos-arm64
+                  retention-days: 7
+
+    build-libkrun-macos-arm64:
+        # Build the TRIMMED libkrun.dylib to SHIP in the release, so macOS users
+        # don't have to `brew install` it themselves. Same setup-libkrun-macos
+        # composite (scripts/build-libkrun-macos.sh at the vendor/libkrun/
+        # libkrun.lock pin) that every macOS CI lane links and boots against —
+        # the shipped dylib is BY CONSTRUCTION the one CI tested. GitHub-hosted
+        # macos-latest is Apple Silicon (arm64).
+        runs-on: macos-latest
+        timeout-minutes: 45
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
+            - name: Toolchain
+              uses: dtolnay/rust-toolchain@stable
+            - name: Provision libkrun (pinned own build)
+              uses: ./.github/actions/setup-libkrun-macos
+            - name: Stage the dylib for signing
+              # The build script already asserted self-containment (no
+              # /opt/homebrew or /usr/local deps) and the krun_add_disk3 API
+              # floor, set the @rpath/libkrun.1.dylib install name, and ad-hoc
+              # signed it.
+              run: cp "$LIBKRUN_PREFIX/libkrun.1.dylib" "$RUNNER_TEMP/temp-libkrun-macos-arm64.dylib"
+            - name: Upload ad-hoc-signed libkrun dylib (temp)
+              # This GitHub-hosted runner has no access to the Developer ID signing
+              # keychain, so the dylib leaves here only ad-hoc signed, under a
+              # `temp-` prefixed name. sign-macos-artifacts (self-hosted) downloads
+              # it, re-signs with Developer ID, and re-uploads under the final
+              # `libkrun-macos-arm64` name. The release job drops any leftover
+              # `temp-` artifact so the ad-hoc copy never ships.
+              uses: actions/upload-artifact@v7
+              with:
+                  name: temp-libkrun-macos-arm64
+                  path: ${{ runner.temp }}/temp-libkrun-macos-arm64.dylib
+                  if-no-files-found: error
+                  retention-days: 7
+
+    sign-macos-artifacts:
+        # Developer ID signing for the macOS artifacts built on normal runners.
+        #
+        # Artifacts come as the output of other jobs under a `temp-` prefixed
+        # artifact, are signed on the self-hosted runner that holds the keychain,
+        # then are re-uploaded under their final names.
+        runs-on: [self-hosted, macOS, ARM64]
+        timeout-minutes: 15
+        if: vars.RUN_MACOS_CI != 'false'
+        needs: [build-libkrun-macos-arm64, fetch-release-guest-artifacts]
+        steps:
+            - name: Download unsigned macOS artifacts (temp)
+              uses: actions/download-artifact@v8
+              with:
+                  pattern: temp-*
+                  path: ${{ runner.temp }}/unsigned
+                  merge-multiple: true
+            - name: Codesign macOS artifacts with Developer ID
+              # Sign with the same Developer ID identity, secure --timestamp, and
+              # hardened runtime (--options runtime) as the binaries so the whole
+              # install is notarization-ready. --force replaces each file's existing
+              # signature (build-libkrun-macos.sh's ad-hoc on libkrun, the Go
+              # linker's ad-hoc on gvproxy). No entitlements: neither libkrun (a library) nor gvproxy
+              # (the network switch) is the hypervisor entry point. The temp- prefix
+              # is dropped so each file carries the final basename the
+              # archive/installer expect.
+              env:
+                  KC_PW: ${{ secrets.KC_PW }}
+              run: |
+                  KC=minimal-signing.keychain-db
+                  IDENTITY="Developer ID Application: Minimal Software Research Ltd. (3G47C5HY64)"
+
+                  security unlock-keychain -p "$KC_PW" "$KC"
+                  security list-keychains -d user -s "$KC" login.keychain-db
+
+                  in="$RUNNER_TEMP/unsigned"
+                  out="$RUNNER_TEMP/signed"
+                  mkdir -p "$out"
+                  cp "$in/temp-libkrun-macos-arm64.dylib" "$out/libkrun-macos-arm64.dylib"
+                  cp "$in/temp-gvproxy-darwin-arm64"      "$out/gvproxy-darwin-arm64"
+
+                  for f in "$out/libkrun-macos-arm64.dylib" "$out/gvproxy-darwin-arm64"; do
+                    codesign --force --timestamp --options runtime --sign "$IDENTITY" "$f"
+                    codesign --verify --strict --verbose=2 "$f"
+                  done
+            - name: Upload signed libkrun dylib
+              uses: actions/upload-artifact@v7
+              with:
+                  name: libkrun-macos-arm64
+                  path: ${{ runner.temp }}/signed/libkrun-macos-arm64.dylib
+                  if-no-files-found: error
+                  retention-days: 7
+            - name: Upload signed gvproxy (darwin-arm64)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: gvproxy-darwin-arm64
+                  path: ${{ runner.temp }}/signed/gvproxy-darwin-arm64
+                  if-no-files-found: error
+                  retention-days: 7
+
+    fetch-release-guest-artifacts:
+        # Fetched guest microVM artifacts shipped in the release: the raw guest
+        # kernel Image, the ext4 rootfs image, and the pinned gvproxy switch
+        # binary. These are already produced piecemeal in the CI lanes
+        # (ci-macos.yml, ci-linux-kvm.yml, ci-gvproxy.yml); this job gathers them
+        # into the release. The initramfs is packed separately in
+        # build-release-initramfs, which reuses the minimald-linux-* binaries.
+        #
+        # None require the target host's arch to produce: the kernel and rootfs are
+        # cache pulls keyed by the pinned upstream commit (the materialize action
+        # pulls any guest arch on an x86_64 runner), and gvproxy is a pin-verified
+        # download of the upstream release binary. So a single x86_64 runner emits
+        # both the amd64 and arm64 variants, covering every release host
+        # (linux-amd64/arm64, macos-arm64). Files are arch-suffixed so
+        # download-artifact's merge-multiple basename-flatten in the release job
+        # doesn't collide.
+        runs-on: ubuntu-latest
+        timeout-minutes: 35
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
+            # NOTE: the `arch` input is the kernel-style target arch
+            # (x86_64/aarch64); only the emitted file/artifact names use the
+            # amd64/arm64 suffixes the release binaries already use.
+            - name: Materialize guest kernel (raw Image, amd64)
+              uses: ./.github/actions/materialize
+              with:
+                  output: virtio-kernel
+                  dest: ${{ runner.temp }}/vmlinuz-amd64
+                  arch: x86_64
+                  channel: unstable
+            - name: Materialize guest kernel (raw Image, arm64)
+              uses: ./.github/actions/materialize
+              with:
+                  output: virtio-kernel
+                  dest: ${{ runner.temp }}/vmlinuz-arm64
+                  arch: aarch64
+                  channel: unstable
+            - name: Materialize guest rootfs (ext4 image, amd64)
+              uses: ./.github/actions/materialize
+              with:
+                  output: minvmd-rootfs
+                  dest: ${{ runner.temp }}/rootfs-amd64.img
+                  arch: x86_64
+                  channel: unstable
+            - name: Materialize guest rootfs (ext4 image, arm64)
+              uses: ./.github/actions/materialize
+              with:
+                  output: minvmd-rootfs
+                  dest: ${{ runner.temp }}/rootfs-arm64.img
+                  arch: aarch64
+                  channel: unstable
+            - name: Fetch pinned gvproxy (linux-amd64)
+              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-linux-amd64" gvproxy-linux-amd64
+            - name: Fetch pinned gvproxy (linux-arm64)
+              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-linux-arm64" gvproxy-linux-arm64
+            - name: Fetch pinned gvproxy (darwin-arm64)
+              # Stashed as a `temp-` so sign-macos-artifacts (self-hosted) can sign it
+              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/temp-gvproxy-darwin-arm64" gvproxy-darwin
+            - name: Upload kernel (amd64)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: virtio-kernel-amd64
+                  path: ${{ runner.temp }}/vmlinuz-amd64
+                  if-no-files-found: error
+                  retention-days: 7
+            - name: Upload kernel (arm64)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: virtio-kernel-arm64
+                  path: ${{ runner.temp }}/vmlinuz-arm64
+                  if-no-files-found: error
+                  retention-days: 7
+            - name: Upload rootfs (amd64)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minvmd-rootfs-amd64
+                  path: ${{ runner.temp }}/rootfs-amd64.img
+                  if-no-files-found: error
+                  retention-days: 7
+            - name: Upload rootfs (arm64)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minvmd-rootfs-arm64
+                  path: ${{ runner.temp }}/rootfs-arm64.img
+                  if-no-files-found: error
+                  retention-days: 7
+            - name: Upload gvproxy (linux-amd64)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: gvproxy-linux-amd64
+                  path: ${{ runner.temp }}/gvproxy-linux-amd64
+                  if-no-files-found: error
+                  retention-days: 7
+            - name: Upload gvproxy (linux-arm64)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: gvproxy-linux-arm64
+                  path: ${{ runner.temp }}/gvproxy-linux-arm64
+                  if-no-files-found: error
+                  retention-days: 7
+            - name: Upload gvproxy (darwin-arm64, temp/unsigned)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: temp-gvproxy-darwin-arm64
+                  path: ${{ runner.temp }}/temp-gvproxy-darwin-arm64
+                  if-no-files-found: error
+                  retention-days: 7
+
+    build-release-initramfs:
+        # Pack the guest initramfs (minimald as pid-1 /init) from the SAME static
+        # musl minimald binaries the build-release-linux-* jobs already built and
+        # ship, instead of recompiling minimald just for the initramfs. Downloads
+        # those artifacts and stamps each into a newc cpio via build-initramfs.sh's
+        # MINIMALD_BIN mode (no cargo/cross toolchain needed — just cpio). Files are
+        # arch-suffixed to match the amd64/arm64 naming and avoid a
+        # merge-multiple basename collision in the release job.
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        needs: [build-release-linux-amd64, build-release-linux-arm64]
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
+            - name: Install cpio
+              run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cpio
+            - name: Download minimald (amd64)
+              uses: actions/download-artifact@v8
+              with:
+                  name: minimald-linux-amd64
+                  path: prebuilt
+            - name: Download minimald (arm64)
+              uses: actions/download-artifact@v8
+              with:
+                  name: minimald-linux-arm64
+                  path: prebuilt
+            - name: Pack initramfs (amd64)
+              run: |
+                  chmod +x prebuilt/minimald-linux-amd64
+                  MINIMALD_BIN="$PWD/prebuilt/minimald-linux-amd64" \
+                    ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs-amd64.cpio"
+            - name: Pack initramfs (arm64)
+              run: |
+                  chmod +x prebuilt/minimald-linux-arm64
+                  MINIMALD_BIN="$PWD/prebuilt/minimald-linux-arm64" \
+                    ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs-arm64.cpio"
+            - name: Upload initramfs (amd64)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimald-initramfs-amd64
+                  path: ${{ runner.temp }}/initramfs-amd64.cpio
+                  if-no-files-found: error
+                  retention-days: 7
+            - name: Upload initramfs (arm64)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minimald-initramfs-arm64
+                  path: ${{ runner.temp }}/initramfs-arm64.cpio
+                  if-no-files-found: error
+                  retention-days: 7
+
+    release:
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        needs:
+            [
+                test,
+                build-release-linux-amd64,
+                build-release-linux-arm64,
+                build-release-macos-arm64,
+                sign-macos-artifacts,
+                fetch-release-guest-artifacts,
+                build-release-initramfs,
+            ]
+        permissions:
+            contents: write
+            id-token: write
+        steps:
+            - uses: actions/checkout@v7
+            - name: Generate release info
+              id: release_info
+              run: |
+                  SHORT_SHA=$(git rev-parse --short=8 HEAD)
+                  echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+                  echo "tag=release-$SHORT_SHA" >> $GITHUB_OUTPUT
+                  echo "name=minimal-$SHORT_SHA" >> $GITHUB_OUTPUT
+            - name: Download artifacts
+              uses: actions/download-artifact@v8
+              with:
+                  pattern: "*-*-*"
+                  path: artifacts/
+                  merge-multiple: true
+            - name: Drop temp-prefixed artifacts
+              run: rm -f artifacts/temp-*
+            - name: Make binaries executable
+              run: chmod +x artifacts/*-*-*
+            - name: Generate completions
+              run: |
+                  mkdir -p artifacts/completions/{bash,zsh,fish}
+                  artifacts/mip-linux-amd64 completions bash > artifacts/completions/bash/mip
+                  artifacts/mip-linux-amd64 completions zsh  > artifacts/completions/zsh/_mip
+                  artifacts/mip-linux-amd64 completions fish > artifacts/completions/fish/mip.fish
+                  artifacts/minimal-linux-amd64 completions bash > artifacts/completions/bash/minimal
+                  artifacts/minimal-linux-amd64 completions zsh  > artifacts/completions/zsh/_minimal
+                  artifacts/minimal-linux-amd64 completions fish > artifacts/completions/fish/minimal.fish
+                  artifacts/minimald-linux-amd64 completions bash > artifacts/completions/bash/minimald
+                  artifacts/minimald-linux-amd64 completions zsh  > artifacts/completions/zsh/_minimald
+                  artifacts/minimald-linux-amd64 completions fish > artifacts/completions/fish/minimald.fish
+            - name: Authenticate to Google Cloud
+              uses: google-github-actions/auth@v3
+              with:
+                  project_id: "289724348228"
+                  workload_identity_provider: "projects/289724348228/locations/global/workloadIdentityPools/github/providers/gominimal"
+            - name: Package and upload archive to GCS
+              run: |
+                  SHA=$(git rev-parse --short=8 HEAD)
+                  tar --zstd -cf "minimalone-${SHA}.tar.zst" -C artifacts .
+
+                  gcloud storage cp \
+                    --cache-control="public, max-age=31536000, immutable" \
+                    "minimalone-${SHA}.tar.zst" gs://minimal-shim/archives/
+            - name: Create Release
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  tar -C artifacts/completions -czf artifacts/completions.tar.gz .
+                  cd artifacts/
+                  gh release create "${{ steps.release_info.outputs.tag }}" \
+                    $(find . -maxdepth 1 -type f) \
+                    --repo="${GITHUB_REPOSITORY}" \
+                    --title="${{ steps.release_info.outputs.name }}"
+
+    stage-installer:
+        # Publish the release into gs://minimal-one in the layout the curl|bash
+        # installer reads (docs/specs/07-spec-installer). It re-fetches the same
+        # build artifacts and touches only gs://minimal-one.
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        needs: [release]
+        permissions:
+            contents: read
+            id-token: write
+        steps:
+            - uses: actions/checkout@v7
+            - name: Generate release info
+              id: release_info
+              run: |
+                  SHORT_SHA=$(git rev-parse --short=8 HEAD)
+                  echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+            - name: Download artifacts
+              uses: actions/download-artifact@v8
+              with:
+                  pattern: "*-*-*"
+                  path: artifacts/
+                  merge-multiple: true
+            - name: Authenticate to Google Cloud (installer bucket)
+              # Distinct project + workload-identity pool from the release job's
+              # minimal-shim auth; this one grants write to gs://minimal-one.
+              uses: google-github-actions/auth@v3
+              with:
+                  project_id: "524228262772"
+                  workload_identity_provider: "projects/524228262772/locations/global/workloadIdentityPools/github/providers/gominimal"
+            - name: Stage release into installer bucket
+              # Upload versions/<sha>/{components,<artifacts>}. Inert on its own:
+              # changes nothing users receive until a channel points at it.
+              run: |
+                  scripts/stage-release.sh \
+                    --artifacts-dir artifacts \
+                    --version "${{ steps.release_info.outputs.short_sha }}" \
+                    --bucket gs://minimal-one
+            - name: Stage the installer script into the versioned folder
+              # Keep a version-pinned copy of the curl|sh installer next to the
+              # components it reads, so each version's install path is immutable
+              # and self-contained. Same immutable cache header as the other
+              # versions/<sha>/ artifacts. Done before the channel advances so the
+              # versioned folder is complete when anything points at it.
+              run: |
+                  gcloud storage cp \
+                    --cache-control="public, max-age=31536000, immutable" \
+                    scripts/install.sh \
+                    "gs://minimal-one/versions/${{ steps.release_info.outputs.short_sha }}/install.sh"
+            - name: Point unstable channel at this release
+              # `unstable` auto-advances to every fresh build — it is the
+              # bleeding-edge channel, so no approval gate. Promotion to `stable`
+              # is the manual, gated promote-cli workflow.
+              run: |
+                  scripts/set-channel.sh \
+                    --channel unstable \
+                    --version "${{ steps.release_info.outputs.short_sha }}" \
+                    --bucket gs://minimal-one

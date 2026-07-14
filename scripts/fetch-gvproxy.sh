@@ -1,20 +1,29 @@
 #!/usr/bin/env bash
-# Download the pinned gvproxy (gvisor-tap-vsock) release binary for the host
-# platform and verify its SHA-256 against vendor/gvproxy/gvproxy.lock.
-# No build, no Go toolchain. minimald spawns this binary as the per-host switch.
+# Download the pinned gvproxy (gvisor-tap-vsock) release binary and verify its
+# SHA-256 against vendor/gvproxy/gvproxy.lock. No build, no Go toolchain.
+# minimald spawns this binary as the per-host switch.
+#
+# The asset defaults to the host platform's binary; pass an explicit asset name
+# (2nd arg) to fetch a different platform's binary regardless of the host arch —
+# the release job uses this to pack every platform's gvproxy from one runner.
+#
+# Usage: scripts/fetch-gvproxy.sh [dest-path] [asset]
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 lock="${here}/../vendor/gvproxy/gvproxy.lock"
 out="${1:-./gvproxy}"
+asset="${2:-}"
 
 ver="$(sed -n 's/^version=//p' "$lock")"
-case "$(uname -s)-$(uname -m)" in
-  Linux-x86_64)  asset=gvproxy-linux-amd64 ;;
-  Linux-aarch64) asset=gvproxy-linux-arm64 ;;
-  Darwin-*)      asset=gvproxy-darwin ;;
-  *) echo "fetch-gvproxy: unsupported platform $(uname -s)-$(uname -m)" >&2; exit 1 ;;
-esac
+if [ -z "$asset" ]; then
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64)  asset=gvproxy-linux-amd64 ;;
+    Linux-aarch64) asset=gvproxy-linux-arm64 ;;
+    Darwin-*)      asset=gvproxy-darwin ;;
+    *) echo "fetch-gvproxy: unsupported platform $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+  esac
+fi
 want="$(sed -n "s/^${asset}=//p" "$lock")"
 [ -n "$want" ] || { echo "fetch-gvproxy: no pinned digest for ${asset}" >&2; exit 1; }
 

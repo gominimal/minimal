@@ -1,11 +1,14 @@
+use crate::channel_progress::ChannelProgress;
+use crate::sessions::{SessionControl, WeakManagerHandle};
 use crate::{
     ChannelConfig,
     session_host::{self, HostAttrs, WinSize},
 };
 use mctx::ConfigBuilder;
+use ot::OpTracker;
 use paths::DaemonAbsPath;
 use russh::{Channel, server::Msg};
-use sessions::{Record, store::SessionObject};
+use sessions::{Record, core::compose::Composition, store::SessionObject};
 use std::fmt::{self};
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -64,7 +67,6 @@ enum SessionMessage {
     GetHostAttrs(oneshot::Sender<Option<HostAttrs>>),
     RefreshRecord(Record),
     Destroy(oneshot::Sender<()>),
-    #[cfg(test)]
     GetRecord(oneshot::Sender<Record>),
 }
 
@@ -84,7 +86,7 @@ pub struct Session<S: SessionObject> {
     /// (`cfg(not(test))`); the `cfg(test)` mock launcher ignores it, so the
     /// unused-field lint is silenced under test rather than threaded through.
     #[cfg_attr(test, allow(dead_code))]
-    net_switch: Arc<Mutex<crate::net::GvproxySwitch>>,
+    net_switch: Arc<Mutex<crate::net::SwitchClient>>,
 
     /// The running host, if minted, paired with the `JoinHandle` of its runtime
     /// loop so teardown can be awaited on destroy.
@@ -92,15 +94,60 @@ pub struct Session<S: SessionObject> {
         session_host::HostHandle,
         JoinHandle<Result<i32, std::io::Error>>,
     )>,
+
+    /// The root of this session's operation tree. Created once for the session
+    /// and wired into the context each launch builds against, so package
+    /// fetches/builds report into it; the channel renderer paints it onto the
+    /// SSH channel while a host is being minted.
+    tracker: OpTracker,
+
+    /// The finalized [`Composition`] this session was created with.
+    /// `None` after a daemon restart — the composition isn't
+    /// persisted, and the launcher falls back to its baseline set
+    /// in that case.
+    ///
+    /// The launcher currently consumes only the composition's
+    /// packages and vars. Patches (need file-upload plumbing) and
+    /// lifecycle hooks (need in-sandbox exec plumbing) are held
+    /// here but not yet applied.
+    #[cfg_attr(test, allow(dead_code))]
+    composition: Option<Arc<Composition>>,
+
+    /// Lazily-built [`mctx::Context`] rooted at this session's
+    /// workspace, cached so repeated attach / task-exec paths don't
+    /// re-parse the workspace mfile.
+    ///
+    /// Each session builds its own [`DaemonContext`] (rather than
+    /// sharing the Manager's `Arc`) so the per-session
+    /// [`OpTracker`] on [`mctx::Config`] stays scoped correctly.
+    ///
+    /// [`DaemonContext`]: mctx::DaemonContext
+    /// [`OpTracker`]: ot::OpTracker
+    context: Option<mctx::Context>,
+
+    /// A non-owning handle to the [`Manager`](crate::sessions::Manager), used to
+    /// build the [`SessionControl`] handed to each [`Binding`] so a shell-exit
+    /// "delete" tears this session down through the manager (record removal and
+    /// all). Weak by design — see [`crate::sessions::Manager::weak_self`].
+    manager: WeakManagerHandle,
 }
 
 impl<S: SessionObject> Session<S> {
     /// Launches the actor for the given session.
+    ///
+    /// `composition` is the daemon's Phase 2 output for this session,
+    /// carried in memory from `Manager::CreateSession` (or the
+    /// `SubmitVerdict` handler that promotes a Pending record). `None`
+    /// when the session was minted before the composables pipeline
+    /// existed, or when the actor is spawned from disk after a daemon
+    /// restart — both cases are graceful degradations.
     pub async fn run(
         minimal_state_dir: DaemonAbsPath,
         minimal_cache_dir: DaemonAbsPath,
         session: S,
-        net_switch: Arc<Mutex<crate::net::GvproxySwitch>>,
+        net_switch: Arc<Mutex<crate::net::SwitchClient>>,
+        composition: Option<Arc<Composition>>,
+        manager: WeakManagerHandle,
     ) -> Result<SessionHandle, std::io::Error> {
         std::fs::create_dir_all(session.workspace_path())?;
         std::fs::create_dir_all(session.home_path())?;
@@ -114,6 +161,10 @@ impl<S: SessionObject> Session<S> {
             minimal_state_dir,
             minimal_cache_dir,
             net_switch,
+            tracker: OpTracker::new_root(),
+            composition,
+            context: None,
+            manager,
         };
 
         tokio::spawn(mngr.mainloop());
@@ -162,7 +213,6 @@ impl<S: SessionObject> Session<S> {
                 let _ = r.send(());
                 return ControlFlow::Break(());
             }
-            #[cfg(test)]
             SessionMessage::GetRecord(r) => {
                 let _ = r.send(self.session.record().clone());
             }
@@ -231,17 +281,39 @@ impl<S: SessionObject> Session<S> {
             }
         };
 
+        // The launcher's context reports into this session's operation tree (see
+        // `context`). Render that tree onto the channel for the duration of the
+        // launch (graph build + package builds + sandbox assembly), then take
+        // the channel back. The host is spawned without a channel so the
+        // renderer has exclusive use of it while building; once the bars are
+        // cleared we attach the channel to the now-running host.
+        // The destroy capability handed down to the host's binding: on a
+        // shell-exit "delete", the binding calls back through this to have the
+        // manager tear the whole session (record included) down.
+        let control = SessionControl::new(self.manager.clone(), self.session.record().id);
         let launcher = self.session_launcher(session_hnd)?;
-        let h = Box::pin(session_host::Host::spawn(
-            launcher,
-            name,
-            conn_username,
-            self.paths(),
-            sz,
-            Some(channel),
-        ))
-        .await
-        .map_err(AttachError::SpawnFailed)?;
+        let progress = ChannelProgress::new(channel, self.tracker.clone(), (sz.cols, sz.rows));
+        let (channel, spawned) = progress
+            .run(Box::pin(session_host::Host::spawn(
+                launcher,
+                name,
+                conn_username,
+                self.paths(),
+                sz,
+                None,
+                Some(control),
+            )))
+            .await;
+        let h = spawned.map_err(AttachError::SpawnFailed)?;
+
+        // Wire the channel to the freshly launched host. A failure here means
+        // the host died in the window between launch and attach; surface it as
+        // a spawn failure rather than leaving a dead, channel-less host.
+        h.0.attach(channel, sz).await.map_err(|_| {
+            AttachError::SpawnFailed(std::io::Error::other(
+                "session host exited before its channel could attach",
+            ))
+        })?;
         self.host = Some(h);
         Ok(())
     }
@@ -251,7 +323,7 @@ impl<S: SessionObject> Session<S> {
     #[cfg(not(test))]
     fn session_launcher(
         &mut self,
-        session: SessionHandle,
+        _session: SessionHandle,
     ) -> Result<session_host::SandboxLauncher, AttachError> {
         let record = self.session.record();
         // R2.1: reject a policy that is incompatible with the network mode
@@ -269,7 +341,7 @@ impl<S: SessionObject> Session<S> {
             network_mode,
             net_switch: Arc::clone(&self.net_switch),
             ingress,
-            session,
+            composition: self.composition.clone(),
         })
     }
 
@@ -290,17 +362,63 @@ impl<S: SessionObject> Session<S> {
         Ok(session_host::MockLauncher)
     }
 
+    /// Return this session's workspace-rooted [`mctx::Context`],
+    /// building it lazily the first time and cloning the cached
+    /// value on every subsequent call. The scaffold pass and mfile
+    /// parse happen once per actor lifetime.
     fn context(&mut self) -> Result<mctx::Context, String> {
+        if let Some(ctx) = &self.context {
+            return Ok(ctx.clone());
+        }
+        let ctx = self.build_context()?;
+        self.context = Some(ctx.clone());
+        Ok(ctx)
+    }
+
+    /// Do the actual context construction: scaffold a default
+    /// workspace mfile if missing, then run [`mctx::Context::new`]
+    /// against a session-rooted [`Config`]. Called at most once per
+    /// actor lifetime by [`Self::context`].
+    ///
+    /// [`Config`]: mctx::Config
+    fn build_context(&self) -> Result<mctx::Context, String> {
         let wsp = self.session.workspace_path();
-        match ConfigBuilder::new()
+        let config = ConfigBuilder::new()
             .with_repo_dir(wsp.as_utf8_path())
             .with_cache_dir(self.minimal_cache_dir.as_utf8_path())
             .with_state_dir(self.minimal_state_dir.as_utf8_path())
+            // Every context this session builds reports into its operation tree.
+            // The host-mint path renders that tree onto the SSH channel; the
+            // task-exec path (via `MakeContext`) also feeds it, so task builds
+            // surface on the same tracker even though only a mint renders it.
+            .with_operation_tracker(self.tracker.clone())
             .build()
-        {
-            Err(e) => Err(mctx::Error::from(e).to_string()),
-            Ok(c) => mctx::Context::new(c).map_err(|e| e.to_string()),
+            .map_err(|e| mctx::Error::from(e).to_string())?;
+
+        // TEMPORARY: scaffold a default `minimal.toml` if the
+        // workspace has none, so `Context::new` below can succeed.
+        // Delete this block (and `mctx::scaffold`) once sessions
+        // receive their project files via the workspace-upload path.
+        //
+        // The scaffold performs a blocking network git clone. On a
+        // multi-thread runtime, `block_in_place` moves other futures
+        // off this worker for the duration; on a current-thread
+        // runtime it panics, so fall back to a plain blocking call.
+        if !wsp.as_utf8_path().join(mfile::MFILE_NAME).exists() {
+            let scaffold = || mctx::scaffold_default_mfile(&config, wsp.as_utf8_path());
+            let on_multi_thread = matches!(
+                tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+                Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+            );
+            if on_multi_thread {
+                tokio::task::block_in_place(scaffold)
+            } else {
+                scaffold()
+            }
+            .map_err(|e| e.to_string())?;
         }
+
+        mctx::Context::new(config).map_err(|e| e.to_string())
     }
     fn paths(&self) -> SessionPaths {
         SessionPaths {
@@ -339,11 +457,9 @@ impl SessionHandle {
         recv.await.expect("corresponding session is dead")
     }
 
-    /// Returns the session record currently held by the live session actor.
-    ///
-    /// This reads the actor's in-memory copy, not the on-disk record, so
-    /// tests can assert that updates have propagated into the running session.
-    #[cfg(test)]
+    /// Returns the session record currently held by the live session actor
+    /// (the in-memory copy, not the on-disk record). Used by the task-exec path
+    /// to read the session's network mode, and by tests to assert propagation.
     pub(crate) async fn record(&self) -> Record {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
@@ -387,7 +503,15 @@ impl SessionHandle {
                 config,
             ))
             .await;
-        recv.await.expect("corresponding session is dead")
+        // A dead session actor (it panicked or was dropped mid-attach) drops the
+        // reply sender. Surface that as an attach error rather than panicking the
+        // daemon worker — the SSH layer reports it to the client and closes.
+        match recv.await {
+            Ok(result) => result,
+            Err(_) => Err(AttachError::SpawnFailed(std::io::Error::other(
+                "session actor terminated before the attach completed",
+            ))),
+        }
     }
 }
 
@@ -395,31 +519,30 @@ impl SessionHandle {
 mod tests {
     use std::time::Duration;
 
-    use paths::HostAbsPath;
     use russh::ChannelMsg;
     use sessions::SessionId;
 
-    use minimald_rpc::{CreateSession, CreateSessionRequest};
+    use minimald_rpc::{CreateSession, GetSessionRecord, GetSessionRecordRequest};
 
-    use crate::test_harness::{TestClient, TestServer};
+    use crate::test_harness::{TestClient, TestServer, create_session_req, unwrap_ready};
+
+    /// Reads the session record for `id`, or `None` once it has been deleted.
+    async fn record_exists(client: &mut TestClient, id: SessionId) -> bool {
+        client
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(id))
+            .await
+            .record
+            .is_some()
+    }
 
     /// Creates a fresh session on the server and returns its id.
     async fn create_session(client: &mut TestClient) -> SessionId {
-        client
-            .call::<CreateSession>(&CreateSessionRequest {
-                record: sessions::Record {
-                    id: SessionId::nil(),
-                    name: Some("shell-test".to_string()),
-                    username: None,
-                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: Default::default(),
-                    policy: Default::default(),
-                    attrs: Default::default(),
-                },
-            })
-            .await
-            .unwrap()
-            .id
+        unwrap_ready(
+            client
+                .call::<CreateSession>(&create_session_req("shell-test", "/uwu"))
+                .await
+                .unwrap(),
+        )
     }
 
     /// Drives the full SSH path into the session host with the mock launcher:
@@ -454,15 +577,34 @@ mod tests {
             }
         }
 
-        // Now ask the mock to exit and confirm the host tears the channel down.
+        // Now ask the mock to exit. The shell exiting raises the session-exit
+        // prompt (see `session_host`), rendered over the channel; answer it by
+        // confirming the first option (Enter -> detach) so teardown proceeds and
+        // the channel closes.
         channel
             .data_bytes(format!("{}\n", crate::session_host::MOCK_EXIT_LINE).into_bytes())
             .await
             .unwrap();
         let mut saw_exit_status = false;
         let mut closed = false;
+        let mut answered_prompt = false;
+        let mut prompt_out = Vec::new();
         while let Ok(msg) = tokio::time::timeout(Duration::from_secs(10), channel.wait()).await {
             match msg {
+                Some(ChannelMsg::Data { data }) => {
+                    // Wait for the prompt to render, then confirm the first
+                    // option. The prompt only appears once the mainloop has
+                    // stopped reading the channel, so this keypress reaches the
+                    // prompt rather than the (now-defunct) stdin path.
+                    prompt_out.extend_from_slice(&data);
+                    if !answered_prompt
+                        && String::from_utf8_lossy(&prompt_out)
+                            .contains(crate::session_host::SHELL_EXIT_PROMPT)
+                    {
+                        channel.data_bytes(b"\r".to_vec()).await.unwrap();
+                        answered_prompt = true;
+                    }
+                }
                 Some(ChannelMsg::ExitStatus { .. }) => saw_exit_status = true,
                 Some(_) => {}
                 None => {
@@ -471,8 +613,90 @@ mod tests {
                 }
             }
         }
+        assert!(
+            answered_prompt,
+            "expected the session-exit prompt to render"
+        );
         assert!(closed, "channel should close once the mock process exits");
         assert!(saw_exit_status, "expected an exit status on teardown");
+
+        // Detach leaves the session alive: its record must still resolve.
+        assert!(
+            record_exists(&mut client, session_id).await,
+            "detach must not delete the session record"
+        );
+    }
+
+    /// Selecting "delete" on the shell-exit prompt must tear the connection down
+    /// *and* destroy the session (record removed), routed through the manager
+    /// via the binding's weak handle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminate_option_deletes_session_and_closes_channel() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        let mut channel = client.open_shell(session_id).await;
+
+        // Confirm the shell is live before exiting it (mock echoes `got:<line>`).
+        channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+        let mut stdout = Vec::new();
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    stdout.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&stdout).contains("got:hello") {
+                        break;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("channel closed before the echo arrived"),
+            }
+        }
+
+        // Exit the shell to raise the prompt, then pick the second option
+        // (delete): a down-arrow to move off the default, then Enter.
+        channel
+            .data_bytes(format!("{}\n", crate::session_host::MOCK_EXIT_LINE).into_bytes())
+            .await
+            .unwrap();
+        let mut closed = false;
+        let mut answered_prompt = false;
+        let mut prompt_out = Vec::new();
+        while let Ok(msg) = tokio::time::timeout(Duration::from_secs(10), channel.wait()).await {
+            match msg {
+                Some(ChannelMsg::Data { data }) => {
+                    prompt_out.extend_from_slice(&data);
+                    if !answered_prompt
+                        && String::from_utf8_lossy(&prompt_out)
+                            .contains(crate::session_host::SHELL_EXIT_PROMPT)
+                    {
+                        channel.data_bytes(b"\x1b[B\r".to_vec()).await.unwrap();
+                        answered_prompt = true;
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+
+        // Requirement 1: the connection is torn down.
+        assert!(
+            answered_prompt,
+            "expected the session-exit prompt to render"
+        );
+        assert!(closed, "channel should close after the delete completes");
+
+        // Requirement 2: the session is gone. The binding awaits the destroy
+        // before closing the channel, so the record is already removed by the
+        // time we observe the close.
+        assert!(
+            !record_exists(&mut client, session_id).await,
+            "delete must remove the session record"
+        );
     }
 
     /// A second shell request to the same session takes over the running host:

@@ -11,6 +11,7 @@
 //! gate functions in this module.
 
 use core::fmt;
+use std::collections::BTreeMap;
 
 use crate::core::decision::{CheckOutcome, Decision, ItemDecision};
 use crate::core::enumerate::{ExpandedProvenancedPatch, PatchFile, enumerate_patch_files};
@@ -22,7 +23,8 @@ use crate::core::source::{
 };
 use crate::wire::policy::{WirePatchVerdict, WireVarVerdict};
 use crate::wire::primitives::{
-    PendingId, WirePendingVar, WireResolvedVar, WireSessionPatch, WireSessionVar,
+    PendingId, WirePendingPatch, WirePendingVar, WireProvenancedHook, WireResolvedVar,
+    WireSessionPatch, WireSessionVar, WireVarSpec,
 };
 
 /// Errors produced while a [`Composable`] materializes its
@@ -55,6 +57,13 @@ pub enum Error {
         #[from]
         source: Conflict,
     },
+    /// A loadout with this name was already added to the composer.
+    /// Loadout names must be unique within a composer instance so
+    /// per-loadout settings (like `follow_symlinks`) can be attributed
+    /// unambiguously; a duplicate would silently overwrite an earlier
+    /// setting on the map keyed by name.
+    #[error("loadout name `{name}` was already added to this composer")]
+    DuplicateLoadout { name: String },
 }
 
 /// Conflicts surfaced when two contributions disagree on a value.
@@ -326,23 +335,28 @@ impl Contribution {
         self.lifecycle_hooks.push(h);
     }
 
-    /// Merge `other` into `self` in place. Used by composers to
-    /// accumulate per-source contributions into one bucket.
-    ///
-    /// Pure aggregation: concatenates vars/patches/hooks and dedupes
-    /// packages. Disagreement *between* contributors (same var, two
-    /// values; same patch dest, two sources) is **not** detected
-    /// here — it would fire before the policy gate runs, making the
-    /// user's `ignore` rule incapable of dropping the offending
-    /// items. Conflict detection happens post-gate in
-    /// [`compose_contribution`] so ignored items are filtered out
-    /// first; only post-gate survivors get compared.
+    /// Overwrite the `follow_symlinks` override on every currently
+    /// accumulated patch. Used by
+    /// [`Loadout::contribute`](crate::core::loadout::Loadout::contribute)
+    /// to stamp the loadout's per-source override after
+    /// `contribute_primitives` produced patches with the default
+    /// `None`.
+    pub fn set_follow_symlinks_on_patches(&mut self, follow: Option<bool>) {
+        for p in std::mem::take(&mut self.patches) {
+            let (patch, source, _) = p.into_parts();
+            self.patches
+                .push(ProvenancedPatch::new(patch, source).with_follow_symlinks(follow));
+        }
+    }
+
+    /// Merge `other` into `self`: concatenate vars/patches/hooks and
+    /// dedupe packages. Cross-contributor conflicts are detected
+    /// post-gate in [`compose_contribution`], not here.
     ///
     /// # Errors
     ///
-    /// `Result` shape preserved as a placeholder: a future
-    /// interactive resolution hook could legitimately fail here.
-    /// Today the body is infallible.
+    /// Infallible today; `Result` shape kept for a future
+    /// interactive resolution hook.
     #[allow(
         clippy::unnecessary_wraps,
         reason = "Result shape reserved for future interactive resolution"
@@ -354,6 +368,17 @@ impl Contribution {
         dedupe_by_name(&mut self.packages, ProvenancedPackage::package);
         self.lifecycle_hooks.extend(other.lifecycle_hooks);
         Ok(())
+    }
+
+    /// True when no items have been contributed across any domain.
+    /// Used by daemon-side composers to take the empty-contribution
+    /// fast path (no pending items to ship back to the client).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.vars.is_empty()
+            && self.patches.is_empty()
+            && self.packages.is_empty()
+            && self.lifecycle_hooks.is_empty()
     }
 
     /// All vars contributed so far.
@@ -422,6 +447,67 @@ pub trait Composable {
     ) -> Result<Contribution, Error>;
 }
 
+/// Build a [`Contribution`] from a loadout-shaped primitive set
+/// (packages, strict vars, lenient vars, patches, lifecycle hooks)
+/// against a single [`Source`], resolving each var against `env`.
+///
+/// Shared by [`crate::core::loadout::Loadout`]'s and every project /
+/// package composable's `contribute` — the only per-source
+/// difference is the [`Source`] tag stamped on every produced item,
+/// so lifting the loop bodies into one helper prevents the impls
+/// from drifting when a new primitive lands.
+///
+/// Positional args over a named struct because wrapping five fields
+/// in a `Primitives`-shaped struct at every callsite (only to
+/// immediately destructure inside the fn) is pure ceremony given
+/// the shape isn't otherwise reused. If a sixth primitive lands,
+/// this signature grows and every caller breaks compile-time —
+/// the intended way to spot missed updates.
+///
+/// # Errors
+///
+/// See [`Composable::contribute`] — the same
+/// [`ResolvedVar::resolve_with`](crate::core::primitives::ResolvedVar::resolve_with)
+/// failure modes propagate.
+pub fn contribute_primitives(
+    source: &crate::core::source::Source,
+    packages: Vec<String>,
+    vars: std::collections::BTreeMap<
+        crate::core::primitives::StrictVarName,
+        crate::core::primitives::VarValue,
+    >,
+    vars_lenient: Vec<crate::core::primitives::LenientVarEntry>,
+    patches: crate::core::primitives::Patches,
+    lifecycle_hooks: Vec<crate::core::lifecyclehook::LifecycleHook>,
+    env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<Contribution, Error> {
+    use crate::core::primitives::ResolvedVar;
+    use crate::core::source::{
+        ProvenancedHook, ProvenancedPackage, ProvenancedPatch, ProvenancedVar,
+    };
+
+    let mut c = Contribution::new();
+    for (name, value) in vars {
+        let resolved = ResolvedVar::resolve_with(name.into_inner(), value, env)?;
+        c.push_var(ProvenancedVar::new(resolved, source.clone()));
+    }
+    for entry in vars_lenient {
+        let (name, value) = entry.into_parts();
+        let resolved = ResolvedVar::resolve_with(name.into_inner(), value, env)?;
+        c.push_var(ProvenancedVar::new(resolved, source.clone()));
+    }
+    for patch in patches {
+        c.push_patch(ProvenancedPatch::new(patch, source.clone()));
+    }
+    for pkg in packages {
+        c.push_package(ProvenancedPackage::new(pkg, source.clone()));
+    }
+    for hook in lifecycle_hooks {
+        c.push_hook(ProvenancedHook::new(hook, source.clone()));
+    }
+    Ok(c)
+}
+
 // =====================================================================
 // Composition: deciding what survives the user's policy
 // =====================================================================
@@ -457,7 +543,7 @@ pub enum ComposeError {
     /// errors (permission denied, non-UTF-8 paths, etc.). All errors
     /// surfaced by every `FileSet::resolve` invocation are accumulated
     /// — none are discarded.
-    #[error("patch enumeration failed ({} error(s)):{}", sources.len(), DisplayJoin(sources))]
+    #[error("patch enumeration produced {} error{}:{}", sources.len(), if sources.len() == 1 { "" } else { "s" }, DisplayJoin(sources))]
     PatchWalk {
         sources: Vec<crate::core::primitives::PatchError>,
     },
@@ -584,21 +670,15 @@ impl<E: fmt::Display> fmt::Display for DisplayJoin<'_, E> {
 pub struct SessionVar(ProvenancedVar);
 
 impl SessionVar {
-    /// Direct construction. Crate-internal because outside callers
-    /// should obtain `SessionVar`s by going through the gate (e.g.
-    /// `UserComposer::compose`) or reconstructing one from a
-    /// [`WireSessionVar`] via the `From` impl — both of which
-    /// guarantee provenance is
-    /// truthful. `pub(crate)` exposes it for in-crate handlers (e.g.
-    /// `client::handler`) that build session vars from already-gated
-    /// wire payloads.
+    /// Direct construction. Crate-internal so external callers can
+    /// only obtain a `SessionVar` via the gate or from a
+    /// [`WireSessionVar`] — both post-gate by construction.
     #[must_use]
     pub(crate) fn new(var: ResolvedVar, source: Source) -> Self {
         Self(ProvenancedVar::new(var, source))
     }
 
-    /// Lift a [`ProvenancedVar`] that has passed the gate into a
-    /// `SessionVar`. Zero-cost (no allocation, no clone).
+    /// Lift a gated [`ProvenancedVar`] into a `SessionVar`.
     #[must_use]
     pub(crate) fn from_provenanced(pv: ProvenancedVar) -> Self {
         Self(pv)
@@ -646,6 +726,14 @@ pub struct SessionPatch {
 }
 
 impl SessionPatch {
+    /// Direct construction. Crate-internal so external callers can
+    /// only obtain a `SessionPatch` via the gate or from a
+    /// [`WireSessionPatch`] — both post-gate by construction.
+    #[must_use]
+    pub(crate) fn new(patch: ResolvedPatch, source: Source) -> Self {
+        Self { patch, source }
+    }
+
     /// The resolved patch — host source path plus the destination
     /// relative to the sandbox user's home directory.
     #[must_use]
@@ -933,6 +1021,61 @@ impl Composition {
         // Run conflict checks against the chained union before
         // touching `self`. `Conflict` propagates through
         // `ComposeError::Conflict` via the `#[from]` impl.
+        self.check_incoming_conflicts(&incoming_vars, &incoming_patches)?;
+
+        // Checks passed — commit.
+        self.vars.extend(incoming_vars);
+        self.patches.extend(incoming_patches);
+        self.packages.extend(incoming_packages);
+        dedupe_by_name(&mut self.packages, ProvenancedPackage::package);
+        self.lifecycle_hooks.extend(incoming_hooks);
+        Ok(())
+    }
+
+    /// Construct a [`Composition`] pre-populated with daemon
+    /// pass-through items (packages and lifecycle hooks — neither
+    /// has a per-item gate). Packages are deduped by name.
+    pub(crate) fn from_daemon_passthrough(
+        mut packages: Vec<ProvenancedPackage>,
+        lifecycle_hooks: Vec<ProvenancedHook>,
+    ) -> Self {
+        dedupe_by_name(&mut packages, ProvenancedPackage::package);
+        Self {
+            vars: Vec::new(),
+            patches: Vec::new(),
+            packages,
+            lifecycle_hooks,
+        }
+    }
+
+    /// Append already-gated vars and patches. Atomic: conflict
+    /// checks run against the union before any mutation; on `Err`,
+    /// `self` is untouched.
+    ///
+    /// # Errors
+    ///
+    /// [`ComposeError::Conflict`] if an incoming var or patch
+    /// disagrees with one already in `self`.
+    pub(crate) fn extend_with(
+        &mut self,
+        vars: Vec<SessionVar>,
+        patches: Vec<SessionPatch>,
+    ) -> Result<(), ComposeError> {
+        self.check_incoming_conflicts(&vars, &patches)?;
+        self.vars.extend(vars);
+        self.patches.extend(patches);
+        Ok(())
+    }
+
+    /// Run the cross-set var- and patch-mismatch checks against the
+    /// union of `self` and the incoming items. Shared by
+    /// [`Self::extend_from_wire`] and [`Self::extend_with`] so both
+    /// atomic-precheck paths run the exact same conflict semantics.
+    fn check_incoming_conflicts(
+        &self,
+        incoming_vars: &[SessionVar],
+        incoming_patches: &[SessionPatch],
+    ) -> Result<(), ComposeError> {
         check_var_mismatches(
             self.vars.iter().chain(incoming_vars.iter()),
             |v| v.var().name(),
@@ -943,13 +1086,6 @@ impl Composition {
             |p| p.patch().destination(),
             |p| p.patch().host_path().as_str(),
         )?;
-
-        // Checks passed — commit.
-        self.vars.extend(incoming_vars);
-        self.patches.extend(incoming_patches);
-        self.packages.extend(incoming_packages);
-        dedupe_by_name(&mut self.packages, ProvenancedPackage::package);
-        self.lifecycle_hooks.extend(incoming_hooks);
         Ok(())
     }
 }
@@ -960,28 +1096,33 @@ impl Composition {
 /// dotfile trees where a symlink may legitimately point outside the
 /// patch source.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct ComposeOptions {
     /// If `true`, [`FileSet::resolve`](crate::core::primitives::FileSet::resolve)
     /// follows symlinks while walking patch sources. Off by default.
     pub follow_symlinks: bool,
 }
 
+impl ComposeOptions {
+    /// Owned-builder setter for [`Self::follow_symlinks`]. Prefer
+    /// this over struct-literal syntax so external callers keep
+    /// compiling when new fields are added.
+    #[must_use]
+    pub fn with_follow_symlinks(mut self, follow: bool) -> Self {
+        self.follow_symlinks = follow;
+        self
+    }
+}
+
 // =====================================================================
 // Per-domain gating
 // =====================================================================
 
-/// Invoke a var-domain hook on a batch of unapproved items. The
-/// hook gets `policy` cloned (it can't mutate the caller's directly);
-/// on success the caller gets back `(decisions, policy)` where
-/// `policy` is the hook's `updated_policy` if it returned one, else
-/// the original. Decision count is validated; mismatches return
-/// `HookContract`.
-///
-/// Lifts the boilerplate (call hook, handle `Abort`, fold in
-/// `updated_policy`, validate decision count) shared by [`gate_vars`]
-/// (Phase 1 of `docs/COMPOSITION.md`) and
-/// [`handle_response`](crate::client::handler::handle_response)
-/// (Phase 3).
+/// Invoke a var-domain hook on a batch of unapproved items. Returns
+/// `(decisions, policy)` where `policy` is the hook's
+/// `updated_policy` if provided, else the original. Validates
+/// decision count against `view.len()`; a mismatch returns
+/// [`ComposeError::HookContract`].
 pub(crate) fn prompt_var_hook(
     hooks: &dyn PolicyHooks,
     policy: VarsPolicy,
@@ -1143,21 +1284,30 @@ pub(crate) fn gate_vars(
 /// first [`ExpandError`](crate::core::expansion::ExpandError); a partial
 /// expansion would let some patches reach the walker with their
 /// references intact, which silently matches wrong paths.
+///
+/// Per-patch `follow_symlinks` is resolved here: any `Some(v)` carried
+/// on the [`ProvenancedPatch`] wins; `None` inherits
+/// `default_follow_symlinks`. The resolved bool is stamped onto the
+/// emitted [`ExpandedProvenancedPatch`] so downstream code doesn't
+/// have to re-consult a sidecar map.
 pub(crate) fn expand_patch_sources(
     patches: Vec<ProvenancedPatch>,
     gated_vars: &[SessionVar],
     home_fallback: Option<&str>,
+    default_follow_symlinks: bool,
 ) -> Result<Vec<ExpandedProvenancedPatch>, ComposeError> {
     patches
         .into_iter()
         .map(|pp| {
-            let (patch, provenance) = pp.into_parts();
+            let (patch, provenance, follow_override) = pp.into_parts();
             let source =
                 crate::core::expansion::expand_source(patch.source(), gated_vars, home_fallback)?;
+            let follow_symlinks = follow_override.unwrap_or(default_follow_symlinks);
             Ok(ExpandedProvenancedPatch {
                 source,
                 dest: patch.dest().clone(),
                 provenance,
+                follow_symlinks,
             })
         })
         .collect()
@@ -1193,8 +1343,9 @@ pub(crate) fn gate_patches(
     // no IO context for.
     let mut expanded = policy.expand_with(gated_vars, home_fallback)?;
 
-    let expanded_patches = expand_patch_sources(items, gated_vars, home_fallback)?;
-    let files = enumerate_patch_files(expanded_patches, options.follow_symlinks)?;
+    let expanded_patches =
+        expand_patch_sources(items, gated_vars, home_fallback, options.follow_symlinks)?;
+    let files = enumerate_patch_files(expanded_patches)?;
 
     // Pass 1: categorize per file.
     let mut allowed: Vec<PatchFile> = Vec::new();
@@ -1343,6 +1494,90 @@ pub(crate) fn compose_contribution(
         lifecycle_hooks,
     };
     Ok((composition, final_policy))
+}
+
+/// Output of [`contribution_to_pending`]: daemon-collected items in
+/// their wire shape, plus the daemon-side stash keyed by
+/// [`PendingId`] so [`resume_from_verdict`] can rehydrate provenance
+/// from the verdict.
+///
+/// [`resume_from_verdict`]: crate::daemon::composer::resume_from_verdict
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PendingTransform {
+    pub(crate) wire: WirePending,
+    pub(crate) pending_vars: BTreeMap<PendingId, ProvenancedVar>,
+    pub(crate) pending_patches: BTreeMap<PendingId, ProvenancedPatch>,
+}
+
+/// Wire-shaped pending payload — the subset of [`PendingTransform`]
+/// that crosses the RPC boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct WirePending {
+    pub(crate) vars: Vec<WirePendingVar>,
+    pub(crate) patches: Vec<WirePendingPatch>,
+    pub(crate) lifecycle_hooks: Vec<WireProvenancedHook>,
+}
+
+/// Convert daemon-collected vars, patches, and lifecycle hooks into
+/// their wire pending shape plus a per-item [`PendingId`] stash.
+/// Pure: no policy consulted, no env touched.
+///
+/// Ids are assigned by position within each domain; correlation is
+/// per `(domain, id)`.
+///
+/// # Panics
+///
+/// If a single domain holds more than `u32::MAX + 1` items.
+pub(crate) fn contribution_to_pending(
+    vars: Vec<ProvenancedVar>,
+    patches: Vec<ProvenancedPatch>,
+    lifecycle_hooks: Vec<ProvenancedHook>,
+) -> PendingTransform {
+    let mut pending_vars: BTreeMap<PendingId, ProvenancedVar> = BTreeMap::new();
+    let mut wire_vars: Vec<WirePendingVar> = Vec::with_capacity(vars.len());
+    for (i, pv) in vars.into_iter().enumerate() {
+        let id = PendingId::new(u32::try_from(i).expect("pending var index fits in u32"));
+        // Items reach this transform already resolved (the composer's
+        // input is `ResolvedVar`); ship as a `Specified` spec so the
+        // client treats the value verbatim instead of re-resolving
+        // against its env.
+        wire_vars.push(WirePendingVar {
+            id,
+            name: pv.var().name().to_string(),
+            spec: WireVarSpec::Specified {
+                value: pv.var().value().to_string(),
+            },
+            source: pv.source().clone().into(),
+        });
+        pending_vars.insert(id, pv);
+    }
+
+    let mut pending_patches: BTreeMap<PendingId, ProvenancedPatch> = BTreeMap::new();
+    let mut wire_patches: Vec<WirePendingPatch> = Vec::with_capacity(patches.len());
+    for (i, pp) in patches.into_iter().enumerate() {
+        let id = PendingId::new(u32::try_from(i).expect("pending patch index fits in u32"));
+        wire_patches.push(WirePendingPatch {
+            id,
+            source_pattern: pp.patch().source().to_string(),
+            destination: pp.patch().dest().as_sandbox_path().clone(),
+            description: None,
+            source: pp.source().clone().into(),
+        });
+        pending_patches.insert(id, pp);
+    }
+
+    let wire_hooks: Vec<WireProvenancedHook> =
+        lifecycle_hooks.into_iter().map(Into::into).collect();
+
+    PendingTransform {
+        wire: WirePending {
+            vars: wire_vars,
+            patches: wire_patches,
+            lifecycle_hooks: wire_hooks,
+        },
+        pending_vars,
+        pending_patches,
+    }
 }
 
 // =====================================================================
@@ -1815,15 +2050,20 @@ mod tests {
             assert_eq!(dests, ["nvim/a.lua", "nvim/sub/b.lua"]);
         }
 
+        /// A patch whose walk root doesn't exist on the host is
+        /// silently dropped with a `tracing::warn!`, not surfaced as
+        /// [`ComposeError::PatchWalk`]. A user activating a loadout
+        /// that opportunistically patches something absent (e.g. a
+        /// missing dotfile tree) shouldn't have activation fail.
         #[test]
-        fn walk_failure_surfaces_as_patch_walk() {
+        fn missing_patch_source_is_dropped_not_error() {
             let patch = Patch::new(
                 "/definitely/does/not/exist/*",
                 PatchDest::try_new("x").unwrap(),
             );
             let pp = ProvenancedPatch::new(patch, user_source());
             let policy = PatchPolicy::empty();
-            let err = gate_patches(
+            let (patches, _policy) = gate_patches(
                 vec![pp],
                 policy,
                 Some(&PanicHook),
@@ -1831,11 +2071,49 @@ mod tests {
                 &[],
                 None,
             )
-            .unwrap_err();
+            .expect("missing walk root should not error");
             assert!(
-                matches!(err, ComposeError::PatchWalk { ref sources } if !sources.is_empty()),
-                "got: {err:?}",
+                patches.is_empty(),
+                "missing source should yield no patches, got {patches:?}",
             );
+        }
+
+        /// A batch mixing missing and present patch sources keeps
+        /// the present ones through and warn-drops the missing —
+        /// one bad path doesn't sink the whole activation.
+        #[test]
+        fn missing_and_present_patches_partition_cleanly() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+            std::fs::write(root.join("real.txt").as_std_path(), "x").unwrap();
+            let real_pattern = format!("{root}/real.txt");
+
+            let present = ProvenancedPatch::new(
+                Patch::new(&real_pattern, PatchDest::try_new("real.txt").unwrap()),
+                user_source(),
+            );
+            let missing = ProvenancedPatch::new(
+                Patch::new(
+                    "/definitely/does/not/exist/*",
+                    PatchDest::try_new("m").unwrap(),
+                ),
+                user_source(),
+            );
+            let policy = PatchPolicy::empty();
+            let (patches, _) = gate_patches(
+                vec![present, missing],
+                policy,
+                Some(&PanicHook),
+                ComposeOptions::default(),
+                &[],
+                None,
+            )
+            .expect("mixed batch should not error");
+            let dests: Vec<&str> = patches
+                .iter()
+                .map(|sp| sp.patch().destination().as_str())
+                .collect();
+            assert_eq!(dests, ["real.txt"]);
         }
 
         #[test]
@@ -1941,8 +2219,11 @@ mod tests {
             );
         }
 
+        /// `~someuser/…` (per-user tilde) is rejected at expansion —
+        /// only bare `~` and `~/…` are supported. Silent noop
+        /// otherwise: the pattern would be literal and never match.
         #[test]
-        fn user_prefixed_tilde_is_rejected_as_relative() {
+        fn user_prefixed_tilde_is_rejected() {
             let (_tmp, patch) = single_file_patch("conf.toml", "conf");
             let pp = ProvenancedPatch::new(patch, user_source());
             let policy = PatchPolicy::empty().with_deny(["~someuser/.ssh/**"]);
@@ -1959,7 +2240,7 @@ mod tests {
                 matches!(
                     err,
                     ComposeError::Expansion(
-                        crate::core::expansion::ExpandError::NotAbsolute { .. }
+                        crate::core::expansion::ExpandError::UnsupportedTildeUser { .. }
                     )
                 ),
                 "got: {err:?}",

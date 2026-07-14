@@ -9,10 +9,15 @@ const ZSTD_LEVEL: i32 = 5;
 
 /// Errors which can occur when working with archives.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ArchiveError {
     IO(std::io::Error),
     StripPrefix(StripPrefixError),
     CompressionError(String),
+    /// A tar entry's path resolved outside the destination directory. Carries
+    /// the offending archive-relative path. (A symlink/hardlink whose *target*
+    /// escapes is skipped with a warning instead — see `extract_tar_impl`.)
+    PathTraversal(PathBuf),
 }
 
 impl fmt::Display for ArchiveError {
@@ -21,6 +26,13 @@ impl fmt::Display for ArchiveError {
             ArchiveError::IO(e) => write!(f, "I/O error: {}", e),
             ArchiveError::StripPrefix(e) => write!(f, "strip prefix error: {}", e),
             ArchiveError::CompressionError(s) => write!(f, "compression error: {}", s),
+            ArchiveError::PathTraversal(p) => {
+                write!(
+                    f,
+                    "tar entry {} escapes the destination directory",
+                    p.display()
+                )
+            }
         }
     }
 }
@@ -31,6 +43,7 @@ impl std::error::Error for ArchiveError {
             ArchiveError::IO(e) => Some(e),
             ArchiveError::StripPrefix(e) => Some(e),
             ArchiveError::CompressionError(_) => None,
+            ArchiveError::PathTraversal(_) => None,
         }
     }
 }
@@ -191,6 +204,31 @@ pub fn extract_compressed_tar<R: Read>(
     }
 }
 
+/// Lexically resolves `.` and `..` in a relative path without touching the
+/// filesystem, returning `None` if the path is absolute or escapes its own
+/// root (a `..` that would climb above the starting directory).
+///
+/// This is the containment gate for prefix-stripped tar extraction: unlike
+/// [`Path::join`], it refuses entries and link targets that would resolve
+/// outside `dest_dir`.
+fn normalize_within_root(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => return None,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(c) => out.push(c),
+        }
+    }
+    Some(out)
+}
+
 /// Extracts the tarball encoded in the given reader to the given directory,
 /// stripping the given prefix.
 fn extract_tar_impl<R: Read>(
@@ -207,11 +245,48 @@ fn extract_tar_impl<R: Read>(
             if p.as_ref().as_os_str() == "pax_global_header" {
                 continue;
             }
-            let path = p.strip_prefix(prefix)?.to_owned();
+            let stripped = p.strip_prefix(prefix)?.to_owned();
+
+            // `Path::join` lets an entry named `../../x` (or an absolute path)
+            // escape `dest_dir`, and per-entry `Entry::unpack` — unlike the
+            // whole-archive `Archive::unpack` in the else branch — does not
+            // contain the write. Reject any entry that resolves outside the
+            // destination tree before touching the filesystem.
+            let safe_path = normalize_within_root(&stripped)
+                .ok_or_else(|| ArchiveError::PathTraversal(stripped.clone()))?;
+
+            // A symlink/hardlink whose target escapes the tree would let a
+            // subsequent entry be written through it to an arbitrary location
+            // (target is relative to the link's own directory for a symlink,
+            // to the destination root for a hardlink). SKIP such a link rather
+            // than abort: never creating it defeats the write-through vector (a
+            // later entry resolves to a contained regular path instead), while
+            // legitimate upstream tarballs that ship escaping symlinks in test
+            // fixtures (next.js, syft) still extract. The entry-path escape
+            // above stays a hard error — a file writing to `../x` has no benign
+            // form.
+            let entry_type = entry.header().entry_type();
+            if (entry_type.is_symlink() || entry_type.is_hard_link())
+                && let Some(target) = entry.link_name()?
+            {
+                let base = if entry_type.is_symlink() {
+                    safe_path.parent().unwrap_or_else(|| Path::new(""))
+                } else {
+                    Path::new("")
+                };
+                if normalize_within_root(&base.join(target.as_ref())).is_none() {
+                    tracing::warn!(
+                        entry = %stripped.display(),
+                        target = %target.display(),
+                        "skipping tar link whose target escapes the destination"
+                    );
+                    continue;
+                }
+            }
 
             // Ensure any containing directory exists - most tarballs are good about ordering directory entries
             // ahead of files within them, but not all.
-            if let Some(dirs) = path.parent()
+            if let Some(dirs) = safe_path.parent()
                 && !dirs.as_os_str().is_empty()
             {
                 let dir_path = dest_dir.join(dirs);
@@ -220,7 +295,7 @@ fn extract_tar_impl<R: Read>(
                 }
             }
 
-            if let tar::Unpacked::File(f) = entry.unpack(dest_dir.join(&path))? {
+            if let tar::Unpacked::File(f) = entry.unpack(dest_dir.join(&safe_path))? {
                 f.sync_all()?;
                 drop(f);
             };
@@ -345,6 +420,173 @@ mod tests {
         // Verify the prefix directory doesn't exist
         assert!(!extract_dir.path().join("prefix").exists());
 
+        Ok(())
+    }
+
+    #[test]
+    fn extract_rejects_parent_dir_traversal() {
+        let extract_dir = tempfile::tempdir().unwrap();
+
+        // A malicious upstream tarball whose entry escapes the strip prefix.
+        // The tar *writer* refuses a `..` path via `set_path`, so write the
+        // header name field directly — exactly what a hand-crafted archive
+        // (e.g. GNU tar `--absolute-names`) produces.
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let content = b"pwned";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            let name = b"prefix/../../evil.txt";
+            header.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name);
+            header.set_cksum();
+            builder.append(&header, &content[..]).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let err = extract_compressed_tar(
+            &tar_data[..],
+            Compression::None,
+            extract_dir.path(),
+            Some(&"prefix".to_string()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ArchiveError::PathTraversal(_)),
+            "expected PathTraversal, got {err:?}"
+        );
+        // Nothing was written outside the destination.
+        assert!(
+            !extract_dir
+                .path()
+                .parent()
+                .unwrap()
+                .join("evil.txt")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn extract_skips_escaping_symlink() -> Result<(), ArchiveError> {
+        let extract_dir = tempfile::tempdir().unwrap();
+
+        // A symlink pointing outside the tree (as legit upstream test fixtures
+        // ship). We SKIP it rather than abort the extraction, and the other
+        // entries still land.
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_path("prefix/link").unwrap();
+            link.set_link_name("../../../etc").unwrap();
+            link.set_size(0);
+            link.set_cksum();
+            builder.append(&link, &[][..]).unwrap();
+
+            let content = b"ok";
+            let mut file = tar::Header::new_gnu();
+            file.set_path("prefix/keep.txt").unwrap();
+            file.set_size(content.len() as u64);
+            file.set_cksum();
+            builder.append(&file, &content[..]).unwrap();
+
+            builder.finish().unwrap();
+        }
+
+        extract_compressed_tar(
+            &tar_data[..],
+            Compression::None,
+            extract_dir.path(),
+            Some(&"prefix".to_string()),
+        )?;
+
+        // The escaping symlink was skipped, not created (symlink_metadata sees
+        // even a dangling link, so this is a real "does not exist" check).
+        assert!(extract_dir.path().join("link").symlink_metadata().is_err());
+        // The rest of the archive extracted fine.
+        assert_eq!(
+            std::fs::read_to_string(extract_dir.path().join("keep.txt")).unwrap(),
+            "ok"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn skipping_escaping_symlink_still_contains_write_through() -> Result<(), ArchiveError> {
+        let extract_dir = tempfile::tempdir().unwrap();
+
+        // The tar-slip vector: an escaping symlink followed by a write *through*
+        // it. Because the link is skipped (never created), the follow-up write
+        // resolves to a contained regular path under dest_dir — not `/etc`.
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_path("prefix/link").unwrap();
+            link.set_link_name("../../../etc").unwrap();
+            link.set_size(0);
+            link.set_cksum();
+            builder.append(&link, &[][..]).unwrap();
+
+            let content = b"pwned";
+            let mut file = tar::Header::new_gnu();
+            file.set_path("prefix/link/passwd").unwrap();
+            file.set_size(content.len() as u64);
+            file.set_cksum();
+            builder.append(&file, &content[..]).unwrap();
+
+            builder.finish().unwrap();
+        }
+
+        extract_compressed_tar(
+            &tar_data[..],
+            Compression::None,
+            extract_dir.path(),
+            Some(&"prefix".to_string()),
+        )?;
+
+        // The write landed contained (dest/link/passwd), NOT through an escaping
+        // symlink to some /etc/passwd outside the tree.
+        assert_eq!(
+            std::fs::read_to_string(extract_dir.path().join("link/passwd")).unwrap(),
+            "pwned"
+        );
+        assert!(extract_dir.path().join("link").is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn extract_allows_in_tree_symlink() -> Result<(), ArchiveError> {
+        let extract_dir = tempfile::tempdir().unwrap();
+
+        // A relative symlink that stays within the extracted tree is fine.
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_path("prefix/sub/link").unwrap();
+            header.set_link_name("../target").unwrap();
+            header.set_size(0);
+            header.set_cksum();
+            builder.append(&header, &[][..]).unwrap();
+            builder.finish().unwrap();
+        }
+
+        extract_compressed_tar(
+            &tar_data[..],
+            Compression::None,
+            extract_dir.path(),
+            Some(&"prefix".to_string()),
+        )?;
+
+        assert!(extract_dir.path().join("sub/link").is_symlink());
         Ok(())
     }
 

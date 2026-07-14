@@ -8,22 +8,11 @@ use crate::core::compose::ComposeError;
 use crate::core::primitives::{FileSet, PatchDest, PatchError};
 use crate::core::source::{Provenanced, Source};
 
-/// Per-file entry derived from a [`Patch`] after its source [`FileSet`]
-/// is walked.
-///
-/// `link_path` is `Some` only when symlink resolution produced a
-/// distinct path from `target_path` — i.e. `follow_symlinks: true` was
-/// set AND the walker traversed an actual symlink. In every other case
-/// the link is implicitly the target, and `link_path` is `None`.
-///
-/// Both paths are realmed [`HostAbsPath`] — the gate upholds the
-/// absoluteness invariant via the
-/// [`ExpandError::NotAbsolute`](crate::core::expansion::ExpandError::NotAbsolute)
-/// gate at expansion time, and `target_path` is also canonical (via
-/// [`std::fs::canonicalize`]).
-///
-/// Policy matching runs against both when both are present — a deny
-/// on either wins.
+/// Per-file entry derived from a [`Patch`] after its source
+/// [`FileSet`] is walked. `link_path` is `Some` only when symlink
+/// resolution produced a distinct path (i.e. `follow_symlinks: true`
+/// and the walker traversed a symlink). Policy matching runs
+/// against both when present; deny on either wins.
 ///
 /// [`Patch`]: crate::core::primitives::Patch
 /// [`FileSet`]: crate::core::primitives::FileSet
@@ -67,35 +56,51 @@ pub(crate) struct ExpandedProvenancedPatch {
     pub(crate) source: FileSet,
     pub(crate) dest: PatchDest,
     pub(crate) provenance: Source,
+    /// Whether the walker should follow symlinks for this patch.
+    /// Resolved by [`expand_patch_sources`] from the compose default
+    /// and any per-patch override carried on [`ProvenancedPatch`], so
+    /// `enumerate_patch_files` reads it per-item and doesn't need to
+    /// consult any sidecar map.
+    ///
+    /// [`expand_patch_sources`]: crate::core::compose::expand_patch_sources
+    /// [`ProvenancedPatch`]: crate::core::source::ProvenancedPatch
+    pub(crate) follow_symlinks: bool,
 }
 
 /// Walk each pre-expanded patch's `FileSet` and produce one
 /// [`PatchFile`] per matched host file.
 ///
+/// **Per-item follow behavior.** Each [`ExpandedProvenancedPatch`]
+/// carries its own resolved `follow_symlinks` bool — the walker
+/// reads it per iteration, so two patches in the same call can
+/// drive different follow behavior.
+///
 /// **Path safety:** every yielded file is canonicalized via
-/// [`std::fs::canonicalize`] — so when `follow_symlinks` is true the
-/// symlink target is known, and dual-path policy checks become
-/// possible downstream. The walk itself starts from the un-canonical
-/// `walk_root` so the yielded link paths preserve the user's
-/// structural intent (matching against the original glob pattern and
-/// driving dest computation).
+/// [`std::fs::canonicalize`] when the item's `follow_symlinks` is
+/// true, so the symlink target is known and dual-path policy checks
+/// become possible downstream. The walk itself starts from the
+/// un-canonical `walk_root` so the yielded link paths preserve the
+/// user's structural intent (matching against the original glob
+/// pattern and driving dest computation).
 ///
 /// `..` and `.` components are rejected at expansion time, so they
 /// can't appear in the walk root or yielded paths. A non-existent
 /// walk root surfaces as a walkdir error on first iteration.
 ///
-/// All errors across every patch are accumulated — a permission-denied
-/// subtree under one patch doesn't hide an unwalkable pattern in
-/// another. If any error occurred, they surface together as
-/// [`ComposeError::PatchWalk`]; otherwise the file list is returned
-/// cleanly.
+/// A patch whose walk root doesn't exist is *not* a hard error —
+/// a `tracing::warn!` names the missing path and the patch is
+/// dropped, so a loadout that opportunistically patches something
+/// like `~/dotfiles/helix/` doesn't fail activation on a host that
+/// doesn't have that dotfile tree. Other walk failures (permission
+/// denied, non-UTF-8 paths, etc.) still accumulate and surface as
+/// [`ComposeError::PatchWalk`].
 pub(crate) fn enumerate_patch_files(
     items: Vec<ExpandedProvenancedPatch>,
-    follow_symlinks: bool,
 ) -> Result<Vec<PatchFile>, ComposeError> {
     let mut out = Vec::new();
     let mut accumulated_errors = Vec::new();
     for pp in items {
+        let follow_symlinks = pp.follow_symlinks;
         let Some(walk_root) = pp.source.walk_root() else {
             accumulated_errors.push(PatchError::NoWalkRoot {
                 pattern: pp.source.pattern().to_owned(),
@@ -110,6 +115,28 @@ pub(crate) fn enumerate_patch_files(
             let entry = match entry_result {
                 Ok(entry) => entry,
                 Err(source) => {
+                    // `NotFound` is treated as "user doesn't have
+                    // this on their host" — warn and move on.
+                    // `walkdir::Error::path()` reports the specific
+                    // item that failed, which is either the walk
+                    // root itself (the common case) or a subitem
+                    // that vanished mid-walk (the race). Log both
+                    // the pattern's declared root and the failing
+                    // path so operators can distinguish. `.io_error()`
+                    // returns `None` for the loop-detection variant;
+                    // those still fail hard.
+                    if source
+                        .io_error()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        tracing::warn!(
+                            source_pattern = %pp.source.pattern(),
+                            walk_root = %walk_root_path,
+                            missing_path = ?source.path(),
+                            "patch source not found on host filesystem; dropping"
+                        );
+                        continue;
+                    }
                     accumulated_errors.push(PatchError::WalkFailure {
                         root: walk_root_path.clone(),
                         source,
@@ -306,5 +333,106 @@ mod tests {
             "got: {:?}",
             errors[0],
         );
+    }
+
+    // =================================================================
+    // Per-patch `follow_symlinks` — each item drives its own walker
+    // =================================================================
+
+    /// Two patches in a single `enumerate_patch_files` call: one
+    /// follows a symlink, the other doesn't. Verifies the walker
+    /// reads the bool per-item rather than from a call-level arg.
+    #[test]
+    fn per_patch_follow_symlinks_drives_each_walker_independently() {
+        use crate::core::primitives::{FileSet, PatchDest};
+        use crate::core::source::Source;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Canonicalize upfront to sidestep macOS's `/tmp -> /private/tmp`
+        // prefix symlink. Without this, `canonicalize_utf8` inside
+        // `enumerate_patch_files` returns the `/private/tmp/...`
+        // form for every file — including the plain files — so
+        // `target != walker_path` fires spuriously and the assertion
+        // "at least one entry has link_path = None" fails. Two
+        // sibling symlink tests in compose.rs do the same thing for
+        // the same reason.
+        let root = Utf8PathBuf::from_path_buf(std::fs::canonicalize(tmp.path()).unwrap()).unwrap();
+        // Two sibling dirs, each with one real file. Each dir also
+        // contains a symlink named `link` pointing at a third dir's
+        // real file. When follow_symlinks is on, we get 2 files
+        // (target + link); when off, we get 1 (just the real file).
+        let target_dir = root.join("target");
+        std::fs::create_dir(target_dir.as_std_path()).unwrap();
+        std::fs::write(target_dir.join("real.conf").as_std_path(), "t").unwrap();
+
+        let follow_dir = root.join("follow");
+        std::fs::create_dir(follow_dir.as_std_path()).unwrap();
+        std::fs::write(follow_dir.join("real.conf").as_std_path(), "f").unwrap();
+        std::os::unix::fs::symlink(
+            target_dir.join("real.conf").as_std_path(),
+            follow_dir.join("link.conf").as_std_path(),
+        )
+        .unwrap();
+
+        let nofollow_dir = root.join("nofollow");
+        std::fs::create_dir(nofollow_dir.as_std_path()).unwrap();
+        std::fs::write(nofollow_dir.join("real.conf").as_std_path(), "n").unwrap();
+        std::os::unix::fs::symlink(
+            target_dir.join("real.conf").as_std_path(),
+            nofollow_dir.join("link.conf").as_std_path(),
+        )
+        .unwrap();
+
+        let items = vec![
+            ExpandedProvenancedPatch {
+                source: FileSet::try_new(format!("{}/*.conf", follow_dir.as_str())).unwrap(),
+                dest: PatchDest::try_new("dest_follow").unwrap(),
+                provenance: Source::UserLoadout {
+                    name: "follow".to_string(),
+                },
+                follow_symlinks: true,
+            },
+            ExpandedProvenancedPatch {
+                source: FileSet::try_new(format!("{}/*.conf", nofollow_dir.as_str())).unwrap(),
+                dest: PatchDest::try_new("dest_nofollow").unwrap(),
+                provenance: Source::UserLoadout {
+                    name: "nofollow".to_string(),
+                },
+                follow_symlinks: false,
+            },
+        ];
+
+        let files = enumerate_patch_files(items).unwrap();
+
+        // Bucket by dest to identify which patch produced which.
+        let follow_files: Vec<_> = files
+            .iter()
+            .filter(|f| f.dest.as_str().starts_with("dest_follow"))
+            .collect();
+        let nofollow_files: Vec<_> = files
+            .iter()
+            .filter(|f| f.dest.as_str().starts_with("dest_nofollow"))
+            .collect();
+
+        // Follow: two files (real.conf + link.conf as symlink to target).
+        assert_eq!(
+            follow_files.len(),
+            2,
+            "follow patch should yield real + link entries",
+        );
+        // A followed symlink populates `link_path`; the plain file
+        // has `link_path = None`.
+        assert!(follow_files.iter().any(|f| f.link_path.is_some()));
+        assert!(follow_files.iter().any(|f| f.link_path.is_none()));
+
+        // No-follow: just the single real file (walkdir skips the
+        // symlink because `is_file()` on a symlink entry is false
+        // when follow_links is off).
+        assert_eq!(
+            nofollow_files.len(),
+            1,
+            "no-follow patch should yield the real file only",
+        );
+        assert!(nofollow_files[0].link_path.is_none());
     }
 }

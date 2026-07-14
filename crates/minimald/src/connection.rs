@@ -1,19 +1,23 @@
 use russh::{
     Channel as RuChannel, ChannelId,
-    server::{Config as RuConfig, Msg, RunningSession, Session},
+    server::{ChannelOpenHandle, Config as RuConfig, Msg, RunningSession, Session},
 };
 use sessions::SessionId;
 use std::{
     collections::BTreeMap,
     fmt,
     sync::{Arc, LazyLock},
-    time::Duration,
 };
+// Used only by the `ssh-forward` direct-tcpip handler.
+#[cfg(feature = "ssh-forward")]
+use std::time::Duration;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::TcpStream,
     sync::{Mutex, MutexGuard},
 };
+// Used only by the `ssh-forward` direct-tcpip handler.
+#[cfg(feature = "ssh-forward")]
+use tokio::net::TcpStream;
 
 use crate::{
     ChannelConfig, RequestedPty, exec,
@@ -277,17 +281,22 @@ impl russh::server::Handler for ConnectionHandler {
     async fn channel_open_session(
         &mut self,
         c: RuChannel<Msg>,
+        reply: ChannelOpenHandle,
         _: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         let mut s = self.0.lock().await;
         if s.auth != Auth::Local {
-            return Ok(false); // indicate failure
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await; // indicate failure
+            return Ok(());
         }
 
         protocol_trace!("Minting session channel with id {}", c.id());
         s.channels.insert(c.id(), Channel::new_session(c.id(), c));
 
-        Ok(true) // indicate success
+        reply.accept().await; // indicate success
+        Ok(())
     }
 
     async fn env_request(
@@ -461,6 +470,7 @@ impl russh::server::Handler for ConnectionHandler {
     ///
     /// The connection attempt times out after 10 seconds; a failure rejects the
     /// channel so the SSH client receives a clean error rather than hanging.
+    #[cfg(feature = "ssh-forward")]
     async fn channel_open_direct_tcpip(
         &mut self,
         channel: RuChannel<Msg>,
@@ -468,8 +478,9 @@ impl russh::server::Handler for ConnectionHandler {
         port_to_connect: u32,
         originator_address: &str,
         originator_port: u32,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         protocol_trace!(
             "Got channel_open_direct_tcpip: {host_to_connect}:{port_to_connect} \
              from {originator_address}:{originator_port}"
@@ -485,7 +496,10 @@ impl russh::server::Handler for ConnectionHandler {
         };
 
         if !is_local {
-            return Ok(false);
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
         }
 
         // Validate the session identified by the SSH username (R4.9). The client
@@ -495,11 +509,17 @@ impl russh::server::Handler for ConnectionHandler {
         // without a valid session context.
         let Some(uname) = username.as_deref() else {
             tracing::warn!("direct-tcpip rejected: no SSH username");
-            return Ok(false);
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
         };
         let Ok(session_id) = SessionId::parse_str(uname) else {
             tracing::warn!(value = %uname, "direct-tcpip rejected: username not a session UUID");
-            return Ok(false);
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
         };
         let mngr = serv.sessions_manager().await;
         match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
@@ -509,7 +529,10 @@ impl russh::server::Handler for ConnectionHandler {
                     %session_id,
                     "direct-tcpip rejected: session not found"
                 );
-                return Ok(false);
+                reply
+                    .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+                return Ok(());
             }
             Err(e) => {
                 tracing::warn!(
@@ -517,7 +540,10 @@ impl russh::server::Handler for ConnectionHandler {
                     error = %e,
                     "direct-tcpip rejected: session lookup failed"
                 );
-                return Ok(false);
+                reply
+                    .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+                return Ok(());
             }
         }
 
@@ -526,7 +552,8 @@ impl russh::server::Handler for ConnectionHandler {
             Ok(p) => p,
             Err(_) => {
                 tracing::warn!(port = port_to_connect, "direct-tcpip: port out of range");
-                return Ok(false);
+                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                return Ok(());
             }
         };
 
@@ -547,7 +574,8 @@ impl russh::server::Handler for ConnectionHandler {
                     %error,
                     "direct-tcpip: could not connect to target"
                 );
-                return Ok(false);
+                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                return Ok(());
             }
             Err(_) => {
                 tracing::warn!(
@@ -555,18 +583,43 @@ impl russh::server::Handler for ConnectionHandler {
                     port,
                     "direct-tcpip: connection to target timed out"
                 );
-                return Ok(false);
+                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                return Ok(());
             }
         };
+
+        reply.accept().await;
 
         // Relay bytes bidirectionally: SSH channel ↔ upstream TCP.
         tokio::spawn(relay_streams(channel.into_stream(), upstream));
 
-        Ok(true)
+        Ok(())
+    }
+
+    /// With the `ssh-forward` feature disabled, port-forwarding is compiled out.
+    /// Reject every `direct-tcpip` channel so forwarding fails **closed**, rather
+    /// than relying on whatever russh's default handler does (finding #4 / the
+    /// user decision to disable ssh-forward for now).
+    #[cfg(not(feature = "ssh-forward"))]
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        _channel: RuChannel<Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        reply
+            .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        Ok(())
     }
 }
 
 /// Relay bytes bidirectionally between two async streams, logging any relay error.
+#[cfg(feature = "ssh-forward")]
 async fn relay_streams<A, B>(mut a: A, mut b: B)
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -577,7 +630,10 @@ where
     }
 }
 
-#[cfg(test)]
+// The only test here exercises `relay_streams`, which is itself behind
+// `ssh-forward`; gate the whole module so it (and its imports) compile out with
+// the feature.
+#[cfg(all(test, feature = "ssh-forward"))]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

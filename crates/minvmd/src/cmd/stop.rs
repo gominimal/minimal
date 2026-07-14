@@ -1,11 +1,13 @@
-//! `minvmd stop` subcommand (R4.4).
+//! `minvmd stop` subcommand (R4.4, R2.3).
 //!
-//! Reads `vmm_pid` from `state.toml`, sends `SIGTERM` to the VMM child,
-//! waits up to 5 s, escalates to `SIGKILL` on timeout, then removes `vmm.pid`
-//! and resets `state.toml` to `Stopped`.
+//! Reads `vmm_pid` from `minvmd.toml`, asks the in-VM minimald to shut down
+//! (drain sessions + quiesce the data volume) over the bridge UDS, then sends
+//! `SIGTERM` to the VMM child, waits up to 5 s, escalates to `SIGKILL` on
+//! timeout, then resets `minvmd.toml` to `Stopped`.
 //!
 //! The command is idempotent: if the daemon is already stopped (or has never
-//! been provisioned), it returns successfully with no action.
+//! been provisioned), it returns successfully with no action. Stale active
+//! state from a dead daemon is repaired to `Stopped`.
 
 use anyhow::{Context as _, Result};
 
@@ -14,10 +16,12 @@ use crate::state::{State, StateDir};
 
 /// Run the `stop` subcommand.
 pub fn run() -> Result<()> {
-    run_with_state_dir(StateDir::default_path())
+    run_with_state_dir(StateDir::default_path(), true)
 }
 
-fn run_with_state_dir(dir: std::path::PathBuf) -> Result<()> {
+/// `quiesce_guest` gates the Shutdown RPC (R2.3): production passes `true`;
+/// unit tests pass `false` so they never reach a live daemon's bridge socket.
+fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()> {
     let state_dir = StateDir::new(dir).context("opening state dir")?;
 
     // ── Phase 1: read current state under lock ───────────────────────────────
@@ -28,25 +32,35 @@ fn run_with_state_dir(dir: std::path::PathBuf) -> Result<()> {
         let _guard = lock.write().context("acquiring lifecycle write lock")?;
         let state = state_dir.read_state().context("reading state")?;
 
-        match state.lifecycle {
-            Lifecycle::Stopped | Lifecycle::NotProvisioned => {
-                tracing::info!("minvmd is not running");
-                return Ok(()); // idempotent: already stopped
-            }
-            Lifecycle::Stopping => {
-                tracing::info!("minvmd is already stopping");
-                return Ok(()); // idempotent: stop already in progress
-            }
-            _ => {}
+        if !state.lifecycle.is_active() {
+            tracing::info!("minvmd is not running");
+            return Ok(()); // idempotent: already stopped
+        }
+        if !state_dir.daemon_alive().context("probing alive lock")? {
+            // Dead daemon left active state behind; nothing to signal.
+            state_dir
+                .write_state(&State::stopped())
+                .context("repairing stale state")?;
+            tracing::info!("minvmd was not running; cleared stale state");
+            return Ok(());
+        }
+        if state.lifecycle == Lifecycle::Stopping {
+            tracing::info!("minvmd is already stopping");
+            return Ok(()); // idempotent: stop already in progress
         }
 
         state.vmm_pid // may be None during Starting before pid is written
     };
 
-    // ── Phase 2: signal the VMM child (lock NOT held) ────────────────────────
+    // ── Phase 2: quiesce the guest, then signal the VMM child (lock NOT held) ─
     // Releasing the lock during the wait allows concurrent `status` reads.
     match vmm_pid {
-        Some(pid) => signal_and_wait(pid)?,
+        Some(pid) => {
+            if quiesce_guest {
+                shutdown_guest_best_effort();
+            }
+            signal_and_wait(pid)?
+        }
         None => {
             tracing::warn!("daemon is active but vmm_pid is absent; cleaning up state");
         }
@@ -58,7 +72,6 @@ fn run_with_state_dir(dir: std::path::PathBuf) -> Result<()> {
             .lifecycle_lock()
             .context("opening lifecycle lock")?;
         let _guard = lock.write().context("acquiring lifecycle write lock")?;
-        let _ = std::fs::remove_file(state_dir.vmm_pid_path());
         state_dir
             .write_state(&State::stopped())
             .context("writing Stopped state")?;
@@ -66,6 +79,36 @@ fn run_with_state_dir(dir: std::path::PathBuf) -> Result<()> {
 
     tracing::info!("minvmd stopped");
     Ok(())
+}
+
+/// R2.3: ask the in-VM minimald (over the vsock bridge UDS) to drain sessions
+/// and quiesce the data volume before the VMM is signalled, so a clean stop
+/// leaves a clean ext4 journal. Best-effort: on any failure — guest already
+/// gone, bridge down, timeout — SIGTERM proceeds and the journal replay
+/// backstop bounds the damage.
+fn shutdown_guest_best_effort() {
+    // Two deadlines, because they bound different things. The connect
+    // deadline is short: libkrun accepts the bridge UDS connect even when the
+    // guest is wedged, so a completed SSH handshake is the only proof of a
+    // live daemon — a broken VM must not stall the user's recovery command.
+    // The RPC deadline is long: the handler force-drains every session
+    // (sandbox teardown, process kills — unbounded real work) and then
+    // quiesces (10 s guest-side ceiling) before it acknowledges; giving up
+    // mid-drain would SIGTERM the VMM with a dirty journal, defeating the
+    // point of the call.
+    const GUEST_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const GUEST_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+    match crate::sock::resolve_uds_path()
+        .map_err(anyhow::Error::from)
+        .and_then(|uds| {
+            crate::rpc_client::shutdown_guest(&uds, GUEST_CONNECT_TIMEOUT, GUEST_SHUTDOWN_TIMEOUT)
+        }) {
+        Ok(resp) => tracing::info!(?resp, "guest acknowledged Shutdown RPC"),
+        Err(e) => {
+            tracing::warn!(error = %e, "guest Shutdown RPC failed; proceeding with SIGTERM")
+        }
+    }
 }
 
 /// Send `SIGTERM` to `pid`; wait up to 5 s; escalate to `SIGKILL` on timeout.
@@ -79,7 +122,7 @@ fn signal_and_wait(pid: u32) -> Result<()> {
     }
 
     // SAFETY: kill(pid, SIGTERM) delivers SIGTERM to the named process. The pid
-    // was stored in state.toml by the `run` supervisor that created the VMM
+    // was stored in minvmd.toml by the `run` supervisor that created the VMM
     // child; it may have already exited (ESRCH), which is handled below.
     let r = unsafe { libc::kill(pid_t, libc::SIGTERM) };
     if r != 0 {
@@ -132,8 +175,8 @@ mod tests {
     #[test]
     fn stop_is_noop_when_not_provisioned() {
         let tmp = tempfile::tempdir().unwrap();
-        // No state.toml — should be a no-op.
-        run_with_state_dir(tmp.path().to_path_buf()).unwrap();
+        // No state file — should be a no-op.
+        run_with_state_dir(tmp.path().to_path_buf(), false).unwrap();
     }
 
     #[test]
@@ -141,7 +184,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sd = make_state_dir(&tmp);
         sd.write_state(&State::stopped()).unwrap();
-        run_with_state_dir(tmp.path().to_path_buf()).unwrap();
+        run_with_state_dir(tmp.path().to_path_buf(), false).unwrap();
         // State should still be Stopped.
         let s = sd.read_state().unwrap();
         assert_eq!(s.lifecycle, Lifecycle::Stopped);
@@ -157,35 +200,30 @@ mod tests {
             started_at: None,
         })
         .unwrap();
-        // Should return Ok without error, even with a non-existent pid.
-        run_with_state_dir(tmp.path().to_path_buf()).unwrap();
+        // Hold the alive lock so Stopping counts as a live daemon.
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
+        run_with_state_dir(tmp.path().to_path_buf(), false).unwrap();
+        // The live daemon owns the transition; state is untouched.
+        let s = sd.read_state().unwrap();
+        assert_eq!(s.lifecycle, Lifecycle::Stopping);
     }
 
     #[test]
-    fn stop_cleans_up_running_state_with_nonexistent_pid() {
+    fn stop_repairs_stale_active_state_without_signalling() {
         let tmp = tempfile::tempdir().unwrap();
         let sd = make_state_dir(&tmp);
-        // Use a PID that cannot exist (pid 0 is the kernel scheduler on Unix).
-        // signal_and_wait will get ESRCH and skip the wait.
-        // We use a large synthetic PID that won't collide with real processes
-        // in the test runner.
-        let fake_pid = 999_998u32; // likely ESRCH in CI
+        // Running per the state file, but no alive-lock holder: the daemon is
+        // dead. `stop` must repair to Stopped without touching the pid (which
+        // may have been recycled).
         sd.write_state(&State {
             lifecycle: Lifecycle::Running,
-            vmm_pid: Some(fake_pid),
+            vmm_pid: Some(std::process::id()), // a live pid that must NOT be signalled
             started_at: Some(0),
         })
         .unwrap();
-        // Write a vmm.pid file too.
-        std::fs::write(sd.vmm_pid_path(), format!("{fake_pid}\n")).unwrap();
-
-        // stop must not error even when the process is gone (ESRCH).
-        run_with_state_dir(tmp.path().to_path_buf()).unwrap();
-
-        // State must be Stopped and vmm.pid must be removed.
+        run_with_state_dir(tmp.path().to_path_buf(), false).unwrap();
         let s = sd.read_state().unwrap();
         assert_eq!(s.lifecycle, Lifecycle::Stopped);
-        assert!(!sd.vmm_pid_path().exists(), "vmm.pid must be removed");
     }
 
     #[test]
@@ -198,7 +236,8 @@ mod tests {
             started_at: None,
         })
         .unwrap();
-        run_with_state_dir(tmp.path().to_path_buf()).unwrap();
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
+        run_with_state_dir(tmp.path().to_path_buf(), false).unwrap();
         let s = sd.read_state().unwrap();
         assert_eq!(s.lifecycle, Lifecycle::Stopped);
     }
@@ -213,7 +252,8 @@ mod tests {
             started_at: None,
         })
         .unwrap();
-        assert!(run_with_state_dir(tmp.path().to_path_buf()).is_err());
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
+        assert!(run_with_state_dir(tmp.path().to_path_buf(), false).is_err());
     }
 
     #[test]
@@ -231,6 +271,7 @@ mod tests {
             started_at: None,
         })
         .unwrap();
-        assert!(run_with_state_dir(tmp.path().to_path_buf()).is_err());
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
+        assert!(run_with_state_dir(tmp.path().to_path_buf(), false).is_err());
     }
 }

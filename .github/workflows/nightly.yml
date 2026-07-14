@@ -1,0 +1,85 @@
+name: nightly
+
+# Cut a release once a day and bless it onto the `nightly` distribution
+# channel. This reuses release.yml verbatim (via workflow_call) to build and
+# stage, then flips the `nightly` pointer inline — so promote.yml stays the
+# gated, manual stable/unstable path and needs no nightly-specific carve-outs.
+#
+# `nightly` is bleeding-edge like `unstable` (it's a once-a-day snapshot of
+# HEAD's build), so it is intentionally ungated — no approval issue.
+on:
+    schedule:
+        - cron: "0 10 * * *" # 10:00 UTC = 02:00 PST
+    workflow_dispatch:
+
+permissions:
+    contents: write # release job cuts a GitHub release
+    id-token: write # OIDC for the GCS auth in promote-nightly
+
+jobs:
+    # Skip the build on no-op nights: a finished release stages an immutable
+    # versions/<sha>/components manifest in gs://minimal-one, so if HEAD hasn't
+    # moved since the last release that object already exists. When it does we
+    # skip the (re)build but still run promote-nightly, so the `nightly` channel
+    # always ends up pointing at HEAD's build whether or not we cut it tonight.
+    # The bucket is public, so this is an unauthenticated HEAD — no GCS auth.
+    check:
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        outputs:
+            sha: ${{ steps.check.outputs.sha }}
+            should_release: ${{ steps.check.outputs.should_release }}
+        steps:
+            - uses: actions/checkout@v7
+            - name: Determine whether HEAD is already staged
+              id: check
+              run: |
+                  set -euo pipefail
+                  SHA=$(git rev-parse --short=8 HEAD)
+                  echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+                  URL="https://storage.googleapis.com/minimal-one/versions/$SHA/components"
+                  if curl -sf -o /dev/null -I "$URL"; then
+                    echo "$SHA already staged; skipping build, will still point nightly at it."
+                    echo "should_release=false" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "$SHA not staged; cutting a fresh release."
+                    echo "should_release=true" >> "$GITHUB_OUTPUT"
+                  fi
+
+    release:
+        needs: check
+        if: ${{ needs.check.outputs.should_release == 'true' }}
+        uses: ./.github/workflows/release.yml
+        secrets: inherit
+
+    promote-nightly:
+        needs: [check, release]
+        # Run whether release executed (success) or was skipped as a no-op;
+        # bail only if it actually failed or was cancelled. always() is needed
+        # so a skipped `release` doesn't auto-skip this job.
+        if: ${{ always() && needs.check.result == 'success' && needs.release.result != 'failure' && needs.release.result != 'cancelled' }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        permissions:
+            contents: read
+            id-token: write
+        steps:
+            - uses: actions/checkout@v7
+            - name: Authenticate to Google Cloud (installer bucket)
+              # Same project + workload-identity pool as release.yml's
+              # stage-installer job; grants write to gs://minimal-one.
+              uses: google-github-actions/auth@v3
+              with:
+                  project_id: "524228262772"
+                  workload_identity_provider: "projects/524228262772/locations/global/workloadIdentityPools/github/providers/gominimal"
+            - name: Point nightly channel at this release
+              # The SHA `check` computed is HEAD at this ref, i.e. exactly what
+              # release.yml staged. set-channel.sh verifies versions/<sha>/ is
+              # staged before flipping, so a missing stage fails loudly.
+              env:
+                  SHA: ${{ needs.check.outputs.sha }}
+              run: |
+                  scripts/set-channel.sh \
+                    --channel nightly \
+                    --version "$SHA" \
+                    --bucket gs://minimal-one
