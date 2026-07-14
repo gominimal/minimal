@@ -95,9 +95,7 @@ impl<C: sandbox2::Channel> TaskEnv<'_, C> {
     /// Sandbox execution is only available on Linux (hakoniwa).
     #[cfg(not(target_os = "linux"))]
     async fn resolve_cmdcmd(&mut self, _argv: &[String]) -> Result<Vec<Invocation>, Error> {
-        Err(Error::Other(anyhow::anyhow!(
-            "sandbox execution is only supported on Linux"
-        )))
+        Err(crate::sandbox_unsupported())
     }
 }
 

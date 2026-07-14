@@ -108,7 +108,7 @@ impl<'a> StandaloneTest<'a> {
         Ok((dependencies, needs_dns, need_internet))
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn invocations(&self, test: &SpecTest) -> Result<Vec<sandbox2::config::Invocation>, Error> {
         if test.cmds.is_empty() || test.cmds[0].is_empty() {
             return Err(Error::Other(anyhow!(
@@ -166,9 +166,7 @@ impl<'a> StandaloneTest<'a> {
         _sandbox: &mut sandbox2::Sandbox<()>,
         _test: &SpecTest,
     ) -> Result<Vec<StandaloneTestError>, Error> {
-        Err(Error::Other(anyhow!(
-            "sandbox execution is only supported on Linux"
-        )))
+        Err(crate::sandbox_unsupported())
     }
 }
 

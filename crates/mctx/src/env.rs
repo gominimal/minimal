@@ -752,9 +752,7 @@ impl<'a> Env<'a> {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (invocations, stdout_writer, stderr_writer);
-            Err(Error::Other(anyhow::anyhow!(
-                "sandbox execution is only supported on Linux"
-            )))
+            Err(op::sandbox_unsupported().into())
         }
     }
 }

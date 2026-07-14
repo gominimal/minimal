@@ -180,7 +180,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         Ok((dependencies, needs_dns, need_internet))
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn invocations(&self, build: &BuildSpec) -> Result<Vec<(String, Vec<String>)>, Error> {
         if build.cmds.is_empty() || build.cmds[0].is_empty() {
             return Err(Error::Other(anyhow!(
@@ -228,9 +228,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         _sandbox: &mut sandbox2::Sandbox<()>,
         _build: &BuildSpec,
     ) -> Result<(), Error> {
-        Err(Error::Other(anyhow!(
-            "sandbox execution is only supported on Linux"
-        )))
+        Err(crate::sandbox_unsupported())
     }
 
     async fn materialize_prebuilt<'b>(
