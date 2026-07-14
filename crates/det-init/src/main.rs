@@ -58,8 +58,6 @@ const DROPPRIV: &str = "/opt/detonation/droppriv";
 const EVENTS: &str = "/run/det-events.jsonl";
 /// The observer touches this once its LSM programs are attached and it is ready.
 const READY: &str = "/run/mon.ready";
-/// vsock port the observer streams the feed to the host on (file is the fallback).
-const MONITOR_VSOCK_PORT: u16 = 1024;
 
 /// The deny-channel tripwire path the LSM `file_open` hook denies with `-EPERM`.
 const TRIPWIRE: &str = "/det-tripwire-DENY";
@@ -140,6 +138,16 @@ async fn async_main() -> Result<(), MainError> {
         tracing::warn!(error = %e, device = STATE_VOLUME_DEVICE, "data volume unavailable; build-env limited to rootfs + /tmp");
     }
 
+    // Emit the READY vsock beacon NOW — the microVM supervisor (minvmd) waits for
+    // it (port 7350) with a short (~5s) timeout and tears the guest down if it
+    // never arrives. It must fire BEFORE the slow steps below (the observer-ready
+    // wait alone is bounded at 10s), so we announce "booted" as soon as the rootfs
+    // is entered, then detonate at leisure. Simple form: det-init runs no SSH
+    // server, so there is no host key to carry (the host reader tolerates that).
+    if let Err(e) = guest::emit_simple_ready_marker().await {
+        tracing::warn!(error = %e, "emitting READY beacon failed; the supervisor may time out");
+    }
+
     // ── BPF pseudo-filesystems (detonation-specific; minimald does not mount
     // these — a vanilla build VM should not carry bpffs). Best-effort: a kernel
     // without them just degrades coverage (the host caps the verdict at REVIEW).
@@ -169,7 +177,7 @@ async fn async_main() -> Result<(), MainError> {
     // Held for the detonation's lifetime (dropping tears the relay down).
     // Best-effort: no host gvproxy → the sample simply has no network (the prior
     // no-NIC behaviour), which is still a valid detonation.
-    let _egress = match guest::bring_up_root_egress().await {
+    let egress = match guest::bring_up_root_egress().await {
         Ok(relay) => Some(relay),
         Err(e) => {
             tracing::warn!(error = %e, "root egress unavailable; detonating without network");
@@ -183,13 +191,16 @@ async fn async_main() -> Result<(), MainError> {
     // ── Start the root observer, block on readiness ────────────────────────
     let _ = std::fs::remove_file(READY);
     let _ = std::fs::remove_file(EVENTS);
+    // File output is the reliable primary sink: the observer writes the feed to
+    // EVENTS and signals ready as soon as its hooks are attached. We deliberately
+    // do NOT pass `--vsock-port` here — that makes the observer BLOCK connecting
+    // its sink to a host vsock listener, and if none is up (as in a one-shot
+    // detonation) it never signals ready and this boot stalls. The host collects
+    // the feed via the drained file (streamed on stdout by `emit_feed_to_stdout`,
+    // or read from the data volume); live vsock streaming is a future opt-in that
+    // requires a host-side listener.
     let mut mon = Command::new(MONITOR);
-    mon.arg("--output")
-        .arg(EVENTS)
-        .arg("--ready-file")
-        .arg(READY)
-        .arg("--vsock-port")
-        .arg(MONITOR_VSOCK_PORT.to_string());
+    mon.arg("--output").arg(EVENTS).arg("--ready-file").arg(READY);
     if let Some(n) = &nonce {
         // The nonce is set on the OBSERVER's environment only; it is never set on
         // the sample's, so uid 65534 never sees it (the F3/F4 guarantee).
@@ -243,13 +254,19 @@ async fn async_main() -> Result<(), MainError> {
     // ── Route the sample's DNS through the collector (networked model only) ──
     // The collector (127.0.0.1:53) is now listening and forwards to the upstream,
     // so repointing the resolver keeps resolution working while making every
-    // query name observable. Skip in the no-NIC model (upstream loopback/empty).
-    match dns_upstream.as_deref() {
-        None | Some("") | Some("127.0.0.1") | Some("::1") => {}
-        Some(up) => match install_local_resolver() {
-            Ok(()) => tracing::info!(upstream = up, "routed sample DNS through the collector"),
-            Err(e) => tracing::warn!(error = %e, "could not repoint resolver; DNS names may go unobserved"),
-        },
+    // query name observable. Gated on egress being UP: with no network there is
+    // nothing to collect, and doing the bind-mount anyway both wastes work and
+    // shows up as a spurious pid-1 Mount event the verdict reads as a
+    // container-escape signal (a false positive on an otherwise-benign run).
+    // Also skipped when the upstream is already loopback/empty (no-NIC model).
+    if egress.is_some() {
+        match dns_upstream.as_deref() {
+            None | Some("") | Some("127.0.0.1") | Some("::1") => {}
+            Some(up) => match install_local_resolver() {
+                Ok(()) => tracing::info!(upstream = up, "routed sample DNS through the collector"),
+                Err(e) => tracing::warn!(error = %e, "could not repoint resolver; DNS names may go unobserved"),
+            },
+        }
     }
 
     // ── uid-boundary self-check (PR3): nobody must not be able to write the feed ──
@@ -298,8 +315,31 @@ async fn async_main() -> Result<(), MainError> {
     // ── Drain the observer: SIGTERM asks it to flush the ringbuf, bounded ──
     drain_monitor(&mut monitor, mon_pid).await;
 
+    // Emit the captured feed on stdout so a host that collects via the console
+    // (rather than the observer's live vsock-1024 stream) still gets it — e.g.
+    // the boot-test harness that captures the guest console. Harmless in
+    // production, where vsock is the primary channel.
+    emit_feed_to_stdout();
+
     tracing::info!("detonation complete");
     Ok(())
+}
+
+/// Write the captured JSONL feed (the observer's `--output` file, now drained) to
+/// stdout, for a host that collects via the guest console rather than the vsock
+/// stream.
+fn emit_feed_to_stdout() {
+    use std::io::Write as _;
+    match std::fs::read(EVENTS) {
+        Ok(bytes) => {
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(&bytes);
+            let _ = out.flush();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = EVENTS, "could not read feed to emit on stdout")
+        }
+    }
 }
 
 /// Whether this process is the detonation microVM's init: the kernel runs the
