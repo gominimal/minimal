@@ -586,6 +586,322 @@ jobs:
                   if-no-files-found: error
                   retention-days: 7
 
+    # --- Smoke: prove the JUST-BUILT release artifacts actually run before we
+    # publish any of them. Each job downloads the uploaded artifacts by name,
+    # puts the SHIPPED binaries on PATH (never a fresh target/ build), and runs
+    # the ONE shared session e2e (scripts/session-e2e.sh — the same proof the CI
+    # lanes run), so the bytes this release would ship are the bytes proven to
+    # boot a daemon and round-trip a session. All three gate `release` via the
+    # `smoke-success` aggregator below; none is guarded by `!inputs.dry_run`,
+    # because smoke is validation, not publishing — a dry run still builds,
+    # signs, assembles, and SMOKES, it just publishes nothing.
+
+    smoke-linux-amd64:
+        # DM2 (native minimald on the host, no VM): the SHIPPED static-musl
+        # `min`/`minimald` — downloaded back by name — must auto-spawn a daemon
+        # and pass the session e2e. Mirrors ci-linux-native's `native-daemon-e2e`
+        # job, but against the release artifacts instead of a target/debug build.
+        needs: [build-release-linux-amd64]
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
+            - name: Download shipped min
+              uses: actions/download-artifact@v8
+              with:
+                  name: minimal-linux-amd64
+                  path: ${{ runner.temp }}/bin
+            - name: Download shipped minimald
+              uses: actions/download-artifact@v8
+              with:
+                  name: minimald-linux-amd64
+                  path: ${{ runner.temp }}/bin
+            - name: Put the shipped binaries on PATH
+              # download-artifact drops each file under its platform-suffixed
+              # name; the CLI autospawns the daemon by the bare `minimald` name
+              # and users invoke `min`, so rename both and prepend the dir to PATH.
+              run: |
+                  set -euo pipefail
+                  BIN="$RUNNER_TEMP/bin"
+                  mv "$BIN/minimal-linux-amd64" "$BIN/min"
+                  mv "$BIN/minimald-linux-amd64" "$BIN/minimald"
+                  chmod +x "$BIN/min" "$BIN/minimald"
+                  echo "$BIN" >> "$GITHUB_PATH"
+            - name: Enable unprivileged user namespaces
+              # The session sandbox (hakoniwa) needs userns; Ubuntu 24.04
+              # restricts them via AppArmor by default. Mirrors the native lane.
+              run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            - name: Cache minimal package cache
+              # Session creation materializes the project's stack via cache pulls
+              # keyed by the pinned upstream commit; carry it across runs so the
+              # smoke isn't dominated by pulls. The e2e resets XDG_STATE_HOME /
+              # XDG_RUNTIME_DIR but leaves XDG_CACHE_HOME alone for this reason.
+              uses: actions/cache@v6
+              with:
+                  path: ~/.cache/minimal
+                  key: smoke-amd64-minimal-cache-${{ hashFiles('.minimal/minimal.toml') }}
+                  restore-keys: smoke-amd64-minimal-cache-
+            - name: Session e2e (shipped native minimald)
+              # No E2E_* knobs: native target, host daemon, and the e2e seeds its
+              # own project workspace (E2E_PROJECT_DIR defaults to the checkout).
+              run: ./scripts/session-e2e.sh
+
+    smoke-linux-kvm:
+        # DM3 (native Linux + a minvmd/libkrun microVM): boot a REAL microVM from
+        # the SHIPPED minvmd and pass the session e2e over the vsock bridge, the
+        # same proof ci-linux-kvm's `test-kvm` runs. Every moving part is a
+        # downloaded release artifact: the native-glibc `minvmd`, the guest kernel
+        # + ext4 rootfs + initramfs, and the pinned gvproxy switch. libkrun itself
+        # is NOT shipped on Linux (users resolve it from the system / the upstream
+        # package), so it is materialized here exactly as the release build linked
+        # it, reusing the shipped static `mip` to drive the cache fetch.
+        needs: [build-release-linux-amd64, fetch-release-guest-artifacts, build-release-initramfs]
+        runs-on: ubuntu-latest # x86_64; KVM-capable
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
+            - name: Enable /dev/kvm access
+              # GitHub-hosted x86_64 Linux runners expose /dev/kvm but the runner
+              # user is not in the `kvm` group; widen the node so libkrun can open
+              # it. Fail fast if this runner has no KVM at all. (Ported from
+              # ci-linux-kvm's test-kvm.)
+              run: |
+                  if [ ! -e /dev/kvm ]; then
+                    echo "::error::/dev/kvm not present on this runner; cannot boot the microVM." >&2
+                    exit 1
+                  fi
+                  echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+                    | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+                  sudo udevadm control --reload-rules
+                  sudo udevadm trigger --name-match=kvm
+                  ls -l /dev/kvm
+            - name: Enable unprivileged user namespaces
+              # `mip materialize` (the libkrun cache fetch below) runs the build
+              # pipeline, which needs userns; Ubuntu 24.04 restricts it via
+              # AppArmor by default.
+              run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            - name: Download shipped linux-amd64 binaries
+              # Pulls min, minvmd, mip and gvproxy (plus minimald, unused on the
+              # host — it ships inside the initramfs). `*-linux-amd64` is a clean
+              # glob here: only darwin artifacts carry the `temp-` prefix.
+              uses: actions/download-artifact@v8
+              with:
+                  pattern: "*-linux-amd64"
+                  path: ${{ runner.temp }}/bin
+                  merge-multiple: true
+            - name: Download shipped guest kernel
+              uses: actions/download-artifact@v8
+              with:
+                  name: virtio-kernel-amd64
+                  path: ${{ runner.temp }}/guest
+            - name: Download shipped guest rootfs
+              uses: actions/download-artifact@v8
+              with:
+                  name: minvmd-rootfs-amd64
+                  path: ${{ runner.temp }}/guest
+            - name: Download shipped guest initramfs
+              uses: actions/download-artifact@v8
+              with:
+                  name: minimald-initramfs-amd64
+                  path: ${{ runner.temp }}/guest
+            - name: Put the shipped binaries on PATH
+              # Rename off the platform suffix and prepend to PATH so `min`
+              # autospawns `minvmd` — and minvmd spawns the host `gvproxy` switch —
+              # all by bare name.
+              run: |
+                  set -euo pipefail
+                  BIN="$RUNNER_TEMP/bin"
+                  mv "$BIN/minimal-linux-amd64" "$BIN/min"
+                  mv "$BIN/minvmd-linux-amd64" "$BIN/minvmd"
+                  mv "$BIN/mip-linux-amd64" "$BIN/mip"
+                  mv "$BIN/gvproxy-linux-amd64" "$BIN/gvproxy"
+                  chmod +x "$BIN/min" "$BIN/minvmd" "$BIN/mip" "$BIN/gvproxy"
+                  echo "$BIN" >> "$GITHUB_PATH"
+            - name: Materialize libkrun prefix (upstream package)
+              # minvmd links libkrun.so + dlopens libkrunfw.so.5 at runtime; the
+              # Linux release ships neither (its rpath resolves them from the
+              # system / LD_LIBRARY_PATH). Reuse the shipped static mip to drive
+              # the cache fetch (no Rust toolchain) — the exact libkrun the release
+              # build linked against. Publishes LIBKRUN_PREFIX and
+              # LD_LIBRARY_PATH=$HOME/.krun to later steps.
+              uses: ./.github/actions/setup-libkrun-linux
+              with:
+                  arch: x86_64
+                  mip: ${{ runner.temp }}/bin/mip
+            - name: Point the microVM env at the shipped guest artifacts
+              run: |
+                  {
+                    echo "MINVMD_KERNEL_PATH=$RUNNER_TEMP/guest/vmlinuz-amd64"
+                    echo "MINVMD_ROOTFS_PATH=$RUNNER_TEMP/guest/rootfs-amd64.img"
+                    echo "MINVMD_INITRAMFS=$RUNNER_TEMP/guest/initramfs-amd64.cpio"
+                  } >> "$GITHUB_ENV"
+            - name: Session e2e (shipped minvmd microVM)
+              # activate must auto-spawn minvmd, boot the guest, and round-trip a
+              # session. E2E_PROJECT_DIR=/tmp — the guest sees no host project dir
+              # yet (no project sync), and /tmp exists in the guest image.
+              env:
+                  MINVMD_BOOT_LOG: ${{ runner.temp }}/cli-e2e-boot.log
+              run: E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd E2E_PROJECT_DIR=/tmp ./scripts/session-e2e.sh
+            - name: Reap leftover VM processes
+              # The autospawned minvmd can leak a __krun-vmm child on a failed
+              # teardown; reap defensively (ported from test-kvm). The runner is
+              # ephemeral, so this is hygiene, not correctness.
+              if: always()
+              run: |
+                  sudo pkill -x minvmd || true
+                  sudo pkill -f __krun-vmm || true
+            - name: Upload guest boot console log
+              if: always()
+              uses: actions/upload-artifact@v7
+              with:
+                  name: smoke-linux-kvm-boot-log
+                  path: ${{ runner.temp }}/cli-e2e-boot.log
+                  if-no-files-found: ignore
+
+    smoke-macos:
+        # DM1 (macOS is always VM-backed): prove the SIGNED macOS artifacts boot
+        # the microVM from the INSTALLER LAYOUT — the same session e2e ci-macos
+        # runs, but against the Developer-ID-signed `min`/`minvmd`, the signed
+        # shipped `libkrun.1.dylib` laid out as a `lib/` sibling of `bin/` (minvmd
+        # resolves it via its @loader_path/../lib rpath, exactly as
+        # scripts/install.sh drops it), the signed gvproxy, and the shipped arm64
+        # guest kernel/rootfs/initramfs.
+        #
+        # SKIP-TOLERANT: runs on the single self-hosted Apple-Silicon mini (it
+        # holds the signing keychain), a scarce shared resource. Gated on the same
+        # RUN_MACOS_CI kill-switch as the mac build/sign jobs, so taking the mini
+        # offline skips this smoke as `skipped` (never `failure`); `smoke-success`
+        # treats a skip as pass, so a skipped mac smoke does not wedge a release.
+        if: vars.RUN_MACOS_CI != 'false'
+        needs:
+            [
+                build-release-macos-arm64,
+                sign-macos-artifacts,
+                fetch-release-guest-artifacts,
+                build-release-initramfs,
+            ]
+        runs-on: [self-hosted, macOS, ARM64]
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  # Don't leave git credentials on the persistent self-hosted runner.
+                  persist-credentials: false
+            - name: Download signed CLI (min)
+              uses: actions/download-artifact@v8
+              with:
+                  name: minimal-macos-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download signed minvmd
+              uses: actions/download-artifact@v8
+              with:
+                  name: minvmd-macos-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download signed libkrun dylib
+              uses: actions/download-artifact@v8
+              with:
+                  name: libkrun-macos-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download signed gvproxy
+              uses: actions/download-artifact@v8
+              with:
+                  name: gvproxy-darwin-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download shipped guest kernel
+              uses: actions/download-artifact@v8
+              with:
+                  name: virtio-kernel-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download shipped guest rootfs
+              uses: actions/download-artifact@v8
+              with:
+                  name: minvmd-rootfs-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download shipped guest initramfs
+              uses: actions/download-artifact@v8
+              with:
+                  name: minimald-initramfs-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Assemble the installer layout
+              # Reproduce the on-disk tree scripts/install.sh writes (spec 07):
+              # bin/{min,minvmd,gvproxy}, lib/libkrun.1.dylib (bin's sibling, the
+              # @rpath target), data/{vmlinuz,rootfs.img,initramfs.cpio}. The dylib
+              # basename MUST be libkrun.1.dylib — minvmd's load command is
+              # @rpath/libkrun.1.dylib. Then bin/ joins PATH so `min` autospawns
+              # `minvmd` (which finds libkrun via @loader_path/../lib) and minvmd
+              # spawns the host `gvproxy`, all by bare name.
+              run: |
+                  set -euo pipefail
+                  DL="$RUNNER_TEMP/dl"
+                  ROOT="$RUNNER_TEMP/install"
+                  mkdir -p "$ROOT/bin" "$ROOT/lib" "$ROOT/data"
+                  mv "$DL/minimal-macos-arm64" "$ROOT/bin/min"
+                  mv "$DL/minvmd-macos-arm64" "$ROOT/bin/minvmd"
+                  mv "$DL/gvproxy-darwin-arm64" "$ROOT/bin/gvproxy"
+                  mv "$DL/libkrun-macos-arm64.dylib" "$ROOT/lib/libkrun.1.dylib"
+                  mv "$DL/vmlinuz-arm64" "$ROOT/data/vmlinuz"
+                  mv "$DL/rootfs-arm64.img" "$ROOT/data/rootfs.img"
+                  mv "$DL/initramfs-arm64.cpio" "$ROOT/data/initramfs.cpio"
+                  chmod +x "$ROOT/bin/min" "$ROOT/bin/minvmd" "$ROOT/bin/gvproxy"
+                  echo "$ROOT/bin" >> "$GITHUB_PATH"
+            - name: Reap stale VM processes before the smoke
+              # The mini is persistent and shared: a prior run's stray minvmd,
+              # __krun-vmm or gvproxy would wedge the host->guest vsock bridge and
+              # sink the cold activate. Clear the tree first (mirrors ci-macos).
+              run: |
+                  pkill -x minvmd 2>/dev/null || true
+                  pkill -f '__krun-vmm' 2>/dev/null || true
+                  pkill -f gvproxy 2>/dev/null || true
+                  sleep 1
+            - name: Session e2e (signed microVM, installer layout)
+              # activate must auto-spawn minvmd, boot the guest, and round-trip a
+              # session. E2E_PROJECT_DIR=/tmp — the guest sees no host project dir
+              # yet, and /tmp exists in the guest image. Runs the laid-out binaries
+              # directly (never cargo, which would relink and unsign minvmd).
+              env:
+                  MINVMD_KERNEL_PATH: ${{ runner.temp }}/install/data/vmlinuz
+                  MINVMD_ROOTFS_PATH: ${{ runner.temp }}/install/data/rootfs.img
+                  MINVMD_INITRAMFS: ${{ runner.temp }}/install/data/initramfs.cpio
+                  MINVMD_BOOT_LOG: ${{ runner.temp }}/cli-e2e-boot.log
+              run: E2E_VM=1 E2E_PROJECT_DIR=/tmp ./scripts/session-e2e.sh
+            - name: Reap VM processes
+              # Leave the shared mini clean for the next job (Guest teardown does
+              # not always reap the __krun-vmm grandchild or the gvproxy switch).
+              if: always()
+              run: |
+                  pkill -x minvmd 2>/dev/null || true
+                  pkill -f '__krun-vmm' 2>/dev/null || true
+                  pkill -f gvproxy 2>/dev/null || true
+            - name: Upload guest boot console log
+              if: always()
+              uses: actions/upload-artifact@v7
+              with:
+                  name: smoke-macos-boot-log
+                  path: ${{ runner.temp }}/cli-e2e-boot.log
+                  if-no-files-found: ignore
+
+    smoke-success:
+        # Skip-tolerant gate that `release` needs: the shipped-artifact smokes
+        # must pass BEFORE anything is published. `if: always()` so a kill-switch
+        # skip (RUN_MACOS_CI off skipping smoke-macos) still lets this run, and
+        # only a real failure/cancellation reds it — a `skipped` smoke reads as
+        # pass, mirroring the lane `*-success` aggregators. Failing here blocks
+        # `release`, and thus every publish step. No dry_run guard: smoke gates
+        # dry runs too.
+        if: always()
+        needs: [smoke-linux-amd64, smoke-linux-kvm, smoke-macos]
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        steps:
+            - name: Verify every smoke job succeeded or was skipped
+              if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+              run: exit 1
+            - run: echo "shipped-artifact smoke green"
+
     release:
         runs-on: ubuntu-latest
         timeout-minutes: 30
@@ -598,6 +914,7 @@ jobs:
                 sign-macos-artifacts,
                 fetch-release-guest-artifacts,
                 build-release-initramfs,
+                smoke-success,
             ]
         permissions:
             contents: write
