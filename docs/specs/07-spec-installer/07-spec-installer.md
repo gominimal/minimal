@@ -310,7 +310,14 @@ downloads) one init file per shell family under `<data>/shell-init/`:
   no-op once the user manages `PATH` themselves.
 
 `zsh.sh` additionally adds the zsh completions dir (R9.3) to `fpath` and runs
-`compinit`. All three files are regenerated on every run and appended to the
+`compinit` — and then **self-heals a lying dump**: `compinit` trusts its cached
+`.zcompdump` whenever the dump's (zsh version, completion-file count) header
+matches, a check that misses real changes (one completions dir replacing
+another with the same file count). If `min` is still unregistered after
+`compinit` while the `_min` file exists, `zsh.sh` deletes
+`${ZDOTDIR:-$HOME}/.zcompdump` and reruns `compinit`; the file-exists guard
+keeps a home without generated completions from rebuilding the dump on every
+startup. All three files are regenerated on every run and appended to the
 install record (R6.1) with the on-disk digest in **both** hash columns (no
 manifest hash exists for generated content), so reruns replace them and
 uninstall removes them like any component.
@@ -376,6 +383,15 @@ installed, and completions regenerate on the next run. Specifically:
   with stderr nulled — a command-level `2>/dev/null` cannot catch them), so the
   user sees the installer's warning, never a raw `Permission denied` line.
 
+Writing the zsh completion file also **drops a pre-existing
+`${ZDOTDIR:-$HOME}/.zcompdump`** (announced, best-effort like the rest of the
+step): the dump is a pure, regenerable cache, and its staleness check cannot
+see `_min` change when the completion-file count stays equal — the upgrade
+from the pre-rewrite installer hits exactly that, leaving `min` completion
+dead in every new shell until an unrelated `fpath` change. Dropping the cache
+forces a real rescan on the next zsh startup (the `zsh.sh` self-heal in R9.1
+is the belt-and-braces for dumps that go stale later).
+
 **R9.4** — Uninstall (Units 7–8) undoes shell integration completely:
 
 - the generated init and completion files are ordinary record rows, removed by
@@ -390,6 +406,11 @@ installed, and completions regenerate on the next run. Specifically:
 - the emptied `shell-init` and completion dirs (and their possibly
   installer-created parents) are pruned with the same `rmdir`-only discipline
   as R8.1 — they are shared locations, never `rm -rf`ed;
+- `${ZDOTDIR:-$HOME}/.zcompdump` is dropped (announced), but **only when the
+  record shows zsh completions were installed**: the dump is the user's cache,
+  and left behind it keeps a `min` registration whose function file is gone,
+  so the first `min <tab>` in every new zsh fails with `function definition
+  file not found`;
 - `--dry-run` composes: it announces the would-be rc strip and removals and
   touches nothing.
 
@@ -408,7 +429,11 @@ installed, and completions regenerate on the next run. Specifically:
   (sourcing `~/.minimal/shim/shell-init/…`) has it replaced — the run announces
   the replacement, exactly one marker block remains, it sources the current
   init file, no shim reference survives, and user content on both sides of the
-  old block is preserved; a rerun then rewrites nothing.
+  old block is preserved; a rerun then rewrites nothing. A pre-existing
+  `.zcompdump` is dropped by that upgrade (announced), and the rerun — with no
+  dump present — announces no drop.
+- **Test**: the generated `zsh.sh` carries the compinit self-heal (checks
+  `_comps[min]` against the `_min` file).
 - **Test**: an rc file with a start marker but no end marker is left untouched
   by both install and uninstall — each warns naming the file, appends nothing,
   preserves the content after the stray marker, and exits 0.
@@ -423,8 +448,11 @@ installed, and completions regenerate on the next run. Specifically:
   0, warns naming that dir, still installs the other shells' completions, and
   leaks no raw shell `Permission denied` error into the output.
 - **Test**: `--uninstall` removes the generated files, strips the rc block
-  while preserving the user's own rc content, and prunes the emptied
-  completion/shell-init dirs; `--dry-run` announces the strip without editing.
+  while preserving the user's own rc content, prunes the emptied
+  completion/shell-init dirs, and drops the `.zcompdump` cache; `--dry-run`
+  announces the strip and the dump drop without editing either. A data-only
+  install (no zsh completions in the record) leaves the user's `.zcompdump`
+  untouched on uninstall.
 
 ## Non-Goals
 
