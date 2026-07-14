@@ -169,9 +169,18 @@ async fn ls_raw_with_sessions() {
 async fn activate_creates_session() {
     let (daemon, args) = setup().await;
 
+    // Create a temp project dir with a minimal.toml so the
+    // missing-mfile prompt doesn't fire.
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+
     let activate_args = ActivateArgs {
         name: Some("test-session".to_string()),
-        path: ".".to_string(),
+        path: project.path().to_string_lossy().to_string(),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
         loadout: vec![],
