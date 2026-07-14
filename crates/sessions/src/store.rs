@@ -44,8 +44,10 @@ pub trait Loader {
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if the backing record cannot be read or
-    /// deserialized.
+    /// - `NotFound` if `key` is stale — its short is gone from the index, or
+    ///   has been re-allocated to a different session (same semantics as
+    ///   [`Self::save`]). Prevents reading an unrelated session's record.
+    /// - Other I/O errors if the backing record cannot be read or deserialized.
     fn get(&self, key: &Self::Key) -> Result<Self::Object, std::io::Error>;
 
     /// Returns a lookup key corresponding to the given session ID, if
@@ -126,8 +128,12 @@ pub trait Loader {
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if the record cannot be read or the index cannot be
-    /// flushed. A missing directory tree is not an error.
+    /// - `NotFound` if `key` is stale — its short is gone from the index, or
+    ///   has been re-allocated to a different session (same semantics as
+    ///   [`Self::save`]). Prevents destroying an unrelated session. A missing
+    ///   *directory tree* for a still-indexed key is not an error.
+    /// - Other I/O errors if the record cannot be read or the index cannot be
+    ///   flushed.
     fn delete(&mut self, key: &Self::Key) -> Result<(), std::io::Error>;
 }
 
@@ -635,6 +641,39 @@ impl DiskLoader {
 
         Ok(())
     }
+
+    /// Resolve `key` to its live short directory name, or `NotFound` if the
+    /// key is stale.
+    ///
+    /// A [`DiskSessionKey`] can outlive the session it names — a caller may
+    /// hold a key (or a `SessionRecordHandle`) across a concurrent delete. A
+    /// stale key is refused two ways:
+    ///
+    /// - its short is no longer in the index (the session was deleted), or
+    /// - its short is present but now maps to a *different* id. The short is
+    ///   the UUID's last 5 hex chars (20 bits) and is re-allocatable after a
+    ///   delete, so a freed short can be handed to a new session.
+    ///
+    /// The id-strict second check is what stops a stale key from addressing
+    /// the unrelated session that inherited its short — without it, [`get`]
+    /// would read, and [`delete`] would destroy, the wrong session.
+    ///
+    /// [`get`]: Loader::get
+    /// [`delete`]: Loader::delete
+    fn live_short(&self, key: &DiskSessionKey) -> Result<String, std::io::Error> {
+        let short = key.dir_key.to_string();
+        match self.index.short_to_id.get(&short) {
+            Some(stored_id) if stored_id == key.id() => Ok(short),
+            _ => Err(std::io::Error::new(
+                NotFound,
+                format!(
+                    "no session with key (short `{short}`, id `{}`) \
+                     is present in the index",
+                    key.id(),
+                ),
+            )),
+        }
+    }
 }
 
 impl Loader for DiskLoader {
@@ -698,16 +737,15 @@ impl Loader for DiskLoader {
     }
 
     fn get(&self, key: &Self::Key) -> Result<Self::Object, std::io::Error> {
-        assert!(
-            self.index.find_by_short(&key.dir_key).is_some(),
-            "key {:?} not present in index — Keys are only handed out for sessions that exist",
-            key.dir_key,
-        );
+        // Refuse a stale key (session deleted, or its short re-allocated to a
+        // different session) with `NotFound` rather than reading the wrong
+        // record. See `live_short`.
+        let short = self.live_short(key)?;
         let record_file = self
             .minimal_dir
             .as_utf8_path()
             .join("sessions")
-            .join(&key.dir_key)
+            .join(&short)
             .join("record.json");
         let record: Record = serde_json::from_reader(std::fs::File::open(record_file)?)?;
         Ok(DiskSession {
@@ -731,27 +769,12 @@ impl Loader for DiskLoader {
             ));
         }
 
-        let short = key.dir_key.to_string();
+        // Refuse to save against a stale key — one the index has dropped, or
+        // whose short has since been re-allocated to a different session — so
+        // a stale caller can't overwrite the session that inherited the short.
+        // See `live_short`.
+        let short = self.live_short(key)?;
         let id = *key.id();
-
-        // Refuse to save against a key the index has dropped *or* whose
-        // short has since been reused by a different session. The short
-        // is derived from the UUID's last 5 hex chars (20 bits) and is
-        // re-allocatable after `delete`, so a stale key whose original
-        // session was deleted could otherwise overwrite the unrelated
-        // session that inherited the short.
-        match self.index.short_to_id.get(&short) {
-            Some(stored_id) if *stored_id == id => {}
-            _ => {
-                return Err(std::io::Error::new(
-                    NotFound,
-                    format!(
-                        "no session with key (short `{short}`, id `{id}`) \
-                         is present in the index",
-                    ),
-                ));
-            }
-        }
 
         let old_name = self.index.name_by_id(&id).cloned();
         let new_name = record.name.clone();
@@ -792,7 +815,11 @@ impl Loader for DiskLoader {
     }
 
     fn delete(&mut self, key: &Self::Key) -> Result<(), std::io::Error> {
-        let short = key.dir_key.to_string();
+        // Refuse a stale key up front: without the id-strict check, a key
+        // whose short was re-allocated after its own session was deleted would
+        // deindex and `remove_dir_all` the *unrelated* session that inherited
+        // the short. `live_short` returns `NotFound` in that case.
+        let short = self.live_short(key)?;
         // Discover the name index entry from the index itself, not by reading
         // the record: index cleanup must not depend on the on-disk tree still
         // existing, or a half-deleted session (dir gone, index entries left)
@@ -1365,6 +1392,103 @@ mod tests {
         assert_eq!(loader.find_by_name("my-session").unwrap(), None);
         // Session still reachable by id.
         assert_eq!(loader.find_by_id(key.id()).unwrap(), Some(key));
+    }
+
+    // =================================================================
+    // Stale-key rejection on get / delete (id-strict, mirrors save)
+    // =================================================================
+
+    /// `get` against a stale key — for a session that's been deleted — must
+    /// refuse with `NotFound` rather than trying to read a now-absent record.
+    #[test]
+    fn get_against_stale_key_after_delete_errors_with_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        loader.delete(&key).unwrap();
+
+        let err = loader.get(&key).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    /// Plant the "reused short" scenario: create a session, delete it (freeing
+    /// its short), then write a *different* session (distinct id, name
+    /// "squatter") straight onto disk at the freed short and re-open the loader
+    /// so self-heal indexes it as an orphan. Returns the reopened loader, the
+    /// now-stale key of the deleted session, and the new session's id + short.
+    fn reused_short_scenario(tmp: &TempDir) -> (DiskLoader, DiskSessionKey, SessionId, String) {
+        let mut loader = DiskLoader::new(loader_dir(tmp)).unwrap();
+        let stale_key = loader.create(sample_record()).unwrap();
+        let stale_short = stale_key.dir_key.to_string();
+        loader.delete(&stale_key).unwrap();
+        drop(loader);
+
+        // We can't make `create` reliably collide on the 20-bit short, so we
+        // craft the on-disk state directly at the freed short.
+        let new_id = SessionId(uuid::Uuid::from_u128(0xFACE_FEED));
+        assert_ne!(new_id, *stale_key.id(), "test setup: ids must differ");
+        let dir = loader_dir(tmp)
+            .as_utf8_path()
+            .join("sessions")
+            .join(&stale_short);
+        std::fs::create_dir_all(dir.as_std_path()).unwrap();
+        let mut new_record = sample_record();
+        new_record.id = new_id;
+        new_record.name = Some("squatter".into());
+        std::fs::write(
+            dir.join("record.json").as_std_path(),
+            serde_json::to_vec(&new_record).unwrap(),
+        )
+        .unwrap();
+
+        let loader = DiskLoader::new(loader_dir(tmp)).unwrap();
+        assert_eq!(
+            loader.index.short_to_id.get(&stale_short).copied(),
+            Some(new_id),
+            "test setup: the new session should own the reused short",
+        );
+        (loader, stale_key, new_id, stale_short)
+    }
+
+    /// `get` against a stale key whose short has been *reused* by a different
+    /// session must refuse — otherwise a stale caller reads the unrelated
+    /// session's record. The check is id-strict, not just short-presence.
+    #[test]
+    fn get_against_stale_key_with_reused_short_errors_with_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let (loader, stale_key, _new_id, _short) = reused_short_scenario(&tmp);
+
+        let err = loader.get(&stale_key).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    /// `delete` against a stale key whose short was reused must refuse and
+    /// leave the session that inherited the short fully intact — its index
+    /// entry, its `record.json`, and its dir. Without the id-strict guard the
+    /// stale delete would deindex and `remove_dir_all` the wrong session.
+    #[test]
+    fn delete_against_stale_key_with_reused_short_leaves_new_session_intact() {
+        let tmp = TempDir::new().unwrap();
+        let (mut loader, stale_key, new_id, stale_short) = reused_short_scenario(&tmp);
+
+        let err = loader.delete(&stale_key).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+
+        // The squatting session is untouched: still indexed, record readable,
+        // dir on disk.
+        let new_key = loader
+            .find_by_id(&new_id)
+            .unwrap()
+            .expect("the reused-short session must remain indexed");
+        assert_eq!(
+            loader.get(&new_key).unwrap().record().name.as_deref(),
+            Some("squatter"),
+        );
+        assert!(
+            session_dir_path(&loader_dir(&tmp), &stale_short).exists(),
+            "the reused-short session's dir must not be removed",
+        );
     }
 
     // =================================================================
