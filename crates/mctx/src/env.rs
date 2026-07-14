@@ -12,10 +12,9 @@ use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives, TransitivesDep};
 use mfile::{EnvPatches, EnvVarValue};
 use op::Runnable;
 use ot::OpTracker;
-use sandbox2::{
-    Container,
-    config::{Invocation, SandboxMapped},
-};
+#[cfg(target_os = "linux")]
+use sandbox2::Container;
+use sandbox2::config::{Invocation, SandboxMapped};
 use tempfile::TempDir;
 
 #[allow(dead_code)]

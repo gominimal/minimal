@@ -1,10 +1,11 @@
-use std::{
-    io::BufRead,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
+
+#[cfg(target_os = "linux")]
+use std::io::BufRead;
 
 use mfile::{Task, TaskAction};
 use sandbox2::config::Invocation;
+#[cfg(target_os = "linux")]
 use shlex::Shlex;
 
 use crate::{Error, Options, Runnable};

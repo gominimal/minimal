@@ -180,6 +180,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         Ok((dependencies, needs_dns, need_internet))
     }
 
+    #[cfg(target_os = "linux")]
     fn invocations(&self, build: &BuildSpec) -> Result<Vec<(String, Vec<String>)>, Error> {
         if build.cmds.is_empty() || build.cmds[0].is_empty() {
             return Err(Error::Other(anyhow!(

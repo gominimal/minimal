@@ -108,6 +108,7 @@ impl<'a> StandaloneTest<'a> {
         Ok((dependencies, needs_dns, need_internet))
     }
 
+    #[cfg(target_os = "linux")]
     fn invocations(&self, test: &SpecTest) -> Result<Vec<sandbox2::config::Invocation>, Error> {
         if test.cmds.is_empty() || test.cmds[0].is_empty() {
             return Err(Error::Other(anyhow!(
