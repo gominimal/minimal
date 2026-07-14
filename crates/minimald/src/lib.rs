@@ -14,6 +14,7 @@ mod session;
 pub mod session_host;
 mod sessions;
 mod sftp;
+mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_harness;
 

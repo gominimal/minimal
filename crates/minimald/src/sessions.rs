@@ -3,12 +3,13 @@ use std::{collections::BTreeMap, io::ErrorKind::NotFound};
 use crate::{
     session::{Session, SessionHandle},
     session_host::HostAttrs,
+    store::{RecordPredicate, Store, StoreHandle},
 };
 use paths::DaemonAbsPath;
 use sessions::{
     SessionId,
     daemon::composer::{ComposeOutcome, PendingComposeState, resume_from_verdict},
-    store::{DiskLoader, Loader, SessionKey, SessionObject},
+    store::SessionObject,
     wire::request::{ContributionVerdict, SessionStep, WireContribution},
 };
 use std::sync::Arc;
@@ -34,6 +35,15 @@ pub struct SessionInfo {
 pub enum SessionKeyPredicate {
     Id(SessionId),
     Name(String),
+}
+
+impl From<SessionKeyPredicate> for RecordPredicate {
+    fn from(pred: SessionKeyPredicate) -> Self {
+        match pred {
+            SessionKeyPredicate::Id(id) => RecordPredicate::Id(id),
+            SessionKeyPredicate::Name(name) => RecordPredicate::Name(name),
+        }
+    }
 }
 
 /// Transport / internal error when communicating with the sessions actor.
@@ -183,19 +193,15 @@ enum ManagerMessage {
 ///
 /// Follows the actor pattern.
 #[derive(Debug)]
-pub struct Manager<L: Loader = DiskLoader> {
+pub struct Manager {
     in_shutdown: bool,
     receiver: mpsc::Receiver<ManagerMessage>,
-    running: BTreeMap<L::Key, SessionHandle>,
-    store: L,
+    running: BTreeMap<SessionId, SessionHandle>,
+    store: StoreHandle,
 
-    /// A weak handle to this manager, handed down to each session it spawns so
-    /// a session's [`Binding`](crate::session_host) can ask the manager to
-    /// destroy it (the "delete" choice on the shell-exit prompt) without owning
-    /// the manager. It must be weak: a strong self-handle would keep the
-    /// manager's own `recv` loop from ever seeing all senders dropped (wedging
-    /// shutdown) and would close an ownership cycle
-    /// (manager → session → host → binding → manager).
+    /// A weak handle to this manager, which can be duplicated so
+    /// that downstream actors (session, session host) have a handle
+    /// to do operations on us.
     weak_self: WeakManagerHandle,
 
     /// Per-session stash for in-flight `CreateSession` flows that
@@ -252,8 +258,8 @@ impl Manager {
         mctx_config: mctx::Config,
         net_switch: Arc<Mutex<crate::net::SwitchClient>>,
     ) -> Result<ManagerHandle, std::io::Error> {
-        let mut l = DiskLoader::new(minimal_state_dir.clone())?;
-        Self::reap_orphan_pending(&mut l)?;
+        let store = Store::init(minimal_state_dir.clone()).await?;
+        Self::reap_orphan_pending(&store).await?;
 
         // Build the daemon-scoped mctx state once at startup. Each
         // `CreateSession` will build a per-session `Context` on top of
@@ -292,7 +298,7 @@ impl Manager {
             in_shutdown: false,
             receiver,
             running,
-            store: l,
+            store,
             weak_self,
             pending: BTreeMap::new(),
             compositions: BTreeMap::new(),
@@ -309,25 +315,16 @@ impl Manager {
     }
 }
 
-impl<L: Loader> Manager<L> {
-    fn key_for(&self, pred: &SessionKeyPredicate) -> Result<Option<L::Key>, std::io::Error> {
-        match pred {
-            SessionKeyPredicate::Id(id) => self.store.find_by_id(id),
-            SessionKeyPredicate::Name(name) => self.store.find_by_name(name),
-        }
-    }
-
+impl Manager {
     /// Delete any on-disk `Pending` records at startup. Their
     /// in-memory `PendingComposeState` didn't survive the restart,
     /// so they can never transition to `Active`.
-    fn reap_orphan_pending(store: &mut L) -> Result<(), std::io::Error> {
+    async fn reap_orphan_pending(store: &StoreHandle) -> Result<(), std::io::Error> {
         let mut reaped = 0u64;
-        let keys: Vec<L::Key> = store.keys().collect();
-        for k in keys {
-            let obj = store.get(&k)?;
-            if obj.record().status == sessions::SessionStatus::Pending {
-                let id = obj.record().id;
-                store.delete(&k)?;
+        for handle in store.handles().await? {
+            if handle.record().await?.status == sessions::SessionStatus::Pending {
+                let id = *handle.id();
+                handle.delete().await?;
                 tracing::info!(
                     session_id = %id,
                     "reaped orphan Pending session on startup",
@@ -356,18 +353,15 @@ impl<L: Loader> Manager<L> {
             ManagerMessage::List(r) => {
                 r.handle(async {
                     let mut out = Vec::with_capacity(32);
-                    for k in self.store.keys() {
-                        out.push({
-                            let s = self.store.get(&k)?;
-                            let r = s.record();
-                            SessionInfo {
-                                id: r.id,
-                                name: r.name.clone(),
-                                attrs: match self.running.get(&k) {
-                                    Some(h) => h.get_attrs().await,
-                                    None => None,
-                                },
-                            }
+                    for handle in self.store.handles().await? {
+                        let record = handle.record().await?;
+                        out.push(SessionInfo {
+                            id: record.id,
+                            name: record.name.clone(),
+                            attrs: match self.running.get(&record.id) {
+                                Some(h) => h.get_attrs().await,
+                                None => None,
+                            },
                         });
                     }
                     Ok(out)
@@ -377,15 +371,9 @@ impl<L: Loader> Manager<L> {
             // Gets the record for a specific session.
             ManagerMessage::GetRecord(pred, r) => {
                 r.handle(async {
-                    Ok::<_, SessionsError>(match pred {
-                        SessionKeyPredicate::Id(id) => self
-                            .store
-                            .find_by_id(&id)?
-                            .map(|k| self.store.get(&k).unwrap().record().clone()),
-                        SessionKeyPredicate::Name(name) => self
-                            .store
-                            .find_by_name(&name)?
-                            .map(|k| self.store.get(&k).unwrap().record().clone()),
+                    Ok::<_, SessionsError>(match self.store.find(pred.into()).await? {
+                        Some(handle) => Some(handle.record().await?),
+                        None => None,
                     })
                 })
                 .await;
@@ -402,10 +390,10 @@ impl<L: Loader> Manager<L> {
                             "in shutdown",
                         ));
                     }
-                    match self.key_for(&pred)? {
+                    match self.store.find(pred.into()).await? {
                         None => Ok(None),
-                        Some(k) => {
-                            let obj = self.store.get(&k)?;
+                        Some(handle) => {
+                            let obj = handle.object().await?;
                             if obj.record().status != sessions::SessionStatus::Active {
                                 tracing::info!(
                                     session_id = %obj.record().id,
@@ -414,11 +402,11 @@ impl<L: Loader> Manager<L> {
                                 );
                                 return Ok(None);
                             }
-                            let session_handle = match self.running.get(&k) {
+                            let session_id = obj.record().id;
+                            let session_handle = match self.running.get(&session_id) {
                                 Some(h) => h.clone(),
                                 None => {
                                     // Not running, start it!
-                                    let obj = self.store.get(&k)?;
                                     // Register a PTask's hostname on launch so it
                                     // routes host-side (R3.1/R3.6). Both HostNet and
                                     // OwnIp resolve to loopback: a HostNet PTask's
@@ -454,7 +442,6 @@ impl<L: Loader> Manager<L> {
                                     // identically. Drain happens only on
                                     // the success path just after the
                                     // spawn returns.
-                                    let session_id = obj.record().id;
                                     let composition = self.compositions.get(&session_id).cloned();
                                     // A spawn failure at this point (only
                                     // I/O failures on `mkdir` of the
@@ -495,7 +482,7 @@ impl<L: Loader> Manager<L> {
                                             _ => reg.register_host_net(id, &name),
                                         };
                                     }
-                                    self.running.insert(k, h.clone());
+                                    self.running.insert(session_id, h.clone());
                                     h
                                 }
                             };
@@ -528,7 +515,7 @@ impl<L: Loader> Manager<L> {
                     });
                 let pending = &mut self.pending;
                 let compositions = &mut self.compositions;
-                let store = &mut self.store;
+                let store = self.store.clone();
                 responder
                     .handle(async move {
                         if in_shutdown {
@@ -568,8 +555,8 @@ impl<L: Loader> Manager<L> {
                                     username,
                                     sessions::SessionStatus::Active,
                                 )?;
-                                let k = store.create(record)?;
-                                let id = *k.id();
+                                let handle = store.create(record).await?;
+                                let id = *handle.id();
                                 compositions.insert(id, Arc::new(composition));
                                 Ok(minimald_rpc::CreateSessionResponse::Ready { id })
                             }
@@ -598,8 +585,8 @@ impl<L: Loader> Manager<L> {
                                     username,
                                     sessions::SessionStatus::Pending,
                                 )?;
-                                let k = store.create(record)?;
-                                let id = *k.id();
+                                let handle = store.create(record).await?;
+                                let id = *handle.id();
                                 response.session_id = id;
                                 pending.insert(id, state);
                                 Ok(minimald_rpc::CreateSessionResponse::Pending { id, response })
@@ -629,7 +616,7 @@ impl<L: Loader> Manager<L> {
                 } else {
                     self.pending.remove(&session_id)
                 };
-                let store = &mut self.store;
+                let store = self.store.clone();
                 let compositions = &mut self.compositions;
                 responder
                     .handle(async move {
@@ -667,8 +654,9 @@ impl<L: Loader> Manager<L> {
                                 // A delete failure here is logged but
                                 // doesn't override the verdict-level
                                 // error returned to the client.
-                                if let Some(k) = store.find_by_id(&session_id)?
-                                    && let Err(del_err) = store.delete(&k)
+                                if let Some(handle) =
+                                    store.find(RecordPredicate::Id(session_id)).await?
+                                    && let Err(del_err) = handle.delete().await
                                 {
                                     tracing::warn!(
                                         session_id = %session_id,
@@ -685,15 +673,15 @@ impl<L: Loader> Manager<L> {
                         // Active`. A mid-flight delete or a status
                         // already past `Pending` is degenerate but
                         // surfaces as a structured `WrongState`.
-                        let k = match store.find_by_id(&session_id)? {
-                            Some(k) => k,
+                        let handle = match store.find(RecordPredicate::Id(session_id)).await? {
+                            Some(h) => h,
                             None => {
                                 return Ok(SessionStep::Fault {
                                     error: sessions::wire::errors::WireError::UnknownSessionId,
                                 });
                             }
                         };
-                        let mut record = store.get(&k)?.record().clone();
+                        let mut record = handle.record().await?;
                         if record.status != sessions::SessionStatus::Pending {
                             return Ok(SessionStep::Fault {
                                 error: sessions::wire::errors::WireError::WrongState {
@@ -702,7 +690,7 @@ impl<L: Loader> Manager<L> {
                             });
                         }
                         record.status = sessions::SessionStatus::Active;
-                        store.save(&k, &record)?;
+                        handle.write(record).await?;
                         compositions.insert(session_id, Arc::new(composition));
                         Ok(SessionStep::Active { id: session_id })
                     })
@@ -717,12 +705,13 @@ impl<L: Loader> Manager<L> {
                             "in shutdown",
                         ));
                     }
-                    match self.store.find_by_id(&id)? {
+                    match self.store.find(RecordPredicate::Id(id)).await? {
                         None => Err(std::io::Error::new(
                             NotFound,
                             format!("no session with ID `{}`", id.as_ref()),
                         )),
-                        Some(k) => {
+                        Some(handle) => {
+                            let mut record = handle.record().await?;
                             // Snapshot the live route (id + pre-rename name + mode)
                             // before the rename mutates the record. Only a running
                             // session has a route (registered on launch), and both
@@ -732,21 +721,21 @@ impl<L: Loader> Manager<L> {
                                 SessionId,
                                 String,
                                 sessions::NetworkMode,
-                            )> = if self.running.contains_key(&k) {
-                                let rec = self.store.get(&k)?;
-                                let net = rec.record().network;
+                            )> = if self.running.contains_key(&id) {
+                                let net = record.network;
                                 matches!(
                                     net,
                                     sessions::NetworkMode::HostNet | sessions::NetworkMode::OwnIp
                                 )
-                                .then(|| (rec.record().id, registry_name(rec.record()), net))
+                                .then(|| (record.id, registry_name(&record), net))
                             } else {
                                 None
                             };
 
-                            self.store.rename(&k, new_name.clone())?;
-                            if let Some(hnd) = self.running.get(&k) {
-                                hnd.apply_record(self.store.get(&k)?.record().clone()).await;
+                            record.name = Some(new_name.clone());
+                            handle.write(record.clone()).await?;
+                            if let Some(hnd) = self.running.get(&id) {
+                                hnd.apply_record(record.clone()).await;
                             }
 
                             // Follow the rename in the hostname registry so
@@ -755,7 +744,7 @@ impl<L: Loader> Manager<L> {
                             // under the launch name.
                             #[cfg(target_os = "linux")]
                             if let Some((id, old_name, net)) = relink {
-                                let new_reg = registry_name(self.store.get(&k)?.record());
+                                let new_reg = registry_name(&record);
                                 let mut reg = self
                                     .hostnames
                                     .write()
@@ -786,13 +775,17 @@ impl<L: Loader> Manager<L> {
                             "in shutdown",
                         ));
                     }
-                    let k = self.store.find_by_id(&id)?.ok_or_else(|| {
-                        std::io::Error::new(
-                            NotFound,
-                            format!("no session with ID `{}`", id.as_ref()),
-                        )
-                    })?;
-                    let record = self.store.get(&k)?.record().clone();
+                    let handle =
+                        self.store
+                            .find(RecordPredicate::Id(id))
+                            .await?
+                            .ok_or_else(|| {
+                                std::io::Error::new(
+                                    NotFound,
+                                    format!("no session with ID `{}`", id.as_ref()),
+                                )
+                            })?;
+                    let record = handle.record().await?;
                     if record.status != sessions::SessionStatus::Pending {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
@@ -812,7 +805,7 @@ impl<L: Loader> Manager<L> {
                     // (post-Active) path, so a Pending abort always
                     // finds nothing here; the call is a no-op today.
                     self.compositions.remove(&id);
-                    self.store.delete(&k)?;
+                    handle.delete().await?;
                     Ok(())
                 })
                 .await
@@ -827,18 +820,22 @@ impl<L: Loader> Manager<L> {
                             "in shutdown",
                         ));
                     }
-                    let k = self.store.find_by_id(&id)?.ok_or_else(|| {
-                        std::io::Error::new(
-                            NotFound,
-                            format!("no session with ID `{}`", id.as_ref()),
-                        )
-                    })?;
+                    let handle =
+                        self.store
+                            .find(RecordPredicate::Id(id))
+                            .await?
+                            .ok_or_else(|| {
+                                std::io::Error::new(
+                                    NotFound,
+                                    format!("no session with ID `{}`", id.as_ref()),
+                                )
+                            })?;
                     // Derive the hostname registry key from the record up front,
                     // letting a read error propagate before anything is torn
                     // down. `deregister` is a no-op for a session that never
                     // registered one, so it is called unconditionally.
                     #[cfg(target_os = "linux")]
-                    let host_net_name = registry_name(self.store.get(&k)?.record());
+                    let host_net_name = registry_name(&handle.record().await?);
                     // Drain the composition stash before teardown. A
                     // session that never advanced to `GetSession`
                     // (created + destroyed without an attach) would
@@ -848,7 +845,7 @@ impl<L: Loader> Manager<L> {
                     // Stop the live session first (killing its host and waiting
                     // for the sandbox to be released) so the on-disk tree is
                     // free to remove.
-                    if let Some(hnd) = self.running.remove(&k) {
+                    if let Some(hnd) = self.running.remove(&id) {
                         hnd.destroy().await;
                     }
                     // Withdraw the PTask hostname (R3.5) before the fallible
@@ -860,7 +857,7 @@ impl<L: Loader> Manager<L> {
                         .write()
                         .expect("hostname registry lock poisoned")
                         .deregister(&host_net_name);
-                    self.store.delete(&k)?;
+                    handle.delete().await?;
                     Ok(())
                 })
                 .await
@@ -877,18 +874,21 @@ impl<L: Loader> Manager<L> {
                     // Withdraw the PTask hostnames (R3.5) for every live session
                     // before tearing them down, mirroring DestroySession, so the
                     // shutdown drain never leaves stale routing entries pointing
-                    // at destroyed sessions. Names are derived up front via
-                    // synchronous store reads so the registry lock is never held
-                    // across `destroy().await`. `deregister` is a no-op for a
-                    // session that never registered a hostname.
+                    // at destroyed sessions. Names are read from the store up
+                    // front (best-effort — a read failure just skips that entry)
+                    // so the registry lock is never held across `destroy().await`.
+                    // `deregister` is a no-op for a session that never registered
+                    // a hostname.
                     #[cfg(target_os = "linux")]
                     {
-                        let names: Vec<String> = self
-                            .running
-                            .keys()
-                            .filter_map(|k| self.store.get(k).ok())
-                            .map(|obj| registry_name(obj.record()))
-                            .collect();
+                        let mut names: Vec<String> = Vec::new();
+                        for id in self.running.keys().copied().collect::<Vec<_>>() {
+                            if let Ok(Some(handle)) = self.store.find(RecordPredicate::Id(id)).await
+                                && let Ok(record) = handle.record().await
+                            {
+                                names.push(registry_name(&record));
+                            }
+                        }
                         let mut reg = self
                             .hostnames
                             .write()
@@ -972,12 +972,10 @@ impl WeakManagerHandle {
     }
 }
 
-/// The capability handed to a session's [`Binding`](crate::session_host) to
-/// tear its own session down — the "delete" choice on the shell-exit prompt.
+/// A non-owning handle to manipulate a specific session on a sessions actor.
 ///
-/// Bundles a [`WeakManagerHandle`] with the [`SessionId`] to destroy, so the
-/// binding neither owns the manager nor needs to know how destruction is
-/// carried out.
+/// Used by downstream actors (i.e. [`Binding`](crate::session_host)) to
+/// manipulate the session itself, such as deletion.
 #[derive(Debug, Clone)]
 pub struct SessionControl {
     manager: WeakManagerHandle,
@@ -1367,9 +1365,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reap_orphan_pending_deletes_pending_records() {
         let tmp = TempDir::new().unwrap();
-        let mut loader = DiskLoader::new(daemon_dir(&tmp)).unwrap();
+        let store = Store::init(daemon_dir(&tmp)).await.unwrap();
 
-        let pending_key = loader
+        let pending_id = *store
             .create(sessions::Record {
                 id: SessionId::nil(),
                 name: Some("pending".into()),
@@ -1380,8 +1378,10 @@ mod tests {
                 status: sessions::SessionStatus::Pending,
                 attrs: Default::default(),
             })
-            .unwrap();
-        let active_key = loader
+            .await
+            .unwrap()
+            .id();
+        let active_id = *store
             .create(sessions::Record {
                 id: SessionId::nil(),
                 name: Some("active".into()),
@@ -1392,22 +1392,27 @@ mod tests {
                 status: sessions::SessionStatus::Active,
                 attrs: Default::default(),
             })
-            .unwrap();
+            .await
+            .unwrap()
+            .id();
 
-        let pending_id = *pending_key.id();
-        let active_id = *active_key.id();
-        Manager::<DiskLoader>::reap_orphan_pending(&mut loader).unwrap();
+        Manager::reap_orphan_pending(&store).await.unwrap();
 
         assert!(
-            loader.find_by_id(&pending_id).unwrap().is_none(),
+            store
+                .find(RecordPredicate::Id(pending_id))
+                .await
+                .unwrap()
+                .is_none(),
             "the Pending record should be reaped from the index",
         );
-        let active_key_again = loader
-            .find_by_id(&active_id)
+        let active = store
+            .find(RecordPredicate::Id(active_id))
+            .await
             .unwrap()
             .expect("Active record's index entry should remain");
         assert_eq!(
-            loader.get(&active_key_again).unwrap().record().status,
+            active.record().await.unwrap().status,
             sessions::SessionStatus::Active,
             "the Active record should remain",
         );

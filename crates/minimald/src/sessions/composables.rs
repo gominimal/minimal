@@ -1,7 +1,7 @@
 //! Free helpers that assemble the daemon-side composables for a
 //! `CreateSession` request.
 //!
-//! The three pipeline stages sit here rather than on `Manager<L>`
+//! The three pipeline stages sit here rather than on `Manager`
 //! so each can be unit-tested in isolation without spinning the
 //! actor mainloop:
 //! - [`resolve_project_ctx_and_graph`] parses the client's project
