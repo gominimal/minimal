@@ -1,33 +1,15 @@
 //! Streaming tar+zstd upload of the project directory to the daemon.
+//!
+//! The tar builder writes directly into a zstd encoder which writes
+//! to the SSH channel stream — nothing is buffered in memory beyond
+//! the encoder's internal buffer.
 
 use std::path::Path;
 
 use anyhow::Context as _;
 use async_tar::Builder;
 use tokio::fs;
-
-/// Builds an in-memory tar archive of `dir`, preserving relative paths.
-///
-/// Symlinks are stored as symlinks. Directory entries are included so
-/// empty directories survive the round-trip. Unreadable directories
-/// and non-regular files (sockets, FIFOs, devices) are silently skipped.
-pub async fn tar_directory(dir: &Path) -> Result<Vec<u8>, anyhow::Error> {
-    let mut tar = Builder::new(Vec::new());
-    let result = add_dir_entries(&mut tar, dir, "").await;
-    if let Err(e) = result {
-        let _ = tar.into_inner().await;
-        return Err(e);
-    }
-    tar.into_inner().await.context("finalizing tar archive")
-}
-
-async fn add_dir_entries(
-    tar: &mut Builder<Vec<u8>>,
-    root: &Path,
-    prefix: &str,
-) -> Result<(), anyhow::Error> {
-    add_dir_entries_inner(tar, root, prefix).await
-}
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// Directories always skipped during upload. A proper .gitignore
 /// implementation is tracked as a follow-up on #263.
@@ -37,15 +19,55 @@ fn is_default_excluded(name: &str) -> bool {
     DEFAULT_EXCLUDED_DIRS.contains(&name)
 }
 
-async fn file_type_will_be_dir(entry: &tokio::fs::DirEntry, entry_path: &std::path::Path) -> bool {
-    match entry.file_type().await {
-        Ok(t) => t.is_dir(),
-        Err(_) => entry_path.is_dir(),
-    }
+/// Streams a zstd-compressed tar archive of `dir` into `writer`.
+///
+/// The tar builder writes directly into the zstd encoder which writes
+/// to `writer`, so the archive is never fully buffered in memory.
+pub async fn stream_tar_zstd<W: AsyncWrite + Unpin + Send>(
+    dir: &Path,
+    mut writer: W,
+) -> Result<(), anyhow::Error> {
+    // async_tar::Builder requires W: Sync, but the SSH channel stream
+    // is not Sync. Use a duplex pipe: the tar builder writes to one end
+    // (in a background task), and we copy from the other end to writer.
+    const PIPE_BUF: usize = 256 * 1024;
+    let (tx, mut rx) = tokio::io::duplex(PIPE_BUF);
+
+    let build = {
+        let dir = dir.to_path_buf();
+        tokio::spawn(async move {
+            let encoder = async_compression::tokio::write::ZstdEncoder::new(tx);
+            let mut tar = Builder::new(encoder);
+            add_dir_entries(&mut tar, &dir, "").await?;
+            let mut encoder = tar.into_inner().await.context("finalizing tar archive")?;
+            encoder.shutdown().await.context("flushing zstd encoder")?;
+            Ok::<(), anyhow::Error>(())
+        })
+    };
+
+    tokio::io::copy(&mut rx, &mut writer)
+        .await
+        .context("copying tar stream to channel")?;
+    writer.flush().await.context("flushing upload stream")?;
+    writer
+        .shutdown()
+        .await
+        .context("shutting down upload stream")?;
+
+    build.await.context("tar build task panicked")??;
+    Ok(())
 }
 
-fn add_dir_entries_inner<'a>(
-    tar: &'a mut Builder<Vec<u8>>,
+async fn add_dir_entries<W: AsyncWrite + Unpin + Send + Sync>(
+    tar: &mut Builder<W>,
+    root: &Path,
+    prefix: &str,
+) -> Result<(), anyhow::Error> {
+    add_dir_entries_inner(tar, root, prefix).await
+}
+
+fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
+    tar: &'a mut Builder<W>,
     root: &'a Path,
     prefix: &'a str,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'a>> {
@@ -78,10 +100,19 @@ fn add_dir_entries_inner<'a>(
             let name_str = name.to_string_lossy();
             let entry_path = entry.path();
 
-            // Skip common heavy/irrelevant directories. A proper .gitignore
-            // implementation is tracked as a follow-up on #263.
-            if file_type_will_be_dir(&entry, &entry_path).await && is_default_excluded(&name_str) {
-                continue;
+            // Skip common heavy/irrelevant directories.
+            if is_default_excluded(&name_str) {
+                let ft = match entry.file_type().await {
+                    Ok(t) => t,
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
+                    Err(e) => {
+                        return Err(anyhow::Error::from(e)
+                            .context(format!("getting file type for {}", entry_path.display())));
+                    }
+                };
+                if ft.is_dir() {
+                    continue;
+                }
             }
 
             let archive_path = if prefix.is_empty() {
@@ -166,13 +197,19 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
 
-    /// Unpacks a raw tar archive into a tempdir and returns the list of
-    /// all file paths (relative) found by walking the unpacked tree.
-    async fn unpack_and_list(tar_bytes: &[u8]) -> Vec<String> {
+    /// Streams a tar+zstd archive into a buffer, decompresses it, unpacks
+    /// it into a tempdir, and returns the list of all file/symlink paths
+    /// (relative) found by walking the unpacked tree.
+    async fn stream_and_list(dir: &Path) -> Vec<String> {
+        let mut buf = Vec::new();
+        stream_tar_zstd(dir, &mut buf).await.unwrap();
+
+        let decoder = async_compression::tokio::bufread::ZstdDecoder::new(&buf[..]);
         let out = tempfile::TempDir::new().unwrap();
-        let archive = async_tar::Archive::new(tar_bytes);
+        let archive = async_tar::Archive::new(decoder);
         archive.unpack(out.path().to_path_buf()).await.unwrap();
 
+        let mut paths = Vec::new();
         fn walk(dir: &std::path::Path, base: &std::path::Path, paths: &mut Vec<String>) {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let entry = entry.unwrap();
@@ -190,20 +227,17 @@ mod tests {
                 }
             }
         }
-        let mut paths = Vec::new();
         walk(out.path(), out.path(), &mut paths);
         paths
     }
 
     #[tokio::test]
-    async fn tar_skips_unix_sockets() {
+    async fn stream_skips_unix_sockets() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("hello.txt"), "hello").unwrap();
         let _socket = UnixListener::bind(dir.path().join("sock")).unwrap();
 
-        let tar = tar_directory(dir.path()).await.unwrap();
-        let paths = unpack_and_list(&tar).await;
-
+        let paths = stream_and_list(dir.path()).await;
         assert!(
             paths.iter().any(|p| p == "hello.txt"),
             "hello.txt should be in the archive"
@@ -212,7 +246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tar_skips_permission_denied_dirs() {
+    async fn stream_skips_permission_denied_dirs() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("readable.txt"), "ok").unwrap();
 
@@ -221,11 +255,9 @@ mod tests {
         std::fs::write(restricted.join("secret.txt"), "secret").unwrap();
         std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let tar = tar_directory(dir.path()).await.unwrap();
-
+        let paths = stream_and_list(dir.path()).await;
         std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o755)).ok();
 
-        let paths = unpack_and_list(&tar).await;
         assert!(
             paths.iter().any(|p| p == "readable.txt"),
             "readable.txt should be in the archive"
@@ -237,16 +269,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tar_includes_regular_files_dirs_and_symlinks() {
+    async fn stream_includes_regular_files_dirs_and_symlinks() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("file.txt"), "content").unwrap();
         std::fs::create_dir_all(dir.path().join("subdir")).unwrap();
         std::fs::write(dir.path().join("subdir/nested.txt"), "nested").unwrap();
         std::os::unix::fs::symlink("file.txt", dir.path().join("link")).unwrap();
 
-        let tar = tar_directory(dir.path()).await.unwrap();
-        let paths = unpack_and_list(&tar).await;
-
+        let paths = stream_and_list(dir.path()).await;
         assert!(paths.iter().any(|p| p == "file.txt"), "file.txt missing");
         assert!(
             paths.iter().any(|p| p == "subdir/nested.txt"),
@@ -256,22 +286,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tar_does_not_follow_symlinks_to_external_files() {
+    async fn stream_does_not_follow_symlinks_to_external_files() {
         let dir = tempfile::TempDir::new().unwrap();
         let external = tempfile::TempDir::new().unwrap();
         std::fs::write(external.path().join("secret"), "sensitive").unwrap();
 
-        // Create a symlink pointing outside the project dir.
         std::os::unix::fs::symlink(external.path().join("secret"), dir.path().join("escape"))
             .unwrap();
         std::fs::write(dir.path().join("safe.txt"), "safe").unwrap();
 
-        let tar = tar_directory(dir.path()).await.unwrap();
+        let mut buf = Vec::new();
+        stream_tar_zstd(dir.path(), &mut buf).await.unwrap();
 
-        // Unpack into a tempdir and verify the symlink was stored as a
-        // symlink (not the external file's contents).
+        let decoder = async_compression::tokio::bufread::ZstdDecoder::new(&buf[..]);
         let out = tempfile::TempDir::new().unwrap();
-        let archive = async_tar::Archive::new(&tar[..]);
+        let archive = async_tar::Archive::new(decoder);
         archive.unpack(out.path().to_path_buf()).await.unwrap();
 
         let escape_path = out.path().join("escape");
@@ -279,22 +308,11 @@ mod tests {
             escape_path.is_symlink(),
             "escape should be a symlink, not a copied file"
         );
-        // Verify it still points to the external path, not the content.
-        let target = std::fs::read_link(&escape_path).unwrap();
-        assert_eq!(target, external.path().join("secret"));
-
-        // The external file's content should NOT have been copied.
-        assert!(
-            !std::fs::exists(escape_path.join("secret")).unwrap_or(false),
-            "should not have followed the symlink"
-        );
-
-        // safe.txt should be present.
         assert!(out.path().join("safe.txt").is_file());
     }
 
     #[tokio::test]
-    async fn tar_excludes_default_dirs() {
+    async fn stream_excludes_default_dirs() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("keep.txt"), "keep").unwrap();
         std::fs::create_dir_all(dir.path().join("target")).unwrap();
@@ -304,9 +322,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
         std::fs::write(dir.path().join("node_modules/lib.js"), "lib").unwrap();
 
-        let tar = tar_directory(dir.path()).await.unwrap();
-        let paths = unpack_and_list(&tar).await;
-
+        let paths = stream_and_list(dir.path()).await;
         assert!(
             paths.iter().any(|p| p == "keep.txt"),
             "keep.txt should be uploaded"

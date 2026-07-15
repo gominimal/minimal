@@ -178,33 +178,11 @@ impl Client {
             .await
             .context("request WorkspaceFilesTarZst subsystem")?;
 
-        let mut stream = channel.into_stream();
+        let stream = channel.into_stream();
 
-        // Build a tar archive of the directory, zstd-compress it, and
-        // stream it over the channel.
-        let tar = crate::file_upload::tar_directory(dir).await?;
-        let mut encoder = async_compression::tokio::write::ZstdEncoder::new(Vec::new());
-        encoder
-            .write_all(&tar)
-            .await
-            .context("zstd-compressing workspace tarball")?;
-        encoder.shutdown().await.context("flushing zstd encoder")?;
-        let compressed = encoder.into_inner();
-
-        stream
-            .write_all(&compressed)
-            .await
-            .context("writing workspace tarball to daemon")?;
-        stream
-            .shutdown()
-            .await
-            .context("shutting down upload stream")?;
-
-        // Drain any response (the daemon sends extended-data on error,
-        // or closes the channel on success).
-        stream.read_to_end(&mut Vec::new()).await.ok();
-
-        Ok(())
+        // Stream a tar+zstd archive directly to the daemon channel,
+        // avoiding buffering the entire archive in memory.
+        crate::file_upload::stream_tar_zstd(dir, stream).await
     }
 }
 
