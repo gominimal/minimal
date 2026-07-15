@@ -584,8 +584,12 @@ while read -r comp _ _ _ want kind dest src; do
     # R5.5 — last moment before the first live file is swapped, so a run where
     # every component is up to date (or one that dies fetching/verifying) never
     # touches a healthy daemon. The guard inside makes this a no-op after the
-    # first replaced component.
-    stop_running_daemon
+    # first replaced component. Only executable images wedge a running daemon
+    # (bin, and lib — minvmd's @rpath dylib); replacing a data file (e.g. a
+    # re-shipped apparmor text) must not kill live sessions.
+    case "$prefix" in
+        bin|lib) stop_running_daemon ;;
+    esac
 
     mv -f "$tmp" "$target_file"
     installed=$((installed + 1))
@@ -826,21 +830,37 @@ esac
 # restriction at install time (Linux only) and point at the AppArmor loader we
 # just shipped. Advice only: installing the profile needs root, and this
 # installer never elevates. Silent on hosts that do not need it, AND on a host
-# already remediated: once the loader has installed /etc/apparmor.d/minimald the
-# sysctl is still 1 but sessions work, so a reinstall must not claim they cannot
-# start. The sysctl and apparmor.d paths are overridable for install_test.sh.
+# already remediated — but "remediated" depends on the bin prefix: the stock
+# tunable attaches only /usr/bin, /usr/local/bin, and ~/.local/bin, so for a
+# custom MINIMAL_BIN the advised command carries --path, and a loaded profile
+# counts as remediation only if the tunables actually name this binary
+# (otherwise sessions still die and a reinstall must keep saying so). The
+# sysctl and apparmor.d paths are overridable for install_test.sh.
 userns_sysctl="${MINIMAL_OVERRIDE_USERNS_SYSCTL:-/proc/sys/kernel/apparmor_restrict_unprivileged_userns}"
 apparmor_dir="${MINIMAL_OVERRIDE_APPARMOR_DIR:-/etc/apparmor.d}"
 if [ "$os" = linux ] && [ -r "$userns_sysctl" ] \
-    && [ "$(cat "$userns_sysctl" 2>/dev/null)" = 1 ] \
-    && [ ! -e "$apparmor_dir/minimald" ]; then
+    && [ "$(cat "$userns_sysctl" 2>/dev/null)" = 1 ]; then
     apparmor_loader="$(resolve_prefix data)/apparmor/install-apparmor-profile.sh"
-    if [ -f "$apparmor_loader" ]; then
+    aa_loader_args=""
+    aa_remediated=0
+    case "$bindir" in
+        /usr/bin|/usr/local/bin|"$HOME/.local/bin")
+            [ -e "$apparmor_dir/minimald" ] && aa_remediated=1
+            ;;
+        *)
+            aa_loader_args=" --path \"$bindir/minimald\""
+            if [ -e "$apparmor_dir/minimald" ] \
+                && grep -rqs "$bindir/minimald" "$apparmor_dir/tunables" 2>/dev/null; then
+                aa_remediated=1
+            fi
+            ;;
+    esac
+    if [ "$aa_remediated" -eq 0 ] && [ -f "$apparmor_loader" ]; then
         say ""
         say "note: this host restricts unprivileged user namespaces (Ubuntu 24.04+);"
         say "  minimald's session sandbox cannot start until you install its AppArmor"
         say "  profile — a one-time step that needs root:"
-        say "      sudo bash \"$apparmor_loader\""
+        say "      sudo bash \"$apparmor_loader\"$aa_loader_args"
         say "  details: https://docs.minimal.dev/reference/linux-host-setup"
     fi
 fi

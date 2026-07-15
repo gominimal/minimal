@@ -206,6 +206,12 @@ TEST_SHELL=
 USERNS_SYSCTL=
 APPARMOR_DIR=
 
+# Bin prefix the installer sees. Empty means the harness default ($hp/bin — a
+# custom MINIMAL_BIN, NOT one of the AppArmor tunable's stock attachment
+# paths); scenarios set it to $hp/.local/bin to exercise the default-prefix
+# branch of the userns advisory.
+BIN_OVERRIDE=
+
 # run <label> <homeprefix> [args...] ; sets rc, captures combined output in $OUT.
 OUT=
 run() {
@@ -216,7 +222,7 @@ run() {
         PATH="$stubbin:/usr/bin:/bin" \
         HOME="$hp" \
         SHELL="${TEST_SHELL:-/bin/sh}" \
-        MINIMAL_BIN="$hp/bin" \
+        MINIMAL_BIN="${BIN_OVERRIDE:-$hp/bin}" \
         XDG_DATA_HOME="$hp/xdg-data" \
         XDG_STATE_HOME="$hp/xdg-state" \
         XDG_CACHE_HOME="$hp/xdg-cache" \
@@ -271,6 +277,10 @@ want_ok "advisory names the userns restriction" \
     grep -q "restricts unprivileged user namespaces" "$OUT"
 want_ok "advisory points at the shipped loader with sudo bash" \
     grep -q "sudo bash .*apparmor/install-apparmor-profile.sh" "$OUT"
+# The harness bindir is a custom MINIMAL_BIN, outside the tunable's stock
+# attachment set, so the advised command must attach it explicitly.
+want_ok "advisory carries --path for a custom MINIMAL_BIN" \
+    grep -q -- "--path \"$H1/bin/minimald\"" "$OUT"
 
 USERNS_SYSCTL="$root/sysctl-off"
 run aa_unrestricted "$H1"
@@ -278,14 +288,32 @@ USERNS_SYSCTL=
 want_err "no advisory when the restriction is off (sysctl 0)" \
     grep -q "restricts unprivileged user namespaces" "$OUT"
 
-# Advisory is suppressed on an already-remediated host: sysctl still reads 1 but
-# the system profile is installed, so a reinstall must not claim sessions fail.
+# A loaded system profile alone is NOT remediation for a custom MINIMAL_BIN:
+# the stock tunable does not attach it, so sessions still die and the advisory
+# must keep firing (with --path) until the tunables name this binary.
 mkdir -p "$root/aa-present"; printf 'profile\n' >"$root/aa-present/minimald"
 USERNS_SYSCTL="$root/sysctl-on"; APPARMOR_DIR="$root/aa-present"
-run aa_already "$H1"
-USERNS_SYSCTL=; APPARMOR_DIR=
-want_err "no advisory when the system profile is already installed" \
+run aa_present_unattached "$H1"
+want_ok "advisory still fires when the profile is loaded but MINIMAL_BIN unattached" \
+    grep -q -- "--path \"$H1/bin/minimald\"" "$OUT"
+
+# ...and is suppressed once the tunables do name it (what the loader's --path
+# records under tunables/minimald.d).
+mkdir -p "$root/aa-present/tunables/minimald.d"
+printf '@{minimald_bin} += %s/bin/minimald\n' "$H1" \
+    >"$root/aa-present/tunables/minimald.d/paths"
+run aa_attached "$H1"
+want_err "no advisory when the tunables attach this MINIMAL_BIN" \
     grep -q "restricts unprivileged user namespaces" "$OUT"
+
+# For the stock prefix (~/.local/bin) the profile's own tunable already
+# attaches the binary, so the profile file existing IS remediation.
+BIN_OVERRIDE="$H1/.local/bin"
+run aa_already_default_bin "$H1"
+BIN_OVERRIDE=
+want_err "no advisory for the default prefix when the system profile is installed" \
+    grep -q "restricts unprivileged user namespaces" "$OUT"
+USERNS_SYSCTL=; APPARMOR_DIR=
 
 # Darwin hosts never receive the apparmor components (linux-only manifest rows).
 HAA_D="$root/haa_d"; mkdir -p "$HAA_D"
@@ -473,6 +501,17 @@ run daemonupgrade "$H8"
 check 0 "$rc" "upgrade exits 0"
 want_ok "upgrade runs min stop --force (R5.5)" test -f "$H8/stop.calls"
 check "stop --force" "$(cat "$H8/stop.calls")" "stop is called once, with --force (R5.5)"
+
+# Replacing only a data component must NOT stop the daemon: data files (the
+# apparmor profile/tunable/loader) are not executable images, and the running
+# daemon does not serve from them — only bin/lib swaps wedge it (R5.5).
+rm -f "$H8/stop.calls"
+printf 'tampered\n' >"$H8/xdg-data/minimal/apparmor/minimald"
+run daemondataonly "$H8"
+check 0 "$rc" "data-only rerun exits 0"
+want_err "data-only replacement leaves the daemon alone (R5.5)" test -e "$H8/stop.calls"
+check "$h_aaprof" "$(hash_file "$H8/xdg-data/minimal/apparmor/minimald")" \
+    "tampered data component was re-placed"
 
 # A `min` that fails and shouts is non-fatal and silent: an old binary may not
 # know `stop --force`, and no daemon running is itself a non-zero `min stop`.
