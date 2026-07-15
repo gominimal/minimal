@@ -120,6 +120,12 @@ write_manifest() {
             apparmor-tunable linux amd64 v1 "$h_aatun" file data/apparmor/tunables/minimald versions/v1/minimald.apparmor-tunable
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             apparmor-installer linux amd64 v1 "$h_aaload" file data/apparmor/install-apparmor-profile.sh versions/v1/install-apparmor-profile.sh
+        # Symlink rows (R5.6): sha256 is the `-` placeholder, src is the link
+        # target relative to dest's directory.
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            git-remote-min linux amd64 v1 - symlink bin/git-remote-min min
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            git-remote-min darwin arm64 v1 - symlink bin/git-remote-min min
     } >"$mock/versions/v1/components"
 }
 write_manifest 1
@@ -251,6 +257,8 @@ check "$h_minimald" "$(hash_file "$H1/bin/minimald")" "installed content matches
 # Only linux/amd64 rows apply on this host: darwin row must not be installed.
 want_err "darwin-only component skipped on linux host" test -e "$H1/data/rootfs.img"
 n1="$(downloads)"; want_ok "first run downloaded ($n1)" test "$n1" -gt 0
+want_ok "symlink component placed as a symlink (R5.6)" test -L "$H1/bin/git-remote-min"
+check "min" "$(readlink "$H1/bin/git-remote-min")" "symlink points at its manifest target (R5.6)"
 
 reset_dl
 run second "$H1"
@@ -346,13 +354,16 @@ want_ok "non-interactive uninstall never elevates (profile survives)" \
 want_err "uninstall removed the shipped apparmor loader" \
     test -e "$HAA_U/xdg-data/minimal/apparmor/install-apparmor-profile.sh"
 
-# Corrupt one on-disk binary -> only that component re-fetches.
+# Corrupt one on-disk binary and retarget the symlink -> only the binary
+# re-fetches (a symlink repair needs no download), and both are restored.
 printf 'tampered\n' >"$H1/bin/minimald"
+rm -f "$H1/bin/git-remote-min"; ln -s minimald "$H1/bin/git-remote-min"
 reset_dl
 run third "$H1"
 check 0 "$rc" "rerun after tamper exits 0"
 check 1 "$(downloads)" "only the changed component re-downloads"
 check "$h_minimald" "$(hash_file "$H1/bin/minimald")" "tampered binary restored"
+check "min" "$(readlink "$H1/bin/git-remote-min")" "retargeted symlink repaired without a download (R5.6)"
 
 # --- Unit 5: checksum mismatch (R5.3) --------------------------------------
 # Point the manifest's minimal hash at a wrong value; artifact stays as-is.
@@ -455,6 +466,8 @@ record="$H1/xdg-state/minimal/installed"
 want_ok "install record lists components (R6.1)" grep -q "minimald" "$record"
 want_ok "install record lists resolved dest (R6.1)" grep -q "$H1/bin/minimald" "$record"
 want_ok "install record lists hash (R6.1)" grep -q "$h_minimald" "$record"
+want_ok "symlink row records link:<target> in the hash columns (R6.1)" \
+    grep -q "link:min" "$record"
 
 # bin not on PATH -> advisory printed.
 run advise_off "$H1"
@@ -796,6 +809,7 @@ run u_basic "$HU" --uninstall
 check 0 "$rc" "uninstall exits 0 (R8.4)"
 want_err "uninstall removed minimald (R7.3)" test -e "$HU/bin/minimald"
 want_err "uninstall removed min (R7.3)" test -e "$HU/bin/min"
+want_err "uninstall removed the git-remote-min symlink (R7.3)" test -L "$HU/bin/git-remote-min"
 want_err "uninstall removed the record (R8.1)" test -e "$urec"
 want_ok "uninstall prints a summary" grep -q "uninstall:" "$OUT"
 want_err "empty bin dir pruned (R8.1)" test -d "$HU/bin"
@@ -865,6 +879,32 @@ check 0 "$rc" "uninstall over a non-regular path exits 0 (R7.3)"
 want_ok "directory at a recorded path is left alone (R7.3)" test -d "$HU6/bin/minimald"
 want_ok "foreign entry is reported (R7.3)" grep -q "not a regular file" "$OUT"
 want_ok "record retained due to the foreign entry (R8.1)" test -f "$urec6"
+
+# R7.3 — a symlink retargeted since install is the user's edit: kept by default,
+# removed under --force. A regular file now at the recorded symlink path is
+# foreign — kept even with --force.
+HU8="$root/hu8"; mkdir -p "$HU8"
+run u8_install "$HU8"
+urec8="$HU8/xdg-state/minimal/installed"
+rm -f "$HU8/bin/git-remote-min"; ln -s minimald "$HU8/bin/git-remote-min"
+run u8_keep "$HU8" --uninstall
+check 0 "$rc" "uninstall with a retargeted symlink exits 0 (R8.4)"
+want_ok "retargeted symlink kept (R7.3)" test -L "$HU8/bin/git-remote-min"
+want_ok "retarget keep is reported (R7.3)" grep -q "retargeted" "$OUT"
+want_ok "record retained while the link remains (R8.1)" test -f "$urec8"
+run u8_force "$HU8" --uninstall --force
+check 0 "$rc" "uninstall --force over a retargeted symlink exits 0"
+want_err "retargeted symlink removed under --force (R7.3)" test -L "$HU8/bin/git-remote-min"
+want_err "record removed once footprint is gone (R8.1)" test -e "$urec8"
+
+HU9="$root/hu9"; mkdir -p "$HU9"
+run u9_install "$HU9"
+rm -f "$HU9/bin/git-remote-min"; printf 'a real file now\n' >"$HU9/bin/git-remote-min"
+run u9_foreign "$HU9" --uninstall --force
+check 0 "$rc" "uninstall over a file at a symlink row exits 0 (R7.3)"
+want_ok "regular file at a symlink row kept even with --force (R7.3)" \
+    test -f "$HU9/bin/git-remote-min"
+want_ok "foreign symlink row is reported (R7.3)" grep -q "not a symlink" "$OUT"
 
 # R9.4 — uninstall removes the generated init/completion files (they are plain
 # record rows), strips the marker block from the rc file, prunes the emptied

@@ -148,6 +148,40 @@ impl Client {
             .with_context(|| format!("decode response for {}", R::NAME))
     }
 
+    /// Open a session channel and issue an `exec` request for `command`,
+    /// returning the channel once the daemon has acknowledged it.
+    ///
+    /// The daemon replies to the exec request before the process produces
+    /// any output, so everything after the ack is the process conversation:
+    /// data, extended data, and finally an exit status.
+    pub async fn open_exec_channel(
+        &mut self,
+        command: &str,
+    ) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
+        let mut channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .context("open exec channel")?;
+        channel
+            .exec(true, command)
+            .await
+            .with_context(|| format!("exec request for {command:?}"))?;
+
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Success) => return Ok(channel),
+                Some(russh::ChannelMsg::Failure) => {
+                    anyhow::bail!("daemon rejected exec request {command:?}")
+                }
+                // Window adjustments and the like can precede the ack;
+                // process output cannot, since the server acks first.
+                Some(_) => continue,
+                None => anyhow::bail!("channel closed before the exec request was acknowledged"),
+            }
+        }
+    }
+
     /// Stream a zstd-compressed tarball of `dir` to the daemon's
     /// `WorkspaceFilesTarZst` subsystem, which unpacks it into the
     /// session's workspace directory.

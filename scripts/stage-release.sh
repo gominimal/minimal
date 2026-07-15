@@ -96,7 +96,10 @@ fi
 #     `lib` -> ~/.local/lib (a bin sibling, for @rpath/../lib), and `data` ->
 #     ~/.local/share/minimal, and marks anything under `bin` +x.
 #   - artifact-basename is the file's name inside ARTIFACTS_DIR (the release
-#     workflow's merge-multiple flattens every upload to its basename).
+#     workflow's merge-multiple flattens every upload to its basename). For
+#     kind `symlink` rows it is instead the LINK TARGET, relative to dest's own
+#     directory: no artifact is hashed or uploaded, and the manifest's sha256
+#     column carries the `-` placeholder (spec R5.6).
 #   - the `minimal` CLI installs as `bin/min`: the user-facing command is `min`
 #     (the installer's completion generation runs `<bin>/min`, spec R9.3), while
 #     the component and artifact names keep the crate name.
@@ -110,12 +113,15 @@ COMPONENTS=(
     "minimald|linux|amd64|file|bin/minimald|minimald-linux-amd64"
     "mip|linux|amd64|file|bin/mip|mip-linux-amd64"
     "minimal|linux|amd64|file|bin/min|minimal-linux-amd64"
+    "git-remote-min|linux|amd64|symlink|bin/git-remote-min|min"
     # Linux arm64
     "minimald|linux|arm64|file|bin/minimald|minimald-linux-arm64"
     "mip|linux|arm64|file|bin/mip|mip-linux-arm64"
     "minimal|linux|arm64|file|bin/min|minimal-linux-arm64"
+    "git-remote-min|linux|arm64|symlink|bin/git-remote-min|min"
     # macOS arm64 (darwin)
     "minimal|darwin|arm64|file|bin/min|minimal-macos-arm64"
+    "git-remote-min|darwin|arm64|symlink|bin/git-remote-min|min"
     "minvmd|darwin|arm64|file|bin/minvmd|minvmd-macos-arm64"
     # The trimmed libkrun minvmd links against (built by the release workflow's
     # build-libkrun-macos-arm64 job), staged into lib/ (ie: minvmd/../lib).
@@ -177,6 +183,18 @@ upload_list=()
 
 for entry in "${COMPONENTS[@]}"; do
     IFS='|' read -r comp os arch kind dest basename <<<"$entry"
+
+    # `git push min://<session>` resolves the min:// scheme to a
+    # `git-remote-min` helper on PATH; the min binary detects that basename
+    # (argv[0]) and enters remote-helper mode, so a symlink is all it takes.
+    # A symlink row ships no artifact: the last field is the link target and
+    # the sha256 column is the `-` placeholder the installer expects (R5.6).
+    if [ "$kind" = symlink ]; then
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            "$comp" "$os" "$arch" "$VERSION" "-" "$kind" "$dest" "$basename" >>"$manifest"
+        continue
+    fi
+
     file="$staged_dir/$basename"
     [ -f "$file" ] || file="$ARTIFACTS_DIR/$basename"
 

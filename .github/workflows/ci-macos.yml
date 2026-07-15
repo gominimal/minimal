@@ -328,6 +328,14 @@ jobs:
                   pkill -f '__krun-vmm' 2>/dev/null || true
                   pkill -f gvproxy 2>/dev/null || true
                   sleep 1
+            - name: Fetch pinned gvproxy switch binary
+              # minvmd spawns this (gvproxy-darwin) as the host-side switch that
+              # provides the guest's egress (NAT + DNS). Without it minvmd boots
+              # the VM switchless (gvproxy resolution is best-effort and never
+              # errors), so the guest overlay has no other end and every egress —
+              # including the in-guest `pkgs` clone during session mint — dies
+              # with "Could not resolve host".
+              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
             - name: Session e2e via the CLI (activate/exec/destroy; autospawns minvmd)
               # The unified session e2e (scripts/session-e2e.sh — the SAME
               # proof every target lane runs), here against the VM-backed
@@ -340,14 +348,15 @@ jobs:
               # full user path and subsumes it (the cold activate IS the
               # autospawn). Runs the prebuilt binaries directly (never
               # `cargo run`, which would relink and unsign minvmd).
-              # E2E_PROJECT_DIR=/tmp: the guest sees no host project dir yet
-              # (no project sync), and /tmp exists in the guest image.
+              # Since #748 activate uploads the project into the guest;
+              # E2E_PROJECT_DIR=/tmp still names a guest path.
               run: |
                   export PATH="$PWD/target/debug:$PATH"
                   export MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz"
                   export MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img"
                   export MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio"
                   export MINVMD_BOOT_LOG="$RUNNER_TEMP/cli-e2e-boot.log"
+                  export MINVMD_GVPROXY_BIN="$RUNNER_TEMP/gvproxy"
                   E2E_VM=1 E2E_PROJECT_DIR=/tmp ./scripts/session-e2e.sh
             - name: Upload guest boot console logs
               # Capture hvc0 output for diagnosing a stuck/failed boot (e.g. a missing
