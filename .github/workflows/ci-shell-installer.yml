@@ -47,7 +47,7 @@ jobs:
         # shallow, credential-free checkout cannot provide) — and pushes to
         # main / dispatches run everything regardless.
         if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706
         with:
           filters: |
             installer:

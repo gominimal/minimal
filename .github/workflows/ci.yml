@@ -47,7 +47,7 @@ jobs:
               # `code` = anything that is not documentation; the negations
               # mirror the old paths-ignore list.
               if: github.event_name == 'pull_request'
-              uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
+              uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706
               with:
                   filters: |
                       code:
@@ -109,7 +109,7 @@ jobs:
               with:
                   persist-credentials: false
             - name: Cache Cargo state
-              uses: actions/cache@v5
+              uses: actions/cache@v6
               with:
                   path: ~/.local/state/minimal/state
                   key: dogfood-minimal-cargo-${{ hashFiles('**/Cargo.lock') }}
