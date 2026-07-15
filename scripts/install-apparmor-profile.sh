@@ -36,6 +36,9 @@ note() { printf '%s\n' "$*"; }
 
 mode=install
 extra_paths=()
+# The parse loop consumes $@; keep the original invocation for the sudo hint
+# below, or a copy-pasted retry silently drops --uninstall/--path.
+original_args=("$@")
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -67,7 +70,7 @@ if [ "$mode" = check ]; then
     exit 0
 fi
 
-[ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo $0 $*)"
+[ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo $0${original_args[0]+ }${original_args[*]-})"
 
 if [ "$mode" = uninstall ]; then
     # Unload first: removing the file alone leaves the profile live in the
