@@ -26,6 +26,14 @@ pub mod krun;
 
 pub use error::VmError;
 
+/// Env marker set on the re-exec'd child by `run --detach`. When present,
+/// the process routes tracing output to the daily-rotated
+/// `<state_dir>/logs/minvmd.log.<date>` instead of stdout — a detached
+/// supervisor's stdout goes nowhere, and field diagnostics (`min bug`) need
+/// the history on disk. Lives here (not `main.rs`) because the detach spawn
+/// in `cmd::run` sets it and the binary entry point reads it.
+pub const DETACHED_ENV: &str = "MINVMD_DETACHED";
+
 #[cfg(test)]
 mod integration_naming_convention {
     //! Guards the integration-test auto-discovery contract. The KVM and macOS
