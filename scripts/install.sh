@@ -841,6 +841,6 @@ if [ "$os" = linux ] && [ -r "$userns_sysctl" ] \
         say "  minimald's session sandbox cannot start until you install its AppArmor"
         say "  profile — a one-time step that needs root:"
         say "      sudo bash \"$apparmor_loader\""
-        say "  details: https://github.com/gominimal/minimal/blob/main/docs/reference/linux-host-setup.md"
+        say "  details: https://docs.minimal.dev/reference/linux-host-setup"
     fi
 fi
