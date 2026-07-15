@@ -137,3 +137,137 @@ fn add_dir_entries_inner<'a>(
         Ok(())
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    /// Unpacks a raw tar archive into a tempdir and returns the list of
+    /// all file paths (relative) found by walking the unpacked tree.
+    async fn unpack_and_list(tar_bytes: &[u8]) -> Vec<String> {
+        let out = tempfile::TempDir::new().unwrap();
+        let archive = async_tar::Archive::new(tar_bytes);
+        archive.unpack(out.path().to_path_buf()).await.unwrap();
+
+        fn walk(dir: &std::path::Path, base: &std::path::Path, paths: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                let ftype = entry.file_type().unwrap();
+                if ftype.is_file() || ftype.is_symlink() {
+                    paths.push(rel);
+                } else if ftype.is_dir() {
+                    walk(&path, base, paths);
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        walk(out.path(), out.path(), &mut paths);
+        paths
+    }
+
+    #[tokio::test]
+    async fn tar_skips_unix_sockets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "hello").unwrap();
+        let _socket = UnixListener::bind(dir.path().join("sock")).unwrap();
+
+        let tar = tar_directory(dir.path()).await.unwrap();
+        let paths = unpack_and_list(&tar).await;
+
+        assert!(
+            paths.iter().any(|p| p == "hello.txt"),
+            "hello.txt should be in the archive"
+        );
+        assert!(!paths.iter().any(|p| p == "sock"), "sock should be skipped");
+    }
+
+    #[tokio::test]
+    async fn tar_skips_permission_denied_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("readable.txt"), "ok").unwrap();
+
+        let restricted = dir.path().join("restricted");
+        std::fs::create_dir(&restricted).unwrap();
+        std::fs::write(restricted.join("secret.txt"), "secret").unwrap();
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let tar = tar_directory(dir.path()).await.unwrap();
+
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o755)).ok();
+
+        let paths = unpack_and_list(&tar).await;
+        assert!(
+            paths.iter().any(|p| p == "readable.txt"),
+            "readable.txt should be in the archive"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("secret")),
+            "restricted/secret.txt should be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn tar_includes_regular_files_dirs_and_symlinks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "content").unwrap();
+        std::fs::create_dir_all(dir.path().join("subdir")).unwrap();
+        std::fs::write(dir.path().join("subdir/nested.txt"), "nested").unwrap();
+        std::os::unix::fs::symlink("file.txt", dir.path().join("link")).unwrap();
+
+        let tar = tar_directory(dir.path()).await.unwrap();
+        let paths = unpack_and_list(&tar).await;
+
+        assert!(paths.iter().any(|p| p == "file.txt"), "file.txt missing");
+        assert!(
+            paths.iter().any(|p| p == "subdir/nested.txt"),
+            "nested.txt missing"
+        );
+        assert!(paths.iter().any(|p| p == "link"), "symlink missing");
+    }
+
+    #[tokio::test]
+    async fn tar_does_not_follow_symlinks_to_external_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let external = tempfile::TempDir::new().unwrap();
+        std::fs::write(external.path().join("secret"), "sensitive").unwrap();
+
+        // Create a symlink pointing outside the project dir.
+        std::os::unix::fs::symlink(external.path().join("secret"), dir.path().join("escape"))
+            .unwrap();
+        std::fs::write(dir.path().join("safe.txt"), "safe").unwrap();
+
+        let tar = tar_directory(dir.path()).await.unwrap();
+
+        // Unpack into a tempdir and verify the symlink was stored as a
+        // symlink (not the external file's contents).
+        let out = tempfile::TempDir::new().unwrap();
+        let archive = async_tar::Archive::new(&tar[..]);
+        archive.unpack(out.path().to_path_buf()).await.unwrap();
+
+        let escape_path = out.path().join("escape");
+        assert!(
+            escape_path.is_symlink(),
+            "escape should be a symlink, not a copied file"
+        );
+        // Verify it still points to the external path, not the content.
+        let target = std::fs::read_link(&escape_path).unwrap();
+        assert_eq!(target, external.path().join("secret"));
+
+        // The external file's content should NOT have been copied.
+        assert!(
+            !std::fs::exists(escape_path.join("secret")).unwrap_or(false),
+            "should not have followed the symlink"
+        );
+
+        // safe.txt should be present.
+        assert!(out.path().join("safe.txt").is_file());
+    }
+}
