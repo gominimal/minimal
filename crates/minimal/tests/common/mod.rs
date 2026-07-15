@@ -13,6 +13,8 @@ use minimal::GlobalArgs;
 pub struct TestDaemon {
     /// The underlying minimald test server. Exposed so tests can create
     /// sessions directly via `server.state` or connect a `TestClient`.
+    /// Not every test binary that includes this shared module uses it.
+    #[allow(dead_code)]
     pub server: minimald::test_harness::TestServer,
     temp: tempfile::TempDir,
 }

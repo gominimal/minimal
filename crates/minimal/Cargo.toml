@@ -28,6 +28,7 @@ clap.workspace = true
 clap_complete.workspace = true
 camino.workspace = true
 chrono.workspace = true
+common.workspace = true
 constcat.workspace = true
 dirs.workspace = true
 mctx.workspace = true
@@ -39,7 +40,9 @@ russh.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sessions.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -47,12 +50,12 @@ tracing-subscriber.workspace = true
 # the client helpers (sock/lifecycle) and calls no krun code, so it must not
 # inherit libkrun's `#[link]` load command (would make it unloadable without
 # libkrun).
+libc.workspace = true
 minvmd = { path = "../minvmd", default-features = false }
 ot.workspace = true
 
 [dev-dependencies]
 minimald = { path = "../minimald", features = ["test-support"] }
-tempfile.workspace = true
 # `test-util` (not in tokio's `full`) for `#[tokio::test(start_paused = true)]`:
 # lets the client's handshake-deadline test elapse in virtual time.
 tokio = { workspace = true, features = ["test-util"] }

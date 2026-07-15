@@ -3594,8 +3594,10 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "common",
  "constcat",
  "dirs",
+ "libc",
  "mctx",
  "mfile",
  "minimald",
@@ -3610,6 +3612,7 @@ dependencies = [
  "sessions",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3720,6 +3723,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
 ]
 

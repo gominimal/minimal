@@ -218,6 +218,77 @@ impl Client {
         // avoiding buffering the entire archive in memory.
         crate::file_upload::stream_tar_zstd(dir, stream).await
     }
+
+    /// Requests the daemon's diagnostic bundle (`min bug`): sends `req` on
+    /// the `DiagBundleTarZst` subsystem and collects the streamed tar+zstd
+    /// archive, up to `max_bytes`.
+    ///
+    /// Returns `(bytes, truncated)`. Errors the daemon reports before
+    /// streaming arrive over extended-data stream 1 and become the `Err`
+    /// here; a refused subsystem request means the daemon predates the RPC.
+    pub async fn download_diag_bundle(
+        &mut self,
+        req: &minimald_rpc::DiagBundleRequest,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, bool), anyhow::Error> {
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .context("open channel for diagnostic bundle")?;
+
+        channel
+            .request_subsystem(true, minimald_rpc::DIAG_BUNDLE_SUBSYSTEM)
+            .await
+            .context(
+                "request DiagBundleTarZst subsystem \
+                 (daemon may predate the diagnostics RPC — upgrade minimald)",
+            )?;
+
+        let body = serde_json::to_vec(req).context("serialize diag request")?;
+        channel
+            .data(&body[..])
+            .await
+            .context("write diag request")?;
+        channel.eof().await.context("half-close diag request")?;
+
+        // Data carries the archive; extended-data stream 1 carries a
+        // pre-stream error message.
+        let mut channel = channel;
+        let mut bundle = Vec::new();
+        let mut daemon_error = Vec::new();
+        let mut truncated = false;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { data } => {
+                    if bundle.len() + data.len() > max_bytes {
+                        let room = max_bytes - bundle.len();
+                        bundle.extend_from_slice(&data[..room]);
+                        truncated = true;
+                        break;
+                    }
+                    bundle.extend_from_slice(&data);
+                }
+                russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                    daemon_error.extend_from_slice(&data);
+                }
+                _ => {}
+            }
+        }
+
+        if bundle.is_empty() {
+            let msg = String::from_utf8_lossy(&daemon_error);
+            anyhow::bail!(
+                "daemon sent no bundle{}",
+                if msg.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {msg}")
+                }
+            );
+        }
+        Ok((bundle, truncated))
+    }
 }
 
 /// Resolve the provider-instance dir (`<state dir>/providers/local-0`) the

@@ -12,6 +12,7 @@ use tokio::io::AsyncWriteExt as _;
 pub mod autospawn;
 pub mod client;
 pub mod config;
+pub mod diag;
 pub mod dirs;
 mod file_upload;
 pub mod git_remote;
@@ -46,6 +47,14 @@ pub enum Command {
     Loadout(LoadoutArgs),
     /// Print important directories and file paths for debugging
     Dirs,
+    /// Collect a diagnostic bundle (logs, state, process/network info) to
+    /// send to the minimal dev team.
+    ///
+    /// Writes `minimal-diag-<timestamp>.tar.zst` to the current directory.
+    /// Secret-shaped values (env vars, tokens) are redacted and session/
+    /// project file contents are never included — only name/size listings.
+    /// Works even when no daemon is running; never starts one.
+    Bug(diag::BugArgs),
     /// WireGuard mesh: join, leave, and inspect remote-access state
     #[cfg(feature = "remote-access")]
     Mesh(MeshArgs),
@@ -446,6 +455,7 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
             command: LoadoutCommand::List(args),
         }) => loadouts::cmd_loadout_list(args, &cli.global_args),
         Command::Dirs => dirs::cmd_dirs(&cli.global_args),
+        Command::Bug(args) => diag::cmd_bug(&cli.global_args, args).await,
         #[cfg(feature = "remote-access")]
         Command::Mesh(MeshArgs { command }) => match command {
             MeshCommand::Status => cmd_mesh_status(&cli.global_args).await,
