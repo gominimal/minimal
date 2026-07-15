@@ -260,10 +260,23 @@ async fn stop_succeeds_when_no_sessions() {
 }
 
 #[tokio::test]
-async fn stop_refuses_with_live_session() {
+async fn stop_succeeds_with_idle_session() {
     let (daemon, args) = setup().await;
-    let session_id = create_session(&daemon, "active").await;
+    let session_id = create_session(&daemon, "idle").await;
     daemon.server.bring_session_up(session_id).await;
+
+    // An idle session (actor up, but no shell hosted and no create flow in
+    // flight) does not block an unforced stop; its record survives for the
+    // next daemon start.
+    cmd_stop(&args, StopArgs { force: false }).await.unwrap();
+}
+
+#[tokio::test]
+async fn stop_refuses_with_pending_session() {
+    let (daemon, args) = setup().await;
+    // A Pending session (mid create flow, awaiting the client's verdict) is
+    // busy: an unforced stop must refuse rather than strand the flow.
+    let _id = create_pending_session(&daemon, "mid-create").await;
 
     let result = cmd_stop(&args, StopArgs { force: false }).await;
     assert!(result.is_err());
@@ -339,7 +352,47 @@ async fn session_policy_succeeds() {
 
 // --- helpers ---
 
-/// Create a session on the daemon via TestClient and return its ID.
+/// Creates a session whose workspace mfile declares a `[session.vars]`
+/// entry, which the daemon must route back to the client for gating — so
+/// configuring its loadout returns `Pending` and the session actor parks in
+/// its Draft state awaiting a verdict. Returns its ID.
+async fn create_pending_session(daemon: &common::TestDaemon, name: &str) -> SessionId {
+    let mut client = daemon.server.connect().await;
+    let project_path =
+        camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
+    let config = minimald_rpc::SessionConfig {
+        name: Some(name.to_string()),
+        project_path: paths::HostAbsPath::try_new(project_path).unwrap(),
+        network: sessions::NetworkMode::NoNet,
+        policy: Default::default(),
+        attrs: Default::default(),
+    };
+
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, ConfigureLoadoutResponse, CreateSession,
+        CreateSessionRequest,
+    };
+    let id = client
+        .call::<CreateSession>(&CreateSessionRequest { config })
+        .await
+        .unwrap()
+        .id;
+    daemon
+        .server
+        .seed_workspace_mfile(id, "[session.vars]\nRUST_LOG = \"info\"\n")
+        .await;
+    let resp = client
+        .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+            session_id: id,
+            contribution: Default::default(),
+        })
+        .await;
+    match resp {
+        minimald_rpc::Errorable::Ok(ConfigureLoadoutResponse::Pending { .. }) => id,
+        other => panic!("expected a Pending loadout, got {other:?}"),
+    }
+}
+
 async fn create_session(daemon: &common::TestDaemon, name: &str) -> SessionId {
     let mut client = daemon.server.connect().await;
 
@@ -355,17 +408,31 @@ async fn create_session(daemon: &common::TestDaemon, name: &str) -> SessionId {
         attrs: Default::default(),
     };
 
-    use minimald_rpc::{CreateSession, CreateSessionRequest};
-    let resp = client
-        .call::<CreateSession>(&CreateSessionRequest {
-            config,
-            contribution: Default::default(),
-        })
-        .await;
-    match resp {
-        minimald_rpc::Errorable::Ok(r) => unwrap_ready(r),
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
+    };
+    let id = match client
+        .call::<CreateSession>(&CreateSessionRequest { config })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(r) => r.id,
         minimald_rpc::Errorable::Err { error } => {
             panic!("CreateSession failed: {error}")
         }
+    };
+    // Finalize the session's loadout, as `min activate` does: its workspace
+    // is empty, so this composes to an empty `Ready` in one shot.
+    match client
+        .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+            session_id: id,
+            contribution: Default::default(),
+        })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(r) => unwrap_ready(r),
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("ConfigureLoadout failed: {error}")
+        }
     }
+    id
 }

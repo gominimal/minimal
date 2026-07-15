@@ -264,7 +264,6 @@ async fn run_session_exec(
                 policy: Default::default(),
                 attrs: Default::default(),
             },
-            contribution: Default::default(),
         };
         let body = serde_json::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
 
@@ -281,17 +280,9 @@ async fn run_session_exec(
             .map_err(|e| format!("read response: {e}"))?;
         let resp: <CreateSession as OneshotSshRpc>::Response =
             serde_json::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
-        let created = resp
-            .ok()
-            .ok_or_else(|| "CreateSession returned an error".to_string())?;
-        match created {
-            minimald_rpc::CreateSessionResponse::Ready { id } => id,
-            minimald_rpc::CreateSessionResponse::Pending { .. } => {
-                return Err("CreateSession returned Pending; \
-                            e2e test only handles Ready"
-                    .to_string());
-            }
-        }
+        resp.ok()
+            .ok_or_else(|| "CreateSession returned an error".to_string())?
+            .id
     };
 
     // Upload the project's `minimal.toml` into the session workspace over
@@ -328,6 +319,54 @@ async fn run_session_exec(
         sftp.close()
             .await
             .map_err(|e| format!("close sftp session: {e}"))?;
+    }
+
+    // ConfigureLoadout: compose the session's loadout now that its workspace
+    // holds the project files, finalizing it `Pending → Active`. This is the
+    // ordering the create flow is split for, and it has to happen before the
+    // exec below — a session with an unconfigured loadout has no context to
+    // resolve a task against.
+    {
+        use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, ConfigureLoadoutResponse};
+        let channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("open ConfigureLoadout channel: {e}"))?;
+        channel
+            .request_subsystem(false, ConfigureLoadout::NAME)
+            .await
+            .map_err(|e| format!("request_subsystem: {e}"))?;
+
+        let req = ConfigureLoadoutRequest {
+            session_id,
+            contribution: Default::default(),
+        };
+        let body = serde_json::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
+
+        let mut rpc = channel.into_stream();
+        rpc.write_all(&body)
+            .await
+            .map_err(|e| format!("write request: {e}"))?;
+        rpc.shutdown()
+            .await
+            .map_err(|e| format!("shutdown write half: {e}"))?;
+        let mut resp_buf = Vec::with_capacity(256);
+        rpc.read_to_end(&mut resp_buf)
+            .await
+            .map_err(|e| format!("read response: {e}"))?;
+        let resp: <ConfigureLoadout as OneshotSshRpc>::Response =
+            serde_json::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
+        match resp.ok() {
+            // The uploaded mfile declares only tasks, so nothing needs a
+            // client gate and the loadout finalizes in one shot.
+            Some(ConfigureLoadoutResponse::Ready) => {}
+            Some(ConfigureLoadoutResponse::Pending { .. }) => {
+                return Err("ConfigureLoadout returned Pending; \
+                            this test's mfile gates nothing"
+                    .to_string());
+            }
+            None => return Err("ConfigureLoadout returned an error".to_string()),
+        }
     }
 
     // Exec the command in that session.

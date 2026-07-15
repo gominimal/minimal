@@ -804,9 +804,16 @@ fn project_has_mfile(project_path: &camino::Utf8Path) -> bool {
     )
 }
 
-/// Check for a `minimal.toml` at the project path. If missing, prompt
-/// the user to initialize one before proceeding with activation.
-fn ensure_mfile_or_prompt(
+/// Offer to initialize a `minimal.toml` at the project path when it has
+/// none, on the way into an activation.
+///
+/// Purely an offer: a project without one still activates. The daemon never
+/// reads this path — it is a path on the *client's* machine — and fabricates
+/// a default shell-stack `minimal.toml` inside the session's own workspace
+/// instead, so the session comes up either way. Scaffolding here is a
+/// convenience for the interactive case (the project gets a real config it
+/// can grow), not a precondition.
+fn offer_mfile_scaffold(
     project_path: &camino::Utf8Path,
     global: &GlobalArgs,
 ) -> Result<(), anyhow::Error> {
@@ -819,14 +826,14 @@ fn ensure_mfile_or_prompt(
     // `confirm` treats empty/EOF input as "yes", so on non-interactive
     // stdin (CI, pipes, agents) it would silently default this scaffold to
     // "yes" — and, when a config is discovered under `.minimal/`, the init
-    // writer would clobber it. Only prompt on a real terminal; otherwise
-    // bail with the same hint the declined prompt gives.
-    let create = std::io::stdin().is_terminal() && confirm("Would you like to create one?")?;
-    if !create {
-        bail!(
-            "No {} found. Run 'minimal init' to create one.",
-            mfile::MFILE_NAME
+    // writer would clobber it. Only prompt on a real terminal; anywhere else
+    // (and on a declined prompt) carry on without scaffolding.
+    if !std::io::stdin().is_terminal() || !confirm("Would you like to create one?")? {
+        eprintln!(
+            "Continuing without one; the session gets a default environment. \
+             Run 'minimal init' to give the project its own config."
         );
+        return Ok(());
     }
 
     let config = if global.repo_dir.is_some() {
@@ -856,7 +863,7 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     let abs_path =
         paths::HostAbsPath::try_new(utf8_path.clone()).context("Invalid project path")?;
 
-    ensure_mfile_or_prompt(&utf8_path, global)?;
+    offer_mfile_scaffold(&utf8_path, global)?;
 
     let mut port_mappings = Vec::with_capacity(args.ingress.len());
     for spec in &args.ingress {
@@ -899,13 +906,11 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
 
     let mut client = connect_daemon(global).await?;
 
-    use minimald_rpc::{CreateSession, CreateSessionRequest};
-    let req = CreateSessionRequest {
-        config,
-        contribution,
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
     };
     let resp = client
-        .oneshot_rpc::<CreateSession>(req)
+        .oneshot_rpc::<CreateSession>(CreateSessionRequest { config })
         .await
         .context("CreateSession RPC failed")?;
 
@@ -918,14 +923,29 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
             bail!("CreateSession failed: {error}");
         }
     };
-    // The daemon may finalize immediately (`Ready`) or ask the
-    // client to gate items first (`Pending`).
-    let id = match created {
-        minimald_rpc::CreateSessionResponse::Ready { id } => id,
-        minimald_rpc::CreateSessionResponse::Pending { id: _, response } => {
-            drive_pending_to_active(&mut client, response, user_policy, compose_options).await?
+    let id = created.id;
+
+    // The session exists but has no loadout yet; composing it is a second
+    // round-trip because the daemon's composer reads the project config out
+    // of the session's workspace, not from a path on this machine.
+    let configured = client
+        .oneshot_rpc::<ConfigureLoadout>(ConfigureLoadoutRequest {
+            session_id: id,
+            contribution,
+        })
+        .await
+        .context("ConfigureLoadout RPC failed")?;
+    let configured = match configured {
+        minimald_rpc::Errorable::Ok(r) => r,
+        minimald_rpc::Errorable::Err { error } => {
+            bail!("ConfigureLoadout failed: {error}");
         }
     };
+    // The daemon may finalize immediately (`Ready`) or ask the
+    // client to gate items first (`Pending`).
+    if let minimald_rpc::ConfigureLoadoutResponse::Pending { response } = configured {
+        drive_pending_to_active(&mut client, response, user_policy, compose_options).await?;
+    }
 
     println!("{id}");
 
