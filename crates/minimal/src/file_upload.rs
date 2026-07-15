@@ -13,7 +13,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// Directories always skipped during upload. A proper .gitignore
 /// implementation is tracked as a follow-up on #263.
-const DEFAULT_EXCLUDED_DIRS: &[&str] = &[".git", "target", "node_modules"];
+const DEFAULT_EXCLUDED_DIRS: &[&str] = &["target", "node_modules"];
 
 fn is_default_excluded(name: &str) -> bool {
     DEFAULT_EXCLUDED_DIRS.contains(&name)
@@ -317,8 +317,6 @@ mod tests {
         std::fs::write(dir.path().join("keep.txt"), "keep").unwrap();
         std::fs::create_dir_all(dir.path().join("target")).unwrap();
         std::fs::write(dir.path().join("target/binary.o"), "binary").unwrap();
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
-        std::fs::write(dir.path().join(".git/config"), "gitconfig").unwrap();
         std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
         std::fs::write(dir.path().join("node_modules/lib.js"), "lib").unwrap();
 
@@ -330,10 +328,6 @@ mod tests {
         assert!(
             !paths.iter().any(|p| p.contains("target/")),
             "target/ should be excluded"
-        );
-        assert!(
-            !paths.iter().any(|p| p.contains(".git/")),
-            ".git/ should be excluded"
         );
         assert!(
             !paths.iter().any(|p| p.contains("node_modules/")),
