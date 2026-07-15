@@ -71,6 +71,7 @@ cat >"$mock/versions/v1/minimal-linux-amd64" <<'EOF'
 # mock min (linux-amd64)
 case "${1:-}" in
     completions) printf '# mock min completions for %s\n' "$2" ;;
+    stop)        printf '%s\n' "$*" >>"$HOME/stop.calls" ;;
 esac
 EOF
 cat >"$mock/versions/v1/minimal-darwin-arm64" <<'EOF'
@@ -78,6 +79,7 @@ cat >"$mock/versions/v1/minimal-darwin-arm64" <<'EOF'
 # mock min (darwin-arm64)
 case "${1:-}" in
     completions) printf '# mock min completions for %s\n' "$2" ;;
+    stop)        printf '%s\n' "$*" >>"$HOME/stop.calls" ;;
 esac
 EOF
 printf 'darwin-arm64-rootfs-body\n'   >"$mock/versions/v1/rootfs-arm64.img"
@@ -439,6 +441,57 @@ env -i PATH="$stubbin:$H1/bin:/usr/bin:/bin" HOME="$H1" MINIMAL_BIN="$H1/bin" \
     "$SH" "$installer" >"$OUT" 2>&1
 set -e
 want_err "PATH advisory suppressed when bin present (R6.2)" grep -q "is not on your PATH" "$OUT"
+
+# --- Unit 5: pre-upgrade daemon stop (R5.5) --------------------------------
+# The installed `min` (the mock records its `stop` calls to $HOME/stop.calls) is
+# run once, only on a run that actually replaces a file, and only when it was
+# already on disk beforehand.
+H8="$root/h8"; mkdir -p "$H8"
+run daemonfresh "$H8"
+check 0 "$rc" "fresh install exits 0"
+want_err "fresh install stops no daemon: none installed yet (R5.5)" test -e "$H8/stop.calls"
+
+# Everything up to date -> nothing replaced -> a healthy daemon is left alone.
+run daemonnoop "$H8"
+check 0 "$rc" "up-to-date rerun exits 0"
+want_err "up-to-date rerun stops no daemon (R5.5)" test -e "$H8/stop.calls"
+
+# An upgrade (two components stale) stops the daemon exactly once, before the
+# swap, via the min that is on disk now — an older build than the manifest's,
+# still runnable, still able to reach the daemon it started.
+printf 'stale\n' >"$H8/bin/minimald"
+cat >"$H8/bin/min" <<'EOF'
+#!/bin/sh
+# mock min, previous release
+case "${1:-}" in
+    completions) printf '# mock min completions for %s\n' "$2" ;;
+    stop)        printf '%s\n' "$*" >>"$HOME/stop.calls" ;;
+esac
+EOF
+chmod +x "$H8/bin/min"
+run daemonupgrade "$H8"
+check 0 "$rc" "upgrade exits 0"
+want_ok "upgrade runs min stop --force (R5.5)" test -f "$H8/stop.calls"
+check "stop --force" "$(cat "$H8/stop.calls")" "stop is called once, with --force (R5.5)"
+
+# A `min` that fails and shouts is non-fatal and silent: an old binary may not
+# know `stop --force`, and no daemon running is itself a non-zero `min stop`.
+H9="$root/h9"; mkdir -p "$H9"
+run daemonprep "$H9"
+check 0 "$rc" "prep install exits 0"
+cat >"$H9/bin/min" <<'EOF'
+#!/bin/sh
+echo "old min: unrecognized subcommand 'stop'" >&2
+echo "noise on stdout" >&1
+exit 2
+EOF
+chmod +x "$H9/bin/min"
+printf 'stale\n' >"$H9/bin/minimald"
+run daemonfails "$H9"
+check 0 "$rc" "a failing min stop does not fail the install (R5.5)"
+want_err "min stop stderr is hidden (R5.5)" grep -q "unrecognized subcommand" "$OUT"
+want_err "min stop stdout is hidden (R5.5)" grep -q "noise on stdout" "$OUT"
+check "$h_minimald" "$(hash_file "$H9/bin/minimald")" "the upgrade still completed (R5.5)"
 
 # --- Unit 9: shell-init files, rc hook, completions (R9.1-R9.3) -------------
 # A bash-login-shell install generates the three init files, hooks .bashrc
