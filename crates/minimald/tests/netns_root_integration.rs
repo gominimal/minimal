@@ -9,6 +9,12 @@
 //! * `netns_ingress_static_port_mapping_exposes_then_unexposes` — a static
 //!   ingress mapping makes a listener inside an own-IP task reachable from the
 //!   host, then removes it on exit.
+//! * `netns_ownip_udp_task_to_task` — two own-IP tasks exchange a UDP datagram
+//!   over the switch; the target declares the UDP port in its ingress policy, so
+//!   its production ingress gate admits the datagram and the reply round-trips.
+//! * `netns_ingress_blocks_undeclared_port` — a target own-IP task attached with
+//!   its production ingress gate admits a peer's TCP connection to a declared
+//!   port but drops one to a port it never declared.
 //!
 //! The own-IP proofs drive the **production** switch-attach wiring rather than a
 //! hand-rolled `ip netns` sequence: each task's namespace is created by the same
@@ -20,7 +26,7 @@
 //! which needs `CAP_NET_ADMIN`; the daemon holds it in production, so the proof
 //! wraps each command in `sudo` on the unprivileged CI runner.
 //!
-//! Both tests are `#[ignore]` and additionally early-return unless
+//! All tests are `#[ignore]` and additionally early-return unless
 //! `MINIMALD_NETNS_TEST` is set, and read the gvproxy binary from `GVPROXY_BIN`.
 //! Auto-discovered by the native lane's `minimald-root-integration` job via its
 //! `_root_integration` binary-name suffix (`-E 'binary(/_root_integration$/)'`) — ubuntu-latest
@@ -31,11 +37,12 @@
 //! `MINIMALD_NETNS_TEST=1 GVPROXY_BIN=... cargo test -p minimald --test netns_root_integration -- --include-ignored`
 #![cfg(target_os = "linux")]
 
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use minimald::net::switch::{attach_to_switch, open_tap, tap_netns_commands};
+use minimald::net::switch::{IngressGate, attach_to_switch, open_tap, tap_netns_commands};
 use minimald::net::{PtaskLease, SwitchClient, SwitchSubnet};
 
 /// Whether the gate env var is set; when absent both proofs early-return so the
@@ -74,6 +81,59 @@ fn sudo_ok(label: &str, args: &[&str]) {
         out.status.code(),
         String::from_utf8_lossy(&out.stderr),
     );
+}
+
+/// Attempts one bounded TCP connect to `ip:port` from inside the network
+/// namespace held by `netns_pid` (a peer own-IP task's switch address),
+/// returning the raw `sudo nsenter` output. Bounded by `timeout 2` so a dropped
+/// SYN fails fast rather than hanging on the caller's retry deadline.
+fn connect_from_netns(netns_pid: &str, ip: Ipv4Addr, port: u16) -> Output {
+    sudo(&[
+        "nsenter",
+        "-t",
+        netns_pid,
+        "-n",
+        "timeout",
+        "2",
+        "bash",
+        "-c",
+        &format!("exec 3<>/dev/tcp/{ip}/{port}; head -c2 <&3"),
+    ])
+}
+
+/// Sends one UDP datagram from `src_ip` inside the namespace held by `netns_pid`
+/// to `dst_ip:port` and waits up to two seconds for the echoed reply, exiting 0
+/// only when `b"ok"` comes back. The UDP counterpart of [`connect_from_netns`],
+/// so the two own-IP tasks' switch datagram path is asserted end-to-end. A
+/// timed-out `recvfrom` raises and exits non-zero, which the caller's retry loop
+/// treats as "not yet ready".
+fn udp_probe_from_netns(netns_pid: &str, src_ip: Ipv4Addr, dst_ip: Ipv4Addr, port: u16) -> Output {
+    let prog = format!(
+        "import socket,sys\n\
+         s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n\
+         s.bind((\"{src_ip}\",0))\n\
+         s.settimeout(2)\n\
+         s.sendto(b\"ping\",(\"{dst_ip}\",{port}))\n\
+         d=s.recvfrom(64)[0]\n\
+         sys.exit(0 if d==b\"ok\" else 2)\n",
+    );
+    sudo(&[
+        "nsenter", "-t", netns_pid, "-n", "timeout", "3", "python3", "-c", &prog,
+    ])
+}
+
+/// Retries `attempt` until it reports success or `timeout` elapses, polling every
+/// 200 ms. A fixed sleep is flaky on slow CI runners while a listener comes up and
+/// the switch learns MACs; retrying to a deadline is deterministic.
+async fn retry_until_success(timeout: Duration, mut attempt: impl FnMut() -> Output) -> Output {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let out = attempt();
+        if out.status.success() || tokio::time::Instant::now() >= deadline {
+            return out;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// A no-network task cannot reach the internet.
@@ -139,36 +199,21 @@ async fn netns_ownip_ptask_to_ptask() {
     assert_ne!(lease_a.ip, lease_b.ip);
     let sock = switch.control_socket();
 
-    let mut a = Ptask::provision("peer-a", lease_a, subnet, &sock).await;
-    let mut b = Ptask::provision("peer-b", lease_b, subnet, &sock).await;
+    // Neither peer carries an ingress gate: this proof is bare L2 reachability
+    // over the switch (the gate is exercised by netns_ingress_blocks_undeclared_port).
+    let mut a = Ptask::provision("peer-a", lease_a, subnet, &sock, None).await;
+    let mut b = Ptask::provision("peer-b", lease_b, subnet, &sock, None).await;
 
     // PTask B listens on its switch address; PTask A connects to it. The traffic
     // crosses the gvproxy L2 switch entirely in userspace.
     const PORT: u16 = 9009;
     let mut server = b.spawn_listener(PORT);
 
-    // Retry the connect until the listener is ready and the switch has learned
-    // MACs. A fixed sleep is flaky on slow CI runners; retrying up to a deadline
-    // is deterministic.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let a_pid = a.pid().to_string();
-    let client = loop {
-        let out = sudo(&[
-            "nsenter",
-            "-t",
-            &a_pid,
-            "-n",
-            "timeout",
-            "2",
-            "bash",
-            "-c",
-            &format!("exec 3<>/dev/tcp/{}/{PORT}; head -c2 <&3", lease_b.ip),
-        ]);
-        if out.status.success() || tokio::time::Instant::now() >= deadline {
-            break out;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
+    let client = retry_until_success(Duration::from_secs(30), || {
+        connect_from_netns(&a_pid, lease_b.ip, PORT)
+    })
+    .await;
 
     let _ = server.kill();
     let _ = server.wait();
@@ -213,7 +258,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
 
     let minimald::net::AttachResult { lease, .. } = switch.attach().await.expect("attach PTask");
     let sock = switch.control_socket();
-    let mut ptask = Ptask::provision("ingress", lease, subnet, &sock).await;
+    let mut ptask = Ptask::provision("ingress", lease, subnet, &sock, None).await;
 
     // A listener inside the PTask, bound to its switch address on the internal
     // port the forward targets.
@@ -286,6 +331,158 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
     );
 }
 
+/// UC6 (UDP) + ingress enforcement — two own-IP tasks exchange a UDP datagram
+/// over the gvproxy switch. The target attaches with its production ingress gate
+/// declaring the UDP port, so the gate admits the peer's datagram (an inbound UDP
+/// datagram to an *undeclared* port would be dropped as unsolicited), the echo
+/// server replies, and the reply round-trips back to the sender.
+///
+/// Complements `netns_ownip_ptask_to_ptask` (TCP, no gate) by driving the UDP
+/// relay path and the [`IngressGate`]'s `udp_allowed` admit end-to-end. Neither
+/// exists on the base branch, so this cannot pass against an empty PR.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs netns + gvproxy; gated on MINIMALD_NETNS_TEST; runs in the ci-linux-native netns job"]
+async fn netns_ownip_udp_task_to_task() {
+    if !gated() {
+        return;
+    }
+    use sessions::{IngressPolicy, IpProto, PortMapping};
+
+    const UDP_PORT: u16 = 9053;
+
+    let state = tempfile::tempdir().expect("switch state dir");
+    let mut switch = SwitchClient::new(gvproxy_bin(), state.path());
+    let subnet = SwitchSubnet::default();
+
+    let minimald::net::AttachResult { lease: lease_a, .. } =
+        switch.attach().await.expect("attach PTask A");
+    let minimald::net::AttachResult { lease: lease_b, .. } =
+        switch.attach().await.expect("attach PTask B");
+    assert_ne!(lease_a.ip, lease_b.ip);
+    let sock = switch.control_socket();
+
+    // The target B declares UDP_PORT in its ingress policy, so its gate admits an
+    // unsolicited inbound datagram to that port (the own-IP default drops one).
+    let ingress = IngressPolicy {
+        port_mappings: vec![PortMapping {
+            external_port: 19053,
+            internal_port: UDP_PORT,
+            proto: IpProto::Udp,
+        }],
+        dynamic_allowed_range: None,
+    };
+    let gate = IngressGate::for_session(lease_b.ip.to_string(), Some(&ingress));
+
+    // A initiates with no gate, so B's reply to A's own datagram passes freely.
+    let mut a = Ptask::provision("udp-a", lease_a, subnet, &sock, None).await;
+    let mut b = Ptask::provision("udp-b", lease_b, subnet, &sock, Some(gate)).await;
+
+    let mut echo = b.spawn_udp_echo(UDP_PORT);
+
+    let a_pid = a.pid().to_string();
+    let probe = retry_until_success(Duration::from_secs(30), || {
+        udp_probe_from_netns(&a_pid, lease_a.ip, lease_b.ip, UDP_PORT)
+    })
+    .await;
+
+    let _ = echo.kill();
+    let _ = echo.wait();
+    a.teardown();
+    b.teardown();
+    switch.stop().await.expect("stop switch");
+
+    assert!(
+        probe.status.success(),
+        "UDP datagram A -> B:{UDP_PORT} did not round-trip: status={:?}\nstderr={}",
+        probe.status.code(),
+        String::from_utf8_lossy(&probe.stderr),
+    );
+}
+
+/// R2.3 default-deny / UC6 ingress enforcement — a target own-IP task attached
+/// with its production ingress gate admits a peer's TCP connection to a declared
+/// port but drops a connection to a port it never declared.
+///
+/// The target binds a live listener on BOTH ports, so the only thing that differs
+/// between them is the gate: without it, both connects would succeed. This drives
+/// the production `switch → tap` [`IngressGate`] end-to-end (the same gate the
+/// live launcher wires for an own-IP PTask), which `netns_ownip_ptask_to_ptask`
+/// deliberately omits by attaching with no gate. The gate does not exist on the
+/// base branch, so this cannot pass against an empty PR.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs netns + gvproxy; gated on MINIMALD_NETNS_TEST; runs in the ci-linux-native netns job"]
+async fn netns_ingress_blocks_undeclared_port() {
+    if !gated() {
+        return;
+    }
+    use sessions::{IngressPolicy, IpProto, PortMapping};
+
+    const DECLARED: u16 = 8080;
+    const UNDECLARED: u16 = 8099;
+
+    let state = tempfile::tempdir().expect("switch state dir");
+    let mut switch = SwitchClient::new(gvproxy_bin(), state.path());
+    let subnet = SwitchSubnet::default();
+
+    let minimald::net::AttachResult { lease: lease_a, .. } =
+        switch.attach().await.expect("attach PTask A");
+    let minimald::net::AttachResult { lease: lease_b, .. } =
+        switch.attach().await.expect("attach PTask B");
+    let sock = switch.control_socket();
+
+    // B declares only DECLARED as an inbound TCP port; UNDECLARED is absent, so
+    // its gate must drop a new connection there while admitting one to DECLARED.
+    let ingress = IngressPolicy {
+        port_mappings: vec![PortMapping {
+            external_port: 18080,
+            internal_port: DECLARED,
+            proto: IpProto::Tcp,
+        }],
+        dynamic_allowed_range: None,
+    };
+    let gate = IngressGate::for_session(lease_b.ip.to_string(), Some(&ingress));
+
+    let mut a = Ptask::provision("gate-a", lease_a, subnet, &sock, None).await;
+    let mut b = Ptask::provision("gate-b", lease_b, subnet, &sock, Some(gate)).await;
+
+    // Both ports have a live listener; the gate is the sole discriminator.
+    let mut declared_srv = b.spawn_listener(DECLARED);
+    let mut undeclared_srv = b.spawn_listener(UNDECLARED);
+
+    let a_pid = a.pid().to_string();
+    // The declared-port connect must succeed once the switch has warmed.
+    let declared = retry_until_success(Duration::from_secs(30), || {
+        connect_from_netns(&a_pid, lease_b.ip, DECLARED)
+    })
+    .await;
+    // The undeclared-port connect must fail: the gate drops the inbound SYN so it
+    // never reaches the (live) listener. One bounded attempt suffices — the switch
+    // is already warm (the declared probe just connected), so a *passing* SYN
+    // would connect immediately; the 2s bound turns the gate's silent drop into a
+    // fast timeout instead of a hang.
+    let undeclared = connect_from_netns(&a_pid, lease_b.ip, UNDECLARED);
+
+    let _ = declared_srv.kill();
+    let _ = declared_srv.wait();
+    let _ = undeclared_srv.kill();
+    let _ = undeclared_srv.wait();
+    a.teardown();
+    b.teardown();
+    switch.stop().await.expect("stop switch");
+
+    assert!(
+        declared.status.success(),
+        "A -> B:{DECLARED} (a declared ingress port) must connect: status={:?}\nstderr={}",
+        declared.status.code(),
+        String::from_utf8_lossy(&declared.stderr),
+    );
+    assert!(
+        !undeclared.status.success(),
+        "A -> B:{UNDECLARED} was not dropped by the ingress gate; the undeclared-port \
+         connection reached the listener",
+    );
+}
+
 /// One provisioned `OwnIp` PTask: a PID-identified network namespace (held by a
 /// `sleep` process in a fresh `CLONE_NEWNET` namespace, exactly as the live
 /// launcher targets a sandbox child's netns by PID), a tap bridged onto the
@@ -310,6 +507,7 @@ impl Ptask {
         lease: PtaskLease,
         subnet: SwitchSubnet,
         api_sock: &std::path::Path,
+        gate: Option<IngressGate>,
     ) -> Self {
         let tap = format!("tap-{name}");
         let _ = sudo(&["ip", "link", "del", &tap]);
@@ -346,7 +544,7 @@ impl Ptask {
             sudo_ok("configure PTask tap", &strs);
         }
 
-        let relay = attach_to_switch(fd, api_sock, None)
+        let relay = attach_to_switch(fd, api_sock, gate)
             .await
             .expect("attach tap to switch");
 
@@ -384,6 +582,29 @@ impl Ptask {
             ])
             .spawn()
             .expect("spawn listener")
+    }
+
+    /// Spawns a UDP echo server bound to this PTask's switch address inside its
+    /// netns: every datagram it receives is echoed straight back to the sender.
+    /// Echoing in a loop (bounded by `timeout 25` and teardown's kill) means
+    /// whichever of the peer's retried datagrams first crosses the freshly-learned
+    /// switch path gets a reply to that live sender socket.
+    fn spawn_udp_echo(&self, port: u16) -> std::process::Child {
+        let prog = format!(
+            "import socket\n\
+             s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n\
+             s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n\
+             s.bind((\"{ip}\",{port}))\n\
+             while True: d,a=s.recvfrom(64); s.sendto(b\"ok\",a)\n",
+            ip = self.lease.ip,
+        );
+        let pid = self.netns_pid.to_string();
+        Command::new("sudo")
+            .args([
+                "nsenter", "-t", &pid, "-n", "timeout", "25", "python3", "-c", &prog,
+            ])
+            .spawn()
+            .expect("spawn udp echo")
     }
 
     fn teardown(&mut self) {
