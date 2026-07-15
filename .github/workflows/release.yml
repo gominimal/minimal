@@ -105,16 +105,19 @@ jobs:
                   echo '' >> .cargo/config.toml
                   echo '[target.x86_64-unknown-linux-musl]' >> .cargo/config.toml
                   echo 'linker = "musl-gcc"' >> .cargo/config.toml
-            - uses: actions/cache@v6
+            - name: Cache Rust build artifacts (dependency-pruned)
+              # Was a raw actions/cache of the entire target/ — the largest target
+              # dir in the repo (multi-GB). Cached whole into the 10 GB per-repo
+              # LRU it shares with every PR lane, it was evicted fast, so release
+              # builds kept starting cold. rust-cache prunes target/ to just the
+              # dependency artifacts (the costly aws-lc-sys/crypto compiles),
+              # shrinking the entry so it survives; save-if keeps branch/dry-run
+              # dispatches read-only so they don't churn the budget and evict
+              # main's warm cache. Registry + git caches come for free.
+              uses: Swatinem/rust-cache@v2
               with:
-                  path: |
-                      ~/.cargo/bin/
-                      ~/.cargo/registry/index/
-                      ~/.cargo/registry/cache/
-                      ~/.cargo/git/db/
-                      target/
-                  key: ${{ runner.os }}-amd64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-                  restore-keys: ${{ runner.os }}-amd64-cargo-release-
+                  shared-key: release-amd64
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Build static release binaries
               run: |
                   cargo build --release --locked --target x86_64-unknown-linux-musl \
@@ -179,10 +182,11 @@ jobs:
     build-release-linux-arm64:
         runs-on: ubuntu-latest
         # One combined cross build (was three sequential single-package builds).
-        # Keep the 90m headroom the split had, not the optimistic 60: a dry-run
-        # (run 29375276363) showed the cold-cache cross build (musl +
-        # aws-lc-sys) runs ~65m and hit the 60m cap. The recollapse saves link
-        # time, not the dominant aws-lc-sys compile, so the cap must clear it.
+        # Keep 90m, not the optimistic 60: a dry-run (run 29375276363) showed the
+        # cold cross build (musl + aws-lc-sys) runs ~65m and hit the 60m cap. The
+        # rust-cache below makes the typical run fast, but a cache miss (first
+        # build, Cargo.lock change, or LRU eviction) is still cold, so the cap
+        # must clear the aws-lc-sys compile the recollapse can't shorten.
         timeout-minutes: 90
         steps:
             - uses: actions/checkout@v7
@@ -190,16 +194,17 @@ jobs:
               uses: taiki-e/install-action@v2
               with:
                   tool: cross
-            - uses: actions/cache@v6
+            - name: Cache Rust build artifacts (dependency-pruned)
+              # See the amd64 job: rust-cache replaces a raw multi-GB target/ cache
+              # the 10 GB LRU evicted, which is why this cross build kept running
+              # cold (~65m). Pruned to dependency artifacts so it survives; save-if
+              # keeps branch/dry-run dispatches read-only. cross writes target/ and
+              # reads ~/.cargo on the host, so rust-cache caches them the same as a
+              # native build.
+              uses: Swatinem/rust-cache@v2
               with:
-                  path: |
-                      ~/.cargo/bin/
-                      ~/.cargo/registry/index/
-                      ~/.cargo/registry/cache/
-                      ~/.cargo/git/db/
-                      target/
-                  key: ${{ runner.os }}-arm64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-                  restore-keys: ${{ runner.os }}-arm64-cargo-release-
+                  shared-key: release-arm64
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Build static release binaries
               # One build of all three packages (mirrors the amd64 job) instead of
               # three separate cross invocations resolving the graph three times.
