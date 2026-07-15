@@ -663,16 +663,29 @@ async fn async_main() -> Result<(), MainError> {
     if let Some(restriction) = sandbox2::user_namespaces_restriction() {
         let fix = match restriction {
             sandbox2::UsernsRestriction::ApparmorUnconfined => {
-                "install minimald's AppArmor profile (one-time, needs root): \
-                 sudo bash ~/.local/share/minimal/apparmor/install-apparmor-profile.sh \
-                 (from a checkout: sudo scripts/install-apparmor-profile.sh)"
+                // The loader lands under the installer's `data` prefix, which
+                // resolves through $XDG_DATA_HOME exactly like
+                // `paths::minimal_data_dir` — don't hardcode ~/.local/share.
+                // A daemon at a path outside the profile's tunable (a custom
+                // MINIMAL_BIN, a dev build) needs the binary attached too.
+                format!(
+                    "install minimald's AppArmor profile (one-time, needs root): sudo bash \
+                     {data}/apparmor/install-apparmor-profile.sh --path {bin} (from a checkout: \
+                     sudo scripts/install-apparmor-profile.sh --path {bin})",
+                    data = paths::minimal_data_dir(),
+                    bin = std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.to_str().map(str::to_owned))
+                        .unwrap_or_else(|| "<path to this minimald binary>".to_string()),
+                )
             }
             sandbox2::UsernsRestriction::Disabled => {
                 "re-enable user namespaces, e.g. sudo sysctl -w user.max_user_namespaces=15000"
+                    .to_string()
             }
             // `UsernsRestriction` is #[non_exhaustive]; future variants get
             // the docs pointer until a matching remediation lands here.
-            _ => "see the linux-host-setup doc",
+            _ => "see the linux-host-setup doc".to_string(),
         };
         tracing::warn!(
             reason = %restriction,
