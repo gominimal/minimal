@@ -1216,7 +1216,27 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
 }
 
 /// Shut down the minimald daemon via the `Shutdown` RPC.
+///
+/// A daemon that is already down is the goal state, not a failure: `stop` says
+/// so and exits 0. Without the probe the only way to find that out is to fail
+/// connecting to it, which reports a connect error (or a timeout, against a
+/// stale socket) for a machine that is in exactly the state asked for. Note the
+/// deliberate asymmetry with every other command: they call `ensure_daemon` and
+/// autospawn, which for `stop` would mean booting a VM in order to shut it down.
 pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow::Error> {
+    // Cheap and bounded (a state-file read, or a connect to a local socket that
+    // refuses at once when nothing listens), so it runs inline rather than on
+    // the blocking pool — unlike the shutdown wait below, which sleep-polls.
+    if !autospawn::is_daemon_running(global.minvmd, global.minimal_dir.as_deref())
+        .context("Failed to determine whether the daemon is running")?
+    {
+        println!("Daemon is not running.");
+        return Ok(());
+    }
+
+    // Racy by nature: the daemon may go down between the probe and this connect
+    // (or `--minvmd` may point the probe and the client at different backends),
+    // so a connect failure is still a real error, not something to swallow.
     let mut client = connect_daemon(global).await?;
 
     use minimald_rpc::{Shutdown, ShutdownRequest, ShutdownResponse};
