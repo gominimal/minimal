@@ -245,9 +245,15 @@ impl ServerStateHandle {
     }
 
     /// The configured state dir (the quiesce target when in a microVM).
-    #[cfg(target_os = "linux")]
     pub(crate) async fn minimal_state_dir(&self) -> DaemonAbsPath {
         self.0.lock().await.config.minimal_state_dir.clone()
+    }
+
+    /// Whether this daemon is the in-VM pid-1 instance (as opposed to a
+    /// native host daemon). Recorded in diagnostic bundles and gates the
+    /// guest-only probes (gvproxy gateway reachability).
+    pub(crate) async fn in_microvm(&self) -> bool {
+        self.0.lock().await.config.in_microvm
     }
 
     /// Returns the daemon's TLS certificate authority (only with

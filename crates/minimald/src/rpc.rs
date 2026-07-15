@@ -569,6 +569,7 @@ pub async fn handle_ssh_rpc(
         | GetSessionPolicy::NAME
         | GetMeshStatus::NAME
         | STREAM_WORKSPACE_FILES
+        | minimald_rpc::DIAG_BUNDLE_SUBSYSTEM
         | IssueClientCert::NAME => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
@@ -608,6 +609,9 @@ pub async fn handle_ssh_rpc(
         GetSessionPolicy::NAME => drop(spawn(serve_get_session_policy(s, channel))),
         GetMeshStatus::NAME => drop(spawn(serve_get_mesh_status(s, channel))),
         STREAM_WORKSPACE_FILES => drop(spawn(serve_stream_workspace_files(s, config, channel))),
+        minimald_rpc::DIAG_BUNDLE_SUBSYSTEM => drop(spawn(crate::diag::serve_stream_diag_bundle(
+            s, config, channel,
+        ))),
         IssueClientCert::NAME => {
             #[cfg(feature = "networking-proxy")]
             drop(spawn(serve_issue_client_cert(s, channel)));
