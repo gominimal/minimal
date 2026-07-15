@@ -150,6 +150,10 @@ pub fn minimal_state_dir() -> DaemonAbsPath {
 /// File name of the daemon SSH socket in a provider instance dir. Served by
 /// native minimald or by the minvmd host↔guest bridge — one endpoint either way.
 pub const SSH_SOCK_FILE: &str = "ssh.sock";
+/// File name of the SSH `known_hosts` in a provider instance dir, recording the
+/// daemon's host key under the `local-<instance>` hostname. Written at startup
+/// by native minimald, and by minvmd from the guest's boot beacon.
+pub const KNOWN_HOSTS_FILE: &str = "known_hosts";
 /// Native minimald's single-instance lock, held for the daemon's lifetime.
 pub const MINIMALD_LOCK_FILE: &str = "minimald.lock";
 /// The minvmd supervisor's alive lock, held for the daemon's lifetime.
