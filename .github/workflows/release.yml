@@ -178,9 +178,12 @@ jobs:
 
     build-release-linux-arm64:
         runs-on: ubuntu-latest
-        # One combined cross build (was three sequential single-package builds);
-        # right-sized from the padded 90 the split required.
-        timeout-minutes: 60
+        # One combined cross build (was three sequential single-package builds).
+        # Keep the 90m headroom the split had, not the optimistic 60: a dry-run
+        # (run 29375276363) showed the cold-cache cross build (musl +
+        # aws-lc-sys) runs ~65m and hit the 60m cap. The recollapse saves link
+        # time, not the dominant aws-lc-sys compile, so the cap must clear it.
+        timeout-minutes: 90
         steps:
             - uses: actions/checkout@v7
             - name: Install cross
