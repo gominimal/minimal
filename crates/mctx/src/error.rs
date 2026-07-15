@@ -191,10 +191,12 @@ impl From<checkouts::Error> for Error {
         match value {
             checkouts::Error::IO(e) => Self::IO("vcs", PathBuf::new(), e),
             checkouts::Error::Other(e) => Self::Other(anyhow::anyhow!(e)),
-            checkouts::Error::GitCommandFailed { command, stderr } => Self::Other(anyhow::anyhow!(
-                "unexpected: git command '{}' failed: {}",
+            checkouts::Error::GitCommandFailed {
                 command,
-                stderr
+                stderr,
+                status,
+            } => Self::Other(anyhow::anyhow!(
+                "unexpected: git command '{command}' failed ({status}): {stderr}"
             )),
             checkouts::Error::InvalidPath => {
                 Self::Other(anyhow::anyhow!("vcs: invalid remote path"))

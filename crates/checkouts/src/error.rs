@@ -14,6 +14,12 @@ pub enum Error {
         command: String,
         /// The stderr output from the failed command
         stderr: String,
+        /// How the process terminated (`std::process::ExitStatus`, rendered):
+        /// an exit code (`exit status: N`) or a signal (`signal: 9 (SIGKILL)`).
+        /// Distinguishes a git-reported failure from an externally killed
+        /// process — a signal kill leaves only whatever git wrote before dying,
+        /// which can be a misleadingly benign line (e.g. a templates warning).
+        status: String,
     },
 
     /// The repository path is invalid (e.g., contains invalid UTF-8) or for a different remote.
@@ -48,8 +54,12 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::IO(e) => write!(f, "I/O error: {}", e),
-            Error::GitCommandFailed { command, stderr } => {
-                write!(f, "git command  {} failed: {}", command, stderr)
+            Error::GitCommandFailed {
+                command,
+                stderr,
+                status,
+            } => {
+                write!(f, "git command '{command}' failed ({status}): {stderr}")
             }
             Error::InvalidPath => write!(f, "invalid path"),
             Error::Other(e) => write!(f, "other: {}", e),
