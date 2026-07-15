@@ -22,8 +22,11 @@ DIAG hakoniwa container/process exited non-zero code=125 exit_code=None
   reason=write("/proc/self/uid_map", ..) => Operation not permitted (os error 1)
 ```
 
-`minimal attach` shows this as a session that closes immediately. Confirm the
-host is the cause — this needs no minimal code at all:
+`minimal attach` shows this as a session that closes immediately. The daemon
+also preflights this at startup: on a host that will refuse the namespace it
+logs a `sessions will fail to start` warning naming the restriction and this
+fix, so check the daemon log first. Confirm the host is the cause — this needs
+no minimal code at all:
 
 ```console
 $ cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
