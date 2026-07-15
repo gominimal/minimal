@@ -56,6 +56,7 @@ impl Repo {
             return Err(Error::GitCommandFailed {
                 command: "clone".to_string(),
                 stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                status: output.status.to_string(),
             });
         }
 
@@ -209,6 +210,7 @@ impl Repo {
             return Err(Error::GitCommandFailed {
                 command: args.join(" "),
                 stderr,
+                status: output.status.to_string(),
             });
         }
         Ok(output)
@@ -232,6 +234,7 @@ impl Repo {
             return Err(Error::GitCommandFailed {
                 command: args.join(" "),
                 stderr,
+                status: output.status.to_string(),
             });
         }
         Ok(output)
