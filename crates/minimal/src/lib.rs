@@ -14,6 +14,7 @@ pub mod client;
 pub mod config;
 pub mod dirs;
 mod file_upload;
+pub mod git_remote;
 pub mod loadouts;
 
 #[derive(Parser)]
@@ -197,7 +198,12 @@ pub struct MeshJoinArgs {
 }
 
 /// Shared arguments all subcommands
-#[derive(Debug, Args)]
+///
+/// The `Default` value is the no-flags invocation (no overrides, native
+/// backend) — what a bare `min <cmd>` resolves to, and what indirect
+/// entrypoints like the `git-remote-min` helper mode (which git invokes
+/// without any of our flags) use.
+#[derive(Debug, Default, Args)]
 pub struct GlobalArgs {
     /// Use the given directory as the repository root, instead of the current
     /// working directory.

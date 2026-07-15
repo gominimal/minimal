@@ -1370,7 +1370,6 @@ mod tests {
         use sessions::SessionId;
 
         use crate::MINIMAL_SESSION_ID_ENV;
-        use crate::sessions::SessionKeyPredicate;
         use crate::test_harness::{
             TestClient, TestServer, create_configured_session, create_session_req,
         };
@@ -1471,104 +1470,6 @@ mod tests {
                 "echo task should produce no stderr: {:?}",
                 out.stderr,
             );
-        }
-
-        /// End-to-end: `git push min://<session-id>` driven by an
-        /// OpenSSH process going through a modified `git-remote-min`
-        /// helper lands the pushed commit in the session workspace, with
-        /// the post-receive hook checking out the branch on disk.
-        #[ignore]
-        #[tokio::test]
-        async fn git_receive_pack_lands_pushed_commit_in_workspace() {
-            use std::os::unix::fs::PermissionsExt;
-
-            use tempfile::TempDir;
-            use tokio::process::Command;
-
-            async fn run_git(cwd: &std::path::Path, args: &[&str]) {
-                let out = Command::new("git")
-                    .current_dir(cwd)
-                    .args(args)
-                    .output()
-                    .await
-                    .expect("git should be invocable");
-                assert!(
-                    out.status.success(),
-                    "git {args:?} failed: {}",
-                    String::from_utf8_lossy(&out.stderr),
-                );
-            }
-
-            let server = TestServer::new().await;
-            let sock_dir = TempDir::new().unwrap();
-            let sock_path = sock_dir.path().join("ssh.sock");
-            server.listen_on_uds(&sock_path).await;
-
-            let mut client = server.connect().await;
-            let session_id = fresh_session(&mut client).await;
-
-            // Drop a `git-remote-min` into a tempdir and prepend that
-            // tempdir to PATH so `git push min://…` resolves to it. The
-            // script is the production one with its hard-coded socket
-            // path swapped for the test server's UDS.
-            let helpers_dir = TempDir::new().unwrap();
-            let helper_path = helpers_dir.path().join("git-remote-min");
-            let template = include_str!("../git-remote-min");
-            let script = template.replace(
-                "$HOME/.local/state/minimal/providers/local-0/ssh.sock",
-                sock_path.to_str().unwrap(),
-            );
-            tokio::fs::write(&helper_path, script).await.unwrap();
-            tokio::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o755))
-                .await
-                .unwrap();
-
-            // Source repo with a single commit on `main`. Local
-            // user.email/user.name to keep the test independent of any
-            // global git config.
-            let src_dir = TempDir::new().unwrap();
-            let src_path = src_dir.path();
-            run_git(src_path, &["init", "-q", "-b", "main"]).await;
-            run_git(src_path, &["config", "user.email", "t@example.com"]).await;
-            run_git(src_path, &["config", "user.name", "Test"]).await;
-            tokio::fs::write(src_path.join("hello.txt"), b"hi there\n")
-                .await
-                .unwrap();
-            run_git(src_path, &["add", "hello.txt"]).await;
-            run_git(src_path, &["commit", "-q", "-m", "first commit"]).await;
-
-            let inherited_path = std::env::var("PATH").unwrap_or_default();
-            let path_with_helper = format!("{}:{}", helpers_dir.path().display(), inherited_path);
-            let url = format!("min://{session_id}");
-            let push = Command::new("git")
-                .current_dir(src_path)
-                .env("PATH", &path_with_helper)
-                .args(["push", &url, "main"])
-                .output()
-                .await
-                .expect("git push should run");
-            assert!(
-                push.status.success(),
-                "git push failed: stdout={} stderr={}",
-                String::from_utf8_lossy(&push.stdout),
-                String::from_utf8_lossy(&push.stderr),
-            );
-
-            // The post-receive hook checks out `refs/heads/main` into
-            // the worktree, so the pushed file should be readable from
-            // the session workspace.
-            let mngr = server.state.sessions_manager().await;
-            let session_handle = mngr
-                .get_session(SessionKeyPredicate::Id(session_id))
-                .await
-                .unwrap()
-                .expect("session should be retrievable");
-            let paths = session_handle.paths().await.unwrap();
-            let pushed = paths.working.as_utf8_path().join("hello.txt");
-            let contents = tokio::fs::read(&pushed)
-                .await
-                .unwrap_or_else(|e| panic!("reading pushed file {pushed} failed: {e}"));
-            assert_eq!(contents, b"hi there\n");
         }
     }
 }
