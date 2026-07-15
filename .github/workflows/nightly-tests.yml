@@ -205,6 +205,68 @@ jobs:
       pull-requests: read
     uses: ./.github/workflows/ci-shell-installer.yml
 
+  networking-integration:
+    # Re-run minimald's single-host networking proofs — the network-namespace
+    # root integration harness — nightly, so drift in the pinned gvproxy switch,
+    # the runner's userns/netns capability, or the newest nextest is caught even
+    # on days no PR touches the networking crates. Exactly the `installer` job's
+    # rationale one tier down: the per-PR home for these proofs
+    # (ci-linux-native's `minimald-root-integration` job) is path-scoped to
+    # crates/** + vendor/gvproxy/**, so between such changes nothing exercises
+    # the netns/tap/gvproxy path; this nightly run does.
+    #
+    # Same harness, same convention selector (`binary(/_root_integration$/)`),
+    # same env (MINIMALD_NETNS_TEST + GVPROXY_BIN) as that lane — a new
+    # crates/minimald/tests/*_root_integration.rs is picked up here with no edit.
+    # Single-host only: the cross-host WireGuard mesh proof (networking-wg) is
+    # feature-gated off and its file name does not match the convention, so it
+    # stays out. BLOCKING (networking failures are real signal): feeds `notify`.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          # Same cache class as ci-linux-native's netns job (it compiles the
+          # identical minimald integration targets); a scheduled run on main
+          # writes it back, keeping that shared pool warm.
+          shared-key: netns
+      - name: Install nextest
+        # Convention selection is a nextest filterset (binary(/_root_integration$/));
+        # cargo test cannot select test targets by pattern.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Enable unprivileged user namespaces
+        # The PTask namespaces (hakoniwa/unshare) need userns; Ubuntu 24.04
+        # restricts them via AppArmor by default.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Fetch pinned gvproxy switch binary
+        run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
+      - name: Confirm netns capability
+        # Fail fast with a clear message if the runner image ever drops userns,
+        # rather than letting every gated test mis-skip into a false green.
+        run: |
+          if ! unshare --user --net true 2>/dev/null && ! sudo ip netns add _ci_probe; then
+            echo "::error::runner cannot create a network namespace (no userns and no sudo netns)" >&2
+            exit 1
+          fi
+          sudo ip netns del _ci_probe 2>/dev/null || true
+          echo "netns capability: OK"
+      - name: Run minimald root integration proofs (auto-discovered)
+        env:
+          MINIMALD_NETNS_TEST: "1"
+          GVPROXY_BIN: ${{ runner.temp }}/gvproxy
+        # `binary(/_root_integration$/)` selects every root harness by suffix;
+        # `--run-ignored all` flips the #[ignore] proofs from early-return to
+        # run; `--no-tests=fail` reds the job if the convention ever matches
+        # nothing. The tap/netns commands sudo themselves.
+        run: |
+          cargo nextest run -p minimald --profile ci \
+            --run-ignored all --no-tests=fail -E 'binary(/_root_integration$/)'
+
   hygiene:
     # Workflow lint + unused-dependency check. Non-blocking; especially handy
     # during CI surgery. Tool installs are best-effort under continue-on-error.
@@ -241,14 +303,15 @@ jobs:
     # a regression doesn't rot in the Actions tab. Canaries are
     # continue-on-error and deliberately do NOT trip this — read them in the
     # run itself.
-    needs: [advisories, session-e2e-soak, installer]
+    needs: [advisories, session-e2e-soak, installer, networking-integration]
     # Fire on failure OR cancellation of a blocking job (a timeout reports
     # 'failure', so hangs are covered; this also catches an infra cancel).
     if: >-
       always() &&
       (needs.advisories.result == 'failure' || needs.advisories.result == 'cancelled'
        || needs.session-e2e-soak.result == 'failure' || needs.session-e2e-soak.result == 'cancelled'
-       || needs.installer.result == 'failure' || needs.installer.result == 'cancelled')
+       || needs.installer.result == 'failure' || needs.installer.result == 'cancelled'
+       || needs.networking-integration.result == 'failure' || needs.networking-integration.result == 'cancelled')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -262,6 +325,7 @@ jobs:
           ADV: ${{ needs.advisories.result }}
           SOAK: ${{ needs.session-e2e-soak.result }}
           INSTALLER: ${{ needs.installer.result }}
+          NET: ${{ needs.networking-integration.result }}
         run: |
           set -euo pipefail
           title="Nightly test tier failing"
@@ -273,8 +337,8 @@ jobs:
           # The trigger condition fires on both failure and cancellation (a
           # timeout reports 'failure'); the per-job lines below carry the exact
           # result, so keep the lead line accurate for either outcome.
-          body="$(printf 'A nightly-tests run failed or was cancelled.\n\n- advisories: %s\n- session-e2e-soak: %s\n- installer: %s\n\nRun: %s' \
-            "$ADV" "$SOAK" "$INSTALLER" "$RUN_URL")"
+          body="$(printf 'A nightly-tests run failed or was cancelled.\n\n- advisories: %s\n- session-e2e-soak: %s\n- installer: %s\n- networking-integration: %s\n\nRun: %s' \
+            "$ADV" "$SOAK" "$INSTALLER" "$NET" "$RUN_URL")"
           existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --label ci-nightly --json number --jq '.[0].number // empty')"
           if [ -n "$existing" ]; then
