@@ -13,6 +13,7 @@ pub mod autospawn;
 pub mod client;
 pub mod config;
 pub mod dirs;
+mod file_upload;
 pub mod loadouts;
 
 #[derive(Parser)]
@@ -946,6 +947,14 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     if let minimald_rpc::ConfigureLoadoutResponse::Pending { response } = configured {
         drive_pending_to_active(&mut client, response, user_policy, compose_options).await?;
     }
+
+    // Upload the project directory to the daemon so the session
+    // sandbox has the user's files available.
+    eprintln!("Uploading project files...");
+    client
+        .upload_workspace_files(id, utf8_path.as_std_path())
+        .await
+        .context("Failed to upload project files")?;
 
     println!("{id}");
 

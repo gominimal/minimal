@@ -43,6 +43,22 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROJECT_DIR="${E2E_PROJECT_DIR:-$ROOT}"
 E2E_VM="${E2E_VM:-}"
 
+# On VM lanes the project dir is /tmp (a path that exists in the guest
+# image), but uploading all of /tmp is impractical. Create a minimal
+# project subdir with a minimal.toml so the file upload stays small.
+if [ -n "$E2E_VM" ] && [ "$PROJECT_DIR" = "/tmp" ]; then
+  PROJECT_DIR="/tmp/mnl-e2e-project"
+  mkdir -p "$PROJECT_DIR"
+  cat > "$PROJECT_DIR/minimal.toml" <<'TOML'
+[upstream]
+repo = "https://github.com/gominimal/pkgs"
+branch = "main"
+
+[stack]
+use = "shell"
+TOML
+fi
+
 # Fresh state under /tmp — NOT $TMPDIR: macOS's deep $TMPDIR would push
 # `.../minimal/providers/local-0/*.sock` past the 104-byte sun_path limit.
 # Post-#690, all daemon state (minvmd.toml, locks, the bridge socket) lives

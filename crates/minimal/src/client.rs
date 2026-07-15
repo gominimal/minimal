@@ -147,6 +147,43 @@ impl Client {
         serde_json::from_slice(&resp_buf)
             .with_context(|| format!("decode response for {}", R::NAME))
     }
+
+    /// Stream a zstd-compressed tarball of `dir` to the daemon's
+    /// `WorkspaceFilesTarZst` subsystem, which unpacks it into the
+    /// session's workspace directory.
+    ///
+    /// `session_id` is set as the `MINIMAL_SESSION_ID` env var on the
+    /// channel so the daemon can scope the upload to the correct session.
+    pub async fn upload_workspace_files(
+        &mut self,
+        session_id: sessions::SessionId,
+        dir: &Path,
+    ) -> Result<(), anyhow::Error> {
+        let subsystem =
+            constcat::concat!(minimald_rpc::RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
+
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .context("open channel for workspace file upload")?;
+
+        channel
+            .set_env(true, "MINIMAL_SESSION_ID", session_id.to_string())
+            .await
+            .context("set MINIMAL_SESSION_ID env")?;
+
+        channel
+            .request_subsystem(true, subsystem)
+            .await
+            .context("request WorkspaceFilesTarZst subsystem")?;
+
+        let stream = channel.into_stream();
+
+        // Stream a tar+zstd archive directly to the daemon channel,
+        // avoiding buffering the entire archive in memory.
+        crate::file_upload::stream_tar_zstd(dir, stream).await
+    }
 }
 
 /// Resolve the provider-instance dir (`<state dir>/providers/local-0`) the

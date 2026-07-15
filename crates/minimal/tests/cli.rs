@@ -197,6 +197,57 @@ async fn activate_creates_session() {
     assert_eq!(resp.sessions[0].name.as_deref(), Some("test-session"));
 }
 
+// --- activate uploads project files ---
+
+#[tokio::test]
+async fn activate_uploads_project_files() {
+    let (daemon, args) = setup().await;
+
+    // Create a temp project dir with a minimal.toml and some files.
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+    std::fs::write(project.path().join("hello.txt"), "hello world").unwrap();
+    std::fs::create_dir_all(project.path().join("subdir")).unwrap();
+    std::fs::write(project.path().join("subdir/nested.txt"), "nested").unwrap();
+
+    let activate_args = ActivateArgs {
+        name: Some("upload-test".to_string()),
+        path: project.path().to_string_lossy().to_string(),
+        network: CliNetworkMode::NoNet,
+        ingress: vec![],
+        loadout: vec![],
+        no_loadouts: false,
+        attach: false,
+    };
+    cmd_activate(&args, activate_args).await.unwrap();
+
+    // Look up the session and verify the uploaded files landed in the
+    // session's workspace directory by reading them back over SFTP.
+    let mut sftp_client = daemon.server.connect().await;
+    let sessions = {
+        use minimald_rpc::ListSessions;
+        let resp = sftp_client.call::<ListSessions>(&()).await;
+        resp.sessions
+    };
+    assert_eq!(sessions.len(), 1);
+    let session_id: SessionId = sessions[0].id;
+
+    let sftp = sftp_client.open_sftp(session_id).await;
+
+    let hello = sftp.read("hello.txt").await.unwrap();
+    assert_eq!(hello, b"hello world");
+
+    let nested = sftp.read("subdir/nested.txt").await.unwrap();
+    assert_eq!(nested, b"nested");
+
+    let mfile = sftp.read("minimal.toml").await.unwrap();
+    assert!(mfile.starts_with(b"# test"));
+}
+
 // --- destroy ---
 
 #[tokio::test]
