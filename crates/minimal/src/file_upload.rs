@@ -29,6 +29,21 @@ async fn add_dir_entries(
     add_dir_entries_inner(tar, root, prefix).await
 }
 
+/// Directories always skipped during upload. A proper .gitignore
+/// implementation is tracked as a follow-up on #263.
+const DEFAULT_EXCLUDED_DIRS: &[&str] = &[".git", "target", "node_modules"];
+
+fn is_default_excluded(name: &str) -> bool {
+    DEFAULT_EXCLUDED_DIRS.contains(&name)
+}
+
+async fn file_type_will_be_dir(entry: &tokio::fs::DirEntry, entry_path: &std::path::Path) -> bool {
+    match entry.file_type().await {
+        Ok(t) => t.is_dir(),
+        Err(_) => entry_path.is_dir(),
+    }
+}
+
 fn add_dir_entries_inner<'a>(
     tar: &'a mut Builder<Vec<u8>>,
     root: &'a Path,
@@ -62,6 +77,13 @@ fn add_dir_entries_inner<'a>(
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             let entry_path = entry.path();
+
+            // Skip common heavy/irrelevant directories. A proper .gitignore
+            // implementation is tracked as a follow-up on #263.
+            if file_type_will_be_dir(&entry, &entry_path).await && is_default_excluded(&name_str) {
+                continue;
+            }
+
             let archive_path = if prefix.is_empty() {
                 name_str.to_string()
             } else {
@@ -269,5 +291,37 @@ mod tests {
 
         // safe.txt should be present.
         assert!(out.path().join("safe.txt").is_file());
+    }
+
+    #[tokio::test]
+    async fn tar_excludes_default_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "keep").unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target/binary.o"), "binary").unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/config"), "gitconfig").unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+        std::fs::write(dir.path().join("node_modules/lib.js"), "lib").unwrap();
+
+        let tar = tar_directory(dir.path()).await.unwrap();
+        let paths = unpack_and_list(&tar).await;
+
+        assert!(
+            paths.iter().any(|p| p == "keep.txt"),
+            "keep.txt should be uploaded"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("target/")),
+            "target/ should be excluded"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains(".git/")),
+            ".git/ should be excluded"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("node_modules/")),
+            "node_modules/ should be excluded"
+        );
     }
 }
