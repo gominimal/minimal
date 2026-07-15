@@ -142,23 +142,29 @@ COMPONENTS=(
 )
 
 # Stage the AppArmor components from the checkout this script runs in. They are
-# repo files rather than release-workflow artifacts, so copy them into
-# ARTIFACTS_DIR under the stable basenames the component table references; from
-# there the manifest loop treats them like any downloaded artifact.
-repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-stage_repo_file() {
-    [ -f "$repo_root/$1" ] || die "missing repo file for staging: $1"
-    cp "$repo_root/$1" "$ARTIFACTS_DIR/$2" || die "failed to stage $1 into $ARTIFACTS_DIR"
-}
-stage_repo_file packaging/apparmor/minimald          minimald.apparmor
-stage_repo_file packaging/apparmor/tunables/minimald minimald.apparmor-tunable
-stage_repo_file scripts/install-apparmor-profile.sh  install-apparmor-profile.sh
+# repo files rather than release-workflow artifacts, so copy them into the
+# ephemeral workdir — never into ARTIFACTS_DIR, which the caller owns and
+# --dry-run promises not to touch (it may even be read-only) — under the
+# stable basenames the component table references. The manifest loop prefers
+# a staged file over an ARTIFACTS_DIR one of the same basename, so a stale
+# copy left in the artifacts dir cannot shadow the checkout's current file.
 
 # --- Build the manifest ----------------------------------------------------
 
 workdir="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-stage)"
 trap 'rm -rf "$workdir"' EXIT
 manifest="$workdir/components"
+
+staged_dir="$workdir/staged"
+mkdir -p "$staged_dir"
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+stage_repo_file() {
+    [ -f "$repo_root/$1" ] || die "missing repo file for staging: $1"
+    cp "$repo_root/$1" "$staged_dir/$2" || die "failed to stage $1 into $staged_dir"
+}
+stage_repo_file packaging/apparmor/minimald          minimald.apparmor
+stage_repo_file packaging/apparmor/tunables/minimald minimald.apparmor-tunable
+stage_repo_file scripts/install-apparmor-profile.sh  install-apparmor-profile.sh
 
 {
     printf '# format: %s\n' "$FORMAT_VERSION"
@@ -171,7 +177,8 @@ upload_list=()
 
 for entry in "${COMPONENTS[@]}"; do
     IFS='|' read -r comp os arch kind dest basename <<<"$entry"
-    file="$ARTIFACTS_DIR/$basename"
+    file="$staged_dir/$basename"
+    [ -f "$file" ] || file="$ARTIFACTS_DIR/$basename"
 
     if [ ! -f "$file" ]; then
         if [ "$ALLOW_MISSING" -eq 1 ]; then
