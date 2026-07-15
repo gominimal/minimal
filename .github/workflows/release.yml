@@ -80,7 +80,13 @@ jobs:
 
     build-release-linux-amd64:
         runs-on: ubuntu-latest
-        timeout-minutes: 60
+        # 90m, matching arm64. The build step below links the three binaries one
+        # at a time, so LTO links that used to overlap now serialize, and this
+        # job builds minvmd natively on top of them. The old 60m cap was only
+        # ever measured against the combined build, so it is not evidence this
+        # shape fits; a cap only bounds a hang, and an early finish bills for the
+        # time actually used.
+        timeout-minutes: 90
         steps:
             - name: Free Disk Space
               # Static release build of the full workspace; the cargo target dir
@@ -119,11 +125,22 @@ jobs:
                   shared-key: release-amd64
                   save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Build static release binaries
+              # One invocation per package, not one combined build.
+              # `[profile.release]` is fat LTO with codegen-units = 1, so a
+              # combined build lets cargo schedule all three final LTO links
+              # concurrently at -j4. That peak is what got the arm64 job
+              # SIGTERMed (exit 143) immediately after its last workspace crate
+              # compiled; this job has the same profile on a runner with the same
+              # 16 GB, so it was clearing the ceiling on headroom rather than by
+              # design. Sequential invocations share dependency artifacts through
+              # the same target/ dir, so the cost is three graph resolutions, not
+              # three builds — while the LTO links run one at a time. Do not
+              # recollapse these without cutting the release profile's link-time
+              # memory first.
               run: |
-                  cargo build --release --locked --target x86_64-unknown-linux-musl \
-                     --package mip \
-                     --package minimal \
-                     --package minimald
+                  cargo build --release --locked --target x86_64-unknown-linux-musl --package mip
+                  cargo build --release --locked --target x86_64-unknown-linux-musl --package minimal
+                  cargo build --release --locked --target x86_64-unknown-linux-musl --package minimald
             - name: Rename binaries with platform suffix
               # download-artifact merge-multiple flattens every artifact into one
               # directory using each file's basename, so the uploaded files must
@@ -219,11 +236,14 @@ jobs:
                   shared-key: release-arm64
                   save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Build static release binaries
+              # See the amd64 job: one invocation per package so the fat-LTO
+              # links run one at a time. Recollapsing them into a single build is
+              # what got this job SIGTERMed (exit 143) on the 16 GB runner, right
+              # after the last workspace crate compiled.
               run: |
-                  cargo build --release --locked --target aarch64-unknown-linux-musl \
-                     --package mip \
-                     --package minimal \
-                     --package minimald
+                  cargo build --release --locked --target aarch64-unknown-linux-musl --package mip
+                  cargo build --release --locked --target aarch64-unknown-linux-musl --package minimal
+                  cargo build --release --locked --target aarch64-unknown-linux-musl --package minimald
             - name: Rename binaries with platform suffix
               # Platform-suffixed so download-artifact's merge-multiple basename
               # flatten does not collide with the amd64 build.
