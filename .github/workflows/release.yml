@@ -87,6 +87,13 @@ jobs:
         # shape fits; a cap only bounds a hang, and an early finish bills for the
         # time actually used.
         timeout-minutes: 90
+        # `CARGO_TARGET_<TRIPLE>_LINKER` is the documented env equivalent of the
+        # `[target.<triple>] linker` config key (triple uppercased, dashes to
+        # underscores). Set here rather than appended to `.cargo/config.toml` so
+        # the build never mutates the checkout. Job-level env merges with the
+        # workflow-level block above rather than replacing it.
+        env:
+            CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         steps:
             - name: Free Disk Space
               # Static release build of the full workspace; the cargo target dir
@@ -106,11 +113,6 @@ jobs:
               run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
             - name: Add Rust target
               run: rustup target add x86_64-unknown-linux-musl
-            - name: Configure musl linker
-              run: |
-                  echo '' >> .cargo/config.toml
-                  echo '[target.x86_64-unknown-linux-musl]' >> .cargo/config.toml
-                  echo 'linker = "musl-gcc"' >> .cargo/config.toml
             - name: Cache Rust build artifacts (dependency-pruned)
               # Was a raw actions/cache of the entire target/ — the largest target
               # dir in the repo (multi-GB). Cached whole into the 10 GB per-repo
@@ -199,6 +201,10 @@ jobs:
     build-release-linux-arm64:
         runs-on: ubuntu-26.04-arm
         timeout-minutes: 90
+        # See the amd64 job: cargo's env equivalent of `[target.<triple>]
+        # linker`, so the build leaves the checkout untouched.
+        env:
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         steps:
             - uses: actions/checkout@v7
             - name: Free Disk Space
@@ -214,16 +220,10 @@ jobs:
                   remove_dotnet: true
                   remove_haskell: true
                   remove_tool_cache: true
-            - uses: actions/checkout@v7
             - name: Install dependencies
               run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
             - name: Add Rust target
               run: rustup target add aarch64-unknown-linux-musl
-            - name: Configure musl linker
-              run: |
-                  echo '' >> .cargo/config.toml
-                  echo '[target.aarch64-unknown-linux-musl]' >> .cargo/config.toml
-                  echo 'linker = "musl-gcc"' >> .cargo/config.toml
             - name: Cache Rust build artifacts (dependency-pruned)
               # See the amd64 job: rust-cache replaces a raw multi-GB target/ cache
               # the 10 GB LRU evicted, which is why this build kept running
