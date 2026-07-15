@@ -235,6 +235,9 @@ pub struct ActivateArgs {
     /// Project path to activate (defaults to current directory)
     #[arg(default_value = ".")]
     pub path: String,
+    /// How to load project files into the session.
+    #[arg(long, value_enum, default_value_t = SyncMode::Tarball)]
+    pub sync: SyncMode,
     /// Network mode: no-net, host-net (default), or own-ip.
     #[arg(long, value_enum, default_value_t = CliNetworkMode::HostNet)]
     pub network: CliNetworkMode,
@@ -254,6 +257,15 @@ pub struct ActivateArgs {
     /// Automatically attach after creation
     #[arg(long)]
     pub attach: bool,
+}
+
+/// Configuration for file sync during activation.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum SyncMode {
+    /// Stream a tarball of your project and unpack it into the session.
+    Tarball,
+    /// Do not populate the worktree of the session.
+    None,
 }
 
 /// CLI surface for [`sessions::NetworkMode`]. A local `ValueEnum` keeps the
@@ -956,11 +968,16 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
 
     // Upload the project directory to the daemon so the session
     // sandbox has the user's files available.
-    eprintln!("Uploading project files...");
-    client
-        .upload_workspace_files(id, utf8_path.as_std_path())
-        .await
-        .context("Failed to upload project files")?;
+    match args.sync {
+        SyncMode::None => {}
+        SyncMode::Tarball => {
+            eprintln!("Uploading project files...");
+            client
+                .upload_workspace_files(id, utf8_path.as_std_path())
+                .await
+                .context("Failed to upload project files")?;
+        }
+    };
 
     println!("{id}");
 
