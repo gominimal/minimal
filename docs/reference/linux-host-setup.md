@@ -46,6 +46,16 @@ loaded the minimald AppArmor profile (/etc/apparmor.d/minimald)
 That is all. Sessions work; nothing else on the host gains the ability to create
 user namespaces.
 
+If you installed minimal with the `curl … | sh` installer rather than from a
+checkout, the same loader ships alongside the binaries — run it with root:
+
+```console
+$ sudo bash ~/.local/share/minimal/apparmor/install-apparmor-profile.sh
+```
+
+The installer prints this exact hint on its own when it detects the restriction
+on the host, so you do not have to know to look for it.
+
 The profile **confines nothing** — it is declared `flags=(unconfined)`, so it
 does not restrict what minimald may do. It exists only to give minimald a named
 AppArmor label, because on Ubuntu only a *labelled* program can be granted
@@ -62,7 +72,11 @@ $ sudo scripts/install-apparmor-profile.sh --path "$PWD/target/debug/minimald"
 ```
 
 Re-run the installer after moving or reinstalling the binary. To remove the
-profile: `sudo scripts/install-apparmor-profile.sh --uninstall`.
+profile: `sudo scripts/install-apparmor-profile.sh --uninstall` (from a
+checkout) or `sudo bash ~/.local/share/minimal/apparmor/install-apparmor-profile.sh --uninstall`
+(curl-installed). `minimal`'s own uninstaller
+(`curl … | sh -s -- --uninstall`) also offers to remove this system profile —
+prompting on a terminal, or printing the root command otherwise.
 
 ## Alternative: lift the restriction host-wide
 

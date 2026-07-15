@@ -126,7 +126,33 @@ COMPONENTS=(
     "initramfs|darwin|arm64|file|data/initramfs.cpio|initramfs-arm64.cpio"
     "rootfs|darwin|arm64|file|data/rootfs.img|rootfs-arm64.img"
     "vmlinuz|darwin|arm64|file|data/vmlinuz|vmlinuz-arm64"
+    # AppArmor profile, its tunable, and the privileged loader that installs it,
+    # for Ubuntu 24.04+ hosts (docs/reference/linux-host-setup). These are repo
+    # files, not build outputs — staged into ARTIFACTS_DIR below — and ship to
+    # every Linux host as ordinary `data`-prefix components. noarch text, but the
+    # manifest keys on arch, so one row per Linux arch; the uploader dedups by
+    # basename to a single upload. The loader lands non-+x under data/ and is run
+    # as `sudo bash <path>`; the installer prints that hint when a host needs it.
+    "apparmor-profile|linux|amd64|file|data/apparmor/minimald|minimald.apparmor"
+    "apparmor-profile|linux|arm64|file|data/apparmor/minimald|minimald.apparmor"
+    "apparmor-tunable|linux|amd64|file|data/apparmor/tunables/minimald|minimald.apparmor-tunable"
+    "apparmor-tunable|linux|arm64|file|data/apparmor/tunables/minimald|minimald.apparmor-tunable"
+    "apparmor-installer|linux|amd64|file|data/apparmor/install-apparmor-profile.sh|install-apparmor-profile.sh"
+    "apparmor-installer|linux|arm64|file|data/apparmor/install-apparmor-profile.sh|install-apparmor-profile.sh"
 )
+
+# Stage the AppArmor components from the checkout this script runs in. They are
+# repo files rather than release-workflow artifacts, so copy them into
+# ARTIFACTS_DIR under the stable basenames the component table references; from
+# there the manifest loop treats them like any downloaded artifact.
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+stage_repo_file() {
+    [ -f "$repo_root/$1" ] || die "missing repo file for staging: $1"
+    cp "$repo_root/$1" "$ARTIFACTS_DIR/$2" || die "failed to stage $1 into $ARTIFACTS_DIR"
+}
+stage_repo_file packaging/apparmor/minimald          minimald.apparmor
+stage_repo_file packaging/apparmor/tunables/minimald minimald.apparmor-tunable
+stage_repo_file scripts/install-apparmor-profile.sh  install-apparmor-profile.sh
 
 # --- Build the manifest ----------------------------------------------------
 

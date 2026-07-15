@@ -23,6 +23,10 @@ $> sudo scripts/install-apparmor-profile.sh              # installed binary
 $> sudo scripts/install-apparmor-profile.sh --path "$PWD/target/debug/minimald"   # dev build
 ```
 
+Installed via `curl … | sh` instead of a checkout? The installer ships this
+loader and prints a hint when the host needs it; run
+`sudo bash ~/.local/share/minimal/apparmor/install-apparmor-profile.sh`.
+
 See [docs/reference/linux-host-setup.md](docs/reference/linux-host-setup.md).
 
 ## Using minimal

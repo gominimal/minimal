@@ -20,7 +20,15 @@ set -euo pipefail
 
 readonly PROFILE_NAME=minimald
 readonly APPARMOR_D=/etc/apparmor.d
-SRC_DIR="$(cd "$(dirname "$0")/../packaging/apparmor" && pwd)"
+# In a checkout the profile + tunable live at ../packaging/apparmor. When the
+# curl|sh installer ships them, this script sits flat beside them under
+# ~/.local/share/minimal/apparmor. Prefer the checkout layout, else the script's
+# own dir — both expose $SRC_DIR/minimald and $SRC_DIR/tunables/minimald.
+if [ -d "$(dirname "$0")/../packaging/apparmor" ]; then
+    SRC_DIR="$(cd "$(dirname "$0")/../packaging/apparmor" && pwd)"
+else
+    SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
+fi
 readonly SRC_DIR
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
