@@ -276,6 +276,15 @@ USERNS_SYSCTL=
 want_err "no advisory when the restriction is off (sysctl 0)" \
     grep -q "restricts unprivileged user namespaces" "$OUT"
 
+# Advisory is suppressed on an already-remediated host: sysctl still reads 1 but
+# the system profile is installed, so a reinstall must not claim sessions fail.
+mkdir -p "$root/aa-present"; printf 'profile\n' >"$root/aa-present/minimald"
+USERNS_SYSCTL="$root/sysctl-on"; APPARMOR_DIR="$root/aa-present"
+run aa_already "$H1"
+USERNS_SYSCTL=; APPARMOR_DIR=
+want_err "no advisory when the system profile is already installed" \
+    grep -q "restricts unprivileged user namespaces" "$OUT"
+
 # Darwin hosts never receive the apparmor components (linux-only manifest rows).
 HAA_D="$root/haa_d"; mkdir -p "$HAA_D"
 PLAT_S=Darwin; PLAT_M=arm64

@@ -800,11 +800,15 @@ esac
 # sessions then die at uid_map with an opaque EPERM, far from here. Detect the
 # restriction at install time (Linux only) and point at the AppArmor loader we
 # just shipped. Advice only: installing the profile needs root, and this
-# installer never elevates. Silent on hosts that do not need it. The sysctl path
-# is overridable so install_test.sh can drive both branches.
+# installer never elevates. Silent on hosts that do not need it, AND on a host
+# already remediated: once the loader has installed /etc/apparmor.d/minimald the
+# sysctl is still 1 but sessions work, so a reinstall must not claim they cannot
+# start. The sysctl and apparmor.d paths are overridable for install_test.sh.
 userns_sysctl="${MINIMAL_OVERRIDE_USERNS_SYSCTL:-/proc/sys/kernel/apparmor_restrict_unprivileged_userns}"
+apparmor_dir="${MINIMAL_OVERRIDE_APPARMOR_DIR:-/etc/apparmor.d}"
 if [ "$os" = linux ] && [ -r "$userns_sysctl" ] \
-    && [ "$(cat "$userns_sysctl" 2>/dev/null)" = 1 ]; then
+    && [ "$(cat "$userns_sysctl" 2>/dev/null)" = 1 ] \
+    && [ ! -e "$apparmor_dir/minimald" ]; then
     apparmor_loader="$(resolve_prefix data)/apparmor/install-apparmor-profile.sh"
     if [ -f "$apparmor_loader" ]; then
         say ""

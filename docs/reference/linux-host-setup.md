@@ -51,6 +51,7 @@ checkout, the same loader ships alongside the binaries — run it with root:
 
 ```console
 $ sudo bash ~/.local/share/minimal/apparmor/install-apparmor-profile.sh
+loaded the minimald AppArmor profile (/etc/apparmor.d/minimald)
 ```
 
 The installer prints this exact hint on its own when it detects the restriction
