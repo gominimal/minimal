@@ -180,25 +180,38 @@ jobs:
                   retention-days: 7
 
     build-release-linux-arm64:
-        runs-on: ubuntu-latest
-        # One combined cross build (was three sequential single-package builds).
-        # Keep 90m, not the optimistic 60: a dry-run (run 29375276363) showed the
-        # cold cross build (musl + aws-lc-sys) runs ~65m and hit the 60m cap. The
-        # rust-cache below makes the typical run fast, but a cache miss (first
-        # build, Cargo.lock change, or LRU eviction) is still cold, so the cap
-        # must clear the aws-lc-sys compile the recollapse can't shorten.
+        runs-on: ubuntu-26.04-arm
         timeout-minutes: 90
         steps:
             - uses: actions/checkout@v7
-            - name: Install cross
-              uses: taiki-e/install-action@v2
+            - name: Free Disk Space
+              # Static release build of the full workspace; the cargo target dir
+              # is the largest in any of the linux jobs. `remove_tool_cache: true`
+              # is safe even without a `dtolnay/rust-toolchain` step — the
+              # pre-installed Rust toolchain on ubuntu-latest lives in
+              # `~/.rustup` + `~/.cargo`, not `/opt/hostedtoolcache`, so
+              # `rustup target add` below still resolves.
+              uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
               with:
-                  tool: cross
+                  remove_android: true
+                  remove_dotnet: true
+                  remove_haskell: true
+                  remove_tool_cache: true
+            - uses: actions/checkout@v7
+            - name: Install dependencies
+              run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
+            - name: Add Rust target
+              run: rustup target add aarch64-unknown-linux-musl
+            - name: Configure musl linker
+              run: |
+                  echo '' >> .cargo/config.toml
+                  echo '[target.aarch64-unknown-linux-musl]' >> .cargo/config.toml
+                  echo 'linker = "musl-gcc"' >> .cargo/config.toml
             - name: Cache Rust build artifacts (dependency-pruned)
               # See the amd64 job: rust-cache replaces a raw multi-GB target/ cache
-              # the 10 GB LRU evicted, which is why this cross build kept running
+              # the 10 GB LRU evicted, which is why this build kept running
               # cold (~65m). Pruned to dependency artifacts so it survives; save-if
-              # keeps branch/dry-run dispatches read-only. cross writes target/ and
+              # keeps branch/dry-run dispatches read-only. writes target/ and
               # reads ~/.cargo on the host, so rust-cache caches them the same as a
               # native build.
               uses: Swatinem/rust-cache@v2
@@ -206,13 +219,10 @@ jobs:
                   shared-key: release-arm64
                   save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Build static release binaries
-              # One build of all three packages (mirrors the amd64 job) instead of
-              # three separate cross invocations resolving the graph three times.
               run: |
-                  cross build --release --locked \
-                     --target aarch64-unknown-linux-musl \
-                     --package minimal \
+                  cargo build --release --locked --target aarch64-unknown-linux-musl \
                      --package mip \
+                     --package minimal \
                      --package minimald
             - name: Rename binaries with platform suffix
               # Platform-suffixed so download-artifact's merge-multiple basename
