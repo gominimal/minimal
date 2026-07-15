@@ -155,6 +155,11 @@ resolve_prefix() {
     esac
 }
 
+# The bin prefix, resolved once. Needed early: the pre-upgrade daemon stop
+# (R5.5) runs the `min` already installed there, before the component loop
+# replaces it.
+bindir="$(resolve_prefix bin)"
+
 # --- Unit 9: shared shell-integration paths and markers ---------------------
 
 # Where the generated (not downloaded) shell-integration files live. Init
@@ -433,6 +438,22 @@ records="$tmpdir/installed"
 : >"$records"
 installed=0 skipped=0
 
+# R5.5 — swapping binaries under a running daemon wedges it: the daemon keeps
+# serving from the old image while the new `min` talks to it. Stop it first,
+# using the `min` ALREADY on disk — that one matches the daemon it started, and
+# it is about to be overwritten. Deliberately best-effort and silent: nothing
+# installed yet, no daemon running, or a `min` too old to have `stop --force`
+# all mean "nothing to stop", and none of them should fail an install whose
+# binaries are otherwise fine. `min stop` only connects (it never autospawns),
+# so with no daemon up this is a failed connect and nothing more.
+daemon_stop_tried=0
+stop_running_daemon() {
+    [ "$daemon_stop_tried" -eq 0 ] || return 0
+    daemon_stop_tried=1
+    [ -x "$bindir/min" ] || return 0
+    "$bindir/min" stop --force >/dev/null 2>&1 || true
+}
+
 # The prior run's install record (R6.1) maps each component to the hash of the
 # file it placed on disk. Written into place at the end of this run; here we only
 # need its path so a completed run can replace it. The on-disk file — not this
@@ -503,6 +524,12 @@ while read -r comp _ _ _ want kind dest src; do
         xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true
     fi
 
+    # R5.5 — last moment before the first live file is swapped, so a run where
+    # every component is up to date (or one that dies fetching/verifying) never
+    # touches a healthy daemon. The guard inside makes this a no-op after the
+    # first replaced component.
+    stop_running_daemon
+
     mv -f "$tmp" "$target_file"
     installed=$((installed + 1))
     # Record the manifest hash paired with the on-disk hash, so a later
@@ -514,8 +541,6 @@ while read -r comp _ _ _ want kind dest src; do
 done <"$applicable"
 
 # --- Unit 9a: generated shell-init files and completions -------------------
-
-bindir="$(resolve_prefix bin)"
 
 # Append a generated file to this run's install record so a later run and
 # `--uninstall` treat it exactly like a downloaded component (R9.1/R9.3). No

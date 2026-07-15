@@ -254,6 +254,26 @@ got=$(sha256 "$target.tmp.$$")
 mv -f "$target.tmp.$$" "$target"
 ```
 
+**R5.5** — Installing a new version over a **running daemon** wedges it: the
+daemon goes on serving from the old image while the newly-installed `min` speaks
+to it. Before the first component file is replaced, the installer therefore runs
+`<bin>/min stop --force` — the `min` **already on disk**, which is the build that
+matches the daemon it started and is the one about to be overwritten. `--force`
+because an upgrade must not be blocked by live sessions, and because a prompt is
+not available in a `curl … | sh` pipeline.
+
+The step is **best-effort and silent**, output discarded and exit status ignored:
+"no `min` installed yet" (a fresh install), "no daemon running" (`min stop`
+merely connects — it never autospawns — so this is a failed connect and nothing
+more), and "the installed `min` is too old to know `stop --force`" are all just
+*nothing to stop*, and none may fail an install whose binaries are otherwise
+fine. Only `<bin>/min` is ever run — never a `min` found on `$PATH`, which is not
+this installer's footprint.
+
+It is attempted **at most once per run**, and only from the path that actually
+replaces a file: a rerun where every component is already up to date, or a run
+that dies fetching or checksum-verifying, must leave a healthy daemon running.
+
 **Proof artifacts**:
 
 - **Test**: Running twice against the same fixture manifest downloads on the
@@ -265,6 +285,13 @@ mv -f "$target.tmp.$$" "$target"
   *same* manifest performs zero downloads and no re-sign, but a rerun against a
   manifest whose `sha256` for that component *changed* re-downloads and re-signs
   it — the recorded installed hash does not mask a new release.
+- **Test** (R5.5): a fresh install stops nothing (no `min` on disk yet) and an
+  up-to-date rerun stops nothing (nothing replaced); an upgrade whose components
+  are stale runs the on-disk `min` with exactly `stop --force`, once, however
+  many components it replaces.
+- **Test** (R5.5): an installed `min` whose `stop` exits non-zero and writes to
+  both stdout and stderr still yields exit 0, leaks neither stream into the
+  installer's output, and completes the upgrade.
 
 ### Unit 6 — Install record and PATH advisory
 
