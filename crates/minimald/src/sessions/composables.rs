@@ -21,6 +21,7 @@
 use std::sync::Arc;
 
 use mctx::PackageSelection;
+use paths::DaemonAbsPath;
 use sessions::{
     SessionId,
     core::compose::ComposeOptions,
@@ -213,7 +214,7 @@ pub(crate) enum ProjectResolution {
 /// mfile errors are returned as `InvalidInput`.
 pub(crate) fn resolve_project_ctx_and_graph(
     daemon_ctx: &Arc<mctx::DaemonContext>,
-    project_path: &paths::HostAbsPath,
+    project_path: &DaemonAbsPath,
 ) -> Result<ProjectResolution, std::io::Error> {
     let project_path_std = project_path.as_utf8_path().as_std_path().to_path_buf();
     let mfile = match mctx::MFileSearchStrategy::Override(project_path_std).find_mfile() {
@@ -302,7 +303,7 @@ fn fold_stack_vars_into_session<'a, I>(
 /// package-composables list; the client's wire contribution still
 /// lands.
 pub(crate) fn build_composables(
-    project_path: &paths::HostAbsPath,
+    project_path: &DaemonAbsPath,
     resolution: &ProjectResolution,
     contribution: &WireContribution,
 ) -> Result<
@@ -401,7 +402,10 @@ pub(crate) fn build_composables(
         // `effective` empty despite the pre-check. Rare, but the
         // recheck is cheap.
         (!effective.is_empty()).then(|| {
-            mfile::ProjectComposable::new(paths::HostPath::from(project_path.clone()), effective)
+            mfile::ProjectComposable::new(
+                paths::AbsPath::<paths::Host>::new_unchecked(project_path.as_utf8_path()).into(),
+                effective,
+            )
         })
     };
 
@@ -439,6 +443,23 @@ pub(crate) fn build_composables(
         }
     };
     Ok((project_composable, package_composables))
+}
+
+/// The full compose chain for a create flow: resolve the project,
+/// build its composables, and run the composer. Synchronous and
+/// potentially expensive (nickel evaluation, graph resolution) —
+/// callers on an async runtime should wrap it in a blocking-safe
+/// helper. Kept free of `.await`s so its non-`Send` intermediaries
+/// ([`mctx::Context`], nickel-`Rc`-carrying errors) never cross one.
+pub(crate) fn run_compose(
+    daemon_ctx: &Arc<mctx::DaemonContext>,
+    project_path: &DaemonAbsPath,
+    contribution: WireContribution,
+) -> Result<ComposeOutcome, std::io::Error> {
+    let resolution = resolve_project_ctx_and_graph(daemon_ctx, project_path)?;
+    let (project_composable, package_composables) =
+        build_composables(project_path, &resolution, &contribution)?;
+    run_composer(contribution, project_composable, package_composables)
 }
 
 /// Assemble the [`SessionComposer`], `add()` the daemon-side

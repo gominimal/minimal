@@ -137,6 +137,9 @@ async fn serve_get_session_record(s: ServerStateHandle, c: RuChannel<Msg>) {
     }
 }
 
+/// `CreateSession`: allocates the session's record and brings its actor
+/// up, replying with the assigned id. The loadout is composed separately,
+/// by the `ConfigureLoadout` that follows.
 async fn serve_create_session(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
@@ -146,31 +149,19 @@ async fn serve_create_session(
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
 
-            Ok(
-                match mngr
-                    .create_session(req.config, ssh_username, req.contribution)
-                    .await
-                {
-                    Ok(resp) => Errorable::Ok(resp),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
-                        error: "A session with that name already exists".to_string(),
-                    },
-                    // R2.1: a policy/network-mode mismatch is rejected at
-                    // declaration time and surfaced as a clean typed error rather
-                    // than a transport failure.
-                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
-                        error: e.to_string(),
-                    },
-                    // The daemon's in-flight Pending stash is full
-                    // (see `MAX_PENDING_SESSIONS`). Surface as a clean
-                    // typed error so the client can retry rather than
-                    // treat it as a transport failure.
-                    Err(e) if e.kind() == std::io::ErrorKind::ResourceBusy => Errorable::Err {
-                        error: e.to_string(),
-                    },
-                    Err(e) => return Err(ConnectionError::Internal(e.to_string())),
+            Ok(match mngr.create_session(req.config, ssh_username).await {
+                Ok(id) => Errorable::Ok(minimald_rpc::CreateSessionResponse { id }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
+                    error: "A session with that name already exists".to_string(),
                 },
-            )
+                // R2.1: a policy/network-mode mismatch is rejected at
+                // declaration time and surfaced as a clean typed error rather
+                // than a transport failure.
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
+                    error: e.to_string(),
+                },
+                Err(e) => return Err(ConnectionError::Internal(e.to_string())),
+            })
         })
         .await;
     if let Err(e) = res {
@@ -178,37 +169,112 @@ async fn serve_create_session(
     }
 }
 
+/// `ConfigureLoadout`: composes a created session's loadout from the
+/// project config in its workspace plus the client's contribution.
+/// Resolves the session's live actor and routes the contribution to it;
+/// the actor composes and either promotes its record `Pending → Active`
+/// (`Ready`) or parks awaiting a verdict (`Pending`).
+///
+/// A compose failure leaves the session alive and unconfigured, so it
+/// surfaces as an `Errorable::Err` the client can act on (fix the project
+/// and retry, or abort) rather than a transport failure. An unknown id —
+/// including an actor that died between resolve and delivery — is a
+/// `NotFound`-flavoured `Errorable::Err`.
+async fn serve_configure_loadout(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = minimald_rpc::ConfigureLoadout
+        .handle_channel(c, async |req: minimald_rpc::ConfigureLoadoutRequest| {
+            let mngr = s.sessions_manager().await;
+            let handle = mngr
+                .get_session(SessionKeyPredicate::Id(req.session_id))
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            let Some(h) = handle else {
+                return Ok(Errorable::Err {
+                    error: format!("no session with ID `{}`", req.session_id.as_ref()),
+                });
+            };
+            Ok(match h.configure_loadout(req.contribution).await {
+                Ok(None) => Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Ready),
+                Ok(Some(response)) => {
+                    Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Pending { response })
+                }
+                Err(e) => Errorable::Err {
+                    error: e.to_string(),
+                },
+            })
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!(
+            "RPC handler for {} failed: {}",
+            minimald_rpc::ConfigureLoadout::NAME,
+            e
+        );
+    }
+}
+
 /// `SubmitVerdict`: the client's per-item decisions for a `Pending`
-/// session. Delegates to the manager actor, which pops the matching
-/// `PendingComposeState`, runs `resume_from_verdict`, and promotes
-/// the record `Pending → Active`. Replies with `Errorable::Ok(SessionStep)`
+/// session. Resolves the session's live actor and routes the verdict
+/// to it; the actor runs `resume_from_verdict` and promotes its
+/// record `Pending → Active`. Replies with `Errorable::Ok(SessionStep)`
 /// where the `SessionStep` is `Active { id }` on success or
-/// `Fault { error }` for a structured failure (unknown id, wrong
-/// state, or a `ComposeError`-mapped `WireError`). Manager-side
-/// `io::Error`s bubble up as `ConnectionError::Internal`.
+/// `Fault { error }` for a structured failure. A verdict for an id
+/// with no live session — including an actor that died between
+/// resolve and delivery — maps to `Fault { UnknownSessionId }` here;
+/// other `io::Error`s bubble up as `ConnectionError::Internal`.
 async fn serve_submit_verdict(s: ServerStateHandle, c: RuChannel<Msg>) {
     let res = SubmitVerdict
-        .handle_channel(c, async |req| {
-            let mngr = s.sessions_manager().await;
-            match mngr.submit_verdict(req).await {
-                Ok(step) => Ok(Errorable::Ok(step)),
-                Err(e) => Err(ConnectionError::Internal(e.to_string())),
-            }
-        })
+        .handle_channel(
+            c,
+            async |req: sessions::wire::request::ContributionVerdict| {
+                let mngr = s.sessions_manager().await;
+                let unknown = || {
+                    Errorable::Ok(sessions::wire::request::SessionStep::Fault {
+                        error: sessions::wire::errors::WireError::UnknownSessionId,
+                    })
+                };
+                let handle = mngr
+                    .get_session(SessionKeyPredicate::Id(req.session_id))
+                    .await
+                    .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+                match handle {
+                    None => Ok(unknown()),
+                    Some(h) => match h.submit_verdict(req).await {
+                        Ok(step) => Ok(Errorable::Ok(step)),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotConnected => Ok(unknown()),
+                        Err(e) => Err(ConnectionError::Internal(e.to_string())),
+                    },
+                }
+            },
+        )
         .await;
     if let Err(e) = res {
         tracing::warn!("RPC handler for {} failed: {}", SubmitVerdict::NAME, e);
     }
 }
 
+/// `RenameSession`: resolves the session's actor (spinning it up from
+/// disk if needed) and lets it persist the new name and relink its
+/// PTask hostname. A name collision surfaces as the store's
+/// `AlreadyExists` in the `Errorable::Err` text.
 async fn serve_rename_session(s: ServerStateHandle, c: RuChannel<Msg>) {
     let res = RenameSession
         .handle_channel(c, async |req| {
-            let res = s
-                .sessions_manager()
-                .await
-                .rename_session(req.id, req.new_name)
-                .await;
+            let res = async {
+                match s
+                    .sessions_manager()
+                    .await
+                    .get_session(SessionKeyPredicate::Id(req.id))
+                    .await?
+                {
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("no session with ID `{}`", req.id.as_ref()),
+                    )),
+                    Some(h) => h.rename(req.new_name).await,
+                }
+            }
+            .await;
             match res {
                 Ok(()) => Ok(Errorable::Ok(RenameSessionResponse)),
                 Err(e) => Ok(Errorable::Err {
@@ -225,7 +291,7 @@ async fn serve_rename_session(s: ServerStateHandle, c: RuChannel<Msg>) {
 async fn serve_destroy_session(s: ServerStateHandle, c: RuChannel<Msg>) {
     let res = DestroySession
         .handle_channel(c, async |req| {
-            let res = s.sessions_manager().await.destroy_session(req.id).await;
+            let res = s.sessions_manager().await.delete_session(req.id).await;
             match res {
                 Ok(()) => Ok(Errorable::Ok(DestroySessionResponse)),
                 Err(e) => Ok(Errorable::Err {
@@ -300,13 +366,28 @@ async fn quiesce_state_volume_if_mounted(s: &ServerStateHandle) {
 #[cfg(not(target_os = "linux"))]
 async fn quiesce_state_volume_if_mounted(_s: &ServerStateHandle) {}
 
-/// `AbortSession`: drop a `Pending` session's stash entry and delete
-/// its on-disk record. See the manager arm for the actor-side rules
-/// (refuses `Active` records and unknown ids).
+/// `AbortSession`: routes to the session actor, whose state machine
+/// deletes a `Draft` session's record and stops, or refuses an
+/// `Active` session with `InvalidInput` (use `DestroySession`).
+/// Unknown ids are `NotFound`.
 async fn serve_abort_session(s: ServerStateHandle, c: RuChannel<Msg>) {
     let res = AbortSession
         .handle_channel(c, async |req| {
-            let res = s.sessions_manager().await.abort_session(req.id).await;
+            let res = async {
+                match s
+                    .sessions_manager()
+                    .await
+                    .get_session(SessionKeyPredicate::Id(req.id))
+                    .await?
+                {
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("no session with ID `{}`", req.id.as_ref()),
+                    )),
+                    Some(h) => h.abort().await,
+                }
+            }
+            .await;
             match res {
                 Ok(()) => Ok(Errorable::Ok(AbortSessionResponse)),
                 Err(e) => Ok(Errorable::Err {
@@ -438,7 +519,10 @@ async fn unpack_workspace_files(
         .await
         .map_err(|e| format!("session UUID lookup failed: {e}"))?
         .ok_or("unknown session UUID")?;
-    let paths = session_handle.paths().await;
+    let paths = session_handle
+        .paths()
+        .await
+        .map_err(|e| format!("session is gone: {e}"))?;
 
     let reader = async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(
         c.make_reader(),
@@ -476,6 +560,7 @@ pub async fn handle_ssh_rpc(
         | ListSessions::NAME
         | GetSessionRecord::NAME
         | CreateSession::NAME
+        | minimald_rpc::ConfigureLoadout::NAME
         | SubmitVerdict::NAME
         | RenameSession::NAME
         | DestroySession::NAME
@@ -514,6 +599,7 @@ pub async fn handle_ssh_rpc(
         ListSessions::NAME => drop(spawn(serve_list_sessions(s, channel))),
         GetSessionRecord::NAME => drop(spawn(serve_get_session_record(s, channel))),
         CreateSession::NAME => drop(spawn(serve_create_session(s, channel, ssh_username))),
+        minimald_rpc::ConfigureLoadout::NAME => drop(spawn(serve_configure_loadout(s, channel))),
         SubmitVerdict::NAME => drop(spawn(serve_submit_verdict(s, channel))),
         RenameSession::NAME => drop(spawn(serve_rename_session(s, channel))),
         DestroySession::NAME => drop(spawn(serve_destroy_session(s, channel))),
@@ -576,16 +662,12 @@ mod tests {
         encoder.into_inner()
     }
 
-    use crate::test_harness::{create_session_req as req, unwrap_ready};
+    use crate::test_harness::create_session_req as req;
 
-    /// Creates a session through the public RPC and returns its id.
+    /// Creates a session through the public RPCs and returns its id, ready
+    /// to attach.
     async fn fresh_session(client: &mut TestClient) -> SessionId {
-        unwrap_ready(
-            client
-                .call::<CreateSession>(&req("stream-test", "/tmp"))
-                .await
-                .unwrap(),
-        )
+        crate::test_harness::create_configured_session(client, "stream-test", "/tmp").await
     }
 
     #[tokio::test]
@@ -621,7 +703,7 @@ mod tests {
             .await
             .unwrap()
             .expect("freshly-created session should be retrievable");
-        let paths = handle.paths().await;
+        let paths = handle.paths().await.unwrap();
 
         assert_eq!(
             tokio::fs::read(paths.working.as_utf8_path().join("hello.txt"))
@@ -736,12 +818,11 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        let id = unwrap_ready(
-            client
-                .call::<CreateSession>(&req("my session", "/uwu"))
-                .await
-                .unwrap(),
-        );
+        let id = client
+            .call::<CreateSession>(&req("my session", "/uwu"))
+            .await
+            .unwrap()
+            .id;
         assert!(id != SessionId::nil());
 
         let get_session = client
@@ -781,21 +862,19 @@ mod tests {
             allow_dns_hosts: None,
             allow_protocols: None,
         };
-        let created_id = unwrap_ready(
-            client
-                .call::<CreateSession>(&CreateSessionRequest {
-                    config: minimald_rpc::SessionConfig {
-                        name: Some("policy-session".to_string()),
-                        project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                        network: NetworkMode::OwnIp,
-                        policy: SessionPolicy::new(Some(egress.clone()), None),
-                        attrs: Default::default(),
-                    },
-                    contribution: Default::default(),
-                })
-                .await
-                .unwrap(),
-        );
+        let created_id = client
+            .call::<CreateSession>(&CreateSessionRequest {
+                config: minimald_rpc::SessionConfig {
+                    name: Some("policy-session".to_string()),
+                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                    network: NetworkMode::OwnIp,
+                    policy: SessionPolicy::new(Some(egress.clone()), None),
+                    attrs: Default::default(),
+                },
+            })
+            .await
+            .unwrap()
+            .id;
 
         let policy = client
             .call::<GetSessionPolicy>(&GetSessionPolicyRequest::Id(created_id))
@@ -812,12 +891,11 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        let id = unwrap_ready(
-            client
-                .call::<CreateSession>(&req("my session", "/uwu"))
-                .await
-                .unwrap(),
-        );
+        let id = client
+            .call::<CreateSession>(&req("my session", "/uwu"))
+            .await
+            .unwrap()
+            .id;
         assert!(id != SessionId::nil());
 
         assert_eq!(
@@ -851,7 +929,6 @@ mod tests {
                     policy: SessionPolicy::new(Some(egress), None),
                     attrs: Default::default(),
                 },
-                contribution: Default::default(),
             })
             .await;
         assert_eq!(
@@ -890,7 +967,7 @@ mod tests {
         assert_eq!(resp, Errorable::Ok(RenameSessionResponse));
 
         // The record held by the running session reflects the new name...
-        let record = handle.record().await;
+        let record = handle.record().await.unwrap();
         assert_eq!(record.name.as_deref(), Some("renamed"));
         // ...while its id is untouched by the rename.
         assert_eq!(record.id, session_id);
@@ -921,6 +998,30 @@ mod tests {
             matches!(resp, Errorable::Err { error } if error.contains("no session with ID")),
             "expected an unknown-id error",
         );
+    }
+
+    /// A verdict for an id with no live session is a terminal, structured
+    /// `Fault::UnknownSessionId` on the wire — not a transport error. This
+    /// mapping lives in `serve_submit_verdict` now that verdicts route to
+    /// per-session actors.
+    #[tokio::test]
+    async fn submit_verdict_unknown_id_returns_unknown_session_id() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let resp = client
+            .call::<minimald_rpc::SubmitVerdict>(&sessions::wire::request::ContributionVerdict {
+                session_id: SessionId::nil(),
+                vars: vec![],
+                patches: vec![],
+            })
+            .await;
+        match resp {
+            Errorable::Ok(sessions::wire::request::SessionStep::Fault {
+                error: sessions::wire::errors::WireError::UnknownSessionId,
+            }) => {}
+            other => panic!("expected Fault::UnknownSessionId, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -998,19 +1099,30 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_without_force_refuses_while_a_session_is_live() {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
         let session_id = fresh_session(&mut client).await;
 
-        // A persisted session isn't "live" until it's brought up; do so, so the
-        // manager has a running actor that an unforced shutdown must protect.
-        let mngr = server.state.sessions_manager().await;
-        mngr.get_session(SessionKeyPredicate::Id(session_id))
-            .await
-            .unwrap()
-            .expect("freshly-created session should be retrievable");
+        // A session is only "busy" once it hosts a live shell (an idle actor
+        // no longer blocks an unforced shutdown). Open one and drive an echo
+        // round trip so the host is provably up before the shutdown request.
+        let mut channel = client.open_shell(session_id).await;
+        channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+        let mut stdout = Vec::new();
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Data { data }) => {
+                    stdout.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&stdout).contains("got:hello") {
+                        break;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("channel closed before the echo arrived"),
+            }
+        }
 
         let resp = client
             .call::<Shutdown>(&ShutdownRequest { force: false })
@@ -1019,6 +1131,7 @@ mod tests {
 
         // The refusal left the daemon fully operational: the live session is
         // still reachable and no shutdown flag was latched.
+        let mngr = server.state.sessions_manager().await;
         assert!(
             mngr.get_session(SessionKeyPredicate::Id(session_id))
                 .await

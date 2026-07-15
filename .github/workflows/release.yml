@@ -80,7 +80,20 @@ jobs:
 
     build-release-linux-amd64:
         runs-on: ubuntu-latest
-        timeout-minutes: 60
+        # 90m, matching arm64. The build step below links the three binaries one
+        # at a time, so LTO links that used to overlap now serialize, and this
+        # job builds minvmd natively on top of them. The old 60m cap was only
+        # ever measured against the combined build, so it is not evidence this
+        # shape fits; a cap only bounds a hang, and an early finish bills for the
+        # time actually used.
+        timeout-minutes: 90
+        # `CARGO_TARGET_<TRIPLE>_LINKER` is the documented env equivalent of the
+        # `[target.<triple>] linker` config key (triple uppercased, dashes to
+        # underscores). Set here rather than appended to `.cargo/config.toml` so
+        # the build never mutates the checkout. Job-level env merges with the
+        # workflow-level block above rather than replacing it.
+        env:
+            CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         steps:
             - name: Free Disk Space
               # Static release build of the full workspace; the cargo target dir
@@ -100,27 +113,36 @@ jobs:
               run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
             - name: Add Rust target
               run: rustup target add x86_64-unknown-linux-musl
-            - name: Configure musl linker
-              run: |
-                  echo '' >> .cargo/config.toml
-                  echo '[target.x86_64-unknown-linux-musl]' >> .cargo/config.toml
-                  echo 'linker = "musl-gcc"' >> .cargo/config.toml
-            - uses: actions/cache@v6
+            - name: Cache Rust build artifacts (dependency-pruned)
+              # Was a raw actions/cache of the entire target/ — the largest target
+              # dir in the repo (multi-GB). Cached whole into the 10 GB per-repo
+              # LRU it shares with every PR lane, it was evicted fast, so release
+              # builds kept starting cold. rust-cache prunes target/ to just the
+              # dependency artifacts (the costly aws-lc-sys/crypto compiles),
+              # shrinking the entry so it survives; save-if keeps branch/dry-run
+              # dispatches read-only so they don't churn the budget and evict
+              # main's warm cache. Registry + git caches come for free.
+              uses: Swatinem/rust-cache@v2
               with:
-                  path: |
-                      ~/.cargo/bin/
-                      ~/.cargo/registry/index/
-                      ~/.cargo/registry/cache/
-                      ~/.cargo/git/db/
-                      target/
-                  key: ${{ runner.os }}-amd64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-                  restore-keys: ${{ runner.os }}-amd64-cargo-release-
+                  shared-key: release-amd64
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Build static release binaries
+              # One invocation per package, not one combined build.
+              # `[profile.release]` is fat LTO with codegen-units = 1, so a
+              # combined build lets cargo schedule all three final LTO links
+              # concurrently at -j4. That peak is what got the arm64 job
+              # SIGTERMed (exit 143) immediately after its last workspace crate
+              # compiled; this job has the same profile on a runner with the same
+              # 16 GB, so it was clearing the ceiling on headroom rather than by
+              # design. Sequential invocations share dependency artifacts through
+              # the same target/ dir, so the cost is three graph resolutions, not
+              # three builds — while the LTO links run one at a time. Do not
+              # recollapse these without cutting the release profile's link-time
+              # memory first.
               run: |
-                  cargo build --release --locked --target x86_64-unknown-linux-musl \
-                     --package mip \
-                     --package minimal \
-                     --package minimald
+                  cargo build --release --locked --target x86_64-unknown-linux-musl --package mip
+                  cargo build --release --locked --target x86_64-unknown-linux-musl --package minimal
+                  cargo build --release --locked --target x86_64-unknown-linux-musl --package minimald
             - name: Rename binaries with platform suffix
               # download-artifact merge-multiple flattens every artifact into one
               # directory using each file's basename, so the uploaded files must
@@ -177,35 +199,51 @@ jobs:
                   retention-days: 7
 
     build-release-linux-arm64:
-        runs-on: ubuntu-latest
-        # One combined cross build (was three sequential single-package builds);
-        # right-sized from the padded 90 the split required.
-        timeout-minutes: 60
+        runs-on: ubuntu-26.04-arm
+        timeout-minutes: 90
+        # See the amd64 job: cargo's env equivalent of `[target.<triple>]
+        # linker`, so the build leaves the checkout untouched.
+        env:
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         steps:
             - uses: actions/checkout@v7
-            - name: Install cross
-              uses: taiki-e/install-action@v2
+            - name: Free Disk Space
+              # Static release build of the full workspace; the cargo target dir
+              # is the largest in any of the linux jobs. `remove_tool_cache: true`
+              # is safe even without a `dtolnay/rust-toolchain` step — the
+              # pre-installed Rust toolchain on ubuntu-latest lives in
+              # `~/.rustup` + `~/.cargo`, not `/opt/hostedtoolcache`, so
+              # `rustup target add` below still resolves.
+              uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
               with:
-                  tool: cross
-            - uses: actions/cache@v6
+                  remove_android: true
+                  remove_dotnet: true
+                  remove_haskell: true
+                  remove_tool_cache: true
+            - name: Install dependencies
+              run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
+            - name: Add Rust target
+              run: rustup target add aarch64-unknown-linux-musl
+            - name: Cache Rust build artifacts (dependency-pruned)
+              # See the amd64 job: rust-cache replaces a raw multi-GB target/ cache
+              # the 10 GB LRU evicted, which is why this build kept running
+              # cold (~65m). Pruned to dependency artifacts so it survives; save-if
+              # keeps branch/dry-run dispatches read-only. writes target/ and
+              # reads ~/.cargo on the host, so rust-cache caches them the same as a
+              # native build.
+              uses: Swatinem/rust-cache@v2
               with:
-                  path: |
-                      ~/.cargo/bin/
-                      ~/.cargo/registry/index/
-                      ~/.cargo/registry/cache/
-                      ~/.cargo/git/db/
-                      target/
-                  key: ${{ runner.os }}-arm64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-                  restore-keys: ${{ runner.os }}-arm64-cargo-release-
+                  shared-key: release-arm64
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Build static release binaries
-              # One build of all three packages (mirrors the amd64 job) instead of
-              # three separate cross invocations resolving the graph three times.
+              # See the amd64 job: one invocation per package so the fat-LTO
+              # links run one at a time. Recollapsing them into a single build is
+              # what got this job SIGTERMed (exit 143) on the 16 GB runner, right
+              # after the last workspace crate compiled.
               run: |
-                  cross build --release --locked \
-                     --target aarch64-unknown-linux-musl \
-                     --package minimal \
-                     --package mip \
-                     --package minimald
+                  cargo build --release --locked --target aarch64-unknown-linux-musl --package mip
+                  cargo build --release --locked --target aarch64-unknown-linux-musl --package minimal
+                  cargo build --release --locked --target aarch64-unknown-linux-musl --package minimald
             - name: Rename binaries with platform suffix
               # Platform-suffixed so download-artifact's merge-multiple basename
               # flatten does not collide with the amd64 build.

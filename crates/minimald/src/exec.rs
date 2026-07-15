@@ -179,7 +179,7 @@ async fn task_producer(
         // guest rootfs lacking `ip`/`nsenter`), so an `OwnIp` session's task
         // falls back to `HostNet` here instead of running in an empty,
         // egress-less netns.
-        let network_mode = match session.record().await.network {
+        let network_mode = match session.record().await?.network {
             m @ (sandbox2::NetworkMode::HostNet | sandbox2::NetworkMode::NoNet) => m,
             // OwnIp falls back to HostNet (the per-PTask tap/switch attach for the
             // task producer is a follow-up); `NetworkMode` is #[non_exhaustive],
@@ -880,7 +880,15 @@ async fn handle_git_receive(
     session.channel_success(id)?;
 
     spawn(async move {
-        let paths = session_handle.paths().await;
+        let paths = match session_handle.paths().await {
+            Ok(paths) => paths,
+            // The actor died between resolve and this call (raced an
+            // abort/destroy); the channel was already acked, so just drop it.
+            Err(e) => {
+                tracing::warn!(error = %e, "git-receive-pack aborted: session is gone");
+                return;
+            }
+        };
 
         let dotgit_dir = paths.working.as_utf8_path().join(".git");
         if let Ok(false) = tokio::fs::try_exists(&dotgit_dir).await {
@@ -1361,22 +1369,17 @@ mod tests {
         //! and `handle_exec` request routing.
         use sessions::SessionId;
 
-        use minimald_rpc::CreateSession;
-
         use crate::MINIMAL_SESSION_ID_ENV;
         use crate::sessions::SessionKeyPredicate;
-        use crate::test_harness::{TestClient, TestServer, create_session_req, unwrap_ready};
+        use crate::test_harness::{
+            TestClient, TestServer, create_configured_session, create_session_req,
+        };
 
         /// Creates a fresh session through the public CreateSession RPC
         /// and returns its id, mirroring how a real client sets up state
         /// before running commands against the session.
         async fn fresh_session(client: &mut TestClient) -> SessionId {
-            unwrap_ready(
-                client
-                    .call::<CreateSession>(&create_session_req("exec-test", "/tmp"))
-                    .await
-                    .unwrap(),
-            )
+            create_configured_session(client, "exec-test", "/tmp").await
         }
 
         /// An exec request that isn't `min run <task>` must be refused
@@ -1408,29 +1411,48 @@ mod tests {
         /// serviced straight from the workspace `minimal.toml` — no
         /// package graph, upstream, or sandbox — and its text (plus a
         /// trailing newline) round-trips over the channel with exit 0.
+        ///
+        /// Drives the client's real ordering — create, populate the
+        /// workspace, *then* configure the loadout against it — which is the
+        /// sequence `minvmd`'s libkrun e2e test runs over the bridge. Keeping
+        /// it in-process here means a break in that sequence (e.g. execing a
+        /// session whose loadout was never configured, which has no context
+        /// to resolve a task against) surfaces without needing a VM.
         #[tokio::test]
         async fn exec_runs_echo_task() {
+            use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+
             let server = TestServer::new().await;
             let mut client = server.connect().await;
-            let session_id = fresh_session(&mut client).await;
-            let session_str = session_id.to_string();
-
-            // Drop a task-only `minimal.toml` into the session workspace.
-            // No `[upstream]`: the echo short-circuit never builds a graph,
-            // so nothing here reaches the (network-bound) package machinery.
-            let mngr = server.state.sessions_manager().await;
-            let session_handle = mngr
-                .get_session(SessionKeyPredicate::Id(session_id))
+            let session_id = client
+                .call::<CreateSession>(&create_session_req("exec-test", "/tmp"))
                 .await
                 .unwrap()
-                .expect("freshly-created session should be retrievable");
-            let workspace = session_handle.paths().await.working;
-            tokio::fs::write(
-                workspace.as_utf8_path().join(mfile::MFILE_NAME),
-                "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n",
-            )
-            .await
-            .unwrap();
+                .id;
+            let session_str = session_id.to_string();
+
+            // Drop a task-only `minimal.toml` into the session workspace,
+            // standing in for the e2e test's SFTP upload. No `[upstream]`:
+            // the echo short-circuit never builds a graph, so nothing here
+            // reaches the (network-bound) package machinery.
+            server
+                .seed_workspace_mfile(
+                    session_id,
+                    "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n",
+                )
+                .await;
+
+            // A task-only mfile gates nothing, so the loadout finalizes in
+            // one shot rather than erroring or pending.
+            crate::test_harness::unwrap_ready(
+                client
+                    .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                        session_id,
+                        contribution: Default::default(),
+                    })
+                    .await
+                    .unwrap(),
+            );
 
             let out = client
                 .exec(
@@ -1541,7 +1563,7 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("session should be retrievable");
-            let paths = session_handle.paths().await;
+            let paths = session_handle.paths().await.unwrap();
             let pushed = paths.working.as_utf8_path().join("hello.txt");
             let contents = tokio::fs::read(&pushed)
                 .await

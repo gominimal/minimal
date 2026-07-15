@@ -3,6 +3,7 @@
 use anyhow::{Context as _, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
+use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
@@ -12,6 +13,7 @@ pub mod autospawn;
 pub mod client;
 pub mod config;
 pub mod dirs;
+mod file_upload;
 pub mod loadouts;
 
 #[derive(Parser)]
@@ -787,22 +789,52 @@ async fn send_abort(client: &mut client::Client, session_id: sessions::SessionId
     }
 }
 
-/// Check for a `minimal.toml` at the project path. If missing, prompt
-/// the user to initialize one before proceeding with activation.
-fn ensure_mfile_or_prompt(
+/// Whether the project already has a `minimal.toml`, in either the root
+/// (`<project>/minimal.toml`) or `.minimal/`
+/// (`<project>/.minimal/minimal.toml`) layout.
+///
+/// Uses [`mfile::File::from_dir`] — the same resolver the CLI loads config
+/// with — rather than a naive `join(MFILE_NAME)`, so detection matches the
+/// path the init writer would target and we never scaffold over a config
+/// living under `.minimal/`. Any outcome other than [`mfile::Error::NotFound`]
+/// (including a present-but-malformed file) counts as "exists".
+fn project_has_mfile(project_path: &camino::Utf8Path) -> bool {
+    !matches!(
+        mfile::File::from_dir(project_path.as_std_path()),
+        Err(mfile::Error::NotFound)
+    )
+}
+
+/// Offer to initialize a `minimal.toml` at the project path when it has
+/// none, on the way into an activation.
+///
+/// Purely an offer: a project without one still activates. The daemon never
+/// reads this path — it is a path on the *client's* machine — and fabricates
+/// a default shell-stack `minimal.toml` inside the session's own workspace
+/// instead, so the session comes up either way. Scaffolding here is a
+/// convenience for the interactive case (the project gets a real config it
+/// can grow), not a precondition.
+fn offer_mfile_scaffold(
     project_path: &camino::Utf8Path,
     global: &GlobalArgs,
 ) -> Result<(), anyhow::Error> {
-    if project_path.join(mfile::MFILE_NAME).exists() {
+    if project_has_mfile(project_path) {
         return Ok(());
     }
 
     eprintln!("\nNo {} found at {}.", mfile::MFILE_NAME, project_path);
-    if !confirm("Would you like to create one?")? {
-        bail!(
-            "No {} found. Run 'minimal init' to create one.",
-            mfile::MFILE_NAME
+
+    // `confirm` treats empty/EOF input as "yes", so on non-interactive
+    // stdin (CI, pipes, agents) it would silently default this scaffold to
+    // "yes" — and, when a config is discovered under `.minimal/`, the init
+    // writer would clobber it. Only prompt on a real terminal; anywhere else
+    // (and on a declined prompt) carry on without scaffolding.
+    if !std::io::stdin().is_terminal() || !confirm("Would you like to create one?")? {
+        eprintln!(
+            "Continuing without one; the session gets a default environment. \
+             Run 'minimal init' to give the project its own config."
         );
+        return Ok(());
     }
 
     let config = if global.repo_dir.is_some() {
@@ -832,7 +864,7 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     let abs_path =
         paths::HostAbsPath::try_new(utf8_path.clone()).context("Invalid project path")?;
 
-    ensure_mfile_or_prompt(&utf8_path, global)?;
+    offer_mfile_scaffold(&utf8_path, global)?;
 
     let mut port_mappings = Vec::with_capacity(args.ingress.len());
     for spec in &args.ingress {
@@ -875,13 +907,11 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
 
     let mut client = connect_daemon(global).await?;
 
-    use minimald_rpc::{CreateSession, CreateSessionRequest};
-    let req = CreateSessionRequest {
-        config,
-        contribution,
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
     };
     let resp = client
-        .oneshot_rpc::<CreateSession>(req)
+        .oneshot_rpc::<CreateSession>(CreateSessionRequest { config })
         .await
         .context("CreateSession RPC failed")?;
 
@@ -894,14 +924,37 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
             bail!("CreateSession failed: {error}");
         }
     };
-    // The daemon may finalize immediately (`Ready`) or ask the
-    // client to gate items first (`Pending`).
-    let id = match created {
-        minimald_rpc::CreateSessionResponse::Ready { id } => id,
-        minimald_rpc::CreateSessionResponse::Pending { id: _, response } => {
-            drive_pending_to_active(&mut client, response, user_policy, compose_options).await?
+    let id = created.id;
+
+    // The session exists but has no loadout yet; composing it is a second
+    // round-trip because the daemon's composer reads the project config out
+    // of the session's workspace, not from a path on this machine.
+    let configured = client
+        .oneshot_rpc::<ConfigureLoadout>(ConfigureLoadoutRequest {
+            session_id: id,
+            contribution,
+        })
+        .await
+        .context("ConfigureLoadout RPC failed")?;
+    let configured = match configured {
+        minimald_rpc::Errorable::Ok(r) => r,
+        minimald_rpc::Errorable::Err { error } => {
+            bail!("ConfigureLoadout failed: {error}");
         }
     };
+    // The daemon may finalize immediately (`Ready`) or ask the
+    // client to gate items first (`Pending`).
+    if let minimald_rpc::ConfigureLoadoutResponse::Pending { response } = configured {
+        drive_pending_to_active(&mut client, response, user_policy, compose_options).await?;
+    }
+
+    // Upload the project directory to the daemon so the session
+    // sandbox has the user's files available.
+    eprintln!("Uploading project files...");
+    client
+        .upload_workspace_files(id, utf8_path.as_std_path())
+        .await
+        .context("Failed to upload project files")?;
 
     println!("{id}");
 
@@ -1671,5 +1724,36 @@ mod tests {
         let sources: [sessions::core::source::Source; 0] = [];
         let d = decisions_for_trusted_sources(sources.iter()).expect("empty → Some(empty)");
         assert!(d.is_empty());
+    }
+
+    /// Regression: a config in the `.minimal/` layout must be detected so
+    /// `activate` returns without prompting and never scaffolds over it.
+    /// The old naive `join(MFILE_NAME)` check missed this path.
+    #[test]
+    fn project_has_mfile_detects_dot_minimal_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mfile_dir = dir.path().join(".minimal");
+        std::fs::create_dir(&mfile_dir).unwrap();
+        std::fs::write(
+            mfile_dir.join(mfile::MFILE_NAME),
+            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+        )
+        .unwrap();
+
+        let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        assert!(
+            project_has_mfile(path),
+            "config under .minimal/ must be detected",
+        );
+    }
+
+    /// A project with no config in either layout is genuinely missing an
+    /// mfile, so detection reports false and the caller falls through to
+    /// the (tty-gated) prompt.
+    #[test]
+    fn project_has_mfile_false_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        assert!(!project_has_mfile(path));
     }
 }

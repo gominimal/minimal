@@ -148,6 +148,32 @@ impl TestServer {
             .expect("get_session RPC should succeed")
             .expect("session should be retrievable");
     }
+
+    /// Seed a project mfile into a session's daemon-side workspace,
+    /// standing in for the client's workspace upload.
+    ///
+    /// The composer reads a session's project config out of its workspace,
+    /// never from the record's `project_path` — that's a path on the
+    /// *client's* machine. So a test that wants `ConfigureLoadout` to see a
+    /// project seeds it here, between `CreateSession` and `ConfigureLoadout`,
+    /// exactly where a real client streams its files up.
+    pub async fn seed_workspace_mfile(&self, session_id: sessions::SessionId, contents: &str) {
+        let mngr = self.state.sessions_manager().await;
+        let paths = mngr
+            .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .await
+            .expect("get_session RPC should succeed")
+            .expect("session should be retrievable")
+            .paths()
+            .await
+            .expect("the session actor should be live");
+        tokio::fs::write(
+            paths.working.as_utf8_path().join(mfile::MFILE_NAME),
+            contents,
+        )
+        .await
+        .expect("seeding the workspace mfile should succeed");
+    }
 }
 
 /// Dials an already-listening minimald UDS and returns an authenticated
@@ -367,16 +393,48 @@ pub fn create_session_req(name: &str, project: &str) -> minimald_rpc::CreateSess
             policy: Default::default(),
             attrs: Default::default(),
         },
-        contribution: Default::default(),
     }
 }
 
-/// Unwrap the `Ready` arm of a [`minimald_rpc::CreateSessionResponse`].
-pub fn unwrap_ready(resp: minimald_rpc::CreateSessionResponse) -> sessions::SessionId {
+/// Unwrap the `Ready` arm of a [`minimald_rpc::ConfigureLoadoutResponse`],
+/// for a caller that expects its contribution to compose in one shot.
+pub fn unwrap_ready(resp: minimald_rpc::ConfigureLoadoutResponse) {
     match resp {
-        minimald_rpc::CreateSessionResponse::Ready { id } => id,
-        minimald_rpc::CreateSessionResponse::Pending { .. } => {
+        minimald_rpc::ConfigureLoadoutResponse::Ready => {}
+        minimald_rpc::ConfigureLoadoutResponse::Pending { .. } => {
             panic!("expected Ready variant, got Pending")
         }
     }
+}
+
+/// Drive the client half of the whole create flow — `CreateSession` plus
+/// the `ConfigureLoadout` that finalizes it — and return the session's id.
+///
+/// A session isn't usable until its loadout is configured (a `Draft` refuses
+/// attach and context creation), so any test that goes on to *use* the
+/// session wants this rather than a bare `CreateSession`. The workspace is
+/// left empty, so the loadout composes to an empty `Ready` in one shot; a
+/// test that wants a project in the mix seeds the workspace in between and
+/// calls the two RPCs itself.
+pub async fn create_configured_session(
+    client: &mut TestClient,
+    name: &str,
+    project: &str,
+) -> SessionId {
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+    let id = client
+        .call::<CreateSession>(&create_session_req(name, project))
+        .await
+        .unwrap()
+        .id;
+    unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    id
 }

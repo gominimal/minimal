@@ -448,7 +448,16 @@ pub(crate) async fn handle_sftp_subsystem(
             return Ok(());
         }
     };
-    let paths = session_handle.paths().await;
+    let paths = match session_handle.paths().await {
+        Ok(paths) => paths,
+        // The actor died between resolve and this call (raced an
+        // abort/destroy) — to this channel the session no longer exists.
+        Err(e) => {
+            tracing::warn!(%session_id, error = %e, "sftp subsystem rejected: session is gone");
+            session.channel_failure(id)?;
+            return Ok(());
+        }
+    };
 
     session.channel_success(id)?;
     spawn(russh_sftp::server::run(
@@ -466,21 +475,13 @@ mod tests {
     use sessions::SessionId;
     use tokio::io::AsyncWriteExt;
 
-    use minimald_rpc::CreateSession;
-
     use crate::test_harness::TestServer;
 
     /// Creates a fresh session through the public CreateSession RPC and
     /// returns its uuid, mirroring how a real client would set things up
     /// before opening an SFTP channel.
     async fn fresh_session(client: &mut crate::test_harness::TestClient) -> SessionId {
-        use crate::test_harness::{create_session_req, unwrap_ready};
-        unwrap_ready(
-            client
-                .call::<CreateSession>(&create_session_req("sftp-test", "/tmp"))
-                .await
-                .unwrap(),
-        )
+        crate::test_harness::create_configured_session(client, "sftp-test", "/tmp").await
     }
 
     #[tokio::test]
