@@ -3,6 +3,7 @@
 use anyhow::{Context as _, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
+use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
@@ -787,18 +788,41 @@ async fn send_abort(client: &mut client::Client, session_id: sessions::SessionId
     }
 }
 
+/// Whether the project already has a `minimal.toml`, in either the root
+/// (`<project>/minimal.toml`) or `.minimal/`
+/// (`<project>/.minimal/minimal.toml`) layout.
+///
+/// Uses [`mfile::File::from_dir`] — the same resolver the CLI loads config
+/// with — rather than a naive `join(MFILE_NAME)`, so detection matches the
+/// path the init writer would target and we never scaffold over a config
+/// living under `.minimal/`. Any outcome other than [`mfile::Error::NotFound`]
+/// (including a present-but-malformed file) counts as "exists".
+fn project_has_mfile(project_path: &camino::Utf8Path) -> bool {
+    !matches!(
+        mfile::File::from_dir(project_path.as_std_path()),
+        Err(mfile::Error::NotFound)
+    )
+}
+
 /// Check for a `minimal.toml` at the project path. If missing, prompt
 /// the user to initialize one before proceeding with activation.
 fn ensure_mfile_or_prompt(
     project_path: &camino::Utf8Path,
     global: &GlobalArgs,
 ) -> Result<(), anyhow::Error> {
-    if project_path.join(mfile::MFILE_NAME).exists() {
+    if project_has_mfile(project_path) {
         return Ok(());
     }
 
     eprintln!("\nNo {} found at {}.", mfile::MFILE_NAME, project_path);
-    if !confirm("Would you like to create one?")? {
+
+    // `confirm` treats empty/EOF input as "yes", so on non-interactive
+    // stdin (CI, pipes, agents) it would silently default this scaffold to
+    // "yes" — and, when a config is discovered under `.minimal/`, the init
+    // writer would clobber it. Only prompt on a real terminal; otherwise
+    // bail with the same hint the declined prompt gives.
+    let create = std::io::stdin().is_terminal() && confirm("Would you like to create one?")?;
+    if !create {
         bail!(
             "No {} found. Run 'minimal init' to create one.",
             mfile::MFILE_NAME
@@ -1671,5 +1695,36 @@ mod tests {
         let sources: [sessions::core::source::Source; 0] = [];
         let d = decisions_for_trusted_sources(sources.iter()).expect("empty → Some(empty)");
         assert!(d.is_empty());
+    }
+
+    /// Regression: a config in the `.minimal/` layout must be detected so
+    /// `activate` returns without prompting and never scaffolds over it.
+    /// The old naive `join(MFILE_NAME)` check missed this path.
+    #[test]
+    fn project_has_mfile_detects_dot_minimal_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mfile_dir = dir.path().join(".minimal");
+        std::fs::create_dir(&mfile_dir).unwrap();
+        std::fs::write(
+            mfile_dir.join(mfile::MFILE_NAME),
+            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+        )
+        .unwrap();
+
+        let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        assert!(
+            project_has_mfile(path),
+            "config under .minimal/ must be detected",
+        );
+    }
+
+    /// A project with no config in either layout is genuinely missing an
+    /// mfile, so detection reports false and the caller falls through to
+    /// the (tty-gated) prompt.
+    #[test]
+    fn project_has_mfile_false_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        assert!(!project_has_mfile(path));
     }
 }
