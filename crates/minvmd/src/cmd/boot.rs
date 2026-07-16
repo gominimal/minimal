@@ -106,6 +106,10 @@ fn run_boot(foreground: bool) -> Result<()> {
     let volume_preexisted = crate::cmd::volume_preexists(&volume_path);
 
     // Spawn `minvmd __krun-vmm` — the VMM child that calls krun_start_enter.
+    // The child boots with the pre-spawn resource snapshot handed to it here
+    // (`MINVMD_BOOTED_*`), not its own config read, so a concurrent `config
+    // set` cannot change what this boot uses (R2.6).
+    let (booted_vcpus, booted_ram_mib) = crate::cmd::effective_resources();
     let exe = std::env::current_exe().context("resolving current executable path")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("__krun-vmm");
@@ -115,6 +119,8 @@ fn run_boot(foreground: bool) -> Result<()> {
     alive_lock.inherit_into(&mut cmd);
     let mut child = cmd
         .env(MARKER_SOCK_ENV, &marker_sock_path)
+        .env(crate::cmd::BOOTED_VCPUS_ENV, booted_vcpus.to_string())
+        .env(crate::cmd::BOOTED_RAM_MIB_ENV, booted_ram_mib.to_string())
         // Inherit MINVMD_KERNEL_PATH and MINVMD_ROOTFS_PATH from environment.
         .spawn()
         .with_context(|| format!("spawning VMM child: {}", exe.display()))?;

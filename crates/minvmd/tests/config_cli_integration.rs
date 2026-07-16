@@ -5,10 +5,23 @@
 //! need no VM, so — unlike the boot harness — they are neither `#[ignore]`d nor
 //! `MINVMD_E2E`-gated and run on every lane. They prove the config surface and
 //! the `status --json` schema through the actual CLI, including that a persisted
-//! value is what the boot path's `effective_ram_mib()` would read (surfaced as
-//! `ram_mib_source: "config"` by `config show`).
+//! value is what boot resolution (`effective_resources()`) would read (surfaced
+//! as `ram_mib_source: "config"` by `config show`).
 
 use std::process::Command;
+
+/// The provider-instance `config.toml` under an isolated `XDG_STATE_HOME`, for
+/// tests that plant hand-edited (i.e. never `config set`-validated) content.
+fn config_toml_path(state_home: &std::path::Path) -> std::path::PathBuf {
+    state_home.join("minimal/providers/local-0/config.toml")
+}
+
+/// Write raw `content` as the provider's `config.toml`, creating the dir tree.
+fn plant_config_toml(state_home: &std::path::Path, content: &str) {
+    let path = config_toml_path(state_home);
+    std::fs::create_dir_all(path.parent().expect("provider dir")).expect("create provider dir");
+    std::fs::write(path, content).expect("write config.toml");
+}
 
 /// The minvmd binary under test: `MINVMD_BIN` when set (CI's split build/test
 /// runners), else the compile-time cargo-built path.
@@ -77,6 +90,42 @@ fn set_merges_without_clobbering_the_other_field() {
         "earlier ram_mib must survive a later set"
     );
     assert_eq!(v["vcpus"], 1);
+}
+
+#[test]
+fn show_survives_a_malformed_config_toml() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    plant_config_toml(tmp.path(), "vcpus = \"not-a-number\"");
+
+    // Boot resolution falls back to defaults on a malformed file; `config show`
+    // must do the same — not fail — or the one command that could report the
+    // fallback is the one command the malformed file breaks.
+    let (ok, out, err) = run(tmp.path(), &["config", "show", "--json"]);
+    assert!(
+        ok,
+        "config show must not fail on malformed TOML; stderr: {err}"
+    );
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    assert_eq!(v["vcpus_source"], "default");
+    assert_eq!(v["ram_mib_source"], "default");
+}
+
+#[test]
+fn hand_edited_invalid_values_fall_back_to_defaults() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // `config set` rejects both of these; a hand-edited file is the only way
+    // they reach disk. Resolution must treat them as unset rather than hand a
+    // 0-vcpu / 64 MiB VmConfig to the VMM.
+    plant_config_toml(tmp.path(), "vcpus = 0\nram_mib = 64\n");
+
+    let (ok, out, err) = run(tmp.path(), &["config", "show", "--json"]);
+    assert!(ok, "config show must succeed; stderr: {err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    assert_eq!(v["vcpus_source"], "default", "vcpus = 0 must be ignored");
+    assert_eq!(
+        v["ram_mib_source"], "default",
+        "sub-floor ram_mib must be ignored"
+    );
 }
 
 #[test]

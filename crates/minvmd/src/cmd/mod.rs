@@ -71,12 +71,24 @@ pub fn ready_timeout() -> std::time::Duration {
 /// Environment variable overriding the [`DEFAULT_VM_RAM_MIB`] guest RAM size.
 pub const VM_RAM_MIB_ENV: &str = "MINVMD_VM_RAM_MIB";
 
+/// Environment variable carrying the parent supervisor's pre-spawn vcpu
+/// snapshot to the VMM child (with [`BOOTED_RAM_MIB_ENV`]). The child boots
+/// with exactly the pair the parent records as `State.booted_*` at the Running
+/// transition, so a `config set` landing inside the boot window cannot make
+/// `status` report resources the VM did not boot with (R2.6). Internal — set
+/// by `boot`/`run` alongside [`MARKER_SOCK_ENV`], not a user knob.
+pub const BOOTED_VCPUS_ENV: &str = "MINVMD_BOOTED_VCPUS";
+
+/// Environment variable carrying the parent supervisor's pre-spawn RAM-MiB
+/// snapshot to the VMM child. See [`BOOTED_VCPUS_ENV`].
+pub const BOOTED_RAM_MIB_ENV: &str = "MINVMD_BOOTED_RAM_MIB";
+
 /// Environment variable overriding the [`DEFAULT_VM_VCPUS`] guest vcpu count.
 pub const VM_VCPUS_ENV: &str = "MINVMD_VM_VCPUS";
 
 /// Default guest vcpu count. 2 is the v0.1 baseline; stay below the guest
 /// kernel's `CONFIG_NR_CPUS`. Overridable via [`VM_VCPUS_ENV`] or persisted
-/// resource config (see [`effective_vcpus`]).
+/// resource config (see [`effective_resources`]).
 pub const DEFAULT_VM_VCPUS: u8 = 2;
 
 /// Logical cores backed off from the vcpu ceiling for the host side: the VMM
@@ -149,15 +161,41 @@ pub(crate) fn env_vcpus() -> Option<u8> {
 /// The persisted resource config from the provider dir. A missing file yields
 /// the all-`None` default; a malformed file is logged — so a boot that silently
 /// falls back to built-in defaults is at least diagnosable — and also treated as
-/// the default, so an unreadable file never blocks boot (R9.7).
+/// the default, so an unreadable file never blocks boot (R9.7). Values `config
+/// set` would reject are sanitized out (see [`sanitize_persisted`]).
 pub(crate) fn persisted_resource_config() -> crate::config::ResourceConfig {
-    match crate::config::ResourceConfig::read(&crate::state::provider_dir()) {
+    let cfg = match crate::config::ResourceConfig::read(&crate::state::provider_dir()) {
         Ok(cfg) => cfg,
         Err(e) => {
             tracing::warn!(error = %e, "failed to read persisted resource config; using defaults");
             crate::config::ResourceConfig::default()
         }
+    };
+    sanitize_persisted(cfg)
+}
+
+/// Drop persisted values that `config set` would reject — it validates only
+/// the write path, so a hand-edited `config.toml` can carry `vcpus = 0` or a
+/// sub-floor `ram_mib` that boot resolution would otherwise hand straight to
+/// the VMM (a 0-vcpu VmConfig, or a guest that cannot reach userspace). Each
+/// offending field is warned about and treated as unset, falling back to the
+/// built-in default.
+fn sanitize_persisted(mut cfg: crate::config::ResourceConfig) -> crate::config::ResourceConfig {
+    if cfg.vcpus == Some(0) {
+        tracing::warn!("persisted vcpus = 0 is invalid; falling back to the default");
+        cfg.vcpus = None;
     }
+    if let Some(m) = cfg.ram_mib
+        && m < config::MIN_RAM_MIB
+    {
+        tracing::warn!(
+            ram_mib = m,
+            min = config::MIN_RAM_MIB,
+            "persisted ram_mib is below the boot floor; falling back to the default"
+        );
+        cfg.ram_mib = None;
+    }
+    cfg
 }
 
 /// Clamp a resolved vcpu count to this host's [`max_vm_vcpus`]. Warns when it
@@ -177,51 +215,109 @@ fn clamp_vcpus(vcpus: u8) -> u8 {
     }
 }
 
-/// The effective guest RAM in MiB, resolved as
-/// `env override ?? persisted config ?? default` (R9.7). The
-/// [`VM_RAM_MIB_ENV`] override still wins so power users keep a per-boot escape
-/// hatch; `minvmd config set --ram-mib` supplies the persisted layer beneath it.
+/// Which layer supplied an effective resource value (R9.5), matching the
+/// `env override ?? persisted config ?? default` precedence (R9.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValueSource {
+    /// A `MINVMD_VM_*` environment override.
+    Env,
+    /// The persisted `config.toml` (`minvmd config set`).
+    Config,
+    /// The built-in default.
+    Default,
+}
+
+impl ValueSource {
+    /// The label reported by `config show` (`env` / `config` / `default`).
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Env => "env",
+            Self::Config => "config",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// The effective resource pair plus each value's source, resolved in one pass
+/// (see [`resolve_resources`]).
+pub(crate) struct ResolvedResources {
+    pub vcpus: u8,
+    pub ram_mib: u32,
+    pub vcpus_source: ValueSource,
+    pub ram_mib_source: ValueSource,
+}
+
+/// Resolve values and sources from one `(env, config)` snapshot. Pure — inputs
+/// are injected so precedence is testable without touching the process env or
+/// a real state dir. vcpus is clamped to this host's [`max_vm_vcpus`].
 ///
-/// Note: the RAM stop-gap is *not* reduced when the cache moves to the writable
-/// volume. A reduced baseline is only safe once a failed volume mount is fatal
-/// (no silent tmpfs fallback) and the floor is measured against real in-VM build
-/// memory pressure; reducing it here would leave a mount-failed VM at half RAM
-/// with the cache still on the tmpfs. Out of scope for this feature — deferred to
-/// a separate memory-pressure spec.
-#[must_use]
-pub fn effective_ram_mib() -> u32 {
-    env_ram_mib()
-        .or_else(|| persisted_resource_config().ram_mib)
-        .unwrap_or(DEFAULT_VM_RAM_MIB)
+/// Note: the RAM stop-gap default is *not* reduced when the cache moves to the
+/// writable volume. A reduced baseline is only safe once a failed volume mount
+/// is fatal (no silent tmpfs fallback) and the floor is measured against real
+/// in-VM build memory pressure; reducing it here would leave a mount-failed VM
+/// at half RAM with the cache still on the tmpfs. Out of scope for this
+/// feature — deferred to a separate memory-pressure spec.
+fn resolve_from(
+    env_vcpus: Option<u8>,
+    env_ram_mib: Option<u32>,
+    cfg: &crate::config::ResourceConfig,
+) -> ResolvedResources {
+    let (vcpus, vcpus_source) = match (env_vcpus, cfg.vcpus) {
+        (Some(v), _) => (v, ValueSource::Env),
+        (None, Some(v)) => (v, ValueSource::Config),
+        (None, None) => (DEFAULT_VM_VCPUS, ValueSource::Default),
+    };
+    let (ram_mib, ram_mib_source) = match (env_ram_mib, cfg.ram_mib) {
+        (Some(m), _) => (m, ValueSource::Env),
+        (None, Some(m)) => (m, ValueSource::Config),
+        (None, None) => (DEFAULT_VM_RAM_MIB, ValueSource::Default),
+    };
+    ResolvedResources {
+        vcpus: clamp_vcpus(vcpus),
+        ram_mib,
+        vcpus_source,
+        ram_mib_source,
+    }
 }
 
-/// The effective guest vcpu count, resolved as
-/// `env override ?? persisted config ?? default` (R9.7) and clamped to this
-/// host's [`max_vm_vcpus`] so an over-large env/config value cannot brick the
-/// boot.
-#[must_use]
-pub fn effective_vcpus() -> u8 {
-    clamp_vcpus(
-        env_vcpus()
-            .or_else(|| persisted_resource_config().vcpus)
-            .unwrap_or(DEFAULT_VM_VCPUS),
-    )
+/// Resolve the effective resources — and each value's source — from a
+/// **single** read of the persisted config, so neither the `(vcpus, ram_mib)`
+/// pair nor its source labels can tear when `config.toml` changes between two
+/// separate reads. The `MINVMD_VM_*` overrides still win so power users keep a
+/// per-boot escape hatch; `minvmd config set` supplies the persisted layer
+/// beneath them (R9.7). Shared by boot resolution and `config show`, so both
+/// see the same malformed-file fallback (defaults, with a warning).
+pub(crate) fn resolve_resources() -> ResolvedResources {
+    resolve_from(env_vcpus(), env_ram_mib(), &persisted_resource_config())
 }
 
-/// Resolve `(vcpus, ram_mib)` from a **single** read of the persisted config, so
-/// the pair cannot tear when `config.toml` changes between two separate
-/// `effective_*` calls (e.g. the two `booted_*` fields recorded at the Running
-/// transition). Per-field env overrides still take precedence; vcpus is clamped
-/// to this host's [`max_vm_vcpus`].
+/// The effective `(vcpus, ram_mib)` pair — [`resolve_resources`] without the
+/// source labels.
 #[must_use]
 pub fn effective_resources() -> (u8, u32) {
-    let env_v = env_vcpus();
-    let env_r = env_ram_mib();
-    let cfg = persisted_resource_config();
-    (
-        clamp_vcpus(env_v.or(cfg.vcpus).unwrap_or(DEFAULT_VM_VCPUS)),
-        env_r.or(cfg.ram_mib).unwrap_or(DEFAULT_VM_RAM_MIB),
+    let resolved = resolve_resources();
+    (resolved.vcpus, resolved.ram_mib)
+}
+
+/// The parent supervisor's pre-spawn resource snapshot from the environment
+/// ([`BOOTED_VCPUS_ENV`] / [`BOOTED_RAM_MIB_ENV`]), if both halves are present
+/// and valid.
+#[cfg(any(minvmd_libkrun, test))]
+pub(crate) fn booted_resources_from_env() -> Option<(u8, u32)> {
+    parse_booted_snapshot(
+        std::env::var(BOOTED_VCPUS_ENV).ok().as_deref(),
+        std::env::var(BOOTED_RAM_MIB_ENV).ok().as_deref(),
     )
+}
+
+/// Parse the two snapshot halves; `None` unless both are positive integers, so
+/// a half-set or corrupted snapshot falls back to local resolution rather than
+/// booting a 0-vcpu VM.
+#[cfg(any(minvmd_libkrun, test))]
+fn parse_booted_snapshot(vcpus: Option<&str>, ram_mib: Option<&str>) -> Option<(u8, u32)> {
+    let vcpus = vcpus?.trim().parse::<u8>().ok().filter(|&v| v > 0)?;
+    let ram_mib = ram_mib?.trim().parse::<u32>().ok().filter(|&m| m > 0)?;
+    Some((vcpus, ram_mib))
 }
 
 /// Verify the host hypervisor backend is accessible before booting a VM (R2.4).
@@ -485,6 +581,47 @@ mod tests {
         let msg = kvm_access_error(&Error::from(ErrorKind::PermissionDenied)).to_string();
         assert!(msg.contains("permission denied"), "got: {msg}");
         assert!(msg.contains("`kvm` group"), "got: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod resource_resolution_tests {
+    use super::*;
+    use crate::config::ResourceConfig;
+
+    #[test]
+    fn sanitize_drops_zero_vcpus_and_sub_floor_ram() {
+        let cfg = sanitize_persisted(ResourceConfig {
+            vcpus: Some(0),
+            ram_mib: Some(config::MIN_RAM_MIB - 1),
+        });
+        assert_eq!(cfg.vcpus, None, "vcpus = 0 must fall back to the default");
+        assert_eq!(
+            cfg.ram_mib, None,
+            "sub-floor ram_mib must fall back to the default"
+        );
+    }
+
+    #[test]
+    fn sanitize_keeps_valid_persisted_values() {
+        let cfg = ResourceConfig {
+            vcpus: Some(2),
+            ram_mib: Some(config::MIN_RAM_MIB),
+        };
+        assert_eq!(sanitize_persisted(cfg.clone()), cfg);
+    }
+
+    #[test]
+    fn snapshot_parses_only_when_both_halves_are_positive_integers() {
+        assert_eq!(
+            parse_booted_snapshot(Some("2"), Some("3072")),
+            Some((2, 3072))
+        );
+        assert_eq!(parse_booted_snapshot(None, Some("3072")), None);
+        assert_eq!(parse_booted_snapshot(Some("2"), None), None);
+        assert_eq!(parse_booted_snapshot(Some("0"), Some("3072")), None);
+        assert_eq!(parse_booted_snapshot(Some("two"), Some("3072")), None);
+        assert_eq!(parse_booted_snapshot(Some("2"), Some("")), None);
     }
 }
 

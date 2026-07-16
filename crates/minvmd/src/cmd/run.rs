@@ -312,6 +312,13 @@ fn run_foreground() -> Result<()> {
     let volume_path = crate::volume::resolve_data_volume_path();
     let volume_preexisted = crate::cmd::volume_preexists(&volume_path);
 
+    // Resolve the boot resources ONCE, pre-spawn, and hand the snapshot to the
+    // child: the child boots with exactly this pair, and the Running transition
+    // below records the same pair as `booted_*` — a `config set` landing inside
+    // the boot window cannot make `status` report resources the VM did not boot
+    // with (R2.6).
+    let (booted_vcpus, booted_ram_mib) = crate::cmd::effective_resources();
+
     let exe = std::env::current_exe().context("resolving current executable path")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("__krun-vmm");
@@ -321,6 +328,8 @@ fn run_foreground() -> Result<()> {
     alive_lock.inherit_into(&mut cmd);
     let mut child = cmd
         .env(MARKER_SOCK_ENV, &marker_sock_path)
+        .env(crate::cmd::BOOTED_VCPUS_ENV, booted_vcpus.to_string())
+        .env(crate::cmd::BOOTED_RAM_MIB_ENV, booted_ram_mib.to_string())
         .spawn()
         .with_context(|| format!("spawning VMM child: {}", exe.display()))?;
 
@@ -407,13 +416,9 @@ fn run_foreground() -> Result<()> {
         let state = state_dir.read_state().context("reading state")?;
         let running = next_state(state.lifecycle, Action::MarkRunning)
             .map_err(|e| anyhow::anyhow!("lifecycle transition error: {e}"))?;
-        // Record the resources the running VM was booted with (R2.6), resolved
-        // from a single config read so the (vcpus, ram_mib) pair cannot tear. The
-        // VMM child resolves the same effective values from the inherited env +
-        // shared config.toml; a `config set` landing inside the brief boot window
-        // could still make this parent read diverge from the child's, but the
-        // recorded pair itself is always self-consistent.
-        let (booted_vcpus, booted_ram_mib) = crate::cmd::effective_resources();
+        // Record the pre-spawn snapshot the VMM child was handed via
+        // `MINVMD_BOOTED_*` — by construction the exact resources the running
+        // VM booted with (R2.6).
         state_dir
             .write_state(&State {
                 lifecycle: running,

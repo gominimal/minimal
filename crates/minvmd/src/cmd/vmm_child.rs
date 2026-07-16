@@ -49,18 +49,22 @@ fn run_vmm() -> Result<()> {
     })?;
 
     let mut ctx = Context::create().context("krun_create_ctx")?;
-    // vcpus and guest RAM are the *effective* values: env override ?? persisted
-    // `minvmd config` ?? default (R9.7). RAM keeps its tmpfs-headroom default and
-    // x86_64 hole-safe rule (see `DEFAULT_VM_RAM_MIB`); vcpus stay below the
-    // kernel's CONFIG_NR_CPUS. `apply` configures the kernel + initramfs, the
-    // ext4 root disk, the writable data volume, and the vsock bridge.
-    let mut cfg = VmConfig::new(
-        crate::cmd::effective_vcpus(),
-        crate::cmd::effective_ram_mib(),
-        kernel,
-        rootfs,
-        initramfs,
-    );
+    // vcpus and guest RAM come from the parent's pre-spawn snapshot
+    // (`MINVMD_BOOTED_*`), so this child boots with exactly the pair the parent
+    // records as `State.booted_*` — a `config set` landing between the parent's
+    // resolution and this point cannot make the two diverge (R2.6). A missing
+    // snapshot (a child spawned by an older parent binary mid-upgrade) falls
+    // back to local resolution: env override ?? persisted `minvmd config` ??
+    // default (R9.7). `apply` configures the kernel + initramfs, the ext4 root
+    // disk, the writable data volume, and the vsock bridge.
+    let (vcpus, ram_mib) = crate::cmd::booted_resources_from_env().unwrap_or_else(|| {
+        tracing::warn!(
+            "no booted-resource snapshot in the environment; resolving locally \
+             (VMM child spawned by an older parent?)"
+        );
+        crate::cmd::effective_resources()
+    });
+    let mut cfg = VmConfig::new(vcpus, ram_mib, kernel, rootfs, initramfs);
     // An own-IP VM registers the per-PTask gvproxy shuttle vsock
     // bridge in `apply`; the host gvproxy is spawned by the parent supervisor.
     // The env var keeps the parent's gvproxy-spawn decision and this child's VM

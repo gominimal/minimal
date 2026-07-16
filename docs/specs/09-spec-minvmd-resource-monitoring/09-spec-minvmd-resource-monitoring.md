@@ -36,8 +36,8 @@ in-guest, post-mortem — OOM via `/sys/fs/cgroup/memory.events` and disk-full v
 `df … ≥95%`, each pointing the user at the knob to raise. This spec ports those
 ideas to a host-side, typed, tested implementation.
 
-`vcpus`/`ram_mib` are read at boot from `crate::cmd::effective_*` and are static
-for the VM's lifetime. This work monitors the *current* allocation and persists
+`vcpus`/`ram_mib` are resolved once per boot (`crate::cmd::resolve_resources`)
+and are static for the VM's lifetime. This work monitors the *current* allocation and persists
 config for the *next* boot; live hot-add / resize of a running VM is explicitly a
 non-goal, per the host-daemon spec's deferral of "RAM resizing, vcpu hot-add"
 (`docs/specs/01-spec-minvmd-host-daemon/01-spec-minvmd-host-daemon.md:335`).
@@ -166,8 +166,9 @@ process in `status --json` and `status` human output.
 - `crates/minvmd/src/state.rs` — extract `atomic_write_toml` helper; add
   `booted_vcpus`/`booted_ram_mib` runtime snapshot fields
 - `crates/minvmd/src/cmd/config.rs` (new) — `show`/`set` + validation
-- `crates/minvmd/src/cmd/mod.rs` — `effective_vcpus`/`effective_ram_mib`
-- `crates/minvmd/src/cmd/vmm_child.rs` — boot from effective values
+- `crates/minvmd/src/cmd/mod.rs` — `resolve_resources`/`effective_resources`
+- `crates/minvmd/src/cmd/vmm_child.rs` — boot from the parent's pre-spawn
+  snapshot
 - `crates/minvmd/src/cmd/run.rs` — stamp booted snapshot into `Running` state
 - `crates/minvmd/src/main.rs` — `config` subcommand
 - `crates/minvmd/src/lib.rs` — `pub mod config;`
@@ -185,12 +186,16 @@ process in `status --json` and `status` human output.
   provider-instance dir — **separate from `State`**, so a stop/crash reset cannot
   wipe it. `read` treats a missing file as the all-`None` default; `write` is
   atomic via the shared `crate::state::atomic_write_toml`.
-- **R2.2**: `crates/minvmd/src/cmd/mod.rs` shall provide `effective_vcpus() -> u8`
-  and `effective_ram_mib() -> u32`, each resolving
+- **R2.2**: `crates/minvmd/src/cmd/mod.rs` shall provide a single-pass
+  resolution (`resolve_resources()`, with `effective_resources() -> (u8, u32)`
+  as the value-only view) resolving
   `environment override ?? persisted config ?? built-in default`
   (`MINVMD_VM_VCPUS`/`MINVMD_VM_RAM_MIB`; defaults `DEFAULT_VM_VCPUS = 2` and the
-  existing arch-conditional `DEFAULT_VM_RAM_MIB`). `status` (R1.3) and
-  `vmm_child` shall report/boot from these.
+  existing arch-conditional `DEFAULT_VM_RAM_MIB`) from one persisted-config
+  read, so neither the pair nor its source labels can tear. Persisted values
+  `config set` would reject (zero vcpus, sub-floor RAM) are treated as unset
+  with a warning. `status` (R1.3) and `vmm_child` shall report/boot from this
+  resolution.
 - **R2.3**: `minvmd config set [--vcpus N] [--ram-mib M]` shall validate, merge
   into the existing persisted config, and write it atomically. Validation rejects
   `vcpus == 0` and `ram_mib < 512` (the userspace floor). With neither flag it is
@@ -198,14 +203,17 @@ process in `status --json` and `status` human output.
 - **R2.4**: `minvmd config show [--json]` shall print the effective `vcpus`/`ram_mib`
   and each value's source (`env`/`config`/`default`).
 - **R2.5**: `crates/minvmd/src/cmd/vmm_child.rs` shall construct its `VmConfig`
-  from `effective_vcpus()`/`effective_ram_mib()`, so a persisted config takes
-  effect on the next boot.
-- **R2.6**: The `Running` state shall record the resolved boot-time `vcpus`/`ram_mib`
-  as `State.booted_vcpus`/`booted_ram_mib` (runtime facts like `vmm_pid`, cleared
-  on stop, `#[serde(default)]` for backward compatibility). `status` shall report
-  and warn against these live values for a running VM — **not** a later
-  `config set`'s next-boot resolution — falling back to `effective_*` only when
-  stopped or when reading a pre-#747 state file with no snapshot.
+  from the parent's pre-spawn resource snapshot (`MINVMD_BOOTED_VCPUS`/
+  `MINVMD_BOOTED_RAM_MIB`), so a persisted config takes effect on the next boot
+  and a `config set` racing the boot window cannot change what that boot uses;
+  a missing snapshot (older parent binary) falls back to local resolution.
+- **R2.6**: The `Running` state shall record the pre-spawn snapshot handed to
+  the VMM child as `State.booted_vcpus`/`booted_ram_mib` (runtime facts like
+  `vmm_pid`, cleared on stop, `#[serde(default)]` for backward compatibility).
+  `status` shall report and warn against these live values for a running VM —
+  **not** a later `config set`'s next-boot resolution — falling back to the
+  effective (next-boot) resolution only when stopped or when reading a pre-#747
+  state file with no snapshot.
 
 **Proof Artifacts:**
 1. **Test:** `config::tests::round_trips_through_toml` and

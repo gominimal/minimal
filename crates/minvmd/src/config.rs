@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 /// Persisted resource parameters. A `None` field means "unset — use the
 /// built-in default"; an explicit value overrides the default (but is itself
 /// overridden by the matching environment variable at resolution time, see
-/// [`crate::cmd::effective_ram_mib`]).
+/// [`crate::cmd::effective_resources`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ResourceConfig {

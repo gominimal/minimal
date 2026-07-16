@@ -23,11 +23,13 @@ the next launch).
 
 2. **Config** (`config.rs` + `cmd/config.rs`) — `ResourceConfig { vcpus, ram_mib }`
    persists to `config.toml` in the provider-instance dir, **separate from the
-   runtime `State`** so a stop/crash reset cannot wipe it. `effective_vcpus()` /
-   `effective_ram_mib()` resolve `env ?? config ?? default`; `vmm_child` boots
-   from them and `config show` reports them. The `Running` state additionally
-   records the resolved boot-time values (`State.booted_*`), and `status` reports
-   *those* for a live VM.
+   runtime `State`** so a stop/crash reset cannot wipe it. `resolve_resources()`
+   resolves `env ?? config ?? default` (values + sources) in one pass from a
+   single config read; `boot`/`run` snapshot it once pre-spawn and hand the pair
+   to `vmm_child` via `MINVMD_BOOTED_*`, and `config show` reports the same
+   resolution. The `Running` state records that pre-spawn snapshot
+   (`State.booted_*`) — by construction what the VM booted with — and `status`
+   reports *those* for a live VM.
 
 3. **Warnings** — proactive only: over-allocation vs host cores/memory, the
    x86_64 MMIO hole, and a host-derived vCPU ceiling (logical cores minus a
@@ -59,11 +61,14 @@ are motivated below.
   value)`; `write_state` delegates to it (behaviour unchanged). Shared with
   `ResourceConfig::write`.
 - `cmd/mod.rs` — `DEFAULT_VM_VCPUS`, `VM_VCPUS_ENV`, `env_ram_mib`/`env_vcpus`
-  (private), `persisted_resource_config`, `effective_ram_mib`/`effective_vcpus`.
-  `vm_ram_mib()` is removed (its two callers move to `effective_ram_mib`).
+  (private), `persisted_resource_config` (sanitizing hand-edited invalid
+  values), `resolve_resources`/`effective_resources`, and the `MINVMD_BOOTED_*`
+  parent→child snapshot env vars. `vm_ram_mib()` is removed (its two callers
+  move to the effective resolution).
 - `cmd/status.rs` — inline `json!` → `#[derive(Serialize)] StatusReport { …,
   metrics }`; pure `build_report`; metrics sampled only when running.
-- `cmd/vmm_child.rs` — `VmConfig::new(effective_vcpus(), effective_ram_mib(), …)`.
+- `cmd/vmm_child.rs` — `VmConfig::new` from the parent's `MINVMD_BOOTED_*`
+  snapshot (local resolution only as a fallback).
 - `cmd/run.rs` — abnormal-exit resource hint before the existing `bail!`.
 - `main.rs` — `Command::Config { action: ConfigAction::{Show, Set} }`.
 - `Cargo.toml` (workspace + crate) — `sysinfo` dependency.

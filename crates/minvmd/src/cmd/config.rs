@@ -8,7 +8,7 @@
 
 use anyhow::{Context as _, Result, bail};
 
-use crate::cmd::{DEFAULT_VM_RAM_MIB, DEFAULT_VM_VCPUS, env_ram_mib, env_vcpus};
+use crate::cmd::{DEFAULT_VM_RAM_MIB, DEFAULT_VM_VCPUS};
 use crate::config::ResourceConfig;
 use crate::state::provider_dir;
 
@@ -142,25 +142,34 @@ pub fn run_set(vcpus: Option<u8>, ram_mib: Option<u32>) -> Result<()> {
 }
 
 /// Run `minvmd config show`: print the effective configuration and each value's
-/// source (`env` / `config` / `default`).
+/// source (`env` / `config` / `default`). Values and sources come from the one
+/// resolution pass boot itself uses ([`crate::cmd::resolve_resources`]) — a
+/// single persisted-config read, so the labels cannot describe a different
+/// `config.toml` version than the values, and a malformed file falls back to
+/// the defaults (as boot would) instead of failing the one command that could
+/// report the fallback.
 pub fn run_show(json: bool) -> Result<()> {
-    let cfg = ResourceConfig::read(&provider_dir()).context("reading resource config")?;
-    let vcpus = crate::cmd::effective_vcpus();
-    let ram_mib = crate::cmd::effective_ram_mib();
-    let vcpus_source = source(env_vcpus().is_some(), cfg.vcpus.is_some());
-    let ram_source = source(env_ram_mib().is_some(), cfg.ram_mib.is_some());
+    let resolved = crate::cmd::resolve_resources();
 
     if json {
         let out = serde_json::json!({
-            "vcpus": vcpus,
-            "ram_mib": ram_mib,
-            "vcpus_source": vcpus_source,
-            "ram_mib_source": ram_source,
+            "vcpus": resolved.vcpus,
+            "ram_mib": resolved.ram_mib,
+            "vcpus_source": resolved.vcpus_source.label(),
+            "ram_mib_source": resolved.ram_mib_source.label(),
         });
         println!("{out}");
     } else {
-        println!("vcpus   = {vcpus} ({vcpus_source})");
-        println!("ram_mib = {ram_mib} ({ram_source})");
+        println!(
+            "vcpus   = {} ({})",
+            resolved.vcpus,
+            resolved.vcpus_source.label()
+        );
+        println!(
+            "ram_mib = {} ({})",
+            resolved.ram_mib,
+            resolved.ram_mib_source.label()
+        );
     }
     Ok(())
 }
@@ -168,18 +177,6 @@ pub fn run_show(json: bool) -> Result<()> {
 /// Render a persisted-or-default value for the confirmation line.
 fn describe<T: std::fmt::Display>(value: Option<T>, default: impl std::fmt::Display) -> String {
     value.map_or_else(|| format!("{default} (default)"), |v| v.to_string())
-}
-
-/// Which layer supplied the effective value: env override, persisted config, or
-/// the built-in default (matching [`crate::cmd::effective_ram_mib`] precedence).
-fn source(from_env: bool, from_config: bool) -> &'static str {
-    if from_env {
-        "env"
-    } else if from_config {
-        "config"
-    } else {
-        "default"
-    }
 }
 
 #[cfg(test)]
@@ -252,8 +249,31 @@ mod tests {
 
     #[test]
     fn source_precedence_is_env_then_config_then_default() {
-        assert_eq!(source(true, true), "env");
-        assert_eq!(source(false, true), "config");
-        assert_eq!(source(false, false), "default");
+        use crate::cmd::ValueSource;
+
+        // Env beats a persisted value; a persisted value beats the default.
+        let cfg = ResourceConfig {
+            vcpus: Some(2),
+            ram_mib: Some(1024),
+        };
+        let r = crate::cmd::resolve_from(Some(1), None, &cfg);
+        assert_eq!(r.vcpus_source, ValueSource::Env);
+        assert_eq!(r.vcpus, 1);
+        assert_eq!(r.ram_mib_source, ValueSource::Config);
+        assert_eq!(r.ram_mib, 1024);
+
+        let r = crate::cmd::resolve_from(None, None, &ResourceConfig::default());
+        assert_eq!(r.vcpus_source, ValueSource::Default);
+        assert_eq!(r.vcpus, DEFAULT_VM_VCPUS);
+        assert_eq!(r.ram_mib_source, ValueSource::Default);
+        assert_eq!(r.ram_mib, DEFAULT_VM_RAM_MIB);
+    }
+
+    #[test]
+    fn source_labels_match_the_show_schema() {
+        use crate::cmd::ValueSource;
+        assert_eq!(ValueSource::Env.label(), "env");
+        assert_eq!(ValueSource::Config.label(), "config");
+        assert_eq!(ValueSource::Default.label(), "default");
     }
 }
