@@ -44,7 +44,13 @@ fn krun_smoke_bring_up() {
         return;
     }
 
-    let exe = env!("CARGO_BIN_EXE_krun_smoke_child");
+    // The compile-time `CARGO_BIN_EXE_krun_smoke_child` path only exists on
+    // the machine that built the helper; when this test replays from a
+    // nextest archive on another machine (CI's split build/test lanes),
+    // nextest carries the helper in the archive and publishes its extracted
+    // location as `NEXTEST_BIN_EXE_krun_smoke_child`.
+    let exe = std::env::var_os("NEXTEST_BIN_EXE_krun_smoke_child")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_krun_smoke_child").into());
     let output = Command::new(exe)
         .output()
         .expect("spawning krun_smoke_child helper binary");
