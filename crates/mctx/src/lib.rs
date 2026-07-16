@@ -30,11 +30,6 @@ pub use sandbox2::config::Invocation;
 mod mfile_search_strategy;
 pub use mfile_search_strategy::MFileSearchStrategy;
 
-// TEMPORARY: default-`minimal.toml` scaffolding for empty session workspaces.
-// See `scaffold.rs`; remove with the workspace-upload gap.
-mod scaffold;
-pub use scaffold::scaffold_default_mfile;
-
 mod project_setup;
 pub use project_setup::ProjectSetup;
 
