@@ -82,8 +82,12 @@ enum ConfigAction {
 
 fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Diagnostics go to stderr: stdout is a machine-readable surface (`status
+    // --json`, `config show --json`), so a warning on stdout corrupts piped
+    // JSON; and the detached supervisor captures *stderr* into run.log — on
+    // stdout its diagnostics would vanish into /dev/null instead.
     tracing_subscriber::registry()
-        .with(fmt::layer())
+        .with(fmt::layer().with_writer(std::io::stderr))
         .with(filter)
         .init();
 
