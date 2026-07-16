@@ -7,8 +7,14 @@
 # instead of blocking on a password prompt in CI. The proper fix is
 # harness-side process-group reaping, tracked separately.
 #
+# Matching is scoped to THIS checkout's binaries: the persistent leftovers all
+# carry the absolute repo path in their cmdline (minvmd's supervisor and
+# __krun-vmm re-exec via current_exe(); gvproxy is spawned from the full
+# MINVMD_GVPROXY_BIN path), so a bare-name pkill would only add collateral —
+# an unrelated checkout's live VM, or podman's gvproxy.
+#
 # Usage: scripts/reap-vms.sh
 set -u
-sudo -n pkill -x minvmd 2>/dev/null || true
-sudo -n pkill -f __krun-vmm 2>/dev/null || true
-sudo -n pkill -f gvproxy 2>/dev/null || true
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+sudo -n pkill -f "$ROOT/.*minvmd" 2>/dev/null || true
+sudo -n pkill -f "$ROOT/.*gvproxy" 2>/dev/null || true
