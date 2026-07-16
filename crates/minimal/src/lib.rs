@@ -1564,13 +1564,6 @@ fn run_init_flow(config: mctx::Config, skip_confirm: bool) -> Result<(), anyhow:
         .with_context(|| format!("writing {}", plan.toml_path.display()))?;
 
     eprintln!("Created {}", plan.toml_path.display());
-    eprintln!();
-    eprintln!("Next steps:");
-    eprintln!("  minimal update      # pin package versions");
-    eprintln!("  minimal activate .  # create a session");
-    if plan.matched {
-        eprintln!("  minimal attach      # attach to the session");
-    }
 
     Ok(())
 }
