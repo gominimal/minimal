@@ -216,8 +216,7 @@ fn run_foreground() -> Result<()> {
         state_dir
             .write_state(&State {
                 lifecycle: starting,
-                vmm_pid: None,
-                started_at: None,
+                ..State::stopped()
             })
             .context("writing Starting state")?;
     }
@@ -349,7 +348,7 @@ fn run_foreground() -> Result<()> {
             .write_state(&State {
                 lifecycle: Lifecycle::Starting,
                 vmm_pid: Some(child_pid),
-                started_at: None,
+                ..State::stopped()
             })
             .context("writing Starting state with vmm_pid")?;
     }
@@ -408,11 +407,20 @@ fn run_foreground() -> Result<()> {
         let state = state_dir.read_state().context("reading state")?;
         let running = next_state(state.lifecycle, Action::MarkRunning)
             .map_err(|e| anyhow::anyhow!("lifecycle transition error: {e}"))?;
+        // Record the resources the running VM was booted with (R2.6), resolved
+        // from a single config read so the (vcpus, ram_mib) pair cannot tear. The
+        // VMM child resolves the same effective values from the inherited env +
+        // shared config.toml; a `config set` landing inside the brief boot window
+        // could still make this parent read diverge from the child's, but the
+        // recorded pair itself is always self-consistent.
+        let (booted_vcpus, booted_ram_mib) = crate::cmd::effective_resources();
         state_dir
             .write_state(&State {
                 lifecycle: running,
                 vmm_pid: Some(child_pid),
                 started_at: Some(started_at),
+                booted_vcpus: Some(booted_vcpus),
+                booted_ram_mib: Some(booted_ram_mib),
             })
             .context("writing Running state")?;
     }
@@ -455,6 +463,17 @@ fn run_foreground() -> Result<()> {
 
     if !status.success() {
         let code = status.code().unwrap_or(-1);
+        // R9.10: host-side analog of `minimal-entry`'s OOM post-mortem. Only a
+        // real guest-workload exit code (libkrun `exit()`s the VMM child with it)
+        // suggests resource exhaustion; a signal-kill (`code == None`) is a
+        // deliberate `minvmd stop` terminating the child, not a crash — so the
+        // resource hint would be misleading there and is suppressed.
+        if status.code().is_some() {
+            eprintln!(
+                "minvmd: the VM exited abnormally (code {code}); if a build was killed for lack \
+                 of resources, raise them with `minvmd config set --ram-mib <MiB>` / `--vcpus <n>`."
+            );
+        }
         bail!("VMM child exited with code {code}");
     }
 

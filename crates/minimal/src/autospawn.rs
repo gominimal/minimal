@@ -379,6 +379,7 @@ mod tests {
             lifecycle: l,
             vmm_pid: Some(999_999_999),
             started_at: Some(0),
+            ..State::stopped()
         }
     }
 
@@ -425,6 +426,7 @@ mod tests {
                 lifecycle: Lifecycle::Running,
                 vmm_pid: Some(999_999_999),
                 started_at: Some(0),
+                ..State::stopped()
             })
             .unwrap();
         wait_for_minvmd_stopped(Some(tmp.path())).expect("stale Running must resolve as stopped");

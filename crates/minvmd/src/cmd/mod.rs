@@ -1,6 +1,7 @@
 //! CLI subcommand implementations for `minvmd`.
 
 pub mod boot;
+pub mod config;
 pub mod run;
 pub mod status;
 pub mod stop;
@@ -70,6 +71,39 @@ pub fn ready_timeout() -> std::time::Duration {
 /// Environment variable overriding the [`DEFAULT_VM_RAM_MIB`] guest RAM size.
 pub const VM_RAM_MIB_ENV: &str = "MINVMD_VM_RAM_MIB";
 
+/// Environment variable overriding the [`DEFAULT_VM_VCPUS`] guest vcpu count.
+pub const VM_VCPUS_ENV: &str = "MINVMD_VM_VCPUS";
+
+/// Default guest vcpu count. 2 is the v0.1 baseline; stay below the guest
+/// kernel's `CONFIG_NR_CPUS`. Overridable via [`VM_VCPUS_ENV`] or persisted
+/// resource config (see [`effective_vcpus`]).
+pub const DEFAULT_VM_VCPUS: u8 = 2;
+
+/// Logical cores backed off from the vcpu ceiling for the host side: the VMM
+/// and its worker threads, plus whatever else the machine is running.
+pub const VCPU_HOST_RESERVE: u32 = 2;
+
+/// Upper bound on guest vcpus for a host with `logical_cores` logical CPUs:
+/// the core count minus [`VCPU_HOST_RESERVE`], floored at [`DEFAULT_VM_VCPUS`]
+/// so small hosts keep the baseline, saturated to the `u8` vcpu type. The
+/// ceiling is host-derived rather than a fixed cap so a many-core host can run
+/// a wide VM; the generic guest kernel's `CONFIG_NR_CPUS` (typically ≥ 64) is
+/// assumed not to be the binding constraint.
+#[must_use]
+pub fn max_vm_vcpus(logical_cores: u32) -> u8 {
+    u8::try_from(logical_cores.saturating_sub(VCPU_HOST_RESERVE))
+        .unwrap_or(u8::MAX)
+        .max(DEFAULT_VM_VCPUS)
+}
+
+/// The host's logical core count (1 if probing fails) — the input to
+/// [`max_vm_vcpus`].
+pub(crate) fn host_logical_cores() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+}
+
 /// Default guest RAM in MiB. 512 MiB is the floor to reach userspace; the extra
 /// headroom feeds the in-VM session build, whose package cache lives on a tmpfs
 /// (`/run/minimal/cache`) sized from RAM (1024 MiB overflowed `StorageFull`
@@ -89,8 +123,64 @@ pub const DEFAULT_VM_RAM_MIB: u32 = 2048;
 #[cfg(not(target_arch = "x86_64"))]
 pub const DEFAULT_VM_RAM_MIB: u32 = 4096;
 
-/// The guest RAM size in MiB, overridable via [`VM_RAM_MIB_ENV`]. A non-numeric,
-/// empty, or zero value falls back to [`DEFAULT_VM_RAM_MIB`].
+/// Parse a positive integer from environment variable `var`; a missing,
+/// non-numeric, empty, or non-positive value is treated as unset. Shared by the
+/// `MINVMD_VM_RAM_MIB` / `MINVMD_VM_VCPUS` overrides.
+fn positive_env<T>(var: &str) -> Option<T>
+where
+    T: std::str::FromStr + PartialOrd + Default,
+{
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<T>().ok())
+        .filter(|value| *value > T::default())
+}
+
+/// The `MINVMD_VM_RAM_MIB` override as a positive value, if set and valid.
+pub(crate) fn env_ram_mib() -> Option<u32> {
+    positive_env(VM_RAM_MIB_ENV)
+}
+
+/// The `MINVMD_VM_VCPUS` override as a positive value, if set and valid.
+pub(crate) fn env_vcpus() -> Option<u8> {
+    positive_env(VM_VCPUS_ENV)
+}
+
+/// The persisted resource config from the provider dir. A missing file yields
+/// the all-`None` default; a malformed file is logged — so a boot that silently
+/// falls back to built-in defaults is at least diagnosable — and also treated as
+/// the default, so an unreadable file never blocks boot (R9.7).
+pub(crate) fn persisted_resource_config() -> crate::config::ResourceConfig {
+    match crate::config::ResourceConfig::read(&crate::state::provider_dir()) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read persisted resource config; using defaults");
+            crate::config::ResourceConfig::default()
+        }
+    }
+}
+
+/// Clamp a resolved vcpu count to this host's [`max_vm_vcpus`]. Warns when it
+/// clamps (e.g. an over-large [`VM_VCPUS_ENV`] override that skips `config set`
+/// validation) so a boot with fewer vcpus than requested is not silent.
+fn clamp_vcpus(vcpus: u8) -> u8 {
+    let max = max_vm_vcpus(host_logical_cores());
+    if vcpus > max {
+        tracing::warn!(
+            requested = vcpus,
+            max,
+            "requested vcpu count exceeds the host-derived vcpu ceiling; clamping"
+        );
+        max
+    } else {
+        vcpus
+    }
+}
+
+/// The effective guest RAM in MiB, resolved as
+/// `env override ?? persisted config ?? default` (R9.7). The
+/// [`VM_RAM_MIB_ENV`] override still wins so power users keep a per-boot escape
+/// hatch; `minvmd config set --ram-mib` supplies the persisted layer beneath it.
 ///
 /// Note: the RAM stop-gap is *not* reduced when the cache moves to the writable
 /// volume. A reduced baseline is only safe once a failed volume mount is fatal
@@ -99,12 +189,39 @@ pub const DEFAULT_VM_RAM_MIB: u32 = 4096;
 /// with the cache still on the tmpfs. Out of scope for this feature — deferred to
 /// a separate memory-pressure spec.
 #[must_use]
-pub fn vm_ram_mib() -> u32 {
-    std::env::var(VM_RAM_MIB_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&mib| mib > 0)
+pub fn effective_ram_mib() -> u32 {
+    env_ram_mib()
+        .or_else(|| persisted_resource_config().ram_mib)
         .unwrap_or(DEFAULT_VM_RAM_MIB)
+}
+
+/// The effective guest vcpu count, resolved as
+/// `env override ?? persisted config ?? default` (R9.7) and clamped to this
+/// host's [`max_vm_vcpus`] so an over-large env/config value cannot brick the
+/// boot.
+#[must_use]
+pub fn effective_vcpus() -> u8 {
+    clamp_vcpus(
+        env_vcpus()
+            .or_else(|| persisted_resource_config().vcpus)
+            .unwrap_or(DEFAULT_VM_VCPUS),
+    )
+}
+
+/// Resolve `(vcpus, ram_mib)` from a **single** read of the persisted config, so
+/// the pair cannot tear when `config.toml` changes between two separate
+/// `effective_*` calls (e.g. the two `booted_*` fields recorded at the Running
+/// transition). Per-field env overrides still take precedence; vcpus is clamped
+/// to this host's [`max_vm_vcpus`].
+#[must_use]
+pub fn effective_resources() -> (u8, u32) {
+    let env_v = env_vcpus();
+    let env_r = env_ram_mib();
+    let cfg = persisted_resource_config();
+    (
+        clamp_vcpus(env_v.or(cfg.vcpus).unwrap_or(DEFAULT_VM_VCPUS)),
+        env_r.or(cfg.ram_mib).unwrap_or(DEFAULT_VM_RAM_MIB),
+    )
 }
 
 /// Verify the host hypervisor backend is accessible before booting a VM (R2.4).
@@ -368,6 +485,28 @@ mod tests {
         let msg = kvm_access_error(&Error::from(ErrorKind::PermissionDenied)).to_string();
         assert!(msg.contains("permission denied"), "got: {msg}");
         assert!(msg.contains("`kvm` group"), "got: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod vcpu_ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn max_backs_off_the_host_reserve() {
+        assert_eq!(max_vm_vcpus(64), 62);
+        assert_eq!(max_vm_vcpus(8), 6);
+    }
+
+    #[test]
+    fn max_floors_at_the_default_on_small_hosts() {
+        assert_eq!(max_vm_vcpus(1), DEFAULT_VM_VCPUS);
+        assert_eq!(max_vm_vcpus(4), DEFAULT_VM_VCPUS);
+    }
+
+    #[test]
+    fn max_saturates_to_the_vcpu_type() {
+        assert_eq!(max_vm_vcpus(1000), u8::MAX);
     }
 }
 
