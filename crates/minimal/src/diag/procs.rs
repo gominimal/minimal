@@ -10,19 +10,24 @@ use anyhow::Context as _;
 use super::bundle::BundleWriter;
 use super::manifest::Redaction;
 
-/// Substrings of a command line that mark a process as ours.
-const PROCESS_MARKERS: &[&str] = &["minimald", "minvmd", "__krun-vmm", "gvproxy"];
+/// Process names (argv0 basenames) that mark a process as ours.
+const PROCESS_MARKERS: &[&str] = &[
+    "min",
+    "minimal",
+    "minimald",
+    "minvmd",
+    "__krun-vmm",
+    "gvproxy",
+];
 
 /// Returns true when a `ps` args column names a minimal-related process.
-/// `min`/`minimal` need word-ish matching so e.g. `vim minutes.txt` or
-/// `terminal` don't match.
+/// Only the executable name (argv0 basename) is matched — substring matching
+/// on the whole command line would capture unrelated user activity like
+/// `vim minimald.log` or `tail -f minvmd.log.2026-07-15`.
 fn is_relevant(args: &str) -> bool {
-    if PROCESS_MARKERS.iter().any(|m| args.contains(m)) {
-        return true;
-    }
     args.split_whitespace().next().is_some_and(|argv0| {
         let bin = argv0.rsplit('/').next().unwrap_or(argv0);
-        bin == "min" || bin == "minimal"
+        PROCESS_MARKERS.contains(&bin)
     })
 }
 
@@ -149,5 +154,12 @@ mod tests {
         assert!(!is_relevant("vim minutes.txt"));
         assert!(!is_relevant("gnome-terminal"));
         assert!(!is_relevant("/usr/bin/administrator --min 5"));
+
+        // Marker names appearing as arguments (a user triaging our logs)
+        // must not drag their editor/pager into the bundle.
+        assert!(!is_relevant("vim minimald.log"));
+        assert!(!is_relevant("tail -f /var/log/minvmd.log.2026-07-15"));
+        assert!(!is_relevant("less gvproxy-notes.md"));
+        assert!(!is_relevant("grep minimald /home/u/tickets/notes"));
     }
 }
