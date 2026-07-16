@@ -272,6 +272,16 @@ impl Client {
                 russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
                     daemon_error.extend_from_slice(&data);
                 }
+                // The daemon refused the subsystem (`want_reply` failure). A
+                // healthy daemon replies `Success` then streams; a refusal
+                // means it doesn't serve this RPC — bail now rather than block
+                // on `wait()` until the caller's timeout, since a bare refusal
+                // doesn't close the channel.
+                russh::ChannelMsg::Failure => anyhow::bail!(
+                    "daemon refused the {} subsystem — it likely predates the \
+                     diagnostics RPC (upgrade minimald)",
+                    minimald_rpc::DIAG_BUNDLE_SUBSYSTEM
+                ),
                 _ => {}
             }
         }
