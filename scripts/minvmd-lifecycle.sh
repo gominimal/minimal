@@ -46,18 +46,24 @@ cat "$WORK/config.json"
 jq -e '.ram_mib == 3072 and .ram_mib_source == "config"' "$WORK/config.json"
 echo "::endgroup::"
 
+# Boot window: how long `run --detach` may wait for the host socket, and how
+# long the Running poll below may keep checking. CI's guests boot well inside
+# the 30s default; slower dev hosts (e.g. nested KVM, where the generic guest
+# kernel spends 40-70s probing hardware) override via the env.
+BOOT_TIMEOUT="${MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS:-30}"
+
 echo "::group::run --detach"
-minvmd run --detach --timeout 30
+minvmd run --detach --timeout "$BOOT_TIMEOUT"
 echo "::endgroup::"
 
 echo "::group::status (expect running)"
 # `run --detach` returns once the host UDS accepts connections, which
 # libkrun opens early in VM setup — slightly ahead of the supervisor's
 # Starting->Running transition (set after the guest READY marker). Poll
-# status (up to ~15s) for Running rather than asserting immediately. jq
-# parses structurally so the check doesn't break on harmless JSON
-# formatting changes.
-for _ in $(seq 1 75); do
+# status (up to the boot window) for Running rather than asserting
+# immediately. jq parses structurally so the check doesn't break on harmless
+# JSON formatting changes.
+for _ in $(seq 1 $((BOOT_TIMEOUT * 5))); do
   minvmd status --json > "$WORK/status.json" || true
   if jq -e '.state == "running" and (.vmm_pid | type == "number")' "$WORK/status.json" >/dev/null; then
     break

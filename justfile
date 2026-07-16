@@ -495,6 +495,11 @@ test-lifecycle: artifacts initramfs minvmd-build
       Linux)
         [ -e /dev/kvm ] && [ -w /dev/kvm ] || { echo "test-lifecycle needs writable /dev/kvm; try: sg kvm -c 'just test-lifecycle'" >&2; exit 1; }
         export LD_LIBRARY_PATH="{{krun-prefix}}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        # Same boot headroom as dm3/e2e: on slower Linux hosts (nested KVM)
+        # the generic guest kernel can take 40-70s to reach pid-1, past the
+        # script's 30s default and the supervisor's 60s READY default.
+        export MINVMD_READY_TIMEOUT_SECS="${MINVMD_READY_TIMEOUT_SECS:-150}"
+        export MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS="${MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS:-150}"
         ;;
     esac
     ./scripts/minvmd-lifecycle.sh
