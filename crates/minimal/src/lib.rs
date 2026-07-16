@@ -1566,13 +1566,27 @@ fn run_init_flow(config: mctx::Config, skip_confirm: bool) -> Result<(), anyhow:
     eprintln!("Created {}", plan.toml_path.display());
     eprintln!();
     eprintln!("Next steps:");
-    eprintln!("  minimal update      # pin package versions");
-    eprintln!("  minimal activate .  # create a session");
-    if plan.matched {
-        eprintln!("  minimal attach      # attach to the session");
+    let in_session = std::env::var("MINIMAL_SESSION_ID").is_ok_and(|v| !v.is_empty());
+    for step in init_next_steps(plan.matched, in_session) {
+        eprintln!("{step}");
     }
 
     Ok(())
+}
+
+/// Compute the "Next steps" hint lines printed after `init` writes the
+/// `minimal.toml`. When already inside an active session
+/// (`MINIMAL_SESSION_ID` is set), the "create a session" and "attach"
+/// hints are stale, so they are omitted.
+fn init_next_steps(matched: bool, in_session: bool) -> Vec<&'static str> {
+    let mut steps = vec!["  minimal update      # pin package versions"];
+    if !in_session {
+        steps.push("  minimal activate .  # create a session");
+        if matched {
+            steps.push("  minimal attach      # attach to the session");
+        }
+    }
+    steps
 }
 
 /// Initialize a `minimal.toml` based on the source tree.
@@ -1744,6 +1758,42 @@ mod tests {
         assert!(
             hosts_file.contains(r#"q\"uote"#) && hosts_file.contains(r"back\\slash"),
             "path must reach ssh escaped, got: {hosts_file}"
+        );
+    }
+
+    /// Inside an active session the "create a session" and "attach" hints
+    /// are stale, so `init` shows only the `update` next step regardless of
+    /// whether the plan matched an existing session.
+    #[test]
+    fn init_next_steps_omits_session_hints_when_in_session() {
+        assert_eq!(
+            init_next_steps(false, true),
+            ["  minimal update      # pin package versions"]
+        );
+        assert_eq!(
+            init_next_steps(true, true),
+            ["  minimal update      # pin package versions"]
+        );
+    }
+
+    /// Outside a session, `init` keeps suggesting `activate`, and adds the
+    /// `attach` hint only when the plan matched an existing session.
+    #[test]
+    fn init_next_steps_shows_session_hints_when_not_in_session() {
+        assert_eq!(
+            init_next_steps(false, false),
+            [
+                "  minimal update      # pin package versions",
+                "  minimal activate .  # create a session",
+            ]
+        );
+        assert_eq!(
+            init_next_steps(true, false),
+            [
+                "  minimal update      # pin package versions",
+                "  minimal activate .  # create a session",
+                "  minimal attach      # attach to the session",
+            ]
         );
     }
 
