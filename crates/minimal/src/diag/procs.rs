@@ -123,7 +123,7 @@ pub async fn hang_triage(w: &mut BundleWriter) -> Result<(), anyhow::Error> {
 
 /// Runs `cmd` with a deadline, returning stdout. Non-zero exit with output
 /// still counts (lsof exits 1 whenever any pid's listing is incomplete).
-async fn command_capture(
+pub(super) async fn command_capture(
     cmd: &str,
     args: &[String],
     timeout: std::time::Duration,

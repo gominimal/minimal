@@ -19,6 +19,7 @@ pub mod collect;
 pub mod guest;
 pub mod manifest;
 pub mod net;
+pub mod power;
 pub mod procs;
 pub mod redact;
 
@@ -89,6 +90,7 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
     collect_step!(w, "host.net.listening", net::listening_sockets(&mut w));
     collect_step!(w, "host.net.interfaces", net::interfaces(&mut w));
     collect_step!(w, "host.net.routes", net::routes(&mut w));
+    collect_step!(w, "host.power", power::power(&mut w));
     collect_step!(w, "config", collect::config(&mut w, &paths));
     collect_step!(w, "state", collect::state(&mut w, &paths));
     collect_step!(w, "logs", collect::logs(&mut w, &paths));
