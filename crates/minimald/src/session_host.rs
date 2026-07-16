@@ -365,6 +365,11 @@ impl Binding {
     }
 
     async fn run(mut self) {
+        // The channel id ties every line this binding logs back to the
+        // `accepted connection`/`closed` lines in `minimald::server` — the
+        // #788 analysis stalled twice for want of this correlation.
+        let chan_id = self.channel.id();
+        tracing::info!(channel = %chan_id, "binding attached to session channel");
         let (mut rs, ws) = self.channel.split();
         let mut w = ws.make_writer();
 
@@ -409,7 +414,12 @@ impl Binding {
                             // burst of bytes forwarded through the
                             // channel, v. noisy.
                             russh::ChannelMsg::WindowAdjusted { .. } => {}
-                            _ => tracing::warn!("skipping msg: {:?}", msg),
+                            // Duplicates of pre-attach requests the
+                            // connection handler already answered (russh
+                            // buffers them into the taken channel); noise on
+                            // every healthy attach, so keep them out of
+                            // info-level field bundles.
+                            _ => tracing::debug!(channel = %chan_id, "ignoring channel request on attached binding: {:?}", msg),
                         };
                     }
                 },
@@ -449,7 +459,7 @@ impl Binding {
             }
         };
 
-        tracing::debug!("Binding leaving mainloop due to {:?}", exit_reason);
+        tracing::info!(channel = %chan_id, reason = ?exit_reason, "binding leaving mainloop");
 
         if exit_reason == MainloopExitReason::ProcessExited {
             // The shell process exited. For a bash shell, this usually meant someone pressed ctrl-d absent-mindedly.

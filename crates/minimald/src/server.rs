@@ -354,6 +354,10 @@ impl Listener for tokio_vsock::VsockListener {
 /// [`Shutdown`](minimald_rpc::Shutdown) RPC before aborting the stragglers. The
 /// shutdown-initiating client's own connection stays open until it disconnects,
 /// so an unbounded wait could hang the process; this bounds it.
+/// Monotonic id stamped on every accepted connection's log lines, so a
+/// connection's accept, channel bindings, and close correlate across the log.
+static CONN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A listening minimald server.
@@ -400,7 +404,8 @@ impl Server {
                 () = shutdown.cancelled() => break,
                 accepted = listener.accept() => accepted?,
             };
-            tracing::info!(?peer, transport = L::TRANSPORT, "accepted connection");
+            let conn = CONN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(conn, ?peer, transport = L::TRANSPORT, "accepted connection");
             let (_conn_hnd, session_fut) = match Connection::from_stream(
                 stream,
                 russh_config.clone(),
@@ -414,15 +419,33 @@ impl Server {
                     // A handshake failure must not take the daemon down — in
                     // the guest minimald is pid-1. Drop this connection and
                     // keep accepting.
-                    tracing::warn!(error = %e, transport = L::TRANSPORT, "SSH handshake failed; dropping connection");
+                    tracing::warn!(conn, error = %e, transport = L::TRANSPORT, "SSH handshake failed; dropping connection");
                     continue;
                 }
             };
             // Log session errors instead of silently dropping the spawned
             // future, so a failed handshake is visible on any transport.
             session_set.spawn(async move {
-                if let Err(e) = session_fut.await {
-                    tracing::warn!(error = %e, transport = L::TRANSPORT, "session ended with error");
+                match session_fut.await {
+                    Ok(()) => tracing::info!(conn, transport = L::TRANSPORT, "connection closed"),
+                    Err(e) => {
+                        // Abrupt hangups are how the CLI's oneshot RPC
+                        // connections and Ctrl-C'd attaches normally end;
+                        // framing them as errors made routine traffic read
+                        // like a transport incident during the #788
+                        // analysis. Match on the rendered message: russh
+                        // wraps the underlying io error, and this is log
+                        // framing only.
+                        let msg = e.to_string();
+                        if msg.contains("early eof")
+                            || msg.contains("Broken pipe")
+                            || msg.contains("Disconnected")
+                        {
+                            tracing::info!(conn, reason = %msg, transport = L::TRANSPORT, "connection closed by peer");
+                        } else {
+                            tracing::warn!(conn, error = %msg, transport = L::TRANSPORT, "session ended with error");
+                        }
+                    }
                 }
             });
         }
