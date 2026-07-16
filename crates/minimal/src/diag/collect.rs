@@ -472,13 +472,18 @@ pub async fn provider_files(
         ),
     }
 
-    // The detached supervisor's boot log (stderr redirect): panics and the
-    // final error print of a failed boot.
-    let run_log = dir.join("run.log");
-    if tokio::fs::try_exists(&run_log).await.unwrap_or(false) {
-        let dest = format!("providers/{name}/run.log");
-        if let Err(e) = w.add_file_tail(&dest, &run_log, LOG_TAIL_CAP).await {
-            w.skip(&dest, format!("unreadable: {e}"));
+    // run.log: the detached supervisor's stderr redirect (panics, the final
+    // error print of a failed boot). boot.log: the VMM's hvc0 console
+    // capture — kernel prints and the guest pid-1's stdout, the only
+    // evidence when the guest wedges before (or its transport dies after)
+    // the daemon is reachable (#788).
+    for log_name in ["run.log", "boot.log"] {
+        let log_path = dir.join(log_name);
+        if tokio::fs::try_exists(&log_path).await.unwrap_or(false) {
+            let dest = format!("providers/{name}/{log_name}");
+            if let Err(e) = w.add_file_tail(&dest, &log_path, LOG_TAIL_CAP).await {
+                w.skip(&dest, format!("unreadable: {e}"));
+            }
         }
     }
 
