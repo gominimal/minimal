@@ -86,13 +86,18 @@ async fn stream_diag_bundle(s: &ServerStateHandle, c: &mut RuChannel<Msg>) -> Re
     let mut writer = c.make_writer();
     let copy_result = tokio::io::copy(&mut rx, &mut writer).await;
     let shutdown_result = writer.shutdown().await;
+    // The read half must be gone before waiting on the build task: if the
+    // copy failed mid-stream (client vanished) the task is still writing,
+    // and only a dropped `rx` turns its next write into `BrokenPipe`
+    // instead of an indefinite block on the full duplex buffer.
+    drop(rx);
+    copy_result.map_err(|e| format!("streaming diag bundle: {e}"))?;
 
     match build.await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(format!("building diag bundle: {e}")),
         Err(e) => return Err(format!("diag bundle task panicked: {e}")),
     }
-    copy_result.map_err(|e| format!("streaming diag bundle: {e}"))?;
     shutdown_result.map_err(|e| format!("closing diag stream: {e}"))?;
     Ok(())
 }
@@ -175,14 +180,13 @@ async fn meta<W: AsyncWrite + Unpin + Send + Sync>(
     s: &ServerStateHandle,
     tar: &mut Builder<W>,
 ) -> Result<(), String> {
+    let uptime = tokio::fs::read_to_string("/proc/uptime").await.ok();
     let info = Meta {
         version: env!("CARGO_PKG_VERSION"),
         long_version: env!("LONG_VERSION"),
         stdlib_version: stdlib::VERSION,
         pid: std::process::id(),
-        uptime_secs: std::fs::read_to_string("/proc/uptime")
-            .ok()
-            .and_then(|s| s.split_whitespace().next()?.parse().ok()),
+        uptime_secs: uptime.and_then(|s| s.split_whitespace().next()?.parse().ok()),
         in_microvm: s.in_microvm().await,
         state_volume_mounted: s.state_volume_mounted().await,
         state_dir: s.minimal_state_dir().await.to_string(),
@@ -203,11 +207,24 @@ async fn logs<W: AsyncWrite + Unpin + Send + Sync>(
     } else {
         req.log_tail_bytes
     };
-    let Ok(entries) = std::fs::read_dir(state_dir.join("logs")) else {
+    let Ok(mut entries) = tokio::fs::read_dir(state_dir.join("logs")).await else {
         return Ok(()); // never ran detached — no log dir
     };
+    // Only this daemon's own rotated logs: the state dir can be shared with
+    // minvmd (native installs), whose files belong to the host-side
+    // collector, not the daemon's self-view.
+    let mut files = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("minimald.log"))
+        {
+            files.push(path);
+        }
+    }
     // Rolling filenames embed the date, so reverse lexical = newest first.
-    let mut files: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
     files.sort();
     files.reverse();
     for path in files.into_iter().take(LOG_FILES_MAX) {
@@ -234,11 +251,11 @@ async fn sessions<W: AsyncWrite + Unpin + Send + Sync>(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(format!("reading sessions/index.json: {e}")),
     }
-    let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
+    let Ok(mut entries) = tokio::fs::read_dir(&sessions_dir).await else {
         return Ok(());
     };
-    for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if !entry.file_type().await.is_ok_and(|t| t.is_dir()) {
             continue;
         }
         let short = entry.file_name().to_string_lossy().to_string();
@@ -273,6 +290,17 @@ async fn sessions<W: AsyncWrite + Unpin + Send + Sync>(
 /// guest rootfs has no `ps`; inside the VM every process is ours anyway. On
 /// the (Linux-only) native daemon this stays scoped to the daemon's view.
 async fn procs<W: AsyncWrite + Unpin + Send + Sync>(tar: &mut Builder<W>) -> Result<(), String> {
+    // Hundreds of synchronous /proc reads on a busy host — keep them off the
+    // shared RPC-serving runtime.
+    let text = tokio::task::spawn_blocking(proc_table)
+        .await
+        .map_err(|e| format!("proc scrape task panicked: {e}"))??;
+    append_bytes(tar, "proc.txt", text.as_bytes())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn proc_table() -> Result<String, String> {
     use std::fmt::Write as _;
     let mut text = String::from("pid\tppid\tvmrss_kb\tcmdline\n");
     let entries = std::fs::read_dir("/proc").map_err(|e| format!("reading /proc: {e}"))?;
@@ -303,16 +331,15 @@ async fn procs<W: AsyncWrite + Unpin + Send + Sync>(tar: &mut Builder<W>) -> Res
             field("VmRSS:")
         );
     }
-    append_bytes(tar, "proc.txt", text.as_bytes())
-        .await
-        .map_err(|e| e.to_string())
+    Ok(text)
 }
 
 async fn net_tables<W: AsyncWrite + Unpin + Send + Sync>(
     tar: &mut Builder<W>,
 ) -> Result<(), String> {
-    let interfaces =
-        std::fs::read_to_string("/proc/net/dev").unwrap_or_else(|e| format!("<unreadable: {e}>"));
+    let interfaces = tokio::fs::read_to_string("/proc/net/dev")
+        .await
+        .unwrap_or_else(|e| format!("<unreadable: {e}>"));
     append_bytes(tar, "net/interfaces.txt", interfaces.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
@@ -321,7 +348,7 @@ async fn net_tables<W: AsyncWrite + Unpin + Send + Sync>(
     for table in ["tcp", "tcp6", "udp", "unix"] {
         let path = format!("/proc/net/{table}");
         listening.push_str(&format!("=== {path} ===\n"));
-        match std::fs::read_to_string(&path) {
+        match tokio::fs::read_to_string(&path).await {
             Ok(t) => listening.push_str(&t),
             Err(e) => listening.push_str(&format!("<unreadable: {e}>\n")),
         }
@@ -414,7 +441,8 @@ async fn disk<W: AsyncWrite + Unpin + Send + Sync>(
                 }
             })
             .collect(),
-        mounts: std::fs::read_to_string("/proc/mounts")
+        mounts: tokio::fs::read_to_string("/proc/mounts")
+            .await
             .unwrap_or_else(|e| format!("<unreadable: {e}>")),
     };
     let json =
@@ -552,6 +580,36 @@ mod tests {
         assert!(files.contains_key("disk.json"));
         // Not in a microVM: no gvproxy probe entry.
         assert!(!files.contains_key("net/gvproxy.json"));
+    }
+
+    #[tokio::test]
+    async fn diag_bundle_logs_exclude_other_daemons_files() {
+        let server = TestServer::new().await;
+        let state_dir = server.state.minimal_state_dir().await;
+        let log_dir = state_dir.as_utf8_path().as_std_path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        // minvmd shares the state dir on native installs; its logs sort
+        // after ours lexically and must not crowd out the daemon's own.
+        for name in [
+            "minimald.log.2026-07-14",
+            "minimald.log.2026-07-15",
+            "minvmd.log.2026-07-01",
+            "minvmd.log.2026-07-02",
+            "minvmd.log.2026-07-03",
+            "minvmd.log.2026-07-04",
+            "minvmd.log.2026-07-05",
+        ] {
+            std::fs::write(log_dir.join(name), name).unwrap();
+        }
+
+        let files = fetch_bundle(&server).await;
+        assert!(files.contains_key("logs/minimald.log.2026-07-15"));
+        assert!(files.contains_key("logs/minimald.log.2026-07-14"));
+        assert!(
+            !files.keys().any(|k| k.starts_with("logs/minvmd")),
+            "minvmd logs belong to the host-side collector, got: {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
