@@ -132,13 +132,45 @@ COMPONENTS=(
     "initramfs|darwin|arm64|file|data/initramfs.cpio|initramfs-arm64.cpio"
     "rootfs|darwin|arm64|file|data/rootfs.img|rootfs-arm64.img"
     "vmlinuz|darwin|arm64|file|data/vmlinuz|vmlinuz-arm64"
+    # AppArmor profile, its tunable, and the privileged loader that installs it,
+    # for Ubuntu 24.04+ hosts (docs/reference/linux-host-setup). These are repo
+    # files, not build outputs — staged into ARTIFACTS_DIR below — and ship to
+    # every Linux host as ordinary `data`-prefix components. noarch text, but the
+    # manifest keys on arch, so one row per Linux arch; the uploader dedups by
+    # basename to a single upload. The loader lands non-+x under data/ and is run
+    # as `sudo bash <path>`; the installer prints that hint when a host needs it.
+    "apparmor-profile|linux|amd64|file|data/apparmor/minimald|minimald.apparmor"
+    "apparmor-profile|linux|arm64|file|data/apparmor/minimald|minimald.apparmor"
+    "apparmor-tunable|linux|amd64|file|data/apparmor/tunables/minimald|minimald.apparmor-tunable"
+    "apparmor-tunable|linux|arm64|file|data/apparmor/tunables/minimald|minimald.apparmor-tunable"
+    "apparmor-installer|linux|amd64|file|data/apparmor/install-apparmor-profile.sh|install-apparmor-profile.sh"
+    "apparmor-installer|linux|arm64|file|data/apparmor/install-apparmor-profile.sh|install-apparmor-profile.sh"
 )
+
+# Stage the AppArmor components from the checkout this script runs in. They are
+# repo files rather than release-workflow artifacts, so copy them into the
+# ephemeral workdir — never into ARTIFACTS_DIR, which the caller owns and
+# --dry-run promises not to touch (it may even be read-only) — under the
+# stable basenames the component table references. The manifest loop prefers
+# a staged file over an ARTIFACTS_DIR one of the same basename, so a stale
+# copy left in the artifacts dir cannot shadow the checkout's current file.
 
 # --- Build the manifest ----------------------------------------------------
 
 workdir="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-stage)"
 trap 'rm -rf "$workdir"' EXIT
 manifest="$workdir/components"
+
+staged_dir="$workdir/staged"
+mkdir -p "$staged_dir"
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+stage_repo_file() {
+    [ -f "$repo_root/$1" ] || die "missing repo file for staging: $1"
+    cp "$repo_root/$1" "$staged_dir/$2" || die "failed to stage $1 into $staged_dir"
+}
+stage_repo_file packaging/apparmor/minimald          minimald.apparmor
+stage_repo_file packaging/apparmor/tunables/minimald minimald.apparmor-tunable
+stage_repo_file scripts/install-apparmor-profile.sh  install-apparmor-profile.sh
 
 {
     printf '# format: %s\n' "$FORMAT_VERSION"
@@ -163,7 +195,8 @@ for entry in "${COMPONENTS[@]}"; do
         continue
     fi
 
-    file="$ARTIFACTS_DIR/$basename"
+    file="$staged_dir/$basename"
+    [ -f "$file" ] || file="$ARTIFACTS_DIR/$basename"
 
     if [ ! -f "$file" ]; then
         if [ "$ALLOW_MISSING" -eq 1 ]; then

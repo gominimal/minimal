@@ -110,8 +110,9 @@ jobs:
     # The unified session e2e (scripts/session-e2e.sh — the SAME proof every
     # target lane runs) against the NATIVE minimald (DM2): `min activate`
     # auto-spawns `minimald run --detach`, creates a session for this repo's
-    # own project, `min attach --command` execs in the sandbox asserting
-    # stdout + exit status, then list/destroy/stop. Before this job, no CI
+    # own project, lists it, then destroys it and stops the daemon. It does not
+    # exec inside the session sandbox (that path is proven in Rust — see the
+    # note in session-e2e.sh), so it forks no sandbox. Before this job, no CI
     # ran the daemon natively at all. The native target needs no E2E_* knobs:
     # host daemon, repo as the project.
     needs: [changes]
@@ -127,10 +128,11 @@ jobs:
           # `-p` builds unify features differently than the workspace test
           # suite — own cache class.
           shared-key: native-e2e
-      - name: Enable unprivileged user namespaces
-        # The session sandbox (hakoniwa) needs userns; Ubuntu 24.04 restricts
-        # them via AppArmor by default.
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # No userns setup here on purpose: session-e2e.sh drives
+      # activate/list/destroy/stop only and never forks a session sandbox, so
+      # this job needs no unprivileged user namespace. Sandbox-forking coverage
+      # (which does need userns) lives in the workspace tests and the
+      # minimald-root-integration job below.
       - name: Cache minimal package cache
         # Session creation materializes the project's stack (rust + socat)
         # into ~/.cache/minimal via cache pulls keyed by the pinned upstream

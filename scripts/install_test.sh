@@ -84,10 +84,19 @@ esac
 EOF
 printf 'darwin-arm64-rootfs-body\n'   >"$mock/versions/v1/rootfs-arm64.img"
 
+# AppArmor components: noarch text (the loader is a runnable stub here), shipped
+# to Linux hosts under the data prefix (see stage-release.sh).
+printf 'mock-apparmor-profile-body\n'  >"$mock/versions/v1/minimald.apparmor"
+printf 'mock-apparmor-tunable-body\n'  >"$mock/versions/v1/minimald.apparmor-tunable"
+printf '#!/bin/sh\n# mock apparmor loader\n' >"$mock/versions/v1/install-apparmor-profile.sh"
+
 h_minimald="$(hash_file "$mock/versions/v1/minimald-linux-amd64")"
 h_minimal="$(hash_file "$mock/versions/v1/minimal-linux-amd64")"
 h_dmin="$(hash_file "$mock/versions/v1/minimal-darwin-arm64")"
 h_rootfs="$(hash_file "$mock/versions/v1/rootfs-arm64.img")"
+h_aaprof="$(hash_file "$mock/versions/v1/minimald.apparmor")"
+h_aatun="$(hash_file "$mock/versions/v1/minimald.apparmor-tunable")"
+h_aaload="$(hash_file "$mock/versions/v1/install-apparmor-profile.sh")"
 
 printf 'v1\n' >"$mock/stable"
 
@@ -105,6 +114,12 @@ write_manifest() {
             minimal darwin arm64 v1 "$h_dmin" file bin/min versions/v1/minimal-darwin-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             rootfs darwin arm64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-arm64.img
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            apparmor-profile linux amd64 v1 "$h_aaprof" file data/apparmor/minimald versions/v1/minimald.apparmor
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            apparmor-tunable linux amd64 v1 "$h_aatun" file data/apparmor/tunables/minimald versions/v1/minimald.apparmor-tunable
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            apparmor-installer linux amd64 v1 "$h_aaload" file data/apparmor/install-apparmor-profile.sh versions/v1/install-apparmor-profile.sh
         # Symlink rows (R5.6): sha256 is the `-` placeholder, src is the link
         # target relative to dest's directory.
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
@@ -189,6 +204,20 @@ PLAT_M=x86_64
 # unknown-shell fallback branch).
 TEST_SHELL=
 
+# Host userns state the installer sees. Empty leaves both overrides pointing at
+# nonexistent paths (a host without the restriction and without a system
+# profile), so the AppArmor advisory/prompt stays silent; scenarios point these
+# at fixtures to drive it. USERNS_SYSCTL is a file whose contents are the sysctl
+# value; APPARMOR_DIR stands in for /etc/apparmor.d.
+USERNS_SYSCTL=
+APPARMOR_DIR=
+
+# Bin prefix the installer sees. Empty means the harness default ($hp/bin — a
+# custom MINIMAL_BIN, NOT one of the AppArmor tunable's stock attachment
+# paths); scenarios set it to $hp/.local/bin to exercise the default-prefix
+# branch of the userns advisory.
+BIN_OVERRIDE=
+
 # run <label> <homeprefix> [args...] ; sets rc, captures combined output in $OUT.
 OUT=
 run() {
@@ -199,7 +228,7 @@ run() {
         PATH="$stubbin:/usr/bin:/bin" \
         HOME="$hp" \
         SHELL="${TEST_SHELL:-/bin/sh}" \
-        MINIMAL_BIN="$hp/bin" \
+        MINIMAL_BIN="${BIN_OVERRIDE:-$hp/bin}" \
         XDG_DATA_HOME="$hp/xdg-data" \
         XDG_STATE_HOME="$hp/xdg-state" \
         XDG_CACHE_HOME="$hp/xdg-cache" \
@@ -207,7 +236,9 @@ run() {
         MINIMAL_OVERRIDE_INSTALLER_BUCKET="$BUCKET_HOST" \
         STUB_UNAME_S="$PLAT_S" \
         STUB_UNAME_M="$PLAT_M" \
-        "$SH" "$installer" "$@" >"$OUT" 2>&1
+        MINIMAL_OVERRIDE_USERNS_SYSCTL="${USERNS_SYSCTL:-$root/no-such-sysctl}" \
+        MINIMAL_OVERRIDE_APPARMOR_DIR="${APPARMOR_DIR:-$root/no-such-apparmor.d}" \
+        "$SH" "$installer" "$@" </dev/null >"$OUT" 2>&1
     rc=$?
     set -e
 }
@@ -233,6 +264,95 @@ reset_dl
 run second "$H1"
 check 0 "$rc" "rerun exits 0"
 check 0 "$(downloads)" "rerun performs zero downloads (R5.1/R2 reruns cheap)"
+
+# --- AppArmor components + Ubuntu 24.04+ advisory --------------------------
+# The three noarch apparmor components install under the data prefix on Linux.
+aa_root="$H1/xdg-data/minimal/apparmor"
+want_ok "apparmor profile installed under data prefix"  test -f "$aa_root/minimald"
+want_ok "apparmor tunable installed under data prefix"  test -f "$aa_root/tunables/minimald"
+want_ok "apparmor loader installed under data prefix"   test -f "$aa_root/install-apparmor-profile.sh"
+
+# The advisory fires only when the userns restriction is active (sysctl reads 1),
+# points at the shipped loader, and never elevates — install still exits 0.
+printf '1\n' >"$root/sysctl-on"
+printf '0\n' >"$root/sysctl-off"
+
+USERNS_SYSCTL="$root/sysctl-on"
+run aa_restricted "$H1"
+USERNS_SYSCTL=
+check 0 "$rc" "install on a restricted host still exits 0 (advice only)"
+want_ok "advisory names the userns restriction" \
+    grep -q "restricts unprivileged user namespaces" "$OUT"
+want_ok "advisory points at the shipped loader with sudo bash" \
+    grep -q "sudo bash .*apparmor/install-apparmor-profile.sh" "$OUT"
+# The harness bindir is a custom MINIMAL_BIN, outside the tunable's stock
+# attachment set, so the advised command must attach it explicitly.
+want_ok "advisory carries --path for a custom MINIMAL_BIN" \
+    grep -q -- "--path \"$H1/bin/minimald\"" "$OUT"
+
+USERNS_SYSCTL="$root/sysctl-off"
+run aa_unrestricted "$H1"
+USERNS_SYSCTL=
+want_err "no advisory when the restriction is off (sysctl 0)" \
+    grep -q "restricts unprivileged user namespaces" "$OUT"
+
+# A loaded system profile alone is NOT remediation for a custom MINIMAL_BIN:
+# the stock tunable does not attach it, so sessions still die and the advisory
+# must keep firing (with --path) until the tunables name this binary.
+mkdir -p "$root/aa-present"; printf 'profile\n' >"$root/aa-present/minimald"
+USERNS_SYSCTL="$root/sysctl-on"; APPARMOR_DIR="$root/aa-present"
+run aa_present_unattached "$H1"
+want_ok "advisory still fires when the profile is loaded but MINIMAL_BIN unattached" \
+    grep -q -- "--path \"$H1/bin/minimald\"" "$OUT"
+
+# ...and is suppressed once the tunables do name it (what the loader's --path
+# records under tunables/minimald.d).
+mkdir -p "$root/aa-present/tunables/minimald.d"
+printf '@{minimald_bin} += %s/bin/minimald\n' "$H1" \
+    >"$root/aa-present/tunables/minimald.d/paths"
+run aa_attached "$H1"
+want_err "no advisory when the tunables attach this MINIMAL_BIN" \
+    grep -q "restricts unprivileged user namespaces" "$OUT"
+
+# For the stock prefix (~/.local/bin) the profile's own tunable already
+# attaches the binary, so the profile file existing IS remediation.
+BIN_OVERRIDE="$H1/.local/bin"
+run aa_already_default_bin "$H1"
+BIN_OVERRIDE=
+want_err "no advisory for the default prefix when the system profile is installed" \
+    grep -q "restricts unprivileged user namespaces" "$OUT"
+USERNS_SYSCTL=; APPARMOR_DIR=
+
+# Darwin hosts never receive the apparmor components (linux-only manifest rows).
+HAA_D="$root/haa_d"; mkdir -p "$HAA_D"
+PLAT_S=Darwin; PLAT_M=arm64
+run aa_darwin "$HAA_D"
+PLAT_S=Linux; PLAT_M=x86_64
+check 0 "$rc" "darwin install exits 0"
+want_err "apparmor components skipped on darwin" \
+    test -e "$HAA_D/xdg-data/minimal/apparmor/minimald"
+
+# --- Uninstall: offer to remove the system AppArmor profile ----------------
+# A non-interactive uninstall (stdin is /dev/null, not a tty) advises the root
+# removal command and never elevates: the seeded system profile survives, while
+# the shipped loader is removed by the record walk like any other component.
+HAA_U="$root/haa_u"; mkdir -p "$HAA_U"
+run aa_u_seed "$HAA_U"
+check 0 "$rc" "uninstall-apparmor seed install exits 0"
+fake_aa="$root/fake-apparmor.d"; mkdir -p "$fake_aa/tunables"
+printf 'profile\n' >"$fake_aa/minimald"
+printf 'tunable\n' >"$fake_aa/tunables/minimald"
+APPARMOR_DIR="$fake_aa"
+run aa_u_run "$HAA_U" --uninstall
+APPARMOR_DIR=
+check 0 "$rc" "uninstall with a loaded system profile exits 0"
+want_ok "uninstall advises the system profile is still loaded" \
+    grep -q "system AppArmor profile is still loaded" "$OUT"
+want_ok "advisory gives the root removal command" grep -q "apparmor_parser -R" "$OUT"
+want_ok "non-interactive uninstall never elevates (profile survives)" \
+    test -f "$fake_aa/minimald"
+want_err "uninstall removed the shipped apparmor loader" \
+    test -e "$HAA_U/xdg-data/minimal/apparmor/install-apparmor-profile.sh"
 
 # Corrupt one on-disk binary and retarget the symlink -> only the binary
 # re-fetches (a symlink repair needs no download), and both are restored.
@@ -394,6 +514,17 @@ run daemonupgrade "$H8"
 check 0 "$rc" "upgrade exits 0"
 want_ok "upgrade runs min stop --force (R5.5)" test -f "$H8/stop.calls"
 check "stop --force" "$(cat "$H8/stop.calls")" "stop is called once, with --force (R5.5)"
+
+# Replacing only a data component must NOT stop the daemon: data files (the
+# apparmor profile/tunable/loader) are not executable images, and the running
+# daemon does not serve from them — only bin/lib swaps wedge it (R5.5).
+rm -f "$H8/stop.calls"
+printf 'tampered\n' >"$H8/xdg-data/minimal/apparmor/minimald"
+run daemondataonly "$H8"
+check 0 "$rc" "data-only rerun exits 0"
+want_err "data-only replacement leaves the daemon alone (R5.5)" test -e "$H8/stop.calls"
+check "$h_aaprof" "$(hash_file "$H8/xdg-data/minimal/apparmor/minimald")" \
+    "tampered data component was re-placed"
 
 # A `min` that fails and shouts is non-fatal and silent: an old binary may not
 # know `stop --force`, and no daemon running is itself a non-zero `min stop`.
