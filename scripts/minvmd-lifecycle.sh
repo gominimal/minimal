@@ -25,14 +25,34 @@ command -v jq >/dev/null || { echo "::error::jq is required"; exit 1; }
 # Scratch dir for status captures; EXIT-trap teardown so a failed assert
 # can't strand a running daemon on the runner.
 WORK="$(mktemp -d /tmp/mnl-lifecycle.XXXXXX)"
+
+# This proof mutates the default provider's config.toml. Back up any
+# pre-existing file so a local run restores the user's real resource settings
+# instead of erasing them; CI runners have none, so teardown just drops the
+# proof's own config (either way the session-e2e boot that runs next on the
+# same default state dir sees the pre-proof state).
+CFG_PATH="${XDG_STATE_HOME:-$HOME/.local/state}/minimal/providers/local-0/config.toml"
+CFG_BACKUP=""
+if [ -f "$CFG_PATH" ]; then
+  CFG_BACKUP="$WORK/config.toml.pre-proof"
+  cp "$CFG_PATH" "$CFG_BACKUP"
+fi
+
 teardown() {
   minvmd stop >/dev/null 2>&1 || true
-  # Drop the resource config this proof persisted so it cannot alter the
-  # session-e2e boot that runs next on the same default state dir.
-  rm -f "${XDG_STATE_HOME:-$HOME/.local/state}/minimal/providers/local-0/config.toml"
+  if [ -n "$CFG_BACKUP" ] && [ -f "$CFG_BACKUP" ]; then
+    cp "$CFG_BACKUP" "$CFG_PATH"
+  else
+    rm -f "$CFG_PATH"
+  fi
   rm -rf "$WORK"
 }
 trap teardown EXIT
+
+# Ambient overrides out-rank the persisted layer (env ?? config ?? default),
+# so a caller-exported MINVMD_VM_* would fail the `ram_mib_source == "config"`
+# assertion below for reasons unrelated to the code under proof.
+unset MINVMD_VM_RAM_MIB MINVMD_VM_VCPUS
 
 # Persist a resource config BEFORE boot so the running VM demonstrably
 # consumes it (R2.3/R2.4/R2.5). 3072 MiB differs from the x86_64 default
