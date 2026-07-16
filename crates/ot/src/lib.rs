@@ -12,7 +12,9 @@ use tokio::sync::watch;
 #[cfg(feature = "indicatif")]
 mod indicatif_shim;
 #[cfg(feature = "indicatif")]
-pub use indicatif_shim::{IndicatifShim, StdoutWriter, render_operations_while, render_to_stderr};
+pub use indicatif_shim::{
+    IndicatifShim, StdoutWriter, global_progress, render_operations_while, render_to_stderr,
+};
 
 #[derive(Debug, Clone)]
 pub enum CheckKind {

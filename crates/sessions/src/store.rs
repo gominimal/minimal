@@ -23,6 +23,11 @@ pub trait SessionObject: Sized + Send + Clone + 'static + std::fmt::Debug {
     fn workspace_path(&self) -> DaemonAbsPath;
     fn home_path(&self) -> DaemonAbsPath;
     fn cache_path(&self) -> DaemonAbsPath;
+    /// Directory the daemon stages the client-uploaded
+    /// composition patches into, ready for the launcher to
+    /// materialize into the sandbox home. Each entry is stored
+    /// under the patch's sandbox-home-relative destination path.
+    fn patches_path(&self) -> DaemonAbsPath;
 }
 
 /// Describes the primary key a [`Loader`] uses to reference
@@ -188,6 +193,9 @@ impl SessionObject for DiskSession {
     }
     fn cache_path(&self) -> DaemonAbsPath {
         sub_path!(self.root_path(), "cache")
+    }
+    fn patches_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root_path(), "patches")
     }
 }
 

@@ -83,6 +83,18 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 35
         steps:
+            - name: Free Disk Space
+              # The cross aarch64-musl initramfs build plus the restored
+              # target/ cache routinely exceed the ~14 GB free on a fresh
+              # GitHub-hosted Ubuntu runner. `remove_tool_cache: true`
+              # reclaims /opt/hostedtoolcache (~14 GB); the dtolnay Toolchain
+              # step below reinstalls the Rust toolchain we actually need.
+              uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+              with:
+                  remove_android: true
+                  remove_dotnet: true
+                  remove_haskell: true
+                  remove_tool_cache: true
             - uses: actions/checkout@v7
               with:
                   persist-credentials: false

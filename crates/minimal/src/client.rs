@@ -12,6 +12,105 @@ use anyhow::Context as _;
 use minimald_rpc::OneshotSshRpc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Add a spinner-style progress bar to the process-global `MultiProgress`.
+/// Bars must be inserted before any style/message/tick configuration —
+/// otherwise `ProgressBar::hidden`'s defaults would draw directly to stderr
+/// and MP's coordinated redraws couldn't reach the stale lines
+/// (`finish_and_clear` only wipes lines MP itself drew).
+///
+/// Animation: three quadrant-block glyphs (`▗`, then `▚`, then `▚`)
+/// appear one at a time from left to right, hold for ~1 s, then
+/// disappear one at a time from right to left. Every frame is padded
+/// to the same 5-character width so the trailing `{msg}` doesn't
+/// jitter horizontally as the animation grows and shrinks. The last
+/// entry in `tick_strings` is indicatif's "finished" state — kept
+/// blank so `bar.finish()` / `finish_and_clear` leave no trailing
+/// glyphs behind.
+pub(crate) fn add_spinner_bar(msg: &'static str) -> indicatif::ProgressBar {
+    const FRAMES: &[&str] = &[
+        // build
+        "     ",
+        "▗    ",
+        "▗ ▚  ",
+        "▗ ▚ ▚",
+        // hold ~1 s at 100 ms/tick
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        // fade (mirrors the build, right-to-left)
+        "▗ ▚  ",
+        "▗    ",
+        "     ",
+        // finished
+        "     ",
+    ];
+    let bar = ot::global_progress().add(indicatif::ProgressBar::hidden());
+    bar.set_style(
+        indicatif::ProgressStyle::with_template("  {spinner} {msg} — {bytes} ({bytes_per_sec})")
+            .expect("valid template")
+            .tick_strings(FRAMES),
+    );
+    bar.set_message(msg);
+    bar.enable_steady_tick(Duration::from_millis(100));
+    bar
+}
+
+/// Add a file-count progress bar to the process-global `MultiProgress`.
+/// Same insertion-before-configuration rationale as [`add_spinner_bar`].
+///
+/// Bar rendering: a leading `▗` followed by up to [`PATCHES_BAR_TAIL_UNITS`]
+/// `" ▚"` units, growing left-to-right in proportion to `pos / len`.
+/// Sequence at increasing progress: `▗` → `▗ ▚ ▚` → `▗ ▚ ▚ ▚ ▚ ▚ ▚ ▚ ▚ ▚`
+/// → `▗ ▚ ▚ …`. Indicatif's built-in `{wide_bar}` renders one glyph per
+/// cell with no way to insert spaces between filled cells, so this
+/// registers a custom `{tail}` key and formats the string ourselves.
+/// The un-filled tail is padded with `"  "` (matching the width of a
+/// `" ▚"` unit) so `{pos}/{len}` etc. stay in a fixed column.
+fn add_patches_bar(total: u64) -> indicatif::ProgressBar {
+    /// Max number of `" ▚"` units at 100 % progress. Widen for a
+    /// longer bar; narrow for tighter terminals.
+    const PATCHES_BAR_TAIL_UNITS: usize = 30;
+
+    let bar = ot::global_progress().add(indicatif::ProgressBar::hidden());
+    bar.set_length(total);
+    bar.set_style(
+        indicatif::ProgressStyle::with_template(
+            "  {msg} {tail} {pos}/{len} patches ({per_sec}, {eta})",
+        )
+        .expect("valid template")
+        .with_key(
+            "tail",
+            |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+                let progress = state
+                    .len()
+                    .filter(|&l| l > 0)
+                    .map(|len| (state.pos() as f64) / (len as f64))
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                let filled = (progress * PATCHES_BAR_TAIL_UNITS as f64).round() as usize;
+                let _ = w.write_str("▗");
+                for _ in 0..filled {
+                    let _ = w.write_str(" ▚");
+                }
+                // Pad each un-filled unit with two spaces so total
+                // rendered width stays constant across the animation.
+                for _ in 0..(PATCHES_BAR_TAIL_UNITS - filled) {
+                    let _ = w.write_str("  ");
+                }
+            },
+        ),
+    );
+    bar.set_message("Uploading composition patches");
+    bar
+}
+
 /// Max retries when connecting to the daemon UDS.
 const CONNECT_RETRIES: u32 = 20;
 /// Delay between connection retries.
@@ -200,14 +299,153 @@ impl Client {
         session_id: sessions::SessionId,
         dir: &Path,
     ) -> Result<(), anyhow::Error> {
-        let subsystem =
-            constcat::concat!(minimald_rpc::RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
+        // Spinner-style bar: workspace file counts vary (and pre-walking to
+        // sum sizes would double the disk work), so we drive on
+        // wire-bytes-through-SSH with no fixed total. `finish_and_clear`
+        // wipes the bar off the terminal on success so it doesn't hang
+        // around above the next line.
+        let bar = add_spinner_bar("Uploading project files");
+        let bar_for_wrap = bar.clone();
+        let result = self
+            .stream_upload(
+                session_id,
+                constcat::concat!(minimald_rpc::RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst"),
+                "workspace file",
+                async |writer| {
+                    // `writer` is already `Box<dyn AsyncWrite + ...>`
+                    // from `stream_upload`, and `stream_tar_zstd` is
+                    // generic over `W: AsyncWrite + Unpin + Send` —
+                    // `ProgressWriter<Box<...>>` satisfies that
+                    // directly, no second heap allocation needed.
+                    let writer = crate::file_upload::ProgressWriter::new(writer, bar_for_wrap);
+                    crate::file_upload::stream_tar_zstd(dir, writer).await
+                },
+            )
+            .await;
+        bar.finish_and_clear();
+        result
+    }
 
+    /// Stream a zstd-compressed tarball of composition patches to the
+    /// daemon's `WorkspacePatchesTarZst` subsystem, which unpacks
+    /// each entry under `<workspace>/patches/<destination>`. The
+    /// launcher reads from that tree when materializing the session's
+    /// sandbox home.
+    ///
+    /// `patches` is a list of `(host_path, sandbox_destination)`
+    /// pairs pulled from the finalized [`Composition`]. An empty
+    /// list is a no-op — no channel is opened. Callers dedup by
+    /// destination first; the composer's post-gate
+    /// `check_patch_mismatches` guarantees no two Approved verdicts
+    /// share a destination with different sources, so any duplicates
+    /// here are exact matches and safe to collapse.
+    ///
+    /// The archive is streamed with `follow_symlinks: true` and
+    /// `mode_override: Some(0o644)` so a `/nix/store/…` link source
+    /// lands as a writable copy inside the sandbox.
+    ///
+    /// [`Composition`]: sessions::core::compose::Composition
+    pub async fn upload_patches(
+        &mut self,
+        session_id: sessions::SessionId,
+        patches: &[(std::path::PathBuf, paths::SandboxRelPath)],
+    ) -> Result<(), anyhow::Error> {
+        if patches.is_empty() {
+            return Ok(());
+        }
+        // File-count bar: we know the target up front, so the operator
+        // sees "N/M patches" instead of a spinner. Incremented inside
+        // the tar loop after each `add_file` returns — the file is
+        // fully queued into the encoder at that point, even if it
+        // hasn't been fully compressed or shipped yet.
+        let bar = add_patches_bar(patches.len() as u64);
+        let bar_for_loop = bar.clone();
+        let result = self
+            .stream_upload(
+                session_id,
+                constcat::concat!(minimald_rpc::RPC_SUBSYSTEM_PREFIX, "WorkspacePatchesTarZst"),
+                "composition patch",
+                async |writer| {
+                    // Route through the pipe helper because SSH channel
+                    // writers aren't Sync but `TarZstArchive` requires
+                    // Sync. The pipe's tx (a `DuplexStream`) is Sync;
+                    // its rx pumps into the channel writer on the same
+                    // task.
+                    crate::file_upload::stream_via_pipe(writer, async |tx| {
+                        let mut archive = crate::file_upload::TarZstArchive::new(tx);
+                        // Always finalize the archive, even on
+                        // build error: `async_tar::Builder` panics
+                        // from its `Drop` impl if dropped without
+                        // `finish()` (async-tar 0.6 builder.rs:668),
+                        // and `?`-propagation isn't a panic-unwind
+                        // so the Drop guard fires. If both branches
+                        // fail, prefer the build error — it's
+                        // usually the root cause (encoder writes
+                        // then error with "broken pipe" once the
+                        // upstream file read has already failed).
+                        let build_result: Result<(), anyhow::Error> = async {
+                            for (host_path, dest) in patches {
+                                archive
+                                    .add_file(
+                                        host_path,
+                                        dest.as_str(),
+                                        crate::file_upload::AddFileOptions {
+                                            mode_override: Some(0o644),
+                                        },
+                                    )
+                                    .await
+                                    .with_context(|| {
+                                        format!(
+                                            "adding patch {} → {}",
+                                            host_path.display(),
+                                            dest.as_str()
+                                        )
+                                    })?;
+                                bar_for_loop.inc(1);
+                            }
+                            Ok(())
+                        }
+                        .await;
+                        let finish_result = archive.finish().await;
+                        match (build_result, finish_result) {
+                            (Err(build), _) => Err(build),
+                            (Ok(()), r) => r,
+                        }
+                    })
+                    .await
+                },
+            )
+            .await;
+        bar.finish_and_clear();
+        result
+    }
+
+    /// Common plumbing behind [`Self::upload_workspace_files`] and
+    /// [`Self::upload_patches`]: open a channel, set the session-id
+    /// env var, request a subsystem, drive `stream` over the
+    /// channel's writer, wait for the daemon's channel close,
+    /// surface any stderr the daemon relayed.
+    async fn stream_upload<F>(
+        &mut self,
+        session_id: sessions::SessionId,
+        subsystem: &'static str,
+        what: &'static str,
+        stream: F,
+    ) -> Result<(), anyhow::Error>
+    where
+        // `channel.make_writer()` returns `impl AsyncWrite + 'static`,
+        // not a named type. Take a closure that receives that opaque
+        // writer and pumps the tar into it. `AsyncFnOnce` handles the
+        // .await for us.
+        F: for<'w> AsyncFnOnce(
+            Box<dyn tokio::io::AsyncWrite + Unpin + Send + 'w>,
+        ) -> Result<(), anyhow::Error>,
+    {
         let mut channel = self
             .handle
             .channel_open_session()
             .await
-            .context("open channel for workspace file upload")?;
+            .with_context(|| format!("open channel for {what} upload"))?;
 
         send_traceparent(&channel).await;
         channel
@@ -218,9 +456,10 @@ impl Client {
         channel
             .request_subsystem(true, subsystem)
             .await
-            .context("request WorkspaceFilesTarZst subsystem")?;
+            .with_context(|| format!("request {subsystem} subsystem"))?;
 
-        crate::file_upload::stream_tar_zstd(dir, channel.make_writer()).await?;
+        let writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(channel.make_writer());
+        stream(writer).await?;
 
         // Wait for the channel to close to signal that unpacking is done.
         // The daemon relays any unpack failure on extended-data stream 1 and
@@ -235,7 +474,7 @@ impl Client {
         }
         if !err.is_empty() {
             anyhow::bail!(
-                "daemon failed to unpack project files: {}",
+                "daemon failed to unpack {what}s: {}",
                 String::from_utf8_lossy(&err)
             );
         }

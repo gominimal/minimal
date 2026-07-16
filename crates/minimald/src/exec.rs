@@ -1450,7 +1450,10 @@ mod tests {
         /// to resolve a task against) surfaces without needing a VM.
         #[tokio::test]
         async fn exec_runs_echo_task() {
-            use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+            use minimald_rpc::{
+                ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, FinalizeSession,
+                FinalizeSessionRequest,
+            };
 
             let server = TestServer::new().await;
             let mut client = server.connect().await;
@@ -1472,7 +1475,7 @@ mod tests {
                 )
                 .await;
 
-            // A task-only mfile gates nothing, so the loadout finalizes in
+            // A task-only mfile gates nothing, so the loadout composes in
             // one shot rather than erroring or pending.
             crate::test_harness::unwrap_ready(
                 client
@@ -1483,6 +1486,21 @@ mod tests {
                     .await
                     .unwrap(),
             );
+
+            // ConfigureLoadout leaves the record `Materializing`; exec
+            // (and its `context()` gate) requires `Active`. This
+            // composition has no patches, so FinalizeSession takes the
+            // empty-composition shortcut past the marker check and
+            // promotes the record to `Active` in one call.
+            match client
+                .call::<FinalizeSession>(&FinalizeSessionRequest { session_id })
+                .await
+            {
+                minimald_rpc::Errorable::Ok(_) => {}
+                minimald_rpc::Errorable::Err { error } => {
+                    panic!("FinalizeSession failed: {error}");
+                }
+            }
 
             let out = client
                 .exec(

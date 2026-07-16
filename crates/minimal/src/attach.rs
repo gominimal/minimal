@@ -110,12 +110,15 @@ impl fmt::Display for SessionCandidate {
 }
 
 /// One-row glyph for a session's lifecycle status, used as a visual prefix
-/// in the picker. `Active` sessions are ready to attach; `Pending` ones are
-/// still composing (e.g. awaiting a verdict) and may not be attachable yet.
+/// in the picker. `Active` sessions are ready to attach; `Pending` and
+/// `Materializing` ones aren't attachable yet — `Pending` is still awaiting
+/// the client's verdict, `Materializing` has finalized its composition but
+/// is still ingesting patches. Both render with the hollow glyph so the
+/// picker communicates "not-yet-ready" uniformly.
 fn state_glyph(status: sessions::SessionStatus) -> &'static str {
     match status {
         sessions::SessionStatus::Active => "●",
-        sessions::SessionStatus::Pending => "◯",
+        sessions::SessionStatus::Pending | sessions::SessionStatus::Materializing => "◯",
     }
 }
 
