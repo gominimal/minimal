@@ -93,7 +93,7 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
     // ── Per-provider: files, then the staged socket probe, then (when the
     // probe handshook and --no-guest wasn't given) the daemon's own bundle
     // over the connection the probe already opened.
-    let providers = collect::provider_dirs(&paths.state);
+    let providers = collect::provider_dirs(&paths.state).await;
     if providers.is_empty() {
         w.skip(
             "providers/",
@@ -115,6 +115,7 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
             net::add_probe(&mut w, name, &probe)
         );
 
+        let guest_started = std::time::Instant::now();
         let guest_result = match (args.no_guest, client) {
             (true, _) => {
                 guest::record_skipped(&mut w, name, "guest collection skipped: --no-guest").await
@@ -138,7 +139,11 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
             }
         };
         if let Err(e) = guest_result {
-            w.error(format!("guest.{name}"), format!("{e:#}"), started.elapsed());
+            w.error(
+                format!("guest.{name}"),
+                format!("{e:#}"),
+                guest_started.elapsed(),
+            );
         }
     }
 

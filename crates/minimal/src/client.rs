@@ -223,9 +223,10 @@ impl Client {
     /// the `DiagBundleTarZst` subsystem and collects the streamed tar+zstd
     /// archive, up to `max_bytes`.
     ///
-    /// Returns `(bytes, truncated)`. Errors the daemon reports before
-    /// streaming arrive over extended-data stream 1 and become the `Err`
-    /// here; a refused subsystem request means the daemon predates the RPC.
+    /// Returns `(bytes, truncated)`. Errors the daemon reports — before or
+    /// during streaming — arrive over extended-data stream 1 and become the
+    /// `Err` here, discarding any partial bundle; a refused subsystem
+    /// request means the daemon predates the RPC.
     pub async fn download_diag_bundle(
         &mut self,
         req: &minimald_rpc::DiagBundleRequest,
@@ -286,16 +287,22 @@ impl Client {
             }
         }
 
-        if bundle.is_empty() {
+        // A daemon error can also arrive mid-stream (collector-tar
+        // finalization failed after bytes were sent); a partial archive
+        // without the error would be a silently corrupt diagnostic.
+        if !daemon_error.is_empty() {
             let msg = String::from_utf8_lossy(&daemon_error);
             anyhow::bail!(
-                "daemon sent no bundle{}",
-                if msg.is_empty() {
-                    String::new()
+                "daemon reported an error{}: {msg}",
+                if bundle.is_empty() {
+                    ""
                 } else {
-                    format!(": {msg}")
+                    " after streaming a partial bundle"
                 }
             );
+        }
+        if bundle.is_empty() {
+            anyhow::bail!("daemon sent no bundle");
         }
         Ok((bundle, truncated))
     }

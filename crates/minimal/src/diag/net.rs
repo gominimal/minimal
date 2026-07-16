@@ -41,7 +41,7 @@ pub async fn listening_sockets(w: &mut BundleWriter) -> Result<(), anyhow::Error
     let last_err = last_err.unwrap_or_else(|| anyhow::anyhow!("no listening-socket source"));
     #[cfg(target_os = "linux")]
     {
-        let tables = proc_net_listeners().context("/proc/net fallback")?;
+        let tables = proc_net_listeners().await.context("/proc/net fallback")?;
         let text = format!("(commands unavailable: {last_err:#})\n{tables}");
         return w
             .add_bytes("host/net/listening.txt", text.as_bytes(), Redaction::None)
@@ -68,12 +68,12 @@ async fn command_output(cmd: &str, args: &[&str]) -> Result<String, anyhow::Erro
 /// Raw `/proc/net` tables. Not parsed — the dev team can decode hex
 /// address:port pairs; fidelity beats prettiness in a fallback.
 #[cfg(target_os = "linux")]
-fn proc_net_listeners() -> Result<String, anyhow::Error> {
+async fn proc_net_listeners() -> Result<String, anyhow::Error> {
     let mut text = String::new();
     for table in ["tcp", "tcp6", "udp", "unix"] {
         let path = format!("/proc/net/{table}");
         text.push_str(&format!("=== {path} ===\n"));
-        match std::fs::read_to_string(&path) {
+        match tokio::fs::read_to_string(&path).await {
             Ok(t) => text.push_str(&t),
             Err(e) => text.push_str(&format!("<unreadable: {e}>\n")),
         }
@@ -147,7 +147,8 @@ pub async fn probe_socket(sock_path: &Path) -> (SocketProbe, Option<crate::clien
     let t = Instant::now();
     probe.stat = Stage::run(
         t,
-        std::fs::metadata(sock_path)
+        tokio::fs::metadata(sock_path)
+            .await
             .map(|_| ())
             .map_err(|e| e.to_string()),
     );

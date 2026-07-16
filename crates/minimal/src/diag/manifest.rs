@@ -18,6 +18,9 @@ pub enum Redaction {
     ListingOnly,
     /// Only the trailing portion of a large file was captured.
     TailCapped,
+    /// A streamed source exceeded its cap; only the leading portion was
+    /// captured and the rest was discarded mid-stream.
+    Truncated,
 }
 
 /// Top-level manifest, serialized as the bundle's `manifest.json`.

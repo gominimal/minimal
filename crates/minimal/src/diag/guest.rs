@@ -37,13 +37,14 @@ pub async fn collect(
     let dest = format!("providers/{provider}/guest/daemon-diag.tar.zst");
     match result {
         Ok(Ok((bytes, truncated))) => {
-            if truncated {
-                w.skip(
-                    &dest,
-                    format!("stream truncated at the {GUEST_BUNDLE_MAX_BYTES}-byte cap"),
-                );
-            }
-            w.add_bytes(&dest, &bytes, Redaction::None).await
+            // A truncated stream is still collected — the manifest entry's
+            // redaction records that only the leading bytes survived.
+            let redaction = if truncated {
+                Redaction::Truncated
+            } else {
+                Redaction::None
+            };
+            w.add_bytes(&dest, &bytes, redaction).await
         }
         Ok(Err(e)) => {
             let msg = format!("guest bundle download failed: {e:#}");

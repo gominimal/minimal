@@ -221,8 +221,8 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
     )
     .await;
 
-    if let Ok(entries) = std::fs::read_dir(paths.config.join("loadouts")) {
-        for entry in entries.flatten() {
+    if let Ok(mut entries) = tokio::fs::read_dir(paths.config.join("loadouts")).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "toml")
                 && let Some(name) = path.file_name().and_then(|n| n.to_str())
@@ -238,8 +238,11 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
         "private key material — never collected",
     );
     let certs: std::collections::BTreeMap<&str, Option<FileMeta>> = [
-        ("client.pem", file_meta(&paths.config.join("client.pem"))),
-        ("ca.pem", file_meta(&paths.config.join("ca.pem"))),
+        (
+            "client.pem",
+            file_meta(&paths.config.join("client.pem")).await,
+        ),
+        ("ca.pem", file_meta(&paths.config.join("ca.pem")).await),
     ]
     .into_iter()
     .collect();
@@ -292,8 +295,8 @@ struct FileMeta {
     mtime_unix: Option<u64>,
 }
 
-fn file_meta(path: &Path) -> Option<FileMeta> {
-    let meta = std::fs::metadata(path).ok()?;
+async fn file_meta(path: &Path) -> Option<FileMeta> {
+    let meta = tokio::fs::metadata(path).await.ok()?;
     Some(FileMeta {
         bytes: meta.len(),
         mtime_unix: meta
@@ -328,9 +331,9 @@ pub async fn state(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow
     }
 
     // Per-session records, secret-shaped values masked.
-    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
-        for entry in entries.flatten() {
-            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+    if let Ok(mut entries) = tokio::fs::read_dir(&sessions_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if !entry.file_type().await.is_ok_and(|t| t.is_dir()) {
                 continue;
             }
             let short = entry.file_name().to_string_lossy().to_string();
@@ -367,15 +370,18 @@ const LOG_FILES_PER_PREFIX: usize = 5;
 
 pub async fn logs(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow::Error> {
     let log_dir = paths.state.join("logs");
+    let Ok(mut entries) = tokio::fs::read_dir(&log_dir).await else {
+        return Ok(()); // no log dir at all — nothing ever detached
+    };
+    let mut all: Vec<PathBuf> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        all.push(entry.path());
+    }
     for prefix in ["minimald.log", "minvmd.log"] {
-        let Ok(entries) = std::fs::read_dir(&log_dir) else {
-            return Ok(()); // no log dir at all — nothing ever detached
-        };
         // Rolling filenames embed the date (`minimald.log.2026-07-15`), so a
         // reverse lexical sort is newest-first.
-        let mut files: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
+        let mut files: Vec<&PathBuf> = all
+            .iter()
             .filter(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
@@ -387,7 +393,7 @@ pub async fn logs(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow:
         for path in files.into_iter().take(LOG_FILES_PER_PREFIX) {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             let dest = format!("logs/{name}");
-            if let Err(e) = w.add_file_tail(&dest, &path, LOG_TAIL_CAP).await {
+            if let Err(e) = w.add_file_tail(&dest, path, LOG_TAIL_CAP).await {
                 w.skip(&dest, format!("unreadable: {e}"));
             }
         }
@@ -399,18 +405,22 @@ pub async fn logs(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow:
 
 /// Provider instance dirs under `<state>/providers`, sorted. Empty when the
 /// providers dir doesn't exist (nothing was ever spawned).
-pub fn provider_dirs(state: &Path) -> Vec<(String, PathBuf)> {
-    let Ok(entries) = std::fs::read_dir(state.join("providers")) else {
+pub async fn provider_dirs(state: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(mut entries) = tokio::fs::read_dir(state.join("providers")).await else {
         return Vec::new();
     };
-    let mut dirs: Vec<(String, PathBuf)> = entries
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter_map(|e| {
-            let name = e.file_name().to_str()?.to_string();
-            name.starts_with("local-").then(|| (name, e.path()))
-        })
-        .collect();
+    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if !entry.file_type().await.is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if name.starts_with("local-") {
+            dirs.push((name, entry.path()));
+        }
+    }
     dirs.sort();
     dirs
 }
@@ -465,7 +475,7 @@ pub async fn provider_files(
     // The detached supervisor's boot log (stderr redirect): panics and the
     // final error print of a failed boot.
     let run_log = dir.join("run.log");
-    if run_log.exists() {
+    if tokio::fs::try_exists(&run_log).await.unwrap_or(false) {
         let dest = format!("providers/{name}/run.log");
         if let Err(e) = w.add_file_tail(&dest, &run_log, LOG_TAIL_CAP).await {
             w.skip(&dest, format!("unreadable: {e}"));
@@ -478,7 +488,7 @@ pub async fn provider_files(
     let state_dir = minvmd::state::StateDir::new(dir.to_path_buf());
     let status = match &state_dir {
         Ok(sd) => {
-            let (state, state_read_error) = match std::fs::read_to_string(sd.state_path()) {
+            let (state, state_read_error) = match tokio::fs::read_to_string(sd.state_path()).await {
                 Ok(s) => match s.parse::<toml::Table>() {
                     Ok(v) => (Some(v), None),
                     Err(e) => (None, Some(e.to_string())),
@@ -513,8 +523,8 @@ pub async fn provider_files(
 mod tests {
     use super::*;
 
-    #[test]
-    fn provider_dirs_finds_only_local_instances() {
+    #[tokio::test]
+    async fn provider_dirs_finds_only_local_instances() {
         let tmp = tempfile::TempDir::new().unwrap();
         let providers = tmp.path().join("providers");
         std::fs::create_dir_all(providers.join("local-0")).unwrap();
@@ -522,14 +532,14 @@ mod tests {
         std::fs::create_dir_all(providers.join("remote-x")).unwrap();
         std::fs::write(providers.join("stray-file"), "").unwrap();
 
-        let dirs = provider_dirs(tmp.path());
+        let dirs = provider_dirs(tmp.path()).await;
         let names: Vec<&str> = dirs.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["local-0", "local-2"]);
     }
 
-    #[test]
-    fn provider_dirs_empty_when_never_spawned() {
+    #[tokio::test]
+    async fn provider_dirs_empty_when_never_spawned() {
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(provider_dirs(tmp.path()).is_empty());
+        assert!(provider_dirs(tmp.path()).await.is_empty());
     }
 }
