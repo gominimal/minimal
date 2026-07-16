@@ -14,6 +14,7 @@ pub mod client;
 pub mod config;
 pub mod dirs;
 mod file_upload;
+pub mod git_remote;
 pub mod loadouts;
 
 #[derive(Parser)]
@@ -197,7 +198,12 @@ pub struct MeshJoinArgs {
 }
 
 /// Shared arguments all subcommands
-#[derive(Debug, Args)]
+///
+/// The `Default` value is the no-flags invocation (no overrides, native
+/// backend) — what a bare `min <cmd>` resolves to, and what indirect
+/// entrypoints like the `git-remote-min` helper mode (which git invokes
+/// without any of our flags) use.
+#[derive(Debug, Default, Args)]
 pub struct GlobalArgs {
     /// Use the given directory as the repository root, instead of the current
     /// working directory.
@@ -229,6 +235,9 @@ pub struct ActivateArgs {
     /// Project path to activate (defaults to current directory)
     #[arg(default_value = ".")]
     pub path: String,
+    /// How to load project files into the session.
+    #[arg(long, value_enum, default_value_t = SyncMode::Tarball)]
+    pub sync: SyncMode,
     /// Network mode: no-net, host-net (default), or own-ip.
     #[arg(long, value_enum, default_value_t = CliNetworkMode::HostNet)]
     pub network: CliNetworkMode,
@@ -248,6 +257,15 @@ pub struct ActivateArgs {
     /// Automatically attach after creation
     #[arg(long)]
     pub attach: bool,
+}
+
+/// Configuration for file sync during activation.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum SyncMode {
+    /// Stream a tarball of your project and unpack it into the session.
+    Tarball,
+    /// Do not populate the worktree of the session.
+    None,
 }
 
 /// CLI surface for [`sessions::NetworkMode`]. A local `ValueEnum` keeps the
@@ -950,11 +968,16 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
 
     // Upload the project directory to the daemon so the session
     // sandbox has the user's files available.
-    eprintln!("Uploading project files...");
-    client
-        .upload_workspace_files(id, utf8_path.as_std_path())
-        .await
-        .context("Failed to upload project files")?;
+    match args.sync {
+        SyncMode::None => {}
+        SyncMode::Tarball => {
+            eprintln!("Uploading project files...");
+            client
+                .upload_workspace_files(id, utf8_path.as_std_path())
+                .await
+                .context("Failed to upload project files")?;
+        }
+    };
 
     println!("{id}");
 
@@ -973,6 +996,42 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
 /// Shell-quote a string for safe interpolation into `sh -c`.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+/// Quote a path for use as an `ssh -o` option value.
+///
+/// ssh re-parses the value as a config line, splitting on whitespace to allow a
+/// file list and honouring `\` escapes inside quotes. So the quotes carry a path
+/// with spaces, and `\`/`"` must be escaped within them — unescaped, a `"`
+/// resolves the option to the wrong file and a trailing `\` swallows the closing
+/// quote, both of which make ssh reject the line outright.
+fn ssh_opt_quote(path: &std::path::Path) -> String {
+    // Backslashes first: escaping quotes introduces backslashes of its own.
+    let escaped = path
+        .display()
+        .to_string()
+        .replace('\\', r"\\")
+        .replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// The `ssh` host-key options for attaching, given the `known_hosts` sitting
+/// next to the daemon socket.
+///
+/// minvmd records the guest's host key there from the boot beacon, so when the
+/// file is present we pin against it. A native minimald also writes this.
+fn host_key_opts(known_hosts: &std::path::Path) -> [String; 2] {
+    if known_hosts.is_file() {
+        [
+            "StrictHostKeyChecking=yes".to_string(),
+            format!("UserKnownHostsFile={}", ssh_opt_quote(known_hosts)),
+        ]
+    } else {
+        [
+            "StrictHostKeyChecking=no".to_string(),
+            "UserKnownHostsFile=/dev/null".to_string(),
+        ]
+    }
 }
 
 /// Attach to an existing session. Both interactive and `--command` paths
@@ -1006,6 +1065,8 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
         shell_quote(&sock.display().to_string()),
     );
 
+    let [strict, known_hosts_file] = host_key_opts(&sock.with_file_name(paths::KNOWN_HOSTS_FILE));
+
     let mut ssh = std::process::Command::new("ssh");
     ssh.env("MINIMAL_SESSION_ID", record.id.to_string()).args([
         "-o",
@@ -1013,9 +1074,9 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
         "-o",
         &format!("ProxyCommand={proxy_cmd}"),
         "-o",
-        "StrictHostKeyChecking=no",
+        &strict,
         "-o",
-        "UserKnownHostsFile=/dev/null",
+        &known_hosts_file,
     ]);
 
     // The interactive path opens the in-sandbox session shell via the daemon's
@@ -1635,6 +1696,56 @@ pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A VM-backed provider dir carries the guest's recorded host key, so
+    /// attach must verify against it rather than waive the check.
+    #[test]
+    fn host_key_opts_pin_to_an_adjacent_known_hosts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let known_hosts = tmp.path().join(paths::KNOWN_HOSTS_FILE);
+        std::fs::write(&known_hosts, "local-0 ssh-ed25519 AAAA...\n").unwrap();
+
+        let [strict, hosts_file] = host_key_opts(&known_hosts);
+        assert_eq!(strict, "StrictHostKeyChecking=yes");
+        assert_eq!(
+            hosts_file,
+            format!("UserKnownHostsFile=\"{}\"", known_hosts.display())
+        );
+    }
+
+    /// ssh re-parses the option value as a config line, so the path must survive
+    /// its quote and backslash handling intact. These expectations were checked
+    /// against OpenSSH's own parser with `ssh -G`.
+    #[test]
+    fn ssh_opt_quote_escapes_backslashes_and_quotes() {
+        let q = |s: &str| ssh_opt_quote(std::path::Path::new(s));
+
+        assert_eq!(q("/state/known_hosts"), r#""/state/known_hosts""#);
+        // A space is why we quote at all: ssh would otherwise read a file list.
+        assert_eq!(q("/st ate/known_hosts"), r#""/st ate/known_hosts""#);
+        assert_eq!(q(r#"/st"ate/known_hosts"#), r#""/st\"ate/known_hosts""#);
+        assert_eq!(q(r"/st\ate/known_hosts"), r#""/st\\ate/known_hosts""#);
+        // A trailing backslash must not escape the closing quote.
+        assert_eq!(q(r"/state\"), r#""/state\\""#);
+    }
+
+    /// The assembled option for a state dir carrying every character ssh's
+    /// parser treats specially.
+    #[test]
+    fn host_key_opts_pin_to_a_path_needing_escapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(r#"sp ace q"uote back\slash"#);
+        std::fs::create_dir_all(&dir).unwrap();
+        let known_hosts = dir.join(paths::KNOWN_HOSTS_FILE);
+        std::fs::write(&known_hosts, "local-0 ssh-ed25519 AAAA...\n").unwrap();
+
+        let [strict, hosts_file] = host_key_opts(&known_hosts);
+        assert_eq!(strict, "StrictHostKeyChecking=yes");
+        assert!(
+            hosts_file.contains(r#"q\"uote"#) && hosts_file.contains(r"back\\slash"),
+            "path must reach ssh escaped, got: {hosts_file}"
+        );
+    }
 
     #[test]
     fn ingress_spec_defaults_to_tcp() {

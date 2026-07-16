@@ -10,8 +10,9 @@
 >   (dorny/paths-filter) and an `if: always()` aggregator; the five aggregators
 >   are the required checks.
 > - The "compile once per triple, fan out" archive pattern lives in the KVM
->   lane (`cargo nextest archive` → toolchain-free test job); the same unified
->   proof (`scripts/session-e2e.sh`) runs on all three targets.
+>   and macOS lanes (`cargo nextest archive` + prebuilt binaries → a
+>   toolchain-free test job; the mac mini compiles nothing, per §7); the same
+>   unified proof (`scripts/session-e2e.sh`) runs on all three targets.
 > - The strategy's `cargo xtask` is this repo's **justfile + `scripts/`** — the
 >   same "logic in reviewed code, YAML stays a thin scheduler" property (§10).
 > - Guest kernel/rootfs come prebuilt from the GCS channel via the

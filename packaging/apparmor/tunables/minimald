@@ -1,0 +1,22 @@
+# Binary paths the `minimald` AppArmor profile attaches to.
+#
+# minimald has no single install path: the curl|sh installer puts it in
+# ${MINIMAL_BIN:-$HOME/.local/bin} (scripts/install.sh), a distro package would
+# use /usr/bin, a hand-built one /usr/local/bin. AppArmor matches profiles by
+# executable path, so all of them have to be named up front — the attachment is
+# in the profile header and cannot be widened by a <local/...> include.
+#
+# @{HOME} comes from <tunables/home> (pulled in by <tunables/global>), so a site
+# that keeps home dirs somewhere other than /home is already handled.
+#
+# To attach the profile to an extra path — a dev build in target/debug, say —
+# drop a file in tunables/minimald.d/ that appends to the variable rather than
+# editing this one:
+#
+#     @{minimald_bin} += /path/to/target/debug/minimald
+#
+# `scripts/install-apparmor-profile.sh --path <binary>` writes exactly that.
+
+@{minimald_bin} = /usr/bin/minimald /usr/local/bin/minimald @{HOME}/.local/bin/minimald
+
+include if exists <tunables/minimald.d>

@@ -886,23 +886,23 @@ impl Session {
     /// session's workspace if it has none, so [`mctx::Context::new`] can
     /// succeed and the session gets a usable set of packages. A workspace
     /// that already holds an uploaded `minimal.toml` is left alone.
-    ///
-    /// Deliberately on the context-build path rather than the compose path:
-    /// it resolves the default package repo's branch head over the network,
-    /// so it belongs where a session is actually being brought up, and is
-    /// paid once per actor. The packages it declares reach the sandbox
-    /// through the launcher's context, which is built from this file.
-    ///
-    /// Delete this (and `mctx::scaffold`) once sessions receive their project
-    /// files via the workspace-upload path.
     fn scaffold_mfile_if_missing(&self, wsp: &DaemonAbsPath) -> Result<(), String> {
         if wsp.as_utf8_path().join(mfile::MFILE_NAME).exists() {
             return Ok(());
         }
-        let config = self.workspace_config(wsp)?;
-        mctx::scaffold_default_mfile(&config, wsp.as_utf8_path())
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        match mfile::File::from_dir(wsp.as_utf8_path()) {
+            Ok(_) => Ok(()), // it exists
+            Err(mfile::Error::NotFound) => {
+                let config = self.workspace_config(wsp)?;
+
+                use op::ProjectOp as _;
+                let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| e.to_string())?;
+                let plan = op::InitProject.run(&mut env).map_err(|e| e.to_string())?;
+
+                std::fs::write(&plan.toml_path, &plan.content).map_err(|e| e.to_string())
+            }
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     /// Do the actual context construction: run [`mctx::Context::new`] against

@@ -212,6 +212,55 @@ strip_rc_block() {
     say "  removed shell-init block from $1"
 }
 
+# Offer to also remove the *system* AppArmor profile on uninstall. That profile
+# (packaging/apparmor/minimald) is installed separately, with root, by
+# install-apparmor-profile.sh; it outlives minimald, leaving an inert label
+# bound to a now-absent binary path under /etc/apparmor.d. Removing it needs
+# root — which this installer never assumes — so on an interactive terminal we
+# prompt and, on yes, elevate via the shipped loader's own --uninstall (run here,
+# before the record walk deletes that loader). Piped (curl|sh), non-interactive,
+# or dry-run: advise the root command instead, which stays valid after the walk.
+# Gated on the profile actually being present, so macOS and never-set-up hosts
+# see nothing. The apparmor.d path is overridable for install_test.sh.
+maybe_remove_apparmor_profile() {
+    _aa_dir="${MINIMAL_OVERRIDE_APPARMOR_DIR:-/etc/apparmor.d}"
+    _aa_profile="$_aa_dir/minimald"
+    [ -e "$_aa_profile" ] || return 0
+    _aa_tunable="$_aa_dir/tunables/minimald"
+
+    if [ "$dry_run" -eq 1 ]; then
+        say "  would offer to remove the system AppArmor profile $_aa_profile"
+        return 0
+    fi
+
+    # Prompt only when stdin is a terminal. Under `curl … | sh -s -- --uninstall`
+    # stdin is the script pipe, not a tty, so advise rather than consume it.
+    if [ -t 0 ]; then
+        _aa_loader="$(resolve_prefix data)/apparmor/install-apparmor-profile.sh"
+        printf 'Also remove the system AppArmor profile %s (needs root)? [y/N] ' \
+            "$_aa_profile" >&2
+        _aa_ans=
+        read -r _aa_ans || _aa_ans=
+        case "$_aa_ans" in
+            [Yy]*)
+                if [ -f "$_aa_loader" ] && command -v sudo >/dev/null 2>&1 \
+                    && sudo bash "$_aa_loader" --uninstall; then
+                    return 0
+                fi
+                say "  warning: could not remove it automatically; do it manually (root):"
+                say "      sudo apparmor_parser -R \"$_aa_profile\" && sudo rm -f \"$_aa_profile\" \"$_aa_tunable\""
+                return 0
+                ;;
+            *) return 0 ;;
+        esac
+    fi
+
+    say ""
+    say "note: the system AppArmor profile is still loaded at $_aa_profile."
+    say "  it was installed separately with root; remove it too with:"
+    say "      sudo apparmor_parser -R \"$_aa_profile\" && sudo rm -f \"$_aa_profile\" \"$_aa_tunable\""
+}
+
 # --- Units 7+8: uninstall (walk the install record and undo it) ------------
 
 # Offline teardown driven solely by the local install record (R6.1). The record
@@ -234,6 +283,10 @@ do_uninstall() {
         return 0
     fi
     [ "$dry_run" -eq 1 ] && say "uninstall: dry run — nothing will be removed"
+
+    # Before the walk (which deletes the shipped loader), offer to tear down the
+    # separately-installed system AppArmor profile too.
+    maybe_remove_apparmor_profile
 
     # Tab, computed once, so rows are split on tab alone (R7.3): a dest under a
     # $HOME containing spaces must still parse as one field.
@@ -259,7 +312,33 @@ do_uninstall() {
             continue
         fi
 
-        # The installer only ever writes regular files. A symlink or directory
+        # A `link:<target>` row is a symlink the installer created (R5.6); the
+        # regular-file rules below don't apply. It is still ours while the
+        # path is a symlink pointing at the recorded target — `rm` removes the
+        # link itself, never what it points at. A retargeted link is the
+        # user's edit (kept unless --force); a non-symlink is foreign, always
+        # kept.
+        case "$want" in
+            link:*)
+                if [ ! -L "$dest" ]; then
+                    say "  $comp: kept ($dest is not a symlink the installer wrote)"
+                    kept_foreign=$((kept_foreign + 1))
+                elif [ "$(readlink "$dest")" != "${want#link:}" ] && [ "$uninstall_force" -eq 0 ]; then
+                    say "  $comp: kept (retargeted since install; pass --force to remove)"
+                    kept_modified=$((kept_modified + 1))
+                elif [ "$dry_run" -eq 1 ]; then
+                    say "  $comp: would remove $dest"
+                    removed=$((removed + 1))
+                else
+                    rm -f "$dest" || die "failed to remove $dest"
+                    say "  $comp: removed $dest"
+                    removed=$((removed + 1))
+                fi
+                continue
+                ;;
+        esac
+
+        # A `file` row only ever wrote a regular file. A symlink or directory
         # now at this path is something else — never follow it into a delete.
         if [ -L "$dest" ] || [ ! -f "$dest" ]; then
             say "  $comp: kept ($dest is not a regular file the installer wrote)"
@@ -349,6 +428,8 @@ do_uninstall() {
         # parents, which the installer may have created) are shared with other
         # tools so, like bin, they are only ever rmdir'd-if-empty.
         for d in "$init_dir" \
+                 "$(resolve_prefix data)/apparmor/tunables" \
+                 "$(resolve_prefix data)/apparmor" \
                  "$bash_comp_dir" "${bash_comp_dir%/*}" \
                  "$zsh_comp_dir" "${zsh_comp_dir%/*}" \
                  "$fish_comp_dir"; do
@@ -466,9 +547,13 @@ prev_record="$state_dir/installed"
 # The os/arch/version columns are consumed into `_` (already matched in awk, or
 # informational); comp/want/kind/dest/src are what drive the install.
 while read -r comp _ _ _ want kind dest src; do
-    # v1 handles single files only; an unknown kind is a hard error, not a
-    # silent skip (the column reserves room for archive kinds later).
-    [ "$kind" = file ] || die "component $comp has unsupported kind '$kind'"
+    # `file` and `symlink` are the kinds this installer understands; an
+    # unknown kind is a hard error, not a silent skip (the column reserves
+    # room for archive kinds later).
+    case "$kind" in
+        file|symlink) ;;
+        *) die "component $comp has unsupported kind '$kind'" ;;
+    esac
 
     # dest is `<prefix-token>/<subpath>`. Require both halves.
     case "$dest" in
@@ -487,6 +572,35 @@ while read -r comp _ _ _ want kind dest src; do
     dir="$(resolve_prefix "$prefix")"
     target_file="$dir/$subpath"
 
+    # R5.6 — a symlink component: `src` is the LINK TARGET rather than a bucket
+    # path, resolved by the OS relative to the link's own directory. It gets
+    # the same traversal discipline as the dest subpath, so a manifest can only
+    # point a link within its own prefix. Nothing is downloaded either way.
+    if [ "$kind" = symlink ]; then
+        case "$src" in
+            ''|/*|..|../*|*/..|*/../*) die "component $comp has unsafe symlink target '$src'" ;;
+        esac
+        if [ -L "$target_file" ] && [ "$(readlink "$target_file")" = "$src" ]; then
+            say "  $comp: up to date"
+            skipped=$((skipped + 1))
+        else
+            # Atomic like R5.4: create the link as a temp sibling and rename it
+            # over whatever holds the path now — notably a stale regular file
+            # from a release that shipped this component as a copy.
+            mkdir -p "$dir"
+            tmp="$target_file.tmp.$$"
+            ln -s "$src" "$tmp" || { rm -f "$tmp"; die "failed to create symlink for $comp"; }
+            mv -f "$tmp" "$target_file"
+            say "  $comp: linked -> $src"
+            installed=$((installed + 1))
+        fi
+        # No artifact hashes exist for a link; both hash columns carry the
+        # link target instead (`link:` cannot collide with a hex digest), so
+        # --uninstall can verify the link is still ours (R6.1/R7.3).
+        printf '%s\t%s\t%s\t%s\n' "$comp" "$target_file" "link:$src" "link:$src" >>"$records"
+        continue
+    fi
+
     # R5.1 — the on-disk file is the skip oracle: it is up to date when its hash
     # equals the manifest `sha256`. A changed manifest hash (a new release) fails
     # this check and is re-downloaded.
@@ -501,8 +615,10 @@ while read -r comp _ _ _ want kind dest src; do
     fi
 
     # R4.3/R5.2 — create the destination dir, then download to a temp sibling
-    # IN that dir so the final rename is a same-filesystem atomic swap.
-    mkdir -p "$dir"
+    # IN that dir so the final rename is a same-filesystem atomic swap. Create
+    # the target file's PARENT (not just the prefix root): a component whose
+    # subpath nests dirs (e.g. apparmor/tunables/minimald) needs them made first.
+    mkdir -p "${target_file%/*}"
     tmp="$target_file.tmp.$$"
     say "  $comp: downloading"
     fetch "$BUCKET/$src" "$tmp" || { rm -f "$tmp"; die "download failed: $comp ($src)"; }
@@ -527,8 +643,12 @@ while read -r comp _ _ _ want kind dest src; do
     # R5.5 — last moment before the first live file is swapped, so a run where
     # every component is up to date (or one that dies fetching/verifying) never
     # touches a healthy daemon. The guard inside makes this a no-op after the
-    # first replaced component.
-    stop_running_daemon
+    # first replaced component. Only executable images wedge a running daemon
+    # (bin, and lib — minvmd's @rpath dylib); replacing a data file (e.g. a
+    # re-shipped apparmor text) must not kill live sessions.
+    case "$prefix" in
+        bin|lib) stop_running_daemon ;;
+    esac
 
     mv -f "$tmp" "$target_file"
     installed=$((installed + 1))
@@ -760,3 +880,46 @@ case ":${PATH:-}:" in
        say "note: $bindir is not on your PATH yet."
        say "  restart your shell, or add it now:  export PATH=\"$bindir:\$PATH\"" ;;
 esac
+
+# --- Linux host advisory: unprivileged user namespaces ----------------------
+
+# Ubuntu 24.04+ defaults kernel.apparmor_restrict_unprivileged_userns=1, under
+# which minimald cannot create the user namespace every session sandbox needs —
+# sessions then die at uid_map with an opaque EPERM, far from here. Detect the
+# restriction at install time (Linux only) and point at the AppArmor loader we
+# just shipped. Advice only: installing the profile needs root, and this
+# installer never elevates. Silent on hosts that do not need it, AND on a host
+# already remediated — but "remediated" depends on the bin prefix: the stock
+# tunable attaches only /usr/bin, /usr/local/bin, and ~/.local/bin, so for a
+# custom MINIMAL_BIN the advised command carries --path, and a loaded profile
+# counts as remediation only if the tunables actually name this binary
+# (otherwise sessions still die and a reinstall must keep saying so). The
+# sysctl and apparmor.d paths are overridable for install_test.sh.
+userns_sysctl="${MINIMAL_OVERRIDE_USERNS_SYSCTL:-/proc/sys/kernel/apparmor_restrict_unprivileged_userns}"
+apparmor_dir="${MINIMAL_OVERRIDE_APPARMOR_DIR:-/etc/apparmor.d}"
+if [ "$os" = linux ] && [ -r "$userns_sysctl" ] \
+    && [ "$(cat "$userns_sysctl" 2>/dev/null)" = 1 ]; then
+    apparmor_loader="$(resolve_prefix data)/apparmor/install-apparmor-profile.sh"
+    aa_loader_args=""
+    aa_remediated=0
+    case "$bindir" in
+        /usr/bin|/usr/local/bin|"$HOME/.local/bin")
+            [ -e "$apparmor_dir/minimald" ] && aa_remediated=1
+            ;;
+        *)
+            aa_loader_args=" --path \"$bindir/minimald\""
+            if [ -e "$apparmor_dir/minimald" ] \
+                && grep -rqs "$bindir/minimald" "$apparmor_dir/tunables" 2>/dev/null; then
+                aa_remediated=1
+            fi
+            ;;
+    esac
+    if [ "$aa_remediated" -eq 0 ] && [ -f "$apparmor_loader" ]; then
+        say ""
+        say "note: this host restricts unprivileged user namespaces (Ubuntu 24.04+);"
+        say "  minimald's session sandbox cannot start until you install its AppArmor"
+        say "  profile — a one-time step that needs root:"
+        say "      sudo bash \"$apparmor_loader\"$aa_loader_args"
+        say "  details: https://docs.minimal.dev/reference/linux-host-setup"
+    fi
+fi

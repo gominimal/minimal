@@ -257,7 +257,7 @@ fn kvm_access_error(err: &std::io::Error) -> anyhow::Error {
 /// `<provider dir>/known_hosts`.
 #[cfg(minvmd_libkrun)]
 pub(crate) fn default_vm_known_hosts_path() -> std::path::PathBuf {
-    crate::state::provider_dir().join("known_hosts")
+    crate::state::provider_dir().join(paths::KNOWN_HOSTS_FILE)
 }
 
 /// Outcome of the guest boot beacon (R2.4/R2.5): the guest either reached

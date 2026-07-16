@@ -181,6 +181,7 @@ async fn activate_creates_session() {
     let activate_args = ActivateArgs {
         name: Some("test-session".to_string()),
         path: project.path().to_string_lossy().to_string(),
+        sync: SyncMode::Tarball,
         network: CliNetworkMode::NoNet,
         ingress: vec![],
         loadout: vec![],
@@ -217,6 +218,7 @@ async fn activate_uploads_project_files() {
     let activate_args = ActivateArgs {
         name: Some("upload-test".to_string()),
         path: project.path().to_string_lossy().to_string(),
+        sync: SyncMode::Tarball,
         network: CliNetworkMode::NoNet,
         ingress: vec![],
         loadout: vec![],

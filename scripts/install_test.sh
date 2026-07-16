@@ -84,10 +84,19 @@ esac
 EOF
 printf 'darwin-arm64-rootfs-body\n'   >"$mock/versions/v1/rootfs-arm64.img"
 
+# AppArmor components: noarch text (the loader is a runnable stub here), shipped
+# to Linux hosts under the data prefix (see stage-release.sh).
+printf 'mock-apparmor-profile-body\n'  >"$mock/versions/v1/minimald.apparmor"
+printf 'mock-apparmor-tunable-body\n'  >"$mock/versions/v1/minimald.apparmor-tunable"
+printf '#!/bin/sh\n# mock apparmor loader\n' >"$mock/versions/v1/install-apparmor-profile.sh"
+
 h_minimald="$(hash_file "$mock/versions/v1/minimald-linux-amd64")"
 h_minimal="$(hash_file "$mock/versions/v1/minimal-linux-amd64")"
 h_dmin="$(hash_file "$mock/versions/v1/minimal-darwin-arm64")"
 h_rootfs="$(hash_file "$mock/versions/v1/rootfs-arm64.img")"
+h_aaprof="$(hash_file "$mock/versions/v1/minimald.apparmor")"
+h_aatun="$(hash_file "$mock/versions/v1/minimald.apparmor-tunable")"
+h_aaload="$(hash_file "$mock/versions/v1/install-apparmor-profile.sh")"
 
 printf 'v1\n' >"$mock/stable"
 
@@ -105,6 +114,18 @@ write_manifest() {
             minimal darwin arm64 v1 "$h_dmin" file bin/min versions/v1/minimal-darwin-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             rootfs darwin arm64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-arm64.img
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            apparmor-profile linux amd64 v1 "$h_aaprof" file data/apparmor/minimald versions/v1/minimald.apparmor
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            apparmor-tunable linux amd64 v1 "$h_aatun" file data/apparmor/tunables/minimald versions/v1/minimald.apparmor-tunable
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            apparmor-installer linux amd64 v1 "$h_aaload" file data/apparmor/install-apparmor-profile.sh versions/v1/install-apparmor-profile.sh
+        # Symlink rows (R5.6): sha256 is the `-` placeholder, src is the link
+        # target relative to dest's directory.
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            git-remote-min linux amd64 v1 - symlink bin/git-remote-min min
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            git-remote-min darwin arm64 v1 - symlink bin/git-remote-min min
     } >"$mock/versions/v1/components"
 }
 write_manifest 1
@@ -183,6 +204,20 @@ PLAT_M=x86_64
 # unknown-shell fallback branch).
 TEST_SHELL=
 
+# Host userns state the installer sees. Empty leaves both overrides pointing at
+# nonexistent paths (a host without the restriction and without a system
+# profile), so the AppArmor advisory/prompt stays silent; scenarios point these
+# at fixtures to drive it. USERNS_SYSCTL is a file whose contents are the sysctl
+# value; APPARMOR_DIR stands in for /etc/apparmor.d.
+USERNS_SYSCTL=
+APPARMOR_DIR=
+
+# Bin prefix the installer sees. Empty means the harness default ($hp/bin — a
+# custom MINIMAL_BIN, NOT one of the AppArmor tunable's stock attachment
+# paths); scenarios set it to $hp/.local/bin to exercise the default-prefix
+# branch of the userns advisory.
+BIN_OVERRIDE=
+
 # run <label> <homeprefix> [args...] ; sets rc, captures combined output in $OUT.
 OUT=
 run() {
@@ -193,7 +228,7 @@ run() {
         PATH="$stubbin:/usr/bin:/bin" \
         HOME="$hp" \
         SHELL="${TEST_SHELL:-/bin/sh}" \
-        MINIMAL_BIN="$hp/bin" \
+        MINIMAL_BIN="${BIN_OVERRIDE:-$hp/bin}" \
         XDG_DATA_HOME="$hp/xdg-data" \
         XDG_STATE_HOME="$hp/xdg-state" \
         XDG_CACHE_HOME="$hp/xdg-cache" \
@@ -201,7 +236,9 @@ run() {
         MINIMAL_OVERRIDE_INSTALLER_BUCKET="$BUCKET_HOST" \
         STUB_UNAME_S="$PLAT_S" \
         STUB_UNAME_M="$PLAT_M" \
-        "$SH" "$installer" "$@" >"$OUT" 2>&1
+        MINIMAL_OVERRIDE_USERNS_SYSCTL="${USERNS_SYSCTL:-$root/no-such-sysctl}" \
+        MINIMAL_OVERRIDE_APPARMOR_DIR="${APPARMOR_DIR:-$root/no-such-apparmor.d}" \
+        "$SH" "$installer" "$@" </dev/null >"$OUT" 2>&1
     rc=$?
     set -e
 }
@@ -220,19 +257,113 @@ check "$h_minimald" "$(hash_file "$H1/bin/minimald")" "installed content matches
 # Only linux/amd64 rows apply on this host: darwin row must not be installed.
 want_err "darwin-only component skipped on linux host" test -e "$H1/data/rootfs.img"
 n1="$(downloads)"; want_ok "first run downloaded ($n1)" test "$n1" -gt 0
+want_ok "symlink component placed as a symlink (R5.6)" test -L "$H1/bin/git-remote-min"
+check "min" "$(readlink "$H1/bin/git-remote-min")" "symlink points at its manifest target (R5.6)"
 
 reset_dl
 run second "$H1"
 check 0 "$rc" "rerun exits 0"
 check 0 "$(downloads)" "rerun performs zero downloads (R5.1/R2 reruns cheap)"
 
-# Corrupt one on-disk binary -> only that component re-fetches.
+# --- AppArmor components + Ubuntu 24.04+ advisory --------------------------
+# The three noarch apparmor components install under the data prefix on Linux.
+aa_root="$H1/xdg-data/minimal/apparmor"
+want_ok "apparmor profile installed under data prefix"  test -f "$aa_root/minimald"
+want_ok "apparmor tunable installed under data prefix"  test -f "$aa_root/tunables/minimald"
+want_ok "apparmor loader installed under data prefix"   test -f "$aa_root/install-apparmor-profile.sh"
+
+# The advisory fires only when the userns restriction is active (sysctl reads 1),
+# points at the shipped loader, and never elevates — install still exits 0.
+printf '1\n' >"$root/sysctl-on"
+printf '0\n' >"$root/sysctl-off"
+
+USERNS_SYSCTL="$root/sysctl-on"
+run aa_restricted "$H1"
+USERNS_SYSCTL=
+check 0 "$rc" "install on a restricted host still exits 0 (advice only)"
+want_ok "advisory names the userns restriction" \
+    grep -q "restricts unprivileged user namespaces" "$OUT"
+want_ok "advisory points at the shipped loader with sudo bash" \
+    grep -q "sudo bash .*apparmor/install-apparmor-profile.sh" "$OUT"
+# The harness bindir is a custom MINIMAL_BIN, outside the tunable's stock
+# attachment set, so the advised command must attach it explicitly.
+want_ok "advisory carries --path for a custom MINIMAL_BIN" \
+    grep -q -- "--path \"$H1/bin/minimald\"" "$OUT"
+
+USERNS_SYSCTL="$root/sysctl-off"
+run aa_unrestricted "$H1"
+USERNS_SYSCTL=
+want_err "no advisory when the restriction is off (sysctl 0)" \
+    grep -q "restricts unprivileged user namespaces" "$OUT"
+
+# A loaded system profile alone is NOT remediation for a custom MINIMAL_BIN:
+# the stock tunable does not attach it, so sessions still die and the advisory
+# must keep firing (with --path) until the tunables name this binary.
+mkdir -p "$root/aa-present"; printf 'profile\n' >"$root/aa-present/minimald"
+USERNS_SYSCTL="$root/sysctl-on"; APPARMOR_DIR="$root/aa-present"
+run aa_present_unattached "$H1"
+want_ok "advisory still fires when the profile is loaded but MINIMAL_BIN unattached" \
+    grep -q -- "--path \"$H1/bin/minimald\"" "$OUT"
+
+# ...and is suppressed once the tunables do name it (what the loader's --path
+# records under tunables/minimald.d).
+mkdir -p "$root/aa-present/tunables/minimald.d"
+printf '@{minimald_bin} += %s/bin/minimald\n' "$H1" \
+    >"$root/aa-present/tunables/minimald.d/paths"
+run aa_attached "$H1"
+want_err "no advisory when the tunables attach this MINIMAL_BIN" \
+    grep -q "restricts unprivileged user namespaces" "$OUT"
+
+# For the stock prefix (~/.local/bin) the profile's own tunable already
+# attaches the binary, so the profile file existing IS remediation.
+BIN_OVERRIDE="$H1/.local/bin"
+run aa_already_default_bin "$H1"
+BIN_OVERRIDE=
+want_err "no advisory for the default prefix when the system profile is installed" \
+    grep -q "restricts unprivileged user namespaces" "$OUT"
+USERNS_SYSCTL=; APPARMOR_DIR=
+
+# Darwin hosts never receive the apparmor components (linux-only manifest rows).
+HAA_D="$root/haa_d"; mkdir -p "$HAA_D"
+PLAT_S=Darwin; PLAT_M=arm64
+run aa_darwin "$HAA_D"
+PLAT_S=Linux; PLAT_M=x86_64
+check 0 "$rc" "darwin install exits 0"
+want_err "apparmor components skipped on darwin" \
+    test -e "$HAA_D/xdg-data/minimal/apparmor/minimald"
+
+# --- Uninstall: offer to remove the system AppArmor profile ----------------
+# A non-interactive uninstall (stdin is /dev/null, not a tty) advises the root
+# removal command and never elevates: the seeded system profile survives, while
+# the shipped loader is removed by the record walk like any other component.
+HAA_U="$root/haa_u"; mkdir -p "$HAA_U"
+run aa_u_seed "$HAA_U"
+check 0 "$rc" "uninstall-apparmor seed install exits 0"
+fake_aa="$root/fake-apparmor.d"; mkdir -p "$fake_aa/tunables"
+printf 'profile\n' >"$fake_aa/minimald"
+printf 'tunable\n' >"$fake_aa/tunables/minimald"
+APPARMOR_DIR="$fake_aa"
+run aa_u_run "$HAA_U" --uninstall
+APPARMOR_DIR=
+check 0 "$rc" "uninstall with a loaded system profile exits 0"
+want_ok "uninstall advises the system profile is still loaded" \
+    grep -q "system AppArmor profile is still loaded" "$OUT"
+want_ok "advisory gives the root removal command" grep -q "apparmor_parser -R" "$OUT"
+want_ok "non-interactive uninstall never elevates (profile survives)" \
+    test -f "$fake_aa/minimald"
+want_err "uninstall removed the shipped apparmor loader" \
+    test -e "$HAA_U/xdg-data/minimal/apparmor/install-apparmor-profile.sh"
+
+# Corrupt one on-disk binary and retarget the symlink -> only the binary
+# re-fetches (a symlink repair needs no download), and both are restored.
 printf 'tampered\n' >"$H1/bin/minimald"
+rm -f "$H1/bin/git-remote-min"; ln -s minimald "$H1/bin/git-remote-min"
 reset_dl
 run third "$H1"
 check 0 "$rc" "rerun after tamper exits 0"
 check 1 "$(downloads)" "only the changed component re-downloads"
 check "$h_minimald" "$(hash_file "$H1/bin/minimald")" "tampered binary restored"
+check "min" "$(readlink "$H1/bin/git-remote-min")" "retargeted symlink repaired without a download (R5.6)"
 
 # --- Unit 5: checksum mismatch (R5.3) --------------------------------------
 # Point the manifest's minimal hash at a wrong value; artifact stays as-is.
@@ -335,6 +466,8 @@ record="$H1/xdg-state/minimal/installed"
 want_ok "install record lists components (R6.1)" grep -q "minimald" "$record"
 want_ok "install record lists resolved dest (R6.1)" grep -q "$H1/bin/minimald" "$record"
 want_ok "install record lists hash (R6.1)" grep -q "$h_minimald" "$record"
+want_ok "symlink row records link:<target> in the hash columns (R6.1)" \
+    grep -q "link:min" "$record"
 
 # bin not on PATH -> advisory printed.
 run advise_off "$H1"
@@ -381,6 +514,17 @@ run daemonupgrade "$H8"
 check 0 "$rc" "upgrade exits 0"
 want_ok "upgrade runs min stop --force (R5.5)" test -f "$H8/stop.calls"
 check "stop --force" "$(cat "$H8/stop.calls")" "stop is called once, with --force (R5.5)"
+
+# Replacing only a data component must NOT stop the daemon: data files (the
+# apparmor profile/tunable/loader) are not executable images, and the running
+# daemon does not serve from them — only bin/lib swaps wedge it (R5.5).
+rm -f "$H8/stop.calls"
+printf 'tampered\n' >"$H8/xdg-data/minimal/apparmor/minimald"
+run daemondataonly "$H8"
+check 0 "$rc" "data-only rerun exits 0"
+want_err "data-only replacement leaves the daemon alone (R5.5)" test -e "$H8/stop.calls"
+check "$h_aaprof" "$(hash_file "$H8/xdg-data/minimal/apparmor/minimald")" \
+    "tampered data component was re-placed"
 
 # A `min` that fails and shouts is non-fatal and silent: an old binary may not
 # know `stop --force`, and no daemon running is itself a non-zero `min stop`.
@@ -665,6 +809,7 @@ run u_basic "$HU" --uninstall
 check 0 "$rc" "uninstall exits 0 (R8.4)"
 want_err "uninstall removed minimald (R7.3)" test -e "$HU/bin/minimald"
 want_err "uninstall removed min (R7.3)" test -e "$HU/bin/min"
+want_err "uninstall removed the git-remote-min symlink (R7.3)" test -L "$HU/bin/git-remote-min"
 want_err "uninstall removed the record (R8.1)" test -e "$urec"
 want_ok "uninstall prints a summary" grep -q "uninstall:" "$OUT"
 want_err "empty bin dir pruned (R8.1)" test -d "$HU/bin"
@@ -734,6 +879,32 @@ check 0 "$rc" "uninstall over a non-regular path exits 0 (R7.3)"
 want_ok "directory at a recorded path is left alone (R7.3)" test -d "$HU6/bin/minimald"
 want_ok "foreign entry is reported (R7.3)" grep -q "not a regular file" "$OUT"
 want_ok "record retained due to the foreign entry (R8.1)" test -f "$urec6"
+
+# R7.3 — a symlink retargeted since install is the user's edit: kept by default,
+# removed under --force. A regular file now at the recorded symlink path is
+# foreign — kept even with --force.
+HU8="$root/hu8"; mkdir -p "$HU8"
+run u8_install "$HU8"
+urec8="$HU8/xdg-state/minimal/installed"
+rm -f "$HU8/bin/git-remote-min"; ln -s minimald "$HU8/bin/git-remote-min"
+run u8_keep "$HU8" --uninstall
+check 0 "$rc" "uninstall with a retargeted symlink exits 0 (R8.4)"
+want_ok "retargeted symlink kept (R7.3)" test -L "$HU8/bin/git-remote-min"
+want_ok "retarget keep is reported (R7.3)" grep -q "retargeted" "$OUT"
+want_ok "record retained while the link remains (R8.1)" test -f "$urec8"
+run u8_force "$HU8" --uninstall --force
+check 0 "$rc" "uninstall --force over a retargeted symlink exits 0"
+want_err "retargeted symlink removed under --force (R7.3)" test -L "$HU8/bin/git-remote-min"
+want_err "record removed once footprint is gone (R8.1)" test -e "$urec8"
+
+HU9="$root/hu9"; mkdir -p "$HU9"
+run u9_install "$HU9"
+rm -f "$HU9/bin/git-remote-min"; printf 'a real file now\n' >"$HU9/bin/git-remote-min"
+run u9_foreign "$HU9" --uninstall --force
+check 0 "$rc" "uninstall over a file at a symlink row exits 0 (R7.3)"
+want_ok "regular file at a symlink row kept even with --force (R7.3)" \
+    test -f "$HU9/bin/git-remote-min"
+want_ok "foreign symlink row is reported (R7.3)" grep -q "not a symlink" "$OUT"
 
 # R9.4 — uninstall removes the generated init/completion files (they are plain
 # record rows), strips the marker block from the rc file, prunes the emptied

@@ -150,6 +150,10 @@ pub fn minimal_state_dir() -> DaemonAbsPath {
 /// File name of the daemon SSH socket in a provider instance dir. Served by
 /// native minimald or by the minvmd host↔guest bridge — one endpoint either way.
 pub const SSH_SOCK_FILE: &str = "ssh.sock";
+/// File name of the SSH `known_hosts` in a provider instance dir, recording the
+/// daemon's host key under the `local-<instance>` hostname. Written at startup
+/// by native minimald, and by minvmd from the guest's boot beacon.
+pub const KNOWN_HOSTS_FILE: &str = "known_hosts";
 /// Native minimald's single-instance lock, held for the daemon's lifetime.
 pub const MINIMALD_LOCK_FILE: &str = "minimald.lock";
 /// The minvmd supervisor's alive lock, held for the daemon's lifetime.
@@ -186,6 +190,31 @@ pub fn minimal_config_dir() -> DaemonAbsPath {
 /// says relative paths are invalid and should be ignored.
 fn xdg_config_home() -> Option<std::path::PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+/// Returns minimal's default data directory, `<data>/minimal`.
+///
+/// The base is `$XDG_DATA_HOME` when set to an absolute path, otherwise
+/// `~/.local/share` on every platform — the same resolution
+/// `scripts/install.sh` uses for `data`-prefix components, so paths derived
+/// here point at what the installer actually shipped. Like
+/// [`minimal_config_dir`], deliberately not [`dirs::data_dir`]: on macOS that
+/// would be `~/Library/Application Support`.
+///
+/// # Panics
+///
+/// Panics if neither `$XDG_DATA_HOME` nor a home directory can be resolved,
+/// or if the resulting path is not valid UTF-8.
+pub fn minimal_data_dir() -> DaemonAbsPath {
+    default_dir(xdg_data_home, ".local/share")
+}
+
+/// Return `$XDG_DATA_HOME` if it's set to an absolute path, per the XDG
+/// spec's rule that relative paths are invalid and should be ignored.
+fn xdg_data_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .filter(|p| p.is_absolute())
 }
