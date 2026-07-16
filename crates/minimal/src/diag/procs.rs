@@ -63,6 +63,121 @@ pub async fn process_tree(w: &mut BundleWriter) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Cap on how many matched processes get the deep hang-triage treatment; a
+/// runaway match list must not turn `min bug` into a profiler session.
+const HANG_TRIAGE_PIDS_MAX: usize = 8;
+
+/// Hang-triage capture for the matched process family: where each process is
+/// parked (thread samples on macOS, wait channel + kernel stack on Linux) and
+/// what it holds open (`lsof`). "It's frozen" reports run almost entirely on
+/// exactly this evidence (#788: vCPUs in WFI, proxy in kevent, a unix socket
+/// open with no EOF), so capture it while the hang is live.
+pub async fn hang_triage(w: &mut BundleWriter) -> Result<(), anyhow::Error> {
+    let (_, pids) = match ps_capture().await {
+        Ok(v) => v,
+        #[cfg(target_os = "linux")]
+        Err(_) => proc_scrape()?,
+        #[cfg(not(target_os = "linux"))]
+        Err(e) => return Err(e),
+    };
+    let pids: Vec<u32> = pids.into_iter().take(HANG_TRIAGE_PIDS_MAX).collect();
+    if pids.is_empty() {
+        w.skip("host/proc/", "no minimal-related processes to hang-triage");
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    for &pid in &pids {
+        let dest = format!("host/proc/{pid}.sample.txt");
+        let args = [pid.to_string(), "1".into(), "10".into()];
+        match command_capture("sample", &args, std::time::Duration::from_secs(15)).await {
+            Ok(text) => w.add_bytes(&dest, text.as_bytes(), Redaction::None).await?,
+            Err(e) => w.skip(&dest, format!("sample failed: {e:#}")),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    for &pid in &pids {
+        let text = linux_park_state(pid).await;
+        w.add_bytes(
+            &format!("host/proc/{pid}.stack.txt"),
+            text.as_bytes(),
+            Redaction::None,
+        )
+        .await?;
+    }
+
+    let pid_list = pids
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let dest = "host/proc/lsof.txt";
+    let args = ["-nP".to_string(), "-p".to_string(), pid_list];
+    match command_capture("lsof", &args, std::time::Duration::from_secs(10)).await {
+        Ok(text) => w.add_bytes(dest, text.as_bytes(), Redaction::None).await?,
+        Err(e) => w.skip(dest, format!("lsof unavailable: {e:#}")),
+    }
+    Ok(())
+}
+
+/// Runs `cmd` with a deadline, returning stdout. Non-zero exit with output
+/// still counts (lsof exits 1 whenever any pid's listing is incomplete).
+async fn command_capture(
+    cmd: &str,
+    args: &[String],
+    timeout: std::time::Duration,
+) -> Result<String, anyhow::Error> {
+    let out = tokio::time::timeout(
+        timeout,
+        tokio::process::Command::new(cmd).args(args).output(),
+    )
+    .await
+    .with_context(|| format!("{cmd} timed out"))?
+    .with_context(|| format!("spawning {cmd}"))?;
+    if !out.status.success() && out.stdout.is_empty() {
+        anyhow::bail!(
+            "{cmd} exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .next()
+                .unwrap_or("")
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Where a Linux process is parked: wait channel, current syscall, kernel
+/// stack (root-only; the error is data), and its open fds by readlink.
+#[cfg(target_os = "linux")]
+async fn linux_park_state(pid: u32) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    for label in ["wchan", "syscall", "stack"] {
+        let value = tokio::fs::read_to_string(format!("/proc/{pid}/{label}"))
+            .await
+            .unwrap_or_else(|e| format!("<unreadable: {e}>"));
+        let _ = writeln!(text, "=== {label} ===\n{}", value.trim_end());
+    }
+    text.push_str("=== fds ===\n");
+    match tokio::fs::read_dir(format!("/proc/{pid}/fd")).await {
+        Ok(mut entries) => {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let target = tokio::fs::read_link(entry.path())
+                    .await
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|e| format!("<unreadable: {e}>"));
+                let _ = writeln!(text, "{} -> {target}", entry.file_name().to_string_lossy());
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(text, "<unreadable: {e}>");
+        }
+    }
+    text
+}
+
 /// Filtered `ps` output plus the matched pids. The header line and a total
 /// process count are kept so "nothing matched" is distinguishable from
 /// "ps saw nothing".
