@@ -158,7 +158,6 @@ env:
     printf 'export MINVMD_KERNEL_PATH="%s"\n' '{{kernel}}'
     printf 'export MINVMD_ROOTFS_PATH="%s"\n' '{{rootfs}}'
     printf 'export MINVMD_INITRAMFS="%s"\n' '{{initramfs}}'
-    printf 'export MINVMD_BOOT_LOG="%s"\n' '{{scratch}}/boot.log'
     printf 'export MINVMD_GVPROXY_BIN="%s"\n' '{{gvproxy}}'
     printf 'export PATH="%s:$PATH"\n' '{{justfile_directory()}}/target/debug'
     case "$(uname -s)" in
@@ -184,7 +183,7 @@ stop:
 # Remove only the bring-up artifacts this justfile manages (.scratch is a shared
 # scratchpad — do NOT blow the whole directory away).
 clean:
-    rm -f {{kernel}} {{rootfs}} {{initramfs}} {{gvproxy}} {{scratch}}/boot.log
+    rm -f {{kernel}} {{rootfs}} {{initramfs}} {{gvproxy}}
 
 # Run the curl|sh installer's test harness under every POSIX sh available. The
 # installer targets strict POSIX sh, so dash conformance is checked alongside sh
@@ -236,7 +235,6 @@ dm1:
     export MINVMD_KERNEL_PATH="{{kernel}}"
     export MINVMD_ROOTFS_PATH="{{rootfs}}"
     export MINVMD_INITRAMFS="{{initramfs}}"
-    export MINVMD_BOOT_LOG="{{scratch}}/boot.log"
     # Host gvproxy switch: minvmd spawns it for guest egress (root netns + own-IP
     # PTasks). Best-effort — skipped if the binary is absent.
     export MINVMD_GVPROXY_BIN="{{gvproxy}}"
@@ -254,7 +252,7 @@ dm3: artifacts gvproxy initramfs minvmd-build minimal-cli
     [ -e /dev/kvm ] || { echo "DM3 needs /dev/kvm (KVM host)"; exit 1; }
     [ -w /dev/kvm ] || { echo "DM3: /dev/kvm not writable here; retry: sg kvm -c 'just dm3'"; exit 1; }
     export MINVMD_KERNEL_PATH="{{kernel}}" MINVMD_ROOTFS_PATH="{{rootfs}}"
-    export MINVMD_INITRAMFS="{{initramfs}}" MINVMD_BOOT_LOG="{{scratch}}/boot.log"
+    export MINVMD_INITRAMFS="{{initramfs}}"
     export MINVMD_GVPROXY_BIN="{{gvproxy}}"
     export PATH="{{justfile_directory()}}/target/debug:$PATH"
     export LD_LIBRARY_PATH="{{krun-prefix}}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
