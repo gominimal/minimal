@@ -231,10 +231,10 @@ impl StateDir {
     }
 }
 
-/// Serialise `value` to TOML and write it to `target` atomically: content is
-/// written to a `.toml.tmp` sibling, `fsync`'d, then renamed over the target
-/// (R4.1). Shared by [`StateDir::write_state`] and
-/// [`crate::config::ResourceConfig::write`].
+/// Serialise `value` to TOML and write it to `target` atomically and durably:
+/// content is written to a `.toml.tmp` sibling, `fsync`'d, renamed over the
+/// target, and the parent directory `fsync`'d (R4.1). Shared by
+/// [`StateDir::write_state`] and [`crate::config::ResourceConfig::write`].
 pub(crate) fn atomic_write_toml<T: Serialize>(target: &Path, value: &T) -> io::Result<()> {
     let tmp = target.with_extension("toml.tmp");
     let serialised =
@@ -244,7 +244,14 @@ pub(crate) fn atomic_write_toml<T: Serialize>(target: &Path, value: &T) -> io::R
         f.write_all(serialised.as_bytes())?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, target)
+    fs::rename(&tmp, target)?;
+    // The file fsync above only persists the tmp file's *contents*; the rename
+    // lives in the directory, so without a parent-dir fsync a crash here can
+    // resurface the old file after the caller was told the write succeeded.
+    if let Some(parent) = target.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Whether some process holds an exclusive advisory lock on `path`.
