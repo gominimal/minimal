@@ -14,7 +14,7 @@ use anyhow::{Context as _, Result};
 use serde::Serialize;
 
 use crate::lifecycle::Lifecycle;
-use crate::metrics::{VmMetrics, Warning};
+use crate::metrics::VmMetrics;
 use crate::state::{State, StateDir};
 
 /// Exit classification returned by [`run`].
@@ -72,20 +72,14 @@ fn run_with_state_dir(json: bool, dir: std::path::PathBuf) -> Result<StatusExit>
     });
 
     // Sample live host-visible metrics only for a running VM with a tracked
-    // PID (R9.1); reading process stats does not disturb the VM (R9.2). Disk
-    // usage feeds the reactive disk-pressure warning (R9.9).
+    // PID (R9.1); reading process stats does not disturb the VM (R9.2).
     let metrics = match (state.lifecycle, state.vmm_pid) {
         (Lifecycle::Running, Some(pid)) => crate::metrics::sample(pid),
         _ => None,
     };
-    let disk_usage = if metrics.is_some() {
-        crate::metrics::data_volume_usage()
-    } else {
-        None
-    };
 
     let (vcpus, ram_mib) = reported_resources(&state);
-    let report = build_report(&state, uptime_seconds, vcpus, ram_mib, metrics, disk_usage);
+    let report = build_report(&state, uptime_seconds, vcpus, ram_mib, metrics);
 
     if json {
         print_json(&report)?;
@@ -99,9 +93,10 @@ fn run_with_state_dir(json: bool, dir: std::path::PathBuf) -> Result<StatusExit>
     })
 }
 
-/// The serialised shape of `minvmd status --json` (R4.3 + R9.1/R9.9). `vcpus`
-/// and `ram_mib` are the *effective* values (env ?? persisted config ??
-/// default). `metrics` is `null` and `warnings` empty unless the VM is running.
+/// The serialised shape of `minvmd status --json` (R4.3 + R9.1). `vcpus` and
+/// `ram_mib` are the values the running VM booted with (or the effective
+/// next-boot resolution when stopped). `metrics` is `null` unless the VM is
+/// running.
 #[derive(Debug, Serialize)]
 struct StatusReport {
     state: &'static str,
@@ -110,26 +105,17 @@ struct StatusReport {
     vcpus: u8,
     ram_mib: u32,
     metrics: Option<VmMetrics>,
-    warnings: Vec<Warning>,
 }
 
 /// Assemble the report from already-resolved inputs. Pure (no I/O) so the JSON
-/// shape and warning wiring are unit-testable without a live VM.
+/// shape is unit-testable without a live VM.
 fn build_report(
     state: &State,
     uptime_seconds: Option<u64>,
     vcpus: u8,
     ram_mib: u32,
     metrics: Option<VmMetrics>,
-    disk_usage: Option<(u64, u64)>,
 ) -> StatusReport {
-    let warnings = match &metrics {
-        Some(m) => {
-            let (used, cap) = disk_usage.unwrap_or((0, 0));
-            crate::metrics::evaluate_warnings(m, ram_mib, used, cap)
-        }
-        None => Vec::new(),
-    };
     StatusReport {
         state: lifecycle_state_str(state.lifecycle),
         vmm_pid: state.vmm_pid,
@@ -137,17 +123,15 @@ fn build_report(
         vcpus,
         ram_mib,
         metrics,
-        warnings,
     }
 }
 
 /// The `vcpus`/`ram_mib` to report. For a *running* VM these are the values it
-/// was actually booted with (`State.booted_*`), so the reported figures and the
-/// reactive-warning denominator match the live VM rather than a later
-/// `config set`'s next-boot resolution (#747, R2.6). When stopped — or reading a
-/// pre-#747 state file with no snapshot — they fall back to the effective
-/// (next-boot) resolution, which is the meaningful thing to show for a VM that
-/// is not running.
+/// was actually booted with (`State.booted_*`), so the reported figures match
+/// the live VM rather than a later `config set`'s next-boot resolution (#747,
+/// R2.6). When stopped — or reading a pre-#747 state file with no snapshot —
+/// they fall back to the effective (next-boot) resolution, which is the
+/// meaningful thing to show for a VM that is not running.
 fn reported_resources(state: &State) -> (u8, u32) {
     match (state.lifecycle, state.booted_vcpus, state.booted_ram_mib) {
         // Running with a recorded snapshot: report exactly what the live VM
@@ -197,10 +181,6 @@ fn print_human(report: &StatusReport) {
             m.disk_read_bytes / (1024 * 1024),
             m.disk_written_bytes / (1024 * 1024),
         );
-    }
-    // Reactive warnings go to stderr so they don't pollute a piped status line.
-    for w in &report.warnings {
-        eprintln!("warning: {}", w.message);
     }
 }
 
@@ -310,8 +290,8 @@ mod tests {
     }
 
     #[test]
-    fn report_schema_when_stopped_has_null_metrics_and_no_warnings() {
-        let report = build_report(&State::stopped(), None, 2, 2048, None, None);
+    fn report_schema_when_stopped_has_null_metrics() {
+        let report = build_report(&State::stopped(), None, 2, 2048, None);
         let v = serde_json::to_value(&report).unwrap();
         for key in [
             "state",
@@ -320,24 +300,19 @@ mod tests {
             "vcpus",
             "ram_mib",
             "metrics",
-            "warnings",
         ] {
             assert!(v.get(key).is_some(), "status --json must contain {key}");
         }
         assert_eq!(v["state"], "stopped");
         assert!(v["metrics"].is_null(), "metrics must be null when stopped");
-        assert!(
-            v["warnings"].as_array().unwrap().is_empty(),
-            "no warnings when stopped"
-        );
     }
 
     #[test]
     fn running_reports_booted_snapshot_not_next_boot_resolution() {
         // A VM booted at 2048 MiB / 4 vcpus. Even if `config set` later changed
-        // the persisted next-boot values, `status` must report and warn against
-        // what the live VM actually booted with (R2.6). booted_* set ⇒ no
-        // effective_* fallback, so this is deterministic.
+        // the persisted next-boot values, `status` must report what the live VM
+        // actually booted with (R2.6). booted_* set ⇒ no effective_* fallback, so
+        // this is deterministic.
         let state = State {
             lifecycle: Lifecycle::Running,
             vmm_pid: Some(1),
@@ -349,26 +324,20 @@ mod tests {
     }
 
     #[test]
-    fn report_when_running_includes_metrics_and_pressure_warning() {
+    fn report_when_running_includes_metrics() {
         let state = State {
             lifecycle: Lifecycle::Running,
             vmm_pid: Some(1),
             started_at: Some(0),
             ..State::stopped()
         };
-        // Resident set == the full 1024 MiB cap ⇒ ≥90% ⇒ memory_pressure fires.
         let metrics = VmMetrics {
             cpu_percent: 12.5,
             resident_bytes: 1024 * 1024 * 1024,
             disk_read_bytes: 0,
             disk_written_bytes: 0,
         };
-        let report = build_report(&state, Some(42), 4, 1024, Some(metrics), Some((0, 0)));
-        assert!(
-            report.warnings.iter().any(|w| w.kind == "memory_pressure"),
-            "expected a memory_pressure warning: {:?}",
-            report.warnings
-        );
+        let report = build_report(&state, Some(42), 4, 1024, Some(metrics));
         let v = serde_json::to_value(&report).unwrap();
         assert_eq!(v["state"], "running");
         assert_eq!(v["vcpus"], 4);

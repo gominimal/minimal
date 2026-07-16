@@ -7,8 +7,8 @@
 # Also proves the #747 resource surface end-to-end against a real VM:
 # a persisted `config set --ram-mib` is consumed at boot (the running VM
 # reports that RAM, R2.5/R2.6), and `status --json` on a live VM carries
-# host-visible resource metrics (R9.1) and a warnings array (R9.9) — none
-# of which a unit test can exercise, since they need a booted VMM process.
+# host-visible resource metrics (R9.1) — neither of which a unit test can
+# exercise, since they need a booted VMM process.
 #
 # Target-agnostic: resolves `minvmd` from PATH (no cargo), so the same proof
 # runs on the Linux/KVM lane today and a macOS testbed later. Requires jq,
@@ -71,11 +71,10 @@ echo "::endgroup::"
 
 echo "::group::resource metrics + config consumed at boot (#747)"
 # The running VM must report (a) the ram it actually booted with — the 3072
-# persisted above, not the 2048 default (R2.5/R2.6); (b) live host-visible
-# metrics (R9.1); and (c) a warnings array (R9.9). cpu_percent and the disk
-# byte counters may legitimately be 0 on an idle VM, so assert they are
-# numeric rather than positive; a live VMM process always has resident_bytes
-# > 0.
+# persisted above, not the 2048 default (R2.5/R2.6); and (b) live host-visible
+# metrics (R9.1). cpu_percent and the disk byte counters may legitimately be 0
+# on an idle VM, so assert they are numeric rather than positive; a live VMM
+# process always has resident_bytes > 0.
 jq -e '
   .ram_mib == 3072
   and (.vcpus | type) == "number"
@@ -85,7 +84,6 @@ jq -e '
   and .metrics.resident_bytes > 0
   and (.metrics.disk_read_bytes | type) == "number"
   and (.metrics.disk_written_bytes | type) == "number"
-  and (.warnings | type) == "array"
 ' "$WORK/status.json"
 echo "::endgroup::"
 

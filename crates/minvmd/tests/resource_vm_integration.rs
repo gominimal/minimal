@@ -6,7 +6,7 @@
 //! - a `config set --ram-mib` persisted **before** boot is consumed at that
 //!   boot — the running VM's `status --json` reports it (R2.5/R2.6);
 //! - `status --json` on a live VM carries host-visible resource `metrics`
-//!   (numeric CPU / resident / disk-I/O, R9.1) and a `warnings` array (R9.9).
+//!   (numeric CPU / resident / disk-I/O, R9.1).
 //!
 //! Gates (identical to `boot_integration`): `#[cfg(minvmd_libkrun)]` (needs
 //! libkrun), `#[ignore]` (run with `--run-ignored`), `MINVMD_E2E=1`, and the
@@ -124,9 +124,9 @@ fn resource_metrics_and_config_consumed_at_boot() {
     };
 
     // 4. The live VM must report the persisted RAM (R2.5/R2.6) and live metrics
-    //    (R9.1) + a warnings array (R9.9). cpu_percent and the disk counters can
-    //    legitimately be 0 on an idle VM, so require numeric, not positive; a
-    //    live VMM process always has resident_bytes > 0.
+    //    (R9.1). cpu_percent and the disk counters can legitimately be 0 on an
+    //    idle VM, so require numeric, not positive; a live VMM process always has
+    //    resident_bytes > 0.
     assert_eq!(
         status["ram_mib"], 3072,
         "running VM must report the persisted ram_mib: {status}"
@@ -149,10 +149,6 @@ fn resource_metrics_and_config_consumed_at_boot() {
     assert!(
         m["disk_written_bytes"].is_number(),
         "disk_written_bytes: {status}"
-    );
-    assert!(
-        status["warnings"].is_array(),
-        "warnings must be an array: {status}"
     );
 
     // 5. Explicit stop, then confirm Stopped (the Stopper drop is a backstop).

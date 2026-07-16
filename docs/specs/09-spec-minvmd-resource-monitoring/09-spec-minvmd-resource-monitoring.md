@@ -53,11 +53,11 @@ Three additions, all host-side:
    configuration and each value's source; `config set --vcpus/--ram-mib`
    validates against host capacity and persists to a new `config.toml` in the
    provider-instance dir, consumed at the next boot.
-3. **Warnings**, in two forms: **proactive** over-allocation warnings at
-   `config set` (requested value exceeds host cores/memory, or straddles the
-   x86_64 MMIO hole), and **reactive** threshold warnings surfaced by `status`
-   when a running VM's resident memory nears its RAM cap or its data volume nears
-   full — plus a supervisor post-exit resource hint on abnormal VMM-child exit.
+3. **Warnings**: **proactive** over-allocation warnings at `config set`
+   (requested value exceeds host cores/memory, straddles the x86_64 MMIO hole, or
+   exceeds the guest-kernel vCPU ceiling), plus a supervisor post-exit resource
+   hint on an abnormal VMM-child exit (a guest workload's non-zero exit). There is
+   **no** host-side reactive memory/disk *pressure* threshold — see the note below.
 
 Configuration is kept in a **separate `config.toml`**, not in the runtime
 `State`: `State::stopped()` and `StartingGuard` reset runtime state on every stop
@@ -66,9 +66,14 @@ or crash, which would silently wipe config stored there. Resolution precedence i
 existing `MINVMD_VM_RAM_MIB` power-user escape hatch.
 
 Metrics are **host-visible VMM-process** usage, not guest-internal per-process
-metrics (minvmd runs no in-guest agent). The reactive warnings are likewise
-host-observable thresholds (sampled RSS vs the configured cap; the sparse data
-volume's on-disk allocation vs its cap), not guest cgroup / `df` introspection.
+metrics (minvmd runs no in-guest agent), so they are reported **raw**. Reactive
+memory/disk *pressure* thresholds were prototyped and removed as unmeasurable
+host-side: the VMM's RSS includes the guest's reclaimable page cache (so it
+approaches the cap for any long-running VM), and the data volume's host
+allocation is a monotonic high-water mark, not the guest ext4's free space.
+Accurate df/cgroup-based pressure warnings would require an in-guest agent
+(out of scope); the reliable reactive signal is the supervisor's abnormal-exit
+hint.
 
 ## Goals
 
@@ -80,9 +85,9 @@ volume's on-disk allocation vs its cap), not guest cgroup / `df` introspection.
    their source.
 3. `minvmd config set` warns (non-fatally) when a requested value over-allocates
    host resources or hits the x86_64 MMIO hole, and rejects structurally invalid
-   values.
-4. A running VM approaching a memory or disk limit surfaces a reactive warning via
-   `status`; an abnormal VMM-child exit prints a resource hint.
+   values (including a vcpu count above the guest-kernel ceiling).
+4. An abnormal VMM-child exit (a guest workload's non-zero exit) prints a resource
+   hint.
 5. No new behaviour on the non-VM (native minimald) path; the change is confined
    to the `minvmd` crate.
 
@@ -135,17 +140,16 @@ process in `status --json` and `status` human output.
   inspection). `status` shall sample only when the lifecycle is `Running` and
   `vmm_pid` is present; otherwise the `metrics` field is `null`.
 - **R1.3**: `crates/minvmd/src/cmd/status.rs` shall serialise a typed
-  `StatusReport { state, vmm_pid, uptime_seconds, vcpus, ram_mib, metrics,
-  warnings }`. Existing fields keep their shape and types; `metrics` is
-  `null`-or-object and `warnings` is an array (Unit 3). Assembly shall be a pure
-  `build_report(...)` function so the JSON shape is unit-testable without a live VM.
+  `StatusReport { state, vmm_pid, uptime_seconds, vcpus, ram_mib, metrics }`.
+  Existing fields keep their shape and types; `metrics` is `null`-or-object.
+  Assembly shall be a pure `build_report(...)` function so the JSON shape is
+  unit-testable without a live VM.
 
 **Proof Artifacts:**
 1. **Test:** `metrics::tests::sample_of_self_returns_metrics` — `sample(std::process::id())`
    returns `Some` with non-zero `resident_bytes`; `sample(0)` returns `None`.
-2. **Test:** `status::tests::report_schema_when_stopped_has_null_metrics_and_no_warnings`
-   — `build_report` for a stopped state serialises all seven keys with
-   `metrics: null`, `warnings: []`.
+2. **Test:** `status::tests::report_schema_when_stopped_has_null_metrics`
+   — `build_report` for a stopped state serialises all six keys with `metrics: null`.
 3. **CLI:** on a running VM, `minvmd status --json | jq .metrics.resident_bytes`
    prints a non-null integer.
 
@@ -217,53 +221,50 @@ process in `status --json` and `status` human output.
 
 ---
 
-### Unit 3: Resource warnings (proactive + reactive)
+### Unit 3: Resource warnings (proactive validation + supervisor hint)
 
-**Purpose:** Warn on over-allocation at config time and on resource pressure at
-runtime.
+**Purpose:** Warn on over-allocation at config time, and hint at resource
+exhaustion when a guest workload exits non-zero.
 
-**Depends on:** Unit 1 (sampler), Unit 2 (config surface + effective values)
+**Depends on:** Unit 2 (config surface + effective values)
 
 **Affected areas:**
-- `crates/minvmd/src/cmd/config.rs` — host-capacity validation
-- `crates/minvmd/src/metrics.rs` — `evaluate_warnings`, `data_volume_usage`
-- `crates/minvmd/src/cmd/status.rs` — `warnings` field
+- `crates/minvmd/src/cmd/config.rs` — host-capacity + ceiling validation
 - `crates/minvmd/src/cmd/run.rs` — supervisor post-exit hint
 
 **Baseline:**
-- No host-capacity check anywhere; no runtime resource warnings; the supervisor
-  bails on abnormal VMM-child exit with a bare code (`run.rs`).
+- No host-capacity check anywhere; the supervisor bails on abnormal VMM-child
+  exit with a bare code (`run.rs`).
 
 **Functional Requirements:**
 
 - **R3.1**: `minvmd config set` shall probe host capacity (logical cores via std,
   total memory via `sysinfo`) and emit **non-fatal** warnings when the request
   exceeds host cores or memory, and — on `x86_64` — when `ram_mib` falls in the
-  MMIO-hole range `3073..=6143`. The pure validator takes capacity as a parameter
-  so it is testable without the real host.
-- **R3.2**: `crates/minvmd/src/metrics.rs` shall provide
-  `evaluate_warnings(metrics, ram_mib, disk_used, disk_cap) -> Vec<Warning>`
-  emitting `memory_pressure` at resident-memory ≥ 90 % of the RAM cap and
-  `disk_pressure` at data-volume allocation ≥ 95 % of its cap (`disk_cap == 0`
-  disables the disk check). The RAM cap is the *booted* value (R2.6), not the
-  next-boot resolution. `data_volume_usage()` reports the sparse image's actual
-  on-disk allocation (`blocks × 512`) vs the image's own fixed size (`len`), not
-  `volume_bytes()` — which would drift if `MINVMD_VOLUME_BYTES` changed after the
-  image was created.
-- **R3.3**: `status` (R1.3) shall include the evaluated `warnings` array when
-  running (empty otherwise) and print each to stderr in human mode.
-- **R3.4**: `crates/minvmd/src/cmd/run.rs` shall, on abnormal VMM-child exit,
-  print a resource hint naming `minvmd config set --ram-mib/--vcpus` before it
-  bails (host-side analog of `minimal-entry`'s OOM post-mortem).
+  MMIO-hole range `3073..=6143`. It shall **reject** structurally unsafe values:
+  `vcpus == 0`, `vcpus > MAX_VM_VCPUS` (the guest-kernel ceiling), and
+  `ram_mib < 512`. The pure validator takes capacity as a parameter so it is
+  testable without the real host.
+- **R3.2**: `crates/minvmd/src/cmd/run.rs` shall, on an abnormal VMM-child exit
+  **with a real exit code** (a guest workload's non-zero exit; a signal-kill from
+  `minvmd stop` is excluded), print a resource hint naming `minvmd config set
+  --ram-mib/--vcpus` before it bails — the host-side analog of `minimal-entry`'s
+  OOM post-mortem, and the only reliable reactive resource signal available
+  without an in-guest agent.
+
+> **Removed:** an earlier draft added reactive `memory_pressure`/`disk_pressure`
+> threshold warnings in `status`. They were removed as unmeasurable host-side
+> (RSS includes guest page cache; sparse-image allocation is a high-water mark),
+> so `status --json` has no `warnings` field. See the Non-Goals and the
+> host-visible-metrics note in the Introduction.
 
 **Proof Artifacts:**
 1. **Test:** `cmd::config::tests::over_core_and_over_mem_warn_but_succeed` and
    `x86_mmio_hole_range_warns` — proactive warnings.
-2. **Test:** `metrics::tests::{memory_pressure_fires_at_or_above_threshold,
-   disk_pressure_fires_at_or_above_threshold}` and their below-threshold
-   negatives — reactive thresholds.
-3. **Test:** `status::tests::report_when_running_includes_metrics_and_pressure_warning`
-   — a running report with RSS at its cap carries a `memory_pressure` warning.
+2. **Test:** `cmd::config::tests::{zero_vcpus_is_rejected, vcpus_over_ceiling_is_rejected,
+   ram_below_floor_is_rejected}` — structural rejections.
+3. **Code:** `crates/minvmd/src/cmd/run.rs` — the abnormal-exit hint, guarded on a
+   real exit code.
 
 ## Non-Goals
 
@@ -271,8 +272,10 @@ runtime.
   reaffirms `docs/specs/01-spec-minvmd-host-daemon/…:335`.
 - **Guest-internal per-process metrics** — needs an in-guest agent; metrics are
   host-VMM-process only.
-- **Reading guest cgroup `memory.events` / in-guest `df`** — the reactive warnings
-  are host-observable proxies, not guest introspection.
+- **Reactive memory/disk pressure warnings** — accurate detection needs guest
+  cgroup `memory.events` / in-guest `df`, i.e. an in-guest agent. The host-side
+  proxies (RSS, sparse allocation) are unmeasurable and were removed; the reliable
+  reactive signal is the supervisor exit hint (R3.2).
 - **Multi-VM config** — single `local-0` instance, per the v0.1 single-VM stance.
 
 ## Design Considerations
@@ -290,10 +293,9 @@ runtime.
   running `status` reports the boot-time snapshot (R2.6) — so the two answer
   different, correctly-scoped questions ("what will next boot use" vs "what is the
   live VM running").
-- **The reactive warning must measure against the live cap, not the next-boot
-  cap.** Without R2.6, `config set --ram-mib 16384` on a VM booted at 2048 would
-  silence a genuine `memory_pressure` warning (RSS compared against 16384 instead
-  of 2048). Recording the booted values in `State` closes this.
+- **`status` reports the booted snapshot for a running VM (R2.6).** `State`
+  records the resolved boot-time `vcpus`/`ram_mib` so a running `status` reports
+  what the live VM booted with, not a later `config set`'s next-boot value.
 
 ## Repository Standards
 
@@ -315,16 +317,17 @@ runtime.
 
 ## Technical Considerations
 
-- `data_volume_usage` uses `std::os::unix::fs::MetadataExt::blocks()` (unix-only;
-  minvmd targets macOS + Linux). The default 256 GiB sparse volume means
-  `disk_pressure` fires only on genuine near-full, which is intended.
 - `sysinfo` is added with `default-features = false, features = ["system"]` to
   keep the dependency footprint to process + memory info.
+- `MAX_VM_VCPUS` is a conservative constant, not the real guest-kernel
+  `CONFIG_NR_CPUS` (not pinned in this repo). It restores the boot-safety the
+  previously hardcoded `2` gave; raise it once the guest kernel's true ceiling is
+  confirmed.
 
 ## Security Considerations
 
-- Metrics and warnings expose only host-visible aggregate resource figures for a
-  process minvmd already owns; no new privileged access or guest data crosses the
+- Metrics expose only host-visible aggregate resource figures for a process
+  minvmd already owns; no new privileged access or guest data crosses the
   boundary. `config set` writes only within the provider-instance dir.
 
 ## Verification
@@ -332,16 +335,14 @@ runtime.
 | Req | Proof type | Command / observable |
 |-----|------------|----------------------|
 | R1.1 | Test | `cargo test -p minvmd metrics::tests::sample_of_self_returns_metrics` |
-| R1.2/R1.3 | Test | `cargo test -p minvmd status::tests::report_schema_when_stopped_has_null_metrics_and_no_warnings` |
+| R1.2/R1.3 | Test | `cargo test -p minvmd status::tests::report_schema_when_stopped_has_null_metrics` |
 | R1.3 | CLI | `minvmd status --json \| jq .metrics` — object when running, `null` when stopped |
-| R1.3/R9.1/R9.9 | E2E | `scripts/minvmd-lifecycle.sh` (KVM lane) asserts a live VM's `status --json` carries numeric `metrics.*` and a `warnings` array |
+| R1.3/R9.1 | E2E | `scripts/minvmd-lifecycle.sh` (KVM lane) asserts a live VM's `status --json` carries numeric `metrics.*` |
 | R2.1 | Test | `cargo test -p minvmd config::tests` |
 | R2.2 | Test | `cargo test -p minvmd cmd::config::tests::source_precedence_is_env_then_config_then_default` |
 | R2.3/R2.4 | CLI | `minvmd config set --ram-mib 3072 && minvmd config show --json` |
 | R2.5/R2.6 | E2E | `scripts/minvmd-lifecycle.sh` (KVM lane): `config set --ram-mib 3072` → `run --detach` → the running VM's `status --json` reports `ram_mib == 3072` (the persisted value, consumed at real boot) |
-| R2.5/R2.6/R9.1/R9.9 | E2E (both VM lanes) | `crates/minvmd/tests/resource_vm_integration.rs` — auto-discovered on Linux/KVM **and** macOS/HVF: boots a VM, asserts `status --json` reports the persisted `ram_mib` plus live `metrics.*` and a `warnings` array |
+| R2.5/R2.6/R9.1 | E2E (both VM lanes) | `crates/minvmd/tests/resource_vm_integration.rs` — auto-discovered on Linux/KVM **and** macOS/HVF: boots a VM, asserts `status --json` reports the persisted `ram_mib` plus live `metrics.*` |
 | R2.6 | Test | `cargo test -p minvmd status::tests::running_reports_booted_snapshot_not_next_boot_resolution` + `state::tests::pre_747_state_file_without_booted_fields_reads_as_none` |
-| R3.1 | Test | `cargo test -p minvmd cmd::config::tests::over_core_and_over_mem_warn_but_succeed` |
-| R3.2 | Test | `cargo test -p minvmd metrics::tests` (pressure thresholds) |
-| R3.3 | Test | `cargo test -p minvmd status::tests::report_when_running_includes_metrics_and_pressure_warning` |
-| R3.4 | Code | `crates/minvmd/src/cmd/run.rs` abnormal-exit hint |
+| R3.1 | Test | `cargo test -p minvmd cmd::config::tests` (over-core/over-mem warn; zero/over-ceiling/sub-floor reject) |
+| R3.2 | Code | `crates/minvmd/src/cmd/run.rs` abnormal-exit hint (guarded on a real exit code) |

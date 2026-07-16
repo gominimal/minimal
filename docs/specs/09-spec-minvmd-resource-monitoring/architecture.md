@@ -27,24 +27,25 @@ the next launch).
    `effective_ram_mib()` resolve `env ?? config ?? default`; `vmm_child` boots
    from them and `config show` reports them. The `Running` state additionally
    records the resolved boot-time values (`State.booted_*`), and `status` reports
-   *those* for a live VM (see the warning-denominator decision below).
+   *those* for a live VM.
 
-3. **Warnings** — proactive (over-allocation vs host cores/memory + the x86_64
-   MMIO hole, checked at `config set`) and reactive (memory/disk pressure vs the
-   configured caps, evaluated by `status`; plus a supervisor post-exit hint).
+3. **Warnings** — proactive only: over-allocation vs host cores/memory, the
+   x86_64 MMIO hole, and a guest-kernel vCPU ceiling, all checked at `config set`;
+   plus a supervisor post-exit resource hint on a guest workload's non-zero exit.
+   There is **no** host-side reactive pressure threshold (see the removed-warnings
+   note under Alternatives).
 
 The config-vs-state separation, the `env ?? config ?? default` precedence, and
-the boot-time snapshot (so the reactive warning measures live RSS against the cap
-the VM *actually booted with*, not a later `config set`'s next-boot value) are the
-load-bearing decisions; all are motivated below.
+the boot-time snapshot (so `status` reports what the VM *actually booted with*,
+not a later `config set`'s next-boot value) are the load-bearing decisions; all
+are motivated below.
 
 ## Data and interface changes
 
 ### New files
 
-- `crates/minvmd/src/metrics.rs` — `VmMetrics`, `Warning`, `sample(pid) ->
-  Option<VmMetrics>`, `data_volume_usage() -> Option<(u64, u64)>`,
-  `evaluate_warnings(&VmMetrics, ram_mib, disk_used, disk_cap) -> Vec<Warning>`.
+- `crates/minvmd/src/metrics.rs` — `VmMetrics`, `sample(pid) -> Option<VmMetrics>`
+  (raw host-visible sampling only; no pressure thresholds).
 - `crates/minvmd/src/config.rs` — `ResourceConfig { vcpus: Option<u8>, ram_mib:
   Option<u32> }` with `read(dir)` / `write(dir)` (atomic).
 - `crates/minvmd/src/cmd/config.rs` — `run_show(json)`, `run_set(vcpus, ram_mib)`,
@@ -60,7 +61,7 @@ load-bearing decisions; all are motivated below.
   (private), `persisted_resource_config`, `effective_ram_mib`/`effective_vcpus`.
   `vm_ram_mib()` is removed (its two callers move to `effective_ram_mib`).
 - `cmd/status.rs` — inline `json!` → `#[derive(Serialize)] StatusReport { …,
-  metrics, warnings }`; pure `build_report`; metrics sampled only when running.
+  metrics }`; pure `build_report`; metrics sampled only when running.
 - `cmd/vmm_child.rs` — `VmConfig::new(effective_vcpus(), effective_ram_mib(), …)`.
 - `cmd/run.rs` — abnormal-exit resource hint before the existing `bail!`.
 - `main.rs` — `Command::Config { action: ConfigAction::{Show, Set} }`.
@@ -69,7 +70,8 @@ load-bearing decisions; all are motivated below.
 ### `status --json` schema delta
 
 Existing keys (`state`, `vmm_pid`, `uptime_seconds`, `vcpus`, `ram_mib`) keep
-their types; `vcpus`/`ram_mib` are now the *effective* values. Two keys are added:
+their types; for a running VM `vcpus`/`ram_mib` are the booted snapshot. One key
+is added:
 
 ```json
 {
@@ -78,10 +80,7 @@ their types; `vcpus`/`ram_mib` are now the *effective* values. Two keys are adde
     "resident_bytes": 1073741824,
     "disk_read_bytes": 0,
     "disk_written_bytes": 0
-  },
-  "warnings": [                   // [] unless a threshold is crossed
-    { "kind": "memory_pressure", "message": "VM resident memory is 92% of its …" }
-  ]
+  }
 }
 ```
 
@@ -97,14 +96,18 @@ their types; `vcpus`/`ram_mib` are now the *effective* values. Two keys are adde
   on every stop/crash, which would silently wipe persisted config; a sibling
   `config.toml` decouples user intent from ephemeral runtime state.
 - **Report the next-boot `effective_*` resolution as the live values** (no boot
-  snapshot). Rejected during review: it makes the `memory_pressure` warning
-  measure live RSS against the wrong cap — `config set --ram-mib 16384` on a VM
-  booted at 2048 silences a genuine OOM warning. Chosen instead: stamp the
-  resolved boot values into `State.booted_*` (R2.6) and report/warn against those.
-- **Guest-internal metrics / cgroup + `df` reactive warnings** (as
-  `minimal-vm-mac` does in-guest). Rejected for v0.2: no in-guest agent exists;
-  host-observable proxies (VMM RSS vs cap, sparse-image allocation vs cap) deliver
-  the same guidance without a guest round-trip.
+  snapshot). Rejected during review: `status` would misreport a running VM's
+  resources after a `config set`. Chosen instead: stamp the resolved boot values
+  into `State.booted_*` (R2.6) and report those.
+- **Host-side reactive `memory_pressure`/`disk_pressure` threshold warnings.**
+  Prototyped, then **removed** after review: they are unmeasurable host-side. The
+  VMM's RSS includes the guest's reclaimable page cache, so a threshold fires on
+  any long-running VM (false alarm); the data volume's host allocation is a
+  monotonic high-water mark, not guest ext4 free space, so a disk threshold fires
+  too late or never (false negative), and its `MINVMD_VOLUME_BYTES` advice is a
+  no-op on an existing image. Accurate df/cgroup warnings need an in-guest agent
+  (`minimal-vm-mac` does exactly this in-guest) — out of scope. The reliable
+  reactive signal kept is the supervisor's abnormal-exit hint.
 
 ## Assumption ledger
 
@@ -112,9 +115,8 @@ their types; `vcpus`/`ram_mib` are now the *effective* values. Two keys are adde
 |------|-----------|--------|----------|
 | vmm-rss-reflects-guest | The VMM process's RSS/CPU/disk-I/O meaningfully reflect the guest, since libkrun runs the guest inside that process. | confident | libkrun architecture; `minimal-vm-mac` samples the same host process by PID. |
 | sysinfo-cross-platform-diskio | `sysinfo` `Process::disk_usage()` is populated on both macOS and Linux. | confident | sysinfo supports process disk usage on Linux/macOS/Windows/FreeBSD; verified by the self-sample test. |
-| blocks-tracks-sparse-usage | `MetadataExt::blocks() × 512` tracks a sparse raw image's real allocation. | confident | `st_blocks` is allocated 512-B blocks on APFS and ext4. |
-| env-divergence-resolved | A running `status` reflects the live VM's actual booted `vcpus`/`ram_mib`, including env-override boots, via `State.booted_*`. | confident | R2.6; the warning denominator uses the booted cap, not the next-boot resolution. |
-| default-256gib-volume | The 256 GiB default data volume means `disk_pressure` rarely fires, which is correct (only near-full). | confident | `volume.rs:DEFAULT_VOLUME_BYTES`. |
+| env-divergence-resolved | A running `status` reflects the live VM's actual booted `vcpus`/`ram_mib`, including env-override boots, via `State.booted_*`. | confident | R2.6. |
+| max-vcpus-conservative | `MAX_VM_VCPUS = 8` is at or below the guest kernel's `CONFIG_NR_CPUS`, so a clamped/validated count never bricks the boot. | needs-confirm | the guest kernel config is not pinned in this repo; 8 is a conservative guard, raisable once confirmed. |
 
 ## Knowledge gaps
 

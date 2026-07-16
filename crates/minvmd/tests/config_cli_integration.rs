@@ -93,11 +93,9 @@ fn status_json_schema_when_stopped() {
         "vcpus",
         "ram_mib",
         "metrics",
-        "warnings",
     ] {
         assert!(v.get(key).is_some(), "status --json missing {key}: {out}");
     }
     assert_eq!(v["state"], "stopped");
     assert!(v["metrics"].is_null(), "metrics null when stopped");
-    assert!(v["warnings"].as_array().unwrap().is_empty());
 }
