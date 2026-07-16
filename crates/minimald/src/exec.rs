@@ -179,7 +179,7 @@ async fn task_producer(
         // guest rootfs lacking `ip`/`nsenter`), so an `OwnIp` session's task
         // falls back to `HostNet` here instead of running in an empty,
         // egress-less netns.
-        let network_mode = match session.record().await.network {
+        let network_mode = match session.record().await?.network {
             m @ (sandbox2::NetworkMode::HostNet | sandbox2::NetworkMode::NoNet) => m,
             // OwnIp falls back to HostNet (the per-PTask tap/switch attach for the
             // task producer is a follow-up); `NetworkMode` is #[non_exhaustive],
@@ -880,7 +880,15 @@ async fn handle_git_receive(
     session.channel_success(id)?;
 
     spawn(async move {
-        let paths = session_handle.paths().await;
+        let paths = match session_handle.paths().await {
+            Ok(paths) => paths,
+            // The actor died between resolve and this call (raced an
+            // abort/destroy); the channel was already acked, so just drop it.
+            Err(e) => {
+                tracing::warn!(error = %e, "git-receive-pack aborted: session is gone");
+                return;
+            }
+        };
 
         let dotgit_dir = paths.working.as_utf8_path().join(".git");
         if let Ok(false) = tokio::fs::try_exists(&dotgit_dir).await {
@@ -1361,22 +1369,16 @@ mod tests {
         //! and `handle_exec` request routing.
         use sessions::SessionId;
 
-        use minimald_rpc::CreateSession;
-
         use crate::MINIMAL_SESSION_ID_ENV;
-        use crate::sessions::SessionKeyPredicate;
-        use crate::test_harness::{TestClient, TestServer, create_session_req, unwrap_ready};
+        use crate::test_harness::{
+            TestClient, TestServer, create_configured_session, create_session_req,
+        };
 
         /// Creates a fresh session through the public CreateSession RPC
         /// and returns its id, mirroring how a real client sets up state
         /// before running commands against the session.
         async fn fresh_session(client: &mut TestClient) -> SessionId {
-            unwrap_ready(
-                client
-                    .call::<CreateSession>(&create_session_req("exec-test", "/tmp"))
-                    .await
-                    .unwrap(),
-            )
+            create_configured_session(client, "exec-test", "/tmp").await
         }
 
         /// An exec request that isn't `min run <task>` must be refused
@@ -1408,29 +1410,48 @@ mod tests {
         /// serviced straight from the workspace `minimal.toml` — no
         /// package graph, upstream, or sandbox — and its text (plus a
         /// trailing newline) round-trips over the channel with exit 0.
+        ///
+        /// Drives the client's real ordering — create, populate the
+        /// workspace, *then* configure the loadout against it — which is the
+        /// sequence `minvmd`'s libkrun e2e test runs over the bridge. Keeping
+        /// it in-process here means a break in that sequence (e.g. execing a
+        /// session whose loadout was never configured, which has no context
+        /// to resolve a task against) surfaces without needing a VM.
         #[tokio::test]
         async fn exec_runs_echo_task() {
+            use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+
             let server = TestServer::new().await;
             let mut client = server.connect().await;
-            let session_id = fresh_session(&mut client).await;
-            let session_str = session_id.to_string();
-
-            // Drop a task-only `minimal.toml` into the session workspace.
-            // No `[upstream]`: the echo short-circuit never builds a graph,
-            // so nothing here reaches the (network-bound) package machinery.
-            let mngr = server.state.sessions_manager().await;
-            let session_handle = mngr
-                .get_session(SessionKeyPredicate::Id(session_id))
+            let session_id = client
+                .call::<CreateSession>(&create_session_req("exec-test", "/tmp"))
                 .await
                 .unwrap()
-                .expect("freshly-created session should be retrievable");
-            let workspace = session_handle.paths().await.working;
-            tokio::fs::write(
-                workspace.as_utf8_path().join(mfile::MFILE_NAME),
-                "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n",
-            )
-            .await
-            .unwrap();
+                .id;
+            let session_str = session_id.to_string();
+
+            // Drop a task-only `minimal.toml` into the session workspace,
+            // standing in for the e2e test's SFTP upload. No `[upstream]`:
+            // the echo short-circuit never builds a graph, so nothing here
+            // reaches the (network-bound) package machinery.
+            server
+                .seed_workspace_mfile(
+                    session_id,
+                    "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n",
+                )
+                .await;
+
+            // A task-only mfile gates nothing, so the loadout finalizes in
+            // one shot rather than erroring or pending.
+            crate::test_harness::unwrap_ready(
+                client
+                    .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                        session_id,
+                        contribution: Default::default(),
+                    })
+                    .await
+                    .unwrap(),
+            );
 
             let out = client
                 .exec(
@@ -1449,104 +1470,6 @@ mod tests {
                 "echo task should produce no stderr: {:?}",
                 out.stderr,
             );
-        }
-
-        /// End-to-end: `git push min://<session-id>` driven by an
-        /// OpenSSH process going through a modified `git-remote-min`
-        /// helper lands the pushed commit in the session workspace, with
-        /// the post-receive hook checking out the branch on disk.
-        #[ignore]
-        #[tokio::test]
-        async fn git_receive_pack_lands_pushed_commit_in_workspace() {
-            use std::os::unix::fs::PermissionsExt;
-
-            use tempfile::TempDir;
-            use tokio::process::Command;
-
-            async fn run_git(cwd: &std::path::Path, args: &[&str]) {
-                let out = Command::new("git")
-                    .current_dir(cwd)
-                    .args(args)
-                    .output()
-                    .await
-                    .expect("git should be invocable");
-                assert!(
-                    out.status.success(),
-                    "git {args:?} failed: {}",
-                    String::from_utf8_lossy(&out.stderr),
-                );
-            }
-
-            let server = TestServer::new().await;
-            let sock_dir = TempDir::new().unwrap();
-            let sock_path = sock_dir.path().join("ssh.sock");
-            server.listen_on_uds(&sock_path).await;
-
-            let mut client = server.connect().await;
-            let session_id = fresh_session(&mut client).await;
-
-            // Drop a `git-remote-min` into a tempdir and prepend that
-            // tempdir to PATH so `git push min://…` resolves to it. The
-            // script is the production one with its hard-coded socket
-            // path swapped for the test server's UDS.
-            let helpers_dir = TempDir::new().unwrap();
-            let helper_path = helpers_dir.path().join("git-remote-min");
-            let template = include_str!("../git-remote-min");
-            let script = template.replace(
-                "$HOME/.local/state/minimal/providers/local-0/ssh.sock",
-                sock_path.to_str().unwrap(),
-            );
-            tokio::fs::write(&helper_path, script).await.unwrap();
-            tokio::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o755))
-                .await
-                .unwrap();
-
-            // Source repo with a single commit on `main`. Local
-            // user.email/user.name to keep the test independent of any
-            // global git config.
-            let src_dir = TempDir::new().unwrap();
-            let src_path = src_dir.path();
-            run_git(src_path, &["init", "-q", "-b", "main"]).await;
-            run_git(src_path, &["config", "user.email", "t@example.com"]).await;
-            run_git(src_path, &["config", "user.name", "Test"]).await;
-            tokio::fs::write(src_path.join("hello.txt"), b"hi there\n")
-                .await
-                .unwrap();
-            run_git(src_path, &["add", "hello.txt"]).await;
-            run_git(src_path, &["commit", "-q", "-m", "first commit"]).await;
-
-            let inherited_path = std::env::var("PATH").unwrap_or_default();
-            let path_with_helper = format!("{}:{}", helpers_dir.path().display(), inherited_path);
-            let url = format!("min://{session_id}");
-            let push = Command::new("git")
-                .current_dir(src_path)
-                .env("PATH", &path_with_helper)
-                .args(["push", &url, "main"])
-                .output()
-                .await
-                .expect("git push should run");
-            assert!(
-                push.status.success(),
-                "git push failed: stdout={} stderr={}",
-                String::from_utf8_lossy(&push.stdout),
-                String::from_utf8_lossy(&push.stderr),
-            );
-
-            // The post-receive hook checks out `refs/heads/main` into
-            // the worktree, so the pushed file should be readable from
-            // the session workspace.
-            let mngr = server.state.sessions_manager().await;
-            let session_handle = mngr
-                .get_session(SessionKeyPredicate::Id(session_id))
-                .await
-                .unwrap()
-                .expect("session should be retrievable");
-            let paths = session_handle.paths().await;
-            let pushed = paths.working.as_utf8_path().join("hello.txt");
-            let contents = tokio::fs::read(&pushed)
-                .await
-                .unwrap_or_else(|e| panic!("reading pushed file {pushed} failed: {e}"));
-            assert_eq!(contents, b"hi there\n");
         }
     }
 }

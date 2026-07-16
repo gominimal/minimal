@@ -335,17 +335,26 @@ jobs:
           MINVMD_BOOT_LOG: ${{ runner.temp }}/boot-daemon.log
         run: ./scripts/minvmd-lifecycle.sh
 
+      - name: Fetch pinned gvproxy switch binary
+        # minvmd spawns this as the per-host-VM switch that provides the guest's
+        # egress (NAT + DNS). Without it minvmd boots the VM switchless
+        # (gvproxy resolution is best-effort and never errors), so the guest's
+        # overlay has no other end and every egress — including the in-guest
+        # `pkgs` clone during session mint — dies with "Could not resolve host".
+        run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
+
       - name: Session e2e via the CLI (activate/exec/destroy; autospawns minvmd)
         # The SAME unified proof every target lane runs (scripts/session-e2e.sh)
         # against Deployment Model 3 (native Linux + VM — the target this
         # lane owns; see docs/specs/03-spec-networking): from a clean state
         # `minimal --minvmd activate` must auto-spawn minvmd, boot the microVM,
         # and round-trip a session exec over the vsock bridge — the Linux/KVM
-        # counterpart of the macOS lane's CLI gate. E2E_PROJECT_DIR=/tmp: no
-        # project sync into the guest yet, so activate a path that exists in
-        # the guest image. minimal/minvmd resolve from the testbed on PATH.
+        # counterpart of the macOS lane's CLI gate. Since #748 activate uploads
+        # the project into the guest; E2E_PROJECT_DIR=/tmp still names a guest
+        # path. minimal/minvmd resolve from the testbed on PATH.
         env:
           MINVMD_BOOT_LOG: ${{ runner.temp }}/cli-e2e-boot.log
+          MINVMD_GVPROXY_BIN: ${{ runner.temp }}/gvproxy
         run: E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd E2E_PROJECT_DIR=/tmp ./scripts/session-e2e.sh
 
       - name: Upload guest boot console logs

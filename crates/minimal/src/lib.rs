@@ -3,6 +3,7 @@
 use anyhow::{Context as _, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
+use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
@@ -12,6 +13,8 @@ pub mod autospawn;
 pub mod client;
 pub mod config;
 pub mod dirs;
+mod file_upload;
+pub mod git_remote;
 pub mod loadouts;
 
 #[derive(Parser)]
@@ -195,7 +198,12 @@ pub struct MeshJoinArgs {
 }
 
 /// Shared arguments all subcommands
-#[derive(Debug, Args)]
+///
+/// The `Default` value is the no-flags invocation (no overrides, native
+/// backend) — what a bare `min <cmd>` resolves to, and what indirect
+/// entrypoints like the `git-remote-min` helper mode (which git invokes
+/// without any of our flags) use.
+#[derive(Debug, Default, Args)]
 pub struct GlobalArgs {
     /// Use the given directory as the repository root, instead of the current
     /// working directory.
@@ -227,6 +235,9 @@ pub struct ActivateArgs {
     /// Project path to activate (defaults to current directory)
     #[arg(default_value = ".")]
     pub path: String,
+    /// How to load project files into the session.
+    #[arg(long, value_enum, default_value_t = SyncMode::Tarball)]
+    pub sync: SyncMode,
     /// Network mode: no-net, host-net (default), or own-ip.
     #[arg(long, value_enum, default_value_t = CliNetworkMode::HostNet)]
     pub network: CliNetworkMode,
@@ -246,6 +257,15 @@ pub struct ActivateArgs {
     /// Automatically attach after creation
     #[arg(long)]
     pub attach: bool,
+}
+
+/// Configuration for file sync during activation.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum SyncMode {
+    /// Stream a tarball of your project and unpack it into the session.
+    Tarball,
+    /// Do not populate the worktree of the session.
+    None,
 }
 
 /// CLI surface for [`sessions::NetworkMode`]. A local `ValueEnum` keeps the
@@ -787,22 +807,52 @@ async fn send_abort(client: &mut client::Client, session_id: sessions::SessionId
     }
 }
 
-/// Check for a `minimal.toml` at the project path. If missing, prompt
-/// the user to initialize one before proceeding with activation.
-fn ensure_mfile_or_prompt(
+/// Whether the project already has a `minimal.toml`, in either the root
+/// (`<project>/minimal.toml`) or `.minimal/`
+/// (`<project>/.minimal/minimal.toml`) layout.
+///
+/// Uses [`mfile::File::from_dir`] — the same resolver the CLI loads config
+/// with — rather than a naive `join(MFILE_NAME)`, so detection matches the
+/// path the init writer would target and we never scaffold over a config
+/// living under `.minimal/`. Any outcome other than [`mfile::Error::NotFound`]
+/// (including a present-but-malformed file) counts as "exists".
+fn project_has_mfile(project_path: &camino::Utf8Path) -> bool {
+    !matches!(
+        mfile::File::from_dir(project_path.as_std_path()),
+        Err(mfile::Error::NotFound)
+    )
+}
+
+/// Offer to initialize a `minimal.toml` at the project path when it has
+/// none, on the way into an activation.
+///
+/// Purely an offer: a project without one still activates. The daemon never
+/// reads this path — it is a path on the *client's* machine — and fabricates
+/// a default shell-stack `minimal.toml` inside the session's own workspace
+/// instead, so the session comes up either way. Scaffolding here is a
+/// convenience for the interactive case (the project gets a real config it
+/// can grow), not a precondition.
+fn offer_mfile_scaffold(
     project_path: &camino::Utf8Path,
     global: &GlobalArgs,
 ) -> Result<(), anyhow::Error> {
-    if project_path.join(mfile::MFILE_NAME).exists() {
+    if project_has_mfile(project_path) {
         return Ok(());
     }
 
     eprintln!("\nNo {} found at {}.", mfile::MFILE_NAME, project_path);
-    if !confirm("Would you like to create one?")? {
-        bail!(
-            "No {} found. Run 'minimal init' to create one.",
-            mfile::MFILE_NAME
+
+    // `confirm` treats empty/EOF input as "yes", so on non-interactive
+    // stdin (CI, pipes, agents) it would silently default this scaffold to
+    // "yes" — and, when a config is discovered under `.minimal/`, the init
+    // writer would clobber it. Only prompt on a real terminal; anywhere else
+    // (and on a declined prompt) carry on without scaffolding.
+    if !std::io::stdin().is_terminal() || !confirm("Would you like to create one?")? {
+        eprintln!(
+            "Continuing without one; the session gets a default environment. \
+             Run 'minimal init' to give the project its own config."
         );
+        return Ok(());
     }
 
     let config = if global.repo_dir.is_some() {
@@ -832,7 +882,7 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     let abs_path =
         paths::HostAbsPath::try_new(utf8_path.clone()).context("Invalid project path")?;
 
-    ensure_mfile_or_prompt(&utf8_path, global)?;
+    offer_mfile_scaffold(&utf8_path, global)?;
 
     let mut port_mappings = Vec::with_capacity(args.ingress.len());
     for spec in &args.ingress {
@@ -875,13 +925,11 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
 
     let mut client = connect_daemon(global).await?;
 
-    use minimald_rpc::{CreateSession, CreateSessionRequest};
-    let req = CreateSessionRequest {
-        config,
-        contribution,
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
     };
     let resp = client
-        .oneshot_rpc::<CreateSession>(req)
+        .oneshot_rpc::<CreateSession>(CreateSessionRequest { config })
         .await
         .context("CreateSession RPC failed")?;
 
@@ -894,12 +942,40 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
             bail!("CreateSession failed: {error}");
         }
     };
+    let id = created.id;
+
+    // The session exists but has no loadout yet; composing it is a second
+    // round-trip because the daemon's composer reads the project config out
+    // of the session's workspace, not from a path on this machine.
+    let configured = client
+        .oneshot_rpc::<ConfigureLoadout>(ConfigureLoadoutRequest {
+            session_id: id,
+            contribution,
+        })
+        .await
+        .context("ConfigureLoadout RPC failed")?;
+    let configured = match configured {
+        minimald_rpc::Errorable::Ok(r) => r,
+        minimald_rpc::Errorable::Err { error } => {
+            bail!("ConfigureLoadout failed: {error}");
+        }
+    };
     // The daemon may finalize immediately (`Ready`) or ask the
     // client to gate items first (`Pending`).
-    let id = match created {
-        minimald_rpc::CreateSessionResponse::Ready { id } => id,
-        minimald_rpc::CreateSessionResponse::Pending { id: _, response } => {
-            drive_pending_to_active(&mut client, response, user_policy, compose_options).await?
+    if let minimald_rpc::ConfigureLoadoutResponse::Pending { response } = configured {
+        drive_pending_to_active(&mut client, response, user_policy, compose_options).await?;
+    }
+
+    // Upload the project directory to the daemon so the session
+    // sandbox has the user's files available.
+    match args.sync {
+        SyncMode::None => {}
+        SyncMode::Tarball => {
+            eprintln!("Uploading project files...");
+            client
+                .upload_workspace_files(id, utf8_path.as_std_path())
+                .await
+                .context("Failed to upload project files")?;
         }
     };
 
@@ -920,6 +996,42 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
 /// Shell-quote a string for safe interpolation into `sh -c`.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+/// Quote a path for use as an `ssh -o` option value.
+///
+/// ssh re-parses the value as a config line, splitting on whitespace to allow a
+/// file list and honouring `\` escapes inside quotes. So the quotes carry a path
+/// with spaces, and `\`/`"` must be escaped within them — unescaped, a `"`
+/// resolves the option to the wrong file and a trailing `\` swallows the closing
+/// quote, both of which make ssh reject the line outright.
+fn ssh_opt_quote(path: &std::path::Path) -> String {
+    // Backslashes first: escaping quotes introduces backslashes of its own.
+    let escaped = path
+        .display()
+        .to_string()
+        .replace('\\', r"\\")
+        .replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// The `ssh` host-key options for attaching, given the `known_hosts` sitting
+/// next to the daemon socket.
+///
+/// minvmd records the guest's host key there from the boot beacon, so when the
+/// file is present we pin against it. A native minimald also writes this.
+fn host_key_opts(known_hosts: &std::path::Path) -> [String; 2] {
+    if known_hosts.is_file() {
+        [
+            "StrictHostKeyChecking=yes".to_string(),
+            format!("UserKnownHostsFile={}", ssh_opt_quote(known_hosts)),
+        ]
+    } else {
+        [
+            "StrictHostKeyChecking=no".to_string(),
+            "UserKnownHostsFile=/dev/null".to_string(),
+        ]
+    }
 }
 
 /// Attach to an existing session. Both interactive and `--command` paths
@@ -953,6 +1065,8 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
         shell_quote(&sock.display().to_string()),
     );
 
+    let [strict, known_hosts_file] = host_key_opts(&sock.with_file_name(paths::KNOWN_HOSTS_FILE));
+
     let mut ssh = std::process::Command::new("ssh");
     ssh.env("MINIMAL_SESSION_ID", record.id.to_string()).args([
         "-o",
@@ -960,9 +1074,9 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
         "-o",
         &format!("ProxyCommand={proxy_cmd}"),
         "-o",
-        "StrictHostKeyChecking=no",
+        &strict,
         "-o",
-        "UserKnownHostsFile=/dev/null",
+        &known_hosts_file,
     ]);
 
     // The interactive path opens the in-sandbox session shell via the daemon's
@@ -1163,7 +1277,27 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
 }
 
 /// Shut down the minimald daemon via the `Shutdown` RPC.
+///
+/// A daemon that is already down is the goal state, not a failure: `stop` says
+/// so and exits 0. Without the probe the only way to find that out is to fail
+/// connecting to it, which reports a connect error (or a timeout, against a
+/// stale socket) for a machine that is in exactly the state asked for. Note the
+/// deliberate asymmetry with every other command: they call `ensure_daemon` and
+/// autospawn, which for `stop` would mean booting a VM in order to shut it down.
 pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow::Error> {
+    // Cheap and bounded (a state-file read, or a connect to a local socket that
+    // refuses at once when nothing listens), so it runs inline rather than on
+    // the blocking pool — unlike the shutdown wait below, which sleep-polls.
+    if !autospawn::is_daemon_running(global.minvmd, global.minimal_dir.as_deref())
+        .context("Failed to determine whether the daemon is running")?
+    {
+        println!("Daemon is not running.");
+        return Ok(());
+    }
+
+    // Racy by nature: the daemon may go down between the probe and this connect
+    // (or `--minvmd` may point the probe and the client at different backends),
+    // so a connect failure is still a real error, not something to swallow.
     let mut client = connect_daemon(global).await?;
 
     use minimald_rpc::{Shutdown, ShutdownRequest, ShutdownResponse};
@@ -1563,6 +1697,56 @@ pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
 mod tests {
     use super::*;
 
+    /// A VM-backed provider dir carries the guest's recorded host key, so
+    /// attach must verify against it rather than waive the check.
+    #[test]
+    fn host_key_opts_pin_to_an_adjacent_known_hosts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let known_hosts = tmp.path().join(paths::KNOWN_HOSTS_FILE);
+        std::fs::write(&known_hosts, "local-0 ssh-ed25519 AAAA...\n").unwrap();
+
+        let [strict, hosts_file] = host_key_opts(&known_hosts);
+        assert_eq!(strict, "StrictHostKeyChecking=yes");
+        assert_eq!(
+            hosts_file,
+            format!("UserKnownHostsFile=\"{}\"", known_hosts.display())
+        );
+    }
+
+    /// ssh re-parses the option value as a config line, so the path must survive
+    /// its quote and backslash handling intact. These expectations were checked
+    /// against OpenSSH's own parser with `ssh -G`.
+    #[test]
+    fn ssh_opt_quote_escapes_backslashes_and_quotes() {
+        let q = |s: &str| ssh_opt_quote(std::path::Path::new(s));
+
+        assert_eq!(q("/state/known_hosts"), r#""/state/known_hosts""#);
+        // A space is why we quote at all: ssh would otherwise read a file list.
+        assert_eq!(q("/st ate/known_hosts"), r#""/st ate/known_hosts""#);
+        assert_eq!(q(r#"/st"ate/known_hosts"#), r#""/st\"ate/known_hosts""#);
+        assert_eq!(q(r"/st\ate/known_hosts"), r#""/st\\ate/known_hosts""#);
+        // A trailing backslash must not escape the closing quote.
+        assert_eq!(q(r"/state\"), r#""/state\\""#);
+    }
+
+    /// The assembled option for a state dir carrying every character ssh's
+    /// parser treats specially.
+    #[test]
+    fn host_key_opts_pin_to_a_path_needing_escapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(r#"sp ace q"uote back\slash"#);
+        std::fs::create_dir_all(&dir).unwrap();
+        let known_hosts = dir.join(paths::KNOWN_HOSTS_FILE);
+        std::fs::write(&known_hosts, "local-0 ssh-ed25519 AAAA...\n").unwrap();
+
+        let [strict, hosts_file] = host_key_opts(&known_hosts);
+        assert_eq!(strict, "StrictHostKeyChecking=yes");
+        assert!(
+            hosts_file.contains(r#"q\"uote"#) && hosts_file.contains(r"back\\slash"),
+            "path must reach ssh escaped, got: {hosts_file}"
+        );
+    }
+
     #[test]
     fn ingress_spec_defaults_to_tcp() {
         let m = parse_ingress_mapping("18080:80").unwrap();
@@ -1671,5 +1855,36 @@ mod tests {
         let sources: [sessions::core::source::Source; 0] = [];
         let d = decisions_for_trusted_sources(sources.iter()).expect("empty → Some(empty)");
         assert!(d.is_empty());
+    }
+
+    /// Regression: a config in the `.minimal/` layout must be detected so
+    /// `activate` returns without prompting and never scaffolds over it.
+    /// The old naive `join(MFILE_NAME)` check missed this path.
+    #[test]
+    fn project_has_mfile_detects_dot_minimal_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mfile_dir = dir.path().join(".minimal");
+        std::fs::create_dir(&mfile_dir).unwrap();
+        std::fs::write(
+            mfile_dir.join(mfile::MFILE_NAME),
+            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+        )
+        .unwrap();
+
+        let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        assert!(
+            project_has_mfile(path),
+            "config under .minimal/ must be detected",
+        );
+    }
+
+    /// A project with no config in either layout is genuinely missing an
+    /// mfile, so detection reports false and the caller falls through to
+    /// the (tty-gated) prompt.
+    #[test]
+    fn project_has_mfile_false_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        assert!(!project_has_mfile(path));
     }
 }

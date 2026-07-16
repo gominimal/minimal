@@ -181,6 +181,7 @@ async fn activate_creates_session() {
     let activate_args = ActivateArgs {
         name: Some("test-session".to_string()),
         path: project.path().to_string_lossy().to_string(),
+        sync: SyncMode::Tarball,
         network: CliNetworkMode::NoNet,
         ingress: vec![],
         loadout: vec![],
@@ -195,6 +196,58 @@ async fn activate_creates_session() {
     let resp = client.call::<ListSessions>(&()).await;
     assert_eq!(resp.sessions.len(), 1);
     assert_eq!(resp.sessions[0].name.as_deref(), Some("test-session"));
+}
+
+// --- activate uploads project files ---
+
+#[tokio::test]
+async fn activate_uploads_project_files() {
+    let (daemon, args) = setup().await;
+
+    // Create a temp project dir with a minimal.toml and some files.
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+    std::fs::write(project.path().join("hello.txt"), "hello world").unwrap();
+    std::fs::create_dir_all(project.path().join("subdir")).unwrap();
+    std::fs::write(project.path().join("subdir/nested.txt"), "nested").unwrap();
+
+    let activate_args = ActivateArgs {
+        name: Some("upload-test".to_string()),
+        path: project.path().to_string_lossy().to_string(),
+        sync: SyncMode::Tarball,
+        network: CliNetworkMode::NoNet,
+        ingress: vec![],
+        loadout: vec![],
+        no_loadouts: false,
+        attach: false,
+    };
+    cmd_activate(&args, activate_args).await.unwrap();
+
+    // Look up the session and verify the uploaded files landed in the
+    // session's workspace directory by reading them back over SFTP.
+    let mut sftp_client = daemon.server.connect().await;
+    let sessions = {
+        use minimald_rpc::ListSessions;
+        let resp = sftp_client.call::<ListSessions>(&()).await;
+        resp.sessions
+    };
+    assert_eq!(sessions.len(), 1);
+    let session_id: SessionId = sessions[0].id;
+
+    let sftp = sftp_client.open_sftp(session_id).await;
+
+    let hello = sftp.read("hello.txt").await.unwrap();
+    assert_eq!(hello, b"hello world");
+
+    let nested = sftp.read("subdir/nested.txt").await.unwrap();
+    assert_eq!(nested, b"nested");
+
+    let mfile = sftp.read("minimal.toml").await.unwrap();
+    assert!(mfile.starts_with(b"# test"));
 }
 
 // --- destroy ---
@@ -260,10 +313,23 @@ async fn stop_succeeds_when_no_sessions() {
 }
 
 #[tokio::test]
-async fn stop_refuses_with_live_session() {
+async fn stop_succeeds_with_idle_session() {
     let (daemon, args) = setup().await;
-    let session_id = create_session(&daemon, "active").await;
+    let session_id = create_session(&daemon, "idle").await;
     daemon.server.bring_session_up(session_id).await;
+
+    // An idle session (actor up, but no shell hosted and no create flow in
+    // flight) does not block an unforced stop; its record survives for the
+    // next daemon start.
+    cmd_stop(&args, StopArgs { force: false }).await.unwrap();
+}
+
+#[tokio::test]
+async fn stop_refuses_with_pending_session() {
+    let (daemon, args) = setup().await;
+    // A Pending session (mid create flow, awaiting the client's verdict) is
+    // busy: an unforced stop must refuse rather than strand the flow.
+    let _id = create_pending_session(&daemon, "mid-create").await;
 
     let result = cmd_stop(&args, StopArgs { force: false }).await;
     assert!(result.is_err());
@@ -339,7 +405,47 @@ async fn session_policy_succeeds() {
 
 // --- helpers ---
 
-/// Create a session on the daemon via TestClient and return its ID.
+/// Creates a session whose workspace mfile declares a `[session.vars]`
+/// entry, which the daemon must route back to the client for gating — so
+/// configuring its loadout returns `Pending` and the session actor parks in
+/// its Draft state awaiting a verdict. Returns its ID.
+async fn create_pending_session(daemon: &common::TestDaemon, name: &str) -> SessionId {
+    let mut client = daemon.server.connect().await;
+    let project_path =
+        camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
+    let config = minimald_rpc::SessionConfig {
+        name: Some(name.to_string()),
+        project_path: paths::HostAbsPath::try_new(project_path).unwrap(),
+        network: sessions::NetworkMode::NoNet,
+        policy: Default::default(),
+        attrs: Default::default(),
+    };
+
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, ConfigureLoadoutResponse, CreateSession,
+        CreateSessionRequest,
+    };
+    let id = client
+        .call::<CreateSession>(&CreateSessionRequest { config })
+        .await
+        .unwrap()
+        .id;
+    daemon
+        .server
+        .seed_workspace_mfile(id, "[session.vars]\nRUST_LOG = \"info\"\n")
+        .await;
+    let resp = client
+        .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+            session_id: id,
+            contribution: Default::default(),
+        })
+        .await;
+    match resp {
+        minimald_rpc::Errorable::Ok(ConfigureLoadoutResponse::Pending { .. }) => id,
+        other => panic!("expected a Pending loadout, got {other:?}"),
+    }
+}
+
 async fn create_session(daemon: &common::TestDaemon, name: &str) -> SessionId {
     let mut client = daemon.server.connect().await;
 
@@ -355,17 +461,31 @@ async fn create_session(daemon: &common::TestDaemon, name: &str) -> SessionId {
         attrs: Default::default(),
     };
 
-    use minimald_rpc::{CreateSession, CreateSessionRequest};
-    let resp = client
-        .call::<CreateSession>(&CreateSessionRequest {
-            config,
-            contribution: Default::default(),
-        })
-        .await;
-    match resp {
-        minimald_rpc::Errorable::Ok(r) => unwrap_ready(r),
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
+    };
+    let id = match client
+        .call::<CreateSession>(&CreateSessionRequest { config })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(r) => r.id,
         minimald_rpc::Errorable::Err { error } => {
             panic!("CreateSession failed: {error}")
         }
+    };
+    // Finalize the session's loadout, as `min activate` does: its workspace
+    // is empty, so this composes to an empty `Ready` in one shot.
+    match client
+        .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+            session_id: id,
+            contribution: Default::default(),
+        })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(r) => unwrap_ready(r),
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("ConfigureLoadout failed: {error}")
+        }
     }
+    id
 }

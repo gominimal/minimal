@@ -155,6 +155,11 @@ resolve_prefix() {
     esac
 }
 
+# The bin prefix, resolved once. Needed early: the pre-upgrade daemon stop
+# (R5.5) runs the `min` already installed there, before the component loop
+# replaces it.
+bindir="$(resolve_prefix bin)"
+
 # --- Unit 9: shared shell-integration paths and markers ---------------------
 
 # Where the generated (not downloaded) shell-integration files live. Init
@@ -254,7 +259,33 @@ do_uninstall() {
             continue
         fi
 
-        # The installer only ever writes regular files. A symlink or directory
+        # A `link:<target>` row is a symlink the installer created (R5.6); the
+        # regular-file rules below don't apply. It is still ours while the
+        # path is a symlink pointing at the recorded target — `rm` removes the
+        # link itself, never what it points at. A retargeted link is the
+        # user's edit (kept unless --force); a non-symlink is foreign, always
+        # kept.
+        case "$want" in
+            link:*)
+                if [ ! -L "$dest" ]; then
+                    say "  $comp: kept ($dest is not a symlink the installer wrote)"
+                    kept_foreign=$((kept_foreign + 1))
+                elif [ "$(readlink "$dest")" != "${want#link:}" ] && [ "$uninstall_force" -eq 0 ]; then
+                    say "  $comp: kept (retargeted since install; pass --force to remove)"
+                    kept_modified=$((kept_modified + 1))
+                elif [ "$dry_run" -eq 1 ]; then
+                    say "  $comp: would remove $dest"
+                    removed=$((removed + 1))
+                else
+                    rm -f "$dest" || die "failed to remove $dest"
+                    say "  $comp: removed $dest"
+                    removed=$((removed + 1))
+                fi
+                continue
+                ;;
+        esac
+
+        # A `file` row only ever wrote a regular file. A symlink or directory
         # now at this path is something else — never follow it into a delete.
         if [ -L "$dest" ] || [ ! -f "$dest" ]; then
             say "  $comp: kept ($dest is not a regular file the installer wrote)"
@@ -433,6 +464,22 @@ records="$tmpdir/installed"
 : >"$records"
 installed=0 skipped=0
 
+# R5.5 — swapping binaries under a running daemon wedges it: the daemon keeps
+# serving from the old image while the new `min` talks to it. Stop it first,
+# using the `min` ALREADY on disk — that one matches the daemon it started, and
+# it is about to be overwritten. Deliberately best-effort and silent: nothing
+# installed yet, no daemon running, or a `min` too old to have `stop --force`
+# all mean "nothing to stop", and none of them should fail an install whose
+# binaries are otherwise fine. `min stop` only connects (it never autospawns),
+# so with no daemon up this is a failed connect and nothing more.
+daemon_stop_tried=0
+stop_running_daemon() {
+    [ "$daemon_stop_tried" -eq 0 ] || return 0
+    daemon_stop_tried=1
+    [ -x "$bindir/min" ] || return 0
+    "$bindir/min" stop --force >/dev/null 2>&1 || true
+}
+
 # The prior run's install record (R6.1) maps each component to the hash of the
 # file it placed on disk. Written into place at the end of this run; here we only
 # need its path so a completed run can replace it. The on-disk file — not this
@@ -445,9 +492,13 @@ prev_record="$state_dir/installed"
 # The os/arch/version columns are consumed into `_` (already matched in awk, or
 # informational); comp/want/kind/dest/src are what drive the install.
 while read -r comp _ _ _ want kind dest src; do
-    # v1 handles single files only; an unknown kind is a hard error, not a
-    # silent skip (the column reserves room for archive kinds later).
-    [ "$kind" = file ] || die "component $comp has unsupported kind '$kind'"
+    # `file` and `symlink` are the kinds this installer understands; an
+    # unknown kind is a hard error, not a silent skip (the column reserves
+    # room for archive kinds later).
+    case "$kind" in
+        file|symlink) ;;
+        *) die "component $comp has unsupported kind '$kind'" ;;
+    esac
 
     # dest is `<prefix-token>/<subpath>`. Require both halves.
     case "$dest" in
@@ -465,6 +516,35 @@ while read -r comp _ _ _ want kind dest src; do
 
     dir="$(resolve_prefix "$prefix")"
     target_file="$dir/$subpath"
+
+    # R5.6 — a symlink component: `src` is the LINK TARGET rather than a bucket
+    # path, resolved by the OS relative to the link's own directory. It gets
+    # the same traversal discipline as the dest subpath, so a manifest can only
+    # point a link within its own prefix. Nothing is downloaded either way.
+    if [ "$kind" = symlink ]; then
+        case "$src" in
+            ''|/*|..|../*|*/..|*/../*) die "component $comp has unsafe symlink target '$src'" ;;
+        esac
+        if [ -L "$target_file" ] && [ "$(readlink "$target_file")" = "$src" ]; then
+            say "  $comp: up to date"
+            skipped=$((skipped + 1))
+        else
+            # Atomic like R5.4: create the link as a temp sibling and rename it
+            # over whatever holds the path now — notably a stale regular file
+            # from a release that shipped this component as a copy.
+            mkdir -p "$dir"
+            tmp="$target_file.tmp.$$"
+            ln -s "$src" "$tmp" || { rm -f "$tmp"; die "failed to create symlink for $comp"; }
+            mv -f "$tmp" "$target_file"
+            say "  $comp: linked -> $src"
+            installed=$((installed + 1))
+        fi
+        # No artifact hashes exist for a link; both hash columns carry the
+        # link target instead (`link:` cannot collide with a hex digest), so
+        # --uninstall can verify the link is still ours (R6.1/R7.3).
+        printf '%s\t%s\t%s\t%s\n' "$comp" "$target_file" "link:$src" "link:$src" >>"$records"
+        continue
+    fi
 
     # R5.1 — the on-disk file is the skip oracle: it is up to date when its hash
     # equals the manifest `sha256`. A changed manifest hash (a new release) fails
@@ -503,6 +583,12 @@ while read -r comp _ _ _ want kind dest src; do
         xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true
     fi
 
+    # R5.5 — last moment before the first live file is swapped, so a run where
+    # every component is up to date (or one that dies fetching/verifying) never
+    # touches a healthy daemon. The guard inside makes this a no-op after the
+    # first replaced component.
+    stop_running_daemon
+
     mv -f "$tmp" "$target_file"
     installed=$((installed + 1))
     # Record the manifest hash paired with the on-disk hash, so a later
@@ -514,8 +600,6 @@ while read -r comp _ _ _ want kind dest src; do
 done <"$applicable"
 
 # --- Unit 9a: generated shell-init files and completions -------------------
-
-bindir="$(resolve_prefix bin)"
 
 # Append a generated file to this run's install record so a later run and
 # `--uninstall` treat it exactly like a downloaded component (R9.1/R9.3). No

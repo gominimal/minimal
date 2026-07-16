@@ -71,6 +71,7 @@ cat >"$mock/versions/v1/minimal-linux-amd64" <<'EOF'
 # mock min (linux-amd64)
 case "${1:-}" in
     completions) printf '# mock min completions for %s\n' "$2" ;;
+    stop)        printf '%s\n' "$*" >>"$HOME/stop.calls" ;;
 esac
 EOF
 cat >"$mock/versions/v1/minimal-darwin-arm64" <<'EOF'
@@ -78,6 +79,7 @@ cat >"$mock/versions/v1/minimal-darwin-arm64" <<'EOF'
 # mock min (darwin-arm64)
 case "${1:-}" in
     completions) printf '# mock min completions for %s\n' "$2" ;;
+    stop)        printf '%s\n' "$*" >>"$HOME/stop.calls" ;;
 esac
 EOF
 printf 'darwin-arm64-rootfs-body\n'   >"$mock/versions/v1/rootfs-arm64.img"
@@ -103,6 +105,12 @@ write_manifest() {
             minimal darwin arm64 v1 "$h_dmin" file bin/min versions/v1/minimal-darwin-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             rootfs darwin arm64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-arm64.img
+        # Symlink rows (R5.6): sha256 is the `-` placeholder, src is the link
+        # target relative to dest's directory.
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            git-remote-min linux amd64 v1 - symlink bin/git-remote-min min
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            git-remote-min darwin arm64 v1 - symlink bin/git-remote-min min
     } >"$mock/versions/v1/components"
 }
 write_manifest 1
@@ -218,19 +226,24 @@ check "$h_minimald" "$(hash_file "$H1/bin/minimald")" "installed content matches
 # Only linux/amd64 rows apply on this host: darwin row must not be installed.
 want_err "darwin-only component skipped on linux host" test -e "$H1/data/rootfs.img"
 n1="$(downloads)"; want_ok "first run downloaded ($n1)" test "$n1" -gt 0
+want_ok "symlink component placed as a symlink (R5.6)" test -L "$H1/bin/git-remote-min"
+check "min" "$(readlink "$H1/bin/git-remote-min")" "symlink points at its manifest target (R5.6)"
 
 reset_dl
 run second "$H1"
 check 0 "$rc" "rerun exits 0"
 check 0 "$(downloads)" "rerun performs zero downloads (R5.1/R2 reruns cheap)"
 
-# Corrupt one on-disk binary -> only that component re-fetches.
+# Corrupt one on-disk binary and retarget the symlink -> only the binary
+# re-fetches (a symlink repair needs no download), and both are restored.
 printf 'tampered\n' >"$H1/bin/minimald"
+rm -f "$H1/bin/git-remote-min"; ln -s minimald "$H1/bin/git-remote-min"
 reset_dl
 run third "$H1"
 check 0 "$rc" "rerun after tamper exits 0"
 check 1 "$(downloads)" "only the changed component re-downloads"
 check "$h_minimald" "$(hash_file "$H1/bin/minimald")" "tampered binary restored"
+check "min" "$(readlink "$H1/bin/git-remote-min")" "retargeted symlink repaired without a download (R5.6)"
 
 # --- Unit 5: checksum mismatch (R5.3) --------------------------------------
 # Point the manifest's minimal hash at a wrong value; artifact stays as-is.
@@ -333,6 +346,8 @@ record="$H1/xdg-state/minimal/installed"
 want_ok "install record lists components (R6.1)" grep -q "minimald" "$record"
 want_ok "install record lists resolved dest (R6.1)" grep -q "$H1/bin/minimald" "$record"
 want_ok "install record lists hash (R6.1)" grep -q "$h_minimald" "$record"
+want_ok "symlink row records link:<target> in the hash columns (R6.1)" \
+    grep -q "link:min" "$record"
 
 # bin not on PATH -> advisory printed.
 run advise_off "$H1"
@@ -347,6 +362,57 @@ env -i PATH="$stubbin:$H1/bin:/usr/bin:/bin" HOME="$H1" MINIMAL_BIN="$H1/bin" \
     "$SH" "$installer" >"$OUT" 2>&1
 set -e
 want_err "PATH advisory suppressed when bin present (R6.2)" grep -q "is not on your PATH" "$OUT"
+
+# --- Unit 5: pre-upgrade daemon stop (R5.5) --------------------------------
+# The installed `min` (the mock records its `stop` calls to $HOME/stop.calls) is
+# run once, only on a run that actually replaces a file, and only when it was
+# already on disk beforehand.
+H8="$root/h8"; mkdir -p "$H8"
+run daemonfresh "$H8"
+check 0 "$rc" "fresh install exits 0"
+want_err "fresh install stops no daemon: none installed yet (R5.5)" test -e "$H8/stop.calls"
+
+# Everything up to date -> nothing replaced -> a healthy daemon is left alone.
+run daemonnoop "$H8"
+check 0 "$rc" "up-to-date rerun exits 0"
+want_err "up-to-date rerun stops no daemon (R5.5)" test -e "$H8/stop.calls"
+
+# An upgrade (two components stale) stops the daemon exactly once, before the
+# swap, via the min that is on disk now — an older build than the manifest's,
+# still runnable, still able to reach the daemon it started.
+printf 'stale\n' >"$H8/bin/minimald"
+cat >"$H8/bin/min" <<'EOF'
+#!/bin/sh
+# mock min, previous release
+case "${1:-}" in
+    completions) printf '# mock min completions for %s\n' "$2" ;;
+    stop)        printf '%s\n' "$*" >>"$HOME/stop.calls" ;;
+esac
+EOF
+chmod +x "$H8/bin/min"
+run daemonupgrade "$H8"
+check 0 "$rc" "upgrade exits 0"
+want_ok "upgrade runs min stop --force (R5.5)" test -f "$H8/stop.calls"
+check "stop --force" "$(cat "$H8/stop.calls")" "stop is called once, with --force (R5.5)"
+
+# A `min` that fails and shouts is non-fatal and silent: an old binary may not
+# know `stop --force`, and no daemon running is itself a non-zero `min stop`.
+H9="$root/h9"; mkdir -p "$H9"
+run daemonprep "$H9"
+check 0 "$rc" "prep install exits 0"
+cat >"$H9/bin/min" <<'EOF'
+#!/bin/sh
+echo "old min: unrecognized subcommand 'stop'" >&2
+echo "noise on stdout" >&1
+exit 2
+EOF
+chmod +x "$H9/bin/min"
+printf 'stale\n' >"$H9/bin/minimald"
+run daemonfails "$H9"
+check 0 "$rc" "a failing min stop does not fail the install (R5.5)"
+want_err "min stop stderr is hidden (R5.5)" grep -q "unrecognized subcommand" "$OUT"
+want_err "min stop stdout is hidden (R5.5)" grep -q "noise on stdout" "$OUT"
+check "$h_minimald" "$(hash_file "$H9/bin/minimald")" "the upgrade still completed (R5.5)"
 
 # --- Unit 9: shell-init files, rc hook, completions (R9.1-R9.3) -------------
 # A bash-login-shell install generates the three init files, hooks .bashrc
@@ -612,6 +678,7 @@ run u_basic "$HU" --uninstall
 check 0 "$rc" "uninstall exits 0 (R8.4)"
 want_err "uninstall removed minimald (R7.3)" test -e "$HU/bin/minimald"
 want_err "uninstall removed min (R7.3)" test -e "$HU/bin/min"
+want_err "uninstall removed the git-remote-min symlink (R7.3)" test -L "$HU/bin/git-remote-min"
 want_err "uninstall removed the record (R8.1)" test -e "$urec"
 want_ok "uninstall prints a summary" grep -q "uninstall:" "$OUT"
 want_err "empty bin dir pruned (R8.1)" test -d "$HU/bin"
@@ -681,6 +748,32 @@ check 0 "$rc" "uninstall over a non-regular path exits 0 (R7.3)"
 want_ok "directory at a recorded path is left alone (R7.3)" test -d "$HU6/bin/minimald"
 want_ok "foreign entry is reported (R7.3)" grep -q "not a regular file" "$OUT"
 want_ok "record retained due to the foreign entry (R8.1)" test -f "$urec6"
+
+# R7.3 — a symlink retargeted since install is the user's edit: kept by default,
+# removed under --force. A regular file now at the recorded symlink path is
+# foreign — kept even with --force.
+HU8="$root/hu8"; mkdir -p "$HU8"
+run u8_install "$HU8"
+urec8="$HU8/xdg-state/minimal/installed"
+rm -f "$HU8/bin/git-remote-min"; ln -s minimald "$HU8/bin/git-remote-min"
+run u8_keep "$HU8" --uninstall
+check 0 "$rc" "uninstall with a retargeted symlink exits 0 (R8.4)"
+want_ok "retargeted symlink kept (R7.3)" test -L "$HU8/bin/git-remote-min"
+want_ok "retarget keep is reported (R7.3)" grep -q "retargeted" "$OUT"
+want_ok "record retained while the link remains (R8.1)" test -f "$urec8"
+run u8_force "$HU8" --uninstall --force
+check 0 "$rc" "uninstall --force over a retargeted symlink exits 0"
+want_err "retargeted symlink removed under --force (R7.3)" test -L "$HU8/bin/git-remote-min"
+want_err "record removed once footprint is gone (R8.1)" test -e "$urec8"
+
+HU9="$root/hu9"; mkdir -p "$HU9"
+run u9_install "$HU9"
+rm -f "$HU9/bin/git-remote-min"; printf 'a real file now\n' >"$HU9/bin/git-remote-min"
+run u9_foreign "$HU9" --uninstall --force
+check 0 "$rc" "uninstall over a file at a symlink row exits 0 (R7.3)"
+want_ok "regular file at a symlink row kept even with --force (R7.3)" \
+    test -f "$HU9/bin/git-remote-min"
+want_ok "foreign symlink row is reported (R7.3)" grep -q "not a symlink" "$OUT"
 
 # R9.4 — uninstall removes the generated init/completion files (they are plain
 # record rows), strips the marker block from the rc file, prunes the emptied

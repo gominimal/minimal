@@ -151,10 +151,14 @@ minimald     darwin  arm64    1.4.2    2c26…    file    bin/minimald      mini
 - `version` — component version (informational; the artifact identity is the
   hash).
 - `sha256` — lowercase hex digest of the artifact at `src`.
-- `kind` — `file` for a directly-placed file (only kind in v1; the column
-  exists so multi-file/archive kinds can be added without a format break).
+- `kind` — `file` for a directly-placed file, or `symlink` for a symbolic
+  link the installer creates (R5.6). The column exists so further kinds
+  (e.g. archives) can be added without a format break.
 - `dest` — install destination as `<prefix-token>/<subpath>` (see R4).
 - `src` — download path **relative to the bucket root** (not to `stable/`).
+  For `symlink` rows, `src` is instead the **link target** — a path the OS
+  resolves relative to the link's own directory — and `sha256` is the
+  literal placeholder `-` (there is no artifact to hash).
 
 **R3.2** — No field ever contains whitespace; this invariant is what makes
 `awk` field-splitting safe. Extraction uses exact field equality, never
@@ -254,6 +258,38 @@ got=$(sha256 "$target.tmp.$$")
 mv -f "$target.tmp.$$" "$target"
 ```
 
+**R5.5** — Installing a new version over a **running daemon** wedges it: the
+daemon goes on serving from the old image while the newly-installed `min` speaks
+to it. Before the first component file is replaced, the installer therefore runs
+`<bin>/min stop --force` — the `min` **already on disk**, which is the build that
+matches the daemon it started and is the one about to be overwritten. `--force`
+because an upgrade must not be blocked by live sessions, and because a prompt is
+not available in a `curl … | sh` pipeline.
+
+The step is **best-effort and silent**, output discarded and exit status ignored:
+"no `min` installed yet" (a fresh install), "no daemon running" (`min stop`
+merely connects — it never autospawns — so this is a failed connect and nothing
+more), and "the installed `min` is too old to know `stop --force`" are all just
+*nothing to stop*, and none may fail an install whose binaries are otherwise
+fine. Only `<bin>/min` is ever run — never a `min` found on `$PATH`, which is not
+this installer's footprint.
+
+It is attempted **at most once per run**, and only from the path that actually
+replaces a file: a rerun where every component is already up to date, or a run
+that dies fetching or checksum-verifying, must leave a healthy daemon running.
+
+**R5.6** — A `kind = symlink` component places a symbolic link at `dest`
+pointing at `src` (the link target, see R3.1). The target is validated with
+the same discipline as a `dest` subpath (R4.2) — never absolute, no `..`
+component — so a manifest can only point a link within the tree of its own
+prefix. The link itself is the skip oracle: a symlink already at `dest`
+whose `readlink` equals `src` is up to date. Installation mirrors
+R5.2/R5.4's atomicity: the link is created as a temp sibling (`ln -s`) and
+`mv -f`ed over whatever holds the path — notably a stale regular file from
+a release that shipped the component as a copy. Nothing is downloaded for a
+symlink row either way. The record row (R6.1) carries `link:<target>` in
+both hash columns in place of digests.
+
 **Proof artifacts**:
 
 - **Test**: Running twice against the same fixture manifest downloads on the
@@ -265,6 +301,16 @@ mv -f "$target.tmp.$$" "$target"
   *same* manifest performs zero downloads and no re-sign, but a rerun against a
   manifest whose `sha256` for that component *changed* re-downloads and re-signs
   it — the recorded installed hash does not mask a new release.
+- **Test** (R5.5): a fresh install stops nothing (no `min` on disk yet) and an
+  up-to-date rerun stops nothing (nothing replaced); an upgrade whose components
+  are stale runs the on-disk `min` with exactly `stop --force`, once, however
+  many components it replaces.
+- **Test** (R5.5): an installed `min` whose `stop` exits non-zero and writes to
+  both stdout and stderr still yields exit 0, leaks neither stream into the
+  installer's output, and completes the upgrade.
+- **Test** (R5.6): a `symlink` component lands as a symlink at its `dest`
+  pointing at the manifest target, with no download; a rerun skips it, and a
+  retargeted link is repaired on the next run — still with no download.
 
 ### Unit 6 — Install record and PATH advisory
 
@@ -275,8 +321,11 @@ tab-delimited. `manifest-sha256` is the artifact's `sha256` from the manifest;
 `installed-sha256` is the SHA-256 of the bytes actually on disk, which equals
 `manifest-sha256` except for a macOS-signed `bin` file. Pairing the two is what
 lets the R5.1 signed-file skip stay correct across releases (skip only while the
-manifest still wants that artifact). The record also enables uninstall (Units
-7–8) and surfaces prefix drift if `XDG_*` variables change between runs.
+manifest still wants that artifact). A `symlink` row (R5.6) records
+`link:<target>` in both hash columns instead of digests — the `link:` prefix
+cannot collide with a hex digest and is what the uninstaller keys on (R7.3).
+The record also enables uninstall (Units 7–8) and surfaces prefix drift if
+`XDG_*` variables change between runs.
 
 **R6.2** — If the resolved `bin` directory is not on `$PATH` **in the
 installing session**, the installer prints an advisory: the Unit 9 rc hook only
@@ -460,8 +509,9 @@ is the belt-and-braces for dumps that go stale later).
   uninstall command itself is out of scope.~~ Now specified below — see
   [Uninstaller](#uninstaller). The install record (R6.1) is the sole authority
   for what to remove.
-- **Multi-file / archive components.** v1 handles `kind = file` single files only.
-  The `kind` column reserves room for archive kinds without a format break.
+- **Multi-file / archive components.** v1 handles `kind = file` single files
+  and `kind = symlink` links (R5.6) only. The `kind` column reserves room for
+  archive kinds without a format break.
 - **Signing/verification beyond TLS + SHA-256.** See Security Considerations for
   the future `minisign` path.
 - **Windows.** POSIX-sh targets macOS and Linux only.
@@ -526,7 +576,10 @@ architecture record; design rationale is captured above.
   `gensub`/`\<`/PCRE.
 - **Avoided non-portable tools.** `sed -i` (BSD requires an arg, GNU forbids it),
   `grep -P` (no macOS), `readlink -f`/`realpath` (not on older macOS), `stat`
-  (incompatible BSD/GNU flags), and GNU `date -d` are not used anywhere.
+  (incompatible BSD/GNU flags), and GNU `date -d` are not used anywhere. Plain
+  flagless `readlink` (used only to verify `symlink` rows, R5.6) is fine: it is
+  present on macOS/BSD, GNU coreutils, and busybox — only the `-f` canonicalize
+  flag is the portability trap.
 - **`mktemp` for the manifest** uses `mktemp -d 2>/dev/null || mktemp -d -t
   minimal` to bridge BSD/GNU template differences, with a `trap … EXIT` cleanup.
 
@@ -657,12 +710,19 @@ is success, not an error.
 
 - `dest` **absent** → counted as *already removed*, skipped.
 - `dest` is **not a regular file** (a symlink or directory now occupies the
-  path) → left in place with a warning; the installer only ever writes regular
-  files, so something else owns this path.
+  path) → left in place with a warning; a `file` row only ever wrote a regular
+  file, so something else owns this path.
 - `dest` present, a regular file, and `sha256(dest) == installed-hash` → removed.
 - `dest` present but `sha256(dest) != installed-hash` → the file was modified or
   replaced since install; **left in place** with a warning by default, removed
   only under `--force`.
+
+A row whose hash columns carry `link:<target>` (R5.6) is a symlink the
+installer created, and the regular-file rules above invert for it: `dest` is
+removed when it is still a symlink whose `readlink` equals `<target>` (removal
+is of the link itself, never what it points at); a symlink pointing elsewhere
+was retargeted by the user — kept unless `--force`; and anything that is not a
+symlink is foreign and always kept.
 
 **R7.4** — The comparison is against the recorded `installed-hash`, **not** the
 manifest `sha256` (which the uninstaller does not have offline). This is what
@@ -677,6 +737,9 @@ manifest — still match and be recognized as ours.
   **kept** (reported as modified) and removed only when `--force` is added.
 - **Test**: A record listing a `dest` that has already been deleted causes
   `--uninstall` to exit 0, counting it as already-removed, with no error.
+- **Test**: A recorded symlink is removed by `--uninstall`; one retargeted
+  since install is kept and removed only under `--force`; a regular file now
+  occupying the recorded path is kept even with `--force`.
 
 ### Unit 8 — Record teardown, directory pruning, and purge
 
@@ -766,8 +829,10 @@ behind explicit `--purge` and confined to the `.../minimal` roots the tool owns.
   `state` dir and lists absolute paths the installer itself wrote through the
   validated `resolve_prefix` + subpath checks (R4). The uninstaller does not
   re-derive paths from any network input. As defense in depth it still refuses to
-  remove a `dest` that is not a regular file (R7.3), so a symlink swapped in at a
-  recorded path is not followed into deleting something else.
+  remove a `file`-row `dest` that is not a regular file (R7.3), so a symlink
+  swapped in at a recorded path is not followed into deleting something else;
+  for `link:` rows, removal targets the link itself — `rm` never follows it —
+  and only when it still points at the recorded target.
 - **No privilege escalation.** Like the installer, uninstall runs as the user and
   writes only under user-owned prefixes; it never invokes `sudo`.
 - **`--force`/`--purge` are opt-in.** The destructive behaviors (removing modified
