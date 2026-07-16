@@ -187,6 +187,27 @@ fail() {
   exit 1
 }
 
+# The sandbox proof below forks a real session sandbox, which needs
+# unprivileged user namespaces. On Ubuntu 24.04+ the AppArmor restriction
+# (kernel.apparmor_restrict_unprivileged_userns=1) denies those to the
+# unconfined daemon this script spawns, so on a restricted native-Linux host
+# (stock CI runners included) load the shipped remediation — the minimald
+# AppArmor profile, attached to the minimald this run will spawn — exactly as
+# docs/reference/linux-host-setup.md tells users to. VM lanes skip this: their
+# sandbox userns is created by the in-guest root daemon. `sudo -n` so a host
+# without passwordless sudo gets a clear pointer instead of a mid-script
+# prompt (the proof would die at uid_map otherwise).
+if [ -z "$E2E_VM" ] && [ "$(uname -s)" = Linux ] \
+    && [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ]; then
+  minimald_bin="$(command -v minimald || true)"
+  if [ -n "$minimald_bin" ] \
+      && sudo -n "$ROOT/scripts/install-apparmor-profile.sh" --path "$minimald_bin"; then
+    echo "restricted host: minimald AppArmor profile loaded (attached: $minimald_bin)"
+  else
+    echo "::warning::this host restricts unprivileged user namespaces and the minimald AppArmor profile could not be loaded; the sandbox proof will fail — see docs/reference/linux-host-setup.md"
+  fi
+fi
+
 # Cold: `min activate` must auto-spawn the target's daemon and print the
 # new session id on stdout. The id is the LAST stdout line (any log lines
 # that slip through the RUST_LOG filter precede it), validated as a UUID.
