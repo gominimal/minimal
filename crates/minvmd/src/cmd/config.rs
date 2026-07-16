@@ -57,6 +57,12 @@ fn validate_resources(
         if v == 0 {
             bail!("--vcpus must be at least 1");
         }
+        if v > crate::cmd::MAX_VM_VCPUS {
+            bail!(
+                "--vcpus must be at most {} (the guest-kernel vCPU ceiling)",
+                crate::cmd::MAX_VM_VCPUS
+            );
+        }
         if u32::from(v) > host.logical_cores {
             warnings.push(format!(
                 "requested {v} vcpus exceeds the host's {} logical cores; the VM will \
@@ -101,10 +107,16 @@ pub fn run_set(vcpus: Option<u8>, ram_mib: Option<u32>) -> Result<()> {
     let warnings = validate_resources(vcpus, ram_mib, HostCapacity::probe())?;
 
     let dir = provider_dir();
-    // The provider dir may not exist yet (no boot has run); `StateDir::new`
-    // normally creates it, but `config set` can precede any lifecycle command.
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating state dir {}", dir.display()))?;
+    // `StateDir::new` creates the provider dir (a `config set` can precede any
+    // lifecycle command, so it may not exist yet). Serialize the whole
+    // read-modify-write under the shared lifecycle lock so two concurrent
+    // `config set`s cannot lose one field's update to a last-writer-wins rename.
+    let state_dir = crate::state::StateDir::new(dir.clone()).context("opening state dir")?;
+    let mut lock = state_dir
+        .lifecycle_lock()
+        .context("opening lifecycle lock")?;
+    let _guard = lock.write().context("acquiring lifecycle write lock")?;
+
     let mut cfg = ResourceConfig::read(&dir).context("reading existing resource config")?;
     if let Some(v) = vcpus {
         cfg.vcpus = Some(v);
@@ -170,8 +182,11 @@ fn source(from_env: bool, from_config: bool) -> &'static str {
 mod tests {
     use super::*;
 
+    // logical_cores is below MAX_VM_VCPUS (8) so the over-core *warning* path
+    // (vcpus > cores, still <= the ceiling) stays reachable and distinct from the
+    // over-ceiling *rejection*.
     const HOST: HostCapacity = HostCapacity {
-        logical_cores: 8,
+        logical_cores: 4,
         total_mib: 16384,
     };
 
@@ -188,6 +203,12 @@ mod tests {
     }
 
     #[test]
+    fn vcpus_over_ceiling_is_rejected() {
+        let err = validate_resources(Some(crate::cmd::MAX_VM_VCPUS + 1), None, HOST).unwrap_err();
+        assert!(err.to_string().contains("at most"), "got: {err}");
+    }
+
+    #[test]
     fn ram_below_floor_is_rejected() {
         let err = validate_resources(None, Some(256), HOST).unwrap_err();
         assert!(err.to_string().contains("at least 512"), "got: {err}");
@@ -195,7 +216,8 @@ mod tests {
 
     #[test]
     fn over_core_and_over_mem_warn_but_succeed() {
-        let warns = validate_resources(Some(64), Some(65536), HOST).expect("warn, not error");
+        // 6 vcpus: above the host's 4 cores (warns) but within the ceiling (8).
+        let warns = validate_resources(Some(6), Some(65536), HOST).expect("warn, not error");
         assert!(
             warns.iter().any(|w| w.contains("vcpus")),
             "expected an over-core warning: {warns:?}"

@@ -63,7 +63,11 @@ fn resource_metrics_and_config_consumed_at_boot() {
         eprintln!("resource_vm_integration: MINVMD_E2E != 1, skipping");
         return;
     }
-    for var in ["MINVMD_KERNEL_PATH", "MINVMD_ROOTFS_PATH", "MINVMD_INITRAMFS"] {
+    for var in [
+        "MINVMD_KERNEL_PATH",
+        "MINVMD_ROOTFS_PATH",
+        "MINVMD_INITRAMFS",
+    ] {
         assert!(
             std::env::var(var).is_ok(),
             "resource_vm_integration: {var} must be set when MINVMD_E2E=1"
@@ -129,15 +133,27 @@ fn resource_metrics_and_config_consumed_at_boot() {
     );
     assert!(status["vcpus"].is_number(), "vcpus: {status}");
     let m = &status["metrics"];
-    assert!(m.is_object(), "metrics must be an object while running: {status}");
+    assert!(
+        m.is_object(),
+        "metrics must be an object while running: {status}"
+    );
     assert!(m["cpu_percent"].is_number(), "cpu_percent: {status}");
     assert!(
         m["resident_bytes"].as_u64().is_some_and(|b| b > 0),
         "resident_bytes must be > 0: {status}"
     );
-    assert!(m["disk_read_bytes"].is_number(), "disk_read_bytes: {status}");
-    assert!(m["disk_written_bytes"].is_number(), "disk_written_bytes: {status}");
-    assert!(status["warnings"].is_array(), "warnings must be an array: {status}");
+    assert!(
+        m["disk_read_bytes"].is_number(),
+        "disk_read_bytes: {status}"
+    );
+    assert!(
+        m["disk_written_bytes"].is_number(),
+        "disk_written_bytes: {status}"
+    );
+    assert!(
+        status["warnings"].is_array(),
+        "warnings must be an array: {status}"
+    );
 
     // 5. Explicit stop, then confirm Stopped (the Stopper drop is a backstop).
     let stop = minvmd(sd, &["stop"]);

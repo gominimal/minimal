@@ -79,6 +79,14 @@ pub const VM_VCPUS_ENV: &str = "MINVMD_VM_VCPUS";
 /// resource config (see [`effective_vcpus`]).
 pub const DEFAULT_VM_VCPUS: u8 = 2;
 
+/// Conservative upper bound on guest vcpus. The generic guest kernel's
+/// `CONFIG_NR_CPUS` is not pinned in this repo, so a resolved count is clamped
+/// here (and `config set` rejects above it): the boot path used to hardcode `2`,
+/// and an unbounded count from config/env could exceed the guest kernel's
+/// ceiling and panic the boot. Raise once the guest kernel's real limit is
+/// confirmed higher.
+pub const MAX_VM_VCPUS: u8 = 8;
+
 /// Default guest RAM in MiB. 512 MiB is the floor to reach userspace; the extra
 /// headroom feeds the in-VM session build, whose package cache lives on a tmpfs
 /// (`/run/minimal/cache`) sized from RAM (1024 MiB overflowed `StorageFull`
@@ -98,27 +106,57 @@ pub const DEFAULT_VM_RAM_MIB: u32 = 2048;
 #[cfg(not(target_arch = "x86_64"))]
 pub const DEFAULT_VM_RAM_MIB: u32 = 4096;
 
-/// The `MINVMD_VM_RAM_MIB` override as a positive value, if set and valid. A
-/// non-numeric, empty, or zero value is treated as unset.
-pub(crate) fn env_ram_mib() -> Option<u32> {
-    std::env::var(VM_RAM_MIB_ENV)
+/// Parse a positive integer from environment variable `var`; a missing,
+/// non-numeric, empty, or non-positive value is treated as unset. Shared by the
+/// `MINVMD_VM_RAM_MIB` / `MINVMD_VM_VCPUS` overrides.
+fn positive_env<T>(var: &str) -> Option<T>
+where
+    T: std::str::FromStr + PartialOrd + Default,
+{
+    std::env::var(var)
         .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&mib| mib > 0)
+        .and_then(|v| v.trim().parse::<T>().ok())
+        .filter(|value| *value > T::default())
+}
+
+/// The `MINVMD_VM_RAM_MIB` override as a positive value, if set and valid.
+pub(crate) fn env_ram_mib() -> Option<u32> {
+    positive_env(VM_RAM_MIB_ENV)
 }
 
 /// The `MINVMD_VM_VCPUS` override as a positive value, if set and valid.
 pub(crate) fn env_vcpus() -> Option<u8> {
-    std::env::var(VM_VCPUS_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u8>().ok())
-        .filter(|&c| c > 0)
+    positive_env(VM_VCPUS_ENV)
 }
 
-/// The persisted resource config from the provider dir; the all-`None` default
-/// on any read error, so a missing or unreadable file never blocks boot (R9.7).
+/// The persisted resource config from the provider dir. A missing file yields
+/// the all-`None` default; a malformed file is logged — so a boot that silently
+/// falls back to built-in defaults is at least diagnosable — and also treated as
+/// the default, so an unreadable file never blocks boot (R9.7).
 pub(crate) fn persisted_resource_config() -> crate::config::ResourceConfig {
-    crate::config::ResourceConfig::read(&crate::state::provider_dir()).unwrap_or_default()
+    match crate::config::ResourceConfig::read(&crate::state::provider_dir()) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read persisted resource config; using defaults");
+            crate::config::ResourceConfig::default()
+        }
+    }
+}
+
+/// Clamp a resolved vcpu count to [`MAX_VM_VCPUS`]. Warns when it clamps (e.g. an
+/// over-large [`VM_VCPUS_ENV`] override that skips `config set` validation) so a
+/// boot with fewer vcpus than requested is not silent.
+fn clamp_vcpus(vcpus: u8) -> u8 {
+    if vcpus > MAX_VM_VCPUS {
+        tracing::warn!(
+            requested = vcpus,
+            max = MAX_VM_VCPUS,
+            "requested vcpu count exceeds the guest-kernel ceiling; clamping"
+        );
+        MAX_VM_VCPUS
+    } else {
+        vcpus
+    }
 }
 
 /// The effective guest RAM in MiB, resolved as
@@ -140,12 +178,31 @@ pub fn effective_ram_mib() -> u32 {
 }
 
 /// The effective guest vcpu count, resolved as
-/// `env override ?? persisted config ?? default` (R9.7).
+/// `env override ?? persisted config ?? default` (R9.7) and clamped to
+/// [`MAX_VM_VCPUS`] so an over-large env/config value cannot brick the boot.
 #[must_use]
 pub fn effective_vcpus() -> u8 {
-    env_vcpus()
-        .or_else(|| persisted_resource_config().vcpus)
-        .unwrap_or(DEFAULT_VM_VCPUS)
+    clamp_vcpus(
+        env_vcpus()
+            .or_else(|| persisted_resource_config().vcpus)
+            .unwrap_or(DEFAULT_VM_VCPUS),
+    )
+}
+
+/// Resolve `(vcpus, ram_mib)` from a **single** read of the persisted config, so
+/// the pair cannot tear when `config.toml` changes between two separate
+/// `effective_*` calls (e.g. the two `booted_*` fields recorded at the Running
+/// transition). Per-field env overrides still take precedence; vcpus is clamped
+/// to [`MAX_VM_VCPUS`].
+#[must_use]
+pub fn effective_resources() -> (u8, u32) {
+    let env_v = env_vcpus();
+    let env_r = env_ram_mib();
+    let cfg = persisted_resource_config();
+    (
+        clamp_vcpus(env_v.or(cfg.vcpus).unwrap_or(DEFAULT_VM_VCPUS)),
+        env_r.or(cfg.ram_mib).unwrap_or(DEFAULT_VM_RAM_MIB),
+    )
 }
 
 /// Verify the host hypervisor backend is accessible before booting a VM (R2.4).

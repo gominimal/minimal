@@ -149,19 +149,14 @@ fn build_report(
 /// (next-boot) resolution, which is the meaningful thing to show for a VM that
 /// is not running.
 fn reported_resources(state: &State) -> (u8, u32) {
-    match state.lifecycle {
-        Lifecycle::Running => (
-            state
-                .booted_vcpus
-                .unwrap_or_else(crate::cmd::effective_vcpus),
-            state
-                .booted_ram_mib
-                .unwrap_or_else(crate::cmd::effective_ram_mib),
-        ),
-        _ => (
-            crate::cmd::effective_vcpus(),
-            crate::cmd::effective_ram_mib(),
-        ),
+    match (state.lifecycle, state.booted_vcpus, state.booted_ram_mib) {
+        // Running with a recorded snapshot: report exactly what the live VM
+        // booted with (R2.6).
+        (Lifecycle::Running, Some(vcpus), Some(ram_mib)) => (vcpus, ram_mib),
+        // Stopped — or a Running VM from a pre-#747 state file with no snapshot —
+        // falls back to the effective (next-boot) resolution, resolved from a
+        // single config read so the (vcpus, ram_mib) pair cannot tear.
+        _ => crate::cmd::effective_resources(),
     }
 }
 
