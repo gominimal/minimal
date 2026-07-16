@@ -922,15 +922,23 @@ async fn handle_git_receive(
                 unset GIT_DIR GIT_WORK_TREE GIT_QUARANTINE_PATH
                 g() { git --git-dir="$GIT_DIR_ABS" --work-tree="$WORK_TREE" "$@"; }
 
+                zero=0000000000000000000000000000000000000000
                 while read -r old new ref; do
                     case "$ref" in refs/heads/*) ;; *) continue ;; esac
                     branch=${ref#refs/heads/}
 
-                    if ! g diff --quiet || ! g diff --cached --quiet; then
+                    # Dirtiness is measured against the PRE-push tip ($old):
+                    # post-receive runs after the ref has already moved, so a
+                    # plain `diff --cached` (index vs the NEW tip) would flag
+                    # the pushed delta itself and skip every checkout. An
+                    # all-zeros $old is a previously-unborn branch — nothing
+                    # was tracked, so nothing can be locally modified.
+                    if [ "$old" != "$zero" ] \
+                        && { ! g diff --quiet "$old" || ! g diff --cached --quiet "$old"; }; then
                         echo "remote worktree has uncommitted changes; skipping checkout of $branch" >&2
                         continue
                     fi
-                    g checkout -f "$branch"
+                    g checkout -qf "$branch"
                 done"#
                     .as_bytes(),
             )
@@ -943,8 +951,16 @@ async fn handle_git_receive(
             session: session_handle,
             channel_id: id,
             exec: TokioExec {
+                // receive.denyCurrentBranch=ignore: the workspace is a
+                // non-bare repo with the pushed branch typically checked
+                // out, and stock git refuses that ref update outright —
+                // before any hook runs. `ignore` accepts it silently; the
+                // post-receive hook above then syncs the worktree (or
+                // warns and skips when it is dirty). NOT `updateInstead`:
+                // that rejects the whole push on a dirty worktree, while
+                // the hook's contract is "ref lands, checkout best-effort".
                 argv: format!(
-                    "git -c core.hooksPath={} receive-pack .",
+                    "git -c core.hooksPath={} -c receive.denyCurrentBranch=ignore receive-pack .",
                     hooks_tmp.path().to_str().unwrap()
                 ),
                 cwd: paths.working,
