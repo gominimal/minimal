@@ -1,14 +1,117 @@
-## Building `minimal`
+# Minimal
 
-The "minimal" CLI tool runs on amd64 and aarch64 Linux.
+Minimal provides VM-based development sandboxes and a secure package manager the for dev tools used in those sandboxes.
 
-8 cores and at least 16 Gb of RAM is recommended to build the entire package registry but it should (slowly) run on a wet piece of spaghetti.
+# Features
+Minimal can repeatably create a Linux, terminal-baseed development environment sandboxes populated with exactly the toolsets and agents you need as specified in your minimal.toml blueprint.
 
-### Dependencies
-1. Install a fairly recent version of rust: https://rust-lang.org/tools/install/
-2. Install deps (openssl, pkg-config, build-essential, git, protoc-compiler): `sudo apt-get install build-essential openssl pkg-config libssl-dev git protobuf-compiler `
+The tool executables (compilers, agents, shells, etc.) available in these sandboxes come from Minimal's [curated package registry](https://github.com/gominimal/pkgs/) which is refreshed daily. Simply add a minimal.toml to your project's git repo and all your teammates will have identical development environemnts that isolate AI agents from their laptops. Updating the shared minimal.toml to reference the freshest tool versions is just a `min update` away.  No more outdated wiki pages for dev-env setup and version drift across your team.
 
-### Building the binary
+Per-developer "Loadouts" can be included in each development environment so everyone can work efficiently by using the editors, terminal multiplexers and their configs that match their hard-earned muscle memory.
+
+## Contents
+
+
+## Tech Stack
+
+Sandboxes: pure Rust client, daemon and VM manager. The sandbox VM is powered by [libkrun](https://github.com/libkrun/libkrun), a custom Linux kernel image and an Alpine Linux rootfs
+
+[Packages](https://github.com/gominimal/pkgs/): glibc-based packages built frequently on Minimal's build servers from their cannonical sources (GNU, Github, Gitlab, etc.)
+
+
+## Installation
+
+Minimal works on MacOS/ARM64 and Linux/{ARM64,X86_64}. To get started, install it with the following shell command (stable is coming soon):
+
+```shell
+curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/unstable' | sh
+```
+
+This should install Minimal on your system, add "min" to your PATH, and setup shell completions for bash, fish, and zsh.
+
+Minimal can be unistalled with:
+```shell
+curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/unstable' | sh -s -- --uninstall
+```
+
+## Getting Started
+
+### Create a new project with Minimal
+
+In this example we'll create a new git repo from within a Minimal sandbox using tools from the [Minimal Public Registry](https://github.com/gominimal/pkgs/)
+
+```shell
+mkdir -p ~/projects/foo
+cd  ~/projects/foo
+
+# create and update a minimal.toml file
+min init
+min add --session git gh claude-code mermaid-cli kittyview less emacs
+
+# copy a Github PAT to your clipboard
+security find-generic-password -w -s "PAT-foo-repo" -a "my-mac-user-namea" | pbcopy
+
+# start and enter a sandbox, which copies up the CWD file tree into the sandbox
+min activate --attach .
+
+read -sp "paste GH PAT now:" GH_TOKEN && export GH_TOKEN
+git init
+
+claude --dangerously-skip-permissions
+# develop specs, generate code etc
+
+git add -A
+git commit -m "initial checkin"
+
+git remote add origin https@github.com:gominimal/gatehouse.git
+git branch -M main
+git push -u origin main
+
+exit
+
+```
+
+We show using a github personal access token (PAT) from the MacOS keychain in the example above. To create fine-grained PATs (e.g. scoped to a specific repo) go to https://github.com/settings/personal-access-tokens.  To add a new token to the MacOS keychain use:
+```shell
+security add-generic-password -s "PAT-foo-repo" -a "my-mac-user-name" -w
+```
+
+### Work on an existing project in a Minimal sandbox
+
+In this example we'll work on an existing git repo that already has minimal.toml
+
+```shell
+cd  ~/projects/foo
+
+# get latest files on current branch
+git pull
+
+# copy a Github PAT to your clipboard
+security find-generic-password -w -s "PAT-foo-repo" -a "my-mac-user-namea" | pbcopy
+
+# don't copy any files up we'll git pull in the sandbox
+min activate --attach --sync none .
+
+read -sp "paste GH PAT now:" GH_TOKEN && export GH_TOKEN
+
+git pull <your-project>
+
+claude --dangerously-skip-permissions
+# add new features, fix bugs etc
+
+git add -A
+git commit -m "feat: add foozinator CLI option"
+git push -u origin main
+
+exit
+```
+
+### Add a Minimal Loadout with your preferred tools and configurations
+
+## Building and Testing
+
+(To be updated)
+
 Either: `cargo build` for debug (faster build) and `cargo build --release` (slower build, faster execution)
 
 ### Ubuntu 24.04+ hosts
@@ -29,92 +132,24 @@ loader and prints a hint when the host needs it; run
 
 See [docs/reference/linux-host-setup.md](docs/reference/linux-host-setup.md).
 
-## Using minimal
 
-You can run minimal either via the build binary in `target/{debug,release}/minimal` or using cargo (which will auto-rebuild as you change rust sauce):
+## Contributing
 
-```shell
-$> cargo run -- <minimal args>
-```
+We'd love your help! Please [open an Issue](https://github.com/gominimal/minimal/issues/new/choose) (or a [Discussion](https://github.com/gominimal/minimal/discussions/new/choose)( if it's large in scope) to outline the improvments you're seeking
 
-### Minimal commands
+If you want to contribute code, docs, etc please head over to [CONTRIBUTING.md](./CONTRIBUTING.md) for the development workflow and what we look for in a contribution.
 
-```
-The Minimal CLI
 
-Usage: minimal [OPTIONS] <COMMAND>
+### Contributor License Agreement
 
-Commands:
-  run          Runs a task specified in `minimal.toml`
-  update       Refreshes local checkouts of upstream packages & the standard library
-  add          Add a new tool or dependency
-  init         Automatically initialize minimal configuration based on your source tree
-  status       Shows the status of Minimal in this codebase
-  shell        Launches a development shell (shorthand for `minimal run shell`)
-  build        Runs the build task. Shorthand for `minimal run build`
-  test         Runs the test task. Shorthand for `minimal run test`
-  materialize  Materializes an output specified in `minimal.toml`
-  pkg          Builds the specified package(s) in a clean room, making them available in the local cache
-  cache        Manipulate the local cache
-  check        Validates minimal configuration including packages, stacks, and profiles
-  dep          Generates Graphviz source code of the dependency graph
-  completions  Generate shell completion script
-  help         Print this message or the help of the given subcommand(s)
+Before we can merge your first pull request, you'll need to accept our **Individual Contributor License Agreement (ICLA)**. This is a one-time, ~30 second step: [CLA Assistant](https://cla-assistant.io/) will post a link on your PR, you click through, sign in with GitHub, and you're done — you're then covered for all future contributions to this repository.
 
-Options:
-      --minimal-dir <MINIMAL_DIR>
-          Override the base directory used for operations (default: ~/.cache/minimal)
-  -C, --repo-dir <REPO_DIR>
-          Use the given directory as the repository root, instead of searching from the current working directory
-      --no-cache
-          Ignore locally-available binary artifacts (results in rebuilds unless present in a remote cache)
-      --no-fetch
-          Do not fetch binary artifacts from the internet
-      --offline
-          Use only what's already in the local cache; fail on any network call
-  -n, --num-parallel-builds <NUM_PARALLEL_BUILDS>
-          Configure the number of parallel builds
-  -h, --help
-          Print help
-  -V, --version
-          Print version
-```
+If you're contributing on your employer's time, or with code your employer might own, your employer will also need a **Corporate CLA (CCLA)** on file listing you as an authorized contributor. See [CONTRIBUTING.md](./CONTRIBUTING.md) for details, or email **security@minimal.dev** if you need help getting one set up.
 
-You'll probably use the subcommands `build` and `pkg` most of the time.
+Full text: [ICLA](./legal/ICLA.md) · [CCLA](./legal/CCLA.md)
 
-Switches for the local & remote cache:
+## License
 
- * `--no-fetch`: Do not fetch anything from the "remote cache" (the GCP bucket).
- * `--no-cache`: Rebuild everything thats needed: do not use anything that was built in an earlier invocation nor anything fetched in an earlier invocation.
+This project is licensed under the [Apache License Version 2.0](LICENSE)
+- see the [LICENSE](LICENSE) file for details.
 
-These args apply to planning as well.
-
-## CI/CD
-
-### ci.yml — Build pipeline
-
-Runs on every push and PR to `main`. On pushes to `main`, builds static
-musl binaries for amd64 and arm64, creates a GitHub release, and uploads
-CLI archives to `gs://minimal-shim/archives/`.
-
-### promote.yml — CLI version promotion
-
-Manual `workflow_dispatch` with inputs:
-- `sha` (optional): short SHA to promote (defaults to latest archive in bucket)
-- `platforms` (optional): comma-separated list or `"all"` (default: `"amd64-linux,arm64-linux"`)
-- `dry_run` (optional, boolean, default `false`): when `true`, opens the approval issue and logs what would be written but skips the actual GCS config write
-
-Verifies the archive exists in GCS, then writes per-platform config files
-under `gs://minimal-shim/config/`.
-
-### GCS permissions
-
-CI workflows authenticate via Workload Identity Federation (WIF). The WIF
-principal for this repo requires `roles/storage.objectUser` on the
-`gs://minimal-shim` bucket, which grants create, delete, get, list, and
-update on objects. This is the minimum predefined role that supports
-uploading archives and overwriting config files during promotion.
-
-```
-principal://iam.googleapis.com/projects/289724348228/locations/global/workloadIdentityPools/github/subject/repo:gominimal/minimal:ref:refs/heads/main
-```
