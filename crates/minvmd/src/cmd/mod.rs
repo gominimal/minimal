@@ -301,8 +301,9 @@ pub fn effective_resources() -> (u8, u32) {
 
 /// The parent supervisor's pre-spawn resource snapshot from the environment
 /// ([`BOOTED_VCPUS_ENV`] / [`BOOTED_RAM_MIB_ENV`]), if both halves are present
-/// and valid.
-#[cfg(any(minvmd_libkrun, test))]
+/// and valid. Only the libkrun VMM child calls this; the stub build has no
+/// boot path (`parse_booted_snapshot` stays test-visible for coverage).
+#[cfg(minvmd_libkrun)]
 pub(crate) fn booted_resources_from_env() -> Option<(u8, u32)> {
     parse_booted_snapshot(
         std::env::var(BOOTED_VCPUS_ENV).ok().as_deref(),
