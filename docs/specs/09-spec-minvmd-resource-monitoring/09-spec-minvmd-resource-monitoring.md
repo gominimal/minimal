@@ -334,10 +334,11 @@ runtime.
 | R1.1 | Test | `cargo test -p minvmd metrics::tests::sample_of_self_returns_metrics` |
 | R1.2/R1.3 | Test | `cargo test -p minvmd status::tests::report_schema_when_stopped_has_null_metrics_and_no_warnings` |
 | R1.3 | CLI | `minvmd status --json \| jq .metrics` — object when running, `null` when stopped |
+| R1.3/R9.1/R9.9 | E2E | `scripts/minvmd-lifecycle.sh` (KVM lane) asserts a live VM's `status --json` carries numeric `metrics.*` and a `warnings` array |
 | R2.1 | Test | `cargo test -p minvmd config::tests` |
 | R2.2 | Test | `cargo test -p minvmd cmd::config::tests::source_precedence_is_env_then_config_then_default` |
 | R2.3/R2.4 | CLI | `minvmd config set --ram-mib 3072 && minvmd config show --json` |
-| R2.5 | Integration (`MINVMD_E2E=1`) | boot → `config set` → stop → boot → `status --json` reflects the persisted value |
+| R2.5/R2.6 | E2E | `scripts/minvmd-lifecycle.sh` (KVM lane): `config set --ram-mib 3072` → `run --detach` → the running VM's `status --json` reports `ram_mib == 3072` (the persisted value, consumed at real boot) |
 | R2.6 | Test | `cargo test -p minvmd status::tests::running_reports_booted_snapshot_not_next_boot_resolution` + `state::tests::pre_747_state_file_without_booted_fields_reads_as_none` |
 | R3.1 | Test | `cargo test -p minvmd cmd::config::tests::over_core_and_over_mem_warn_but_succeed` |
 | R3.2 | Test | `cargo test -p minvmd metrics::tests` (pressure thresholds) |
