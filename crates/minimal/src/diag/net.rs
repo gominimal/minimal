@@ -51,6 +51,87 @@ pub async fn listening_sockets(w: &mut BundleWriter) -> Result<(), anyhow::Error
     Err(last_err)
 }
 
+// ── host/net/interfaces.txt + host/net/routes.txt ───────────────────────────
+
+/// Host interface addresses. The IPs and subnets are the diagnostic payload
+/// (own-IP rides 100.64/16 inside the CGNAT block Tailscale-style VPNs also
+/// use, so collisions must be visible); MAC addresses carry no such signal
+/// and are masked down to their vendor OUI.
+pub async fn interfaces(w: &mut BundleWriter) -> Result<(), anyhow::Error> {
+    let attempts: &[(&str, &[&str])] = if cfg!(target_os = "linux") {
+        &[("ip", &["addr"]), ("ifconfig", &["-a"])]
+    } else {
+        &[("ifconfig", &["-a"])]
+    };
+    let mut last_err = None;
+    for (cmd, args) in attempts {
+        match command_output(cmd, args).await {
+            Ok(text) => {
+                let text = format!("$ {cmd} {}\n{}", args.join(" "), mask_macs(&text));
+                return w
+                    .add_bytes("host/net/interfaces.txt", text.as_bytes(), Redaction::Keys)
+                    .await;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no interface source")))
+}
+
+/// Host routing table — which gateway/tunnel the default route rides, and
+/// whether anything overlaps the own-IP or gvproxy switch subnets.
+pub async fn routes(w: &mut BundleWriter) -> Result<(), anyhow::Error> {
+    let attempts: &[(&str, &[&str])] = if cfg!(target_os = "linux") {
+        &[("ip", &["route", "show"]), ("netstat", &["-rn"])]
+    } else {
+        &[("netstat", &["-rn"])]
+    };
+    let mut last_err = None;
+    for (cmd, args) in attempts {
+        match command_output(cmd, args).await {
+            Ok(text) => {
+                let text = format!("$ {cmd} {}\n{text}", args.join(" "));
+                return w
+                    .add_bytes("host/net/routes.txt", text.as_bytes(), Redaction::None)
+                    .await;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no route source")))
+}
+
+/// Masks the device-unique half of every MAC address, keeping the vendor
+/// OUI: `f0:18:98:aa:bb:cc` → `f0:18:98:<redacted>`.
+///
+/// Token-wise (whitespace-delimited) so IPv6 shorthand like
+/// `fe80::aa:bb:cc:dd:ee:ff` — colon-adjacent, never a standalone six-group
+/// token — is left alone.
+fn mask_macs(text: &str) -> String {
+    fn is_mac(tok: &str) -> bool {
+        tok.len() == 17
+            && tok.bytes().enumerate().all(|(i, b)| match i % 3 {
+                2 => b == b':',
+                _ => b.is_ascii_hexdigit(),
+            })
+    }
+    text.lines()
+        .map(|line| {
+            line.split(' ')
+                .map(|tok| {
+                    if is_mac(tok) {
+                        format!("{}:<redacted>", &tok[..8])
+                    } else {
+                        tok.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 async fn command_output(cmd: &str, args: &[&str]) -> Result<String, anyhow::Error> {
     let out = tokio::time::timeout(
         Duration::from_secs(5),
@@ -215,6 +296,26 @@ pub async fn add_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mask_macs_keeps_oui_and_leaves_ipv6_alone() {
+        let input = "\tether f0:18:98:aa:bb:cc\n\
+                     \tinet6 fe80::aa:bb:cc:dd:ee:ff%en0 prefixlen 64\n\
+                     2: eth0: link/ether 02:42:ac:11:00:02 brd ff:ff:ff:ff:ff:ff\n\
+                     \tinet 192.168.1.10 netmask 0xffffff00";
+        let out = mask_macs(input);
+        assert!(out.contains("ether f0:18:98:<redacted>"), "{out}");
+        assert!(out.contains("link/ether 02:42:ac:<redacted>"), "{out}");
+        assert!(
+            out.contains("ff:ff:ff:<redacted>"),
+            "broadcast is MAC-shaped too: {out}"
+        );
+        assert!(
+            out.contains("fe80::aa:bb:cc:dd:ee:ff%en0"),
+            "IPv6 survives: {out}"
+        );
+        assert!(out.contains("192.168.1.10"), "IPv4 survives: {out}");
+    }
 
     #[tokio::test]
     async fn probe_reports_missing_socket_at_the_stat_stage() {

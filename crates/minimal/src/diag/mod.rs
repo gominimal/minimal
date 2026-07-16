@@ -86,6 +86,8 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
     collect_step!(w, "host.dirs", dirs_report(&mut w, global));
     collect_step!(w, "host.process-tree", procs::process_tree(&mut w));
     collect_step!(w, "host.net.listening", net::listening_sockets(&mut w));
+    collect_step!(w, "host.net.interfaces", net::interfaces(&mut w));
+    collect_step!(w, "host.net.routes", net::routes(&mut w));
     collect_step!(w, "config", collect::config(&mut w, &paths));
     collect_step!(w, "state", collect::state(&mut w, &paths));
     collect_step!(w, "logs", collect::logs(&mut w, &paths));

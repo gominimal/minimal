@@ -169,6 +169,46 @@ async fn bug_without_daemon_still_produces_a_bundle() {
     );
     assert!(find(&files, "host/system.json").is_some());
     assert!(find(&files, "state/listing.txt").is_some());
+
+    // Host network capture: interfaces (MACs masked to their OUI) and the
+    // routing table. Hosts without ip/ifconfig/netstat (minimal containers)
+    // degrade to a recorded collector error instead — assert one or the
+    // other, never silence.
+    let collector_error = |name: &str| {
+        manifest["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["collector"] == name)
+    };
+    match find(&files, "host/net/interfaces.txt") {
+        Some(contents) => {
+            let interfaces = String::from_utf8_lossy(contents);
+            let mac_shaped = |tok: &str| {
+                tok.len() == 17
+                    && tok.bytes().enumerate().all(|(i, b)| match i % 3 {
+                        2 => b == b':',
+                        _ => b.is_ascii_hexdigit(),
+                    })
+            };
+            assert!(
+                !interfaces
+                    .split_whitespace()
+                    .any(|tok| mac_shaped(tok.trim_end_matches(','))),
+                "no full MAC address may survive masking: {interfaces}"
+            );
+        }
+        None => assert!(
+            collector_error("host.net.interfaces"),
+            "interfaces absent without a collector error: {}",
+            manifest["errors"]
+        ),
+    }
+    assert!(
+        find(&files, "host/net/routes.txt").is_some() || collector_error("host.net.routes"),
+        "routes absent without a collector error: {}",
+        manifest["errors"]
+    );
 }
 
 #[tokio::test]
