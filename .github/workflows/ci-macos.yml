@@ -315,6 +315,20 @@ jobs:
                   pkill -f '__krun-vmm' 2>/dev/null || true
                   pkill -f gvproxy 2>/dev/null || true
                   sleep 1
+            - name: Daemon lifecycle (run --detach → status → stop)
+              # Exercises the supervised daemon path (detach, status polling,
+              # documented stop semantics) that the integration harnesses and
+              # the CLI autospawn below do not cover directly — the same proof
+              # the KVM lane runs, and the script's header was written
+              # target-agnostic for exactly this testbed. minvmd resolves from
+              # PATH (the testbed bin/, added at unpack). Requires jq on the
+              # runner; the script fails fast with a clear error if absent.
+              env:
+                  MINVMD_KERNEL_PATH: ${{ runner.temp }}/kernel/vmlinuz
+                  MINVMD_ROOTFS_PATH: ${{ runner.temp }}/rootfs/rootfs.img
+                  MINVMD_INITRAMFS: ${{ runner.temp }}/initramfs/initramfs.cpio
+                  MINVMD_BOOT_LOG: ${{ runner.temp }}/boot-daemon.log
+              run: ./scripts/minvmd-lifecycle.sh
             - name: Fetch pinned gvproxy switch binary
               # minvmd spawns this (gvproxy-darwin) as the host-side switch that
               # provides the guest's egress (NAT + DNS). Without it minvmd boots
@@ -354,6 +368,7 @@ jobs:
                   name: minvmd-boot-logs
                   path: |
                       ${{ runner.temp }}/boot.log
+                      ${{ runner.temp }}/boot-daemon.log
                       ${{ runner.temp }}/cli-e2e-boot.log
                   if-no-files-found: ignore
 
