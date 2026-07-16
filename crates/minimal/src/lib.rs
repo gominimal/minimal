@@ -971,11 +971,30 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     match args.sync {
         SyncMode::None => {}
         SyncMode::Tarball => {
-            eprintln!("Uploading project files...");
-            client
-                .upload_workspace_files(id, utf8_path.as_std_path())
-                .await
-                .context("Failed to upload project files")?;
+            // Guard against accidentally uploading a non-VCS directory
+            // (e.g. `~`): if the project path is not a recognized VCS
+            // root, warn and ask for confirmation before the recursive
+            // upload. On non-interactive stdin (CI, pipes, agents) we
+            // proceed without prompting — `--sync none` remains available
+            // for explicit opt-out (#770).
+            let should_upload = file_upload::is_vcs_root(utf8_path.as_std_path())
+                || !std::io::stdin().is_terminal()
+                || confirm(&format!(
+                    "{utf8_path} is not a version control repository root. \
+                     Upload all files from this directory?"
+                ))?;
+            if should_upload {
+                eprintln!("Uploading project files...");
+                client
+                    .upload_workspace_files(id, utf8_path.as_std_path())
+                    .await
+                    .context("Failed to upload project files")?;
+            } else {
+                eprintln!(
+                    "Skipping file upload; the session will start with an \
+                     empty workspace."
+                );
+            }
         }
     };
 
