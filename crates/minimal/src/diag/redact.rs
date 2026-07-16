@@ -9,10 +9,15 @@ use common::redact::{is_env_table_name, is_sensitive_key};
 /// Env vars whose *values* are safe and useful to include verbatim. Everything
 /// else is reported by name only.
 const ENV_VALUE_ALLOWLIST_EXACT: &[&str] = &["RUST_LOG", "HOME", "SHELL", "TERM", "PATH"];
-const ENV_VALUE_ALLOWLIST_PREFIXES: &[&str] = &["XDG_", "MINIMAL", "MINVMD_", "MINIMALD_"];
+const ENV_VALUE_ALLOWLIST_PREFIXES: &[&str] = &["XDG_", "MINIMAL_", "MINVMD_", "MINIMALD_"];
 
 /// Returns true when the named env var's value may be captured verbatim.
+/// A sensitive-shaped name always loses to the allowlist — `MINIMAL_AUTH_TOKEN`
+/// matches the project prefix but must never leave the machine.
 pub fn is_env_value_allowlisted(name: &str) -> bool {
+    if is_sensitive_key(name) {
+        return false;
+    }
     ENV_VALUE_ALLOWLIST_EXACT.contains(&name)
         || ENV_VALUE_ALLOWLIST_PREFIXES
             .iter()
@@ -37,7 +42,7 @@ fn redact_toml_value(value: &mut toml::Value, mask_all: bool) {
     match value {
         toml::Value::Table(table) => {
             for (key, child) in table.iter_mut() {
-                let child_mask = mask_all || is_env_table_name(key);
+                let child_mask = mask_all || is_env_table_name(key) || is_sensitive_key(key);
                 match child {
                     toml::Value::Table(_) | toml::Value::Array(_) => {
                         redact_toml_value(child, child_mask);
@@ -86,7 +91,16 @@ mod tests {
         ] {
             assert!(is_env_value_allowlisted(name), "{name} should be allowed");
         }
-        for name in ["AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "LANG", "USER"] {
+        for name in [
+            "AWS_SECRET_ACCESS_KEY",
+            "GITHUB_TOKEN",
+            "LANG",
+            "USER",
+            "MINIMAL_AUTH_TOKEN",
+            "MINIMALD_API_KEY",
+            "MINVMD_PASSWORD",
+            "MINIMALIST_THING",
+        ] {
             assert!(!is_env_value_allowlisted(name), "{name} must not be");
         }
     }
@@ -114,6 +128,24 @@ mod tests {
         assert!(out.contains(r#"GITHUB_TOKEN = "<redacted:len=7>""#));
         // Hook bodies are not env values and carry no key-based signal.
         assert!(out.contains("echo hi"));
+    }
+
+    #[test]
+    fn sensitive_tables_are_masked_wholesale() {
+        let input = r#"
+            api_token = ["primary", "secondary"]
+
+            [tokens]
+            github = "ghp_zzz"
+
+            [credentials.aws]
+            access_key_id = "AKIA"
+        "#;
+        let out = redact_toml(input).expect("valid toml");
+        assert!(!out.contains("ghp_zzz"));
+        assert!(!out.contains("AKIA"));
+        assert!(!out.contains("primary"));
+        assert!(!out.contains("secondary"));
     }
 
     #[test]

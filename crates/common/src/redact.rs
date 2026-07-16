@@ -28,11 +28,13 @@ const ENV_TABLE_NAMES: &[&str] = &["vars", "vars_lenient", "env", "environment"]
 
 /// Returns true when a key looks like it names secret material.
 ///
-/// Keys containing `public` are exempt (`public_key` must survive redaction —
-/// mesh diagnostics depend on it).
+/// `public_key`-shaped keys are exempt (`public_key`, `wg_public_key` must
+/// survive redaction — mesh diagnostics depend on them). The exemption is
+/// anchored so keys that merely contain `public` (`publication_secret`,
+/// `public_password`) stay sensitive.
 pub fn is_sensitive_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
-    if key.contains("public") {
+    if key == "public_key" || key.ends_with("_public_key") || key.starts_with("public_key_") {
         return false;
     }
     SENSITIVE_KEY_PARTS.iter().any(|part| key.contains(part))
@@ -57,8 +59,9 @@ pub fn redaction_placeholder(original: &Value) -> Value {
 /// Recursively masks sensitive values in `value` in place.
 ///
 /// A leaf is masked when its own key is sensitive per [`is_sensitive_key`],
-/// or when any ancestor object was named like an env table
-/// ([`is_env_table_name`]) — inside those, every leaf is masked.
+/// or when any ancestor was named like an env table ([`is_env_table_name`])
+/// or like secret material — inside those, every leaf is masked, so a
+/// `tokens` object can't smuggle its members out under harmless inner keys.
 pub fn redact_json(value: &mut Value) {
     redact_json_inner(value, false);
 }
@@ -67,7 +70,7 @@ fn redact_json_inner(value: &mut Value, mask_all: bool) {
     match value {
         Value::Object(map) => {
             for (key, child) in map.iter_mut() {
-                let child_mask = mask_all || is_env_table_name(key);
+                let child_mask = mask_all || is_env_table_name(key) || is_sensitive_key(key);
                 if child.is_object() || child.is_array() {
                     redact_json_inner(child, child_mask);
                 } else if child_mask || is_sensitive_key(key) {
@@ -113,6 +116,28 @@ mod tests {
         assert!(!is_sensitive_key("WG_PUBLIC_KEY"));
         assert!(!is_sensitive_key("name"));
         assert!(!is_sensitive_key("packages"));
+    }
+
+    #[test]
+    fn public_exemption_is_anchored_to_public_key() {
+        assert!(is_sensitive_key("publication_secret"));
+        assert!(is_sensitive_key("public_password"));
+        assert!(is_sensitive_key("republic_token"));
+    }
+
+    #[test]
+    fn sensitive_keys_mask_container_values_wholesale() {
+        let mut v = json!({
+            "tokens": { "github": "ghp_xxx", "gitlab": "glpat_yyy" },
+            "api_token": ["primary", "secondary"],
+            "credentials": { "aws": { "access_key_id": "AKIA" } },
+        });
+        redact_json(&mut v);
+        assert_eq!(v["tokens"]["github"], "<redacted:len=7>");
+        assert_eq!(v["tokens"]["gitlab"], "<redacted:len=9>");
+        assert_eq!(v["api_token"][0], "<redacted:len=7>");
+        assert_eq!(v["api_token"][1], "<redacted:len=9>");
+        assert_eq!(v["credentials"]["aws"]["access_key_id"], "<redacted:len=4>");
     }
 
     #[test]
