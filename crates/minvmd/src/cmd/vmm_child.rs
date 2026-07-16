@@ -49,12 +49,18 @@ fn run_vmm() -> Result<()> {
     })?;
 
     let mut ctx = Context::create().context("krun_create_ctx")?;
-    // 2 vCPU; guest RAM from `vm_ram_mib()` (env-overridable, tmpfs-headroom
-    // default; x86_64 needs a hole-safe size — see `DEFAULT_VM_RAM_MIB`). Stay
-    // below the kernel's CONFIG_NR_CPUS. `apply` configures the kernel +
-    // initramfs, the ext4 root disk, the writable data volume, and the vsock
-    // bridge.
-    let mut cfg = VmConfig::new(2, crate::cmd::vm_ram_mib(), kernel, rootfs, initramfs);
+    // vcpus and guest RAM are the *effective* values: env override ?? persisted
+    // `minvmd config` ?? default (R9.7). RAM keeps its tmpfs-headroom default and
+    // x86_64 hole-safe rule (see `DEFAULT_VM_RAM_MIB`); vcpus stay below the
+    // kernel's CONFIG_NR_CPUS. `apply` configures the kernel + initramfs, the
+    // ext4 root disk, the writable data volume, and the vsock bridge.
+    let mut cfg = VmConfig::new(
+        crate::cmd::effective_vcpus(),
+        crate::cmd::effective_ram_mib(),
+        kernel,
+        rootfs,
+        initramfs,
+    );
     // An own-IP VM registers the per-PTask gvproxy shuttle vsock
     // bridge in `apply`; the host gvproxy is spawned by the parent supervisor.
     // The env var keeps the parent's gvproxy-spawn decision and this child's VM

@@ -216,8 +216,7 @@ fn run_foreground() -> Result<()> {
         state_dir
             .write_state(&State {
                 lifecycle: starting,
-                vmm_pid: None,
-                started_at: None,
+                ..State::stopped()
             })
             .context("writing Starting state")?;
     }
@@ -349,7 +348,7 @@ fn run_foreground() -> Result<()> {
             .write_state(&State {
                 lifecycle: Lifecycle::Starting,
                 vmm_pid: Some(child_pid),
-                started_at: None,
+                ..State::stopped()
             })
             .context("writing Starting state with vmm_pid")?;
     }
@@ -413,6 +412,13 @@ fn run_foreground() -> Result<()> {
                 lifecycle: running,
                 vmm_pid: Some(child_pid),
                 started_at: Some(started_at),
+                // Record the resources the VMM child actually booted with (R2.6).
+                // The child resolves the same `effective_*` from the inherited
+                // env + shared config.toml, so this parent-side resolution
+                // matches what the live VM is running; `status` reports and warns
+                // against these, not a later `config set`'s next-boot values.
+                booted_vcpus: Some(crate::cmd::effective_vcpus()),
+                booted_ram_mib: Some(crate::cmd::effective_ram_mib()),
             })
             .context("writing Running state")?;
     }
@@ -455,6 +461,13 @@ fn run_foreground() -> Result<()> {
 
     if !status.success() {
         let code = status.code().unwrap_or(-1);
+        // R9.10: host-side analog of `minimal-entry`'s OOM post-mortem. An
+        // abnormal VMM-child exit is often a guest OOM/resource kill; point the
+        // user at the knob rather than leaving a bare exit code.
+        eprintln!(
+            "minvmd: the VM exited abnormally (code {code}); if a build was killed for lack of \
+             resources, raise them with `minvmd config set --ram-mib <MiB>` / `--vcpus <n>`."
+        );
         bail!("VMM child exited with code {code}");
     }
 

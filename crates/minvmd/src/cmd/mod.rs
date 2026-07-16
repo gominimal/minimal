@@ -1,6 +1,7 @@
 //! CLI subcommand implementations for `minvmd`.
 
 pub mod boot;
+pub mod config;
 pub mod run;
 pub mod status;
 pub mod stop;
@@ -70,6 +71,14 @@ pub fn ready_timeout() -> std::time::Duration {
 /// Environment variable overriding the [`DEFAULT_VM_RAM_MIB`] guest RAM size.
 pub const VM_RAM_MIB_ENV: &str = "MINVMD_VM_RAM_MIB";
 
+/// Environment variable overriding the [`DEFAULT_VM_VCPUS`] guest vcpu count.
+pub const VM_VCPUS_ENV: &str = "MINVMD_VM_VCPUS";
+
+/// Default guest vcpu count. 2 is the v0.1 baseline; stay below the guest
+/// kernel's `CONFIG_NR_CPUS`. Overridable via [`VM_VCPUS_ENV`] or persisted
+/// resource config (see [`effective_vcpus`]).
+pub const DEFAULT_VM_VCPUS: u8 = 2;
+
 /// Default guest RAM in MiB. 512 MiB is the floor to reach userspace; the extra
 /// headroom feeds the in-VM session build, whose package cache lives on a tmpfs
 /// (`/run/minimal/cache`) sized from RAM (1024 MiB overflowed `StorageFull`
@@ -89,8 +98,33 @@ pub const DEFAULT_VM_RAM_MIB: u32 = 2048;
 #[cfg(not(target_arch = "x86_64"))]
 pub const DEFAULT_VM_RAM_MIB: u32 = 4096;
 
-/// The guest RAM size in MiB, overridable via [`VM_RAM_MIB_ENV`]. A non-numeric,
-/// empty, or zero value falls back to [`DEFAULT_VM_RAM_MIB`].
+/// The `MINVMD_VM_RAM_MIB` override as a positive value, if set and valid. A
+/// non-numeric, empty, or zero value is treated as unset.
+pub(crate) fn env_ram_mib() -> Option<u32> {
+    std::env::var(VM_RAM_MIB_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&mib| mib > 0)
+}
+
+/// The `MINVMD_VM_VCPUS` override as a positive value, if set and valid.
+pub(crate) fn env_vcpus() -> Option<u8> {
+    std::env::var(VM_VCPUS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u8>().ok())
+        .filter(|&c| c > 0)
+}
+
+/// The persisted resource config from the provider dir; the all-`None` default
+/// on any read error, so a missing or unreadable file never blocks boot (R9.7).
+pub(crate) fn persisted_resource_config() -> crate::config::ResourceConfig {
+    crate::config::ResourceConfig::read(&crate::state::provider_dir()).unwrap_or_default()
+}
+
+/// The effective guest RAM in MiB, resolved as
+/// `env override ?? persisted config ?? default` (R9.7). The
+/// [`VM_RAM_MIB_ENV`] override still wins so power users keep a per-boot escape
+/// hatch; `minvmd config set --ram-mib` supplies the persisted layer beneath it.
 ///
 /// Note: the RAM stop-gap is *not* reduced when the cache moves to the writable
 /// volume. A reduced baseline is only safe once a failed volume mount is fatal
@@ -99,12 +133,19 @@ pub const DEFAULT_VM_RAM_MIB: u32 = 4096;
 /// with the cache still on the tmpfs. Out of scope for this feature — deferred to
 /// a separate memory-pressure spec.
 #[must_use]
-pub fn vm_ram_mib() -> u32 {
-    std::env::var(VM_RAM_MIB_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&mib| mib > 0)
+pub fn effective_ram_mib() -> u32 {
+    env_ram_mib()
+        .or_else(|| persisted_resource_config().ram_mib)
         .unwrap_or(DEFAULT_VM_RAM_MIB)
+}
+
+/// The effective guest vcpu count, resolved as
+/// `env override ?? persisted config ?? default` (R9.7).
+#[must_use]
+pub fn effective_vcpus() -> u8 {
+    env_vcpus()
+        .or_else(|| persisted_resource_config().vcpus)
+        .unwrap_or(DEFAULT_VM_VCPUS)
 }
 
 /// Verify the host hypervisor backend is accessible before booting a VM (R2.4).

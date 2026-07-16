@@ -78,6 +78,18 @@ pub struct State {
     pub vmm_pid: Option<u32>,
     /// Unix timestamp (seconds) when the daemon last entered `Running`.
     pub started_at: Option<u64>,
+    /// vcpu count the *running* VM was actually booted with (#747, R2.6). A
+    /// runtime fact like `vmm_pid` — recorded on entering `Running`, cleared on
+    /// stop — so `status` reports and warns against the live VM's real
+    /// allocation, not the next-boot resolution (which may have since changed
+    /// via `config set`). `#[serde(default)]` keeps pre-#747 state files
+    /// readable.
+    #[serde(default)]
+    pub booted_vcpus: Option<u8>,
+    /// Guest RAM in MiB the *running* VM was actually booted with (#747, R2.6).
+    /// See [`State::booted_vcpus`].
+    #[serde(default)]
+    pub booted_ram_mib: Option<u32>,
 }
 
 impl State {
@@ -87,6 +99,8 @@ impl State {
             lifecycle: Lifecycle::Stopped,
             vmm_pid: None,
             started_at: None,
+            booted_vcpus: None,
+            booted_ram_mib: None,
         }
     }
 }
@@ -139,8 +153,7 @@ impl StateDir {
             Ok(s) => toml::from_str(&s).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(State {
                 lifecycle: Lifecycle::NotProvisioned,
-                vmm_pid: None,
-                started_at: None,
+                ..State::stopped()
             }),
             Err(e) => Err(e),
         }
@@ -148,16 +161,7 @@ impl StateDir {
 
     /// Write `state` to `minvmd.toml` atomically (tmp → fsync → rename) (R4.1).
     pub fn write_state(&self, state: &State) -> io::Result<()> {
-        let target = self.state_path();
-        let tmp = target.with_extension("toml.tmp");
-        let serialised =
-            toml::to_string(state).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        {
-            let mut f = File::create(&tmp)?;
-            f.write_all(serialised.as_bytes())?;
-            f.sync_all()?;
-        }
-        fs::rename(&tmp, &target)
+        atomic_write_toml(&self.state_path(), state)
     }
 
     /// Read the state, treating a dead daemon's leftovers as `Stopped`.
@@ -225,6 +229,22 @@ impl StateDir {
     pub fn lifecycle_lock(&self) -> io::Result<RwLock<File>> {
         Ok(RwLock::new(self.open_lock_file()?))
     }
+}
+
+/// Serialise `value` to TOML and write it to `target` atomically: content is
+/// written to a `.toml.tmp` sibling, `fsync`'d, then renamed over the target
+/// (R4.1). Shared by [`StateDir::write_state`] and
+/// [`crate::config::ResourceConfig::write`].
+pub(crate) fn atomic_write_toml<T: Serialize>(target: &Path, value: &T) -> io::Result<()> {
+    let tmp = target.with_extension("toml.tmp");
+    let serialised =
+        toml::to_string(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(serialised.as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, target)
 }
 
 /// Whether some process holds an exclusive advisory lock on `path`.
@@ -367,6 +387,8 @@ mod tests {
             lifecycle: Lifecycle::Running,
             vmm_pid: Some(12345),
             started_at: Some(1_700_000_000),
+            booted_vcpus: Some(4),
+            booted_ram_mib: Some(3072),
         };
         sd.write_state(&original).expect("write");
 
@@ -374,6 +396,26 @@ mod tests {
         assert_eq!(read_back.lifecycle, Lifecycle::Running);
         assert_eq!(read_back.vmm_pid, Some(12345));
         assert_eq!(read_back.started_at, Some(1_700_000_000));
+        assert_eq!(read_back.booted_vcpus, Some(4));
+        assert_eq!(read_back.booted_ram_mib, Some(3072));
+    }
+
+    #[test]
+    fn pre_747_state_file_without_booted_fields_reads_as_none() {
+        // Backward compat: a state file written before #747 has no booted_*
+        // keys; `#[serde(default)]` must accept it with those fields as None.
+        let tmp = temp_dir();
+        let sd = make_state_dir(&tmp);
+        std::fs::write(
+            sd.state_path(),
+            "lifecycle = \"running\"\nvmm_pid = 42\nstarted_at = 1700000000\n",
+        )
+        .expect("write legacy toml");
+
+        let s = sd.read_state().expect("read legacy");
+        assert_eq!(s.lifecycle, Lifecycle::Running);
+        assert_eq!(s.vmm_pid, Some(42));
+        assert!(s.booted_vcpus.is_none() && s.booted_ram_mib.is_none());
     }
 
     #[test]
@@ -502,6 +544,7 @@ mod tests {
             lifecycle: Lifecycle::Running,
             vmm_pid: Some(12345),
             started_at: Some(1),
+            ..State::stopped()
         })
         .unwrap();
 
@@ -521,6 +564,7 @@ mod tests {
             lifecycle: Lifecycle::Running,
             vmm_pid: Some(42),
             started_at: Some(1),
+            ..State::stopped()
         })
         .unwrap();
 
@@ -552,6 +596,7 @@ mod tests {
             lifecycle: Lifecycle::Starting,
             vmm_pid: Some(999),
             started_at: Some(42),
+            ..State::stopped()
         })
         .expect("write starting");
 
@@ -580,6 +625,7 @@ mod tests {
             lifecycle: Lifecycle::Running,
             vmm_pid: Some(777),
             started_at: Some(99),
+            ..State::stopped()
         })
         .expect("write running");
 
