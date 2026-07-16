@@ -55,16 +55,28 @@ fn set_then_show_reports_persisted_value_and_source() {
 #[test]
 fn set_merges_without_clobbering_the_other_field() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    run(tmp.path(), &["config", "set", "--ram-mib", "2048"]);
-    run(tmp.path(), &["config", "set", "--vcpus", "3"]);
+    // Values valid on any runner: 3072 MiB is off the arch defaults (2048/4096)
+    // and MMIO-hole-safe; 1 vcpu is below the host-derived ceiling on even a
+    // 2-core CI runner yet differs from the DEFAULT_VM_VCPUS (2) floor, so both
+    // assertions distinguish a persisted value from a fallback default.
+    let (ok, _o, err) = run(tmp.path(), &["config", "set", "--ram-mib", "3072"]);
+    assert!(
+        ok,
+        "first `config set --ram-mib` must succeed; stderr: {err}"
+    );
+    let (ok, _o, err) = run(tmp.path(), &["config", "set", "--vcpus", "1"]);
+    assert!(
+        ok,
+        "second `config set --vcpus` must succeed; stderr: {err}"
+    );
 
     let (_ok, out, _err) = run(tmp.path(), &["config", "show", "--json"]);
     let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
     assert_eq!(
-        v["ram_mib"], 2048,
+        v["ram_mib"], 3072,
         "earlier ram_mib must survive a later set"
     );
-    assert_eq!(v["vcpus"], 3);
+    assert_eq!(v["vcpus"], 1);
 }
 
 #[test]
