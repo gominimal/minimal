@@ -441,10 +441,10 @@ map to a binary-name suffix + `just`/`scripts`, per the preamble):
 
 | Test kind | Where it goes | How CI discovers it | Local proof command |
 |---|---|---|---|
-| Unit | `#[cfg(test)]` module next to the code | cargo/nextest target discovery | `cargo nextest run --workspace` |
-| In-process integration | `crates/<crate>/tests/*.rs` | cargo target discovery | `cargo nextest run --workspace` |
-| Integration harness (real VM / kernel / netns) | `crates/<crate>/tests/*_integration.rs` (add `_root` → `*_root_integration.rs` if it needs `CAP_NET_ADMIN`) | the KVM/macOS/native lanes' non-root filterset `-E 'binary(/_integration$/) and not binary(/_root_integration$/)'` (root step: `-E 'binary(/_root_integration$/)'`, run under `sudo`) | `just up`, then run the harness binary |
-| End-to-end (drives the `minimal` CLI through the whole system) | a script under `scripts/` (e.g. `session-e2e.sh`) | the target lane invokes the script | `E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd ./scripts/session-e2e.sh` |
+| Unit | `#[cfg(test)]` module next to the code | cargo/nextest target discovery | `just test` |
+| In-process integration | `crates/<crate>/tests/*.rs` | cargo target discovery | `just test` |
+| Integration harness (real VM / kernel / netns) | `crates/<crate>/tests/*_integration.rs` (add `_root` → `*_root_integration.rs` if it needs `CAP_NET_ADMIN`) | the KVM/macOS/native lanes' non-root filterset `-E 'binary(/_integration$/) and not binary(/_root_integration$/)'` (root step: `-E 'binary(/_root_integration$/)'`, run under `sudo`) | `just test-vm` (root: `just test-root-integration`) |
+| End-to-end (drives the `minimal` CLI through the whole system) | a script under `scripts/` (e.g. `session-e2e.sh`) | the target lane invokes the script | `just e2e` (Linux native daemon: `just e2e-native`) |
 
 The discriminator between the last two rows is whether the test drives the
 `minimal` CLI through a full user workflow: if so it is *end-to-end* and lives as
