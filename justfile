@@ -641,7 +641,15 @@ dm2: minimald-build minimal-cli gvproxy
     echo "DM2 up: host-native minimald at $sock (pid $(cat "$pidf"))"
     echo "  own-IP: {{min-bin}} --minimal-dir $dir activate -n net1 --network own-ip . && \\"
     echo "          {{min-bin}} --minimal-dir $dir attach net1   # curl http://example.com -> 200"
-    "{{min-bin}}" --minimal-dir "$dir" ls
+    # Same first-connect retry as dm3: minimald can reset the very first SSH
+    # connect right after binding the socket, which trips the CLI's autospawn
+    # (and fails the recipe) even though the daemon is healthy.
+    ok=0
+    for _ in $(seq 1 5); do
+      if "{{min-bin}}" --minimal-dir "$dir" ls; then ok=1; break; fi
+      sleep 2
+    done
+    [ "$ok" = 1 ] || { echo "DM2: min ls failed after retries; see {{scratch}}/dm2-minimald.log" >&2; exit 1; }
 
 # Stop the DM2 host-native minimald.
 dm2-down:
