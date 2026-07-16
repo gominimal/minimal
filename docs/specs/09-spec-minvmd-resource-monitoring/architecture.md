@@ -30,7 +30,8 @@ the next launch).
    *those* for a live VM.
 
 3. **Warnings** — proactive only: over-allocation vs host cores/memory, the
-   x86_64 MMIO hole, and a guest-kernel vCPU ceiling, all checked at `config set`;
+   x86_64 MMIO hole, and a host-derived vCPU ceiling (logical cores minus a
+   two-core host reserve), all checked at `config set`;
    plus a supervisor post-exit resource hint on a guest workload's non-zero exit.
    There is **no** host-side reactive pressure threshold (see the removed-warnings
    note under Alternatives).
@@ -116,7 +117,7 @@ is added:
 | vmm-rss-reflects-guest | The VMM process's RSS/CPU/disk-I/O meaningfully reflect the guest, since libkrun runs the guest inside that process. | confident | libkrun architecture; `minimal-vm-mac` samples the same host process by PID. |
 | sysinfo-cross-platform-diskio | `sysinfo` `Process::disk_usage()` is populated on both macOS and Linux. | confident | sysinfo supports process disk usage on Linux/macOS/Windows/FreeBSD; verified by the self-sample test. |
 | env-divergence-resolved | A running `status` reflects the live VM's actual booted `vcpus`/`ram_mib`, including env-override boots, via `State.booted_*`. | confident | R2.6. |
-| max-vcpus-conservative | `MAX_VM_VCPUS = 8` is at or below the guest kernel's `CONFIG_NR_CPUS`, so a clamped/validated count never bricks the boot. | needs-confirm | the guest kernel config is not pinned in this repo; 8 is a conservative guard, raisable once confirmed. |
+| max-vcpus-host-derived | The host-derived ceiling (`max_vm_vcpus`: logical cores − 2, floored at the default) stays at or below the guest kernel's `CONFIG_NR_CPUS`, so a clamped/validated count never bricks the boot. | needs-confirm | the guest kernel config is not pinned in this repo; generic configs ship `CONFIG_NR_CPUS` ≥ 64, but a very-many-core host could exceed it (PR #775 review chose host-derived over a fixed cap of 8). |
 
 ## Knowledge gaps
 

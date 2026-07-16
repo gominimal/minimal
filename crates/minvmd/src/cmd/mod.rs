@@ -79,13 +79,30 @@ pub const VM_VCPUS_ENV: &str = "MINVMD_VM_VCPUS";
 /// resource config (see [`effective_vcpus`]).
 pub const DEFAULT_VM_VCPUS: u8 = 2;
 
-/// Conservative upper bound on guest vcpus. The generic guest kernel's
-/// `CONFIG_NR_CPUS` is not pinned in this repo, so a resolved count is clamped
-/// here (and `config set` rejects above it): the boot path used to hardcode `2`,
-/// and an unbounded count from config/env could exceed the guest kernel's
-/// ceiling and panic the boot. Raise once the guest kernel's real limit is
-/// confirmed higher.
-pub const MAX_VM_VCPUS: u8 = 8;
+/// Logical cores backed off from the vcpu ceiling for the host side: the VMM
+/// and its worker threads, plus whatever else the machine is running.
+pub const VCPU_HOST_RESERVE: u32 = 2;
+
+/// Upper bound on guest vcpus for a host with `logical_cores` logical CPUs:
+/// the core count minus [`VCPU_HOST_RESERVE`], floored at [`DEFAULT_VM_VCPUS`]
+/// so small hosts keep the baseline, saturated to the `u8` vcpu type. The
+/// ceiling is host-derived rather than a fixed cap so a many-core host can run
+/// a wide VM; the generic guest kernel's `CONFIG_NR_CPUS` (typically ≥ 64) is
+/// assumed not to be the binding constraint.
+#[must_use]
+pub fn max_vm_vcpus(logical_cores: u32) -> u8 {
+    u8::try_from(logical_cores.saturating_sub(VCPU_HOST_RESERVE))
+        .unwrap_or(u8::MAX)
+        .max(DEFAULT_VM_VCPUS)
+}
+
+/// The host's logical core count (1 if probing fails) — the input to
+/// [`max_vm_vcpus`].
+pub(crate) fn host_logical_cores() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+}
 
 /// Default guest RAM in MiB. 512 MiB is the floor to reach userspace; the extra
 /// headroom feeds the in-VM session build, whose package cache lives on a tmpfs
@@ -143,17 +160,18 @@ pub(crate) fn persisted_resource_config() -> crate::config::ResourceConfig {
     }
 }
 
-/// Clamp a resolved vcpu count to [`MAX_VM_VCPUS`]. Warns when it clamps (e.g. an
-/// over-large [`VM_VCPUS_ENV`] override that skips `config set` validation) so a
-/// boot with fewer vcpus than requested is not silent.
+/// Clamp a resolved vcpu count to this host's [`max_vm_vcpus`]. Warns when it
+/// clamps (e.g. an over-large [`VM_VCPUS_ENV`] override that skips `config set`
+/// validation) so a boot with fewer vcpus than requested is not silent.
 fn clamp_vcpus(vcpus: u8) -> u8 {
-    if vcpus > MAX_VM_VCPUS {
+    let max = max_vm_vcpus(host_logical_cores());
+    if vcpus > max {
         tracing::warn!(
             requested = vcpus,
-            max = MAX_VM_VCPUS,
-            "requested vcpu count exceeds the guest-kernel ceiling; clamping"
+            max,
+            "requested vcpu count exceeds the host-derived vcpu ceiling; clamping"
         );
-        MAX_VM_VCPUS
+        max
     } else {
         vcpus
     }
@@ -178,8 +196,9 @@ pub fn effective_ram_mib() -> u32 {
 }
 
 /// The effective guest vcpu count, resolved as
-/// `env override ?? persisted config ?? default` (R9.7) and clamped to
-/// [`MAX_VM_VCPUS`] so an over-large env/config value cannot brick the boot.
+/// `env override ?? persisted config ?? default` (R9.7) and clamped to this
+/// host's [`max_vm_vcpus`] so an over-large env/config value cannot brick the
+/// boot.
 #[must_use]
 pub fn effective_vcpus() -> u8 {
     clamp_vcpus(
@@ -193,7 +212,7 @@ pub fn effective_vcpus() -> u8 {
 /// the pair cannot tear when `config.toml` changes between two separate
 /// `effective_*` calls (e.g. the two `booted_*` fields recorded at the Running
 /// transition). Per-field env overrides still take precedence; vcpus is clamped
-/// to [`MAX_VM_VCPUS`].
+/// to this host's [`max_vm_vcpus`].
 #[must_use]
 pub fn effective_resources() -> (u8, u32) {
     let env_v = env_vcpus();
@@ -466,6 +485,28 @@ mod tests {
         let msg = kvm_access_error(&Error::from(ErrorKind::PermissionDenied)).to_string();
         assert!(msg.contains("permission denied"), "got: {msg}");
         assert!(msg.contains("`kvm` group"), "got: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod vcpu_ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn max_backs_off_the_host_reserve() {
+        assert_eq!(max_vm_vcpus(64), 62);
+        assert_eq!(max_vm_vcpus(8), 6);
+    }
+
+    #[test]
+    fn max_floors_at_the_default_on_small_hosts() {
+        assert_eq!(max_vm_vcpus(1), DEFAULT_VM_VCPUS);
+        assert_eq!(max_vm_vcpus(4), DEFAULT_VM_VCPUS);
+    }
+
+    #[test]
+    fn max_saturates_to_the_vcpu_type() {
+        assert_eq!(max_vm_vcpus(1000), u8::MAX);
     }
 }
 

@@ -55,7 +55,7 @@ Three additions, all host-side:
    provider-instance dir, consumed at the next boot.
 3. **Warnings**: **proactive** over-allocation warnings at `config set`
    (requested value exceeds host cores/memory, straddles the x86_64 MMIO hole, or
-   exceeds the guest-kernel vCPU ceiling), plus a supervisor post-exit resource
+   exceeds the host-derived vCPU ceiling), plus a supervisor post-exit resource
    hint on an abnormal VMM-child exit (a guest workload's non-zero exit). There is
    **no** host-side reactive memory/disk *pressure* threshold — see the note below.
 
@@ -85,7 +85,7 @@ hint.
    their source.
 3. `minvmd config set` warns (non-fatally) when a requested value over-allocates
    host resources or hits the x86_64 MMIO hole, and rejects structurally invalid
-   values (including a vcpu count above the guest-kernel ceiling).
+   values (including a vcpu count above the host-derived ceiling).
 4. An abnormal VMM-child exit (a guest workload's non-zero exit) prints a resource
    hint.
 5. No new behaviour on the non-VM (native minimald) path; the change is confined
@@ -242,7 +242,8 @@ exhaustion when a guest workload exits non-zero.
   total memory via `sysinfo`) and emit **non-fatal** warnings when the request
   exceeds host cores or memory, and — on `x86_64` — when `ram_mib` falls in the
   MMIO-hole range `3073..=6143`. It shall **reject** structurally unsafe values:
-  `vcpus == 0`, `vcpus > MAX_VM_VCPUS` (the guest-kernel ceiling), and
+  `vcpus == 0`, `vcpus > max_vm_vcpus(host cores)` (the host's logical core
+  count minus a two-core host reserve, floored at the default), and
   `ram_mib < 512`. The pure validator takes capacity as a parameter so it is
   testable without the real host.
 - **R3.2**: `crates/minvmd/src/cmd/run.rs` shall, on an abnormal VMM-child exit
@@ -261,7 +262,7 @@ exhaustion when a guest workload exits non-zero.
 **Proof Artifacts:**
 1. **Test:** `cmd::config::tests::over_core_and_over_mem_warn_but_succeed` and
    `x86_mmio_hole_range_warns` — proactive warnings.
-2. **Test:** `cmd::config::tests::{zero_vcpus_is_rejected, vcpus_over_ceiling_is_rejected,
+2. **Test:** `cmd::config::tests::{zero_vcpus_is_rejected, vcpus_over_host_derived_ceiling_is_rejected,
    ram_below_floor_is_rejected}` — structural rejections.
 3. **Code:** `crates/minvmd/src/cmd/run.rs` — the abnormal-exit hint, guarded on a
    real exit code.
@@ -319,10 +320,11 @@ exhaustion when a guest workload exits non-zero.
 
 - `sysinfo` is added with `default-features = false, features = ["system"]` to
   keep the dependency footprint to process + memory info.
-- `MAX_VM_VCPUS` is a conservative constant, not the real guest-kernel
-  `CONFIG_NR_CPUS` (not pinned in this repo). It restores the boot-safety the
-  previously hardcoded `2` gave; raise it once the guest kernel's true ceiling is
-  confirmed.
+- The vcpu ceiling is host-derived (`max_vm_vcpus`: logical cores minus a
+  two-core host reserve, floored at the default), not a fixed constant, so a
+  many-core host can run a wide VM (PR #775 review). It assumes the generic
+  guest kernel's `CONFIG_NR_CPUS` (not pinned in this repo, typically ≥ 64) is
+  not the binding constraint.
 
 ## Security Considerations
 

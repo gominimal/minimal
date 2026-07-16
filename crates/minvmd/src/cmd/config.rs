@@ -29,9 +29,7 @@ impl HostCapacity {
     /// Probe the host: logical cores via std, total memory via sysinfo.
     #[must_use]
     pub fn probe() -> Self {
-        let logical_cores = std::thread::available_parallelism()
-            .map(|n| n.get() as u32)
-            .unwrap_or(1);
+        let logical_cores = crate::cmd::host_logical_cores();
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total_mib = u32::try_from(sys.total_memory() / (1024 * 1024)).unwrap_or(u32::MAX);
@@ -57,12 +55,18 @@ fn validate_resources(
         if v == 0 {
             bail!("--vcpus must be at least 1");
         }
-        if v > crate::cmd::MAX_VM_VCPUS {
+        let max = crate::cmd::max_vm_vcpus(host.logical_cores);
+        if v > max {
             bail!(
-                "--vcpus must be at most {} (the guest-kernel vCPU ceiling)",
-                crate::cmd::MAX_VM_VCPUS
+                "--vcpus must be at most {max} on this host ({} logical cores minus a \
+                 {}-core reserve for the host side)",
+                host.logical_cores,
+                crate::cmd::VCPU_HOST_RESERVE
             );
         }
+        // Reachable only when the DEFAULT_VM_VCPUS floor lifts the ceiling
+        // above the core count (tiny hosts); otherwise the ceiling rejects
+        // oversubscription before this warning can fire.
         if u32::from(v) > host.logical_cores {
             warnings.push(format!(
                 "requested {v} vcpus exceeds the host's {} logical cores; the VM will \
@@ -182,17 +186,23 @@ fn source(from_env: bool, from_config: bool) -> &'static str {
 mod tests {
     use super::*;
 
-    // logical_cores is below MAX_VM_VCPUS (8) so the over-core *warning* path
-    // (vcpus > cores, still <= the ceiling) stays reachable and distinct from the
-    // over-ceiling *rejection*.
+    // 8 logical cores → a host-derived vcpu ceiling of 6 (cores minus the
+    // 2-core host reserve), so the over-ceiling *rejection* is testable.
     const HOST: HostCapacity = HostCapacity {
-        logical_cores: 4,
+        logical_cores: 8,
+        total_mib: 16384,
+    };
+
+    // Small enough that the DEFAULT_VM_VCPUS floor lifts the ceiling above the
+    // core count, keeping the oversubscription *warning* path reachable.
+    const TINY_HOST: HostCapacity = HostCapacity {
+        logical_cores: 1,
         total_mib: 16384,
     };
 
     #[test]
     fn valid_values_within_capacity_have_no_warnings() {
-        let warns = validate_resources(Some(4), Some(8192), HOST).expect("valid");
+        let warns = validate_resources(Some(6), Some(8192), HOST).expect("valid");
         assert!(warns.is_empty(), "got: {warns:?}");
     }
 
@@ -203,8 +213,9 @@ mod tests {
     }
 
     #[test]
-    fn vcpus_over_ceiling_is_rejected() {
-        let err = validate_resources(Some(crate::cmd::MAX_VM_VCPUS + 1), None, HOST).unwrap_err();
+    fn vcpus_over_host_derived_ceiling_is_rejected() {
+        let max = crate::cmd::max_vm_vcpus(HOST.logical_cores);
+        let err = validate_resources(Some(max + 1), None, HOST).unwrap_err();
         assert!(err.to_string().contains("at most"), "got: {err}");
     }
 
@@ -216,8 +227,9 @@ mod tests {
 
     #[test]
     fn over_core_and_over_mem_warn_but_succeed() {
-        // 6 vcpus: above the host's 4 cores (warns) but within the ceiling (8).
-        let warns = validate_resources(Some(6), Some(65536), HOST).expect("warn, not error");
+        // 2 vcpus on a 1-core host: within the floored ceiling (2) but above
+        // the core count, so it warns instead of rejecting.
+        let warns = validate_resources(Some(2), Some(65536), TINY_HOST).expect("warn, not error");
         assert!(
             warns.iter().any(|w| w.contains("vcpus")),
             "expected an over-core warning: {warns:?}"
