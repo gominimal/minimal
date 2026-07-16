@@ -339,6 +339,7 @@ runtime.
 | R2.2 | Test | `cargo test -p minvmd cmd::config::tests::source_precedence_is_env_then_config_then_default` |
 | R2.3/R2.4 | CLI | `minvmd config set --ram-mib 3072 && minvmd config show --json` |
 | R2.5/R2.6 | E2E | `scripts/minvmd-lifecycle.sh` (KVM lane): `config set --ram-mib 3072` → `run --detach` → the running VM's `status --json` reports `ram_mib == 3072` (the persisted value, consumed at real boot) |
+| R2.5/R2.6/R9.1/R9.9 | E2E (both VM lanes) | `crates/minvmd/tests/resource_vm_integration.rs` — auto-discovered on Linux/KVM **and** macOS/HVF: boots a VM, asserts `status --json` reports the persisted `ram_mib` plus live `metrics.*` and a `warnings` array |
 | R2.6 | Test | `cargo test -p minvmd status::tests::running_reports_booted_snapshot_not_next_boot_resolution` + `state::tests::pre_747_state_file_without_booted_fields_reads_as_none` |
 | R3.1 | Test | `cargo test -p minvmd cmd::config::tests::over_core_and_over_mem_warn_but_succeed` |
 | R3.2 | Test | `cargo test -p minvmd metrics::tests` (pressure thresholds) |
