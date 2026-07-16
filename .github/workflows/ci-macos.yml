@@ -162,12 +162,15 @@ jobs:
                   key: ${{ steps.stage2-cache.outputs.cache-primary-key }}
 
     e2e:
-        # Hypervisor E2E on real hardware, using the cache-pulled kernel + rootfs
-        # ext4 image and the built initramfs (all from the `artifacts` job). One
-        # job (formerly separate boot, autospawn, and FFI-smoke jobs) so
-        # the single shared runner checks out, builds, and codesigns exactly
-        # once per run — everything that does NOT need the hypervisor lives in
-        # the GitHub-hosted `unit` job, keeping this runner free.
+        # Hypervisor E2E on real hardware — the mac lane's TEST phase. The
+        # mini COMPILES NOTHING (the KVM lane's build→test split, podman
+        # pattern): kernel/rootfs/initramfs come from the `artifacts` job, and
+        # every host binary — minvmd, min, the test harnesses in the nextest
+        # archive, libkrun.1.dylib in the shipped bin/../lib layout — comes
+        # prebuilt in the `unit` job's darwin testbed. This runner only
+        # downloads, codesigns, and runs, so the shared mini spends its time
+        # exclusively on the hypervisor and a flake rerun replays only this
+        # test job, not a build+test monolith.
         #
         # GATING: green on the runner — raw kernel load (KRUN_KERNEL_FORMAT_RAW),
         # initramfs boot (minimald as `/init`, pid-1), minimald mounting the ext4
@@ -185,21 +188,13 @@ jobs:
         # offline; a skipped e2e reads as `skipped`, which the aggregator
         # treats as pass.
         if: ${{ vars.RUN_MACOS_CI != 'false' && (github.event_name != 'pull_request' || needs.changes.outputs.macos == 'true') }}
-        needs: [changes, artifacts]
+        needs: [changes, artifacts, unit]
         runs-on: [self-hosted, macOS, ARM64]
         timeout-minutes: 30
-        env:
-            # Slim debug info; see the unit job. First run after this change
-            # rebuilds the mini's persistent target dir once (new fingerprints).
-            CARGO_PROFILE_DEV_DEBUG: line-tables-only
         steps:
             - uses: actions/checkout@v7
               with:
                   persist-credentials: false
-            - name: Toolchain
-              uses: dtolnay/rust-toolchain@stable
-            - name: Provision libkrun (pinned own build)
-              uses: ./.github/actions/setup-libkrun-macos
             - name: Download virtio-linux kernel
               uses: actions/download-artifact@v8
               with:
@@ -215,97 +210,89 @@ jobs:
               with:
                   name: minimald-initramfs-aarch64
                   path: ${{ runner.temp }}/initramfs
+            - name: Download darwin testbed
+              uses: actions/download-artifact@v8
+              with:
+                  name: mac-testbed
+                  path: ${{ runner.temp }}/testbed
             - name: Install nextest
               uses: taiki-e/install-action@v2
               with:
                   tool: nextest
-            - name: Build the nextest archive + minvmd + minimal (no run)
-              # Build EVERYTHING before the single codesign, then run the test
-              # binaries from the nextest ARCHIVE (below). Any cargo invocation
-              # after signing relinks (and unsigns) target/debug/minvmd, so
-              # krun_start_enter fails with EINVAL; `nextest run --archive-file`
-              # is offline (no rebuild), so the signature survives. The archive
-              # carries every minvmd test binary, so the harnesses are selected
-              # by the `_integration` convention below with no per-test list — a new
-              # crates/minvmd/tests/*_integration.rs is picked up with no yaml. The
-              # full-boot harnesses spawn minvmd as a subprocess (resolved via
-              # MINVMD_BIN to the codesigned bin); minimal spawns minvmd by name
-              # from PATH. The archive step also leaves the per-test binaries in
-              # target/debug/deps, so the FFI smoke below still runs directly.
+            - name: Unpack testbed + resolve paths
+              # Artifact transfer strips exec bits on the sidecar binaries;
+              # restore them (the nextest archive preserves its own). The
+              # Mach-O contents round-trip byte-for-byte, so the build-time
+              # ad-hoc signatures on min and libkrun.1.dylib stay valid;
+              # minvmd is re-signed with the hypervisor entitlement below.
+              # MINVMD_BIN points the harnesses at the testbed minvmd (their
+              # baked CARGO_BIN_EXE path only exists on the build runner);
+              # bin/ joins PATH so the CLI e2e's autospawn resolves
+              # min/minvmd by name.
               run: |
-                  cargo nextest archive -p minvmd \
-                    --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" --locked
-                  cargo build -p minvmd --bin minvmd --locked
-                  # SEPARATE invocation for the CLI (mirrors release.yml): built
-                  # together, cargo unifies minvmd's default `libkrun` feature
-                  # into minimal's default-features=false opt-out, and the CLI
-                  # links libkrun. The brew era masked this (absolute install
-                  # name loaded from anywhere); our @rpath dylib turns it into
-                  # dyld "Library not loaded" at autospawn, since minimal bakes
-                  # no rpaths.
-                  cargo build -p minimal --bin min --locked
-            - name: Verify minimal links only system libraries
-              # The CLI spawns minvmd as a subprocess and calls no libkrun; a
-              # krun load command means the feature unification above regressed.
-              # Catch it here with a clear message, not as a dyld error mid-e2e.
-              run: |
-                  bad="$(otool -L target/debug/min | tail -n +2 | awk '{print $1}' \
-                    | grep -vE '^(/usr/lib/|/System/)' || true)"
-                  if [ -n "$bad" ]; then
-                    echo "::error::minimal links non-system libraries (feature unification with minvmd's libkrun?):" >&2
-                    printf '%s\n' "$bad" >&2
-                    exit 1
-                  fi
+                  set -euo pipefail
+                  TESTBED="$RUNNER_TEMP/testbed"
+                  chmod +x "$TESTBED/bin/minvmd" "$TESTBED/bin/min"
+                  echo "$TESTBED/bin" >> "$GITHUB_PATH"
+                  {
+                    echo "TESTBED=$TESTBED"
+                    echo "MINVMD_BIN=$TESTBED/bin/minvmd"
+                  } >> "$GITHUB_ENV"
             - name: Codesign minvmd (hypervisor entitlement)
-              run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - target/debug/minvmd
-            - name: Production linkage static check (rewrite on a copy)
-              # Run the release pipeline's @rpath rewrite + verification against a
-              # THROWAWAY COPY of the just-built minvmd, so a change that would
-              # break the shipped bin/../lib layout (a lost @rpath load command, a
-              # leaked non-system dylib) reds the PR instead of the next release.
-              # The copy keeps the e2e binaries untouched (the rewrite invalidates
-              # the signature; the copy is never executed).
-              run: |
-                  cp target/debug/minvmd "$RUNNER_TEMP/minvmd-linkage-check"
-                  scripts/rewrite-macos-linkage.sh "$RUNNER_TEMP/minvmd-linkage-check"
+              run: codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - "$TESTBED/bin/minvmd"
             - name: FFI smoke against real libkrun (no VM boot)
-              # Exercises create_ctx -> set_vm_config -> set_exec through the safe
-              # wrappers via the krun_smoke_child helper. No kernel/rootfs env is
-              # set, so it takes the bring-up-only path: no krun_start_enter, no
-              # codesigned entitlement needed. Run directly from the built test
-              # binary (never `cargo test`, which would relink and unsign
-              # minvmd). krun_smoke_integration is EXCLUDED from the archive run below:
-              # unlike the full-boot harnesses (which boot via the codesigned
-              # minvmd subprocess), it boots in-process through krun_smoke_child,
-              # which cannot take the hypervisor entitlement from within the
-              # archive — so it runs here, kernel-less, instead.
+              # Exercises create_ctx -> set_vm_config -> set_exec through the
+              # safe wrappers via the krun_smoke_child helper. No kernel/rootfs
+              # env is set, so it takes the bring-up-only path: no
+              # krun_start_enter, so the unentitled archive binary suffices —
+              # unlike the full-boot harnesses below (which boot via the
+              # codesigned minvmd subprocess), it boots in-process, which is
+              # why it is excluded from the kernel-env harness step.
+              #
+              # DYLD_FALLBACK_LIBRARY_PATH resolves the archive binaries'
+              # @rpath/libkrun.1.dylib load command from the testbed: their
+              # baked rpaths (@loader_path + the build runner's
+              # LIBKRUN_PREFIX) don't exist on this machine. Exported inside
+              # the script — SIP strips DYLD_* from the environment of
+              # Apple-signed shells, so a step-level `env:` entry may never
+              # reach the test processes. (The testbed minvmd needs no such
+              # help: its rewritten @loader_path/../lib rpath finds the
+              # bundled dylib.)
+              env:
+                  MINVMD_E2E: "1"
               run: |
-                  testbin="$(ls -1t target/debug/deps/krun_smoke_integration-* | grep -v '\.d$' | head -1)"
-                  test -x "$testbin" || { echo "::error::krun_smoke_integration test binary not found"; exit 1; }
-                  MINVMD_E2E=1 "$testbin" --include-ignored --nocapture
+                  export DYLD_FALLBACK_LIBRARY_PATH="$TESTBED/lib"
+                  cargo-nextest nextest run \
+                    --archive-file "$TESTBED/nextest-archive.tar.zst" \
+                    --workspace-remap "$GITHUB_WORKSPACE" --profile vm \
+                    --run-ignored all --no-tests=fail \
+                    -E 'binary(krun_smoke_integration)'
             - name: VM integration harnesses (auto-discovered from the archive)
               # Run every full-boot harness the archive carries by the `_integration`
               # convention — `binary(/_integration$/)` minus the `_root_integration` harnesses
               # (Linux-only; empty here) and minus krun_smoke_integration (the kernel-less
-              # FFI smoke run above). Currently boot_integration, minimald_session_integration,
+              # FFI smoke run above; the sessions unit binaries the archive also
+              # carries don't match the filterset — their tier ran on the hosted
+              # `unit` job). Currently boot_integration, minimald_session_integration,
               # and volume_quiesce_integration; a new *_integration.rs joins with no yaml. Each
               # boots the GENERIC upstream rootfs with minimald as the initramfs
               # /init and drives the full Stage-2 path (russh client -> bridge ->
               # guest vsock -> minimald, no socat relay) over the codesigned
-              # minvmd subprocess (MINVMD_BIN). `--run-ignored all` runs the
-              # #[ignore] bodies; `--no-tests=fail` reds a filterset that matches
-              # nothing. profile vm is serial with fail-fast, so a failed boot
-              # preserves its hvc0 console in boot.log. Needs libkrun >= 1.19.0.
+              # minvmd subprocess (MINVMD_BIN, set at unpack). `--run-ignored all`
+              # runs the #[ignore] bodies; `--no-tests=fail` reds a filterset that
+              # matches nothing. profile vm is serial with fail-fast, so a failed
+              # boot preserves its hvc0 console in boot.log. Needs libkrun >= 1.19.0.
+              # In-script DYLD export: see the FFI smoke above.
               env:
                   MINVMD_E2E: "1"
-                  MINVMD_BIN: ${{ github.workspace }}/target/debug/minvmd
                   MINVMD_KERNEL_PATH: ${{ runner.temp }}/kernel/vmlinuz
                   MINVMD_ROOTFS_PATH: ${{ runner.temp }}/rootfs/rootfs.img
                   MINVMD_INITRAMFS: ${{ runner.temp }}/initramfs/initramfs.cpio
                   MINVMD_BOOT_LOG: ${{ runner.temp }}/boot.log
               run: |
+                  export DYLD_FALLBACK_LIBRARY_PATH="$TESTBED/lib"
                   cargo-nextest nextest run \
-                    --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst" \
+                    --archive-file "$TESTBED/nextest-archive.tar.zst" \
                     --workspace-remap "$GITHUB_WORKSPACE" --profile vm \
                     --run-ignored all --no-tests=fail \
                     -E 'binary(/_integration$/) and not binary(/_root_integration$/) and not binary(krun_smoke_integration)'
@@ -346,12 +333,12 @@ jobs:
               # it over the vsock bridge. Replaces the old autospawn step,
               # which only proved `min ls` cold/warm — this proves the
               # full user path and subsumes it (the cold activate IS the
-              # autospawn). Runs the prebuilt binaries directly (never
-              # `cargo run`, which would relink and unsign minvmd).
+              # autospawn). min and minvmd resolve from the testbed bin/ on
+              # PATH (set at unpack) — prebuilt, codesigned, nothing rebuilt
+              # on this machine.
               # Since #748 activate uploads the project into the guest;
               # E2E_PROJECT_DIR=/tmp still names a guest path.
               run: |
-                  export PATH="$PWD/target/debug:$PATH"
                   export MINVMD_KERNEL_PATH="$RUNNER_TEMP/kernel/vmlinuz"
                   export MINVMD_ROOTFS_PATH="$RUNNER_TEMP/rootfs/rootfs.img"
                   export MINVMD_INITRAMFS="$RUNNER_TEMP/initramfs/initramfs.cpio"
@@ -376,8 +363,15 @@ jobs:
         # macOS — the Linux CI builds it as a stub — so its clippy/unit tier
         # needs a mac, but NOT the hypervisor: everything hypervisor-backed
         # (the krun_smoke FFI smoke, VM boots) lives in the `e2e` job on the
-        # self-hosted runner, which this job frees up for exactly that. Scoped
-        # to the macOS-sensitive crates; widen to --workspace once the tree is
+        # self-hosted runner.
+        #
+        # This job is ALSO the mac lane's BUILD phase (the KVM lane's
+        # build-linux → test-kvm split, podman pattern): the one compile of
+        # the macOS-sensitive crates produces the nextest archive AND the
+        # darwin testbed (minvmd, min, libkrun.1.dylib in the shipped
+        # bin/../lib layout) that the mini's e2e job downloads, codesigns,
+        # and runs — the mini itself compiles nothing. Scoped to the
+        # macOS-sensitive crates; widen to --workspace once the tree is
         # mac-buildable. Kept lean (private repo: macOS minutes bill at 10x).
         needs: [changes]
         if: github.event_name != 'pull_request' || needs.changes.outputs.macos == 'true'
@@ -406,22 +400,84 @@ jobs:
                   save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
+            - name: Install nextest
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: nextest
             - name: Clippy (minvmd)
               run: cargo clippy -p minvmd --all-targets --locked -- -D warnings
-            - name: Test (minvmd)
-              run: cargo test -p minvmd --locked
-            - name: Test (sessions)
-              # Platform-sensitive surface: std::fs::canonicalize behavior on
-              # prefix-symlinked roots (/tmp → /private/tmp on macOS) and the
-              # follow_symlinks dual-path policy logic.
+            - name: Unit tests (minvmd + sessions)
+              # sessions is platform-sensitive surface: std::fs::canonicalize
+              # behavior on prefix-symlinked roots (/tmp → /private/tmp on
+              # macOS) and the follow_symlinks dual-path policy logic. The
+              # `_integration` harnesses are excluded here — they are the
+              # hypervisor tier, replayed on the mini from the archive staged
+              # below (one compile serves both tiers).
               #
               # NOTE: `cargo test -p minimal` is deliberately absent — the CLI's
               # dev-dependencies pull minimald (test-support), whose ungated
               # hakoniwa -> libcgroups -> procfs chain does not build on macOS.
               # (`cargo build -p minimal` is fine: no dev-deps.) The CLI's macOS
-              # coverage stays the autospawn e2e until minimald's sandbox deps
+              # coverage stays the session e2e until minimald's sandbox deps
               # are cfg(linux)-gated.
-              run: cargo test -p sessions --locked
+              run: |
+                  cargo nextest run -p minvmd -p sessions --locked --profile ci \
+                    --no-tests=fail -E 'not binary(/_integration$/)'
+            - name: Doctests (minvmd + sessions)
+              # nextest does not run doctests; same split as core-tests.
+              run: cargo test --doc -p minvmd -p sessions --locked
+            - name: Build minvmd + the minimal CLI
+              run: |
+                  cargo build -p minvmd --bin minvmd --locked
+                  # SEPARATE invocation for the CLI (mirrors release.yml): built
+                  # together, cargo unifies minvmd's default `libkrun` feature
+                  # into minimal's default-features=false opt-out, and the CLI
+                  # links libkrun. The brew era masked this (absolute install
+                  # name loaded from anywhere); our @rpath dylib turns it into
+                  # dyld "Library not loaded" at autospawn, since minimal bakes
+                  # no rpaths.
+                  cargo build -p minimal --bin min --locked
+            - name: Verify minimal links only system libraries
+              # The CLI spawns minvmd as a subprocess and calls no libkrun; a
+              # krun load command means the feature unification above regressed.
+              # Catch it here with a clear message, not as a dyld error at
+              # autospawn on the mini.
+              run: |
+                  bad="$(otool -L target/debug/min | tail -n +2 | awk '{print $1}' \
+                    | grep -vE '^(/usr/lib/|/System/)' || true)"
+                  if [ -n "$bad" ]; then
+                    echo "::error::minimal links non-system libraries (feature unification with minvmd's libkrun?):" >&2
+                    printf '%s\n' "$bad" >&2
+                    exit 1
+                  fi
+            - name: Stage the darwin testbed (shipped bin/../lib layout)
+              # Everything the mini runs, in the layout the installer drops:
+              # bin/minvmd beside lib/libkrun.1.dylib, with the release
+              # pipeline's @rpath rewrite applied so minvmd resolves
+              # @rpath/libkrun.1.dylib via @loader_path/../lib. The rewrite
+              # script also VERIFIES the result (rpath retargeted, only system
+              # libs otherwise), so a broken ship layout reds the PR here — and
+              # the e2e then BOOTS that exact layout, replacing the old static
+              # check on a throwaway copy. The archive carries every minvmd
+              # test binary, so the mini's harnesses are selected by the
+              # `_integration` convention with no per-test list — a new
+              # crates/minvmd/tests/*_integration.rs is picked up with no yaml.
+              run: |
+                  set -euo pipefail
+                  mkdir -p testbed/bin testbed/lib
+                  cargo nextest archive -p minvmd -p sessions --locked \
+                    --archive-file testbed/nextest-archive.tar.zst
+                  cp target/debug/minvmd testbed/bin/minvmd
+                  cp target/debug/min testbed/bin/min
+                  cp "$LIBKRUN_PREFIX/libkrun.1.dylib" testbed/lib/libkrun.1.dylib
+                  scripts/rewrite-macos-linkage.sh testbed/bin/minvmd
+            - name: Upload darwin testbed
+              uses: actions/upload-artifact@v7
+              with:
+                  name: mac-testbed
+                  path: testbed/
+                  if-no-files-found: error
+                  retention-days: 3
 
     # Single required status check for this lane (branch-protection context:
     # ci-macos-success). Green when every gating job succeeded OR was
