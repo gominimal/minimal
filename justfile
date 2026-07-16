@@ -470,9 +470,26 @@ e2e-native:
       Linux) ;;
       *) echo "native-daemon e2e is Linux-only (minimald); SKIP on $(uname -s)"; exit 0 ;;
     esac
-    v="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)"
-    [ "$v" = "0" ] || { echo "unprivileged userns is restricted; run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0" >&2; exit 1; }
+    # Build before the userns preflight so the advised --path target exists.
     cargo build -p minimald --bin minimald -p minimal --bin min --locked
+    # Ubuntu 24.04+ gates unprivileged userns behind AppArmor. The sanctioned
+    # fix is the per-binary profile the installer advises end users — it
+    # grants `userns` to minimald alone, where flipping the sysctl hands it
+    # back to everything on the host. Remediated = profile installed AND its
+    # tunables name THIS checkout's dev binary (the installer's own check);
+    # the sysctl stays 1 either way, so it alone can't be the gate.
+    v="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)"
+    bin="{{justfile_directory()}}/target/debug/minimald"
+    if [ "$v" != "0" ] && ! { [ -e /etc/apparmor.d/minimald ] && grep -rqs "$bin" /etc/apparmor.d/tunables 2>/dev/null; }; then
+      {
+        echo "note: this host restricts unprivileged user namespaces (Ubuntu 24.04+);"
+        echo "  minimald's session sandbox cannot start until you install its AppArmor"
+        echo "  profile — a one-time step that needs root:"
+        echo "      sudo scripts/install-apparmor-profile.sh --path $bin"
+        echo "  details: docs/reference/linux-host-setup.md"
+      } >&2
+      exit 1
+    fi
     export PATH="{{justfile_directory()}}/target/debug:$PATH"
     ./scripts/session-e2e.sh
 
@@ -652,6 +669,19 @@ dm2: minimald-build minimal-cli gvproxy
     echo "DM2 up: host-native minimald at $sock (pid $(cat "$pidf"))"
     echo "  own-IP: {{min-bin}} --minimal-dir $dir activate -n net1 --network own-ip . && \\"
     echo "          {{min-bin}} --minimal-dir $dir attach net1   # curl http://example.com -> 200"
+    # Warn-only twin of the e2e-native preflight: the daemon runs fine without
+    # it, but every `activate` sandbox will die at uid_map with EPERM until the
+    # profile is in (see that recipe's comment for the remediation logic).
+    v="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)"
+    if [ "$v" != "0" ] && ! { [ -e /etc/apparmor.d/minimald ] && grep -rqs "$bin" /etc/apparmor.d/tunables 2>/dev/null; }; then
+      {
+        echo "note: this host restricts unprivileged user namespaces (Ubuntu 24.04+);"
+        echo "  minimald's session sandbox cannot start until you install its AppArmor"
+        echo "  profile — a one-time step that needs root:"
+        echo "      sudo scripts/install-apparmor-profile.sh --path $bin"
+        echo "  details: docs/reference/linux-host-setup.md"
+      } >&2
+    fi
     # Same first-connect retry as dm3: minimald can reset the very first SSH
     # connect right after binding the socket, which trips the CLI's autospawn
     # (and fails the recipe) even though the daemon is healthy.
