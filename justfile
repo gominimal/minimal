@@ -449,6 +449,12 @@ e2e: artifacts gvproxy initramfs minimal-cli minvmd-build
       Linux)
         [ -e /dev/kvm ] && [ -w /dev/kvm ] || { echo "e2e (VM) needs writable /dev/kvm; try: sg kvm -c 'just e2e' — or use 'just e2e-native'" >&2; exit 1; }
         export LD_LIBRARY_PATH="{{krun-prefix}}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        # Same boot headroom as dm3: the generic guest kernel can spend 40-70s
+        # probing hardware before pid-1 starts, overrunning both the
+        # supervisor's 60s READY default and the CLI autospawn's 75s wait
+        # (the e2e's post-stop respawn proof autospawns via the CLI).
+        export MINVMD_READY_TIMEOUT_SECS="${MINVMD_READY_TIMEOUT_SECS:-150}"
+        export MINIMAL_SPAWN_TIMEOUT_SECS="${MINIMAL_SPAWN_TIMEOUT_SECS:-150}"
         E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd E2E_PROJECT_DIR=/tmp ./scripts/session-e2e.sh
         ;;
       *) echo "unsupported host $(uname -s)" >&2; exit 1 ;;
