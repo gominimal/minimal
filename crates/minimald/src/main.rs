@@ -416,6 +416,14 @@ impl DeferredFileWriter {
         *self.inner.write().unwrap() = Some(writer);
         Ok(guard)
     }
+
+    /// Points the writer back at the discard sink. With the appender's
+    /// [`WorkerGuard`] also dropped, no fd stays open on the state volume.
+    ///
+    /// [`WorkerGuard`]: tracing_appender::non_blocking::WorkerGuard
+    fn deactivate(&self) {
+        *self.inner.write().unwrap() = None;
+    }
 }
 
 /// Install the tracing subscriber. Foreground processes log to stdout; a
@@ -658,9 +666,12 @@ async fn async_main() -> Result<(), MainError> {
     // With the state volume mounted and state relocated onto it, point the
     // microVM's deferred log appender at `<state>/logs` so the in-VM daemon's
     // runtime logs land on the persistent volume where `min bug`'s guest
-    // collector reads them. Bound at function scope for the server's lifetime;
-    // a failure here must not wedge pid-1, so fall back to console-only.
-    let mut _vm_log_guard: Option<tracing_appender::non_blocking::WorkerGuard> = None;
+    // collector reads them. The appender handle and its worker guard park in
+    // the guest release hook: they live for the daemon's lifetime, unless the
+    // Shutdown RPC releases them — the appender's write-open fd would
+    // otherwise keep the volume busy and defeat the clean unmount, leaving a
+    // dirty ext4 journal on every stop. A failure here must not wedge pid-1,
+    // so fall back to console-only.
     if let Some(deferred) = &deferred_log {
         let log_dir = cli
             .minimal_state_dir()
@@ -669,7 +680,13 @@ async fn async_main() -> Result<(), MainError> {
             .join("logs");
         match deferred.activate(&log_dir) {
             Ok(guard) => {
-                _vm_log_guard = Some(guard);
+                let deferred = deferred.clone();
+                guest::set_volume_log_release(move || {
+                    deferred.deactivate();
+                    // Dropping the guard flushes queued records and joins the
+                    // worker thread, closing the on-volume file.
+                    drop(guard);
+                });
                 tracing::info!(
                     log_dir = %log_dir.display(),
                     "microVM minimald: routing tracing output to daily-rotated log file on the data volume",
