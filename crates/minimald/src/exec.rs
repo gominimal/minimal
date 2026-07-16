@@ -925,16 +925,31 @@ async fn handle_git_receive(
                 zero=0000000000000000000000000000000000000000
                 while read -r old new ref; do
                     case "$ref" in refs/heads/*) ;; *) continue ;; esac
+                    # A deleted branch (new = zeros) has nothing to check out.
+                    # Deleting the CURRENT branch never reaches here: git's own
+                    # receive.denyDeleteCurrent refuses it during receive-pack.
+                    [ "$new" = "$zero" ] && continue
                     branch=${ref#refs/heads/}
+
+                    if [ "$old" = "$zero" ]; then
+                        # Previously-unborn branch: nothing tracked, so tracked
+                        # dirtiness cannot exist — but uploaded/untracked files
+                        # may collide with the pushed tree, and -f would
+                        # silently clobber them. -B pins the branch at the
+                        # pushed tip and checks it out; WITHOUT -f, git refuses
+                        # to overwrite untracked files (its stderr names them),
+                        # and we surface the skip like the dirty case below.
+                        if ! g checkout -q -B "$branch" "$new"; then
+                            echo "remote worktree has local files the push would overwrite; skipping checkout of $branch" >&2
+                        fi
+                        continue
+                    fi
 
                     # Dirtiness is measured against the PRE-push tip ($old):
                     # post-receive runs after the ref has already moved, so a
                     # plain `diff --cached` (index vs the NEW tip) would flag
-                    # the pushed delta itself and skip every checkout. An
-                    # all-zeros $old is a previously-unborn branch — nothing
-                    # was tracked, so nothing can be locally modified.
-                    if [ "$old" != "$zero" ] \
-                        && { ! g diff --quiet "$old" || ! g diff --cached --quiet "$old"; }; then
+                    # the pushed delta itself and skip every checkout.
+                    if ! g diff --quiet "$old" || ! g diff --cached --quiet "$old"; then
                         echo "remote worktree has uncommitted changes; skipping checkout of $branch" >&2
                         continue
                     fi
