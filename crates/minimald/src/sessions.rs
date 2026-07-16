@@ -285,10 +285,14 @@ impl Manager {
         }
     }
 
-    /// Allocate a session's record and bring its actor up. The session is
-    /// live but unconfigured — the RPC handler follows this up with an
-    /// inline `configure_loadout` on the returned actor to compose the
-    /// loadout and finalize it.
+    /// Allocate a session's record and bring its actor up as `Draft`.
+    /// Compose is *not* driven from here: the client's `cmd_activate` runs
+    /// its own workspace upload (`WorkspaceFilesTarZst`) after the
+    /// returned id, then sends a separate `ConfigureLoadout` RPC that the
+    /// actor handles to compose the loadout and promote itself to
+    /// `Active`. That split is load-bearing — the compose reads the
+    /// project mfile off the daemon-side workspace, which is only
+    /// populated once the upload has landed.
     ///
     /// If the actor can't be spawned the record is rolled back — the caller
     /// never received an id, so nothing else could ever reach the session to

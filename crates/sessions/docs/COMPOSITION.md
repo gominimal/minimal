@@ -220,23 +220,33 @@ placeholder `session_id` on the `ContributionResponse`, and ships
 runs Phase 3 and sends a `ContributionVerdict` over the
 `SubmitVerdict` RPC. The daemon's `SubmitVerdict` handler:
 
-1. Takes the matching stash entry (missing → `WireError::WrongState`
-   because compose state is memory-only; see the "resume stash"
-   invariant below).
-2. Runs `resume_from_verdict`: per-item verdicts walked,
-   `Approved` items take the verdict's value + the stashed source
-   provenance, `Ignored` items drop silently, `Denied` items
-   surface as `ComposeError::Denied` (project- or package-declared
-   items the user policy rejected — the session can't finalize
-   in a state inconsistent with what was declared). Verdicts are
-   deduplicated per `PendingId` up front so a client that ships
-   two entries for the same id gets an actionable "duplicate"
-   error instead of an "unknown" one from the second lookup.
+1. Reads the matching stash entry. Missing → `SessionStep::Fault`
+   carrying `WireError::WrongState` (compose state is memory-only;
+   see the "resume stash" invariant below). The stash is
+   **cloned**, not taken — a verdict that fails to resume has to
+   leave the session still resumable so the client can correct
+   the offending item and re-submit.
+2. Runs `resume_from_verdict` on the clone: per-item verdicts
+   walked, `Approved` items take the verdict's value + the
+   stashed source provenance, `Ignored` items drop silently,
+   `Denied` items surface as `ComposeError::Denied` (project- or
+   package-declared items the user policy rejected — the session
+   can't finalize in a state inconsistent with what was declared).
+   Verdicts are deduplicated per `PendingId` up front so a client
+   that ships two entries for the same id gets an actionable
+   "duplicate" error instead of an "unknown" one from the second
+   lookup. On any error here the handler returns
+   `SessionStep::Fault` and the actor stays `Draft { pending:
+   Some(_) }`.
 3. Merges the stashed `client_contribution` via
    `Composition::extend_from_wire` — same cross-process conflict
    checks as the Ready path.
 4. Promotes the record `Pending → Active` via `store.save`.
-5. Replies with `SessionStep::Active { id }`.
+5. Replaces the actor's `SessionInner::Draft { pending: Some(_) }`
+   with `SessionInner::Active { composition, ... }`, which is
+   also what drops the stash — it survives every failure path
+   above and only goes away on a successful finalization.
+6. Replies with `SessionStep::Active { id }`.
 
 **Resume stash is in-memory only.** A `Draft` actor spawned from
 an on-disk `Pending` record (daemon restart, or the session was
@@ -408,20 +418,22 @@ overload:
   daemon couldn't auto-decide and emits verdicts. Phase 4 on the
   daemon applies those verdicts without re-checking them.
 - **`carries_user_data` gates policy enforcement.** The
-  `ResolvedVar::carries_user_data` bit is `true` only when the
-  value came from a `VarValue::Inherit` lookup that succeeded
-  against the caller's env; `Specified` literals and
-  `InheritWithDefault` fallbacks stay `false`. The bit is
-  preserved through the wire (`WireResolvedVar.carries_user_data`,
-  `#[serde(default)]` for older peers) and through the daemon's
-  `From<WireResolvedVar>` conversion. Both client-side gate
-  entrypoints (`gate_vars` in `core::compose` and `classify_var`
-  in `client::handler`) short-circuit false to `Allowed`
-  regardless of policy — the intent is that the user policy
-  exists to control what pieces of the user's environment cross
-  into the sandbox, not to referee what packages hardcode. A
-  package that ships `LD_PRELOAD = "/tmp/x"` as a literal is
-  a package-declaration matter, not a policy matter.
+  `ResolvedVar::carries_user_data` bit is `true` whenever the
+  value came out of a successful env lookup — either
+  `VarValue::Inherit` or `VarValue::InheritWithDefault` when the
+  env had an entry. It stays `false` for `Specified` literals and
+  for `InheritWithDefault` when the env was empty and the value
+  fell back to the declared default. The bit is preserved through
+  the wire (`WireResolvedVar.carries_user_data`, `#[serde(default)]`
+  for older peers) and through the daemon's `From<WireResolvedVar>`
+  conversion. Both client-side gate entrypoints (`gate_vars` in
+  `core::compose` and `classify_var` in `client::handler`) short-
+  circuit false to `Allowed` regardless of policy — the intent is
+  that the user policy exists to control what pieces of the
+  user's environment cross into the sandbox, not to referee what
+  packages hardcode. A package that ships `LD_PRELOAD = "/tmp/x"`
+  as a literal is a package-declaration matter, not a policy
+  matter.
 - **Composers accumulate; compose decides.** Per phase, all
   contribution happens first; the gate pipeline runs over the
   accumulated `Contribution`. Phases 2 and 3 are linked by exactly
