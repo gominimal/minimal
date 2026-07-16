@@ -123,17 +123,25 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
                 guest::record_skipped(&mut w, name, "guest collection skipped: --no-guest").await
             }
             (false, None) => {
-                guest::record_skipped(
+                // The daemon being unreachable is the volume fallback's
+                // marquee case: nothing else can say what the guest was
+                // doing when it died.
+                match guest::record_skipped(
                     &mut w,
                     name,
                     "guest collection skipped: daemon not reachable (see socket-probe.json)",
                 )
                 .await
+                {
+                    Ok(()) => guest::volume_fallback(&mut w, name, dir).await,
+                    err => err,
+                }
             }
             (false, Some(mut client)) => {
                 guest::collect(
                     &mut w,
                     name,
+                    dir,
                     &mut client,
                     Duration::from_secs(args.guest_timeout_secs),
                 )
