@@ -13,6 +13,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sessions::SessionId;
 
+pub mod trace;
+
 pub use sessions::{EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy};
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";

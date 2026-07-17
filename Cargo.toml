@@ -91,12 +91,14 @@ hex = "0.4"
 indicatif = "0.18"
 indoc = "^2.0"
 jaq-all = "0.2.0"
+json-subscriber = "0.3"
 libc = "0.2"
 lzma-rs = "0.3"
 
 # Revert back to crates.io dep once new version is released.
 nickel-lang-core = { git = "https://github.com/nickel-lang/nickel.git", rev = "e8a0ab95e52ab31ac9a8ae1a3bef854d8de73cea", default-features = false, features = ["format"] }
 
+opentelemetry-semantic-conventions = "0.32"
 nix = { version = "0.31", features = ["fs", "user"] }
 nutype = { version = "0.7", features = ["serde"] }
 object = { version = "0.39", default-features = false, features = ["archive", "elf", "read_core", "std"] }

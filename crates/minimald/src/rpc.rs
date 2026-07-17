@@ -621,24 +621,58 @@ pub async fn handle_ssh_rpc(
         None => return Ok(()),
     };
 
+    // Adopt the client's propagated trace context into this dispatch's span:
+    // same trace id, fresh span id, the client's span as parent. Absent or
+    // malformed values mint fresh — propagation is a diagnostic aid and must
+    // never fail a request. Every record the handler emits carries the ids,
+    // so one trace_id grep joins the CLI's log with this daemon's.
+    use minimald_rpc::trace::{TRACEPARENT_ENV, TraceContext};
+    use tracing::Instrument as _;
+    let client_ctx = config
+        .env_vars
+        .get(TRACEPARENT_ENV)
+        .and_then(|v| TraceContext::parse_traceparent(v));
+    let ctx = client_ctx
+        .as_ref()
+        .map(TraceContext::child)
+        .unwrap_or_else(TraceContext::mint);
+    let span = tracing::info_span!(
+        "rpc",
+        rpc = name,
+        trace_id = %ctx.trace_id_hex(),
+        span_id = %ctx.span_id_hex(),
+        parent_span_id = tracing::field::Empty,
+    );
+    if let Some(client_ctx) = &client_ctx {
+        span.record(
+            "parent_span_id",
+            tracing::field::display(client_ctx.span_id_hex()),
+        );
+    }
+
     // Handle the named RPC (fire-and-forget; join handles are discarded).
+    macro_rules! serve {
+        ($fut:expr) => {
+            drop(spawn($fut.instrument(span.clone())))
+        };
+    }
     match name {
-        GetVersion::NAME => drop(spawn(serve_get_version(channel))),
-        ListSessions::NAME => drop(spawn(serve_list_sessions(s, channel))),
-        GetSessionRecord::NAME => drop(spawn(serve_get_session_record(s, channel))),
-        CreateSession::NAME => drop(spawn(serve_create_session(s, channel, ssh_username))),
-        minimald_rpc::ConfigureLoadout::NAME => drop(spawn(serve_configure_loadout(s, channel))),
-        SubmitVerdict::NAME => drop(spawn(serve_submit_verdict(s, channel))),
-        RenameSession::NAME => drop(spawn(serve_rename_session(s, channel))),
-        DestroySession::NAME => drop(spawn(serve_destroy_session(s, channel))),
-        Shutdown::NAME => drop(spawn(serve_shutdown(s, channel))),
-        AbortSession::NAME => drop(spawn(serve_abort_session(s, channel))),
-        GetSessionPolicy::NAME => drop(spawn(serve_get_session_policy(s, channel))),
-        GetMeshStatus::NAME => drop(spawn(serve_get_mesh_status(s, channel))),
-        STREAM_WORKSPACE_FILES => drop(spawn(serve_stream_workspace_files(s, config, channel))),
+        GetVersion::NAME => serve!(serve_get_version(channel)),
+        ListSessions::NAME => serve!(serve_list_sessions(s, channel)),
+        GetSessionRecord::NAME => serve!(serve_get_session_record(s, channel)),
+        CreateSession::NAME => serve!(serve_create_session(s, channel, ssh_username)),
+        minimald_rpc::ConfigureLoadout::NAME => serve!(serve_configure_loadout(s, channel)),
+        SubmitVerdict::NAME => serve!(serve_submit_verdict(s, channel)),
+        RenameSession::NAME => serve!(serve_rename_session(s, channel)),
+        DestroySession::NAME => serve!(serve_destroy_session(s, channel)),
+        Shutdown::NAME => serve!(serve_shutdown(s, channel)),
+        AbortSession::NAME => serve!(serve_abort_session(s, channel)),
+        GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
+        GetMeshStatus::NAME => serve!(serve_get_mesh_status(s, channel)),
+        STREAM_WORKSPACE_FILES => serve!(serve_stream_workspace_files(s, config, channel)),
         IssueClientCert::NAME => {
             #[cfg(feature = "networking-proxy")]
-            drop(spawn(serve_issue_client_cert(s, channel)));
+            serve!(serve_issue_client_cert(s, channel));
             #[cfg(not(feature = "networking-proxy"))]
             {
                 tracing::warn!(
@@ -646,7 +680,7 @@ pub async fn handle_ssh_rpc(
                      feature is not enabled; replying with an error"
                 );
                 drop(s);
-                drop(spawn(serve_issue_client_cert_unavailable(channel)));
+                serve!(serve_issue_client_cert_unavailable(channel));
             }
         }
         _ => unreachable!(),

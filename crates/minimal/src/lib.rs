@@ -448,7 +448,28 @@ pub struct CompletionsArgs {
     pub shell: Shell,
 }
 
+/// The process-wide trace context, minted once at command dispatch. The
+/// root span carries its ids into every log line, and the SSH client sends
+/// the same context to the daemon as a `TRACEPARENT` channel env request —
+/// one grep joins host and guest records.
+pub(crate) fn trace_context() -> &'static minimald_rpc::trace::TraceContext {
+    static CONTEXT: std::sync::OnceLock<minimald_rpc::trace::TraceContext> =
+        std::sync::OnceLock::new();
+    CONTEXT.get_or_init(minimald_rpc::trace::TraceContext::mint)
+}
+
 pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
+    use tracing::Instrument as _;
+    let ctx = trace_context();
+    let root = tracing::info_span!(
+        "cmd",
+        trace_id = %ctx.trace_id_hex(),
+        span_id = %ctx.span_id_hex(),
+    );
+    run_command(cli).instrument(root).await
+}
+
+async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     match cli.command {
         Command::Ls(args) => cmd_ls(&cli.global_args, args).await,
         Command::Activate(args) => cmd_activate(&cli.global_args, args).await,
