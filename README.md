@@ -49,7 +49,7 @@ min init
 min add --session git gh claude-code mermaid-cli kittyview less emacs
 
 # copy a Github PAT to your clipboard
-security find-generic-password -w -s "PAT-foo-repo" -a "my-mac-user-namea" | pbcopy
+security find-generic-password -w -s "PAT-foo-repo" -a "my-mac-user-name" | pbcopy
 
 # start and enter a sandbox, which copies up the CWD file tree into the sandbox
 min activate --attach .
@@ -87,7 +87,7 @@ cd  ~/projects/foo
 git pull
 
 # copy a Github PAT to your clipboard
-security find-generic-password -w -s "PAT-foo-repo" -a "my-mac-user-namea" | pbcopy
+security find-generic-password -w -s "PAT-foo-repo" -a "my-mac-user-name" | pbcopy
 
 # don't copy any files up we'll git pull in the sandbox
 min activate --attach --sync none .
