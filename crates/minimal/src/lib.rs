@@ -20,7 +20,9 @@ pub mod loadouts;
 
 #[derive(Parser)]
 #[command(name = "min", version = version::VERSION, long_version = version::LONG_VERSION)]
-#[command(about = "The Minimal CLI")]
+#[command(
+    about = "min, the Minimal session CLI — create, attach to, and manage sandboxed development sessions"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -80,22 +82,23 @@ pub enum Command {
     #[cfg(feature = "remote-access")]
     #[command(name = "ssh-forward", visible_alias = "forward")]
     SshForward(SshForwardArgs),
-    /// Obtain an mTLS client certificate from minimald for use with the HTTPS
-    /// reverse proxy (R4.4, R4.5).
+    /// Obtain an mTLS client certificate for the HTTPS reverse proxy
     ///
     /// Connects to minimald, generates a fresh client certificate signed by
-    /// the daemon's internal CA, and saves the certificate and private key to
-    /// `~/.config/minimal/client.pem` / `~/.config/minimal/client.key`. Also
-    /// saves the CA certificate to `~/.config/minimal/ca.pem` so tools like
-    /// `curl` can trust the HTTPS proxy.
+    /// the daemon's internal CA (R4.4, R4.5), and saves the certificate and
+    /// private key to `~/.config/minimal/client.pem` /
+    /// `~/.config/minimal/client.key`. Also saves the CA certificate to
+    /// `~/.config/minimal/ca.pem` so tools like `curl` can trust the HTTPS
+    /// proxy.
     ///
     /// Example:
     ///
-    ///   minimal login
+    ///   min login
     ///   curl --cacert ~/.config/minimal/ca.pem \
     ///        --cert ~/.config/minimal/client.pem \
     ///        --key  ~/.config/minimal/client.key \
     ///        https://localhost:7655/
+    #[command(verbatim_doc_comment)]
     Login(LoginArgs),
     /// Rename an existing session
     Rename(RenameArgs),
@@ -109,7 +112,7 @@ pub enum Command {
     Version,
     /// Generate shell completion script
     #[command(
-        long_about = "Generate a shell tab-completion script for the minimal CLI.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(min completions bash)"
+        long_about = "Generate a shell tab-completion script for the min CLI.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(min completions bash)"
     )]
     Completions(CompletionsArgs),
 }
@@ -206,12 +209,16 @@ pub struct MeshJoinArgs {
     pub address: String,
 }
 
-/// Shared arguments all subcommands
-///
-/// The `Default` value is the no-flags invocation (no overrides, native
-/// backend) — what a bare `min <cmd>` resolves to, and what indirect
-/// entrypoints like the `git-remote-min` helper mode (which git invokes
-/// without any of our flags) use.
+// Shared arguments for all subcommands.
+//
+// The `Default` value is the no-flags invocation (no overrides, native
+// backend) — what a bare `min <cmd>` resolves to, and what indirect
+// entrypoints like the `git-remote-min` helper mode (which git invokes
+// without any of our flags) use.
+//
+// Deliberately NOT a doc comment: clap propagates a flattened struct's doc
+// comment into the parent command's long_about, which would replace the
+// top-level `min --help` description with this text.
 #[derive(Debug, Default, Args)]
 pub struct GlobalArgs {
     /// Use the given directory as the repository root, instead of the current
