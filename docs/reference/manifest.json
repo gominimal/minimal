@@ -1,0 +1,13 @@
+{
+  "pages": [
+    "cli.md",
+    "cli-mip.md",
+    "cli-min.md",
+    "minimal-dot-toml.md",
+    "tasks.md",
+    "build-specs.md",
+    "harness-specs.md",
+    "sandbox-operations.md",
+    "linux-host-setup.md"
+  ]
+}
