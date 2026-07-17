@@ -12,7 +12,6 @@ export default withMermaid({
     "specs/**",
     "spikes/**",
     "internal/**",
-    "session-domain-diag.md",
   ],
 
   // Dead links are build failures, by design. Do not flip this to true to

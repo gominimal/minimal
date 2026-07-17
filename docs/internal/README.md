@@ -11,6 +11,8 @@ and process detail.
 |---|---|
 | [licensing.md](licensing.md) | Licensing decisions and per-file/per-crate license layout for the workspace. |
 | [session-domain-diag.md](session-domain-diag.md) | Session domain model: provider/session vernacular, deployment diagrams, socket lifecycle, and bootstrap rules. |
+| [release-pipeline.md](release-pipeline.md) | The release/install pipeline: release.yml, channels, staging, promotion, pruning, and the operator runbook. |
+| [proposals/](proposals/README.md) | Drafted needs-human CI artifacts: the docs-site lane, ci.yml filter patch, promote.yml repoint, and the webapp reference-sync workflow. |
 
 ## Related corpora outside this directory
 
