@@ -18,7 +18,7 @@ pub mod git_remote;
 pub mod loadouts;
 
 #[derive(Parser)]
-#[command(name = "min", version = env!("CARGO_PKG_VERSION"), long_version = env!("LONG_VERSION"))]
+#[command(name = "min", version = version::VERSION, long_version = version::LONG_VERSION)]
 #[command(about = "The Minimal CLI")]
 pub struct Cli {
     #[command(subcommand)]
@@ -1734,7 +1734,7 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
 /// not autospawn the daemon — it is a lightweight diagnostic that should
 /// report versions without starting a VM.
 pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
-    println!("Client: minimal {}", env!("LONG_VERSION"));
+    println!("Client: minimal {}", version::LONG_VERSION);
 
     let sock = match client::resolve_socket_path(global.minimal_dir.as_deref()) {
         Ok(p) => p,

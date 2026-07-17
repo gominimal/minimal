@@ -25,7 +25,7 @@ const DEFAULT_VSOCK_PORT_BASE: u32 = 2222;
 const DETACHED_ENV: &str = "MINIMALD_DETACHED";
 
 #[derive(Parser)]
-#[command(name = "minimald", version = env!("CARGO_PKG_VERSION"), long_version = env!("LONG_VERSION"))]
+#[command(name = "minimald", version = version::VERSION, long_version = version::LONG_VERSION)]
 #[command(about = "The Minimal daemon")]
 struct Cli {
     #[command(subcommand)]

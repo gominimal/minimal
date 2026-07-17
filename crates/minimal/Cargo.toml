@@ -1,6 +1,6 @@
 [package]
 name = "minimal"
-version = "0.0.1"
+version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
@@ -42,6 +42,7 @@ sessions.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+version.workspace = true
 
 # default-features = false drops minvmd's `libkrun` feature: the CLI only uses
 # the client helpers (sock/lifecycle) and calls no krun code, so it must not

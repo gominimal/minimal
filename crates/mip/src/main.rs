@@ -44,7 +44,7 @@ mod cmd_remote_build;
 use cmd_remote_build::{RemoteBuildArgs, cmd_remote_build};
 
 #[derive(Parser)]
-#[command(name = "minimal", version = env!("CARGO_PKG_VERSION"), long_version = env!("LONG_VERSION"))]
+#[command(name = "minimal", version = version::VERSION, long_version = version::LONG_VERSION)]
 #[command(about = "The Minimal CLI")]
 struct Cli {
     #[command(subcommand)]
