@@ -101,12 +101,27 @@
   --vp-custom-block-tip-bg: rgba(61, 143, 88, 0.08);
   --vp-custom-block-tip-code-bg: rgba(61, 143, 88, 0.12);
 
+  /* All other admonitions stay monochrome (brand rule). */
+  --vp-custom-block-info-border: #cccccc;
+  --vp-custom-block-info-text: #141414;
+  --vp-custom-block-info-bg: rgba(20, 20, 20, 0.04);
+  --vp-custom-block-info-code-bg: rgba(20, 20, 20, 0.06);
+  --vp-custom-block-note-border: #cccccc;
+  --vp-custom-block-note-text: #141414;
+  --vp-custom-block-note-bg: rgba(20, 20, 20, 0.04);
+  --vp-custom-block-note-code-bg: rgba(20, 20, 20, 0.06);
+  --vp-custom-block-warning-border: #141414;
+  --vp-custom-block-warning-text: #141414;
+  --vp-custom-block-warning-bg: rgba(20, 20, 20, 0.04);
+  --vp-custom-block-warning-code-bg: rgba(20, 20, 20, 0.06);
+  --vp-custom-block-danger-border: #141414;
+  --vp-custom-block-danger-text: #141414;
+  --vp-custom-block-danger-bg: rgba(20, 20, 20, 0.04);
+  --vp-custom-block-danger-code-bg: rgba(20, 20, 20, 0.06);
+
   /* Copy icon — pixelarticons copy */
   --vp-icon-copy: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath fill='%23666666' d='M6 6h16v2H6zM2 2h16v2H2zm4 6h2v12H6zM2 4h2v12H2zm4 16h16v2H6zM20 8h2v12h-2zm-4-4h2v2h-2zM2 16h4v2H2z'/%3E%3C/svg%3E");
   --vp-icon-copied: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath fill='%23141414' d='M3 12h2v2H3zm2 2h2v2H5zm2 2h2v2H7zm2 0h2v2H9zm2-2h2v2h-2zm2-2h2v2h-2zm2-2h2v2h-2zm2-2h2v2h-2zm2-2h2v2h-2z'/%3E%3C/svg%3E");
-
-  /* Sidebar active indicator */
-  --vp-c-brand-lighter: #141414;
 
   /* Navbar & sidebar */
   --vp-nav-bg-color: #f5f5f5;
@@ -162,6 +177,24 @@
   --vp-custom-block-tip-text: #cccccc;
   --vp-custom-block-tip-bg: rgba(126, 200, 151, 0.08);
   --vp-custom-block-tip-code-bg: rgba(126, 200, 151, 0.12);
+
+  /* All other admonitions stay monochrome (brand rule), dark variant. */
+  --vp-custom-block-info-border: #3d3d3d;
+  --vp-custom-block-info-text: #cccccc;
+  --vp-custom-block-info-bg: rgba(229, 229, 229, 0.05);
+  --vp-custom-block-info-code-bg: rgba(229, 229, 229, 0.08);
+  --vp-custom-block-note-border: #3d3d3d;
+  --vp-custom-block-note-text: #cccccc;
+  --vp-custom-block-note-bg: rgba(229, 229, 229, 0.05);
+  --vp-custom-block-note-code-bg: rgba(229, 229, 229, 0.08);
+  --vp-custom-block-warning-border: #e0e0e0;
+  --vp-custom-block-warning-text: #cccccc;
+  --vp-custom-block-warning-bg: rgba(229, 229, 229, 0.05);
+  --vp-custom-block-warning-code-bg: rgba(229, 229, 229, 0.08);
+  --vp-custom-block-danger-border: #e0e0e0;
+  --vp-custom-block-danger-text: #cccccc;
+  --vp-custom-block-danger-bg: rgba(229, 229, 229, 0.05);
+  --vp-custom-block-danger-code-bg: rgba(229, 229, 229, 0.08);
 
   /* Copy icon */
   --vp-icon-copy: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath fill='%23a3a3a3' d='M6 6h16v2H6zM2 2h16v2H2zm4 6h2v12H6zM2 4h2v12H2zm4 16h16v2H6zM20 8h2v12h-2zm-4-4h2v2h-2zM2 16h4v2H2z'/%3E%3C/svg%3E");
