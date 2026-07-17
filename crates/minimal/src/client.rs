@@ -81,7 +81,15 @@ impl Client {
             })?
         };
 
-        let config = Arc::new(russh::client::Config::default());
+        let config = Arc::new(russh::client::Config {
+            // Mirror of the daemon's liveness policy: a silently dead
+            // daemon or transport becomes an error within ~60s instead of
+            // an indefinite hang. An idle connection is not a dead one, so
+            // inactivity_timeout stays at its default None.
+            keepalive_interval: Some(std::time::Duration::from_secs(20)),
+            keepalive_max: 3,
+            ..Default::default()
+        });
         let handshake = async {
             let mut handle = russh::client::connect_stream(config, stream, MinimalClientHandler)
                 .await
