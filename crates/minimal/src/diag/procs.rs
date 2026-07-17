@@ -130,7 +130,10 @@ pub(super) async fn command_capture(
 ) -> Result<String, anyhow::Error> {
     let out = tokio::time::timeout(
         timeout,
-        tokio::process::Command::new(cmd).args(args).output(),
+        tokio::process::Command::new(cmd)
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
     )
     .await
     .with_context(|| format!("{cmd} timed out"))?
@@ -186,6 +189,7 @@ async fn ps_capture() -> Result<(String, Vec<u32>), anyhow::Error> {
         std::time::Duration::from_secs(5),
         tokio::process::Command::new("ps")
             .args(["axww", "-o", "pid=,ppid=,user=,pcpu=,rss=,etime=,args="])
+            .kill_on_drop(true)
             .output(),
     )
     .await

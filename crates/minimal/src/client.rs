@@ -253,6 +253,9 @@ impl Client {
             .context("write diag request")?;
         channel.eof().await.context("half-close diag request")?;
 
+        // Cap on the accumulated daemon error message (extended-data 1).
+        const DAEMON_ERROR_MAX: usize = 64 * 1024;
+
         // Data carries the archive; extended-data stream 1 carries a
         // pre-stream error message.
         let mut channel = channel;
@@ -271,7 +274,11 @@ impl Client {
                     bundle.extend_from_slice(&data);
                 }
                 russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
-                    daemon_error.extend_from_slice(&data);
+                    // The error message is a human-readable line; cap it so a
+                    // daemon streaming only extended data can't balloon the
+                    // CLI past the archive bound it's meant to respect.
+                    let room = DAEMON_ERROR_MAX.saturating_sub(daemon_error.len());
+                    daemon_error.extend_from_slice(&data[..room.min(data.len())]);
                 }
                 // The daemon refused the subsystem (`want_reply` failure). A
                 // healthy daemon replies `Success` then streams; a refusal

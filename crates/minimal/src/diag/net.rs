@@ -135,7 +135,10 @@ fn mask_macs(text: &str) -> String {
 async fn command_output(cmd: &str, args: &[&str]) -> Result<String, anyhow::Error> {
     let out = tokio::time::timeout(
         Duration::from_secs(5),
-        tokio::process::Command::new(cmd).args(args).output(),
+        tokio::process::Command::new(cmd)
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
     )
     .await
     .with_context(|| format!("{cmd} timed out"))?

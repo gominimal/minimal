@@ -32,9 +32,25 @@ impl BundleWriter {
     /// Creates the output file at `out_path`; `root` becomes the single
     /// top-level directory inside the archive.
     pub async fn create(out_path: &Path, root: &str) -> Result<Self, anyhow::Error> {
-        let file = tokio::fs::File::create(out_path)
+        // 0600: the bundle carries unredacted log tails, session records, and
+        // process state, and lands in the cwd by default — not world-readable.
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let file = opts
+            .open(out_path)
             .await
             .with_context(|| format!("creating {}", out_path.display()))?;
+        // mode() only applies when create() makes the file; a pre-existing
+        // 0644 file keeps its bits, so pin them explicitly.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .await
+                .with_context(|| format!("securing {}", out_path.display()))?;
+        }
         Ok(Self {
             tar: Builder::new(ZstdEncoder::new(file)),
             root: root.to_string(),
@@ -69,14 +85,20 @@ impl BundleWriter {
         src: &Path,
         cap: u64,
     ) -> Result<(), anyhow::Error> {
+        // lstat first: a symlink planted in a tool-owned dir must not steer an
+        // unrelated target (a host key, another user's log) into a bundle the
+        // user then shares. symlink_metadata does not follow the link, so a
+        // symlink is rejected here before it is ever opened.
+        let meta = tokio::fs::symlink_metadata(src)
+            .await
+            .with_context(|| format!("statting {}", src.display()))?;
+        if !meta.is_file() {
+            anyhow::bail!("{} is not a regular file", src.display());
+        }
         let mut file = tokio::fs::File::open(src)
             .await
             .with_context(|| format!("opening {}", src.display()))?;
-        let len = file
-            .metadata()
-            .await
-            .with_context(|| format!("statting {}", src.display()))?
-            .len();
+        let len = meta.len();
         let capped = len > cap;
         if capped {
             use tokio::io::AsyncSeekExt as _;
@@ -84,8 +106,12 @@ impl BundleWriter {
                 .await
                 .with_context(|| format!("seeking {}", src.display()))?;
         }
+        // Bound the read at the reader, not just the seek: the file may be a
+        // live log appended to between the stat and the read.
         let mut contents = Vec::with_capacity(len.min(cap) as usize);
-        file.read_to_end(&mut contents)
+        (&mut file)
+            .take(cap)
+            .read_to_end(&mut contents)
             .await
             .with_context(|| format!("reading {}", src.display()))?;
         let redaction = if capped {

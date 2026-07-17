@@ -28,16 +28,16 @@ const ENV_TABLE_NAMES: &[&str] = &["vars", "vars_lenient", "env", "environment"]
 
 /// Returns true when a key looks like it names secret material.
 ///
-/// `public_key`-shaped keys are exempt (`public_key`, `wg_public_key` must
-/// survive redaction — mesh diagnostics depend on them). The exemption is
-/// anchored so keys that merely contain `public` (`publication_secret`,
-/// `public_password`) stay sensitive.
+/// `public_key` is exempt (`public_key`, `wg_public_key` must survive
+/// redaction — mesh diagnostics depend on them), but only the `public_key`
+/// token itself: a key that pairs it with a sensitive marker
+/// (`public_key_token`, `private_public_key`) stays sensitive. Removing the
+/// exempt token before the marker scan keeps that fail-closed.
 pub fn is_sensitive_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    if key == "public_key" || key.ends_with("_public_key") || key.starts_with("public_key_") {
-        return false;
-    }
-    SENSITIVE_KEY_PARTS.iter().any(|part| key.contains(part))
+    let stripped = key.to_ascii_lowercase().replace("public_key", "");
+    SENSITIVE_KEY_PARTS
+        .iter()
+        .any(|part| stripped.contains(part))
 }
 
 /// Returns true when a table/object with this name holds env-var style values
@@ -123,6 +123,11 @@ mod tests {
         assert!(is_sensitive_key("publication_secret"));
         assert!(is_sensitive_key("public_password"));
         assert!(is_sensitive_key("republic_token"));
+        // The exempt token must not launder a sensitive marker sitting
+        // beside it.
+        assert!(is_sensitive_key("public_key_token"));
+        assert!(is_sensitive_key("public_key_password"));
+        assert!(is_sensitive_key("private_public_key"));
     }
 
     #[test]

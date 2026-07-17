@@ -130,6 +130,9 @@ pub async fn volume_fallback(
         tokio::process::Command::new("debugfs")
             .args(["-c", "-R", &rdump])
             .arg(&image)
+            // On timeout the dropped future must not leave debugfs scanning a
+            // large image after its target TempDir is gone.
+            .kill_on_drop(true)
             .output(),
     )
     .await;

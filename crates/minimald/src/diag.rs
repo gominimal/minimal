@@ -137,9 +137,24 @@ async fn collect_into_tar<W: AsyncWrite + Unpin + Send + Sync>(
         fail(&mut errors, "logs", e);
     }
     if req.include_state_listing {
-        let listing = common::listing::listing_text(&state_dir, LISTING_MAX_ENTRIES);
-        if let Err(e) = append_bytes(tar, "state-listing.txt", listing.as_bytes()).await {
-            fail(&mut errors, "state-listing", e.to_string());
+        // Up to 100k synchronous fs ops — keep them off the RPC-serving
+        // runtime, matching the spawn_blocking treatment procs() already uses.
+        let listing_dir = state_dir.clone();
+        match tokio::task::spawn_blocking(move || {
+            common::listing::listing_text(&listing_dir, LISTING_MAX_ENTRIES)
+        })
+        .await
+        {
+            Ok(listing) => {
+                if let Err(e) = append_bytes(tar, "state-listing.txt", listing.as_bytes()).await {
+                    fail(&mut errors, "state-listing", e.to_string());
+                }
+            }
+            Err(e) => fail(
+                &mut errors,
+                "state-listing",
+                format!("listing task panicked: {e}"),
+            ),
         }
     }
     if let Err(e) = sessions(&state_dir, tar).await {
@@ -215,6 +230,12 @@ async fn logs<W: AsyncWrite + Unpin + Send + Sync>(
     // collector, not the daemon's self-view.
     let mut files = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
+        // Regular files only: the in-VM daemon reads a volume guest tasks can
+        // write, so a symlink named `minimald.log.*` must not steer an
+        // unrelated target into the bundle. dirent file_type does not follow.
+        if !entry.file_type().await.is_ok_and(|t| t.is_file()) {
+            continue;
+        }
         let path = entry.path();
         if path
             .file_name()
@@ -259,8 +280,24 @@ async fn sessions<W: AsyncWrite + Unpin + Send + Sync>(
             continue;
         }
         let short = entry.file_name().to_string_lossy().to_string();
-        let Ok(raw) = tokio::fs::read(entry.path().join("record.json")).await else {
-            continue;
+        // An absent file is always explainable (the module contract): a
+        // genuinely-missing record is silent, but a read failure or an
+        // unparseable-and-withheld record leaves a note in its place rather
+        // than vanishing.
+        let raw = match tokio::fs::read(entry.path().join("record.json")).await {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                let note = format!("withheld: unreadable: {e}");
+                append_bytes(
+                    tar,
+                    &format!("sessions/{short}/record.error.txt"),
+                    note.as_bytes(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                continue;
+            }
         };
         // Records can hold user env-var values (loadout vars); mask
         // secret-shaped content before it leaves the machine.
@@ -277,9 +314,16 @@ async fn sessions<W: AsyncWrite + Unpin + Send + Sync>(
                 .await
                 .map_err(|e| e.to_string())?;
             }
-            Err(_) => {
-                // Unparseable: withhold (cannot redact safely). The state
-                // listing still shows the file exists.
+            Err(e) => {
+                // Withheld: can't redact safely. Record why in its place.
+                let note = format!("withheld: does not parse as JSON, cannot redact safely: {e}");
+                append_bytes(
+                    tar,
+                    &format!("sessions/{short}/record.error.txt"),
+                    note.as_bytes(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
             }
         }
     }
@@ -300,9 +344,23 @@ async fn procs<W: AsyncWrite + Unpin + Send + Sync>(tar: &mut Builder<W>) -> Res
         .map_err(|e| e.to_string())
 }
 
+/// argv0 basenames whose full command line is ours to record. Everything
+/// else is reported by process name (`comm`) only.
+const PROC_MARKERS: &[&str] = &[
+    "min",
+    "minimal",
+    "minimald",
+    "minvmd",
+    "__krun-vmm",
+    "gvproxy",
+];
+
 fn proc_table() -> Result<String, String> {
     use std::fmt::Write as _;
-    let mut text = String::from("pid\tppid\tvmrss_kb\tcmdline\n");
+    // On a native (non-VM) daemon /proc is the whole host process table, so
+    // full argv is captured only for the minimal process family — unrelated
+    // processes contribute their `comm` name, never their arguments.
+    let mut text = String::from("pid\tppid\tvmrss_kb\tcmd\n");
     let entries = std::fs::read_dir("/proc").map_err(|e| format!("reading /proc: {e}"))?;
     for entry in entries.flatten() {
         let Some(pid) = entry
@@ -315,6 +373,19 @@ fn proc_table() -> Result<String, String> {
         let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
             .map(|raw| String::from_utf8_lossy(&raw).replace('\0', " "))
             .unwrap_or_default();
+        let ours = cmdline
+            .split_whitespace()
+            .next()
+            .map(|argv0| argv0.rsplit('/').next().unwrap_or(argv0))
+            .is_some_and(|bin| PROC_MARKERS.contains(&bin));
+        let cmd = if ours {
+            cmdline.trim_end().to_string()
+        } else {
+            // comm is the process name only (no arguments).
+            std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .map(|c| c.trim_end().to_string())
+                .unwrap_or_default()
+        };
         let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
         let field = |key: &str| {
             status
@@ -326,7 +397,7 @@ fn proc_table() -> Result<String, String> {
         };
         let _ = writeln!(
             text,
-            "{pid}\t{}\t{}\t{cmdline}",
+            "{pid}\t{}\t{}\t{cmd}",
             field("PPid:"),
             field("VmRSS:")
         );

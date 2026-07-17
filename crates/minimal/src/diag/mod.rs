@@ -112,6 +112,23 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
             collect::provider_files(&mut w, name, dir)
         );
 
+        // `--no-guest` means "collect host-side state only" — the socket probe
+        // handshakes with the daemon (a GetVersion RPC), so it is a guest
+        // contact and must be skipped too, not just the bundle download.
+        if args.no_guest {
+            let guest_started = std::time::Instant::now();
+            if let Err(e) =
+                guest::record_skipped(&mut w, name, "guest collection skipped: --no-guest").await
+            {
+                w.error(
+                    format!("guest.{name}"),
+                    format!("{e:#}"),
+                    guest_started.elapsed(),
+                );
+            }
+            continue;
+        }
+
         let sock = dir.join(paths::SSH_SOCK_FILE);
         let (probe, client) = net::probe_socket(&sock).await;
         collect_step!(
@@ -121,11 +138,8 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
         );
 
         let guest_started = std::time::Instant::now();
-        let guest_result = match (args.no_guest, client) {
-            (true, _) => {
-                guest::record_skipped(&mut w, name, "guest collection skipped: --no-guest").await
-            }
-            (false, None) => {
+        let guest_result = match client {
+            None => {
                 // The daemon being unreachable is the volume fallback's
                 // marquee case: nothing else can say what the guest was
                 // doing when it died.
@@ -140,7 +154,7 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
                     err => err,
                 }
             }
-            (false, Some(mut client)) => {
+            Some(mut client) => {
                 guest::collect(
                     &mut w,
                     name,

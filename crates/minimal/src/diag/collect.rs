@@ -95,7 +95,10 @@ pub async fn system(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
 async fn command_line_output(cmd: &str, args: &[&str]) -> Option<String> {
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        tokio::process::Command::new(cmd).args(args).output(),
+        tokio::process::Command::new(cmd)
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
     )
     .await
     .ok()?
@@ -191,12 +194,16 @@ fn statvfs(path: &Path) -> Option<(u64, u64)> {
 // ── host/env.json ────────────────────────────────────────────────────────────
 
 pub async fn env(w: &mut BundleWriter) -> Result<(), anyhow::Error> {
-    let env: std::collections::BTreeMap<String, String> = std::env::vars()
-        .map(|(name, value)| {
+    // vars_os, not vars: the latter panics on a non-UTF-8 name or value, and
+    // a panic here would unwind past the collect_step! guard and abort the
+    // whole run with an unfinalized archive.
+    let env: std::collections::BTreeMap<String, String> = std::env::vars_os()
+        .map(|(name_os, value_os)| {
+            let name = name_os.to_string_lossy().into_owned();
             let shown = if is_env_value_allowlisted(&name) {
-                value
+                value_os.to_string_lossy().into_owned()
             } else {
-                format!("<redacted:len={}>", value.len())
+                format!("<redacted:len={}>", value_os.as_encoded_bytes().len())
             };
             (name, shown)
         })

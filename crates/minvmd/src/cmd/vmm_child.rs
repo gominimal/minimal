@@ -86,12 +86,12 @@ fn run_vmm() -> Result<()> {
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| crate::state::provider_dir().join("boot.log"));
+    // Capture is diagnostics, not a boot dependency: any failure — creating
+    // the file or wiring the console — warns and boots on, never propagates.
     if let Err(e) = std::fs::File::create(&boot_log) {
-        // Capture is diagnostics, not a boot dependency: warn and boot on.
         tracing::warn!(path = %boot_log.display(), error = %e, "cannot create boot log; console discarded");
-    } else {
-        ctx.set_console_output(&boot_log)
-            .context("setting console output log")?;
+    } else if let Err(e) = ctx.set_console_output(&boot_log) {
+        tracing::warn!(path = %boot_log.display(), error = %e, "cannot wire console to boot log; console discarded");
     }
 
     // Register the READY-marker vsock port (guest→host). The plain
