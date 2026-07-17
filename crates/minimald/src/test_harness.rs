@@ -59,7 +59,7 @@ impl TestServer {
             in_microvm: false,
             state_volume_mounted: false,
         };
-        let state = ServerStateHandle::new(config).await.unwrap();
+        let state = ServerStateHandle::new(config, None).await.unwrap();
 
         let host_key = state.host_key().await.unwrap();
         let russh_config = Arc::new(russh::server::Config {
