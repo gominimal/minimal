@@ -1505,6 +1505,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "diagnostics"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-compression",
+ "async-tar",
+ "chrono",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "diff"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
