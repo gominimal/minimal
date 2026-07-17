@@ -1,0 +1,22 @@
+Minimal
+
+This product is licensed under either of
+
+  * Apache License, Version 2.0 (see LICENSE-APACHE)
+  * MIT License (see LICENSE-MIT)
+
+at your option.
+
+Third-party attributions
+------------------------
+
+The macOS (darwin/arm64) release artifacts redistribute the following
+third-party components:
+
+  * libkrun (v1.19.4), shipped as libkrun.1.dylib
+    Licensed under the Apache License, Version 2.0
+    https://github.com/containers/libkrun
+
+  * gvproxy from gvisor-tap-vsock (v0.8.9)
+    Licensed under the Apache License, Version 2.0
+    https://github.com/containers/gvisor-tap-vsock
