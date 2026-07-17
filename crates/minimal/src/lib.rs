@@ -343,7 +343,14 @@ pub struct LsArgs {
 #[derive(Debug, Args)]
 pub struct DestroyArgs {
     /// Session identifier (UUID or session name)
-    pub session: String,
+    #[arg(required_unless_present = "all", conflicts_with = "all")]
+    pub session: Option<String>,
+    /// Destroy all sessions
+    #[arg(long)]
+    pub all: bool,
+    /// Skip confirmation when destroying all sessions
+    #[arg(long, short, requires = "all")]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -599,6 +606,19 @@ fn confirm(question: &str) -> Result<bool, anyhow::Error> {
     Ok(trimmed.is_empty()
         || trimmed.eq_ignore_ascii_case("y")
         || trimmed.eq_ignore_ascii_case("yes"))
+}
+
+/// Prompt for confirmation, defaulting to no.
+fn confirm_default_no(question: &str) -> Result<bool, anyhow::Error> {
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush().ok();
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .context("reading stdin")?;
+    let trimmed = input.trim();
+    Ok(trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes"))
 }
 
 /// List sessions via the `ListSessions` RPC.
@@ -1267,20 +1287,80 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
 
     let mut client = connect_daemon(global).await?;
 
+    if args.all {
+        return destroy_all_sessions(&mut client, args.force).await;
+    }
+
+    let session = args
+        .session
+        .as_deref()
+        .context("a session or --all is required")?;
+    let record = resolve_session(&mut client, session).await?;
+
+    destroy_session(&mut client, record.id, record.name.as_deref()).await
+}
+
+async fn destroy_all_sessions(
+    client: &mut client::Client,
+    force: bool,
+) -> Result<(), anyhow::Error> {
+    use minimald_rpc::ListSessions;
+
+    let sessions = client
+        .oneshot_rpc::<ListSessions>(())
+        .await
+        .context("ListSessions RPC failed")?
+        .sessions;
+
+    if sessions.is_empty() {
+        println!("No active sessions.");
+        return Ok(());
+    }
+
+    if !force {
+        if !std::io::stdin().is_terminal() {
+            bail!("refusing to destroy all sessions without confirmation; pass --force")
+        }
+        if !confirm_default_no(&format!("Destroy all {} sessions?", sessions.len()))? {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let session_count = sessions.len();
+    let mut failures = 0;
+    for session in sessions {
+        if let Err(error) = destroy_session(client, session.id, session.name.as_deref()).await {
+            failures += 1;
+            eprintln!(
+                "Failed to destroy session {} ({}): {error:#}",
+                session.id,
+                session.name.as_deref().unwrap_or("-")
+            );
+        }
+    }
+
+    if failures > 0 {
+        bail!("failed to destroy {failures} of {session_count} sessions")
+    }
+
+    Ok(())
+}
+
+async fn destroy_session(
+    client: &mut client::Client,
+    id: sessions::SessionId,
+    name: Option<&str>,
+) -> Result<(), anyhow::Error> {
     use minimald_rpc::{DestroySession, DestroySessionRequest};
-    let record = resolve_session(&mut client, &args.session).await?;
 
     let resp = client
-        .oneshot_rpc::<DestroySession>(DestroySessionRequest { id: record.id })
+        .oneshot_rpc::<DestroySession>(DestroySessionRequest { id })
         .await
         .context("DestroySession RPC failed")?;
 
     if resp.ok().is_some() {
-        println!(
-            "Destroyed session {} ({})",
-            record.id,
-            record.name.as_deref().unwrap_or("-")
-        );
+        println!("Destroyed session {} ({})", id, name.unwrap_or("-"));
     } else {
         bail!("DestroySession returned an error from the daemon");
     }
