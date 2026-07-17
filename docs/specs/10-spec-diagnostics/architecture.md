@@ -254,8 +254,8 @@ pub async fn process_tree<W: ..>(w: &mut BundleWriter<W>, markers: &[&str]) -> R
 pub async fn hang_triage<W: ..>(w: &mut BundleWriter<W>, markers: &[&str]) -> Result<()>;
 // net.rs: listening_sockets / interfaces (MAC→OUI) / routes
 // power.rs: power (pmset | journalctl, event-capped)
-// collect.rs: disk_info (statvfs), rotated_logs (newest-N by prefix, tail-capped),
-//             env(allowlist: impl Fn(&str) -> bool)
+// (disk / rotated-log / env / system mechanics already landed with the
+// host-bundle unit — see the additions block above)
 ```
 
 ref: crate exists at `crates/diagnostics/src/{bundle,manifest,redact,listing}.rs`
