@@ -15,6 +15,9 @@ on:
 permissions:
     contents: write # release job cuts a GitHub release
     id-token: write # OIDC for the GCS auth in promote-nightly
+    checks: read # release.yml's verify-ci gate reads check-run conclusions; a
+    # called workflow cannot hold a scope its caller doesn't grant, and an
+    # ungranted request fails the whole run at startup (startup_failure).
 
 jobs:
     # Skip the build on no-op nights: a finished release stages an immutable
