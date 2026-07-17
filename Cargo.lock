@@ -1519,6 +1519,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "toml",
  "walkdir",
 ]
 
@@ -3613,6 +3614,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "constcat",
+ "diagnostics",
  "dirs",
  "mctx",
  "mfile",
@@ -3628,6 +3630,7 @@ dependencies = [
  "sessions",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "version",
