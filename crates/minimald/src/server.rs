@@ -9,6 +9,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
 use crate::connection::Connection;
 use crate::sessions;
@@ -100,6 +101,22 @@ impl Config {
     }
 }
 
+/// A one-shot closure that closes the microVM's on-volume log appender —
+/// reloading its tracing layer off and dropping the worker guard — so the
+/// write-open fd is gone before the Shutdown RPC quiesces the state volume
+/// (otherwise it defeats the clean unmount and leaves a dirty ext4 journal).
+///
+/// Owned by the server state and run via
+/// [`ServerStateHandle::release_volume_log`] — no process-global mutable
+/// state.
+pub struct VolumeLogRelease(pub Box<dyn FnOnce() + Send>);
+
+impl std::fmt::Debug for VolumeLogRelease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VolumeLogRelease(..)")
+    }
+}
+
 /// A container for the state of the server.
 #[derive(Debug)]
 pub struct ServerState {
@@ -110,6 +127,11 @@ pub struct ServerState {
     /// torn down, telling [`Server::run`]'s accept loop to stop accepting,
     /// drain in-flight connections, and return so the process can exit.
     shutdown: CancellationToken,
+
+    /// Closes the microVM's on-volume log appender before the Shutdown RPC
+    /// quiesces the state volume. `None` outside the microVM (no on-volume
+    /// log to close).
+    volume_log_release: Option<VolumeLogRelease>,
 
     /// Memoized SSH host key, after first successful load.
     host_key: Option<PrivateKey>,
@@ -129,7 +151,10 @@ pub struct ServerState {
 }
 
 impl ServerState {
-    pub async fn new(config: Config) -> Result<Self, std::io::Error> {
+    pub async fn new(
+        config: Config,
+        volume_log_release: Option<VolumeLogRelease>,
+    ) -> Result<Self, std::io::Error> {
         let minimal_state_dir = config.minimal_state_dir.clone();
         let minimal_cache_dir = config.minimal_cache_dir.clone();
         // Construct the per-host switch once, here at daemon scope, so a single
@@ -184,6 +209,7 @@ impl ServerState {
             .await?,
             config,
             shutdown: CancellationToken::new(),
+            volume_log_release,
             host_key: None,
             #[cfg(feature = "networking-proxy")]
             cert_authority,
@@ -199,8 +225,24 @@ pub struct ServerStateHandle(Arc<Mutex<ServerState>>);
 
 impl ServerStateHandle {
     /// Constructs a fresh handle wrapping a newly-initialized [`ServerState`].
-    pub(crate) async fn new(config: Config) -> Result<Self, std::io::Error> {
-        Ok(Self(Arc::new(Mutex::new(ServerState::new(config).await?))))
+    pub(crate) async fn new(
+        config: Config,
+        volume_log_release: Option<VolumeLogRelease>,
+    ) -> Result<Self, std::io::Error> {
+        Ok(Self(Arc::new(Mutex::new(
+            ServerState::new(config, volume_log_release).await?,
+        ))))
+    }
+
+    /// Runs and clears the microVM's on-volume log release (closing the
+    /// appender's fd), so the caller may quiesce the state volume without the
+    /// log holding it busy. A no-op after the first call, and outside the
+    /// microVM. Called by the Shutdown RPC before quiescing.
+    pub async fn release_volume_log(&self) {
+        let release = self.0.lock().await.volume_log_release.take();
+        if let Some(VolumeLogRelease(release)) = release {
+            release();
+        }
     }
 
     pub async fn host_key(&self) -> Result<PrivateKey, KeyError> {
@@ -350,6 +392,10 @@ impl Listener for tokio_vsock::VsockListener {
 /// so an unbounded wait could hang the process; this bounds it.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Monotonic id carried by each accepted connection's span, so a
+/// connection's accept, channel bindings, and close correlate across the log.
+static CONN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A listening minimald server.
 #[derive(Debug)]
 pub struct Server;
@@ -357,12 +403,16 @@ pub struct Server;
 impl Server {
     /// Launches minimald, accepting connections on the given listener and
     /// driving an SSH session over each until the listener errors.
-    pub async fn run<L: Listener>(config: Config, listener: L) -> Result<(), std::io::Error> {
+    pub async fn run<L: Listener>(
+        config: Config,
+        listener: L,
+        volume_log_release: Option<VolumeLogRelease>,
+    ) -> Result<(), std::io::Error> {
         // `config` is moved into the state below; capture the deployment-model
         // flag the proxy startup needs first.
         #[cfg(target_os = "linux")]
         let in_microvm = config.in_microvm;
-        let state = ServerStateHandle::new(config).await?;
+        let state = ServerStateHandle::new(config, volume_log_release).await?;
 
         // Start minimald's two host-side proxies (B5 egress :7654, B8 mTLS
         // :7655) for the server's lifetime and, in a microVM (DM1), publish them
@@ -394,31 +444,55 @@ impl Server {
                 () = shutdown.cancelled() => break,
                 accepted = listener.accept() => accepted?,
             };
-            tracing::info!(?peer, transport = L::TRANSPORT, "accepted connection");
-            let (_conn_hnd, session_fut) = match Connection::from_stream(
-                stream,
-                russh_config.clone(),
-                state.clone(),
-                L::IS_LOCAL,
-            )
-            .await
-            {
+            // One span per accepted connection: every record the connection
+            // and its channels emit carries `conn`, so accept, channel
+            // bindings, and close correlate across the log with a grep
+            // instead of manual id fields on each line.
+            let conn = CONN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let span = tracing::info_span!("conn", conn, transport = L::TRANSPORT);
+            span.in_scope(|| tracing::info!(?peer, "accepted connection"));
+            let from_stream =
+                Connection::from_stream(stream, russh_config.clone(), state.clone(), L::IS_LOCAL);
+            let (_conn_hnd, session_fut) = match from_stream.instrument(span.clone()).await {
                 Ok(conn) => conn,
                 Err(e) => {
                     // A handshake failure must not take the daemon down — in
                     // the guest minimald is pid-1. Drop this connection and
                     // keep accepting.
-                    tracing::warn!(error = %e, transport = L::TRANSPORT, "SSH handshake failed; dropping connection");
+                    span.in_scope(
+                        || tracing::warn!(error = %e, "SSH handshake failed; dropping connection"),
+                    );
                     continue;
                 }
             };
             // Log session errors instead of silently dropping the spawned
             // future, so a failed handshake is visible on any transport.
-            session_set.spawn(async move {
-                if let Err(e) = session_fut.await {
-                    tracing::warn!(error = %e, transport = L::TRANSPORT, "session ended with error");
+            session_set.spawn(
+                async move {
+                    match session_fut.await {
+                        Ok(()) => tracing::info!("connection closed"),
+                        Err(e) => {
+                            // Abrupt hangups are how the CLI's oneshot RPC
+                            // connections and Ctrl-C'd attaches normally end;
+                            // framing them as errors makes routine traffic
+                            // read like a transport incident during field
+                            // analysis. Match on the rendered message: russh
+                            // wraps the underlying io error, and this is log
+                            // framing only.
+                            let msg = e.to_string();
+                            if msg.contains("early eof")
+                                || msg.contains("Broken pipe")
+                                || msg.contains("Disconnected")
+                            {
+                                tracing::info!(reason = %msg, "connection closed by peer");
+                            } else {
+                                tracing::warn!(error = %msg, "session ended with error");
+                            }
+                        }
+                    }
                 }
-            });
+                .instrument(span),
+            );
         }
 
         // Shutdown requested: stop accepting (done — loop exited) and drain
@@ -636,6 +710,32 @@ mod tests {
         }
     }
 
+    /// The volume-log release must run exactly once no matter how many
+    /// times the Shutdown path invokes it, and a harness-style `None`
+    /// release must be a no-op.
+    #[tokio::test]
+    async fn volume_log_release_runs_exactly_once() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let dir = TempDir::new().unwrap();
+        let count = Arc::new(AtomicU32::new(0));
+        let counted = count.clone();
+        let release = VolumeLogRelease(Box::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
+        let state = ServerStateHandle::new(test_config(&dir), Some(release))
+            .await
+            .unwrap();
+        state.release_volume_log().await;
+        state.release_volume_log().await;
+        assert_eq!(count.load(Ordering::SeqCst), 1, "one-shot, then a no-op");
+
+        let none = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
+        none.release_volume_log().await;
+    }
+
     /// Binds a UDS in `dir` and spawns `Server::run` against it, returning the
     /// run task's join handle alongside the socket path clients dial.
     fn spawn_server(
@@ -646,7 +746,7 @@ mod tests {
     ) {
         let sock = dir.path().join("minimald.sock");
         let listener = UnixListener::bind(&sock).unwrap();
-        let run = tokio::spawn(Server::run(test_config(dir), listener));
+        let run = tokio::spawn(Server::run(test_config(dir), listener, None));
         (run, sock)
     }
 

@@ -369,6 +369,10 @@ async fn quiesce_state_volume_if_mounted(s: &ServerStateHandle) {
     if !s.state_volume_mounted().await {
         return;
     }
+    // The on-volume log appender holds a write-open fd under the mountpoint,
+    // which defeats both the clean unmount and the read-only remount —
+    // close it first. Records keep flowing to the console (host boot.log).
+    s.release_volume_log().await;
     let mountpoint = s.minimal_state_dir().await;
     let quiesce = tokio::task::spawn_blocking(move || {
         crate::guest::quiesce_state_volume(mountpoint.as_utf8_path().as_str())

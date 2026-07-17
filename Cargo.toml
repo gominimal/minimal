@@ -92,6 +92,7 @@ indicatif = "0.18"
 indoc = "^2.0"
 jaq-all = "0.2.0"
 libc = "0.2"
+logroller = "0.1"
 lzma-rs = "0.3"
 
 # Revert back to crates.io dep once new version is released.
