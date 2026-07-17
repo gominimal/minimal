@@ -34,9 +34,9 @@ ids/field names (no OTEL dependency), so host and guest records join on a
 `trace_id` grep.
 
 The work re-lands from the reference branch `min-bug-diagnostics`
-(head `77fc711e` — PR #784 with all review findings addressed) as eight
-serial units, each an independently mergeable PR under 1000 lines. Baselines
-below cite the reference tree as `ref:`.
+(head `77fc711e`, all design-review findings addressed) as eight serial
+units, each an independently mergeable PR under 1000 lines. Baselines below
+cite the reference tree as `ref:`.
 
 ## System view
 
@@ -403,9 +403,10 @@ analysis machine.
 
 **Streaming RPC for debug data.** Rejected: replaces a ~200-line one-shot
 blob with protocol machinery whose failure modes are opaque exactly when the
-transport is the suspect (#788's failure domain was the vsock transport
-itself). The one-shot subsystem is served identically by native and in-VM
-daemons and is preceded by a probe that already localizes transport faults.
+transport is the suspect — and a wedged transport is precisely the scenario
+the subsystem must serve. The one-shot subsystem is served identically by
+native and in-VM daemons and is preceded by a probe that already localizes
+transport faults.
 
 **`BundleWriter` writing the russh channel directly.** Rejected:
 `async_tar::Builder` requires `W: Sync`; the russh writer is not (`ref
@@ -426,9 +427,9 @@ single out-of-tree consumer (Unit 8) rather than carry the split forever.
 | default-type-param | `BundleWriter<W = File>` keeps `&mut BundleWriter` call sites compiling unchanged | settled | Rust default type parameters; verified against ~15 collector signatures on ref | R1.2 |
 | logroller-fit | logroller composes under `tracing_appender::non_blocking` + reload as a plain `io::Write` | settled | logroller 0.1.12 API (io::Write); same shape as the appender it replaces | R3.6 |
 | russh-env-request | Client can send an SSH channel env request and minimald's russh handler can surface it before subsystem dispatch | needs-spike | russh supports `env` channel requests; minimald's handler surface not yet desk-verified for env interception | R4.4 |
-| debugfs-live-read | `debugfs -c` reads an ext4 image safely while a VM writes it | settled | exercised live during the #788 incident against `data-vol.raw`; harvest may be torn mid-write (acceptable) | R7.5 |
+| debugfs-live-read | `debugfs -c` reads an ext4 image safely while a VM writes it | settled | exercised live in the field against a running VM's `data-vol.raw`; harvest may be torn mid-write (acceptable) | R7.5 |
 | rootless-guest-bundle | Consumers (nested verification, diag-explore) assume guest bundle entries at archive top level | settled | ref `minimald/src/diag.rs` (no root dir); diag-explore exact-key lookups | R1.2, R6.2, R8.3 |
-| markers-basename | argv0-basename matching is sufficient to scope full-argv capture to the minimal process family | settled | ref `minimal/src/diag/procs.rs:14-32`, reviewed in #784 | R5.2, R6.2 |
+| markers-basename | argv0-basename matching is sufficient to scope full-argv capture to the minimal process family | settled | ref `minimal/src/diag/procs.rs:14-32`, settled in design review | R5.2, R6.2 |
 
 The `russh-env-request` row blocks planning of R4.4 only: desk-verify during
 Unit 4 design (read russh `ChannelMsg::Env`/handler plumbing both ends). If
@@ -455,6 +456,6 @@ if taken.
 - The 09 spec slot is claimed by `09-spec-minvmd-resource-monitoring` on an
   unmerged branch (`d0441771`); this spec takes 10. If 09 is abandoned before
   this lands, renumbering is a mechanical rename.
-- Prior work referenced but not in-tree: the #788 field bundle
-  (`minimal-diag-20260716T203346Z.tar.zst`, attached to the issue) is the
-  canonical pre-convergence sample for Unit 8's dual-format check.
+- Prior work referenced but not in-tree: a field-captured pre-convergence
+  bundle (`minimal-diag-20260716T203346Z.tar.zst`, retained by the team) is
+  the canonical sample for Unit 8's dual-format check.

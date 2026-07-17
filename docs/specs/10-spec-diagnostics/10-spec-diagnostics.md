@@ -11,38 +11,35 @@ supersedes:
 
 ## Context
 
-When an established attach stream died silently mid-session (#788), diagnosis
-ran entirely on files scraped off disk after the fact — and the two biggest
-gaps were files that did not exist. The in-VM daemon logged to a console the
-VMM discarded (`~1.7 KB` written to a `/dev/null`-routed stream), and the host
-CLI had no way to capture what the guest had been doing when it died. The
-incident was root-caused anyway (thread stacks, socket states, and the data
-volume's mtime dated the stall), but every one of those artifacts was
-hand-collected. A "please run one command and send us the output" story did
-not exist.
+When a session transport dies silently mid-flight, diagnosis runs entirely on
+files scraped off disk after the fact — and today the highest-value files do
+not exist. The in-VM daemon logs to a console the VMM discards, and the host
+CLI has no way to capture what the guest was doing when it died. Incidents of
+this class are root-caused by hand — thread stacks, socket states, the data
+volume's mtime dating the stall — with every artifact collected manually. A
+"run one command and send us the output" story does not exist.
 
-PR #784 built that story end to end: a `min bug` command producing a redacted
-`minimal-diag-<ts>.tar.zst`, a daemon-side streaming subsystem contributing an
-in-VM bundle, persistent daemon logs for both daemons, and the #788 field
-captures (boot.log, hang triage, degraded-mode volume harvest, sleep/wake
-history). It grew to +4107/−68 across 38 files and was moved to draft. The
-branch `min-bug-diagnostics` (head `77fc711e`, all review findings addressed)
-is the **reference implementation** for this spec: baselines below cite it as
-`ref:` alongside the `origin/main` state each unit lands on. Units take
-final-tree file states from that branch — not cherry-picked commit sequences —
-because the review fixes are interleaved across its history.
+A complete reference implementation of that story exists on the branch
+`min-bug-diagnostics` (head `77fc711e`): a `min bug` command producing a
+redacted `minimal-diag-<ts>.tar.zst`, a daemon-side streaming subsystem
+contributing an in-VM bundle, persistent daemon logs for both daemons, and
+the field-incident captures (boot.log, hang triage, degraded-mode volume
+harvest, sleep/wake history). It grew too large to review as a single change;
+this spec re-lands it as independently mergeable units. Baselines below cite
+the reference tree as `ref:` alongside the `origin/main` state each unit
+lands on. Units take final-tree file states from that branch — not
+cherry-picked commit sequences — because review fixes are interleaved across
+its history.
 
-Scope boundaries settled during review of #784 (informed by #784 review
-threads):
+Scope boundaries settled during design review:
 
 - App-agnostic machinery lives in a dedicated `diagnostics` crate; only
   `bug`-command-specific code stays in `crates/minimal`, and `common` stays
-  free of diagnostics logic (Tom, #784 r3599479514/r3599482662).
+  free of diagnostics logic.
 - Correlation metadata belongs on tracing spans, not hand-stamped per-line
-  fields (Tom, #784 r3599524698).
+  fields.
 - Process-global mutable state for the log-release hook is out; the release is
-  owned by `ServerState` and invoked through it (Tom, #784 r3599508618/
-  r3599517777).
+  owned by `ServerState` and invoked through it.
 
 Domain vernacular (Session, Provider, the socket lifecycle) is defined in
 `docs/session-domain-diag.md` and used here without redefinition. The bundle
@@ -346,15 +343,15 @@ records carry correlation ids on spans.
   UNIT** or dev flows lose the console between the export removal and the
   default.
 - The in-VM minimald logs to the console only; nothing survives the VM —
-  **NO PERSISTED GUEST LOGS** (the #788 gap). ref: `minimald/src/main.rs`
+  **NO PERSISTED GUEST LOGS**. ref: `minimald/src/main.rs`
   installs a `tracing_subscriber::reload` layer whose activator attaches a
   rolling on-volume appender after the state volume mounts, and
   `server.rs:103-118` owns a `VolumeLogRelease` invoked from the
   **pre-existing** Shutdown→quiesce path (`rpc.rs:346` on `origin/main`) so
   the appender (and its `WorkerGuard`) drop before the ext4 unmount.
 - ref: `session_host.rs:368-372` and `server.rs:398-401` stamp channel/conn
-  ids as **manual per-line fields** — superseded here by spans (Tom, #784
-  r3599524698).
+  ids as **manual per-line fields** — superseded here by spans per the
+  design-review boundary above.
 - `tracing-appender` rotation is time-based only; nothing caps intra-day
   growth (tokio-rs/tracing#1940) — **NO SIZE CAP EXISTS** on any log path.
 
@@ -394,8 +391,9 @@ records carry correlation ids on spans.
 1. **CLI (gate):** boot a VM, hold an idle attach, `minvmd stop`; the volume
    unmounts cleanly (no journal replay on next mount), `boot.log` is present
    in the host-side provider directory, and rotated `minimald.log*` appear on
-   the data volume at next boot — demonstrates R3.2–R3.4. This is the #784
-   field-validation item and gates the unit.
+   the data volume at next boot — demonstrates R3.2–R3.4. The
+   release-before-quiesce path is compile/unit-verified only on the reference
+   branch; this live check gates the unit.
 2. **Test:** log-release runs exactly once and before quiesce returns;
    harness passes `None` release unaffected — demonstrates R3.4.
 3. **Test:** writing past the size threshold rotates and prunes to
@@ -423,8 +421,8 @@ the daemon across the SSH boundary.
 
 **Baseline:**
 - All log output is human-format text; no trace/span ids exist anywhere —
-  **NOT YET IN CODEBASE** (this unit is new scope beyond #784, adopted by
-  decision on 2026-07-16).
+  **NOT YET IN CODEBASE** (this unit is new scope beyond the reference
+  implementation, adopted by decision on 2026-07-16).
 - `tracing-subscriber`'s JSON formatter does not emit span/trace ids by
   itself (tokio-rs/tracing#1481 open) — ids must be minted and stamped as
   explicit span fields.
@@ -474,7 +472,7 @@ the daemon across the SSH boundary.
 
 ### Unit 5: Incident collectors, mechanics in-crate
 
-**Purpose:** The #788-shaped captures: network state, process tree, hang
+**Purpose:** The wedged-system captures: network state, process tree, hang
 triage, and power history. Mechanics land in `diagnostics` parameterized by
 app inputs — satisfying the crate rule — and the generic collect helpers
 migrate out of `crates/minimal`.
@@ -566,8 +564,8 @@ same `manifest.json` schema as the host bundle.
 - ref: the daemon's network capture is listening tables + `/proc/net/dev`
   counters only (`diag.rs:408-430`) — **NO ROUTES, NO ADDRESSES, NO ENV, NO
   HANG TRIAGE IN-VM**. The partial-wedge case (daemon responsive, a session
-  child or vsock binding stuck — the #788 shape) is invisible to the current
-  guest bundle; this unit closes it via the Unit 5 mechanics.
+  child or transport binding stuck) is invisible to the current guest bundle;
+  this unit closes it via the Unit 5 mechanics.
 
 **Functional Requirements:**
 
@@ -727,8 +725,8 @@ read both pre-convergence (`errors.json`) and post-convergence
 **Proof Artifacts:**
 
 1. **CLI:** `summary`/`check`/`errors` against one pre-convergence bundle
-   (the #788 field bundle) and one post-Unit-6 bundle — both pass —
-   demonstrates R8.1–R8.3.
+   (a field-captured sample retained by the team) and one post-Unit-6 bundle
+   — both pass — demonstrates R8.1–R8.3.
 
 ## Non-Goals
 
@@ -802,7 +800,8 @@ half-close request and extended-data error relay — ~200 lines whose failure
 modes are inspectable with the same probe that precedes it. OTLP/gRPC or
 otel-arrow streaming would replace that with a protocol stack (HTTP/2 flow
 control, batch buffering, backpressure) that is opaque exactly when the
-transport is the suspect — and #788's failure domain *was* the transport.
+transport is the suspect — and a wedged transport is precisely the scenario
+this subsystem must serve.
 Every OTEL export path is push-based from a live process and loses its
 in-memory tail on a hang; the only OTEL-shaped post-mortem pattern is
 "write files while healthy, scrape later", which is what Unit 3 does without
@@ -854,9 +853,9 @@ Unit 8's dual-format rework, sequenced after Unit 6.
 
 ## Open Questions
 
-1. Should minvmd's *foreground* runs also tee to the file log (Tom, #784
-   r3599529270: "why don't we just do this unconditionally?")? Default
-   posture here: detached-only in Unit 3; revisit in Unit 3 review with Tom.
+1. Should minvmd's *foreground* runs also tee to the file log — why not
+   unconditionally? Default posture here: detached-only in Unit 3; revisit at
+   Unit 3 review.
 2. `service.instance.id` (R4.2): provider name vs VM/session uuid — decide in
    Unit 4 design review; must be stable across a VM's lifetime and present in
    both host and guest resource fields.
