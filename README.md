@@ -167,6 +167,10 @@ cargo build --release  # optimized build (slower to build, faster to run)
 cargo test             # run the test suite
 ```
 
+Binaries land at `target/debug/{min,mip,minimald,minvmd}` (or
+`target/release/`). Building the entire package registry is heavy — 8 cores
+and at least 16 GB of RAM are recommended.
+
 ### Ubuntu 24.04+ hosts
 
 Sessions run in an unprivileged user namespace, which Ubuntu 24.04 blocks by
