@@ -63,7 +63,7 @@ claude --dangerously-skip-permissions
 git add -A
 git commit -m "initial checkin"
 
-git remote add origin https@github.com:gominimal/gatehouse.git
+git remote add origin https@github.com:<your-repo>.git
 git branch -M main
 git push -u origin main
 
@@ -94,7 +94,7 @@ min activate --attach --sync none .
 
 read -sp "paste GH PAT now:" GH_TOKEN && export GH_TOKEN
 
-git pull <your-project>
+git pull https@github.com:<your-repo>.git
 
 claude --dangerously-skip-permissions
 # add new features, fix bugs etc
