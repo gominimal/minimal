@@ -41,9 +41,16 @@ WORKFLOW_FILE="${WORKFLOW_FILE:-nightly.yml}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --sha)      SHA="$2"; shift 2 ;;
-        --repo)     REPO="$2"; shift 2 ;;
-        --workflow) WORKFLOW_FILE="$2"; shift 2 ;;
+        --sha|--repo|--workflow)
+            # Guard $2: under `set -u` a trailing valueless flag would abort
+            # with an unbound-variable error instead of a usable message.
+            [ $# -ge 2 ] || die "missing value for $1"
+            case "$1" in
+                --sha)      SHA="$2" ;;
+                --repo)     REPO="$2" ;;
+                --workflow) WORKFLOW_FILE="$2" ;;
+            esac
+            shift 2 ;;
         -h|--help)  usage 0 ;;
         *)          die "unknown argument: $1 (try --help)" ;;
     esac
@@ -52,12 +59,14 @@ done
 [ -n "$SHA" ] || die "missing --sha"
 [ -n "$REPO" ] || die "missing --repo (and GITHUB_REPOSITORY is unset)"
 
-# Staged versions are short (8-hex) commit SHAs; insist on a sane prefix so a
-# stray short string can't accidentally prefix-match an unrelated run.
+# Staged versions are `git rev-parse --short=8` SHAs: 8 hex chars, longer only
+# on prefix collision, and a full 40-char SHA is always acceptable. Refuse
+# anything shorter so a stray fragment can't prefix-match an unrelated run.
 case "$SHA" in
     *[!0-9a-fA-F]*) die "sha '$SHA' contains non-hex characters" ;;
 esac
-[ "${#SHA}" -ge 7 ] || die "sha '$SHA' is too short (need at least 7 hex chars)"
+[ "${#SHA}" -ge 8 ] || die "sha '$SHA' is too short (staged versions are 8+ hex chars)"
+[ "${#SHA}" -le 40 ] || die "sha '$SHA' is longer than a full 40-char commit SHA"
 
 command -v gh >/dev/null 2>&1 || die "gh not found"
 
@@ -69,7 +78,9 @@ runs=$(gh api --paginate \
     "repos/${REPO}/actions/workflows/${WORKFLOW_FILE}/runs?status=success&per_page=100" \
     --jq '.workflow_runs[] | "\(.head_sha) \(.html_url)"')
 
-match=$(printf '%s\n' "$runs" | grep -m1 "^${sha_lc}" || true)
+# Anchor the prefix match to the head_sha field (hex run, then the space
+# before the URL) so the input can only ever match a prefix of the commit SHA.
+match=$(printf '%s\n' "$runs" | grep -m1 -E "^${sha_lc}[0-9a-f]* " || true)
 
 [ -n "$match" ] || die "version '$SHA' was not built by a successful ${WORKFLOW_FILE} run in ${REPO}; \
 promote a nightly-built version, or re-dispatch with the emergency provenance override"

@@ -205,6 +205,20 @@ test-installer:
         SH="$sh" "$sh" scripts/install_test.sh
     done
 
+# Run the promotion provenance gate's test harness (stubbed `gh`, no network,
+# no auth); shellcheck runs when present.
+test-promote-gate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v shellcheck >/dev/null 2>&1; then
+        echo "== shellcheck =="
+        shellcheck scripts/verify-nightly-provenance.sh scripts/verify-nightly-provenance_test.sh
+    else
+        echo "== shellcheck not found, skipping static check =="
+    fi
+    echo "== running verify-nightly-provenance_test.sh =="
+    bash scripts/verify-nightly-provenance_test.sh
+
 # ── DM1 / DM2 / DM3 deployment-model bring-up ────────────────────────────────
 #
 # DM1: macOS (Apple Silicon) host + Linux VM(s) over Hypervisor.framework. This
