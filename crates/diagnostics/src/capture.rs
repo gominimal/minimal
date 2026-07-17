@@ -113,6 +113,20 @@ pub async fn command_capture(
     })
 }
 
+/// First line of `cmd args…` stdout, or `None` when the command can't run,
+/// fails, or times out. The one-liner for collectors that want a single
+/// fact from a tool (`uname -srvm`) and treat any failure as "unknown".
+pub async fn first_stdout_line(cmd: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    let capture = command_capture(cmd, args, timeout).await.ok()?;
+    capture.status.is_some_and(|s| s.success()).then(|| {
+        String::from_utf8_lossy(&capture.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +167,22 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, CaptureError::Spawn { .. }), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn first_stdout_line_takes_line_one_and_maps_failure_to_none() {
+        let line = first_stdout_line(
+            "sh",
+            &["-c", "echo first; echo second"],
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(line.as_deref(), Some("first"));
+
+        let failed = first_stdout_line("sh", &["-c", "exit 1"], Duration::from_secs(10)).await;
+        assert_eq!(failed, None, "non-zero exit is None, not empty");
+        let missing =
+            first_stdout_line("definitely-not-a-real-binary", &[], Duration::from_secs(1)).await;
+        assert_eq!(missing, None);
     }
 }

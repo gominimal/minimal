@@ -1,9 +1,13 @@
 //! Key-based redaction of secret-shaped values in structured data.
 //!
 //! Shared by the CLI-side diagnostic bundler and the daemon-side
-//! diagnostic RPC so both apply identical rules. Redaction is
-//! deliberately conservative: false positives (masking a harmless value) are
+//! diagnostic RPC so both apply identical rules, over both formats the
+//! producers read (JSON and TOML), plus the process-environment masking
+//! both sides use for their `env.json`. Redaction is deliberately
+//! conservative: false positives (masking a harmless value) are
 //! acceptable, false negatives (leaking a secret) are not.
+
+use std::collections::BTreeMap;
 
 use serde_json::Value;
 
@@ -87,6 +91,78 @@ fn redact_json_inner(value: &mut Value, mask_all: bool) {
             }
         }
     }
+}
+
+/// Parses `input` as TOML and masks sensitive values: any value whose key is
+/// sensitive per [`is_sensitive_key`], and *every* value inside tables named
+/// like env-var containers ([`is_env_table_name`]), e.g. a loadout's `[vars]`.
+///
+/// Returns the re-serialized document. Comments and key ordering are not
+/// preserved — callers record that in the bundle manifest. Unparseable input
+/// is an error; callers must withhold the file rather than pass it through.
+pub fn redact_toml(input: &str) -> Result<String, toml::de::Error> {
+    let table: toml::Table = input.parse()?;
+    let mut value = toml::Value::Table(table);
+    redact_toml_value(&mut value, false);
+    Ok(toml::to_string_pretty(&value).expect("re-serializing a just-parsed TOML value"))
+}
+
+fn redact_toml_value(value: &mut toml::Value, mask_all: bool) {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, child) in table.iter_mut() {
+                let child_mask = mask_all || is_env_table_name(key) || is_sensitive_key(key);
+                match child {
+                    toml::Value::Table(_) | toml::Value::Array(_) => {
+                        redact_toml_value(child, child_mask);
+                    }
+                    leaf => {
+                        if child_mask || is_sensitive_key(key) {
+                            *leaf = toml_placeholder(leaf);
+                        }
+                    }
+                }
+            }
+        }
+        toml::Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_toml_value(item, mask_all)),
+        leaf => {
+            if mask_all {
+                *leaf = toml_placeholder(leaf);
+            }
+        }
+    }
+}
+
+fn toml_placeholder(original: &toml::Value) -> toml::Value {
+    let len = match original {
+        toml::Value::String(s) => s.len(),
+        other => other.to_string().len(),
+    };
+    toml::Value::String(format!("<redacted:len={len}>"))
+}
+
+/// The process environment with every value the caller's policy does not
+/// explicitly allow masked to `<redacted:len=N>` (N = the OS value's byte
+/// length, so size-related issues stay diagnosable). Names are always
+/// recorded; only values are masked.
+///
+/// Enumerates via `vars_os`, never `vars` — the latter panics on a
+/// non-UTF-8 name or value, and a panic inside a collector aborts the whole
+/// run with an unfinalized archive.
+pub fn masked_process_env(is_value_allowed: impl Fn(&str) -> bool) -> BTreeMap<String, String> {
+    std::env::vars_os()
+        .map(|(name_os, value_os)| {
+            let name = name_os.to_string_lossy().into_owned();
+            let shown = if is_value_allowed(&name) {
+                value_os.to_string_lossy().into_owned()
+            } else {
+                format!("<redacted:len={}>", value_os.as_encoded_bytes().len())
+            };
+            (name, shown)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -193,5 +269,83 @@ mod tests {
         let mut v = json!({ "auth_retries": 3 });
         redact_json(&mut v);
         assert_eq!(v["auth_retries"], "<redacted:len=1>");
+    }
+
+    #[test]
+    fn toml_redacts_vars_tables_and_sensitive_keys() {
+        let input = r#"
+            description = "dev loadout"
+            packages = ["ripgrep", "fd"]
+            api_token = "abc123"
+
+            [vars]
+            EDITOR = "vim"
+            GITHUB_TOKEN = "ghp_zzz"
+
+            [[lifecycle_hooks]]
+            type = "inline"
+            value = "echo hi"
+        "#;
+        let out = redact_toml(input).expect("valid toml");
+        assert!(out.contains(r#"description = "dev loadout""#));
+        assert!(out.contains("ripgrep"));
+        assert!(out.contains(r#"api_token = "<redacted:len=6>""#));
+        assert!(out.contains(r#"EDITOR = "<redacted:len=3>""#));
+        assert!(out.contains(r#"GITHUB_TOKEN = "<redacted:len=7>""#));
+        // Hook bodies are not env values and carry no key-based signal.
+        assert!(out.contains("echo hi"));
+    }
+
+    #[test]
+    fn toml_sensitive_tables_are_masked_wholesale() {
+        let input = r#"
+            api_token = ["primary", "secondary"]
+
+            [tokens]
+            github = "ghp_zzz"
+
+            [credentials.aws]
+            access_key_id = "AKIA"
+        "#;
+        let out = redact_toml(input).expect("valid toml");
+        assert!(!out.contains("ghp_zzz"));
+        assert!(!out.contains("AKIA"));
+        assert!(!out.contains("primary"));
+        assert!(!out.contains("secondary"));
+    }
+
+    #[test]
+    fn toml_redacts_inherit_vars_wholesale() {
+        let input = r#"
+            [vars]
+            TERM = { inherit = true, default = "xterm-256color" }
+        "#;
+        let out = redact_toml(input).expect("valid toml");
+        assert!(!out.contains("xterm-256color"));
+        assert!(out.contains("<redacted:len=14>"));
+    }
+
+    #[test]
+    fn unparseable_toml_is_an_error() {
+        assert!(redact_toml("not = [ valid").is_err());
+    }
+
+    #[test]
+    fn toml_public_key_survives() {
+        let out = redact_toml(r#"public_key = "wg-pub-abc""#).expect("valid toml");
+        assert!(out.contains("wg-pub-abc"));
+    }
+
+    #[test]
+    fn masked_process_env_masks_everything_the_policy_rejects() {
+        // PATH is always present in a test environment.
+        let env = masked_process_env(|name| name == "PATH");
+        assert!(!env["PATH"].starts_with("<redacted:"), "allowed verbatim");
+        for (name, value) in &env {
+            assert!(
+                name == "PATH" || value.starts_with("<redacted:len="),
+                "{name} must be masked, got: {value}"
+            );
+        }
     }
 }
