@@ -548,33 +548,6 @@ pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Release hook for the on-volume log appender, run before the volume is
-/// quiesced. The microVM's pid-1 routes its tracing output to a file on the
-/// state volume (the binary's `DeferredFileWriter`); that appender's
-/// write-open fd defeats both the plain unmount and the read-only remount in
-/// [`quiesce_state_volume`], leaving the ext4 journal dirty on every clean
-/// stop. The binary registers a closure here after wiring the appender;
-/// [`release_volume_log`] runs it (once) so the file is closed before the
-/// unmount. Console logging is unaffected.
-static VOLUME_LOG_RELEASE: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
-    std::sync::Mutex::new(None);
-
-/// Registers the closure that closes the on-volume log appender.
-pub fn set_volume_log_release(release: impl FnOnce() + Send + 'static) {
-    *VOLUME_LOG_RELEASE.lock().expect("volume-log release lock") = Some(Box::new(release));
-}
-
-/// Closes the on-volume log appender, if one was registered. Idempotent.
-pub fn release_volume_log() {
-    let release = VOLUME_LOG_RELEASE
-        .lock()
-        .expect("volume-log release lock")
-        .take();
-    if let Some(release) = release {
-        release();
-    }
-}
-
 /// Take the microVM down, by resetting it. Does not return on success: the
 /// guest resets, and libkrun's VMM exits with it. On failure it returns the
 /// `reboot(2)` error.
@@ -1034,18 +1007,5 @@ mod tests {
             .unwrap();
         assert!(reason.len() <= MOUNT_FAILED_REASON_MAX_BYTES);
         assert!(reason.chars().all(|c| c == 'é'));
-    }
-
-    #[test]
-    fn volume_log_release_runs_the_hook_exactly_once() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let count = std::sync::Arc::new(AtomicUsize::new(0));
-        let hook_count = count.clone();
-        set_volume_log_release(move || {
-            hook_count.fetch_add(1, Ordering::SeqCst);
-        });
-        release_volume_log();
-        release_volume_log(); // idempotent: a second release is a no-op
-        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

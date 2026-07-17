@@ -347,95 +347,27 @@ fn lock_held(path: &std::path::Path) -> std::io::Result<bool> {
     }
 }
 
-/// A `MakeWriter` whose file sink is installed *after* tracing is already
-/// running. The microVM's pid-1 minimald calls [`init_tracing`] before it
-/// mounts its state volume, but its rolling log must land on that volume so
-/// `min bug`'s guest collector can read it back. We install this indirection at
-/// init time (discarding — records still reach stdout, so the console and host
-/// boot.log lose nothing) and point it at the appender once `/var/lib/minimal`
-/// is mounted, via [`DeferredFileWriter::activate`].
-#[derive(Clone, Default)]
-struct DeferredFileWriter {
-    inner: std::sync::Arc<std::sync::RwLock<Option<tracing_appender::non_blocking::NonBlocking>>>,
-}
-
-/// One resolved write target for [`DeferredFileWriter`]: the on-volume appender
-/// once activated, a discard sink before then.
-enum DeferredSink {
-    File(tracing_appender::non_blocking::NonBlocking),
-    Pending(std::io::Sink),
-}
-
-impl std::io::Write for DeferredSink {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            DeferredSink::File(w) => w.write(buf),
-            DeferredSink::Pending(s) => s.write(buf),
-        }
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            DeferredSink::File(w) => w.flush(),
-            DeferredSink::Pending(s) => s.flush(),
-        }
-    }
-}
-
-impl<'a> fmt::MakeWriter<'a> for DeferredFileWriter {
-    type Writer = DeferredSink;
-    fn make_writer(&'a self) -> Self::Writer {
-        match self.inner.read().unwrap().as_ref() {
-            Some(nb) => DeferredSink::File(nb.clone()),
-            None => DeferredSink::Pending(std::io::sink()),
-        }
-    }
-}
-
-impl DeferredFileWriter {
-    /// Opens the daily-rotated `minimald.log` under `log_dir` and routes this
-    /// writer at it. Returns the appender's [`WorkerGuard`], which the caller
-    /// must keep alive for the daemon's lifetime. Called once, right after the
-    /// state volume mounts.
-    ///
-    /// [`WorkerGuard`]: tracing_appender::non_blocking::WorkerGuard
-    fn activate(
-        &self,
-        log_dir: &std::path::Path,
-    ) -> Result<tracing_appender::non_blocking::WorkerGuard, MainError> {
-        std::fs::create_dir_all(log_dir)
-            .map_err(|e| MainError::IO(e, "creating minimald log directory"))?;
-        let appender = tracing_appender::rolling::Builder::new()
-            .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .filename_prefix("minimald.log")
-            .max_log_files(14)
-            .build(log_dir)
-            .map_err(|e| {
-                MainError::IO(std::io::Error::other(e), "building rolling log appender")
-            })?;
-        let (writer, guard) = tracing_appender::non_blocking(appender);
-        *self.inner.write().unwrap() = Some(writer);
-        Ok(guard)
-    }
-
-    /// Points the writer back at the discard sink. With the appender's
-    /// [`WorkerGuard`] also dropped, no fd stays open on the state volume.
-    ///
-    /// [`WorkerGuard`]: tracing_appender::non_blocking::WorkerGuard
-    fn deactivate(&self) {
-        *self.inner.write().unwrap() = None;
-    }
-}
+/// Installs the microVM's on-volume log appender post-mount, given the log
+/// directory. Returns the [`VolumeLogRelease`] the Shutdown RPC runs before
+/// quiescing the volume: it reloads the file layer off and drops the worker
+/// guard, closing the appender's fd. microVM pid-1 only.
+///
+/// [`VolumeLogRelease`]: minimald::server::VolumeLogRelease
+type LogActivator = Box<
+    dyn FnOnce(&std::path::Path) -> Result<minimald::server::VolumeLogRelease, MainError> + Send,
+>;
 
 /// Install the tracing subscriber. Foreground processes log to stdout; a
 /// detached native daemon (marked by [`DETACHED_ENV`]) writes only to a
 /// daily-rotated `<state_dir>/logs/minimald.log`. The microVM's pid-1 minimald
 /// logs to stdout (serial → host boot.log, for boot diagnosis) *and* to a
-/// [`DeferredFileWriter`] that `async_main` points at the state volume once
-/// it's mounted, so `min bug` can collect the in-VM daemon's logs.
+/// reloadable file layer that starts inert and is pointed at the state volume
+/// once it mounts (see async_main), so `min bug` can collect the in-VM
+/// daemon's logs.
 ///
-/// Returns `(guard, deferred)`: the [`WorkerGuard`] for the native detached
-/// appender (else `None`), and the microVM's deferred writer to be activated
-/// post-mount (else `None`). Both must outlive the process — dropping a guard
+/// Returns `(guard, activator)`: the [`WorkerGuard`] for the native detached
+/// appender (else `None`), and the microVM's [`LogActivator`] to be invoked
+/// post-mount (else `None`). The guard must outlive the process — dropping it
 /// flushes pending records and terminates the appender's worker thread.
 ///
 /// [`WorkerGuard`]: tracing_appender::non_blocking::WorkerGuard
@@ -445,7 +377,7 @@ fn init_tracing(
 ) -> Result<
     (
         Option<tracing_appender::non_blocking::WorkerGuard>,
-        Option<DeferredFileWriter>,
+        Option<LogActivator>,
     ),
     MainError,
 > {
@@ -456,17 +388,45 @@ fn init_tracing(
     });
 
     // microVM pid-1: log to the console (serial → host boot.log) *and* to a
-    // file appender wired up once the state volume mounts (see async_main). A
-    // microVM is never `spawn_detached`'d, so this precedes the DETACHED check
-    // with no overlap.
+    // reloadable file layer wired up once the state volume mounts (see
+    // async_main). A microVM is never `spawn_detached`'d, so this precedes the
+    // DETACHED check with no overlap.
     if is_minimal_microvm() {
-        let deferred = DeferredFileWriter::default();
+        // The file layer starts as `None` (inert — records still reach the
+        // console). `reload` lets async_main swap the on-volume appender in
+        // post-mount and the Shutdown RPC swap it back out pre-quiesce,
+        // without a hand-rolled deferred writer or a process-global hook.
+        let (file_layer, reload_handle) = tracing_subscriber::reload::Layer::new(None);
         tracing_subscriber::registry()
             .with(fmt::layer().with_writer(ot::StdoutWriter::new))
-            .with(fmt::layer().with_ansi(false).with_writer(deferred.clone()))
+            .with(file_layer)
             .with(filter)
             .init();
-        return Ok((None, Some(deferred)));
+        let activator: LogActivator = Box::new(move |log_dir: &std::path::Path| {
+            std::fs::create_dir_all(log_dir)
+                .map_err(|e| MainError::IO(e, "creating minimald log directory"))?;
+            let appender = tracing_appender::rolling::Builder::new()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix("minimald.log")
+                .max_log_files(14)
+                .build(log_dir)
+                .map_err(|e| {
+                    MainError::IO(std::io::Error::other(e), "building rolling log appender")
+                })?;
+            let (writer, guard) = tracing_appender::non_blocking(appender);
+            reload_handle
+                .modify(|layer| {
+                    *layer = Some(fmt::layer().with_ansi(false).with_writer(writer).boxed());
+                })
+                .map_err(|e| MainError::Other(format!("installing on-volume log layer: {e}")))?;
+            // The release: reload the file layer back off, then drop the guard
+            // to flush and close the on-volume file.
+            Ok(minimald::server::VolumeLogRelease(Box::new(move || {
+                let _ = reload_handle.modify(|layer| *layer = None);
+                drop(guard);
+            })))
+        });
+        return Ok((None, Some(activator)));
     }
 
     let detached = std::env::var_os(DETACHED_ENV).is_some();
@@ -569,7 +529,7 @@ async fn async_main() -> Result<(), MainError> {
     // state volume mounts. `_log_guard` is bound at function scope so the
     // non-blocking appender's worker survives for the daemon's entire
     // lifetime; dropping it would flush and terminate it prematurely.
-    let (_log_guard, deferred_log) = init_tracing(&cli)?;
+    let (_log_guard, log_activator) = init_tracing(&cli)?;
 
     let listen_args = cli.listen_args().unwrap();
 
@@ -664,29 +624,23 @@ async fn async_main() -> Result<(), MainError> {
     }
 
     // With the state volume mounted and state relocated onto it, point the
-    // microVM's deferred log appender at `<state>/logs` so the in-VM daemon's
+    // microVM's reloadable log layer at `<state>/logs` so the in-VM daemon's
     // runtime logs land on the persistent volume where `min bug`'s guest
-    // collector reads them. The appender handle and its worker guard park in
-    // the guest release hook: they live for the daemon's lifetime, unless the
-    // Shutdown RPC releases them — the appender's write-open fd would
-    // otherwise keep the volume busy and defeat the clean unmount, leaving a
-    // dirty ext4 journal on every stop. A failure here must not wedge pid-1,
-    // so fall back to console-only.
-    if let Some(deferred) = &deferred_log {
+    // collector reads them. The resulting release is handed to the server
+    // state and run by the Shutdown RPC before the quiesce: the appender's
+    // write-open fd would otherwise keep the volume busy and defeat the clean
+    // unmount, leaving a dirty ext4 journal on every stop. A failure here must
+    // not wedge pid-1, so fall back to console-only.
+    let mut volume_log_release: Option<minimald::server::VolumeLogRelease> = None;
+    if let Some(activate) = log_activator {
         let log_dir = cli
             .minimal_state_dir()
             .as_utf8_path()
             .as_std_path()
             .join("logs");
-        match deferred.activate(&log_dir) {
-            Ok(guard) => {
-                let deferred = deferred.clone();
-                guest::set_volume_log_release(move || {
-                    deferred.deactivate();
-                    // Dropping the guard flushes queued records and joins the
-                    // worker thread, closing the on-volume file.
-                    drop(guard);
-                });
+        match activate(&log_dir) {
+            Ok(release) => {
+                volume_log_release = Some(release);
                 tracing::info!(
                     log_dir = %log_dir.display(),
                     "microVM minimald: routing tracing output to daily-rotated log file on the data volume",
@@ -865,7 +819,9 @@ async fn async_main() -> Result<(), MainError> {
         );
         // TODO: When we have a daemonize command, daemonize here.
 
-        Server::run(config, listener)
+        // A UDS (native/DM2) daemon is never the microVM pid-1, so there is no
+        // on-volume log to release.
+        Server::run(config, listener, None)
             .await
             .map_err(|e| MainError::IO(e, "serving on UDS"))
     } else {
@@ -896,7 +852,7 @@ async fn async_main() -> Result<(), MainError> {
             }
         };
 
-        Server::run(config, listener)
+        Server::run(config, listener, volume_log_release)
             .await
             .map_err(|e| MainError::IO(e, "serving on guest vsock"))
     }

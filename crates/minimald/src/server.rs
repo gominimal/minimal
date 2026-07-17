@@ -100,6 +100,22 @@ impl Config {
     }
 }
 
+/// A one-shot closure that closes the microVM's on-volume log appender —
+/// reloading its tracing layer off and dropping the worker guard — so the
+/// write-open fd is gone before the Shutdown RPC quiesces the state volume
+/// (otherwise it defeats the clean unmount and leaves a dirty ext4 journal).
+///
+/// Owned by the server state and run via
+/// [`ServerStateHandle::release_volume_log`]; this replaces the former
+/// process-global static hook.
+pub struct VolumeLogRelease(pub Box<dyn FnOnce() + Send>);
+
+impl std::fmt::Debug for VolumeLogRelease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VolumeLogRelease(..)")
+    }
+}
+
 /// A container for the state of the server.
 #[derive(Debug)]
 pub struct ServerState {
@@ -110,6 +126,11 @@ pub struct ServerState {
     /// torn down, telling [`Server::run`]'s accept loop to stop accepting,
     /// drain in-flight connections, and return so the process can exit.
     shutdown: CancellationToken,
+
+    /// Closes the microVM's on-volume log appender before the Shutdown RPC
+    /// quiesces the state volume. `None` outside the microVM (no on-volume
+    /// log to close).
+    volume_log_release: Option<VolumeLogRelease>,
 
     /// Memoized SSH host key, after first successful load.
     host_key: Option<PrivateKey>,
@@ -129,7 +150,10 @@ pub struct ServerState {
 }
 
 impl ServerState {
-    pub async fn new(config: Config) -> Result<Self, std::io::Error> {
+    pub async fn new(
+        config: Config,
+        volume_log_release: Option<VolumeLogRelease>,
+    ) -> Result<Self, std::io::Error> {
         let minimal_state_dir = config.minimal_state_dir.clone();
         let minimal_cache_dir = config.minimal_cache_dir.clone();
         // Construct the per-host switch once, here at daemon scope, so a single
@@ -184,6 +208,7 @@ impl ServerState {
             .await?,
             config,
             shutdown: CancellationToken::new(),
+            volume_log_release,
             host_key: None,
             #[cfg(feature = "networking-proxy")]
             cert_authority,
@@ -199,8 +224,24 @@ pub struct ServerStateHandle(Arc<Mutex<ServerState>>);
 
 impl ServerStateHandle {
     /// Constructs a fresh handle wrapping a newly-initialized [`ServerState`].
-    pub(crate) async fn new(config: Config) -> Result<Self, std::io::Error> {
-        Ok(Self(Arc::new(Mutex::new(ServerState::new(config).await?))))
+    pub(crate) async fn new(
+        config: Config,
+        volume_log_release: Option<VolumeLogRelease>,
+    ) -> Result<Self, std::io::Error> {
+        Ok(Self(Arc::new(Mutex::new(
+            ServerState::new(config, volume_log_release).await?,
+        ))))
+    }
+
+    /// Runs and clears the microVM's on-volume log release (closing the
+    /// appender's fd), so the caller may quiesce the state volume without the
+    /// log holding it busy. A no-op after the first call, and outside the
+    /// microVM. Called by the Shutdown RPC before quiescing.
+    pub async fn release_volume_log(&self) {
+        let release = self.0.lock().await.volume_log_release.take();
+        if let Some(VolumeLogRelease(release)) = release {
+            release();
+        }
     }
 
     pub async fn host_key(&self) -> Result<PrivateKey, KeyError> {
@@ -367,12 +408,16 @@ pub struct Server;
 impl Server {
     /// Launches minimald, accepting connections on the given listener and
     /// driving an SSH session over each until the listener errors.
-    pub async fn run<L: Listener>(config: Config, listener: L) -> Result<(), std::io::Error> {
+    pub async fn run<L: Listener>(
+        config: Config,
+        listener: L,
+        volume_log_release: Option<VolumeLogRelease>,
+    ) -> Result<(), std::io::Error> {
         // `config` is moved into the state below; capture the deployment-model
         // flag the proxy startup needs first.
         #[cfg(target_os = "linux")]
         let in_microvm = config.in_microvm;
-        let state = ServerStateHandle::new(config).await?;
+        let state = ServerStateHandle::new(config, volume_log_release).await?;
 
         // Start minimald's two host-side proxies (B5 egress :7654, B8 mTLS
         // :7655) for the server's lifetime and, in a microVM (DM1), publish them
@@ -664,7 +709,7 @@ mod tests {
     ) {
         let sock = dir.path().join("minimald.sock");
         let listener = UnixListener::bind(&sock).unwrap();
-        let run = tokio::spawn(Server::run(test_config(dir), listener));
+        let run = tokio::spawn(Server::run(test_config(dir), listener, None));
         (run, sock)
     }
 
