@@ -1,4 +1,4 @@
-# Contributing to Minimal's Public Registry (https://github.com/gominimal/pkgs)
+# Contributing to Minimal (https://github.com/gominimal/minimal)
 
 Thank you for your interest in contributing! This project is developed by **Minimal.dev Software Inc.** and released under the [Apache License 2.0](./LICENSE).
 
