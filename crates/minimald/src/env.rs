@@ -277,27 +277,20 @@ impl Env {
         // branch — they aren't user-gate-able, so if we add a new
         // `SetupForPackages` field make sure to route it through
         // the same branch as `env_vars`/`fs_mappings`, not with these.
-        let (mut patch, legacy_state_dirs, mut pkg_env_vars) = if args.include_package_attr_wiring {
+        let (legacy_state_dirs, mut pkg_env_vars) = if args.include_package_attr_wiring {
             let SetupForPackages {
-                fs_mappings,
+                fs_mappings: _,
                 needs_dns: _,
                 needs_internet: _,
                 state_dirs,
                 env_vars,
             } = SetupForPackages::build(&graph, transitives.keys())
                 .map_err(std::io::Error::other)?;
-            (fs_mappings, state_dirs, env_vars)
+            (state_dirs, env_vars)
         } else {
-            (
-                EnvPatches::default(),
-                std::collections::HashSet::<String>::new(),
-                HashMap::new(),
-            )
+            (std::collections::HashSet::<String>::new(), HashMap::new())
         };
 
-        if let Some(p) = &args.patches {
-            patch.union(p);
-        }
         if let Some(vars) = &args.env_vars {
             for (k, v) in vars {
                 let value = match v {
@@ -646,24 +639,6 @@ impl SessionChannel {
                 .filter(|bsr| !self.has_packages.contains(bsr)),
         ) {
             Ok(setup) => {
-                if !setup.fs_mappings.dir.is_empty() || !setup.fs_mappings.file.is_empty() {
-                    let _ = writeln!(
-                        stream,
-                        "msg:Error: A package needed for this install requires files from your host to be patched in,"
-                    );
-                    let _ = writeln!(
-                        stream,
-                        "msg:which cannot be performed within an existing session."
-                    );
-                    let _ = writeln!(stream, "msg:");
-                    let _ = writeln!(
-                        stream,
-                        "msg:Exit the session, add the package yourself, and then restart your session to work around this."
-                    );
-                    let _ = writeln!(stream, "error: Failed installation.");
-                    return;
-                }
-
                 for want_dir in setup.state_dirs {
                     if let Err(e) =
                         std::fs::create_dir_all(self.state_dir.as_utf8_path().join(want_dir))
