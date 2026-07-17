@@ -192,6 +192,11 @@ impl<W: AsyncWrite + Unpin + Send + Sync> BundleWriter<W> {
     pub async fn finish(self, created_at: DateTime<Utc>, took: Duration) -> Result<()>;
 }
 
+// bundle.rs — the shared no-follow discipline for every content read
+// (log tails, config TOMLs, mesh enrolment): O_NOFOLLOW open + fstat
+// regular-file verification on the descriptor, no check-then-open window.
+pub async fn open_regular_nofollow(src: &Path) -> Result<(tokio::fs::File, std::fs::Metadata)>;
+
 // capture.rs (new module)
 pub async fn command_capture(cmd: &str, args: &[&str], timeout: Duration) -> Result<Capture>;
 // kill_on_drop(true); stdout + stderr + exit status; timeout → typed error.
@@ -206,7 +211,8 @@ pub fn redact_json(value: &mut Value);           // recursive, fail-closed
 pub fn listing(root: &Path, max_entries: usize) -> Result<Listing>;
 // names/sizes/kinds only; Err on unreadable root (caller records a manifest
 // error); per-entry failures recorded inline; cap hit appends an explicit
-// trailing truncation marker line.
+// trailing truncation marker line. The walk is synchronous — async callers
+// wrap it in spawn_blocking so their collector timeouts stay effective.
 ```
 
 The host-bundle unit grows the crate with the mechanics whose second

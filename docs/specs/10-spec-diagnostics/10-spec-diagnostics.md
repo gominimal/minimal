@@ -248,6 +248,9 @@ the run never aborts.
   allowlist predicate
 - `crates/diagnostics/src/logs.rs` (new) — `newest_rotated(dir, prefix, n)`
 - `crates/diagnostics/src/disk.rs` (new) — `disk_usage` (statvfs)
+- `crates/diagnostics/src/system.rs` (new) — `system_info`, the host
+  identity/capability probe (uname facts, euid, KVM availability, disk
+  capacity over caller-supplied paths)
 - `crates/diagnostics/src/capture.rs` — grows `first_stdout_line`
 - `crates/minimal/src/dirs.rs` — print→String refactor so the `min dirs` table can be captured
 - `crates/minimal/src/lib.rs` — `Command::Bug` wiring
@@ -285,10 +288,18 @@ paths, and the archive layout.
 - **R2.2**: Each collector shall run under a per-collector timeout (30 s);
   failure or timeout is recorded as a manifest error and the run continues
   (ref: `collect_step!`, `mod.rs:51-66`). The command mutates no state and
-  spawns no daemons.
-- **R2.3**: `host/system.json` shall capture uname/OS, CLI version, disk usage
-  of the state/cache dirs (statvfs), and KVM availability (Linux only,
-  cfg-gated).
+  spawns no daemons. Filesystem errors are never reported as absence: an
+  unreadable directory is a manifest error or an `unreadable` skip, and
+  absence claims ("no provider instances found", "no log directory") may
+  only be made on a true NotFound.
+- **R2.3**: `host/system.json` shall capture the host identity/capability
+  probe (`diagnostics::system_info`): OS/arch, kernel and hostname (uname),
+  cpu count, euid, KVM availability (Linux only, cfg-gated), and disk usage
+  (statvfs) of the state, cache, and invoking dirs — the probed paths are
+  the CLI's policy, the probe itself is crate machinery any bundle-producing
+  binary can reuse. Every probe is best-effort: an unreadable fact is
+  `null`, never an error. (The producing binary's version is recorded once,
+  in the manifest, per R1.3.)
 - **R2.4**: `host/env.json` shall enumerate via `std::env::vars_os` (never
   `vars` — panics on non-UTF-8), record allowlisted values verbatim
   (`RUST_LOG`, `HOME`, `SHELL`, `TERM`, `PATH`; prefixes `XDG_`, `MINIMAL_`,
@@ -300,10 +311,16 @@ paths, and the archive layout.
   user-identifying paths are covered by the review-before-sharing notice
   (R2.9).
 - **R2.5**: Config files (`config.toml`, `user_policy.toml`, loadouts) shall
-  be bundled through the TOML redaction adapter over the Unit 1 engine;
-  unparseable TOML is withheld with a manifest error, never shipped raw.
+  be bundled through the TOML redaction walker; unparseable TOML is withheld
+  with a manifest note, never shipped raw. Every content read — config
+  TOMLs and the mesh-enrolment file included — goes through the shared
+  no-follow open (R1.4's `open_regular_nofollow`), so a symlinked "config"
+  file cannot steer unrelated data into the bundle; a refused link is a
+  recorded skip.
 - **R2.6**: `state/listing.txt` shall be a metadata-only recursive listing of
-  the state dir (names/sizes/kinds, entry-capped) — no file contents.
+  the state dir (names/sizes/kinds, entry-capped) — no file contents. The
+  walk is synchronous and runs on a blocking thread, so a wedged filesystem
+  strands that thread rather than defeating the R2.2 timeout.
 - **R2.7**: Log collection shall gather, per known prefix
   (`minimald.log*`, `minvmd.log*`) and per known name (`run.log`,
   `boot.log`), the newest **5** files per prefix by rotation order,
@@ -396,7 +413,11 @@ records carry correlation ids on spans.
   `max_keep_files`), wrapped in the existing
   `tracing_appender::non_blocking` + `WorkerGuard` plumbing with
   `lossy(false)`; guards drop deterministically (minimald: R3.4; minvmd: on
-  shutdown).
+  shutdown). Rotated archives shift logrotate-style (live file bare, `.1`
+  newest — the reason rotated-log selection orders by mtime, not name), and
+  archive publication runs on a background thread joined on drop
+  (`graceful_shutdown`), so a release leaves no partial `.pending.` files
+  on an unmounting volume.
 - **R3.7**: Building the daemon crates without a reachable git context
   (source tarballs, container mounts that exclude `.git`) shall not panic.
   Satisfied on the baseline: the shared `version` crate's build script falls
@@ -502,14 +523,13 @@ the daemon across the SSH boundary.
 
 **Purpose:** The wedged-system captures: network state, process tree, hang
 triage, and power history. Mechanics land in `diagnostics` parameterized by
-app inputs — satisfying the crate rule — and the generic collect helpers
-migrate out of `crates/minimal`.
+app inputs — the same mechanics/policy boundary the host-bundle unit
+established for its disk/log/env/system helpers.
 
 **Depends on:** Unit 1, Unit 2
 
 **Affected areas:**
 - `crates/diagnostics/src/{net.rs,procs.rs,power.rs}` (new) — mechanics
-- `crates/diagnostics/src/collect.rs` (new) — migrated generic helpers (statvfs/disk, logs-by-prefix, env-with-allowlist)
 - `crates/minimal/src/diag/mod.rs` — marker list + six `collect_step!` lines
 - `crates/minimal/tests/bug.rs` — interfaces/routes/MAC-mask assertions
 
@@ -543,11 +563,11 @@ migrate out of `crates/minimal`.
 - **R5.4**: The minimal marker list and the six `collect_step!` wiring lines
   stay in `crates/minimal`; every mechanic above consumes
   `diagnostics::capture::command_capture`.
-- **R5.5**: The generic helpers still in `crates/minimal` after Unit 2
-  (statvfs/`DiskInfo`, newest-N-by-prefix log collection, env capture over an
-  allowlist predicate) shall migrate into `diagnostics::collect`, leaving
-  `crates/minimal/src/diag` holding only paths/config resolution, the marker
-  and allowlist *data*, and clap/orchestration — the crate rule holds at
+- **R5.5**: After this unit `crates/minimal/src/diag` shall hold only
+  paths/config resolution, the marker and allowlist *data*, and
+  clap/orchestration — every generic mechanic lives in `diagnostics` (the
+  disk/log/env/system helpers landed there with the host-bundle unit; this
+  unit moves the remaining net/procs/power) — the crate rule holds at
   series end.
 
 **Proof Artifacts:**
@@ -990,10 +1010,12 @@ Unit 8's dual-format rework, sequenced after Unit 6.
   handled by two nets: the CLI's explicit review-before-sharing notice
   (R2.9) and the team-side explorer's `audit` secret-pattern scan (Unit 8
   prior art).
-- **The collector must not be a read gadget.** Files are opened no-follow
-  with descriptor-based verification on both layers (R1.4, R6.3) — not a
-  racy check-then-open — so a crafted `minimald.log.evil` symlink cannot
-  exfiltrate `/etc/shadow` into a bundle.
+- **The collector must not be a read gadget.** Every content read on both
+  layers — log tails, config TOMLs, the mesh-enrolment file — goes through
+  one shared no-follow open with descriptor-based verification (R1.4's
+  `open_regular_nofollow`, R6.3) — not a racy check-then-open — so a
+  crafted `minimald.log.evil` or symlinked loadout cannot exfiltrate
+  `/etc/shadow` into a bundle.
 - **The archive is private by default**: created `0600` before content is
   written (R1.2).
 - **The daemon endpoint is DoS-bounded**: request reads length-capped,
