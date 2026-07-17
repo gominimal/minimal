@@ -36,128 +36,13 @@ pub struct DiagPaths {
 
 // ── host/system.json ─────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
-struct SystemInfo {
-    os: &'static str,
-    arch: &'static str,
-    kernel: Option<String>,
-    hostname: Option<String>,
-    ncpu: Option<usize>,
-    euid: u32,
-    #[cfg(target_os = "linux")]
-    kvm: KvmInfo,
-    disks: Vec<DiskInfo>,
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Serialize)]
-struct KvmInfo {
-    exists: bool,
-    /// `ok` / `enoent` / `eacces` / other errno string — ENOENT means the
-    /// module isn't loaded, EACCES means the user isn't in the kvm group.
-    open_result: String,
-    mode: Option<String>,
-    owner_gid: Option<u32>,
-    user_in_kvm_group: Option<bool>,
-}
-
-#[derive(Serialize)]
-struct DiskInfo {
-    path: String,
-    total_bytes: Option<u64>,
-    free_bytes: Option<u64>,
-}
-
-/// Timeout for single-fact commands like `uname`; a wedged tool must not
-/// eat the collector's whole 30 s budget.
-const FACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 pub async fn system(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow::Error> {
-    let kernel = diagnostics::first_stdout_line("uname", &["-srvm"], FACT_TIMEOUT).await;
-    let hostname = diagnostics::first_stdout_line("uname", &["-n"], FACT_TIMEOUT).await;
-    let info = SystemInfo {
-        os: std::env::consts::OS,
-        arch: std::env::consts::ARCH,
-        kernel,
-        hostname,
-        ncpu: std::thread::available_parallelism().map(usize::from).ok(),
-        // SAFETY: geteuid has no failure modes or preconditions.
-        euid: unsafe { libc::geteuid() },
-        #[cfg(target_os = "linux")]
-        kvm: kvm_info(),
-        disks: [&paths.state, &paths.cache, &paths.cwd]
-            .into_iter()
-            .map(|p| disk_info(p))
-            .collect(),
-    };
+    // Which filesystems matter is this binary's policy: the state dir, the
+    // cache dir, and the invoking directory the archive is written into.
+    let info = diagnostics::system_info(&[&paths.state, &paths.cache, &paths.cwd]).await;
     let json = serde_json::to_vec_pretty(&info).context("serializing system info")?;
     w.add_bytes("host/system.json", &json, Redaction::None)
         .await
-}
-
-#[cfg(target_os = "linux")]
-fn kvm_info() -> KvmInfo {
-    use std::os::unix::fs::MetadataExt as _;
-    let meta = std::fs::metadata("/dev/kvm").ok();
-    let open_result = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-    {
-        Ok(_) => "ok".to_string(),
-        Err(e) => match e.kind() {
-            std::io::ErrorKind::NotFound => "enoent".to_string(),
-            std::io::ErrorKind::PermissionDenied => "eacces".to_string(),
-            _ => e.to_string(),
-        },
-    };
-    KvmInfo {
-        exists: meta.is_some(),
-        open_result,
-        mode: meta.as_ref().map(|m| format!("{:o}", m.mode())),
-        owner_gid: meta.as_ref().map(|m| m.gid()),
-        user_in_kvm_group: user_in_group("kvm"),
-    }
-}
-
-/// Whether the current user's supplementary groups include `name`.
-/// `None` when the group doesn't exist or the group list can't be read.
-#[cfg(target_os = "linux")]
-fn user_in_group(name: &str) -> Option<bool> {
-    let c_name = std::ffi::CString::new(name).ok()?;
-    // SAFETY: getgrnam reads a NUL-terminated string; the returned struct is
-    // a static buffer only read before any other getgr* call in this thread.
-    let grp = unsafe { libc::getgrnam(c_name.as_ptr()) };
-    if grp.is_null() {
-        return None;
-    }
-    // SAFETY: non-null getgrnam result points to a valid `group`.
-    let target_gid = unsafe { (*grp).gr_gid };
-
-    // SAFETY: first call sizes the buffer, second fills it.
-    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-    if n < 0 {
-        return None;
-    }
-    let mut gids = vec![0 as libc::gid_t; n as usize];
-    // SAFETY: buffer is exactly the size getgroups asked for.
-    let n = unsafe { libc::getgroups(n, gids.as_mut_ptr()) };
-    if n < 0 {
-        return None;
-    }
-    gids.truncate(n as usize);
-    // SAFETY: getegid has no failure modes.
-    let egid = unsafe { libc::getegid() };
-    Some(gids.contains(&target_gid) || egid == target_gid)
-}
-
-fn disk_info(path: &Path) -> DiskInfo {
-    let usage = diagnostics::disk_usage(path);
-    DiskInfo {
-        path: path.display().to_string(),
-        total_bytes: usage.map(|u| u.total_bytes),
-        free_bytes: usage.map(|u| u.free_bytes),
-    }
 }
 
 // ── host/env.json ────────────────────────────────────────────────────────────

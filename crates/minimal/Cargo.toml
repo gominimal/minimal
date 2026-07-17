@@ -31,7 +31,6 @@ chrono.workspace = true
 constcat.workspace = true
 diagnostics.workspace = true
 dirs.workspace = true
-libc.workspace = true
 mctx.workspace = true
 mfile.workspace = true
 minimald-rpc.workspace = true

@@ -16,6 +16,7 @@
 //!   collectors
 //! - [`logs`] — newest-first selection of rotated log files
 //! - [`disk`] — filesystem capacity probes
+//! - [`system`] — host identity/capability probe (OS, kernel, KVM, disks)
 //!
 //! The split with the app crates is mechanics vs. policy: the *how* lives
 //! here; the *what* — which paths, which log prefixes, which env names are
@@ -29,6 +30,8 @@ pub mod listing;
 pub mod logs;
 pub mod manifest;
 pub mod redact;
+#[cfg(unix)]
+pub mod system;
 
 pub use bundle::{BundleSink, BundleWriter, LOG_TAIL_CAP, open_regular_nofollow};
 pub use capture::{Capture, CaptureError, command_capture, first_stdout_line};
@@ -37,3 +40,5 @@ pub use disk::{DiskUsage, disk_usage};
 pub use listing::{Listing, listing};
 pub use logs::newest_rotated;
 pub use manifest::{CollectedEntry, CollectorError, Manifest, Redaction, SkippedEntry};
+#[cfg(unix)]
+pub use system::{DiskInfo, SystemInfo, system_info};
