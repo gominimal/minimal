@@ -18,10 +18,15 @@ Sandboxes: pure Rust client, daemon and VM manager. The sandbox VM is powered by
 
 [Packages](https://github.com/gominimal/pkgs/): glibc-based packages built frequently on Minimal's build servers from their cannonical sources (GNU, Github, Gitlab, etc.)
 
+## Supported Platforms
+
+Minimal works on:
+- MacOS / ARM64 (Apple Silicon)
+- Ubuntu and Debian Linux, ARM64 and X86_64, with a Linux kernel >= 5.10. Rootless user-namespace creation must be enabled for non-VM usage.
 
 ## Installation
 
-Minimal works on MacOS/ARM64 and Linux/{ARM64,X86_64}. To get started, install it with the following shell command (stable is coming soon):
+ To get started, install it with the following shell command (stable is coming soon):
 
 ```shell
 curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/unstable' | sh
@@ -38,7 +43,32 @@ curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/unstable' | sh -s 
 
 ### Create a new project with Minimal
 
-In this example we'll create a new git repo from within a Minimal sandbox using tools from the [Minimal Public Registry](https://github.com/gominimal/pkgs/)
+In this example we'll create a new git repo from within a Minimal sandbox using tools from the [Minimal Public Registry](https://github.com/gominimal/pkgs/). In this example we assume your claude code has been granted access to your git repos in order to push your changes there.
+
+```shell
+mkdir -p ~/projects/foo
+cd  ~/projects/foo
+
+# create and update a minimal.toml file
+min init
+min add --session git gh claude-code
+
+# start and enter a sandbox, which copies up the CWD file tree into the sandbox
+min activate --attach .
+
+git init
+
+# develop specs, generate & test code etc, push to git, etc
+# agents can add sw tools from Minimal Public Registry dynamically with "min add"
+claude-code
+
+exit
+```
+
+Above we show using Claude Code where you have trusted Claude Github App is Github on your behalf.   Below we show using a Github personal access token (PAT) from the MacOS keychain. To create fine-grained PATs (e.g. scoped to a specific repo) go to https://github.com/settings/personal-access-tokens.
+
+Once you have created the PAT and copied it into your keychain (e.g. `security add-generic-password -s "PAT-foo-repo" -a "my-mac-user-name" -w`), and created the new, empty Github repo, the following example shows populating it the repo from within a sandbox.
+
 
 ```shell
 mkdir -p ~/projects/foo
@@ -48,13 +78,14 @@ cd  ~/projects/foo
 min init
 min add --session git gh claude-code mermaid-cli kittyview less emacs
 
-# copy a Github PAT to your clipboard
+# copy a Github PAT to your clipboard from your MacOS keychain
 security find-generic-password -w -s "PAT-foo-repo" -a "my-mac-user-name" | pbcopy
 
 # start and enter a sandbox, which copies up the CWD file tree into the sandbox
 min activate --attach .
 
 read -sp "paste GH PAT now:" GH_TOKEN && export GH_TOKEN
+
 git init
 
 claude --dangerously-skip-permissions
@@ -71,46 +102,34 @@ exit
 
 ```
 
-We show using a github personal access token (PAT) from the MacOS keychain in the example above. To create fine-grained PATs (e.g. scoped to a specific repo) go to https://github.com/settings/personal-access-tokens.  To add a new token to the MacOS keychain use:
-```shell
-security add-generic-password -s "PAT-foo-repo" -a "my-mac-user-name" -w
-```
 
 ### Work on an existing project in a Minimal sandbox
 
-In this example we'll work on an existing git repo that already has minimal.toml
+In this example we'll work on an existing git repo that already has minimal.toml where we have granted claude code access to our github repos.
 
 ```shell
 cd  ~/projects/foo
 
-# get latest files on current branch
+# get latest files on current branch - we need the minimal.toml
 git pull
-
-# copy a Github PAT to your clipboard
-security find-generic-password -w -s "PAT-foo-repo" -a "my-mac-user-name" | pbcopy
 
 # don't copy any files up we'll git pull in the sandbox
 min activate --attach --sync none .
 
-read -sp "paste GH PAT now:" GH_TOKEN && export GH_TOKEN
 
-git pull https@github.com:<your-repo>.git
-
-claude --dangerously-skip-permissions
-# add new features, fix bugs etc
-
-git add -A
-git commit -m "feat: add foozinator CLI option"
-git push -u origin main
+# tell claude to pull https@github.com:<your-repo>.git
+# then add new features, fix bugs etc
+# then ask claude to create PR
+claude
 
 exit
 ```
 
 ### Add a Minimal Loadout with your preferred tools and configurations
 
-## Building and Testing
+TBD
 
-(To be updated)
+## Building and Testing
 
 Either: `cargo build` for debug (faster build) and `cargo build --release` (slower build, faster execution)
 
