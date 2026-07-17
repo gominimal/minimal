@@ -1,0 +1,93 @@
+name: Prune old releases
+
+# Deletes the auto-cut `release-<sha>` GitHub Releases once they age out, so they
+# don't accumulate forever. Wholly a housekeeping job: the installer serves from
+# the GCS buckets, not GitHub Releases, and `scripts/prune-releases.sh` will NEVER
+# touch a vMAJOR.MINOR.PATCH release (hard guard, independent of --match).
+#
+# All the logic lives in scripts/prune-releases.sh so it can be run and tested
+# outside CI; this workflow is just the schedule + the on-demand button.
+
+on:
+    workflow_dispatch:
+        inputs:
+            execute:
+                description: "Actually delete (unchecked = dry-run preview in the logs)"
+                type: boolean
+                default: false
+            older_than:
+                description: "Age cutoff (any GNU `date -d` spec)"
+                type: string
+                default: "2 months"
+            keep_latest:
+                description: "Always retain this many newest release-* releases"
+                type: string
+                default: "10"
+            verify_permissions:
+                description: "Self-test only: create + delete a throwaway release/tag to prove the token can, then stop (no pruning)"
+                type: boolean
+                default: false
+    schedule:
+        # Nightly at 04:17 UTC Monday and Friday.
+        - cron: "17 4 * * 1,5"
+
+# Deleting releases/tags needs write on contents; nothing else.
+permissions:
+    contents: write
+
+# Never let two prune runs (e.g. a manual dispatch during the nightly) race.
+concurrency:
+    group: prune-releases
+    cancel-in-progress: false
+
+jobs:
+    prune:
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        # Don't run the scheduled deletion on forks; a manual dispatch on a fork is
+        # still allowed (it'll act on that fork's own releases).
+        if: github.event_name != 'schedule' || github.repository == 'gominimal/minimal'
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  # The script authenticates via GH_TOKEN and deletes tags through the
+                  # API, so no git credentials need to persist on the runner.
+                  persist-credentials: false
+            - name: Verify GITHUB_TOKEN can delete a release + tag (opt-in self-test)
+              # Proves the *workflow token's* effective permissions in-context — the
+              # only faithful check, since an external PAT has different scopes. Creates
+              # a throwaway release/tag and deletes it, isolating the two failure modes:
+              # missing contents:write vs. a tag-protection ruleset blocking --cleanup-tag.
+              if: github.event_name == 'workflow_dispatch' && inputs.verify_permissions
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  TAG: prune-perms-check-${{ github.run_id }}
+              run: |
+                  set -euo pipefail
+                  echo "Creating throwaway release $TAG at $GITHUB_SHA ..."
+                  gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" \
+                      --notes "Permission self-test; safe to ignore, auto-deleted." >/dev/null
+                  echo "Deleting it with --cleanup-tag ..."
+                  if gh release delete "$TAG" --yes --cleanup-tag; then
+                      echo "::notice::OK — token can delete releases AND tags; --cleanup-tags will work."
+                  else
+                      echo "::warning::release+tag delete failed; retrying release-only to isolate the cause"
+                      gh release delete "$TAG" --yes \
+                          && echo "::error::Release deletion works but TAG deletion is blocked (likely a tag ruleset). Run without --cleanup-tags, or exempt release-* tags." \
+                          || echo "::error::Even release deletion failed — the token lacks effective contents:write."
+                      exit 1
+                  fi
+            - name: Prune release-* older than the cutoff
+              # Skipped when running the self-test above.
+              if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.verify_permissions) }}
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  # The nightly run always executes; a manual dispatch honors the
+                  # checkbox (defaulting to a safe dry-run preview).
+                  EXECUTE: ${{ github.event_name == 'schedule' || inputs.execute }}
+                  OLDER_THAN: ${{ inputs.older_than || '2 months' }}
+                  KEEP_LATEST: ${{ inputs.keep_latest || '10' }}
+              run: |
+                  args=(--older-than "$OLDER_THAN" --keep-latest "$KEEP_LATEST" --cleanup-tags)
+                  [ "$EXECUTE" = "true" ] && args+=(--execute)
+                  scripts/prune-releases.sh "${args[@]}"
