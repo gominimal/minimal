@@ -592,10 +592,10 @@ fn ensure_daemon(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         .context("Failed to ensure the minimald daemon is running")
 }
 
-/// Prompt the user with a yes/no question on stderr. Defaults to yes
-/// (empty input or Y/y/yes returns true; anything else returns false).
-fn confirm(question: &str) -> Result<bool, anyhow::Error> {
-    eprint!("{question} [Y/n] ");
+/// Prompt the user with a yes/no question on stderr.
+fn confirm(question: &str, default: bool) -> Result<bool, anyhow::Error> {
+    let prompt = if default { "[Y/n]" } else { "[y/N]" };
+    eprint!("{question} {prompt} ");
     std::io::stderr().flush().ok();
 
     let mut input = String::new();
@@ -603,22 +603,11 @@ fn confirm(question: &str) -> Result<bool, anyhow::Error> {
         .read_line(&mut input)
         .context("reading stdin")?;
     let trimmed = input.trim();
-    Ok(trimmed.is_empty()
-        || trimmed.eq_ignore_ascii_case("y")
-        || trimmed.eq_ignore_ascii_case("yes"))
-}
-
-/// Prompt for confirmation, defaulting to no.
-fn confirm_default_no(question: &str) -> Result<bool, anyhow::Error> {
-    eprint!("{question} [y/N] ");
-    std::io::stderr().flush().ok();
-
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .context("reading stdin")?;
-    let trimmed = input.trim();
-    Ok(trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes"))
+    Ok(if trimmed.is_empty() {
+        default
+    } else {
+        trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes")
+    })
 }
 
 /// List sessions via the `ListSessions` RPC.
@@ -879,7 +868,7 @@ fn offer_mfile_scaffold(
     // "yes" — and, when a config is discovered under `.minimal/`, the init
     // writer would clobber it. Only prompt on a real terminal; anywhere else
     // (and on a declined prompt) carry on without scaffolding.
-    if !std::io::stdin().is_terminal() || !confirm("Would you like to create one?")? {
+    if !std::io::stdin().is_terminal() || !confirm("Would you like to create one?", true)? {
         eprintln!(
             "Continuing without one; the session gets a default environment. \
              Run 'minimal init' to give the project its own config."
@@ -1321,7 +1310,7 @@ async fn destroy_all_sessions(
         if !std::io::stdin().is_terminal() {
             bail!("refusing to destroy all sessions without confirmation; pass --force")
         }
-        if !confirm_default_no(&format!("Destroy all {} sessions?", sessions.len()))? {
+        if !confirm(&format!("Destroy all {} sessions?", sessions.len()), false)? {
             println!("Aborted.");
             return Ok(());
         }
@@ -1646,7 +1635,7 @@ fn run_init_flow(config: mctx::Config, skip_confirm: bool) -> Result<(), anyhow:
         eprint!("{}", plan.content);
         eprintln!("---");
         eprintln!();
-        if !confirm("Continue?")? {
+        if !confirm("Continue?", true)? {
             eprintln!("Aborted.");
             return Ok(());
         }
