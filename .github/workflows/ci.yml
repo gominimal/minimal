@@ -109,7 +109,10 @@ jobs:
               with:
                   persist-credentials: false
             - name: Cache Cargo state
-              uses: actions/cache@v5
+              # Restore-only; the save half (main only) runs at the end of the
+              # job, matching the KVM lane's cache policy.
+              id: cargo-cache
+              uses: actions/cache/restore@v6
               with:
                   path: ~/.local/state/minimal/state
                   key: dogfood-minimal-cargo-${{ hashFiles('**/Cargo.lock') }}
@@ -119,6 +122,14 @@ jobs:
               with:
                   channel: unstable
                   task: build-smoke
+            - name: Save Cargo state cache (main only)
+              # PR branches restore but never write: caches written by every
+              # branch LRU-evict the main entries all PRs restore from.
+              if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+              uses: actions/cache/save@v6
+              with:
+                  path: ~/.local/state/minimal/state
+                  key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
     cargo-deny:
         needs: [changes]
