@@ -641,6 +641,28 @@ pub fn format_ls(
         return Ok(());
     }
 
+    if !args.raw
+        && let Some(pool) = &resp.resource_pool
+    {
+        let session_count = resp.sessions.len();
+        let core_label = if pool.cpu_cores == 1 { "core" } else { "cores" };
+        let session_label = if session_count == 1 {
+            "session"
+        } else {
+            "sessions"
+        };
+        writeln!(
+            out,
+            "RESOURCE POOL:  {} CPU {} · {} memory · shared by {} {}",
+            pool.cpu_cores,
+            core_label,
+            format_memory(pool.memory_bytes),
+            session_count,
+            session_label,
+        )?;
+        writeln!(out)?;
+    }
+
     if resp.sessions.is_empty() {
         if !args.raw {
             writeln!(out, "No active sessions.")?;
@@ -690,6 +712,22 @@ pub fn format_ls(
     }
 
     Ok(())
+}
+
+fn format_memory(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    if bytes >= GIB {
+        let gib = bytes as f64 / GIB as f64;
+        if bytes.is_multiple_of(GIB) {
+            format!("{gib:.0} GiB")
+        } else {
+            format!("{gib:.1} GiB")
+        }
+    } else {
+        format!("{} MiB", bytes / MIB)
+    }
 }
 
 /// Default policy hook for `minimal activate`: auto-approves any
