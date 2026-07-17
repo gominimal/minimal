@@ -42,7 +42,7 @@ recent version before reporting — the issue may already be fixed.
 In scope:
 
 - The released binaries: `min`, `mip`, `minimald`, and `minvmd`.
-- The installer (the `curl | bash` install flow and the artifacts it
+- The installer (the `curl | sh` install flow and the artifacts it
   downloads and verifies).
 - The isolation boundaries: escapes from the build/task sandbox
   (Linux namespaces) or from the microVM used on macOS, and anything
