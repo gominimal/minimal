@@ -204,11 +204,16 @@ async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
     let log_dir = state.path().join("logs");
     std::fs::create_dir_all(&log_dir).unwrap();
     for day in 1..=7 {
-        std::fs::write(
-            log_dir.join(format!("minimald.log.2026-07-{day:02}")),
-            format!("day {day}\n"),
-        )
-        .unwrap();
+        // Older dates get explicitly older mtimes: selection is
+        // modified-time order, not filename order.
+        let path = log_dir.join(format!("minimald.log.2026-07-{day:02}"));
+        std::fs::write(&path, format!("day {day}\n")).unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs((8 - day) * 100),
+            )
+            .unwrap();
     }
 
     let provider = state.path().join("providers/local-0");
