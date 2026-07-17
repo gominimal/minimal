@@ -1505,6 +1505,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "diagnostics"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-compression",
+ "async-tar",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "walkdir",
+]
+
+[[package]]
 name = "diff"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3596,6 +3611,7 @@ dependencies = [
  "clap_complete",
  "common",
  "constcat",
+ "diagnostics",
  "dirs",
  "libc",
  "mctx",
@@ -3641,6 +3657,7 @@ dependencies = [
  "common",
  "constcat",
  "decode",
+ "diagnostics",
  "either",
  "fd-lock",
  "futures",

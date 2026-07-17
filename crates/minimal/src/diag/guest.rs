@@ -11,9 +11,9 @@ use std::time::Duration;
 use anyhow::Context as _;
 use serde::Serialize;
 
-use super::bundle::{BundleWriter, LOG_TAIL_CAP};
-use super::manifest::Redaction;
 use crate::client::Client;
+use diagnostics::bundle::{BundleWriter, LOG_TAIL_CAP};
+use diagnostics::manifest::Redaction;
 
 /// Hard cap on the accepted guest bundle. A wedged vsock or runaway log
 /// cannot make `min bug` itself balloon.

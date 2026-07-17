@@ -7,8 +7,8 @@
 
 use anyhow::Context as _;
 
-use super::bundle::BundleWriter;
-use super::manifest::Redaction;
+use diagnostics::bundle::BundleWriter;
+use diagnostics::manifest::Redaction;
 
 /// Process names (argv0 basenames) that mark a process as ours.
 const PROCESS_MARKERS: &[&str] = &[

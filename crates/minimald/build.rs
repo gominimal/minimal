@@ -1,11 +1,16 @@
 use std::process::Command;
 fn main() {
-    let output = Command::new("git")
+    // git may be unavailable (source tarball, a worktree whose .git is not
+    // mounted inside a cross container): degrade to an empty hash rather than
+    // panicking the build.
+    let git_hash = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
-        .unwrap();
-    let git_hash = String::from_utf8(output.stdout).unwrap();
-    println!("cargo:rustc-env=GIT_HASH={}", git_hash);
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=GIT_HASH={git_hash}");
 
     let is_clean = std::process::Command::new("git")
         .args(["status", "--porcelain=v1"])
@@ -17,10 +22,13 @@ fn main() {
         println!("cargo::warning=Always build production binaries from a clean checkout.");
     }
 
+    let hash_suffix = if git_hash.is_empty() {
+        String::new()
+    } else {
+        format!(" ({}{git_hash})", if is_clean { "" } else { "dirty " })
+    };
     println!(
-        "cargo:rustc-env=LONG_VERSION={} ({}{})",
+        "cargo:rustc-env=LONG_VERSION={}{hash_suffix}",
         std::env::var("CARGO_PKG_VERSION").unwrap().as_str(),
-        if is_clean { "" } else { "dirty " },
-        git_hash.strip_suffix("\n").unwrap(),
     );
 }

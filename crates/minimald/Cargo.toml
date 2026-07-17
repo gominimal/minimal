@@ -59,6 +59,7 @@ args.workspace = true
 async-dialog.workspace = true
 check.workspace = true
 common.workspace = true
+diagnostics.workspace = true
 graph.workspace = true
 mctx.workspace = true
 mfile.workspace = true

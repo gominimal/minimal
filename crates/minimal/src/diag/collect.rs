@@ -11,9 +11,9 @@ use std::time::UNIX_EPOCH;
 use anyhow::Context as _;
 use serde::Serialize;
 
-use super::bundle::{BundleWriter, LOG_TAIL_CAP};
-use super::manifest::Redaction;
 use super::redact::{is_env_value_allowlisted, redact_toml};
+use diagnostics::bundle::{BundleWriter, LOG_TAIL_CAP};
+use diagnostics::manifest::Redaction;
 
 /// Cap on entries in a recursive state-dir listing; a runaway tree (huge
 /// session workspaces) is truncated with a marker line, not walked forever.
@@ -319,7 +319,7 @@ async fn file_meta(path: &Path) -> Option<FileMeta> {
 pub async fn state(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow::Error> {
     // Recursive listing: names, sizes, and metadata only — session workspace
     // *contents* stay on the user's machine.
-    let listing = common::listing::listing_text(&paths.state, LISTING_MAX_ENTRIES);
+    let listing = diagnostics::listing::listing_text(&paths.state, LISTING_MAX_ENTRIES);
     w.add_bytes(
         "state/listing.txt",
         listing.as_bytes(),
@@ -356,7 +356,7 @@ pub async fn state(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow
             };
             match serde_json::from_slice::<serde_json::Value>(&content) {
                 Ok(mut value) => {
-                    common::redact::redact_json(&mut value);
+                    diagnostics::redact::redact_json(&mut value);
                     let json = serde_json::to_vec_pretty(&value).context("serializing record")?;
                     w.add_bytes(&dest, &json, Redaction::Keys).await?;
                 }
@@ -449,7 +449,7 @@ pub async fn provider_files(
     dir: &Path,
 ) -> Result<(), anyhow::Error> {
     // Shallow listing of the provider dir: which sockets/locks/keys exist.
-    let listing = common::listing::listing_text(dir, LISTING_MAX_ENTRIES);
+    let listing = diagnostics::listing::listing_text(dir, LISTING_MAX_ENTRIES);
     w.add_bytes(
         &format!("providers/{name}/dir-listing.txt"),
         listing.as_bytes(),

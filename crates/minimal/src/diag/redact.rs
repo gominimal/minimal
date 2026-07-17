@@ -1,10 +1,10 @@
 //! CLI-side redaction: TOML files and the process environment.
 //!
-//! The key-based rules live in [`common::redact`] so the daemon applies the
+//! The key-based rules live in [`diagnostics::redact`] so the daemon applies the
 //! same policy to the JSON it bundles; this module adds the TOML walk (config
 //! files, loadouts) and the env-var allowlist used for `host/env.json`.
 
-use common::redact::{is_env_table_name, is_sensitive_key};
+use diagnostics::redact::{is_env_table_name, is_sensitive_key};
 
 /// Env vars whose *values* are safe and useful to include verbatim. Everything
 /// else is reported by name only.

@@ -14,18 +14,16 @@ use std::time::Duration;
 use anyhow::Context as _;
 use clap::Args;
 
-pub mod bundle;
 pub mod collect;
 pub mod guest;
-pub mod manifest;
 pub mod net;
 pub mod power;
 pub mod procs;
 pub mod redact;
 
-use bundle::BundleWriter;
 use collect::DiagPaths;
-use manifest::Redaction;
+use diagnostics::bundle::BundleWriter;
+use diagnostics::manifest::Redaction;
 
 use crate::GlobalArgs;
 
@@ -78,7 +76,7 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
         .unwrap_or_else(|| PathBuf::from(format!("{bundle_name}.tar.zst")));
 
     let paths = resolve_paths(global);
-    let mut w = BundleWriter::create(&out_path, &bundle_name).await?;
+    let mut w = BundleWriter::create(&out_path, &bundle_name, env!("LONG_VERSION")).await?;
 
     // ── Host-side collectors: independent, each failure becomes a
     // manifest error rather than aborting the run.

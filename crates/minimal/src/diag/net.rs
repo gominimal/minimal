@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use serde::Serialize;
 
-use super::bundle::BundleWriter;
-use super::manifest::Redaction;
+use diagnostics::bundle::BundleWriter;
+use diagnostics::manifest::Redaction;
 
 // ── host/net/listening.txt ───────────────────────────────────────────────────
 
@@ -197,7 +197,15 @@ impl Stage {
     }
 }
 
-/// The staged probe record for one provider socket.
+/// A staged connection-health record for one provider's daemon socket.
+///
+/// Reaching the daemon has four steps, each a prerequisite for the next:
+/// `stat()` the socket file, `connect()`, complete the SSH handshake + auth,
+/// then issue a `GetVersion` RPC. The probe attempts them in order and records
+/// how far it got — the *failing* stage is the diagnosis: no socket file
+/// (daemon never ran / cleaned up), connect refused (stale socket after a
+/// crash), handshake timeout (wedged guest behind libkrun's always-accepting
+/// bridge, #730), RPC failure (daemon up but unhealthy).
 #[derive(Serialize)]
 pub struct SocketProbe {
     socket_path: String,

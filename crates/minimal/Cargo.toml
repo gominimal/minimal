@@ -29,6 +29,7 @@ clap_complete.workspace = true
 camino.workspace = true
 chrono.workspace = true
 common.workspace = true
+diagnostics.workspace = true
 constcat.workspace = true
 dirs.workspace = true
 mctx.workspace = true

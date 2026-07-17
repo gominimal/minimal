@@ -8,6 +8,7 @@ members = [
     "crates/checkouts",
     "crates/common",
     "crates/decode",
+    "crates/diagnostics",
     "crates/graph",
     "crates/mctx",
     "crates/mfile",
@@ -156,6 +157,7 @@ check = { version = "0.0.1", path = "crates/check" }
 checkouts = { version = "0.0.1", path = "crates/checkouts" }
 common = { version = "0.0.1", path = "crates/common" }
 decode = { version = "0.0.1", path = "crates/decode" }
+diagnostics = { version = "0.0.1", path = "crates/diagnostics" }
 mctx = { version = "0.0.1", path = "crates/mctx" }
 minimald-rpc = { version = "0.0.1", path = "crates/minimald-rpc" }
 mfile = { version = "0.0.1", path = "crates/mfile" }

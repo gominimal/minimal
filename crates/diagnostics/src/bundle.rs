@@ -1,8 +1,9 @@
 //! Tar+zstd writer for the diagnostic bundle.
 //!
-//! Unlike the workspace upload ([`crate::file_upload`]) this writes to a local
-//! file, which is `Sync`, so the tar builder writes straight through the zstd
-//! encoder with no duplex pipe. Every entry lands under a single top-level
+//! This writes to a local file, which is `Sync`, so the tar builder writes
+//! straight through the zstd encoder with no duplex pipe (unlike the
+//! daemon-side streaming bundler, which pumps through a channel). Every entry
+//! lands under a single top-level
 //! directory (the bundle name) so extraction is tidy, and the manifest is
 //! appended last from the accumulated record — even a run whose collectors all
 //! failed produces a valid archive with a complete error report.
@@ -14,7 +15,7 @@ use async_compression::tokio::write::ZstdEncoder;
 use async_tar::{Builder, EntryType, Header};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use super::manifest::{CollectedEntry, CollectorError, Manifest, Redaction, SkippedEntry};
+use crate::manifest::{CollectedEntry, CollectorError, Manifest, Redaction, SkippedEntry};
 
 /// Default per-file tail cap for bundled logs.
 pub const LOG_TAIL_CAP: u64 = 5 * 1024 * 1024;
@@ -23,6 +24,9 @@ pub struct BundleWriter {
     tar: Builder<ZstdEncoder<tokio::fs::File>>,
     /// Bundle name, used as the top-level directory for every entry.
     root: String,
+    /// Producer version recorded in the manifest — the crate is app-agnostic,
+    /// so the caller supplies it.
+    cli_version: String,
     collected: Vec<CollectedEntry>,
     skipped: Vec<SkippedEntry>,
     errors: Vec<CollectorError>,
@@ -30,8 +34,13 @@ pub struct BundleWriter {
 
 impl BundleWriter {
     /// Creates the output file at `out_path`; `root` becomes the single
-    /// top-level directory inside the archive.
-    pub async fn create(out_path: &Path, root: &str) -> Result<Self, anyhow::Error> {
+    /// top-level directory inside the archive, and `cli_version` is recorded
+    /// in the manifest.
+    pub async fn create(
+        out_path: &Path,
+        root: &str,
+        cli_version: &str,
+    ) -> Result<Self, anyhow::Error> {
         // 0600: the bundle carries unredacted log tails, session records, and
         // process state, and lands in the cwd by default — not world-readable.
         let mut opts = tokio::fs::OpenOptions::new();
@@ -54,6 +63,7 @@ impl BundleWriter {
         Ok(Self {
             tar: Builder::new(ZstdEncoder::new(file)),
             root: root.to_string(),
+            cli_version: cli_version.to_string(),
             collected: Vec::new(),
             skipped: Vec::new(),
             errors: Vec::new(),
@@ -160,9 +170,9 @@ impl BundleWriter {
         duration: std::time::Duration,
     ) -> Result<(), anyhow::Error> {
         let manifest = Manifest {
-            schema_version: super::manifest::SCHEMA_VERSION,
+            schema_version: crate::manifest::SCHEMA_VERSION,
             created_at,
-            cli_version: env!("LONG_VERSION").to_string(),
+            cli_version: std::mem::take(&mut self.cli_version),
             duration_ms: duration.as_millis() as u64,
             collected: std::mem::take(&mut self.collected),
             skipped: std::mem::take(&mut self.skipped),
@@ -242,7 +252,7 @@ pub(crate) mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let out = tmp.path().join("b.tar.zst");
 
-        let mut w = BundleWriter::create(&out, "minimal-diag-test")
+        let mut w = BundleWriter::create(&out, "minimal-diag-test", "test-version")
             .await
             .unwrap();
         w.add_bytes("host/system.json", b"{}", Redaction::None)
@@ -276,7 +286,9 @@ pub(crate) mod tests {
         std::fs::write(&big, [b'a'; 100].as_slice()).unwrap();
         let out = tmp.path().join("b.tar.zst");
 
-        let mut w = BundleWriter::create(&out, "r").await.unwrap();
+        let mut w = BundleWriter::create(&out, "r", "test-version")
+            .await
+            .unwrap();
         w.add_file_tail("logs/big.log", &big, 10).await.unwrap();
         w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
             .await

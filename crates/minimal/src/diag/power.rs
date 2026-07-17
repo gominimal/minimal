@@ -7,9 +7,9 @@
 
 use std::fmt::Write as _;
 
-use super::bundle::BundleWriter;
-use super::manifest::Redaction;
 use super::procs::command_capture;
+use diagnostics::bundle::BundleWriter;
+use diagnostics::manifest::Redaction;
 
 /// Sleep/wake transitions kept from the (potentially huge) power log.
 const POWER_EVENTS_MAX: usize = 100;

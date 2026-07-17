@@ -141,7 +141,7 @@ async fn collect_into_tar<W: AsyncWrite + Unpin + Send + Sync>(
         // runtime, matching the spawn_blocking treatment procs() already uses.
         let listing_dir = state_dir.clone();
         match tokio::task::spawn_blocking(move || {
-            common::listing::listing_text(&listing_dir, LISTING_MAX_ENTRIES)
+            diagnostics::listing::listing_text(&listing_dir, LISTING_MAX_ENTRIES)
         })
         .await
         {
@@ -303,7 +303,7 @@ async fn sessions<W: AsyncWrite + Unpin + Send + Sync>(
         // secret-shaped content before it leaves the machine.
         match serde_json::from_slice::<serde_json::Value>(&raw) {
             Ok(mut value) => {
-                common::redact::redact_json(&mut value);
+                diagnostics::redact::redact_json(&mut value);
                 let json = serde_json::to_vec_pretty(&value)
                     .map_err(|e| format!("serializing record: {e}"))?;
                 append_bytes(
