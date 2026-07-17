@@ -198,6 +198,7 @@ mod tests {
             lifecycle: Lifecycle::Stopping,
             vmm_pid: Some(999_999_999),
             started_at: None,
+            ..State::stopped()
         })
         .unwrap();
         // Hold the alive lock so Stopping counts as a live daemon.
@@ -219,6 +220,7 @@ mod tests {
             lifecycle: Lifecycle::Running,
             vmm_pid: Some(std::process::id()), // a live pid that must NOT be signalled
             started_at: Some(0),
+            ..State::stopped()
         })
         .unwrap();
         run_with_state_dir(tmp.path().to_path_buf(), false).unwrap();
@@ -234,6 +236,7 @@ mod tests {
             lifecycle: Lifecycle::Running,
             vmm_pid: None,
             started_at: None,
+            ..State::stopped()
         })
         .unwrap();
         let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
@@ -250,6 +253,7 @@ mod tests {
             lifecycle: Lifecycle::Running,
             vmm_pid: Some(0),
             started_at: None,
+            ..State::stopped()
         })
         .unwrap();
         let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
@@ -269,6 +273,7 @@ mod tests {
             lifecycle: Lifecycle::Running,
             vmm_pid: Some(u32::MAX),
             started_at: None,
+            ..State::stopped()
         })
         .unwrap();
         let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");

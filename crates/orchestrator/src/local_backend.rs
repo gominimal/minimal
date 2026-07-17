@@ -240,7 +240,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
             });
             drop(permit);
             drop(shared);
-            res
+            res.map_err(|e| Error::BuildFailed(name, e))
         }
         .await?;
 

@@ -212,6 +212,55 @@ strip_rc_block() {
     say "  removed shell-init block from $1"
 }
 
+# Offer to also remove the *system* AppArmor profile on uninstall. That profile
+# (packaging/apparmor/minimald) is installed separately, with root, by
+# install-apparmor-profile.sh; it outlives minimald, leaving an inert label
+# bound to a now-absent binary path under /etc/apparmor.d. Removing it needs
+# root — which this installer never assumes — so on an interactive terminal we
+# prompt and, on yes, elevate via the shipped loader's own --uninstall (run here,
+# before the record walk deletes that loader). Piped (curl|sh), non-interactive,
+# or dry-run: advise the root command instead, which stays valid after the walk.
+# Gated on the profile actually being present, so macOS and never-set-up hosts
+# see nothing. The apparmor.d path is overridable for install_test.sh.
+maybe_remove_apparmor_profile() {
+    _aa_dir="${MINIMAL_OVERRIDE_APPARMOR_DIR:-/etc/apparmor.d}"
+    _aa_profile="$_aa_dir/minimald"
+    [ -e "$_aa_profile" ] || return 0
+    _aa_tunable="$_aa_dir/tunables/minimald"
+
+    if [ "$dry_run" -eq 1 ]; then
+        say "  would offer to remove the system AppArmor profile $_aa_profile"
+        return 0
+    fi
+
+    # Prompt only when stdin is a terminal. Under `curl … | sh -s -- --uninstall`
+    # stdin is the script pipe, not a tty, so advise rather than consume it.
+    if [ -t 0 ]; then
+        _aa_loader="$(resolve_prefix data)/apparmor/install-apparmor-profile.sh"
+        printf 'Also remove the system AppArmor profile %s (needs root)? [y/N] ' \
+            "$_aa_profile" >&2
+        _aa_ans=
+        read -r _aa_ans || _aa_ans=
+        case "$_aa_ans" in
+            [Yy]*)
+                if [ -f "$_aa_loader" ] && command -v sudo >/dev/null 2>&1 \
+                    && sudo bash "$_aa_loader" --uninstall; then
+                    return 0
+                fi
+                say "  warning: could not remove it automatically; do it manually (root):"
+                say "      sudo apparmor_parser -R \"$_aa_profile\" && sudo rm -f \"$_aa_profile\" \"$_aa_tunable\""
+                return 0
+                ;;
+            *) return 0 ;;
+        esac
+    fi
+
+    say ""
+    say "note: the system AppArmor profile is still loaded at $_aa_profile."
+    say "  it was installed separately with root; remove it too with:"
+    say "      sudo apparmor_parser -R \"$_aa_profile\" && sudo rm -f \"$_aa_profile\" \"$_aa_tunable\""
+}
+
 # --- Units 7+8: uninstall (walk the install record and undo it) ------------
 
 # Offline teardown driven solely by the local install record (R6.1). The record
@@ -234,6 +283,10 @@ do_uninstall() {
         return 0
     fi
     [ "$dry_run" -eq 1 ] && say "uninstall: dry run — nothing will be removed"
+
+    # Before the walk (which deletes the shipped loader), offer to tear down the
+    # separately-installed system AppArmor profile too.
+    maybe_remove_apparmor_profile
 
     # Tab, computed once, so rows are split on tab alone (R7.3): a dest under a
     # $HOME containing spaces must still parse as one field.
@@ -375,6 +428,8 @@ do_uninstall() {
         # parents, which the installer may have created) are shared with other
         # tools so, like bin, they are only ever rmdir'd-if-empty.
         for d in "$init_dir" \
+                 "$(resolve_prefix data)/apparmor/tunables" \
+                 "$(resolve_prefix data)/apparmor" \
                  "$bash_comp_dir" "${bash_comp_dir%/*}" \
                  "$zsh_comp_dir" "${zsh_comp_dir%/*}" \
                  "$fish_comp_dir"; do
@@ -560,8 +615,10 @@ while read -r comp _ _ _ want kind dest src; do
     fi
 
     # R4.3/R5.2 — create the destination dir, then download to a temp sibling
-    # IN that dir so the final rename is a same-filesystem atomic swap.
-    mkdir -p "$dir"
+    # IN that dir so the final rename is a same-filesystem atomic swap. Create
+    # the target file's PARENT (not just the prefix root): a component whose
+    # subpath nests dirs (e.g. apparmor/tunables/minimald) needs them made first.
+    mkdir -p "${target_file%/*}"
     tmp="$target_file.tmp.$$"
     say "  $comp: downloading"
     fetch "$BUCKET/$src" "$tmp" || { rm -f "$tmp"; die "download failed: $comp ($src)"; }
@@ -586,8 +643,12 @@ while read -r comp _ _ _ want kind dest src; do
     # R5.5 — last moment before the first live file is swapped, so a run where
     # every component is up to date (or one that dies fetching/verifying) never
     # touches a healthy daemon. The guard inside makes this a no-op after the
-    # first replaced component.
-    stop_running_daemon
+    # first replaced component. Only executable images wedge a running daemon
+    # (bin, and lib — minvmd's @rpath dylib); replacing a data file (e.g. a
+    # re-shipped apparmor text) must not kill live sessions.
+    case "$prefix" in
+        bin|lib) stop_running_daemon ;;
+    esac
 
     mv -f "$tmp" "$target_file"
     installed=$((installed + 1))
@@ -819,3 +880,46 @@ case ":${PATH:-}:" in
        say "note: $bindir is not on your PATH yet."
        say "  restart your shell, or add it now:  export PATH=\"$bindir:\$PATH\"" ;;
 esac
+
+# --- Linux host advisory: unprivileged user namespaces ----------------------
+
+# Ubuntu 24.04+ defaults kernel.apparmor_restrict_unprivileged_userns=1, under
+# which minimald cannot create the user namespace every session sandbox needs —
+# sessions then die at uid_map with an opaque EPERM, far from here. Detect the
+# restriction at install time (Linux only) and point at the AppArmor loader we
+# just shipped. Advice only: installing the profile needs root, and this
+# installer never elevates. Silent on hosts that do not need it, AND on a host
+# already remediated — but "remediated" depends on the bin prefix: the stock
+# tunable attaches only /usr/bin, /usr/local/bin, and ~/.local/bin, so for a
+# custom MINIMAL_BIN the advised command carries --path, and a loaded profile
+# counts as remediation only if the tunables actually name this binary
+# (otherwise sessions still die and a reinstall must keep saying so). The
+# sysctl and apparmor.d paths are overridable for install_test.sh.
+userns_sysctl="${MINIMAL_OVERRIDE_USERNS_SYSCTL:-/proc/sys/kernel/apparmor_restrict_unprivileged_userns}"
+apparmor_dir="${MINIMAL_OVERRIDE_APPARMOR_DIR:-/etc/apparmor.d}"
+if [ "$os" = linux ] && [ -r "$userns_sysctl" ] \
+    && [ "$(cat "$userns_sysctl" 2>/dev/null)" = 1 ]; then
+    apparmor_loader="$(resolve_prefix data)/apparmor/install-apparmor-profile.sh"
+    aa_loader_args=""
+    aa_remediated=0
+    case "$bindir" in
+        /usr/bin|/usr/local/bin|"$HOME/.local/bin")
+            [ -e "$apparmor_dir/minimald" ] && aa_remediated=1
+            ;;
+        *)
+            aa_loader_args=" --path \"$bindir/minimald\""
+            if [ -e "$apparmor_dir/minimald" ] \
+                && grep -rqs "$bindir/minimald" "$apparmor_dir/tunables" 2>/dev/null; then
+                aa_remediated=1
+            fi
+            ;;
+    esac
+    if [ "$aa_remediated" -eq 0 ] && [ -f "$apparmor_loader" ]; then
+        say ""
+        say "note: this host restricts unprivileged user namespaces (Ubuntu 24.04+);"
+        say "  minimald's session sandbox cannot start until you install its AppArmor"
+        say "  profile — a one-time step that needs root:"
+        say "      sudo bash \"$apparmor_loader\"$aa_loader_args"
+        say "  details: https://docs.minimal.dev/reference/linux-host-setup"
+    fi
+fi

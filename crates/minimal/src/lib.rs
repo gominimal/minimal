@@ -399,7 +399,7 @@ pub struct UpdateArgs {}
 pub struct ProxyArgs {
     /// UDS socket path to connect to
     #[arg(long)]
-    pub socket: String,
+    pub socket: Option<String>,
 }
 
 /// Arguments for `minimal ssh-forward`.
@@ -452,7 +452,7 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
             MeshCommand::Join(args) => cmd_mesh_join(&cli.global_args, args),
             MeshCommand::Leave => cmd_mesh_leave(&cli.global_args),
         },
-        Command::Proxy(args) => cmd_proxy(args).await,
+        Command::Proxy(args) => cmd_proxy(&cli.global_args, args).await,
         #[cfg(feature = "remote-access")]
         Command::SshForward(args) => cmd_ssh_forward(&cli.global_args, args).await,
         Command::Login(args) => cmd_login(&cli.global_args, args).await,
@@ -548,10 +548,22 @@ async fn resolve_session(
 ///
 /// Intended for use as an SSH `ProxyCommand`: ssh writes to our stdin and
 /// reads from our stdout, while we bridge both directions to the UDS.
-pub async fn cmd_proxy(args: ProxyArgs) -> Result<(), anyhow::Error> {
-    let stream = tokio::net::UnixStream::connect(&args.socket)
+pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyhow::Error> {
+    let socket_path = match args.socket {
+        Some(socket_path) => socket_path,
+        None => {
+            ensure_daemon(global)?;
+            client::resolve_socket_path(global.minimal_dir.as_deref())
+                .context("Failed to resolve daemon socket path")?
+                .to_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+
+    let stream = tokio::net::UnixStream::connect(&socket_path)
         .await
-        .with_context(|| format!("connect to {}", args.socket))?;
+        .with_context(|| format!("connect to {}", socket_path))?;
 
     let (mut rx, mut tx) = stream.into_split();
     let mut stdin = tokio::io::stdin();
@@ -1564,13 +1576,6 @@ fn run_init_flow(config: mctx::Config, skip_confirm: bool) -> Result<(), anyhow:
         .with_context(|| format!("writing {}", plan.toml_path.display()))?;
 
     eprintln!("Created {}", plan.toml_path.display());
-    eprintln!();
-    eprintln!("Next steps:");
-    eprintln!("  minimal update      # pin package versions");
-    eprintln!("  minimal activate .  # create a session");
-    if plan.matched {
-        eprintln!("  minimal attach      # attach to the session");
-    }
 
     Ok(())
 }

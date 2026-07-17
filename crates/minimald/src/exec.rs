@@ -922,15 +922,38 @@ async fn handle_git_receive(
                 unset GIT_DIR GIT_WORK_TREE GIT_QUARANTINE_PATH
                 g() { git --git-dir="$GIT_DIR_ABS" --work-tree="$WORK_TREE" "$@"; }
 
+                zero=0000000000000000000000000000000000000000
                 while read -r old new ref; do
                     case "$ref" in refs/heads/*) ;; *) continue ;; esac
+                    # A deleted branch (new = zeros) has nothing to check out.
+                    # Deleting the CURRENT branch never reaches here: git's own
+                    # receive.denyDeleteCurrent refuses it during receive-pack.
+                    [ "$new" = "$zero" ] && continue
                     branch=${ref#refs/heads/}
 
-                    if ! g diff --quiet || ! g diff --cached --quiet; then
+                    if [ "$old" = "$zero" ]; then
+                        # Previously-unborn branch: nothing tracked, so tracked
+                        # dirtiness cannot exist — but uploaded/untracked files
+                        # may collide with the pushed tree, and -f would
+                        # silently clobber them. -B pins the branch at the
+                        # pushed tip and checks it out; WITHOUT -f, git refuses
+                        # to overwrite untracked files (its stderr names them),
+                        # and we surface the skip like the dirty case below.
+                        if ! g checkout -q -B "$branch" "$new"; then
+                            echo "remote worktree has local files the push would overwrite; skipping checkout of $branch" >&2
+                        fi
+                        continue
+                    fi
+
+                    # Dirtiness is measured against the PRE-push tip ($old):
+                    # post-receive runs after the ref has already moved, so a
+                    # plain `diff --cached` (index vs the NEW tip) would flag
+                    # the pushed delta itself and skip every checkout.
+                    if ! g diff --quiet "$old" || ! g diff --cached --quiet "$old"; then
                         echo "remote worktree has uncommitted changes; skipping checkout of $branch" >&2
                         continue
                     fi
-                    g checkout -f "$branch"
+                    g checkout -qf "$branch"
                 done"#
                     .as_bytes(),
             )
@@ -943,8 +966,16 @@ async fn handle_git_receive(
             session: session_handle,
             channel_id: id,
             exec: TokioExec {
+                // receive.denyCurrentBranch=ignore: the workspace is a
+                // non-bare repo with the pushed branch typically checked
+                // out, and stock git refuses that ref update outright —
+                // before any hook runs. `ignore` accepts it silently; the
+                // post-receive hook above then syncs the worktree (or
+                // warns and skips when it is dirty). NOT `updateInstead`:
+                // that rejects the whole push on a dirty worktree, while
+                // the hook's contract is "ref lands, checkout best-effort".
                 argv: format!(
-                    "git -c core.hooksPath={} receive-pack .",
+                    "git -c core.hooksPath={} -c receive.denyCurrentBranch=ignore receive-pack .",
                     hooks_tmp.path().to_str().unwrap()
                 ),
                 cwd: paths.working,

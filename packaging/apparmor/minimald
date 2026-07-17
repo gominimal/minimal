@@ -1,0 +1,31 @@
+# AppArmor profile for minimald.
+#
+# Ubuntu 24.04+ ships kernel.apparmor_restrict_unprivileged_userns=1, which bars
+# unconfined programs from creating unprivileged user namespaces. minimald's
+# session sandbox (hakoniwa) needs one for every session: without it the sandbox
+# child dies writing /proc/self/uid_map with EPERM, before it runs anything, so
+# on a stock 24.04 host *no* session can start.
+#
+# This profile is the accommodation Ubuntu intends for that case, and is the
+# same shape the distro ships for rootlesskit, runc, and podman: it confines
+# nothing — flags=(unconfined) — and exists only to give minimald a named label
+# that carries the `userns` permission. Installing it does not restrict
+# minimald, and it does not hand unprivileged user namespaces back to anything
+# else on the host, which is what flipping the sysctl to 0 would do.
+#
+#   Install:  sudo scripts/install-apparmor-profile.sh
+#   Docs:     docs/reference/linux-host-setup.md
+#
+# The attachment paths live in tunables/minimald (see the comments there).
+
+abi <abi/4.0>,
+
+include <tunables/global>
+include <tunables/minimald>
+
+profile minimald @{minimald_bin} flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/minimald>
+}

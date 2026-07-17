@@ -49,11 +49,35 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show or set persisted per-VM resource configuration (applied next boot).
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Stop the running daemon gracefully.
     Stop,
     /// Hidden VMM child subcommand — spawned by `boot`, not for direct use.
     #[command(name = "__krun-vmm", hide = true)]
     KrunVmm,
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Print the effective resource configuration and each value's source.
+    Show {
+        /// Print as a JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate and persist resource parameters for the next boot.
+    Set {
+        /// Number of virtual CPUs.
+        #[arg(long)]
+        vcpus: Option<u8>,
+        /// Guest RAM in MiB.
+        #[arg(long)]
+        ram_mib: Option<u32>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -89,6 +113,10 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Config { action } => match action {
+            ConfigAction::Show { json } => minvmd::cmd::config::run_show(json),
+            ConfigAction::Set { vcpus, ram_mib } => minvmd::cmd::config::run_set(vcpus, ram_mib),
+        },
         Command::Stop => minvmd::cmd::stop::run(),
         Command::KrunVmm => minvmd::cmd::vmm_child::run(),
     }
