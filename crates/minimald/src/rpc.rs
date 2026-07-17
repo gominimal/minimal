@@ -66,8 +66,8 @@ async fn serve_get_version(c: RuChannel<Msg>) {
     let res = GetVersion
         .handle_channel(c, async |_req| {
             Ok(GetVersionResponse {
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                long_version: env!("LONG_VERSION").to_string(),
+                version: version::VERSION.to_string(),
+                long_version: version::LONG_VERSION.to_string(),
                 stdlib_version: stdlib::VERSION.to_string(),
             })
         })
@@ -757,8 +757,8 @@ mod tests {
 
         let resp = client.call::<GetVersion>(&()).await;
 
-        assert_eq!(resp.version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(resp.long_version, env!("LONG_VERSION"));
+        assert_eq!(resp.version, version::VERSION);
+        assert_eq!(resp.long_version, version::LONG_VERSION);
         assert_eq!(resp.stdlib_version, stdlib::VERSION);
     }
 
@@ -809,7 +809,7 @@ mod tests {
         for _ in 0..3 {
             let mut client = server.connect().await;
             let resp = client.call::<GetVersion>(&()).await;
-            assert_eq!(resp.version, env!("CARGO_PKG_VERSION"));
+            assert_eq!(resp.version, version::VERSION);
         }
     }
 

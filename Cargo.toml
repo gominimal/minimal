@@ -27,11 +27,16 @@ members = [
     "crates/sessions",
     "crates/stdlib",
     "crates/switch",
+    "crates/version",
 ]
 resolver = "3"
 
 package.edition = "2024"
 package.publish = false
+# Shared base version for the workspace. This is the fallback the `version` crate
+# reports when no `v*` git tag is reachable; the real release version comes from
+# `git describe` at build time. See crates/version/build.rs.
+package.version = "0.5.0-rc1"
 
 [profile.release]
 strip = true
@@ -148,28 +153,31 @@ walkdir = "2.5"
 
 petgraph = "0.8"
 
-# our crates
-args = { version = "0.0.1", path = "crates/args" }
-async-dialog = { version = "0.0.1", path = "crates/async-dialog" }
-graph = { version = "0.0.1", path = "crates/graph" }
-lcache = { version = "0.0.1", path = "crates/lcache" }
-rcache = { version = "0.0.1", path = "crates/rcache" }
-check = { version = "0.0.1", path = "crates/check" }
-checkouts = { version = "0.0.1", path = "crates/checkouts" }
-common = { version = "0.0.1", path = "crates/common" }
-decode = { version = "0.0.1", path = "crates/decode" }
-diagnostics = { version = "0.0.1", path = "crates/diagnostics" }
-mctx = { version = "0.0.1", path = "crates/mctx" }
-minimald-rpc = { version = "0.0.1", path = "crates/minimald-rpc" }
-mfile = { version = "0.0.1", path = "crates/mfile" }
-op = { version = "0.0.1", path = "crates/op" }
-ot = { version = "0.0.1", path = "crates/ot" }
-orchestrator = { version = "0.0.1", path = "crates/orchestrator" }
-paths = { version = "0.0.1", path = "crates/paths" }
-remote-proto = { version = "0.0.1", path = "crates/remote-proto" }
-remote-client = { version = "0.0.1", path = "crates/remote-client" }
-sandbox2 = { version = "0.0.1", path = "crates/sandbox2" }
-sessions = { version = "0.0.1", path = "crates/sessions" }
-switch = { version = "0.0.1", path = "crates/switch" }
+# Our crates. These are path deps in a `publish = false` workspace, so no
+# `version` requirement is needed (or used) — cargo resolves them by path. Adding
+# one would just be a pin to keep in sync with each crate's own version.
+args = { path = "crates/args" }
+async-dialog = { path = "crates/async-dialog" }
+graph = { path = "crates/graph" }
+lcache = { path = "crates/lcache" }
+rcache = { path = "crates/rcache" }
+check = { path = "crates/check" }
+checkouts = { path = "crates/checkouts" }
+common = { path = "crates/common" }
+decode = { path = "crates/decode" }
+diagnostics = { path = "crates/diagnostics" }
+mctx = { path = "crates/mctx" }
+minimald-rpc = { path = "crates/minimald-rpc" }
+mfile = { path = "crates/mfile" }
+op = { path = "crates/op" }
+ot = { path = "crates/ot" }
+orchestrator = { path = "crates/orchestrator" }
+paths = { path = "crates/paths" }
+remote-proto = { path = "crates/remote-proto" }
+remote-client = { path = "crates/remote-client" }
+sandbox2 = { path = "crates/sandbox2" }
+sessions = { path = "crates/sessions" }
+switch = { path = "crates/switch" }
+version = { path = "crates/version" }
 
-stdlib = { version = "0.0.17", path = "crates/stdlib" }
+stdlib = { path = "crates/stdlib" }
