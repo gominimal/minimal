@@ -48,48 +48,24 @@ default:
 
 # ── build & fetch ────────────────────────────────────────────────────────────
 #
-# Prereqs — macOS: `brew install slp/krun/libkrun` + the `minimal` shim.
-# Linux: a KVM host with kvm-group membership, Rust + protoc + jq + cpio.
+# Prereqs — macOS: `brew install slp/krun/libkrun zstd jq`.
+# Linux: a KVM host with kvm-group membership, Rust + protoc + jq + cpio + zstd.
 # See crates/minvmd/README.md for the manual bring-up.
 
-# Materialize the guest kernel + generic rootfs (`just clean` forces a refresh).
-[macos]
-artifacts:
-    #!/usr/bin/env sh
-    set -eu
-    [ -f {{kernel}} ] && [ -f {{rootfs}} ] && exit 0
-    mkdir -p {{scratch}}
-    # Resolve the shim by its install path FIRST: PATH is polluted with this
-    # repo's own target/debug (see the global export), where a stale `minimal`
-    # binary would shadow the shim.
-    if [ -x "$HOME/.minimal/shim/bin/minimal" ]; then shim="$HOME/.minimal/shim/bin/minimal"
-    elif command -v minimal >/dev/null 2>&1; then shim=minimal
-    else echo "the \`minimal\` shim is required (not at ~/.minimal/shim/bin, not on PATH)" >&2; exit 1
-    fi
-    # The shim's --output MUST be repo-RELATIVE (outputs sync back through the
-    # project-dir overlay; absolute paths fail the copy-out), and a cold cache
-    # can transiently drop the output — retry.
-    materialize() {
-      for n in 1 2 3; do
-        "$shim" materialize --output "$1" --arch {{arch}} "$2" && return 0
-        echo "materialize $2 failed (attempt $n)" >&2; rm -f "$1"; sleep 2
-      done
-      return 1
-    }
-    [ -f {{kernel}} ] || materialize .scratch/vmlinuz virtio-kernel
-    [ -f {{rootfs}} ] || materialize .scratch/rootfs.img minvmd-rootfs
-
-# Materialize the guest kernel + generic rootfs (`just clean` forces a refresh).
-[linux]
+# Prebuilt from the public cache via the per-commit package index — nothing is
+# built or materialized locally (scripts/fetch-prebuilt.sh; pkgs commit pinned
+# in .minimal/minimal.toml).
+#
+# Fetch the prebuilt guest kernel + generic rootfs (`just clean` forces a refresh).
 artifacts:
     @mkdir -p {{scratch}}
-    @[ -f {{kernel}} ] || scripts/fetch-artifact.sh virtio-kernel {{kernel}} {{arch}}
-    @[ -f {{rootfs}} ] || scripts/fetch-artifact.sh minvmd-rootfs {{rootfs}} {{arch}}
+    @[ -f {{kernel}} ] || scripts/fetch-prebuilt.sh kernel {{kernel}} {{arch}}
+    @[ -f {{rootfs}} ] || scripts/fetch-prebuilt.sh rootfs {{rootfs}} {{arch}}
 
-# Fetch libkrun + libkrunfw into the link/runtime prefix.
+# Fetch prebuilt libkrun + libkrunfw into the link/runtime prefix.
 [linux]
 libkrun:
-    scripts/fetch-libkrun.sh {{krun-prefix}} {{arch}}
+    scripts/fetch-prebuilt.sh krun {{krun-prefix}} {{arch}}
 
 # Fetch the pinned gvproxy switch (guest egress + own-IP; missing = switchless boot).
 gvproxy:
