@@ -112,6 +112,7 @@ sequenceDiagram
         alt probe ok and not --no-guest
             B->>D: TRACEPARENT env request, then DiagBundleRequest (JSON, half-close)
             D->>V: read logs / state listing / sessions (redacted)
+            D->>D: /proc triage: routes, env, family stacks, fd→socket join
             D-->>B: rootless tar.zst, manifest.json last
             B->>W: nest raw at providers/n/guest/daemon-diag.tar.zst
         else daemon unreachable / timeout / subsystem refused
@@ -299,10 +300,14 @@ ALREADY EXISTS: the oneshot/subsystem RPC plumbing and
 // duplex pump stays: russh channel writer is !Sync, async_tar::Builder needs Sync
 let (tx, rx) = tokio::io::duplex(64 * 1024);
 let mut w = BundleWriter::stream(ZstdEncoder::new(tx), version);
-// collect: meta.json, logs/ (tail-capped, lstat-guarded), state-listing.txt
+// collect: meta.json, logs/ (tail-capped, no-follow opens), state-listing.txt
 // (spawn_blocking), sessions/ (redact_json, per-record error files), proc.txt
 // (full argv only for diagnostics::procs marker matches, else comm),
-// net/ (raw /proc/net tables), disk.json → finish() writes manifest.json
+// net/ (raw /proc/net tables + routes.txt: route + fib_trie), env.json
+// (allowlist + sensitive-key policy), proc/<pid>.stack.txt +
+// proc/sockets.txt (in-VM hang triage: wchan/stacks/fd readlinks and the
+// fd→socket-inode join — pure /proc, no lsof/ss/ip in the microVM rootfs),
+// disk.json → finish() writes manifest.json
 // errors.json is RETIRED — both bundle layers carry manifest.json.
 
 // server.rs (Unit 3)

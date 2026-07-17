@@ -502,13 +502,16 @@ migrate out of `crates/minimal`.
   re-serialization), interfaces with MACs masked to their vendor OUI, and
   routes.
 - **R5.2**: `diagnostics::procs` shall provide the process tree and hang
-  triage (macOS: 1 s `sample` per pid; Linux: wchan/syscall/kernel-stack/fd
-  readlinks; one `lsof -nP` over the set, accepting lsof's
-  exit-1-with-output convention) for up to 8 pids matched by **argv0
-  basename** against a caller-supplied `markers: &[&str]`. Recorded argv
-  strings shall be scrubbed token-wise: any `key=value` token whose key trips
-  the R1.5 sensitive-key policy has its value replaced by the redaction
-  placeholder.
+  triage for up to 8 pids matched by **argv0 basename** against a
+  caller-supplied `markers: &[&str]`. The Linux path shall be **pure `/proc`
+  reads** — wchan/syscall/kernel-stack/fd readlinks, plus an
+  fd→socket-inode join against the `/proc/net` tables as the binary-free
+  `lsof` equivalent — so it runs as microVM pid-1 with no external binaries.
+  External tools are host-side extras used when present: macOS 1 s `sample`
+  per pid, and one `lsof -nP` over the set (accepting lsof's
+  exit-1-with-output convention). Recorded argv strings shall be scrubbed
+  token-wise: any `key=value` token whose key trips the R1.5 sensitive-key
+  policy has its value replaced by the redaction placeholder.
 - **R5.3**: `diagnostics::power` shall capture sleep/wake history
   (macOS `pmset`; Linux `journalctl`), event-capped.
 - **R5.4**: The minimal marker list and the six `collect_step!` wiring lines
@@ -560,6 +563,11 @@ same `manifest.json` schema as the host bundle.
 - ref: the russh channel writer is not `Sync`, so the duplex-pipe +
   `tokio::io::copy` pump stays (`diag.rs:57` comment); only the tar/manifest
   half moves into the crate.
+- ref: the daemon's network capture is listening tables + `/proc/net/dev`
+  counters only (`diag.rs:408-430`) — **NO ROUTES, NO ADDRESSES, NO ENV, NO
+  HANG TRIAGE IN-VM**. The partial-wedge case (daemon responsive, a session
+  child or vsock binding stuck — the #788 shape) is invisible to the current
+  guest bundle; this unit closes it via the Unit 5 mechanics.
 
 **Functional Requirements:**
 
@@ -576,6 +584,22 @@ same `manifest.json` schema as the host bundle.
   — scrubbed per the R5.2 argv rule — only for marker-matched processes,
   `comm` otherwise), raw `/proc/net` tables, and `disk.json` — finishing
   with `manifest.json`.
+- **R6.6**: The bundle shall additionally capture the guest-side incident
+  trio via the Unit 5 mechanics (all pure `/proc`, R5.2 — the microVM rootfs
+  has no `lsof`/`ss`/`ip`):
+  - `net/routes.txt` — `/proc/net/route` + `/proc/net/fib_trie` (routing
+    *and* addresses: the guest half of the gvproxy-subnet/CGNAT collision
+    picture the host's R5.1 exposes);
+  - `proc/<pid>.stack.txt` — hang triage (wchan/syscall/kernel-stack/fd
+    readlinks) for the marker-matched in-VM family (minimald pid-1, session
+    hosts, task children), so the partial wedge — daemon responsive, one
+    binding or child stuck — is self-diagnosing;
+  - `proc/sockets.txt` — the fd→socket-inode join over the family (the
+    binary-free `lsof` equivalent: which process holds which socket in which
+    state);
+  - `env.json` — the daemon's own environment through the same
+    allowlist-plus-sensitive-key policy as R2.4 (answers "which mode booted,
+    why is logging off" — `RUST_LOG`, `MINIMALD_*`, detach markers).
 - **R6.3**: Request reads shall be length-bounded; caller-controlled
   `log_tail_bytes` is clamped to a server cap; log collection rejects
   non-regular files and symlinks.
@@ -595,6 +619,10 @@ same `manifest.json` schema as the host bundle.
    decompressible rootless tar.zst — demonstrates R6.2.
 3. **Test:** oversized request body and oversized `log_tail_bytes` are
    clamped/rejected — demonstrates R6.3.
+4. **Test:** the harness bundle contains `net/routes.txt`, per-pid
+   `proc/<pid>.stack.txt` for the daemon's own family, `proc/sockets.txt`
+   with fd→inode-resolved sockets, and `env.json` with a planted
+   `MINIMALD_TOKEN`-style variable masked — demonstrates R6.6.
 
 ---
 
@@ -915,6 +943,7 @@ Unit 8's dual-format rework, sequenced after Unit 6.
 | 6 | R6.1, R6.2, R6.4 | Test | harness fetch: `meta.json` + `manifest.json`; pre-stream error via extended data |
 | 6 | R6.2 | CLI | raw `ssh -s` subsystem fetch decompresses, rootless |
 | 6 | R6.3 | Test | oversized request/tail clamped |
+| 6 | R6.6 | Test | guest bundle carries routes, per-pid stacks, fd→socket join, allowlisted env (planted secret masked) |
 | 7 | R7.1–R7.3 | Test | full-stack nested-bundle test with redaction across layers |
 | 7 | R7.3 | Test | oversize/entry-bomb nested bundle → verification fails within caps, raw bytes + manifest error recorded |
 | 7 | R7.1, R7.5 | Test | stale socket → connect-stage failure + fallback artifacts |
