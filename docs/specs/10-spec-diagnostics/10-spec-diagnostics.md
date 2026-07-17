@@ -89,8 +89,9 @@ The subsystem stands on three legs:
    operation across the CLI→daemon boundary, OTEL-compatible field
    conventions, no OTEL dependency.
 5. The daemon contributes its own view (meta, logs, state listing, sessions,
-   proc/net/disk) as a nested bundle over a one-shot RPC; a daemon that
-   refuses the subsystem fails fast with the reason relayed to the user.
+   proc/net/disk) as a nested bundle over a single-shot streaming RPC; a
+   daemon that refuses the subsystem fails fast with the reason relayed to
+   the user.
 6. When the daemon or transport is the suspect, the bundle still captures the
    guest: socket probe stages pinpoint where contact broke, and the data
    volume's vital signs and `/logs` tree are harvested read-only from the
@@ -573,7 +574,11 @@ same `manifest.json` schema as the host bundle.
   (`minimald-v1-DiagBundleTarZst` — wire contract, never renamed) and
   `#[non_exhaustive] DiagBundleRequest { log_tail_bytes: u64 /* 0 = daemon
   default */, include_state_listing: bool /* default true */ }`; an empty
-  JSON body decodes to the documented defaults.
+  JSON body decodes to the documented defaults. The subsystem follows the
+  streaming-subsystem pattern already established by `WorkspaceFilesTarZst`
+  (`crates/minimald/src/rpc.rs:485-486`, main), in the mirror direction: the
+  client writes one JSON request and half-closes, the daemon streams one
+  tar.zst and closes.
 - **R6.2**: The daemon shall stream its bundle through
   `BundleWriter::stream` (rootless): `meta.json` (version, uptime, microVM
   flag), tail-capped `logs/`, metadata-only `state-listing.txt` (on
@@ -736,9 +741,11 @@ read both pre-convergence (`errors.json`) and post-convergence
   everything else is dead". Unit 4's conventions are the seam; an OTLP
   exporter layer is additive later work (future spec; see Design
   Considerations).
-- **Streaming/live debug RPC** — the team-discussed streaming collection is
-  deliberately not this: one-shot blob only. Reopen only with a use case that
-  post-mortem files cannot serve.
+- **Continuous/live debug streaming** — to be precise about terms: the bundle
+  transport *is* a streaming RPC, in the single-shot sense — one request, one
+  streamed archive, close (R6.1). What is out of scope is the long-lived
+  form: an open-ended stream of live debug data from a running daemon. Reopen
+  only with a use case that post-mortem files cannot serve.
 - **`BundleWriter` writing directly to the russh channel** — blocked on
   `async_tar::Builder`'s `Sync` bound vs the non-`Sync` channel writer; the
   duplex pump stays (see Technical Considerations).
@@ -793,15 +800,20 @@ Reopen-trigger: abandonment, or tracing-appender shipping size-based
 rotation — the writer is swappable behind one constructor either way.
 Decided 2026-07-16.
 
-### One-shot blob, not streaming; files, not telemetry
+### One streamed blob per request; no live telemetry stream
 
-The daemon bundle rides the existing SSH subsystem as a single tar.zst with a
-half-close request and extended-data error relay — ~200 lines whose failure
-modes are inspectable with the same probe that precedes it. OTLP/gRPC or
-otel-arrow streaming would replace that with a protocol stack (HTTP/2 flow
-control, batch buffering, backpressure) that is opaque exactly when the
-transport is the suspect — and a wedged transport is precisely the scenario
-this subsystem must serve.
+The bundle transport *is* a streaming RPC — deliberately the smallest
+possible one. `DiagBundleTarZst` mirrors the streaming-subsystem pattern the
+wire already carries for workspace upload (`WorkspaceFilesTarZst`,
+`crates/minimald/src/rpc.rs:485-486` on main), direction reversed: one JSON
+request, half-close, one tar.zst streamed back with pre-stream errors on
+extended-data stream 1, close. ~200 lines whose failure modes are inspectable
+with the same probe that precedes it. What this spec rejects is the
+*continuous* form — a long-lived live debug stream (OTLP/gRPC, otel-arrow):
+that replaces the blob with a protocol stack (HTTP/2 flow control, batch
+buffering, backpressure) that is opaque exactly when the transport is the
+suspect — and a wedged transport is precisely the scenario this subsystem
+must serve.
 Every OTEL export path is push-based from a live process and loses its
 in-memory tail on a hang; the only OTEL-shaped post-mortem pattern is
 "write files while healthy, scrape later", which is what Unit 3 does without

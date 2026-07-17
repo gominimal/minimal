@@ -18,7 +18,7 @@ end — the net/procs/power collector mechanics parameterized by caller data.
 **`minimal`** owns only what is specific to the `bug` command: clap surface,
 path/config resolution, the marker and allowlist *data*, provider discovery,
 the socket probe, and the guest fetch. **`minimald`** serves its own bundle
-over a one-shot SSH subsystem (`DiagBundleTarZst`, contract in
+over a single-shot streaming SSH subsystem (`DiagBundleTarZst`, contract in
 **`minimald-rpc`**) and persists its logs onto the data volume behind a
 reload-swappable layer whose release is owned by `ServerState`. **`minvmd`**
 persists detached-mode logs and defaults the VMM console into
@@ -293,6 +293,12 @@ pub struct DiagBundleRequest {
 ALREADY EXISTS: the oneshot/subsystem RPC plumbing and
 `RPC_SUBSYSTEM_PREFIX` — `crates/minimald-rpc/src/lib.rs` (main).
 
+ALREADY EXISTS: the streaming-subsystem pattern this contract mirrors —
+`WorkspaceFilesTarZst` (`STREAM_WORKSPACE_FILES`,
+`crates/minimald/src/rpc.rs:485-486` on main) streams a tar.zst *to* the
+daemon; `DiagBundleTarZst` streams one *from* it. Same request/half-close
+lifecycle, same `*TarZst` naming, no new transport machinery.
+
 ### `crates/minimald` — serving + on-volume logs
 
 ```rust
@@ -401,10 +407,14 @@ alive on the path that must work when nothing is. Adopted instead: the
 conventions (Unit 4) that make later OTLP conversion a file transform on the
 analysis machine.
 
-**Streaming RPC for debug data.** Rejected: replaces a ~200-line one-shot
-blob with protocol machinery whose failure modes are opaque exactly when the
-transport is the suspect — and a wedged transport is precisely the scenario
-the subsystem must serve. The one-shot subsystem is served identically by
+**Continuous/live debug streaming.** Rejected — with terms kept precise: the
+chosen transport is itself a streaming RPC in the single-shot sense (one
+request, one streamed archive, close), reusing the wire's existing
+`WorkspaceFilesTarZst` subsystem pattern. What is rejected is the long-lived
+form — an open-ended live debug stream — which replaces the blob with
+protocol machinery whose failure modes are opaque exactly when the transport
+is the suspect, and a wedged transport is precisely the scenario the
+subsystem must serve. The single-shot subsystem is served identically by
 native and in-VM daemons and is preceded by a probe that already localizes
 transport faults.
 
