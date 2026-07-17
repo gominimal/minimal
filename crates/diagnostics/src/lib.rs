@@ -30,7 +30,7 @@ pub mod logs;
 pub mod manifest;
 pub mod redact;
 
-pub use bundle::{BundleSink, BundleWriter, LOG_TAIL_CAP};
+pub use bundle::{BundleSink, BundleWriter, LOG_TAIL_CAP, open_regular_nofollow};
 pub use capture::{Capture, CaptureError, command_capture, first_stdout_line};
 #[cfg(unix)]
 pub use disk::{DiskUsage, disk_usage};

@@ -141,30 +141,7 @@ impl<W: BundleSink> BundleWriter<W> {
         src: &Path,
         cap: u64,
     ) -> Result<(), anyhow::Error> {
-        // Open without following symlinks: a symlink planted in a tool-owned
-        // dir must not steer an unrelated target (a host key, another user's
-        // log) into a bundle the user then shares. O_NOFOLLOW refuses the
-        // link at open time — no check-then-open window to race. (It guards
-        // the final component only; intermediate directories are the tool's
-        // own, per the threat model.)
-        let mut opts = tokio::fs::OpenOptions::new();
-        opts.read(true);
-        #[cfg(unix)]
-        opts.custom_flags(libc::O_NOFOLLOW);
-        let mut file = opts
-            .open(src)
-            .await
-            .with_context(|| format!("opening {}", src.display()))?;
-        // fstat the descriptor we actually read from: rejects directories and
-        // devices, and doubles as the symlink guard where O_NOFOLLOW is
-        // unavailable.
-        let meta = file
-            .metadata()
-            .await
-            .with_context(|| format!("statting {}", src.display()))?;
-        if !meta.is_file() {
-            anyhow::bail!("{} is not a regular file", src.display());
-        }
+        let (mut file, meta) = open_regular_nofollow(src).await?;
         let len = meta.len();
         let capped = len > cap;
         if capped {
@@ -267,6 +244,38 @@ impl<W: BundleSink> BundleWriter<W> {
             .await
             .with_context(|| format!("adding {full}"))
     }
+}
+
+/// Opens `src` for reading without following symlinks and verifies on the
+/// descriptor that it is a regular file — the shared no-follow discipline
+/// for every content read that ends up in a bundle.
+///
+/// A symlink planted in a tool-owned dir must not steer an unrelated target
+/// (a host key, another user's log) into a bundle the user then shares.
+/// O_NOFOLLOW refuses the link at open time — no check-then-open window to
+/// race — and the fstat rejects directories and devices, doubling as the
+/// symlink guard where O_NOFOLLOW is unavailable. (It guards the final
+/// component only; intermediate directories are the tool's own, per the
+/// threat model.)
+pub async fn open_regular_nofollow(
+    src: &Path,
+) -> Result<(tokio::fs::File, std::fs::Metadata), anyhow::Error> {
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    opts.custom_flags(libc::O_NOFOLLOW);
+    let file = opts
+        .open(src)
+        .await
+        .with_context(|| format!("opening {}", src.display()))?;
+    let meta = file
+        .metadata()
+        .await
+        .with_context(|| format!("statting {}", src.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!("{} is not a regular file", src.display());
+    }
+    Ok((file, meta))
 }
 
 #[cfg(test)]

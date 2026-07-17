@@ -126,11 +126,30 @@ async fn planted_secrets_never_reach_the_bundle() {
     let config = fake_config_dir();
     let args = global_args(state.path(), config.path());
 
+    // A symlinked "loadout" pointing outside the config dir: TOML-shaped so
+    // it would survive redaction if the collector followed the link.
+    let outside = tempfile::TempDir::new().unwrap();
+    let target = outside.path().join("outside.toml");
+    std::fs::write(&target, "stolen = \"symlink-target-contents\"\n").unwrap();
+    std::os::unix::fs::symlink(&target, config.path().join("minimal/loadouts/evil.toml")).unwrap();
+
     let out_dir = tempfile::TempDir::new().unwrap();
     let out = out_dir.path().join("diag.tar.zst");
     cmd_bug(&args, bug_args(&out)).await.unwrap();
 
     let files = unpack(&out).await;
+
+    // The symlink was refused at open, its target never read, and the
+    // refusal recorded.
+    assert!(find(&files, "evil.toml.redacted").is_none());
+    for contents in files.values() {
+        assert!(
+            !contents
+                .windows(b"symlink-target-contents".len())
+                .any(|w| w == b"symlink-target-contents"),
+            "symlink target leaked into the bundle"
+        );
+    }
 
     // The loadout is included with its env-var value masked; keys and
     // non-secret values survive so the config is still diagnosable.
@@ -157,6 +176,15 @@ async fn planted_secrets_never_reach_the_bundle() {
     assert!(find(&files, "client.key").is_none());
     let manifest: serde_json::Value =
         serde_json::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
+    assert!(
+        manifest["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["what"].as_str().unwrap().contains("evil.toml")),
+        "refused symlink must be recorded as a skip: {}",
+        manifest["skipped"]
+    );
     assert!(
         manifest["skipped"]
             .as_array()

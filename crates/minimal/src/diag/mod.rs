@@ -77,22 +77,27 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
 
     // Daemon-side state (socket probes, guest bundles, per-provider status)
     // is collected over the daemon connection, not from the host bundle;
-    // record what exists so the manifest is honest about coverage.
-    let providers = collect::provider_dirs(&paths.state).await;
-    if providers.is_empty() {
-        w.skip(
+    // record what exists so the manifest is honest about coverage. An
+    // unreadable providers dir is an error, not absence.
+    let providers_started = std::time::Instant::now();
+    match collect::provider_dirs(&paths.state).await {
+        Ok(providers) if providers.is_empty() => w.skip(
             "providers/",
             "no provider instances found — no daemon was ever spawned here",
-        );
-    } else {
-        w.skip(
+        ),
+        Ok(providers) => w.skip(
             "providers/",
             format!(
                 "{} provider instance(s) present — only run.log/boot.log captured; \
                  daemon-side state not collected",
                 providers.len()
             ),
-        );
+        ),
+        Err(e) => w.error(
+            "providers".to_string(),
+            format!("listing provider dirs: {e}"),
+            providers_started.elapsed(),
+        ),
     }
 
     let entries = w.entry_count();

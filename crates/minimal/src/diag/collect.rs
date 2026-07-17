@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use super::redact::is_env_value_allowlisted;
 use diagnostics::redact::{masked_process_env, redact_toml};
-use diagnostics::{BundleWriter, LOG_TAIL_CAP, Redaction};
+use diagnostics::{BundleWriter, LOG_TAIL_CAP, Redaction, open_regular_nofollow};
 
 /// Cap on entries in a recursive state-dir listing; a runaway tree (huge
 /// session workspaces) is truncated with a marker line, not walked forever.
@@ -184,15 +184,27 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
     )
     .await;
 
-    if let Ok(mut entries) = tokio::fs::read_dir(paths.config.join("loadouts")).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "toml")
-                && let Some(name) = path.file_name().and_then(|n| n.to_str())
-            {
-                add_redacted_toml(w, &path, &format!("config/loadouts/{name}.redacted")).await;
+    match tokio::fs::read_dir(paths.config.join("loadouts")).await {
+        Ok(mut entries) => loop {
+            match entries.next_entry().await {
+                Ok(Some(entry)) => {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|e| e == "toml")
+                        && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    {
+                        add_redacted_toml(w, &path, &format!("config/loadouts/{name}.redacted"))
+                            .await;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    w.skip("config/loadouts/", format!("listing interrupted: {e}"));
+                    break;
+                }
             }
-        }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => w.skip("config/loadouts/", format!("unreadable: {e}")),
     }
 
     // mTLS material: cert/CA metadata only, private key never touched.
@@ -213,26 +225,30 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
     w.add_bytes("config/client-cert.json", &json, Redaction::ListingOnly)
         .await?;
 
-    // Mesh enrolment holds only a host:port endpoint.
-    match tokio::fs::read(&paths.mesh_enrolment).await {
-        Ok(bytes) => {
-            w.add_bytes("config/mesh-enrolment", &bytes, Redaction::None)
+    // Mesh enrolment holds only a host:port endpoint. No-follow like every
+    // other content read: it ships verbatim, so a symlink here would
+    // exfiltrate an arbitrary file byte-for-byte.
+    match read_string_nofollow(&paths.mesh_enrolment).await {
+        Ok(content) => {
+            w.add_bytes("config/mesh-enrolment", content.as_bytes(), Redaction::None)
                 .await?
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => w.skip("config/mesh-enrolment", format!("unreadable: {e}")),
+        Err(e) if is_not_found(&e) => {}
+        Err(e) => w.skip("config/mesh-enrolment", format!("unreadable: {e:#}")),
     }
     Ok(())
 }
 
 /// Adds a TOML file with values redacted; a missing file is silently fine,
-/// an unparseable or unreadable one is withheld with a manifest note.
+/// an unparseable, unreadable, or symlinked one is withheld with a manifest
+/// note (the no-follow discipline covers content reads, not just log tails —
+/// a symlinked "config" file must not steer unrelated data into the bundle).
 async fn add_redacted_toml(w: &mut BundleWriter, src: &Path, dest: &str) {
-    let content = match tokio::fs::read_to_string(src).await {
+    let content = match read_string_nofollow(src).await {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) if is_not_found(&e) => return,
         Err(e) => {
-            w.skip(dest, format!("unreadable: {e}"));
+            w.skip(dest, format!("unreadable: {e:#}"));
             return;
         }
     };
@@ -250,6 +266,17 @@ async fn add_redacted_toml(w: &mut BundleWriter, src: &Path, dest: &str) {
             format!("withheld: does not parse as TOML, cannot redact safely: {e}"),
         ),
     }
+}
+
+/// Reads a regular file to a string without following symlinks.
+async fn read_string_nofollow(src: &Path) -> Result<String, anyhow::Error> {
+    use tokio::io::AsyncReadExt as _;
+    let (mut file, _) = open_regular_nofollow(src).await?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .await
+        .with_context(|| format!("reading {}", src.display()))?;
+    Ok(content)
 }
 
 #[derive(Serialize)]
@@ -274,9 +301,15 @@ async fn file_meta(path: &Path) -> Option<FileMeta> {
 
 pub async fn state(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow::Error> {
     // Recursive listing: names, sizes, and metadata only — session workspace
-    // *contents* stay on the user's machine.
+    // *contents* stay on the user's machine. The walk is synchronous, so it
+    // runs on a blocking thread: a wedged filesystem must strand that
+    // thread, not the worker whose collect_step! timeout is the failsafe.
+    let state_dir = paths.state.clone();
     let listing =
-        diagnostics::listing(&paths.state, LISTING_MAX_ENTRIES).context("listing state dir")?;
+        tokio::task::spawn_blocking(move || diagnostics::listing(&state_dir, LISTING_MAX_ENTRIES))
+            .await
+            .context("listing worker")?
+            .context("listing state dir")?;
     w.add_bytes(
         "state/listing.txt",
         listing.text.as_bytes(),
@@ -292,21 +325,28 @@ const LOG_FILES_PER_PREFIX: usize = 5;
 
 pub async fn logs(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow::Error> {
     let log_dir = paths.state.join("logs");
-    if !tokio::fs::try_exists(&log_dir).await.unwrap_or(false) {
-        // No log dir at all — nothing ever detached. Absence is data.
-        w.skip("logs/", "no log directory — no daemon has ever logged here");
-    } else {
-        for prefix in ["minimald.log", "minvmd.log"] {
-            let files = diagnostics::newest_rotated(&log_dir, prefix, LOG_FILES_PER_PREFIX).await;
-            if files.is_empty() {
-                w.skip(format!("logs/{prefix}*"), "no files with this prefix");
-                continue;
-            }
-            for path in files {
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                let dest = format!("logs/{name}");
-                if let Err(e) = w.add_file_tail(&dest, &path, LOG_TAIL_CAP).await {
-                    w.skip(&dest, format!("unreadable: {e}"));
+    // Absence and inaccessibility are different facts: "no log directory"
+    // may only be claimed on a real NotFound, never on EACCES or I/O errors.
+    match tokio::fs::metadata(&log_dir).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // No log dir at all — nothing ever detached. Absence is data.
+            w.skip("logs/", "no log directory — no daemon has ever logged here");
+        }
+        Err(e) => w.skip("logs/", format!("unreadable: {e}")),
+        Ok(_) => {
+            for prefix in ["minimald.log", "minvmd.log"] {
+                let files =
+                    diagnostics::newest_rotated(&log_dir, prefix, LOG_FILES_PER_PREFIX).await;
+                if files.is_empty() {
+                    w.skip(format!("logs/{prefix}*"), "no files with this prefix");
+                    continue;
+                }
+                for path in files {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    let dest = format!("logs/{name}");
+                    if let Err(e) = w.add_file_tail(&dest, &path, LOG_TAIL_CAP).await {
+                        w.skip(&dest, format!("unreadable: {e}"));
+                    }
                 }
             }
         }
@@ -317,7 +357,7 @@ pub async fn logs(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow:
     // the VMM's hvc0 console capture — kernel prints and the guest pid-1's
     // stdout, the only evidence when the guest wedges before (or its
     // transport dies after) the daemon is reachable.
-    for (name, dir) in provider_dirs(&paths.state).await {
+    for (name, dir) in provider_dirs(&paths.state).await? {
         for log_name in ["run.log", "boot.log"] {
             let dest = format!("providers/{name}/{log_name}");
             match w
@@ -343,13 +383,17 @@ fn is_not_found(err: &anyhow::Error) -> bool {
 // ── providers/local-<n>/ discovery ───────────────────────────────────────────
 
 /// Provider instance dirs under `<state>/providers`, sorted. Empty when the
-/// providers dir doesn't exist (nothing was ever spawned).
-pub async fn provider_dirs(state: &Path) -> Vec<(String, PathBuf)> {
-    let Ok(mut entries) = tokio::fs::read_dir(state.join("providers")).await else {
-        return Vec::new();
+/// providers dir doesn't exist (nothing was ever spawned); any other
+/// filesystem error is an `Err` — "no daemon was ever spawned here" must
+/// never be claimed on the strength of an EACCES.
+pub async fn provider_dirs(state: &Path) -> Result<Vec<(String, PathBuf)>, std::io::Error> {
+    let mut entries = match tokio::fs::read_dir(state.join("providers")).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
     let mut dirs: Vec<(String, PathBuf)> = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    while let Some(entry) = entries.next_entry().await? {
         if !entry.file_type().await.is_ok_and(|t| t.is_dir()) {
             continue;
         }
@@ -361,5 +405,5 @@ pub async fn provider_dirs(state: &Path) -> Vec<(String, PathBuf)> {
         }
     }
     dirs.sort();
-    dirs
+    Ok(dirs)
 }

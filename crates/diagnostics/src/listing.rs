@@ -28,6 +28,10 @@ pub struct Listing {
 /// explicit trailing truncation marker. The walk is iterative (walkdir), so a
 /// pathologically deep tree cannot blow the stack, and symlinks are never
 /// followed.
+///
+/// The walk is synchronous. Async callers must wrap it in
+/// `tokio::task::spawn_blocking`, or a wedged filesystem blocks the worker
+/// thread and their timeouts never fire.
 pub fn listing(root: &Path, max_entries: usize) -> Result<Listing, anyhow::Error> {
     use std::fmt::Write as _;
     use std::os::unix::fs::MetadataExt as _;
