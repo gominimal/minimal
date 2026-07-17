@@ -87,7 +87,7 @@ The subsystem stands on three legs:
    post-mortem always has something to read.
 4. Host and guest log records correlate: span-carried ids, one trace id per
    operation across the CLI→daemon boundary, OTEL-compatible field
-   conventions, no OTEL dependency.
+   conventions, no OTEL runtime dependency.
 5. The daemon contributes its own view (meta, logs, state listing, sessions,
    proc/net/disk) as a nested bundle over a single-shot streaming RPC; a
    daemon that refuses the subsystem fails fast with the reason relayed to
@@ -407,7 +407,7 @@ records carry correlation ids on spans.
 ### Unit 4: OTEL-compatible log format and trace propagation
 
 **Purpose:** Make correlation a grep and a future OTLP export a field-copy,
-without taking any OpenTelemetry dependency. File logs become JSON-lines with
+without taking any OTEL runtime dependency. File logs become JSON-lines with
 span context; operations mint W3C-shaped ids; the CLI hands its trace id to
 the daemon across the SSH boundary.
 
@@ -433,13 +433,23 @@ the daemon across the SSH boundary.
 **Functional Requirements:**
 
 - **R4.1**: Daemon *file* logs (both daemons) shall switch to JSON-lines via
-  `fmt::layer().json().with_current_span(true).with_span_list(true)` with UTC
-  RFC3339 timestamps; console/stdout layers stay human-format.
-- **R4.2**: Each process shall open a root span carrying resource identity:
-  `service.name` (`minimal-cli`/`minimald`/`minvmd`), `service.version`,
+  a `json-subscriber` layer — flat records, span fields flattened per
+  record, UTC RFC3339 timestamps — composed over the existing `MakeWriter`
+  plumbing, leaving the Unit 3 `non_blocking`/logroller/reload stack
+  untouched. Console/stdout layers stay human-format.
+  (`tracing-subscriber`'s built-in JSON formatter cannot emit static
+  top-level fields and nests span context in a buried list;
+  `json-subscriber`'s dependency closure is already in the workspace.)
+- **R4.2**: The file-log layer shall stamp resource identity as **static
+  top-level fields on every record**: `service.name`
+  (`minimal-cli`/`minimald`/`minvmd`), `service.version`,
   `service.instance.id` (provider/VM id where applicable), `host.name`,
-  `process.pid` — the OTLP resource-attribute names, so a bundle holding
-  files from three processes is self-describing.
+  `process.pid` — using the const names from
+  `opentelemetry-semantic-conventions` (consts-only, zero runtime
+  dependencies) so the names cannot drift from the conventions. A bundle
+  holding files from three processes is self-describing, and top-level
+  statics map onto the OTLP *Resource* exactly (span fields map onto
+  attributes).
 - **R4.3**: Top-level operations (CLI command dispatch, daemon RPC dispatch,
   session/binding lifecycles) shall mint ids in OTLP-required formats —
   `trace_id` 32 lowercase hex, `span_id` 16 lowercase hex — recorded as span
@@ -461,7 +471,8 @@ the daemon across the SSH boundary.
 **Proof Artifacts:**
 
 1. **Test:** a file-log line parses as JSON and carries level, target,
-   timestamp, span list, and resource fields — demonstrates R4.1, R4.2.
+   timestamp, flattened span fields, and top-level resource fields —
+   demonstrates R4.1, R4.2.
 2. **CLI (gate):** run one attach with `min`; a single `trace_id` greps
    across the host CLI log and the guest daemon's on-volume log —
    demonstrates R4.3, R4.4.
@@ -735,12 +746,16 @@ read both pre-convergence (`errors.json`) and post-convergence
 
 ## Non-Goals
 
-- **OpenTelemetry SDK adoption** — opentelemetry-rust is pre-1.0 (traces
-  Beta), the OTLP file-exporter spec is a placeholder with no durability
-  semantics, and the bundle path's correctness criterion is "works when
-  everything else is dead". Unit 4's conventions are the seam; an OTLP
-  exporter layer is additive later work (future spec; see Design
-  Considerations).
+- **OpenTelemetry runtime adoption (SDK, exporters, bridges)** —
+  opentelemetry-rust is pre-1.0 (traces Beta), the OTLP file-exporter spec
+  is a placeholder with no durability semantics, and the bundle path's
+  correctness criterion is "works when everything else is dead". Unit 4's
+  conventions are the seam; an OTLP exporter layer is additive later work
+  (future spec; see Design Considerations). Two OTEL-orbit crates carrying
+  no runtime machinery are deliberately in scope and are not exceptions to
+  this rejection: `opentelemetry-semantic-conventions` (consts only) and
+  `json-subscriber` (a tracing-ecosystem formatting layer whose dependency
+  closure is already in the workspace).
 - **Continuous/live debug streaming** — to be precise about terms: the bundle
   transport *is* a streaming RPC, in the single-shot sense — one request, one
   streamed archive, close (R6.1). What is out of scope is the long-lived
@@ -823,16 +838,32 @@ plain files). A resident collector in the initramfs (Go otelcol or Rust
 rotel) inverts the design: it adds a component that must be alive and healthy
 to the path that must work when nothing is.
 
-### OTEL-compatible conventions without the dependency
+### OTEL-compatible conventions without the runtime
 
 Unit 4 holds the format seam so a later OTLP move is mechanical:
 tracing levels map exactly onto OTLP SeverityText/SeverityNumber; `target` ≙
 InstrumentationScope; `fields.message` ≙ Body; resource attributes use the
-OTLP names (R4.2); trace/span ids use the OTLP-required hex formats (R4.3),
-minted by us because tracing's JSON formatter does not emit ids
+OTLP names as top-level statics (R4.2 — mapping onto the OTLP *Resource*
+directly); trace/span ids use the OTLP-required hex formats (R4.3), minted
+by us because tracing's JSON formatter does not emit ids
 (tokio-rs/tracing#1481). Conversion to OTLP-JSON, if ever wanted, is a
 transform on the *analysis* machine over files already in the bundle — the
-guest never takes the dependency.
+guest never takes the runtime.
+
+Two OTEL-orbit crates are adopted because they carry none of the rejected
+costs (no runtime, no binary weight, nothing that can misbehave in a wedged
+process): `opentelemetry-semantic-conventions` — consts only, zero runtime
+dependencies — pins the attribute names; `json-subscriber` provides the flat
+JSON layer with static top-level fields that `tracing-subscriber`'s built-in
+formatter cannot produce, with a dependency closure already entirely in the
+workspace. Reopen-triggers, mirroring the logroller treatment: abandonment,
+or `tracing-subscriber` gaining static top-level fields natively.
+Const-rename churn across semconv 0.x releases is contained to compile
+errors. One cost correction to the seam pricing: `prost` is already resident
+in this workspace for the RPC layer, so a future OTLP-JSON emitter via
+`opentelemetry-proto` (serde feature) is a smaller step than the general
+"pulls the tonic stack" estimate — the posture stays convert-on-analysis,
+but the seam is named and cheap.
 
 ### Guest bundle format convergence
 
@@ -945,7 +976,7 @@ Unit 8's dual-format rework, sequenced after Unit 6.
 | 3 | R3.4 | Test | release runs exactly once, before quiesce returns |
 | 3 | R3.6 | Test | size-threshold rotation + retention pruning |
 | 3 | R3.5 | CLI | grep one channel id across accept/attach/close records |
-| 4 | R4.1, R4.2 | Test | file-log line parses as JSON with span list + resource fields |
+| 4 | R4.1, R4.2 | Test | file-log line parses as JSON with flattened span fields + top-level resource fields (semconv names) |
 | 4 | R4.3, R4.4 | CLI (gate) | one `trace_id` greps across host CLI log and guest on-volume log for one attach |
 | 4 | R4.4 | Test | malformed `TRACEPARENT` value → fresh mint, no error; shared env-name constant both ends |
 | 5 | R5.1 | Test | MAC→OUI masking; interfaces/routes in bundle |

@@ -134,7 +134,7 @@ flowchart LR
         CONS["console fmt layer<br/>human format, always on"]
         RELOAD["reload slot<br/>None until volume mounts"]
     end
-    JSON["JSON-lines fmt layer<br/>with_current_span + span_list"]
+    JSON["json-subscriber layer<br/>flat records, top-level resource fields"]
     NB["non_blocking<br/>lossy(false) + WorkerGuard"]
     ROLL["logroller<br/>size rotation, max_keep_files"]
     VOL[("data volume<br/>logs/minimald.log*")]
@@ -360,10 +360,13 @@ W3C traceparent-format value (`00-{trace_id}-{span_id}-01`), before
 subsystem/exec invocation — out-of-band, no RPC envelope change,
 unknown-env-tolerant on old daemons. The daemon validates and adopts
 the trace id into its dispatch span; malformed/absent mints fresh. File logs
-switch to `fmt::layer().json().with_current_span(true).with_span_list(true)`;
-console layers stay human-format. Resource identity (`service.name`,
-`service.version`, `service.instance.id`, `host.name`, `process.pid`) lives
-on each process's root span using OTLP attribute names.
+switch to a `json-subscriber` layer (flat records, span fields flattened,
+static top-level fields; composes over the same `MakeWriter` stack as
+Unit 3); console layers stay human-format. Resource identity
+(`service.name`, `service.version`, `service.instance.id`, `host.name`,
+`process.pid`) is stamped as static top-level fields on every record, using
+`opentelemetry-semantic-conventions` const names (consts-only crate, zero
+runtime deps) — top-level statics map onto the OTLP Resource exactly.
 
 ## Alternatives considered
 
@@ -405,7 +408,14 @@ the tail on a hang. Rust collectors (rotel) are resident services solving
 telemetry forwarding, not post-mortem scraping — a component that must be
 alive on the path that must work when nothing is. Adopted instead: the
 conventions (Unit 4) that make later OTLP conversion a file transform on the
-analysis machine.
+analysis machine — plus the only two OTEL-orbit crates that carry none of
+the rejected costs: `opentelemetry-semantic-conventions` (consts only, zero
+runtime deps — pins the attribute names) and `json-subscriber` (formatting
+layer, dependency closure already in the workspace — static top-level
+resource fields the built-in JSON formatter cannot emit). `prost` being
+already resident for the RPC layer also makes a future `opentelemetry-proto`
+OTLP-JSON emitter cheaper than the general estimate; the seam stays
+convert-on-analysis.
 
 **Continuous/live debug streaming.** Rejected — with terms kept precise: the
 chosen transport is itself a streaming RPC in the single-shot sense (one
@@ -437,6 +447,7 @@ single out-of-tree consumer (Unit 8) rather than carry the split forever.
 | default-type-param | `BundleWriter<W = File>` keeps `&mut BundleWriter` call sites compiling unchanged | settled | Rust default type parameters; verified against ~15 collector signatures on ref | R1.2 |
 | logroller-fit | logroller composes under `tracing_appender::non_blocking` + reload as a plain `io::Write` | settled | logroller 0.1.12 API (io::Write); same shape as the appender it replaces | R3.6 |
 | russh-env-request | Client can send an SSH channel env request and minimald's russh handler can surface it before subsystem dispatch | needs-spike | russh supports `env` channel requests; minimald's handler surface not yet desk-verified for env interception | R4.4 |
+| json-subscriber-fit | `json-subscriber` composes over the Unit 3 `MakeWriter` stack (non_blocking/logroller) under the reload slot, and its static fields cover resource identity | settled | layer is `MakeWriter`-generic; dependency closure (serde, serde_json, tracing\*, uuid) already in workspace; active releases through 2026-07 | R4.1, R4.2 |
 | debugfs-live-read | `debugfs -c` reads an ext4 image safely while a VM writes it | settled | exercised live in the field against a running VM's `data-vol.raw`; harvest may be torn mid-write (acceptable) | R7.5 |
 | rootless-guest-bundle | Consumers (nested verification, diag-explore) assume guest bundle entries at archive top level | settled | ref `minimald/src/diag.rs` (no root dir); diag-explore exact-key lookups | R1.2, R6.2, R8.3 |
 | markers-basename | argv0-basename matching is sufficient to scope full-argv capture to the minimal process family | settled | ref `minimal/src/diag/procs.rs:14-32`, settled in design review | R5.2, R6.2 |
