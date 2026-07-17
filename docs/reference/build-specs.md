@@ -4,7 +4,7 @@ description: Build spec schema for defining Minimal packages in Nickel — build
 
 # Build specs
 
-Build specs declare everything about a [package](/concepts/packages), the fundamental unit of software
+Build specs declare everything about a [package](https://docs.minimal.dev/concepts/packages), the fundamental unit of software
 in Minimal.
 
 This declaration includes:
@@ -15,8 +15,8 @@ This declaration includes:
    directories used at runtime for state, and a number of other data points.
 
 Build specs are defined in a [Nickel](https://nickel-lang.org/) file located at `packages/<package name>/build.ncl`, either in your codebase
-or any layer in your [software supply chain](/concepts/software-supply-chain). The `packages/` directory in a layer is always adjacent to
-the [`minimal.toml`](/reference/minimal-dot-toml) file at its base. The directory can be omitted if the layer does not define any packages.
+or any layer in your [software supply chain](https://docs.minimal.dev/concepts/software-supply-chain). The `packages/` directory in a layer is always adjacent to
+the [`minimal.toml`](./minimal-dot-toml.md) file at its base. The directory can be omitted if the layer does not define any packages.
 
 ## Example
 

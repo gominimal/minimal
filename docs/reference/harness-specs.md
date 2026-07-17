@@ -7,8 +7,8 @@ description: Harness spec schema for defining build system harnesses in Nickel â
 Harnesses specify a set of tools and how to use them in a codebase. They encapsulate a common pattern for building software.
 
 Harnesses are defined in a [Nickel](https://nickel-lang.org/) file located at `harnesses/<harness name>/harness.ncl`, either in your codebase
-or any layer in your [software supply chain](/concepts/software-supply-chain). The `harnesses/` directory in a layer is always adjacent to
-the [`minimal.toml`](/reference/minimal-dot-toml) file at the base of the layer. The directory can be omitted if the layer does not define any harnesses.
+or any layer in your [software supply chain](https://docs.minimal.dev/concepts/software-supply-chain). The `harnesses/` directory in a layer is always adjacent to
+the [`minimal.toml`](./minimal-dot-toml.md) file at the base of the layer. The directory can be omitted if the layer does not define any harnesses.
 
 ## Examples
 

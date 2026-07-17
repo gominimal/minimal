@@ -4,7 +4,7 @@ description: Full task schema reference — packages, exec/bash commands, state_
 
 # Tasks
 
-Tasks are defined in a [`minimal.toml`](/reference/minimal-dot-toml) file, and describe
+Tasks are defined in a [`minimal.toml`](./minimal-dot-toml.md) file, and describe
 a runtime environment + command invocations to be executed using [`mip run <taskname>`](./cli-mip.md#run)
 
 ## Tasks schema
@@ -15,7 +15,7 @@ Tasks are defined in a `[tasks.<task-name>]` block in your minimal file.
 
 _Optional_
 
-`packages` lists additional [packages](/concepts/packages) which will be installed in the tasks'
+`packages` lists additional [packages](https://docs.minimal.dev/concepts/packages) which will be installed in the tasks'
 runtime environment. Packages listed here are in addition to any installed due to the profile or harness.
 
 ```toml

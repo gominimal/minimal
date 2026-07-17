@@ -49,7 +49,7 @@ exec = "bash -l"
 ### `[upstream]` - Where software comes from {#upstream}
 
 The `[upstream]` section defines the precise source of packages, harnesses, and profiles. This represents the
-preceding link in the [software supply chain](/concepts/software-supply-chain).
+preceding link in the [software supply chain](https://docs.minimal.dev/concepts/software-supply-chain).
 
 ```toml
 [upstream]
@@ -86,7 +86,7 @@ build_packages = ["<additional build package>"]     # optional
 runtime_packages = ["<additional runtime package>"] # optional
 ```
 
-The `[stack]` section configures the [harness](/concepts/harnesses) to use for building code, if any.
+The `[stack]` section configures the [harness](https://docs.minimal.dev/concepts/harnesses) to use for building code, if any.
 
 `[harness]` is accepted as a deprecated alias for `[stack]`, pending removal after
 July 2026; prefer `[stack]` in new configs.
@@ -106,7 +106,7 @@ profile = "<profile name>" # optional
 state_key = "<state key>"  # optional
 ```
 
-When set, `defaults.profile` will set a [profile](/concepts/profiles) on all tasks which do not set a profile.
+When set, `defaults.profile` will set a [profile](https://docs.minimal.dev/concepts/profiles) on all tasks which do not set a profile.
 
 When set, `defaults.state_key` will set a state key on all tasks which do not set `state_key`.
 
@@ -114,7 +114,7 @@ When set, `defaults.state_key` will set a state key on all tasks which do not se
 
 ### `[tasks.*]` - Run tasks, scripts, & dev tooling {#tasks}
 
-See: [tasks](/reference/tasks).
+See: [tasks](./tasks.md).
 
 
 

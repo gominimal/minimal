@@ -9,14 +9,14 @@
 
 ## Idiomaticity
 
-- Cheapest reference that works. &str over &String, &[T] over &Vec<T>, &Path over &PathBuf, impl AsRef<Path> at boundaries.
-- impl IntoIterator<Item = T> for consuming a sequence; impl Iterator<Item = T> for returning one (avoid allocating).
-- Make illegal states unrepresentable. Encode invariants in the type system: enums for mutually exclusive states (not bool flags + Options), non-empty collections via Vec1 or (T, Vec<T>), parsed types instead of
+- Cheapest reference that works. `&str` over `&String`, `&[T]` over `&Vec<T>`, `&Path` over `&PathBuf`, `impl AsRef<Path>` at boundaries.
+- `impl IntoIterator<Item = T>` for consuming a sequence; `impl Iterator<Item = T>` for returning one (avoid allocating).
+- Make illegal states unrepresentable. Encode invariants in the type system: enums for mutually exclusive states (not bool flags + Options), non-empty collections via Vec1 or `(T, Vec<T>)`, parsed types instead of
 validated-then-passed-as-string. If a function can't be called in some state, that state shouldn't typecheck.
 - Newtypes for domain values (struct UserId(u64)) over bare primitives. Use the https://crates.io/crates/nutype crate when the type needs trivial invariants enforced (non-empty, range bounds, regex, trimmed, etc.) — it generates the
 validating constructor and keeps the inner value unconstructable elsewhere.
 - Default only when the default is meaningful.
-- Cow<'_, str> for sometimes-owned, sometimes-borrowed values.
+- `Cow<'_, str>` for sometimes-owned, sometimes-borrowed values.
 - Builder pattern for types with more than a couple of fields or any optional config. Owned style: pub fn with_x(mut self, x: T) -> Self, never &mut self -> &mut Self.
 - Cloning discipline. .clone() is fine for Arc/Rc and small Copy-ish types; cloning a String/Vec/HashMap to dodge the borrow checker means restructure or borrow instead.
 - Captured-identifier formatting. format!("{path}") over format!("{}", path).
@@ -36,7 +36,7 @@ validating constructor and keeps the inner value unconstructable elsewhere.
 ## Async & Concurrency
 
 - No blocking in async context. No std::fs, std::thread::sleep, blocking network, or sync Mutex held across .await — use tokio::fs, tokio::time::sleep, tokio::sync::Mutex.
-- Don't reach for Arc<Mutex<T>> reflexively. Plain Arc<T> suffices if T is immutable after construction. Spawned tasks must satisfy Send + 'static — design data flow accordingly.
+- Don't reach for `Arc<Mutex<T>>` reflexively. Plain `Arc<T>` suffices if `T` is immutable after construction. Spawned tasks must satisfy `Send + 'static` — design data flow accordingly.
 
 ## Logging
 
