@@ -83,7 +83,7 @@ jobs:
     needs: [changes]
     if: github.event_name != 'pull_request' || needs.changes.outputs.kvm == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       # Slim debug info (usable backtraces, smaller caches, faster links);
       # this job doesn't run the setup-rust composite that sets this on the

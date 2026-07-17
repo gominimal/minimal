@@ -81,6 +81,11 @@ impl Client {
             })?
         };
 
+        // The client deliberately runs without keepalives: a laptop closed
+        // for an hour should reconnect transparently on wake rather than have
+        // the link torn down mid-sleep. The server's long-interval keepalive
+        // is the only liveness mechanism, and it no longer reaps
+        // idle-but-alive sessions.
         let config = Arc::new(russh::client::Config::default());
         let handshake = async {
             let mut handle = russh::client::connect_stream(config, stream, MinimalClientHandler)
