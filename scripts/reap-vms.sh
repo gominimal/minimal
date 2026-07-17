@@ -16,5 +16,9 @@
 # Usage: scripts/reap-vms.sh
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# User-owned leftovers first — this must not depend on sudo succeeding.
+pkill -f "$ROOT/.*minvmd" 2>/dev/null || true
+pkill -f "$ROOT/.*gvproxy" 2>/dev/null || true
+# Root-owned relay leftovers need sudo; -n fails fast without passwordless sudo.
 sudo -n pkill -f "$ROOT/.*minvmd" 2>/dev/null || true
 sudo -n pkill -f "$ROOT/.*gvproxy" 2>/dev/null || true
