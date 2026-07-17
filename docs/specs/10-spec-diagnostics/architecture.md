@@ -201,13 +201,17 @@ pub fn is_env_table_name(name: &str) -> bool;
 pub fn redaction_placeholder(original: &Value) -> Value;   // <redacted:len=N>
 pub fn redact_json(value: &mut Value);           // recursive, fail-closed
 
-// listing.rs
-pub fn listing_text(root: &Path, max_entries: usize) -> String;  // names/sizes/kinds only
+// listing.rs — structured so failure is distinguishable from emptiness
+pub fn listing(root: &Path, max_entries: usize) -> Result<Listing>;
+// names/sizes/kinds only; Err on unreadable root (caller records a manifest
+// error); per-entry failures recorded inline; cap hit appends an explicit
+// trailing truncation marker line.
 ```
 
 Crate root curates the surface (`pub use` of `BundleWriter`, `Redaction`,
-`LOG_TAIL_CAP`, manifest types); `Manifest`/`CollectedEntry`/`SkippedEntry`/
-`CollectorError`/`Redaction` are `#[non_exhaustive]`. Unit 5 adds
+`LOG_TAIL_CAP`, `capture::{command_capture, Capture}`, manifest types);
+`Manifest`/`CollectedEntry`/`SkippedEntry`/`CollectorError`/`Redaction` are
+`#[non_exhaustive]`. Unit 5 adds
 `net`/`procs`/`power`/`collect` modules whose signatures take caller data:
 
 ```rust
@@ -222,8 +226,9 @@ pub async fn hang_triage<W: ..>(w: &mut BundleWriter<W>, markers: &[&str]) -> Re
 
 ref: crate exists at `crates/diagnostics/src/{bundle,manifest,redact,listing}.rs`
 (file-only writer). ALREADY EXISTS: the manifest schema, redaction engine
-with compound-key regressions, symlink/lstat + `take(cap)` hardening —
-`bundle.rs:92-133`, `redact.rs:36-90`.
+with compound-key regressions, `take(cap)` read bounding and an
+lstat-then-open symlink guard — `bundle.rs:92-133`, `redact.rs:36-90`; Unit 1
+upgrades the guard to a no-follow open (R1.4, TOCTOU-safe).
 
 ### `crates/minimal` — `min bug` (`src/diag/`)
 
@@ -256,6 +261,9 @@ pub async fn download_diag_bundle(&mut self, req: &DiagBundleRequest, max_bytes:
 
 // guest.rs
 pub async fn collect(..) -> Result<()>;          // nest raw daemon-diag.tar.zst per provider
+// verification of the downloaded blob is a bounded STREAMING decode (R7.3):
+// decompressed ≤ 4× compressed, 1 GiB ceiling, ≤ 10k entries — never full
+// materialization of the decompressed stream.
 pub async fn volume_fallback(..) -> Result<()>;  // volume-meta.json + debugfs -c /logs harvest
 ```
 
@@ -269,10 +277,14 @@ ALREADY EXISTS: `Client::connect` / `oneshot_rpc::<GetVersion>` —
 pub const DIAG_BUNDLE_SUBSYSTEM: &str = "minimald-v1-DiagBundleTarZst"; // never renamed
 
 #[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiagBundleRequest {
+    #[serde(default)]
     pub log_tail_bytes: u64,          // 0 = daemon default; clamped server-side
+    #[serde(default = "default_true")]
     pub include_state_listing: bool,  // default true
 }
+// A bare `{}` decodes to the documented defaults (R6.1 empty-request test).
 // Client writes one JSON request + half-close; daemon streams tar.zst and closes.
 // Pre-stream errors relay on extended-data stream 1 (zero payload bytes ⇒ read it).
 ```
@@ -331,9 +343,11 @@ no code import in either direction.
 ### Trace propagation (Unit 4)
 
 The CLI mints `trace_id` (32 hex) / `span_id` (16 hex) at command dispatch
-and sends `traceparent` (`00-{trace_id}-{span_id}-01`) as an **SSH channel
-env request** before subsystem/exec invocation — out-of-band, no RPC envelope
-change, unknown-env-tolerant on old daemons. The daemon validates and adopts
+and sends an **SSH channel env request** named exactly `TRACEPARENT` — one
+shared constant on both ends; SSH env names are byte-exact — carrying the
+W3C traceparent-format value (`00-{trace_id}-{span_id}-01`), before
+subsystem/exec invocation — out-of-band, no RPC envelope change,
+unknown-env-tolerant on old daemons. The daemon validates and adopts
 the trace id into its dispatch span; malformed/absent mints fresh. File logs
 switch to `fmt::layer().json().with_current_span(true).with_span_list(true)`;
 console layers stay human-format. Resource identity (`service.name`,
@@ -412,11 +426,13 @@ single out-of-tree consumer (Unit 8) rather than carry the split forever.
 | markers-basename | argv0-basename matching is sufficient to scope full-argv capture to the minimal process family | settled | ref `minimal/src/diag/procs.rs:14-32`, reviewed in #784 | R5.2, R6.2 |
 
 The `russh-env-request` row blocks planning of R4.4 only: desk-verify during
-Unit 4 design (read russh `ChannelMsg::Env`/handler plumbing both ends); if
-interception is not possible without patching russh, fall back to carrying
-`traceparent` as an optional field on each subsystem's *request body* (a
-compatible, additive change — `DiagBundleRequest` is `#[non_exhaustive]`)
-and record the deviation here.
+Unit 4 design (read russh `ChannelMsg::Env`/handler plumbing both ends). If
+interception is not possible without patching russh, the fallback is carrying
+`traceparent` as an optional field on each subsystem's *request body* — an
+**intentional additive wire-contract change** (compatible because request
+bodies are `#[non_exhaustive]` with serde defaults), which amends R4.4's
+no-wire-change clause and its acceptance criteria; record the deviation here
+if taken.
 
 ## Knowledge gaps
 

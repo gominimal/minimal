@@ -172,15 +172,21 @@ unified subprocess capture helper.
   keeps `&mut BundleWriter` compiling unchanged at every CLI collector call
   site. The `Sync` bound is load-bearing: `async_tar::Builder` requires it
   (see Technical Considerations).
-- **R1.3**: `finish(...)` shall write `manifest.json` as the final entry, then
-  finalize the underlying writer via a sealed strategy: file-backed flushes
-  and `sync_all`s; stream mode flushes and shuts down the writer. Both paths
-  produce a manifest with `schema_version: 1`, `created_at`, `version`,
-  `duration_ms`, `collected[] {path, redaction, bytes}`, `skipped[] {what,
-  reason}`, `errors[] {collector, error, duration_ms}`.
-- **R1.4**: `add_file_tail` shall reject symlinks by `symlink_metadata`
-  *before* opening, and bound the read with `Read::take(cap)` so a file
-  growing mid-read cannot exceed the recorded cap (ref: `bundle.rs:92-133`).
+- **R1.3**: `finish(...)` shall write the manifest as the final archive entry
+  — at `{root}/manifest.json` in file-backed mode, at top-level
+  `manifest.json` in stream mode — then finalize the underlying writer via a
+  sealed strategy: file-backed flushes and `sync_all`s; stream mode flushes
+  and shuts down the writer. Both paths produce a manifest with
+  `schema_version: 1`, `created_at`, `version`, `duration_ms`,
+  `collected[] {path, redaction, bytes}`, `skipped[] {what, reason}`,
+  `errors[] {collector, error, duration_ms}`.
+- **R1.4**: `add_file_tail` shall open collected files **without following
+  symlinks** — `O_NOFOLLOW` via `OpenOptions::custom_flags`, with an
+  open-then-`fstat` regular-file verification on the descriptor as the
+  fallback — never a check-then-open sequence, which is TOCTOU-racy (ref:
+  `bundle.rs:92-133` uses `symlink_metadata` before open; this unit upgrades
+  it). The read is bounded with `Read::take(cap)` so a file growing mid-read
+  cannot exceed the recorded cap.
 - **R1.5**: `redact.rs` shall provide the key-based policy engine:
   `is_sensitive_key` (substring parts list, with compound-key handling such
   that `public_key` only exempts when no sensitive part remains after
@@ -191,7 +197,11 @@ unified subprocess capture helper.
   withheld or masked wholesale, never passed through.
 - **R1.6**: `listing.rs` shall produce metadata-only recursive listings
   (name, size, kind — with symlinks reported as symlinks, not their targets)
-  bounded by an entry cap.
+  bounded by an entry cap, returning a structured result that distinguishes
+  failure from emptiness: an unreadable root is `Err` (the caller records a
+  manifest error), per-entry read failures are recorded inline, and hitting
+  the cap appends an explicit trailing truncation marker
+  (`… truncated at N entries`).
 - **R1.7**: `capture.rs` (new) shall provide the single subprocess helper
   ```rust
   pub async fn command_capture(cmd: &str, args: &[&str], timeout: Duration) -> Result<Capture>
@@ -199,19 +209,26 @@ unified subprocess capture helper.
   with `kill_on_drop(true)`, capturing stdout+stderr+status, replacing the
   three private near-duplicates in the reference tree.
 - **R1.8**: The public API shall be curated per repository standards: crate
-  root `pub use` of `BundleWriter`, `Redaction`, `LOG_TAIL_CAP`, and the
-  manifest types; `#[non_exhaustive]` on `Manifest`, `CollectedEntry`,
-  `SkippedEntry`, `CollectorError`, and `Redaction`.
+  root `pub use` of `BundleWriter`, `Redaction`, `LOG_TAIL_CAP`,
+  `capture::{command_capture, Capture}`, and the manifest types;
+  `#[non_exhaustive]` on `Manifest`, `CollectedEntry`, `SkippedEntry`,
+  `CollectorError`, and `Redaction`.
 
 **Proof Artifacts:**
 
 1. **Test:** unit tests for redaction (compound public-key regressions:
    `public_key_token`, `public_key_password`, `private_public_key`), tail-cap
-   bounding, symlink rejection, listing caps — demonstrates R1.4–R1.6.
+   bounding, symlink rejection, listing caps and truncation marker —
+   demonstrates R1.4–R1.6.
 2. **Test:** the same entry set written through `create` and through `stream`
-   round-trips to identical archives modulo the root prefix, both carrying a
-   `manifest.json` final entry — demonstrates R1.2, R1.3.
+   round-trips to identical archives modulo the root prefix, each carrying
+   the manifest as its final entry at the exact mode-specific path
+   (`{root}/manifest.json` file-backed; top-level `manifest.json` streamed)
+   — demonstrates R1.2, R1.3.
 3. **Test:** archive created with mode `0600` — demonstrates R1.2.
+4. **Test:** a subprocess exceeding its timeout is terminated
+   (`kill_on_drop`), with captured stdout/stderr/status retained alongside a
+   typed timeout error — demonstrates R1.7.
 
 ---
 
@@ -264,6 +281,12 @@ the run never aborts.
   `vars` — panics on non-UTF-8), record allowlisted values verbatim
   (`RUST_LOG`, `HOME`, `SHELL`, `TERM`, `PATH`; prefixes `XDG_`, `MINIMAL_`,
   `MINVMD_`, `MINIMALD_`), and mask everything else to `<redacted:len=N>`.
+  The allowlist grants candidacy, not exemption: an allowlisted name that
+  trips the R1.5 sensitive-key policy (e.g. `MINIMAL_TOKEN`,
+  `MINIMALD_SECRET`) is masked regardless. `HOME` and `PATH` are recorded
+  deliberately — install-layout questions dominate field triage — and their
+  user-identifying paths are covered by the review-before-sharing notice
+  (R2.9).
 - **R2.5**: Config files (`config.toml`, `user_policy.toml`, loadouts) shall
   be bundled through the TOML redaction adapter over the Unit 1 engine;
   unparseable TOML is withheld with a manifest error, never shipped raw.
@@ -271,9 +294,10 @@ the run never aborts.
   the state dir (names/sizes/kinds, entry-capped) — no file contents.
 - **R2.7**: Log collection shall gather, per known prefix
   (`minimald.log*`, `minvmd.log*`) and per known name (`run.log`,
-  `boot.log`), the newest N files by rotation order, tail-capped, rejecting
-  non-regular files. Absent files are manifest skips, not errors (the files
-  only begin to exist after Unit 3 — best-effort by design).
+  `boot.log`), the newest **5** files per prefix by rotation order,
+  tail-capped, rejecting non-regular files (no-follow discipline per R1.4).
+  Absent files are manifest skips, not errors (the files only begin to exist
+  after Unit 3 — best-effort by design).
 - **R2.8**: `host/dirs.txt` shall capture the `min dirs` report; `dirs.rs`
   refactors to return `String` with `cmd_dirs` printing it (behavior of
   `min dirs` unchanged).
@@ -368,9 +392,10 @@ records carry correlation ids on spans.
 **Proof Artifacts:**
 
 1. **CLI (gate):** boot a VM, hold an idle attach, `minvmd stop`; the volume
-   unmounts cleanly (no journal replay on next mount) and the next boot shows
-   both `boot.log` and rotated `minimald.log*` on the volume — demonstrates
-   R3.2–R3.4. This is the #784 field-validation item and gates the unit.
+   unmounts cleanly (no journal replay on next mount), `boot.log` is present
+   in the host-side provider directory, and rotated `minimald.log*` appear on
+   the data volume at next boot — demonstrates R3.2–R3.4. This is the #784
+   field-validation item and gates the unit.
 2. **Test:** log-release runs exactly once and before quiesce returns;
    harness passes `None` release unaffected — demonstrates R3.4.
 3. **Test:** writing past the size threshold rotates and prunes to
@@ -421,11 +446,15 @@ the daemon across the SSH boundary.
   `trace_id` 32 lowercase hex, `span_id` 16 lowercase hex — recorded as span
   fields. Correlation values (`channel_id`, `session_id`, …) are span fields
   with stable snake_case keys, never interpolated into messages.
-- **R4.4**: The CLI shall send `traceparent` (`00-{trace_id}-{span_id}-01`)
-  as an SSH channel env request before subsystem/exec invocation; the daemon
+- **R4.4**: The CLI shall send an SSH channel env request named exactly
+  **`TRACEPARENT`** (uppercase — SSH env names are byte-exact; both ends use
+  one shared constant) whose value is the W3C traceparent format
+  `00-{trace_id}-{span_id}-01`, before subsystem/exec invocation; the daemon
   shall adopt a valid received value as the `trace_id` of its dispatch span
-  (malformed or absent → mint fresh). No RPC envelope or wire-contract
-  change.
+  (malformed or absent → mint fresh). No RPC envelope or wire-contract change
+  **on this primary path**; the assumption-ledger fallback (an optional
+  `traceparent` field on `#[non_exhaustive]` request bodies) is an
+  intentional additive contract change that amends this clause if taken.
 - **R4.5**: The conventions above are the acceptance contract for all future
   daemon/CLI logging (recorded in this spec; see Design Considerations for
   the OTLP mapping rationale).
@@ -437,8 +466,9 @@ the daemon across the SSH boundary.
 2. **CLI (gate):** run one attach with `min`; a single `trace_id` greps
    across the host CLI log and the guest daemon's on-volume log —
    demonstrates R4.3, R4.4.
-3. **Test:** malformed `traceparent` env values are ignored (fresh mint, no
-   error) — demonstrates R4.4.
+3. **Test:** malformed `TRACEPARENT` values are ignored (fresh mint, no
+   error), and client and daemon reference the same env-name constant —
+   demonstrates R4.4.
 
 ---
 
@@ -475,7 +505,10 @@ migrate out of `crates/minimal`.
   triage (macOS: 1 s `sample` per pid; Linux: wchan/syscall/kernel-stack/fd
   readlinks; one `lsof -nP` over the set, accepting lsof's
   exit-1-with-output convention) for up to 8 pids matched by **argv0
-  basename** against a caller-supplied `markers: &[&str]`.
+  basename** against a caller-supplied `markers: &[&str]`. Recorded argv
+  strings shall be scrubbed token-wise: any `key=value` token whose key trips
+  the R1.5 sensitive-key policy has its value replaced by the redaction
+  placeholder.
 - **R5.3**: `diagnostics::power` shall capture sleep/wake history
   (macOS `pmset`; Linux `journalctl`), event-capped.
 - **R5.4**: The minimal marker list and the six `collect_step!` wiring lines
@@ -540,8 +573,9 @@ same `manifest.json` schema as the host bundle.
   flag), tail-capped `logs/`, metadata-only `state-listing.txt` (on
   `spawn_blocking`; caps honored), `sessions/` records with `redact_json`
   applied and read/parse failures recorded per-record, `proc.txt` (full argv
-  only for marker-matched processes, `comm` otherwise), raw `/proc/net`
-  tables, and `disk.json` — finishing with `manifest.json`.
+  — scrubbed per the R5.2 argv rule — only for marker-matched processes,
+  `comm` otherwise), raw `/proc/net` tables, and `disk.json` — finishing
+  with `manifest.json`.
 - **R6.3**: Request reads shall be length-bounded; caller-controlled
   `log_tail_bytes` is clamped to a server cap; log collection rejects
   non-regular files and symlinks.
@@ -601,9 +635,12 @@ and logs harvested read-only from the volume image.
   64 KiB), fail fast when the daemon refuses the subsystem, and honor
   `--guest-timeout-secs` (default 60) as the per-provider deadline.
 - **R7.3**: The daemon bundle shall be nested **raw** (undecompressed) at
-  `providers/<name>/guest/daemon-diag.tar.zst` after verifying it
-  decompresses and contains `manifest.json`; verification failure records the
-  bytes anyway with a manifest error.
+  `providers/<name>/guest/daemon-diag.tar.zst` after verification by
+  **bounded streaming decode** — never full materialization of the
+  decompressed stream: decompressed size capped at 4× the compressed size
+  with a 1 GiB hard ceiling, entry count capped at 10,000, and the check
+  requires `manifest.json` present. Cap breach or decode failure records the
+  raw bytes anyway with a manifest error naming the failed check.
 - **R7.4**: `--no-guest` shall skip *all* daemon contact including the probe
   (the probe handshakes), recording the skip per provider.
 - **R7.5**: On probe failure, download failure, or timeout, the bundle shall
@@ -820,26 +857,37 @@ Unit 8's dual-format rework, sequenced after Unit 6.
 - Rotation/pruning in file appenders happens on the write path — an idle
   daemon does not rotate; "daily" files can span days. Size-based rotation
   (R3.6) makes the cap independent of wall clock.
-- Caps (reference values): collector timeout 30 s, log tail 5 MiB, listing
-  100k entries, guest bundle 256 MiB, daemon-error 64 KiB, hang-triage 8
-  pids, power events 100.
+- Caps (reference values): collector timeout 30 s, log tail 5 MiB, log files
+  5 per prefix, listing 100k entries, guest bundle 256 MiB compressed
+  (verification: ≤4× decompressed with 1 GiB ceiling, ≤10k entries),
+  daemon-error 64 KiB, hang-triage 8 pids, power events 100.
 
 ## Security Considerations
 
-- **Trust boundary: the bundle leaves the machine.** Everything collected
-  must survive being pasted into a public issue: fail-closed redaction on
-  config/env/session records (R1.5, R2.4, R2.5, R6.2), full argv recorded
-  only for marker-matched processes — a concurrent unrelated process's
-  command line (tokens, URLs) is never captured (`comm` only) (R6.2),
-  MACs masked to vendor OUI (R5.1).
-- **The collector must not be a read gadget.** Symlinks are rejected by
-  lstat before open on both layers (R1.4, R6.3), so a crafted
-  `minimald.log.evil` symlink cannot exfiltrate `/etc/shadow` into a bundle.
+- **Trust boundary: the bundle leaves the machine.** Structured data is
+  redacted fail-closed: config/env/session records (R1.5, R2.4, R2.5, R6.2),
+  MACs masked to vendor OUI (R5.1). Free-text artifacts are bounded
+  differently and honestly: collected logs are our own daemons' output,
+  governed by the no-interpolated-values tracing standard; full argv is
+  recorded only for marker-matched minimal-family processes — a concurrent
+  unrelated process's command line is never captured (`comm` only) — and is
+  scrubbed of sensitive `key=value` tokens (R5.2, R6.2). Residual risk is
+  handled by two nets: the CLI's explicit review-before-sharing notice
+  (R2.9) and the team-side explorer's `audit` secret-pattern scan (Unit 8
+  prior art).
+- **The collector must not be a read gadget.** Files are opened no-follow
+  with descriptor-based verification on both layers (R1.4, R6.3) — not a
+  racy check-then-open — so a crafted `minimald.log.evil` symlink cannot
+  exfiltrate `/etc/shadow` into a bundle.
 - **The archive is private by default**: created `0600` before content is
   written (R1.2).
 - **The daemon endpoint is DoS-bounded**: request reads length-capped,
   caller-supplied tail sizes clamped server-side, listing entry caps,
   streaming size caps client-side (R6.3, R7.2).
+- **The client is bomb-bounded**: nested-bundle verification is a streaming
+  decode under decompressed-size and entry-count caps, never full
+  materialization (R7.3) — a malicious or corrupt guest bundle cannot
+  exhaust host memory.
 - **Diagnosis must not mutate**: no state writes, no daemon autospawn, no
   volume writes (`debugfs -c` is read-only) — a bundle taken during an
   incident cannot contaminate the incident.
@@ -848,24 +896,27 @@ Unit 8's dual-format rework, sequenced after Unit 6.
 
 | Unit | Req | Proof type | Command / observable |
 |------|-----|-----------|----------------------|
-| 1 | R1.4–R1.6 | Test | `cargo test -p diagnostics` — redaction compound keys, tail cap, symlink reject, listing cap |
-| 1 | R1.2, R1.3 | Test | file-vs-stream round-trip identical modulo root; `manifest.json` last entry both modes |
+| 1 | R1.4–R1.6 | Test | `cargo test -p diagnostics` — redaction compound keys, tail cap, no-follow open, listing cap + truncation marker |
+| 1 | R1.2, R1.3 | Test | file-vs-stream round-trip identical modulo root; manifest last at `{root}/manifest.json` / top-level `manifest.json` |
+| 1 | R1.7 | Test | capture timeout kills the child, retains stdout/stderr/status + typed error |
 | 2 | R2.1, R2.2, R2.6 | Test | `bug_without_daemon_still_produces_a_bundle` (Linux lane) |
 | 2 | R2.4, R2.5 | Test | planted secret → `<redacted:len=N>`, never verbatim |
 | 2 | R2.3, R2.7–R2.9 | CLI | `min bug` on dev box; manifest counts, `host/` entries |
-| 3 | R3.2–R3.4 | CLI (gate) | idle attach + `minvmd stop` → clean ext4 journal; `boot.log` + `minimald.log*` on volume next boot |
+| 3 | R3.2–R3.4 | CLI (gate) | idle attach + `minvmd stop` → clean ext4 journal; `boot.log` in provider dir, `minimald.log*` on volume next boot |
 | 3 | R3.4 | Test | release runs exactly once, before quiesce returns |
 | 3 | R3.6 | Test | size-threshold rotation + retention pruning |
 | 3 | R3.5 | CLI | grep one channel id across accept/attach/close records |
 | 4 | R4.1, R4.2 | Test | file-log line parses as JSON with span list + resource fields |
 | 4 | R4.3, R4.4 | CLI (gate) | one `trace_id` greps across host CLI log and guest on-volume log for one attach |
-| 4 | R4.4 | Test | malformed `traceparent` → fresh mint, no error |
+| 4 | R4.4 | Test | malformed `TRACEPARENT` value → fresh mint, no error; shared env-name constant both ends |
 | 5 | R5.1 | Test | MAC→OUI masking; interfaces/routes in bundle |
+| 5 | R5.2 | Test | argv0-basename matching; sensitive `key=value` argv tokens masked |
 | 5 | R5.2, R5.4 | CLI | `min bug` during `min attach` → per-pid sample/stack + lsof for family |
 | 6 | R6.1, R6.2, R6.4 | Test | harness fetch: `meta.json` + `manifest.json`; pre-stream error via extended data |
 | 6 | R6.2 | CLI | raw `ssh -s` subsystem fetch decompresses, rootless |
 | 6 | R6.3 | Test | oversized request/tail clamped |
 | 7 | R7.1–R7.3 | Test | full-stack nested-bundle test with redaction across layers |
+| 7 | R7.3 | Test | oversize/entry-bomb nested bundle → verification fails within caps, raw bytes + manifest error recorded |
 | 7 | R7.1, R7.5 | Test | stale socket → connect-stage failure + fallback artifacts |
 | 7 | R7.4 | Test | `--no-guest` → zero daemon contact against live harness |
 | 7 | R7.5 | CLI (gate) | kill VM daemon mid-session; `min bug` → probe stages + volume-meta + harvested logs |
