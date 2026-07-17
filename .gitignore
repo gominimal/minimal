@@ -6,3 +6,8 @@ target/
 # Claude Code / git worktree scratch dirs (agent worktrees, embedded repos)
 .claude/
 .worktrees/
+
+# docs site (VitePress) toolchain and build outputs
+node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/

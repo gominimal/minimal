@@ -1,0 +1,501 @@
+/*
+ * Minimal brand theme for VitePress (ported from the historical
+ * gominimal/docs custom.css, adapted for VitePress 1.6).
+ *
+ * Design rules: monochrome palette (#141414 / #f5f5f5), accent equals
+ * foreground, zero border-radius, 1px borders, uppercase headings.
+ * The docs-site green (#3d8f58 / #7ec897) is reserved for tip/success
+ * admonitions only.
+ */
+
+/* ── Brand heading/mono font ──
+ * AstroMono is the brand font for headings/buttons/labels, but its
+ * license has not been verified for redistribution yet. Until then the
+ * heading/mono stack falls back to system monospace fonts.
+ */
+/* TODO(launch): enable pending font license verification
+@font-face {
+  font-family: AstroMono;
+  src: url("/fonts/ASTROMONO-REGULAR.TTF") format("truetype");
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap;
+  ascent-override: 80%;
+  descent-override: 20%;
+  line-gap-override: 0%;
+}
+
+@font-face {
+  font-family: AstroMono;
+  src: url("/fonts/ASTROMONO-BOLD.TTF") format("truetype");
+  font-weight: bold;
+  font-style: normal;
+  font-display: swap;
+  ascent-override: 80%;
+  descent-override: 20%;
+  line-gap-override: 0%;
+}
+*/
+
+:root {
+  /* Heading + mono stack. TODO(launch): prepend AstroMono once the font
+   * license is verified and the @font-face block above is enabled. */
+  --mnml-font-heading: ui-monospace, "SFMono-Regular", "Menlo", "Consolas",
+    "Liberation Mono", monospace;
+}
+
+/* ── Light mode ── */
+:root {
+  /* Brand palette — monochrome; accent is the foreground color */
+  --vp-c-brand-1: #141414;
+  --vp-c-brand-2: #292929;
+  --vp-c-brand-3: #141414;
+  --vp-c-brand-soft: rgba(20, 20, 20, 0.08);
+
+  /* Text — gray-8 body, gray-32 secondary, gray-56 tertiary */
+  --vp-c-text-1: #141414;
+  --vp-c-text-2: #525252;
+  --vp-c-text-3: #8f8f8f;
+
+  /* Backgrounds — gray-96 light, card white */
+  --vp-c-bg: #f5f5f5;
+  --vp-c-bg-alt: #e0e0e0;
+  --vp-c-bg-elv: #ffffff;
+  --vp-c-bg-soft: #e0e0e0;
+
+  /* Borders — gray-88, always 1px */
+  --vp-c-divider: #e0e0e0;
+  --vp-c-border: #e0e0e0;
+  --vp-c-gutter: #e0e0e0;
+
+  /* Typography */
+  --vp-font-family-base: "Space Grotesk", sans-serif;
+  --vp-font-family-mono: var(--mnml-font-heading);
+
+  /* Code blocks */
+  --vp-code-bg: #ebebeb;
+  --vp-code-block-bg: #ebebeb;
+  --vp-code-color: #141414;
+
+  /* Home hero — accent equals foreground, no gradient */
+  --vp-home-hero-name-color: var(--vp-c-text-1);
+
+  /* Buttons — monochrome */
+  --vp-button-brand-bg: #141414;
+  --vp-button-brand-text: #f5f5f5;
+  --vp-button-brand-border: #141414;
+  --vp-button-brand-hover-bg: #292929;
+  --vp-button-brand-hover-text: #f5f5f5;
+  --vp-button-brand-hover-border: #292929;
+  --vp-button-alt-bg: transparent;
+  --vp-button-alt-text: #141414;
+  --vp-button-alt-border: #141414;
+  --vp-button-alt-hover-bg: rgba(20, 20, 20, 0.08);
+  --vp-button-alt-hover-text: #141414;
+  --vp-button-alt-hover-border: #141414;
+
+  /* Tip/success admonitions may use the docs-site green; all other
+   * admonitions stay monochrome. */
+  --vp-custom-block-tip-border: #3d8f58;
+  --vp-custom-block-tip-text: #141414;
+  --vp-custom-block-tip-bg: rgba(61, 143, 88, 0.08);
+  --vp-custom-block-tip-code-bg: rgba(61, 143, 88, 0.12);
+
+  /* Copy icon — pixelarticons copy */
+  --vp-icon-copy: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath fill='%23666666' d='M6 6h16v2H6zM2 2h16v2H2zm4 6h2v12H6zM2 4h2v12H2zm4 16h16v2H6zM20 8h2v12h-2zm-4-4h2v2h-2zM2 16h4v2H2z'/%3E%3C/svg%3E");
+  --vp-icon-copied: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath fill='%23141414' d='M3 12h2v2H3zm2 2h2v2H5zm2 2h2v2H7zm2 0h2v2H9zm2-2h2v2h-2zm2-2h2v2h-2zm2-2h2v2h-2zm2-2h2v2h-2zm2-2h2v2h-2z'/%3E%3C/svg%3E");
+
+  /* Sidebar active indicator */
+  --vp-c-brand-lighter: #141414;
+
+  /* Navbar & sidebar */
+  --vp-nav-bg-color: #f5f5f5;
+  --vp-local-nav-bg-color: #f5f5f5;
+  --vp-sidebar-bg-color: #f5f5f5;
+}
+
+/* ── Dark mode ── */
+.dark {
+  /* Brand — gray-88 */
+  --vp-c-brand-1: #e0e0e0;
+  --vp-c-brand-2: #a3a3a3;
+  --vp-c-brand-3: #e0e0e0;
+  --vp-c-brand-soft: rgba(224, 224, 224, 0.08);
+
+  /* Text — between gray-88 and gray-64 */
+  --vp-c-text-1: #cccccc;
+  --vp-c-text-2: #a3a3a3;
+  --vp-c-text-3: #666666;
+
+  /* Backgrounds — gray-8 (page), gray-16 (card/muted) */
+  --vp-c-bg: #141414;
+  --vp-c-bg-alt: #292929;
+  --vp-c-bg-elv: #292929;
+  --vp-c-bg-soft: #292929;
+
+  /* Borders — gray-24 */
+  --vp-c-divider: #3d3d3d;
+  --vp-c-border: #3d3d3d;
+  --vp-c-gutter: #3d3d3d;
+
+  /* Code blocks — gray-16 */
+  --vp-code-bg: #292929;
+  --vp-code-block-bg: #292929;
+  --vp-code-color: #e0e0e0;
+
+  /* Buttons — inverted monochrome */
+  --vp-button-brand-bg: #e0e0e0;
+  --vp-button-brand-text: #141414;
+  --vp-button-brand-border: #e0e0e0;
+  --vp-button-brand-hover-bg: #cccccc;
+  --vp-button-brand-hover-text: #141414;
+  --vp-button-brand-hover-border: #cccccc;
+  --vp-button-alt-bg: transparent;
+  --vp-button-alt-text: #e0e0e0;
+  --vp-button-alt-border: #3d3d3d;
+  --vp-button-alt-hover-bg: rgba(224, 224, 224, 0.08);
+  --vp-button-alt-hover-text: #e0e0e0;
+  --vp-button-alt-hover-border: #e0e0e0;
+
+  /* Tip/success green, dark variant */
+  --vp-custom-block-tip-border: #7ec897;
+  --vp-custom-block-tip-text: #cccccc;
+  --vp-custom-block-tip-bg: rgba(126, 200, 151, 0.08);
+  --vp-custom-block-tip-code-bg: rgba(126, 200, 151, 0.12);
+
+  /* Copy icon */
+  --vp-icon-copy: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath fill='%23a3a3a3' d='M6 6h16v2H6zM2 2h16v2H2zm4 6h2v12H6zM2 4h2v12H2zm4 16h16v2H6zM20 8h2v12h-2zm-4-4h2v2h-2zM2 16h4v2H2z'/%3E%3C/svg%3E");
+  --vp-icon-copied: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath fill='%23e0e0e0' d='M3 12h2v2H3zm2 2h2v2H5zm2 2h2v2H7zm2 0h2v2H9zm2-2h2v2h-2zm2-2h2v2h-2zm2-2h2v2h-2zm2-2h2v2h-2zm2-2h2v2h-2z'/%3E%3C/svg%3E");
+
+  /* Navbar & sidebar */
+  --vp-nav-bg-color: #141414;
+  --vp-local-nav-bg-color: #141414;
+  --vp-sidebar-bg-color: #141414;
+}
+
+/* ── Logo sizing ── */
+.VPImage.logo {
+  height: 24px;
+  width: auto;
+}
+
+/* ── Headings: bold, uppercased, foreground ── */
+.vp-doc h1,
+.vp-doc h2,
+.vp-doc h3,
+.VPNavBarTitle .title,
+.VPSidebar .title {
+  font-family: var(--mnml-font-heading);
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  color: #141414;
+}
+
+.dark .vp-doc h1,
+.dark .vp-doc h2,
+.dark .vp-doc h3,
+.dark .VPNavBarTitle .title,
+.dark .VPSidebar .title {
+  color: #e0e0e0;
+}
+
+/* ── Home hero: match the uppercase heading treatment ── */
+.VPHero .name,
+.VPHero .text {
+  font-family: var(--mnml-font-heading);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+/* ── Strong text ── */
+.vp-doc strong {
+  color: #525252;
+}
+
+.dark .vp-doc strong {
+  color: #e0e0e0;
+}
+
+/* ── Body text sizing ── */
+.vp-doc {
+  font-size: 1em;
+  line-height: 1.5;
+}
+
+/* ── Links: underline with offset, double underline on hover ── */
+.vp-doc a {
+  text-underline-offset: 3px;
+  transition: text-decoration-style 0.15s;
+}
+
+.vp-doc a:hover {
+  text-decoration-style: double;
+}
+
+/* ── Search backdrop fade-in ── */
+@keyframes backdrop-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.VPLocalSearchBox .backdrop {
+  animation: backdrop-fade-in 0.2s ease-out;
+}
+
+/* ── Search: brand mono treatment ── */
+.VPNavBarSearchButton,
+.VPLocalSearchBox .search-input {
+  font-family: var(--mnml-font-heading);
+}
+
+.VPNavBarSearchButton {
+  text-transform: lowercase;
+}
+
+.VPNavBarSearchButton .text {
+  position: relative;
+  top: -1px;
+}
+
+.VPNavBarSearchButton kbd {
+  text-transform: uppercase;
+  font-size: 14px;
+}
+
+.VPNavBarSearchButton .keys {
+  border: none !important;
+  border-radius: 0 !important;
+}
+
+.VPNavBarSearchButton {
+  background-color: transparent !important;
+  border: 1px solid var(--vp-c-border);
+}
+
+.dark .VPNavBarSearchButton {
+  background-color: #292929 !important;
+}
+
+/* ── Zero border-radius everywhere it matters ── */
+.VPNavBarSearchButton,
+.VPLocalSearchBox .search-bar,
+.VPLocalSearchBox .shell,
+.VPLocalSearchBox button,
+.VPLocalSearchBox .result,
+.VPButton,
+.vp-doc input,
+.vp-doc div[class*="language-"] {
+  border-radius: 0 !important;
+}
+
+.VPButton {
+  border-width: 1px !important;
+}
+
+.vp-doc div[class*="language-"] {
+  border: 1px solid var(--vp-c-divider);
+}
+
+.vp-doc [class*="language-"] pre {
+  padding: 12px 0;
+}
+
+.vp-doc [class*="language-"] code {
+  padding: 0 16px;
+}
+
+.vp-doc div[class*="language-"] button {
+  border-radius: 0 !important;
+}
+
+.vp-doc [class*="language-"] > button.copy {
+  top: 4px;
+  right: 4px;
+  width: 40px;
+  height: 40px;
+  background-size: 22px;
+}
+
+.dark .vp-doc div[class*="language-"] {
+  border-color: #292929;
+}
+
+.VPLocalSearchBox button,
+.VPLocalSearchBox .result {
+  font-family: var(--mnml-font-heading);
+  color: var(--vp-c-text-1);
+  background-color: var(--vp-c-bg);
+  font-size: 14px;
+}
+
+/* ── Prevent layout shift when search modal locks scroll ── */
+html {
+  scrollbar-gutter: stable;
+}
+
+/* ── Tables ── */
+.vp-doc td {
+  font-size: 1em;
+}
+
+.vp-doc tr:nth-child(2n) {
+  background-color: #ebebeb;
+}
+
+.dark .vp-doc tr:nth-child(2n) {
+  background-color: #292929;
+}
+
+/* ── Inline code ── */
+.vp-doc :not(pre) > code {
+  padding: 2px 6px;
+  background-color: var(--vp-c-bg-alt);
+  color: var(--vp-code-color);
+  border-radius: 0;
+}
+
+/* ── Selection style ── */
+::selection {
+  background: var(--vp-c-text-1);
+  color: var(--vp-c-bg);
+}
+
+/* ── Nav bar ── */
+.VPNavBar {
+  position: relative;
+  background-color: var(--vp-nav-bg-color) !important;
+  border-bottom: 1px solid var(--vp-c-border);
+}
+
+.VPNavBar:not(.home.top) .content-body {
+  background-color: transparent !important;
+}
+
+.VPNavBar .divider,
+.VPNavBar .divider-line {
+  display: none;
+}
+
+.VPLocalNav .menu-text,
+.VPLocalNavOutlineDropdown > button {
+  font-family: var(--mnml-font-heading) !important;
+  text-transform: uppercase;
+}
+
+.VPLocalNavOutlineDropdown .items,
+.VPDocAsideOutline {
+  border-radius: 0 !important;
+  font-family: var(--mnml-font-heading);
+}
+
+.VPDocAsideOutline .outline-title {
+  text-transform: uppercase;
+}
+
+.VPNavBarTitle.has-sidebar .title {
+  border-bottom: none;
+}
+
+.VPNavBar .title {
+  font-family: var(--mnml-font-heading);
+  text-transform: uppercase;
+  font-size: 14px;
+  letter-spacing: 0.02em;
+}
+
+/* ── Sidebar ── */
+.VPSidebar {
+  font-size: 0.75rem;
+  font-family: var(--mnml-font-heading);
+}
+
+.VPSidebarItem .link .text {
+  color: #8f8f8f;
+}
+
+.dark .VPSidebarItem .link .text {
+  color: var(--vp-c-text-2);
+}
+
+/* ── Nav menu items ── */
+.VPNavBarMenu {
+  font-family: var(--mnml-font-heading);
+  text-transform: uppercase;
+}
+
+.VPSidebarItem.is-active > .item > .link {
+  background-color: var(--vp-c-bg-alt);
+  padding: 0 8px;
+  margin: 0 -8px;
+  font-weight: bold;
+}
+
+.VPSidebarItem.level-0 > .item > .text {
+  font-family: var(--mnml-font-heading);
+  text-transform: uppercase;
+}
+
+/* ── Noise texture overlay ── */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  opacity: 0.2;
+  pointer-events: none;
+  z-index: 40;
+  background: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E") 0 0/180px 180px;
+  mix-blend-mode: multiply;
+}
+
+.dark body::before {
+  mix-blend-mode: screen;
+  opacity: 0.05;
+}
+
+/* ── Theme-aware images ── */
+.dark .light-only,
+.dark-only {
+  display: none;
+}
+
+.dark .dark-only {
+  display: block;
+}
+
+/* ── Prev/next navigation ── */
+.VPDocFooter .pager-link {
+  font-family: var(--mnml-font-heading);
+  border-radius: 0;
+}
+
+.VPDocFooter .pager-link .title {
+  font-size: 16px !important;
+}
+
+.VPDocFooter .pager-link .desc {
+  font-size: 12px !important;
+}
+
+.VPDocFooter .desc {
+  text-transform: uppercase;
+}
+
+/* ── Dark mode toggle ── */
+.VPSwitch {
+  border-radius: 0 !important;
+}
+
+.VPSwitch .check,
+.VPSwitch .icon {
+  border-radius: 0 !important;
+}
+
+/* ── Images: soften bitmaps in dark mode ── */
+.dark .vp-doc img:not([src$=".svg" i]) {
+  filter: brightness(0.85);
+}

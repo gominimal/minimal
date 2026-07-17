@@ -1,0 +1,19 @@
+{
+  "name": "minimal-docs",
+  "private": true,
+  "description": "VitePress toolchain for the in-repo engineering docs site (docs/)",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs"
+  },
+  "devDependencies": {
+    "@fontsource/space-grotesk": "5.2.10",
+    "mermaid": "11.16.0",
+    "vitepress": "1.6.4",
+    "vitepress-plugin-mermaid": "2.0.17"
+  }
+}
