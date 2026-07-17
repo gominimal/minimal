@@ -263,7 +263,9 @@ async fn destroy_removes_session() {
     cmd_destroy(
         &args,
         DestroyArgs {
-            session: session_id.to_string(),
+            session: Some(session_id.to_string()),
+            all: false,
+            force: false,
         },
     )
     .await
@@ -284,7 +286,9 @@ async fn destroy_by_name() {
     cmd_destroy(
         &args,
         DestroyArgs {
-            session: "by-name".to_string(),
+            session: Some("by-name".to_string()),
+            all: false,
+            force: false,
         },
     )
     .await
@@ -297,11 +301,52 @@ async fn destroy_unknown_session_fails() {
     let result = cmd_destroy(
         &args,
         DestroyArgs {
-            session: "nonexistent".to_string(),
+            session: Some("nonexistent".to_string()),
+            all: false,
+            force: false,
         },
     )
     .await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn destroy_all_removes_every_session() {
+    let (daemon, args) = setup().await;
+    let _ = create_session(&daemon, "first").await;
+    let _ = create_session(&daemon, "second").await;
+
+    cmd_destroy(
+        &args,
+        DestroyArgs {
+            session: None,
+            all: true,
+            force: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut client = daemon.server.connect().await;
+    use minimald_rpc::ListSessions;
+    let resp = client.call::<ListSessions>(&()).await;
+    assert!(resp.sessions.is_empty());
+}
+
+#[tokio::test]
+async fn destroy_all_succeeds_when_there_are_no_sessions() {
+    let (_daemon, args) = setup().await;
+
+    cmd_destroy(
+        &args,
+        DestroyArgs {
+            session: None,
+            all: true,
+            force: true,
+        },
+    )
+    .await
+    .unwrap();
 }
 
 // --- stop ---
