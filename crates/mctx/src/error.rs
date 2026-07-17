@@ -191,10 +191,12 @@ impl From<checkouts::Error> for Error {
         match value {
             checkouts::Error::IO(e) => Self::IO("vcs", PathBuf::new(), e),
             checkouts::Error::Other(e) => Self::Other(anyhow::anyhow!(e)),
-            checkouts::Error::GitCommandFailed { command, stderr } => Self::Other(anyhow::anyhow!(
-                "unexpected: git command '{}' failed: {}",
+            checkouts::Error::GitCommandFailed {
                 command,
-                stderr
+                stderr,
+                status,
+            } => Self::Other(anyhow::anyhow!(
+                "unexpected: git command '{command}' failed ({status}): {stderr}"
             )),
             checkouts::Error::InvalidPath => {
                 Self::Other(anyhow::anyhow!("vcs: invalid remote path"))
@@ -239,6 +241,9 @@ impl From<orchestrator::Error> for Error {
             orchestrator::Error::IO(e) => Self::IO("vcs", PathBuf::new(), e),
             orchestrator::Error::Other(e) => Self::Other(anyhow::anyhow!(e)),
             orchestrator::Error::Cache(e) => Self::Other(anyhow::anyhow!(e)), // TODO: better error
+            orchestrator::Error::BuildFailed(build, e) => {
+                Self::Other(anyhow::anyhow!("`{build}` failed to build: {e}"))
+            } // TODO: better error
             orchestrator::Error::Sandbox(e) => Self::Other(anyhow::anyhow!(e)), // TODO: better error
             orchestrator::Error::Plan(graph, e) => Self::Plan(Box::new((graph, e))),
         }
@@ -274,6 +279,7 @@ impl From<sandbox2::Error> for Error {
                     stderr,
                     stdout,
                 },
+                #[cfg(target_os = "linux")]
                 sandbox2::error::ExecutionError::SpawnFailed(e) => {
                     Self::Other(anyhow::anyhow!("spawn failed: {}", e))
                 }

@@ -1,0 +1,7 @@
+# Code owners for this repository.
+# See https://docs.github.com/articles/about-code-owners
+#
+# The minimalists team owns everything in the repo. Later, more specific rules
+# can be added below — the last matching pattern for a path wins.
+
+* @gominimal/minimalists

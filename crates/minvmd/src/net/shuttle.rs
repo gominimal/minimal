@@ -49,15 +49,14 @@ pub use switch::VSOCK_GVPROXY_SHUTTLE_PORT;
 ///
 /// # Errors
 ///
-/// Propagates [`crate::sock::resolve_uds_path`]'s error when neither
-/// `XDG_RUNTIME_DIR` nor a home directory can be determined.
+/// Propagates [`crate::sock::resolve_uds_path`]'s error.
 pub fn resolve_switch_sock() -> io::Result<PathBuf> {
     Ok(switch_sock_beside(&crate::sock::resolve_uds_path()?))
 }
 
 /// The gvproxy switch socket path beside a given minimald bridge UDS (same
 /// parent dir). Pure — derived only from `uds`, no env — so it is unit-testable
-/// without mutating process-global `XDG_RUNTIME_DIR`.
+/// without mutating process-global state.
 fn switch_sock_beside(uds: &std::path::Path) -> PathBuf {
     uds.parent()
         .unwrap_or_else(|| std::path::Path::new("."))
@@ -76,7 +75,7 @@ mod tests {
 
     #[test]
     fn switch_sock_sits_beside_the_bridge_socket() {
-        // Pure helper, asserted directly — no `XDG_RUNTIME_DIR` mutation, so this
+        // Pure helper, asserted directly — no env mutation, so this
         // can't race other tests that read the env (std::env is process-global).
         let uds = std::path::Path::new("/run/user/1000/minimal/bridge.sock");
         assert_eq!(

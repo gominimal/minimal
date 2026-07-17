@@ -1,12 +1,14 @@
 [workspace]
 members = [
     "crates/args",
+    "crates/async-dialog",
     "crates/lcache",
     "crates/rcache",
     "crates/check",
     "crates/checkouts",
     "crates/common",
     "crates/decode",
+    "crates/diagnostics",
     "crates/graph",
     "crates/mctx",
     "crates/mfile",
@@ -25,11 +27,16 @@ members = [
     "crates/sessions",
     "crates/stdlib",
     "crates/switch",
+    "crates/version",
 ]
 resolver = "3"
 
 package.edition = "2024"
 package.publish = false
+# Shared base version for the workspace. This is the fallback the `version` crate
+# reports when no `v*` git tag is reachable; the real release version comes from
+# `git describe` at build time. See crates/version/build.rs.
+package.version = "0.5.0-rc1"
 
 [profile.release]
 strip = true
@@ -90,11 +97,11 @@ lzma-rs = "0.3"
 # Revert back to crates.io dep once new version is released.
 nickel-lang-core = { git = "https://github.com/nickel-lang/nickel.git", rev = "e8a0ab95e52ab31ac9a8ae1a3bef854d8de73cea", default-features = false, features = ["format"] }
 
-nix = { version = "0.31", features = ["fs"] }
+nix = { version = "0.31", features = ["fs", "user"] }
 nutype = { version = "0.7", features = ["serde"] }
 object = { version = "0.39", default-features = false, features = ["archive", "elf", "read_core", "std"] }
 oci-spec = "0.10"
-path-absolutize = "3.1"
+path-absolutize = "4.0"
 rand = "0.10"
 # rand_core 0.6 (not 0.10) to match boringtun/x25519-dalek's RNG traits for
 # WireGuard keypair generation (`networking-wg`).
@@ -119,6 +126,7 @@ sha2 = "0.11"
 shlex = "2.0"
 size = "0.5"
 smallvec = {version = "1.15", features = ["serde"]}
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 tar = "0.4"
 tempfile = "3.27"
 tokio = { version = "1.52", features = ["full"] }
@@ -132,6 +140,7 @@ tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
 thiserror = "2"
 url = "2" # keep in sync with reqwest
 uuid = { version = "1.23", features = ["v4", "v7", "serde"] }
@@ -144,26 +153,31 @@ walkdir = "2.5"
 
 petgraph = "0.8"
 
-# our crates
-args = { version = "0.0.1", path = "crates/args" }
-graph = { version = "0.0.1", path = "crates/graph" }
-lcache = { version = "0.0.1", path = "crates/lcache" }
-rcache = { version = "0.0.1", path = "crates/rcache" }
-check = { version = "0.0.1", path = "crates/check" }
-checkouts = { version = "0.0.1", path = "crates/checkouts" }
-common = { version = "0.0.1", path = "crates/common" }
-decode = { version = "0.0.1", path = "crates/decode" }
-mctx = { version = "0.0.1", path = "crates/mctx" }
-minimald-rpc = { version = "0.0.1", path = "crates/minimald-rpc" }
-mfile = { version = "0.0.1", path = "crates/mfile" }
-op = { version = "0.0.1", path = "crates/op" }
-ot = { version = "0.0.1", path = "crates/ot" }
-orchestrator = { version = "0.0.1", path = "crates/orchestrator" }
-paths = { version = "0.0.1", path = "crates/paths" }
-remote-proto = { version = "0.0.1", path = "crates/remote-proto" }
-remote-client = { version = "0.0.1", path = "crates/remote-client" }
-sandbox2 = { version = "0.0.1", path = "crates/sandbox2" }
-sessions = { version = "0.0.1", path = "crates/sessions" }
-switch = { version = "0.0.1", path = "crates/switch" }
+# Our crates. These are path deps in a `publish = false` workspace, so no
+# `version` requirement is needed (or used) — cargo resolves them by path. Adding
+# one would just be a pin to keep in sync with each crate's own version.
+args = { path = "crates/args" }
+async-dialog = { path = "crates/async-dialog" }
+graph = { path = "crates/graph" }
+lcache = { path = "crates/lcache" }
+rcache = { path = "crates/rcache" }
+check = { path = "crates/check" }
+checkouts = { path = "crates/checkouts" }
+common = { path = "crates/common" }
+decode = { path = "crates/decode" }
+diagnostics = { path = "crates/diagnostics" }
+mctx = { path = "crates/mctx" }
+minimald-rpc = { path = "crates/minimald-rpc" }
+mfile = { path = "crates/mfile" }
+op = { path = "crates/op" }
+ot = { path = "crates/ot" }
+orchestrator = { path = "crates/orchestrator" }
+paths = { path = "crates/paths" }
+remote-proto = { path = "crates/remote-proto" }
+remote-client = { path = "crates/remote-client" }
+sandbox2 = { path = "crates/sandbox2" }
+sessions = { path = "crates/sessions" }
+switch = { path = "crates/switch" }
+version = { path = "crates/version" }
 
-stdlib = { version = "0.0.16", path = "crates/stdlib" }
+stdlib = { path = "crates/stdlib" }

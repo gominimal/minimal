@@ -1,20 +1,30 @@
 [package]
 name = "minvmd"
-version = "0.0.1"
+version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[features]
+default = ["libkrun"]
+# Compile the real VM backend (the `krun` module's `#[link(name = "krun")]` +
+# build.rs link/rpath wiring). On by default; the `minimal` CLI opts out with
+# default-features = false so libkrun's load command isn't stamped into a binary
+# that calls no krun code.
+libkrun = []
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
-dirs.workspace = true
 fd-lock.workspace = true
 libc.workspace = true
 serde = { workspace = true }
 thiserror.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+# Cross-platform per-process resource sampling (CPU%, RSS, disk I/O) of the VMM
+# child PID, and host capacity (cores/memory) for `config set` validation (#747).
+sysinfo.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 # Shares minimald's portable RPC wire types: `NetworkMode` / `IpProto` drive the
@@ -30,9 +40,13 @@ tokio.workspace = true
 # Production beacon-reading code calls russh::keys::known_hosts::learn_known_hosts_path
 # and russh::keys::ssh_key::PublicKey::from_openssh (R2.5).
 russh.workspace = true
+# Canonical state-dir base + provider-instance dir layout (`state`, `sock`,
+# `volume`).
+paths.workspace = true
+version.workspace = true
 
 [dev-dependencies]
 serial_test.workspace = true
 tempfile.workspace = true
 sessions.workspace = true
-paths.workspace = true
+russh-sftp.workspace = true

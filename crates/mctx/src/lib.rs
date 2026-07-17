@@ -30,15 +30,10 @@ pub use sandbox2::config::Invocation;
 mod mfile_search_strategy;
 pub use mfile_search_strategy::MFileSearchStrategy;
 
-// TEMPORARY: default-`minimal.toml` scaffolding for empty session workspaces.
-// See `scaffold.rs`; remove with the workspace-upload gap.
-mod scaffold;
-pub use scaffold::scaffold_default_mfile;
-
 mod project_setup;
 pub use project_setup::ProjectSetup;
 
-pub use env::Env;
+pub use env::{Env, interpolate_task_strings};
 use tokio::sync::Semaphore;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
 
@@ -261,6 +256,13 @@ impl DaemonContext {
     /// Returns a handle to the local cache.
     pub fn local_cache(&self) -> Cache {
         self.cache.clone()
+    }
+
+    /// Releases the local cache's read tracker (its held-open append-log fd).
+    /// Called on daemon shutdown before unmounting the filesystem that holds
+    /// the cache; harmless otherwise (read tracking is best-effort).
+    pub fn release_cache_read_tracker(&self) {
+        self.cache.release_read_tracker();
     }
 
     /// Initializes a bunch of internals and returns them. Use
@@ -898,7 +900,7 @@ impl Context {
         let mut out = std::collections::HashSet::new();
         let mut graph = self.graph_from_all_packages()?;
         let mfile = self.minimal_file().clone();
-        for (name, _) in mfile.tasks.iter() {
+        for name in mfile.tasks.keys() {
             let res = self.task(graph, name)?.unwrap();
             let task = res.0;
             graph = res.1;

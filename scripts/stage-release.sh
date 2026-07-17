@@ -92,10 +92,17 @@ fi
 # One entry per (component, os, arch) variant the installer should place, as
 # `component|os|arch|kind|dest|artifact-basename`:
 #   - os/arch use the installer's normalized names (linux|darwin, amd64|arm64).
-#   - dest is `<prefix-token>/<subpath>`; the installer maps `bin`  -> ~/.local/bin
-#     and `data` -> ~/.local/share/minimal, and marks anything under `bin` +x.
+#   - dest is `<prefix-token>/<subpath>`; the installer maps `bin`  -> ~/.local/bin,
+#     `lib` -> ~/.local/lib (a bin sibling, for @rpath/../lib), and `data` ->
+#     ~/.local/share/minimal, and marks anything under `bin` +x.
 #   - artifact-basename is the file's name inside ARTIFACTS_DIR (the release
-#     workflow's merge-multiple flattens every upload to its basename).
+#     workflow's merge-multiple flattens every upload to its basename). For
+#     kind `symlink` rows it is instead the LINK TARGET, relative to dest's own
+#     directory: no artifact is hashed or uploaded, and the manifest's sha256
+#     column carries the `-` placeholder (spec R5.6).
+#   - the `minimal` CLI installs as `bin/min`: the user-facing command is `min`
+#     (the installer's completion generation runs `<bin>/min`, spec R9.3), while
+#     the component and artifact names keep the crate name.
 #
 # Linux hosts install just the three self-contained musl binaries. macOS hosts
 # additionally need minvmd + gvproxy and the guest microVM payload (kernel,
@@ -105,33 +112,65 @@ COMPONENTS=(
     # Linux amd64
     "minimald|linux|amd64|file|bin/minimald|minimald-linux-amd64"
     "mip|linux|amd64|file|bin/mip|mip-linux-amd64"
-    "minimal|linux|amd64|file|bin/minimal|minimal-linux-amd64"
+    "minimal|linux|amd64|file|bin/min|minimal-linux-amd64"
+    "git-remote-min|linux|amd64|symlink|bin/git-remote-min|min"
     # Linux arm64
     "minimald|linux|arm64|file|bin/minimald|minimald-linux-arm64"
     "mip|linux|arm64|file|bin/mip|mip-linux-arm64"
-    "minimal|linux|arm64|file|bin/minimal|minimal-linux-arm64"
+    "minimal|linux|arm64|file|bin/min|minimal-linux-arm64"
+    "git-remote-min|linux|arm64|symlink|bin/git-remote-min|min"
     # macOS arm64 (darwin)
-    "minimal|darwin|arm64|file|bin/minimal|minimal-macos-arm64"
+    "minimal|darwin|arm64|file|bin/min|minimal-macos-arm64"
+    "git-remote-min|darwin|arm64|symlink|bin/git-remote-min|min"
     "minvmd|darwin|arm64|file|bin/minvmd|minvmd-macos-arm64"
-    # The trimmed libkrun minvmd links against (built from source by the release
-    # workflow's build-libkrun-macos-arm64 job). Stamped into bin/ next to minvmd
-    # for now — weird for a dylib, but it puts it on a known user-owned path the
-    # loader can be pointed at; the +x bit bin/ adds is inert. The basename MUST
-    # be libkrun.1.dylib: minvmd's load command is rewritten to
-    # `@rpath/libkrun.1.dylib` and `@loader_path` (bin/, next to minvmd) is its
-    # first rpath, so the loader looks for exactly this name beside the binary.
-    "libkrun|darwin|arm64|file|bin/libkrun.1.dylib|libkrun-macos-arm64.dylib"
+    # The trimmed libkrun minvmd links against (built by the release workflow's
+    # build-libkrun-macos-arm64 job), staged into lib/ (ie: minvmd/../lib).
+    # Basename MUST be libkrun.1.dylib: minvmd's load command is @rpath/libkrun.1.dylib
+    # and the release job adds a @loader_path/../lib rpath.
+    "libkrun|darwin|arm64|file|lib/libkrun.1.dylib|libkrun-macos-arm64.dylib"
     "gvproxy|darwin|arm64|file|bin/gvproxy|gvproxy-darwin-arm64"
     "initramfs|darwin|arm64|file|data/initramfs.cpio|initramfs-arm64.cpio"
     "rootfs|darwin|arm64|file|data/rootfs.img|rootfs-arm64.img"
     "vmlinuz|darwin|arm64|file|data/vmlinuz|vmlinuz-arm64"
+    # AppArmor profile, its tunable, and the privileged loader that installs it,
+    # for Ubuntu 24.04+ hosts (docs/reference/linux-host-setup). These are repo
+    # files, not build outputs — staged into ARTIFACTS_DIR below — and ship to
+    # every Linux host as ordinary `data`-prefix components. noarch text, but the
+    # manifest keys on arch, so one row per Linux arch; the uploader dedups by
+    # basename to a single upload. The loader lands non-+x under data/ and is run
+    # as `sudo bash <path>`; the installer prints that hint when a host needs it.
+    "apparmor-profile|linux|amd64|file|data/apparmor/minimald|minimald.apparmor"
+    "apparmor-profile|linux|arm64|file|data/apparmor/minimald|minimald.apparmor"
+    "apparmor-tunable|linux|amd64|file|data/apparmor/tunables/minimald|minimald.apparmor-tunable"
+    "apparmor-tunable|linux|arm64|file|data/apparmor/tunables/minimald|minimald.apparmor-tunable"
+    "apparmor-installer|linux|amd64|file|data/apparmor/install-apparmor-profile.sh|install-apparmor-profile.sh"
+    "apparmor-installer|linux|arm64|file|data/apparmor/install-apparmor-profile.sh|install-apparmor-profile.sh"
 )
+
+# Stage the AppArmor components from the checkout this script runs in. They are
+# repo files rather than release-workflow artifacts, so copy them into the
+# ephemeral workdir — never into ARTIFACTS_DIR, which the caller owns and
+# --dry-run promises not to touch (it may even be read-only) — under the
+# stable basenames the component table references. The manifest loop prefers
+# a staged file over an ARTIFACTS_DIR one of the same basename, so a stale
+# copy left in the artifacts dir cannot shadow the checkout's current file.
 
 # --- Build the manifest ----------------------------------------------------
 
 workdir="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-stage)"
 trap 'rm -rf "$workdir"' EXIT
 manifest="$workdir/components"
+
+staged_dir="$workdir/staged"
+mkdir -p "$staged_dir"
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+stage_repo_file() {
+    [ -f "$repo_root/$1" ] || die "missing repo file for staging: $1"
+    cp "$repo_root/$1" "$staged_dir/$2" || die "failed to stage $1 into $staged_dir"
+}
+stage_repo_file packaging/apparmor/minimald          minimald.apparmor
+stage_repo_file packaging/apparmor/tunables/minimald minimald.apparmor-tunable
+stage_repo_file scripts/install-apparmor-profile.sh  install-apparmor-profile.sh
 
 {
     printf '# format: %s\n' "$FORMAT_VERSION"
@@ -144,7 +183,20 @@ upload_list=()
 
 for entry in "${COMPONENTS[@]}"; do
     IFS='|' read -r comp os arch kind dest basename <<<"$entry"
-    file="$ARTIFACTS_DIR/$basename"
+
+    # `git push min://<session>` resolves the min:// scheme to a
+    # `git-remote-min` helper on PATH; the min binary detects that basename
+    # (argv[0]) and enters remote-helper mode, so a symlink is all it takes.
+    # A symlink row ships no artifact: the last field is the link target and
+    # the sha256 column is the `-` placeholder the installer expects (R5.6).
+    if [ "$kind" = symlink ]; then
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            "$comp" "$os" "$arch" "$VERSION" "-" "$kind" "$dest" "$basename" >>"$manifest"
+        continue
+    fi
+
+    file="$staged_dir/$basename"
+    [ -f "$file" ] || file="$ARTIFACTS_DIR/$basename"
 
     if [ ! -f "$file" ]; then
         if [ "$ALLOW_MISSING" -eq 1 ]; then

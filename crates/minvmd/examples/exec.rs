@@ -27,11 +27,17 @@ use std::time::Duration;
 use russh::ChannelMsg;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use minimald_rpc::{CreateSessionRequest, CreateSessionResponse, SessionConfig};
+use minimald_rpc::{
+    ConfigureLoadoutRequest, ConfigureLoadoutResponse, CreateSessionRequest, CreateSessionResponse,
+    Errorable, SessionConfig,
+};
 
 /// SSH subsystem for the CreateSession RPC (mirrors minimald's
 /// `RPC_SUBSYSTEM_PREFIX` + "CreateSession").
 const CREATE_SESSION_SUBSYSTEM: &str = "minimald-v1-CreateSession";
+/// SSH subsystem for the ConfigureLoadout RPC, which finalizes the session
+/// a `CreateSession` allocated.
+const CONFIGURE_LOADOUT_SUBSYSTEM: &str = "minimald-v1-ConfigureLoadout";
 /// Env var minimald reads to scope an exec to a session.
 const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
 
@@ -164,7 +170,6 @@ async fn run_session_exec(
                 policy: Default::default(),
                 attrs: Default::default(),
             },
-            contribution: Default::default(),
         };
         let body = serde_json::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
 
@@ -181,15 +186,55 @@ async fn run_session_exec(
             .map_err(|e| format!("read response: {e}"))?;
         let resp: CreateSessionResponse =
             serde_json::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
+        resp.id
+    };
+
+    // ConfigureLoadout: finalize the session the create allocated. Required
+    // before the exec below — a session with an unconfigured loadout has no
+    // context to resolve a task against. This example uploads no project
+    // files, so the loadout composes empty and finalizes in one shot.
+    {
+        let channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("open ConfigureLoadout channel: {e}"))?;
+        channel
+            .request_subsystem(false, CONFIGURE_LOADOUT_SUBSYSTEM)
+            .await
+            .map_err(|e| format!("request_subsystem: {e}"))?;
+
+        let req = ConfigureLoadoutRequest {
+            session_id,
+            contribution: Default::default(),
+        };
+        let body = serde_json::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
+
+        let mut rpc = channel.into_stream();
+        rpc.write_all(&body)
+            .await
+            .map_err(|e| format!("write request: {e}"))?;
+        rpc.shutdown()
+            .await
+            .map_err(|e| format!("shutdown write half: {e}"))?;
+        let mut resp_buf = Vec::with_capacity(256);
+        rpc.read_to_end(&mut resp_buf)
+            .await
+            .map_err(|e| format!("read response: {e}"))?;
+        // The RPC's wire type is `Errorable<_>`: decoding the bare response
+        // would turn a daemon-side error into a confusing "missing field
+        // `kind`" decode failure, swallowing the message it carries.
+        let resp: Errorable<ConfigureLoadoutResponse> =
+            serde_json::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
         match resp {
-            CreateSessionResponse::Ready { id } => id,
-            CreateSessionResponse::Pending { .. } => {
-                return Err("CreateSession returned Pending; \
+            Errorable::Ok(ConfigureLoadoutResponse::Ready) => {}
+            Errorable::Ok(ConfigureLoadoutResponse::Pending { .. }) => {
+                return Err("ConfigureLoadout returned Pending; \
                             this example only handles Ready"
                     .to_string());
             }
+            Errorable::Err { error } => return Err(format!("ConfigureLoadout failed: {error}")),
         }
-    };
+    }
 
     // Exec the command in that session.
     let mut channel = handle

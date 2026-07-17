@@ -50,6 +50,13 @@ pub struct Config {
     /// `false` (DM2, native Linux) keeps the local-spawn + tap relay path.
     #[serde(default)]
     pub in_microvm: bool,
+    /// Whether the guest boot path actually mounted the writable data volume
+    /// at `minimal_state_dir`. Gates the shutdown quiesce (R2.1/R2.2): only a
+    /// filesystem this daemon mounted may be synced and unmounted — the vsock
+    /// transport alone doesn't imply one (a native `--vsock` daemon, or a
+    /// microVM booted without a data volume, must never unmount its state dir).
+    #[serde(default)]
+    pub state_volume_mounted: bool,
 }
 
 impl Config {
@@ -227,6 +234,20 @@ impl ServerStateHandle {
     /// Idempotent: repeated calls (e.g. two `Shutdown` RPCs) are harmless.
     pub(crate) async fn trigger_shutdown(&self) {
         self.0.lock().await.shutdown.cancel();
+    }
+
+    /// Whether the boot path mounted the writable data volume at the state
+    /// dir. The `Shutdown` RPC handler quiesces (syncs + unmounts) the state
+    /// dir only when this daemon mounted it — never a host directory or a
+    /// tmpfs it merely uses.
+    pub(crate) async fn state_volume_mounted(&self) -> bool {
+        self.0.lock().await.config.state_volume_mounted
+    }
+
+    /// The configured state dir (the quiesce target when in a microVM).
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn minimal_state_dir(&self) -> DaemonAbsPath {
+        self.0.lock().await.config.minimal_state_dir.clone()
     }
 
     /// Returns the daemon's TLS certificate authority (only with
@@ -434,6 +455,12 @@ impl Server {
     }
 }
 
+/// How often an otherwise-quiet connection is probed with an SSH keepalive.
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Unanswered keepalives tolerated before the connection is torn down.
+const KEEPALIVE_MAX: usize = 3;
+
 /// Builds the shared russh server config from the server state.
 async fn build_russh_config(
     state: &ServerStateHandle,
@@ -442,6 +469,11 @@ async fn build_russh_config(
         keys: vec![state.host_key().await?],
         auth_rejection_time_initial: Some(std::time::Duration::ZERO),
         nodelay: true,
+        // Keepalives own deadness detection; the default 600s inactivity
+        // reaper would kill healthy idle attaches, so it is explicitly off.
+        inactivity_timeout: None,
+        keepalive_interval: Some(KEEPALIVE_INTERVAL),
+        keepalive_max: KEEPALIVE_MAX,
         ..Default::default()
     }))
 }
@@ -529,10 +561,24 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
     }
 }
 
+/// Upper bound on the best-effort host-loopback publish in
+/// [`expose_proxy_on_host`]. Deliberately far below `post_json`'s gvproxy
+/// control timeout: the publish is awaited on [`Server::run`]'s boot path
+/// *before* the SSH accept loop starts serving. When the forwarder control
+/// request does not complete promptly — it times out at the full 5 s even with a
+/// host gvproxy present, since the forwarder control path is not reachable over
+/// the shuttle in every deployment — the accept loop must not be held that long:
+/// the cold `minimal ls` connect-retry deadline expires first and the first list
+/// fails (`ssh connect: Disconnected`). A reachable forwarder answers in well
+/// under this bound.
+#[cfg(target_os = "linux")]
+const HOST_EXPOSE_PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Publishes a guest-side proxy bound on `daemon_ip:port` onto the macOS host's
 /// loopback (`127.0.0.1:port`) via the host gvproxy forwarder, reached over the
 /// vsock shuttle (DM1). Best-effort: warns and returns on failure, since the
-/// host gvproxy may be absent.
+/// host gvproxy may be absent. Capped at [`HOST_EXPOSE_PUBLISH_TIMEOUT`] so it
+/// never stalls [`Server::run`]'s SSH accept loop.
 #[cfg(target_os = "linux")]
 async fn expose_proxy_on_host(daemon_ip: std::net::Ipv4Addr, port: u16) {
     use crate::net::policy::{ControlChannel, ExposeRequest, post_json};
@@ -546,12 +592,23 @@ async fn expose_proxy_on_host(daemon_ip: std::net::Ipv4Addr, port: u16) {
         remote: format!("{daemon_ip}:{port}"),
         protocol: "tcp".to_string(),
     };
-    if let Err(error) = post_json(&control, "/services/forwarder/expose", &request).await {
-        tracing::warn!(
+    match tokio::time::timeout(
+        HOST_EXPOSE_PUBLISH_TIMEOUT,
+        post_json(&control, "/services/forwarder/expose", &request),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!(
             %port,
             %error,
             "could not publish host-side proxy on the host loopback via gvproxy forwarder"
-        );
+        ),
+        Err(_) => tracing::warn!(
+            %port,
+            timeout = ?HOST_EXPOSE_PUBLISH_TIMEOUT,
+            "host-side proxy publish did not complete in time; continuing (best-effort)"
+        ),
     }
 }
 
@@ -575,6 +632,7 @@ mod tests {
             minimal_cache_dir: DaemonAbsPath::try_new(path).unwrap(),
             gvproxy_bin: None,
             in_microvm: false,
+            state_volume_mounted: false,
         }
     }
 

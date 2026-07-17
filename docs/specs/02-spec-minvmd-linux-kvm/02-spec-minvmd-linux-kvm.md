@@ -18,7 +18,7 @@ implementation is complete: libkrun FFI wrappers (`src/krun/raw.rs`,
 `src/krun/ctx.rs`), VM configuration builder (`src/vm.rs`), the
 UDS↔vsock bridge (via `krun_add_vsock_port2`), lifecycle daemon
 (`src/lifecycle.rs`, `src/state.rs`), and a bidirectional bash session e2e
-(`tests/minimald_session_e2e.rs`) all work end-to-end on macOS (informed by
+(`tests/minimald_session_integration.rs`) all work end-to-end on macOS (informed by
 #374, merged 2026-06-11).
 
 Linux hosts today reach `minimald` over direct UDS with namespace (hakoniwa)
@@ -73,7 +73,7 @@ This spec realizes the `minvmd` side of that diagram for Linux
    `READY` marker, and exits 0.
 3. The UDS↔vsock bridge works on Linux: `minimal` reaches in-VM `minimald`
    via the host UDS without knowing a VM exists.
-4. The bidirectional bash session e2e (`tests/minimald_session_e2e.rs`)
+4. The bidirectional bash session e2e (`tests/minimald_session_integration.rs`)
    passes on Linux, mirroring the macOS Stage-2 e2e.
 5. Warm-boot latency on Linux/KVM is measured and reported against the
    ~75 ms macOS baseline.
@@ -201,7 +201,7 @@ instead of Hypervisor.framework availability.
 1. **CLI:** `MINVMD_KERNEL_PATH=<k> MINVMD_ROOTFS_PATH=<r> MINVMD_INITRAMFS=<i> minvmd boot --foreground`
    on a Linux host with `/dev/kvm` prints `vm-up` within 10 s — demonstrates
    KVM boot + READY marker round-trip on Linux.
-2. **Test:** `MINVMD_E2E=1 cargo test -p minvmd --test boot_e2e -- --include-ignored`
+2. **Test:** `MINVMD_E2E=1 cargo test -p minvmd --test boot_integration -- --include-ignored`
    on a Linux host with `/dev/kvm` exits 0 — demonstrates the automated boot
    e2e passes (test is un-gated from macOS in Unit 3).
 
@@ -215,19 +215,19 @@ establish the Linux/KVM baseline.
 
 **Depends on:** Unit 2
 
-**Affected areas:** `crates/minvmd/tests/boot_e2e.rs`,
-`crates/minvmd/tests/minimald_session_e2e.rs`,
+**Affected areas:** `crates/minvmd/tests/boot_integration.rs`,
+`crates/minvmd/tests/minimald_session_integration.rs`,
 `crates/minvmd/tests/bridge_e2e.rs`,
 `.github/workflows/` (new Linux KVM e2e job),
 `scripts/bench-minvmd-boot.sh` (or equivalent on Linux)
 
 **Functional Requirements:**
 
-- **R3.1**: `tests/boot_e2e.rs` shall remove the `#![cfg(target_os = "macos")]`
+- **R3.1**: `tests/boot_integration.rs` shall remove the `#![cfg(target_os = "macos")]`
   file-level attribute. The READY-marker round-trip test shall run on Linux
   when `MINVMD_E2E=1` and the kernel/rootfs/initramfs env vars are set; it is
   still gated `#[ignore]` by default. The test body is unchanged.
-- **R3.2**: `tests/minimald_session_e2e.rs` shall remove the
+- **R3.2**: `tests/minimald_session_integration.rs` shall remove the
   `#![cfg(target_os = "macos")]` attribute. The bidirectional bash session
   e2e (russh client → UDS bridge → guest vsock → minimald SSH → exec) shall
   run on Linux under the same gate (`MINVMD_E2E=1` + env vars). The test
@@ -235,6 +235,8 @@ establish the Linux/KVM baseline.
   requirement as macOS).
 - **R3.3**: `tests/bridge_e2e.rs` shall be un-gated from macOS in the same
   way. The 5-concurrent-connection multiplexing test shall run on Linux.
+  (`bridge_e2e.rs` was later removed in the auto-discovery migration —
+  superseded by `minimald_session_integration.rs`.)
 - **R3.4**: The CI configuration shall add a Linux KVM e2e job. The job runs
   on a self-hosted Linux runner with `/dev/kvm` access (GCP nested-virt or
   equivalent). It provisions libkrun ≥ 1.19.0, materializes the kernel +
@@ -251,7 +253,7 @@ establish the Linux/KVM baseline.
 
 **Proof Artifacts:**
 
-1. **Test:** `MINVMD_E2E=1 cargo test -p minvmd --test minimald_session_e2e -- --include-ignored`
+1. **Test:** `MINVMD_E2E=1 cargo test -p minvmd --test minimald_session_integration -- --include-ignored`
    on a Linux host with `/dev/kvm` exits 0, proving the bidirectional bash
    session e2e passes on Linux over the host UDS→vsock bridge.
 2. **File:** The pull request description contains a latency table (min /
@@ -386,6 +388,6 @@ kernel + rootfs + initramfs.
 | R1.5 | — | `cargo build -p minvmd` (Linux) | Exit 0 |
 | R1.5 | — | `cargo test -p minvmd` (Linux, unit tests) | All pass |
 | R2.3 | `MINVMD_E2E=1` + env vars | `minvmd boot --foreground` (Linux) | Prints `vm-up` ≤ 10 s |
-| R3.1 | `MINVMD_E2E=1` + env vars | `cargo test -p minvmd --test boot_e2e -- --include-ignored` | Exit 0 |
-| R3.2 | `MINVMD_E2E=1` + env vars | `cargo test -p minvmd --test minimald_session_e2e -- --include-ignored` | Exit 0 |
+| R3.1 | `MINVMD_E2E=1` + env vars | `cargo test -p minvmd --test boot_integration -- --include-ignored` | Exit 0 |
+| R3.2 | `MINVMD_E2E=1` + env vars | `cargo test -p minvmd --test minimald_session_integration -- --include-ignored` | Exit 0 |
 | R3.5 | `MINVMD_E2E=1` + env vars | `scripts/bench-minvmd-boot.sh` (Linux, ≥ 10 runs) | Latency table in PR description |

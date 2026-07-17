@@ -1,6 +1,7 @@
 //! CLI subcommand implementations for `minvmd`.
 
 pub mod boot;
+pub mod config;
 pub mod run;
 pub mod status;
 pub mod stop;
@@ -70,6 +71,39 @@ pub fn ready_timeout() -> std::time::Duration {
 /// Environment variable overriding the [`DEFAULT_VM_RAM_MIB`] guest RAM size.
 pub const VM_RAM_MIB_ENV: &str = "MINVMD_VM_RAM_MIB";
 
+/// Environment variable overriding the [`DEFAULT_VM_VCPUS`] guest vcpu count.
+pub const VM_VCPUS_ENV: &str = "MINVMD_VM_VCPUS";
+
+/// Default guest vcpu count. 2 is the v0.1 baseline; stay below the guest
+/// kernel's `CONFIG_NR_CPUS`. Overridable via [`VM_VCPUS_ENV`] or persisted
+/// resource config (see [`effective_vcpus`]).
+pub const DEFAULT_VM_VCPUS: u8 = 2;
+
+/// Logical cores backed off from the vcpu ceiling for the host side: the VMM
+/// and its worker threads, plus whatever else the machine is running.
+pub const VCPU_HOST_RESERVE: u32 = 2;
+
+/// Upper bound on guest vcpus for a host with `logical_cores` logical CPUs:
+/// the core count minus [`VCPU_HOST_RESERVE`], floored at [`DEFAULT_VM_VCPUS`]
+/// so small hosts keep the baseline, saturated to the `u8` vcpu type. The
+/// ceiling is host-derived rather than a fixed cap so a many-core host can run
+/// a wide VM; the generic guest kernel's `CONFIG_NR_CPUS` (typically ≥ 64) is
+/// assumed not to be the binding constraint.
+#[must_use]
+pub fn max_vm_vcpus(logical_cores: u32) -> u8 {
+    u8::try_from(logical_cores.saturating_sub(VCPU_HOST_RESERVE))
+        .unwrap_or(u8::MAX)
+        .max(DEFAULT_VM_VCPUS)
+}
+
+/// The host's logical core count (1 if probing fails) — the input to
+/// [`max_vm_vcpus`].
+pub(crate) fn host_logical_cores() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+}
+
 /// Default guest RAM in MiB. 512 MiB is the floor to reach userspace; the extra
 /// headroom feeds the in-VM session build, whose package cache lives on a tmpfs
 /// (`/run/minimal/cache`) sized from RAM (1024 MiB overflowed `StorageFull`
@@ -89,15 +123,105 @@ pub const DEFAULT_VM_RAM_MIB: u32 = 2048;
 #[cfg(not(target_arch = "x86_64"))]
 pub const DEFAULT_VM_RAM_MIB: u32 = 4096;
 
-/// The guest RAM size in MiB, overridable via [`VM_RAM_MIB_ENV`]. A non-numeric,
-/// empty, or zero value falls back to [`DEFAULT_VM_RAM_MIB`].
-#[must_use]
-pub fn vm_ram_mib() -> u32 {
-    std::env::var(VM_RAM_MIB_ENV)
+/// Parse a positive integer from environment variable `var`; a missing,
+/// non-numeric, empty, or non-positive value is treated as unset. Shared by the
+/// `MINVMD_VM_RAM_MIB` / `MINVMD_VM_VCPUS` overrides.
+fn positive_env<T>(var: &str) -> Option<T>
+where
+    T: std::str::FromStr + PartialOrd + Default,
+{
+    std::env::var(var)
         .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&mib| mib > 0)
+        .and_then(|v| v.trim().parse::<T>().ok())
+        .filter(|value| *value > T::default())
+}
+
+/// The `MINVMD_VM_RAM_MIB` override as a positive value, if set and valid.
+pub(crate) fn env_ram_mib() -> Option<u32> {
+    positive_env(VM_RAM_MIB_ENV)
+}
+
+/// The `MINVMD_VM_VCPUS` override as a positive value, if set and valid.
+pub(crate) fn env_vcpus() -> Option<u8> {
+    positive_env(VM_VCPUS_ENV)
+}
+
+/// The persisted resource config from the provider dir. A missing file yields
+/// the all-`None` default; a malformed file is logged — so a boot that silently
+/// falls back to built-in defaults is at least diagnosable — and also treated as
+/// the default, so an unreadable file never blocks boot (R9.7).
+pub(crate) fn persisted_resource_config() -> crate::config::ResourceConfig {
+    match crate::config::ResourceConfig::read(&crate::state::provider_dir()) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read persisted resource config; using defaults");
+            crate::config::ResourceConfig::default()
+        }
+    }
+}
+
+/// Clamp a resolved vcpu count to this host's [`max_vm_vcpus`]. Warns when it
+/// clamps (e.g. an over-large [`VM_VCPUS_ENV`] override that skips `config set`
+/// validation) so a boot with fewer vcpus than requested is not silent.
+fn clamp_vcpus(vcpus: u8) -> u8 {
+    let max = max_vm_vcpus(host_logical_cores());
+    if vcpus > max {
+        tracing::warn!(
+            requested = vcpus,
+            max,
+            "requested vcpu count exceeds the host-derived vcpu ceiling; clamping"
+        );
+        max
+    } else {
+        vcpus
+    }
+}
+
+/// The effective guest RAM in MiB, resolved as
+/// `env override ?? persisted config ?? default` (R9.7). The
+/// [`VM_RAM_MIB_ENV`] override still wins so power users keep a per-boot escape
+/// hatch; `minvmd config set --ram-mib` supplies the persisted layer beneath it.
+///
+/// Note: the RAM stop-gap is *not* reduced when the cache moves to the writable
+/// volume. A reduced baseline is only safe once a failed volume mount is fatal
+/// (no silent tmpfs fallback) and the floor is measured against real in-VM build
+/// memory pressure; reducing it here would leave a mount-failed VM at half RAM
+/// with the cache still on the tmpfs. Out of scope for this feature — deferred to
+/// a separate memory-pressure spec.
+#[must_use]
+pub fn effective_ram_mib() -> u32 {
+    env_ram_mib()
+        .or_else(|| persisted_resource_config().ram_mib)
         .unwrap_or(DEFAULT_VM_RAM_MIB)
+}
+
+/// The effective guest vcpu count, resolved as
+/// `env override ?? persisted config ?? default` (R9.7) and clamped to this
+/// host's [`max_vm_vcpus`] so an over-large env/config value cannot brick the
+/// boot.
+#[must_use]
+pub fn effective_vcpus() -> u8 {
+    clamp_vcpus(
+        env_vcpus()
+            .or_else(|| persisted_resource_config().vcpus)
+            .unwrap_or(DEFAULT_VM_VCPUS),
+    )
+}
+
+/// Resolve `(vcpus, ram_mib)` from a **single** read of the persisted config, so
+/// the pair cannot tear when `config.toml` changes between two separate
+/// `effective_*` calls (e.g. the two `booted_*` fields recorded at the Running
+/// transition). Per-field env overrides still take precedence; vcpus is clamped
+/// to this host's [`max_vm_vcpus`].
+#[must_use]
+pub fn effective_resources() -> (u8, u32) {
+    let env_v = env_vcpus();
+    let env_r = env_ram_mib();
+    let cfg = persisted_resource_config();
+    (
+        clamp_vcpus(env_v.or(cfg.vcpus).unwrap_or(DEFAULT_VM_VCPUS)),
+        env_r.or(cfg.ram_mib).unwrap_or(DEFAULT_VM_RAM_MIB),
+    )
 }
 
 /// Verify the host hypervisor backend is accessible before booting a VM (R2.4).
@@ -149,37 +273,40 @@ fn kvm_access_error(err: &std::io::Error) -> anyhow::Error {
 }
 
 /// Returns the path to the VM SSH known_hosts file:
-/// `$XDG_STATE_HOME/minimal/providers/local-0/known_hosts`.
-///
-/// Uses the same XDG derivation as [`crate::state::StateDir::default_path`].
+/// `<provider dir>/known_hosts`.
 #[cfg(minvmd_libkrun)]
 pub(crate) fn default_vm_known_hosts_path() -> std::path::PathBuf {
-    dirs::state_dir()
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| {
-                    tracing::warn!(
-                        "XDG_STATE_HOME and HOME both unset; known_hosts falls back to /tmp"
-                    );
-                    std::path::PathBuf::from("/tmp")
-                })
-                .join(".local/state")
-        })
-        // TODO: pass instance_num through once multi-instance is needed
-        .join("minimal/providers/local-0/known_hosts")
+    crate::state::provider_dir().join(paths::KNOWN_HOSTS_FILE)
 }
 
-/// Read the READY beacon from `reader` and, if a valid SSH public key is on
-/// the second line, record it in `known_hosts_path` (R2.1–R2.4).
+/// Outcome of the guest boot beacon (R2.4/R2.5): the guest either reached
+/// READY, or refused with `MOUNT_FAILED\n<reason>\n` because the data volume
+/// could not be mounted.
+#[cfg(any(minvmd_libkrun, test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BootBeacon {
+    /// The guest is up and serving.
+    Ready,
+    /// The guest refused READY: the data volume mount failed (R2.5).
+    MountFailed {
+        /// One-line failure cause relayed from the guest (capped there).
+        reason: String,
+    },
+}
+
+/// Read the boot beacon from `reader`. For a `READY` beacon, if a valid SSH
+/// public key is on the second line, record it in `known_hosts_path`
+/// (R2.1–R2.4); for a `MOUNT_FAILED` beacon, carry the guest's one-line
+/// reason (R2.5).
 ///
-/// Returns `Err` only when the first line is not `READY`. Key parse failures
-/// and known_hosts write errors are logged as warnings and do not abort boot
-/// (R2.3).
+/// Returns `Err` only when the first line is neither marker. Key parse
+/// failures and known_hosts write errors are logged as warnings and do not
+/// abort boot (R2.3).
 #[cfg(any(minvmd_libkrun, test))]
 pub(crate) fn read_ready_beacon<R: std::io::BufRead>(
     reader: &mut R,
     known_hosts_path: &std::path::Path,
-) -> Result<(), String> {
+) -> Result<BootBeacon, String> {
     use std::io::BufRead;
     let mut line = String::new();
     // Use UFCS so Rust resolves `Self = &mut R` (not `R`) in the function-call
@@ -188,6 +315,22 @@ pub(crate) fn read_ready_beacon<R: std::io::BufRead>(
         .read_line(&mut line)
         .map_err(|e| format!("reading READY marker: {e}"))?;
     let trimmed = line.trim();
+    if trimmed == "MOUNT_FAILED" {
+        // Optional second line: the failure reason (guest caps it at 512 B;
+        // 1024 here leaves margin without unbounding the read).
+        let mut reason = String::new();
+        if let Err(e) = std::io::Read::take(reader.by_ref(), 1024).read_line(&mut reason) {
+            tracing::debug!(error = %e, "failed to read MOUNT_FAILED reason line");
+        }
+        let reason = reason.trim();
+        return Ok(BootBeacon::MountFailed {
+            reason: if reason.is_empty() {
+                "no reason given".to_string()
+            } else {
+                reason.to_string()
+            },
+        });
+    }
     if trimmed != "READY" {
         return Err(format!("expected READY on marker socket, got {trimmed:?}"));
     }
@@ -207,7 +350,7 @@ pub(crate) fn read_ready_beacon<R: std::io::BufRead>(
             let key_str = pubkey_line.trim();
             if key_str.len() > 4096 {
                 tracing::warn!(len = key_str.len(), "pubkey line too long; skipping");
-                return Ok(());
+                return Ok(BootBeacon::Ready);
             }
             if !key_str.is_empty() {
                 // R2.4: create the directory hierarchy before writing.
@@ -219,7 +362,7 @@ pub(crate) fn read_ready_beacon<R: std::io::BufRead>(
                         path = %parent.display(),
                         "failed to create known_hosts directory; skipping key write",
                     );
-                    return Ok(());
+                    return Ok(BootBeacon::Ready);
                 }
                 // R2.2: parse and record the key.
                 match russh::keys::ssh_key::PublicKey::from_openssh(key_str) {
@@ -250,7 +393,79 @@ pub(crate) fn read_ready_beacon<R: std::io::BufRead>(
         }
     }
 
-    Ok(())
+    Ok(BootBeacon::Ready)
+}
+
+/// Build the user-facing error for a guest `MOUNT_FAILED` boot (R2.5 host
+/// half). Fatality follows from whether the volume image pre-existed this
+/// boot: a pre-existing image may hold session data, so it is left untouched
+/// and the message points at repair; a freshly provisioned blank one is
+/// removed so the next boot does not misclassify the failed blank as prior
+/// state.
+#[cfg(minvmd_libkrun)]
+pub(crate) fn mount_failed_error(
+    reason: &str,
+    volume_path: &std::path::Path,
+    volume_preexisted: bool,
+) -> anyhow::Error {
+    if volume_preexisted {
+        anyhow::anyhow!(
+            "guest failed to mount the data volume at {path}: {reason}. \
+             The image pre-exists and may hold session data — it was left untouched. \
+             Repair it (e2fsck) or move it aside (or point {env} elsewhere), then retry.",
+            path = volume_path.display(),
+            env = crate::volume::DATA_VOLUME_PATH_ENV,
+        )
+    } else {
+        anyhow::anyhow!(
+            "guest failed to format/mount the freshly provisioned data volume at {path}: \
+             {reason}. The blank image was removed; check {env} and retry.",
+            path = volume_path.display(),
+            env = crate::volume::VOLUME_BYTES_ENV,
+        )
+    }
+}
+
+/// Whether the data-volume image already exists before this boot provisions
+/// it — the input to the R2.5 fatality decision. A stat error counts as
+/// **pre-existing**: the failure disposition for a pre-existing image is
+/// "never touch it", so doubt must land on the safe side rather than let a
+/// transient stat failure send a data-bearing image down the delete branch.
+#[cfg(minvmd_libkrun)]
+pub(crate) fn volume_preexists(volume_path: &std::path::Path) -> bool {
+    volume_path.try_exists().unwrap_or(true)
+}
+
+/// Disposition of the data-volume image after a failed boot (R2.5 host half):
+/// an image that pre-existed this boot may hold session data and is never
+/// touched; a blank one freshly provisioned by this boot holds nothing and is
+/// removed. Runs on **every** failed-boot arm — mount failure, beacon read
+/// error, READY timeout — because a blank stranded by a timeout would be
+/// misclassified as "pre-existing, may hold session data" on the next boot,
+/// wedging all subsequent boots behind a scary message about an empty file.
+#[cfg(minvmd_libkrun)]
+pub(crate) fn discard_fresh_volume_image(volume_path: &std::path::Path, volume_preexisted: bool) {
+    if volume_preexisted {
+        return;
+    }
+    // Racing a concurrent boot's fresh provisioning is possible but harmless:
+    // both boots fail loudly either way.
+    match std::fs::remove_file(volume_path) {
+        Ok(()) => {
+            tracing::info!(
+                path = %volume_path.display(),
+                "removed freshly provisioned volume image after failed boot",
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %volume_path.display(),
+                "removing freshly provisioned volume image after failed boot",
+            );
+        }
+    }
 }
 
 #[cfg(all(test, minvmd_libkrun))]
@@ -270,6 +485,28 @@ mod tests {
         let msg = kvm_access_error(&Error::from(ErrorKind::PermissionDenied)).to_string();
         assert!(msg.contains("permission denied"), "got: {msg}");
         assert!(msg.contains("`kvm` group"), "got: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod vcpu_ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn max_backs_off_the_host_reserve() {
+        assert_eq!(max_vm_vcpus(64), 62);
+        assert_eq!(max_vm_vcpus(8), 6);
+    }
+
+    #[test]
+    fn max_floors_at_the_default_on_small_hosts() {
+        assert_eq!(max_vm_vcpus(1), DEFAULT_VM_VCPUS);
+        assert_eq!(max_vm_vcpus(4), DEFAULT_VM_VCPUS);
+    }
+
+    #[test]
+    fn max_saturates_to_the_vcpu_type() {
+        assert_eq!(max_vm_vcpus(1000), u8::MAX);
     }
 }
 
@@ -350,6 +587,40 @@ mod beacon_tests {
         assert!(
             err.contains("READY"),
             "error must mention READY, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn read_ready_beacon_returns_ready_variant() {
+        let mut reader = Cursor::new(b"READY\n".as_ref());
+        let tmp = tempfile::tempdir().unwrap();
+        let beacon = read_ready_beacon(&mut reader, &tmp.path().join("known_hosts")).unwrap();
+        assert_eq!(beacon, BootBeacon::Ready);
+    }
+
+    #[test]
+    fn read_ready_beacon_parses_mount_failed_with_reason() {
+        let mut reader = Cursor::new(b"MOUNT_FAILED\nmkfs.ext4 failed: exit 1\n".as_ref());
+        let tmp = tempfile::tempdir().unwrap();
+        let beacon = read_ready_beacon(&mut reader, &tmp.path().join("known_hosts")).unwrap();
+        assert_eq!(
+            beacon,
+            BootBeacon::MountFailed {
+                reason: "mkfs.ext4 failed: exit 1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn read_ready_beacon_parses_mount_failed_without_reason() {
+        let mut reader = Cursor::new(b"MOUNT_FAILED\n".as_ref());
+        let tmp = tempfile::tempdir().unwrap();
+        let beacon = read_ready_beacon(&mut reader, &tmp.path().join("known_hosts")).unwrap();
+        assert_eq!(
+            beacon,
+            BootBeacon::MountFailed {
+                reason: "no reason given".to_string()
+            }
         );
     }
 }

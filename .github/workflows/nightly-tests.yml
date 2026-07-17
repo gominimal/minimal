@@ -1,0 +1,292 @@
+name: nightly-tests
+
+# Nightly TEST tier — distinct from nightly.yml (which cuts + blesses the
+# `nightly` release channel). This runs the checks that are too slow, too
+# flaky-adjacent, or not tied to a specific PR: an advisory re-check, a
+# repeated session-e2e soak, toolchain/dependency canaries, and workflow
+# hygiene. A blocking-job failure files (or updates) a tracking issue rather
+# than rotting in the Actions tab.
+on:
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC — offset from nightly.yml's 10:00
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never overlap a slow soak with the next night's run.
+concurrency:
+  group: nightly-tests
+  cancel-in-progress: false
+
+jobs:
+  advisories:
+    # cargo-deny advisories, BLOCKING here — the between-PRs counterpart of
+    # the PR-side `cargo-deny` (which stays blocking too). Catches RUSTSEC
+    # advisories published since the last PR touched the tree. Feeds notify.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+
+  session-e2e-soak:
+    # Boot a real microVM and round-trip a full session ten times to shake
+    # out the boot / first-connect raciness that a single PR-lane run cannot
+    # surface. Self-contained: builds minvmd + the CLI, materializes the
+    # guest images, then loops scripts/soak-session-e2e.sh.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - name: Free Disk Space
+        uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install build dependencies
+        run: |
+          sudo sh -c \
+            'apt-get update && apt-get install -y --no-install-recommends \
+               protobuf-compiler libprotobuf-dev cpio git'
+      - name: Install cross
+        # build-initramfs.sh cross-compiles the guest minimald to static musl;
+        # install the prebuilt cross like the KVM lane so it never falls back
+        # to `cargo install cross` from source inside this blocking job.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Enable /dev/kvm access
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm not present on this runner." >&2
+            exit 1
+          fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Cache cargo + build artifacts
+        # Shares the KVM lane's build cache key (same minvmd + CLI compile);
+        # a scheduled run on main also writes it back, keeping it warm.
+        id: cargo-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-x86_64-minvmd-kvm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-x86_64-minvmd-kvm-
+      - name: Materialize libkrun prefix (upstream package)
+        uses: ./.github/actions/setup-libkrun-linux
+        with:
+          arch: x86_64
+      - name: Build guest initramfs (minimald as /init)
+        run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs.cpio" x86_64-unknown-linux-musl
+      - name: Build minvmd + the CLI
+        # Separate invocations: a combined build feature-unifies libkrun into
+        # the CLI (the regression the macOS lane guards).
+        run: |
+          cargo build -p minvmd --bin minvmd --locked
+          cargo build -p minimal --bin min --locked
+      - name: Materialize guest kernel (raw Image)
+        uses: ./.github/actions/materialize
+        with:
+          output: virtio-kernel
+          dest: ${{ runner.temp }}/vmlinuz
+          arch: x86_64
+          channel: unstable
+      - name: Materialize guest rootfs (ext4 image)
+        uses: ./.github/actions/materialize
+        with:
+          output: minvmd-rootfs
+          dest: ${{ runner.temp }}/rootfs.img
+          arch: x86_64
+          channel: unstable
+      - name: Fetch pinned gvproxy switch binary
+        # minvmd spawns this as the per-host-VM switch that provides the guest's
+        # egress (NAT + DNS). Without it minvmd boots the VM switchless
+        # (gvproxy resolution is best-effort and never errors), so the guest's
+        # overlay has no other end and every egress — including the in-guest
+        # `pkgs` clone during session mint — dies with "Could not resolve host".
+        run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
+      - name: Soak the session e2e (x10)
+        env:
+          MINVMD_KERNEL_PATH: ${{ runner.temp }}/vmlinuz
+          MINVMD_ROOTFS_PATH: ${{ runner.temp }}/rootfs.img
+          MINVMD_INITRAMFS: ${{ runner.temp }}/initramfs.cpio
+          MINVMD_GVPROXY_BIN: ${{ runner.temp }}/gvproxy
+          E2E_VM: "1"
+          E2E_MINIMAL_ARGS: --minvmd
+          E2E_PROJECT_DIR: /tmp
+        run: |
+          export PATH="$PWD/target/debug:$PATH"
+          ./scripts/soak-session-e2e.sh 10 "$RUNNER_TEMP/soak-logs"
+      - name: Save cargo + build artifacts cache (main only)
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+      - name: Upload soak boot logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: soak-boot-logs
+          path: ${{ runner.temp }}/soak-logs
+          if-no-files-found: ignore
+
+  beta-canary:
+    # Run the workspace suite on beta rustc to catch upcoming-toolchain
+    # breakage ahead of the 1.97.0 pin. Non-blocking (the pin is the gate);
+    # RUSTUP_TOOLCHAIN overrides rust-toolchain.toml for this job only.
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    continue-on-error: true
+    env:
+      RUSTUP_TOOLCHAIN: beta
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Beta toolchain
+        uses: dtolnay/rust-toolchain@beta
+      - name: Core workspace tests (beta)
+        uses: ./.github/actions/core-tests
+        with:
+          # Own cache class, and never write (a nightly beta build must not
+          # consume the shared pool the real lanes restore from).
+          shared-key: beta-canary
+          save-if: "false"
+
+  update-canary:
+    # Re-resolve every dependency to its newest semver-compatible version and
+    # run the suite, to catch upstream breakage early. Non-blocking.
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo update (newest compatible deps)
+        run: cargo update
+      - name: Core workspace tests (updated deps)
+        uses: ./.github/actions/core-tests
+        with:
+          shared-key: update-canary
+          save-if: "false"
+
+  installer:
+    # Re-run the curl|sh installer suite (shellcheck + the POSIX-sh matrix,
+    # incl. macOS's frozen /bin/sh) nightly, so runner-image shell drift is
+    # caught even when nobody touches install.sh — the PR lane is path-scoped
+    # to it. Same definition, reused via workflow_call (no duplication).
+    permissions:
+      contents: read
+      # ci-shell-installer.yml declares pull-requests: read at the workflow
+      # level (dorny/paths-filter on its PR runs); a called reusable workflow
+      # cannot request a permission the caller withheld, so grant it here too
+      # or the whole nightly fails at startup. It is unused on this non-PR call.
+      pull-requests: read
+    uses: ./.github/workflows/ci-shell-installer.yml
+
+  hygiene:
+    # Workflow lint + unused-dependency check. Non-blocking; especially handy
+    # during CI surgery. Tool installs are best-effort under continue-on-error.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install cargo-machete + zizmor
+        # Both are prebuilt binaries in taiki-e's manifest (zizmor is Rust,
+        # from zizmorcore/zizmor). actionlint is NOT — it runs from its
+        # pinned official image below.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete,zizmor
+      - name: actionlint (workflow lint)
+        # `if: always()` so a failed install (or an earlier failing check)
+        # doesn't skip the remaining hygiene checks — each should report on its
+        # own. actionlint itself needs no install (pinned official image; it
+        # auto-discovers .github/workflows; Docker is preinstalled).
+        if: always()
+        run: docker run --rm -v "$PWD":/repo -w /repo rhysd/actionlint:1.7.12 -color
+      - name: cargo-machete (unused deps)
+        if: always()
+        run: cargo machete
+      - name: zizmor (workflow security)
+        if: always()
+        run: zizmor .github/workflows/
+
+  notify:
+    # File (or update) a tracking issue when a BLOCKING nightly job fails, so
+    # a regression doesn't rot in the Actions tab. Canaries are
+    # continue-on-error and deliberately do NOT trip this — read them in the
+    # run itself.
+    needs: [advisories, session-e2e-soak, installer]
+    # Fire on failure OR cancellation of a blocking job (a timeout reports
+    # 'failure', so hangs are covered; this also catches an infra cancel).
+    if: >-
+      always() &&
+      (needs.advisories.result == 'failure' || needs.advisories.result == 'cancelled'
+       || needs.session-e2e-soak.result == 'failure' || needs.session-e2e-soak.result == 'cancelled'
+       || needs.installer.result == 'failure' || needs.installer.result == 'cancelled')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or update the nightly-failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ADV: ${{ needs.advisories.result }}
+          SOAK: ${{ needs.session-e2e-soak.result }}
+          INSTALLER: ${{ needs.installer.result }}
+        run: |
+          set -euo pipefail
+          title="Nightly test tier failing"
+          # Dedup by LABEL, not free-text title search: label filtering is
+          # immediately consistent, whereas the search index lags creation and
+          # would let back-to-back failing runs open duplicate issues.
+          gh label create ci-nightly --repo "$GITHUB_REPOSITORY" \
+            --color B60205 --description "Nightly test-tier failure" 2>/dev/null || true
+          # The trigger condition fires on both failure and cancellation (a
+          # timeout reports 'failure'); the per-job lines below carry the exact
+          # result, so keep the lead line accurate for either outcome.
+          body="$(printf 'A nightly-tests run failed or was cancelled.\n\n- advisories: %s\n- session-e2e-soak: %s\n- installer: %s\n\nRun: %s' \
+            "$ADV" "$SOAK" "$INSTALLER" "$RUN_URL")"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --label ci-nightly --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" --label ci-nightly
+          fi

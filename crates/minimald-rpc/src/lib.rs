@@ -132,9 +132,20 @@ pub struct ListSessionsEntry {
     pub attrs: Option<RunningSessionAttrs>,
 }
 
+/// Resources shared by every session managed by a minimald instance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourcePool {
+    pub cpu_cores: u32,
+    pub memory_bytes: u64,
+}
+
 /// The response to the [`ListSessions`] RPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListSessionsResponse {
+    /// Provider capacity shared by all sessions. Optional for compatibility
+    /// with minimald versions that predate resource-pool reporting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_pool: Option<ResourcePool>,
     pub sessions: Vec<ListSessionsEntry>,
 }
 
@@ -174,11 +185,12 @@ impl OneshotSshRpc for GetSessionRecord {
 
 /// An RPC to create a new session.
 ///
-/// Carries two parts: a [`SessionConfig`] (everything that doesn't
-/// fit in a [`WireContribution`] — name, network, policy, attrs)
-/// plus the client's Phase 1 [`WireContribution`]. Callers that
-/// don't go through the composition pipeline (sftp / exec /
-/// session-recovery) send `WireContribution::default()`.
+/// Allocates the session's record and brings its actor up; the
+/// session exists but has no loadout yet. The client follows up with
+/// [`ConfigureLoadout`] once the daemon-side workspace holds the
+/// project files the composer reads — nothing here composes, so a
+/// caller that only needs a session (sftp / exec / session-recovery)
+/// can stop after this RPC.
 pub struct CreateSession;
 
 /// Session configuration that lives outside the composable
@@ -213,51 +225,73 @@ pub struct SessionConfig {
 pub struct CreateSessionRequest {
     /// Out-of-band session config.
     pub config: SessionConfig,
-    /// Client-side Phase 1 contribution. Defaulted (empty) by
-    /// internal callers that aren't composing a session — e.g. sftp,
-    /// exec, session-recovery — so the daemon takes the empty-
-    /// contribution fast path and returns [`CreateSessionResponse::Ready`]
-    /// immediately.
-    #[serde(default)]
-    pub contribution: sessions::wire::request::WireContribution,
 }
 
-/// The response for a [`CreateSession`] RPC.
+/// The response for a [`CreateSession`] RPC: the allocated session.
 ///
-/// Both variants are part of the Phase 2 flow and reachable on the
-/// wire: `Ready` when the daemon's composer finalizes in one shot,
-/// `Pending` when it collects items the client must gate before
-/// composition completes (the client follows up via `SubmitVerdict`).
-///
-/// In practice today every caller still takes the `Ready` path — no
-/// daemon-side contributors (project / package `Composable`s) are
-/// wired into the manager yet, so the composer never has anything to
-/// route back for gating. `Pending` lights up automatically once
-/// those contributors land.
+/// The session's loadout is not composed yet — the returned id is
+/// what the client names it by in the [`ConfigureLoadout`] that
+/// follows.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CreateSessionResponse {
-    /// No items need user gating. The session id is the finalized
-    /// session — callers can immediately use it.
-    Ready {
-        /// Daemon-assigned session id.
-        id: SessionId,
-    },
-    /// Items need client-side gating. The session id is allocated
-    /// and the session is persisted (status reflects "in flight").
-    /// Client follows up with `SubmitVerdict` carrying the same id.
-    Pending {
-        /// Daemon-assigned session id; also embedded in `response`.
-        id: SessionId,
-        /// Pending items the client must gate.
-        response: sessions::wire::request::ContributionResponse,
-    },
+pub struct CreateSessionResponse {
+    /// Daemon-assigned session id.
+    pub id: SessionId,
 }
 
 impl OneshotSshRpc for CreateSession {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "CreateSession");
     type Request<'a> = CreateSessionRequest;
     type Response = Errorable<CreateSessionResponse>;
+}
+
+/// An RPC to compose a session's loadout, completing its create flow.
+///
+/// Split from [`CreateSession`] because the composer reads the
+/// project config out of the session's *daemon-side workspace*, which
+/// only holds the project files once the client has streamed them up
+/// — the record's `project_path` is a path on the client's machine,
+/// which the daemon generally can't read. So the client creates the
+/// session, populates its workspace, and only then configures the
+/// loadout.
+pub struct ConfigureLoadout;
+
+/// The request for a [`ConfigureLoadout`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfigureLoadoutRequest {
+    /// The session to configure, from [`CreateSessionResponse::id`].
+    pub session_id: SessionId,
+    /// Client-side Phase 1 contribution. Defaulted (empty) by
+    /// callers that aren't composing a session, which take the
+    /// empty-contribution fast path to [`ConfigureLoadoutResponse::Ready`].
+    #[serde(default)]
+    pub contribution: sessions::wire::request::WireContribution,
+}
+
+/// The response for a [`ConfigureLoadout`] RPC.
+///
+/// Both variants are part of the Phase 2 flow and reachable on the
+/// wire: `Ready` when the daemon's composer finalizes in one shot,
+/// `Pending` when it collects items the client must gate before
+/// composition completes (the client follows up via `SubmitVerdict`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConfigureLoadoutResponse {
+    /// No items need user gating; the session is finalized and
+    /// callers can immediately use it.
+    Ready,
+    /// Items need client-side gating. The session stays in flight;
+    /// the client follows up with `SubmitVerdict` carrying the same
+    /// id.
+    Pending {
+        /// Pending items the client must gate.
+        response: sessions::wire::request::ContributionResponse,
+    },
+}
+
+impl OneshotSshRpc for ConfigureLoadout {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ConfigureLoadout");
+    type Request<'a> = ConfigureLoadoutRequest;
+    type Response = Errorable<ConfigureLoadoutResponse>;
 }
 
 /// An RPC to rename an existing session.
@@ -632,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn create_session_request_round_trips_with_explicit_contribution() {
+    fn create_session_request_round_trips() {
         let req = CreateSessionRequest {
             config: SessionConfig {
                 name: Some("my-session".into()),
@@ -643,42 +677,58 @@ mod tests {
                     .into_iter()
                     .collect(),
             },
-            contribution: WireContribution::default(),
         };
         assert_eq!(round_trip(&req), req);
     }
 
     #[test]
-    fn create_session_request_accepts_missing_contribution_field() {
-        // Wire payload from an internal caller that doesn't know about
-        // the composition pipeline: only `config` is set.
+    fn create_session_response_round_trips() {
+        let resp = CreateSessionResponse {
+            id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+        };
+        assert_eq!(round_trip(&resp), resp);
+    }
+
+    #[test]
+    fn list_sessions_accepts_response_without_resource_pool() {
+        let resp: ListSessionsResponse =
+            serde_json::from_str(r#"{"sessions":[]}"#).expect("deserialize");
+        assert!(resp.resource_pool.is_none());
+        assert!(resp.sessions.is_empty());
+    }
+
+    #[test]
+    fn configure_loadout_request_round_trips_with_explicit_contribution() {
+        let req = ConfigureLoadoutRequest {
+            session_id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            contribution: WireContribution::default(),
+        };
+        assert_eq!(round_trip(&req), req);
+    }
+
+    /// A caller that doesn't compose a session omits `contribution`
+    /// entirely; it defaults to empty rather than failing to parse.
+    #[test]
+    fn configure_loadout_request_accepts_missing_contribution_field() {
         let raw = serde_json::json!({
-            "config": {
-                "name": null,
-                "project_path": "/proj",
-                "network": "host_net",
-                "policy": { "egress": null, "ingress": null },
-                "attrs": {},
-            },
+            "session_id": "00000000-0000-0000-0000-000000000001",
         });
-        let req: CreateSessionRequest = serde_json::from_value(raw).expect("deserialize");
+        let req: ConfigureLoadoutRequest = serde_json::from_value(raw).expect("deserialize");
         assert_eq!(req.contribution, WireContribution::default());
     }
 
     #[test]
-    fn create_session_response_ready_round_trips() {
-        let id = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
-        let resp = CreateSessionResponse::Ready { id };
+    fn configure_loadout_response_ready_round_trips() {
+        let resp = ConfigureLoadoutResponse::Ready;
         assert_eq!(round_trip(&resp), resp);
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains(r#""kind":"ready""#), "got: {json}");
     }
 
     #[test]
-    fn create_session_response_pending_round_trips() {
+    fn configure_loadout_response_pending_round_trips() {
         let id = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
-        let resp = CreateSessionResponse::Pending {
-            id,
+        let resp = ConfigureLoadoutResponse::Pending {
             response: ContributionResponse {
                 session_id: id,
                 vars: vec![],

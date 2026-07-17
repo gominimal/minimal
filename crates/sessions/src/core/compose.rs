@@ -57,6 +57,13 @@ pub enum Error {
         #[from]
         source: Conflict,
     },
+    /// A loadout with this name was already added to the composer.
+    /// Loadout names must be unique within a composer instance so
+    /// per-loadout settings (like `follow_symlinks`) can be attributed
+    /// unambiguously; a duplicate would silently overwrite an earlier
+    /// setting on the map keyed by name.
+    #[error("loadout name `{name}` was already added to this composer")]
+    DuplicateLoadout { name: String },
 }
 
 /// Conflicts surfaced when two contributions disagree on a value.
@@ -328,6 +335,20 @@ impl Contribution {
         self.lifecycle_hooks.push(h);
     }
 
+    /// Overwrite the `follow_symlinks` override on every currently
+    /// accumulated patch. Used by
+    /// [`Loadout::contribute`](crate::core::loadout::Loadout::contribute)
+    /// to stamp the loadout's per-source override after
+    /// `contribute_primitives` produced patches with the default
+    /// `None`.
+    pub fn set_follow_symlinks_on_patches(&mut self, follow: Option<bool>) {
+        for p in std::mem::take(&mut self.patches) {
+            let (patch, source, _) = p.into_parts();
+            self.patches
+                .push(ProvenancedPatch::new(patch, source).with_follow_symlinks(follow));
+        }
+    }
+
     /// Merge `other` into `self`: concatenate vars/patches/hooks and
     /// dedupe packages. Cross-contributor conflicts are detected
     /// post-gate in [`compose_contribution`], not here.
@@ -522,7 +543,7 @@ pub enum ComposeError {
     /// errors (permission denied, non-UTF-8 paths, etc.). All errors
     /// surfaced by every `FileSet::resolve` invocation are accumulated
     /// — none are discarded.
-    #[error("patch enumeration failed ({} error(s)):{}", sources.len(), DisplayJoin(sources))]
+    #[error("patch enumeration produced {} error{}:{}", sources.len(), if sources.len() == 1 { "" } else { "s" }, DisplayJoin(sources))]
     PatchWalk {
         sources: Vec<crate::core::primitives::PatchError>,
     },
@@ -1075,10 +1096,22 @@ impl Composition {
 /// dotfile trees where a symlink may legitimately point outside the
 /// patch source.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct ComposeOptions {
     /// If `true`, [`FileSet::resolve`](crate::core::primitives::FileSet::resolve)
     /// follows symlinks while walking patch sources. Off by default.
     pub follow_symlinks: bool,
+}
+
+impl ComposeOptions {
+    /// Owned-builder setter for [`Self::follow_symlinks`]. Prefer
+    /// this over struct-literal syntax so external callers keep
+    /// compiling when new fields are added.
+    #[must_use]
+    pub fn with_follow_symlinks(mut self, follow: bool) -> Self {
+        self.follow_symlinks = follow;
+        self
+    }
 }
 
 // =====================================================================
@@ -1251,21 +1284,30 @@ pub(crate) fn gate_vars(
 /// first [`ExpandError`](crate::core::expansion::ExpandError); a partial
 /// expansion would let some patches reach the walker with their
 /// references intact, which silently matches wrong paths.
+///
+/// Per-patch `follow_symlinks` is resolved here: any `Some(v)` carried
+/// on the [`ProvenancedPatch`] wins; `None` inherits
+/// `default_follow_symlinks`. The resolved bool is stamped onto the
+/// emitted [`ExpandedProvenancedPatch`] so downstream code doesn't
+/// have to re-consult a sidecar map.
 pub(crate) fn expand_patch_sources(
     patches: Vec<ProvenancedPatch>,
     gated_vars: &[SessionVar],
     home_fallback: Option<&str>,
+    default_follow_symlinks: bool,
 ) -> Result<Vec<ExpandedProvenancedPatch>, ComposeError> {
     patches
         .into_iter()
         .map(|pp| {
-            let (patch, provenance) = pp.into_parts();
+            let (patch, provenance, follow_override) = pp.into_parts();
             let source =
                 crate::core::expansion::expand_source(patch.source(), gated_vars, home_fallback)?;
+            let follow_symlinks = follow_override.unwrap_or(default_follow_symlinks);
             Ok(ExpandedProvenancedPatch {
                 source,
                 dest: patch.dest().clone(),
                 provenance,
+                follow_symlinks,
             })
         })
         .collect()
@@ -1301,8 +1343,9 @@ pub(crate) fn gate_patches(
     // no IO context for.
     let mut expanded = policy.expand_with(gated_vars, home_fallback)?;
 
-    let expanded_patches = expand_patch_sources(items, gated_vars, home_fallback)?;
-    let files = enumerate_patch_files(expanded_patches, options.follow_symlinks)?;
+    let expanded_patches =
+        expand_patch_sources(items, gated_vars, home_fallback, options.follow_symlinks)?;
+    let files = enumerate_patch_files(expanded_patches)?;
 
     // Pass 1: categorize per file.
     let mut allowed: Vec<PatchFile> = Vec::new();
@@ -2007,15 +2050,20 @@ mod tests {
             assert_eq!(dests, ["nvim/a.lua", "nvim/sub/b.lua"]);
         }
 
+        /// A patch whose walk root doesn't exist on the host is
+        /// silently dropped with a `tracing::warn!`, not surfaced as
+        /// [`ComposeError::PatchWalk`]. A user activating a loadout
+        /// that opportunistically patches something absent (e.g. a
+        /// missing dotfile tree) shouldn't have activation fail.
         #[test]
-        fn walk_failure_surfaces_as_patch_walk() {
+        fn missing_patch_source_is_dropped_not_error() {
             let patch = Patch::new(
                 "/definitely/does/not/exist/*",
                 PatchDest::try_new("x").unwrap(),
             );
             let pp = ProvenancedPatch::new(patch, user_source());
             let policy = PatchPolicy::empty();
-            let err = gate_patches(
+            let (patches, _policy) = gate_patches(
                 vec![pp],
                 policy,
                 Some(&PanicHook),
@@ -2023,11 +2071,49 @@ mod tests {
                 &[],
                 None,
             )
-            .unwrap_err();
+            .expect("missing walk root should not error");
             assert!(
-                matches!(err, ComposeError::PatchWalk { ref sources } if !sources.is_empty()),
-                "got: {err:?}",
+                patches.is_empty(),
+                "missing source should yield no patches, got {patches:?}",
             );
+        }
+
+        /// A batch mixing missing and present patch sources keeps
+        /// the present ones through and warn-drops the missing —
+        /// one bad path doesn't sink the whole activation.
+        #[test]
+        fn missing_and_present_patches_partition_cleanly() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+            std::fs::write(root.join("real.txt").as_std_path(), "x").unwrap();
+            let real_pattern = format!("{root}/real.txt");
+
+            let present = ProvenancedPatch::new(
+                Patch::new(&real_pattern, PatchDest::try_new("real.txt").unwrap()),
+                user_source(),
+            );
+            let missing = ProvenancedPatch::new(
+                Patch::new(
+                    "/definitely/does/not/exist/*",
+                    PatchDest::try_new("m").unwrap(),
+                ),
+                user_source(),
+            );
+            let policy = PatchPolicy::empty();
+            let (patches, _) = gate_patches(
+                vec![present, missing],
+                policy,
+                Some(&PanicHook),
+                ComposeOptions::default(),
+                &[],
+                None,
+            )
+            .expect("mixed batch should not error");
+            let dests: Vec<&str> = patches
+                .iter()
+                .map(|sp| sp.patch().destination().as_str())
+                .collect();
+            assert_eq!(dests, ["real.txt"]);
         }
 
         #[test]
@@ -2133,8 +2219,11 @@ mod tests {
             );
         }
 
+        /// `~someuser/…` (per-user tilde) is rejected at expansion —
+        /// only bare `~` and `~/…` are supported. Silent noop
+        /// otherwise: the pattern would be literal and never match.
         #[test]
-        fn user_prefixed_tilde_is_rejected_as_relative() {
+        fn user_prefixed_tilde_is_rejected() {
             let (_tmp, patch) = single_file_patch("conf.toml", "conf");
             let pp = ProvenancedPatch::new(patch, user_source());
             let policy = PatchPolicy::empty().with_deny(["~someuser/.ssh/**"]);
@@ -2151,7 +2240,7 @@ mod tests {
                 matches!(
                     err,
                     ComposeError::Expansion(
-                        crate::core::expansion::ExpandError::NotAbsolute { .. }
+                        crate::core::expansion::ExpandError::UnsupportedTildeUser { .. }
                     )
                 ),
                 "got: {err:?}",

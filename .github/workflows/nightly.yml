@@ -1,0 +1,433 @@
+name: nightly
+
+# Cut a release once a day and bless it onto the `nightly` distribution
+# channel. This reuses release.yml verbatim (via workflow_call) to build and
+# stage, then flips the `nightly` pointer inline — so promote.yml stays the
+# gated, manual stable/unstable path and needs no nightly-specific carve-outs.
+#
+# `nightly` is bleeding-edge like `unstable` (it's a once-a-day snapshot of
+# HEAD's build), so it is intentionally ungated — no approval issue.
+on:
+    schedule:
+        - cron: "0 10 * * *" # 10:00 UTC = 02:00 PST
+    workflow_dispatch:
+        inputs:
+            dry_run:
+                description: "Build, sign, assemble, and smoke everything but publish nothing (no GCS upload, no GitHub release, no installer-bucket write, no nightly channel advance). Forces the build even when HEAD is already staged."
+                type: boolean
+                default: false
+            skip_ci_verify:
+                description: "Bypass release.yml's verify-ci gate that requires this commit's five lane aggregators to be green. Admin override for a commit whose checks are known-good but unreported."
+                type: boolean
+                default: false
+
+permissions:
+    contents: write # release job cuts a GitHub release
+    id-token: write # OIDC for the GCS auth in promote-nightly
+    checks: read # release.yml's verify-ci gate reads check-run conclusions; a
+    # called workflow cannot hold a scope its caller doesn't grant, and an
+    # ungranted request fails the whole run at startup (startup_failure).
+
+jobs:
+    # Skip the build on no-op nights: a finished release stages an immutable
+    # versions/<sha>/components manifest in gs://minimal-one, so if HEAD hasn't
+    # moved since the last release that object already exists. When it does we
+    # skip the (re)build but still run promote-nightly, so the `nightly` channel
+    # always ends up pointing at HEAD's build whether or not we cut it tonight.
+    # The bucket is public, so this is an unauthenticated HEAD — no GCS auth.
+    check:
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        outputs:
+            sha: ${{ steps.check.outputs.sha }}
+            should_release: ${{ steps.check.outputs.should_release }}
+        steps:
+            - uses: actions/checkout@v7
+            - name: Determine whether HEAD is already staged
+              id: check
+              run: |
+                  set -euo pipefail
+                  SHA=$(git rev-parse --short=8 HEAD)
+                  echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+                  URL="https://storage.googleapis.com/minimal-one/versions/$SHA/components"
+                  if curl -sf -o /dev/null -I "$URL"; then
+                    echo "$SHA already staged; skipping build, will still point nightly at it."
+                    echo "should_release=false" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "$SHA not staged; cutting a fresh release."
+                    echo "should_release=true" >> "$GITHUB_OUTPUT"
+                  fi
+
+    release:
+        needs: check
+        # A dry_run dispatch forces the build even when HEAD is already staged
+        # (a rehearsal that skips itself proves nothing). On schedule the
+        # inputs context is empty, so both expressions fall back to the
+        # unforced/real-release path.
+        if: ${{ needs.check.outputs.should_release == 'true' || inputs.dry_run == true }}
+        uses: ./.github/workflows/release.yml
+        with:
+            dry_run: ${{ inputs.dry_run || false }}
+            skip_ci_verify: ${{ inputs.skip_ci_verify || false }}
+        secrets: inherit
+
+    # --- Smoke: prove the artifacts release.yml just built actually run before
+    # the `nightly` channel is pointed at them. The workflow_call jobs above are
+    # part of THIS run, so each smoke job downloads the uploaded artifacts by
+    # name, puts the SHIPPED binaries on PATH (never a fresh target/ build), and
+    # runs the ONE shared session e2e (scripts/session-e2e.sh — the same proof
+    # the CI lanes run). All three `needs: [release]`, so on a no-op night (HEAD
+    # already staged, release skipped) they skip too and the channel flip
+    # proceeds against bytes that were smoked the night they were cut. All three
+    # gate `promote-nightly` via the `smoke-success` aggregator below.
+
+    smoke-linux-amd64:
+        # DM2 (native minimald on the host, no VM): the SHIPPED static-musl
+        # `min`/`minimald` — downloaded back by name — must auto-spawn a daemon
+        # and pass the session e2e. Mirrors ci-linux-native's `native-daemon-e2e`
+        # job, but against the release artifacts instead of a target/debug build.
+        needs: [release]
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
+            - name: Download shipped min
+              uses: actions/download-artifact@v8
+              with:
+                  name: minimal-linux-amd64
+                  path: ${{ runner.temp }}/bin
+            - name: Download shipped minimald
+              uses: actions/download-artifact@v8
+              with:
+                  name: minimald-linux-amd64
+                  path: ${{ runner.temp }}/bin
+            - name: Put the shipped binaries on PATH
+              # download-artifact drops each file under its platform-suffixed
+              # name; the CLI autospawns the daemon by the bare `minimald` name
+              # and users invoke `min`, so rename both and prepend the dir to PATH.
+              run: |
+                  set -euo pipefail
+                  BIN="$RUNNER_TEMP/bin"
+                  mv "$BIN/minimal-linux-amd64" "$BIN/min"
+                  mv "$BIN/minimald-linux-amd64" "$BIN/minimald"
+                  chmod +x "$BIN/min" "$BIN/minimald"
+                  echo "$BIN" >> "$GITHUB_PATH"
+            - name: Enable unprivileged user namespaces
+              # The session sandbox (hakoniwa) needs userns; Ubuntu 24.04
+              # restricts them via AppArmor by default. Mirrors the native lane.
+              run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            - name: Cache minimal package cache
+              # Session creation materializes the project's stack via cache pulls
+              # keyed by the pinned upstream commit; carry it across runs so the
+              # smoke isn't dominated by pulls. The e2e resets XDG_STATE_HOME /
+              # XDG_RUNTIME_DIR but leaves XDG_CACHE_HOME alone for this reason.
+              uses: actions/cache@v6
+              with:
+                  path: ~/.cache/minimal
+                  key: smoke-amd64-minimal-cache-${{ hashFiles('.minimal/minimal.toml') }}
+                  restore-keys: smoke-amd64-minimal-cache-
+            - name: Session e2e (shipped native minimald)
+              # No E2E_* knobs: native target, host daemon, and the e2e seeds its
+              # own project workspace (E2E_PROJECT_DIR defaults to the checkout).
+              run: ./scripts/session-e2e.sh
+
+    smoke-linux-kvm:
+        # DM3 (native Linux + a minvmd/libkrun microVM): boot a REAL microVM from
+        # the SHIPPED minvmd and pass the session e2e over the vsock bridge, the
+        # same proof ci-linux-kvm's `test-kvm` runs. Every moving part is a
+        # downloaded release artifact: the native-glibc `minvmd`, the guest kernel
+        # + ext4 rootfs + initramfs, and the pinned gvproxy switch. libkrun itself
+        # is NOT shipped on Linux (users resolve it from the system / the upstream
+        # package), so it is materialized here exactly as the release build linked
+        # it, reusing the shipped static `mip` to drive the cache fetch.
+        needs: [release]
+        runs-on: ubuntu-latest # x86_64; KVM-capable
+        timeout-minutes: 30
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
+            - name: Enable /dev/kvm access
+              # GitHub-hosted x86_64 Linux runners expose /dev/kvm but the runner
+              # user is not in the `kvm` group; widen the node so libkrun can open
+              # it. Fail fast if this runner has no KVM at all. (Ported from
+              # ci-linux-kvm's test-kvm.)
+              run: |
+                  if [ ! -e /dev/kvm ]; then
+                    echo "::error::/dev/kvm not present on this runner; cannot boot the microVM." >&2
+                    exit 1
+                  fi
+                  echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+                    | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+                  sudo udevadm control --reload-rules
+                  sudo udevadm trigger --name-match=kvm
+                  ls -l /dev/kvm
+            - name: Enable unprivileged user namespaces
+              # `mip materialize` (the libkrun cache fetch below) runs the build
+              # pipeline, which needs userns; Ubuntu 24.04 restricts it via
+              # AppArmor by default.
+              run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            - name: Download shipped linux-amd64 binaries
+              # Pulls min, minvmd, mip and gvproxy (plus minimald, unused on the
+              # host — it ships inside the initramfs). `*-linux-amd64` is a clean
+              # glob here: only darwin artifacts carry the `temp-` prefix.
+              uses: actions/download-artifact@v8
+              with:
+                  pattern: "*-linux-amd64"
+                  path: ${{ runner.temp }}/bin
+                  merge-multiple: true
+            - name: Download shipped guest kernel
+              uses: actions/download-artifact@v8
+              with:
+                  name: virtio-kernel-amd64
+                  path: ${{ runner.temp }}/guest
+            - name: Download shipped guest rootfs
+              uses: actions/download-artifact@v8
+              with:
+                  name: minvmd-rootfs-amd64
+                  path: ${{ runner.temp }}/guest
+            - name: Download shipped guest initramfs
+              uses: actions/download-artifact@v8
+              with:
+                  name: minimald-initramfs-amd64
+                  path: ${{ runner.temp }}/guest
+            - name: Put the shipped binaries on PATH
+              # Rename off the platform suffix and prepend to PATH so `min`
+              # autospawns `minvmd` by bare name. gvproxy is NOT resolved from
+              # PATH — minvmd only honours MINVMD_GVPROXY_BIN, the installer
+              # bin dir, or /usr/lib/minimal/bin (see resolve_gvproxy_path) —
+              # so the e2e step below points MINVMD_GVPROXY_BIN at it.
+              run: |
+                  set -euo pipefail
+                  BIN="$RUNNER_TEMP/bin"
+                  mv "$BIN/minimal-linux-amd64" "$BIN/min"
+                  mv "$BIN/minvmd-linux-amd64" "$BIN/minvmd"
+                  mv "$BIN/mip-linux-amd64" "$BIN/mip"
+                  mv "$BIN/gvproxy-linux-amd64" "$BIN/gvproxy"
+                  chmod +x "$BIN/min" "$BIN/minvmd" "$BIN/mip" "$BIN/gvproxy"
+                  echo "$BIN" >> "$GITHUB_PATH"
+            - name: Materialize libkrun prefix (upstream package)
+              # minvmd links libkrun.so + dlopens libkrunfw.so.5 at runtime; the
+              # Linux release ships neither (its rpath resolves them from the
+              # system / LD_LIBRARY_PATH). Reuse the shipped static mip to drive
+              # the cache fetch (no Rust toolchain) — the exact libkrun the release
+              # build linked against. Publishes LIBKRUN_PREFIX and
+              # LD_LIBRARY_PATH=$HOME/.krun to later steps.
+              uses: ./.github/actions/setup-libkrun-linux
+              with:
+                  arch: x86_64
+                  mip: ${{ runner.temp }}/bin/mip
+            - name: Point the microVM env at the shipped guest artifacts
+              run: |
+                  {
+                    echo "MINVMD_KERNEL_PATH=$RUNNER_TEMP/guest/vmlinuz-amd64"
+                    echo "MINVMD_ROOTFS_PATH=$RUNNER_TEMP/guest/rootfs-amd64.img"
+                    echo "MINVMD_INITRAMFS=$RUNNER_TEMP/guest/initramfs-amd64.cpio"
+                  } >> "$GITHUB_ENV"
+            - name: Session e2e (shipped minvmd microVM)
+              # activate must auto-spawn minvmd, boot the guest, and round-trip a
+              # session. E2E_PROJECT_DIR=/tmp — the guest sees no host project dir
+              # yet (no project sync), and /tmp exists in the guest image.
+              # MINVMD_GVPROXY_BIN: without it minvmd boots the VM switchless
+              # (gvproxy resolution is best-effort and never errors) and every
+              # guest egress — including the in-guest `pkgs` clone during
+              # session mint — dies with "Could not resolve host".
+              env:
+                  MINVMD_BOOT_LOG: ${{ runner.temp }}/cli-e2e-boot.log
+                  MINVMD_GVPROXY_BIN: ${{ runner.temp }}/bin/gvproxy
+              run: E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd E2E_PROJECT_DIR=/tmp ./scripts/session-e2e.sh
+            - name: Reap leftover VM processes
+              # The autospawned minvmd can leak a __krun-vmm child on a failed
+              # teardown; reap defensively (ported from test-kvm). The runner is
+              # ephemeral, so this is hygiene, not correctness.
+              if: always()
+              run: |
+                  sudo pkill -x minvmd || true
+                  sudo pkill -f __krun-vmm || true
+            - name: Upload guest boot console log
+              if: always()
+              uses: actions/upload-artifact@v7
+              with:
+                  name: smoke-linux-kvm-boot-log
+                  path: ${{ runner.temp }}/cli-e2e-boot.log
+                  if-no-files-found: ignore
+
+    smoke-macos:
+        # DM1 (macOS is always VM-backed): prove the SIGNED macOS artifacts boot
+        # the microVM from the INSTALLER LAYOUT — the same session e2e ci-macos
+        # runs, but against the Developer-ID-signed `min`/`minvmd`, the signed
+        # shipped `libkrun.1.dylib` laid out as a `lib/` sibling of `bin/` (minvmd
+        # resolves it via its @loader_path/../lib rpath, exactly as
+        # scripts/install.sh drops it), the signed gvproxy, and the shipped arm64
+        # guest kernel/rootfs/initramfs.
+        #
+        # SKIP-TOLERANT: runs on the single self-hosted Apple-Silicon mini (it
+        # holds the signing keychain), a scarce shared resource. Gated on the same
+        # RUN_MACOS_CI kill-switch as the mac build/sign jobs, so taking the mini
+        # offline skips this smoke as `skipped` (never `failure`); `smoke-success`
+        # treats a skip as pass, so a skipped mac smoke does not wedge the nightly.
+        if: vars.RUN_MACOS_CI != 'false'
+        needs: [release]
+        runs-on: [self-hosted, macOS, ARM64]
+        timeout-minutes: 30
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  # Don't leave git credentials on the persistent self-hosted runner.
+                  persist-credentials: false
+            - name: Download signed CLI (min)
+              uses: actions/download-artifact@v8
+              with:
+                  name: minimal-macos-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download signed minvmd
+              uses: actions/download-artifact@v8
+              with:
+                  name: minvmd-macos-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download signed libkrun dylib
+              uses: actions/download-artifact@v8
+              with:
+                  name: libkrun-macos-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download signed gvproxy
+              uses: actions/download-artifact@v8
+              with:
+                  name: gvproxy-darwin-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download shipped guest kernel
+              uses: actions/download-artifact@v8
+              with:
+                  name: virtio-kernel-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download shipped guest rootfs
+              uses: actions/download-artifact@v8
+              with:
+                  name: minvmd-rootfs-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Download shipped guest initramfs
+              uses: actions/download-artifact@v8
+              with:
+                  name: minimald-initramfs-arm64
+                  path: ${{ runner.temp }}/dl
+            - name: Assemble the installer layout
+              # Reproduce the on-disk tree scripts/install.sh writes (spec 07):
+              # bin/{min,minvmd,gvproxy}, lib/libkrun.1.dylib (bin's sibling, the
+              # @rpath target), data/{vmlinuz,rootfs.img,initramfs.cpio}. The dylib
+              # basename MUST be libkrun.1.dylib — minvmd's load command is
+              # @rpath/libkrun.1.dylib. Then bin/ joins PATH so `min` autospawns
+              # `minvmd` (which finds libkrun via @loader_path/../lib) by bare
+              # name. gvproxy is NOT resolved from PATH — the e2e step below
+              # points MINVMD_GVPROXY_BIN at the laid-out binary.
+              run: |
+                  set -euo pipefail
+                  DL="$RUNNER_TEMP/dl"
+                  ROOT="$RUNNER_TEMP/install"
+                  mkdir -p "$ROOT/bin" "$ROOT/lib" "$ROOT/data"
+                  mv "$DL/minimal-macos-arm64" "$ROOT/bin/min"
+                  mv "$DL/minvmd-macos-arm64" "$ROOT/bin/minvmd"
+                  mv "$DL/gvproxy-darwin-arm64" "$ROOT/bin/gvproxy"
+                  mv "$DL/libkrun-macos-arm64.dylib" "$ROOT/lib/libkrun.1.dylib"
+                  mv "$DL/vmlinuz-arm64" "$ROOT/data/vmlinuz"
+                  mv "$DL/rootfs-arm64.img" "$ROOT/data/rootfs.img"
+                  mv "$DL/initramfs-arm64.cpio" "$ROOT/data/initramfs.cpio"
+                  chmod +x "$ROOT/bin/min" "$ROOT/bin/minvmd" "$ROOT/bin/gvproxy"
+                  echo "$ROOT/bin" >> "$GITHUB_PATH"
+            - name: Reap stale VM processes before the smoke
+              # The mini is persistent and shared: a prior run's stray minvmd,
+              # __krun-vmm or gvproxy would wedge the host->guest vsock bridge and
+              # sink the cold activate. Clear the tree first (mirrors ci-macos).
+              run: |
+                  pkill -x minvmd 2>/dev/null || true
+                  pkill -f '__krun-vmm' 2>/dev/null || true
+                  pkill -f gvproxy 2>/dev/null || true
+                  sleep 1
+            - name: Session e2e (signed microVM, installer layout)
+              # activate must auto-spawn minvmd, boot the guest, and round-trip a
+              # session. E2E_PROJECT_DIR=/tmp — the guest sees no host project dir
+              # yet, and /tmp exists in the guest image. Runs the laid-out binaries
+              # directly (never cargo, which would relink and unsign minvmd).
+              env:
+                  MINVMD_KERNEL_PATH: ${{ runner.temp }}/install/data/vmlinuz
+                  MINVMD_ROOTFS_PATH: ${{ runner.temp }}/install/data/rootfs.img
+                  MINVMD_INITRAMFS: ${{ runner.temp }}/install/data/initramfs.cpio
+                  MINVMD_BOOT_LOG: ${{ runner.temp }}/cli-e2e-boot.log
+                  MINVMD_GVPROXY_BIN: ${{ runner.temp }}/install/bin/gvproxy
+              run: E2E_VM=1 E2E_PROJECT_DIR=/tmp ./scripts/session-e2e.sh
+            - name: Reap VM processes
+              # Leave the shared mini clean for the next job (Guest teardown does
+              # not always reap the __krun-vmm grandchild or the gvproxy switch).
+              if: always()
+              run: |
+                  pkill -x minvmd 2>/dev/null || true
+                  pkill -f '__krun-vmm' 2>/dev/null || true
+                  pkill -f gvproxy 2>/dev/null || true
+            - name: Upload guest boot console log
+              if: always()
+              uses: actions/upload-artifact@v7
+              with:
+                  name: smoke-macos-boot-log
+                  path: ${{ runner.temp }}/cli-e2e-boot.log
+                  if-no-files-found: ignore
+
+    smoke-success:
+        # Skip-tolerant gate that `promote-nightly` needs: the shipped-artifact
+        # smokes must pass BEFORE the `nightly` channel is advanced. `if:
+        # always()` so a no-op night (release skipped, smokes skipped) or a
+        # kill-switch skip (RUN_MACOS_CI off skipping smoke-macos) still lets
+        # this run, and only a real failure/cancellation reds it — a `skipped`
+        # smoke reads as pass, mirroring the lane `*-success` aggregators.
+        if: always()
+        needs: [smoke-linux-amd64, smoke-linux-kvm, smoke-macos]
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        permissions:
+            contents: read
+        steps:
+            - name: Verify every smoke job succeeded or was skipped
+              if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+              run: exit 1
+            - run: echo "shipped-artifact smoke green"
+
+    promote-nightly:
+        needs: [check, release, smoke-success]
+        # Run whether release executed (success) or was skipped as a no-op;
+        # bail only if it actually failed or was cancelled, or if the smoke
+        # gate reds. always() is needed so a skipped `release` doesn't
+        # auto-skip this job. A dry_run dispatch never advances the channel —
+        # a dry-run release stages nothing, and re-pointing nightly at a
+        # previously staged HEAD would make the rehearsal publish.
+        if: ${{ always() && needs.check.result == 'success' && needs.release.result != 'failure' && needs.release.result != 'cancelled' && needs.smoke-success.result == 'success' && !inputs.dry_run }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        permissions:
+            contents: read
+            id-token: write
+        steps:
+            - uses: actions/checkout@v7
+            - name: Authenticate to Google Cloud (installer bucket)
+              # Same project + workload-identity pool as release.yml's
+              # stage-installer job; grants write to gs://minimal-one.
+              uses: google-github-actions/auth@v3
+              with:
+                  project_id: "524228262772"
+                  workload_identity_provider: "projects/524228262772/locations/global/workloadIdentityPools/github/providers/gominimal"
+            - name: Point nightly channel at this release
+              # The SHA `check` computed is HEAD at this ref, i.e. exactly what
+              # release.yml staged. set-channel.sh verifies versions/<sha>/ is
+              # staged before flipping, so a missing stage fails loudly.
+              env:
+                  SHA: ${{ needs.check.outputs.sha }}
+              run: |
+                  scripts/set-channel.sh \
+                    --channel nightly \
+                    --version "$SHA" \
+                    --bucket gs://minimal-one

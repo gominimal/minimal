@@ -132,16 +132,91 @@ pub fn minimal_cache_dir() -> DaemonAbsPath {
 
 /// Returns minimal's default state directory, `<state>/minimal`.
 ///
-/// The base is the platform state directory (e.g. `$XDG_STATE_HOME` or
-/// `~/.local/state` on Linux), falling back to `~/.local/state` when it cannot
-/// be determined.
+/// The base is `$XDG_STATE_HOME` when set (honored on all platforms;
+/// `dirs::state_dir` ignores it on macOS), else the platform state directory,
+/// else `~/.local/state`.
 ///
 /// # Panics
 ///
 /// Panics if neither a state directory nor a home directory can be resolved,
 /// or if the resulting path is not valid UTF-8.
 pub fn minimal_state_dir() -> DaemonAbsPath {
-    default_dir(dirs::state_dir, ".local/state")
+    let explicit = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute());
+    default_dir(|| explicit.or_else(dirs::state_dir), ".local/state")
+}
+
+/// File name of the daemon SSH socket in a provider instance dir. Served by
+/// native minimald or by the minvmd host↔guest bridge — one endpoint either way.
+pub const SSH_SOCK_FILE: &str = "ssh.sock";
+/// File name of the SSH `known_hosts` in a provider instance dir, recording the
+/// daemon's host key under the `local-<instance>` hostname. Written at startup
+/// by native minimald, and by minvmd from the guest's boot beacon.
+pub const KNOWN_HOSTS_FILE: &str = "known_hosts";
+/// Native minimald's single-instance lock, held for the daemon's lifetime.
+pub const MINIMALD_LOCK_FILE: &str = "minimald.lock";
+/// The minvmd supervisor's alive lock, held for the daemon's lifetime.
+pub const MINVMD_LOCK_FILE: &str = "minvmd.lock";
+
+/// `<state_dir>/providers/local-<instance>` — the directory holding the
+/// sockets, locks, and state files a client needs to reach one local daemon
+/// instance.
+pub fn provider_instance_dir(state_dir: &DaemonAbsPath, instance: u32) -> DaemonAbsPath {
+    sub_path!(state_dir, "providers").sub_path_unchecked(&format!("local-{instance}"))
+}
+
+/// Returns minimal's default config directory, `<config>/minimal`.
+///
+/// The base is `$XDG_CONFIG_HOME` when set to an absolute path, otherwise
+/// `~/.config` on every platform. Deliberately does not use
+/// [`dirs::config_dir`]: on macOS that would produce
+/// `~/Library/Application Support`, diverging from how the rest of minimal's
+/// on-disk state is laid out ([`minimal_state_dir`] already falls through to
+/// `~/.local/state`). One layout everywhere is easier to document, and users
+/// who genuinely want the platform-native location can override with the
+/// CLI's `--config-dir` flag.
+///
+/// # Panics
+///
+/// Panics if neither `$XDG_CONFIG_HOME` nor a home directory can be
+/// resolved, or if the resulting path is not valid UTF-8.
+pub fn minimal_config_dir() -> DaemonAbsPath {
+    default_dir(xdg_config_home, ".config")
+}
+
+/// Return `$XDG_CONFIG_HOME` if it's set to an absolute path. Matches the
+/// spec: [XDG Base Directory Specification, "XDG_CONFIG_HOME"](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
+/// says relative paths are invalid and should be ignored.
+fn xdg_config_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+/// Returns minimal's default data directory, `<data>/minimal`.
+///
+/// The base is `$XDG_DATA_HOME` when set to an absolute path, otherwise
+/// `~/.local/share` on every platform — the same resolution
+/// `scripts/install.sh` uses for `data`-prefix components, so paths derived
+/// here point at what the installer actually shipped. Like
+/// [`minimal_config_dir`], deliberately not [`dirs::data_dir`]: on macOS that
+/// would be `~/Library/Application Support`.
+///
+/// # Panics
+///
+/// Panics if neither `$XDG_DATA_HOME` nor a home directory can be resolved,
+/// or if the resulting path is not valid UTF-8.
+pub fn minimal_data_dir() -> DaemonAbsPath {
+    default_dir(xdg_data_home, ".local/share")
+}
+
+/// Return `$XDG_DATA_HOME` if it's set to an absolute path, per the XDG
+/// spec's rule that relative paths are invalid and should be ignored.
+fn xdg_data_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
 }
 
 /// Computes `<base>/minimal`, where `base` comes from `base_dir` or, failing
@@ -1424,6 +1499,33 @@ mod tests {
     }
 
     #[test]
+    fn provider_instance_dir_layout() {
+        let state = DaemonAbsPath::try_new("/state/minimal").unwrap();
+        assert_eq!(
+            provider_instance_dir(&state, 0).as_str(),
+            "/state/minimal/providers/local-0",
+        );
+        assert_eq!(
+            provider_instance_dir(&state, 3).as_str(),
+            "/state/minimal/providers/local-3",
+        );
+    }
+
+    #[test]
+    fn minimal_state_dir_honors_xdg_state_home() {
+        // Only this test reads XDG_STATE_HOME; restore to avoid surprising a
+        // developer's environment leaking into other assertions.
+        let prev = std::env::var_os("XDG_STATE_HOME");
+        unsafe { std::env::set_var("XDG_STATE_HOME", "/custom/state") };
+        let dir = minimal_state_dir();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
+        assert_eq!(dir.as_str(), "/custom/state/minimal");
+    }
+
+    #[test]
     fn sub_path_abs() {
         let p = HostAbsPath::try_new("/silly").unwrap();
         assert_eq!(
@@ -1438,5 +1540,41 @@ mod tests {
             sub_path!(p, "moose"),
             HostRelPath::try_new("silly/moose").unwrap()
         );
+    }
+
+    /// Shared lock for every test in this file that mutates
+    /// `std::env`. Cargo runs `#[test]`s in parallel, and every
+    /// test in the process shares one process env — a second env-
+    /// touching test added anywhere in this crate must acquire this
+    /// lock too, or the runs will race. `Mutex` (not `PoisonError`-
+    /// aware) is fine because a panicking test would poison it and
+    /// downstream env tests would fail with a clear error, which is
+    /// what we want.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `xdg_config_home` reflects `$XDG_CONFIG_HOME` when it's an
+    /// absolute path (per the XDG spec) and yields `None` otherwise,
+    /// so the caller can fall through to `$HOME/.config`. Three
+    /// assertions kept in one test to minimize env-lock contention.
+    #[test]
+    fn xdg_config_home_resolution() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // SAFETY: `ENV_LOCK` serializes every env-touching test in
+        // this crate; the block runs single-threaded w.r.t. any
+        // sibling test that might read or write these vars.
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        assert_eq!(xdg_config_home(), None, "unset → None");
+
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", "not/absolute") };
+        assert_eq!(xdg_config_home(), None, "relative → ignored per spec");
+
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", "/some/absolute/xdg") };
+        assert_eq!(
+            xdg_config_home(),
+            Some(std::path::PathBuf::from("/some/absolute/xdg")),
+            "absolute → returned verbatim",
+        );
+
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 }

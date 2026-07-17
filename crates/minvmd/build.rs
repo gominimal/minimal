@@ -5,22 +5,20 @@
 //! Without that cfg the crate compiles to a runtime-bailing stub and never
 //! links libkrun.
 //!
-//! The rpath leads with a binary-relative entry (`$ORIGIN` / `@loader_path`) so
-//! a relocated release binary prefers libkrun's shared objects shipped next to
-//! it, and only then falls back to the absolute libkrun prefix. The prefix is
-//! recorded except for a Linux `--release` build (its prefix is an ephemeral
-//! build path that must not leak). A macOS release keeps the prefix because it
-//! is the stable Homebrew lib dir (`/opt/homebrew/lib`), so a host that has
-//! `brew install slp/krun/libkrun` but is missing the shipped dylib still
-//! resolves libkrun. On Linux the standard system lib dirs ([`LINUX_LIB_DIRS`])
-//! are added too, so a target with a system-installed libkrun resolves it
-//! without bundling. See [`emit_rpaths`] for the full ordering.
+//! The rpath leads with a binary-relative entry (`$ORIGIN` / `@loader_path`) so a
+//! relocated binary prefers libkrun shipped next to it, then falls back to the
+//! absolute prefix. That prefix is recorded except on a Linux `--release` build,
+//! whose prefix is an ephemeral path that must not leak; macOS keeps it (stable
+//! `/opt/homebrew/lib`) and Linux adds [`LINUX_LIB_DIRS`]. See [`emit_rpaths`].
 //!
-//! dyld only consults these rpaths for a load command that begins with
-//! `@rpath/`. macOS links libkrun by its own (absolute Homebrew) install name,
-//! so the release workflow rewrites minvmd's load command to
-//! `@rpath/libkrun.1.dylib` with `install_name_tool` after the build — that is
-//! what activates the `@loader_path`-first search above.
+//! dyld only consults these rpaths for an `@rpath/` load command. macOS links
+//! libkrun by its absolute Homebrew install name, so the release workflow
+//! rewrites minvmd's load command to `@rpath/libkrun.1.dylib` post-build.
+//!
+//! Gated behind the `libkrun` cargo feature (ON by default). With it OFF every
+//! target builds the stub and links nothing — how the `minimal` CLI depends on
+//! this crate (`default-features = false`) without inheriting libkrun's `#[link]`
+//! load command. Per-platform behaviour below applies only with the feature on:
 //!
 //! - **macOS**: libkrun is always linked (Hypervisor.framework backend). The
 //!   prefix defaults to `/opt/homebrew/lib` (the Homebrew tap install location);
@@ -56,17 +54,22 @@ fn main() {
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
-    let prefix = match target_os.as_str() {
-        // macOS always links libkrun: it is the only VM backend on the platform
-        // and the existing proof artifacts assume it is provisioned.
-        "macos" => Some(
-            std::env::var("LIBKRUN_PREFIX").unwrap_or_else(|_| "/opt/homebrew/lib".to_string()),
-        ),
-        // Linux links libkrun only when it can be found, so a host without it
-        // (e.g. the stock Ubuntu CI runners) still builds the no-op stub.
-        "linux" => find_libkrun_prefix(),
-        _ => None,
-    };
+    // Real backend is opt-in via the `libkrun` feature (default on; the `minimal`
+    // CLI opts out). Off => stub, and no dependent binary inherits libkrun's
+    // `#[link]`. Cargo reruns build scripts on feature changes automatically.
+    let want_libkrun = std::env::var_os("CARGO_FEATURE_LIBKRUN").is_some();
+
+    let prefix = want_libkrun
+        .then(|| match target_os.as_str() {
+            // macOS: the only VM backend on the platform; always present.
+            "macos" => {
+                Some(std::env::var("LIBKRUN_PREFIX").unwrap_or_else(|_| "/opt/homebrew/lib".into()))
+            }
+            // Linux: link only when found, else stub (e.g. stock Ubuntu CI).
+            "linux" => find_libkrun_prefix(),
+            _ => None,
+        })
+        .flatten();
 
     if let Some(prefix) = prefix {
         println!("cargo:rustc-link-search=native={prefix}");
@@ -75,48 +78,34 @@ fn main() {
     }
 }
 
-/// Record the runtime library search paths (rpath) baked into the binary. The
-/// dynamic loader tries them in the order emitted here, so binary-relative comes
-/// FIRST: a libkrun shipped next to the binary must win over any system or
-/// Homebrew copy.
+/// Runtime library search paths (rpath) baked into the binary, in the order dyld
+/// tries them — binary-relative FIRST, so a libkrun shipped next to the binary
+/// wins over any system or Homebrew copy.
 fn emit_rpaths(target_os: &str, prefix: &str) {
     let is_release = std::env::var("PROFILE").as_deref() == Ok("release");
 
-    // 1. Binary-relative (`@loader_path` on macOS, `$ORIGIN` on Linux) — FIRST,
-    //    so a RELOCATED binary prefers libkrun's shared objects shipped alongside
-    //    it (e.g. the release-staged `bin/libkrun.1.dylib` next to minvmd). dyld
-    //    honours this only for an `@rpath/...` load command; on macOS the release
-    //    workflow rewrites minvmd's absolute Homebrew load command to
-    //    `@rpath/libkrun.1.dylib` (install_name_tool) precisely so this entry
-    //    takes effect. Reaches the linker as a literal argv token (no shell
-    //    expansion here), so it is recorded verbatim.
+    // 1. Binary-relative: finds a libkrun shipped alongside a relocated binary
+    //    (e.g. a dev build with the dylib next to it). dyld honours it only for an
+    //    `@rpath/` load command — the macOS release rewrites minvmd's to that. The
+    //    macOS *release* stages the dylib in a `lib/` sibling of `bin/` and
+    //    retargets this very entry to `@loader_path/../lib` post-build (see
+    //    release.yml), so the same rpath covers the dev layout here and the ship
+    //    layout there. Recorded verbatim (literal argv token, no shell expansion).
     rpath(if target_os == "macos" {
         "@loader_path"
     } else {
         "$ORIGIN"
     });
 
-    // 2. Absolute `{prefix}` — a FALLBACK consulted only when the binary-relative
-    //    lookup above misses. Recorded EXCEPT for a Linux `--release` build:
-    //   - Non-release (dev + every e2e CI run use `target/debug/minvmd`): resolve
-    //     libkrun where it was materialized, no LD_LIBRARY_PATH needed.
-    //   - macOS release: KEEP it. On Apple Silicon the prefix is the canonical
-    //     Homebrew lib dir (`/opt/homebrew/lib`) — a stable system path identical
-    //     on any target with `brew install slp/krun/libkrun`, so a host missing
-    //     the shipped dylib still resolves libkrun. dyld consults this rpath when
-    //     the load command is `@rpath/...` (see entry 1), and ignores it
-    //     harmlessly when the install name is already absolute.
-    //   - Linux release: DROP it — the prefix is an ephemeral build path (e.g.
-    //     `$HOME/.krun`) that must not leak into the artifact; entries 1 and 3
-    //     cover that binary instead.
+    // 2. Absolute {prefix}: fallback when entry 1 misses. Dropped on a Linux
+    //    --release build (ephemeral path, must not leak); kept for dev (resolve
+    //    where materialized) and macOS release (stable /opt/homebrew/lib).
     if !is_release || target_os == "macos" {
         rpath(prefix);
     }
 
-    // 3. Standard system lib dirs on Linux — lets a target with a system-installed
-    //    libkrun resolve it without bundling (the counterpart to macOS reusing the
-    //    Homebrew prefix in entry 1). Stable absolute paths, so safe in a release
-    //    artifact; nonexistent dirs are skipped by the loader.
+    // 3. Linux system lib dirs: resolve a system-installed libkrun without
+    //    bundling. Stable paths; nonexistent ones are skipped by the loader.
     if target_os == "linux" {
         LINUX_LIB_DIRS.iter().for_each(|dir| rpath(dir));
     }

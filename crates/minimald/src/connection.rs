@@ -7,13 +7,17 @@ use std::{
     collections::BTreeMap,
     fmt,
     sync::{Arc, LazyLock},
-    time::Duration,
 };
+// Used only by the `ssh-forward` direct-tcpip handler.
+#[cfg(feature = "ssh-forward")]
+use std::time::Duration;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::TcpStream,
     sync::{Mutex, MutexGuard},
 };
+// Used only by the `ssh-forward` direct-tcpip handler.
+#[cfg(feature = "ssh-forward")]
+use tokio::net::TcpStream;
 
 use crate::{
     ChannelConfig, RequestedPty, exec,
@@ -466,6 +470,7 @@ impl russh::server::Handler for ConnectionHandler {
     ///
     /// The connection attempt times out after 10 seconds; a failure rejects the
     /// channel so the SSH client receives a clean error rather than hanging.
+    #[cfg(feature = "ssh-forward")]
     async fn channel_open_direct_tcpip(
         &mut self,
         channel: RuChannel<Msg>,
@@ -590,9 +595,31 @@ impl russh::server::Handler for ConnectionHandler {
 
         Ok(())
     }
+
+    /// With the `ssh-forward` feature disabled, port-forwarding is compiled out.
+    /// Reject every `direct-tcpip` channel so forwarding fails **closed**, rather
+    /// than relying on whatever russh's default handler does (finding #4 / the
+    /// user decision to disable ssh-forward for now).
+    #[cfg(not(feature = "ssh-forward"))]
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        _channel: RuChannel<Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        reply
+            .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        Ok(())
+    }
 }
 
 /// Relay bytes bidirectionally between two async streams, logging any relay error.
+#[cfg(feature = "ssh-forward")]
 async fn relay_streams<A, B>(mut a: A, mut b: B)
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -603,7 +630,10 @@ where
     }
 }
 
-#[cfg(test)]
+// The only test here exercises `relay_streams`, which is itself behind
+// `ssh-forward`; gate the whole module so it (and its imports) compile out with
+// the feature.
+#[cfg(all(test, feature = "ssh-forward"))]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

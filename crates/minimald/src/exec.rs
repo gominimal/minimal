@@ -88,7 +88,7 @@ pub struct TaskExec {
 }
 
 impl Exec for TaskExec {
-    type Process = HakoniwaProcess;
+    type Process = TaskProcess;
 
     fn exec(self, session: SessionHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         // 1-slot request/response channels: the producer only spawns
@@ -96,7 +96,7 @@ impl Exec for TaskExec {
         // `HakoniwaProcess` orphans the child, so we don't want to
         // spawn one we may never deliver.
         let (req_tx, req_rx) = mpsc::channel::<()>(1);
-        let (proc_tx, proc_rx) = mpsc::channel::<io::Result<HakoniwaProcess>>(1);
+        let (proc_tx, proc_rx) = mpsc::channel::<io::Result<TaskProcess>>(1);
 
         // Producer task: holds `env`, `container`, and the invocation
         // list on its stack frame. `env` owns the temp dirs and the
@@ -126,13 +126,35 @@ async fn task_producer(
     exec: TaskExec,
     session: SessionHandle,
     mut req_rx: mpsc::Receiver<()>,
-    proc_tx: mpsc::Sender<io::Result<HakoniwaProcess>>,
+    proc_tx: mpsc::Sender<io::Result<TaskProcess>>,
 ) {
     // Wrap the whole body in a fallible async block so setup errors
     // short-circuit with `?`. An `Err` outcome triggers the
     // "wait for the first request, deliver error, exit" branch below.
     let outcome: io::Result<()> = async {
         let mut ctx = session.context().await.map_err(io::Error::other)?;
+
+        // An `echo` task's output lives entirely in its declaration, so it
+        // needs no package graph or sandbox: emit it straight from the
+        // daemon and skip the heavy path below. Only mfile-local tasks are
+        // matched; a stack-provided echo task falls through to the sandbox.
+        if let Some(task) = ctx.minimal_file().task(&exec.task)
+            && task.action.as_echo().is_some()
+        {
+            let task = mctx::interpolate_task_strings(&task, exec.args.as_ref())
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let text = task.action.as_echo().unwrap_or_default().to_string();
+            if req_rx.recv().await.is_some() {
+                let _ = proc_tx
+                    .send(Ok(TaskProcess::Echo(EchoProcess::new(&text))))
+                    .await;
+            }
+            // Park until the consumer drops the stream, mirroring the
+            // sandbox path's tail so the bridge sees a clean end-of-stream.
+            let _ = req_rx.recv().await;
+            return Ok(());
+        }
+
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
         // doesn't stall the async executor.
@@ -157,7 +179,7 @@ async fn task_producer(
         // guest rootfs lacking `ip`/`nsenter`), so an `OwnIp` session's task
         // falls back to `HostNet` here instead of running in an empty,
         // egress-less netns.
-        let network_mode = match session.record().await.network {
+        let network_mode = match session.record().await?.network {
             m @ (sandbox2::NetworkMode::HostNet | sandbox2::NetworkMode::NoNet) => m,
             // OwnIp falls back to HostNet (the per-PTask tap/switch attach for the
             // task producer is a follow-up); `NetworkMode` is #[non_exhaustive],
@@ -191,7 +213,7 @@ async fn task_producer(
             if req_rx.recv().await.is_none() {
                 return Ok(());
             }
-            let result = (|| -> io::Result<HakoniwaProcess> {
+            let result = (|| -> io::Result<TaskProcess> {
                 let mut cmd = env
                     .command(&container, &inv.executable, inv.args.iter())
                     .map_err(|e| io::Error::other(format!("building command failed: {}", e)))?;
@@ -201,7 +223,7 @@ async fn task_producer(
                 let child = cmd
                     .spawn()
                     .map_err(|e| io::Error::other(format!("command launch failed: {}", e)))?;
-                Ok(HakoniwaProcess::new(child))
+                Ok(TaskProcess::Sandbox(HakoniwaProcess::new(child)))
             })();
             if let Err(send_err) = proc_tx.send(result).await {
                 // Receiver dropped between our `recv` returning `Some`
@@ -336,9 +358,92 @@ impl Process for HakoniwaProcess {
     }
 }
 
-/// Production [`Exec`]: runs the SSH `exec_request` argv through
-/// `/bin/sh -c`, matching what OpenSSH would do for the same request.
-/// Always produces a single process.
+/// The [`Process`] produced by a [`TaskExec`]: either a real sandboxed child
+/// ([`HakoniwaProcess`]) or a synthetic [`EchoProcess`] for `echo` tasks.
+///
+/// Stdio is boxed so the two variants' differing handle types unify behind
+/// one associated type; the bridge only ever sees `dyn AsyncRead`/`AsyncWrite`.
+pub enum TaskProcess {
+    Sandbox(HakoniwaProcess),
+    Echo(EchoProcess),
+}
+
+impl Process for TaskProcess {
+    type Stdin = std::pin::Pin<Box<dyn AsyncWrite + Send + Unpin>>;
+    type Stdout = std::pin::Pin<Box<dyn AsyncRead + Send + Unpin>>;
+    type Stderr = std::pin::Pin<Box<dyn AsyncRead + Send + Unpin>>;
+
+    fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
+        match self {
+            TaskProcess::Sandbox(p) => {
+                let (i, o, e) = p.take_stdio()?;
+                Some((Box::pin(i), Box::pin(o), Box::pin(e)))
+            }
+            TaskProcess::Echo(p) => p.take_stdio(),
+        }
+    }
+
+    async fn wait(&mut self) -> io::Result<Option<i32>> {
+        match self {
+            TaskProcess::Sandbox(p) => p.wait().await,
+            TaskProcess::Echo(p) => p.wait().await,
+        }
+    }
+
+    fn start_kill(&mut self) -> io::Result<()> {
+        match self {
+            TaskProcess::Sandbox(p) => p.start_kill(),
+            TaskProcess::Echo(p) => p.start_kill(),
+        }
+    }
+}
+
+/// A synthetic [`Process`] that emits a fixed string on stdout and exits 0,
+/// without spawning anything. Backs `echo` tasks, whose entire output is
+/// known from the task declaration — so no package graph or sandbox is built.
+///
+/// The stdout carries `text` plus a trailing newline, matching what
+/// `/bin/echo "text"` would produce.
+pub struct EchoProcess {
+    /// `Some` until `take_stdio` hands the streams out; `None` thereafter.
+    stdout: Option<Vec<u8>>,
+}
+
+impl EchoProcess {
+    fn new(text: &str) -> Self {
+        Self {
+            stdout: Some(format!("{text}\n").into_bytes()),
+        }
+    }
+}
+
+impl Process for EchoProcess {
+    type Stdin = std::pin::Pin<Box<dyn AsyncWrite + Send + Unpin>>;
+    type Stdout = std::pin::Pin<Box<dyn AsyncRead + Send + Unpin>>;
+    type Stderr = std::pin::Pin<Box<dyn AsyncRead + Send + Unpin>>;
+
+    fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
+        let bytes = self.stdout.take()?;
+        Some((
+            // Client stdin is accepted and discarded, as a real fast-exiting
+            // process would leave it unread.
+            Box::pin(tokio::io::sink()),
+            Box::pin(std::io::Cursor::new(bytes)),
+            Box::pin(tokio::io::empty()),
+        ))
+    }
+
+    async fn wait(&mut self) -> io::Result<Option<i32>> {
+        Ok(Some(0))
+    }
+
+    fn start_kill(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Runs an unsandboxed process to service an ssh execution. See [`TaskExec`],
+/// this must only be used to service specific safe invocations like `git recieve-pack`.
 #[derive(Debug, Clone)]
 pub struct TokioExec {
     pub argv: String,
@@ -702,36 +807,28 @@ pub(crate) async fn handle_exec(
         }
     };
 
+    let task = match argv.strip_prefix("min run ") {
+        None => {
+            tracing::warn!(%session_id, "execution request rejected: expected `min run <task name>`");
+            session.channel_failure(id)?;
+            return Ok(());
+        }
+        Some(t) => t,
+    }.to_string();
     session.channel_success(id)?;
 
     spawn(async move {
-        if let Some(task) = argv.strip_prefix("min run ") {
-            let exec_task = ExecTask {
-                conn,
-                serv,
-                session: session_handle,
-                channel_id: id,
-                exec: TaskExec {
-                    args: None,
-                    task: task.to_string(),
-                },
-            };
-            exec_task.run(channel).await;
-        } else {
-            let paths = session_handle.paths().await;
-            let exec_task = ExecTask {
-                conn,
-                serv,
-                session: session_handle,
-                channel_id: id,
-                exec: TokioExec {
-                    argv,
-                    cwd: paths.working,
-                    env: config.env_vars,
-                },
-            };
-            exec_task.run(channel).await;
+        let exec_task = ExecTask {
+            conn,
+            serv,
+            session: session_handle,
+            channel_id: id,
+            exec: TaskExec {
+                args: None,
+                task: task.to_string(),
+            },
         };
+        exec_task.run(channel).await;
     });
 
     Ok(())
@@ -783,7 +880,15 @@ async fn handle_git_receive(
     session.channel_success(id)?;
 
     spawn(async move {
-        let paths = session_handle.paths().await;
+        let paths = match session_handle.paths().await {
+            Ok(paths) => paths,
+            // The actor died between resolve and this call (raced an
+            // abort/destroy); the channel was already acked, so just drop it.
+            Err(e) => {
+                tracing::warn!(error = %e, "git-receive-pack aborted: session is gone");
+                return;
+            }
+        };
 
         let dotgit_dir = paths.working.as_utf8_path().join(".git");
         if let Ok(false) = tokio::fs::try_exists(&dotgit_dir).await {
@@ -817,15 +922,38 @@ async fn handle_git_receive(
                 unset GIT_DIR GIT_WORK_TREE GIT_QUARANTINE_PATH
                 g() { git --git-dir="$GIT_DIR_ABS" --work-tree="$WORK_TREE" "$@"; }
 
+                zero=0000000000000000000000000000000000000000
                 while read -r old new ref; do
                     case "$ref" in refs/heads/*) ;; *) continue ;; esac
+                    # A deleted branch (new = zeros) has nothing to check out.
+                    # Deleting the CURRENT branch never reaches here: git's own
+                    # receive.denyDeleteCurrent refuses it during receive-pack.
+                    [ "$new" = "$zero" ] && continue
                     branch=${ref#refs/heads/}
 
-                    if ! g diff --quiet || ! g diff --cached --quiet; then
+                    if [ "$old" = "$zero" ]; then
+                        # Previously-unborn branch: nothing tracked, so tracked
+                        # dirtiness cannot exist — but uploaded/untracked files
+                        # may collide with the pushed tree, and -f would
+                        # silently clobber them. -B pins the branch at the
+                        # pushed tip and checks it out; WITHOUT -f, git refuses
+                        # to overwrite untracked files (its stderr names them),
+                        # and we surface the skip like the dirty case below.
+                        if ! g checkout -q -B "$branch" "$new"; then
+                            echo "remote worktree has local files the push would overwrite; skipping checkout of $branch" >&2
+                        fi
+                        continue
+                    fi
+
+                    # Dirtiness is measured against the PRE-push tip ($old):
+                    # post-receive runs after the ref has already moved, so a
+                    # plain `diff --cached` (index vs the NEW tip) would flag
+                    # the pushed delta itself and skip every checkout.
+                    if ! g diff --quiet "$old" || ! g diff --cached --quiet "$old"; then
                         echo "remote worktree has uncommitted changes; skipping checkout of $branch" >&2
                         continue
                     fi
-                    g checkout -f "$branch"
+                    g checkout -qf "$branch"
                 done"#
                     .as_bytes(),
             )
@@ -838,8 +966,16 @@ async fn handle_git_receive(
             session: session_handle,
             channel_id: id,
             exec: TokioExec {
+                // receive.denyCurrentBranch=ignore: the workspace is a
+                // non-bare repo with the pushed branch typically checked
+                // out, and stock git refuses that ref update outright —
+                // before any hook runs. `ignore` accepts it silently; the
+                // post-receive hook above then syncs the worktree (or
+                // warns and skips when it is dirty). NOT `updateInstead`:
+                // that rejects the whole push on a dirty worktree, while
+                // the hook's contract is "ref lands, checkout best-effort".
                 argv: format!(
-                    "git -c core.hooksPath={} receive-pack .",
+                    "git -c core.hooksPath={} -c receive.denyCurrentBranch=ignore receive-pack .",
                     hooks_tmp.path().to_str().unwrap()
                 ),
                 cwd: paths.working,
@@ -1216,212 +1352,155 @@ mod tests {
         assert_eq!(out, b"AAABBB");
     }
 
+    /// An `EchoProcess` drives through the bridge as a zero-cost stand-in
+    /// for a spawned child: its text (plus a trailing newline, matching
+    /// `/bin/echo`) reaches the SSH stdout stream, stderr stays empty, and
+    /// it reports exit 0 — no sandbox involved.
+    #[tokio::test]
+    async fn echo_process_writes_text_and_exits_zero() {
+        use futures::stream::{self, StreamExt};
+
+        use super::{EchoProcess, TaskProcess};
+
+        let echo = TaskProcess::Echo(EchoProcess::new("MINIMALD_SESSION_OK"));
+        let mut echo_stream = stream::iter(vec![Ok(echo)]).boxed();
+
+        // SSH stdin closed: bridge sees EOF immediately.
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (mut client_stdout, mut bridge_stdout) = duplex(64 * 1024);
+        let (mut client_stderr, mut bridge_stderr) = duplex(64 * 1024);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                &mut echo_stream,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+            )
+            .await
+        });
+
+        let exit = bridge_task.await.unwrap();
+        assert_eq!(exit, 0);
+
+        let mut out = Vec::new();
+        client_stdout.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"MINIMALD_SESSION_OK\n");
+
+        let mut err = Vec::new();
+        client_stderr.read_to_end(&mut err).await.unwrap();
+        assert!(err.is_empty(), "echo should produce no stderr: {err:?}");
+    }
+
     mod end_to_end {
         //! Tests that exercise the full ssh-exec stack against a real
         //! `TestServer`: russh transport, `ConnectionHandler` dispatch,
-        //! `handle_exec`, and a real `/bin/sh -c` child.
+        //! and `handle_exec` request routing.
         use sessions::SessionId;
 
-        use minimald_rpc::CreateSession;
-
         use crate::MINIMAL_SESSION_ID_ENV;
-        use crate::sessions::SessionKeyPredicate;
-        use crate::test_harness::{TestClient, TestServer, create_session_req, unwrap_ready};
+        use crate::test_harness::{
+            TestClient, TestServer, create_configured_session, create_session_req,
+        };
 
         /// Creates a fresh session through the public CreateSession RPC
         /// and returns its id, mirroring how a real client sets up state
         /// before running commands against the session.
         async fn fresh_session(client: &mut TestClient) -> SessionId {
-            unwrap_ready(
-                client
-                    .call::<CreateSession>(&create_session_req("exec-test", "/tmp"))
-                    .await
-                    .unwrap(),
-            )
+            create_configured_session(client, "exec-test", "/tmp").await
         }
 
+        /// An exec request that isn't `min run <task>` must be refused
+        /// before any process starts: the daemon only services specific
+        /// safe invocations, never arbitrary client-supplied commands.
         #[tokio::test]
-        async fn exec_round_trips_stdout_stderr_and_exit_code() {
+        async fn exec_rejects_arbitrary_command() {
             let server = TestServer::new().await;
             let mut client = server.connect().await;
             let session_id = fresh_session(&mut client).await;
             let session_str = session_id.to_string();
 
+            let result = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    "printf pwned",
+                    &[],
+                )
+                .await;
+
+            assert!(
+                result.is_err(),
+                "arbitrary command should be rejected, got {result:?}",
+            );
+        }
+
+        /// End-to-end happy path for `min run <task>`: an `echo` task is
+        /// serviced straight from the workspace `minimal.toml` — no
+        /// package graph, upstream, or sandbox — and its text (plus a
+        /// trailing newline) round-trips over the channel with exit 0.
+        ///
+        /// Drives the client's real ordering — create, populate the
+        /// workspace, *then* configure the loadout against it — which is the
+        /// sequence `minvmd`'s libkrun e2e test runs over the bridge. Keeping
+        /// it in-process here means a break in that sequence (e.g. execing a
+        /// session whose loadout was never configured, which has no context
+        /// to resolve a task against) surfaces without needing a VM.
+        #[tokio::test]
+        async fn exec_runs_echo_task() {
+            use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let session_id = client
+                .call::<CreateSession>(&create_session_req("exec-test", "/tmp"))
+                .await
+                .unwrap()
+                .id;
+            let session_str = session_id.to_string();
+
+            // Drop a task-only `minimal.toml` into the session workspace,
+            // standing in for the e2e test's SFTP upload. No `[upstream]`:
+            // the echo short-circuit never builds a graph, so nothing here
+            // reaches the (network-bound) package machinery.
+            server
+                .seed_workspace_mfile(
+                    session_id,
+                    "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n",
+                )
+                .await;
+
+            // A task-only mfile gates nothing, so the loadout finalizes in
+            // one shot rather than erroring or pending.
+            crate::test_harness::unwrap_ready(
+                client
+                    .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                        session_id,
+                        contribution: Default::default(),
+                    })
+                    .await
+                    .unwrap(),
+            );
+
             let out = client
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    "printf out; printf err 1>&2; exit 7",
+                    "min run echo_ok",
                     &[],
                 )
                 .await
-                .expect("exec request should be accepted");
+                .expect("min run echo_ok should be accepted");
 
-            assert_eq!(out.stdout, b"out");
-            assert_eq!(out.stderr, b"err");
-            assert_eq!(out.exit_status, Some(7));
-        }
-
-        #[tokio::test]
-        async fn exec_pipes_stdin_to_child() {
-            let server = TestServer::new().await;
-            let mut client = server.connect().await;
-            let session_id = fresh_session(&mut client).await;
-            let session_str = session_id.to_string();
-
-            let payload: &[u8] = b"hello from stdin\n";
-            let out = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    "cat",
-                    payload,
-                )
-                .await
-                .expect("exec request should be accepted");
-
-            assert_eq!(out.stdout, payload);
+            assert_eq!(out.stdout, b"MINIMALD_SESSION_OK\n");
             assert_eq!(out.exit_status, Some(0));
             assert!(
                 out.stderr.is_empty(),
-                "unexpected stderr from cat: {:?}",
+                "echo task should produce no stderr: {:?}",
                 out.stderr,
             );
-        }
-
-        #[tokio::test]
-        async fn exec_runs_in_session_workspace() {
-            let server = TestServer::new().await;
-            let mut client = server.connect().await;
-            let session_id = fresh_session(&mut client).await;
-            let session_str = session_id.to_string();
-
-            // Fetch the workspace path the server will hand to the
-            // child, so we can compare with what `pwd` reports.
-            let mngr = server.state.sessions_manager().await;
-            let session_handle = mngr
-                .get_session(SessionKeyPredicate::Id(session_id))
-                .await
-                .unwrap()
-                .expect("freshly-created session should be retrievable");
-            let paths = session_handle.paths().await;
-            // getcwd resolves symlinks (e.g. /tmp -> /private/tmp on some
-            // platforms); canonicalize both sides so the comparison is
-            // about the same inode rather than spelling.
-            let expected = std::fs::canonicalize(paths.working.as_str()).unwrap();
-
-            let out = client
-                .exec(
-                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
-                    false,
-                    "pwd",
-                    &[],
-                )
-                .await
-                .expect("exec request should be accepted");
-
-            assert_eq!(out.exit_status, Some(0));
-            let observed = String::from_utf8(out.stdout).unwrap();
-            let observed = std::path::PathBuf::from(observed.trim_end());
-            assert_eq!(observed, expected);
-        }
-
-        /// End-to-end: `git push min://<session-id>` driven by an
-        /// OpenSSH process going through a modified `git-remote-min`
-        /// helper lands the pushed commit in the session workspace, with
-        /// the post-receive hook checking out the branch on disk.
-        #[ignore]
-        #[tokio::test]
-        async fn git_receive_pack_lands_pushed_commit_in_workspace() {
-            use std::os::unix::fs::PermissionsExt;
-
-            use tempfile::TempDir;
-            use tokio::process::Command;
-
-            async fn run_git(cwd: &std::path::Path, args: &[&str]) {
-                let out = Command::new("git")
-                    .current_dir(cwd)
-                    .args(args)
-                    .output()
-                    .await
-                    .expect("git should be invocable");
-                assert!(
-                    out.status.success(),
-                    "git {args:?} failed: {}",
-                    String::from_utf8_lossy(&out.stderr),
-                );
-            }
-
-            let server = TestServer::new().await;
-            let sock_dir = TempDir::new().unwrap();
-            let sock_path = sock_dir.path().join("ssh.sock");
-            server.listen_on_uds(&sock_path).await;
-
-            let mut client = server.connect().await;
-            let session_id = fresh_session(&mut client).await;
-
-            // Drop a `git-remote-min` into a tempdir and prepend that
-            // tempdir to PATH so `git push min://…` resolves to it. The
-            // script is the production one with its hard-coded socket
-            // path swapped for the test server's UDS.
-            let helpers_dir = TempDir::new().unwrap();
-            let helper_path = helpers_dir.path().join("git-remote-min");
-            let template = include_str!("../git-remote-min");
-            let script = template.replace(
-                "$HOME/.local/state/minimal/providers/local-0/ssh.sock",
-                sock_path.to_str().unwrap(),
-            );
-            tokio::fs::write(&helper_path, script).await.unwrap();
-            tokio::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o755))
-                .await
-                .unwrap();
-
-            // Source repo with a single commit on `main`. Local
-            // user.email/user.name to keep the test independent of any
-            // global git config.
-            let src_dir = TempDir::new().unwrap();
-            let src_path = src_dir.path();
-            run_git(src_path, &["init", "-q", "-b", "main"]).await;
-            run_git(src_path, &["config", "user.email", "t@example.com"]).await;
-            run_git(src_path, &["config", "user.name", "Test"]).await;
-            tokio::fs::write(src_path.join("hello.txt"), b"hi there\n")
-                .await
-                .unwrap();
-            run_git(src_path, &["add", "hello.txt"]).await;
-            run_git(src_path, &["commit", "-q", "-m", "first commit"]).await;
-
-            let inherited_path = std::env::var("PATH").unwrap_or_default();
-            let path_with_helper = format!("{}:{}", helpers_dir.path().display(), inherited_path);
-            let url = format!("min://{session_id}");
-            let push = Command::new("git")
-                .current_dir(src_path)
-                .env("PATH", &path_with_helper)
-                .args(["push", &url, "main"])
-                .output()
-                .await
-                .expect("git push should run");
-            assert!(
-                push.status.success(),
-                "git push failed: stdout={} stderr={}",
-                String::from_utf8_lossy(&push.stdout),
-                String::from_utf8_lossy(&push.stderr),
-            );
-
-            // The post-receive hook checks out `refs/heads/main` into
-            // the worktree, so the pushed file should be readable from
-            // the session workspace.
-            let mngr = server.state.sessions_manager().await;
-            let session_handle = mngr
-                .get_session(SessionKeyPredicate::Id(session_id))
-                .await
-                .unwrap()
-                .expect("session should be retrievable");
-            let paths = session_handle.paths().await;
-            let pushed = paths.working.as_utf8_path().join("hello.txt");
-            let contents = tokio::fs::read(&pushed)
-                .await
-                .unwrap_or_else(|e| panic!("reading pushed file {pushed} failed: {e}"));
-            assert_eq!(contents, b"hi there\n");
         }
     }
 }

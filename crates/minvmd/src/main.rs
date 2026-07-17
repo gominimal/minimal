@@ -6,13 +6,18 @@ use clap_complete::Shell;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[derive(Parser)]
-#[command(name = "minvmd", version = env!("CARGO_PKG_VERSION"))]
+#[command(name = "minvmd", version = version::VERSION, long_version = version::LONG_VERSION)]
 #[command(
     about = "Host daemon that brings up a Linux microVM via libkrun (macOS/HVF or Linux/KVM)"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// Override the state dir base (default: $XDG_STATE_HOME/minimal).
+    /// Runtime files live under `<dir>/providers/local-0/`.
+    #[arg(long, global = true)]
+    minimal_state_dir: Option<paths::CwdRelative<paths::Daemon>>,
 }
 
 #[derive(Subcommand)]
@@ -44,11 +49,35 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show or set persisted per-VM resource configuration (applied next boot).
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Stop the running daemon gracefully.
     Stop,
     /// Hidden VMM child subcommand — spawned by `boot`, not for direct use.
     #[command(name = "__krun-vmm", hide = true)]
     KrunVmm,
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Print the effective resource configuration and each value's source.
+    Show {
+        /// Print as a JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate and persist resource parameters for the next boot.
+    Set {
+        /// Number of virtual CPUs.
+        #[arg(long)]
+        vcpus: Option<u8>,
+        /// Guest RAM in MiB.
+        #[arg(long)]
+        ram_mib: Option<u32>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -59,6 +88,13 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    if let Some(dir) = &cli.minimal_state_dir {
+        let dir = dir
+            .resolve()
+            .map_err(|e| anyhow::anyhow!("resolving --minimal-state-dir: {e}"))?;
+        minvmd::state::set_state_dir_override(dir);
+    }
 
     match cli.command {
         Command::Boot { foreground } => minvmd::cmd::boot::run(foreground),
@@ -77,6 +113,10 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Config { action } => match action {
+            ConfigAction::Show { json } => minvmd::cmd::config::run_show(json),
+            ConfigAction::Set { vcpus, ram_mib } => minvmd::cmd::config::run_set(vcpus, ram_mib),
+        },
         Command::Stop => minvmd::cmd::stop::run(),
         Command::KrunVmm => minvmd::cmd::vmm_child::run(),
     }

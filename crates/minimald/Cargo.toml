@@ -1,6 +1,6 @@
 [package]
 name = "minimald"
-version = "0.0.1"
+version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
@@ -12,6 +12,15 @@ networking-proxy = ["dep:rcgen", "dep:rustls", "dep:tokio-rustls"]
 # default `minimald` build pulls in no WireGuard code and pays no binary-size or
 # startup cost (R4.7); enable with `--features networking-wg`.
 networking-wg = ["dep:boringtun", "dep:base64", "dep:rand_core"]
+# Enables the SSH `direct-tcpip` (LocalForward) handler for `minimal ssh-forward`
+# (R4.8/R4.9). Off by default so port-forwarding is compiled out and every
+# `direct-tcpip` channel is rejected fail-closed; deferred for now (finding #4).
+ssh-forward = []
+# Exposes the in-process test harness (TestServer/TestClient) so external
+# crates — notably `minimal`'s integration tests — can spin up a real
+# minimald server over an in-memory or UDS transport without a separate
+# binary. No production code should depend on this.
+test-support = []
 
 [dependencies]
 async-compression.workspace = true
@@ -22,6 +31,7 @@ clap.workspace = true
 clap_complete.workspace = true
 constcat.workspace = true
 either.workspace = true
+fd-lock.workspace = true
 futures.workspace = true
 hakoniwa.workspace = true
 libc.workspace = true
@@ -30,6 +40,7 @@ russh-sftp.workspace = true
 path-absolutize.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sysinfo.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 vt100-ctt.workspace = true
@@ -37,6 +48,7 @@ vt100-ctt.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 
 # WireGuard mesh peer (Unit 4, R4.1/R4.7): compiled only under `networking-wg`.
@@ -45,6 +57,7 @@ boringtun = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
 
 args.workspace = true
+async-dialog.workspace = true
 check.workspace = true
 common.workspace = true
 graph.workspace = true
@@ -58,6 +71,7 @@ sandbox2.workspace = true
 sessions.workspace = true
 switch.workspace = true
 stdlib.workspace = true
+version.workspace = true
 
 rcgen = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }

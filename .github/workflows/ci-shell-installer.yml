@@ -1,25 +1,27 @@
 name: CI shell installer
 
+# Also static-analyses the AppArmor profile installer (the `apparmor` job at the
+# bottom) — same shape of artifact: a shell script plus the policy it ships.
+#
 # Static-analyses and tests the curl|sh fallback installer
 # (docs/specs/07-spec-installer). The installer targets strict POSIX sh, so this
 # gate enforces its Verification section: shellcheck --shell=sh with no warnings
 # (§1), and the unit-test harness run under dash and — critically — macOS's
 # frozen /bin/sh (§2/§3), where the installer takes its BSD mktemp and `shasum`
 # (no sha256sum) code paths. No network: the harness stubs the bucket.
+#
+# ALWAYS-TRIGGERED, path-scoped INSIDE the workflow (the `changes` job), so
+# the `if: always()` aggregator can join the required checks. Do NOT add
+# trigger-level `paths:` — a path-skipped required context wedges the PR.
 on:
   pull_request:
     branches: ["main"]
-    paths:
-      - "scripts/install.sh"
-      - "scripts/install_test.sh"
-      - ".github/workflows/ci-shell-installer.yml"
   push:
     branches: ["main"]
-    paths:
-      - "scripts/install.sh"
-      - "scripts/install_test.sh"
-      - ".github/workflows/ci-shell-installer.yml"
   workflow_dispatch:
+  # Reused by nightly-tests.yml to re-run the suite against a fresh runner
+  # image even when install.sh is untouched (runner-image shell drift).
+  workflow_call:
 
 # Cancel superseded runs on a branch; never cancel a run on main.
 concurrency:
@@ -28,19 +30,56 @@ concurrency:
 
 permissions:
   contents: read
+  # dorny/paths-filter reads the PR file list on pull_request events.
+  pull-requests: read
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      installer: ${{ steps.filter.outputs.installer }}
+      apparmor: ${{ steps.filter.outputs.apparmor }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Detect installer changes
+        id: filter
+        # v3.0.2, SHA-pinned. Runs ONLY on pull_request, where dorny reads
+        # the PR file list via the API (a push would need a local diff our
+        # shallow, credential-free checkout cannot provide) — and pushes to
+        # main / dispatches run everything regardless.
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706
+        with:
+          filters: |
+            installer:
+              - "scripts/install.sh"
+              - "scripts/install_test.sh"
+              - ".github/workflows/ci-shell-installer.yml"
+            apparmor:
+              - "scripts/install-apparmor-profile.sh"
+              - "packaging/apparmor/**"
+              - ".github/workflows/ci-shell-installer.yml"
+
   shellcheck:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.installer == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: shellcheck --shell=sh (no warnings)
         # shellcheck is preinstalled on the ubuntu-latest runner image.
         run: shellcheck --shell=sh scripts/install.sh scripts/install_test.sh
 
   test:
     name: test (${{ matrix.os }} / ${{ matrix.shell }})
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.installer == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
@@ -56,18 +95,44 @@ jobs:
             shell: sh # macOS frozen bash 3.2 as /bin/sh
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Run installer test harness under ${{ matrix.shell }}
         run: SH='${{ matrix.shell }}' '${{ matrix.shell }}' scripts/install_test.sh
 
-  # Single stable status for branch protection: green only when shellcheck and
-  # every test lane succeed (the matrix lanes have dynamic names).
+  # The AppArmor profile that grants minimald `userns` on Ubuntu 24.04+
+  # (docs/reference/linux-host-setup.md). A malformed profile is silently
+  # inert — apparmor_parser rejects it and every session then dies at
+  # uid_map — so parse it on every change. `--check` neither loads the
+  # policy nor writes the cache, hence no root.
+  apparmor:
+    needs: [changes]
+    if: github.event_name != 'pull_request' || needs.changes.outputs.apparmor == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Ensure apparmor_parser is present
+        # Stock on the Ubuntu runner image, but the check is worthless if it
+        # silently isn't — install rather than skip.
+        run: command -v apparmor_parser || sudo apt-get install -y --no-install-recommends apparmor
+      - name: shellcheck the profile installer
+        run: shellcheck scripts/install-apparmor-profile.sh
+      - name: Profile parses (apparmor_parser)
+        run: ./scripts/install-apparmor-profile.sh --check
+
+  # Single stable status for branch protection: green when shellcheck and
+  # every test lane succeeded OR were path-skipped (the matrix lanes have
+  # dynamic names); red only on failure/cancellation.
   ci-shell-installer-success:
     if: always()
-    needs: [shellcheck, test]
+    needs: [changes, shellcheck, test, apparmor]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Verify all gating jobs succeeded
+      - name: Verify all gating jobs succeeded or were skipped
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         run: exit 1
-      - run: echo "installer shellcheck + tests passed"
+      - run: echo "installer shellcheck + tests and apparmor profile checks passed"

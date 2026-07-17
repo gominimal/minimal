@@ -5,6 +5,7 @@
 //!
 //! The [`Host`] struct holds the running state of an active session.
 
+use async_dialog::Selection;
 use either::Either;
 use russh::Channel;
 use russh::server::Msg;
@@ -24,9 +25,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::RequestedPty;
-#[cfg(not(test))]
-use crate::session::SessionHandle;
 use crate::session::SessionPaths;
+use crate::sessions::SessionControl;
 #[cfg(not(test))]
 use sessions::NetworkMode;
 
@@ -40,6 +40,12 @@ const CTRL_W_CSI_U: &[u8] = b"\x1b[119;5u";
 ///
 /// Corrsponds to: modifyOtherKeys: CSI 27 ; 5 ; 119 ~
 const CTRL_W_CSI_27: &[u8] = b"\x1b[27;5;119~";
+
+/// Header of the prompt shown over the channel when a session's shell process
+/// exits, offering to detach or delete. Exposed so tests can await its
+/// appearance in the channel output before answering.
+pub(crate) const SHELL_EXIT_PROMPT: &str =
+    "Session shell process exited. What would you like to do with this session?";
 
 /// The dimensions of a terminal.
 ///
@@ -155,6 +161,115 @@ impl Pty {
     }
 }
 
+/// Emit one `tracing::info!` per item the launcher folds into the
+/// session — packages, vars, patches, and lifecycle hooks —
+/// tagging each with its provenance so an operator can trace
+/// "where did `EDITOR=hx` come from?" back to the loadout /
+/// project / package that contributed it.
+///
+/// Baseline items (the launcher-defaults `PS1`, `base`, `coreutils`,
+/// `socat`) log with `source = "launcher-baseline"` so they can be
+/// distinguished from composition contributions. Patches and hooks
+/// still log even though the launcher can't act on them yet — an
+/// operator inspecting a session should see the intent even when
+/// the plumbing is deferred.
+///
+/// Var values are logged at `debug` (separate call) rather than
+/// `info` so an accidentally-inherited secret doesn't sit in the
+/// default log stream.
+#[cfg(not(test))]
+fn log_session_contents(
+    session_name: &str,
+    baseline_packages: &[&str],
+    baseline_var_names: &[&str],
+    composition: Option<&sessions::core::compose::Composition>,
+) {
+    for p in baseline_packages {
+        tracing::info!(
+            session = session_name,
+            domain = "package",
+            name = p,
+            source = "launcher-baseline",
+            "session content",
+        );
+    }
+    for k in baseline_var_names {
+        tracing::info!(
+            session = session_name,
+            domain = "var",
+            name = k,
+            source = "launcher-baseline",
+            "session content",
+        );
+    }
+    let Some(comp) = composition else {
+        return;
+    };
+    for p in comp.packages() {
+        tracing::info!(
+            session = session_name,
+            domain = "package",
+            name = %p.package(),
+            source = ?sessions::core::source::Provenanced::source(p),
+            "session content",
+        );
+    }
+    for v in comp.vars() {
+        let var = v.var();
+        tracing::info!(
+            session = session_name,
+            domain = "var",
+            name = %var.name(),
+            source = ?sessions::core::source::Provenanced::source(v),
+            "session content",
+        );
+        tracing::debug!(
+            session = session_name,
+            name = %var.name(),
+            value = %var.value(),
+            "session var value",
+        );
+    }
+    for sp in comp.patches() {
+        let patch = sp.patch();
+        tracing::info!(
+            session = session_name,
+            domain = "patch",
+            host_source = %patch.host_path(),
+            sandbox_dest = %patch.destination(),
+            source = ?sessions::core::source::Provenanced::source(sp),
+            deferred = true,
+            "session content (patch: file-upload plumbing deferred)",
+        );
+    }
+    for h in comp.lifecycle_hooks() {
+        let src = sessions::core::source::Provenanced::source(h);
+        let hook = h.hook();
+        [
+            ("on_activate", hook.on_activate()),
+            ("on_destroy", hook.on_destroy()),
+            ("on_failure", hook.on_failure()),
+        ]
+        .into_iter()
+        .filter_map(|(event, script)| script.map(|s| (event, s)))
+        .for_each(|(event, script)| {
+            let kind = match script {
+                sessions::core::lifecyclehook::HookScript::Inline(_) => "inline",
+                sessions::core::lifecyclehook::HookScript::External(_) => "external",
+            };
+            tracing::info!(
+                session = session_name,
+                domain = "lifecycle_hook",
+                event = event,
+                script_kind = kind,
+                source = ?src,
+                deferred = true,
+                "session content (lifecycle hook: exec plumbing deferred)",
+            );
+        });
+    }
+}
+
 /// Duplicate `fd` into a new close-on-exec `OwnedFd` via
 /// `F_DUPFD_CLOEXEC`, so a concurrent `fork` can't inherit and hold
 /// the pty open past our child's exit.
@@ -201,7 +316,12 @@ fn set_winsize(fd: RawFd, size: WinSize) -> io::Result<()> {
 
 enum BindingMsg {
     Stdin(Vec<u8>),
-    TeardownDueToStdoutErr(std::io::Error),
+    /// The session process ended, so the binding should tear down and raise the
+    /// shell-exit prompt. Carries the pty error when teardown was triggered by
+    /// an *unexpected* master read/write failure (surfaced to the user); `None`
+    /// when the process was reaped cleanly or the master reported the expected
+    /// `EIO`-on-exit.
+    TeardownDueToProcessExit(Option<std::io::Error>),
     TeardownDueToSuperceded(Vec<u8>),
     TeardownDueToDetach(Vec<u8>),
 }
@@ -218,6 +338,10 @@ struct Binding {
     stdin_tx: mpsc::Sender<Either<bytes::Bytes, RequestedPty>>,
     /// Channel the [`Host`] uses to communicate with this [`Binding`].
     receiver: mpsc::Receiver<BindingMsg>,
+    /// Capability to destroy the owning session, exercised when the user picks
+    /// "delete" on the shell-exit prompt. `None` for hosts spawned without a
+    /// manager (the test harness), where "delete" degrades to a detach.
+    control: Option<SessionControl>,
 }
 
 impl Binding {
@@ -226,6 +350,7 @@ impl Binding {
     pub(crate) async fn spawn(
         channel: Channel<Msg>,
         stdin_tx: mpsc::Sender<Either<bytes::Bytes, RequestedPty>>,
+        control: Option<SessionControl>,
     ) -> (mpsc::Sender<BindingMsg>, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(4);
 
@@ -233,6 +358,7 @@ impl Binding {
             channel,
             stdin_tx,
             receiver: rx,
+            control,
         };
 
         (tx, tokio::spawn(binding.run()))
@@ -242,10 +368,18 @@ impl Binding {
         let (mut rs, ws) = self.channel.split();
         let mut w = ws.make_writer();
 
+        #[derive(Debug, PartialEq, Eq)]
+        enum MainloopExitReason {
+            HostGone,
+            Detach,
+            Superceded,
+            ProcessExited,
+        }
+
         // Reading from the remote stops once it sends EOF;
         // the loop lives on to keep forwarding stdout.
         let mut remote_open = true;
-        loop {
+        let exit_reason = loop {
             tokio::select! {
                 // Remote (ssh channel) => session stdin.
                 res = rs.wait(), if remote_open => match res {
@@ -271,6 +405,10 @@ impl Binding {
                                     modes: terminal_modes.to_vec(),
                                 })).await;
                             },
+                            // Flow-control window updates fire on every
+                            // burst of bytes forwarded through the
+                            // channel, v. noisy.
+                            russh::ChannelMsg::WindowAdjusted { .. } => {}
                             _ => tracing::warn!("skipping msg: {:?}", msg),
                         };
                     }
@@ -279,36 +417,83 @@ impl Binding {
                 // A closed channel means the host is gone;
                 // tear the attachment down.
                 msg = self.receiver.recv() => {
-                    let Some(msg) = msg else { break };
+                    let Some(msg) = msg else { break MainloopExitReason::HostGone; };
                     match msg {
                         BindingMsg::Stdin(b) => {
                             let _ = w.write_all(&b).await;
                         },
-                        BindingMsg::TeardownDueToStdoutErr(e) => {
-                            if e.raw_os_error() != Some(5) {
+                        BindingMsg::TeardownDueToProcessExit(err) => {
+                            // Surface only a genuine, unexpected master error; the
+                            // expected `EIO`-on-exit (os error 5) and clean reaps
+                            // stay silent — the shell-exit prompt speaks for them.
+                            if let Some(e) = err
+                                && e.raw_os_error() != Some(5)
+                            {
                                 let _ = w.write_all(format!("Error reading stdout: {e}\n").as_bytes()).await;
                             }
-                            break;
+                            break MainloopExitReason::ProcessExited;
                         }
                         BindingMsg::TeardownDueToSuperceded(unwind_codes) => {
                             let _ = w.write_all(&unwind_codes).await;
                             let _ = w.write_all(b"\r\nDisconnecting - session attached to from a different connection\r\n").await;
-                            break;
+                            break MainloopExitReason::Superceded;
                         }
                         BindingMsg::TeardownDueToDetach(unwind_codes) => {
                             let _ = w.write_all(&unwind_codes).await;
                             let _ = w.write_all(b"\r\nDetaching due to ctrl-w.\r\n").await;
-                            break;
+                            break MainloopExitReason::Detach;
                         }
                     };
 
                 }
             }
+        };
+
+        tracing::debug!("Binding leaving mainloop due to {:?}", exit_reason);
+
+        if exit_reason == MainloopExitReason::ProcessExited {
+            // The shell process exited. For a bash shell, this usually meant someone pressed ctrl-d absent-mindedly.
+            // We presume they didnt want to completely destroy the session, perhaps just detach, but lets prompt
+            // to see where they wanted to go from here.
+            let _ = w.write_all(b"\r\n").await;
+            match async_dialog::Select::new()
+                .with_prompt(SHELL_EXIT_PROMPT)
+                .items([
+                    "Detach, leaving the session running",
+                    "Delete, all in-session files permanently deleted",
+                ])
+                .interact(rs.make_reader(), &mut w)
+                .await
+            {
+                // User selected detach, keep going to disconnect
+                Ok(Selection::At(0)) => {}
+                // User cancelled selection, safest option is to detach
+                Ok(Selection::Cancelled) => {}
+                // User selected delete: ask the manager to tear the whole
+                // session down (kill the host, remove the on-disk record) before
+                // we close the channel. Awaiting is deadlock-free here — the
+                // destroy cascade waits on the host runtime loop (already exiting
+                // now that the process has ended), never on this binding task.
+                Ok(Selection::At(1)) => match &self.control {
+                    Some(control) => {
+                        let _ = w.write_all(b"\r\nDeleting session...\r\n").await;
+                        if let Err(e) = control.destroy().await {
+                            tracing::warn!(error = %e, "session delete failed");
+                            let _ = w
+                                .write_all(format!("Failed to delete session: {e}\r\n").as_bytes())
+                                .await;
+                        }
+                    }
+                    // No manager wired (test harness): degrade to a detach.
+                    None => tracing::warn!("delete selected but no session control available"),
+                },
+                Ok(Selection::At(_)) => unreachable!(),
+                Err(e) => tracing::warn!(error = %e, "session-exit prompt failed"),
+            }
         }
 
-        tracing::debug!("Binding shutting down");
         let _ = ws.eof().await;
-        let _ = ws.exit_status(0).await; // TODO: Only report this if process terminates
+        let _ = ws.exit_status(0).await;
         let _ = ws.close().await; // needed to release the remote
     }
 }
@@ -533,6 +718,11 @@ pub(crate) struct Host<P: SessionProcess, G: Send + 'static> {
     // thus the sandbox files) is dropped. `None` for `HostNet`/`NoNet` and tests.
     net_guard: Option<Box<dyn sandbox2::NetGuard>>,
 
+    // Destroy capability handed to each binding this host spawns, so a
+    // shell-exit "delete" can tear the whole session down. `None` for hosts
+    // built without a manager (the test harness).
+    control: Option<SessionControl>,
+
     // Keeps launcher-owned resources (the session's `Env`, which owns the
     // sandbox files backing the running process's rootfs along with the context
     // and graph) alive for as long as this host (and thus the session process)
@@ -591,13 +781,28 @@ impl SessionProcess for SandboxProcess {
     }
 }
 
+/// Packages every session sandbox gets unconditionally, regardless of
+/// the client's contribution: `base` for the shell, `coreutils` for
+/// `ls`/`cat`/etc, and `socat` for the `min` command bridge (the
+/// helper installed at `/usr/bin/min` speaks to `/run/minenv_sock`
+/// via `socat`).
+#[cfg(not(test))]
+const BASELINE_PACKAGES: &[&str] = &["base", "coreutils", "socat"];
+
+/// Env vars every session sandbox gets unconditionally, regardless of
+/// the client's contribution. `PS1` is here so the shell prompt is
+/// styled the same whether a composition sets it or not.
+#[cfg(not(test))]
+const BASELINE_VARS: &[(&str, &str)] = &[(
+    "PS1",
+    r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ ",
+)];
+
 /// The real [`SessionLauncher`]: evaluates a minimal context into a graph,
 /// builds a sandboxed `/bin/bash`, and wires it to a freshly opened PTY.
 #[cfg(not(test))]
 pub(crate) struct SandboxLauncher {
     pub(crate) ctx: mctx::Context,
-    #[allow(dead_code)]
-    pub(crate) session: SessionHandle,
     pub(crate) network_mode: NetworkMode,
     /// Shared per-host gvproxy switch. Used only for
     /// [`NetworkMode::OwnIp`] launches.
@@ -676,6 +881,10 @@ impl SessionLauncher for SandboxLauncher {
         let ingress = self.ingress;
         let network_mode = self.network_mode;
         let net_switch = self.net_switch;
+        // The session name, registered as this PTask's `*.min.internal` hostname on
+        // an own-IP attach (finding #3 / UC6); cloned because `name` is consumed by
+        // the sandbox env below.
+        let session_name = name.clone();
         let composition = self.composition;
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
@@ -759,7 +968,6 @@ impl SessionLauncher for SandboxLauncher {
         // are not applied yet (the file-upload path and in-sandbox
         // exec plumbing that they need aren't wired), so they pass
         // through this stage untouched.
-        let baseline_packages = ["base", "coreutils", "socat"];
         // A shadow set tracks membership so the composition-union
         // pass below stays O(n) instead of the naive
         // `Vec::contains` per iteration (see clippy's O(n²) hint).
@@ -768,13 +976,13 @@ impl SessionLauncher for SandboxLauncher {
         // strings and `String::clone` is a deep copy. Trivial cost
         // for a three-element baseline.
         let mut packages: Vec<String> =
-            baseline_packages.iter().map(|s| (*s).to_string()).collect();
+            BASELINE_PACKAGES.iter().map(|s| (*s).to_string()).collect();
         let mut package_set: std::collections::HashSet<String> =
-            baseline_packages.iter().map(|s| (*s).to_string()).collect();
-        let mut env_vars: HashMap<String, String> = HashMap::from([(
-            "PS1".to_string(),
-            r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ ".to_string(),
-        )]);
+            BASELINE_PACKAGES.iter().map(|s| (*s).to_string()).collect();
+        let mut env_vars: HashMap<String, String> = BASELINE_VARS
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
         if let Some(comp) = &composition {
             for p in comp.packages() {
                 let name = p.package();
@@ -787,6 +995,17 @@ impl SessionLauncher for SandboxLauncher {
                 env_vars.insert(var.name().to_string(), var.value().to_string());
             }
         }
+        // Log every item that will (or would) end up in the session,
+        // tagged with its provenance. Patches and lifecycle hooks are
+        // included even though the launcher can't act on them yet —
+        // an operator inspecting logs should see the intent.
+        let baseline_var_names: Vec<&str> = BASELINE_VARS.iter().map(|(k, _)| *k).collect();
+        log_session_contents(
+            &name,
+            BASELINE_PACKAGES,
+            &baseline_var_names,
+            composition.as_deref(),
+        );
 
         // Build the env + container and spawn the process. Any failure here (env
         // build, container build, spawn) leaves no process to reap; the phase-1
@@ -891,6 +1110,7 @@ impl SessionLauncher for SandboxLauncher {
                     tap_fd,
                     sock,
                     lease_ip,
+                    &session_name,
                     ingress.as_ref(),
                 )
                 .await
@@ -914,6 +1134,7 @@ impl SessionLauncher for SandboxLauncher {
             } else if matches!(network_mode, NetworkMode::OwnIp) {
                 let network = crate::net::gvproxy_network::GvproxyNetwork::new(
                     std::sync::Arc::clone(&net_switch),
+                    session_name,
                     ingress,
                 );
                 match network.attach(process.id()).await {
@@ -1022,11 +1243,13 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
         paths: SessionPaths,
         sz: WinSize,
         channel: Option<Channel<Msg>>,
+        control: Option<SessionControl>,
     ) -> Result<(HostHandle, JoinHandle<Result<i32, std::io::Error>>), std::io::Error>
     where
         L: SessionLauncher<Process = P, Guard = G>,
     {
-        let (host, handle) = Self::build(launcher, name, username, paths, sz, channel).await?;
+        let (host, handle) =
+            Self::build(launcher, name, username, paths, sz, channel, control).await?;
         let task = tokio::spawn(host.mainloop());
         Ok((handle, task))
     }
@@ -1041,6 +1264,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
         paths: SessionPaths,
         sz: WinSize,
         channel: Option<Channel<Msg>>,
+        control: Option<SessionControl>,
     ) -> Result<(Self, HostHandle), std::io::Error>
     where
         L: SessionLauncher<Process = P, Guard = G>,
@@ -1083,6 +1307,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             stdout_buf: vec![0u8; 8 * 1024],
             stdin_buf: None,
             net_guard,
+            control,
             _guard: guard,
         };
 
@@ -1100,6 +1325,14 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                     // `try_wait` already warns on a non-zero exit with the richer
                     // hakoniwa diagnostics; keep this routine and unconditional.
                     tracing::debug!(exit_code, "session process exited");
+                    // The process was reaped here before the pty surfaced its
+                    // death as an `EIO`. Still notify the attached binding so the
+                    // shell-exit prompt renders (and a "delete" choice can tear
+                    // the session down); otherwise the binding only observes the
+                    // host drop and silently detaches. Without this the prompt is
+                    // lost whenever `try_wait` wins the race against the master's
+                    // `EIO` — a flaky detach under CPU load.
+                    self.notify_remote_process_exit();
                     break Ok(exit_code);
                 }
                 Ok(None) => {}
@@ -1139,7 +1372,24 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     async fn notify_remote_pty_err(&mut self, e: std::io::Error) {
         tracing::warn!(error = %e, "pty master error; tearing down host");
         if let Some((tx, _hnd)) = self.remote.as_mut() {
-            let _ = tx.try_send(BindingMsg::TeardownDueToStdoutErr(e));
+            let _ = tx.try_send(BindingMsg::TeardownDueToProcessExit(Some(e)));
+        }
+    }
+
+    /// Notifies the attached binding that the session process has been reaped,
+    /// so it tears down and raises the shell-exit prompt. Unlike
+    /// [`Self::notify_remote_pty_err`] there is no error to surface — the process
+    /// simply exited, and the pty may never report the death (the reap can win
+    /// the race against the master's `EIO`).
+    ///
+    /// Best-effort `try_send` for the same reason as `notify_remote_pty_err`: the
+    /// notice is never awaited, so a full queue can't wedge teardown. The message
+    /// stays buffered even as this host drops, and an mpsc receiver drains its
+    /// buffer before observing the closed sender — so the binding sees the exit
+    /// before it would fall through to `HostGone`.
+    fn notify_remote_process_exit(&mut self) {
+        if let Some((tx, _hnd)) = self.remote.as_mut() {
+            let _ = tx.try_send(BindingMsg::TeardownDueToProcessExit(None));
         }
     }
 
@@ -1296,7 +1546,8 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                 .write_all(&self.parser.screen().state_formatted())
                 .await;
         }
-        let new_binding = Binding::spawn(channel, self.remote_tx.clone()).await;
+        let new_binding =
+            Binding::spawn(channel, self.remote_tx.clone(), self.control.clone()).await;
 
         if let Some((old_tx, old_join_hnd)) = self.remote.replace(new_binding) {
             // If there was a binding we just swapped out, tell it to
@@ -1472,6 +1723,7 @@ mod tests {
             },
             DEFAULT_SIZE,
             None,
+            None,
         )
         .await
         .expect("failed to build host");
@@ -1536,6 +1788,7 @@ mod tests {
                 home: DaemonAbsPath::root(),
             },
             DEFAULT_SIZE,
+            None,
             None,
         )
         .await
@@ -1636,6 +1889,7 @@ mod tests {
             test_paths(),
             DEFAULT_SIZE,
             None,
+            None,
         )
         .await
         .expect("failed to build host");
@@ -1681,6 +1935,7 @@ mod tests {
             "user".to_string(),
             test_paths(),
             DEFAULT_SIZE,
+            None,
             None,
         )
         .await

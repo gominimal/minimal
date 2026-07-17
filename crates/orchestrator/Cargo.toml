@@ -14,7 +14,6 @@ anyhow.workspace = true
 either.workspace = true
 futures.workspace = true
 generational-arena.workspace = true
-google-cloud-storage.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true

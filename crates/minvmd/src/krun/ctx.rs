@@ -250,6 +250,45 @@ impl Context {
         Ok(())
     }
 
+    /// Add a disk image as a virtio-blk device with cache/sync control
+    /// (`krun_add_disk3`). Unlike [`add_disk`][Self::add_disk], the caller
+    /// selects `direct_io` (bypass host page cache) and `sync_mode` (how
+    /// `VIRTIO_BLK_F_FLUSH` is honoured). Used for the writable data volume,
+    /// which is attached `read_only=false` with a durability-bounding
+    /// [`SyncMode`][raw::SyncMode].
+    pub fn add_disk_with_sync(
+        &mut self,
+        block_id: &str,
+        disk_path: impl AsRef<Path>,
+        disk_format: raw::DiskFormat,
+        read_only: bool,
+        direct_io: bool,
+        sync_mode: raw::SyncMode,
+    ) -> Result<(), VmError> {
+        let id_cstr = cstring_from_str(block_id, "block_id")?;
+        let path_cstr = cstring_from_path(disk_path.as_ref(), "disk")?;
+        // SAFETY: `id_cstr` and `path_cstr` are CStrings owned by this stack
+        // frame; their pointers are NUL-terminated and valid until after the
+        // FFI returns. `disk_format`, `read_only`, `direct_io`, and `sync_mode`
+        // are passed by value (the enums are `#[repr(u32)]`). `ctx_id` is owned
+        // by `self` and refers to a context not yet freed.
+        let ret = unsafe {
+            raw::krun_add_disk3(
+                self.ctx_id,
+                id_cstr.as_ptr(),
+                path_cstr.as_ptr(),
+                disk_format as u32,
+                read_only,
+                direct_io,
+                sync_mode as u32,
+            )
+        };
+        drop(id_cstr);
+        drop(path_cstr);
+        raw::check_backend("krun_add_disk3", ret)?;
+        Ok(())
+    }
+
     /// Redirect implicit-console output to a host file.
     pub fn set_console_output(&mut self, path: impl AsRef<Path>) -> Result<(), VmError> {
         let cstr = cstring_from_path(path.as_ref(), "console_output")?;

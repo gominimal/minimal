@@ -15,7 +15,7 @@
 //! handler's JSON codec, and the sessions actor — runs unmodified. No
 //! mocking.
 
-#![cfg(test)]
+#![cfg(any(test, feature = "test-support"))]
 
 use std::path::Path;
 use std::sync::Arc;
@@ -35,10 +35,10 @@ use crate::server::{Config, HostKey, ServerStateHandle};
 
 /// A minimald instance running against a tempdir, ready to accept
 /// in-memory ssh connections.
-pub(crate) struct TestServer {
+pub struct TestServer {
     /// Public so tests can poke at server state directly (e.g. create
     /// sessions via the manager handle) before issuing RPCs.
-    pub(crate) state: ServerStateHandle,
+    pub state: ServerStateHandle,
     russh_config: Arc<russh::server::Config>,
     _temp: TempDir,
 }
@@ -46,7 +46,7 @@ pub(crate) struct TestServer {
 impl TestServer {
     /// Spins up a fresh server backed by an empty tempdir. The tempdir
     /// lives as long as the [`TestServer`].
-    pub(crate) async fn new() -> Self {
+    pub async fn new() -> Self {
         let temp = TempDir::new().unwrap();
         let path = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let state_dir = DaemonAbsPath::try_new(path.clone()).unwrap();
@@ -57,6 +57,7 @@ impl TestServer {
             minimal_cache_dir: cache_dir,
             gvproxy_bin: None,
             in_microvm: false,
+            state_volume_mounted: false,
         };
         let state = ServerStateHandle::new(config).await.unwrap();
 
@@ -80,7 +81,7 @@ impl TestServer {
     ///
     /// The server-side task is detached; it stays alive as long as the
     /// returned [`TestClient`] keeps its half of the pair open.
-    pub(crate) async fn connect(&self) -> TestClient {
+    pub async fn connect(&self) -> TestClient {
         let (server_side, client_side) = UnixStream::pair().unwrap();
 
         // `russh::server::run_stream` (called inside `Connection::from_socket`)
@@ -117,7 +118,7 @@ impl TestServer {
     /// through the same russh stack `connect()` uses, so external clients
     /// (e.g. an OpenSSH process driven by `git push`) can dial the test
     /// server over a real UDS rather than the in-memory pair.
-    pub(crate) async fn listen_on_uds(&self, sock: &Path) {
+    pub async fn listen_on_uds(&self, sock: &Path) {
         let listener = UnixListener::bind(sock).unwrap();
         let russh_config = self.russh_config.clone();
         let state = self.state.clone();
@@ -136,6 +137,43 @@ impl TestServer {
             }
         });
     }
+
+    /// Bring a session up (make it "live") by looking it up in the
+    /// sessions manager. A persisted session is not "live" until
+    /// `get_session` is called, which starts the session actor.
+    pub async fn bring_session_up(&self, session_id: sessions::SessionId) {
+        let mngr = self.state.sessions_manager().await;
+        mngr.get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .await
+            .expect("get_session RPC should succeed")
+            .expect("session should be retrievable");
+    }
+
+    /// Seed a project mfile into a session's daemon-side workspace,
+    /// standing in for the client's workspace upload.
+    ///
+    /// The composer reads a session's project config out of its workspace,
+    /// never from the record's `project_path` — that's a path on the
+    /// *client's* machine. So a test that wants `ConfigureLoadout` to see a
+    /// project seeds it here, between `CreateSession` and `ConfigureLoadout`,
+    /// exactly where a real client streams its files up.
+    pub async fn seed_workspace_mfile(&self, session_id: sessions::SessionId, contents: &str) {
+        let mngr = self.state.sessions_manager().await;
+        let paths = mngr
+            .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .await
+            .expect("get_session RPC should succeed")
+            .expect("session should be retrievable")
+            .paths()
+            .await
+            .expect("the session actor should be live");
+        tokio::fs::write(
+            paths.working.as_utf8_path().join(mfile::MFILE_NAME),
+            contents,
+        )
+        .await
+        .expect("seeding the workspace mfile should succeed");
+    }
 }
 
 /// Dials an already-listening minimald UDS and returns an authenticated
@@ -145,7 +183,7 @@ impl TestServer {
 /// into `Connection::from_stream`, this drives a real `UnixStream` against a
 /// server's `UnixListener` — so it exercises the actual `Server::run` accept
 /// loop, which is what the shutdown-drain tests need.
-pub(crate) async fn connect_uds(sock: &Path) -> TestClient {
+pub async fn connect_uds(sock: &Path) -> TestClient {
     let stream = UnixStream::connect(sock).await.unwrap();
     let client_config = Arc::new(russh::client::Config::default());
     let mut handle = russh::client::connect_stream(client_config, stream, TestClientHandler)
@@ -157,7 +195,7 @@ pub(crate) async fn connect_uds(sock: &Path) -> TestClient {
 }
 
 /// An authenticated client connection against a [`TestServer`].
-pub(crate) struct TestClient {
+pub struct TestClient {
     handle: russh::client::Handle<TestClientHandler>,
 }
 
@@ -170,7 +208,7 @@ impl TestClient {
     ///
     /// Panics on any transport or codec failure — appropriate for unit
     /// tests, which want loud failure rather than recovery.
-    pub(crate) async fn call<R: OneshotSshRpc>(&mut self, req: &R::Request<'_>) -> R::Response {
+    pub async fn call<R: OneshotSshRpc>(&mut self, req: &R::Request<'_>) -> R::Response {
         let channel = self.handle.channel_open_session().await.unwrap();
         channel.request_subsystem(false, R::NAME).await.unwrap();
 
@@ -189,10 +227,7 @@ impl TestClient {
     /// Sets `MINIMAL_SESSION_ID` on the channel (the env-var contract the
     /// server uses to scope the SFTP subsystem to a session), then requests
     /// the `sftp` subsystem and hands the channel stream to the SFTP client.
-    pub(crate) async fn open_sftp(
-        &mut self,
-        session_id: SessionId,
-    ) -> russh_sftp::client::SftpSession {
+    pub async fn open_sftp(&mut self, session_id: SessionId) -> russh_sftp::client::SftpSession {
         let channel = self.handle.channel_open_session().await.unwrap();
         channel
             .set_env(true, "MINIMAL_SESSION_ID", session_id.to_string())
@@ -207,7 +242,7 @@ impl TestClient {
     /// Opens a session channel, applies `env`, and requests the named
     /// subsystem, returning the live channel so the caller can stream
     /// arbitrary bytes through it (e.g. a zstd-compressed tarball).
-    pub(crate) async fn open_subsystem(
+    pub async fn open_subsystem(
         &mut self,
         subsystem: &str,
         env: &[(&str, &str)],
@@ -224,7 +259,7 @@ impl TestClient {
     /// session, mirroring what a real client does: sets `MINIMAL_SESSION_ID`,
     /// negotiates a PTY, then issues a `shell` request. Returns the live
     /// channel so the caller can write stdin and drain stdout/teardown itself.
-    pub(crate) async fn open_shell(
+    pub async fn open_shell(
         &mut self,
         session_id: SessionId,
     ) -> russh::Channel<russh::client::Msg> {
@@ -249,7 +284,7 @@ impl TestClient {
     /// process ran (with whatever exit code or signal). `Err(ExecRejected)`
     /// when the server returned `SSH_MSG_CHANNEL_FAILURE`, i.e. the request
     /// was refused before a process ever started.
-    pub(crate) async fn exec(
+    pub async fn exec(
         &mut self,
         env: &[(&str, &str)],
         request_pty: bool,
@@ -318,7 +353,7 @@ impl TestClient {
 /// request, the process ran (possibly aborted), and the channel closed
 /// cleanly.
 #[derive(Debug)]
-pub(crate) struct ExecOutcome {
+pub struct ExecOutcome {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     /// `Some` when the server reported a numeric exit code; `None` when
@@ -329,7 +364,7 @@ pub(crate) struct ExecOutcome {
 /// Marker for an exec request the server refused at the request layer
 /// via `SSH_MSG_CHANNEL_FAILURE`, before any process was spawned.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ExecRejected;
+pub struct ExecRejected;
 
 struct TestClientHandler;
 
@@ -349,7 +384,7 @@ impl russh::client::Handler for TestClientHandler {
 
 /// Build a `CreateSessionRequest` with sensible defaults for tests
 /// that only care about `name` and `project_path`.
-pub(crate) fn create_session_req(name: &str, project: &str) -> minimald_rpc::CreateSessionRequest {
+pub fn create_session_req(name: &str, project: &str) -> minimald_rpc::CreateSessionRequest {
     minimald_rpc::CreateSessionRequest {
         config: minimald_rpc::SessionConfig {
             name: Some(name.to_string()),
@@ -358,20 +393,48 @@ pub(crate) fn create_session_req(name: &str, project: &str) -> minimald_rpc::Cre
             policy: Default::default(),
             attrs: Default::default(),
         },
-        contribution: Default::default(),
     }
 }
 
-/// Unwrap the `Ready` arm of a [`minimald_rpc::CreateSessionResponse`].
-/// The only arm reachable in tests today — `Pending` is unreachable
-/// until daemon Phase 2 routing lands. Avoids dumping the full
-/// `Pending` payload in the panic message so test output stays focused
-/// on the variant mismatch.
-pub(crate) fn unwrap_ready(resp: minimald_rpc::CreateSessionResponse) -> sessions::SessionId {
+/// Unwrap the `Ready` arm of a [`minimald_rpc::ConfigureLoadoutResponse`],
+/// for a caller that expects its contribution to compose in one shot.
+pub fn unwrap_ready(resp: minimald_rpc::ConfigureLoadoutResponse) {
     match resp {
-        minimald_rpc::CreateSessionResponse::Ready { id } => id,
-        minimald_rpc::CreateSessionResponse::Pending { .. } => {
+        minimald_rpc::ConfigureLoadoutResponse::Ready => {}
+        minimald_rpc::ConfigureLoadoutResponse::Pending { .. } => {
             panic!("expected Ready variant, got Pending")
         }
     }
+}
+
+/// Drive the client half of the whole create flow — `CreateSession` plus
+/// the `ConfigureLoadout` that finalizes it — and return the session's id.
+///
+/// A session isn't usable until its loadout is configured (a `Draft` refuses
+/// attach and context creation), so any test that goes on to *use* the
+/// session wants this rather than a bare `CreateSession`. The workspace is
+/// left empty, so the loadout composes to an empty `Ready` in one shot; a
+/// test that wants a project in the mix seeds the workspace in between and
+/// calls the two RPCs itself.
+pub async fn create_configured_session(
+    client: &mut TestClient,
+    name: &str,
+    project: &str,
+) -> SessionId {
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+    let id = client
+        .call::<CreateSession>(&create_session_req(name, project))
+        .await
+        .unwrap()
+        .id;
+    unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    id
 }

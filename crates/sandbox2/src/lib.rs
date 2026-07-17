@@ -25,6 +25,10 @@ pub mod error;
 use crate::config::{Invocation, WdSetup};
 use crate::error::ExecutionError;
 pub use error::Error;
+/// Re-export so downstream crates (e.g. `mctx`) can use the command type
+/// without depending on `hakoniwa` directly.
+#[cfg(target_os = "linux")]
+pub use hakoniwa::Command;
 
 mod listener;
 
@@ -311,16 +315,19 @@ impl<C: Channel> Sandbox<C> {
 }
 
 /// An initialized sandbox environment.
+#[cfg(target_os = "linux")]
 pub struct Container {
     container: hakoniwa::Container,
 }
 
+#[cfg(target_os = "linux")]
 impl AsRef<hakoniwa::Container> for Container {
     fn as_ref(&self) -> &hakoniwa::Container {
         &self.container
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Container {
     /// Instructs the container to perform the setsid() & associate controlling
     /// terminal dance.
@@ -435,12 +442,14 @@ impl Container {
 
 /// Options for [`Sandbox::bind_mount`].
 #[derive(Debug, Default, Clone, Copy)]
+#[cfg(target_os = "linux")]
 struct BindOpts {
     read_only: bool,
     recursive: bool,
 }
 
 // Sandbox usage
+#[cfg(target_os = "linux")]
 impl<C: Channel> Sandbox<C> {
     fn bind_mount(
         path: &Path,
@@ -477,6 +486,7 @@ impl<C: Channel> Sandbox<C> {
     /// on the calling thread and arms `PR_SET_PDEATHSIG(SIGKILL)`, tying the
     /// child's lifetime to that thread. See [`run_with_cancel`](Self::run_with_cancel)
     /// for the thread-affinity constraints this imposes on callers.
+    #[cfg(target_os = "linux")]
     pub fn new_container(&self) -> Result<Container, Error> {
         let mut container = hakoniwa::Container::new();
         container
@@ -749,6 +759,7 @@ impl<C: Channel> Sandbox<C> {
     }
 
     /// Initializes a hakoniwa command structure.
+    #[cfg(target_os = "linux")]
     pub fn command<I, ArgS, IE, EnvK, EnvV>(
         &mut self,
         container: &Container,
@@ -779,7 +790,7 @@ impl<C: Channel> Sandbox<C> {
             .unwrap()
             && fs::exists(rootfs.join("usr/bin").join(&program)).unwrap()
         {
-            program = format!("/usr/bin/{}", &program);
+            program = format!("/usr/bin/{program}");
         }
 
         container.command_inner(self, &program, args, env_vars)
@@ -789,6 +800,7 @@ impl<C: Channel> Sandbox<C> {
     ///
     /// Delegates to [`run_with_cancel`](Self::run_with_cancel) — see its docs for
     /// the important thread-affinity constraint on the sandbox container.
+    #[cfg(target_os = "linux")]
     pub async fn run<W1, W2>(
         &mut self,
         invocations: Vec<Invocation>,
@@ -836,6 +848,7 @@ impl<C: Channel> Sandbox<C> {
     /// By contrast, purely-synchronous work that forks no container (e.g. staging
     /// the rootfs in `Sandbox::new`) carries none of this and could be offloaded
     /// to the blocking pool if it ever became hot enough to matter.
+    #[cfg(target_os = "linux")]
     pub async fn run_with_cancel<W1, W2>(
         &mut self,
         invocations: Vec<Invocation>,
@@ -1150,6 +1163,7 @@ impl Sandbox {
 
 // Matches the logic in the libcgroups crate. If we do not conditionally
 // set cpu resources, the underlying code in libcgroups will panic :(
+#[cfg(target_os = "linux")]
 fn booted_with_systemd() -> bool {
     std::fs::symlink_metadata("/run/systemd/system")
         .map(|p| p.is_dir())
@@ -1169,6 +1183,7 @@ fn hardlink_dir_contents(src_dir: &Path, dst_parent_dir: &Path) -> Result<(), Er
 /// hakoniwa, the remount succeeds even in nested sandboxes—without
 /// resorting to MountFallback (which can silently drop requested
 /// restrictions like RDONLY).
+#[cfg(target_os = "linux")]
 fn locked_mount_flags(path: &Path) -> hakoniwa::MountOptions {
     use nix::sys::statfs::statfs;
     use nix::sys::statvfs::FsFlags;
@@ -1218,6 +1233,109 @@ fn network_namespaces_available() -> bool {
         .is_some_and(|n| n > 0)
 }
 
+/// A host-level obstruction to creating the unprivileged user namespace every
+/// sandbox needs, as diagnosed by [`user_namespaces_restriction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UsernsRestriction {
+    /// User namespaces are unavailable outright: `/proc/sys/user/
+    /// max_user_namespaces` is missing (kernel built without
+    /// `CONFIG_USER_NS`) or zero (administratively disabled).
+    Disabled,
+    /// `kernel.apparmor_restrict_unprivileged_userns=1` (stock Ubuntu 24.04+)
+    /// and this process is unconfined, so the kernel will deny the unshare.
+    /// Loading an AppArmor profile that grants this process `userns` lifts
+    /// the restriction for it alone (`packaging/apparmor/minimald`).
+    ApparmorUnconfined,
+}
+
+impl std::fmt::Display for UsernsRestriction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => {
+                write!(
+                    f,
+                    "user namespaces are unavailable (user.max_user_namespaces is 0 or missing)"
+                )
+            }
+            Self::ApparmorUnconfined => {
+                write!(
+                    f,
+                    "kernel.apparmor_restrict_unprivileged_userns=1 and this process is unconfined"
+                )
+            }
+        }
+    }
+}
+
+/// Best-effort probe for whether this host will refuse the unprivileged user
+/// namespace every sandbox starts by unsharing — the counterpart of the
+/// network probe above, for the namespace that has no fallback.
+///
+/// Returns the obstruction it finds, or `None` when none is visible. The
+/// sandbox child is forked from the calling process with no exec in between,
+/// so the caller's own privileges and AppArmor label are exactly what the
+/// kernel will check at `unshare`/`uid_map` time — probe from the daemon,
+/// not from a helper. Like the network probe this is a necessary-not-
+/// sufficient signal (seccomp or LSM policy can still deny at spawn time),
+/// but it is advisory: a false `None` surfaces later as the spawn error it
+/// always was, never as a loss of isolation.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn user_namespaces_restriction() -> Option<UsernsRestriction> {
+    userns_restriction_from(
+        std::fs::read_to_string("/proc/sys/user/max_user_namespaces").ok(),
+        std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").ok(),
+        nix::unistd::geteuid().is_root(),
+        apparmor_label().as_deref(),
+    )
+}
+
+/// This process's AppArmor label, e.g. `unconfined` or `minimald (unconfined)`.
+///
+/// The `apparmor/` subdir is the modern location; older kernels expose only
+/// the shared `attr/current`. Unreadable (AppArmor absent) is `None`.
+#[cfg(target_os = "linux")]
+fn apparmor_label() -> Option<String> {
+    [
+        "/proc/self/attr/apparmor/current",
+        "/proc/self/attr/current",
+    ]
+    .iter()
+    .find_map(|p| std::fs::read_to_string(p).ok())
+}
+
+/// Decision core of [`user_namespaces_restriction`], on pre-read inputs.
+#[cfg(target_os = "linux")]
+fn userns_restriction_from(
+    max_user_namespaces: Option<String>,
+    apparmor_restrict: Option<String>,
+    euid_is_root: bool,
+    apparmor_label: Option<&str>,
+) -> Option<UsernsRestriction> {
+    if !max_user_namespaces
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .is_some_and(|n| n > 0)
+    {
+        return Some(UsernsRestriction::Disabled);
+    }
+    // The AppArmor restriction below only binds unprivileged processes; a
+    // root daemon (e.g. the in-guest microVM pid-1) is exempt from it.
+    if euid_is_root {
+        return None;
+    }
+    let restricted = apparmor_restrict
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .is_some_and(|v| v != 0);
+    // The label reads `unconfined` or `<profile> (<mode>)`, possibly
+    // NUL/newline-terminated. An unreadable label on a kernel that has the
+    // restriction sysctl means no profile is attached — which the kernel
+    // treats as unconfined, so we do too.
+    let unconfined =
+        apparmor_label.is_none_or(|l| l.trim_end_matches(['\n', '\0']).trim() == "unconfined");
+    (restricted && unconfined).then_some(UsernsRestriction::ApparmorUnconfined)
+}
+
 /// Whether `mode` runs the sandbox in its own network namespace rather than
 /// sharing the host's.
 ///
@@ -1242,6 +1360,7 @@ mod tests {
     // mapping and a nested sandbox would silently lose those locked flags
     // again. NOEXEC is also common but skipped here since it's not
     // universal.
+    #[cfg(target_os = "linux")]
     #[test]
     fn locked_mount_flags_reads_proc_flags() {
         let opts = locked_mount_flags(Path::new("/proc"));
@@ -1249,6 +1368,7 @@ mod tests {
         assert!(opts.contains(hakoniwa::MountOptions::NODEV));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn locked_mount_flags_empty_on_statfs_failure() {
         let opts = locked_mount_flags(Path::new("/nonexistent-path-for-statfs-test"));
@@ -1260,6 +1380,85 @@ mod tests {
         assert!(!isolates_network(NetworkMode::HostNet));
         assert!(isolates_network(NetworkMode::NoNet));
         assert!(isolates_network(NetworkMode::OwnIp));
+    }
+
+    /// The Ubuntu 24.04+ default: restriction sysctl on, daemon unconfined —
+    /// the one case the AppArmor profile exists to fix.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn userns_restricted_and_unconfined_is_diagnosed() {
+        let got = userns_restriction_from(
+            Some("15000\n".into()),
+            Some("1\n".into()),
+            false,
+            Some("unconfined\n"),
+        );
+        assert_eq!(got, Some(UsernsRestriction::ApparmorUnconfined));
+    }
+
+    /// With the minimald profile attached the label is no longer bare
+    /// `unconfined`, so the restriction does not bind — no warning.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn userns_restricted_but_confined_is_clear() {
+        let got = userns_restriction_from(
+            Some("15000\n".into()),
+            Some("1\n".into()),
+            false,
+            Some("minimald (unconfined)\n"),
+        );
+        assert_eq!(got, None);
+    }
+
+    /// Root is exempt from the AppArmor restriction (the in-guest microVM
+    /// daemon runs as root and must stay silent).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn userns_restricted_but_root_is_clear() {
+        let got = userns_restriction_from(
+            Some("15000\n".into()),
+            Some("1\n".into()),
+            true,
+            Some("unconfined\n"),
+        );
+        assert_eq!(got, None);
+    }
+
+    /// Most distros: the restriction sysctl reads 0 (or does not exist on
+    /// non-AppArmor kernels) — unconfined is fine.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn userns_unrestricted_is_clear() {
+        for sysctl in [Some("0\n".to_string()), None] {
+            let got = userns_restriction_from(
+                Some("15000\n".into()),
+                sysctl,
+                false,
+                Some("unconfined\n"),
+            );
+            assert_eq!(got, None);
+        }
+    }
+
+    /// A zero or missing user-namespace quota means no sandbox can start at
+    /// all, root or not, regardless of AppArmor.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn userns_zero_or_missing_quota_is_disabled() {
+        for quota in [Some("0\n".to_string()), None] {
+            let got = userns_restriction_from(quota, Some("0\n".into()), true, None);
+            assert_eq!(got, Some(UsernsRestriction::Disabled));
+        }
+    }
+
+    /// An unreadable label on a kernel that enforces the restriction means no
+    /// profile is attached: the kernel treats that as unconfined, so the probe
+    /// must as well.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn userns_restricted_with_unreadable_label_is_diagnosed() {
+        let got = userns_restriction_from(Some("15000\n".into()), Some("1\n".into()), false, None);
+        assert_eq!(got, Some(UsernsRestriction::ApparmorUnconfined));
     }
 
     /// Creates a tempdir with the `synth/usr/` structure required by

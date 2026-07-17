@@ -1,0 +1,73 @@
+name: Setup libkrun (macOS)
+description: >
+  Provision the libkrun.dylib we SHIP — built from source at the commit
+  pinned in vendor/libkrun/libkrun.lock via scripts/build-libkrun-macos.sh —
+  into a commit-keyed prefix, and publish LIBKRUN_PREFIX to GITHUB_ENV.
+  minvmd's build.rs prefers LIBKRUN_PREFIX over its /opt/homebrew fallback
+  and bakes the prefix as an rpath, so every later cargo build links, and
+  every test boots, the exact dylib users receive — a leftover brew libkrun
+  on a runner is ignored, and the old slp/krun tap is no longer a CI
+  dependency. Build-on-miss: on GitHub-hosted runners the prefix rides
+  actions/cache; on the persistent self-hosted mini the directory itself
+  survives between runs, so the source build happens once per pin bump.
+  Requires a Rust toolchain (run this after dtolnay/rust-toolchain) and the
+  repository checked out.
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve libkrun pin
+      id: pin
+      shell: bash
+      run: |
+        commit="$(sed -n 's/^commit=//p' vendor/libkrun/libkrun.lock)"
+        if [ -z "$commit" ]; then
+          echo "::error::no commit= line in vendor/libkrun/libkrun.lock" >&2
+          exit 1
+        fi
+        script_hash="$(shasum -a 256 scripts/build-libkrun-macos.sh | cut -d' ' -f1)"
+        {
+          echo "commit=$commit"
+          # The prefix embeds BOTH build inputs (pinned commit + build-script
+          # hash) so the persistent mini rebuilds when either changes — the
+          # same invalidation the actions/cache key gives GitHub-hosted
+          # runners. Stale sibling prefixes on the mini are inert (nothing
+          # references them) and may be deleted by hand.
+          echo "prefix=$HOME/.cache/minimal-ci/libkrun/$commit-${script_hash:0:12}"
+          echo "script_hash=$script_hash"
+        } >> "$GITHUB_OUTPUT"
+    - name: Cache built libkrun (GitHub-hosted)
+      # The mini needs no cache action: the input-keyed prefix under $HOME
+      # persists across runs on its own.
+      if: runner.environment == 'github-hosted'
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/minimal-ci/libkrun
+        key: libkrun-macos-${{ runner.arch }}-${{ steps.pin.outputs.commit }}-${{ steps.pin.outputs.script_hash }}
+    - name: Build libkrun from source (on miss)
+      shell: bash
+      env:
+        PREFIX: ${{ steps.pin.outputs.prefix }}
+      run: |
+        if [ ! -f "$PREFIX/libkrun.1.dylib" ]; then
+          ./scripts/build-libkrun-macos.sh "$PREFIX"
+        else
+          echo "libkrun already staged at $PREFIX (cache hit)"
+        fi
+    - name: Verify staged libkrun + export LIBKRUN_PREFIX
+      # Re-assert the API floor on the staged (possibly cache-restored) dylib
+      # so a corrupt or hand-tampered prefix fails here with an actionable
+      # message instead of a cryptic dyld error at VM boot.
+      shell: bash
+      env:
+        PREFIX: ${{ steps.pin.outputs.prefix }}
+      run: |
+        if [ ! -f "$PREFIX/libkrun.1.dylib" ]; then
+          echo "::error::libkrun.1.dylib missing from $PREFIX after build/restore" >&2
+          exit 1
+        fi
+        if ! nm -gU "$PREFIX/libkrun.1.dylib" 2>/dev/null | grep -q '_krun_add_disk3'; then
+          echo "::error::staged libkrun lacks krun_add_disk3 (need >= 1.19.0); delete $PREFIX and re-run to rebuild" >&2
+          exit 1
+        fi
+        echo "LIBKRUN_PREFIX=$PREFIX" >> "$GITHUB_ENV"

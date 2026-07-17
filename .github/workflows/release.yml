@@ -2,6 +2,31 @@ name: Release
 
 on:
     workflow_dispatch:
+        inputs:
+            dry_run:
+                description: "Build, sign, and assemble everything but publish nothing (no GCS upload, no GitHub release, no installer-bucket write, no channel advance)."
+                type: boolean
+                default: false
+            skip_ci_verify:
+                description: "Bypass the verify-ci gate that requires this commit's five lane aggregators to be green. Admin override for a commit whose checks are known-good but unreported."
+                type: boolean
+                default: false
+    # Invoked by nightly.yml, which depends on this run completing before it
+    # flips the `nightly` channel. Inputs default to a real, verified release.
+    workflow_call:
+        inputs:
+            dry_run:
+                type: boolean
+                default: false
+            skip_ci_verify:
+                type: boolean
+                default: false
+    # Push a version tag (vMAJOR.MINOR.PATCH, optionally a `-prerelease` suffix) to
+    # cut a real, versioned GitHub Release.
+    # Does not release to any channel but unstable.
+    push:
+        tags:
+            - "v[0-9]*.[0-9]*.[0-9]*"
 
 env:
     CARGO_TERM_COLOR: always
@@ -16,30 +41,65 @@ permissions:
     contents: read
 
 jobs:
-    test:
+    verify-ci:
+        # Gate the release on the required CI checks having passed for the EXACT
+        # commit being released, instead of re-running the workspace suite here
+        # (the old `test` job duplicated ci-linux-native's `core-tests`). The five
+        # lane aggregators are the required checks on `main` (ruleset 14240442);
+        # assert each reported success on HEAD. The job always runs so `release`'s
+        # `needs` is satisfied; `skip_ci_verify` short-circuits it to a pass for a
+        # commit whose checks are green but unreported (admin override).
         runs-on: ubuntu-latest
-        timeout-minutes: 40
+        timeout-minutes: 10
+        permissions:
+            contents: read
+            checks: read
         steps:
             - uses: actions/checkout@v7
-            - name: Run core workspace tests
-              uses: ./.github/actions/core-tests
-            - name: Run HTTPS/mTLS proxy tests
-              # The mTLS reverse proxy is behind the non-default `networking-proxy`
-              # feature, so the core-tests `--workspace` run does not compile or run
-              # its proofs (R4.5 mtls_missing_cert_returns_401_with_no_topology, UC2b
-              # mtls_valid_cert_routes_to_backend). Exercise them explicitly.
-              run: cargo nextest run -p minimald --features networking-proxy
-            - name: Run WireGuard mesh tests
-              # The WireGuard mesh peer is behind the non-default `networking-wg`
-              # feature, so the core-tests `--workspace` run does not compile or run
-              # its proofs. Exercise them explicitly (R-WG:
-              # two_meshes_handshake_and_relay_a_packet, rpc get_mesh_status). The
-              # `#[ignore]` two-namespace mesh_uc7 proof runs in the netns lane.
-              run: cargo test -p minimald --features networking-wg
+              with:
+                  persist-credentials: false
+            - name: Verify required checks are green on this commit
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  SKIP: ${{ inputs.skip_ci_verify }}
+              run: |
+                  set -euo pipefail
+                  if [ "$SKIP" = "true" ]; then
+                    echo "::warning::skip_ci_verify set — bypassing the required-checks gate"
+                    exit 0
+                  fi
+                  required="ci-success ci-linux-native-success ci-linux-kvm-success ci-macos-success ci-shell-installer-success"
+                  sha="$(git rev-parse HEAD)"
+                  # Latest conclusion per check-run name for this commit.
+                  runs="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs" --paginate \
+                    --jq '.check_runs[] | "\(.name)\t\(.conclusion)"')"
+                  fail=0
+                  for name in $required; do
+                    c="$(printf '%s\n' "$runs" | awk -F'\t' -v n="$name" '$1==n {print $2}' | tail -1)"
+                    if [ "$c" != "success" ]; then
+                      echo "::error::required check '$name' is '${c:-missing}' on $sha (need success)"
+                      fail=1
+                    fi
+                  done
+                  [ "$fail" -eq 0 ] && echo "all five required checks are green on $sha"
+                  exit "$fail"
 
     build-release-linux-amd64:
         runs-on: ubuntu-latest
-        timeout-minutes: 60
+        # 90m, matching arm64. The build step below links the three binaries one
+        # at a time, so LTO links that used to overlap now serialize, and this
+        # job builds minvmd natively on top of them. The old 60m cap was only
+        # ever measured against the combined build, so it is not evidence this
+        # shape fits; a cap only bounds a hang, and an early finish bills for the
+        # time actually used.
+        timeout-minutes: 90
+        # `CARGO_TARGET_<TRIPLE>_LINKER` is the documented env equivalent of the
+        # `[target.<triple>] linker` config key (triple uppercased, dashes to
+        # underscores). Set here rather than appended to `.cargo/config.toml` so
+        # the build never mutates the checkout. Job-level env merges with the
+        # workflow-level block above rather than replacing it.
+        env:
+            CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         steps:
             - name: Free Disk Space
               # Static release build of the full workspace; the cargo target dir
@@ -54,32 +114,45 @@ jobs:
                   remove_dotnet: true
                   remove_haskell: true
                   remove_tool_cache: true
+            # Full history + tags so crates/version's build.rs can figure out the version.
             - uses: actions/checkout@v7
+              with:
+                  fetch-depth: 0
+                  fetch-tags: true
             - name: Install dependencies
               run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
             - name: Add Rust target
               run: rustup target add x86_64-unknown-linux-musl
-            - name: Configure musl linker
-              run: |
-                  echo '' >> .cargo/config.toml
-                  echo '[target.x86_64-unknown-linux-musl]' >> .cargo/config.toml
-                  echo 'linker = "musl-gcc"' >> .cargo/config.toml
-            - uses: actions/cache@v6
+            - name: Cache Rust build artifacts (dependency-pruned)
+              # Was a raw actions/cache of the entire target/ — the largest target
+              # dir in the repo (multi-GB). Cached whole into the 10 GB per-repo
+              # LRU it shares with every PR lane, it was evicted fast, so release
+              # builds kept starting cold. rust-cache prunes target/ to just the
+              # dependency artifacts (the costly aws-lc-sys/crypto compiles),
+              # shrinking the entry so it survives; save-if keeps branch/dry-run
+              # dispatches read-only so they don't churn the budget and evict
+              # main's warm cache. Registry + git caches come for free.
+              uses: Swatinem/rust-cache@v2
               with:
-                  path: |
-                      ~/.cargo/bin/
-                      ~/.cargo/registry/index/
-                      ~/.cargo/registry/cache/
-                      ~/.cargo/git/db/
-                      target/
-                  key: ${{ runner.os }}-amd64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-                  restore-keys: ${{ runner.os }}-amd64-cargo-release-
+                  shared-key: release-amd64
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
             - name: Build static release binaries
+              # One invocation per package, not one combined build.
+              # `[profile.release]` is fat LTO with codegen-units = 1, so a
+              # combined build lets cargo schedule all three final LTO links
+              # concurrently at -j4. That peak is what got the arm64 job
+              # SIGTERMed (exit 143) immediately after its last workspace crate
+              # compiled; this job has the same profile on a runner with the same
+              # 16 GB, so it was clearing the ceiling on headroom rather than by
+              # design. Sequential invocations share dependency artifacts through
+              # the same target/ dir, so the cost is three graph resolutions, not
+              # three builds — while the LTO links run one at a time. Do not
+              # recollapse these without cutting the release profile's link-time
+              # memory first.
               run: |
-                  cargo build --release --target x86_64-unknown-linux-musl \
-                     --package mip \
-                     --package minimal \
-                     --package minimald
+                  cargo build --release --locked --target x86_64-unknown-linux-musl --package mip
+                  cargo build --release --locked --target x86_64-unknown-linux-musl --package minimal
+                  cargo build --release --locked --target x86_64-unknown-linux-musl --package minimald
             - name: Rename binaries with platform suffix
               # download-artifact merge-multiple flattens every artifact into one
               # directory using each file's basename, so the uploaded files must
@@ -88,7 +161,7 @@ jobs:
               run: |
                   cd target/x86_64-unknown-linux-musl/release
                   mv mip mip-linux-amd64
-                  mv minimal minimal-linux-amd64
+                  mv min minimal-linux-amd64
                   mv minimald minimald-linux-amd64
             - name: Upload binary (mip)
               uses: actions/upload-artifact@v7
@@ -111,24 +184,22 @@ jobs:
             - name: Materialize libkrun prefix (upstream package)
               # minvmd links libkrun's KVM backend dynamically, so unlike the three
               # binaries above it can't join the static-musl cross build — it needs a
-              # native glibc build against a real libkrun. Materialize libkrun (a cache
-              # fetch keyed by the pinned upstream commit, NOT a from-source build) into
-              # a flat prefix that minvmd's build.rs link-searches + rpaths against.
-              #
-              # Reuse the static mip built above (MIP=) instead of letting the script
-              # compile a second, debug mip just to drive this cache fetch.
-              env:
-                  MIP: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/mip-linux-amd64
-              run: ./scripts/fetch-libkrun.sh "$HOME/.krun" x86_64
+              # native glibc build against a real libkrun. Reuse the static mip built
+              # above (mip:) instead of letting the fetch compile a second, debug mip
+              # just to drive the cache fetch.
+              uses: ./.github/actions/setup-libkrun-linux
+              with:
+                  arch: x86_64
+                  mip: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/mip-linux-amd64
             - name: Build native minvmd binary
               # Native host target (x86_64-unknown-linux-gnu), NOT musl: the binary
               # links libkrun.so (and libkrunfw.so.5 is dlopen'd at runtime), so unlike
               # the three above it is not self-contained — running it still needs those
-              # .so's reachable via rpath/LD_LIBRARY_PATH. LIBKRUN_PREFIX drives the
-              # build.rs link search and the `minvmd_libkrun` cfg (real, non-stub impl).
+              # .so's reachable via rpath/LD_LIBRARY_PATH. LIBKRUN_PREFIX — published
+              # by the setup-libkrun-linux composite above — drives the build.rs link
+              # search and the `minvmd_libkrun` cfg (real, non-stub impl).
               run: |
-                  LIBKRUN_PREFIX="$HOME/.krun" \
-                    cargo build --release -p minvmd --bin minvmd
+                  cargo build --release --locked -p minvmd --bin minvmd
                   mv target/release/minvmd target/release/minvmd-linux-amd64
             - name: Upload binary (minvmd)
               uses: actions/upload-artifact@v7
@@ -138,59 +209,74 @@ jobs:
                   retention-days: 7
 
     build-release-linux-arm64:
-        runs-on: ubuntu-latest
+        runs-on: ubuntu-26.04-arm
         timeout-minutes: 90
+        # See the amd64 job: cargo's env equivalent of `[target.<triple>]
+        # linker`, so the build leaves the checkout untouched.
+        env:
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         steps:
+            - name: Free Disk Space
+              # Static release build of the full workspace; the cargo target dir
+              # is the largest in any of the linux jobs.
+              #
+              # Runs BEFORE checkout: the action copies a `bc` binary into its
+              # working dir, which dirty's the checkout.
+              uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+              with:
+                  remove_android: true
+                  remove_dotnet: true
+                  remove_haskell: true
+                  remove_tool_cache: true
+            # Full history + tags so crates/version's build.rs can figure out the version.
             - uses: actions/checkout@v7
-            - name: Install cross
-              uses: taiki-e/install-action@v2
               with:
-                  tool: cross
-            - uses: actions/cache@v6
+                  fetch-depth: 0
+                  fetch-tags: true
+            - name: Install dependencies
+              run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
+            - name: Add Rust target
+              run: rustup target add aarch64-unknown-linux-musl
+            - name: Cache Rust build artifacts (dependency-pruned)
+              # See the amd64 job: rust-cache replaces a raw multi-GB target/ cache
+              # the 10 GB LRU evicted, which is why this build kept running
+              # cold (~65m). Pruned to dependency artifacts so it survives; save-if
+              # keeps branch/dry-run dispatches read-only. writes target/ and
+              # reads ~/.cargo on the host, so rust-cache caches them the same as a
+              # native build.
+              uses: Swatinem/rust-cache@v2
               with:
-                  path: |
-                      ~/.cargo/bin/
-                      ~/.cargo/registry/index/
-                      ~/.cargo/registry/cache/
-                      ~/.cargo/git/db/
-                      target/
-                  key: ${{ runner.os }}-arm64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-                  restore-keys: ${{ runner.os }}-arm64-cargo-release-
-            - name: Build static minimal binary
-              # Rename with a platform suffix so download-artifact's merge-multiple
-              # flatten does not collide with the amd64 build's basename.
+                  shared-key: release-arm64
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
+            - name: Build static release binaries
+              # See the amd64 job: one invocation per package so the fat-LTO
+              # links run one at a time. Recollapsing them into a single build is
+              # what got this job SIGTERMed (exit 143) on the 16 GB runner, right
+              # after the last workspace crate compiled.
               run: |
-                  cross build --release \
-                     --package minimal \
-                     --target aarch64-unknown-linux-musl
-                  mv target/aarch64-unknown-linux-musl/release/minimal \
-                     target/aarch64-unknown-linux-musl/release/minimal-linux-arm64
+                  cargo build --release --locked --target aarch64-unknown-linux-musl --package mip
+                  cargo build --release --locked --target aarch64-unknown-linux-musl --package minimal
+                  cargo build --release --locked --target aarch64-unknown-linux-musl --package minimald
+            - name: Rename binaries with platform suffix
+              # Platform-suffixed so download-artifact's merge-multiple basename
+              # flatten does not collide with the amd64 build.
+              run: |
+                  cd target/aarch64-unknown-linux-musl/release
+                  mv min minimal-linux-arm64
+                  mv mip mip-linux-arm64
+                  mv minimald minimald-linux-arm64
             - name: Upload binary (minimal)
               uses: actions/upload-artifact@v7
               with:
                   name: minimal-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/minimal-linux-arm64
                   retention-days: 7
-            - name: Build static mip binary
-              run: |
-                  cross build --release \
-                     --package mip \
-                     --target aarch64-unknown-linux-musl
-                  mv target/aarch64-unknown-linux-musl/release/mip \
-                     target/aarch64-unknown-linux-musl/release/mip-linux-arm64
             - name: Upload binary (mip)
               uses: actions/upload-artifact@v7
               with:
                   name: mip-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/mip-linux-arm64
                   retention-days: 7
-            - name: Build static minimald binary
-              run: |
-                  cross build --release \
-                     --package minimald \
-                     --target aarch64-unknown-linux-musl
-                  mv target/aarch64-unknown-linux-musl/release/minimald \
-                     target/aarch64-unknown-linux-musl/release/minimald-linux-arm64
             - name: Upload binary (minimald)
               uses: actions/upload-artifact@v7
               with:
@@ -214,59 +300,74 @@ jobs:
               with:
                   # Don't leave git credentials on the persistent self-hosted runner.
                   persist-credentials: false
+                  # Full history + tags so crates/version's build.rs can figure out the version.
+                  fetch-depth: 0
+                  fetch-tags: true
             - name: Toolchain
               uses: dtolnay/rust-toolchain@stable
-            - name: Provision libkrun (slp/krun tap)
-              # Self-install libkrun so the job doesn't depend on hand-provisioned
-              # runner state. Idempotent (a no-op when already present).
-              run: brew install slp/krun/libkrun
-            - name: Verify libkrun is available
-              run: |
-                  if [ ! -f /opt/homebrew/lib/libkrun.dylib ]; then
-                    echo "::error::libkrun.dylib not found under /opt/homebrew/lib. Provision the runner with: brew install slp/krun/libkrun" >&2
-                    exit 1
-                  fi
+            - name: Provision libkrun (pinned own build)
+              uses: ./.github/actions/setup-libkrun-macos
             - name: Build release minvmd binary
-              run: cargo build --release -p minvmd --bin minvmd
-            - name: Point minvmd's libkrun load command at @rpath
-              # Linking against Homebrew's libkrun bakes its ABSOLUTE install name
-              # (/opt/homebrew/opt/libkrun/lib/libkrun.1.dylib) into minvmd as the
-              # load command. dyld resolves an absolute load command directly and
-              # NEVER consults the rpath, so the shipped bin/libkrun.1.dylib next to
-              # minvmd is ignored and the binary is unloadable on a host without that
-              # exact Homebrew keg. Rewrite the load command to `@rpath/…` so dyld
-              # walks minvmd's rpath instead: `@loader_path` (the adjacent shipped
-              # dylib) first, then `/opt/homebrew/lib` as a fallback (see the minvmd
-              # build.rs rpath ordering). Derive the current path from otool rather
-              # than hardcoding it, so a libkrun version/path bump can't silently
-              # skip the rewrite. install_name_tool invalidates the ad-hoc signature,
-              # so re-sign (the installer re-signs on download too, but keep the
-              # artifact valid in the meantime).
-              run: |
-                  current="$(otool -L target/release/minvmd | awk '/libkrun/ {print $1; exit}')"
-                  if [ -z "$current" ]; then
-                    echo "::error::minvmd has no libkrun load command; did it link the stub?" >&2
-                    exit 1
-                  fi
-                  install_name_tool -change "$current" @rpath/libkrun.1.dylib target/release/minvmd
-                  codesign --sign - --force target/release/minvmd
-            - name: Verify minvmd loads libkrun via @rpath
-              # Gate the release on the rewrite above having stuck: an absolute or
-              # bare load command here would ship an unloadable binary (this bug).
-              run: |
-                  otool -L target/release/minvmd | grep -i krun
-                  if ! otool -L target/release/minvmd | grep -q '@rpath/libkrun\.1\.dylib'; then
-                    echo "::error::minvmd does not reference @rpath/libkrun.1.dylib; the shipped dylib will not be found" >&2
-                    exit 1
-                  fi
+              run: cargo build --release --locked -p minvmd --bin minvmd
+            - name: Rewrite + verify minvmd libkrun linkage (@rpath)
+              # Retarget Homebrew's absolute libkrun install name to the shipped
+              # bin/../lib layout and verify the result (rpath entries, no
+              # non-system deps). Extracted to scripts/ so a future CI lane can
+              # exercise the production rewrite per-PR; release is currently its
+              # only consumer. Signing happens below, as the last mutation
+              # before upload.
+              run: scripts/rewrite-macos-linkage.sh target/release/minvmd
             - name: Build release minimal binary
-              run: cargo build --release -p minimal --bin minimal
+              # Separate cargo invocation from minvmd above, so its default
+              # `libkrun` feature can't unify into the CLI (which opts out via
+              # default-features = false). Gated next.
+              run: cargo build --release --locked -p minimal --bin min
+            - name: Verify minimal links only system libraries
+              # The CLI calls no libkrun (it spawns minvmd as a subprocess), so
+              # every dependency must be under /usr/lib or /System. A krun line
+              # means the default-features = false opt-out regressed.
+              run: |
+                  otool -L target/release/min
+                  bad="$(otool -L target/release/min | tail -n +2 | awk '{print $1}' \
+                    | grep -vE '^(/usr/lib/|/System/)' || true)"
+                  if [ -n "$bad" ]; then
+                    echo "::error::minimal links non-system libraries (allowed: /usr/lib, /System):" >&2
+                    printf '%s\n' "$bad" >&2
+                    exit 1
+                  fi
             - name: Rename binaries with platform suffix
               # download-artifact merge-multiple flattens on basename, so the uploaded
               # file must already carry the platform-suffixed name the release job expects.
               run: |
                   mv target/release/minvmd target/release/minvmd-macos-arm64
-                  mv target/release/minimal target/release/minimal-macos-arm64
+                  mv target/release/min target/release/minimal-macos-arm64
+            - name: Codesign binaries with Developer ID
+              # Sign the two shipped Mach-O binaries with the Developer ID
+              # Application identity held in the runner's signing keychain. This
+              # is the LAST mutation before upload.
+              # Hardened runtime (--options runtime) + a secure --timestamp so the
+              # artifacts are notarization-ready.
+              env:
+                  KC_PW: ${{ secrets.KC_PW }}
+              run: |
+                  KC=minimal-signing.keychain-db
+                  IDENTITY="Developer ID Application: Minimal Software Research Ltd. (3G47C5HY64)"
+
+                  # Unlock the signing keychain and put it on the search list so
+                  # codesign can resolve the identity by name.
+                  security unlock-keychain -p "$KC_PW" "$KC"
+                  security list-keychains -d user -s "$KC" login.keychain-db
+
+                  codesign --force --timestamp --options runtime \
+                    --sign "$IDENTITY" \
+                    --entitlements crates/minvmd/minvmd.entitlements \
+                    target/release/minvmd-macos-arm64
+                  codesign --force --timestamp --options runtime \
+                    --sign "$IDENTITY" \
+                    target/release/minimal-macos-arm64
+
+                  codesign --verify --strict --verbose=2 target/release/minvmd-macos-arm64
+                  codesign --verify --strict --verbose=2 target/release/minimal-macos-arm64
             - name: Upload binary (minvmd)
               uses: actions/upload-artifact@v7
               with:
@@ -281,69 +382,99 @@ jobs:
                   retention-days: 7
 
     build-libkrun-macos-arm64:
-        # Build a TRIMMED libkrun.dylib from source to SHIP in the release, so
-        # macOS users don't have to `brew install` it themselves. GitHub-hosted
+        # Build the TRIMMED libkrun.dylib to SHIP in the release, so macOS users
+        # don't have to `brew install` it themselves. Same setup-libkrun-macos
+        # composite (scripts/build-libkrun-macos.sh at the vendor/libkrun/
+        # libkrun.lock pin) that every macOS CI lane links and boots against —
+        # the shipped dylib is BY CONSTRUCTION the one CI tested. GitHub-hosted
         # macos-latest is Apple Silicon (arm64).
         runs-on: macos-latest
         timeout-minutes: 45
-        env:
-            # Pin to the libkrun the slp/krun tap currently ships, so the dylib we
-            # ship matches the ABI the macOS CI lanes build and test against.
-            LIBKRUN_REF: v1.19.4
         steps:
-            - name: Checkout libkrun (${{ env.LIBKRUN_REF }})
-              uses: actions/checkout@v7
+            - uses: actions/checkout@v7
               with:
-                  repository: containers/libkrun
-                  ref: ${{ env.LIBKRUN_REF }}
                   persist-credentials: false
             - name: Toolchain
               uses: dtolnay/rust-toolchain@stable
-            - name: Build trimmed libkrun (blk + net; no gpu, no init-blob)
-              # Direct cargo build — no Makefile, no env, no lld/xz/sysroot.
-              #   -p libkrun            scope to the libkrun crate, so the
-              #                         src/input & src/display workspace members
-              #                         (whose bindgen build scripts need libclang)
-              #                         are never built.
-              #   --no-default-features drop `init-blob`, whose build script
-              #                         cross-compiles a Linux init — the ONLY reason
-              #                         the Makefile needs lld + a Debian sysroot.
-              #                         minvmd supplies its own initramfs, so
-              #                         libkrun's bundled init is unused. (This is
-              #                         exactly the Makefile's INIT_BLOB=0 config.)
-              #   --features blk,net    blk = rootfs disk (krun_add_disk2),
-              #                         net = virtio-net. No gpu => no libepoxy/
-              #                         virglrenderer. Hypervisor.framework is linked
-              #                         automatically by src/vmm/build.rs.
-              # Output: target/release/libkrun.dylib (install_name libkrun.1.dylib,
-              # set by src/libkrun/build.rs).
-              run: cargo build --release -p libkrun --no-default-features --features blk,net
-            - name: Stage the dylib and assert it is self-contained
-              # A trimmed build must link only system libraries. Any /opt/homebrew or
-              # /usr/local reference means a dependency leaked (e.g. a stray GPU lib)
-              # and the dylib would fail to load on a machine without Homebrew — fail
-              # loudly rather than ship an unloadable artifact. `otool -D` prints the
-              # install name for cross-checking against minvmd's recorded load
-              # command (see the minvmd macOS job); informational.
+            - name: Provision libkrun (pinned own build)
+              uses: ./.github/actions/setup-libkrun-macos
+            - name: Stage the dylib for signing
+              # The build script already asserted self-containment (no
+              # /opt/homebrew or /usr/local deps) and the krun_add_disk3 API
+              # floor, set the @rpath/libkrun.1.dylib install name, and ad-hoc
+              # signed it.
+              run: cp "$LIBKRUN_PREFIX/libkrun.1.dylib" "$RUNNER_TEMP/temp-libkrun-macos-arm64.dylib"
+            - name: Upload ad-hoc-signed libkrun dylib (temp)
+              # This GitHub-hosted runner has no access to the Developer ID signing
+              # keychain, so the dylib leaves here only ad-hoc signed, under a
+              # `temp-` prefixed name. sign-macos-artifacts (self-hosted) downloads
+              # it, re-signs with Developer ID, and re-uploads under the final
+              # `libkrun-macos-arm64` name. The release job drops any leftover
+              # `temp-` artifact so the ad-hoc copy never ships.
+              uses: actions/upload-artifact@v7
+              with:
+                  name: temp-libkrun-macos-arm64
+                  path: ${{ runner.temp }}/temp-libkrun-macos-arm64.dylib
+                  if-no-files-found: error
+                  retention-days: 7
+
+    sign-macos-artifacts:
+        # Developer ID signing for the macOS artifacts built on normal runners.
+        #
+        # Artifacts come as the output of other jobs under a `temp-` prefixed
+        # artifact, are signed on the self-hosted runner that holds the keychain,
+        # then are re-uploaded under their final names.
+        runs-on: [self-hosted, macOS, ARM64]
+        timeout-minutes: 15
+        if: vars.RUN_MACOS_CI != 'false'
+        needs: [build-libkrun-macos-arm64, fetch-release-guest-artifacts]
+        steps:
+            - name: Download unsigned macOS artifacts (temp)
+              uses: actions/download-artifact@v8
+              with:
+                  pattern: temp-*
+                  path: ${{ runner.temp }}/unsigned
+                  merge-multiple: true
+            - name: Codesign macOS artifacts with Developer ID
+              # Sign with the same Developer ID identity, secure --timestamp, and
+              # hardened runtime (--options runtime) as the binaries so the whole
+              # install is notarization-ready. --force replaces each file's existing
+              # signature (build-libkrun-macos.sh's ad-hoc on libkrun, the Go
+              # linker's ad-hoc on gvproxy). No entitlements: neither libkrun (a library) nor gvproxy
+              # (the network switch) is the hypervisor entry point. The temp- prefix
+              # is dropped so each file carries the final basename the
+              # archive/installer expect.
+              env:
+                  KC_PW: ${{ secrets.KC_PW }}
               run: |
-                  dylib=target/release/libkrun.dylib
-                  echo "otool -L $dylib"; otool -L "$dylib"
-                  echo "otool -D $dylib (install name):"; otool -D "$dylib"
-                  if otool -L "$dylib" | grep -E '/opt/homebrew|/usr/local'; then
-                    echo "::error::trimmed libkrun links a non-system (Homebrew) dylib; see otool -L above" >&2
-                    exit 1
-                  fi
-                  cp "$dylib" "$RUNNER_TEMP/libkrun-macos-arm64.dylib"
-            - name: Ad-hoc codesign
-              # cargo leaves the dylib ad-hoc/unsigned; arm64 macOS refuses to load a
-              # dylib with an invalid signature. Match the installer's self-sign of
-              # shipped bin/ files.
-              run: codesign --sign - --force "$RUNNER_TEMP/libkrun-macos-arm64.dylib"
-            - name: Upload libkrun dylib
+                  KC=minimal-signing.keychain-db
+                  IDENTITY="Developer ID Application: Minimal Software Research Ltd. (3G47C5HY64)"
+
+                  security unlock-keychain -p "$KC_PW" "$KC"
+                  security list-keychains -d user -s "$KC" login.keychain-db
+
+                  in="$RUNNER_TEMP/unsigned"
+                  out="$RUNNER_TEMP/signed"
+                  mkdir -p "$out"
+                  cp "$in/temp-libkrun-macos-arm64.dylib" "$out/libkrun-macos-arm64.dylib"
+                  cp "$in/temp-gvproxy-darwin-arm64"      "$out/gvproxy-darwin-arm64"
+
+                  for f in "$out/libkrun-macos-arm64.dylib" "$out/gvproxy-darwin-arm64"; do
+                    codesign --force --timestamp --options runtime --sign "$IDENTITY" "$f"
+                    codesign --verify --strict --verbose=2 "$f"
+                  done
+            - name: Upload signed libkrun dylib
               uses: actions/upload-artifact@v7
               with:
                   name: libkrun-macos-arm64
-                  path: ${{ runner.temp }}/libkrun-macos-arm64.dylib
+                  path: ${{ runner.temp }}/signed/libkrun-macos-arm64.dylib
+                  if-no-files-found: error
+                  retention-days: 7
+            - name: Upload signed gvproxy (darwin-arm64)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: gvproxy-darwin-arm64
+                  path: ${{ runner.temp }}/signed/gvproxy-darwin-arm64
                   if-no-files-found: error
                   retention-days: 7
 
@@ -356,8 +487,8 @@ jobs:
         # build-release-initramfs, which reuses the minimald-linux-* binaries.
         #
         # None require the target host's arch to produce: the kernel and rootfs are
-        # cache pulls keyed by the pinned upstream commit (fetch-artifact.sh pulls
-        # any guest arch on an x86_64 runner), and gvproxy is a pin-verified
+        # cache pulls keyed by the pinned upstream commit (the materialize action
+        # pulls any guest arch on an x86_64 runner), and gvproxy is a pin-verified
         # download of the upstream release binary. So a single x86_64 runner emits
         # both the amd64 and arm64 variants, covering every release host
         # (linux-amd64/arm64, macos-arm64). Files are arch-suffixed so
@@ -369,44 +500,44 @@ jobs:
             - uses: actions/checkout@v7
               with:
                   persist-credentials: false
-            - name: Toolchain
-              uses: dtolnay/rust-toolchain@stable
-            - name: Install build dependencies
-              # protoc + libprotobuf-dev: the `mip` CLI build that drives the rootfs
-              # cache pull (the well-known protos live in libprotobuf-dev, only a
-              # `recommends` of protobuf-compiler, so name it under
-              # --no-install-recommends).
-              run: |
-                  sudo apt-get update
-                  sudo apt-get install -y --no-install-recommends \
-                    protobuf-compiler libprotobuf-dev
-            - uses: actions/cache@v6
-              with:
-                  path: |
-                      ~/.cargo/bin/
-                      ~/.cargo/registry/index/
-                      ~/.cargo/registry/cache/
-                      ~/.cargo/git/db/
-                      target/
-                  key: ${{ runner.os }}-guest-artifacts-release-${{ hashFiles('**/Cargo.lock') }}
-                  restore-keys: ${{ runner.os }}-guest-artifacts-release-
-            # NOTE: fetch-artifact.sh takes the kernel-style arch (x86_64/aarch64);
-            # only the emitted file/artifact names use the amd64/arm64 suffixes the
-            # release binaries already use.
+            # NOTE: the `arch` input is the kernel-style target arch
+            # (x86_64/aarch64); only the emitted file/artifact names use the
+            # amd64/arm64 suffixes the release binaries already use.
             - name: Materialize guest kernel (raw Image, amd64)
-              run: ./scripts/fetch-artifact.sh virtio-kernel "$RUNNER_TEMP/vmlinuz-amd64" x86_64
+              uses: ./.github/actions/materialize
+              with:
+                  output: virtio-kernel
+                  dest: ${{ runner.temp }}/vmlinuz-amd64
+                  arch: x86_64
+                  channel: unstable
             - name: Materialize guest kernel (raw Image, arm64)
-              run: ./scripts/fetch-artifact.sh virtio-kernel "$RUNNER_TEMP/vmlinuz-arm64" aarch64
+              uses: ./.github/actions/materialize
+              with:
+                  output: virtio-kernel
+                  dest: ${{ runner.temp }}/vmlinuz-arm64
+                  arch: aarch64
+                  channel: unstable
             - name: Materialize guest rootfs (ext4 image, amd64)
-              run: ./scripts/fetch-artifact.sh minvmd-rootfs "$RUNNER_TEMP/rootfs-amd64.img" x86_64
+              uses: ./.github/actions/materialize
+              with:
+                  output: minvmd-rootfs
+                  dest: ${{ runner.temp }}/rootfs-amd64.img
+                  arch: x86_64
+                  channel: unstable
             - name: Materialize guest rootfs (ext4 image, arm64)
-              run: ./scripts/fetch-artifact.sh minvmd-rootfs "$RUNNER_TEMP/rootfs-arm64.img" aarch64
+              uses: ./.github/actions/materialize
+              with:
+                  output: minvmd-rootfs
+                  dest: ${{ runner.temp }}/rootfs-arm64.img
+                  arch: aarch64
+                  channel: unstable
             - name: Fetch pinned gvproxy (linux-amd64)
               run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-linux-amd64" gvproxy-linux-amd64
             - name: Fetch pinned gvproxy (linux-arm64)
               run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-linux-arm64" gvproxy-linux-arm64
             - name: Fetch pinned gvproxy (darwin-arm64)
-              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy-darwin-arm64" gvproxy-darwin
+              # Stashed as a `temp-` so sign-macos-artifacts (self-hosted) can sign it
+              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/temp-gvproxy-darwin-arm64" gvproxy-darwin
             - name: Upload kernel (amd64)
               uses: actions/upload-artifact@v7
               with:
@@ -449,11 +580,11 @@ jobs:
                   path: ${{ runner.temp }}/gvproxy-linux-arm64
                   if-no-files-found: error
                   retention-days: 7
-            - name: Upload gvproxy (darwin-arm64)
+            - name: Upload gvproxy (darwin-arm64, temp/unsigned)
               uses: actions/upload-artifact@v7
               with:
-                  name: gvproxy-darwin-arm64
-                  path: ${{ runner.temp }}/gvproxy-darwin-arm64
+                  name: temp-gvproxy-darwin-arm64
+                  path: ${{ runner.temp }}/temp-gvproxy-darwin-arm64
                   if-no-files-found: error
                   retention-days: 7
 
@@ -509,18 +640,43 @@ jobs:
                   if-no-files-found: error
                   retention-days: 7
 
+    compute-version-string:
+        # Read the version straight out of a shipped binary so the GitHub Release
+        # NAME is exactly what `min -V` reports — one source of truth.
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        needs: [build-release-linux-amd64]
+        outputs:
+            version: ${{ steps.read.outputs.version }}
+        steps:
+            - name: Download minimald (amd64)
+              uses: actions/download-artifact@v8
+              with:
+                  name: minimald-linux-amd64
+            - name: Read version from the built binary
+              id: read
+              run: |
+                  set -euo pipefail
+                  chmod +x minimald-linux-amd64
+                  # "-V" => "minimald <version>"; take the version field.
+                  ver="$(./minimald-linux-amd64 -V | awk '{print $2}')"
+                  [ -n "$ver" ] || { echo "::error::could not read version from binary"; exit 1; }
+                  echo "version=$ver" >> "$GITHUB_OUTPUT"
+                  echo "resolved release version: $ver"
+
     release:
         runs-on: ubuntu-latest
         timeout-minutes: 30
         needs:
             [
-                test,
+                verify-ci,
                 build-release-linux-amd64,
                 build-release-linux-arm64,
                 build-release-macos-arm64,
-                build-libkrun-macos-arm64,
+                sign-macos-artifacts,
                 fetch-release-guest-artifacts,
                 build-release-initramfs,
+                compute-version-string,
             ]
         permissions:
             contents: write
@@ -529,17 +685,29 @@ jobs:
             - uses: actions/checkout@v7
             - name: Generate release info
               id: release_info
+              env:
+                  REF_TYPE: ${{ github.ref_type }}
+                  REF_NAME: ${{ github.ref_name }}
               run: |
+                  # A version-tag push releases AT that tag (e.g. v1.2.3). The
+                  # SHA-based dispatch/nightly flow keeps its release-<sha> tag, which
+                  # the installer bucket layout and channel pointers key off. Either
+                  # way the release NAME uses the version string (Create Release step).
                   SHORT_SHA=$(git rev-parse --short=8 HEAD)
                   echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
-                  echo "tag=release-$SHORT_SHA" >> $GITHUB_OUTPUT
-                  echo "name=minimal-$SHORT_SHA" >> $GITHUB_OUTPUT
+                  if [ "$REF_TYPE" = "tag" ]; then
+                    echo "tag=$REF_NAME" >> $GITHUB_OUTPUT
+                  else
+                    echo "tag=release-$SHORT_SHA" >> $GITHUB_OUTPUT
+                  fi
             - name: Download artifacts
               uses: actions/download-artifact@v8
               with:
                   pattern: "*-*-*"
                   path: artifacts/
                   merge-multiple: true
+            - name: Drop temp-prefixed artifacts
+              run: rm -f artifacts/temp-*
             - name: Make binaries executable
               run: chmod +x artifacts/*-*-*
             - name: Generate completions
@@ -560,31 +728,57 @@ jobs:
                   project_id: "289724348228"
                   workload_identity_provider: "projects/289724348228/locations/global/workloadIdentityPools/github/providers/gominimal"
             - name: Package and upload archive to GCS
+              env:
+                  DRY_RUN: ${{ inputs.dry_run }}
               run: |
                   SHA=$(git rev-parse --short=8 HEAD)
                   tar --zstd -cf "minimalone-${SHA}.tar.zst" -C artifacts .
-
+                  if [ "$DRY_RUN" = "true" ]; then
+                    echo "::notice::dry_run — packaged minimalone-${SHA}.tar.zst but skipping GCS upload"
+                    exit 0
+                  fi
                   gcloud storage cp \
                     --cache-control="public, max-age=31536000, immutable" \
                     "minimalone-${SHA}.tar.zst" gs://minimal-shim/archives/
             - name: Create Release
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  DRY_RUN: ${{ inputs.dry_run }}
+                  REL_TAG: ${{ steps.release_info.outputs.tag }}
+                  REL_TITLE: minimal ${{ needs.compute-version-string.outputs.version }}
+                  REF_TYPE: ${{ github.ref_type }}
+                  REF_NAME: ${{ github.ref_name }}
               run: |
                   tar -C artifacts/completions -czf artifacts/completions.tar.gz .
+                  if [ "$DRY_RUN" = "true" ]; then
+                    echo "::notice::dry_run — assembled release artifacts but skipping GitHub release create"
+                    exit 0
+                  fi
+                  # A pre-release version tag (e.g. v0.5.0-rc1, i.e. one with a `-`
+                  # suffix) is marked a GitHub prerelease so it doesn't show as
+                  # "Latest"; an exact vX.Y.Z becomes the latest release.
+                  extra=()
+                  if [ "$REF_TYPE" = "tag" ]; then
+                    case "$REF_NAME" in
+                      *-*) extra+=(--prerelease) ;;
+                    esac
+                  fi
                   cd artifacts/
-                  gh release create "${{ steps.release_info.outputs.tag }}" \
+                  gh release create "$REL_TAG" \
                     $(find . -maxdepth 1 -type f) \
                     --repo="${GITHUB_REPOSITORY}" \
-                    --title="${{ steps.release_info.outputs.name }}"
+                    --title="$REL_TITLE" \
+                    "${extra[@]}"
 
     stage-installer:
         # Publish the release into gs://minimal-one in the layout the curl|bash
         # installer reads (docs/specs/07-spec-installer). It re-fetches the same
-        # build artifacts and touches only gs://minimal-one.
+        # build artifacts and touches only gs://minimal-one. Wholly a publish
+        # step, so it is skipped entirely on a dry run.
         runs-on: ubuntu-latest
         timeout-minutes: 20
         needs: [release]
+        if: ${{ !inputs.dry_run }}
         permissions:
             contents: read
             id-token: write

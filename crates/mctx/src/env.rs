@@ -12,10 +12,9 @@ use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives, TransitivesDep};
 use mfile::{EnvPatches, EnvVarValue};
 use op::Runnable;
 use ot::OpTracker;
-use sandbox2::{
-    Container,
-    config::{Invocation, SandboxMapped},
-};
+#[cfg(target_os = "linux")]
+use sandbox2::Container;
+use sandbox2::config::{Invocation, SandboxMapped};
 use tempfile::TempDir;
 
 #[allow(dead_code)]
@@ -290,6 +289,36 @@ impl EnvChannel<'_> {
             Err(e) => return EnvChannel::write_error(e, stream),
             Ok(ctx) => ctx,
         };
+
+        // An `echo` task carries its whole output in its declaration, so it
+        // needs no package graph or sandbox — service it straight from the
+        // mfile. Only mfile-local tasks are matched here; a stack-provided
+        // echo task falls through to the normal (sandboxed) path below.
+        if let Some(task) = build_ctx.minimal_file().task(task_name)
+            && task.action.as_echo().is_some()
+        {
+            let parsed_args = if task.args.is_empty() {
+                None
+            } else {
+                match task.args.parse(args) {
+                    Err(e) => {
+                        for line in format!("{}", e.render().ansi()).lines() {
+                            writeln!(stream, "msg:{}", line).ok();
+                        }
+                        writeln!(stream, "error: failed parsing arguments for task").ok();
+                        return;
+                    }
+                    Ok(args) => Some(args),
+                }
+            };
+            match crate::interpolate_task_strings(&task, parsed_args.as_ref()) {
+                Err(e) => return EnvChannel::write_error(e, stream),
+                // `msg:` framing matches how task stdout lines reach the client.
+                Ok(t) => writeln!(stream, "msg:{}", t.action.as_echo().unwrap_or_default()).ok(),
+            };
+            return;
+        }
+
         let graph = match build_ctx.graph_from_all_packages() {
             Err(e) => return EnvChannel::write_error(e, stream),
             Ok(g) => g,
@@ -499,6 +528,42 @@ pub struct EnvArgs<'a> {
     pub ot: Option<OpTracker>,
 }
 
+/// Returns a clone of `task` with every action string interpolated against
+/// the task's parameters — `task_packages` plus any `parsed_args` — so that
+/// `%{name}`-style placeholders are resolved.
+///
+/// Shared by the invocation path ([`Env::task_invocations`]) and the
+/// sandbox-free `echo` short-circuits, so an echoed string is interpolated
+/// the same way an `exec`/`bash` action would be.
+pub fn interpolate_task_strings(
+    task: &mfile::Task,
+    parsed_args: Option<&args::ArgsSet>,
+) -> Result<mfile::Task, Error> {
+    let base = [(
+        "task_packages",
+        args::Arg::Array(
+            task.packages
+                .iter()
+                .map(|s| args::ScalarArg::String(s.clone()))
+                .collect(),
+        ),
+    )]
+    .into_iter();
+    let var_ctx = if let Some(args) = parsed_args {
+        common::ncl_eval::VarCtx::from_iter(
+            base.chain(args.iter().map(|(k, v)| (k.as_str(), v.clone()))),
+        )
+    } else {
+        common::ncl_eval::VarCtx::from_iter(base)
+    };
+    task.map_exec_strings(|s| {
+        var_ctx
+            .eval_string(s)
+            .map_err(|_| anyhow::anyhow!("nickel eval failed for string: {}", s))
+    })
+    .map_err(Error::Other)
+}
+
 /// A successfully-configured runtime environment.
 pub struct Env<'a> {
     sandbox: sandbox2::Sandbox<EnvChannel<'a>>,
@@ -628,31 +693,7 @@ impl<'a> Env<'a> {
         task: &mfile::Task,
         parsed_args: Option<&args::ArgsSet>,
     ) -> Result<(bool, Vec<Invocation>), Error> {
-        let base = [(
-            "task_packages",
-            args::Arg::Array(
-                task.packages
-                    .iter()
-                    .map(|s| args::ScalarArg::String(s.clone()))
-                    .collect(),
-            ),
-        )]
-        .into_iter();
-        let mapped_task = {
-            let var_ctx = if let Some(args) = parsed_args {
-                common::ncl_eval::VarCtx::from_iter(
-                    base.chain(args.iter().map(|(k, v)| (k.as_str(), v.clone()))),
-                )
-            } else {
-                common::ncl_eval::VarCtx::from_iter(base)
-            };
-            task.map_exec_strings(|s| {
-                var_ctx
-                    .eval_string(s)
-                    .map_err(|_| anyhow::anyhow!("nickel eval failed for string: {}", s))
-            })
-            .map_err(Error::Other)?
-        };
+        let mapped_task = interpolate_task_strings(task, parsed_args)?;
 
         Ok((
             task.interactive,
@@ -666,18 +707,20 @@ impl<'a> Env<'a> {
         ))
     }
 
+    #[cfg(target_os = "linux")]
     pub fn container(&mut self) -> Result<Container, Error> {
         self.sandbox
             .new_container()
             .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
     }
 
+    #[cfg(target_os = "linux")]
     pub fn command<I, S>(
         &mut self,
         container: &Container,
         program: &str,
         args: I,
-    ) -> Result<hakoniwa::Command, Error>
+    ) -> Result<sandbox2::Command, Error>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -699,10 +742,18 @@ impl<'a> Env<'a> {
         W1: tokio::io::AsyncWrite + Unpin + Send,
         W2: tokio::io::AsyncWrite + Unpin + Send,
     {
-        self.sandbox
-            .run(invocations, stdout_writer, stderr_writer)
-            .await
-            .map_err(Error::from)
+        #[cfg(target_os = "linux")]
+        {
+            self.sandbox
+                .run(invocations, stdout_writer, stderr_writer)
+                .await
+                .map_err(Error::from)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (invocations, stdout_writer, stderr_writer);
+            Err(op::sandbox_unsupported().into())
+        }
     }
 }
 
