@@ -342,7 +342,7 @@ records carry correlation ids on spans.
 **Affected areas:**
 - `crates/minvmd/src/{main.rs,lib.rs,cmd/run.rs,cmd/vmm_child.rs}`, `Cargo.toml`
 - `justfile`, `scripts/session-e2e.sh` — boot.log default fallout
-- `crates/minimald/src/{main.rs,server.rs,rpc.rs,session_host.rs,test_harness.rs,build.rs}`
+- `crates/minimald/src/{main.rs,server.rs,rpc.rs,session_host.rs,test_harness.rs}`
 - `crates/minimal/src/dirs.rs` — daemon-log note (deferred from Unit 2)
 - Root `Cargo.toml` — `logroller` workspace dep
 
@@ -397,9 +397,11 @@ records carry correlation ids on spans.
   `tracing_appender::non_blocking` + `WorkerGuard` plumbing with
   `lossy(false)`; guards drop deterministically (minimald: R3.4; minvmd: on
   shutdown).
-- **R3.7**: `minimald/build.rs` shall fall back to an empty git hash when git
-  is unavailable instead of panicking (unblocks cross builds from worktrees
-  and source tarballs), without reporting a missing git as a dirty checkout.
+- **R3.7**: Building the daemon crates without a reachable git context
+  (source tarballs, container mounts that exclude `.git`) shall not panic.
+  Satisfied on the baseline: the shared `version` crate's build script falls
+  back to the Cargo version when `git describe` is unavailable — this unit
+  adds no code for it; the cross build lane is the standing verification.
 
 **Proof Artifacts:**
 

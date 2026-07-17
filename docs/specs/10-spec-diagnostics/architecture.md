@@ -219,7 +219,8 @@ pub fn redact_toml(input: &str) -> Result<String, toml::de::Error>;  // same wal
 pub fn masked_process_env(is_value_allowed: impl Fn(&str) -> bool) -> BTreeMap<String, String>;
 // vars_os-based (never panics on non-UTF-8); non-allowed values → <redacted:len=N>
 
-// logs.rs (new) — newest-first by reverse-lexicographic filename order
+// logs.rs (new) — newest-first by modified time (rotation-scheme agnostic:
+// correct for date suffixes and for logrotate-style numeric shifting alike)
 pub async fn newest_rotated(dir: &Path, prefix: &str, limit: usize) -> Vec<PathBuf>;
 
 // disk.rs (new, unix) — statvfs; f_bavail, the number that predicts write failure
