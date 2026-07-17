@@ -91,7 +91,7 @@ mac-buildable (see the comments in `.github/workflows/ci-macos.yml`).
   pins protoc 25.1 in [Cross.toml](Cross.toml) because its base image's apt
   protoc is too old.
 - **Linux build deps** (per [README.md](README.md)):
-  `build-essential pkg-config libssl-dev git protobuf-compiler`.
+  `build-essential openssl pkg-config libssl-dev git protobuf-compiler`.
 - **VM bring-up on Linux** (`just dm3`): a KVM host with durable `kvm` group
   membership, plus `jq` and `cpio`; `cross` (Docker) when no native musl
   toolchain is present (`scripts/build-initramfs.sh` auto-detects).
