@@ -249,7 +249,7 @@ _kvm:
 
 [linux]
 _kvm:
-    @[ -e /dev/kvm ] && [ -w /dev/kvm ] || { echo "needs writable /dev/kvm — durable: sudo usermod -aG kvm $USER (re-login); one-off: sg kvm -c 'just <recipe>'" >&2; exit 1; }
+    @[ -e /dev/kvm ] && [ -w /dev/kvm ] || { echo "needs writable /dev/kvm (kvm group membership); one-off: sg kvm -c 'just <recipe>'" >&2; exit 1; }
 
 # minvmd's VM harnesses (tests/*_integration.rs). CI: `test-kvm` / macOS `e2e`.
 [macos]
@@ -285,10 +285,12 @@ test-vm: _nextest _kvm artifacts initramfs minvmd-build
       -E 'binary(/_integration$/) and not binary(/_root_integration$/)'
 
 # minimald's netns/tap proofs (the tests sudo their own netns commands).
-# CI: ci-linux-native.yml `minimald-root-integration`.
+# CI: ci-linux-native.yml `minimald-root-integration`. The AppArmor policy
+# can't unlock this surface — its namespaces come from hashed-path test
+# binaries and /usr/bin/unshare, which a per-binary profile can't cover.
 [linux]
 test-root-integration: _nextest gvproxy
-    @[ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "0" ] || { echo "unprivileged userns is restricted; run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0" >&2; exit 1; }
+    @[ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "0" ] || { echo "this host restricts unprivileged user namespaces, which this surface needs from hashed-path test binaries (the AppArmor policy can't cover those); leave this lane to CI, or see docs/reference/linux-host-setup.md before relaxing the restriction host-wide" >&2; exit 1; }
     MINIMALD_NETNS_TEST=1 GVPROXY_BIN="{{gvproxy}}" cargo nextest run -p minimald --profile ci --run-ignored all --no-tests=fail -E 'binary(/_root_integration$/)'
 
 # minvmd-build is LAST so its macOS codesign is the final touch on the binary.
