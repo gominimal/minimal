@@ -413,8 +413,8 @@ hold under this model.
    (download + sha256-verify). Migration to a sibling `alpine-minirootfs`
    minimal package is a follow-up once `virtio-linux` merges.
 2. **Vsock port for `minimald`.** Proposed 2222 (avoids reference impl's
-   agent port 7350). Confirm with #156 owner. (`VSOCK_PORT` is a named
-   constant either way.)
+   agent port 7350); final port choice to be confirmed before
+   stabilization. (`VSOCK_PORT` is a named constant either way.)
 3. **Guest-side vsock terminator.** RESOLVED → vsock-native `minimald`:
    generalize the russh listener edge over `impl AsyncRead + AsyncWrite`
    and add a `run_on_vsock`. v0.1 ships the vsock stub (R3.4); the

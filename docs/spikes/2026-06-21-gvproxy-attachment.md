@@ -3,8 +3,6 @@ id: 511
 title: "gvproxy v0.8.9 switch-attachment protocol for DM2 (tap-fd handshake)"
 status: proved
 date: 2026-06-21
-authors:
-  - gominimal-aw-bot[bot]
 budget_hours: 3
 actual_hours: 2.5
 related:
