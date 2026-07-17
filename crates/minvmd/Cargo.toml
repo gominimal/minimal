@@ -1,6 +1,6 @@
 [package]
 name = "minvmd"
-version = "0.0.1"
+version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
@@ -43,6 +43,7 @@ russh.workspace = true
 # Canonical state-dir base + provider-instance dir layout (`state`, `sock`,
 # `volume`).
 paths.workspace = true
+version.workspace = true
 
 [dev-dependencies]
 serial_test.workspace = true

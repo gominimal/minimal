@@ -2,7 +2,11 @@
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main"
 pre-build = [
     # protoc version in apt is too old and chokes on optional keyword in proto3 fmt
-    "apt-get update && apt-get install --assume-yes wget unzip",
+    # git: the checkouts crate's tests shell out to it (`just test-cross`); CI
+    # runners have a modern one natively, but the image's Ubuntu 20.04 base
+    # ships 2.25, which predates `git init -b` (2.28) — hence the git-core PPA.
+    "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --assume-yes wget unzip software-properties-common",
+    "add-apt-repository -y ppa:git-core/ppa && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --assume-yes git",
     "wget https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-x86_64.zip -O /tmp/protoc.zip",
     "unzip /tmp/protoc.zip -d /usr/local",
 ]

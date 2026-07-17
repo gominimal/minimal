@@ -17,8 +17,8 @@ A number of harnesses are defined and maintained in the [Minimal Public Package 
 Here is a harness for code that uses `pnpm`:
 
 ```ncl
-let { harness, .. } = import "minimal.ncl" in
-harness {
+let { stack, .. } = import "minimal.ncl" in
+stack {
   name = "pnpm",
 
   runtime_packages = ["node"],
@@ -76,24 +76,25 @@ _Dictionary of String's, optional_
 Pairs of environment-variable names and their values that should be set for a build. These are inherited
 by all tasks in a codebase that uses the harness, unless the task sets the environment variable itself.
 
-### `build_cmds` or `build_cmds_cmd`
+### `build_cmd` or `build_cmds_cmd`
 
-_`build_cmds`: Nested array of all the arguments of all commands_
+_`build_cmd`: String or array of strings for the build command_
 
-_`build_cmds_cmd`: Nested array of the arguments for a command, which ultimately generates the build command_
+_`build_cmds_cmd`: String or array of strings for a command that generates the build command_
 
-`build_cmds` & `build_cmds_cmd` are mutually-exclusive fields that declare the command for
+`build_cmd` and `build_cmds_cmd` are mutually exclusive fields that declare the command for
 building software which uses this harness.
 
-`build_cmds` defines static commands to be used when `minimal build` is invoked.
+`build_cmd` defines the command to run when `minimal build` is invoked. It can be a shell-style
+string or an array containing the executable followed by its arguments.
 
-```toml
-let { harness, .. } = import "minimal.ncl" in
-harness {
+```ncl
+let { stack, .. } = import "minimal.ncl" in
+stack {
   name = "rust",
 
   build_packages = ["gcc", "rust", "binutils", "pkgconf"],
-  build_cmds = [["cargo", "build", "--release"]], # [!code focus]
+  build_cmd = ["cargo", "build", "--release"], # [!code focus]
   # ...
 }
 ```
@@ -101,9 +102,9 @@ harness {
 `build_cmds_cmd` defines the arguments for a command that generates the build command. This
 command is expected to print the necessary build commands, with each terminating with a newline.
 
-```toml
-let { harness, .. } = import "minimal.ncl" in
-harness {
+```ncl
+let { stack, .. } = import "minimal.ncl" in
+stack {
   name = "rust",
 
   build_packages = ["gcc", "rust", "binutils", "pkgconf"],

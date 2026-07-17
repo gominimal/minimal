@@ -147,11 +147,6 @@ enum SessionInner {
             session_host::HostHandle,
             JoinHandle<Result<i32, std::io::Error>>,
         )>,
-        /// Lazily-built [`mctx::Context`] rooted at this session's workspace,
-        /// cached so repeated attach / task-exec paths don't re-parse the
-        /// workspace mfile. Boxed to keep the variant's inline size down
-        /// (`Context` runs into the several-hundred-byte range).
-        context: Option<Box<mctx::Context>>,
     },
 }
 
@@ -322,7 +317,6 @@ impl Session {
             SessionStatus::Active => SessionInner::Active {
                 composition: None,
                 host: None,
-                context: None,
             },
             SessionStatus::Pending => SessionInner::Draft { pending: None },
         };
@@ -435,7 +429,7 @@ impl Session {
                 let _ = r.send(self.paths().await);
             }
             SessionMessage::MakeContext(r) => {
-                let _ = r.send(self.context().await);
+                let _ = r.send(self.context(false).await);
             }
             SessionMessage::Attach(r, session_hnd, conn_username, channel, config) => {
                 let _ = r.send(
@@ -568,7 +562,6 @@ impl Session {
                 self.inner = SessionInner::Active {
                     composition: Some(Arc::new(composition)),
                     host: None,
-                    context: None,
                 };
                 // The session is Active now — publish its PTask route
                 // (R3.1/R3.6).
@@ -640,7 +633,6 @@ impl Session {
         self.inner = SessionInner::Active {
             composition: Some(Arc::new(composition)),
             host: None,
-            context: None,
         };
         // The session is Active now — publish its PTask route (R3.1/R3.6).
         #[cfg(target_os = "linux")]
@@ -815,7 +807,7 @@ impl Session {
         let ingress = record.policy.ingress.clone();
         Ok(session_host::SandboxLauncher {
             ctx: self
-                .context()
+                .context(true)
                 .await
                 .map_err(AttachError::ContextCreationFailed)?,
             network_mode,
@@ -842,25 +834,16 @@ impl Session {
         Ok(session_host::MockLauncher)
     }
 
-    /// Return this session's workspace-rooted [`mctx::Context`],
-    /// building it lazily the first time and cloning the cached
-    /// value on every subsequent call. The scaffold pass and mfile
-    /// parse happen once per actor lifetime. A `Draft` session has
-    /// no workspace to root a context in yet.
-    async fn context(&mut self) -> Result<mctx::Context, String> {
-        match &self.inner {
-            SessionInner::Draft { .. } => {
-                return Err("session is pending composition".to_string());
-            }
-            SessionInner::Active {
-                context: Some(ctx), ..
-            } => return Ok((**ctx).clone()),
-            SessionInner::Active { context: None, .. } => {}
+    /// Return this session's workspace-rooted [`mctx::Context`].
+    ///
+    /// This is NOT cached to enable session execution to change as the
+    /// `minimal.toml` file changes.
+    async fn context(&mut self, scaffold_if_missing: bool) -> Result<mctx::Context, String> {
+        if matches!(&self.inner, SessionInner::Draft { .. }) {
+            return Err("session is pending composition".to_string());
         }
-        let ctx = self.build_context().await?;
-        if let SessionInner::Active { context, .. } = &mut self.inner {
-            *context = Some(Box::new(ctx.clone()));
-        }
+
+        let ctx = self.build_context(scaffold_if_missing).await?;
         Ok(ctx)
     }
 
@@ -913,9 +896,11 @@ impl Session {
     /// a default scaffolded here on the way past.
     ///
     /// [`Config`]: mctx::Config
-    async fn build_context(&self) -> Result<mctx::Context, String> {
+    async fn build_context(&self, scaffold_if_missing: bool) -> Result<mctx::Context, String> {
         let wsp = self.record.object().await.unwrap().workspace_path();
-        self.scaffold_mfile_if_missing(&wsp)?;
+        if scaffold_if_missing {
+            self.scaffold_mfile_if_missing(&wsp)?;
+        }
         mctx::Context::new(self.workspace_config(&wsp)?).map_err(|e| e.to_string())
     }
 
