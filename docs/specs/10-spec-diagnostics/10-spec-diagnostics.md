@@ -851,19 +851,34 @@ transform on the *analysis* machine over files already in the bundle — the
 guest never takes the runtime.
 
 Two OTEL-orbit crates are adopted because they carry none of the rejected
-costs (no runtime, no binary weight, nothing that can misbehave in a wedged
-process): `opentelemetry-semantic-conventions` — consts only, zero runtime
-dependencies — pins the attribute names; `json-subscriber` provides the flat
-JSON layer with static top-level fields that `tracing-subscriber`'s built-in
-formatter cannot produce, with a dependency closure already entirely in the
-workspace. Reopen-triggers, mirroring the logroller treatment: abandonment,
-or `tracing-subscriber` gaining static top-level fields natively.
-Const-rename churn across semconv 0.x releases is contained to compile
-errors. One cost correction to the seam pricing: `prost` is already resident
-in this workspace for the RPC layer, so a future OTLP-JSON emitter via
-`opentelemetry-proto` (serde feature) is a smaller step than the general
-"pulls the tonic stack" estimate — the posture stays convert-on-analysis,
-but the seam is named and cheap.
+costs: `opentelemetry-semantic-conventions` — consts only, zero execution —
+pins the attribute names; `json-subscriber` provides the flat JSON layer
+with static top-level fields that `tracing-subscriber`'s built-in formatter
+cannot produce, with a dependency closure already entirely in the workspace.
+`json-subscriber` *is* runtime code, so the boundary is stated precisely:
+its execution (per-span field capture into span extensions; per-event
+serde_json serialization) is confined to the **log-write path of a healthy
+process** — the same class of work as the formatter it replaces, with no
+pipeline machinery of its own (no processor threads, timers, network I/O,
+or shutdown choreography) — and **nothing executes at collection time**:
+`min bug` and the diag RPC read files off disk, so a formatter defect can
+degrade what got written but never the ability to collect what exists.
+Reopen-triggers, mirroring the logroller treatment: abandonment, or
+`tracing-subscriber` gaining static top-level fields natively. Const-rename
+churn across semconv 0.x releases is contained to compile errors.
+
+`tracing-opentelemetry` (the tracing→SDK bridge) stays out, and is the
+named crate for the future export layer: it cannot be adopted piecemeal —
+even trace-id generation requires instantiating a `TracerProvider` with its
+processor machinery, and span data buffered in its batch path is lost on a
+hang (the tail problem the file-first design avoids: our span fields are
+flattened into every line as it is written). The Unit 4 conventions exist
+so bolting it onto the host CLI later grafts cleanly. One cost correction
+to the seam pricing: `prost` is already resident in this workspace for the
+RPC layer, so a future OTLP-JSON emitter via `opentelemetry-proto` (serde
+feature) is a smaller step than the general "pulls the tonic stack"
+estimate — the posture stays convert-on-analysis, but the seam is named and
+cheap.
 
 ### Guest bundle format convergence
 
@@ -927,6 +942,20 @@ Unit 8's dual-format rework, sequenced after Unit 6.
 - Rotation/pruning in file appenders happens on the write path — an idle
   daemon does not rotate; "daily" files can span days. Size-based rotation
   (R3.6) makes the cap independent of wall clock.
+- **The `lossy(false)` backpressure chain (R3.6) is a deliberate coupling.**
+  The in-VM write path is: daemon thread → `non_blocking` bounded channel
+  (~128k lines) → worker thread → logroller (rotation renames/prunes run
+  inline on the worker) → data volume. With `lossy(false)`, a wedged volume
+  stalls the worker; once the channel fills, every daemon thread blocks at
+  its next log call — the log pipeline can propagate a disk wedge into the
+  RPC threads. Accepted because dropping records under pressure destroys
+  exactly the evidence this subsystem exists to keep, and two mitigations
+  bound the damage: the console layer keeps flowing to the VMM console
+  capture (`boot.log`) independent of the volume, and a daemon wedged this
+  way fails the socket probe, sending `min bug` down the volume-fallback
+  path (R7.5), which reads the image without the daemon's help. The
+  headroom claim behind this acceptance is an assumption-ledger row
+  (`nonblocking-headroom`).
 - Caps (reference values): collector timeout 30 s, log tail 5 MiB, log files
   5 per prefix, listing 100k entries, guest bundle 256 MiB compressed
   (verification: ≤4× decompressed with 1 GiB ceiling, ≤10k entries),
