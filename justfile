@@ -121,13 +121,13 @@ minimal-cli:
 # Build a host-native (glibc) minimald with the networking features (for `just up`).
 [linux]
 minimald-build:
-    cargo build -p minimald --features {{features}}
+    cargo build -p minimald --features {{features}} --locked
 
 # ── run & inspect ────────────────────────────────────────────────────────────
 
 # Run the dev-built `min` CLI, args forwarded (e.g. `just min loadout list`).
 min *args:
-    @cargo build {{ if os() == "macos" { "-p minimal" } else { "-p minimal -p minimald" } }}
+    @cargo build {{ if os() == "macos" { "-p minimal" } else { "-p minimal -p minimald" } }} --locked
     @"{{min-bin}}" {{args}}
 
 # Print `export` lines for running the stack by hand: eval "$(just env)".
