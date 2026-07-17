@@ -324,9 +324,14 @@ up: minimald-build minimal-cli gvproxy && (_smoke "--minimal-dir" native-dir)
     sock="{{native-dir}}/providers/local-0/ssh.sock"
     pidf="{{scratch}}/minimald.pid"
     mkdir -p "{{native-dir}}"
-    if [ -S "$sock" ] && [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then
+    # PID files survive reboots and PIDs get reused: only trust the pidfile if
+    # the PID is still THIS checkout's minimald (prefix match tolerates the
+    # "(deleted)" suffix a rebuilt binary leaves on /proc/<pid>/exe).
+    owns() { case "$(readlink "/proc/$1/exe" 2>/dev/null)" in "{{minimald-bin}}"*) return 0 ;; *) return 1 ;; esac; }
+    if [ -S "$sock" ] && [ -f "$pidf" ] && owns "$(cat "$pidf")"; then
       echo "native minimald already up: $sock"
     else
+      rm -f "$sock" "$pidf"
       setsid "{{minimald-bin}}" \
         --minimal-state-dir "{{native-dir}}" --minimal-cache-dir "{{native-dir}}/cache" \
         run --instance-num 0 --gvproxy-bin "{{gvproxy}}" > "{{scratch}}/minimald.log" 2>&1 &
@@ -343,7 +348,7 @@ up: minimald-build minimal-cli gvproxy && (_smoke "--minimal-dir" native-dir)
 # Bring the stack up: native Linux + one Linux VM over KVM (stop with `just stop`).
 [linux]
 up-kvm: _kvm artifacts gvproxy initramfs minvmd-build minimal-cli && (_smoke)
-    MINVMD_GVPROXY_BIN="{{gvproxy}}" "{{minvmd-bin}}" run --detach --timeout 75
+    MINVMD_GVPROXY_BIN="{{gvproxy}}" "{{minvmd-bin}}" run --detach --timeout "$MINVMD_READY_TIMEOUT_SECS"
     @echo "up-kvm: VM booted; minimald reachable at providers/local-0/ssh.sock"
 
 # Stop the stack `just up` started.
@@ -357,7 +362,14 @@ down:
     set -eu
     pidf="{{scratch}}/minimald.pid"
     [ -f "$pidf" ] || { echo "no native minimald running"; exit 0; }
-    pid="$(cat "$pidf")"; kill "$pid" 2>/dev/null || true
+    pid="$(cat "$pidf")"
+    # Never signal a reused PID: the pidfile is only trusted if the process is
+    # still this checkout's minimald (see the matching check in `up`).
+    case "$(readlink "/proc/$pid/exe" 2>/dev/null)" in
+      "{{minimald-bin}}"*) ;;
+      *) rm -f "$pidf"; echo "stale pidfile (pid $pid is not this checkout's minimald); removed"; exit 0 ;;
+    esac
+    kill "$pid" 2>/dev/null || true
     for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
     kill -9 "$pid" 2>/dev/null || true; rm -f "$pidf"
     echo "native minimald stopped (pid $pid)"
