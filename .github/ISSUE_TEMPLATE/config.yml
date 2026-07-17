@@ -1,0 +1,9 @@
+blank_issues_enabled: false
+# TODO(launch): add Discussions/docs links once the Discussions decision lands
+# contact_links:
+#   - name: Questions and discussion
+#     url: <discussions-url>
+#     about: Ask questions and discuss ideas before filing an issue.
+#   - name: Documentation
+#     url: <docs-url>
+#     about: Reference documentation for minimal.
