@@ -363,7 +363,7 @@ single-use auth token plus signals.
 over any bidirectional byte stream. libkrun's `krun_add_vsock_port2`
 delivers exactly that, so `minvmd` stays a thin lifecycle/transport
 daemon rather than a userspace byte relay. The provider-owns-socket and
-connect-and-prune discovery rules from `docs/session-domain-diag.md`
+connect-and-prune discovery rules from `docs/internal/session-domain-diag.md`
 hold under this model.
 
 ### Hard lessons baked in

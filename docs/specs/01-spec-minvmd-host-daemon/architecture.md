@@ -12,7 +12,7 @@ status: shipped
 `minvmd` is a thin lifecycle-and-transport daemon that bridges macOS to
 the Linux-native `minimald` via libkrun's Hypervisor.framework backend.
 The architecture follows the plan's three-process model and the session
-domain model in `docs/session-domain-diag.md`
+domain model in `docs/internal/session-domain-diag.md`
 (translated from plan: Process model).
 
 ### Process model
@@ -55,7 +55,7 @@ process listening on vsock `VSOCK_PORT`. `minvmd` carries no
 per-connection state and runs no userspace byte relay.
 
 The provider-owns-socket and connect-and-prune discovery rules from
-`docs/session-domain-diag.md` hold under this model: the host UDS *is*
+`docs/internal/session-domain-diag.md` hold under this model: the host UDS *is*
 the provider socket. A stale socket after a crash fails connect-and-check
 and is pruned by `minimal`.
 
