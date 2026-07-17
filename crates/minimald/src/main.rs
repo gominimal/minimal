@@ -112,7 +112,7 @@ impl Cli {
 enum Command {
     /// Generate shell completion script
     #[command(
-        long_about = "Generate a shell tab-completion script for the minimal daemon.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(minimal completions bash)"
+        long_about = "Generate a shell tab-completion script for the minimal daemon.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(minimald completions bash)"
     )]
     Completions(CompletionsArgs),
     /// Runs the minimald server in the foreground.
