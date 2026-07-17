@@ -9,7 +9,7 @@ The `minimal.toml` file defines the configuration for Minimal in a codebase.
 This file must be present at the base of the repository (i.e. `./minimal.toml`), or
 in a `.minimal` directory at the base of the repository.
 
-Unless [`-C`](/reference/cli#global-flags) is specified, the [Minimal CLI](/reference/cli) searches the directory tree backwards from
+Unless [`-C`](./cli-mip.md#global-flags) is specified, the [mip CLI](./cli-mip.md) searches the directory tree backwards from
 the current directory till a `minimal.toml` file is found. This behavior allows minimal to be invoked in project directories.
 
 ## Example
@@ -121,7 +121,7 @@ See: [tasks](/reference/tasks).
 ### `[outputs.*]` - Artifacts produced by `minimal materialize` {#outputs}
 
 Each `[outputs.<name>]` section defines an artifact that can be produced with
-[`minimal materialize <name> -o <path>`](/reference/cli#materialize).
+[`mip materialize <name> -o <path>`](./cli-mip.md#materialize).
 
 ```toml
 [outputs.<name>]
@@ -145,7 +145,7 @@ vars = { KEY = "value" }        # oci-image only; alias: `env_vars`
 
 - **`type`** (alias: `ty`) — The output kind, either `oci-image` or `raw-file`. Defaults to `oci-image` when omitted.
 - **`packages`** — Packages to include in the materialized output. When omitted or empty, defaults to `["base"]`.
-- **`arch`** — Target architecture for OCI images. Common values: `amd64`, `arm64`. The CLI flag [`--arch`](/reference/cli#materialize) overrides this; if neither is set, the host architecture is used.
+- **`arch`** — Target architecture for OCI images. Common values: `amd64`, `arm64`. The CLI flag [`--arch`](./cli-mip.md#materialize) overrides this; if neither is set, the host architecture is used.
 - **`path`** — _(`raw-file` only)_ Path, relative to the package file tree, of the single file to extract. Required for `raw-file` outputs; supplying it on an `oci-image` output is an error.
 - **`entrypoint`** — _(`oci-image` only)_ OCI image entrypoint. May be a string (`"/app/server"`) or a list (`["/bin/sh", "-c"]`).
 - **`cmd`** — _(`oci-image` only)_ OCI image default command. Same string-or-list shape as `entrypoint`.

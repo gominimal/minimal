@@ -5,7 +5,7 @@ description: Full task schema reference — packages, exec/bash commands, state_
 # Tasks
 
 Tasks are defined in a [`minimal.toml`](/reference/minimal-dot-toml) file, and describe
-a runtime environment + command invocations to be executed using [`minimal run <taskname>`](/reference/cli#run)
+a runtime environment + command invocations to be executed using [`mip run <taskname>`](./cli-mip.md#run)
 
 ## Tasks schema
 

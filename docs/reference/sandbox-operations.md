@@ -19,7 +19,7 @@ are also configured as a build, runtime, or task dependency in `minimal.toml`.
 | `--build` | Add packages to `harness.build_packages` |
 | `--task <TASK_NAME>` | Add packages to `tasks.<TASK_NAME>.packages` |
 
-`min add` is the in-sandbox equivalent of the [`minimal add`](/reference/cli#add) command.
+`min add` is the in-sandbox equivalent of the [`mip add`](./cli-mip.md#add) command.
 
 ### `search <TERM>`
 
@@ -41,10 +41,10 @@ If no type flags are specified, all types are checked by default.
 
 If filter names are specified, any package, harness, or profile matching a specified name is checked.
 
-`min check` is the in-sandbox equivalent of the [`minimal check`](/reference/cli#check) command.
+`min check` is the in-sandbox equivalent of the [`mip check`](./cli-mip.md#check) command.
 
 ### `run <TASK_NAME> [<ARGS>...]`
 
 Runs the specified task in a new Minimal sandbox. Interactive tasks are not supported.
 
-`min run` is the in-sandbox equivalent of the [`minimal run`](/reference/cli#run) command.
+`min run` is the in-sandbox equivalent of the [`mip run`](./cli-mip.md#run) command.

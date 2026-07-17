@@ -66,7 +66,7 @@ AppArmor label, because on Ubuntu only a *labelled* program can be granted
 `userns`. Installing it neither sandboxes minimald nor weakens the host.
 
 It attaches to minimald at the paths it is normally installed to — `/usr/bin`,
-`/usr/local/bin`, and `~/.local/bin` (where [the installer](/reference/cli) puts
+`/usr/local/bin`, and `~/.local/bin` (where [the installer](./cli.md) puts
 it). A binary somewhere else — a dev build in `target/debug`, or a custom
 `MINIMAL_BIN` — needs that path named explicitly, because AppArmor matches
 profiles by executable path:
