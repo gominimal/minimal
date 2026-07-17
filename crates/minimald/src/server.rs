@@ -455,6 +455,12 @@ impl Server {
     }
 }
 
+/// How often an otherwise-quiet connection is probed with an SSH keepalive.
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Unanswered keepalives tolerated before the connection is torn down.
+const KEEPALIVE_MAX: usize = 3;
+
 /// Builds the shared russh server config from the server state.
 async fn build_russh_config(
     state: &ServerStateHandle,
@@ -463,6 +469,11 @@ async fn build_russh_config(
         keys: vec![state.host_key().await?],
         auth_rejection_time_initial: Some(std::time::Duration::ZERO),
         nodelay: true,
+        // Keepalives own deadness detection; the default 600s inactivity
+        // reaper would kill healthy idle attaches, so it is explicitly off.
+        inactivity_timeout: None,
+        keepalive_interval: Some(KEEPALIVE_INTERVAL),
+        keepalive_max: KEEPALIVE_MAX,
         ..Default::default()
     }))
 }
