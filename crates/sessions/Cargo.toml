@@ -3,6 +3,7 @@ name = "sessions"
 version = "0.0.1"
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 common.workspace = true

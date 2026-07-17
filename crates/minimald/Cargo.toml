@@ -3,6 +3,7 @@ name = "minimald"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [features]
 # Enables the B8 HTTPS reverse proxy with mTLS termination (R4.4–R4.7) in front
