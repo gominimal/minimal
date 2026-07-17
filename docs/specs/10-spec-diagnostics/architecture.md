@@ -38,6 +38,134 @@ The work re-lands from the reference branch `min-bug-diagnostics`
 serial units, each an independently mergeable PR under 1000 lines. Baselines
 below cite the reference tree as `ref:`.
 
+## System view
+
+Crate boundaries and the paths a bundle takes — including the degraded path,
+which is the design center:
+
+```mermaid
+flowchart TB
+    subgraph CLI["crates/minimal — min bug (host CLI)"]
+        direction TB
+        CMD["cmd_bug<br/>collect_step! (30 s, failure-isolated)"]
+        HOSTCOL["host collectors<br/>system / env / config / state / logs<br/>marker + allowlist data for net / procs / power"]
+        PROBE["socket probe<br/>stat → connect → handshake → get_version"]
+        GUEST["guest fetch<br/>download_diag_bundle"]
+        FALLBACK["volume fallback<br/>volume-meta.json + debugfs -c /logs"]
+    end
+
+    subgraph DIAG["crates/diagnostics — app-agnostic mechanics"]
+        BW["BundleWriter — file | stream<br/>one manifest.json schema, 0600 / rootless"]
+        ENG["redact (fail-closed key walk)<br/>listing / capture<br/>net / procs / power mechanics"]
+    end
+
+    RPC["crates/minimald-rpc<br/>DIAG_BUNDLE_SUBSYSTEM<br/>DiagBundleRequest"]
+
+    subgraph DAEMON["crates/minimald — in-VM or native"]
+        SERVE["diag serving<br/>BundleWriter::stream → duplex pump"]
+        DLOG["on-volume logs<br/>reload layer → logroller<br/>VolumeLogRelease owned by ServerState"]
+    end
+
+    subgraph VMM["crates/minvmd — host VMM supervisor"]
+        BOOT["boot.log (hvc0 console, per boot)<br/>run.log"]
+        VLOG["minvmd.log* (detached mode)"]
+    end
+
+    OUT[("minimal-diag-ts.tar.zst<br/>nests providers/n/guest/daemon-diag.tar.zst")]
+    VOL[("data-vol.raw — ext4<br/>logs/ + state")]
+
+    CMD --> HOSTCOL --> BW
+    HOSTCOL --> ENG
+    CMD --> PROBE
+    PROBE -->|"established SSH connection"| GUEST
+    GUEST -->|"one-shot subsystem:<br/>JSON request + half-close,<br/>tar.zst streamed back"| RPC
+    RPC --> SERVE
+    SERVE --> ENG
+    SERVE -->|"reads"| VOL
+    DLOG -->|"writes"| VOL
+    GUEST --> BW
+    PROBE -.->|"unreachable / timeout"| FALLBACK
+    FALLBACK -->|"read-only"| VOL
+    FALLBACK --> BW
+    BW --> OUT
+    HOSTCOL -.->|"filename convention only:<br/>run.log, boot.log, minvmd.log*"| BOOT
+    HOSTCOL -.-> VLOG
+```
+
+A full `min bug` run, including the degraded branch:
+
+```mermaid
+sequenceDiagram
+    participant U as user
+    participant B as min bug (minimal)
+    participant W as BundleWriter (diagnostics)
+    participant D as minimald (DiagBundleTarZst)
+    participant V as data volume (ext4 image)
+
+    U->>B: min bug [--no-guest]
+    B->>W: create(path, root, version) — 0600
+    loop each host collector (30 s cap)
+        B->>W: add entry — failure becomes a manifest error, run continues
+    end
+    loop each provider
+        B->>B: probe stages: stat → connect → handshake → get_version
+        alt probe ok and not --no-guest
+            B->>D: TRACEPARENT env request, then DiagBundleRequest (JSON, half-close)
+            D->>V: read logs / state listing / sessions (redacted)
+            D-->>B: rootless tar.zst, manifest.json last
+            B->>W: nest raw at providers/n/guest/daemon-diag.tar.zst
+        else daemon unreachable / timeout / subsystem refused
+            D--xB: extended-data stream 1 carries the refusal reason
+            B->>V: debugfs -c (read-only, live-VM safe)
+            B->>W: guest/volume-meta.json + guest/volume-logs/
+        end
+    end
+    B->>W: finish — manifest.json written last, sync_all
+    W-->>U: minimal-diag-ts.tar.zst (review before sharing)
+```
+
+The in-VM log pipeline and the release ordering that keeps the volume's
+unmount clean:
+
+```mermaid
+flowchart LR
+    subgraph REG["minimald tracing registry"]
+        CONS["console fmt layer<br/>human format, always on"]
+        RELOAD["reload slot<br/>None until volume mounts"]
+    end
+    JSON["JSON-lines fmt layer<br/>with_current_span + span_list"]
+    NB["non_blocking<br/>lossy(false) + WorkerGuard"]
+    ROLL["logroller<br/>size rotation, max_keep_files"]
+    VOL[("data volume<br/>logs/minimald.log*")]
+
+    RELOAD -->|"activator, post-mount"| JSON --> NB --> ROLL --> VOL
+
+    subgraph SHUTDOWN["clean shutdown ordering"]
+        direction LR
+        S1["Shutdown RPC"] --> S2["quiesce"] --> S3["ServerState.release_volume_log()<br/>reload slot → None, drop guard"] --> S4["syncfs + unmount<br/>clean ext4 journal"]
+    end
+```
+
+Trace propagation across the CLI→daemon boundary (Unit 4):
+
+```mermaid
+sequenceDiagram
+    participant C as min (CLI root span)
+    participant S as SSH channel
+    participant D as minimald (dispatch span)
+
+    C->>C: mint trace_id (32 hex) / span_id (16 hex)
+    C->>S: env request TRACEPARENT = 00-{trace_id}-{span_id}-01
+    C->>S: subsystem / exec request
+    S->>D: channel env + dispatch
+    alt valid traceparent value
+        D->>D: adopt trace_id into the dispatch span
+    else absent or malformed
+        D->>D: mint fresh (no error)
+    end
+    Note over C,D: host CLI log and guest on-volume log now share one trace_id
+```
+
 ## Data and interface changes
 
 ### `crates/diagnostics` (new)
