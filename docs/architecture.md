@@ -158,7 +158,7 @@ client gates those pending items and returns verdicts; the daemon assembles the
 final `Composition` (vars, file patches, packages, lifecycle hooks) for the
 apply layer. User policy is enforced only on the client — the daemon never runs
 it. The **sessions** crate holds these primitives; the full data flow is
-documented in [crates/sessions/docs/COMPOSITION.md](../crates/sessions/docs/COMPOSITION.md).
+documented in [Sessions composition](arch/sessions-composition.md) (source: `crates/sessions/docs/COMPOSITION.md`).
 
 ### VM internals
 
@@ -169,7 +169,7 @@ mounts the rootfs and pseudo-filesystems, `chroot`s in, then writes a `READY`
 beacon over vsock. `minvmd` registers the host UDS↔vsock bridge and `minimald`
 serves SSH directly on that vsock port, so the CLI's connection reaches the
 session with no in-guest relay. Details and local boot instructions:
-[crates/minvmd/README.md](../crates/minvmd/README.md). The ready beacon also
+[minvmd internals](arch/minvmd.md) (source: `crates/minvmd/README.md`). The ready beacon also
 carries the guest's SSH host public key
 ([spec 06](https://github.com/gominimal/minimal/blob/main/docs/specs/06-spec-ssh-host-key-in-beacon/06-spec-ssh-host-key-in-beacon.md)).
 
