@@ -1,0 +1,173 @@
+name: reference-sync
+
+# PROPOSAL — this workflow is FOR the gominimal/webapp repository. It will
+# live at .github/workflows/reference-sync.yml over there, not in
+# gominimal/minimal; it is drafted here because the contract it implements
+# is owned by this repo. Landing it in webapp is a separate webapp PR.
+#
+# Manifest contract: gominimal/minimal ships docs/reference/manifest.json
+# (arriving with the WS8 reference-accuracy work) listing every reference
+# page webapp must mirror, as filenames relative to docs/reference/:
+#
+#   { "pages": ["cli.md", "cli-min.md", "cli-mip.md", ...] }
+#
+# Adjust the jq paths below if WS8 lands a different shape. promote.yml (in
+# gominimal/minimal) dispatches `reference-docs-promoted` with
+# client_payload.sha after a channel promotion; this workflow copies the
+# manifest-listed pages at that SHA into src/content/docs/reference/ and
+# opens (or updates) a sync PR.
+#
+# Webapp-NATIVE reference pages (api.md, mcp.md) are OUT OF SCOPE: they are
+# authored in the webapp repo, never listed in the manifest, and never
+# overwritten by this sync.
+#
+# The FIRST sync will resolve the known drift between the repos: the
+# [stack] rename, the harness build_cmd schema change, and the missing
+# linux-host-setup.md page.
+on:
+  repository_dispatch:
+    types: [reference-docs-promoted]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "gominimal/minimal commit SHA to sync reference docs from"
+        required: true
+        type: string
+  schedule:
+    # Weekly drift check only — the sync job no-ops on schedule.
+    - cron: "0 7 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    if: github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Token permissions: contents:write to push the sync branch,
+    # pull-requests:write to open/update the PR. NOTE: a PR opened with the
+    # default GITHUB_TOKEN does not trigger webapp's own CI (GitHub blocks
+    # recursive workflow runs). If CI must run on sync PRs, mint the token
+    # from the org's GitHub App instead (same pattern as the app-token step
+    # in gominimal/minimal's promote.yml) and use it for push + pr create.
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # Default persist-credentials kept: this job pushes the sync branch.
+      - uses: actions/checkout@v7
+      - name: Fetch manifest-listed pages from gominimal/minimal
+        env:
+          # GITHUB_TOKEN can read gominimal/minimal only once that repo is
+          # public. TODO(launch): until then, mint a cross-repo read token
+          # via the org's GitHub App and use it here.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.event.client_payload.sha || inputs.sha }}
+        run: |
+          set -euo pipefail
+          [ -n "$SHA" ] || { echo "::error::no SHA in dispatch payload or input"; exit 1; }
+
+          # raw <path> — file content from gominimal/minimal at $SHA, via the
+          # contents API with the raw media type (avoids base64 juggling).
+          raw() {
+            gh api -H "Accept: application/vnd.github.raw" \
+              "repos/gominimal/minimal/contents/${1}?ref=${SHA}"
+          }
+
+          mkdir -p src/content/docs/reference
+          raw docs/reference/manifest.json > /tmp/manifest.json
+          jq -r '.pages[]' /tmp/manifest.json | while read -r page; do
+            case "$page" in
+              */* | .* )
+                echo "::error::manifest entry '$page' escapes docs/reference/"
+                exit 1 ;;
+            esac
+            echo "syncing $page"
+            raw "docs/reference/${page}" > "src/content/docs/reference/${page}"
+          done
+
+      - name: Open or update sync PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.event.client_payload.sha || inputs.sha }}
+        run: |
+          set -euo pipefail
+          # Official github-actions bot identity (not a real mailbox).
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BRANCH=reference-sync
+          git checkout -B "$BRANCH"
+          git add src/content/docs/reference/
+          if git diff --cached --quiet; then
+            echo "reference pages already in sync with gominimal/minimal@${SHA}"
+            exit 0
+          fi
+          git commit -m "docs(reference): sync from gominimal/minimal@${SHA}"
+          git push -f origin "$BRANCH"
+
+          # A stable branch name means repeated promotions update one open
+          # PR (the force-push above already refreshed it) instead of
+          # stacking new ones.
+          if [ -z "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            gh pr create \
+              --head "$BRANCH" \
+              --title "docs(reference): sync from gominimal/minimal@${SHA}" \
+              --body "Automated sync of the manifest-listed reference pages from gominimal/minimal@${SHA} (reference-docs-promoted). Webapp-native pages (api.md, mcp.md) are untouched."
+          fi
+
+  drift-check:
+    # Weekly safety net: catches reference edits that merged in
+    # gominimal/minimal without a promotion (or a failed sync). Advisory —
+    # continue-on-error keeps the repo green; the step summary carries the
+    # per-page verdicts.
+    if: github.event_name == 'schedule'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Compare committed copies against gominimal/minimal@main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          raw() {
+            gh api -H "Accept: application/vnd.github.raw" \
+              "repos/gominimal/minimal/contents/${1}?ref=main"
+          }
+
+          raw docs/reference/manifest.json > /tmp/manifest.json
+          drift=0
+          {
+            echo "## Reference-docs drift vs gominimal/minimal@main"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          while read -r page; do
+            upstream=/tmp/upstream-page
+            if ! raw "docs/reference/${page}" > "$upstream"; then
+              echo "- \`$page\`: listed in manifest but missing upstream" >> "$GITHUB_STEP_SUMMARY"
+              drift=1
+              continue
+            fi
+            local_copy="src/content/docs/reference/${page}"
+            if [ ! -f "$local_copy" ]; then
+              echo "- \`$page\`: not yet synced into webapp" >> "$GITHUB_STEP_SUMMARY"
+              drift=1
+            elif ! diff -q "$upstream" "$local_copy" > /dev/null; then
+              echo "- \`$page\`: differs from upstream" >> "$GITHUB_STEP_SUMMARY"
+              drift=1
+            fi
+          done < <(jq -r '.pages[]' /tmp/manifest.json)
+
+          if [ "$drift" -eq 0 ]; then
+            echo "No drift — every synced page matches upstream." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo "Drift detected — dispatch the sync job with a SHA, or wait for the next promotion." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi

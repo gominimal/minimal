@@ -1,0 +1,187 @@
+name: docs-site
+
+# PROPOSAL — this file lives in docs/internal/proposals/ until a code owner
+# copies it to .github/workflows/docs-site.yml. The workflow layer is frozen
+# and CODEOWNER-gated (CONTRIBUTING.md, docs/ci-strategy.md); see README.md
+# in this directory for apply instructions.
+#
+# Docs-site lane: builds the VitePress site from docs/ (`npm run docs:build`),
+# fails on site-absolute links under docs/reference/ (those pages are mirrored
+# into gominimal/webapp, where `](/...` resolves against a different base, and
+# they are equally broken when read on GitHub), offline-checks internal links
+# with lychee, and uploads the rendered site (docs/.vitepress/dist) as an
+# artifact. A weekly scheduled job runs an ONLINE lychee sweep (advisory
+# only); a Pages deploy job is fully drafted but disabled until launch.
+#
+# NOT a required check yet. Making `docs-site-success` required is a
+# branch-protection change (main ruleset edit) AND touches release.yml's
+# verify-ci expectations — its `required=` list of lane aggregators would
+# need `docs-site-success` appended. Both are owner decisions.
+#
+# ALWAYS-TRIGGERED, path-scoped INSIDE the workflow (the `changes` job), so
+# the `if: always()` aggregator can join the required checks later without a
+# deadlock. Do NOT add trigger-level `paths:` — a path-skipped required
+# context stays "Expected" forever and wedges the PR (see ci.yml).
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+  schedule:
+    # Weekly ONLINE link sweep only — every other job no-ops on schedule.
+    # 05:00 UTC Monday, offset from nightly.yml (10:00 daily) and
+    # nightly-tests.yml (06:00 daily).
+    - cron: "0 5 * * 1"
+
+# Cancel superseded runs on a branch; never cancel a run on main.
+concurrency:
+  group: docs-site-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+  # dorny/paths-filter reads the PR file list on pull_request events.
+  pull-requests: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs: ${{ steps.filter.outputs.docs }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Detect docs-site changes
+        id: filter
+        # v3.0.2, SHA-pinned. Runs ONLY on pull_request, where dorny reads
+        # the PR file list via the API (a push would need a local diff our
+        # shallow, credential-free checkout cannot provide) — and pushes to
+        # main / dispatches run everything regardless. POSITIVE filter,
+        # unlike ci.yml's everything-but-docs negation: this lane cares only
+        # about the site sources and the Node toolchain pins.
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706
+        with:
+          filters: |
+            docs:
+              - "docs/**"
+              - "package.json"
+              - "package-lock.json"
+              - ".nvmrc"
+
+  docs-build:
+    needs: [changes]
+    # Never on schedule (that trigger exists only for link-sweep); otherwise
+    # the standard lane gate: run unless a pull_request touched no docs path.
+    if: github.event_name != 'schedule' && (github.event_name != 'pull_request' || needs.changes.outputs.docs == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Install site dependencies
+        run: npm ci
+      # TODO: enable once the gen-cli-docs xtask exists — it regenerates the
+      # docs/reference/cli-*.md pages from the clap definitions and fails on
+      # any diff, so the committed pages can never drift from --help output.
+      # Needs a Rust toolchain when enabled (add
+      # `- uses: ./.github/actions/setup-rust` above it).
+      # - name: CLI reference pages are current
+      #   run: cargo xtask gen-cli-docs --check
+      - name: Build site
+        run: npm run docs:build
+      - name: Forbid site-absolute links under docs/reference
+        # A `](/...)` link resolves against whatever base the page happens to
+        # be served under — wrong on the mirrored webapp copy and dead when
+        # the page is read in-repo on GitHub. Relative links work everywhere.
+        run: |
+          if grep -rnF '](/' docs/reference/ --include='*.md'; then
+            echo "::error::site-absolute links ('](/') found under docs/reference/ — use relative links"
+            exit 1
+          fi
+      - name: Install lychee
+        uses: taiki-e/install-action@v2
+        with:
+          tool: lychee
+      - name: Offline link check (internal links)
+        # --offline verifies file-to-file links and #fragments only; external
+        # URLs are skipped (the weekly link-sweep job covers those, without
+        # letting third-party outages break PRs).
+        run: lychee --offline --no-progress --include-fragments 'docs/**/*.md' '*.md'
+      - name: Upload rendered site
+        uses: actions/upload-artifact@v7
+        with:
+          name: docs-site-dist
+          path: docs/.vitepress/dist
+
+  link-sweep:
+    # Weekly ONLINE sweep of external URLs. Advisory: dead third-party links
+    # and rate limits must not redden the repo, hence continue-on-error at
+    # the job level and no edge into the aggregator; failures surface in the
+    # Actions log for a human to triage.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install lychee
+        uses: taiki-e/install-action@v2
+        with:
+          tool: lychee
+      - name: Online link check
+        run: lychee --no-progress 'docs/**/*.md' '*.md'
+
+  docs-deploy:
+    needs: [docs-build]
+    # Fully drafted but DISABLED. Enabling is a launch decision: it needs the
+    # repository's Pages source set to "GitHub Actions" and the public site
+    # URL settled. To enable, replace the `if: false` line below with:
+    #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: false # enable at launch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: docs-site-dist
+          path: dist
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  # Single stable status for (eventual) branch protection: green when every
+  # gating job succeeded OR was skipped (docs-untouched PRs, the disabled
+  # deploy); red only on failure/cancellation. Mirrors ci.yml's ci-success
+  # idiom. link-sweep is deliberately NOT in `needs`: it is advisory and
+  # runs on a schedule, so it must never colour this check.
+  docs-site-success:
+    if: always()
+    needs: [changes, docs-build, docs-deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify all gating jobs succeeded or were skipped
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - run: echo "All docs-site gates passed"
