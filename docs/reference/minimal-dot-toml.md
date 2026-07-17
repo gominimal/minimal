@@ -167,7 +167,7 @@ type = "oci-image"
 ```
 
 ```sh
-minimal materialize base-image -o ./base.tar
+mip materialize base-image -o ./base.tar
 ```
 
 A server image with extra packages, an entrypoint, and an env var:
@@ -182,13 +182,13 @@ vars = { PORT = "8080" }
 ```
 
 ```sh
-minimal materialize app -o ./app.tar
+mip materialize app -o ./app.tar
 ```
 
 Override the architecture at the command line:
 
 ```sh
-minimal materialize app --arch amd64 -o ./app-amd64.tar
+mip materialize app --arch amd64 -o ./app-amd64.tar
 ```
 
 A `raw-file` output extracts a single file from a package. Here the kernel
@@ -202,5 +202,5 @@ path = "usr/share/virtio-linux/Image"
 ```
 
 ```sh
-minimal materialize virtio-kernel -o ./Image
+mip materialize virtio-kernel -o ./Image
 ```

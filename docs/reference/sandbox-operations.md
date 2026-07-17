@@ -27,7 +27,7 @@ runtime, or task dependency in `minimal.toml`.
 | `--session` | Install for this sandbox session only, without editing `minimal.toml` (the default when no flag is given) |
 | `--runtime` | Also add packages to `stack.runtime_packages` |
 | `--build` | Also add packages to `stack.build_packages` |
-| `--task <TASK_NAME>` | Also add packages to `tasks.<TASK_NAME>.packages` |
+| `--task` | Also add packages to the current task's `packages` list |
 
 `min add` is the in-sandbox equivalent of the [`mip add`](./cli-mip.md#add) command.
 

@@ -29,9 +29,9 @@ Minimal ships as a small set of binaries split across two planes:
 
 - **Linux**: installs ship `min`, `mip`, and `minimald`. `minimald` runs
   natively by default; `min --minvmd` routes sessions through the `minvmd`
-  microVM instead, which needs a `minvmd` binary built from source (a
-  prebuilt Linux amd64 `minvmd` is attached to each GitHub Release; there
-  is no arm64 prebuilt).
+  microVM instead, which needs a separately obtained `minvmd` binary (a
+  prebuilt Linux amd64 `minvmd` is attached to each GitHub Release; arm64
+  must build from source).
 - **macOS**: installs ship `min` and `minvmd` only. `minimald` always runs
   inside the microVM, and the package/build plane runs there with it —
   there is no native macOS `mip`.
