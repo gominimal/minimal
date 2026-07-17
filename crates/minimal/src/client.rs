@@ -201,7 +201,7 @@ impl Client {
         let subsystem =
             constcat::concat!(minimald_rpc::RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
 
-        let channel = self
+        let mut channel = self
             .handle
             .channel_open_session()
             .await
@@ -217,11 +217,22 @@ impl Client {
             .await
             .context("request WorkspaceFilesTarZst subsystem")?;
 
-        let stream = channel.into_stream();
+        crate::file_upload::stream_tar_zstd(dir, channel.make_writer()).await?;
 
-        // Stream a tar+zstd archive directly to the daemon channel,
-        // avoiding buffering the entire archive in memory.
-        crate::file_upload::stream_tar_zstd(dir, stream).await
+        // Wait for the channel to close to signal that unpacking is done.
+        let mut err = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            if let russh::ChannelMsg::ExtendedData { data, ext: 1 } = msg {
+                err.extend_from_slice(&data);
+            }
+        }
+        if !err.is_empty() {
+            anyhow::bail!(
+                "daemon failed to unpack project files: {}",
+                String::from_utf8_lossy(&err)
+            );
+        }
+        Ok(())
     }
 }
 
