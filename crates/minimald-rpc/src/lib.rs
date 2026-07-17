@@ -132,9 +132,20 @@ pub struct ListSessionsEntry {
     pub attrs: Option<RunningSessionAttrs>,
 }
 
+/// Resources shared by every session managed by a minimald instance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourcePool {
+    pub cpu_cores: u32,
+    pub memory_bytes: u64,
+}
+
 /// The response to the [`ListSessions`] RPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListSessionsResponse {
+    /// Provider capacity shared by all sessions. Optional for compatibility
+    /// with minimald versions that predate resource-pool reporting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_pool: Option<ResourcePool>,
     pub sessions: Vec<ListSessionsEntry>,
 }
 
@@ -676,6 +687,14 @@ mod tests {
             id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
         };
         assert_eq!(round_trip(&resp), resp);
+    }
+
+    #[test]
+    fn list_sessions_accepts_response_without_resource_pool() {
+        let resp: ListSessionsResponse =
+            serde_json::from_str(r#"{"sessions":[]}"#).expect("deserialize");
+        assert!(resp.resource_pool.is_none());
+        assert!(resp.sessions.is_empty());
     }
 
     #[test]

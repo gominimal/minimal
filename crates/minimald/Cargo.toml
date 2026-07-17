@@ -40,6 +40,7 @@ russh-sftp.workspace = true
 path-absolutize.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sysinfo.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 vt100-ctt.workspace = true

@@ -9,6 +9,7 @@ mod common;
 
 use common::setup;
 use minimal::*;
+use minimald_rpc::{ListSessionsResponse, ResourcePool};
 use sessions::SessionId;
 
 use minimald::test_harness::unwrap_ready;
@@ -36,6 +37,37 @@ async fn version_succeeds_without_daemon() {
 }
 
 // --- ls ---
+
+#[test]
+fn ls_shows_shared_resource_pool() {
+    let resp = ListSessionsResponse {
+        resource_pool: Some(ResourcePool {
+            cpu_cores: 8,
+            memory_bytes: 16 * 1024 * 1024 * 1024,
+        }),
+        sessions: vec![minimald_rpc::ListSessionsEntry {
+            id: SessionId::nil(),
+            name: None,
+            attrs: None,
+        }],
+    };
+    let mut out = Vec::new();
+
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+    )
+    .unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.starts_with("RESOURCE POOL:  8 CPU cores · 16 GiB memory · shared by 1 session\n\n")
+    );
+}
 
 #[tokio::test]
 async fn ls_empty() {
@@ -101,6 +133,8 @@ async fn ls_json_empty() {
     .unwrap();
     let text = String::from_utf8(out).unwrap();
     let parsed: Value = serde_json::from_str(&text).expect("json output should be valid JSON");
+    assert!(parsed["resource_pool"]["cpu_cores"].as_u64().unwrap() > 0);
+    assert!(parsed["resource_pool"]["memory_bytes"].as_u64().unwrap() > 0);
     assert!(parsed["sessions"].is_array());
     assert!(parsed["sessions"].as_array().unwrap().is_empty());
 }
