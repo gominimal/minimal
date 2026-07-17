@@ -87,6 +87,18 @@ jobs:
             raw "docs/reference/${page}" > "src/content/docs/reference/${page}"
           done
 
+          # Remove manifest-managed pages that were dropped upstream. The
+          # webapp-native pages are never manifest-listed and must survive.
+          NATIVE='api.md mcp.md'
+          for existing in src/content/docs/reference/*.md; do
+            name=$(basename "$existing")
+            case " $NATIVE " in *" $name "*) continue ;; esac
+            if ! jq -e --arg p "$name" '.pages | index($p)' /tmp/manifest.json > /dev/null; then
+              echo "removing $name (no longer in manifest)"
+              git rm -q -- "$existing"
+            fi
+          done
+
       - name: Open or update sync PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

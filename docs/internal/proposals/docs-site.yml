@@ -71,6 +71,8 @@ jobs:
               - "package.json"
               - "package-lock.json"
               - ".nvmrc"
+              # Lane idiom: a workflow-only PR must still exercise its lane.
+              - ".github/workflows/docs-site.yml"
 
   docs-build:
     needs: [changes]

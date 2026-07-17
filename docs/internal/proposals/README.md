@@ -44,9 +44,12 @@ All of this should go through a normal PR that a member of
    cp docs/internal/proposals/docs-site.yml .github/workflows/docs-site.yml
    ```
 
-   Prerequisite: the VitePress scaffold (`package.json`,
+   Prerequisites: the VitePress scaffold (`package.json`,
    `package-lock.json`, `.nvmrc`, a `docs:build` script emitting
-   `docs/.vitepress/dist`) must be on `main` first.
+   `docs/.vitepress/dist`) must be on `main` first, and the reference-page
+   link normalization (no site-absolute `](/` links under `docs/reference/`
+   — ships with the scaffold branch) must have landed, or the lane's
+   link-guard step reds on its first run.
 
 2. **ci.yml filter update** — verify, then apply:
 
