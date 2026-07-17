@@ -184,13 +184,13 @@ pub struct ListenArgs {
 
     /// Daemonize: spawn minimald in a new session (setsid) and return once the
     /// SSH socket accepts connections, or an 8s timeout elapses. Used by the
-    /// `minimal` CLI to auto-start a native (DM2) daemon on Linux.
+    /// `min` CLI to auto-start a native daemon on Linux.
     #[arg(long, default_value_t = false)]
     detach: bool,
 
     /// Path to the gvproxy ("gvisor-tap-vsock") binary backing the per-host
     /// `OwnIp` switch. Defaults to the fixed system install path when unset;
-    /// point it at a local build to run own-IP (DM2) without a system install.
+    /// point it at a local build to run own-IP without a system install.
     #[arg(long)]
     gvproxy_bin: Option<std::path::PathBuf>,
 }

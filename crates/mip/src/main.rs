@@ -104,7 +104,7 @@ enum Command {
     Dump(DumpArgs),
     /// Generates Graphviz source code of the dependency graph
     #[command(
-        long_about = "Generate an image of the dependency graph using graphviz's \"dot\" program.\n\n  mip dep --input_deps_depth=0 -p file | dot -Tpng > deps.png"
+        long_about = "Generate an image of the dependency graph using graphviz's \"dot\" program.\n\n  mip dep --input-deps-depth=0 | dot -Tpng > deps.png"
     )]
     Dep(DepArgs),
 
