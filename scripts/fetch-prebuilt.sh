@@ -61,25 +61,46 @@ MAP="$(curl -sf --max-time 30 "$MAP_URL")" || {
 }
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+PARTIAL=""
+trap 'rm -rf "$TMP" ${PARTIAL:+"$PARTIAL"}' EXIT
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
 
 for pkg in $PKGS; do
   sha256="$(jq -re --arg a "$MAP_ARCH" --arg p "$pkg" '.arches[$a][$p].sha256' <<<"$MAP")" || {
     echo "package '$pkg' not in the $MAP_ARCH index for commit $COMMIT" >&2; exit 1; }
+  [[ "$sha256" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "malformed sha256 for '$pkg' in the index: $sha256" >&2; exit 1; }
   curl -sf --max-time 300 "$CACHE_URL/$sha256.zst" -o "$TMP/$pkg.zst" || {
     echo "artifact fetch failed: $CACHE_URL/$sha256.zst ($pkg)" >&2; exit 1; }
+  # The key is the content address — verify the bytes actually match it before
+  # anything gets extracted.
+  got="$(sha256_of "$TMP/$pkg.zst")"
+  [ "$got" = "$sha256" ] || {
+    echo "checksum mismatch for '$pkg': expected $sha256, got $got" >&2; exit 1; }
   mkdir -p "$TMP/$pkg"
   zstd -dc "$TMP/$pkg.zst" | tar -xf - -C "$TMP/$pkg"
 done
 
+# File artifacts publish atomically: write beside DEST, rename into place, so
+# an interrupted run can't leave a partial file that later guards trust.
+publish() {
+  mkdir -p "$(dirname "$DEST")"
+  PARTIAL="$DEST.partial"
+  install -m 0644 "$1" "$PARTIAL"
+  mv -f "$PARTIAL" "$DEST"
+  PARTIAL=""
+}
+
 case "$WHAT" in
   kernel)
-    mkdir -p "$(dirname "$DEST")"
-    install -m 0644 "$TMP/virtio-kernel-raw/usr/share/virtio-linux/Image" "$DEST"
+    publish "$TMP/virtio-kernel-raw/usr/share/virtio-linux/Image"
     ;;
   rootfs)
-    mkdir -p "$(dirname "$DEST")"
-    install -m 0644 "$TMP/microvm-rootfs/usr/share/microvm-rootfs/rootfs.img" "$DEST"
+    publish "$TMP/microvm-rootfs/usr/share/microvm-rootfs/rootfs.img"
     ;;
   krun)
     # Only the libkrun/libkrunfw libs: the packages' libc closure would shadow
