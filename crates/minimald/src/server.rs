@@ -456,15 +456,20 @@ impl Server {
 }
 
 /// How often an otherwise-quiet connection is probed with an SSH keepalive.
-/// The peer's transport replies automatically and replies count as inbound
-/// activity, so an idle-but-alive attach is never mistaken for a dead one.
-/// The client applies the mirror policy (see `minimal`'s `Client`).
-const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+/// This is a slow liveness backstop, not a fast-detection mechanism: the
+/// wall-clock inactivity reaper is off (see `build_russh_config`), so an
+/// idle-but-alive attach is never reaped and there is no need to probe
+/// often. A long, 30-minute interval keeps us from waking the radio and
+/// draining the battery on every quiet connection — which matters once
+/// these connections run remote. The client runs without keepalives, so
+/// this server-side probe is the only liveness check on the link.
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Unanswered keepalives tolerated before the connection is torn down.
-/// 20s × 3 keeps detection near a minute while leaving margin over macOS
-/// DarkWake windows, where one side can briefly run while the other is
-/// still frozen.
+/// At the 30-minute interval, 3 misses means a truly-dead peer is reaped in
+/// ~90 minutes. That is deliberately slow, and fine: with the inactivity
+/// reaper off no idle-but-alive session is ever spuriously reaped, so we
+/// never need to detect deadness quickly.
 const KEEPALIVE_MAX: usize = 3;
 
 /// Builds the shared russh server config from the server state.
