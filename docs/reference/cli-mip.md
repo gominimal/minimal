@@ -10,7 +10,7 @@ description: Reference for the mip package/build CLI — build packages, run tas
 runs [tasks](./tasks.md) in sandboxes, and manages the content-addressed
 local cache.
 
-Generated from `--help` at `e5ce5fb8`.
+Generated from `--help` at `d9f20165`.
 
 ## Global flags
 
@@ -133,8 +133,14 @@ the local cache.
 mip cache clean [--older-than <DURATION>]
 ```
 
-Removes cache entries that haven't been used recently. `--older-than`
-takes a duration string (e.g. `7d`, `24h`, `30m`); the default is `14d`.
+Removes stale entries from the local cache: cached build artifacts whose
+last recorded use is older than the cutoff, or that have no recorded use
+at all. Packages needed by the current project's tasks and stack are
+always kept. Also removes sandbox, task, and temporary build directories
+whose owning process is no longer running.
+
+`--older-than` takes a whole number of days, hours, or minutes (e.g.
+`30d`, `12h`, `45m`); the default is `14d`.
 
 ### `check` {#check}
 

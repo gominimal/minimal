@@ -1,4 +1,5 @@
 ---
+title: Tasks
 description: Full task schema reference — packages, exec/bash commands, state_key, env_vars, patches, profiles, args, and interactive mode.
 ---
 
@@ -40,6 +41,10 @@ or as a program and its list of arguments:
 exec = ["pnpm", "build"]
 ```
 
+When `exec` names a command without an absolute path (or a `./` prefix), the
+command is resolved to `/bin/<command>` inside the sandbox — in the examples
+above, `pnpm` runs as `/bin/pnpm`.
+
 `bash` describes a bash command that should run when the task is launched.
 
 ```toml
@@ -54,6 +59,19 @@ Nickel's string interpolation [syntax](https://nickel-lang.org/user-manual/synta
 [tasks.greet]
 args.name = "string"
 bash = "echo \"Hello %{name}!\""
+```
+
+
+### `description` - Describe the task
+
+_Optional_
+
+`description` is a free-text description of the task, shown alongside the task
+name in [`mip status`](./cli-mip.md).
+
+```toml
+[tasks.my_task]
+description = "Run the dev server with hot reload"
 ```
 
 
@@ -176,16 +194,31 @@ args = {
 exec = "echo %{greeting} %{name}"
 ```
 
-All arguments become mandatory for invoking the task. In the example above, running the task `greeter`
-without its two arguments will trigger an error:
+Arguments without a default become mandatory for invoking the task. In the example above, running
+the task `greeter` without its two arguments will trigger an error:
 
 ```shell
-$> minimal run greeter
+$> mip run greeter
 error: the following required arguments were not provided:
   --name <name>
   --greeting <greeting>
 
-Usage: minimal run greeter --name <name> --greeting <greeting>
+Usage: mip run greeter --name <name> --greeting <greeting>
 ```
 
-Valid datatypes are `string`, `number`, and `boolean`.
+Each argument's datatype may be:
+
+- a scalar: `"string"`, `"number"`, or `"boolean"` (alias `"bool"`);
+- an array of a scalar type: `"Array string"`, `"Array number"`, `"Array boolean"`;
+- an enum of permitted values, written either as the string `"[a, b]"` or as a
+  TOML array `["a", "b"]`.
+
+Instead of a bare datatype string, an argument can be declared as a table with a
+`type` field plus optional `help` (a human-readable description) and `default`
+(making the argument optional):
+
+```toml
+[tasks.greeter]
+args.name = { type = "string", help = "who to greet", default = "world" }
+exec = "echo Hello %{name}"
+```

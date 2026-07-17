@@ -21,7 +21,13 @@ boots from three artifacts:
 
 Prereqs:
 - Apple Silicon Mac with Docker (for the `cross` musl toolchain).
-- `brew install slp/krun/libkrun` — third-party tap; required by minvmd.
+- libkrun, either of:
+  - the pinned source build CI links and the release ships:
+    `scripts/build-libkrun-macos.sh some-prefix-dir` (builds the commit pinned
+    in `vendor/libkrun/libkrun.lock`), then `export LIBKRUN_PREFIX=some-prefix-dir`
+    before building minvmd;
+  - `brew install slp/krun/libkrun` (third-party tap) — the local-dev fallback:
+    with `LIBKRUN_PREFIX` unset, minvmd's build.rs defaults to `/opt/homebrew/lib`.
 - The `minimal` shim on `PATH` (`~/.minimal/shim/bin/minimal`). On macOS,
   `materialize` runs `minimal` inside a Linux VM; a from-source macOS build
   cannot run the build pipeline (sandbox2 is Linux-only).
@@ -235,8 +241,14 @@ CI runs it (informational) in the `boot-e2e` job.
 - The guest rootfs is the **generic** upstream `microvm-rootfs` package (an ext4
   image built from `base` + `socat`) — minimald is delivered by the initramfs, so
   nothing is baked into the rootfs.
-- Session state is on a tmpfs (`/run/minimal`, ephemeral); a persistent data disk
-  (which needs a way to `mke2fs` it) is a follow-up.
+- Session state persists on a per-VM writable data volume, attached as
+  `/dev/vdb` (`docs/specs/08-spec-vm-ext4-volume`). The host provisions a
+  sparse raw image (`data-vol.raw` in the instance's state dir; 256 GiB
+  ceiling by default, `MINVMD_VOLUME_BYTES` overrides the size and
+  `MINVMD_DATA_VOLUME_PATH` the location), and the guest runs first-boot
+  `mkfs.ext4` against it — keyed off ext4 superblock detection, so later
+  boots just mount it. minimald mounts the volume at `/var/lib/minimal` and
+  relocates cache + state onto it; sessions survive VM restarts.
 - In CI (`.github/workflows/ci-macos.yml`) the kernel + rootfs are materialized on
   a cheap Linux runner (`scripts/fetch-artifact.sh` — cache pulls of the upstream
   packages' prebuilt aarch64 artifacts) and the initramfs is cross-compiled

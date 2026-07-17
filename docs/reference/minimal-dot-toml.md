@@ -1,4 +1,5 @@
 ---
+title: minimal.toml
 description: Schema reference for the minimal.toml configuration file — upstream, stack, defaults, tasks, and outputs sections.
 ---
 
@@ -58,7 +59,10 @@ branch = "<branch>"
 locked_commit = "<commit hash>"
 ```
 
-`locked_commit` is automatically updated when `minimal update` is run.
+`locked_commit` is automatically updated when [`mip update`](./cli-mip.md) is
+run: it re-resolves `branch` to its current HEAD and rewrites the
+`locked_commit` of the upstream (and of every sideload) in `minimal.toml` in
+place — expect a diff on these fields after running it.
 
 #### `[[upstream.sideload]]` - Additional software sideloaded into your supply chain {#sideload}
 
@@ -71,7 +75,7 @@ Each sideload entry is loaded in order from the specified repository, and follow
 [[upstream.sideload]]
 repo = "<git URL>"
 branch = "<branch>"
-locked_commit = "<commit hash>" # Updated via `minimal update`
+locked_commit = "<commit hash>" # Updated via `mip update`
 ```
 
 Sideload repositories have the same layout as an upstream: that is having a `minimal.toml` file, and `packages/` / `harnesses/` / `profiles/`
@@ -118,7 +122,7 @@ See: [tasks](./tasks.md).
 
 
 
-### `[outputs.*]` - Artifacts produced by `minimal materialize` {#outputs}
+### `[outputs.*]` - Artifacts produced by `mip materialize` {#outputs}
 
 Each `[outputs.<name>]` section defines an artifact that can be produced with
 [`mip materialize <name> -o <path>`](./cli-mip.md#materialize).

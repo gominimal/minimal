@@ -1,4 +1,5 @@
 ---
+title: Build specs
 description: Build spec schema for defining Minimal packages in Nickel — build_deps, runtime_deps, commands, outputs, tests, and metadata.
 ---
 
@@ -67,8 +68,9 @@ More examples are maintained in the [Minimal Public Package Registry](https://gi
 ## Schema
 
 The canonical typing of a Build-spec is defined using [Nickel](https://nickel-lang.org/) in Minimal's
-embedded standard library, located
-[here](https://github.com/gominimal/minimal/blob/main/crates/stdlib/minimal-ncl/minimal.ncl#L10).
+embedded standard library, in
+[`crates/stdlib/minimal-ncl/minimal.ncl`](https://github.com/gominimal/minimal/blob/main/crates/stdlib/minimal-ncl/minimal.ncl)
+(the `BuildSpec` contract).
 
 | **Field name** | **Type** | **Usage** |
 |---|---|---|
@@ -80,6 +82,6 @@ embedded standard library, located
 | `outputs` | Map&lt;String, Output> | The named set of output files that are captured from a build. If no files match a named output, it's a build error.   |
 | `attrs` | Attrs | The typed set of metadata attached to a given package. |
 | `needs` | Needs | Any abstract needs declared on a given package. |
-| `tests` | Map&lt;String, Test> | A list of tests that are run by `minimal check`. |
+| `tests` | Map&lt;String, Test> | A list of tests that are run by [`mip check`](./cli-mip.md#check). |
 | `target` | String | The target string this package supports. Defaults to the current target. |
 | `prebuilt` | Bool | Indicates that a package is not built, but just the unpacked files from the first `Source` object in `build_deps`. |

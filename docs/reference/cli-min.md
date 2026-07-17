@@ -10,7 +10,7 @@ description: Reference for the min session CLI — create, attach to, and manage
 development sessions. If the daemon is not running, `min` starts it
 automatically.
 
-Generated from `--help` at `e5ce5fb8`.
+Generated from `--help` at `d9f20165`.
 
 ## Global flags
 
@@ -118,7 +118,15 @@ Obtains an mTLS client certificate from `minimald` for use with the HTTPS
 reverse proxy. Generates a fresh client certificate signed by the
 daemon's internal CA and writes `client.pem`, `client.key`, and the CA's
 `ca.pem` to `~/.config/minimal/` (override with `--cert-dir`), so tools
-like `curl` can authenticate to and trust the proxy.
+like `curl` can authenticate to and trust the proxy:
+
+```
+min login
+curl --cacert ~/.config/minimal/ca.pem \
+     --cert ~/.config/minimal/client.pem \
+     --key  ~/.config/minimal/client.key \
+     https://localhost:7655/
+```
 
 ### `rename`
 

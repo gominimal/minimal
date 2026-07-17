@@ -1,4 +1,5 @@
 ---
+title: Linux host setup
 description: Preparing a Linux host to run minimald — the unprivileged user namespace the session sandbox needs, and the AppArmor profile that grants it on Ubuntu 24.04+.
 ---
 
