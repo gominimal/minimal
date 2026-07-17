@@ -228,6 +228,12 @@ pub fn disk_usage(path: &Path) -> Option<DiskUsage>;   // DiskUsage { total_byte
 
 // capture.rs addition — one fact from one tool, any failure is "unknown"
 pub async fn first_stdout_line(cmd: &str, args: &[&str], timeout: Duration) -> Option<String>;
+
+// system.rs (new, unix) — the opening facts of every bundle; best-effort
+// probes (a field that cannot be read is None, never an error), disk paths
+// are caller policy
+pub async fn system_info(disk_paths: &[&Path]) -> SystemInfo;
+// SystemInfo { os, arch, kernel, hostname, ncpu, euid, kvm (linux), disks }
 ```
 
 Crate root curates the surface (`pub use` of `BundleWriter`, `Redaction`,
