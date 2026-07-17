@@ -11,6 +11,15 @@ on:
     schedule:
         - cron: "0 10 * * *" # 10:00 UTC = 02:00 PST
     workflow_dispatch:
+        inputs:
+            dry_run:
+                description: "Build, sign, assemble, and smoke everything but publish nothing (no GCS upload, no GitHub release, no installer-bucket write, no nightly channel advance). Forces the build even when HEAD is already staged."
+                type: boolean
+                default: false
+            skip_ci_verify:
+                description: "Bypass release.yml's verify-ci gate that requires this commit's five lane aggregators to be green. Admin override for a commit whose checks are known-good but unreported."
+                type: boolean
+                default: false
 
 permissions:
     contents: write # release job cuts a GitHub release
@@ -51,8 +60,15 @@ jobs:
 
     release:
         needs: check
-        if: ${{ needs.check.outputs.should_release == 'true' }}
+        # A dry_run dispatch forces the build even when HEAD is already staged
+        # (a rehearsal that skips itself proves nothing). On schedule the
+        # inputs context is empty, so both expressions fall back to the
+        # unforced/real-release path.
+        if: ${{ needs.check.outputs.should_release == 'true' || inputs.dry_run == true }}
         uses: ./.github/workflows/release.yml
+        with:
+            dry_run: ${{ inputs.dry_run || false }}
+            skip_ci_verify: ${{ inputs.skip_ci_verify || false }}
         secrets: inherit
 
     # --- Smoke: prove the artifacts release.yml just built actually run before
@@ -386,8 +402,10 @@ jobs:
         # Run whether release executed (success) or was skipped as a no-op;
         # bail only if it actually failed or was cancelled, or if the smoke
         # gate reds. always() is needed so a skipped `release` doesn't
-        # auto-skip this job.
-        if: ${{ always() && needs.check.result == 'success' && needs.release.result != 'failure' && needs.release.result != 'cancelled' && needs.smoke-success.result == 'success' }}
+        # auto-skip this job. A dry_run dispatch never advances the channel —
+        # a dry-run release stages nothing, and re-pointing nightly at a
+        # previously staged HEAD would make the rehearsal publish.
+        if: ${{ always() && needs.check.result == 'success' && needs.release.result != 'failure' && needs.release.result != 'cancelled' && needs.smoke-success.result == 'success' && !inputs.dry_run }}
         runs-on: ubuntu-latest
         timeout-minutes: 20
         permissions:
