@@ -242,11 +242,25 @@ the run never aborts.
 **Affected areas:**
 - `crates/minimal/src/diag/mod.rs` (new) — `BugArgs`, `cmd_bug`, `collect_step!`
 - `crates/minimal/src/diag/collect.rs` (new) — system/env/config/state/logs collectors
-- `crates/minimal/src/diag/redact.rs` (new) — TOML adapter + env allowlist over the Unit 1 engine
+- `crates/minimal/src/diag/redact.rs` (new) — the env-value allowlist policy
+- `crates/diagnostics/src/redact.rs` — grows the TOML walker (`redact_toml`,
+  beside `redact_json`) and `masked_process_env` over a caller-supplied
+  allowlist predicate
+- `crates/diagnostics/src/logs.rs` (new) — `newest_rotated(dir, prefix, n)`
+- `crates/diagnostics/src/disk.rs` (new) — `disk_usage` (statvfs)
+- `crates/diagnostics/src/capture.rs` — grows `first_stdout_line`
 - `crates/minimal/src/dirs.rs` — print→String refactor so the `min dirs` table can be captured
 - `crates/minimal/src/lib.rs` — `Command::Bug` wiring
-- `crates/minimal/Cargo.toml` — `diagnostics`, `toml`, `libc`
+- `crates/minimal/Cargo.toml` — `diagnostics`, `toml`, `libc`;
+  `crates/diagnostics/Cargo.toml` — `toml`
 - `crates/minimal/tests/bug.rs` (new) — host-only integration test
+
+The mechanics/policy split is deliberate and forward-looking: every
+mechanism this unit introduces has a second consumer in the daemon bundle
+(its own rotated volume logs, allowlisted guest env, volume disk usage), so
+the mechanics land app-agnostic in the crate on first use, and the CLI
+contributes only policy — the allowlist, the log prefixes, the config
+paths, and the archive layout.
 
 **Baseline:**
 - No `bug` subcommand on `origin/main` — **NOT YET IN CODEBASE**.

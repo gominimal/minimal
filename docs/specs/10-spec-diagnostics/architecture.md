@@ -209,6 +209,26 @@ pub fn listing(root: &Path, max_entries: usize) -> Result<Listing>;
 // trailing truncation marker line.
 ```
 
+The host-bundle unit grows the crate with the mechanics whose second
+consumer is the daemon bundle — the allowlist predicate, prefixes, and
+paths stay caller-supplied policy:
+
+```rust
+// redact.rs additions
+pub fn redact_toml(input: &str) -> Result<String, toml::de::Error>;  // same walk as redact_json
+pub fn masked_process_env(is_value_allowed: impl Fn(&str) -> bool) -> BTreeMap<String, String>;
+// vars_os-based (never panics on non-UTF-8); non-allowed values → <redacted:len=N>
+
+// logs.rs (new) — newest-first by reverse-lexicographic filename order
+pub async fn newest_rotated(dir: &Path, prefix: &str, limit: usize) -> Vec<PathBuf>;
+
+// disk.rs (new, unix) — statvfs; f_bavail, the number that predicts write failure
+pub fn disk_usage(path: &Path) -> Option<DiskUsage>;   // DiskUsage { total_bytes, free_bytes }
+
+// capture.rs addition — one fact from one tool, any failure is "unknown"
+pub async fn first_stdout_line(cmd: &str, args: &[&str], timeout: Duration) -> Option<String>;
+```
+
 Crate root curates the surface (`pub use` of `BundleWriter`, `Redaction`,
 `LOG_TAIL_CAP`, `capture::{command_capture, Capture}`, manifest types);
 `Manifest`/`CollectedEntry`/`SkippedEntry`/`CollectorError`/`Redaction` are
