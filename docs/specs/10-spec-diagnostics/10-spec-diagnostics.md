@@ -1,0 +1,872 @@
+---
+id: spec-diagnostics
+title: "Diagnostics subsystem: `min bug` support bundles and the logs they collect"
+kind: spec
+status: planned
+tracking-issue: 801
+supersedes:
+---
+
+# Diagnostics subsystem: `min bug` support bundles and the logs they collect
+
+## Context
+
+When an established attach stream died silently mid-session (#788), diagnosis
+ran entirely on files scraped off disk after the fact — and the two biggest
+gaps were files that did not exist. The in-VM daemon logged to a console the
+VMM discarded (`~1.7 KB` written to a `/dev/null`-routed stream), and the host
+CLI had no way to capture what the guest had been doing when it died. The
+incident was root-caused anyway (thread stacks, socket states, and the data
+volume's mtime dated the stall), but every one of those artifacts was
+hand-collected. A "please run one command and send us the output" story did
+not exist.
+
+PR #784 built that story end to end: a `min bug` command producing a redacted
+`minimal-diag-<ts>.tar.zst`, a daemon-side streaming subsystem contributing an
+in-VM bundle, persistent daemon logs for both daemons, and the #788 field
+captures (boot.log, hang triage, degraded-mode volume harvest, sleep/wake
+history). It grew to +4107/−68 across 38 files and was moved to draft. The
+branch `min-bug-diagnostics` (head `77fc711e`, all review findings addressed)
+is the **reference implementation** for this spec: baselines below cite it as
+`ref:` alongside the `origin/main` state each unit lands on. Units take
+final-tree file states from that branch — not cherry-picked commit sequences —
+because the review fixes are interleaved across its history.
+
+Scope boundaries settled during review of #784 (informed by #784 review
+threads):
+
+- App-agnostic machinery lives in a dedicated `diagnostics` crate; only
+  `bug`-command-specific code stays in `crates/minimal`, and `common` stays
+  free of diagnostics logic (Tom, #784 r3599479514/r3599482662).
+- Correlation metadata belongs on tracing spans, not hand-stamped per-line
+  fields (Tom, #784 r3599524698).
+- Process-global mutable state for the log-release hook is out; the release is
+  owned by `ServerState` and invoked through it (Tom, #784 r3599508618/
+  r3599517777).
+
+Domain vernacular (Session, Provider, the socket lifecycle) is defined in
+`docs/session-domain-diag.md` and used here without redefinition. The bundle
+explorer tooling on branch `diag-explore-script` (`scripts/diag-explore.py`)
+is prior art for Unit 8.
+
+## Introduction/Overview
+
+One command, one artifact: `min bug` assembles a `minimal-diag-<ts>.tar.zst`
+containing host system state, redacted config, state-dir listings, logs,
+process/network/power captures, and one nested bundle per provider produced by
+the daemon itself over a one-shot streaming RPC (`DiagBundleTarZst`). Every
+collector is independent and failure-isolated: a fully broken install still
+yields a valid archive whose `manifest.json` explains what is missing and why.
+Nothing mutates state or autospawns daemons — diagnosing a wedged system must
+not change it.
+
+The subsystem stands on three legs:
+
+1. **A `diagnostics` crate** — bundle writer (file-backed or streaming),
+   manifest, fail-closed key-based redaction, metadata-only listings, and
+   subprocess capture. The CLI and the daemon apply identical mechanics; both
+   bundle layers carry the same `manifest.json` schema.
+2. **Logs that exist before anything goes wrong** — both daemons persist
+   rolling, size-capped file logs (minvmd when detached; minimald onto the
+   data volume, with a release hook so the volume still unmounts cleanly), and
+   log lines follow OTEL-compatible structured conventions so host and guest
+   records correlate on ids, not timestamps and guesswork.
+3. **A collection path with no liveness assumptions** — the daemon bundle is a
+   single tar.zst blob over the existing SSH subsystem transport; when the
+   daemon is unreachable, `min bug` degrades to reading the guest's log
+   directory straight out of the ext4 volume image. The wedged case is the
+   design center, not the edge case.
+
+## Goals
+
+1. A user on a broken install runs `min bug` and gets a shareable archive; the
+   command never aborts because a collector failed, and `manifest.json`
+   accounts for every collected, skipped, and errored entry.
+2. Bundled config and captured environment are redacted fail-closed: unknown
+   keys in env-shaped tables mask by default, sensitive key parts mask
+   everywhere, and redaction failure withholds content rather than shipping it.
+3. Both daemons produce persistent, size-capped, rotated file logs that
+   survive the process — including across the microVM's volume quiesce — so a
+   post-mortem always has something to read.
+4. Host and guest log records correlate: span-carried ids, one trace id per
+   operation across the CLI→daemon boundary, OTEL-compatible field
+   conventions, no OTEL dependency.
+5. The daemon contributes its own view (meta, logs, state listing, sessions,
+   proc/net/disk) as a nested bundle over a one-shot RPC; a daemon that
+   refuses the subsystem fails fast with the reason relayed to the user.
+6. When the daemon or transport is the suspect, the bundle still captures the
+   guest: socket probe stages pinpoint where contact broke, and the data
+   volume's vital signs and `/logs` tree are harvested read-only from the
+   image.
+7. Every PR in the series is functionally complete, under 1000 changed lines,
+   and CI-green alone.
+
+## User Stories
+
+- As a user with a wedged session, I want to run one command and send one
+  file, so that I do not have to hand-collect logs I do not know exist.
+- As a minimal developer triaging a field report, I want the bundle to tell me
+  what was *not* collected and why, so that absence of evidence is itself
+  evidence.
+- As a security-conscious user, I want config and environment values scrubbed
+  by default, so that sharing a bundle does not leak tokens or keys.
+- As a minimal developer debugging a cross-boundary failure, I want one trace
+  id to follow an attach from the CLI into the guest daemon's logs, so that
+  correlation is a grep, not an inference.
+- As a user whose VM will not respond at all, I want `min bug` to still say
+  what the guest was doing when it died, so that "it's frozen" reports are
+  self-diagnosing.
+
+## Demoable Units of Work
+
+> Requirement IDs use the format **R{unit}.{seq}** (R1.1, R1.2 for Unit 1;
+> R2.1 for Unit 2). These IDs are referenced directly by the planner — do
+> not renumber after approval.
+
+---
+
+### Unit 1: `diagnostics` crate foundation
+
+**Purpose:** The app-agnostic machinery every later unit consumes: a bundle
+writer that works file-backed (CLI) or streaming (daemon), the manifest
+schema, the fail-closed redaction engine, metadata-only listings, and a
+unified subprocess capture helper.
+
+**Depends on:** None
+
+**Affected areas:**
+- `crates/diagnostics/` (new crate): `src/{lib.rs,bundle.rs,manifest.rs,redact.rs,listing.rs,capture.rs}`, `Cargo.toml`
+- Root `Cargo.toml` — workspace member + `diagnostics` workspace dep
+
+**Baseline:**
+- No diagnostics crate exists on `origin/main` — **NOT YET IN CODEBASE**.
+- ref: the crate exists complete on `min-bug-diagnostics`
+  (`crates/diagnostics/src/{bundle.rs,manifest.rs,redact.rs,listing.rs}`)
+  minus two deltas this unit adds: `BundleWriter` is file-only
+  (`bundle.rs:39` `create(out_path, ...)`) — **STREAM MODE NOT YET IN
+  CODEBASE** — and there is no `capture` module (three private near-duplicate
+  command runners live in `crates/minimal/src/diag/{collect.rs:95,net.rs:135,procs.rs:126}`).
+- ref: `walkdir.workspace = true` in `crates/diagnostics/Cargo.toml:17` is an
+  unused dependency (the `walkdir` at `bundle.rs:234` is a local test fn) —
+  **DROPPED IN THIS UNIT**.
+- ref: `crates/diagnostics/src/lib.rs` exposes raw `pub mod`s and the manifest
+  types are exhaustive with public fields — **VIOLATES
+  docs/rust-coding-standards.md:50-51** (`pub use` curation,
+  `#[non_exhaustive]` on public types that may grow); fixed in this unit.
+
+**Functional Requirements:**
+
+- **R1.1**: `crates/diagnostics` shall be a workspace member library crate
+  depending only on pre-existing workspace deps (anyhow, async-compression,
+  async-tar, chrono, serde, serde_json, tokio; tempfile dev-only). No
+  `walkdir`.
+- **R1.2**: `bundle.rs` shall define
+  ```rust
+  pub struct BundleWriter<W: AsyncWrite + Unpin + Send + Sync = tokio::fs::File>
+  ```
+  with two constructors: `create(out_path, root, version)` — file-backed,
+  archive created `0600` via `OpenOptions::mode` before any content is
+  written, every entry prefixed `{root}/` — and `stream(writer, version)` —
+  entries at archive top level with **no root prefix** (the daemon bundle is
+  rootless; exact-key consumers depend on it). The default type parameter
+  keeps `&mut BundleWriter` compiling unchanged at every CLI collector call
+  site. The `Sync` bound is load-bearing: `async_tar::Builder` requires it
+  (see Technical Considerations).
+- **R1.3**: `finish(...)` shall write `manifest.json` as the final entry, then
+  finalize the underlying writer via a sealed strategy: file-backed flushes
+  and `sync_all`s; stream mode flushes and shuts down the writer. Both paths
+  produce a manifest with `schema_version: 1`, `created_at`, `version`,
+  `duration_ms`, `collected[] {path, redaction, bytes}`, `skipped[] {what,
+  reason}`, `errors[] {collector, error, duration_ms}`.
+- **R1.4**: `add_file_tail` shall reject symlinks by `symlink_metadata`
+  *before* opening, and bound the read with `Read::take(cap)` so a file
+  growing mid-read cannot exceed the recorded cap (ref: `bundle.rs:92-133`).
+- **R1.5**: `redact.rs` shall provide the key-based policy engine:
+  `is_sensitive_key` (substring parts list, with compound-key handling such
+  that `public_key` only exempts when no sensitive part remains after
+  stripping it — `public_key_token` masks), `is_env_table_name`,
+  `redaction_placeholder` (`<redacted:len=N>`), and `redact_json` (recursive;
+  env-shaped tables mask **all** child values regardless of key). Redaction is
+  fail-closed: a value that cannot be parsed for selective redaction is
+  withheld or masked wholesale, never passed through.
+- **R1.6**: `listing.rs` shall produce metadata-only recursive listings
+  (name, size, kind — with symlinks reported as symlinks, not their targets)
+  bounded by an entry cap.
+- **R1.7**: `capture.rs` (new) shall provide the single subprocess helper
+  ```rust
+  pub async fn command_capture(cmd: &str, args: &[&str], timeout: Duration) -> Result<Capture>
+  ```
+  with `kill_on_drop(true)`, capturing stdout+stderr+status, replacing the
+  three private near-duplicates in the reference tree.
+- **R1.8**: The public API shall be curated per repository standards: crate
+  root `pub use` of `BundleWriter`, `Redaction`, `LOG_TAIL_CAP`, and the
+  manifest types; `#[non_exhaustive]` on `Manifest`, `CollectedEntry`,
+  `SkippedEntry`, `CollectorError`, and `Redaction`.
+
+**Proof Artifacts:**
+
+1. **Test:** unit tests for redaction (compound public-key regressions:
+   `public_key_token`, `public_key_password`, `private_public_key`), tail-cap
+   bounding, symlink rejection, listing caps — demonstrates R1.4–R1.6.
+2. **Test:** the same entry set written through `create` and through `stream`
+   round-trips to identical archives modulo the root prefix, both carrying a
+   `manifest.json` final entry — demonstrates R1.2, R1.3.
+3. **Test:** archive created with mode `0600` — demonstrates R1.2.
+
+---
+
+### Unit 2: `min bug` host bundle
+
+**Purpose:** The command exists and is useful on day one: host system state,
+environment, redacted config, state listing, and every log file the install
+has produced, in a manifest-bearing archive. Collectors are failure-isolated;
+the run never aborts.
+
+**Depends on:** Unit 1
+
+**Affected areas:**
+- `crates/minimal/src/diag/mod.rs` (new) — `BugArgs`, `cmd_bug`, `collect_step!`
+- `crates/minimal/src/diag/collect.rs` (new) — system/env/config/state/logs collectors
+- `crates/minimal/src/diag/redact.rs` (new) — TOML adapter + env allowlist over the Unit 1 engine
+- `crates/minimal/src/dirs.rs` — print→String refactor so the `min dirs` table can be captured
+- `crates/minimal/src/lib.rs` — `Command::Bug` wiring
+- `crates/minimal/Cargo.toml` — `diagnostics`, `toml`, `libc`
+- `crates/minimal/tests/bug.rs` (new) — host-only integration test
+
+**Baseline:**
+- No `bug` subcommand on `origin/main` — **NOT YET IN CODEBASE**.
+- ref: `crates/minimal/src/diag/mod.rs:83-94` (collector step list),
+  `collect.rs` (all collectors), `diag/redact.rs` (TOML + env allowlist),
+  `dirs.rs` refactor. This unit takes those file states **minus** the guest
+  surface: no `guest/net/procs/power` modules, no `--no-guest`/
+  `--guest-timeout-secs` (flags gating nothing arrive with the behavior in
+  Unit 7), no provider section (`collect.rs:415-532` defers to Unit 7), and
+  the `dirs.rs` daemon-log note hunk (`dirs.rs:158-165,389-393`) defers to
+  Unit 3 (those logs do not exist until then).
+- `cargo build -p minimal` runs on the macOS lane but its tests do not
+  (`.github/workflows/ci-macos.yml:432-439`) — **ALREADY SATISFIES** the
+  cross-platform constraint provided no `mod common;` (daemon test harness)
+  is included while unused (dead-code warnings fail clippy `-D warnings`).
+
+**Functional Requirements:**
+
+- **R2.1**: `min bug [--output <path>]` shall assemble
+  `minimal-diag-<UTC ts>.tar.zst` via `BundleWriter::create`, honoring the
+  same `--minimal-dir`/`--config-dir` overrides as the rest of the CLI.
+- **R2.2**: Each collector shall run under a per-collector timeout (30 s);
+  failure or timeout is recorded as a manifest error and the run continues
+  (ref: `collect_step!`, `mod.rs:51-66`). The command mutates no state and
+  spawns no daemons.
+- **R2.3**: `host/system.json` shall capture uname/OS, CLI version, disk usage
+  of the state/cache dirs (statvfs), and KVM availability (Linux only,
+  cfg-gated).
+- **R2.4**: `host/env.json` shall enumerate via `std::env::vars_os` (never
+  `vars` — panics on non-UTF-8), record allowlisted values verbatim
+  (`RUST_LOG`, `HOME`, `SHELL`, `TERM`, `PATH`; prefixes `XDG_`, `MINIMAL_`,
+  `MINVMD_`, `MINIMALD_`), and mask everything else to `<redacted:len=N>`.
+- **R2.5**: Config files (`config.toml`, `user_policy.toml`, loadouts) shall
+  be bundled through the TOML redaction adapter over the Unit 1 engine;
+  unparseable TOML is withheld with a manifest error, never shipped raw.
+- **R2.6**: `state/listing.txt` shall be a metadata-only recursive listing of
+  the state dir (names/sizes/kinds, entry-capped) — no file contents.
+- **R2.7**: Log collection shall gather, per known prefix
+  (`minimald.log*`, `minvmd.log*`) and per known name (`run.log`,
+  `boot.log`), the newest N files by rotation order, tail-capped, rejecting
+  non-regular files. Absent files are manifest skips, not errors (the files
+  only begin to exist after Unit 3 — best-effort by design).
+- **R2.8**: `host/dirs.txt` shall capture the `min dirs` report; `dirs.rs`
+  refactors to return `String` with `cmd_dirs` printing it (behavior of
+  `min dirs` unchanged).
+- **R2.9**: The final output shall print the archive path, entry and error
+  counts, and a review-before-sharing notice.
+
+**Proof Artifacts:**
+
+1. **Test:** `bug_without_daemon_still_produces_a_bundle` — valid tar.zst,
+   manifest accounts for system.json/env.json/state listing, provider absence
+   recorded as a skip — demonstrates R2.1, R2.2, R2.6.
+2. **Test:** a planted secret in a fake config dir appears as
+   `<redacted:len=N>` in the bundled config and never verbatim anywhere in the
+   archive — demonstrates R2.4, R2.5.
+3. **CLI:** `min bug` on a dev box; inspect manifest counts and `host/`
+   entries — demonstrates R2.3, R2.7–R2.9.
+
+---
+
+### Unit 3: Persistent, correlatable daemon logs
+
+**Purpose:** The raw material `min bug` collects has to exist before the
+incident. Both daemons persist rolling file logs — minvmd when detached, the
+in-VM minimald onto the data volume without breaking the volume's clean
+unmount — the VMM console lands in a `boot.log` by default, and lifecycle
+records carry correlation ids on spans.
+
+**Depends on:** None (order-free with Units 1–2)
+
+**Affected areas:**
+- `crates/minvmd/src/{main.rs,lib.rs,cmd/run.rs,cmd/vmm_child.rs}`, `Cargo.toml`
+- `justfile`, `scripts/session-e2e.sh` — boot.log default fallout
+- `crates/minimald/src/{main.rs,server.rs,rpc.rs,session_host.rs,test_harness.rs,build.rs}`
+- `crates/minimal/src/dirs.rs` — daemon-log note (deferred from Unit 2)
+- Root `Cargo.toml` — `logroller` workspace dep
+
+**Baseline:**
+- minvmd detached logs to nowhere on `origin/main`; the hvc0 console is
+  captured only when `MINVMD_BOOT_LOG` is exported (dev flows via `justfile`)
+  — **NO DEFAULT CONSOLE PERSISTENCE**. ref: `cmd/vmm_child.rs` defaults the
+  console to `<provider dir>/boot.log` (truncated per boot; env override
+  kept; wiring failure warns and boots on), `main.rs` adds detached-mode
+  rolling logs keyed on a `DETACHED_ENV` re-exec marker (mirrors the
+  pre-existing `MINIMALD_DETACHED` pattern), and `justfile`/`session-e2e.sh`
+  drop the now-redundant exports — the justfile fallout **MUST LAND IN THIS
+  UNIT** or dev flows lose the console between the export removal and the
+  default.
+- The in-VM minimald logs to the console only; nothing survives the VM —
+  **NO PERSISTED GUEST LOGS** (the #788 gap). ref: `minimald/src/main.rs`
+  installs a `tracing_subscriber::reload` layer whose activator attaches a
+  rolling on-volume appender after the state volume mounts, and
+  `server.rs:103-118` owns a `VolumeLogRelease` invoked from the
+  **pre-existing** Shutdown→quiesce path (`rpc.rs:346` on `origin/main`) so
+  the appender (and its `WorkerGuard`) drop before the ext4 unmount.
+- ref: `session_host.rs:368-372` and `server.rs:398-401` stamp channel/conn
+  ids as **manual per-line fields** — superseded here by spans (Tom, #784
+  r3599524698).
+- `tracing-appender` rotation is time-based only; nothing caps intra-day
+  growth (tokio-rs/tracing#1940) — **NO SIZE CAP EXISTS** on any log path.
+
+**Functional Requirements:**
+
+- **R3.1**: minvmd shall write rolling file logs (`minvmd.log*`, state dir)
+  when running detached, keyed on a `DETACHED_ENV` marker set by the
+  detach re-exec; foreground behavior unchanged.
+- **R3.2**: The VMM child shall default the hvc0 console capture to
+  `<provider dir>/boot.log`, truncated per boot; `MINVMD_BOOT_LOG` overrides;
+  console wiring failure logs a warning and the boot proceeds.
+- **R3.3**: The in-VM minimald shall attach a rolling file appender writing
+  to the data volume, installed through a `tracing_subscriber::reload` layer
+  activated only after the volume mounts; records before activation go to the
+  console as today.
+- **R3.4**: The volume log release shall be owned by `ServerState`
+  (`VolumeLogRelease`, a boxed `FnOnce` invoked at most once via
+  `release_volume_log()`), called from the quiesce path before unmount, so a
+  clean shutdown leaves a clean ext4 journal. No process-global mutable state.
+- **R3.5**: Binding and connection lifecycle records shall carry their ids via
+  tracing spans (`info_span!("binding", channel = %id)` instrumented onto the
+  spawned future; connection span created at accept, synchronous sites via
+  `span.in_scope`, session future instrumented) — one style, no residual
+  manual id fields.
+- **R3.6**: File-log rotation for both daemons shall be size-based with
+  bounded retention via `logroller` (`Rotation::SizeBased` +
+  `max_keep_files`), wrapped in the existing
+  `tracing_appender::non_blocking` + `WorkerGuard` plumbing with
+  `lossy(false)`; guards drop deterministically (minimald: R3.4; minvmd: on
+  shutdown).
+- **R3.7**: `minimald/build.rs` shall fall back to an empty git hash when git
+  is unavailable instead of panicking (unblocks cross builds from worktrees
+  and source tarballs), without reporting a missing git as a dirty checkout.
+
+**Proof Artifacts:**
+
+1. **CLI (gate):** boot a VM, hold an idle attach, `minvmd stop`; the volume
+   unmounts cleanly (no journal replay on next mount) and the next boot shows
+   both `boot.log` and rotated `minimald.log*` on the volume — demonstrates
+   R3.2–R3.4. This is the #784 field-validation item and gates the unit.
+2. **Test:** log-release runs exactly once and before quiesce returns;
+   harness passes `None` release unaffected — demonstrates R3.4.
+3. **Test:** writing past the size threshold rotates and prunes to
+   `max_keep_files` — demonstrates R3.6.
+4. **CLI:** grep a session's records by span-carried channel id across
+   accept/attach/close lines — demonstrates R3.5.
+
+---
+
+### Unit 4: OTEL-compatible log format and trace propagation
+
+**Purpose:** Make correlation a grep and a future OTLP export a field-copy,
+without taking any OpenTelemetry dependency. File logs become JSON-lines with
+span context; operations mint W3C-shaped ids; the CLI hands its trace id to
+the daemon across the SSH boundary.
+
+**Depends on:** Unit 3
+
+**Affected areas:**
+- `crates/minimald/src/main.rs` — JSON-lines fmt layer for the file appender
+- `crates/minvmd/src/main.rs` — same for detached file logs
+- `crates/minimal/src/client.rs` — `TRACEPARENT` env request on channel open
+- `crates/minimald/src/rpc.rs` — adopt the propagated context into the dispatch span
+- `crates/minimal/src/lib.rs` — root span + trace-id minting at command dispatch
+
+**Baseline:**
+- All log output is human-format text; no trace/span ids exist anywhere —
+  **NOT YET IN CODEBASE** (this unit is new scope beyond #784, adopted by
+  decision on 2026-07-16).
+- `tracing-subscriber`'s JSON formatter does not emit span/trace ids by
+  itself (tokio-rs/tracing#1481 open) — ids must be minted and stamped as
+  explicit span fields.
+- russh supports SSH channel `env` requests; the daemon side must accept the
+  `TRACEPARENT` name (assumption ledger: `russh-env-request`).
+
+**Functional Requirements:**
+
+- **R4.1**: Daemon *file* logs (both daemons) shall switch to JSON-lines via
+  `fmt::layer().json().with_current_span(true).with_span_list(true)` with UTC
+  RFC3339 timestamps; console/stdout layers stay human-format.
+- **R4.2**: Each process shall open a root span carrying resource identity:
+  `service.name` (`minimal-cli`/`minimald`/`minvmd`), `service.version`,
+  `service.instance.id` (provider/VM id where applicable), `host.name`,
+  `process.pid` — the OTLP resource-attribute names, so a bundle holding
+  files from three processes is self-describing.
+- **R4.3**: Top-level operations (CLI command dispatch, daemon RPC dispatch,
+  session/binding lifecycles) shall mint ids in OTLP-required formats —
+  `trace_id` 32 lowercase hex, `span_id` 16 lowercase hex — recorded as span
+  fields. Correlation values (`channel_id`, `session_id`, …) are span fields
+  with stable snake_case keys, never interpolated into messages.
+- **R4.4**: The CLI shall send `traceparent` (`00-{trace_id}-{span_id}-01`)
+  as an SSH channel env request before subsystem/exec invocation; the daemon
+  shall adopt a valid received value as the `trace_id` of its dispatch span
+  (malformed or absent → mint fresh). No RPC envelope or wire-contract
+  change.
+- **R4.5**: The conventions above are the acceptance contract for all future
+  daemon/CLI logging (recorded in this spec; see Design Considerations for
+  the OTLP mapping rationale).
+
+**Proof Artifacts:**
+
+1. **Test:** a file-log line parses as JSON and carries level, target,
+   timestamp, span list, and resource fields — demonstrates R4.1, R4.2.
+2. **CLI (gate):** run one attach with `min`; a single `trace_id` greps
+   across the host CLI log and the guest daemon's on-volume log —
+   demonstrates R4.3, R4.4.
+3. **Test:** malformed `traceparent` env values are ignored (fresh mint, no
+   error) — demonstrates R4.4.
+
+---
+
+### Unit 5: Incident collectors, mechanics in-crate
+
+**Purpose:** The #788-shaped captures: network state, process tree, hang
+triage, and power history. Mechanics land in `diagnostics` parameterized by
+app inputs — satisfying the crate rule — and the generic collect helpers
+migrate out of `crates/minimal`.
+
+**Depends on:** Unit 1, Unit 2
+
+**Affected areas:**
+- `crates/diagnostics/src/{net.rs,procs.rs,power.rs}` (new) — mechanics
+- `crates/diagnostics/src/collect.rs` (new) — migrated generic helpers (statvfs/disk, logs-by-prefix, env-with-allowlist)
+- `crates/minimal/src/diag/mod.rs` — marker list + six `collect_step!` lines
+- `crates/minimal/tests/bug.rs` — interfaces/routes/MAC-mask assertions
+
+**Baseline:**
+- ref: collectors exist as `crates/minimal/src/diag/{net.rs:21-166,
+  procs.rs,power.rs}` — **IN THE WRONG CRATE** per the crate rule; the only
+  minimal-ism is the `PROCESS_MARKERS` list (`procs.rs:14`), duplicated
+  verbatim as `PROC_MARKERS` in `minimald/src/diag.rs:349`.
+- ref: `power.rs:10` uses `super::procs::command_capture` — the modules move
+  together, consuming Unit 1's `capture` module instead of private copies.
+
+**Functional Requirements:**
+
+- **R5.1**: `diagnostics::net` shall capture listening sockets (`ss`/
+  `netstat` with raw `/proc/net` fallback — verbatim output, no typed
+  re-serialization), interfaces with MACs masked to their vendor OUI, and
+  routes.
+- **R5.2**: `diagnostics::procs` shall provide the process tree and hang
+  triage (macOS: 1 s `sample` per pid; Linux: wchan/syscall/kernel-stack/fd
+  readlinks; one `lsof -nP` over the set, accepting lsof's
+  exit-1-with-output convention) for up to 8 pids matched by **argv0
+  basename** against a caller-supplied `markers: &[&str]`.
+- **R5.3**: `diagnostics::power` shall capture sleep/wake history
+  (macOS `pmset`; Linux `journalctl`), event-capped.
+- **R5.4**: The minimal marker list and the six `collect_step!` wiring lines
+  stay in `crates/minimal`; every mechanic above consumes
+  `diagnostics::capture::command_capture`.
+- **R5.5**: The generic helpers still in `crates/minimal` after Unit 2
+  (statvfs/`DiskInfo`, newest-N-by-prefix log collection, env capture over an
+  allowlist predicate) shall migrate into `diagnostics::collect`, leaving
+  `crates/minimal/src/diag` holding only paths/config resolution, the marker
+  and allowlist *data*, and clap/orchestration — the crate rule holds at
+  series end.
+
+**Proof Artifacts:**
+
+1. **Test:** interfaces output masks full MACs to OUI; routes/listening
+   captures present in the bundle — demonstrates R5.1.
+2. **CLI:** `min bug` while a `min attach` runs: `host/proc/<pid>.sample.txt`
+   (macOS) or `.stack.txt` (Linux) plus `host/proc/lsof.txt` appear for the
+   process family — demonstrates R5.2, R5.4.
+3. **Test:** crate-level tests for markers matching (argv0 basename, not
+   substring) and power event caps — demonstrates R5.2, R5.3.
+
+---
+
+### Unit 6: Daemon bundle serving (`DiagBundleTarZst`)
+
+**Purpose:** The daemon's own view, served as one zstd tar blob over the
+existing SSH subsystem transport, built with the same `BundleWriter` and the
+same `manifest.json` schema as the host bundle.
+
+**Depends on:** Unit 1, Unit 5
+
+**Affected areas:**
+- `crates/minimald-rpc/src/lib.rs` — `DIAG_BUNDLE_SUBSYSTEM` + `DiagBundleRequest`
+- `crates/minimald/src/diag.rs` (new) — collection + streaming
+- `crates/minimald/src/{rpc.rs,lib.rs,server.rs}` — dispatch, `in_microvm()`, state-dir accessor ungating
+- `crates/minimald/Cargo.toml` — `diagnostics`
+
+**Baseline:**
+- No diag subsystem on `origin/main` — **NOT YET IN CODEBASE**.
+- ref: `minimald/src/diag.rs` (704 lines) exists but hand-rolls the tar
+  stream (`Builder<ZstdEncoder<DuplexStream>>`, `diag.rs:59-84`) and emits
+  `errors.json` instead of a manifest, duplicating ~150 lines of
+  crate logic (`append_bytes`≡`BundleWriter::append`, `read_tail`≡tail-cap,
+  log selection, session-record walk, statvfs) — **REBUILT ON
+  `BundleWriter::stream` IN THIS UNIT**; the guest bundle format converges on
+  `manifest.json` and `errors.json` is retired (nothing shipped, so no
+  compatibility window — Unit 8 handles the one out-of-tree consumer).
+- ref: the russh channel writer is not `Sync`, so the duplex-pipe +
+  `tokio::io::copy` pump stays (`diag.rs:57` comment); only the tar/manifest
+  half moves into the crate.
+
+**Functional Requirements:**
+
+- **R6.1**: `minimald-rpc` shall define `DIAG_BUNDLE_SUBSYSTEM`
+  (`minimald-v1-DiagBundleTarZst` — wire contract, never renamed) and
+  `#[non_exhaustive] DiagBundleRequest { log_tail_bytes: u64 /* 0 = daemon
+  default */, include_state_listing: bool /* default true */ }`; an empty
+  JSON body decodes to the documented defaults.
+- **R6.2**: The daemon shall stream its bundle through
+  `BundleWriter::stream` (rootless): `meta.json` (version, uptime, microVM
+  flag), tail-capped `logs/`, metadata-only `state-listing.txt` (on
+  `spawn_blocking`; caps honored), `sessions/` records with `redact_json`
+  applied and read/parse failures recorded per-record, `proc.txt` (full argv
+  only for marker-matched processes, `comm` otherwise), raw `/proc/net`
+  tables, and `disk.json` — finishing with `manifest.json`.
+- **R6.3**: Request reads shall be length-bounded; caller-controlled
+  `log_tail_bytes` is clamped to a server cap; log collection rejects
+  non-regular files and symlinks.
+- **R6.4**: Errors before streaming starts shall be relayed on extended-data
+  stream 1 and the channel closed without payload; a client reading zero
+  payload bytes surfaces the extended data as the failure reason.
+- **R6.5**: Marker matching shall reuse `diagnostics::procs` (no duplicated
+  `PROC_MARKERS`).
+
+**Proof Artifacts:**
+
+1. **Test:** in-crate tests fetch a bundle over the test harness and assert
+   `meta.json` + `manifest.json` presence, session redaction, and the
+   pre-stream error path (extended data, zero payload) — demonstrates R6.1,
+   R6.2, R6.4.
+2. **CLI:** raw `ssh -s` subsystem invocation against a dev daemon returns a
+   decompressible rootless tar.zst — demonstrates R6.2.
+3. **Test:** oversized request body and oversized `log_tail_bytes` are
+   clamped/rejected — demonstrates R6.3.
+
+---
+
+### Unit 7: Guest fetch and degraded-mode fallback
+
+**Purpose:** `min bug` reaches into every provider: a staged socket probe
+that says exactly where contact breaks, the bundle download over the probe's
+connection, and — when the daemon or transport is the suspect — vital signs
+and logs harvested read-only from the volume image.
+
+**Depends on:** Unit 2, Unit 6
+
+**Affected areas:**
+- `crates/minimal/src/client.rs` — `download_diag_bundle`
+- `crates/minimal/src/diag/guest.rs` (new) — guest collect, volume fallback, skip records
+- `crates/minimal/src/diag/net.rs` (new, probe half) — `SocketProbe` stages
+- `crates/minimal/src/diag/collect.rs` — provider dirs/files/status (deferred from Unit 2)
+- `crates/minimal/src/diag/mod.rs` — provider loop, `--no-guest`, `--guest-timeout-secs`
+- `crates/minimal/tests/bug.rs` — full-stack, stale-socket, no-guest tests (+ `mod common;`)
+
+**Baseline:**
+- ref: all of the above exists on the reference branch
+  (`client.rs:230-315`, `guest.rs`, `net.rs:168-305`, `collect.rs:415-532`,
+  `mod.rs:112-172`); this unit lands it against the Unit 6 manifest-bearing
+  guest bundle (nested verification updates accordingly).
+- ref: `tempfile` promotes dev→main dep here (`volume_fallback` staging);
+  `mod common;` (daemon harness) enters `tests/bug.rs` here — earlier it
+  would be unused and fail clippy dead-code.
+
+**Functional Requirements:**
+
+- **R7.1**: The socket probe shall record staged outcomes — socket file stat
+  → connect → SSH handshake → `GetVersion` — as `socket-probe.json` per
+  provider, and hand its established connection to the bundle download (no
+  second handshake).
+- **R7.2**: `download_diag_bundle` shall stream the daemon bundle with a
+  total-size cap (256 MiB), cap accumulated extended-data (`daemon_error`,
+  64 KiB), fail fast when the daemon refuses the subsystem, and honor
+  `--guest-timeout-secs` (default 60) as the per-provider deadline.
+- **R7.3**: The daemon bundle shall be nested **raw** (undecompressed) at
+  `providers/<name>/guest/daemon-diag.tar.zst` after verifying it
+  decompresses and contains `manifest.json`; verification failure records the
+  bytes anyway with a manifest error.
+- **R7.4**: `--no-guest` shall skip *all* daemon contact including the probe
+  (the probe handshakes), recording the skip per provider.
+- **R7.5**: On probe failure, download failure, or timeout, the bundle shall
+  record `providers/<n>/guest/volume-meta.json` (image size + mtime — the
+  stall-dating signal) and best-effort harvest `/logs` from the ext4 image
+  via `debugfs -c` (read-only, safe against a live VM) into
+  `guest/volume-logs/`; without e2fsprogs the manifest carries the exact
+  offline `rdump` command.
+- **R7.6**: Provider discovery (`local-*` dirs) shall record per-provider
+  files (`run.log`, `boot.log`, tail-capped) and liveness status
+  (`minvmd`/`minimald` alive checks via `minvmd::state::StateDir`).
+
+**Proof Artifacts:**
+
+1. **Test:** full-stack — `min bug` against the harness daemon nests a guest
+   bundle whose manifest parses; loadout redaction and client-key skip hold
+   across layers — demonstrates R7.1–R7.3.
+2. **Test:** stale socket file → probe records the failed connect stage and
+   `error.txt` explains the skip; volume fallback artifacts appear —
+   demonstrates R7.1, R7.5.
+3. **Test:** `--no-guest` against a live harness daemon performs zero daemon
+   contact — demonstrates R7.4.
+4. **CLI (gate):** kill a real VM's daemon mid-session, run `min bug`: probe
+   stages + `volume-meta.json` + harvested `volume-logs/` present —
+   demonstrates R7.5 end to end.
+
+---
+
+### Unit 8: Bundle explorer, dual-format
+
+**Purpose:** Keep the team-side tooling truthful across the format
+convergence: `scripts/diag-explore.py` (branch `diag-explore-script`) must
+read both pre-convergence (`errors.json`) and post-convergence
+(`manifest.json`) guest bundles.
+
+**Depends on:** Unit 6
+
+**Affected areas:**
+- `scripts/diag-explore.py` (on its own branch/PR)
+
+**Baseline:**
+- ref (branch `diag-explore-script`): guest-bundle detection keys on
+  `errors.json` presence, `_check_guest` hard-requires it, and guest
+  collector errors are read from it — **BREAKS ON THE UNIT 6 CONVERGENCE**
+  (every post-Unit-6 bundle fails its doctor check).
+
+**Functional Requirements:**
+
+- **R8.1**: Guest-bundle detection shall key on `meta.json` presence (not
+  `errors.json`).
+- **R8.2**: Collector errors shall be read from `manifest.json` when present,
+  falling back to `errors.json` for legacy bundles; `check` passes on both.
+- **R8.3**: The explorer shall continue to assume the rootless nested layout
+  (exact-key lookups) — guaranteed by R1.2/R6.2.
+
+**Proof Artifacts:**
+
+1. **CLI:** `summary`/`check`/`errors` against one pre-convergence bundle
+   (the #788 field bundle) and one post-Unit-6 bundle — both pass —
+   demonstrates R8.1–R8.3.
+
+## Non-Goals
+
+- **OpenTelemetry SDK adoption** — opentelemetry-rust is pre-1.0 (traces
+  Beta), the OTLP file-exporter spec is a placeholder with no durability
+  semantics, and the bundle path's correctness criterion is "works when
+  everything else is dead". Unit 4's conventions are the seam; an OTLP
+  exporter layer is additive later work (future spec; see Design
+  Considerations).
+- **Streaming/live debug RPC** — the team-discussed streaming collection is
+  deliberately not this: one-shot blob only. Reopen only with a use case that
+  post-mortem files cannot serve.
+- **`BundleWriter` writing directly to the russh channel** — blocked on
+  `async_tar::Builder`'s `Sync` bound vs the non-`Sync` channel writer; the
+  duplex pump stays (see Technical Considerations).
+- **journald/oslog readers** — wrong platform or wrong weight (libsystemd
+  linkage; forensic-grade tracev3 parsing). If host-Linux journald context is
+  ever needed: shell out to `journalctl -o json` as a collector.
+- **`procfs`-typed daemon collectors and `nix::sys::statvfs` swap** —
+  worthwhile cleanups, tracked as follow-up issues under #801, not blocking.
+- **`min bug --print` text report** (bugreport-style paste mode) — follow-up
+  under #801.
+- **Log-based alerting/telemetry pipelines** — out of scope entirely.
+
+## Design Considerations
+
+### Bespoke collectors vs. system-info crates
+
+The collectors ship raw bytes (`/proc` tables, `ss` output, `pmset` logs)
+because the raw bytes are the deliverable: typed scrapers (`sysinfo`,
+`procfs`) re-serialize, hiding parser version-skew and turning parse failures
+into collection failures. Failure isolation — every collector best-effort,
+degrading to a manifest note — is easy to guarantee over ten-line readers and
+hard over a large library surface. Peer CLIs corroborate: `git bugreport`,
+`starship bug-report`, `bat --diagnostic` produce *less* (text reports);
+sos report and `cockroach debug zip` are hand-rolled in their ecosystems too.
+Re-evaluated 2026-07 against the current crate landscape; conclusion
+unchanged. Reopen-trigger: collectors that *compute over* proc data instead
+of shipping it raw (then `procfs`, already transitive in minimald's graph, is
+the move).
+
+### Redaction must be bespoke and fail-closed
+
+No maintained crate does data-driven recursive key-based scrubbing of
+arbitrary JSON/TOML: `secrecy`/`veil`/`redact` are type-level (annotate your
+own structs — the opposite shape from walking config you didn't define), and
+`redactable` explicitly treats dynamic `serde_json::Value`s as opaque
+wholesale-redact leaves. Vector's VRL `redact()` is the only real prior art
+and is an entire language runtime. The ~200-line fail-closed key-walk stays,
+shared verbatim by CLI and daemon so the two layers can never disagree about
+what is sensitive.
+
+### Rotation: `logroller` over `tracing-appender`
+
+`tracing-appender` rotates by time only (size-based requested since 2022,
+tokio-rs/tracing#1940): with daily rotation + `max_log_files`, nothing caps
+intra-day growth, and a runaway error loop filling the microVM data volume is
+precisely the failure class this subsystem exists to diagnose — the log
+system must not be able to cause the incident it records. `logroller`
+(size-based rotation, `max_keep_files`, optional gzip) is a plain `io::Write`
+that drops into the same `non_blocking`/`WorkerGuard`/`reload` plumbing.
+Risk: young crate (0.1.x, single maintainer, active through 2026-07).
+Reopen-trigger: abandonment, or tracing-appender shipping size-based
+rotation — the writer is swappable behind one constructor either way.
+Decided 2026-07-16.
+
+### One-shot blob, not streaming; files, not telemetry
+
+The daemon bundle rides the existing SSH subsystem as a single tar.zst with a
+half-close request and extended-data error relay — ~200 lines whose failure
+modes are inspectable with the same probe that precedes it. OTLP/gRPC or
+otel-arrow streaming would replace that with a protocol stack (HTTP/2 flow
+control, batch buffering, backpressure) that is opaque exactly when the
+transport is the suspect — and #788's failure domain *was* the transport.
+Every OTEL export path is push-based from a live process and loses its
+in-memory tail on a hang; the only OTEL-shaped post-mortem pattern is
+"write files while healthy, scrape later", which is what Unit 3 does without
+the dependency. No mainstream infra tool uses OTEL for support bundles
+(troubleshoot.sh, `kubectl cluster-info dump`, sos, Docker diagnose: all
+plain files). A resident collector in the initramfs (Go otelcol or Rust
+rotel) inverts the design: it adds a component that must be alive and healthy
+to the path that must work when nothing is.
+
+### OTEL-compatible conventions without the dependency
+
+Unit 4 holds the format seam so a later OTLP move is mechanical:
+tracing levels map exactly onto OTLP SeverityText/SeverityNumber; `target` ≙
+InstrumentationScope; `fields.message` ≙ Body; resource attributes use the
+OTLP names (R4.2); trace/span ids use the OTLP-required hex formats (R4.3),
+minted by us because tracing's JSON formatter does not emit ids
+(tokio-rs/tracing#1481). Conversion to OTLP-JSON, if ever wanted, is a
+transform on the *analysis* machine over files already in the bundle — the
+guest never takes the dependency.
+
+### Guest bundle format convergence
+
+The reference implementation's guest bundle emits `errors.json` and no
+manifest — a second, weaker accounting schema. Since nothing has shipped,
+Unit 6 converges both layers on `manifest.json` (same
+collected/skipped/errors shape, same tooling) rather than replaying the split
+and migrating later. The single out-of-tree consumer (diag-explore) is
+Unit 8's dual-format rework, sequenced after Unit 6.
+
+## Repository Standards
+
+- Every unit lands `cargo fmt`-clean, `cargo clippy --all-targets
+  --all-features -- -D warnings`-clean (feature-gated callers — the
+  test-harness regression on the reference branch was caught only by
+  `--all-features`), and `cargo test -- --include-ignored`-green.
+- Conventional Commits; one logical change per commit; multi-scope
+  (`feat(minvmd,minimald): ...`) where a unit spans crates.
+- `.github/workflows/` is frozen — tests are convention-discovered; nothing
+  in this series may add files named `*_integration.rs`/`*_root_integration.rs`
+  unless they genuinely belong to those lanes.
+- `thiserror` enums in `diagnostics` (library crate); `anyhow` +
+  `.context(...)` in `minimal`/daemon application code (informed by
+  ADR-0001).
+- `// SAFETY:` on every `unsafe` block (statvfs/geteuid FFI); `tracing`
+  structured fields, never interpolated values; no `println!` outside CLI
+  user output.
+- Each unit ships its tests in the same PR; proof artifacts attach to the PR
+  per house convention.
+
+## Open Questions
+
+1. Should minvmd's *foreground* runs also tee to the file log (Tom, #784
+   r3599529270: "why don't we just do this unconditionally?")? Default
+   posture here: detached-only in Unit 3; revisit in Unit 3 review with Tom.
+2. `service.instance.id` (R4.2): provider name vs VM/session uuid — decide in
+   Unit 4 design review; must be stable across a VM's lifetime and present in
+   both host and guest resource fields.
+3. Retention numbers: size threshold and `max_keep_files` per daemon (volume
+   is 32 GiB shared with user data; proposal: 8 MiB × 5 files guest-side,
+   16 MiB × 5 host-side) — settle with measurements in Unit 3.
+
+## Technical Considerations
+
+- `async_tar::Builder<W>` requires `W: Sync`; the russh channel writer is not
+  `Sync`, hence the daemon's duplex-pipe + `tokio::io::copy` pump
+  (ref `minimald/src/diag.rs:57-101`). `tokio::io::DuplexStream` and
+  `tokio::fs::File` are both `Sync` — the `BundleWriter<W>` bound set in R1.2
+  follows.
+- async-tar is pinned at 0.6 (post-CVE-2025-62518/"TARmageddon"; the
+  nested-TAR extraction flaw was fixed in 0.5.1). Never migrate to the dead,
+  unpatched `tokio-tar`; if async-tar stalls, `astral-tokio-tar` is the
+  escape hatch.
+- `std::env::vars()` panics on non-UTF-8 values; all env enumeration uses
+  `vars_os()` (R2.4).
+- Every subprocess capture sets `kill_on_drop(true)` so a collector timeout
+  cannot leak children past the bundle run (R1.7).
+- `debugfs -c` (catastrophic/read-only mode) is safe against an ext4 image
+  with a live writer; harvested logs may be mid-write torn, which is
+  acceptable for post-mortem text (R7.5).
+- Rotation/pruning in file appenders happens on the write path — an idle
+  daemon does not rotate; "daily" files can span days. Size-based rotation
+  (R3.6) makes the cap independent of wall clock.
+- Caps (reference values): collector timeout 30 s, log tail 5 MiB, listing
+  100k entries, guest bundle 256 MiB, daemon-error 64 KiB, hang-triage 8
+  pids, power events 100.
+
+## Security Considerations
+
+- **Trust boundary: the bundle leaves the machine.** Everything collected
+  must survive being pasted into a public issue: fail-closed redaction on
+  config/env/session records (R1.5, R2.4, R2.5, R6.2), full argv recorded
+  only for marker-matched processes — a concurrent unrelated process's
+  command line (tokens, URLs) is never captured (`comm` only) (R6.2),
+  MACs masked to vendor OUI (R5.1).
+- **The collector must not be a read gadget.** Symlinks are rejected by
+  lstat before open on both layers (R1.4, R6.3), so a crafted
+  `minimald.log.evil` symlink cannot exfiltrate `/etc/shadow` into a bundle.
+- **The archive is private by default**: created `0600` before content is
+  written (R1.2).
+- **The daemon endpoint is DoS-bounded**: request reads length-capped,
+  caller-supplied tail sizes clamped server-side, listing entry caps,
+  streaming size caps client-side (R6.3, R7.2).
+- **Diagnosis must not mutate**: no state writes, no daemon autospawn, no
+  volume writes (`debugfs -c` is read-only) — a bundle taken during an
+  incident cannot contaminate the incident.
+
+## Verification
+
+| Unit | Req | Proof type | Command / observable |
+|------|-----|-----------|----------------------|
+| 1 | R1.4–R1.6 | Test | `cargo test -p diagnostics` — redaction compound keys, tail cap, symlink reject, listing cap |
+| 1 | R1.2, R1.3 | Test | file-vs-stream round-trip identical modulo root; `manifest.json` last entry both modes |
+| 2 | R2.1, R2.2, R2.6 | Test | `bug_without_daemon_still_produces_a_bundle` (Linux lane) |
+| 2 | R2.4, R2.5 | Test | planted secret → `<redacted:len=N>`, never verbatim |
+| 2 | R2.3, R2.7–R2.9 | CLI | `min bug` on dev box; manifest counts, `host/` entries |
+| 3 | R3.2–R3.4 | CLI (gate) | idle attach + `minvmd stop` → clean ext4 journal; `boot.log` + `minimald.log*` on volume next boot |
+| 3 | R3.4 | Test | release runs exactly once, before quiesce returns |
+| 3 | R3.6 | Test | size-threshold rotation + retention pruning |
+| 3 | R3.5 | CLI | grep one channel id across accept/attach/close records |
+| 4 | R4.1, R4.2 | Test | file-log line parses as JSON with span list + resource fields |
+| 4 | R4.3, R4.4 | CLI (gate) | one `trace_id` greps across host CLI log and guest on-volume log for one attach |
+| 4 | R4.4 | Test | malformed `traceparent` → fresh mint, no error |
+| 5 | R5.1 | Test | MAC→OUI masking; interfaces/routes in bundle |
+| 5 | R5.2, R5.4 | CLI | `min bug` during `min attach` → per-pid sample/stack + lsof for family |
+| 6 | R6.1, R6.2, R6.4 | Test | harness fetch: `meta.json` + `manifest.json`; pre-stream error via extended data |
+| 6 | R6.2 | CLI | raw `ssh -s` subsystem fetch decompresses, rootless |
+| 6 | R6.3 | Test | oversized request/tail clamped |
+| 7 | R7.1–R7.3 | Test | full-stack nested-bundle test with redaction across layers |
+| 7 | R7.1, R7.5 | Test | stale socket → connect-stage failure + fallback artifacts |
+| 7 | R7.4 | Test | `--no-guest` → zero daemon contact against live harness |
+| 7 | R7.5 | CLI (gate) | kill VM daemon mid-session; `min bug` → probe stages + volume-meta + harvested logs |
+| 8 | R8.1–R8.3 | CLI | explorer `check` green on pre- and post-convergence bundles |
