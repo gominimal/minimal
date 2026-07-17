@@ -183,8 +183,10 @@ jobs:
                   path: ${{ runner.temp }}/guest
             - name: Put the shipped binaries on PATH
               # Rename off the platform suffix and prepend to PATH so `min`
-              # autospawns `minvmd` — and minvmd spawns the host `gvproxy` switch —
-              # all by bare name.
+              # autospawns `minvmd` by bare name. gvproxy is NOT resolved from
+              # PATH — minvmd only honours MINVMD_GVPROXY_BIN, the installer
+              # bin dir, or /usr/lib/minimal/bin (see resolve_gvproxy_path) —
+              # so the e2e step below points MINVMD_GVPROXY_BIN at it.
               run: |
                   set -euo pipefail
                   BIN="$RUNNER_TEMP/bin"
@@ -216,8 +218,13 @@ jobs:
               # activate must auto-spawn minvmd, boot the guest, and round-trip a
               # session. E2E_PROJECT_DIR=/tmp — the guest sees no host project dir
               # yet (no project sync), and /tmp exists in the guest image.
+              # MINVMD_GVPROXY_BIN: without it minvmd boots the VM switchless
+              # (gvproxy resolution is best-effort and never errors) and every
+              # guest egress — including the in-guest `pkgs` clone during
+              # session mint — dies with "Could not resolve host".
               env:
                   MINVMD_BOOT_LOG: ${{ runner.temp }}/cli-e2e-boot.log
+                  MINVMD_GVPROXY_BIN: ${{ runner.temp }}/bin/gvproxy
               run: E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd E2E_PROJECT_DIR=/tmp ./scripts/session-e2e.sh
             - name: Reap leftover VM processes
               # The autospawned minvmd can leak a __krun-vmm child on a failed
@@ -301,8 +308,9 @@ jobs:
               # @rpath target), data/{vmlinuz,rootfs.img,initramfs.cpio}. The dylib
               # basename MUST be libkrun.1.dylib — minvmd's load command is
               # @rpath/libkrun.1.dylib. Then bin/ joins PATH so `min` autospawns
-              # `minvmd` (which finds libkrun via @loader_path/../lib) and minvmd
-              # spawns the host `gvproxy`, all by bare name.
+              # `minvmd` (which finds libkrun via @loader_path/../lib) by bare
+              # name. gvproxy is NOT resolved from PATH — the e2e step below
+              # points MINVMD_GVPROXY_BIN at the laid-out binary.
               run: |
                   set -euo pipefail
                   DL="$RUNNER_TEMP/dl"
@@ -336,6 +344,7 @@ jobs:
                   MINVMD_ROOTFS_PATH: ${{ runner.temp }}/install/data/rootfs.img
                   MINVMD_INITRAMFS: ${{ runner.temp }}/install/data/initramfs.cpio
                   MINVMD_BOOT_LOG: ${{ runner.temp }}/cli-e2e-boot.log
+                  MINVMD_GVPROXY_BIN: ${{ runner.temp }}/install/bin/gvproxy
               run: E2E_VM=1 E2E_PROJECT_DIR=/tmp ./scripts/session-e2e.sh
             - name: Reap VM processes
               # Leave the shared mini clean for the next job (Guest teardown does
