@@ -373,7 +373,7 @@ steps involve real logic — building the guest for the right arch, wiring the
 is reviewed code, not a command list. This repo keeps that logic in the **justfile +
 `scripts/`** (the role the strategy assigns to `cargo xtask`):
 
-- `just up` / `just dm1` / `just dm3` — build the stack and boot the guest for the arch
+- `just up` / `just up-kvm` — build the stack and bring it up for the host (macOS and `up-kvm` boot the guest VM)
 - `scripts/session-e2e.sh` — the unified CLI session proof every target lane runs
 - `scripts/build-initramfs.sh` — the musl guest (minimald) initramfs build
 

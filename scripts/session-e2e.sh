@@ -3,10 +3,9 @@
 # path through the `min` CLI — which abstracts where the daemon lives —
 # so the IDENTICAL proof runs against all three deployment targets:
 #
-#   Linux native (DM2)   minimald on the host          (no extra env)
-#   Linux KVM    (DM3)   minimald in a minvmd microVM  E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd
-#   macOS HVF    (DM1)   minimald in a minvmd microVM  E2E_VM=1 (macOS is always VM-backed)
-# (DM numbers are the deployment models in docs/specs/03-spec-networking.)
+#   Linux native   minimald on the host          (no extra env)
+#   Linux KVM      minimald in a minvmd microVM  E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd
+#   macOS HVF      minimald in a minvmd microVM  E2E_VM=1 (macOS is always VM-backed)
 #
 # Two proofs, in order, on EVERY lane:
 #
@@ -132,7 +131,7 @@ fi
 # under $XDG_STATE_HOME/minimal/providers/local-0 on every platform.
 # XDG_CACHE_HOME is deliberately left alone so package pulls reuse the
 # host/CI cache across runs — which pins where the state dir may live on a
-# native (DM2) lane: minimald HARDLINKS built packages from the cache into
+# Linux-native lane: minimald HARDLINKS built packages from the cache into
 # each session rootfs under the state dir, and hardlinks cannot cross
 # filesystems ("Invalid cross-device link" at session spawn on hosts with a
 # tmpfs /tmp). So on Linux the workdir lives under $HOME (same device as the
