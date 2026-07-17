@@ -2,7 +2,7 @@
 id: spec-minvmd-host-daemon
 title: "minvmd macOS VM provider host daemon"
 kind: spec
-status: planned
+status: shipped
 supersedes:
 ---
 

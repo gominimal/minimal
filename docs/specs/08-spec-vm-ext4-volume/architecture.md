@@ -2,7 +2,7 @@
 id: arch-vm-ext4-volume
 title: Per-VM writable ext4 volume — architecture
 kind: architecture
-status: planned
+status: shipped
 tracking-issue: 583
 ---
 

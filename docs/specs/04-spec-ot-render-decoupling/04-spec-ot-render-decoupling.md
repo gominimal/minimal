@@ -2,7 +2,7 @@
 id: spec-ot-render-decoupling
 title: "ot render decoupling — separate operation state from indicatif, render per SSH channel"
 kind: spec
-status: planned
+status: shipped
 tracking-issue:
 supersedes:
 ---

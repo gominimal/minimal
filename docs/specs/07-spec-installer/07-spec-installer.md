@@ -2,7 +2,7 @@
 id: spec-installer
 title: "feat(installer): POSIX-sh curl|bash fallback installer"
 kind: spec
-status: planned
+status: shipped
 tracking-issue:
 supersedes:
 ---

@@ -2,7 +2,7 @@
 id: arch-minvmd-host-daemon
 title: "minvmd macOS VM provider host daemon — architecture"
 kind: architecture
-status: planned
+status: shipped
 ---
 
 # minvmd macOS VM provider host daemon — architecture

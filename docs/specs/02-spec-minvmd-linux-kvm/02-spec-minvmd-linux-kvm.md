@@ -2,7 +2,7 @@
 id: spec-minvmd-linux-kvm
 title: "minvmd Linux KVM backend"
 kind: spec
-status: planned
+status: shipped
 tracking-issue: 397
 supersedes:
 ---

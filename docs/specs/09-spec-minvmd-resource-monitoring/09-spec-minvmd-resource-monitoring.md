@@ -2,7 +2,7 @@
 id: spec-minvmd-resource-monitoring
 title: "minvmd resource monitoring, configuration, and warnings"
 kind: spec
-status: planned
+status: shipped
 tracking-issue: 747
 supersedes:
 ---

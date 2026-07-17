@@ -2,7 +2,7 @@
 id: arch-networking
 title: "minimald networking — PTask network modes, DNS, egress/ingress, WireGuard mesh — architecture"
 kind: architecture
-status: planned
+status: shipped
 tracking-issue: 478
 ---
 

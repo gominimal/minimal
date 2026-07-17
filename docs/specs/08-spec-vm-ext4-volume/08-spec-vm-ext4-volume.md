@@ -2,7 +2,7 @@
 id: spec-vm-ext4-volume
 title: "Per-VM writable ext4 volume: cache, staging, and sessions"
 kind: spec
-status: planned
+status: shipped
 tracking-issue: 583
 supersedes:
 ---
