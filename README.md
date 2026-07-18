@@ -1,4 +1,14 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/public/minimal-mark-light.svg">
+    <img src="docs/public/minimal-mark-dark.svg" alt="Minimal logo" width="120">
+  </picture>
+</p>
+
 # Minimal
+
+[![CI](https://github.com/gominimal/minimal/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gominimal/minimal/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 Minimal provides VM-based development sandboxes and a secure package manager for the dev tools used inside them.
 
