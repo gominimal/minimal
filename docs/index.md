@@ -22,9 +22,6 @@ features:
     details: Tasks from minimal.toml execute in clean-room sandboxes with only their declared dependencies.
 ---
 
-<!-- TODO(launch): the hero text and tagline above are placeholders; final
-     wording is a launch decision. -->
-
 ## Looking for user guides?
 
 This site is the engineering documentation for the

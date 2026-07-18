@@ -33,7 +33,7 @@ The CLI reference overview is [docs/reference/cli.md](docs/reference/cli.md).
 |---|---|
 | `args` | Types for the argument schema of tasks and sideload parameters. |
 | `async-dialog` | Interactive terminal prompts over any async reader/writer (no TTY required). |
-| `check` | `minimal check` linting of `minimal.toml`, packages, profiles, and stacks. |
+| `check` | `mip check` linting of `minimal.toml`, packages, profiles, and stacks. |
 | `checkouts` | Git checkouts of upstream layer repositories at pinned versions. |
 | `common` | Common types and utilities (e.g. `SpecHash`) used across the codebase. |
 | `decode` | Evaluates a Nickel config layer into in-memory packages/profiles/stacks. |

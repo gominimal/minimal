@@ -2,18 +2,16 @@
 
 ## Reporting a vulnerability
 
-<!-- TODO(launch): confirm reporting channel (advisories-only vs a security@ address) before open-sourcing -->
-Please report vulnerabilities through **GitHub private vulnerability
-reporting**: open the repository's **Security** tab and click
-**"Report a vulnerability"**. This creates a private advisory that only
-the maintainers can see.
+Please report vulnerabilities by email to **security@minimal.dev**. We
+will acknowledge the report and coordinate a fix and disclosure with you
+privately.
 
 Please do **not** report security issues via public GitHub issues,
 discussions, or pull requests — that discloses the problem to everyone
 before a fix exists.
 
 When reporting, include what you can of: the affected component and
-version (`min version` / `mip --version`), reproduction steps or a
+version (`min --version` / `mip --version`), reproduction steps or a
 proof of concept, and your assessment of the impact.
 
 ## Response expectations

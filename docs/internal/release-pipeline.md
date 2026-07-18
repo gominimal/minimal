@@ -59,8 +59,9 @@ override for green-but-unreported commits.
 `min`, and `minimald`, then:
 
 - uploads a legacy `minimalone-<sha>.tar.zst` bundle to
-  `gs://minimal-shim/archives/`;
-  <!-- TODO(launch): retire or document this legacy artifact -->
+  `gs://minimal-shim/archives/` — retained for backward compatibility with
+  the legacy `minimal-shim` archive path, pending retirement once installs
+  resolve through the versioned `minimal-one` layout (below);
 - creates the GitHub Release (tag `release-<sha>`, or the pushed `v*` tag; a
   suffixed tag becomes a prerelease) with all binaries, guest artifacts, and
   `completions.tar.gz`.
