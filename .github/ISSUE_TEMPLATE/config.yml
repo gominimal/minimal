@@ -4,5 +4,5 @@ contact_links:
     url: https://github.com/gominimal/minimal/discussions
     about: Ask questions and discuss ideas before filing an issue.
   - name: Documentation
-    url: https://minimal-docs-staging.pages.dev/
+    url: https://docs.minimal.dev/
     about: Reference documentation for minimal.

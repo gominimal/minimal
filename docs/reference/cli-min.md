@@ -53,7 +53,7 @@ the current directory).
 | `--network <MODE>` | | Network mode: `no-net`, `host-net` (default), or `own-ip` |
 | `--ingress <EXT:INT[/PROTO]>` | | Static ingress port mapping (`PROTO` = `tcp`\|`udp`, default `tcp`). Repeatable. Requires `--network own-ip` |
 | `--loadout <NAME>` | | Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`. Repeatable; if given, config-file `default_loadouts` are ignored |
-| `--no-loadouts` | | Apply no loadouts at all — overrides both `--loadout` and the config's `default_loadouts` |
+| `--no-loadouts` | | Apply no loadouts at all (also skips the config's `default_loadouts`). Conflicts with `--loadout` |
 | `--attach` | | Automatically attach after creation |
 
 ### `attach`

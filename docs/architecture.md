@@ -212,7 +212,7 @@ machines share build results:
 |---|---|---|
 | `args` | build | Types for the argument schema of tasks and sideload parameters. |
 | `async-dialog` | session | Interactive terminal prompts over any async reader/writer (no TTY required). |
-| `check` | build | `minimal check` linting of `minimal.toml`, packages, profiles, and stacks. |
+| `check` | build | `mip check` linting of `minimal.toml`, packages, profiles, and stacks. |
 | `checkouts` | build | Git repository checkout management for source operations (upstream layers at pinned versions). |
 | `common` | shared | Common types and utilities (e.g. `SpecHash`) used across the codebase. |
 | `decode` | build | Evaluates a Nickel config layer into in-memory packages/profiles/stacks. |

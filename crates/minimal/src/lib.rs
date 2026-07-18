@@ -75,7 +75,7 @@ pub enum Command {
     /// Examples:
     ///
     ///   # Forward host port 18080 to the webserver inside the "dev" session:
-    ///   minimal ssh-forward dev 18080:127.0.0.1:80
+    ///   min ssh-forward dev 18080:127.0.0.1:80
     ///
     ///   # Then access it from the host:
     ///   curl http://localhost:18080/
@@ -177,17 +177,17 @@ pub enum MeshCommand {
     ///
     /// Example:
     ///
-    ///   minimal mesh join mesh.example.com:51820
+    ///   min mesh join mesh.example.com:51820
     #[command(verbatim_doc_comment)]
     Join(MeshJoinArgs),
     /// Leave the WireGuard mesh and drop this machine's local enrolment
     ///
-    /// Removes the local enrolment record written by `minimal mesh join`.
+    /// Removes the local enrolment record written by `min mesh join`.
     /// Peer entries on the remote minimald must be removed there (manual v1).
     ///
     /// Example:
     ///
-    ///   minimal mesh leave
+    ///   min mesh leave
     #[command(verbatim_doc_comment)]
     Leave,
     /// Show this minimald's mesh status: public key, advertised subnets, peers
@@ -197,7 +197,7 @@ pub enum MeshCommand {
     ///
     /// Example:
     ///
-    ///   minimal mesh status
+    ///   min mesh status
     #[command(verbatim_doc_comment)]
     Status,
 }
@@ -266,8 +266,8 @@ pub struct ActivateArgs {
     /// `[loadouts].default_loadouts` in the client config are ignored.
     #[arg(long = "loadout", value_name = "NAME")]
     pub loadout: Vec<String>,
-    /// Apply no loadouts at all — overrides both `--loadout` and the
-    /// config's `default_loadouts`.
+    /// Apply no loadouts at all (also skips the config's
+    /// `default_loadouts`). Conflicts with `--loadout`.
     #[arg(long, conflicts_with = "loadout")]
     pub no_loadouts: bool,
     /// Automatically attach after creation
@@ -425,7 +425,7 @@ pub struct ProxyArgs {
     pub socket: Option<String>,
 }
 
-/// Arguments for `minimal ssh-forward`.
+/// Arguments for `min ssh-forward`.
 #[cfg(feature = "remote-access")]
 #[derive(Debug, Args)]
 pub struct SshForwardArgs {
@@ -439,7 +439,7 @@ pub struct SshForwardArgs {
     pub forward: String,
 }
 
-/// Arguments for `minimal login`.
+/// Arguments for `min login`.
 #[derive(Debug, Args)]
 pub struct LoginArgs {
     /// Override the directory where client cert files are written
@@ -747,7 +747,7 @@ fn format_memory(bytes: u64) -> String {
     }
 }
 
-/// Default policy hook for `minimal activate`: auto-approves any
+/// Default policy hook for `min activate`: auto-approves any
 /// item whose provenance is [`Source::Project`] or
 /// [`Source::Package`], and aborts on anything else.
 ///
@@ -760,7 +760,7 @@ fn format_memory(bytes: u64) -> String {
 /// don't recognize hits the safe path (`Abort`) rather than
 /// getting silently allowed.
 ///
-/// Once `minimal activate` grows a real `--policy` / `--allow`
+/// Once `min activate` grows a real `--policy` / `--allow`
 /// interface, this hook stays as the default when no explicit
 /// policy is provided.
 ///
@@ -926,7 +926,7 @@ fn offer_mfile_scaffold(
     if !std::io::stdin().is_terminal() || !confirm("Would you like to create one?", true)? {
         eprintln!(
             "Continuing without one; the session gets a default environment. \
-             Run 'minimal init' to give the project its own config."
+             Run 'min init' to give the project its own config."
         );
         return Ok(());
     }
@@ -1298,7 +1298,7 @@ pub fn cmd_mesh_join(global: &GlobalArgs, args: MeshJoinArgs) -> Result<(), anyh
     );
     println!();
     println!("v1 uses manual key exchange. To complete the join:");
-    println!("  1. Run `minimal mesh status` on the remote host to read its public key.");
+    println!("  1. Run `min mesh status` on the remote host to read its public key.");
     println!("  2. Add this machine's WireGuard public key to the remote minimald's peers.");
     println!("  3. Add the remote's public key and endpoint to this machine's mesh config.");
     Ok(())

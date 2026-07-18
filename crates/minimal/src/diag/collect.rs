@@ -28,7 +28,7 @@ pub struct DiagPaths {
     pub state: PathBuf,
     /// `<cache>/minimal`.
     pub cache: PathBuf,
-    /// Where `minimal mesh join` writes its enrolment file.
+    /// Where `min mesh join` writes its enrolment file.
     pub mesh_enrolment: PathBuf,
     /// The invoking directory (disk-full there breaks the bundle write).
     pub cwd: PathBuf,

@@ -104,7 +104,7 @@ mac-buildable (see the comments in `.github/workflows/ci-macos.yml`).
 
 ## justfile recipes
 
-32 recipes on Linux (`just --summary`; OS-specific recipes carry
+33 recipes on Linux (`just --summary`; OS-specific recipes carry
 `[linux]`/`[macos]` attributes, so macOS shows a smaller set plus
 `test-cross`). The justfile is the local twin of the frozen CI workflows —
 the CI YAML schedules, the logic lives here and in `scripts/`
@@ -123,6 +123,7 @@ CI-parity gates:
 - `test-ignored` — Linux: the locally-runnable `#[ignore]` tests that NO CI lane covers (the VM/netns harnesses self-skip here; `just test-vm` runs those for real).
 - `test-cross` — macOS: clippy + tests for the Linux-only crates via `cross` (musl in Docker; excludes `minvmd`). The first run compiles under emulation and can take an hour+.
 - `test-installer` — run the curl|sh installer's test harness under every available POSIX sh (+ shellcheck when present).
+- `docs-check` — build the VitePress docs site and run the link guards (`scripts/docs-check.sh`, the `docs-site` lane's logic); its own lane, deliberately NOT part of `just ci`.
 
 e2e & test harnesses (KVM on Linux, HVF on macOS):
 
@@ -219,7 +220,7 @@ rationale) and
 
 | Workflow | One line |
 |---|---|
-| `ci` | Repo-wide checks: rustfmt, clippy, cargo-deny, a dogfood build smoke (Minimal building itself, reading prebuilt packages via the R2 mirror canary), `minimal check`. |
+| `ci` | Repo-wide checks: rustfmt, clippy, cargo-deny, a dogfood build smoke (Minimal building itself, reading prebuilt packages via the R2 mirror canary), `mip check`. |
 | `ci-linux-native` | Linux-native target lane: workspace tests, root-integration harnesses, session e2e against a host-native `minimald` (no VM). |
 | `ci-linux-kvm` | Linux/KVM target lane (hosted x86_64): build-once/test-on-KVM split, minvmd VM harnesses, VM-backed session e2e. |
 | `ci-macos` | macOS/HVF target lane: hosted arm64 unit/clippy tier (`minvmd` + `sessions`) plus the hypervisor e2e on the self-hosted Apple Silicon runner. |
