@@ -21,7 +21,8 @@ sandboxes ([`mip run`](./cli-mip.md)), which have their own
 > **packages** and **vars** take effect inside the session today. **Patches**
 > and **lifecycle hooks** are parsed, validated, and composed into the
 > session's configuration, but the session launcher does not yet apply them
-> inside the sandbox. The schema below documents all four so files written
+> inside the sandbox — the daemon holds them with the session and logs each
+> one as deferred. The schema below documents all four so files written
 > now stay valid as the remaining plumbing lands.
 
 ## Where loadouts live
@@ -42,7 +43,8 @@ consistency with Minimal's state and cache dirs, not
 The filename stem **is** the loadout's identifier:
 
 - It must match the `name` field declared inside the file, or loading fails
-  with a descriptive error.
+  with a `NameMismatch` error naming both the file stem and the declared
+  `name`.
 - Names are trimmed and must be non-empty, with no `/`, `\`, or NUL
   characters.
 
@@ -120,6 +122,10 @@ contributors are deduplicated.
 packages = ["helix", "zellij"]
 ```
 
+Names are not checked at activation: an unknown package composes cleanly
+and fails later, when the session sandbox first spawns, with
+`no such package: <name>`.
+
 ### `[vars]` - Environment variables
 
 _Optional_
@@ -186,6 +192,10 @@ fans out into one patch per pattern, sharing the `dest`):
 - Glob patterns must have a literal directory prefix to walk from:
   `~/dotfiles/**/*.lua` is fine, a bare `**/*.pem` is rejected.
 - `..` components are rejected wherever they appear.
+- A source path that does not exist on the host is dropped with a warning
+  at activation rather than failing it, so opportunistically patching a
+  dotfile tree the host may not have is safe. Other enumeration failures
+  (permission denied, unreadable entries) still fail the composition.
 
 **`dest`** is interpreted relative to the sandbox user's home directory; a
 leading `~/` refers to that same home. Absolute paths and `..` components
@@ -250,6 +260,12 @@ Loadouts are resolved and composed **before** the CLI contacts the daemon:
 a missing or malformed loadout file fails the activation loudly on the
 client rather than producing a silently-empty session. When loadouts are
 applied, the CLI prints `Applying loadouts: <names>` to stderr.
+
+Activation is also when loadout contents are captured: the files are read
+once, inherited vars are resolved against the host environment, and the
+composed result is what the session runs with. Editing a loadout file
+does not change sessions that already exist — destroy and re-activate to
+pick up the edit.
 
 ## Client config {#client-config}
 
@@ -317,3 +333,35 @@ automatically pass the `allow` check, but the policy's `deny` and `ignore`
 rules still apply — a loadout patch matching a `deny` pattern fails the
 composition on the client, before the daemon is involved. A missing policy
 file means an empty policy; a fresh install activates fine without it.
+
+## Vars in the attach shell
+
+The interactive shell minted by [`min attach`](./cli-min.md#attach) is
+`bash --noprofile -l` — a login shell that sources **no** startup files
+(not `/etc/profile`, `~/.bash_profile`, or `~/.bashrc`), so rc-file
+patches cannot influence it. Interactive setup travels through the
+environment instead, i.e. through `[vars]`:
+
+- **Prompt** — the session launcher seeds a baseline environment
+  (currently a stock `PS1`) before merging in the composed vars, and a
+  composed var overwrites a baseline entry with the same name. Setting
+  `PS1` in `[vars]` therefore replaces the stock prompt. This baseline is
+  a layer *beneath* composition, not a contributor: the no-override
+  conflict rule above arbitrates between contributors and does not apply
+  to the launcher's defaults.
+- **Banner / MOTD** — bash evaluates `PROMPT_COMMAND` from the
+  environment before the first interactive prompt, so a once-only banner
+  can ship as a payload var plus a self-unsetting trigger:
+
+  ```toml
+  [vars]
+  PROMPT_COMMAND = 'eval "$MINIMAL_MOTD"; unset PROMPT_COMMAND MINIMAL_MOTD'
+  MINIMAL_MOTD   = '''
+  [ -t 1 ] && printf '%s\n' '' '  Welcome to the dev session.' ''
+  '''
+  ```
+
+  The trigger unsets both variables, so the banner prints exactly once
+  and never runs for non-interactive commands; the `[ -t 1 ]` guard keeps
+  redirected output clean. Multi-line literal values survive composition
+  intact.
