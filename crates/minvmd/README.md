@@ -28,18 +28,14 @@ Prereqs:
     before building minvmd;
   - `brew install slp/krun/libkrun` (third-party tap) — the local-dev fallback:
     with `LIBKRUN_PREFIX` unset, minvmd's build.rs defaults to `/opt/homebrew/lib`.
-- The `minimal` shim on `PATH` (`~/.minimal/shim/bin/minimal`). On macOS,
-  `materialize` runs `minimal` inside a Linux VM; a from-source macOS build
-  cannot run the build pipeline (sandbox2 is Linux-only).
 
 ```sh
-# 1. Materialize the kernel + GENERIC guest rootfs INTO THE REPO.
-#    macOS caveat: the shim runs minimal in a VM and only syncs the project dir
-#    back to the host, so --output MUST be a path under the repo. A /tmp path is
-#    written inside the VM and never appears on the host.
+# 1. Fetch the prebuilt kernel + GENERIC guest rootfs into the repo: a direct
+#    content-addressed fetch from the public artifact cache — no toolchain, no
+#    shim, no graph evaluation (`just artifacts` wraps the same two calls).
 mkdir -p .scratch
-minimal materialize --output .scratch/vmlinuz    --arch aarch64 virtio-kernel
-minimal materialize --output .scratch/rootfs.img --arch aarch64 minvmd-rootfs
+scripts/fetch-prebuilt.sh kernel .scratch/vmlinuz    aarch64
+scripts/fetch-prebuilt.sh rootfs .scratch/rootfs.img aarch64
 
 # 2. Build the guest initramfs (cross-compiles minimald → static aarch64, cpio).
 scripts/build-initramfs.sh .scratch/initramfs.cpio
