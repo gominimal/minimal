@@ -217,6 +217,11 @@ test-installer:
         SH="$sh" "$sh" scripts/install_test.sh
     done
 
+# Build the VitePress site + run the link guards. CI: docs-site.yml (its own
+# lane — deliberately NOT part of `just ci`). lychee is skipped if not installed.
+docs-check: (_need "npm" "install Node >= 22 (nodejs.org or your package manager)")
+    scripts/docs-check.sh all
+
 # ── VM & e2e surfaces ────────────────────────────────────────────────────────
 
 # VM recipes need writable /dev/kvm on Linux; no-op on macOS (HVF).

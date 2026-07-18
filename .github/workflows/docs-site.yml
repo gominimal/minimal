@@ -1,12 +1,17 @@
 name: docs-site
 
-# Docs-site lane: builds the VitePress site from docs/ (`npm run docs:build`),
+# Docs-site lane. A THIN SCHEDULER: the build + link-check LOGIC lives in
+# scripts/docs-check.sh (and the `just docs-check` recipe), per the CI contract
+# in CONTRIBUTING.md / docs/ci-strategy.md — this workflow only gates events,
+# installs the toolchain (Node, lychee), invokes the script, and uploads the
+# rendered site. The script builds the VitePress site (`npm run docs:build`),
 # fails on site-absolute links under docs/reference/ (those pages are mirrored
 # into gominimal/webapp, where `](/...` resolves against a different base, and
-# they are equally broken when read on GitHub), offline-checks internal links
-# with lychee, and uploads the rendered site (docs/.vitepress/dist) as an
-# artifact. A weekly scheduled job runs an ONLINE lychee sweep (advisory
-# only); a Pages deploy job is fully drafted but disabled until launch.
+# they are equally broken when read on GitHub), and offline-checks internal
+# links with lychee. This workflow uploads the rendered site
+# (docs/.vitepress/dist) as an artifact; a weekly scheduled job runs the
+# script's ONLINE lychee sweep (advisory only); a Pages deploy job is fully
+# drafted but disabled until launch.
 #
 # NOT a required check yet. Making `docs-site-success` required is a
 # branch-protection change (main ruleset edit) AND touches release.yml's
@@ -84,8 +89,6 @@ jobs:
         with:
           node-version-file: .nvmrc
           cache: npm
-      - name: Install site dependencies
-        run: npm ci
       # TODO: enable once the gen-cli-docs xtask exists — it regenerates the
       # docs/reference/cli-*.md pages from the clap definitions and fails on
       # any diff, so the committed pages can never drift from --help output.
@@ -94,25 +97,16 @@ jobs:
       # - name: CLI reference pages are current
       #   run: cargo xtask gen-cli-docs --check
       - name: Build site
-        run: npm run docs:build
-      - name: Forbid site-absolute links under docs/reference
-        # A `](/...)` link resolves against whatever base the page happens to
-        # be served under — wrong on the mirrored webapp copy and dead when
-        # the page is read in-repo on GitHub. Relative links work everywhere.
-        run: |
-          if grep -rnF '](/' docs/reference/ --include='*.md'; then
-            echo "::error::site-absolute links ('](/') found under docs/reference/ — use relative links"
-            exit 1
-          fi
+        # npm ci + `npm run docs:build`; the logic is repo-owned in the script.
+        run: ./scripts/docs-check.sh build
+      # Tool install is a scheduler concern (kept in the workflow); the offline
+      # link-check LOGIC lives in the script the next step calls.
       - name: Install lychee
         uses: taiki-e/install-action@v2
         with:
           tool: lychee
-      - name: Offline link check (internal links)
-        # --offline verifies file-to-file links and #fragments only; external
-        # URLs are skipped (the weekly link-sweep job covers those, without
-        # letting third-party outages break PRs).
-        run: lychee --offline --no-progress --include-fragments 'docs/**/*.md' '*.md'
+      - name: Check links (site-absolute guard + offline lychee)
+        run: ./scripts/docs-check.sh links
       - name: Upload rendered site
         uses: actions/upload-artifact@v7
         with:
@@ -137,7 +131,7 @@ jobs:
         with:
           tool: lychee
       - name: Online link check
-        run: lychee --no-progress 'docs/**/*.md' '*.md'
+        run: ./scripts/docs-check.sh online-links
 
   docs-deploy:
     needs: [docs-build]
