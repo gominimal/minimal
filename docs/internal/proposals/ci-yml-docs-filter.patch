@@ -6,8 +6,8 @@ What it does: extends the `code` negation filter in ci.yml's `changes` job
 so the docs-site toolchain files (package.json, package-lock.json, .nvmrc)
 and the attribution file (NOTICE) no longer count as "code" — a PR touching
 only those paths skips the Rust lanes and is gated by the docs-site lane
-instead — and widens `!LICENSE` to `!LICENSE*` to cover the LICENSE-MIT /
-LICENSE-APACHE split.
+instead — and widens `!LICENSE` to `!LICENSE*` so any future license-file
+variants are covered too.
 
 Apply from the repo root (verify first):
 

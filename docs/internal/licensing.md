@@ -7,13 +7,14 @@ description: Internal record of the project's license posture, LGPL exceptions, 
 
 # Licensing stance
 
-Minimal is dual-licensed under MIT OR Apache-2.0 (declared once in the
-workspace `Cargo.toml` and inherited by every crate via
-`license.workspace = true`). License texts live at the repo root
-(`LICENSE-MIT`, `LICENSE-APACHE`); redistribution attributions live in
-`NOTICE`. Dependency license policy is enforced by `cargo deny` against
-`deny.toml`, which points back at this document for the exceptions
-explained below.
+Minimal is licensed under Apache-2.0 (declared once in the workspace
+`Cargo.toml` and inherited by every crate via
+`license.workspace = true`). The license text lives at the repo root
+(`LICENSE`); redistribution attributions live in `NOTICE`. Inbound
+contributions are governed by the Contributor License Agreement (see
+`CONTRIBUTING.md` and `legal/`). Dependency license policy is enforced
+by `cargo deny` against `deny.toml`, which points back at this document
+for the exceptions explained below.
 
 ## LGPL exceptions in deny.toml
 
@@ -65,6 +66,3 @@ Apache-2.0 components, pinned in `vendor/`:
 
 Apache-2.0 redistribution requires retaining the license and notices;
 both are attributed in the root `NOTICE` file.
-
-<!-- TODO(launch): the copyright-holder wording in LICENSE-MIT
-("Copyright (c) 2026 The Minimal Authors") needs legal sign-off. -->
