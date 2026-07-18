@@ -10,7 +10,7 @@ description: Reference for the min session CLI — create, attach to, and manage
 development sessions. If the daemon is not running, `min` starts it
 automatically.
 
-Generated from `--help` at `d9f20165`.
+Generated from `--help` at `60e19f60`.
 
 ## Global flags
 
@@ -33,7 +33,9 @@ min ls [--raw] [--json]
 
 Lists sessions. `--raw` prints raw session IDs one per line for piping
 into scripts; `--json` prints the full session list as pretty-printed
-JSON.
+JSON. When the daemon reports a shared resource pool, the table is headed
+by a `RESOURCE POOL:` line (CPU cores, memory, and the number of sessions
+sharing them); `--raw` omits it.
 
 ### `activate`
 
@@ -107,6 +109,31 @@ min dirs
 ```
 
 Prints important directories and file paths for debugging.
+
+### `bug`
+
+```
+min bug [-o <OUTPUT>]
+```
+
+Collects a diagnostic bundle (logs, state, config) to send to the minimal
+dev team. Writes `minimal-diag-<timestamp>.tar.zst` to the current
+directory; `-o/--output` overrides the path. The archive contains host
+system facts, log tails, redacted config, and state listings, plus a
+`manifest.json` recording any collector that failed or timed out — a
+broken install still yields a valid archive that explains what is
+missing.
+
+Diagnosing a wedged system must not change it: `bug` mutates no state and
+never starts a daemon; it works even when none is running.
+
+Secret-shaped values (env vars, tokens) are redacted before they enter
+the archive: only a small allowlist of env names (`RUST_LOG`, `HOME`,
+`SHELL`, `TERM`, `PATH`, and the `XDG_*` / `MINIMAL_*` / `MINVMD_*` /
+`MINIMALD_*` prefixes) has values captured verbatim — a sensitive-shaped
+name always loses to the allowlist — and every other env var is reported
+by name only. Session and project file contents are never included, only
+name/size listings. Review the archive before sharing.
 
 ### `login`
 
