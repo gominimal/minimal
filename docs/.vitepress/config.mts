@@ -68,7 +68,7 @@ export default withMermaid({
           { text: "minimal.toml", link: "/reference/minimal-dot-toml" },
           { text: "Tasks", link: "/reference/tasks" },
           { text: "Build specs", link: "/reference/build-specs" },
-          { text: "Harness specs", link: "/reference/harness-specs" },
+          { text: "Stack specs", link: "/reference/stack-specs" },
           { text: "Sandbox operations", link: "/reference/sandbox-operations" },
           { text: "Linux host setup", link: "/reference/linux-host-setup" },
           {

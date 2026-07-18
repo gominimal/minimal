@@ -6,7 +6,7 @@
     "minimal-dot-toml.md",
     "tasks.md",
     "build-specs.md",
-    "harness-specs.md",
+    "stack-specs.md",
     "sandbox-operations.md",
     "linux-host-setup.md"
   ]

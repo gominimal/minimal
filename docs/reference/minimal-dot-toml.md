@@ -49,7 +49,7 @@ exec = "bash -l"
 
 ### `[upstream]` - Where software comes from {#upstream}
 
-The `[upstream]` section defines the precise source of packages, harnesses, and profiles. This represents the
+The `[upstream]` section defines the precise source of packages, stacks, and profiles. This represents the
 preceding link in the [software supply chain](https://docs.minimal.dev/concepts/software-supply-chain).
 
 ```toml
@@ -66,7 +66,7 @@ place — expect a diff on these fields after running it.
 
 #### `[[upstream.sideload]]` - Additional software sideloaded into your supply chain {#sideload}
 
-Sideload entries let you load in additional packages, harnesses, and profiles from a separate repository, but those packages
+Sideload entries let you load in additional packages, stacks, and profiles from a separate repository, but those packages
 are built using the version of packages from your upstream.
 
 Each sideload entry is loaded in order from the specified repository, and follows the same schema as `[upstream]`:
@@ -78,24 +78,25 @@ branch = "<branch>"
 locked_commit = "<commit hash>" # Updated via `mip update`
 ```
 
-Sideload repositories have the same layout as an upstream: that is having a `minimal.toml` file, and `packages/` / `harnesses/` / `profiles/`
+Sideload repositories have the same layout as an upstream: that is having a `minimal.toml` file, and `packages/` / `stacks/` / `profiles/`
 directories as needed.
 
 ### `[stack]` - How to build code in your repo {#harness}
 
 ```toml
 [stack]
-use = "<harness name>"
+use = "<stack name>"
 build_packages = ["<additional build package>"]     # optional
 runtime_packages = ["<additional runtime package>"] # optional
 ```
 
-The `[stack]` section configures the [harness](https://docs.minimal.dev/concepts/harnesses) to use for building code, if any.
+The `[stack]` section configures the [stack](https://docs.minimal.dev/concepts/harnesses) to use for building code, if any.
+See [stack specs](./stack-specs.md) for how stacks themselves are defined.
 
 `[harness]` is accepted as a deprecated alias for `[stack]`, pending removal after
 July 2026; prefer `[stack]` in new configs.
 
-The environment variables and packages configured on a harness are inherited on all tasks in this repository.
+The environment variables and packages configured on a stack are inherited on all tasks in this repository.
 
 `build_packages` and `runtime_packages` are optional fields that allow you to declare
 additional package dependencies for build time or run time respectively.

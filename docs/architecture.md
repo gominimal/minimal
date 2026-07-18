@@ -77,7 +77,7 @@ Notable crates:
 9. **orchestrator**: Layer that owns runtime orchestration of package builds.
 10. **sandbox2**: Sandboxed build/task execution API using Linux namespaces.
 11. **check**: Lints Minimal configuration — `minimal.toml`, packages,
-    profiles, and harnesses.
+    profiles, and stacks.
 12. **mip**: The package/build CLI entry-point.
 
 ### Overall operation
@@ -212,7 +212,7 @@ machines share build results:
 |---|---|---|
 | `args` | build | Types for the argument schema of tasks and sideload parameters. |
 | `async-dialog` | session | Interactive terminal prompts over any async reader/writer (no TTY required). |
-| `check` | build | `minimal check` linting of `minimal.toml`, packages, profiles, and harnesses. |
+| `check` | build | `minimal check` linting of `minimal.toml`, packages, profiles, and stacks. |
 | `checkouts` | build | Git repository checkout management for source operations (upstream layers at pinned versions). |
 | `common` | shared | Common types and utilities (e.g. `SpecHash`) used across the codebase. |
 | `decode` | build | Evaluates a Nickel config layer into in-memory packages/profiles/stacks. |
