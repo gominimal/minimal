@@ -67,6 +67,7 @@ export default withMermaid({
           { text: "min", link: "/reference/cli-min" },
           { text: "minimal.toml", link: "/reference/minimal-dot-toml" },
           { text: "Tasks", link: "/reference/tasks" },
+          { text: "Loadouts", link: "/reference/loadouts" },
           { text: "Build specs", link: "/reference/build-specs" },
           { text: "Stack specs", link: "/reference/stack-specs" },
           { text: "Sandbox operations", link: "/reference/sandbox-operations" },
