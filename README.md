@@ -79,7 +79,11 @@ cd ~/projects/foo
 
 # create and update a minimal.toml file
 min init
-min add --session git gh claude-code
+cat >> minimal.toml <<'EOF'
+
+[session]
+packages = ["git", "gh", "claude-code"]
+EOF
 
 # start and enter a sandbox, which copies up the CWD file tree into the sandbox
 min activate --attach .
@@ -87,7 +91,7 @@ min activate --attach .
 git init
 
 # develop specs, generate & test code, push to git, etc.
-# agents can add tools from the Minimal Public Registry dynamically with "min add"
+# agents can add build/runtime dependencies from the Minimal Public Registry with "min add"
 claude
 
 exit
@@ -103,7 +107,11 @@ cd ~/projects/foo
 
 # create and update a minimal.toml file
 min init
-min add --session git gh claude-code mermaid-cli kittyview less emacs
+cat >> minimal.toml <<'EOF'
+
+[session]
+packages = ["git", "gh", "claude-code", "mermaid-cli", "kittyview", "less", "emacs"]
+EOF
 
 # copy the GitHub PAT to your clipboard from your macOS keychain
 security find-generic-password -w -s "PAT-foo-repo" -a "my-mac-user-name" | pbcopy
@@ -151,7 +159,28 @@ exit
 
 ### Add a Minimal Loadout with your preferred tools and configurations
 
-TBD
+The project's `minimal.toml` describes what every contributor's session
+needs; a **loadout** carries what *you* want on top — your editor, terminal
+multiplexer, shell config, and dotfiles. Loadouts are single TOML files under
+`~/.config/minimal/loadouts/`:
+
+```toml
+# ~/.config/minimal/loadouts/dev.toml
+name        = "dev"
+description = "helix + zellij with my dotfiles"
+packages    = ["helix", "zellij"]
+
+[vars]
+EDITOR = "hx"
+TERM   = { inherit = true, default = "xterm-256color" }
+```
+
+Apply one with `min activate --loadout dev --attach .`, or list it in
+`default_loadouts` in `~/.config/minimal/config.toml` to have it join every
+session automatically. `min loadout list` shows what's available. The full
+schema — file patches, lifecycle hooks, environment-variable inheritance,
+composition rules — is in the
+[loadouts reference](docs/reference/loadouts.md).
 
 ## Tech Stack
 
@@ -180,6 +209,11 @@ cargo test             # run the test suite
 Binaries land at `target/debug/{min,mip,minimald,minvmd}` (or
 `target/release/`). Building the entire package registry is heavy — 8 cores
 and at least 16 GB of RAM are recommended.
+
+On macOS the full workspace does not build yet (`minimald`'s sandbox stack is
+Linux-only): build the session stack with `cargo build -p minimal -p minvmd`
+and see [AGENTS.md](AGENTS.md#platform-matrix) for the supported test scope
+per platform.
 
 ### Ubuntu 24.04+ hosts
 
