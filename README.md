@@ -5,43 +5,42 @@
   </picture>
 </p>
 
-# Minimal
+<h1 align="center">Minimal</h1>
+
+<p align="center"><strong>Dev Environments, Contained</strong><br>Isolated, reproducible development sandboxes and a secure package manager that give your whole team identical environments — while keeping AI agents off the laptop.</p>
+
+<p align="center">
+  <a href="https://minimal-docs-staging.pages.dev/">Documentation</a> ·
+  <a href="#getting-started">Getting Started</a> ·
+  <a href="docs/reference/loadouts.md">Loadouts</a> ·
+  <a href="docs/architecture.md">Architecture</a> ·
+  <a href="https://github.com/gominimal/minimal/discussions">Discussions</a>
+</p>
+
+<p align="center">
 
 [![CI](https://github.com/gominimal/minimal/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gominimal/minimal/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-staging-blue)](https://minimal-docs-staging.pages.dev/)
+[![Built with Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](https://www.rust-lang.org/)
 
-**Documentation:** <https://minimal-docs-staging.pages.dev/>
+</p>
 
-Minimal provides VM-based development sandboxes and a secure package manager for the dev tools used inside them.
+---
 
-New here? Welcome! [Installation](#installation) and [Getting Started](#getting-started) will have you working in a sandbox in a few minutes, and we'd love to hear how it goes — questions and ideas are always welcome in [Discussions](https://github.com/gominimal/minimal/discussions).
+## What is Minimal?
 
-## Contents
+Minimal is a declarative, content-addressed build system and development-environment manager. It repeatably builds Linux, terminal-based development sandboxes — each populated with exactly the toolsets and agents a project needs, all declared in a single `minimal.toml` blueprint. A sandbox runs natively on Linux via unprivileged user namespaces and inside a lightweight libkrun microVM on macOS, so the same environment travels across your team's machines. Commit that blueprint to your repository and every teammate gets an identical environment — one that keeps AI agents sealed inside the sandbox and off the host laptop.
 
-- [Features](#features)
-- [Supported Platforms](#supported-platforms)
-- [Installation](#installation)
-- [Getting Started](#getting-started)
-  - [Create a new project with Minimal](#create-a-new-project-with-minimal)
-  - [Work on an existing project in a Minimal sandbox](#work-on-an-existing-project-in-a-minimal-sandbox)
-  - [Add a Minimal Loadout with your preferred tools and configurations](#add-a-minimal-loadout-with-your-preferred-tools-and-configurations)
-- [Tech Stack](#tech-stack)
-- [Documentation](#documentation)
-- [Building and Testing](#building-and-testing)
-- [Contributing](#contributing)
-  - [Contributor License Agreement](#contributor-license-agreement)
-- [Code of Conduct](#code-of-conduct)
-- [Security](#security)
-- [License](#license)
+The executables inside a sandbox — git, claude-code, compilers, shells, and more — are delivered by Minimal's secure package manager from a curated registry that is refreshed daily. Because packages are addressed by content rather than mutable version tags and builds are hermetic, the same blueprint resolves to the same environment on every machine. Moving the whole team to the freshest tool versions is one `min update`, which re-pins the blueprint in place. No more stale setup wikis, no more version drift.
 
-## Features
+Per-developer Loadouts then layer each person's own editors, terminal multiplexers, and configs on top of that shared toolchain, so the environment stays identical for everyone while you keep the muscle memory you have earned.
 
-Minimal repeatably creates Linux, terminal-based development sandboxes populated with exactly the toolsets and agents you need, as specified in your `minimal.toml` blueprint.
+> Full documentation lives at [minimal-docs-staging.pages.dev](https://minimal-docs-staging.pages.dev/).
 
-The tool executables (compilers, agents, shells, etc.) available in these sandboxes come from Minimal's [curated package registry](https://github.com/gominimal/pkgs/), which is refreshed daily. Simply add a `minimal.toml` to your project's git repo and all your teammates will have identical development environments that isolate AI agents from their laptops. Updating the shared `minimal.toml` to reference the freshest tool versions is just a `min update` away. No more outdated wiki pages for dev-env setup, and no more version drift across your team.
-
-Per-developer [Loadouts](#add-a-minimal-loadout-with-your-preferred-tools-and-configurations) can be included in each development environment, so everyone can work efficiently using the editors, terminal multiplexers, and configs that match their hard-earned muscle memory.
+<p align="center">
+  <img src="docs/public/loadout-demo.gif" alt="Activating the minimal dev loadout: packages, EDITOR=vim, a themed prompt, and a once-only MOTD banner" width="720">
+</p>
 
 ## Supported Platforms
 
