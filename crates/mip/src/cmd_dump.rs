@@ -3,7 +3,7 @@ use std::{fmt::Display, io::stdout};
 use common::Target;
 use common::fuzzy_search::fuzzy_match;
 use common::target::{Arch, OS};
-use decode::AttrValue;
+use decode::{AttrValue, Stack};
 use graph::{BuildDep, BuildOutput, BuildSpec, BuildSpecRef, Graph, RuntimeDep, SourceInput};
 use mctx::{Cache, Context, Error};
 use nickel_lang_core::term::IndexMap;
@@ -91,6 +91,9 @@ pub enum PkgRef {
         outputs: Vec<String>,
     },
     Source(SourceInput),
+    HostPath {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,10 +162,45 @@ pub async fn cmd_dump(args: DumpArgs, ctx: &mut Context) -> Result<(), Error> {
         } => {
             serde_json::to_writer_pretty(&w, &out_packages).unwrap();
         }
-        _ => todo!("output not implemented: {:?}", args.kind),
+        DumpKind {
+            packages: false,
+            stacks: true,
+        } => {
+            let out_stacks = select_stacks(
+                graph.iter_stacks().map(|(_, stack)| stack),
+                args.name.as_deref(),
+                args.exact,
+            );
+            serde_json::to_writer_pretty(&w, &out_stacks).unwrap();
+        }
+        // The `DumpKind` clap group is `required = true, multiple = false`,
+        // so exactly one of `--packages`/`--stacks` is ever set.
+        DumpKind { packages, stacks } => unreachable!(
+            "dump requires exactly one of --packages/--stacks (packages={packages}, stacks={stacks})"
+        ),
     }
 
     Ok(())
+}
+
+/// Selects the stacks to dump: keeps those matching the optional `--name`
+/// query (fuzzy unless `--exact`) and returns them sorted by name. Stacks are
+/// stored in a `HashMap`, so sorting keeps the dump output stable across runs
+/// — consumers regenerate the CLI reference from it.
+fn select_stacks<'a>(
+    stacks: impl Iterator<Item = &'a Stack>,
+    name: Option<&str>,
+    exact: bool,
+) -> Vec<&'a Stack> {
+    let mut selected: Vec<&Stack> = stacks
+        .filter(|stack| match name {
+            None => true,
+            Some(filter) if exact => stack.name.as_str() == filter,
+            Some(filter) => fuzzy_match(filter, &stack.name).is_some(),
+        })
+        .collect();
+    selected.sort_by(|a, b| a.name.cmp(&b.name));
+    selected
 }
 
 fn build_pkg_info(
@@ -228,7 +266,9 @@ fn pkg_ref_from_input(g: &Graph, i: &BuildDep, _c: &Cache) -> Result<PkgRef, Err
             outputs: s.outputs.iter().cloned().collect(),
         }),
         BuildDep::Source(s) => Ok(PkgRef::Source(s.clone())),
-        _ => todo!("bsi variant {:?}", i),
+        BuildDep::HostPath(path) => Ok(PkgRef::HostPath {
+            path: path.to_string_lossy().into_owned(),
+        }),
     }
 }
 
@@ -251,6 +291,61 @@ fn resolve_target(arch: Option<&str>) -> Result<Target, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use graph::Graph;
+    use std::path::PathBuf;
+
+    fn stack_named(name: &str) -> Stack {
+        Stack {
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn select_stacks_sorts_by_name() {
+        let stacks = [stack_named("beta"), stack_named("alpha")];
+        let selected = select_stacks(stacks.iter(), None, false);
+        let names: Vec<&str> = selected.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn select_stacks_honours_exact_and_fuzzy_name_filter() {
+        let stacks = [stack_named("alpha"), stack_named("beta")];
+
+        let exact = select_stacks(stacks.iter(), Some("alpha"), true);
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].name, "alpha");
+
+        // A substring that is only a subsequence of "alpha".
+        let fuzzy = select_stacks(stacks.iter(), Some("alph"), false);
+        assert_eq!(fuzzy.len(), 1);
+        assert_eq!(fuzzy[0].name, "alpha");
+
+        // Exact match requires the whole name, so a partial misses.
+        let missed = select_stacks(stacks.iter(), Some("alph"), true);
+        assert!(missed.is_empty());
+    }
+
+    #[test]
+    fn pkg_ref_from_host_path_input_maps_the_path() {
+        // Regression: a `HostPath` build dep used to fall through to a
+        // `todo!()` and panic when dumping. Neither the graph nor the cache
+        // is consulted for this variant, so an empty graph and a throwaway
+        // cache dir suffice.
+        let graph = Graph::new();
+        let dir = std::env::temp_dir().join(format!("mip-dump-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Cache::at_dir(&dir).unwrap();
+
+        let dep = BuildDep::HostPath(PathBuf::from("/bin/bash"));
+        let pkg_ref = pkg_ref_from_input(&graph, &dep, &cache).unwrap();
+
+        assert!(
+            matches!(pkg_ref, PkgRef::HostPath { path } if path == "/bin/bash"),
+            "HostPath build dep should map to PkgRef::HostPath",
+        );
+    }
 
     #[test]
     fn resolve_target_defaults_to_host_when_arg_missing() {
