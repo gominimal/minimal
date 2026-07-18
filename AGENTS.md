@@ -92,59 +92,77 @@ mac-buildable (see the comments in `.github/workflows/ci-macos.yml`).
   protoc is too old.
 - **Linux build deps** (per [README.md](README.md)):
   `build-essential openssl pkg-config libssl-dev git protobuf-compiler`.
-- **VM bring-up on Linux** (`just dm3`): a KVM host with durable `kvm` group
-  membership, plus `jq` and `cpio`; `cross` (Docker) when no native musl
-  toolchain is present (`scripts/build-initramfs.sh` auto-detects).
+- **VM bring-up on Linux** (`just up-kvm`, `just test-vm`, `just e2e`): a KVM
+  host with durable `kvm` group membership, plus `jq` and `cpio`; `cross`
+  (Docker) when no native musl toolchain is present
+  (`scripts/build-initramfs.sh` auto-detects).
 - **macOS**: Xcode CLT (`codesign`, `otool`, `install_name_tool`); libkrun via
-  Homebrew (`brew install slp/krun/libkrun`) for `just dm1`.
+  Homebrew (`brew install slp/krun/libkrun`) for the VM recipes (`just up`,
+  `just test-vm`, `just e2e`).
 - **Docs site**: Node >= 22; `npm ci`, then `npm run docs:build` (VitePress
   over `docs/`).
 
 ## justfile recipes
 
-19 recipes (`just --summary`). `.scratch/` is a shared scratchpad; recipes
-manage only their own artifacts there (which is why `clean` is scoped —
-never `rm -rf .scratch` wholesale).
+32 recipes on Linux (`just --summary`; OS-specific recipes carry
+`[linux]`/`[macos]` attributes, so macOS shows a smaller set plus
+`test-cross`). The justfile is the local twin of the frozen CI workflows —
+the CI YAML schedules, the logic lives here and in `scripts/`
+(docs/ci-strategy.md §8). `.scratch/` is a shared scratchpad; recipes manage
+only their own artifacts there (which is why `clean` is scoped — never
+`rm -rf .scratch` wholesale).
+
+CI-parity gates:
+
+- `ci` — the local PR gate set, cheapest first: `fmt-check clippy deny test doctest` (+ `test-ignored` on Linux). The canonical pre-PR command per [CONTRIBUTING.md](CONTRIBUTING.md#building-and-testing).
+- `fmt` / `fmt-check` — apply rustfmt across the workspace / the CI check variant (the fixer for a red `fmt-check` is `fmt`).
+- `clippy` — `cargo clippy --all-targets -- -D warnings` (workspace on Linux; the darwin-capable `-p minvmd -p sessions` scope on macOS).
+- `deny` — `cargo deny --all-features check` (advisories/bans/licenses/sources); a local advisories failure may just mean newer RUSTSEC data than CI's last run.
+- `test` — unit + in-process integration tests via nextest (CI profile on Linux; workspace on Linux, darwin scope on macOS).
+- `doctest` — doctests (`cargo test --doc`); nextest can't run them, so they are their own surface.
+- `test-ignored` — Linux: the locally-runnable `#[ignore]` tests that NO CI lane covers (the VM/netns harnesses self-skip here; `just test-vm` runs those for real).
+- `test-cross` — macOS: clippy + tests for the Linux-only crates via `cross` (musl in Docker; excludes `minvmd`). The first run compiles under emulation and can take an hour+.
+- `test-installer` — run the curl|sh installer's test harness under every available POSIX sh (+ shellcheck when present).
+
+e2e & test harnesses (KVM on Linux, HVF on macOS):
+
+- `e2e` — the unified session e2e (`scripts/session-e2e.sh`) against the VM-backed daemon.
+- `e2e-native` — Linux: the SAME session e2e against a host-native `minimald`, no VM.
+- `test-vm` — `minvmd`'s VM harnesses (`tests/*_integration.rs`); on macOS this uses CI's archive pattern with the codesign as the last binary touch.
+- `test-root-integration` — Linux: `minimald`'s netns/tap proofs (the tests sudo their own netns commands); refuses to run where AppArmor restricts unprivileged userns.
+- `test-lifecycle` — daemon lifecycle proof (`run --detach` → Running → `stop` → Stopped), booted switchless like CI's step.
+- `soak n=10` — nightly soak parity: N session-e2e reps; reaps between iterations, which WILL kill this checkout's live dev stack each pass.
+
+Stack bring-up & daemon lifecycle (`just up` = this host's default run mode):
+
+- `up` — macOS: Linux VM over Hypervisor.framework. Linux: host-native `minimald`, no VM, under `.scratch/native-state` (reach it via `min --minimal-dir`). Both end with a `min ls` smoke.
+- `up-kvm` — Linux: native host + one Linux VM over KVM; `minvmd` binds the CLI socket directly.
+- `down` — stop what `just up` started (macOS: delegates to `stop`; Linux: the pidfile-verified native `minimald`).
+- `status` / `stop` — report / stop (SIGTERM → SIGKILL) the supervised `minvmd`.
+- `min *args` — build `min` (+ `minimald` on Linux), then run `min` with `target/debug` on `PATH` (so auto-spawn finds the sibling daemons by name).
+- `env` — print `export` lines wiring the dev-built binaries and guest artifacts into the environment (`eval "$(just env)"`).
+- `shell` — subshell with that environment loaded.
+- `reap` — kill THIS checkout's stranded VM processes (`scripts/reap-vms.sh`); leftovers wedge the next VM's vsock bridge.
 
 Build artifacts and prerequisites:
 
-- `artifacts` — materialize/fetch the guest kernel + generic rootfs into `.scratch` (skips when present; `clean` to force refresh).
-- `libkrun` — fetch libkrun + libkrunfw into `~/.krun` (Linux; no-op on macOS, which uses Homebrew).
+- `artifacts` — fetch the prebuilt guest kernel + generic rootfs into `.scratch` (skips when present; `clean` to force refresh).
+- `libkrun` — Linux: fetch prebuilt libkrun + libkrunfw into `~/.krun` (macOS links the Homebrew install instead).
+- `gvproxy` — fetch the pinned gvproxy switch binary into `.scratch` (missing = switchless boot).
 - `initramfs` — cross-compile `minimald` (static musl, `FEATURES` baked in) and pack it as the initramfs `/init`.
-- `gvproxy` — fetch the pinned gvproxy switch binary into `.scratch`.
-- `minvmd-build` — build debug `minvmd` (codesigns on macOS; exports `LIBKRUN_PREFIX` on Linux).
-- `minimald-build` — build a host-native `minimald` with the networking features (for DM2).
+- `minvmd-build` — build debug `minvmd` (codesigns last on macOS; links the real libkrun via `LIBKRUN_PREFIX` on Linux).
+- `minimald-build` — Linux: build a host-native `minimald` with the networking features (for `just up`).
 - `minimal-cli` — build the `min` CLI (`cargo build -p minimal`; the binary is `target/debug/min`).
-- `codesign-minvmd` — release-build `minvmd` and codesign it with the hypervisor entitlement.
-
-VM / daemon lifecycle:
-
-- `min *args` — build `min` + `minimald`, then run `min` with `target/debug` on `PATH` (so auto-spawn finds the sibling daemons by name).
-- `env` — print `export` lines wiring the dev-built binaries and guest artifacts into the environment (`eval "$(just env)"`).
-- `shell` — subshell with that environment loaded.
-- `status` — report the supervised `minvmd` lifecycle state.
-- `stop` — stop the supervised `minvmd` (SIGTERM → SIGKILL).
-
-Deployment-model test environments (DM numbers from
-`docs/specs/03-spec-networking`):
-
-- `dm1` — macOS host + Linux VM over Hypervisor.framework: full-stack bring-up (clean SKIP on Linux).
-- `dm2` — native Linux: host-native `minimald` (no VM) under a dedicated state dir, reached via `min --minimal-dir`.
-- `dm2-down` — stop the DM2 host-native `minimald`.
-- `dm3` — native Linux + one Linux VM over KVM; `minvmd` binds the CLI socket directly.
-
-Cleanup and checks:
-
 - `clean` — remove only the bring-up artifacts the justfile manages (never all of `.scratch`).
-- `test-installer` — run the curl|sh installer's test harness under every available POSIX sh (+ shellcheck when present).
 
 ## Footguns
 
 Verified against the current tree; sources in parentheses.
 
 - **Codesign last on macOS.** The hypervisor-entitlement `codesign` must be
-  the last thing to touch the `minvmd` binary — any rebuild invalidates it,
-  so re-sign after every build (justfile `minvmd-build` / `codesign-minvmd`).
+  the last thing to touch the `minvmd` binary — any later cargo call that
+  relinks it drops the signature (EINVAL from `krun_start_enter`), so
+  re-sign after every build (justfile `minvmd-build` / `test-vm`).
 - **`mip update` rewrites `locked_commit`.** It re-resolves the upstream pins
   and edits `minimal.toml` in place (`crates/op/src/project/update.rs`) —
   an easy accidental diff, and it turns pinned cache fetches into new
@@ -156,30 +174,34 @@ Verified against the current tree; sources in parentheses.
   Calling the script directly yields a guest daemon without networking
   features; with a prebuilt `MINIMALD_BIN`, `TARGET`/`FEATURES` are ignored.
 - **macOS `--output` must stay under the repo.** On macOS the `minimal` shim
-  runs the CLI inside a VM, so `materialize --output` paths outside the repo
-  tree are not visible to it (justfile header comments).
+  runs the CLI inside a VM and only syncs the project dir back to the host,
+  so `materialize --output` paths outside the repo tree are not visible to
+  it (`crates/minvmd/README.md`).
 - **SIGTTOU wedges foreground boots.** With a TTY on stdin and
   `MINVMD_BOOT_LOG` unset, libkrun's console setup `tcsetattr()`s the
   terminal from a background process group — SIGTTOU stops the whole group
   and the boot dies silently at the timeout. Redirect stdin from `/dev/null`
   or set `MINVMD_BOOT_LOG` (`scripts/bench-minvmd-boot.sh`).
-- **Cold VM boots overrun the default READY timeout.** The generic guest
-  kernel can spend 40–50 s probing hardware before pid-1 starts, overrunning
-  `minvmd`'s 60 s READY default; `just dm3` exports
-  `MINVMD_READY_TIMEOUT_SECS=150` — do the same for manual cold boots
-  (justfile `dm3`).
+- **Cold VM boots overrun the default timeouts.** The generic guest kernel
+  can spend 40–70 s probing hardware before pid-1 starts, overrunning the
+  60 s READY / 75 s autospawn / 30 s lifecycle defaults; the justfile
+  exports 150 s `MINVMD_READY_TIMEOUT_SECS` /
+  `MINIMAL_SPAWN_TIMEOUT_SECS` / `MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS` for
+  every recipe — do the same for manual cold boots outside `just`
+  (justfile header exports).
 - **Leaked VMMs hold the bridge socket.** A VM in `krun_start_enter` ignores
   SIGTERM; a Ctrl-C'd or killed boot can leave a detached `__krun-vmm` (and
   the gvproxy switch) alive, making every subsequent boot fail. Reap with
-  SIGKILL: `pkill -9 -f __krun-vmm`, plus stray `minvmd`/`gvproxy`
-  (`scripts/bench-minvmd-boot.sh`, the reap step in
-  `.github/workflows/ci-macos.yml`, `scripts/reap-vms.sh`).
+  `just reap` (`scripts/reap-vms.sh`), which SIGKILLs this checkout's
+  stranded `minvmd`/`__krun-vmm`/`gvproxy` processes — matching is scoped
+  to this checkout's binaries, so parallel checkouts are safe.
 - **`min` vs `minimal` naming.** The CLI crate is `minimal` but its binary is
   `min` — build with `-p minimal`, run `target/debug/min`. Cargo never
   removes old binary names, so a stale pre-rename `target/debug/minimal` can
   linger; don't invoke or PATH-resolve it. On macOS, `minimal` on `PATH` is
   typically the distribution shim (`~/.minimal/shim/bin/minimal`), distinct
-  from anything this repo builds (justfile comments).
+  from anything this repo builds (justfile comments,
+  `crates/minvmd/README.md`).
 - **`min attach -c` is not a general remote shell.** The daemon's exec
   handler accepts only `min run <task>` (and the internal
   `git-receive-pack min://` path); anything else fails the channel. Task
@@ -197,8 +219,8 @@ rationale) and
 
 | Workflow | One line |
 |---|---|
-| `ci` | Repo-wide checks: rustfmt, clippy, cargo-deny, a dogfood build smoke (Minimal building itself), `minimal check`. |
-| `ci-linux-native` | Linux-native target lane: workspace tests, root-integration harnesses, DM2 session e2e against a host-native `minimald`. |
+| `ci` | Repo-wide checks: rustfmt, clippy, cargo-deny, a dogfood build smoke (Minimal building itself, reading prebuilt packages via the R2 mirror canary), `minimal check`. |
+| `ci-linux-native` | Linux-native target lane: workspace tests, root-integration harnesses, session e2e against a host-native `minimald` (no VM). |
 | `ci-linux-kvm` | Linux/KVM target lane (hosted x86_64): build-once/test-on-KVM split, minvmd VM harnesses, VM-backed session e2e. |
 | `ci-macos` | macOS/HVF target lane: hosted arm64 unit/clippy tier (`minvmd` + `sessions`) plus the hypervisor e2e on the self-hosted Apple Silicon runner. |
 | `ci-shell-installer` | POSIX-sh gate for the shell installer and the AppArmor profile installer (shellcheck + harness under sh/dash/macOS sh). |
@@ -231,14 +253,19 @@ proves, `nightly` ships.
 
 ### Pre-PR verification
 
-The canonical command block lives in
+The canonical pre-PR command is `just ci`, per
 [CONTRIBUTING.md](CONTRIBUTING.md#building-and-testing) ("Before opening a
-PR"). Platform notes for agents:
+PR") — it runs the same gates the PR lanes run (fmt, clippy, cargo-deny,
+the test suite, doctests; plus `just test-ignored` on Linux), dispatched
+for your OS. Platform notes for agents:
 
-- **Linux** — run the CONTRIBUTING.md block as-is. Agents iterating on a
-  working tree may prefer the auto-fixing clippy variant:
-  `cargo clippy --allow-dirty --fix --all-targets -- -D warnings`.
 - **macOS** — the workspace does not fully build (see
-  [Platform matrix](#platform-matrix)); use the scoped equivalents:
-  `cargo fmt`, `cargo test -p minvmd -p sessions`, and
-  `cargo clippy -p minvmd --all-targets -- -D warnings`.
+  [Platform matrix](#platform-matrix)); `just ci` runs the darwin-capable
+  scope, and `just test-cross` additionally covers the Linux-only crates
+  via `cross` (Docker required).
+- **VM/daemon-path changes** — also run `just e2e` (the session proof)
+  and/or `just test-vm` (the VM integration harnesses).
+- **Tight iteration loops** — `cargo test -p <crate>` on the crate under
+  edit is still the fastest inner loop; agents iterating on a working tree
+  may prefer the auto-fixing clippy variant:
+  `cargo clippy --allow-dirty --fix --all-targets -- -D warnings`.
