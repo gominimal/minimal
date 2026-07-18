@@ -12,13 +12,14 @@ use tokio::io::AsyncWriteExt as _;
 pub mod autospawn;
 pub mod client;
 pub mod config;
+pub mod diag;
 pub mod dirs;
 mod file_upload;
 pub mod git_remote;
 pub mod loadouts;
 
 #[derive(Parser)]
-#[command(name = "min", version = env!("CARGO_PKG_VERSION"), long_version = env!("LONG_VERSION"))]
+#[command(name = "min", version = version::VERSION, long_version = version::LONG_VERSION)]
 #[command(about = "The Minimal CLI")]
 pub struct Cli {
     #[command(subcommand)]
@@ -46,6 +47,14 @@ pub enum Command {
     Loadout(LoadoutArgs),
     /// Print important directories and file paths for debugging
     Dirs,
+    /// Collect a diagnostic bundle (logs, state, config) to send to the
+    /// minimal dev team.
+    ///
+    /// Writes `minimal-diag-<timestamp>.tar.zst` to the current directory.
+    /// Secret-shaped values (env vars, tokens) are redacted and session/
+    /// project file contents are never included — only name/size listings.
+    /// Works even when no daemon is running; never starts one.
+    Bug(diag::BugArgs),
     /// WireGuard mesh: join, leave, and inspect remote-access state
     #[cfg(feature = "remote-access")]
     Mesh(MeshArgs),
@@ -343,7 +352,14 @@ pub struct LsArgs {
 #[derive(Debug, Args)]
 pub struct DestroyArgs {
     /// Session identifier (UUID or session name)
-    pub session: String,
+    #[arg(required_unless_present = "all", conflicts_with = "all")]
+    pub session: Option<String>,
+    /// Destroy all sessions
+    #[arg(long)]
+    pub all: bool,
+    /// Skip confirmation when destroying all sessions
+    #[arg(long, short, requires = "all")]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -446,6 +462,7 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
             command: LoadoutCommand::List(args),
         }) => loadouts::cmd_loadout_list(args, &cli.global_args),
         Command::Dirs => dirs::cmd_dirs(&cli.global_args),
+        Command::Bug(args) => diag::cmd_bug(&cli.global_args, args).await,
         #[cfg(feature = "remote-access")]
         Command::Mesh(MeshArgs { command }) => match command {
             MeshCommand::Status => cmd_mesh_status(&cli.global_args).await,
@@ -585,10 +602,10 @@ fn ensure_daemon(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         .context("Failed to ensure the minimald daemon is running")
 }
 
-/// Prompt the user with a yes/no question on stderr. Defaults to yes
-/// (empty input or Y/y/yes returns true; anything else returns false).
-fn confirm(question: &str) -> Result<bool, anyhow::Error> {
-    eprint!("{question} [Y/n] ");
+/// Prompt the user with a yes/no question on stderr.
+fn confirm(question: &str, default: bool) -> Result<bool, anyhow::Error> {
+    let prompt = if default { "[Y/n]" } else { "[y/N]" };
+    eprint!("{question} {prompt} ");
     std::io::stderr().flush().ok();
 
     let mut input = String::new();
@@ -596,9 +613,11 @@ fn confirm(question: &str) -> Result<bool, anyhow::Error> {
         .read_line(&mut input)
         .context("reading stdin")?;
     let trimmed = input.trim();
-    Ok(trimmed.is_empty()
-        || trimmed.eq_ignore_ascii_case("y")
-        || trimmed.eq_ignore_ascii_case("yes"))
+    Ok(if trimmed.is_empty() {
+        default
+    } else {
+        trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes")
+    })
 }
 
 /// List sessions via the `ListSessions` RPC.
@@ -630,6 +649,28 @@ pub fn format_ls(
             serde_json::to_string_pretty(resp).context("Failed to serialize session list")?;
         writeln!(out, "{json}")?;
         return Ok(());
+    }
+
+    if !args.raw
+        && let Some(pool) = &resp.resource_pool
+    {
+        let session_count = resp.sessions.len();
+        let core_label = if pool.cpu_cores == 1 { "core" } else { "cores" };
+        let session_label = if session_count == 1 {
+            "session"
+        } else {
+            "sessions"
+        };
+        writeln!(
+            out,
+            "RESOURCE POOL:  {} CPU {} · {} memory · shared by {} {}",
+            pool.cpu_cores,
+            core_label,
+            format_memory(pool.memory_bytes),
+            session_count,
+            session_label,
+        )?;
+        writeln!(out)?;
     }
 
     if resp.sessions.is_empty() {
@@ -681,6 +722,22 @@ pub fn format_ls(
     }
 
     Ok(())
+}
+
+fn format_memory(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    if bytes >= GIB {
+        let gib = bytes as f64 / GIB as f64;
+        if bytes.is_multiple_of(GIB) {
+            format!("{gib:.0} GiB")
+        } else {
+            format!("{gib:.1} GiB")
+        }
+    } else {
+        format!("{} MiB", bytes / MIB)
+    }
 }
 
 /// Default policy hook for `minimal activate`: auto-approves any
@@ -859,7 +916,7 @@ fn offer_mfile_scaffold(
     // "yes" — and, when a config is discovered under `.minimal/`, the init
     // writer would clobber it. Only prompt on a real terminal; anywhere else
     // (and on a declined prompt) carry on without scaffolding.
-    if !std::io::stdin().is_terminal() || !confirm("Would you like to create one?")? {
+    if !std::io::stdin().is_terminal() || !confirm("Would you like to create one?", true)? {
         eprintln!(
             "Continuing without one; the session gets a default environment. \
              Run 'minimal init' to give the project its own config."
@@ -1267,20 +1324,80 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
 
     let mut client = connect_daemon(global).await?;
 
+    if args.all {
+        return destroy_all_sessions(&mut client, args.force).await;
+    }
+
+    let session = args
+        .session
+        .as_deref()
+        .context("a session or --all is required")?;
+    let record = resolve_session(&mut client, session).await?;
+
+    destroy_session(&mut client, record.id, record.name.as_deref()).await
+}
+
+async fn destroy_all_sessions(
+    client: &mut client::Client,
+    force: bool,
+) -> Result<(), anyhow::Error> {
+    use minimald_rpc::ListSessions;
+
+    let sessions = client
+        .oneshot_rpc::<ListSessions>(())
+        .await
+        .context("ListSessions RPC failed")?
+        .sessions;
+
+    if sessions.is_empty() {
+        println!("No active sessions.");
+        return Ok(());
+    }
+
+    if !force {
+        if !std::io::stdin().is_terminal() {
+            bail!("refusing to destroy all sessions without confirmation; pass --force")
+        }
+        if !confirm(&format!("Destroy all {} sessions?", sessions.len()), false)? {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let session_count = sessions.len();
+    let mut failures = 0;
+    for session in sessions {
+        if let Err(error) = destroy_session(client, session.id, session.name.as_deref()).await {
+            failures += 1;
+            eprintln!(
+                "Failed to destroy session {} ({}): {error:#}",
+                session.id,
+                session.name.as_deref().unwrap_or("-")
+            );
+        }
+    }
+
+    if failures > 0 {
+        bail!("failed to destroy {failures} of {session_count} sessions")
+    }
+
+    Ok(())
+}
+
+async fn destroy_session(
+    client: &mut client::Client,
+    id: sessions::SessionId,
+    name: Option<&str>,
+) -> Result<(), anyhow::Error> {
     use minimald_rpc::{DestroySession, DestroySessionRequest};
-    let record = resolve_session(&mut client, &args.session).await?;
 
     let resp = client
-        .oneshot_rpc::<DestroySession>(DestroySessionRequest { id: record.id })
+        .oneshot_rpc::<DestroySession>(DestroySessionRequest { id })
         .await
         .context("DestroySession RPC failed")?;
 
     if resp.ok().is_some() {
-        println!(
-            "Destroyed session {} ({})",
-            record.id,
-            record.name.as_deref().unwrap_or("-")
-        );
+        println!("Destroyed session {} ({})", id, name.unwrap_or("-"));
     } else {
         bail!("DestroySession returned an error from the daemon");
     }
@@ -1566,7 +1683,7 @@ fn run_init_flow(config: mctx::Config, skip_confirm: bool) -> Result<(), anyhow:
         eprint!("{}", plan.content);
         eprintln!("---");
         eprintln!();
-        if !confirm("Continue?")? {
+        if !confirm("Continue?", true)? {
             eprintln!("Aborted.");
             return Ok(());
         }
@@ -1665,7 +1782,7 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
 /// not autospawn the daemon — it is a lightweight diagnostic that should
 /// report versions without starting a VM.
 pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
-    println!("Client: minimal {}", env!("LONG_VERSION"));
+    println!("Client: minimal {}", version::LONG_VERSION);
 
     let sock = match client::resolve_socket_path(global.minimal_dir.as_deref()) {
         Ok(p) => p,

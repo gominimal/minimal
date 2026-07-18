@@ -118,11 +118,19 @@ jobs:
           dest: ${{ runner.temp }}/rootfs.img
           arch: x86_64
           channel: unstable
+      - name: Fetch pinned gvproxy switch binary
+        # minvmd spawns this as the per-host-VM switch that provides the guest's
+        # egress (NAT + DNS). Without it minvmd boots the VM switchless
+        # (gvproxy resolution is best-effort and never errors), so the guest's
+        # overlay has no other end and every egress — including the in-guest
+        # `pkgs` clone during session mint — dies with "Could not resolve host".
+        run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
       - name: Soak the session e2e (x10)
         env:
           MINVMD_KERNEL_PATH: ${{ runner.temp }}/vmlinuz
           MINVMD_ROOTFS_PATH: ${{ runner.temp }}/rootfs.img
           MINVMD_INITRAMFS: ${{ runner.temp }}/initramfs.cpio
+          MINVMD_GVPROXY_BIN: ${{ runner.temp }}/gvproxy
           E2E_VM: "1"
           E2E_MINIMAL_ARGS: --minvmd
           E2E_PROJECT_DIR: /tmp

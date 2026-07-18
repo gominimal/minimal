@@ -6,7 +6,7 @@ use clap_complete::Shell;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[derive(Parser)]
-#[command(name = "minvmd", version = env!("CARGO_PKG_VERSION"))]
+#[command(name = "minvmd", version = version::VERSION, long_version = version::LONG_VERSION)]
 #[command(
     about = "Host daemon that brings up a Linux microVM via libkrun (macOS/HVF or Linux/KVM)"
 )]

@@ -57,7 +57,7 @@ jobs:
         # SHOULD run everything anyway: they write the main-only caches and
         # provide the soak signal. Dispatch likewise runs everything.
         if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706
         with:
           filters: |
             kvm:
@@ -83,7 +83,7 @@ jobs:
     needs: [changes]
     if: github.event_name != 'pull_request' || needs.changes.outputs.kvm == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       # Slim debug info (usable backtraces, smaller caches, faster links);
       # this job doesn't run the setup-rust composite that sets this on the

@@ -5,8 +5,8 @@ use minimald_rpc::{
     Errorable, GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
     GetSessionRecordRequest, GetSessionRecordResponse, GetVersion, GetVersionResponse,
     IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse,
-    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, Shutdown,
-    ShutdownRequest, ShutdownResponse, SubmitVerdict,
+    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool,
+    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -66,8 +66,8 @@ async fn serve_get_version(c: RuChannel<Msg>) {
     let res = GetVersion
         .handle_channel(c, async |_req| {
             Ok(GetVersionResponse {
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                long_version: env!("LONG_VERSION").to_string(),
+                version: version::VERSION.to_string(),
+                long_version: version::LONG_VERSION.to_string(),
                 stdlib_version: stdlib::VERSION.to_string(),
             })
         })
@@ -80,8 +80,12 @@ async fn serve_get_version(c: RuChannel<Msg>) {
 async fn serve_list_sessions(s: ServerStateHandle, c: RuChannel<Msg>) {
     let res = ListSessions
         .handle_channel(c, async |_req| {
+            let resource_pool = tokio::task::spawn_blocking(detect_resource_pool)
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             let mngr = s.sessions_manager().await;
             Ok(ListSessionsResponse {
+                resource_pool,
                 sessions: mngr
                     .list()
                     .await
@@ -114,6 +118,22 @@ async fn serve_list_sessions(s: ServerStateHandle, c: RuChannel<Msg>) {
     if let Err(e) = res {
         tracing::warn!("RPC handler for {} failed: {}", ListSessions::NAME, e);
     }
+}
+
+fn detect_resource_pool() -> Option<ResourcePool> {
+    let cpu_cores = std::thread::available_parallelism()
+        .ok()?
+        .get()
+        .try_into()
+        .ok()?;
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    let memory_bytes = system.total_memory();
+
+    (memory_bytes > 0).then_some(ResourcePool {
+        cpu_cores,
+        memory_bytes,
+    })
 }
 
 async fn serve_get_session_record(s: ServerStateHandle, c: RuChannel<Msg>) {
@@ -757,8 +777,8 @@ mod tests {
 
         let resp = client.call::<GetVersion>(&()).await;
 
-        assert_eq!(resp.version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(resp.long_version, env!("LONG_VERSION"));
+        assert_eq!(resp.version, version::VERSION);
+        assert_eq!(resp.long_version, version::LONG_VERSION);
         assert_eq!(resp.stdlib_version, stdlib::VERSION);
     }
 
@@ -809,7 +829,7 @@ mod tests {
         for _ in 0..3 {
             let mut client = server.connect().await;
             let resp = client.call::<GetVersion>(&()).await;
-            assert_eq!(resp.version, env!("CARGO_PKG_VERSION"));
+            assert_eq!(resp.version, version::VERSION);
         }
     }
 
@@ -839,6 +859,7 @@ mod tests {
         );
 
         let list_sessions = client.call::<ListSessions>(&()).await;
+        assert!(list_sessions.resource_pool.is_some());
         assert_eq!(
             list_sessions.sessions,
             vec![ListSessionsEntry {

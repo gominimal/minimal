@@ -1505,6 +1505,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "diagnostics"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-compression",
+ "async-tar",
+ "chrono",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "walkdir",
+]
+
+[[package]]
 name = "diff"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3585,7 +3604,7 @@ dependencies = [
 
 [[package]]
 name = "minimal"
-version = "0.0.1"
+version = "0.5.0-rc1"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -3595,6 +3614,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "constcat",
+ "diagnostics",
  "dirs",
  "mctx",
  "mfile",
@@ -3610,8 +3630,10 @@ dependencies = [
  "sessions",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
+ "version",
 ]
 
 [[package]]
@@ -3622,7 +3644,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "minimald"
-version = "0.0.1"
+version = "0.5.0-rc1"
 dependencies = [
  "args",
  "async-compression",
@@ -3663,6 +3685,7 @@ dependencies = [
  "sessions",
  "stdlib",
  "switch",
+ "sysinfo",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -3672,6 +3695,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "version",
  "vt100-ctt",
 ]
 
@@ -3699,7 +3723,7 @@ dependencies = [
 
 [[package]]
 name = "minvmd"
-version = "0.0.1"
+version = "0.5.0-rc1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3722,6 +3746,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "version",
 ]
 
 [[package]]
@@ -3737,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "mip"
-version = "0.4.1"
+version = "0.5.0-rc1"
 dependencies = [
  "anyhow",
  "args",
@@ -3771,6 +3796,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "version",
 ]
 
 [[package]]
@@ -6161,6 +6187,10 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stdlib"
 version = "0.0.17"
+dependencies = [
+ "fd-lock",
+ "tempfile",
+]
 
 [[package]]
 name = "streaming-iterator"
@@ -7073,6 +7103,10 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "version"
+version = "0.5.0-rc1"
 
 [[package]]
 name = "version_check"
