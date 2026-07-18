@@ -103,9 +103,10 @@ approver allowlist (the initiating user is excluded) comments `approved` /
 job then runs set-channel.sh, which verifies the version is actually staged
 before flipping the pointer. Finally it dispatches a
 `reference-docs-promoted` repository event so the published reference docs
-rebuild. Note: that dispatch currently targets the deprecated
-`gominimal/docs` repository; a repoint proposal is tracked under
-`docs/internal/proposals/`.
+rebuild. The dispatch targets `gominimal/webapp` (which serves
+docs.minimal.dev); the gominimal-aw-bot App must be installed there for the
+token mint to succeed, and webapp's reference-sync workflow consumes the
+event.
 
 ## prune-releases.yml — GitHub Release housekeeping
 

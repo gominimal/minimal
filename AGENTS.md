@@ -215,7 +215,7 @@ Verified against the current tree; sources in parentheses.
 Canonical docs: [docs/ci-strategy.md](docs/ci-strategy.md) (design and
 rationale) and
 [docs/internal/release-pipeline.md](docs/internal/release-pipeline.md)
-(release/promotion mechanics). The 11 workflows on `main`:
+(release/promotion mechanics). The 12 workflows on `main`:
 
 | Workflow | One line |
 |---|---|
@@ -224,6 +224,7 @@ rationale) and
 | `ci-linux-kvm` | Linux/KVM target lane (hosted x86_64): build-once/test-on-KVM split, minvmd VM harnesses, VM-backed session e2e. |
 | `ci-macos` | macOS/HVF target lane: hosted arm64 unit/clippy tier (`minvmd` + `sessions`) plus the hypervisor e2e on the self-hosted Apple Silicon runner. |
 | `ci-shell-installer` | POSIX-sh gate for the shell installer and the AppArmor profile installer (shellcheck + harness under sh/dash/macOS sh). |
+| `docs-site` | Docs-site lane: VitePress build, site-absolute link guard under `docs/reference/`, offline lychee link check, rendered-site artifact; weekly online link sweep (advisory). Aggregator `docs-site-success` is not a required check yet. |
 | `commitlint` | Conventional Commits enforcement on PRs. |
 | `nightly-tests` | 06:00 UTC **test tier**: advisory re-checks, session-e2e soak, toolchain/dependency canaries, workflow hygiene; failures file tracking issues. |
 | `nightly` | 10:00 UTC **channel cut**: reuses `release.yml` to build/stage, then blesses the `nightly` channel after smoke tests. |
