@@ -1,10 +1,5 @@
 name: docs-site
 
-# PROPOSAL — this file lives in docs/internal/proposals/ until a code owner
-# copies it to .github/workflows/docs-site.yml. The workflow layer is frozen
-# and CODEOWNER-gated (CONTRIBUTING.md, docs/ci-strategy.md); see README.md
-# in this directory for apply instructions.
-#
 # Docs-site lane: builds the VitePress site from docs/ (`npm run docs:build`),
 # fails on site-absolute links under docs/reference/ (those pages are mirrored
 # into gominimal/webapp, where `](/...` resolves against a different base, and

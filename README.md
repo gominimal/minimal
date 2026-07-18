@@ -9,6 +9,9 @@
 
 [![CI](https://github.com/gominimal/minimal/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gominimal/minimal/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-staging-blue)](https://minimal-docs-staging.pages.dev/)
+
+**Documentation:** <https://minimal-docs-staging.pages.dev/>
 
 Minimal provides VM-based development sandboxes and a secure package manager for the dev tools used inside them.
 
