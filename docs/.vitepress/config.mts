@@ -22,6 +22,27 @@ export default withMermaid({
     ["link", { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" }],
   ],
 
+  // Mermaid theming, light mode: theme "base" + the monochrome brand
+  // palette from theme/custom.css (no default-mermaid yellows). Dark mode
+  // cannot be themed here — vitepress-plugin-mermaid forces mermaid's
+  // built-in "dark" theme whenever the site is dark — so the dark repaint
+  // lives in theme/custom.css ("Mermaid diagrams" section).
+  mermaid: {
+    theme: "base",
+    themeVariables: {
+      fontFamily: '"Space Grotesk", sans-serif',
+      primaryColor: "#ffffff",
+      primaryTextColor: "#141414",
+      primaryBorderColor: "#141414",
+      lineColor: "#525252",
+      textColor: "#141414",
+      titleColor: "#141414",
+      clusterBkg: "#ebebeb",
+      clusterBorder: "#cccccc",
+      edgeLabelBackground: "#f5f5f5",
+    },
+  },
+
   themeConfig: {
     // The marks are named for the artwork color, not the mode: the dark
     // (#141414) mark renders on the light background and vice versa.

@@ -532,3 +532,57 @@ body::before {
 .dark .vp-doc img:not([src$=".svg" i]) {
   filter: brightness(0.85);
 }
+
+/* ── Mermaid diagrams: dark mode ──
+ * Light mode is themed in config.mts (mermaid theme "base" +
+ * themeVariables). In dark mode vitepress-plugin-mermaid forces mermaid's
+ * built-in "dark" theme (re-rendering on every toggle) with the light
+ * themeVariables still applied on top, so dark diagrams are repainted
+ * here with the brand's dark palette. Mermaid inlines an #id-scoped
+ * <style> into each SVG, hence the !important on every rule. */
+.dark .mermaid .node rect,
+.dark .mermaid .node circle,
+.dark .mermaid .node ellipse,
+.dark .mermaid .node polygon,
+.dark .mermaid .node path {
+  fill: #292929 !important;
+  stroke: #a3a3a3 !important;
+}
+
+.dark .mermaid .cluster rect {
+  fill: #1e1e1e !important;
+  stroke: #3d3d3d !important;
+}
+
+.dark .mermaid .label,
+.dark .mermaid .nodeLabel,
+.dark .mermaid .nodeLabel p,
+.dark .mermaid .cluster-label span,
+.dark .mermaid .cluster-label span p {
+  color: #e0e0e0 !important;
+}
+
+.dark .mermaid text {
+  fill: #e0e0e0 !important;
+}
+
+.dark .mermaid .edgePath .path,
+.dark .mermaid .flowchart-link {
+  stroke: #a3a3a3 !important;
+}
+
+.dark .mermaid .marker {
+  fill: #a3a3a3 !important;
+  stroke: #a3a3a3 !important;
+}
+
+.dark .mermaid .edgeLabel,
+.dark .mermaid .edgeLabel p,
+.dark .mermaid .labelBkg {
+  color: #cccccc !important;
+  background-color: #141414 !important;
+}
+
+.dark .mermaid .edgeLabel rect {
+  fill: #141414 !important;
+}
