@@ -58,6 +58,18 @@ impl Cli {
         }
     }
 
+    /// Returns the standard-library override directory (`--stdlib-dir`),
+    /// resolved against the current directory, if the flag was given.
+    pub fn stdlib_dir(&self) -> Option<std::path::PathBuf> {
+        self.global_args.stdlib_dir.as_ref().map(|p| {
+            p.resolve()
+                .expect("could not resolve --stdlib-dir against the current directory")
+                .as_utf8_path()
+                .as_std_path()
+                .to_path_buf()
+        })
+    }
+
     fn listen_args(&self) -> Option<&ListenArgs> {
         match &self.command {
             Command::Run(a) => Some(a),
@@ -639,6 +651,8 @@ async fn async_main() -> Result<(), MainError> {
         // not spawn gvproxy in-guest. The UDS path is DM2.
         in_microvm: cli.listen_args().unwrap().vsock,
         state_volume_mounted,
+        num_parallel_builds: cli.global_args.num_parallel_builds,
+        stdlib_dir: cli.stdlib_dir(),
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.

@@ -58,6 +58,8 @@ impl TestServer {
             gvproxy_bin: None,
             in_microvm: false,
             state_volume_mounted: false,
+            num_parallel_builds: None,
+            stdlib_dir: None,
         };
         let state = ServerStateHandle::new(config).await.unwrap();
 

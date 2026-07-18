@@ -57,6 +57,15 @@ pub struct Config {
     /// microVM booted without a data volume, must never unmount its state dir).
     #[serde(default)]
     pub state_volume_mounted: bool,
+    /// Max number of parallel builds the daemon runs, from the
+    /// `-n`/`--num-parallel-builds` CLI flag. `None` leaves mctx's
+    /// default parallelism in place.
+    #[serde(default)]
+    pub num_parallel_builds: Option<usize>,
+    /// Override for the standard-library directory, from the
+    /// `--stdlib-dir` CLI flag. `None` uses the bundled stdlib.
+    #[serde(default)]
+    pub stdlib_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -164,13 +173,20 @@ impl ServerState {
         let cert_authority =
             Arc::new(crate::net::proxy::CertAuthority::generate().map_err(std::io::Error::other)?);
 
-        // Build a daemon-scoped mctx config from what the daemon
-        // knows today (dirs). Additional flags (offline, stdlib
-        // override, num-parallel-builds) will thread through from
-        // the CLI as follow-up work; today the defaults hold.
-        let mctx_config = mctx::ConfigBuilder::new()
+        // Build a daemon-scoped mctx config from the dirs plus the
+        // build-orchestration flags threaded through from the CLI
+        // (`-n`/`--num-parallel-builds` and `--stdlib-dir`); an unset
+        // flag leaves mctx's own default in place.
+        let mut mctx_config = mctx::ConfigBuilder::new()
             .with_cache_dir(minimal_cache_dir.as_utf8_path())
-            .with_state_dir(minimal_state_dir.as_utf8_path())
+            .with_state_dir(minimal_state_dir.as_utf8_path());
+        if let Some(num_parallel_builds) = config.num_parallel_builds {
+            mctx_config = mctx_config.with_num_parallel_builds(num_parallel_builds);
+        }
+        if let Some(stdlib_dir) = &config.stdlib_dir {
+            mctx_config = mctx_config.with_stdlib_dir(stdlib_dir.clone());
+        }
+        let mctx_config = mctx_config
             .build()
             .map_err(|e| std::io::Error::other(format!("mctx config: {e}")))?;
 
@@ -633,6 +649,8 @@ mod tests {
             gvproxy_bin: None,
             in_microvm: false,
             state_volume_mounted: false,
+            num_parallel_builds: None,
+            stdlib_dir: None,
         }
     }
 
