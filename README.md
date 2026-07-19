@@ -101,16 +101,19 @@ security find-generic-password -w -s "PAT-foo-repo" -a "my-mac-user-name" | pbco
 # start and enter a sandbox, which copies up the CWD file tree into the sandbox
 min activate --attach .
 
-read -sp "paste GH PAT now:" GH_TOKEN && export GH_TOKEN
-
 git init
 
-claude --dangerously-skip-permissions
 # develop specs, generate code, etc.
+claude --dangerously-skip-permissions
 
+# review the generated code first
 git add -A
 git commit -m "initial checkin"
 
+# add GH credential after AI Agents are terminated
+read -sp "paste GH PAT now:" GH_TOKEN && export GH_TOKEN
+
+# push to github
 git remote add origin https://github.com/<your-owner>/<your-repo>.git
 git branch -M main
 git push -u origin main
