@@ -103,7 +103,6 @@ impl BuildDep {
         Ok(match i {
             builds::BuildDep::Build(br) => Self::Build(loader.load(br)?),
             builds::BuildDep::Source(s) => Self::Source(s.clone().into()),
-            builds::BuildDep::HostPath(p) => Self::HostPath(p.clone()),
             builds::BuildDep::Local {
                 full_path,
                 filename,

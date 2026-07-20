@@ -599,7 +599,7 @@ mod tests {
         let layer = Layer::new_for_test(
             indoc! {
                 "
-                let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
+                let {BuildSpec, OutputLib, ..} = import \"minimal.ncl\" in
 
                 let no_deps_spec = {
         			name = \"no deps\",
@@ -740,7 +740,7 @@ mod tests {
         let layer = Layer::new_for_test(
             indoc! {
                 "
-                let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
+                let {BuildSpec, OutputLib, ..} = import \"minimal.ncl\" in
 
                 let no_deps_spec = {
         			name = \"no deps\",
