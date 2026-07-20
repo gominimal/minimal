@@ -34,6 +34,7 @@ enum Command {
         shell: Shell,
     },
     /// Start the microVM supervisor (foreground by default).
+    #[command(visible_alias = "start")]
     Run {
         /// Spawn the supervisor in the background and return once the host UDS
         /// is accepting connections.
@@ -164,4 +165,17 @@ fn init_tracing() -> Result<Option<tracing_appender::non_blocking::WorkerGuard>>
         "detached minvmd: routing tracing output to daily-rotated log file",
     );
     Ok(Some(guard))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `minvmd start` is a visible alias of `run`, so the lifecycle verbs
+    /// `start`/`stop` are symmetric.
+    #[test]
+    fn start_is_an_alias_for_run() {
+        let cli = Cli::try_parse_from(["minvmd", "start"]).expect("`start` should parse as `run`");
+        assert!(matches!(cli.command, Command::Run { .. }));
+    }
 }
