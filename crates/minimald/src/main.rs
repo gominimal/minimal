@@ -139,11 +139,12 @@ pub struct GlobalArgs {
 
     /// Load the minimal standard library from the given path instead
     #[arg(long)]
-    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    #[clap(hide = true)]
     stdlib_dir: Option<CwdRelative<Daemon>>,
 
     /// Configure the number of parallel builds
     #[arg(short, long, global = true)]
+    #[clap(hide = true)]
     num_parallel_builds: Option<usize>,
 }
 
