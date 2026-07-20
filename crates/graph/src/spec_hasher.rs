@@ -198,11 +198,6 @@ fn build_input_hash(input: &BuildDep, h: &mut Hasher) {
                 h.write_all(prefix.as_bytes()).unwrap();
             }
         }
-        HostPath(p) => {
-            h.write_all(b"host path").unwrap();
-            h.write_all(p.as_path().to_string_lossy().as_bytes())
-                .unwrap();
-        }
         Local {
             full_path: _,
             filename,
@@ -394,43 +389,68 @@ mod tests {
         let _ = SpecHasher::hash(&g, &a);
     }
 
+    /// Builds the representative spec that `attrs_hash` and `subset_hash`
+    /// pin a golden hash over: a Source build-dep plus one output of each
+    /// kind. Constructed in Rust rather than via Nickel so the hash is
+    /// deterministic across architectures — Nickel stdlib evaluation is
+    /// host-sensitive, which is why the Nickel-backed hash tests still need
+    /// the `arch_hash!` macro.
+    fn representative_spec(g: &mut Graph) -> BuildSpecRef {
+        use crate::SourceInput;
+        g.insert_build(BuildSpec {
+            name: "single buildspec".into(),
+            cmds: vec![vec!["something".into()]],
+            build_deps: [BuildDep::Source(SourceInput {
+                from: SourceFetch::Web {
+                    url: "http://uwu.com".into(),
+                    sha256: "abcdef".into(),
+                    url_pos: None,
+                    sha256_pos: None,
+                },
+                extract: false,
+                strip_prefix: None,
+            })]
+            .into_iter()
+            .collect(),
+            outputs: [
+                (
+                    "something".to_string(),
+                    BuildOutput::Library {
+                        glob: "/usr/lib/something.*.so".into(),
+                        allow_data: false,
+                    },
+                ),
+                (
+                    "uwu_tool".to_string(),
+                    BuildOutput::Binary {
+                        glob: "/bin/uwu".into(),
+                        allow_missing_interpreter: false,
+                    },
+                ),
+                (
+                    "some_data".to_string(),
+                    BuildOutput::Data {
+                        glob: "/data/locale/*".into(),
+                        allow_executable: false,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        })
+    }
+
     #[test]
     fn attrs_hash() {
-        let layer = Layer::new_for_test(
-            indoc! {
-                "
-                let {BuildSpec, HostPath, Source, OutputLib, OutputBin, OutputData, ..} = import \"minimal.ncl\" in
-                {
-                    name = \"single buildspec\",
-                    build_deps = [
-                        {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
-                        {path = \"/\"} | HostPath,
-                    ],
-                    outputs = {
-                        something = { glob = \"/usr/lib/something.*.so\" } | OutputLib,
-                        uwu_tool = { glob = \"/bin/uwu\" } | OutputBin,
-                        some_data = { glob = \"/data/locale/*\"  } | OutputData,
-                    },
-                    cmd = \"something\",
-                } | BuildSpec"
-            }
-            .to_string(),
-        )
-        .unwrap_or_else(|e| {
-            e.report_to_stderr();
-            panic!("spec parsing failed");
-        });
+        let mut g = Graph::new();
+        let a = representative_spec(&mut g);
 
-        let dp = Graph::new().ingest(layer).unwrap();
-
-        // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
+        // println!("{}", SpecHasher::hash(&g, &a).0.to_hex());
         assert_eq!(
-            SpecHasher::hash(&dp, &dp.top_levels[0]),
-            SpecHash::from_hex(arch_hash!(
-                "1b0191397ab3b84580087f4ff975dcdbdfc1ef73029ad4413e4deafdaa5710b4",
-                "ddf98033b5667083a4e3e311bd6c2b63a9bd40c8e307f20934bd88ce9510e1b4"
-            ))
-            .unwrap(),
+            SpecHasher::hash(&g, &a),
+            SpecHash::from_hex("a806fdf8423fc0dd9d7109814a08ea7f82a77407b22d4f596e3961bc8f61d31d")
+                .unwrap(),
         );
     }
 
@@ -583,41 +603,14 @@ mod tests {
 
     #[test]
     fn subset_hash() {
-        let layer = Layer::new_for_test(
-            indoc! {
-                "
-                let {BuildSpec, HostPath, Source, OutputLib, OutputBin, OutputData, ..} = import \"minimal.ncl\" in
-                {
-                    name = \"single buildspec\",
-                    build_deps = [
-                        {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
-                        {path = \"/\"} | HostPath,
-                    ],
-                    outputs = {
-                        something = { glob = \"/usr/lib/something.*.so\" } | OutputLib,
-                        uwu_tool = { glob = \"/bin/uwu\" } | OutputBin,
-                        some_data = { glob = \"/data/locale/*\"  } | OutputData,
-                    },
-                    cmd = \"something\",
-                } | BuildSpec"
-            }
-            .to_string(),
-        )
-        .unwrap_or_else(|e| {
-            e.report_to_stderr();
-            panic!("spec parsing failed");
-        });
+        let mut g = Graph::new();
+        let a = representative_spec(&mut g);
 
-        let dp = Graph::new().ingest(layer).unwrap();
-
-        // println!("{}", SpecHasher::hash(&dp, &dp.top_levels[0]).0.to_hex());
+        // println!("{}", SubsetHasher::hash_single(&g, &a, vec!["uwu_tool", "something"]).0.to_hex());
         assert_eq!(
-            SubsetHasher::hash_single(&dp, &dp.top_levels[0], vec!["uwu_tool", "something"]),
-            SpecHash::from_hex(arch_hash!(
-                "e9a11fd6fd4f283d68b5835a577ced9a0b864e9765d753a49527aaf5736a5699",
-                "baca41ad137d878e3a22d09f3f1fb04de0fed042c2b5beaf060c2d0f5c023a17"
-            ))
-            .unwrap(),
+            SubsetHasher::hash_single(&g, &a, vec!["uwu_tool", "something"]),
+            SpecHash::from_hex("c5c005aebf5871b30387126e5052e48206f19112fb9d2c5127c5303195726780")
+                .unwrap(),
         );
     }
 }
