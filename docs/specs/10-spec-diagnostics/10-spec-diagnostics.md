@@ -361,7 +361,7 @@ records carry correlation ids on spans.
 - `justfile`, `scripts/session-e2e.sh` — boot.log default fallout
 - `crates/minimald/src/{main.rs,server.rs,rpc.rs,session_host.rs,test_harness.rs}`
 - `crates/minimal/src/dirs.rs` — daemon-log note (deferred from Unit 2)
-- Root `Cargo.toml` — `logroller` workspace dep
+  (`tracing-appender` daily rotation; already a workspace dep, no new one added)
 
 **Baseline:**
 - minvmd detached logs to nowhere on `origin/main`; the hvc0 console is
@@ -408,16 +408,20 @@ records carry correlation ids on spans.
   spawned future; connection span created at accept, synchronous sites via
   `span.in_scope`, session future instrumented) — one style, no residual
   manual id fields.
-- **R3.6**: File-log rotation for both daemons shall be size-based with
-  bounded retention via `logroller` (`Rotation::SizeBased` +
-  `max_keep_files`), wrapped in the existing
+- **R3.6**: File-log rotation for both daemons shall be time-based (daily)
+  with bounded retention via `tracing_appender::rolling`
+  (`Rotation::DAILY` + `max_log_files`, 14 days), wrapped in the existing
   `tracing_appender::non_blocking` + `WorkerGuard` plumbing with
   `lossy(false)`; guards drop deterministically (minimald: R3.4; minvmd: on
-  shutdown). Rotated archives shift logrotate-style (live file bare, `.1`
-  newest — the reason rotated-log selection orders by mtime, not name), and
-  archive publication runs on a background thread joined on drop
-  (`graceful_shutdown`), so a release leaves no partial `.pending.` files
-  on an unmounting volume.
+  shutdown). Rotation and pruning are inline (no background publication
+  thread), so a release closes the appender with a plain guard drop —
+  nothing to join, and no partial intermediate files left on an unmounting
+  volume. Rotated files carry a date suffix (`minimald.log.<date>`);
+  `newest_rotated`'s modified-time ordering (R2.7) already covers that
+  scheme. (Size-based rotation via `logroller` was evaluated and adopted in
+  an earlier revision; it is reverted here — see Design Considerations — for
+  a smaller dependency surface and simpler shutdown, at the cost of an
+  intra-day size cap.)
 - **R3.7**: Building the daemon crates without a reachable git context
   (source tarballs, container mounts that exclude `.git`) shall not panic.
   Satisfied on the baseline: the shared `version` crate's build script falls
@@ -434,8 +438,10 @@ records carry correlation ids on spans.
    branch; this live check gates the unit.
 2. **Test:** log-release runs exactly once and before quiesce returns;
    harness passes `None` release unaffected — demonstrates R3.4.
-3. **Test:** writing past the size threshold rotates and prunes to
-   `max_keep_files` — demonstrates R3.6.
+3. **Test:** the daily appender writes to its date-suffixed file; retention
+   and rotation are `tracing_appender`'s own tested behavior, and the live
+   gate (artifact 1) confirms rotated `minimald.log*` on the volume —
+   demonstrates R3.6.
 4. **CLI:** grep a session's records by span-carried channel id across
    accept/attach/close lines — demonstrates R3.5.
 
@@ -472,7 +478,7 @@ the daemon across the SSH boundary.
 - **R4.1**: Daemon *file* logs (both daemons) shall switch to JSON-lines via
   a `json-subscriber` layer — flat records, span fields flattened per
   record, UTC RFC3339 timestamps — composed over the existing `MakeWriter`
-  plumbing, leaving the Unit 3 `non_blocking`/logroller/reload stack
+  plumbing, leaving the Unit 3 `non_blocking`/rolling-appender/reload stack
   untouched. Console/stdout layers stay human-format.
   (`tracing-subscriber`'s built-in JSON formatter cannot emit static
   top-level fields and nests span context in a buried list;
@@ -837,19 +843,26 @@ and is an entire language runtime. The ~200-line fail-closed key-walk stays,
 shared verbatim by CLI and daemon so the two layers can never disagree about
 what is sensitive.
 
-### Rotation: `logroller` over `tracing-appender`
+### Rotation: `tracing-appender` (daily) over `logroller`
 
 `tracing-appender` rotates by time only (size-based requested since 2022,
 tokio-rs/tracing#1940): with daily rotation + `max_log_files`, nothing caps
 intra-day growth, and a runaway error loop filling the microVM data volume is
-precisely the failure class this subsystem exists to diagnose — the log
-system must not be able to cause the incident it records. `logroller`
-(size-based rotation, `max_keep_files`, optional gzip) is a plain `io::Write`
-that drops into the same `non_blocking`/`WorkerGuard`/`reload` plumbing.
-Risk: young crate (0.1.x, single maintainer, active through 2026-07).
-Reopen-trigger: abandonment, or tracing-appender shipping size-based
-rotation — the writer is swappable behind one constructor either way.
-Decided 2026-07-16.
+a failure class this subsystem exists to diagnose. `logroller` (size-based
+rotation, `max_keep_files`, optional gzip) was trialled for exactly that
+cap — a plain `io::Write` that drops into the same
+`non_blocking`/`WorkerGuard`/`reload` plumbing — but it rotates and prunes on
+a **background thread**, which (a) leaves partial `.pending.` intermediate
+files if the appender is dropped mid-rotation, precisely during the volume
+release before an unmount, and (b) is a young crate (0.1.x, single
+maintainer). It is **reverted**: `tracing-appender`'s daily appender rotates
+and prunes *inline*, so the release is a plain guard drop with nothing to
+join and no orphaned intermediates, and it is the same writer the reference
+implementation used. The size cap is given up in exchange; the runaway-log
+risk is bounded instead by `max_log_files` retention, the level filter, and
+volume monitoring, and the writer stays swappable behind one constructor if
+`tracing-appender` ever ships size-based rotation. Decided 2026-07-16
+(logroller); reverted 2026-07-20.
 
 ### One streamed blob per request; no live telemetry stream
 
@@ -899,9 +912,9 @@ pipeline machinery of its own (no processor threads, timers, network I/O,
 or shutdown choreography) — and **nothing executes at collection time**:
 `min bug` and the diag RPC read files off disk, so a formatter defect can
 degrade what got written but never the ability to collect what exists.
-Reopen-triggers, mirroring the logroller treatment: abandonment, or
-`tracing-subscriber` gaining static top-level fields natively. Const-rename
-churn across semconv 0.x releases is contained to compile errors.
+Reopen-triggers: abandonment, or `tracing-subscriber` gaining static
+top-level fields natively. Const-rename churn across semconv 0.x releases is
+contained to compile errors.
 
 `tracing-opentelemetry` (the tracing→SDK bridge) stays out, and is the
 named crate for the future export layer: it cannot be adopted piecemeal —
@@ -975,13 +988,15 @@ Unit 8's dual-format rework, sequenced after Unit 6.
 - `debugfs -c` (catastrophic/read-only mode) is safe against an ext4 image
   with a live writer; harvested logs may be mid-write torn, which is
   acceptable for post-mortem text (R7.5).
-- Rotation/pruning in file appenders happens on the write path — an idle
-  daemon does not rotate; "daily" files can span days. Size-based rotation
-  (R3.6) makes the cap independent of wall clock.
+- Rotation/pruning in the daily file appender happens on the write path — an
+  idle daemon does not rotate, so a "daily" file can span days. Retention
+  (`max_log_files`) bounds the file count, not intra-day size (R3.6); a
+  runaway log grows until the next daily boundary.
 - **The `lossy(false)` backpressure chain (R3.6) is a deliberate coupling.**
   The in-VM write path is: daemon thread → `non_blocking` bounded channel
-  (~128k lines) → worker thread → logroller (rotation renames/prunes run
-  inline on the worker) → data volume. With `lossy(false)`, a wedged volume
+  (~128k lines) → worker thread → the daily rolling appender (rotation
+  renames/prunes run inline on the worker) → data volume. With
+  `lossy(false)`, a wedged volume
   stalls the worker; once the channel fills, every daemon thread blocks at
   its next log call — the log pipeline can propagate a disk wedge into the
   RPC threads. Accepted because dropping records under pressure destroys

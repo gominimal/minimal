@@ -63,7 +63,7 @@ flowchart TB
 
     subgraph DAEMON["crates/minimald — in-VM or native"]
         SERVE["diag serving<br/>BundleWriter::stream → duplex pump"]
-        DLOG["on-volume logs<br/>reload layer → logroller<br/>VolumeLogRelease owned by ServerState"]
+        DLOG["on-volume logs<br/>reload layer → daily rolling appender<br/>VolumeLogRelease owned by ServerState"]
     end
 
     subgraph VMM["crates/minvmd — host VMM supervisor"]
@@ -136,7 +136,7 @@ flowchart LR
     end
     JSON["json-subscriber layer<br/>flat records, top-level resource fields"]
     NB["non_blocking<br/>lossy(false) + WorkerGuard"]
-    ROLL["logroller<br/>size rotation, max_keep_files"]
+    ROLL["tracing-appender<br/>daily rotation, max_log_files"]
     VOL[("data volume<br/>logs/minimald.log*")]
 
     RELOAD -->|"activator, post-mount"| JSON --> NB --> ROLL --> VOL
@@ -356,7 +356,7 @@ impl ServerStateHandle {
 }
 // main.rs (Unit 3): reload-layer activation after volume mount
 let (file_layer, reload) = tracing_subscriber::reload::Layer::new(None);
-// activator: build logroller appender → non_blocking (lossy(false)) →
+// activator: build daily rolling appender → non_blocking (lossy(false)) →
 // reload.modify(Some(json_fmt_layer)) ; release: reload.modify(None) + drop(guard)
 ```
 
@@ -366,7 +366,8 @@ ALREADY EXISTS: the Shutdown→quiesce path that triggers the release —
 `create_configured_session` — `crates/minimald/src/test_harness.rs:245,419`
 (main). ref: the reload/release design is proven at
 `minimald/src/{main.rs:391-434,server.rs:103-118}`; Unit 3 re-lands it with
-logroller as the writer and JSON-lines arriving in Unit 4.
+a daily `tracing-appender` rolling appender as the writer and JSON-lines
+arriving in Unit 4.
 
 ### `crates/minvmd` — detached logs + boot.log (Unit 3)
 
@@ -421,14 +422,24 @@ wholesale-redacts dynamic values ("could contain anything") — i.e. the one
 crate that considered the problem punted on it; VRL is a language runtime.
 Nothing is fail-closed. The bespoke key-walk is ~200 lines no crate deletes.
 
-**`tracing-appender` alone for rotation.** Rejected as the end state:
-time-based only (tokio-rs/tracing#1940 open since 2022), so nothing caps
-intra-day growth on a 32 GiB volume shared with user data. `flexi_logger`
+**Log rotation: `tracing-appender` (daily) over `logroller` (size-based).**
+Surveyed: `tracing-appender` (daily rotation, `max_log_files` retention, but
+no size trigger — tokio-rs/tracing#1940 open since 2022), `logroller`
+(size-based, retention, optional gzip, plain `io::Write`), `flexi_logger`
 (most featureful, but `log`-facade world, wants to own the subscriber),
-`log4rs` (same, config-file culture), `rolling-file` (dormant since 2023)
-rejected on ecosystem mismatch or maintenance. `logroller` adopted: plain
-`io::Write` (composes with `non_blocking`/`WorkerGuard`/`reload` untouched),
-size-based + retention + optional gzip. Reopen-trigger recorded in the spec.
+`log4rs` (same, config-file culture), `rolling-file` (dormant since 2023).
+An earlier revision adopted `logroller` for the intra-day size cap on the
+32 GiB volume shared with user data. That is **reverted**: `tracing-appender`
+is the chosen end state. The daily appender rotates and prunes *inline* —
+no background publication thread — so it composes with
+`non_blocking`/`WorkerGuard`/`reload` untouched, needs no shutdown
+handshake, and leaves no partial intermediate files on a volume unmount
+(the one wrinkle `logroller`'s background rotation introduced). The trade is
+the loss of the size cap: a runaway log can grow
+until the daily boundary. Accepted — bounded by `max_log_files` retention,
+the level filter, and volume monitoring — in exchange for one fewer
+dependency and a simpler release path. The reference implementation used
+this same daily scheme; this is a return to it, not new ground.
 
 **OpenTelemetry SDK / OTLP file exporter / collector in the guest.**
 Rejected for the bundle path, in full: opentelemetry-rust is pre-1.0 with
@@ -478,9 +489,9 @@ single out-of-tree consumer (Unit 8) rather than carry the split forever.
 | async-tar-sync | `async_tar::Builder` requires `W: Sync`; `DuplexStream`/`File` satisfy it, russh channel writer does not | settled | ref `minimald/src/diag.rs:57` comment + compile evidence on the reference branch | R1.2, R6.2 |
 | quiesce-hook | The Shutdown→quiesce path that must invoke the log release pre-exists on main | settled | `crates/minimald/src/rpc.rs:319,346` (main) | R3.4 |
 | default-type-param | `BundleWriter<W = File>` keeps `&mut BundleWriter` call sites compiling unchanged | settled | Rust default type parameters; verified against ~15 collector signatures on ref | R1.2 |
-| logroller-fit | logroller composes under `tracing_appender::non_blocking` + reload as a plain `io::Write` | settled | logroller 0.1.12 API (io::Write); same shape as the appender it replaces | R3.6 |
+| rotation-appender-fit | `tracing_appender::rolling` (daily, `max_log_files`) composes under `non_blocking` + reload and rotates inline (no background thread, no shutdown handshake) | settled | the reference implementation used this exact scheme; size-based `logroller` was trialled and reverted for a smaller dep surface | R3.6 |
 | russh-env-request | Client can send an SSH channel env request and minimald's russh handler can surface it before subsystem dispatch | needs-spike | russh supports `env` channel requests; minimald's handler surface not yet desk-verified for env interception | R4.4 |
-| json-subscriber-fit | `json-subscriber` composes over the Unit 3 `MakeWriter` stack (non_blocking/logroller) under the reload slot, and its static fields cover resource identity | settled | layer is `MakeWriter`-generic; dependency closure (serde, serde_json, tracing\*, uuid) already in workspace; active releases through 2026-07 | R4.1, R4.2 |
+| json-subscriber-fit | `json-subscriber` composes over the Unit 3 `MakeWriter` stack (non_blocking/rolling appender) under the reload slot, and its static fields cover resource identity | settled | layer is `MakeWriter`-generic; dependency closure (serde, serde_json, tracing\*, uuid) already in workspace; active releases through 2026-07 | R4.1, R4.2 |
 | nonblocking-headroom | The `non_blocking` channel's ~128k-line bound gives enough headroom that only a sustained log flood coinciding with an already-wedged volume blocks daemon threads (`lossy(false)` backpressure chain) | needs-spike | unmeasured; spike is a Unit 3 unit test — flood a layer over a deliberately stalled `MakeWriter`, measure lines-to-block and memory held | R3.6 |
 | debugfs-live-read | `debugfs -c` reads an ext4 image safely while a VM writes it | settled | exercised live in the field against a running VM's `data-vol.raw`; harvest may be torn mid-write (acceptable) | R7.5 |
 | rootless-guest-bundle | Consumers (nested verification, diag-explore) assume guest bundle entries at archive top level | settled | ref `minimald/src/diag.rs` (no root dir); diag-explore exact-key lookups | R1.2, R6.2, R8.3 |
