@@ -142,13 +142,11 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             ;;
         *)
             echo "Usage: min <subcommand>" >&2
-            echo "See CLAUDE.md at the project root for more detailed instructions." >&2
             echo "" >&2
-            echo "Add packages: min add [--session|--build|--runtime|--task <taskname>] <packages>" >&2
+            echo "Add packages: min add [--session|--build|--runtime|--task] <packages>" >&2
             echo "Search for packages: min search <query>" >&2
             echo "Check minimal configuration: min check" >&2
             echo "Run a task: min run <task name>" >&2
-            echo "Check minimal configuration: min check" >&2
             echo "Try building a package (with potentially-stale dependencies): min patched-pkg <package name>" >&2
             exit 1
             ;;
