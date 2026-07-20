@@ -40,8 +40,8 @@ enum Command {
         #[arg(long)]
         detach: bool,
         /// Timeout in seconds to wait for the host UDS when using --detach.
-        #[arg(long, default_value_t = minvmd::cmd::run::DEFAULT_DETACH_TIMEOUT_SECS)]
-        timeout: u64,
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// Print daemon status (exit 0 if running, 1 if stopped, 2 on lock contention).
     Status {
