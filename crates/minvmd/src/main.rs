@@ -1,6 +1,6 @@
 //! `minvmd` CLI entry point.
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -81,12 +81,10 @@ enum ConfigAction {
 }
 
 fn main() -> Result<()> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(filter)
-        .init();
-
+    // Parse and apply the state-dir override BEFORE installing tracing: the
+    // detached log dir derives from the state dir. Nothing in between may
+    // call `tracing::*` (it would be silently dropped); clap prints its own
+    // parse errors to stderr, which is fine.
     let cli = Cli::parse();
 
     if let Some(dir) = &cli.minimal_state_dir {
@@ -95,6 +93,8 @@ fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("resolving --minimal-state-dir: {e}"))?;
         minvmd::state::set_state_dir_override(dir);
     }
+
+    let _log_guard = init_tracing()?;
 
     match cli.command {
         Command::Boot { foreground } => minvmd::cmd::boot::run(foreground),
@@ -120,4 +120,48 @@ fn main() -> Result<()> {
         Command::Stop => minvmd::cmd::stop::run(),
         Command::KrunVmm => minvmd::cmd::vmm_child::run(),
     }
+}
+
+/// Install the tracing subscriber. Foreground processes log to stdout;
+/// detached supervisors (marked by [`minvmd::DETACHED_ENV`], set by
+/// `run --detach` on its re-exec'd child) write to
+/// `<state_dir>/logs/minvmd.log`, daily-rotated with bounded retention,
+/// mirroring minimald's scheme so `min bug` finds both daemons' logs in one
+/// place. The returned guard must outlive the process — dropping it flushes
+/// pending records.
+fn init_tracing() -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    if std::env::var_os(minvmd::DETACHED_ENV).is_none() {
+        tracing_subscriber::registry()
+            .with(fmt::layer())
+            .with(filter)
+            .init();
+        return Ok(None);
+    }
+
+    let log_dir = minvmd::state::state_base_dir()
+        .as_utf8_path()
+        .as_std_path()
+        .join("logs");
+    std::fs::create_dir_all(&log_dir)
+        .with_context(|| format!("creating minvmd log directory at {}", log_dir.display()))?;
+    let appender = minvmd::build_log_appender(&log_dir, "minvmd.log")
+        .context("building rotating log appender")?;
+    // lossy(false): a diagnostic log that drops records under load answers
+    // the wrong question; the supervisor's log volume is nowhere near the
+    // channel bound.
+    let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(false)
+        .finish(appender);
+    tracing_subscriber::registry()
+        // ANSI escape codes are noise in a file.
+        .with(fmt::layer().with_ansi(false).with_writer(writer))
+        .with(filter)
+        .init();
+    tracing::info!(
+        log_dir = %log_dir.display(),
+        "detached minvmd: routing tracing output to daily-rotated log file",
+    );
+    Ok(Some(guard))
 }

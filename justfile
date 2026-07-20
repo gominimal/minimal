@@ -37,7 +37,6 @@ export LD_LIBRARY_PATH := krun-prefix + if env('LD_LIBRARY_PATH', '') == '' { ''
 export MINVMD_KERNEL_PATH := kernel
 export MINVMD_ROOTFS_PATH := rootfs
 export MINVMD_INITRAMFS := initramfs
-export MINVMD_BOOT_LOG := scratch / "boot.log"
 export MINVMD_READY_TIMEOUT_SECS := env('MINVMD_READY_TIMEOUT_SECS', '150')
 export MINIMAL_SPAWN_TIMEOUT_SECS := env('MINIMAL_SPAWN_TIMEOUT_SECS', '150')
 export MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS := env('MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS', '150')
@@ -111,7 +110,7 @@ env:
     @printf 'export %s="%s"\n' \
       PATH "$PATH" LD_LIBRARY_PATH "$LD_LIBRARY_PATH" \
       MINVMD_KERNEL_PATH "$MINVMD_KERNEL_PATH" MINVMD_ROOTFS_PATH "$MINVMD_ROOTFS_PATH" \
-      MINVMD_INITRAMFS "$MINVMD_INITRAMFS" MINVMD_BOOT_LOG "$MINVMD_BOOT_LOG" \
+      MINVMD_INITRAMFS "$MINVMD_INITRAMFS" \
       MINVMD_GVPROXY_BIN "{{gvproxy}}" \
       MINVMD_READY_TIMEOUT_SECS "$MINVMD_READY_TIMEOUT_SECS" \
       MINIMAL_SPAWN_TIMEOUT_SECS "$MINIMAL_SPAWN_TIMEOUT_SECS"
@@ -131,7 +130,7 @@ stop:
 
 # Remove the bring-up artifacts this justfile manages (never all of .scratch).
 clean:
-    rm -f {{kernel}} {{rootfs}} {{initramfs}} {{gvproxy}} {{scratch}}/boot.log
+    rm -f {{kernel}} {{rootfs}} {{initramfs}} {{gvproxy}}
 
 # Kill THIS checkout's stranded VM processes (they wedge the next VM's vsock bridge).
 reap:

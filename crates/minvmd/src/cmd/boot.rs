@@ -109,6 +109,11 @@ fn run_boot(foreground: bool) -> Result<()> {
     let exe = std::env::current_exe().context("resolving current executable path")?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("__krun-vmm");
+    // The supervisor (a detached `run`) carries MINVMD_DETACHED, which routes
+    // tracing to the rolling `minvmd.log`. The VMM child must not inherit it:
+    // a second appender on the same file would interleave with the
+    // supervisor's. Its diagnostics ride the hvc0 console into boot.log.
+    cmd.env_remove(crate::DETACHED_ENV);
     if let Some(dir) = crate::state::state_dir_override() {
         cmd.args(["--minimal-state-dir", dir.as_str()]);
     }

@@ -83,11 +83,21 @@ fn run_vmm() -> Result<()> {
     cfg.apply(&mut ctx)
         .context("applying VmConfig to krun context")?;
 
-    // Optional early-boot console capture for diagnosing a stuck boot. Off by
-    // default; set `MINVMD_BOOT_LOG=<path>` to capture hvc0 to a host file.
-    if let Some(log_path) = std::env::var_os("MINVMD_BOOT_LOG") {
-        ctx.set_console_output(&log_path)
-            .context("setting console output log")?;
+    // Console capture (hvc0 → host file). `MINVMD_BOOT_LOG=<path>` overrides;
+    // the default is `<provider dir>/boot.log` — a silently-discarded console
+    // is exactly the evidence lost in wedged-boot/dead-transport incidents,
+    // and `min bug` bundles this file (tail-capped) per provider. Truncated
+    // each boot so it holds the current VM generation's console.
+    let boot_log = std::env::var_os("MINVMD_BOOT_LOG")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| crate::state::provider_dir().join("boot.log"));
+    // Capture is diagnostics, not a boot dependency: any failure — creating
+    // the file or wiring the console — warns and boots on, never propagates.
+    if let Err(e) = std::fs::File::create(&boot_log) {
+        tracing::warn!(path = %boot_log.display(), error = %e, "cannot create boot log; console discarded");
+    } else if let Err(e) = ctx.set_console_output(&boot_log) {
+        tracing::warn!(path = %boot_log.display(), error = %e, "cannot wire console to boot log; console discarded");
     }
 
     // Register the READY-marker vsock port (guest→host). The plain

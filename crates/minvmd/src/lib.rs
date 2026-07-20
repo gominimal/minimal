@@ -28,6 +28,62 @@ pub mod krun;
 
 pub use error::VmError;
 
+/// Env marker set on the re-exec'd child by `run --detach`. When present,
+/// the process routes tracing output to the daily-rotated
+/// `<state_dir>/logs/minvmd.log` instead of stdout — a detached supervisor's
+/// stdout goes nowhere, and field diagnostics (`min bug`) need the history
+/// on disk. Lives here (not `main.rs`) because the detach spawn in
+/// `cmd::run` sets it and the binary entry point reads it.
+pub const DETACHED_ENV: &str = "MINVMD_DETACHED";
+
+/// Rotated files retained on disk. Two weeks comfortably covers the usual
+/// "what happened last week" window and bounds the on-disk footprint.
+pub const LOG_KEEP_FILES: usize = 14;
+
+/// The daily-rotated, retention-bounded file appender both daemon log paths
+/// use (minvmd here; minimald mirrors the same scheme on the data volume).
+/// Files carry a date suffix (`minvmd.log.2026-07-20`); rotation and
+/// pruning are inline (no background thread, no partial intermediates), so
+/// dropping the appender — at process exit or before a volume unmount —
+/// needs no shutdown handshake.
+pub fn build_log_appender(
+    dir: &std::path::Path,
+    prefix: &str,
+) -> Result<tracing_appender::rolling::RollingFileAppender, tracing_appender::rolling::InitError> {
+    tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(prefix)
+        .max_log_files(LOG_KEEP_FILES)
+        .build(dir)
+}
+
+#[cfg(test)]
+mod log_appender {
+    use std::io::Write as _;
+
+    #[test]
+    fn writes_to_a_date_suffixed_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut appender = super::build_log_appender(tmp.path(), "minvmd.log").unwrap();
+        writeln!(appender, "a record").unwrap();
+        appender.flush().unwrap();
+
+        let files: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 1, "one dated file: {files:?}");
+        assert!(
+            files[0].starts_with("minvmd.log."),
+            "date-suffixed name: {}",
+            files[0]
+        );
+        let body = std::fs::read_to_string(tmp.path().join(&files[0])).unwrap();
+        assert!(body.contains("a record"), "got: {body}");
+    }
+}
+
 #[cfg(test)]
 mod integration_naming_convention {
     //! Guards the integration-test auto-discovery contract. The KVM and macOS
