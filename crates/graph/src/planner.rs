@@ -536,7 +536,7 @@ impl<'a, BP: BinProvider> ExecPlan<'a, BP> {
                 Build(bsr) | Subset(SubsetInput { from: bsr, .. }) => {
                     process(bsr, seen, &mut out);
                 }
-                Source(_) | HostPath(_) | Local { .. } => {}
+                Source(_) | Local { .. } => {}
             }
         }
         for dep in bs.runtime_deps.iter() {
@@ -767,7 +767,7 @@ mod tests {
         let layer = Layer::new_for_test(
             indoc! {
                 "
-                let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
+                let {BuildSpec, OutputLib, ..} = import \"minimal.ncl\" in
 
                 let no_deps_spec = {
         			name = \"no deps\",

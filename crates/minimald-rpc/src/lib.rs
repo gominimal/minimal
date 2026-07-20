@@ -209,7 +209,12 @@ pub struct SessionConfig {
     /// User-supplied name. `None` is anonymous; the daemon may render
     /// a short display name (e.g. `<user>-<project>-<uuid-suffix>`).
     pub name: Option<String>,
-    /// Absolute host path the session is built from.
+    /// Absolute host path the session is built from. Names a location
+    /// on the *client's* filesystem — the daemon uses it only for
+    /// display and audit. Project files reach the daemon-side
+    /// workspace out-of-band via the `WorkspaceFilesTarZst` SFTP-shaped
+    /// upload after `CreateSession` returns, before `ConfigureLoadout`
+    /// composes against them.
     pub project_path: paths::HostAbsPath,
     /// Network isolation mode.
     #[serde(default)]
@@ -251,10 +256,10 @@ impl OneshotSshRpc for CreateSession {
 /// Split from [`CreateSession`] because the composer reads the
 /// project config out of the session's *daemon-side workspace*, which
 /// only holds the project files once the client has streamed them up
-/// — the record's `project_path` is a path on the client's machine,
-/// which the daemon generally can't read. So the client creates the
-/// session, populates its workspace, and only then configures the
-/// loadout.
+/// via `WorkspaceFilesTarZst` — the record's `project_path` is a path
+/// on the client's machine, which the daemon generally can't read.
+/// So the client creates the session, populates its workspace, and
+/// only then configures the loadout.
 pub struct ConfigureLoadout;
 
 /// The request for a [`ConfigureLoadout`] RPC.

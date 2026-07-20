@@ -168,6 +168,13 @@ impl SessionComposer {
         // per-item verdict in the wire schema, so a daemon
         // contribution carrying only those (or carrying nothing)
         // assembles directly into the Composition.
+        tracing::info!(
+            daemon_vars = vars.len(),
+            daemon_patches = patches.len(),
+            daemon_packages = packages.len(),
+            daemon_lifecycle_hooks = lifecycle_hooks.len(),
+            "compose: daemon-side contribution collected",
+        );
         if vars.is_empty() && patches.is_empty() {
             let mut composition = Composition::from_daemon_passthrough(packages, lifecycle_hooks);
             composition.extend_from_wire(client)?;
@@ -266,7 +273,27 @@ fn apply_var_verdicts(
         .collect();
 
     let mut accepted: Vec<SessionVar> = Vec::new();
+    // A `PendingId` fans out to at most one var verdict — unlike
+    // patches, where one pending fans out to many files, each id
+    // here maps 1:1 to a pending var. A verdict carrying two entries
+    // for the same id (Approved+Approved, Approved+Ignored, etc.) is
+    // a broken client. Detect it with a `seen` set so the second
+    // occurrence surfaces as an actionable `duplicate` error rather
+    // than as the `unknown` fallout of the first occurrence having
+    // already drained the stash. Mirrors `apply_patch_verdicts`.
+    let mut seen: std::collections::BTreeSet<PendingId> = std::collections::BTreeSet::new();
     for v in var_verdicts {
+        let id_for_dedupe = match &v {
+            WireVarVerdict::Approved { id, .. }
+            | WireVarVerdict::Ignored { id, .. }
+            | WireVarVerdict::Denied { id, .. } => *id,
+        };
+        if !seen.insert(id_for_dedupe) {
+            return Err(ComposeError::InvalidWireItem {
+                what: "verdict contains duplicate var entry",
+                context: format!("pending id {id_for_dedupe:?}"),
+            });
+        }
         match v {
             WireVarVerdict::Approved { id, value } => {
                 let pv = take_pending(&mut pending_vars, id, "var")?;
@@ -323,7 +350,7 @@ fn apply_patch_verdicts(
         std::collections::BTreeSet::new();
     for p in patch_verdicts {
         let (id, host_path_for_dedupe) = match &p {
-            WirePatchVerdict::Approved { id, host_path }
+            WirePatchVerdict::Approved { id, host_path, .. }
             | WirePatchVerdict::Ignored { id, host_path }
             | WirePatchVerdict::Denied { id, host_path } => (*id, host_path.clone()),
         };
@@ -338,10 +365,28 @@ fn apply_patch_verdicts(
         }
 
         match p {
-            WirePatchVerdict::Approved { id, host_path } => {
+            WirePatchVerdict::Approved {
+                id,
+                host_path,
+                destination,
+            } => {
                 let pp = lookup_patch(pending_patches, id)?;
                 touched_ids.insert(id);
-                let destination = pp.patch().dest().as_sandbox_path().clone();
+                // Use the client-computed `destination`, not
+                // `pp.patch().dest()`. The pending's dest is the
+                // base (e.g. `~/.claude` for a `~/.claude/**` dir
+                // mapping) — reusing it would collapse every file's
+                // dest to that base and trigger the composer's
+                // patch-destination-conflict check on the second
+                // file. See the wire-side rationale on
+                // `WirePatchVerdict::Approved::destination`.
+                //
+                // Safe against sandbox-escape via a `..` traversal:
+                // `destination` deserialized through
+                // `SandboxRelPath::try_new`, which rejects both
+                // absolute paths and any `..` component. A malicious
+                // client crafting `"../../etc/foo"` never gets past
+                // wire parsing.
                 let source = pp.source().clone();
                 accepted.push(SessionPatch::new(
                     ResolvedPatch::new(host_path, destination),
@@ -609,6 +654,7 @@ mod tests {
                 value: WireResolvedVar {
                     name: "PROJECT_VAR".into(),
                     value: "approved-value".into(),
+                    carries_user_data: true,
                 },
             }],
             patches: vec![],
@@ -670,6 +716,7 @@ mod tests {
                 value: WireResolvedVar {
                     name: "PROJECT_VAR".into(),
                     value: "v".into(),
+                    carries_user_data: true,
                 },
             }],
             patches: vec![],
@@ -764,6 +811,7 @@ mod tests {
                 var: WireResolvedVar {
                     name: "EDITOR".into(),
                     value: "hx".into(),
+                    carries_user_data: true,
                 },
                 source: WireSource::UserLoadout { name: "dev".into() },
             }],
@@ -794,6 +842,7 @@ mod tests {
                 var: WireResolvedVar {
                     name: "EDITOR".into(),
                     value: "hx".into(),
+                    carries_user_data: true,
                 },
                 source: WireSource::UserLoadout { name: "dev".into() },
             }],

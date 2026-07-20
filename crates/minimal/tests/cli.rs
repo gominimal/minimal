@@ -220,6 +220,7 @@ async fn activate_creates_session() {
         ingress: vec![],
         loadout: vec![],
         no_loadouts: false,
+        no_prompt: false,
         attach: false,
     };
     cmd_activate(&args, activate_args).await.unwrap();
@@ -257,6 +258,7 @@ async fn activate_uploads_project_files() {
         ingress: vec![],
         loadout: vec![],
         no_loadouts: false,
+        no_prompt: false,
         attach: false,
     };
     cmd_activate(&args, activate_args).await.unwrap();

@@ -43,12 +43,17 @@ pub enum CheckOutcome<T> {
 /// There is no per-item deny: rejecting a single item is functionally
 /// identical to aborting the whole composition (denial of any item
 /// terminates), so use [`HookResult::Abort`](crate::core::hooks::HookResult::Abort)
-/// to reject. Reserve `AllowOnce` / `UseRule` for items that should
-/// survive or be re-checked.
+/// to reject. `IgnoreOnce` handles the silent-drop case where the item
+/// shouldn't halt the composition but shouldn't reach the session
+/// either — the natural symmetric partner to `AllowOnce`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ItemDecision {
     /// Approve this item without recording a rule.
     AllowOnce,
+    /// Silently drop this item for this activation without recording
+    /// a rule. Same effect as a policy `ignore` match, but scoped to
+    /// the current composition.
+    IgnoreOnce,
     /// Re-check against the (possibly mutated) policy.
     UseRule,
 }

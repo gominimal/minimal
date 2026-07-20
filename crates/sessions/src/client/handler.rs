@@ -52,16 +52,16 @@ pub fn handle_response(
     hooks: &dyn PolicyHooks,
     options: ComposeOptions,
     env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
-) -> Result<ContributionVerdict, ComposeError> {
+) -> Result<(ContributionVerdict, UserPolicy), ComposeError> {
     let session_id = response.session_id;
     let (vars_policy, patches_policy) = policy.into_parts();
 
-    let var_out = gate_pending_vars(response.vars, vars_policy, hooks, env)?;
+    let (var_out, vars_policy) = gate_pending_vars(response.vars, vars_policy, hooks, env)?;
 
     let combined_vars: Vec<SessionVar> =
         gated_vars.iter().cloned().chain(var_out.approved).collect();
 
-    let patch_verdicts = gate_pending_patches(
+    let (patch_verdicts, patches_policy) = gate_pending_patches(
         response.patches,
         patches_policy,
         hooks,
@@ -70,11 +70,18 @@ pub fn handle_response(
         env,
     )?;
 
-    Ok(ContributionVerdict {
-        session_id,
-        vars: var_out.verdicts,
-        patches: patch_verdicts,
-    })
+    let final_policy = UserPolicy::empty()
+        .with_vars(vars_policy)
+        .with_patches(patches_policy);
+
+    Ok((
+        ContributionVerdict {
+            session_id,
+            vars: var_out.verdicts,
+            patches: patch_verdicts,
+        },
+        final_policy,
+    ))
 }
 
 // =====================================================================
@@ -118,7 +125,7 @@ fn gate_pending_vars(
     policy: VarsPolicy,
     hooks: &dyn PolicyHooks,
     env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
-) -> Result<VarGateOutput, ComposeError> {
+) -> Result<(VarGateOutput, VarsPolicy), ComposeError> {
     // Resolve every wire item to its domain form. Fails fast on the
     // first env-lookup miss for an `Inherit` spec.
     let pending: Vec<PendingVar> = pending
@@ -133,7 +140,7 @@ fn gate_pending_vars(
         pending.into_iter().map(|p| classify_var(&policy, p)),
     );
     if unapproved.is_empty() {
-        return Ok(out);
+        return Ok((out, policy));
     }
 
     // Pass 2: prompt.
@@ -152,7 +159,7 @@ fn gate_pending_vars(
     for (p, d) in unapproved.into_iter().zip(decisions) {
         out.push(apply_var_decision(&policy, p, d)?);
     }
-    Ok(out)
+    Ok((out, policy))
 }
 
 /// Drain `classifications` into the finished `VarGateOutput` and a
@@ -189,6 +196,18 @@ fn apply_var_decision(
                 approval: Some(approval),
             })
         }
+        // `IgnoreOnce`: silent drop for this activation. Same wire
+        // shape as a policy `ignore` verdict (no approval, `Ignored`
+        // verdict correlating back to the pending id), so the daemon
+        // treats it identically.
+        ItemDecision::IgnoreOnce => {
+            let name = pending.name().to_owned();
+            let (id, _pv) = pending.into_parts();
+            Ok(VarOutcome {
+                verdict: WireVarVerdict::Ignored { id, name },
+                approval: None,
+            })
+        }
         ItemDecision::UseRule => match classify_var(policy, pending) {
             VarClassification::Decided(outcome) => Ok(outcome),
             VarClassification::Pending(p) => Err(ComposeError::use_rule_undecided(
@@ -214,6 +233,18 @@ fn classify_var(policy: &VarsPolicy, pending: PendingVar) -> VarClassification {
     // arms could reach the name through the returned `pv`.
     let name = pending.name().to_owned();
     let (id, pv) = pending.into_parts();
+    // Vars whose value doesn't pull from the user's environment
+    // (hardcoded literals, or `inherit-with-default` that fell back
+    // to the default) aren't a data-leak vector — bypass the policy
+    // and auto-approve. See `gate_vars` in compose.rs for the
+    // symmetric loadout-side skip.
+    if !pv.var().carries_user_data() {
+        let approval = Some(SessionVar::from_provenanced(pv.clone()));
+        return VarClassification::Decided(VarOutcome {
+            verdict: PendingVar::reassemble(id, pv).into_approved_verdict(),
+            approval,
+        });
+    }
     match policy.check(&name, pv) {
         CheckOutcome::Decided(Decision::Allowed(pv)) => {
             let approval = Some(SessionVar::from_provenanced(pv.clone()));
@@ -247,9 +278,9 @@ fn gate_pending_patches(
     options: ComposeOptions,
     combined_vars: &[SessionVar],
     env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
-) -> Result<Vec<WirePatchVerdict>, ComposeError> {
+) -> Result<(Vec<WirePatchVerdict>, PatchPolicy), ComposeError> {
     if pending.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), policy));
     }
     let home_fallback = env("HOME").ok();
     let home_fallback = home_fallback.as_deref();
@@ -267,7 +298,7 @@ fn gate_pending_patches(
         options.follow_symlinks,
     )?;
     if unapproved.is_empty() {
-        return Ok(verdicts);
+        return Ok((verdicts, policy));
     }
 
     // Pass 2: prompt. If the hook updated the policy, re-expand
@@ -289,7 +320,7 @@ fn gate_pending_patches(
     for (pending, decision) in unapproved.into_iter().zip(decisions) {
         verdicts.push(apply_patch_decision(&expanded_policy, pending, decision)?);
     }
-    Ok(verdicts)
+    Ok((verdicts, policy))
 }
 
 /// Walk every pending patch's source pattern, run each matched file
@@ -309,6 +340,11 @@ fn enumerate_and_classify_patches(
         let provenance: Source = p.source.into();
         let dest = PatchDest::try_new(p.destination.as_utf8_path().to_path_buf())
             .map_err(|source| ComposeError::InvalidPendingPatchDest { source })?;
+        // Captured before `source_pattern` moves into the
+        // `ProvenancedPatch` below; the "no host-anchored walk root"
+        // error path names it so an operator sees which pattern
+        // needs anchoring.
+        let pattern_display = p.source_pattern.clone();
         // Client-response path handles daemon-side patches (Package /
         // Project) — user loadouts never reach this path (see
         // `daemon::composer`, which only accepts non-loadout
@@ -318,11 +354,47 @@ fn enumerate_and_classify_patches(
         let pp = ProvenancedPatch::new(Patch::new(p.source_pattern, dest), provenance);
         let expanded =
             expand_patch_sources(vec![pp], combined_vars, home_fallback, follow_symlinks)?;
+        // Capture the walk root before `enumerate_patch_files`
+        // consumes `expanded`. Needed for the synthetic Ignored
+        // verdict emitted below when the walk yields zero files.
+        let synthetic_host_path = expanded
+            .first()
+            .and_then(|epp| epp.source.walk_root())
+            .and_then(|hp| paths::HostAbsPath::try_new(hp.as_utf8_path().to_path_buf()).ok());
         let files = enumerate_patch_files(expanded)?;
+        let mut emitted_for_id = false;
         for pf in files {
+            emitted_for_id = true;
             match classify_patch_file(policy, PendingPatchFile::new(id, pf)) {
                 PatchClassification::Decided(verdict) => verdicts.push(verdict),
                 PatchClassification::Pending(p) => unapproved.push(p),
+            }
+        }
+        // The daemon requires at least one verdict per pending id.
+        // A pending patch whose walk matched zero files (e.g. the
+        // path doesn't exist on this host, or the glob matched no
+        // real files) still needs an entry — a synthetic `Ignored`
+        // that references the walk root. If we can't even produce a
+        // synthetic host path (walk root wasn't a canonical absolute
+        // path — pathological patterns like `**/*`), surface a
+        // client-side error naming the pending id and pattern rather
+        // than sending an incomplete verdict and letting the daemon
+        // reply with the undebuggable `verdict missing entry for
+        // pending patch`.
+        if !emitted_for_id {
+            if let Some(host_path) = synthetic_host_path {
+                verdicts.push(WirePatchVerdict::Ignored { id, host_path });
+            } else {
+                return Err(ComposeError::InvalidWireItem {
+                    what: "pending patch has no host-anchored walk root",
+                    context: format!(
+                        "pending id {id:?}, source pattern `{pattern_display}` \
+                         — the pattern's literal prefix is not an absolute \
+                         host path, so no Ignored verdict can be emitted; \
+                         make the source pattern host-anchored (e.g. `/…` \
+                         or `~/…`)"
+                    ),
+                });
             }
         }
     }
@@ -337,6 +409,14 @@ fn apply_patch_decision(
 ) -> Result<WirePatchVerdict, ComposeError> {
     match decision {
         ItemDecision::AllowOnce => Ok(pending.into_approved_verdict()),
+        // `IgnoreOnce`: emit an `Ignored` wire verdict so the daemon
+        // correlates the pending id and silently drops the item, same
+        // as a policy `ignore` match.
+        ItemDecision::IgnoreOnce => {
+            let (id, pf) = pending.into_parts();
+            let host_path = pf.target_path;
+            Ok(WirePatchVerdict::Ignored { id, host_path })
+        }
         ItemDecision::UseRule => match classify_patch_file(policy, pending) {
             PatchClassification::Decided(verdict) => Ok(verdict),
             PatchClassification::Pending(p) => Err(ComposeError::use_rule_undecided(

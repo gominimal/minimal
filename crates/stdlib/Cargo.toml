@@ -2,7 +2,7 @@
 name = "stdlib"
 version = "0.0.17"
 rust-version = "1.91"
-license = "MIT OR Apache-2.0"
+license.workspace = true
 edition.workspace = true
 publish.workspace = true
 

@@ -3,6 +3,7 @@ name = "check"
 version = "0.0.1"
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 anyhow.workspace = true

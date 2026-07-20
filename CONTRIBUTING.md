@@ -6,10 +6,10 @@ We welcome contributions of all kinds — bug reports, documentation improvement
 
 ## TL;DR
 
-1. Fork the "main" branch and commit your chanages to your fork
-4. Submit your PR as normal
-2. Before we can accept your pull request, you'll need to sign our **Contributor License Agreement (CLA)**.
-3. This happens automatically on your first PR — a bot will comment with a link. It takes about 30 seconds.
+1. Fork the "main" branch and commit your changes to your fork
+2. Submit your PR as normal
+3. Before we can accept your pull request, you'll need to sign our **Contributor License Agreement (CLA)**.
+4. This happens automatically on your first PR — a bot will comment with a link. It takes about 30 seconds.
 
 ## Commit messages
 
@@ -103,7 +103,7 @@ Your signature record (GitHub username, email, timestamp, CLA version) is stored
 2. Create a feature branch: `git checkout -b your-feature-name`.
 3. Make your changes. Add tests where appropriate.
 4. Ensure the existing tests still pass.
-5. Commit with a clear message. We don't require a specific commit format, but "why" is more useful than "what."
+5. Commit following [Conventional Commits](#commit-messages) (enforced in CI by commitlint); "why" is more useful than "what."
 6. Push to your fork and open a pull request against `main`.
 7. Sign the CLA if prompted.
 

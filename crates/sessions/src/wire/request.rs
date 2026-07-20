@@ -119,6 +119,7 @@ mod tests {
                 source: WireSource::Package {
                     name: "rust".into(),
                 },
+                carries_user_data: true,
             }],
             patches: vec![],
             lifecycle_hooks: vec![],
@@ -135,6 +136,7 @@ mod tests {
                 value: WireResolvedVar {
                     name: "RUSTC".into(),
                     value: "/usr/bin/rustc".into(),
+                    carries_user_data: true,
                 },
             }],
             patches: vec![WirePatchVerdict::Denied {

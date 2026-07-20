@@ -20,7 +20,6 @@
 
 use std::sync::Arc;
 
-use mctx::PackageSelection;
 use paths::DaemonAbsPath;
 use sessions::{
     SessionId,
@@ -37,11 +36,11 @@ use sessions::{
 #[derive(Debug)]
 struct PackageAttrs {
     state_wiring: Vec<mfile::StateWiring>,
-    /// Copy-source paths pulled off `env_dir_mappings` and
-    /// `env_file_mappings` (post credential filter). Each string is
-    /// used verbatim as both source and destination — see
-    /// [`mfile::PackageComposable::new`]'s docs.
-    fs_mapping_paths: Vec<String>,
+    /// Typed fs mappings pulled off `env_dir_mappings` /
+    /// `env_file_mappings` (post credential filter). `Dir` for the
+    /// former, `File` for the latter — [`mfile::PackageComposable::contribute`]
+    /// shapes the walk pattern per variant.
+    fs_mappings: Vec<mfile::PackageFsMapping>,
 }
 
 /// Read the runtime-env attrs off a package's `BuildSpec.attrs`
@@ -54,7 +53,7 @@ struct PackageAttrs {
 fn extract_package_attrs(b: &graph::BuildSpec) -> Result<PackageAttrs, std::io::Error> {
     Ok(PackageAttrs {
         state_wiring: extract_state_wiring(b)?,
-        fs_mapping_paths: extract_fs_mapping_paths(b),
+        fs_mappings: extract_fs_mappings(b),
     })
 }
 
@@ -100,7 +99,7 @@ fn extract_state_wiring(b: &graph::BuildSpec) -> Result<Vec<mfile::StateWiring>,
 
 /// The string form of the nickel enum tag `'Credential` as it
 /// appears after `decode`'s AttrValue conversion. Compared as a
-/// plain string at runtime in [`extract_fs_mapping_paths`], so if
+/// plain string at runtime in [`extract_fs_mappings`], so if
 /// `decode::AttrValue::EnumTag` ever changes its rendering
 /// (angle-brackets, hash prefix, etc.) the check here silently
 /// stops matching — credential mappings would then flow through
@@ -115,58 +114,87 @@ fn extract_state_wiring(b: &graph::BuildSpec) -> Result<Vec<mfile::StateWiring>,
 // rendering.
 const CREDENTIAL_CLASS_TAG: &str = "Credential";
 
-fn extract_fs_mapping_paths(b: &graph::BuildSpec) -> Vec<String> {
+fn extract_fs_mappings(b: &graph::BuildSpec) -> Vec<mfile::PackageFsMapping> {
     // TODO(secrets): `class = 'Credential` mappings are filtered
     // out here rather than routed through a separate secrets
     // channel. When the secrets strategy lands, teach this
     // extractor to emit them via that channel; today they simply
     // aren't seen by the sandbox on the composition path.
+    //
+    // Dir mappings get shaped into a recursive glob downstream by
+    // [`mfile::PackageComposable::contribute`]; here we just tag the
+    // variant so that logic can distinguish them from single-file
+    // mappings.
     ["env_dir_mappings", "env_file_mappings"]
         .iter()
-        .filter_map(|attr| b.attrs.get(*attr))
-        .flat_map(|v| attr_entries(v).into_iter())
-        .filter_map(|entry| {
-            let m = entry.as_map()?;
-            let path = m.get("path")?.as_string()?.clone();
-            // The two filters differ in what they do with the entry:
-            // - Credential-class drops the entry entirely (with a
-            //   warn naming the package + path).
-            // - read_only=true keeps the entry (the mapping still
-            //   reaches the sandbox) but warns that the flag was
-            //   ignored, since minimal is copy-based and there's
-            //   no read-only enforcement to apply.
-            // Both warn so an operator reading daemon logs sees
-            // exactly which package's mapping had its declared
-            // intent altered.
-            //
-            // Missing/malformed `class` still returns silently —
-            // that's a nickel-schema violation on the package side
-            // and the extractor isn't the right layer to surface
-            // it.
-            if m.get("class")
-                .and_then(|c| c.as_string())
-                .map(String::as_str)
-                == Some(CREDENTIAL_CLASS_TAG)
-            {
-                tracing::warn!(
-                    package = %b.name,
-                    path = %path,
-                    "dropping Credential-class fs mapping from session composition; \
-                     the secrets strategy is deferred, so credentials do not reach the \
-                     session sandbox via the composition path",
-                );
-                return None;
-            }
-            if m.get("read_only").and_then(|c| c.as_bool()).copied() == Some(true) {
-                tracing::warn!(
-                    package = %b.name,
-                    path = %path,
-                    "ignoring `read_only = true` on fs mapping; minimal is copy-based \
-                     and the resulting sandbox file is writable regardless of the \
-                     package author's declared intent",
-                );
-            }
-            Some(path)
+        .flat_map(|attr| {
+            let is_dir = *attr == "env_dir_mappings";
+            b.attrs
+                .get(*attr)
+                .into_iter()
+                .flat_map(|v| attr_entries(v).into_iter())
+                .filter_map(move |entry| {
+                    let m = entry.as_map()?;
+                    // Normalize the path: trim trailing slashes so a
+                    // package declaration like `~/.claude/` gives the
+                    // same mapping as `~/.claude`, and reject the
+                    // pathological cases (empty, or a bare `/`) so a
+                    // walker rooted at filesystem root can never
+                    // reach the client.
+                    let path = m.get("path")?.as_string()?.trim_end_matches('/').to_owned();
+                    if path.is_empty() {
+                        tracing::warn!(
+                            package = %b.name,
+                            attr = %attr,
+                            "dropping fs mapping with empty or root path; the walker \
+                             would otherwise be rooted at the filesystem root",
+                        );
+                        return None;
+                    }
+                    // The two filters differ in what they do with the entry:
+                    // - Credential-class drops the entry entirely (with a
+                    //   warn naming the package + path).
+                    // - read_only=true keeps the entry (the mapping still
+                    //   reaches the sandbox) but warns that the flag was
+                    //   ignored, since minimal is copy-based and there's
+                    //   no read-only enforcement to apply.
+                    // Both warn so an operator reading daemon logs sees
+                    // exactly which package's mapping had its declared
+                    // intent altered.
+                    //
+                    // Missing/malformed `class` still returns silently —
+                    // that's a nickel-schema violation on the package side
+                    // and the extractor isn't the right layer to surface
+                    // it.
+                    if m.get("class")
+                        .and_then(|c| c.as_string())
+                        .map(String::as_str)
+                        == Some(CREDENTIAL_CLASS_TAG)
+                    {
+                        tracing::warn!(
+                            package = %b.name,
+                            path = %path,
+                            "dropping Credential-class fs mapping from session composition; \
+                             the secrets strategy is deferred, so credentials do not reach the \
+                             session sandbox via the composition path",
+                        );
+                        return None;
+                    }
+                    if m.get("read_only").and_then(|c| c.as_bool()).copied() == Some(true) {
+                        tracing::warn!(
+                            package = %b.name,
+                            path = %path,
+                            "ignoring `read_only = true` on fs mapping; minimal is copy-based \
+                             and the resulting sandbox file is writable regardless of the \
+                             package author's declared intent",
+                        );
+                    }
+                    Some(if is_dir {
+                        mfile::PackageFsMapping::Dir { path }
+                    } else {
+                        mfile::PackageFsMapping::File { path }
+                    })
+                })
         })
         .collect()
 }
@@ -216,20 +244,35 @@ pub(crate) fn resolve_project_ctx_and_graph(
     daemon_ctx: &Arc<mctx::DaemonContext>,
     project_path: &DaemonAbsPath,
 ) -> Result<ProjectResolution, std::io::Error> {
+    // The daemon reads the project mfile off its *own* workspace copy,
+    // populated by the client's `WorkspaceFilesTarZst` upload between
+    // `CreateSession` and `ConfigureLoadout`. Not from the client's
+    // filesystem — `project_path` in the record names a location on
+    // the client, but this is a `DaemonAbsPath` pointing at the
+    // session's daemon-side workspace tree, so `find_mfile` reads
+    // from a filesystem the daemon actually has (works on every
+    // deployment model, including DM1 where the daemon lives inside
+    // a VM).
+    //
+    // The full workspace tree is needed because
+    // [`graph_from_all_packages`] walks the mfile chain — local
+    // `packages/*.ncl`, `stacks/*.ncl`, and `profiles/*.ncl` all
+    // contribute to graph construction and have to be on disk when
+    // this runs.
     let project_path_std = project_path.as_utf8_path().as_std_path().to_path_buf();
     let mfile = match mctx::MFileSearchStrategy::Override(project_path_std).find_mfile() {
-        Ok(mf) => mf,
+        Ok(m) => m,
         Err(mctx::Error::MFile(mfile::Error::NotFound)) => {
             tracing::debug!(
                 project_path = %project_path,
-                "no project mfile at CreateSession; project contribution will be empty",
+                "no project mfile at workspace root; project contribution will be empty",
             );
             return Ok(ProjectResolution::NoMFile);
         }
         Err(e) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("project `minimal.toml` at {project_path} is invalid: {e}"),
+                format!("loading project mfile at {project_path}: {e}"),
             ));
         }
     };
@@ -237,7 +280,16 @@ pub(crate) fn resolve_project_ctx_and_graph(
     match ctx.graph_from_all_packages() {
         Ok(graph) => Ok(ProjectResolution::Full(ctx, Box::new(graph))),
         Err(e) => {
-            tracing::debug!(
+            // `warn!` rather than `debug!`: when this fires, every
+            // package the project (or its stack) declared silently
+            // vanishes from the composition — no `env_state_wiring`
+            // vars, no `env_dir_mappings` / `env_file_mappings`
+            // patches reach the client. That's not something an
+            // operator wanting to know why claude-code's `~/.claude`
+            // isn't being prompted for can debug from a default-level
+            // daemon log; put it at `warn` so it lands in the
+            // ordinary log without a level bump.
+            tracing::warn!(
                 project_path = %project_path,
                 error = %e,
                 "graph resolution failed at CreateSession; \
@@ -410,38 +462,86 @@ pub(crate) fn build_composables(
     };
 
     let Some(graph) = graph else {
+        // Same silent-drop rationale as the two `warn!`s in
+        // `resolve_project_ctx_and_graph` and `as_bsrs` below: if
+        // `top_level_names` was non-empty (the mfile really did
+        // declare packages) but the graph was missing, the operator
+        // has no way to tell why claude-code isn't prompting.
+        if !top_level_names.is_empty() {
+            tracing::warn!(
+                project_path = %project_path,
+                packages = ?top_level_names,
+                "project declared packages but the graph is unavailable; \
+                 package composables will be empty (no env_state_wiring vars, \
+                 no env_dir/file_mappings patches)",
+            );
+        }
         return Ok((project_composable, Vec::new()));
     };
-    let package_composables = match top_level_names.as_bsrs(graph) {
-        Ok(top_levels) => {
-            let mut out = Vec::new();
-            for bsr in graph::Transitives::for_toplevels(graph, top_levels, false).keys() {
-                let Some(bs) = graph.get(bsr) else { continue };
-                let PackageAttrs {
-                    state_wiring,
-                    fs_mapping_paths,
-                } = extract_package_attrs(bs)?;
-                if state_wiring.is_empty() && fs_mapping_paths.is_empty() {
-                    continue;
-                }
-                out.push(mfile::PackageComposable::new(
-                    bs.name.clone(),
-                    state_wiring,
-                    fs_mapping_paths,
-                ));
-            }
-            out
-        }
-        Err(e) => {
-            tracing::debug!(
+    tracing::info!(
+        project_path = %project_path,
+        top_level_names = ?top_level_names,
+        "compose: walking top-level packages for env_state_wiring + \
+         env_dir/file_mappings",
+    );
+    // Resolve each top-level name individually rather than through
+    // `top_level_names.as_bsrs(graph)`: that helper collects into a
+    // `Result<Vec, _>` and short-circuits on the first unknown name,
+    // so one project-declared package the graph doesn't happen to
+    // know about (e.g. it lives in an upstream not fetched yet)
+    // would silently drop every *other* package's contribution too
+    // — no fs mappings, no state wiring, no prompts. Skipping the
+    // unknown ones with a `warn!` keeps the known packages' fs
+    // mappings flowing into the composer.
+    let (resolved, unresolved): (Vec<_>, Vec<_>) = top_level_names
+        .iter()
+        .map(|n| (n, graph.by_name(n).copied()))
+        .partition(|(_, bsr)| bsr.is_some());
+    if !unresolved.is_empty() {
+        let names: Vec<&str> = unresolved.iter().map(|(n, _)| n.as_str()).collect();
+        tracing::warn!(
+            project_path = %project_path,
+            unresolved = ?names,
+            "some declared packages are not present in the graph and will \
+             contribute nothing (no env_state_wiring, no env_dir/file_mappings); \
+             remaining top-level packages continue to be walked",
+        );
+    }
+    let top_levels: Vec<graph::BuildSpecRef> =
+        resolved.into_iter().filter_map(|(_, bsr)| bsr).collect();
+    let mut package_composables = Vec::new();
+    for bsr in graph::Transitives::for_toplevels(graph, top_levels, false).keys() {
+        let Some(bs) = graph.get(bsr) else { continue };
+        let PackageAttrs {
+            state_wiring,
+            fs_mappings,
+        } = extract_package_attrs(bs)?;
+        if state_wiring.is_empty() && fs_mappings.is_empty() {
+            // Most packages have neither wiring nor mappings —
+            // trace (not info) so a walk over a big transitive
+            // closure doesn't flood the log, but do emit it so
+            // it's clear a package was *considered* rather
+            // than silently skipped.
+            tracing::trace!(
                 project_path = %project_path,
-                error = %e,
-                "package name → BSR resolution failed at CreateSession; \
-                 package composables will be empty",
+                package = %bs.name,
+                "compose: package has no env_state_wiring or fs mappings; skipping",
             );
-            Vec::new()
+            continue;
         }
-    };
+        tracing::info!(
+            project_path = %project_path,
+            package = %bs.name,
+            state_wiring_len = state_wiring.len(),
+            fs_mappings = ?fs_mappings,
+            "compose: package contributes vars and/or patches",
+        );
+        package_composables.push(mfile::PackageComposable::new(
+            bs.name.clone(),
+            state_wiring,
+            fs_mappings,
+        ));
+    }
     Ok((project_composable, package_composables))
 }
 
@@ -546,13 +646,10 @@ mod tests {
 
         let PackageAttrs {
             state_wiring,
-            fs_mapping_paths,
+            fs_mappings,
         } = extract_package_attrs(bs).unwrap();
-        assert!(
-            fs_mapping_paths.is_empty(),
-            "no fs mappings on this fixture"
-        );
-        let composable = mfile::PackageComposable::new("go", state_wiring, fs_mapping_paths);
+        assert!(fs_mappings.is_empty(), "no fs mappings on this fixture");
+        let composable = mfile::PackageComposable::new("go", state_wiring, fs_mappings);
         let env = |_: &str| Err(std::env::VarError::NotPresent);
         let contribution = composable.contribute(&env).unwrap();
 
@@ -576,7 +673,7 @@ mod tests {
     }
 
     /// `class = 'Credential` fs mappings are dropped by
-    /// [`extract_fs_mapping_paths`] pending the future secrets
+    /// [`extract_fs_mappings`] pending the future secrets
     /// strategy. Regression guard: a package that declares one
     /// Credential entry alongside one State entry contributes only
     /// the State one to the composition path.
@@ -606,14 +703,15 @@ mod tests {
         let g = graph::Graph::new().ingest(layer).unwrap();
         let bs = g.get(g.by_name("claude-code").unwrap()).unwrap();
 
-        let PackageAttrs {
-            fs_mapping_paths, ..
-        } = extract_package_attrs(bs).unwrap();
-        let paths: Vec<&str> = fs_mapping_paths.iter().map(String::as_str).collect();
-        assert_eq!(paths, vec!["~/.claude"]);
-        assert!(
-            !paths.contains(&"~/.claude.json"),
-            "Credential-class mapping should be filtered out",
+        let PackageAttrs { fs_mappings, .. } = extract_package_attrs(bs).unwrap();
+        // `env_dir_mappings` → `Dir` (walker fans out to descendants);
+        // `env_file_mappings` with `class = 'Credential` is dropped
+        // entirely by the extractor.
+        assert_eq!(
+            fs_mappings,
+            vec![mfile::PackageFsMapping::Dir {
+                path: "~/.claude".to_string(),
+            }],
         );
     }
 
