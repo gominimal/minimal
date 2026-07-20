@@ -17,6 +17,7 @@ pub mod dirs;
 mod file_upload;
 pub mod git_remote;
 pub mod loadouts;
+pub mod prompt;
 
 #[derive(Parser)]
 #[command(name = "min", version = version::VERSION, long_version = version::LONG_VERSION)]
@@ -263,6 +264,14 @@ pub struct ActivateArgs {
     /// config's `default_loadouts`.
     #[arg(long, conflicts_with = "loadout")]
     pub no_loadouts: bool,
+    /// Fail instead of prompting when the daemon returns items the
+    /// user policy can't auto-decide. Useful for CI and other
+    /// non-interactive contexts — the error message includes a
+    /// `user_policy.toml` snippet that would make the activation
+    /// succeed. This mode is also selected implicitly when stdin
+    /// isn't attached to a terminal.
+    #[arg(long)]
+    pub no_prompt: bool,
     /// Automatically attach after creation
     #[arg(long)]
     pub attach: bool,
@@ -740,122 +749,105 @@ fn format_memory(bytes: u64) -> String {
     }
 }
 
-/// Default policy hook for `minimal activate`: auto-approves any
-/// item whose provenance is [`Source::Project`] or
-/// [`Source::Package`], and aborts on anything else.
-///
-/// Rationale: items reaching a hook are those the base
-/// [`UserPolicy`] couldn't auto-decide — with today's `Source`
-/// palette, that's exclusively project- and package-level
-/// contributions. Both come from the mfile / graph the user
-/// activated against, so activating the project implicitly
-/// consents to what it declares. A future [`Source`] variant we
-/// don't recognize hits the safe path (`Abort`) rather than
-/// getting silently allowed.
-///
-/// Once `minimal activate` grows a real `--policy` / `--allow`
-/// interface, this hook stays as the default when no explicit
-/// policy is provided.
-///
-/// [`Source::Project`]: sessions::core::source::Source::Project
-/// [`Source::Package`]: sessions::core::source::Source::Package
-/// [`UserPolicy`]: sessions::core::policy::UserPolicy
-struct ApproveProjectAndPackage;
-
-/// Return per-item [`AllowOnce`] decisions when every source in
-/// `sources` is a trusted daemon-side origin ([`Source::Project`]
-/// or [`Source::Package`]). `None` on any other source, which the
-/// caller maps to [`HookResult::Abort`].
-///
-/// [`AllowOnce`]: sessions::core::decision::ItemDecision::AllowOnce
-/// [`Source::Project`]: sessions::core::source::Source::Project
-/// [`Source::Package`]: sessions::core::source::Source::Package
-/// [`HookResult::Abort`]: sessions::core::hooks::HookResult::Abort
-fn decisions_for_trusted_sources<'a, I>(
-    sources: I,
-) -> Option<Vec<sessions::core::decision::ItemDecision>>
-where
-    I: IntoIterator<Item = &'a sessions::core::source::Source>,
-{
-    let mut decisions = Vec::new();
-    for source in sources {
-        match source {
-            sessions::core::source::Source::Project { .. }
-            | sessions::core::source::Source::Package { .. } => {
-                decisions.push(sessions::core::decision::ItemDecision::AllowOnce);
-            }
-            _ => return None,
-        }
-    }
-    Some(decisions)
+/// Whether the operator can be prompted interactively. The prompt
+/// renders on stderr (so stderr must be a terminal) and reads
+/// keypresses from stdin (so stdin must be a terminal too). If
+/// either side is redirected we take the `--no-prompt` path — going
+/// interactive when stdin is a pipe just hangs `dialoguer` and then
+/// aborts with a much less helpful error than the `--no-prompt`
+/// snippet the operator actually wants to paste.
+fn can_prompt_interactively() -> bool {
+    dialoguer::console::user_attended() && dialoguer::console::user_attended_stderr()
 }
 
-impl sessions::core::hooks::PolicyHooks for ApproveProjectAndPackage {
-    fn on_var_unapproved(
-        &self,
-        _policy: sessions::core::policy::VarsPolicy,
-        items: &[sessions::core::hooks::Unapproved<'_, str>],
-    ) -> sessions::core::hooks::HookResult<sessions::core::policy::VarsPolicy> {
-        decisions_for_trusted_sources(items.iter().map(|u| u.source()))
-            .map(sessions::core::hooks::HookResult::decided)
-            .unwrap_or(sessions::core::hooks::HookResult::Abort)
-    }
-
-    fn on_patch_unapproved(
-        &self,
-        _policy: sessions::core::policy::PatchPolicy,
-        items: &[sessions::core::hooks::Unapproved<'_, camino::Utf8Path>],
-    ) -> sessions::core::hooks::HookResult<sessions::core::policy::PatchPolicy> {
-        decisions_for_trusted_sources(items.iter().map(|u| u.source()))
-            .map(sessions::core::hooks::HookResult::decided)
-            .unwrap_or(sessions::core::hooks::HookResult::Abort)
-    }
-}
-
-/// Phase 3 + final SubmitVerdict round-trip for a `Pending` session.
+/// Phase 3 gate: run the user policy + hooks over the daemon's
+/// pending items and produce the wire verdict (plus the final
+/// policy after any hook mutations). Does NOT talk to the daemon —
+/// the caller decides whether to actually submit or abort.
 ///
 /// `policy` is the user's own [`UserPolicy`](sessions::core::policy::UserPolicy)
 /// loaded from `user_policy.toml`; daemon-side pending items
 /// (packages, projects) are gated against it here on the client.
-async fn drive_pending_to_active(
-    client: &mut client::Client,
+/// `hooks` decides what happens when the policy can't auto-decide an
+/// item — see [`crate::prompt`] for the two implementations
+/// (interactive prompt vs. `--no-prompt` collect-and-abort).
+///
+/// Split from [`submit_verdict_and_wait`] so `NoPromptHook` — which
+/// fake-approves every item to keep both var and patch hooks firing
+/// — can be intercepted between "verdict computed" and "verdict
+/// submitted"; otherwise a `--no-prompt` run would submit a bogus
+/// approval on the wire.
+fn compute_verdict(
     response: sessions::wire::request::ContributionResponse,
     policy: sessions::core::policy::UserPolicy,
     options: sessions::core::compose::ComposeOptions,
+    hooks: &dyn sessions::core::hooks::PolicyHooks,
+) -> Result<
+    (
+        sessions::wire::request::ContributionVerdict,
+        sessions::core::policy::UserPolicy,
+    ),
+    sessions::core::compose::ComposeError,
+> {
+    sessions::client::handler::handle_response(response, &[], policy, hooks, options, &|name| {
+        std::env::var(name)
+    })
+}
+
+/// Ship the verdict to the daemon and wait for `Active`. Every
+/// failure path in here has to `send_abort` first — the daemon is
+/// parked in `Draft{pending}` and leaks the session slot otherwise.
+async fn submit_verdict_and_wait(
+    client: &mut client::Client,
+    session_id: sessions::SessionId,
+    verdict: sessions::wire::request::ContributionVerdict,
 ) -> Result<sessions::SessionId, anyhow::Error> {
     use minimald_rpc::SubmitVerdict;
-    use sessions::client::handler::handle_response;
     use sessions::wire::request::SessionStep;
 
-    let session_id = response.session_id;
-
-    let hooks = ApproveProjectAndPackage;
-    let verdict = match handle_response(response, &[], policy, &hooks, options, &|name| {
-        std::env::var(name)
-    }) {
-        Ok(v) => v,
+    let resp = match client.oneshot_rpc::<SubmitVerdict>(verdict).await {
+        Ok(r) => r,
         Err(e) => {
             send_abort(client, session_id).await;
-            bail!("Composition gating failed: {e}");
+            return Err(e).context("SubmitVerdict RPC failed");
         }
     };
-
-    let resp = client
-        .oneshot_rpc::<SubmitVerdict>(verdict)
-        .await
-        .context("SubmitVerdict RPC failed")?;
     let step = match resp {
         minimald_rpc::Errorable::Ok(s) => s,
         minimald_rpc::Errorable::Err { error } => {
+            send_abort(client, session_id).await;
             bail!("SubmitVerdict failed: {error}");
         }
     };
     match step {
         SessionStep::Active { id } => Ok(id),
         SessionStep::Fault { error } => {
+            send_abort(client, session_id).await;
             bail!("SubmitVerdict faulted: {error}");
         }
     }
+}
+
+/// The interactive-prompt caller's happy path: gate, then submit,
+/// then return the finalized id + policy. Any gating failure aborts
+/// the daemon-side session before propagating.
+async fn drive_pending_to_active(
+    client: &mut client::Client,
+    response: sessions::wire::request::ContributionResponse,
+    policy: sessions::core::policy::UserPolicy,
+    options: sessions::core::compose::ComposeOptions,
+    hooks: &dyn sessions::core::hooks::PolicyHooks,
+) -> Result<(sessions::SessionId, sessions::core::policy::UserPolicy), anyhow::Error> {
+    let session_id = response.session_id;
+    let (verdict, final_policy) = match compute_verdict(response, policy, options, hooks) {
+        Ok(v) => v,
+        Err(e) => {
+            send_abort(client, session_id).await;
+            bail!("Composition gating failed: {e}");
+        }
+    };
+    let id = submit_verdict_and_wait(client, session_id, verdict).await?;
+    Ok((id, final_policy))
 }
 
 /// Fire an `AbortSession` at the daemon for a `Pending` session the
@@ -981,7 +973,9 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     // fail loudly on the client side without ever touching the
     // daemon.
     let cfg = config::read_client_config(global)?;
+    let policy_path = config::user_policy_path(global);
     let user_policy = config::read_user_policy(global)?;
+    let initial_policy = user_policy.clone();
     let compose_options = loadouts::compose_options_from_config(&cfg);
     let selection = loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts);
     let active = loadouts::resolve_active_loadouts(selection, &cfg, global)?;
@@ -989,8 +983,8 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
         let names: Vec<&str> = active.iter().map(|l| l.name().as_ref()).collect();
         eprintln!("Applying loadouts: {}", names.join(", "));
     }
-    let contribution =
-        loadouts::compose_user_contribution(active, user_policy.clone(), compose_options)?;
+    let (contribution, user_policy) =
+        loadouts::compose_user_contribution(active, user_policy, compose_options)?;
 
     let mut client = connect_daemon(global).await?;
 
@@ -1013,9 +1007,28 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     };
     let id = created.id;
 
-    // The session exists but has no loadout yet; composing it is a second
-    // round-trip because the daemon's composer reads the project config out
-    // of the session's workspace, not from a path on this machine.
+    // Upload the project directory to the daemon so the session
+    // workspace holds the user's files — `ConfigureLoadout`'s compose
+    // reads the mfile (and any local `packages/`, `stacks/`,
+    // `profiles/` used by graph resolution) off that workspace, so it
+    // has to run before `ConfigureLoadout`. `--sync none` opts out;
+    // the daemon then composes against an empty workspace and the
+    // caller is on their own for getting files there.
+    match args.sync {
+        SyncMode::None => {}
+        SyncMode::Tarball => {
+            eprintln!("Uploading project files...");
+            client
+                .upload_workspace_files(id, utf8_path.as_std_path())
+                .await
+                .context("Failed to upload project files")?;
+        }
+    };
+
+    // The session exists but has no loadout yet; composing it is a
+    // second round-trip because the daemon's composer reads the
+    // project config out of the session's workspace, not from a path
+    // on this machine.
     let configured = client
         .oneshot_rpc::<ConfigureLoadout>(ConfigureLoadoutRequest {
             session_id: id,
@@ -1030,23 +1043,93 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
         }
     };
     // The daemon may finalize immediately (`Ready`) or ask the
-    // client to gate items first (`Pending`).
+    // client to gate items first (`Pending`). On the pending path
+    // we run the user-policy prompt loop; on ready there's nothing
+    // to gate.
+    //
+    // Decide up front whether we can prompt: `--no-prompt` forces
+    // the abort path, and a non-TTY stderr triggers it implicitly
+    // (a script or CI run should never expect to read a keypress).
+    // Both fall through to `NoPromptHook`, which accumulates every
+    // item it would have prompted for so we can print a
+    // `user_policy.toml` snippet on the error path.
     if let minimald_rpc::ConfigureLoadoutResponse::Pending { response } = configured {
-        drive_pending_to_active(&mut client, response, user_policy, compose_options).await?;
+        let non_interactive = args.no_prompt || !can_prompt_interactively();
+        if non_interactive {
+            // NoPromptHook fake-approves every unapproved item so
+            // handle_response finishes both the var and patch gates
+            // and records everything in `summary`. If anything was
+            // recorded, we abort *before* actually shipping the
+            // verdict — the daemon must not see those fake
+            // approvals. Only when `summary` is empty (every daemon-
+            // sent item was already handled by the user's policy)
+            // do we submit and let the session go Active.
+            let session_id = response.session_id;
+            let hooks = prompt::NoPromptHook::new();
+            let verdict = match compute_verdict(response, user_policy, compose_options, &hooks) {
+                Ok((verdict, _final_policy)) => verdict,
+                Err(e) => {
+                    send_abort(&mut client, session_id).await;
+                    bail!("Composition gating failed: {e}");
+                }
+            };
+            let summary = hooks.into_summary();
+            if summary.count() > 0 {
+                send_abort(&mut client, session_id).await;
+                let count = summary.count();
+                let snippet = summary.as_toml_snippet();
+                bail!(
+                    "{count} item{s} would require interactive approval, but \
+                     --no-prompt was set (or stdin/stderr is not a terminal).\n\n\
+                     Add the following to {}:\n\n{snippet}\n\
+                     Then re-run this command.",
+                    policy_path.display(),
+                    s = if count == 1 { "" } else { "s" },
+                );
+            }
+            submit_verdict_and_wait(&mut client, session_id, verdict).await?;
+        } else {
+            // The hook stashes policy mutations in interior
+            // `RefCell`s so a `DenyPermanent` (which returns
+            // `HookResult::Abort` and can't pipe an
+            // `updated_policy` back through the composer) still
+            // survives to `into_final_policy`. We save
+            // unconditionally before propagating the result, so a
+            // deny-and-abort still writes the rule.
+            let hooks = prompt::InteractivePrompt::new(&policy_path, user_policy.clone());
+            let result = drive_pending_to_active(
+                &mut client,
+                response,
+                user_policy,
+                compose_options,
+                &hooks,
+            )
+            .await;
+            let final_policy = hooks.into_final_policy();
+            if final_policy != initial_policy {
+                // A `save_user_policy` failure is reported to
+                // stderr and *doesn't* propagate: if the activation
+                // itself also failed (`DenyPermanent` returns Err
+                // and still wants its rule saved; a real
+                // composition fault), `result?` below is what the
+                // operator needs to see. Blindly `?`ing the save
+                // would clobber that error with a spurious
+                // "updating user_policy.toml" message that hides
+                // the true failure.
+                match prompt::save_user_policy(&policy_path, &final_policy) {
+                    Ok(()) => eprintln!("Updated {}", policy_path.display()),
+                    Err(e) => eprintln!("warning: failed to update {}: {e}", policy_path.display()),
+                }
+            }
+            result?;
+        }
     }
 
-    // Upload the project directory to the daemon so the session
-    // sandbox has the user's files available.
-    match args.sync {
-        SyncMode::None => {}
-        SyncMode::Tarball => {
-            eprintln!("Uploading project files...");
-            client
-                .upload_workspace_files(id, utf8_path.as_std_path())
-                .await
-                .context("Failed to upload project files")?;
-        }
-    };
+    // On the Ready path (loadouts auto-decided; no prompt fired)
+    // `initial_policy` is only referenced inside the Pending branch
+    // above, so it appears unused to the compiler. Explicit `_` to
+    // squash the lint without dropping the useful name.
+    let _ = initial_policy;
 
     println!("{id}");
 
@@ -1890,93 +1973,6 @@ mod tests {
         assert!(parse_ingress_mapping("18080").is_err());
         assert!(parse_ingress_mapping("notaport:80").is_err());
         assert!(parse_ingress_mapping("18080:80/icmp").is_err());
-    }
-
-    /// All-Project sources → one `AllowOnce` per item. Baseline
-    /// happy path for the client's default hook.
-    #[test]
-    fn decisions_for_trusted_sources_allows_all_project() {
-        let sources = [
-            sessions::core::source::Source::Project {
-                path: paths::HostPath::new("/proj"),
-            },
-            sessions::core::source::Source::Project {
-                path: paths::HostPath::new("/proj"),
-            },
-        ];
-        let d =
-            decisions_for_trusted_sources(sources.iter()).expect("all Project → Some decisions");
-        assert_eq!(d.len(), 2);
-        assert!(
-            d.iter()
-                .all(|x| matches!(x, sessions::core::decision::ItemDecision::AllowOnce))
-        );
-    }
-
-    /// All-Package sources → same as Project. Same posture: the
-    /// package came from the mfile / graph the user activated
-    /// against, so activation implicitly consents.
-    #[test]
-    fn decisions_for_trusted_sources_allows_all_package() {
-        let sources = [
-            sessions::core::source::Source::Package {
-                name: "go".to_string(),
-            },
-            sessions::core::source::Source::Package {
-                name: "postgres".to_string(),
-            },
-        ];
-        let d =
-            decisions_for_trusted_sources(sources.iter()).expect("all Package → Some decisions");
-        assert_eq!(d.len(), 2);
-    }
-
-    /// A mix of trusted sources still allows; the helper is
-    /// per-item and doesn't care whether the item is a Project or
-    /// Package one.
-    #[test]
-    fn decisions_for_trusted_sources_allows_mixed_project_and_package() {
-        let sources = [
-            sessions::core::source::Source::Project {
-                path: paths::HostPath::new("/proj"),
-            },
-            sessions::core::source::Source::Package {
-                name: "go".to_string(),
-            },
-        ];
-        let d = decisions_for_trusted_sources(sources.iter())
-            .expect("Project+Package → Some decisions");
-        assert_eq!(d.len(), 2);
-    }
-
-    /// A single UserLoadout-origin item mixed in aborts the whole
-    /// batch. `UserLoadout` items shouldn't reach a hook — user
-    /// items auto-decide against the base `UserPolicy` — so seeing
-    /// one here is a caller bug and we abort defensively.
-    #[test]
-    fn decisions_for_trusted_sources_aborts_on_user_loadout() {
-        let sources = [
-            sessions::core::source::Source::Project {
-                path: paths::HostPath::new("/proj"),
-            },
-            sessions::core::source::Source::UserLoadout {
-                name: "dev".to_string(),
-            },
-        ];
-        assert!(
-            decisions_for_trusted_sources(sources.iter()).is_none(),
-            "any UserLoadout source in the batch → None → Abort",
-        );
-    }
-
-    /// An empty source list is `Some(vec![])`. `HookResult::decided(vec![])`
-    /// is the shape the gate expects on the (unusual but legal) empty-
-    /// batch call.
-    #[test]
-    fn decisions_for_trusted_sources_empty_yields_empty_decisions() {
-        let sources: [sessions::core::source::Source; 0] = [];
-        let d = decisions_for_trusted_sources(sources.iter()).expect("empty → Some(empty)");
-        assert!(d.is_empty());
     }
 
     /// Regression: a config in the `.minimal/` layout must be detected so

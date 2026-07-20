@@ -133,12 +133,12 @@ impl UserComposer {
         self,
         policy: UserPolicy,
         options: ComposeOptions,
-    ) -> Result<WireContribution, ComposeError> {
+    ) -> Result<(WireContribution, UserPolicy), ComposeError> {
         // Tilde fallback comes from the user's env on the client side
         // (this is the user's own process environment, so it's the
         // right HOME to use when the loadout doesn't declare one).
         let home_fallback = (*self.env)("HOME").ok();
-        let (composition, _final_policy) = compose_contribution(
+        let (composition, final_policy) = compose_contribution(
             self.contribution,
             &[],
             policy,
@@ -146,7 +146,7 @@ impl UserComposer {
             options,
             home_fallback.as_deref(),
         )?;
-        Ok(composition_to_wire(composition))
+        Ok((composition_to_wire(composition), final_policy))
     }
 }
 
@@ -184,7 +184,7 @@ mod tests {
                 VarValue::specified("hx"),
             ))
             .unwrap();
-        let wire = composer
+        let (wire, _) = composer
             .compose(UserPolicy::empty(), ComposeOptions::default())
             .unwrap();
         assert_eq!(wire.vars.len(), 1);
@@ -198,25 +198,27 @@ mod tests {
 
     /// User policy's `ignore` rule still applies on the client-side
     /// path — matching vars are dropped before they hit the wire.
+    /// Uses `Inherit` for both vars so they carry user data and
+    /// actually pass through the policy gate; a `Specified` literal
+    /// would bypass the gate as "no user data at risk" and both
+    /// vars would survive.
     #[test]
     fn ignore_filters_user_vars() {
         let policy =
             UserPolicy::empty().with_vars(VarsPolicy::empty().try_with_ignore(["_*"]).unwrap());
-        let mut composer = UserComposer::new();
+        let mut composer = UserComposer::new().with_env(Box::new(|name| match name {
+            "_TMP" => Ok("t".to_string()),
+            "EDITOR" => Ok("hx".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        }));
         composer
             .add(
                 loadout_named("dev")
-                    .with_var(
-                        StrictVarName::try_new("_TMP").unwrap(),
-                        VarValue::specified("x"),
-                    )
-                    .with_var(
-                        StrictVarName::try_new("EDITOR").unwrap(),
-                        VarValue::specified("hx"),
-                    ),
+                    .with_var(StrictVarName::try_new("_TMP").unwrap(), VarValue::Inherit)
+                    .with_var(StrictVarName::try_new("EDITOR").unwrap(), VarValue::Inherit),
             )
             .unwrap();
-        let wire = composer.compose(policy, ComposeOptions::default()).unwrap();
+        let (wire, _) = composer.compose(policy, ComposeOptions::default()).unwrap();
         assert_eq!(wire.vars.len(), 1);
         assert_eq!(wire.vars[0].var.name, "EDITOR");
     }
@@ -236,7 +238,7 @@ mod tests {
                     .with_lifecycle_hook(hook),
             )
             .unwrap();
-        let wire = composer
+        let (wire, _) = composer
             .compose(UserPolicy::empty(), ComposeOptions::default())
             .unwrap();
         assert_eq!(wire.requested_packages.len(), 1);
@@ -301,7 +303,7 @@ mod tests {
         );
         let mut composer = UserComposer::new();
         composer.add_all([l1, l2]).unwrap();
-        let wire = composer
+        let (wire, _) = composer
             .compose(UserPolicy::empty(), ComposeOptions::default())
             .unwrap();
         assert_eq!(wire.vars.len(), 2);
@@ -322,7 +324,7 @@ mod tests {
             }
         }));
         composer.add(loadout).unwrap();
-        let wire = composer
+        let (wire, _) = composer
             .compose(UserPolicy::empty(), ComposeOptions::default())
             .unwrap();
         assert_eq!(wire.vars.len(), 1);
@@ -356,7 +358,7 @@ mod tests {
 
         let mut composer = UserComposer::new();
         composer.add(loadout).unwrap();
-        let wire = composer
+        let (wire, _) = composer
             .compose(UserPolicy::empty(), ComposeOptions::default())
             .unwrap();
         assert_eq!(wire.vars.len(), 1);
