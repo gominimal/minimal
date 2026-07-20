@@ -115,6 +115,50 @@ The subsystem stands on three legs:
   what the guest was doing when it died, so that "it's frozen" reports are
   self-diagnosing.
 
+## Porting baseline — reconciling the reference tree with current `main`
+
+The reference branch (`77fc711e`) is a single 4107-line change; the earlier
+units have already merged and reshaped the tree the later ones build on. Take
+file **content** from the reference, but reconcile it against the layout the
+merged units have produced — the reference's private helpers have since moved
+into shared crate surfaces, and a verbatim copy will not compile. Current
+state a later unit must build against (verify with `ls`/`cat` before
+starting, as the merged surface is the truth):
+
+- **`diagnostics` crate (Units 1–2, merged).** App-agnostic mechanics already
+  exported: `bundle` (`BundleWriter`, `BundleSink`, `LOG_TAIL_CAP`,
+  `open_regular_nofollow`), `capture` (`command_capture`, `first_stdout_line`,
+  `Capture`), `disk` (`disk_usage`, `DiskUsage`), `listing`, `logs`
+  (`newest_rotated`), `manifest`, `redact` (`is_sensitive_key`,
+  `is_env_table_name`, `redaction_placeholder`, `redact_json`, `redact_toml`,
+  `masked_process_env`), `system` (`system_info`, `SystemInfo`, `DiskInfo`).
+  A collector moving into the crate (Unit 5's `net`/`procs`/`power`) **must
+  consume these** rather than the reference files' private near-duplicates —
+  the reference's own subprocess runners become `capture::command_capture`,
+  its local `statvfs` becomes `disk::disk_usage`.
+- **`crates/minimal/src/diag/` (Unit 2, merged).** `mod.rs` (`cmd_bug`, the
+  `collect_step!` macro, the provider skip), `collect.rs` (host collectors),
+  `redact.rs` (CLI **policy** only: the env-value allowlist over the crate's
+  `is_sensitive_key`). No `net`/`procs`/`power`/`guest` yet — those arrive
+  with Units 5 and 7. The `--no-guest`/`--guest-timeout-secs` flags are **not
+  present** (deferred to Unit 7); the provider loop currently records a skip.
+- **`crates/minimald` (Unit 3, merged).** Daemon file logging is a
+  `DaemonLogger` in `src/logging.rs` (console + a reloadable file layer;
+  release owned by `ServerState`, run at shutdown). Rotation is
+  `tracing-appender` **daily** (not size-based). Unit 6's `DiagBundleTarZst`
+  arm slots into the current `handle_ssh_rpc` dispatch in `src/rpc.rs`
+  **beside `STREAM_WORKSPACE_FILES`** — in both the take-and-`channel_success`
+  match and the spawn match (grep the constant; do not trust a line number).
+- **`crates/minimald-rpc` (Unit 4).** The `trace` module (`TraceContext`,
+  `TRACEPARENT_ENV`) and the JSON-lines file format land with Unit 4; Unit 6's
+  dispatch runs inside that unit's trace span, so the guest bundle's records
+  already carry the propagated `trace_id`. Confirm Unit 4 has merged before
+  building Unit 6's serving path.
+
+Citations of the form `path:NN` against `77fc711e` are stable (pinned commit);
+citations against `origin/main` drift — re-anchor them by grepping the named
+symbol.
+
 ## Demoable Units of Work
 
 > Requirement IDs use the format **R{unit}.{seq}** (R1.1, R1.2 for Unit 1;
@@ -628,10 +672,11 @@ same `manifest.json` schema as the host bundle.
   `#[non_exhaustive] DiagBundleRequest { log_tail_bytes: u64 /* 0 = daemon
   default */, include_state_listing: bool /* default true */ }`; an empty
   JSON body decodes to the documented defaults. The subsystem follows the
-  streaming-subsystem pattern already established by `WorkspaceFilesTarZst`
-  (`crates/minimald/src/rpc.rs:485-486`, main), in the mirror direction: the
-  client writes one JSON request and half-closes, the daemon streams one
-  tar.zst and closes.
+  streaming-subsystem pattern already established by `STREAM_WORKSPACE_FILES`
+  (grep the const and its two `handle_ssh_rpc` match arms in
+  `crates/minimald/src/rpc.rs`), in the mirror direction: the client writes
+  one JSON request and half-closes, the daemon streams one tar.zst and
+  closes.
 - **R6.2**: The daemon shall stream its bundle through
   `BundleWriter::stream` (rootless): `meta.json` (version, uptime, microVM
   flag), tail-capped `logs/`, metadata-only `state-listing.txt` (on
@@ -868,8 +913,8 @@ volume monitoring, and the writer stays swappable behind one constructor if
 
 The bundle transport *is* a streaming RPC — deliberately the smallest
 possible one. `DiagBundleTarZst` mirrors the streaming-subsystem pattern the
-wire already carries for workspace upload (`WorkspaceFilesTarZst`,
-`crates/minimald/src/rpc.rs:485-486` on main), direction reversed: one JSON
+wire already carries for workspace upload (`STREAM_WORKSPACE_FILES` in
+`crates/minimald/src/rpc.rs`), direction reversed: one JSON
 request, half-close, one tar.zst streamed back with pre-stream errors on
 extended-data stream 1, close. ~200 lines whose failure modes are inspectable
 with the same probe that precedes it. What this spec rejects is the

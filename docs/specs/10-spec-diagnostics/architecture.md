@@ -327,8 +327,8 @@ ALREADY EXISTS: the oneshot/subsystem RPC plumbing and
 `RPC_SUBSYSTEM_PREFIX` — `crates/minimald-rpc/src/lib.rs` (main).
 
 ALREADY EXISTS: the streaming-subsystem pattern this contract mirrors —
-`WorkspaceFilesTarZst` (`STREAM_WORKSPACE_FILES`,
-`crates/minimald/src/rpc.rs:485-486` on main) streams a tar.zst *to* the
+`WorkspaceFilesTarZst` (`STREAM_WORKSPACE_FILES` in
+`crates/minimald/src/rpc.rs`) streams a tar.zst *to* the
 daemon; `DiagBundleTarZst` streams one *from* it. Same request/half-close
 lifecycle, same `*TarZst` naming, no new transport machinery.
 
