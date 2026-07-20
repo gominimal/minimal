@@ -123,6 +123,18 @@ OAuth **device flow** once, the user approves in a browser, and `min` receives a
 **real user** (`GIT_AUTHOR` = user), satisfying G4. `min` refreshes transparently, so
 sessions longer than 8 hours keep working.
 
+**Roles.** There is **one registered GitHub App** ("minimal"), owned by the project. The
+**`min` CLI is the device-flow client**: it uses the App's *public* `client_id` (the
+device authorization grant needs no client secret or private key) to obtain a
+**user-to-server** token for the human at the terminal. The **`minimald` daemon performs
+no OAuth** in this single-user MVP — it receives already-minted short-lived tokens via
+the in-session credential helper, and no App private key is stored anywhere.
+Authenticating (device-flow *login*) is distinct from **installing** the App on a
+repo/org: login proves the user's identity; installation lets that user token reach the
+repo. Both are required for private repos (R1.4). `minimald`/a backend would act *as the
+App* (server-to-server installation tokens minted from the private key) only in the
+future hosted/bot path — NG3/FW2/FW5, not the MVP.
+
 **Least privilege.** The App requests only the permissions the loop needs:
 
 | Permission | Level | Why |
@@ -325,6 +337,9 @@ exit                                  # min attach detects shell exit
 - **FW2** Multi-tenant hosted operation (`minhosted`/`mincloud`, NG2) — a real
   session→GitHub authorization layer and server-held/short-lived installation tokens; the
   `MinHosted`/`MinCloud` placeholders in `docs/session-domain-diag.md` are the anchor.
+  With no local `min` at a terminal, the device authorization grant is driven from the
+  hosted side (the `user_code` is shown in the session/web UI for the user to approve) —
+  same grant, different display surface.
 - **FW3** Headless PR-on-exit via the deferred `on_destroy` lifecycle-hook executor.
 - **FW4** GitHub Enterprise Server support (NG5).
 - **FW5** Optional bot/installation-token transport mode for automation identities (NG3).
