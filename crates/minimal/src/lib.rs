@@ -21,7 +21,9 @@ pub mod prompt;
 
 #[derive(Parser)]
 #[command(name = "min", version = version::VERSION, long_version = version::LONG_VERSION)]
-#[command(about = "The Minimal CLI")]
+#[command(
+    about = "min, the Minimal session CLI — create, attach to, and manage sandboxed development sessions"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -74,29 +76,30 @@ pub enum Command {
     /// Examples:
     ///
     ///   # Forward host port 18080 to the webserver inside the "dev" session:
-    ///   minimal ssh-forward dev 18080:127.0.0.1:80
+    ///   min ssh-forward dev 18080:127.0.0.1:80
     ///
     ///   # Then access it from the host:
     ///   curl http://localhost:18080/
     #[cfg(feature = "remote-access")]
     #[command(name = "ssh-forward", visible_alias = "forward")]
     SshForward(SshForwardArgs),
-    /// Obtain an mTLS client certificate from minimald for use with the HTTPS
-    /// reverse proxy (R4.4, R4.5).
+    /// Obtain an mTLS client certificate for the HTTPS reverse proxy
     ///
     /// Connects to minimald, generates a fresh client certificate signed by
-    /// the daemon's internal CA, and saves the certificate and private key to
-    /// `~/.config/minimal/client.pem` / `~/.config/minimal/client.key`. Also
-    /// saves the CA certificate to `~/.config/minimal/ca.pem` so tools like
-    /// `curl` can trust the HTTPS proxy.
+    /// the daemon's internal CA (R4.4, R4.5), and saves the certificate and
+    /// private key to `~/.config/minimal/client.pem` /
+    /// `~/.config/minimal/client.key`. Also saves the CA certificate to
+    /// `~/.config/minimal/ca.pem` so tools like `curl` can trust the HTTPS
+    /// proxy.
     ///
     /// Example:
     ///
-    ///   minimal login
+    ///   min login
     ///   curl --cacert ~/.config/minimal/ca.pem \
     ///        --cert ~/.config/minimal/client.pem \
     ///        --key  ~/.config/minimal/client.key \
     ///        https://localhost:7655/
+    #[command(verbatim_doc_comment)]
     Login(LoginArgs),
     /// Rename an existing session
     Rename(RenameArgs),
@@ -110,7 +113,7 @@ pub enum Command {
     Version,
     /// Generate shell completion script
     #[command(
-        long_about = "Generate a shell tab-completion script for the minimal CLI.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(min completions bash)"
+        long_about = "Generate a shell tab-completion script for the min CLI.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(min completions bash)"
     )]
     Completions(CompletionsArgs),
 }
@@ -175,17 +178,17 @@ pub enum MeshCommand {
     ///
     /// Example:
     ///
-    ///   minimal mesh join mesh.example.com:51820
+    ///   min mesh join mesh.example.com:51820
     #[command(verbatim_doc_comment)]
     Join(MeshJoinArgs),
     /// Leave the WireGuard mesh and drop this machine's local enrolment
     ///
-    /// Removes the local enrolment record written by `minimal mesh join`.
+    /// Removes the local enrolment record written by `min mesh join`.
     /// Peer entries on the remote minimald must be removed there (manual v1).
     ///
     /// Example:
     ///
-    ///   minimal mesh leave
+    ///   min mesh leave
     #[command(verbatim_doc_comment)]
     Leave,
     /// Show this minimald's mesh status: public key, advertised subnets, peers
@@ -195,7 +198,7 @@ pub enum MeshCommand {
     ///
     /// Example:
     ///
-    ///   minimal mesh status
+    ///   min mesh status
     #[command(verbatim_doc_comment)]
     Status,
 }
@@ -207,12 +210,16 @@ pub struct MeshJoinArgs {
     pub address: String,
 }
 
-/// Shared arguments all subcommands
-///
-/// The `Default` value is the no-flags invocation (no overrides, native
-/// backend) — what a bare `min <cmd>` resolves to, and what indirect
-/// entrypoints like the `git-remote-min` helper mode (which git invokes
-/// without any of our flags) use.
+// Shared arguments for all subcommands.
+//
+// The `Default` value is the no-flags invocation (no overrides, native
+// backend) — what a bare `min <cmd>` resolves to, and what indirect
+// entrypoints like the `git-remote-min` helper mode (which git invokes
+// without any of our flags) use.
+//
+// Deliberately NOT a doc comment: clap propagates a flattened struct's doc
+// comment into the parent command's long_about, which would replace the
+// top-level `min --help` description with this text.
 #[derive(Debug, Default, Args)]
 pub struct GlobalArgs {
     /// Use the given directory as the repository root, instead of the current
@@ -260,8 +267,8 @@ pub struct ActivateArgs {
     /// `[loadouts].default_loadouts` in the client config are ignored.
     #[arg(long = "loadout", value_name = "NAME")]
     pub loadout: Vec<String>,
-    /// Apply no loadouts at all — overrides both `--loadout` and the
-    /// config's `default_loadouts`.
+    /// Apply no loadouts at all (also skips the config's
+    /// `default_loadouts`). Conflicts with `--loadout`.
     #[arg(long, conflicts_with = "loadout")]
     pub no_loadouts: bool,
     /// Fail instead of prompting when the daemon returns items the
@@ -427,7 +434,7 @@ pub struct ProxyArgs {
     pub socket: Option<String>,
 }
 
-/// Arguments for `minimal ssh-forward`.
+/// Arguments for `min ssh-forward`.
 #[cfg(feature = "remote-access")]
 #[derive(Debug, Args)]
 pub struct SshForwardArgs {
@@ -441,7 +448,7 @@ pub struct SshForwardArgs {
     pub forward: String,
 }
 
-/// Arguments for `minimal login`.
+/// Arguments for `min login`.
 #[derive(Debug, Args)]
 pub struct LoginArgs {
     /// Override the directory where client cert files are written
@@ -911,7 +918,7 @@ fn offer_mfile_scaffold(
     if !std::io::stdin().is_terminal() || !confirm("Would you like to create one?", true)? {
         eprintln!(
             "Continuing without one; the session gets a default environment. \
-             Run 'minimal init' to give the project its own config."
+             Run 'min init' to give the project its own config."
         );
         return Ok(());
     }
@@ -1374,7 +1381,7 @@ pub fn cmd_mesh_join(global: &GlobalArgs, args: MeshJoinArgs) -> Result<(), anyh
     );
     println!();
     println!("v1 uses manual key exchange. To complete the join:");
-    println!("  1. Run `minimal mesh status` on the remote host to read its public key.");
+    println!("  1. Run `min mesh status` on the remote host to read its public key.");
     println!("  2. Add this machine's WireGuard public key to the remote minimald's peers.");
     println!("  3. Add the remote's public key and endpoint to this machine's mesh config.");
     Ok(())
