@@ -33,6 +33,7 @@ resolver = "3"
 
 package.edition = "2024"
 package.publish = false
+package.license = "Apache-2.0"
 # Shared base version for the workspace. This is the fallback the `version` crate
 # reports when no `v*` git tag is reachable; the real release version comes from
 # `git describe` at build time. See crates/version/build.rs.

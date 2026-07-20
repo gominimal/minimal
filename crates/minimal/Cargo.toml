@@ -3,6 +3,7 @@ name = "minimal"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 # The user-facing command is `min` — clap has said so since the CLI was named
 # (`#[command(name = "min")]`), and the installer lays the binary down as
