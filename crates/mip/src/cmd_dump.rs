@@ -91,9 +91,6 @@ pub enum PkgRef {
         outputs: Vec<String>,
     },
     Source(SourceInput),
-    HostPath {
-        path: String,
-    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -266,9 +263,6 @@ fn pkg_ref_from_input(g: &Graph, i: &BuildDep, _c: &Cache) -> Result<PkgRef, Err
             outputs: s.outputs.iter().cloned().collect(),
         }),
         BuildDep::Source(s) => Ok(PkgRef::Source(s.clone())),
-        BuildDep::HostPath(path) => Ok(PkgRef::HostPath {
-            path: path.to_string_lossy().into_owned(),
-        }),
     }
 }
 
@@ -291,8 +285,6 @@ fn resolve_target(arch: Option<&str>) -> Result<Target, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use graph::Graph;
-    use std::path::PathBuf;
 
     fn stack_named(name: &str) -> Stack {
         Stack {
@@ -325,26 +317,6 @@ mod tests {
         // Exact match requires the whole name, so a partial misses.
         let missed = select_stacks(stacks.iter(), Some("alph"), true);
         assert!(missed.is_empty());
-    }
-
-    #[test]
-    fn pkg_ref_from_host_path_input_maps_the_path() {
-        // Regression: a `HostPath` build dep used to fall through to a
-        // `todo!()` and panic when dumping. Neither the graph nor the cache
-        // is consulted for this variant, so an empty graph and a throwaway
-        // cache dir suffice.
-        let graph = Graph::new();
-        let dir = std::env::temp_dir().join(format!("mip-dump-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cache = Cache::at_dir(&dir).unwrap();
-
-        let dep = BuildDep::HostPath(PathBuf::from("/bin/bash"));
-        let pkg_ref = pkg_ref_from_input(&graph, &dep, &cache).unwrap();
-
-        assert!(
-            matches!(pkg_ref, PkgRef::HostPath { path } if path == "/bin/bash"),
-            "HostPath build dep should map to PkgRef::HostPath",
-        );
     }
 
     #[test]

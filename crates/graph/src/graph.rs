@@ -226,7 +226,7 @@ impl Graph {
             .filter_map(|input| match input {
                 Build(bsr) => Some(bsr),
                 Subset(si) => Some(&si.from),
-                Source(_) | HostPath(_) | Local { .. } => None,
+                Source(_) | Local { .. } => None,
             })
             .chain(build_spec.runtime_deps.iter().map(|dep| match dep {
                 RuntimeDep::Build(bsr) => bsr,

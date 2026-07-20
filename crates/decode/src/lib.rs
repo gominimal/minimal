@@ -338,7 +338,6 @@ impl DeclAccumulator for () {
 #[allow(dead_code)]
 pub enum ObjTy {
     Builder,
-    Path,
     OutputLib,
     OutputBin,
     OutputData,
@@ -609,11 +608,11 @@ mod tests {
         let l = Loader::new(
             indoc! {
                 "
-                let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
+                let {BuildSpec, Source, OutputLib, ..} = import \"minimal.ncl\" in
                 {
         			name = \"single buildspec\",
         			build_deps = [
-                        {path = \"/\"} | HostPath,
+                        {url = \"http://uwu.com\", sha256 = \"abcdef\"} | Source,
                     ],
                     outputs = {
                         something = { glob = \"/usr/lib/something.*.so\" } | OutputLib,
@@ -642,10 +641,10 @@ mod tests {
                 .map(|b| b.1.name.clone())
                 .collect::<Vec<String>>()
         );
-        // We expect that buildspec to have one HostPath input
+        // We expect that buildspec to have one Source input
         assert!(matches!(
             l.builds.iter().next().unwrap().1.build_deps[0],
-            builds::BuildDep::HostPath(_)
+            builds::BuildDep::Source(_)
         ));
 
         assert_eq!(

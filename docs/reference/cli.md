@@ -108,7 +108,6 @@ Generates a dependency graph visualization.
 | `--build-spec-deps` | | `true` | Include build spec "build_deps" |
 | `--source-deps` | | `false` | Include source code "build_deps" |
 | `--local-deps` | | `false` | Include local (build.sh) "input" deps |
-| `--hostpath-deps` | | `false` | Include host path "build_deps" |
 | `--needs` | | `false` | Include "Needs" nodes and edges |
 | `--provides` | | `false` | Include "Provides" edges and "Needs" nodes |
 | `--bootstrap` | | `false` | Include replace-on-cycle/prebuilts/bootstrap |
