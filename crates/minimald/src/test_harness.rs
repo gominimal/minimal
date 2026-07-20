@@ -150,7 +150,7 @@ impl TestServer {
     }
 
     /// Seed a project mfile into a session's daemon-side workspace,
-    /// standing in for the client's workspace upload.
+    /// standing in for the client's `WorkspaceFilesTarZst` upload.
     ///
     /// The composer reads a session's project config out of its workspace,
     /// never from the record's `project_path` — that's a path on the

@@ -200,6 +200,12 @@ async fn serve_create_session(
 /// and retry, or abort) rather than a transport failure. An unknown id —
 /// including an actor that died between resolve and delivery — is a
 /// `NotFound`-flavoured `Errorable::Err`.
+///
+/// The actor refuses a re-`ConfigureLoadout` when it already holds a
+/// pending contribution awaiting `SubmitVerdict`; the client has to
+/// `AbortSession` and create a new session to retry. Without that guard
+/// a second call would clobber the stashed `PendingComposeState` and
+/// invalidate every `PendingId` the first caller received.
 async fn serve_configure_loadout(s: ServerStateHandle, c: RuChannel<Msg>) {
     let res = minimald_rpc::ConfigureLoadout
         .handle_channel(c, async |req: minimald_rpc::ConfigureLoadoutRequest| {
