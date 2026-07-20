@@ -2,7 +2,7 @@
 id: arch-minvmd-resource-monitoring
 title: minvmd resource monitoring, configuration, and warnings — architecture
 kind: architecture
-status: planned
+status: shipped
 tracking-issue: 747
 ---
 

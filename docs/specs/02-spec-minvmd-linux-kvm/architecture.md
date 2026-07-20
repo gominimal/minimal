@@ -2,7 +2,7 @@
 id: arch-minvmd-linux-kvm
 title: "minvmd Linux KVM backend — architecture"
 kind: architecture
-status: planned
+status: shipped
 tracking-issue: 397
 ---
 

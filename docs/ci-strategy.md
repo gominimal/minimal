@@ -29,7 +29,7 @@
 >   which cuts the release channel).
 >
 > The test-extension contract (§10) is the load-bearing part for contributors —
-> see [CONTRIBUTING.md](../CONTRIBUTING.md).
+> see [CONTRIBUTING.md](https://github.com/gominimal/minimal/blob/main/CONTRIBUTING.md).
 
 ---
 
@@ -202,7 +202,7 @@ Configuration rules:
   `--target` automatically; jobs building different triples or feature sets must not
   share a key, and jobs building identically should (e.g. `build-linux` and
   `vm-smoke-linux` share, if the latter compiles anything at all).
-- **`save-if: ${{ github.ref == 'refs/heads/main' }}`** — PRs restore but never write.
+- **<span v-pre>`save-if: ${{ github.ref == 'refs/heads/main' }}`</span>** — PRs restore but never write.
   GitHub cache is branch-scoped (PRs read own branch + default branch only) and
   LRU-evicts at 10 GB (raisable since Nov 2025, but stay under it). PR churn writing
   caches evicts the main caches every PR actually wants.

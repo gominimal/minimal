@@ -2,7 +2,7 @@
 id: arch-networking
 title: "minimald networking — PTask network modes, DNS, egress/ingress, WireGuard mesh — architecture"
 kind: architecture
-status: planned
+status: shipped
 tracking-issue: 478
 ---
 
@@ -238,8 +238,8 @@ Distillery search (project: minimal) against concepts from this spec returned:
   transport, gvproxy child lifecycle pattern, and `StartingGuard` RAII pattern
   are all re-used. No contradiction.
 - **`spec-minvmd-networking-gvproxy`** (#404, score ≈ 0.56): the prior
-  gvproxy-for-VM spec, whose implementation has not landed yet (issue #404 is
-  in `sdd:triage`). Its `NetworkMode` enum, `spawn_gvproxy`, and
+  gvproxy-for-VM spec, whose implementation has not landed yet. Its
+  `NetworkMode` enum, `spawn_gvproxy`, and
   `check_network_policy` stub are all re-usable as foundation for Unit 1 and
   Unit 2. This architecture depends on #404's implementation landing first (or
   being subsumed by this work — see note in Unit 1).

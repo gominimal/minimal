@@ -2,7 +2,7 @@
 id: spec-minvmd-gvproxy-pidfd
 title: "minvmd: signal gvproxy switch via pidfd to close the independent-crash recycled-PID window"
 kind: spec
-status: planned
+status: shipped
 tracking-issue: 550
 supersedes:
 ---

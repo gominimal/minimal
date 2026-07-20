@@ -2,7 +2,7 @@
 id: spec-ssh-host-key-in-beacon
 title: "feat(minvmd): include SSH host public key in the ready beacon"
 kind: spec
-status: planned
+status: shipped
 tracking-issue: 467
 supersedes:
 ---

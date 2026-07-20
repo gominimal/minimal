@@ -2,7 +2,7 @@
 id: spec-minvmd-host-daemon
 title: "minvmd macOS VM provider host daemon"
 kind: spec
-status: planned
+status: shipped
 supersedes:
 ---
 
@@ -363,7 +363,7 @@ single-use auth token plus signals.
 over any bidirectional byte stream. libkrun's `krun_add_vsock_port2`
 delivers exactly that, so `minvmd` stays a thin lifecycle/transport
 daemon rather than a userspace byte relay. The provider-owns-socket and
-connect-and-prune discovery rules from `docs/session-domain-diag.md`
+connect-and-prune discovery rules from `docs/internal/session-domain-diag.md`
 hold under this model.
 
 ### Hard lessons baked in
@@ -413,8 +413,8 @@ hold under this model.
    (download + sha256-verify). Migration to a sibling `alpine-minirootfs`
    minimal package is a follow-up once `virtio-linux` merges.
 2. **Vsock port for `minimald`.** Proposed 2222 (avoids reference impl's
-   agent port 7350). Confirm with #156 owner. (`VSOCK_PORT` is a named
-   constant either way.)
+   agent port 7350); final port choice to be confirmed before
+   stabilization. (`VSOCK_PORT` is a named constant either way.)
 3. **Guest-side vsock terminator.** RESOLVED → vsock-native `minimald`:
    generalize the russh listener edge over `impl AsyncRead + AsyncWrite`
    and add a `run_on_vsock`. v0.1 ships the vsock stub (R3.4); the

@@ -2,7 +2,7 @@
 id: spec-networking
 title: "minimald networking — PTask network modes, DNS, egress/ingress, WireGuard mesh"
 kind: spec
-status: planned
+status: shipped
 tracking-issue: 478
 supersedes:
 ---

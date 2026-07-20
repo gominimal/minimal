@@ -3,8 +3,6 @@ id: 486
 title: "WireGuard implementation choice — wireguard-go vs boringtun for Unit 4"
 status: partial
 date: 2026-06-20
-authors:
-  - gominimal-aw-bot[bot]
 budget_hours: 2
 actual_hours: 1.5
 related:

@@ -2,7 +2,7 @@
 id: spec-minvmd-linux-kvm
 title: "minvmd Linux KVM backend"
 kind: spec
-status: planned
+status: shipped
 tracking-issue: 397
 supersedes:
 ---
@@ -58,11 +58,11 @@ in-VM `minimald` over vsock, and the `minimal` CLI reaches `minimald`
 transparently — the same path as macOS, without any Hypervisor.framework
 dependency.
 
-The Session Domain Model (`docs/session-domain-diag.md`) already shows a
+The Session Domain Model (`docs/internal/session-domain-diag.md`) already shows a
 "Local Linux deployment" where both `minimald` (direct namespace provider) and
 `minvmd` (VM provider) coexist on the same host, each exposing its own socket.
 This spec realizes the `minvmd` side of that diagram for Linux
-(informed by the session domain model in `docs/session-domain-diag.md`).
+(informed by the session domain model in `docs/internal/session-domain-diag.md`).
 
 ## Goals
 
@@ -270,7 +270,7 @@ establish the Linux/KVM baseline.
   per-session flag, loadout field, or policy mechanism is deferred to a
   follow-up under #396. This explicitly defers the "interacts with the
   taskspec capability envelope" aspect from the tracking issue open question.
-- **Provider-interface formal spec.** The `docs/session-domain-diag.md`
+- **Provider-interface formal spec.** The `docs/internal/session-domain-diag.md`
   Provider contract ("every provider delivers a reachable `minimald` endpoint
   over UDS") is sufficient for this spec. A formal provider-interface spec
   covering CF Firecracker, GCP, Daytona, and other backends is a separate
@@ -312,7 +312,7 @@ runners provisioned via the infrastructure team use the configured path.
 
 ### Relation to the session domain model
 
-`docs/session-domain-diag.md` (informed by the session domain model) already
+`docs/internal/session-domain-diag.md` (informed by the session domain model) already
 models Linux as a coexistence scenario: `minimald` (direct namespace provider)
 and `minvmd` (VM provider) each expose their own UDS; `minimal` discovers both.
 This spec realizes the `minvmd` side of the Linux deployment diagram without
