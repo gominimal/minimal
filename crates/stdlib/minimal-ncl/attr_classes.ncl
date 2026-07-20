@@ -154,5 +154,11 @@ in
         name = "build cost multiple",
         desc = "Hint to build infrastructure that this build is much more intensive than the typical, by some factor.",
         validate = Number,
+    },
+
+    redistributable = {
+        name = "redistributable",
+        desc = "Whether built artifacts of this package may be redistributed through the public binary cache. Absent means true. Set false for packages whose upstream license/ToS forbids redistribution (e.g. vendor-proprietary binaries): build infrastructure then neither uploads, indexes, nor seals their artifacts, and consumers always build locally from the vendor source (gominimal/inbox#290).",
+        validate = Bool,
     }
 }
