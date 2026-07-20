@@ -331,6 +331,12 @@ async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) {
             let mngr = s.sessions_manager().await;
             Ok(match mngr.shutdown(req.force).await {
                 Ok(()) => {
+                    // Close the file log first (both the native daemon and the
+                    // microVM): it flushes buffered records, and in the
+                    // microVM its write-open fd under the mountpoint would
+                    // otherwise defeat the clean unmount below. Records still
+                    // reach the console. A no-op for a foreground run.
+                    s.release_log().await;
                     // R2.1/R2.2: with the sessions drained, quiesce the state
                     // volume (syncfs + detach) before acknowledging, so a
                     // caller-driven VMM teardown right after the ack leaves a
@@ -369,10 +375,8 @@ async fn quiesce_state_volume_if_mounted(s: &ServerStateHandle) {
     if !s.state_volume_mounted().await {
         return;
     }
-    // The on-volume log appender holds a write-open fd under the mountpoint,
-    // which defeats both the clean unmount and the read-only remount —
-    // close it first. Records keep flowing to the console (host boot.log).
-    s.release_volume_log().await;
+    // The file log was already released by the shutdown handler, so its fd no
+    // longer holds the mountpoint busy.
     let mountpoint = s.minimal_state_dir().await;
     let quiesce = tokio::task::spawn_blocking(move || {
         crate::guest::quiesce_state_volume(mountpoint.as_utf8_path().as_str())

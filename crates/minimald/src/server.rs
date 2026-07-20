@@ -101,19 +101,30 @@ impl Config {
     }
 }
 
-/// A one-shot closure that closes the microVM's on-volume log appender —
-/// reloading its tracing layer off and dropping the worker guard — so the
-/// write-open fd is gone before the Shutdown RPC quiesces the state volume
-/// (otherwise it defeats the clean unmount and leaves a dirty ext4 journal).
-///
-/// Owned by the server state and run via
-/// [`ServerStateHandle::release_volume_log`] — no process-global mutable
-/// state.
-pub struct VolumeLogRelease(pub Box<dyn FnOnce() + Send>);
+/// A one-shot closure that closes the daemon's file-log appender — reloading
+/// its tracing layer off and dropping the worker guard, flushing buffered
+/// records and releasing the file descriptor. Authored by the binary's
+/// `DaemonLogger` (which owns the reload handle and the guard); owned here
+/// and run once at shutdown via [`ServerStateHandle::release_log`], so no
+/// process-global mutable state is needed. In the microVM this must precede
+/// the volume quiesce — an open fd under the mountpoint defeats the clean
+/// unmount and leaves a dirty ext4 journal.
+pub struct DaemonLogRelease(Box<dyn FnOnce() + Send>);
 
-impl std::fmt::Debug for VolumeLogRelease {
+impl DaemonLogRelease {
+    /// Wraps the release action. Called by the binary's `DaemonLogger`.
+    pub fn new(release: impl FnOnce() + Send + 'static) -> Self {
+        Self(Box::new(release))
+    }
+
+    fn run(self) {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for DaemonLogRelease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("VolumeLogRelease(..)")
+        f.write_str("DaemonLogRelease(..)")
     }
 }
 
@@ -128,10 +139,9 @@ pub struct ServerState {
     /// drain in-flight connections, and return so the process can exit.
     shutdown: CancellationToken,
 
-    /// Closes the microVM's on-volume log appender before the Shutdown RPC
-    /// quiesces the state volume. `None` outside the microVM (no on-volume
-    /// log to close).
-    volume_log_release: Option<VolumeLogRelease>,
+    /// Closes the daemon's file-log appender at shutdown (before the volume
+    /// quiesce in the microVM). `None` for a foreground run with no file log.
+    log_release: Option<DaemonLogRelease>,
 
     /// Memoized SSH host key, after first successful load.
     host_key: Option<PrivateKey>,
@@ -153,7 +163,7 @@ pub struct ServerState {
 impl ServerState {
     pub async fn new(
         config: Config,
-        volume_log_release: Option<VolumeLogRelease>,
+        log_release: Option<DaemonLogRelease>,
     ) -> Result<Self, std::io::Error> {
         let minimal_state_dir = config.minimal_state_dir.clone();
         let minimal_cache_dir = config.minimal_cache_dir.clone();
@@ -209,7 +219,7 @@ impl ServerState {
             .await?,
             config,
             shutdown: CancellationToken::new(),
-            volume_log_release,
+            log_release,
             host_key: None,
             #[cfg(feature = "networking-proxy")]
             cert_authority,
@@ -227,21 +237,21 @@ impl ServerStateHandle {
     /// Constructs a fresh handle wrapping a newly-initialized [`ServerState`].
     pub(crate) async fn new(
         config: Config,
-        volume_log_release: Option<VolumeLogRelease>,
+        log_release: Option<DaemonLogRelease>,
     ) -> Result<Self, std::io::Error> {
         Ok(Self(Arc::new(Mutex::new(
-            ServerState::new(config, volume_log_release).await?,
+            ServerState::new(config, log_release).await?,
         ))))
     }
 
-    /// Runs and clears the microVM's on-volume log release (closing the
-    /// appender's fd), so the caller may quiesce the state volume without the
-    /// log holding it busy. A no-op after the first call, and outside the
-    /// microVM. Called by the Shutdown RPC before quiescing.
-    pub async fn release_volume_log(&self) {
-        let release = self.0.lock().await.volume_log_release.take();
-        if let Some(VolumeLogRelease(release)) = release {
-            release();
+    /// Runs and clears the daemon's file-log release (flushing records and
+    /// closing the appender's fd), so a subsequent volume quiesce is not
+    /// blocked by the open fd. A no-op after the first call, and for a
+    /// foreground run with no file log. Called by the Shutdown RPC.
+    pub async fn release_log(&self) {
+        let release = self.0.lock().await.log_release.take();
+        if let Some(release) = release {
+            release.run();
         }
     }
 
@@ -406,13 +416,13 @@ impl Server {
     pub async fn run<L: Listener>(
         config: Config,
         listener: L,
-        volume_log_release: Option<VolumeLogRelease>,
+        log_release: Option<DaemonLogRelease>,
     ) -> Result<(), std::io::Error> {
         // `config` is moved into the state below; capture the deployment-model
         // flag the proxy startup needs first.
         #[cfg(target_os = "linux")]
         let in_microvm = config.in_microvm;
-        let state = ServerStateHandle::new(config, volume_log_release).await?;
+        let state = ServerStateHandle::new(config, log_release).await?;
 
         // Start minimald's two host-side proxies (B5 egress :7654, B8 mTLS
         // :7655) for the server's lifetime and, in a microVM (DM1), publish them
@@ -714,26 +724,26 @@ mod tests {
     /// times the Shutdown path invokes it, and a harness-style `None`
     /// release must be a no-op.
     #[tokio::test]
-    async fn volume_log_release_runs_exactly_once() {
+    async fn log_release_runs_exactly_once() {
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let dir = TempDir::new().unwrap();
         let count = Arc::new(AtomicU32::new(0));
         let counted = count.clone();
-        let release = VolumeLogRelease(Box::new(move || {
+        let release = DaemonLogRelease::new(move || {
             counted.fetch_add(1, Ordering::SeqCst);
-        }));
+        });
         let state = ServerStateHandle::new(test_config(&dir), Some(release))
             .await
             .unwrap();
-        state.release_volume_log().await;
-        state.release_volume_log().await;
+        state.release_log().await;
+        state.release_log().await;
         assert_eq!(count.load(Ordering::SeqCst), 1, "one-shot, then a no-op");
 
         let none = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        none.release_volume_log().await;
+        none.release_log().await;
     }
 
     /// Binds a UDS in `dir` and spawns `Server::run` against it, returning the
