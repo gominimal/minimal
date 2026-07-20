@@ -357,27 +357,27 @@ type LogActivator = Box<
     dyn FnOnce(&std::path::Path) -> Result<minimald::server::VolumeLogRelease, MainError> + Send,
 >;
 
-/// The size-rotated, retention-bounded appender both minimald log paths use
-/// (detached native daemon and microVM pid-1). Rotated files shift
-/// logrotate-style: the live file keeps the bare name, `.1` is the most
-/// recently rotated; at 10 MiB × 5 archives the footprint stays bounded.
-fn build_log_roller(log_dir: &std::path::Path) -> Result<logroller::LogRoller, MainError> {
-    logroller::LogRollerBuilder::new(log_dir, std::path::Path::new("minimald.log"))
-        .rotation(logroller::Rotation::SizeBased(logroller::RotationSize::MB(
-            10,
-        )))
-        .max_keep_files(5)
-        // Archive publication happens on a background thread; graceful
-        // shutdown joins it on drop, so the volume-log release leaves no
-        // `.pending.` orphans behind on the unmounting volume.
-        .graceful_shutdown(true)
-        .build()
+/// The daily-rotated, retention-bounded appender both minimald log paths use
+/// (detached native daemon and microVM pid-1). Files carry a date suffix
+/// (`minimald.log.2026-07-20`); rotation and pruning are inline (no
+/// background thread, no partial intermediates), so the volume-log release
+/// closes the file with a plain guard drop — nothing to join.
+fn build_log_appender(
+    log_dir: &std::path::Path,
+) -> Result<tracing_appender::rolling::RollingFileAppender, MainError> {
+    tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("minimald.log")
+        // Two weeks: comfortably past "what happened last week", bounded on
+        // disk.
+        .max_log_files(14)
+        .build(log_dir)
         .map_err(|e| MainError::IO(std::io::Error::other(e), "building rotating log appender"))
 }
 
 /// Install the tracing subscriber. Foreground processes log to stdout; a
 /// detached native daemon (marked by [`DETACHED_ENV`]) writes only to a
-/// size-rotated `<state_dir>/logs/minimald.log`. The microVM's pid-1 minimald
+/// daily-rotated `<state_dir>/logs/minimald.log`. The microVM's pid-1 minimald
 /// logs to stdout (serial → host boot.log, for boot diagnosis) *and* to a
 /// reloadable file layer that starts inert and is pointed at the state volume
 /// once it mounts (see async_main), so `min bug` can collect the in-VM
@@ -423,7 +423,7 @@ fn init_tracing(
         let activator: LogActivator = Box::new(move |log_dir: &std::path::Path| {
             std::fs::create_dir_all(log_dir)
                 .map_err(|e| MainError::IO(e, "creating minimald log directory"))?;
-            let appender = build_log_roller(log_dir)?;
+            let appender = build_log_appender(log_dir)?;
             // lossy(false): a diagnostic log that drops records under load
             // answers the wrong question. The cost is backpressure onto
             // logging threads if the volume wedges — accepted, because the
@@ -467,7 +467,7 @@ fn init_tracing(
         .join("logs");
     std::fs::create_dir_all(&log_dir)
         .map_err(|e| MainError::IO(e, "creating minimald log directory"))?;
-    let appender = build_log_roller(&log_dir)?;
+    let appender = build_log_appender(&log_dir)?;
     // lossy(false): dropped records defeat the whole point of a diagnostic
     // log, and the native daemon's log volume is nowhere near the bound.
     let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
@@ -481,7 +481,7 @@ fn init_tracing(
         .init();
     tracing::info!(
         log_dir = %log_dir.display(),
-        "detached minimald: routing tracing output to size-rotated log file",
+        "detached minimald: routing tracing output to daily-rotated log file",
     );
     Ok((Some(guard), None))
 }
@@ -658,7 +658,7 @@ async fn async_main() -> Result<(), MainError> {
                 volume_log_release = Some(release);
                 tracing::info!(
                     log_dir = %log_dir.display(),
-                    "microVM minimald: routing tracing output to size-rotated log file on the data volume",
+                    "microVM minimald: routing tracing output to daily-rotated log file on the data volume",
                 );
             }
             Err(e) => tracing::warn!(

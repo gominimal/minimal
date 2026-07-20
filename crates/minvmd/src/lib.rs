@@ -29,81 +29,58 @@ pub mod krun;
 pub use error::VmError;
 
 /// Env marker set on the re-exec'd child by `run --detach`. When present,
-/// the process routes tracing output to the size-rotated
+/// the process routes tracing output to the daily-rotated
 /// `<state_dir>/logs/minvmd.log` instead of stdout — a detached supervisor's
 /// stdout goes nowhere, and field diagnostics (`min bug`) need the history
 /// on disk. Lives here (not `main.rs`) because the detach spawn in
 /// `cmd::run` sets it and the binary entry point reads it.
 pub const DETACHED_ENV: &str = "MINVMD_DETACHED";
 
-/// Rotate the daemon log at this size; with [`LOG_KEEP_FILES`] retained
-/// archives this bounds a daemon's log footprint to ~60 MiB.
-pub const LOG_ROTATE_SIZE_MB: u64 = 10;
-/// Rotated archives kept on disk (`minvmd.log.1` newest … `.5` oldest).
-pub const LOG_KEEP_FILES: u64 = 5;
+/// Rotated files retained on disk. Two weeks comfortably covers the usual
+/// "what happened last week" window and bounds the on-disk footprint.
+pub const LOG_KEEP_FILES: usize = 14;
 
-/// The size-rotated, retention-bounded file appender both daemon log paths
+/// The daily-rotated, retention-bounded file appender both daemon log paths
 /// use (minvmd here; minimald mirrors the same scheme on the data volume).
-/// Rotated files shift logrotate-style: the live file keeps the bare name,
-/// `.1` is the most recently rotated.
-pub fn build_log_roller(
+/// Files carry a date suffix (`minvmd.log.2026-07-20`); rotation and
+/// pruning are inline (no background thread, no partial intermediates), so
+/// dropping the appender — at process exit or before a volume unmount —
+/// needs no shutdown handshake.
+pub fn build_log_appender(
     dir: &std::path::Path,
-    filename: &str,
-) -> Result<logroller::LogRoller, logroller::LogRollerError> {
-    roller_with(
-        dir,
-        filename,
-        logroller::RotationSize::MB(LOG_ROTATE_SIZE_MB),
-        LOG_KEEP_FILES,
-    )
-}
-
-fn roller_with(
-    dir: &std::path::Path,
-    filename: &str,
-    size: logroller::RotationSize,
-    keep: u64,
-) -> Result<logroller::LogRoller, logroller::LogRollerError> {
-    logroller::LogRollerBuilder::new(dir, std::path::Path::new(filename))
-        .rotation(logroller::Rotation::SizeBased(size))
-        .max_keep_files(keep)
-        // Archive publication happens on a background thread; graceful
-        // shutdown joins it on drop, so releasing the appender (before a
-        // volume unmount, or at process exit) leaves no `.pending.` orphans.
-        .graceful_shutdown(true)
-        .build()
+    prefix: &str,
+) -> Result<tracing_appender::rolling::RollingFileAppender, tracing_appender::rolling::InitError> {
+    tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(prefix)
+        .max_log_files(LOG_KEEP_FILES)
+        .build(dir)
 }
 
 #[cfg(test)]
-mod log_rotation {
+mod log_appender {
     use std::io::Write as _;
 
     #[test]
-    fn writing_past_the_threshold_rotates_and_prunes() {
+    fn writes_to_a_date_suffixed_file() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut roller = super::roller_with(
-            tmp.path(),
-            "minvmd.log",
-            logroller::RotationSize::Bytes(64),
-            2,
-        )
-        .unwrap();
-        for i in 0..20 {
-            writeln!(roller, "record {i:02} padding-to-force-rotation").unwrap();
-        }
-        drop(roller);
+        let mut appender = super::build_log_appender(tmp.path(), "minvmd.log").unwrap();
+        writeln!(appender, "a record").unwrap();
+        appender.flush().unwrap();
 
-        let mut names: Vec<String> = std::fs::read_dir(tmp.path())
+        let files: Vec<String> = std::fs::read_dir(tmp.path())
             .unwrap()
             .filter_map(Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        names.sort();
-        assert_eq!(
-            names,
-            ["minvmd.log", "minvmd.log.1", "minvmd.log.2"],
-            "live file plus exactly max_keep_files rotated archives"
+        assert_eq!(files.len(), 1, "one dated file: {files:?}");
+        assert!(
+            files[0].starts_with("minvmd.log."),
+            "date-suffixed name: {}",
+            files[0]
         );
+        let body = std::fs::read_to_string(tmp.path().join(&files[0])).unwrap();
+        assert!(body.contains("a record"), "got: {body}");
     }
 }
 

@@ -151,7 +151,7 @@ fn build_dir_rows(dirs: &DirsLookup) -> Vec<DirRow> {
             "State",
             "Daemon logs",
             Some(dirs.state.join("logs")),
-            Some("size-rotated: minimald.log*, minvmd.log*".to_string()),
+            Some("daily-rotated: minimald.log*, minvmd.log*".to_string()),
         )
             .into_row(),
         (
@@ -376,7 +376,7 @@ mod tests {
         let daemon_logs = rows.iter().find(|r| r.name == "Daemon logs").unwrap();
         assert_eq!(
             daemon_logs.note.as_deref(),
-            Some("size-rotated: minimald.log*, minvmd.log*"),
+            Some("daily-rotated: minimald.log*, minvmd.log*"),
         );
     }
 

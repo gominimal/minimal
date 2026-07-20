@@ -125,7 +125,7 @@ fn main() -> Result<()> {
 /// Install the tracing subscriber. Foreground processes log to stdout;
 /// detached supervisors (marked by [`minvmd::DETACHED_ENV`], set by
 /// `run --detach` on its re-exec'd child) write to
-/// `<state_dir>/logs/minvmd.log`, size-rotated with bounded retention,
+/// `<state_dir>/logs/minvmd.log`, daily-rotated with bounded retention,
 /// mirroring minimald's scheme so `min bug` finds both daemons' logs in one
 /// place. The returned guard must outlive the process — dropping it flushes
 /// pending records.
@@ -146,7 +146,7 @@ fn init_tracing() -> Result<Option<tracing_appender::non_blocking::WorkerGuard>>
         .join("logs");
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("creating minvmd log directory at {}", log_dir.display()))?;
-    let appender = minvmd::build_log_roller(&log_dir, "minvmd.log")
+    let appender = minvmd::build_log_appender(&log_dir, "minvmd.log")
         .context("building rotating log appender")?;
     // lossy(false): a diagnostic log that drops records under load answers
     // the wrong question; the supervisor's log volume is nowhere near the
@@ -161,7 +161,7 @@ fn init_tracing() -> Result<Option<tracing_appender::non_blocking::WorkerGuard>>
         .init();
     tracing::info!(
         log_dir = %log_dir.display(),
-        "detached minvmd: routing tracing output to size-rotated log file",
+        "detached minvmd: routing tracing output to daily-rotated log file",
     );
     Ok(Some(guard))
 }

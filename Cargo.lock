@@ -3374,18 +3374,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "logroller"
-version = "0.1.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7525242cbd0624fe9b76dfebc1923a2d20c003e8c5d1a7eab1324bd8c0f615ac"
-dependencies = [
- "chrono",
- "flate2",
- "regex",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3679,7 +3667,6 @@ dependencies = [
  "hakoniwa",
  "indoc",
  "libc",
- "logroller",
  "mctx",
  "mfile",
  "minimald-rpc",
@@ -3743,7 +3730,6 @@ dependencies = [
  "clap_complete",
  "fd-lock",
  "libc",
- "logroller",
  "minimald-rpc",
  "paths",
  "russh",
