@@ -1,0 +1,68 @@
+name: Bug report
+description: Something in minimal is broken or behaving unexpectedly
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: A clear description of the bug, including the full error output if there was any.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What you expected to happen instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Minimal steps to reproduce the behavior — ideally the exact commands and a `minimal.toml` snippet.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: version
+    attributes:
+      label: Version
+      description: Output of the version commands for the binaries involved.
+      placeholder: min version / mip --version
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: os-arch
+    attributes:
+      label: OS/arch
+      options:
+        - Linux amd64
+        - Linux arm64
+        - macOS arm64 (Apple Silicon)
+        - other
+    validations:
+      required: true
+  - type: dropdown
+    id: install-channel
+    attributes:
+      label: Install channel
+      options:
+        - stable
+        - unstable
+        - nightly
+        - built from source
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Any relevant log output. Long logs are fine — this field is rendered as code automatically.
+      render: shell
+    validations:
+      required: false

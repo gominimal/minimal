@@ -57,6 +57,39 @@ pub struct StateWiring {
     pub prefix: String,
 }
 
+/// One fs mapping a package declares — either a single file or a
+/// directory. Keeping the distinction here (rather than a stringly-
+/// typed `"path ends in /**" = dir` convention) is what lets
+/// [`PackageComposable::contribute`] own the walk-pattern shape;
+/// callers can't accidentally hand in a bare dir path that the
+/// client walker would then treat as a single file, silently
+/// dropping the whole mapping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackageFsMapping {
+    /// A single file at `path` on the host, staged at the same
+    /// sandbox-home-relative path.
+    File { path: String },
+    /// A directory rooted at `path`. The client-side walker
+    /// enumerates every descendant file and stages each at
+    /// `path/<relative-suffix>` in the sandbox. [`Self::path`] here
+    /// is the *directory root*; the `/**` suffix that
+    /// [`super::PackageComposable::contribute`] appends is
+    /// implementation detail owned by this crate, so a caller can
+    /// never construct a dir mapping whose walker semantics don't
+    /// match.
+    Dir { path: String },
+}
+
+impl PackageFsMapping {
+    /// The underlying host path, without any glob decoration.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        match self {
+            Self::File { path } | Self::Dir { path } => path.as_str(),
+        }
+    }
+}
+
 /// The runtime-env contribution of a single package, ready to feed
 /// [`SessionComposer::add`]. One [`PackageComposable`] per package
 /// in the transitive closure that has at least one non-empty
@@ -64,16 +97,14 @@ pub struct StateWiring {
 ///
 /// The `package_name` identifies the source in provenance
 /// ([`Source::Package`]); `state_wiring` produces env vars, and
-/// `fs_mapping_paths` produces patches (copy-shape, source == dest).
-/// Each entry in `fs_mapping_paths` is a single path used verbatim
-/// as both the host-side source and the sandbox-home-relative
-/// destination; extraction from
+/// `fs_mappings` produces patches. Extraction from
 /// `BuildSpec.attrs.env_dir_mappings` / `env_file_mappings` lives
 /// at the call site (the crate that owns the graph), which is
 /// also responsible for dropping `class = 'Credential` entries
-/// per the future-secrets deferral. Directory vs file distinction
-/// is irrelevant at the composition layer — both flatten to a
-/// single copy patch.
+/// per the future-secrets deferral. The [`PackageFsMapping`] enum makes
+/// the file-vs-directory distinction load-bearing so
+/// [`Self::contribute`] can shape the walk pattern correctly for
+/// each variant.
 ///
 /// [`SessionComposer::add`]: sessions::daemon::composer::SessionComposer::add
 /// [`Source::Package`]: sessions::core::source::Source::Package
@@ -81,7 +112,7 @@ pub struct StateWiring {
 pub struct PackageComposable {
     package_name: String,
     state_wiring: Vec<StateWiring>,
-    fs_mapping_paths: Vec<String>,
+    fs_mappings: Vec<PackageFsMapping>,
 }
 
 impl PackageComposable {
@@ -90,19 +121,16 @@ impl PackageComposable {
     /// responsible for reading these off `BuildSpec.attrs` (and
     /// dropping `class = 'Credential` mappings) — this type stays
     /// graph-agnostic.
-    ///
-    /// `fs_mappings` is a list of paths, each used verbatim as
-    /// both host source and sandbox-home-relative destination.
     #[must_use]
     pub fn new(
         package_name: impl Into<String>,
         state_wiring: Vec<StateWiring>,
-        fs_mappings: Vec<String>,
+        fs_mappings: Vec<PackageFsMapping>,
     ) -> Self {
         Self {
             package_name: package_name.into(),
             state_wiring,
-            fs_mapping_paths: fs_mappings,
+            fs_mappings,
         }
     }
 
@@ -155,10 +183,28 @@ impl Composable for PackageComposable {
             })?;
             c.push_var(ProvenancedVar::new(resolved, source.clone()));
         }
-        for path in self.fs_mapping_paths {
-            let dest = PatchDest::try_new(&path)?;
+        for mapping in self.fs_mappings {
+            // Dir vs file drives the *source pattern*: a dir needs a
+            // recursive glob (`<dir>/**`) so the client walker
+            // enumerates every descendant, otherwise the walker
+            // hands back zero files and the whole mapping vanishes
+            // (with only a `tracing::warn` in the daemon log). The
+            // *destination* is always the plain path — for a dir
+            // mapping, per-file dests are computed downstream by
+            // joining the walker's relative suffix, so writing
+            // `<dir>/**` here would collapse every file to the
+            // literal glob string.
+            let (source_pattern, dest_path) = match mapping {
+                PackageFsMapping::File { path } => (path.clone(), path),
+                PackageFsMapping::Dir { path } => {
+                    let trimmed = path.trim_end_matches('/').to_owned();
+                    let source = format!("{trimmed}/**");
+                    (source, trimmed)
+                }
+            };
+            let dest = PatchDest::try_new(&dest_path)?;
             c.push_patch(ProvenancedPatch::new(
-                Patch::new(path, dest),
+                Patch::new(source_pattern, dest),
                 source.clone(),
             ));
         }
@@ -227,18 +273,23 @@ mod tests {
         assert!(contribution.is_empty());
     }
 
-    /// A package whose attrs declare `env_dir_mappings` or
-    /// `env_file_mappings` (post credential-filter) contributes
-    /// patches where `source == dest == path`, tagged with the
-    /// package's name.
+    /// A package's fs mappings show up as patches: dir mappings get
+    /// a recursive-glob source (so the client walker enumerates
+    /// descendants) with a plain dest (per-file dests are computed
+    /// downstream), file mappings use the path verbatim for both
+    /// source and dest.
     #[test]
     fn contribute_maps_fs_mappings_to_patches() {
         let comp = PackageComposable::new(
             "claude-code",
             Vec::new(),
             vec![
-                "~/.claude".to_string(),
-                "~/.config/claude/settings.json".to_string(),
+                PackageFsMapping::Dir {
+                    path: "~/.claude".to_string(),
+                },
+                PackageFsMapping::File {
+                    path: "~/.config/claude/settings.json".to_string(),
+                },
             ],
         );
         let env = |_: &str| Err(std::env::VarError::NotPresent);
@@ -246,22 +297,57 @@ mod tests {
 
         assert_eq!(contribution.patches().len(), 2);
         assert!(contribution.vars().is_empty());
-        let sources: std::collections::BTreeSet<&str> = contribution
-            .patches()
-            .iter()
-            .map(|pp| pp.patch().source())
-            .collect();
-        assert!(sources.contains("~/.claude"));
-        assert!(sources.contains("~/.config/claude/settings.json"));
         let expected_source = Source::Package {
             name: "claude-code".into(),
         };
+        let by_source: std::collections::HashMap<&str, &str> = contribution
+            .patches()
+            .iter()
+            .map(|pp| {
+                (
+                    pp.patch().source(),
+                    pp.patch().dest().as_sandbox_path().as_str(),
+                )
+            })
+            .collect();
+        // Dir mapping: source has `/**` for walker fan-out, dest is
+        // the bare path (walker computes per-file dests).
+        assert_eq!(by_source.get("~/.claude/**").copied(), Some("~/.claude"));
+        // File mapping: source == dest.
+        assert_eq!(
+            by_source.get("~/.config/claude/settings.json").copied(),
+            Some("~/.config/claude/settings.json"),
+        );
         for pp in contribution.patches() {
             assert_eq!(pp.source(), &expected_source);
+        }
+    }
+
+    /// Dir-mapping paths get any trailing `/` trimmed before the
+    /// walker glob is appended, so `~/.claude` and `~/.claude/` (and
+    /// `~/.claude////`) all compose to the same source pattern.
+    #[test]
+    fn dir_mapping_trims_trailing_slashes() {
+        for path in ["~/.claude", "~/.claude/", "~/.claude////"] {
+            let comp = PackageComposable::new(
+                "pkg",
+                Vec::new(),
+                vec![PackageFsMapping::Dir {
+                    path: path.to_string(),
+                }],
+            );
+            let env = |_: &str| Err(std::env::VarError::NotPresent);
+            let contribution = comp.contribute(&env).expect("contribute succeeds");
+            let patch = &contribution.patches()[0];
             assert_eq!(
-                pp.patch().source(),
-                pp.patch().dest().as_sandbox_path().as_str(),
-                "package fs_mappings should have source == dest",
+                patch.patch().source(),
+                "~/.claude/**",
+                "trailing slashes should collapse before appending /**"
+            );
+            assert_eq!(
+                patch.patch().dest().as_sandbox_path().as_str(),
+                "~/.claude",
+                "dest should be the trimmed dir path",
             );
         }
     }

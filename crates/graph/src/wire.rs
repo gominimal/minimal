@@ -701,7 +701,7 @@ fn fixup_spec(spec: &mut BuildSpec, remap: &HashMap<Index, BuildSpecRef>) -> Res
         match dep {
             BuildDep::Build(bsr) => fixup_ref(bsr, remap)?,
             BuildDep::Subset(si) => fixup_subset(si, remap)?,
-            BuildDep::Source(_) | BuildDep::HostPath(_) | BuildDep::Local { .. } => {}
+            BuildDep::Source(_) | BuildDep::Local { .. } => {}
         }
     }
     // runtime_deps

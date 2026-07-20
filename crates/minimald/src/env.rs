@@ -365,7 +365,6 @@ impl Env {
             .unwrap(),
             state_dir: args.state_base_dir.clone(),
             working: args.cwd.clone(),
-            task_name: args.name.clone(),
             has_packages: transitives.keys().copied().collect(),
             ot: args.ot.clone(),
             ctx,
@@ -497,8 +496,6 @@ struct SessionChannel {
     /// The host directory the working directory.
     working: DaemonAbsPath,
 
-    /// The environment name, used when adding task packages.
-    task_name: String,
     /// Packages already materialized into the rootfs.
     has_packages: HashSet<BuildSpecRef>,
     ot: Option<OpTracker>,
@@ -519,7 +516,7 @@ impl SessionChannel {
     /// Dispatches a single `method%data` request line.
     async fn handle(&mut self, line: &str, stream: &mut UnixStream) {
         let add_dep = match line.split_once('%') {
-            Some(("add-session", pkgs)) => match self.parse_pkgs_line(pkgs) {
+            Some(("add-transient", pkgs)) => match self.parse_pkgs_line(pkgs) {
                 Err(n) => {
                     let _ = writeln!(stream, "error: no such package '{n}'");
                     None
@@ -549,19 +546,14 @@ impl SessionChannel {
                     Some((AddDepMode::RuntimePackages, pkgs))
                 }
             },
-            Some(("add-task", pkgs)) => match self.parse_pkgs_line(pkgs) {
+            Some(("add-session", pkgs)) => match self.parse_pkgs_line(pkgs) {
                 Err(n) => {
                     let _ = writeln!(stream, "error: no such package '{n}'");
                     None
                 }
                 Ok(pkgs) => {
                     self.install(&pkgs, stream).await;
-                    Some((
-                        AddDepMode::TaskPackages {
-                            name: self.task_name.clone(),
-                        },
-                        pkgs,
-                    ))
+                    Some((AddDepMode::SessionPackages, pkgs))
                 }
             },
             Some(("search", term)) => {
@@ -1027,7 +1019,6 @@ mod tests {
                 Utf8PathBuf::try_from(cwd.path().to_path_buf()).unwrap(),
             )
             .unwrap(),
-            task_name: "test-task".to_string(),
             has_packages: HashSet::new(),
             ot: None,
             ctx,

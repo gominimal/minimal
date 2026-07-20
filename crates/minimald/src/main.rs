@@ -6,9 +6,11 @@ use clap_complete::Shell;
 use paths::{CwdRelative, Daemon, DaemonAbsPath, sub_path};
 use std::io::Write as _;
 use tokio::{net::UnixListener, runtime::Builder};
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use minimald::server::{Config, HostKey, Server};
+
+mod logging;
+use logging::{DaemonLogger, LogMode};
 
 #[cfg(target_os = "linux")]
 use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
@@ -139,11 +141,12 @@ pub struct GlobalArgs {
 
     /// Load the minimal standard library from the given path instead
     #[arg(long)]
-    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    #[clap(hide = true)]
     stdlib_dir: Option<CwdRelative<Daemon>>,
 
     /// Configure the number of parallel builds
     #[arg(short, long, global = true)]
+    #[clap(hide = true)]
     num_parallel_builds: Option<usize>,
 }
 
@@ -347,66 +350,6 @@ fn lock_held(path: &std::path::Path) -> std::io::Result<bool> {
     }
 }
 
-/// Install the tracing subscriber. Foreground processes log to
-/// stdout; detached daemons (marked by [`DETACHED_ENV`]) write to
-/// `<state_dir>/logs/minimald.log`, daily-rotated. The returned
-/// [`WorkerGuard`] must outlive the process — dropping it flushes
-/// pending records and terminates the appender's worker thread.
-///
-/// [`WorkerGuard`]: tracing_appender::non_blocking::WorkerGuard
-fn init_tracing(
-    cli: &Cli,
-) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>, MainError> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("info")
-            .add_directive("topiary=off".parse().unwrap())
-            .add_directive("libcgroups=off".parse().unwrap())
-    });
-
-    let detached = std::env::var_os(DETACHED_ENV).is_some();
-    if !detached {
-        tracing_subscriber::registry()
-            .with(fmt::layer().with_writer(ot::StdoutWriter::new))
-            .with(filter)
-            .init();
-        return Ok(None);
-    }
-
-    // Under `<state_dir>/logs/` so `<state_dir>` itself stays
-    // dominated by the sockets, sessions, and providers it already
-    // owns. `create_dir_all` is idempotent — subsequent daemon
-    // starts don't churn.
-    let log_dir = cli
-        .minimal_state_dir()
-        .as_utf8_path()
-        .as_std_path()
-        .join("logs");
-    std::fs::create_dir_all(&log_dir)
-        .map_err(|e| MainError::IO(e, "creating minimald log directory"))?;
-    // Cap retained files so a long-running daemon doesn't accumulate
-    // logs indefinitely. Two weeks is comfortably longer than the
-    // usual "look at what happened yesterday" window and short enough
-    // that the on-disk footprint stays bounded.
-    let appender = tracing_appender::rolling::Builder::new()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("minimald.log")
-        .max_log_files(14)
-        .build(&log_dir)
-        .map_err(|e| MainError::IO(std::io::Error::other(e), "building rolling log appender"))?;
-    let (writer, guard) = tracing_appender::non_blocking(appender);
-    tracing_subscriber::registry()
-        // ANSI colors only make sense on a terminal; a file logger
-        // just gets noise from the escape sequences.
-        .with(fmt::layer().with_ansi(false).with_writer(writer))
-        .with(filter)
-        .init();
-    tracing::info!(
-        log_dir = %log_dir.display(),
-        "detached minimald: routing tracing output to daily-rotated log file",
-    );
-    Ok(Some(guard))
-}
-
 async fn async_main() -> Result<(), MainError> {
     // With `networking-proxy` on, both the `ring` (workspace rustls) and the
     // `aws-lc-rs` (google-cloud) providers are compiled in, so rustls cannot
@@ -456,15 +399,18 @@ async fn async_main() -> Result<(), MainError> {
         return Ok(());
     }
 
-    // Initialize tracing. Foreground runs (or the parent-side of a
-    // `--detach` re-exec) log to stdout. A child spawned by
-    // `spawn_detached` has its stdio null'd — detectable via the
-    // `MINIMALD_DETACHED` env var — so it routes tracing to a daily-
-    // rotated log file under the state directory instead. `_log_guard`
-    // is bound at function scope so the non-blocking appender's
-    // worker survives for the daemon's entire lifetime; dropping it
-    // would flush and terminate the appender prematurely.
-    let _log_guard = init_tracing(&cli)?;
+    // Install tracing. A foreground run logs to stdout only. A detached
+    // native daemon (stdio null'd, marked by `MINIMALD_DETACHED`) and the
+    // microVM pid-1 both log to a daily-rotated file, wired up by
+    // `logger.activate` once the log directory is final (below): immediately
+    // for the native daemon, after the state volume mounts for the microVM.
+    // The activation yields a release the server state runs at shutdown.
+    let log_mode = if is_minimal_microvm() || std::env::var_os(DETACHED_ENV).is_some() {
+        LogMode::File
+    } else {
+        LogMode::Console
+    };
+    let logger = DaemonLogger::install(log_mode)?;
 
     let listen_args = cli.listen_args().unwrap();
 
@@ -557,6 +503,39 @@ async fn async_main() -> Result<(), MainError> {
     {
         return Err(MainError::IO(e, "creating minimal dir"));
     }
+
+    // The log directory is now final under `<state>/logs` — the native
+    // daemon's from the start, the microVM's now that the state volume is
+    // mounted and state relocated onto it, where `min bug`'s guest collector
+    // reads it. Point the file log at it; the release is handed to the server
+    // state and run at shutdown (in the microVM, before the quiesce — the
+    // appender's write-open fd would otherwise hold the volume busy and
+    // defeat the clean unmount). A foreground run's logger has no file and
+    // yields `None`. A failure here must not wedge the daemon (pid-1 in the
+    // microVM), so fall back to console-only.
+    let log_dir = cli
+        .minimal_state_dir()
+        .as_utf8_path()
+        .as_std_path()
+        .join("logs");
+    let log_release = match logger.activate(&log_dir) {
+        Ok(release) => {
+            if release.is_some() {
+                tracing::info!(
+                    log_dir = %log_dir.display(),
+                    "routing tracing output to daily-rotated log file",
+                );
+            }
+            release
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = ?e,
+                "could not open the daemon log file; continuing with console logging only",
+            );
+            None
+        }
+    };
 
     // The host-key path lives under the instance dir; ensure it exists for
     // both the UDS and vsock paths.
@@ -724,7 +703,7 @@ async fn async_main() -> Result<(), MainError> {
         );
         // TODO: When we have a daemonize command, daemonize here.
 
-        Server::run(config, listener)
+        Server::run(config, listener, log_release)
             .await
             .map_err(|e| MainError::IO(e, "serving on UDS"))
     } else {
@@ -755,7 +734,7 @@ async fn async_main() -> Result<(), MainError> {
             }
         };
 
-        Server::run(config, listener)
+        Server::run(config, listener, log_release)
             .await
             .map_err(|e| MainError::IO(e, "serving on guest vsock"))
     }

@@ -70,6 +70,9 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     if let Some(dir) = crate::state::state_dir_override() {
         cmd.args(["--minimal-state-dir", dir.as_str()]);
     }
+    // Mark the child as detached so it routes tracing to the daily-rotated
+    // log file (`<state>/logs/minvmd.log`) instead of stdout.
+    cmd.env(crate::DETACHED_ENV, "1");
     // The supervisor's stderr goes to a log file, not /dev/null: it carries
     // the boot-failure diagnosis (the guest's mount-failure reason, image
     // disposition, repair guidance), and the failure messages below point at

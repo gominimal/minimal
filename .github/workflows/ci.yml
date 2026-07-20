@@ -118,7 +118,17 @@ jobs:
                   key: dogfood-minimal-cargo-${{ hashFiles('**/Cargo.lock') }}
                   restore-keys: dogfood-minimal-cargo-
             - name: Smoketest building Minimal
+              # R2 read-path canary (build-servers#145): point the package-cache
+              # READER at the Cloudflare R2 mirror to prove GCS egress collapses
+              # with cache hit-rate parity. Only this step reads the package
+              # cache; `run-task` fetches the CLI itself from the separate GCS
+              # shim bucket, which is unaffected. The mutable `index.shisha` is
+              # bypassed to GCS at the edge (infra#277), so it stays fresh.
+              # Trailing slash is required (`Url::join`). Rollback = delete
+              # this `env` block.
               uses: gominimal/run-task@v1
+              env:
+                  MINIMAL_REMOTE_CACHE_URL: https://cache.minimal.farm/
               with:
                   channel: unstable
                   task: build-smoke

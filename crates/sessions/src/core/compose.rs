@@ -23,8 +23,8 @@ use crate::core::source::{
 };
 use crate::wire::policy::{WirePatchVerdict, WireVarVerdict};
 use crate::wire::primitives::{
-    PendingId, WirePendingPatch, WirePendingVar, WireProvenancedHook, WireResolvedVar,
-    WireSessionPatch, WireSessionVar, WireVarSpec,
+    PendingId, WirePendingPatch, WirePendingVar, WireProvenancedHook, WireSessionPatch,
+    WireSessionVar, WireVarSpec,
 };
 
 /// Errors produced while a [`Composable`] materializes its
@@ -791,6 +791,15 @@ impl PendingVar {
         wire: WirePendingVar,
         env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
     ) -> Result<Self, ComposeError> {
+        // Preserve the `carries_user_data` bit the daemon computed.
+        // The daemon always ships pending vars as `Specified` (with
+        // the already-resolved value), so `ResolvedVar::resolve_with`
+        // alone would always return `carries_user_data = false` and
+        // the policy gate would silently skip every daemon-derived
+        // var. We OR the daemon's bit on top: if the daemon resolved
+        // an Inherit against its own env, that value crossed a trust
+        // boundary and the client should still gate it.
+        let daemon_says_carries_user_data = wire.carries_user_data;
         let resolved = ResolvedVar::resolve_with(wire.name, wire.spec.into(), env).map_err(
             |err| match err {
                 VarError::ResolutionFailure { name, source } => {
@@ -806,6 +815,16 @@ impl PendingVar {
                 },
             },
         )?;
+        // OR the two bits: user data flowed in if EITHER the daemon
+        // pulled from its env or the client's own `resolve_with`
+        // pulled from the client env. In the production path today
+        // the daemon always ships `Specified`, so the client's bit is
+        // always false and the daemon's is authoritative; the OR
+        // keeps `WirePendingVar` correct for direct-construction
+        // tests too.
+        let carries_user_data = daemon_says_carries_user_data || resolved.carries_user_data();
+        let (name, value) = resolved.into_parts();
+        let resolved = ResolvedVar::from_env_value_or_literal(name, value, carries_user_data);
         Ok(Self {
             id: wire.id,
             var: ProvenancedVar::new(resolved, wire.source.into()),
@@ -845,10 +864,9 @@ impl PendingVar {
     #[must_use]
     pub(crate) fn into_approved_verdict(self) -> WireVarVerdict {
         let (resolved, _source) = self.var.into_parts();
-        let (name, value) = resolved.into_parts();
         WireVarVerdict::Approved {
             id: self.id,
-            value: WireResolvedVar { name, value },
+            value: resolved.into(),
         }
     }
 
@@ -893,12 +911,17 @@ impl PendingPatchFile {
     }
 
     /// Consume and emit an Approved verdict carrying the canonical
-    /// target path back to the daemon.
+    /// target path and the client-computed per-file destination
+    /// back to the daemon. The daemon reuses `destination` verbatim
+    /// so a dir mapping's file fan-out lands at distinct sandbox
+    /// paths instead of collapsing onto the pending patch's base
+    /// dest.
     #[must_use]
     pub(crate) fn into_approved_verdict(self) -> WirePatchVerdict {
         WirePatchVerdict::Approved {
             id: self.id,
             host_path: self.file.target_path,
+            destination: self.file.dest,
         }
     }
 
@@ -1221,6 +1244,17 @@ pub(crate) fn gate_vars(
     let mut allowed: Vec<ProvenancedVar> = Vec::new();
     let mut unapproved: Vec<ProvenancedVar> = Vec::new();
     for pv in items {
+        // Vars whose value doesn't pull from the user's environment
+        // (hardcoded literals, or `inherit-with-default` that fell
+        // back to the default) aren't a data-leak vector, so the
+        // allow/deny/ignore rules don't apply — send straight to
+        // `allowed` without a policy check. The policy exists to
+        // gate user data crossing into the sandbox; there's no user
+        // data here.
+        if !pv.var().carries_user_data() {
+            allowed.push(pv);
+            continue;
+        }
         let name = pv.var().name().to_owned();
         match policy.check(&name, pv) {
             CheckOutcome::Decided(d) => apply_decision(d, &mut allowed, name_of, source_of)?,
@@ -1252,6 +1286,11 @@ pub(crate) fn gate_vars(
         for (pv, decision) in unapproved.into_iter().zip(decisions) {
             match decision {
                 ItemDecision::AllowOnce => allowed.push(pv),
+                // `IgnoreOnce` is the symmetric partner of `AllowOnce`:
+                // silently drop this item for this activation without
+                // adding a policy rule. Same downstream effect as a
+                // policy `ignore` match.
+                ItemDecision::IgnoreOnce => {}
                 ItemDecision::UseRule => {
                     let name = pv.var().name().to_owned();
                     match policy.check(&name, pv) {
@@ -1387,6 +1426,10 @@ pub(crate) fn gate_patches(
         for (pf, decision) in unapproved.into_iter().zip(decisions) {
             match decision {
                 ItemDecision::AllowOnce => allowed.push(pf),
+                // `IgnoreOnce` — silent drop for this activation
+                // without a policy rule. Mirrors the var-side arm
+                // above.
+                ItemDecision::IgnoreOnce => {}
                 ItemDecision::UseRule => {
                     let link = pf
                         .link_path
@@ -1540,7 +1583,13 @@ pub(crate) fn contribution_to_pending(
         // Items reach this transform already resolved (the composer's
         // input is `ResolvedVar`); ship as a `Specified` spec so the
         // client treats the value verbatim instead of re-resolving
-        // against its env.
+        // against its env. Carry the `carries_user_data` bit
+        // separately so the client's policy gate knows whether the
+        // resolved value pulled from an environment (daemon-side
+        // env, but still a host env — the client policy applies
+        // uniformly to any env-derived value) or was a hardcoded
+        // literal / fallback default.
+        let carries_user_data = pv.var().carries_user_data();
         wire_vars.push(WirePendingVar {
             id,
             name: pv.var().name().to_string(),
@@ -1548,6 +1597,7 @@ pub(crate) fn contribution_to_pending(
                 value: pv.var().value().to_string(),
             },
             source: pv.source().clone().into(),
+            carries_user_data,
         });
         pending_vars.insert(id, pv);
     }
@@ -1616,11 +1666,15 @@ mod tests {
     }
 
     fn pv_value(name: &str, value: &str, source: Source) -> ProvenancedVar {
+        // Model an env-derived var so `carries_user_data` is true —
+        // otherwise the policy gate would auto-approve and every test
+        // that checks deny/ignore/allow semantics would trivially
+        // pass. Tests that specifically care about the
+        // hardcoded-literal path build their `ResolvedVar` directly
+        // with `VarValue::specified`.
         ProvenancedVar::new(
-            ResolvedVar::resolve_with(name.into(), VarValue::specified(value), |_| {
-                Err(std::env::VarError::NotPresent)
-            })
-            .unwrap(),
+            ResolvedVar::resolve_with(name.into(), VarValue::Inherit, |_| Ok(value.to_string()))
+                .unwrap(),
             source,
         )
     }
@@ -3192,6 +3246,7 @@ mod tests {
                 var: WireResolvedVar {
                     name: name.into(),
                     value: value.into(),
+                    carries_user_data: true,
                 },
                 source: dev_loadout(),
             }
@@ -3260,6 +3315,7 @@ mod tests {
                     var: WireResolvedVar {
                         name: "EDITOR".into(),
                         value: "hx".into(),
+                        carries_user_data: true,
                     },
                     source: WireSource::UserLoadout { name: "dev".into() },
                 }],

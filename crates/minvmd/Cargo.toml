@@ -3,6 +3,7 @@ name = "minvmd"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [features]
 default = ["libkrun"]
@@ -26,6 +27,7 @@ toml.workspace = true
 # child PID, and host capacity (cores/memory) for `config set` validation (#747).
 sysinfo.workspace = true
 tracing.workspace = true
+tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 # Shares minimald's portable RPC wire types: `NetworkMode` / `IpProto` drive the
 # VM network mode and VM-wide egress policy (minimald itself is Linux-only and

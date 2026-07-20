@@ -245,6 +245,13 @@ pub enum Error {
     /// A [`RelPath`] was constructed from an absolute input.
     #[error("expected a relative path, got: {0}")]
     IsAbsolute(Utf8PathBuf),
+    /// A [`RelPath`] contained a `..` component, which would let it
+    /// escape whatever base it was joined against. Rejected at
+    /// construction so any caller who joins the path against a
+    /// sensitive root (e.g. a sandbox home dir) doesn't have to
+    /// re-validate.
+    #[error("path contains a `..` traversal component: {0}")]
+    ContainsParentDir(Utf8PathBuf),
 }
 
 #[doc(hidden)]
@@ -536,21 +543,33 @@ pub struct RelPath<R: Realm> {
 }
 
 impl<R: Realm> RelPath<R> {
-    /// Constructs a [`RelPath`] after verifying the input is not absolute.
+    /// Constructs a [`RelPath`] after verifying the input is neither
+    /// absolute nor contains a `..` traversal component.
+    ///
+    /// The `..` rejection is what lets callers like the daemon
+    /// composer trust a [`SandboxRelPath`] arriving over the wire —
+    /// joining it against the sandbox home can't produce a path
+    /// outside that home.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::IsAbsolute`] if `p` is an absolute path.
+    /// - [`Error::IsAbsolute`] if `p` is an absolute path.
+    /// - [`Error::ContainsParentDir`] if any component is `..`.
     pub fn try_new(p: impl Into<Utf8PathBuf>) -> Result<Self, Error> {
         let inner = p.into();
         if inner.is_absolute() {
-            Err(Error::IsAbsolute(inner))
-        } else {
-            Ok(Self {
-                inner,
-                _realm: PhantomData,
-            })
+            return Err(Error::IsAbsolute(inner));
         }
+        if inner
+            .components()
+            .any(|c| matches!(c, camino::Utf8Component::ParentDir))
+        {
+            return Err(Error::ContainsParentDir(inner));
+        }
+        Ok(Self {
+            inner,
+            _realm: PhantomData,
+        })
     }
 
     /// Construct a [`RelPath`] without verifying that `p` is
@@ -563,6 +582,11 @@ impl<R: Realm> RelPath<R> {
     pub fn new_unchecked(p: impl Into<Utf8PathBuf>) -> Self {
         let p = p.into();
         debug_assert!(p.is_relative());
+        debug_assert!(
+            !p.components()
+                .any(|c| matches!(c, camino::Utf8Component::ParentDir)),
+            "`RelPath::new_unchecked` fed a path with a `..` component: {p}"
+        );
         Self {
             inner: p,
             _realm: PhantomData,

@@ -1,4 +1,4 @@
-let Tys = [| 'Builder, 'Path, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Subset, 'Profile, 'Layer, 'Upstream, 'Test, 'Stack |]
+let Tys = [| 'Builder, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Subset, 'Profile, 'Layer, 'Upstream, 'Test, 'Stack |]
 in
 let attrs_schema = import "attr_classes.ncl" in
 let needs_schema = import "need_classes.ncl" in
@@ -88,7 +88,6 @@ let CmdSpec = std.contract.any_of [
         std.contract.custom (fun label value =>
             match {
                 {ty = 'Builder, ..} => std.contract.check BuildSpec label value,
-                {ty = 'Path, ..} => std.contract.check HostPath label value,
                 {ty = 'Source, ..} => std.contract.check Source label value,
                 {ty = 'Local, ..}  => std.contract.check Local label value,
                 {ty = 'Subset, ..} => std.contract.check Subset label value,
@@ -99,12 +98,6 @@ let CmdSpec = std.contract.any_of [
             }
             value
         ),
-
-    HostPath | doc "An input which represents a path on the building machine" = {
-        ty | Tys = 'Path,
-        path
-            | String,
-    },
 
     Source | doc "An input to a build spec which represents source code from some location." = {
         ty | Tys = 'Source,

@@ -39,6 +39,14 @@ pub fn read_client_config(
 pub fn read_user_policy(
     global: &GlobalArgs,
 ) -> Result<sessions::core::policy::UserPolicy, anyhow::Error> {
-    let path = resolve_minimal_config_dir(global).join("user_policy.toml");
-    sessions::core::policy::read_user_policy_or_default(&path).map_err(|e| anyhow::anyhow!("{e}"))
+    sessions::core::policy::read_user_policy_or_default(&user_policy_path(global))
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Absolute path to `user_policy.toml` under the resolved config
+/// dir. Exposed separately so callers that need to save (not just
+/// read) — e.g. after an interactive prompt appends a rule — can
+/// reuse the same resolution.
+pub fn user_policy_path(global: &GlobalArgs) -> PathBuf {
+    resolve_minimal_config_dir(global).join("user_policy.toml")
 }

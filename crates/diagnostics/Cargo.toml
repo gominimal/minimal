@@ -2,7 +2,7 @@
 name = "diagnostics"
 version = "0.0.1"
 rust-version = "1.91"
-license = "MIT OR Apache-2.0"
+license.workspace = true
 edition.workspace = true
 publish.workspace = true
 
@@ -15,6 +15,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+toml.workspace = true
 walkdir.workspace = true
 
 [target.'cfg(unix)'.dependencies]

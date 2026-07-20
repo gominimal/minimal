@@ -17,6 +17,16 @@ pub struct Unapproved<'a, T: ?Sized> {
 }
 
 impl<'a, T: ?Sized> Unapproved<'a, T> {
+    /// Construct an [`Unapproved`] from a borrow. Intended for
+    /// callers that own their own item/source pair (e.g.
+    /// [`PolicyHooks`] implementations under test). The gate loop
+    /// itself constructs [`Unapproved`] via a struct literal from
+    /// its own private types.
+    #[must_use]
+    pub fn new(item: &'a T, source: &'a Source) -> Self {
+        Self { item, source }
+    }
+
     /// The item the policy couldn't decide on (e.g. a variable name or
     /// patch source path).
     #[must_use]

@@ -59,7 +59,7 @@ impl TestServer {
             in_microvm: false,
             state_volume_mounted: false,
         };
-        let state = ServerStateHandle::new(config).await.unwrap();
+        let state = ServerStateHandle::new(config, None).await.unwrap();
 
         let host_key = state.host_key().await.unwrap();
         let russh_config = Arc::new(russh::server::Config {
@@ -150,7 +150,7 @@ impl TestServer {
     }
 
     /// Seed a project mfile into a session's daemon-side workspace,
-    /// standing in for the client's workspace upload.
+    /// standing in for the client's `WorkspaceFilesTarZst` upload.
     ///
     /// The composer reads a session's project config out of its workspace,
     /// never from the record's `project_path` — that's a path on the

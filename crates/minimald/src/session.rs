@@ -526,15 +526,33 @@ impl Session {
     /// Every failure leaves the actor alive and `Draft`: the caller decides
     /// whether to retry with a different contribution or tear the session
     /// down, so a compose error can't strand a half-built session.
+    ///
+    /// A re-`ConfigureLoadout` against a session that already holds
+    /// `Draft{pending: Some(_)}` is refused with `WouldBlock`: overwriting
+    /// the stashed [`PendingComposeState`] would invalidate every
+    /// `PendingId` the first caller received (they were valid moments ago,
+    /// but a fresh stash starts numbering from 0 again). The client must
+    /// `AbortSession` and create a new session to retry rather than
+    /// silently strand its outstanding verdict submission.
     async fn configure_loadout(
         &mut self,
         contribution: WireContribution,
     ) -> Result<Option<ContributionResponse>, std::io::Error> {
-        if matches!(self.inner, SessionInner::Active { .. }) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "session loadout is already configured",
-            ));
+        match &self.inner {
+            SessionInner::Active { .. } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "session loadout is already configured",
+                ));
+            }
+            SessionInner::Draft { pending: Some(_) } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "session already has a pending contribution awaiting SubmitVerdict; \
+                     abort it and create a new session to retry",
+                ));
+            }
+            SessionInner::Draft { pending: None } => {}
         }
         let object = self.record.object().await?;
         let workspace_path = object.workspace_path();
@@ -1140,8 +1158,10 @@ mod tests {
     /// blow up: nothing is in flight on a bare `Draft`, so the attach
     /// configures it with an empty contribution on the way in and mints the
     /// shell as usual. Guards the `min activate` → `min attach` path against
-    /// a client that skipped `ConfigureLoadout`, and any internal caller that
-    /// only ever wanted a session to run something in.
+    /// a caller that never reached the compose step (a compose failure
+    /// leaves the actor `Draft` — attach has to still land it live), and
+    /// any internal caller that only ever wanted a session to run something
+    /// in.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn attach_to_an_unconfigured_session_configures_it_rather_than_failing() {
         use crate::test_harness::create_session_req;
@@ -1149,7 +1169,9 @@ mod tests {
 
         let server = TestServer::new().await;
         let mut client = server.connect().await;
-        // Bare `CreateSession` — no `ConfigureLoadout` follow-up.
+        // Bare `CreateSession` — no `ConfigureLoadout` follow-up. The
+        // session stays `Draft`; the attach path is the one that has
+        // to notice and configure it on the way in.
         let session_id = client
             .call::<CreateSession>(&create_session_req("bare-session", "/uwu"))
             .await

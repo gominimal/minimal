@@ -5,8 +5,8 @@ use minimald_rpc::{
     Errorable, GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
     GetSessionRecordRequest, GetSessionRecordResponse, GetVersion, GetVersionResponse,
     IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse,
-    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, Shutdown,
-    ShutdownRequest, ShutdownResponse, SubmitVerdict,
+    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool,
+    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -80,8 +80,12 @@ async fn serve_get_version(c: RuChannel<Msg>) {
 async fn serve_list_sessions(s: ServerStateHandle, c: RuChannel<Msg>) {
     let res = ListSessions
         .handle_channel(c, async |_req| {
+            let resource_pool = tokio::task::spawn_blocking(detect_resource_pool)
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             let mngr = s.sessions_manager().await;
             Ok(ListSessionsResponse {
+                resource_pool,
                 sessions: mngr
                     .list()
                     .await
@@ -114,6 +118,22 @@ async fn serve_list_sessions(s: ServerStateHandle, c: RuChannel<Msg>) {
     if let Err(e) = res {
         tracing::warn!("RPC handler for {} failed: {}", ListSessions::NAME, e);
     }
+}
+
+fn detect_resource_pool() -> Option<ResourcePool> {
+    let cpu_cores = std::thread::available_parallelism()
+        .ok()?
+        .get()
+        .try_into()
+        .ok()?;
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    let memory_bytes = system.total_memory();
+
+    (memory_bytes > 0).then_some(ResourcePool {
+        cpu_cores,
+        memory_bytes,
+    })
 }
 
 async fn serve_get_session_record(s: ServerStateHandle, c: RuChannel<Msg>) {
@@ -180,6 +200,12 @@ async fn serve_create_session(
 /// and retry, or abort) rather than a transport failure. An unknown id —
 /// including an actor that died between resolve and delivery — is a
 /// `NotFound`-flavoured `Errorable::Err`.
+///
+/// The actor refuses a re-`ConfigureLoadout` when it already holds a
+/// pending contribution awaiting `SubmitVerdict`; the client has to
+/// `AbortSession` and create a new session to retry. Without that guard
+/// a second call would clobber the stashed `PendingComposeState` and
+/// invalidate every `PendingId` the first caller received.
 async fn serve_configure_loadout(s: ServerStateHandle, c: RuChannel<Msg>) {
     let res = minimald_rpc::ConfigureLoadout
         .handle_channel(c, async |req: minimald_rpc::ConfigureLoadoutRequest| {
@@ -311,6 +337,12 @@ async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) {
             let mngr = s.sessions_manager().await;
             Ok(match mngr.shutdown(req.force).await {
                 Ok(()) => {
+                    // Close the file log first (both the native daemon and the
+                    // microVM): it flushes buffered records, and in the
+                    // microVM its write-open fd under the mountpoint would
+                    // otherwise defeat the clean unmount below. Records still
+                    // reach the console. A no-op for a foreground run.
+                    s.release_log().await;
                     // R2.1/R2.2: with the sessions drained, quiesce the state
                     // volume (syncfs + detach) before acknowledging, so a
                     // caller-driven VMM teardown right after the ack leaves a
@@ -349,6 +381,8 @@ async fn quiesce_state_volume_if_mounted(s: &ServerStateHandle) {
     if !s.state_volume_mounted().await {
         return;
     }
+    // The file log was already released by the shutdown handler, so its fd no
+    // longer holds the mountpoint busy.
     let mountpoint = s.minimal_state_dir().await;
     let quiesce = tokio::task::spawn_blocking(move || {
         crate::guest::quiesce_state_volume(mountpoint.as_utf8_path().as_str())
@@ -839,6 +873,7 @@ mod tests {
         );
 
         let list_sessions = client.call::<ListSessions>(&()).await;
+        assert!(list_sessions.resource_pool.is_some());
         assert_eq!(
             list_sessions.sessions,
             vec![ListSessionsEntry {

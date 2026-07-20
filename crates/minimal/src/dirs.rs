@@ -12,9 +12,13 @@ use crate::mesh_enrolment_path;
 /// with an "exists?" marker so unused paths don't look identical to
 /// misconfigured ones.
 pub fn cmd_dirs(global: &GlobalArgs) -> Result<(), anyhow::Error> {
-    // Shown in the "Daemon logs" note to point users at today's
-    // rolling log file directly, e.g. `minimald.log.2026-07-08`.
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    print!("{}", report(global));
+    Ok(())
+}
+
+/// The `cmd_dirs` table as a string — also captured verbatim into `min bug`
+/// diagnostic bundles as `host/dirs.txt`.
+pub(crate) fn report(global: &GlobalArgs) -> String {
     let dirs = DirsLookup {
         config: resolve_minimal_config_dir(global),
         mesh_enrolment: mesh_enrolment_path(global),
@@ -38,10 +42,8 @@ pub fn cmd_dirs(global: &GlobalArgs) -> Result<(), anyhow::Error> {
             .as_utf8_path()
             .as_std_path()
             .to_path_buf(),
-        today,
     };
-    print_dir_rows(&build_dir_rows(&dirs));
-    Ok(())
+    format_dir_rows(&build_dir_rows(&dirs))
 }
 
 /// Resolved locations `cmd_dirs` prints, materialized once so
@@ -63,9 +65,6 @@ struct DirsLookup {
     state: PathBuf,
     /// `<cache>/minimal`.
     cache: PathBuf,
-    /// Today's date in `YYYY-MM-DD`, used only in the "Daemon logs"
-    /// note next to the rolling filename suffix.
-    today: String,
 }
 
 /// Which top-level group the mesh-enrolment row prints under. Values
@@ -152,7 +151,7 @@ fn build_dir_rows(dirs: &DirsLookup) -> Vec<DirRow> {
             "State",
             "Daemon logs",
             Some(dirs.state.join("logs")),
-            Some(format!("daily-rotated: minimald.log.{}", dirs.today)),
+            Some("daily-rotated: minimald.log*, minvmd.log*".to_string()),
         )
             .into_row(),
         (
@@ -182,9 +181,11 @@ fn build_dir_rows(dirs: &DirsLookup) -> Vec<DirRow> {
     rows
 }
 
-/// Print the row list produced by [`build_dir_rows`] with per-column
+/// Format the row list produced by [`build_dir_rows`] with per-column
 /// width-alignment and a blank line between groups.
-fn print_dir_rows(rows: &[DirRow]) {
+fn format_dir_rows(rows: &[DirRow]) -> String {
+    use std::fmt::Write as _;
+
     let group_w = rows.iter().map(|r| r.group.len()).max().unwrap_or(6);
     let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(4).max(4);
     let path_w = rows
@@ -193,7 +194,9 @@ fn print_dir_rows(rows: &[DirRow]) {
         .max()
         .unwrap_or(4);
 
-    println!(
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
         "{group:<group_w$}     {name:<name_w$}  {path:<path_w$}",
         group = "GROUP",
         name = "NAME",
@@ -204,7 +207,7 @@ fn print_dir_rows(rows: &[DirRow]) {
     for row in rows {
         if row.group != current_group {
             if !current_group.is_empty() {
-                println!();
+                out.push('\n');
             }
             current_group = row.group;
         }
@@ -215,14 +218,16 @@ fn print_dir_rows(rows: &[DirRow]) {
             .as_deref()
             .map(|n| format!("  ({n})"))
             .unwrap_or_default();
-        println!(
+        let _ = writeln!(
+            out,
             "{group:<group_w$}  {mark}  {name:<name_w$}  {path:<path_w$}{note}",
             group = row.group,
             name = row.name,
         );
     }
-    println!();
-    println!("  * = exists   - = missing   ? = unknown (path unresolved)");
+    out.push('\n');
+    out.push_str("  * = exists   - = missing   ? = unknown (path unresolved)\n");
+    out
 }
 
 /// One row emitted by [`cmd_dirs`]. Kept as a struct rather than
@@ -282,7 +287,6 @@ mod tests {
             mesh_group: MeshGroup::Config,
             state: PathBuf::from("/home/u/.local/state/minimal"),
             cache: PathBuf::from("/home/u/.cache/minimal"),
-            today: "2026-07-08".to_string(),
         };
         let rows = build_dir_rows(&dirs);
         let shape: Vec<(&str, &str, String)> = rows
@@ -357,24 +361,22 @@ mod tests {
         );
     }
 
-    /// The "Daemon logs" row's note interpolates `today` into the
-    /// rolling-file suffix so operators see the exact filename they
-    /// should look at.
+    /// The "Daemon logs" row's note names both daemons' rotated files so
+    /// operators know which filenames to look at.
     #[test]
-    fn build_dir_rows_daemon_logs_note_interpolates_date() {
+    fn build_dir_rows_daemon_logs_note_names_both_daemons() {
         let dirs = DirsLookup {
             config: PathBuf::from("/c"),
             mesh_enrolment: PathBuf::from("/c/mesh-enrolment"),
             mesh_group: MeshGroup::Config,
             state: PathBuf::from("/s"),
             cache: PathBuf::from("/x"),
-            today: "2030-01-15".to_string(),
         };
         let rows = build_dir_rows(&dirs);
         let daemon_logs = rows.iter().find(|r| r.name == "Daemon logs").unwrap();
         assert_eq!(
             daemon_logs.note.as_deref(),
-            Some("daily-rotated: minimald.log.2030-01-15"),
+            Some("daily-rotated: minimald.log*, minvmd.log*"),
         );
     }
 
@@ -408,7 +410,6 @@ mod tests {
             mesh_group: MeshGroup::State,
             state: PathBuf::from("/override"),
             cache: PathBuf::from("/x"),
-            today: "_".to_string(),
         };
         let rows = build_dir_rows(&dirs);
         let mesh = rows.iter().find(|r| r.name == "Mesh enrolment").unwrap();
