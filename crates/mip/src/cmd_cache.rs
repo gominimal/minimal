@@ -9,7 +9,17 @@ use crate::{Context, Error};
 
 #[derive(Debug, clap::Subcommand)]
 pub enum CacheArgs {
+    /// Remove stale entries from the local cache
+    ///
+    /// Deletes cached build artifacts whose last recorded use is older than
+    /// `--older-than`, or that have no recorded use at all. Packages needed
+    /// by the current project's tasks and stack are always kept. Also removes
+    /// sandbox, task, and temporary build directories whose owning process is
+    /// no longer running.
     Clean {
+        /// Only delete cache entries last used at least this long ago.
+        /// Takes a whole number of days, hours, or minutes: e.g. `30d`,
+        /// `12h`, `45m`
         #[arg(long, value_parser = parse_duration, default_value = "14d")]
         older_than: Duration,
     },

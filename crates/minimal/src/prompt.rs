@@ -1,4 +1,4 @@
-//! Interactive policy prompts for `minimal activate`.
+//! Interactive policy prompts for `min activate`.
 //!
 //! When the daemon returns a pending item (a Project or Package
 //! contribution the user's [`UserPolicy`] can't auto-decide), the

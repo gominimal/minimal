@@ -53,7 +53,7 @@ struct DirsLookup {
     /// `<config>/minimal` — root for `config.toml`, `loadouts/`,
     /// mTLS certs.
     config: PathBuf,
-    /// The specific path `minimal mesh join` writes to. Kept separate
+    /// The specific path `min mesh join` writes to. Kept separate
     /// so a `--minimal-dir` override that redirects the mesh file
     /// (but not the loadouts subsystem) still shows up correctly.
     mesh_enrolment: PathBuf,
