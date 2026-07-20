@@ -1,5 +1,7 @@
 # Security Policy
 
+Thanks for helping keep Minimal and its users safe.
+
 ## Reporting a vulnerability
 
 Please report vulnerabilities by email to **security@minimal.dev**. We
@@ -12,15 +14,21 @@ before a fix exists.
 
 When reporting, include what you can of: the affected component and
 version (`min --version` / `mip --version`), reproduction steps or a
-proof of concept, and your assessment of the impact.
+proof of concept, and your assessment of the impact. If you'd like to
+encrypt your report, say so in your first email and we'll coordinate a
+key exchange.
 
-## Response expectations
+## No bug bounty
 
-We are a small team. We aim to acknowledge new reports within **5
-business days** and to keep you informed as we triage, fix, and
-disclose. Please give us a reasonable window to ship a fix before any
-public disclosure; we will credit reporters in the advisory unless you
-prefer otherwise.
+Minimal does not operate a paid bug bounty program. We genuinely
+appreciate good-faith reports and are glad to credit researchers in the
+disclosure, but we do not offer monetary rewards.
+
+We reserve the right to disregard low-effort, unsolicited "beg bounty"
+reports — for example, automated scanner output, missing security
+headers, or theoretical findings with no demonstrated impact on the
+components in scope below. For background on why, see [Troy Hunt on beg
+bounties](https://www.troyhunt.com/beg-bounties/).
 
 ## Supported versions
 
@@ -56,3 +64,13 @@ Out of scope:
   the machine running minimal.
 - Denial of service of your own local builds (e.g. a package
   definition that consumes excessive resources on your machine).
+
+## Safe harbor
+
+We will not pursue or support legal action against researchers who:
+
+- Make a good-faith effort to comply with this policy.
+- Avoid privacy violations, destruction of data, and interruption or
+  degradation of others' use of minimal.
+- Give us reasonable time to investigate and address a reported issue
+  before any public disclosure.
