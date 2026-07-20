@@ -80,14 +80,13 @@ min_add() {
 
     # If no flag provided, or first arg isn't a flag, default to --session
     if [[ -z "$flag" || "$flag" != --* ]]; then
-        echo "No --flag provided, defaulting to adding package(s) for this session only"
         flag="--session"
     else
         shift
     fi
 
     if [[ -z "$1" ]]; then
-        echo "Usage: min add [--session|--build|--runtime|--task] <packages>" >&2
+        echo "Usage: min add [--session|--build|--runtime] <packages>" >&2
         return 1
     fi
 
@@ -96,9 +95,8 @@ min_add() {
         --session)   prefix="add-session"   ;;
         --build)     prefix="add-build"     ;;
         --runtime)   prefix="add-runtime"   ;;
-        --task)      prefix="add-task"      ;;
         *)
-            echo "error: unknown flag '$flag'. Expected --session, --build, --runtime, or --task" >&2
+            echo "error: unknown flag '$flag'. Expected --session, --build, or --runtime" >&2
             return 1
             ;;
     esac
@@ -142,13 +140,11 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             ;;
         *)
             echo "Usage: min <subcommand>" >&2
-            echo "See CLAUDE.md at the project root for more detailed instructions." >&2
             echo "" >&2
-            echo "Add packages: min add [--session|--build|--runtime|--task <taskname>] <packages>" >&2
+            echo "Add packages: min add [--session|--build|--runtime] <packages>" >&2
             echo "Search for packages: min search <query>" >&2
             echo "Check minimal configuration: min check" >&2
             echo "Run a task: min run <task name>" >&2
-            echo "Check minimal configuration: min check" >&2
             echo "Try building a package (with potentially-stale dependencies): min patched-pkg <package name>" >&2
             exit 1
             ;;
