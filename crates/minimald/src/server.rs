@@ -296,10 +296,17 @@ impl ServerStateHandle {
         self.0.lock().await.config.state_volume_mounted
     }
 
-    /// The configured state dir (the quiesce target when in a microVM).
-    #[cfg(target_os = "linux")]
+    /// The configured state dir (the quiesce target when in a microVM, and the
+    /// root every diagnostic collector reads from).
     pub(crate) async fn minimal_state_dir(&self) -> DaemonAbsPath {
         self.0.lock().await.config.minimal_state_dir.clone()
+    }
+
+    /// Whether this daemon is the in-VM instance rather than a native one.
+    /// Recorded in the diagnostic bundle's `meta.json` so a reader knows which
+    /// of the two answered, and gates the guest-only gvproxy probe.
+    pub(crate) async fn in_microvm(&self) -> bool {
+        self.0.lock().await.config.in_microvm
     }
 
     /// Returns the daemon's TLS certificate authority (only with
