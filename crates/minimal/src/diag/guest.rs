@@ -27,6 +27,10 @@ pub const GUEST_BUNDLE_MAX_BYTES: usize = 256 * 1024 * 1024;
 /// Deadline for the `debugfs` harvest of the volume image. It is scanning a
 /// possibly-large image on a possibly-sick disk; the fallback is best-effort.
 const DEBUGFS_TIMEOUT: Duration = Duration::from_secs(10);
+/// Host disk the volume harvest may spend staging `/logs` before the per-file
+/// caps apply. `rdump` writes the whole tree out first, so without this the
+/// only bound on a long-lived guest's logs is the host's free space.
+const VOLUME_HARVEST_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 // ── R7.3: bounded verification of the nested bundle ──────────────────────────
 //
@@ -65,6 +69,15 @@ const NESTED_EXPANSION_RATIO: u64 = 4;
 const NESTED_MIN_BUDGET: u64 = 64 * 1024 * 1024;
 /// Absolute ceiling on decompressed content, whatever the ratio allows (R7.3).
 const NESTED_MAX_DECOMPRESSED: u64 = 1024 * 1024 * 1024;
+/// Headroom over the content budget for the stream-level cap, covering the tar
+/// structure the content budget does not charge for: a 512-byte header plus up
+/// to 512 bytes of padding per entry, bounded by [`NESTED_MAX_ENTRIES`].
+///
+/// Without it the stream cap bites *before* the per-entry accounting can, and a
+/// genuine oversize bundle gets reported as an unreadable stream instead of by
+/// the check that actually caught it — the caps still hold, but the manifest
+/// stops naming the real cause.
+const NESTED_STREAM_SLACK: u64 = (NESTED_MAX_ENTRIES as u64 + 1) * 1024;
 
 /// Downloads the daemon bundle over `client` and stores it under
 /// `providers/<provider>/guest/`. On failure writes `error.txt` there,
@@ -143,7 +156,22 @@ async fn verify_nested_bundle(bytes: &[u8]) -> Result<(), String> {
         .clamp(NESTED_MIN_BUDGET, NESTED_MAX_DECOMPRESSED);
 
     let decoder = async_compression::tokio::bufread::ZstdDecoder::new(bytes);
-    let mut entries = async_tar::Archive::new(decoder)
+    // The per-entry accounting below cannot see everything. `async_tar` reads
+    // GNU longname/longlink and PAX extension bodies to completion inside
+    // `entries()` (`poll_read_all`, archive.rs) before yielding the entry they
+    // belong to, so those bytes bypass both the byte budget and the entry
+    // count — a tiny archive declaring one enormous, highly compressible
+    // extension member would be decoded straight into memory. Capping the
+    // decompressed stream at its source is the only bound that covers reads
+    // this loop never performs.
+    //
+    // Set above the content budget by the tar structure's worth of headroom:
+    // headers come out of this same allowance, so a cap of exactly the budget
+    // would starve the last legitimate body read and report an oversize bundle
+    // as a corrupt one.
+    let limited =
+        tokio::io::AsyncReadExt::take(decoder, budget.saturating_add(NESTED_STREAM_SLACK));
+    let mut entries = async_tar::Archive::new(limited)
         .entries()
         .map_err(|e| format!("decode check: not a readable tar stream: {e}"))?;
 
@@ -207,7 +235,22 @@ pub async fn volume_fallback(
     provider_dir: &Path,
 ) -> Result<(), anyhow::Error> {
     let image = provider_dir.join("data-vol.raw");
-    let meta = tokio::fs::metadata(&image).await.ok();
+    // "Absent" and "unreadable" are different diagnoses and must not collapse
+    // into the same `exists: false`. This runs when the daemon is already
+    // suspect, so "the image is not there" versus "the image is there and I
+    // could not read it" is often the answer itself.
+    let meta = match tokio::fs::metadata(&image).await {
+        Ok(m) => Some(m),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            w.error(
+                format!("guest.{provider}.volume_fallback"),
+                format!("stat {}: {e}", image.display()),
+                std::time::Duration::ZERO,
+            );
+            None
+        }
+    };
     let info = VolumeMeta {
         path: image.display().to_string(),
         exists: meta.is_some(),
@@ -234,6 +277,32 @@ pub async fn volume_fallback(
         "harvest offline with: debugfs -c -R 'rdump /logs .' {}",
         image.display()
     );
+    // `rdump` writes the whole tree to disk before anything caps it, and the
+    // deadline below bounds only how long that runs — not how much it writes.
+    // A guest that has been logging for weeks would spend the host's free
+    // space during `min bug`, which is a poor trade for a best-effort
+    // fallback. Size the harvest first and decline one that does not fit.
+    match logs_tree_bytes(&image).await {
+        Ok(total) if total > VOLUME_HARVEST_MAX_BYTES => {
+            w.skip(
+                &dest_dir,
+                format!(
+                    "/logs is {total} bytes, over the {VOLUME_HARVEST_MAX_BYTES}-byte \
+                     harvest budget — not spending that much host disk here; {hint}"
+                ),
+            );
+            return Ok(());
+        }
+        Ok(_) => {}
+        // Unsized is not a reason to refuse: `ls -l` may fail on a corrupt
+        // image that `rdump` can still salvage something from, and that is
+        // exactly the case this fallback exists for. The deadline still caps it.
+        Err(e) => w.skip(
+            format!("{dest_dir}/.size-check"),
+            format!("could not size /logs before harvesting ({e}); proceeding"),
+        ),
+    }
+
     let tmp = tempfile::TempDir::new().context("tempdir for volume harvest")?;
     let rdump = format!("rdump /logs {}", tmp.path().display());
     let result = tokio::time::timeout(
@@ -269,6 +338,39 @@ pub async fn volume_fallback(
         ),
     }
     Ok(())
+}
+
+/// Total size of the regular files `debugfs` reports directly under `/logs`.
+///
+/// `ls -l` prints one row per entry; the mode is column 2 and the size is
+/// column 6. Only `100***` (regular file) rows count — directories and the
+/// `.`/`..` entries carry sizes that are not payload. Rows that do not parse
+/// are ignored rather than failing the check: this is a pre-flight estimate,
+/// and the deadline remains the backstop.
+async fn logs_tree_bytes(image: &Path) -> Result<u64, String> {
+    let out = tokio::time::timeout(
+        DEBUGFS_TIMEOUT,
+        tokio::process::Command::new("debugfs")
+            .args(["-c", "-R", "ls -l /logs"])
+            .arg(image)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("timed out after {DEBUGFS_TIMEOUT:?}"))?
+    .map_err(|e| e.to_string())?;
+
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            match cols.as_slice() {
+                [_, mode, ..] if !mode.starts_with("100") => None,
+                [_, _, _, _, _, size, ..] => size.parse::<u64>().ok(),
+                _ => None,
+            }
+        })
+        .sum())
 }
 
 /// Adds every regular file directly under `src` to the bundle under

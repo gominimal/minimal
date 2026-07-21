@@ -328,11 +328,23 @@ pub async fn provider_files(
     );
 
     // Lifecycle state, verbatim (nothing sensitive: enum + pid + timestamp).
+    //
+    // Read through the same `O_NOFOLLOW` discipline as every other bundled
+    // file: `tokio::fs::read` would follow a symlink planted here and copy an
+    // unrelated readable host file into a bundle meant for sharing.
     let dest = format!("providers/{name}/minvmd.toml");
-    match tokio::fs::read(dir.join("minvmd.toml")).await {
-        Ok(bytes) => w.add_bytes(&dest, &bytes, Redaction::None).await?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => w.skip(&dest, format!("unreadable: {e}")),
+    match diagnostics::open_regular_nofollow(&dir.join("minvmd.toml")).await {
+        Ok((mut file, _)) => {
+            let mut bytes = Vec::new();
+            match tokio::io::AsyncReadExt::read_to_end(&mut file, &mut bytes).await {
+                Ok(_) => w.add_bytes(&dest, &bytes, Redaction::None).await?,
+                Err(e) => w.skip(&dest, format!("unreadable: {e}")),
+            }
+        }
+        Err(e) => match e.downcast_ref::<std::io::Error>() {
+            Some(io) if io.kind() == std::io::ErrorKind::NotFound => {}
+            _ => w.skip(&dest, format!("unreadable: {e:#}")),
+        },
     }
 
     let status_dir = dir.to_path_buf();
@@ -365,17 +377,11 @@ struct ProviderStatus {
 /// by writing `Stopped` back — a diagnostic must never mutate what it reads.
 /// Synchronous (file locks and `std::fs`); callers run it on a blocking thread.
 fn provider_status(dir: &Path) -> ProviderStatus {
-    let state_dir = match minvmd::state::StateDir::new(dir.to_path_buf()) {
-        Ok(state_dir) => state_dir,
-        Err(e) => {
-            return ProviderStatus {
-                state: None,
-                state_read_error: Some(e.to_string()),
-                minvmd_alive: None,
-                minimald_alive: None,
-            };
-        }
-    };
+    // `StateDir::new` runs `create_dir_all`, so probing a provider whose
+    // directory had been deleted would recreate it — leaving ghost state
+    // behind and making this collector a mutation, which the paragraph above
+    // says it must never be.
+    let state_dir = minvmd::state::StateDir::open_existing(dir.to_path_buf());
     let (state, state_read_error) = match std::fs::read_to_string(state_dir.state_path()) {
         Ok(s) => match s.parse::<toml::Table>() {
             Ok(table) => (Some(table), None),

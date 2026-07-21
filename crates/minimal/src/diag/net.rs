@@ -117,7 +117,24 @@ pub async fn probe_socket(sock_path: &Path) -> (SocketProbe, Option<crate::clien
             client
         }
         Err(e) => {
-            probe.handshake = Stage::run(t, Err(format!("{e:#}")));
+            // `Client::connect` opens its own connection rather than adopting
+            // the one probed above, so a daemon that died in between fails
+            // *here* — and filing that as a handshake fault is precisely the
+            // misdiagnosis this staged probe exists to prevent. Re-test the
+            // cheaper layer to tell "stopped accepting" from "accepted but
+            // would not handshake".
+            match tokio::net::UnixStream::connect(sock_path).await {
+                Ok(_) => probe.handshake = Stage::run(t, Err(format!("{e:#}"))),
+                Err(again) => {
+                    probe.connect = Stage::run(
+                        t,
+                        Err(format!(
+                            "accepted once, then stopped: {again} \
+                             (handshake never attempted: {e:#})"
+                        )),
+                    );
+                }
+            }
             return (probe, None);
         }
     };

@@ -119,6 +119,18 @@ impl StateDir {
         Ok(Self { dir })
     }
 
+    /// Bind to `dir` without creating it, for readers that must not change
+    /// what they observe — the diagnostic collector reports on providers,
+    /// including deleted ones, and [`StateDir::new`] would resurrect the
+    /// directory as a side effect of looking. Every path accessor and the
+    /// read-only liveness probes work unchanged; the lock-taking and
+    /// state-writing methods will fail on a missing directory, which is the
+    /// correct outcome for a caller that has not created one.
+    #[must_use]
+    pub fn open_existing(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
     /// Default path: [`provider_dir`].
     pub fn default_path() -> PathBuf {
         provider_dir()
