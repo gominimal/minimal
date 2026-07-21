@@ -127,10 +127,24 @@ pub struct RunningSessionAttrs {
 }
 
 /// An entry in the ListSessions response.
+///
+/// `project_path` and `status` mirror the fields of the same name on the
+/// session [`Record`](sessions::Record). They let a client resolve "which
+/// session was built from this directory" and render a state glyph in a
+/// picker without a follow-up `GetSessionRecord` round-trip per session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ListSessionsEntry {
     pub id: SessionId,
     pub name: Option<String>,
+    /// The absolute host path the session was built from. Always present on
+    /// a real record; kept non-optional so the client can match against the
+    /// current working directory without an `Option` unwrap.
+    pub project_path: paths::HostAbsPath,
+    /// The session's lifecycle status, used to render a state glyph in the
+    /// interactive picker. Defaults to `Active` for daemons that predate the
+    /// field so an older server still deserializes cleanly.
+    #[serde(default)]
+    pub status: sessions::SessionStatus,
     pub attrs: Option<RunningSessionAttrs>,
 }
 

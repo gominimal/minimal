@@ -287,6 +287,7 @@ mod tests {
             minimal_dir: None,
             config_dir: Some(PathBuf::from("/definitely/does/not/exist")),
             minvmd: false,
+            no_input: false,
         };
         let out = resolve_active_loadouts(LoadoutSelection::None, &cfg, &global)
             .expect("None → Ok(empty), no I/O");
@@ -307,6 +308,7 @@ mod tests {
             minimal_dir: None,
             config_dir: Some(tmp.path().to_path_buf()),
             minvmd: false,
+            no_input: false,
         };
         let selection = LoadoutSelection::Cli(vec!["missing".to_string()]);
         assert!(resolve_active_loadouts(selection, &cfg, &global).is_err());

@@ -38,6 +38,7 @@ impl TestDaemon {
             minimal_dir: Some(self.temp.path().to_path_buf()),
             config_dir: None,
             minvmd: false,
+            no_input: false,
         }
     }
 }

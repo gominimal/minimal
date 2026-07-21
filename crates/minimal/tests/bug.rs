@@ -71,6 +71,7 @@ fn global_args(state: &Path, config: &Path) -> GlobalArgs {
         minimal_dir: Some(state.to_path_buf()),
         config_dir: Some(config.to_path_buf()),
         minvmd: false,
+        no_input: false,
     }
 }
 
