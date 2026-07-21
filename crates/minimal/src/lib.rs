@@ -870,6 +870,24 @@ fn offer_mfile_scaffold(
     run_init_flow(config, false)
 }
 
+/// Resolves the directory whose tree should be uploaded as the session
+/// workspace, walking up from `dir` to the nearest `minimal.toml` and using
+/// its repo root. Falls back to `dir` itself when no mfile is found, so a
+/// project without one still activates — the daemon fabricates a default
+/// config inside the session workspace. A malformed mfile also falls back
+/// to `dir`; the daemon surfaces the parse error when it loads the
+/// uploaded workspace.
+fn resolve_upload_root(dir: &camino::Utf8Path) -> camino::Utf8PathBuf {
+    match mfile::File::from_dir_recursive(dir.as_std_path()) {
+        Ok(f) => match f.repo_path() {
+            Some(root) => camino::Utf8PathBuf::from_path_buf(root.to_path_buf())
+                .unwrap_or_else(|_| dir.to_path_buf()),
+            None => dir.to_path_buf(),
+        },
+        Err(_) => dir.to_path_buf(),
+    }
+}
+
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
@@ -971,22 +989,32 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     match args.sync {
         SyncMode::None => {}
         SyncMode::Tarball => {
+            // Upload from the project root — the directory the mfile
+            // lives in — rather than wherever the user invoked us. This
+            // matches the CLI's config-discovery walk: a user running
+            // `minimal activate ./subdir` still uploads the whole
+            // project. Falls back to `utf8_path` when no mfile is found
+            // anywhere up the tree (#770).
+            let upload_root = resolve_upload_root(&utf8_path);
+            if upload_root != utf8_path {
+                eprintln!("Uploading from project root {upload_root} (resolved from {utf8_path})");
+            }
             // Guard against accidentally uploading a non-VCS directory
-            // (e.g. `~`): if the project path is not a recognized VCS
-            // root, warn and ask for confirmation before the recursive
+            // (e.g. `~`): if the resolved project root is not a recognized
+            // VCS root, warn and ask for confirmation before the recursive
             // upload. On non-interactive stdin (CI, pipes, agents) we
             // proceed without prompting — `--sync none` remains available
             // for explicit opt-out (#770).
-            let should_upload = file_upload::is_vcs_root(utf8_path.as_std_path())
+            let should_upload = file_upload::is_vcs_root(upload_root.as_std_path())
                 || !std::io::stdin().is_terminal()
                 || confirm(&format!(
-                    "{utf8_path} is not a version control repository root. \
+                    "{upload_root} is not a version control repository root. \
                      Upload all files from this directory?"
                 ))?;
             if should_upload {
                 eprintln!("Uploading project files...");
                 client
-                    .upload_workspace_files(id, utf8_path.as_std_path())
+                    .upload_workspace_files(id, upload_root.as_std_path())
                     .await
                     .context("Failed to upload project files")?;
             } else {
@@ -1905,5 +1933,61 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
         assert!(!project_has_mfile(path));
+    }
+
+    /// With no mfile anywhere up the tree, `resolve_upload_root` returns the
+    /// input directory unchanged — the original activate behaviour.
+    #[test]
+    fn resolve_upload_root_returns_input_when_no_mfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        assert_eq!(resolve_upload_root(path), path);
+    }
+
+    /// `resolve_upload_root` walks up to the nearest mfile and returns its
+    /// repo root, so activating from a subdir still uploads the whole
+    /// project. Covers both the root (`./minimal.toml`) and `.minimal/`
+    /// layouts.
+    #[test]
+    fn resolve_upload_root_walks_up_to_mfile_root_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+        )
+        .unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        let subdir = root.join("nested/deep");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        assert_eq!(resolve_upload_root(&subdir), root);
+    }
+
+    #[test]
+    fn resolve_upload_root_walks_up_to_mfile_dot_minimal_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mfile_dir = dir.path().join(".minimal");
+        std::fs::create_dir(&mfile_dir).unwrap();
+        std::fs::write(
+            mfile_dir.join(mfile::MFILE_NAME),
+            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+        )
+        .unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        let subdir = root.join("nested");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        assert_eq!(resolve_upload_root(&subdir), root);
+    }
+
+    /// `from_dir_recursive` propagates parse errors up, so a malformed
+    /// mfile falls back to the input dir. The daemon surfaces the parse
+    /// error later when it loads the uploaded workspace.
+    #[test]
+    fn resolve_upload_root_falls_back_on_malformed_mfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
+        let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        assert_eq!(resolve_upload_root(path), path);
     }
 }
