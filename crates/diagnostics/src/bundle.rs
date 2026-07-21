@@ -67,6 +67,10 @@ pub struct BundleWriter<W: BundleSink = tokio::fs::File> {
     collected: Vec<CollectedEntry>,
     skipped: Vec<SkippedEntry>,
     errors: Vec<CollectorError>,
+    /// Set for the duration of a tar write and cleared once it completes.
+    /// A writer observed with this still set was dropped mid-record — see
+    /// [`BundleWriter::append`].
+    writing: bool,
 }
 
 impl BundleWriter<tokio::fs::File> {
@@ -113,6 +117,7 @@ impl<W: BundleSink> BundleWriter<W> {
             collected: Vec::new(),
             skipped: Vec::new(),
             errors: Vec::new(),
+            writing: false,
         }
     }
 
@@ -212,24 +217,58 @@ impl<W: BundleSink> BundleWriter<W> {
             skipped: std::mem::take(&mut self.skipped),
             errors: std::mem::take(&mut self.errors),
         };
-        let json = serde_json::to_vec_pretty(&manifest).context("serializing manifest")?;
-        self.append("manifest.json", &json).await?;
+        // No `?` until the Builder has been consumed. `async_tar`'s Drop panics
+        // on a Builder that was never finalized, so an early return here — a
+        // full disk, a broken pipe, an abandoned stream — would abort the
+        // process instead of surfacing the error. Record the outcome, close the
+        // archive either way, and report afterwards.
+        let recorded = match serde_json::to_vec_pretty(&manifest) {
+            Ok(json) => self.append("manifest.json", &json).await,
+            Err(e) => Err(anyhow::Error::new(e).context("serializing manifest")),
+        };
 
-        let mut encoder = self
-            .tar
-            .into_inner()
-            .await
-            .context("finalizing tar archive")?;
-        encoder.shutdown().await.context("flushing zstd encoder")?;
-        encoder
-            .into_inner()
-            .finalize()
-            .await
-            .context("finalizing bundle writer")?;
-        Ok(())
+        let closed = async {
+            let mut encoder = self
+                .tar
+                .into_inner()
+                .await
+                .context("finalizing tar archive")?;
+            encoder.shutdown().await.context("flushing zstd encoder")?;
+            encoder
+                .into_inner()
+                .finalize()
+                .await
+                .context("finalizing bundle writer")?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        // The manifest failure is the more informative of the two.
+        recorded.and(closed)
     }
 
+    /// Appends one tar record.
+    ///
+    /// `append_data` writes the header and the body in a single `await`. When
+    /// the sink is a bounded pipe — the daemon streams into one — a client that
+    /// stops reading fills it and parks this write mid-record. If the caller is
+    /// racing a deadline (`collect_step!` is) the future is then dropped with a
+    /// header, and possibly part of a body, already on the wire; appending the
+    /// next entry after that splices a second record into the first one's
+    /// declared body and the archive silently stops being readable.
+    ///
+    /// A dropped future runs no code, so the guard is inverted: `writing` is
+    /// raised before the await and lowered after it, and a raised flag on entry
+    /// means the previous write never returned. That converts silent corruption
+    /// into a refusal — the bundle ends short and says why, instead of arriving
+    /// intact-looking and unparseable.
     async fn append(&mut self, path: &str, bytes: &[u8]) -> Result<(), anyhow::Error> {
+        anyhow::ensure!(
+            !self.writing,
+            "archive stream abandoned: a previous entry write was cancelled \
+             part-way through its tar record, so nothing further can be \
+             appended without corrupting it"
+        );
         let mut header = Header::new_gnu();
         header.set_size(bytes.len() as u64);
         header.set_mode(0o644);
@@ -239,10 +278,10 @@ impl<W: BundleSink> BundleWriter<W> {
             Some(root) => format!("{root}/{path}"),
             None => path.to_string(),
         };
-        self.tar
-            .append_data(&mut header, &full, bytes)
-            .await
-            .with_context(|| format!("adding {full}"))
+        self.writing = true;
+        let written = self.tar.append_data(&mut header, &full, bytes).await;
+        self.writing = false;
+        written.with_context(|| format!("adding {full}"))
     }
 }
 
@@ -464,5 +503,57 @@ pub(crate) mod tests {
         w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
             .await
             .unwrap();
+    }
+
+    /// A write cancelled part-way through its tar record must not be followed
+    /// by another one: the second record would be spliced into the first's
+    /// declared body and the archive would decode as garbage rather than
+    /// failing. Reproduces the daemon's shape — a bounded pipe whose reader
+    /// has stopped — instead of asserting on the flag directly.
+    #[tokio::test]
+    async fn a_cancelled_write_refuses_further_entries() {
+        // Held, never read: writes fill the pipe and park rather than erroring.
+        let (tx, rx) = tokio::io::duplex(64);
+        let mut w = BundleWriter::stream(tx, "test");
+
+        // Incompressible, so zstd cannot swallow it into its own buffer and the
+        // write genuinely reaches the full pipe.
+        let payload: Vec<u8> = (0..2u32 << 20)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 16) as u8)
+            .collect();
+
+        let parked = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            w.add_bytes("first.txt", &payload, Redaction::None),
+        )
+        .await;
+        assert!(
+            parked.is_err(),
+            "expected the write to park on the unread pipe"
+        );
+
+        let err = w
+            .add_bytes("second.txt", b"after", Redaction::None)
+            .await
+            .expect_err("appending after a cancelled record must fail");
+        assert!(
+            format!("{err:#}").contains("abandoned"),
+            "error should name the abandoned stream: {err:#}"
+        );
+
+        // `finish` writes the manifest through the same path, so it refuses too
+        // rather than emitting a manifest that describes a corrupt archive.
+        //
+        // The reader is dropped first, exactly as the daemon's pump does when
+        // its deadline expires: `finish` must still consume the tar Builder on
+        // this error path, and consuming it writes the trailer. Against a live
+        // but unread pipe that write would park forever — dropping the reader
+        // turns it into `BrokenPipe` and lets the error surface.
+        drop(rx);
+        let err = w
+            .finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .expect_err("finish must refuse a poisoned archive");
+        assert!(format!("{err:#}").contains("abandoned"), "{err:#}");
     }
 }
