@@ -9,6 +9,7 @@
 //! wedged system must not change it.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Args;
