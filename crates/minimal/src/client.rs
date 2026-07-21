@@ -234,6 +234,53 @@ impl Client {
         }
         Ok(())
     }
+
+    /// Stream a zstd-compressed tarball of `dir` to the daemon's
+    /// `HomedirFilesTarZst` subsystem, which unpacks it into the
+    /// session's home directory.
+    ///
+    /// `session_id` is set as the `MINIMAL_SESSION_ID` env var on the
+    /// channel so the daemon can scope the upload to the correct session.
+    pub async fn upload_home_files(
+        &mut self,
+        session_id: sessions::SessionId,
+        dir: &Path,
+    ) -> Result<(), anyhow::Error> {
+        let subsystem = constcat::concat!(minimald_rpc::RPC_SUBSYSTEM_PREFIX, "HomedirFilesTarZst");
+
+        let mut channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .context("open channel for workspace file upload")?;
+
+        channel
+            .set_env(true, "MINIMAL_SESSION_ID", session_id.to_string())
+            .await
+            .context("set MINIMAL_SESSION_ID env")?;
+
+        channel
+            .request_subsystem(true, subsystem)
+            .await
+            .context("request HomedirFilesTarZst subsystem")?;
+
+        crate::file_upload::stream_tar_zstd(dir, channel.make_writer()).await?;
+
+        // Wait for the channel to close to signal that unpacking is done.
+        let mut err = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            if let russh::ChannelMsg::ExtendedData { data, ext: 1 } = msg {
+                err.extend_from_slice(&data);
+            }
+        }
+        if !err.is_empty() {
+            anyhow::bail!(
+                "daemon failed to unpack homedir files: {}",
+                String::from_utf8_lossy(&err)
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Resolve the provider-instance dir (`<state dir>/providers/local-0`) the

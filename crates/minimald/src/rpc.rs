@@ -524,21 +524,41 @@ async fn serve_stream_workspace_files(
     config: ChannelConfig,
     mut c: RuChannel<Msg>,
 ) {
-    if let Err(msg) = unpack_workspace_files(&s, &config, &mut c).await {
+    if let Err(msg) = unpack_files(&s, &config, &mut c, UnpackDir::Workspace).await {
         let _ = c.extended_data_bytes(1, msg).await;
     }
     let _ = c.close().await;
 }
 
+pub(crate) const STREAM_HOMEDIR_FILES: &str =
+    constcat::concat!(RPC_SUBSYSTEM_PREFIX, "HomedirFilesTarZst");
+
+async fn serve_stream_homedir_files(
+    s: ServerStateHandle,
+    config: ChannelConfig,
+    mut c: RuChannel<Msg>,
+) {
+    if let Err(msg) = unpack_files(&s, &config, &mut c, UnpackDir::Homedir).await {
+        let _ = c.extended_data_bytes(1, msg).await;
+    }
+    let _ = c.close().await;
+}
+
+enum UnpackDir {
+    Workspace,
+    Homedir,
+}
+
 /// Unpacks the zstd-compressed tarball streamed over `c` into the
-/// workspace directory of the session named by the channel environment.
+/// given directory of the session named by the channel environment.
 ///
 /// On failure, returns the human-readable message to relay back to the
 /// client over the channel's extended-data stream.
-async fn unpack_workspace_files(
+async fn unpack_files(
     s: &ServerStateHandle,
     config: &ChannelConfig,
     c: &mut RuChannel<Msg>,
+    into_dir: UnpackDir,
 ) -> Result<(), String> {
     let session_id_str = config
         .env_vars
@@ -562,7 +582,13 @@ async fn unpack_workspace_files(
         c.make_reader(),
     ));
     async_tar::Archive::new(reader)
-        .unpack(paths.working.as_utf8_path())
+        .unpack(
+            match into_dir {
+                UnpackDir::Workspace => paths.working,
+                UnpackDir::Homedir => paths.home,
+            }
+            .as_utf8_path(),
+        )
         .await
         .map_err(|e| format!("unpack failed: {e}"))?;
 
@@ -603,6 +629,7 @@ pub async fn handle_ssh_rpc(
         | GetSessionPolicy::NAME
         | GetMeshStatus::NAME
         | STREAM_WORKSPACE_FILES
+        | STREAM_HOMEDIR_FILES
         | IssueClientCert::NAME => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
@@ -642,6 +669,7 @@ pub async fn handle_ssh_rpc(
         GetSessionPolicy::NAME => drop(spawn(serve_get_session_policy(s, channel))),
         GetMeshStatus::NAME => drop(spawn(serve_get_mesh_status(s, channel))),
         STREAM_WORKSPACE_FILES => drop(spawn(serve_stream_workspace_files(s, config, channel))),
+        STREAM_HOMEDIR_FILES => drop(spawn(serve_stream_homedir_files(s, config, channel))),
         IssueClientCert::NAME => {
             #[cfg(feature = "networking-proxy")]
             drop(spawn(serve_issue_client_cert(s, channel)));
@@ -781,6 +809,55 @@ mod tests {
             String::from_utf8_lossy(&stderr).contains("unknown session"),
             "expected an unknown-session error on stderr, got {:?}",
             String::from_utf8_lossy(&stderr),
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_homedir_files_unpacks_tarball_into_home() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let payload = tar_zst(&[
+            ("hello.txt", b"hello world\n"),
+            ("dir/nested.txt", b"nested contents"),
+        ])
+        .await;
+
+        let channel = client
+            .open_subsystem(
+                STREAM_HOMEDIR_FILES,
+                &[(MINIMAL_SESSION_ID_ENV, &session_id.to_string())],
+            )
+            .await;
+        let mut stream = channel.into_stream();
+        stream.write_all(&payload).await.unwrap();
+        // Half-close so the server's decoder sees EOF; then read to the
+        // server's channel close so the unpack has completed on-disk
+        // before we assert.
+        stream.shutdown().await.unwrap();
+        let mut trailing = Vec::new();
+        stream.read_to_end(&mut trailing).await.unwrap();
+
+        let mngr = server.state.sessions_manager().await;
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("freshly-created session should be retrievable");
+        let paths = handle.paths().await.unwrap();
+
+        assert_eq!(
+            tokio::fs::read(paths.home.as_utf8_path().join("hello.txt"))
+                .await
+                .unwrap(),
+            b"hello world\n",
+        );
+        assert_eq!(
+            tokio::fs::read(paths.home.as_utf8_path().join("dir/nested.txt"))
+                .await
+                .unwrap(),
+            b"nested contents",
         );
     }
 
