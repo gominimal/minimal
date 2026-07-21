@@ -102,7 +102,7 @@ pub async fn process_tree<W: BundleSink>(
 ) -> Result<(), anyhow::Error> {
     let (text, pids) = process_table(markers).await?;
     w.add_bytes(
-        &format!("{dest}/process-tree.txt"),
+        &scoped(dest, "process-tree.txt"),
         text.as_bytes(),
         Redaction::Keys,
     )
@@ -119,7 +119,7 @@ pub async fn process_tree<W: BundleSink>(
             .flatten();
         if let Some(status) = status {
             w.add_bytes(
-                &format!("{dest}/proc/{pid}.status"),
+                &scoped(dest, &format!("proc/{pid}.status")),
                 status.as_bytes(),
                 Redaction::None,
             )
@@ -282,13 +282,13 @@ pub async fn hang_triage_including<W: BundleSink>(
                 Ok(sample) => samples.push(sample),
                 // A panicked sample task is a bug, not a diagnostic outcome —
                 // record it rather than dropping the pid silently.
-                Err(e) => w.skip(format!("{dest}/proc/"), format!("sample task failed: {e}")),
+                Err(e) => w.skip(scoped(dest, "proc/"), format!("sample task failed: {e}")),
             }
         }
         // Completion order is nondeterministic; keep bundle order by pid.
         samples.sort_by_key(|(pid, _)| *pid);
         for (pid, result) in samples {
-            let path = format!("{dest}/proc/{pid}.sample.txt");
+            let path = scoped(dest, &format!("proc/{pid}.sample.txt"));
             match result {
                 Ok(text) => w.add_bytes(&path, text.as_bytes(), Redaction::None).await?,
                 Err(e) => w.skip(path, format!("sample failed: {e}")),

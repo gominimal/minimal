@@ -42,6 +42,12 @@ const MAX_LOG_TAIL_BYTES: u64 = 64 * 1024 * 1024;
 const LOG_FILES_MAX: usize = 5;
 /// Entry cap for the recursive state-dir listing.
 const LISTING_MAX_ENTRIES: usize = 100_000;
+/// Ceiling on the whole client-facing transfer. Every collector is deadlined
+/// individually, but those deadlines only bound work — a client that holds the
+/// channel open and stops reading it parks the pump instead, and through the
+/// bounded duplex that stalls collection and finalization behind it. This is
+/// the bound on the peer rather than on ourselves.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(300);
 /// Duplex buffer between the bundle writer and the channel pump.
 const PIPE_BUF: usize = 256 * 1024;
 /// The gvproxy management endpoint, reachable only from inside the switch
@@ -125,7 +131,18 @@ async fn stream_diag_bundle(s: &ServerStateHandle, c: &mut RuChannel<Msg>) -> Re
     };
 
     let mut writer = c.make_writer();
-    let copy_result = tokio::io::copy(&mut rx, &mut writer).await;
+    // Bounded here rather than around the build: cancelling the pump is safe,
+    // cancelling the builder is not (see `build_bundle`). On expiry the `drop`
+    // below turns the build task's next write into `BrokenPipe`, so it unwinds
+    // through its own error path instead of parking on the full duplex.
+    let copy_result =
+        match tokio::time::timeout(STREAM_TIMEOUT, tokio::io::copy(&mut rx, &mut writer)).await {
+            Ok(r) => r,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("client stopped reading the bundle for {STREAM_TIMEOUT:?}"),
+            )),
+        };
     let shutdown_result = writer.shutdown().await;
     // The read half must be gone before waiting on the build task: if the copy
     // failed mid-stream (client vanished) the task is still writing, and only a
@@ -252,6 +269,12 @@ async fn build_bundle(
     }
     collect_step!(w, "disk", disk(&mut w, &state_dir));
 
+    // Deliberately not wrapped in a timeout. `finish` owns the `async_tar`
+    // Builder, whose Drop panics when it has not been finalized, so cancelling
+    // this future would abort the task rather than end it. The bound that stops
+    // a non-reading client from parking this write forever is on the pump in
+    // `stream_diag_bundle`: when it expires the read half is dropped and these
+    // writes fail fast with `BrokenPipe` instead of blocking.
     w.finish(created_at, started.elapsed())
         .await
         .map_err(|e| format!("{e:#}"))
@@ -298,7 +321,14 @@ async fn logs<W: BundleSink>(
     let log_dir = state_dir.join("logs");
     // Absence and inaccessibility are different facts: "no log directory" may
     // only be claimed on a real NotFound, never on EACCES or an I/O error.
-    match tokio::fs::metadata(&log_dir).await {
+    //
+    // `symlink_metadata`, not `metadata`: guest tasks can write this volume, so
+    // the directory itself is attacker-controlled. `add_file_tail`'s O_NOFOLLOW
+    // refuses a symlinked *log file*, but it cannot see that the whole `logs/`
+    // directory was swapped for a link elsewhere — every regular file named
+    // `minimald.log.*` under the target would then be a legitimate open, and
+    // someone else's files would ride out in the bundle.
+    match tokio::fs::symlink_metadata(&log_dir).await {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             w.skip(
                 "logs/",
@@ -308,6 +338,13 @@ async fn logs<W: BundleSink>(
         }
         Err(e) => {
             w.skip("logs/", format!("unreadable: {e}"));
+            return Ok(());
+        }
+        Ok(m) if !m.is_dir() => {
+            w.skip(
+                "logs/",
+                "not a directory — refusing to follow it out of the state dir",
+            );
             return Ok(());
         }
         Ok(_) => {}
