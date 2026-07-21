@@ -71,8 +71,10 @@ pub(crate) fn resolve_for_attach(
     if entries.is_empty() {
         return SmartResolve::NoSessions;
     }
-    let cwd_matches: Vec<&ListSessionsEntry> =
-        entries.iter().filter(|e| &e.project_path == cwd).collect();
+    let cwd_matches: Vec<&ListSessionsEntry> = entries
+        .iter()
+        .filter(|e| e.project_path.as_ref() == Some(cwd))
+        .collect();
     match cwd_matches.len() {
         0 => match entries.len() {
             1 => SmartResolve::Attach(entries[0].clone()),
@@ -141,7 +143,7 @@ fn format_candidate(entry: &ListSessionsEntry, cwd: &paths::HostAbsPath) -> Stri
         .and_then(|a| a.title.as_ref())
         .map(|t| t.value.as_str())
         .unwrap_or("");
-    let cwd_marker = if &entry.project_path == cwd {
+    let cwd_marker = if entry.project_path.as_ref() == Some(cwd) {
         " (cwd)"
     } else {
         ""
@@ -151,10 +153,12 @@ fn format_candidate(entry: &ListSessionsEntry, cwd: &paths::HostAbsPath) -> Stri
     } else {
         format!("{name} | {title}")
     };
-    format!(
-        "{glyph} {head} · {path}{cwd_marker}",
-        path = entry.project_path
-    )
+    let path = entry
+        .project_path
+        .as_ref()
+        .map(paths::HostAbsPath::to_string)
+        .unwrap_or_else(|| "(unknown)".to_string());
+    format!("{glyph} {head} · {path}{cwd_marker}")
 }
 
 /// Runs the interactive session picker over `candidates`, ordered with the
@@ -203,12 +207,17 @@ pub(crate) fn ambiguous_no_input_message(
     );
     for c in candidates {
         let name = c.name.as_deref().unwrap_or("-");
-        let cwd_marker = if &c.project_path == cwd { " (cwd)" } else { "" };
-        out.push_str(&format!(
-            "  {id}  {name}  {path}{cwd_marker}\n",
-            id = c.id,
-            path = c.project_path,
-        ));
+        let cwd_marker = if c.project_path.as_ref() == Some(cwd) {
+            " (cwd)"
+        } else {
+            ""
+        };
+        let path = c
+            .project_path
+            .as_ref()
+            .map(paths::HostAbsPath::to_string)
+            .unwrap_or_else(|| "(unknown)".to_string());
+        out.push_str(&format!("  {id}  {name}  {path}{cwd_marker}\n", id = c.id));
     }
     out.push_str("Pass a session id or name explicitly: `min attach <id>`.");
     out
@@ -225,7 +234,19 @@ mod tests {
         ListSessionsEntry {
             id: sessions::SessionId::parse_str(id).unwrap(),
             name: None,
-            project_path: HostAbsPath::try_new(path).unwrap(),
+            project_path: Some(HostAbsPath::try_new(path).unwrap()),
+            status,
+            attrs: None,
+        }
+    }
+
+    /// Like [`entry`] but builds a session with no project_path, simulating an
+    /// entry from an older daemon that predates the field.
+    fn entry_no_path(id: &str, status: SessionStatus) -> ListSessionsEntry {
+        ListSessionsEntry {
+            id: sessions::SessionId::parse_str(id).unwrap(),
+            name: None,
+            project_path: None,
             status,
             attrs: None,
         }
@@ -308,7 +329,7 @@ mod tests {
         match resolve_for_attach(&entries, &cwd("/a")) {
             SmartResolve::Pick(cands) => {
                 assert_eq!(cands.len(), 2);
-                assert!(cands.iter().all(|c| c.project_path == cwd("/a")));
+                assert!(cands.iter().all(|c| c.project_path == Some(cwd("/a"))));
             }
             other => panic!("expected Pick, got {other:?}"),
         }
@@ -397,5 +418,49 @@ mod tests {
         assert!(msg.contains("019f5d0f-0a99-78b1-9165-0809440f0066"));
         assert!(msg.contains("(cwd)"));
         assert!(msg.contains("min attach <id>"));
+    }
+
+    /// An entry from an older daemon that predates `project_path` (the field
+    /// is `None`) must never match the cwd, but still participates in the
+    /// single-session and pick-over-all paths so a mixed-version daemon farm
+    /// degrades gracefully.
+    #[test]
+    fn entry_without_project_path_never_matches_cwd_but_still_attaches() {
+        let entries = vec![entry_no_path(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            SessionStatus::Active,
+        )];
+        // Single session, no cwd match → attach directly.
+        match resolve_for_attach(&entries, &cwd("/a")) {
+            SmartResolve::Attach(e) => assert_eq!(
+                e.id,
+                sessions::SessionId::parse_str("019f5d0f-0a99-78b1-9165-0809440f0052").unwrap()
+            ),
+            other => panic!("expected Attach for pathless single session, got {other:?}"),
+        }
+
+        // Two pathless sessions → pick over all, none tagged as cwd.
+        let entries = vec![
+            entry_no_path(
+                "019f5d0f-0a99-78b1-9165-0809440f0052",
+                SessionStatus::Active,
+            ),
+            entry_no_path(
+                "019f5d0f-0a99-78b1-9165-0809440f0066",
+                SessionStatus::Active,
+            ),
+        ];
+        match resolve_for_attach(&entries, &cwd("/a")) {
+            SmartResolve::Pick(cands) => {
+                assert_eq!(cands.len(), 2);
+                assert!(cands.iter().all(|c| c.project_path.is_none()));
+            }
+            other => panic!("expected Pick for pathless sessions, got {other:?}"),
+        }
+
+        // The picker row shows "(unknown)" rather than panicking.
+        let label = format_candidate(&entries[0], &cwd("/a"));
+        assert!(label.contains("(unknown)"), "unknown path label: {label}");
+        assert!(!label.contains("(cwd)"), "no cwd marker: {label}");
     }
 }

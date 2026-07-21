@@ -94,7 +94,7 @@ async fn serve_list_sessions(s: ServerStateHandle, c: RuChannel<Msg>) {
                     .map(|i| ListSessionsEntry {
                         id: i.id,
                         name: i.name,
-                        project_path: i.project_path,
+                        project_path: Some(i.project_path),
                         status: i.status,
                         attrs: i.attrs.map(|a| minimald_rpc::RunningSessionAttrs {
                             last_stdout: a.stdout_last.map(|i| i.into()),
@@ -916,7 +916,7 @@ mod tests {
             vec![ListSessionsEntry {
                 id,
                 name: Some("my session".to_string()),
-                project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                project_path: Some(HostAbsPath::try_new("/uwu").unwrap()),
                 // A freshly-created session that hasn't been configured yet
                 // sits in `Pending` until `ConfigureLoadout` promotes it.
                 status: sessions::SessionStatus::Pending,

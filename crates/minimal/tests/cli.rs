@@ -49,7 +49,7 @@ fn ls_shows_shared_resource_pool() {
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
             name: None,
-            project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+            project_path: Some(paths::HostAbsPath::try_new("/p").unwrap()),
             status: sessions::SessionStatus::Active,
             attrs: None,
         }],

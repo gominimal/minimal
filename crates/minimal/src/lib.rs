@@ -582,21 +582,28 @@ async fn cmd_default(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         }
         None => {
             // No sessions exist: activate a new one for the current directory
-            // and chain into attach, mirroring `min activate --attach`.
+            // and chain into attach, mirroring `min activate --attach`. Honor
+            // `--repo-dir` (`-C`) so `min -C /path` activates for /path, not
+            // the process's actual cwd — matching the attach side, which uses
+            // `cwd_host_path(global)` for its cwd comparison.
             drop(client);
+            let path = match global.repo_dir.as_deref() {
+                Some(dir) => dir.to_string_lossy().to_string(),
+                None => ".".to_string(),
+            };
             let activate_args = ActivateArgs {
                 name: None,
-                path: ".".to_string(),
+                path,
                 sync: SyncMode::Tarball,
                 network: CliNetworkMode::HostNet,
                 ingress: Vec::new(),
                 loadout: Vec::new(),
                 no_loadouts: false,
-                // A non-interactive caller (CI, a script) can't answer the
-                // activation policy prompt; `cmd_activate` already falls back
-                // to the `--no-prompt` path when stderr isn't a terminal, so
-                // mirror that here rather than forcing a hang.
-                no_prompt: !can_prompt_interactively(),
+                // A non-interactive caller (--no-input, CI, a script) can't
+                // answer the activation policy prompt; `cmd_activate` already
+                // falls back to the `--no-prompt` path when stderr isn't a
+                // terminal, so mirror that here rather than forcing a hang.
+                no_prompt: global.no_input || !can_prompt_interactively(),
                 attach: true,
             };
             cmd_activate(global, activate_args).await
