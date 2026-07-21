@@ -1,4 +1,5 @@
 ---
+title: minimal.toml
 description: Schema reference for the minimal.toml configuration file — upstream, stack, defaults, tasks, and outputs sections.
 ---
 
@@ -9,7 +10,7 @@ The `minimal.toml` file defines the configuration for Minimal in a codebase.
 This file must be present at the base of the repository (i.e. `./minimal.toml`), or
 in a `.minimal` directory at the base of the repository.
 
-Unless [`-C`](/reference/cli#global-flags) is specified, the [Minimal CLI](/reference/cli) searches the directory tree backwards from
+Unless [`-C`](./cli-mip.md#global-flags) is specified, the [mip CLI](./cli-mip.md) searches the directory tree backwards from
 the current directory till a `minimal.toml` file is found. This behavior allows minimal to be invoked in project directories.
 
 ## Example
@@ -48,8 +49,8 @@ exec = "bash -l"
 
 ### `[upstream]` - Where software comes from {#upstream}
 
-The `[upstream]` section defines the precise source of packages, harnesses, and profiles. This represents the
-preceding link in the [software supply chain](/concepts/software-supply-chain).
+The `[upstream]` section defines the precise source of packages, stacks, and profiles. This represents the
+preceding link in the [software supply chain](https://docs.minimal.dev/concepts/software-supply-chain).
 
 ```toml
 [upstream]
@@ -58,11 +59,14 @@ branch = "<branch>"
 locked_commit = "<commit hash>"
 ```
 
-`locked_commit` is automatically updated when `minimal update` is run.
+`locked_commit` is automatically updated when [`mip update`](./cli-mip.md) is
+run: it re-resolves `branch` to its current HEAD and rewrites the
+`locked_commit` of the upstream (and of every sideload) in `minimal.toml` in
+place — expect a diff on these fields after running it.
 
 #### `[[upstream.sideload]]` - Additional software sideloaded into your supply chain {#sideload}
 
-Sideload entries let you load in additional packages, harnesses, and profiles from a separate repository, but those packages
+Sideload entries let you load in additional packages, stacks, and profiles from a separate repository, but those packages
 are built using the version of packages from your upstream.
 
 Each sideload entry is loaded in order from the specified repository, and follows the same schema as `[upstream]`:
@@ -71,27 +75,28 @@ Each sideload entry is loaded in order from the specified repository, and follow
 [[upstream.sideload]]
 repo = "<git URL>"
 branch = "<branch>"
-locked_commit = "<commit hash>" # Updated via `minimal update`
+locked_commit = "<commit hash>" # Updated via `mip update`
 ```
 
-Sideload repositories have the same layout as an upstream: that is having a `minimal.toml` file, and `packages/` / `harnesses/` / `profiles/`
+Sideload repositories have the same layout as an upstream: that is having a `minimal.toml` file, and `packages/` / `stacks/` / `profiles/`
 directories as needed.
 
 ### `[stack]` - How to build code in your repo {#harness}
 
 ```toml
 [stack]
-use = "<harness name>"
+use = "<stack name>"
 build_packages = ["<additional build package>"]     # optional
 runtime_packages = ["<additional runtime package>"] # optional
 ```
 
-The `[stack]` section configures the [harness](/concepts/harnesses) to use for building code, if any.
+The `[stack]` section configures the [stack](https://docs.minimal.dev/concepts/harnesses) to use for building code, if any.
+See [stack specs](./stack-specs.md) for how stacks themselves are defined.
 
 `[harness]` is accepted as a deprecated alias for `[stack]`, pending removal after
 July 2026; prefer `[stack]` in new configs.
 
-The environment variables and packages configured on a harness are inherited on all tasks in this repository.
+The environment variables and packages configured on a stack are inherited on all tasks in this repository.
 
 `build_packages` and `runtime_packages` are optional fields that allow you to declare
 additional package dependencies for build time or run time respectively.
@@ -106,7 +111,7 @@ profile = "<profile name>" # optional
 state_key = "<state key>"  # optional
 ```
 
-When set, `defaults.profile` will set a [profile](/concepts/profiles) on all tasks which do not set a profile.
+When set, `defaults.profile` will set a [profile](https://docs.minimal.dev/concepts/profiles) on all tasks which do not set a profile.
 
 When set, `defaults.state_key` will set a state key on all tasks which do not set `state_key`.
 
@@ -114,14 +119,14 @@ When set, `defaults.state_key` will set a state key on all tasks which do not se
 
 ### `[tasks.*]` - Run tasks, scripts, & dev tooling {#tasks}
 
-See: [tasks](/reference/tasks).
+See: [tasks](./tasks.md).
 
 
 
-### `[outputs.*]` - Artifacts produced by `minimal materialize` {#outputs}
+### `[outputs.*]` - Artifacts produced by `mip materialize` {#outputs}
 
 Each `[outputs.<name>]` section defines an artifact that can be produced with
-[`minimal materialize <name> -o <path>`](/reference/cli#materialize).
+[`mip materialize <name> -o <path>`](./cli-mip.md#materialize).
 
 ```toml
 [outputs.<name>]
@@ -145,7 +150,7 @@ vars = { KEY = "value" }        # oci-image only; alias: `env_vars`
 
 - **`type`** (alias: `ty`) — The output kind, either `oci-image` or `raw-file`. Defaults to `oci-image` when omitted.
 - **`packages`** — Packages to include in the materialized output. When omitted or empty, defaults to `["base"]`.
-- **`arch`** — Target architecture for OCI images. Common values: `amd64`, `arm64`. The CLI flag [`--arch`](/reference/cli#materialize) overrides this; if neither is set, the host architecture is used.
+- **`arch`** — Target architecture for OCI images. Common values: `amd64`, `arm64`. The CLI flag [`--arch`](./cli-mip.md#materialize) overrides this; if neither is set, the host architecture is used.
 - **`path`** — _(`raw-file` only)_ Path, relative to the package file tree, of the single file to extract. Required for `raw-file` outputs; supplying it on an `oci-image` output is an error.
 - **`entrypoint`** — _(`oci-image` only)_ OCI image entrypoint. May be a string (`"/app/server"`) or a list (`["/bin/sh", "-c"]`).
 - **`cmd`** — _(`oci-image` only)_ OCI image default command. Same string-or-list shape as `entrypoint`.
@@ -163,7 +168,7 @@ type = "oci-image"
 ```
 
 ```sh
-minimal materialize base-image -o ./base.tar
+mip materialize base-image -o ./base.tar
 ```
 
 A server image with extra packages, an entrypoint, and an env var:
@@ -178,13 +183,13 @@ vars = { PORT = "8080" }
 ```
 
 ```sh
-minimal materialize app -o ./app.tar
+mip materialize app -o ./app.tar
 ```
 
 Override the architecture at the command line:
 
 ```sh
-minimal materialize app --arch amd64 -o ./app-amd64.tar
+mip materialize app --arch amd64 -o ./app-amd64.tar
 ```
 
 A `raw-file` output extracts a single file from a package. Here the kernel
@@ -198,5 +203,5 @@ path = "usr/share/virtio-linux/Image"
 ```
 
 ```sh
-minimal materialize virtio-kernel -o ./Image
+mip materialize virtio-kernel -o ./Image
 ```

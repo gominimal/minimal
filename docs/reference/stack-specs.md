@@ -1,20 +1,21 @@
 ---
-description: Harness spec schema for defining build system harnesses in Nickel — packages, build commands, env vars, and project detection rules.
+title: Stacks
+description: Stack spec schema for defining build system stacks in Nickel — packages, build commands, env vars, and project detection rules.
 ---
 
-# Harnesses
+# Stacks
 
-Harnesses specify a set of tools and how to use them in a codebase. They encapsulate a common pattern for building software.
+Stacks specify a set of tools and how to use them in a codebase. They encapsulate a common pattern for building software.
 
-Harnesses are defined in a [Nickel](https://nickel-lang.org/) file located at `harnesses/<harness name>/harness.ncl`, either in your codebase
-or any layer in your [software supply chain](/concepts/software-supply-chain). The `harnesses/` directory in a layer is always adjacent to
-the [`minimal.toml`](/reference/minimal-dot-toml) file at the base of the layer. The directory can be omitted if the layer does not define any harnesses.
+Stacks are defined in a [Nickel](https://nickel-lang.org/) file located at `stacks/<stack name>/stack.ncl`, either in your codebase
+or any layer in your [software supply chain](https://docs.minimal.dev/concepts/software-supply-chain). The `stacks/` directory in a layer is always adjacent to
+the [`minimal.toml`](./minimal-dot-toml.md) file at the base of the layer. The directory can be omitted if the layer does not define any stacks.
 
 ## Examples
 
-A number of harnesses are defined and maintained in the [Minimal Public Package Registry](https://github.com/gominimal/pkgs/tree/main/harnesses), which serves as the canonical reference for defining harnesses.
+A number of stacks are defined and maintained in the [Minimal Public Package Registry](https://github.com/gominimal/pkgs/tree/main/stacks), which serves as the canonical reference for defining stacks.
 
-Here is a harness for code that uses `pnpm`:
+Here is a stack for code that uses `pnpm`:
 
 ```ncl
 let { stack, .. } = import "minimal.ncl" in
@@ -24,7 +25,7 @@ stack {
   runtime_packages = ["node"],
   build_packages = ["pnpm", "base"],
 
-  # A command that generates the build command, i.e. commands executed by `minimal build`.
+  # A command that generates the build command, i.e. commands executed by `mip build`.
   build_cmds_cmd = [
     "/bin/bash",
     "-c",
@@ -35,7 +36,7 @@ stack {
   "%
   ],
 
-  # Rules to detect when the harness is applicable to a codebase.
+  # Rules to detect when the stack is applicable to a codebase.
   matches_project_if_any = [
     {
       file_regexes = {
@@ -53,7 +54,7 @@ stack {
 
 _String_
 
-The name of the harness. Must match the name of the containing directory.
+The name of the stack. Must match the name of the containing directory.
 
 ### `runtime_packages`
 
@@ -74,7 +75,7 @@ build-time tools such as pkg-config or compilers.
 _Dictionary of String's, optional_
 
 Pairs of environment-variable names and their values that should be set for a build. These are inherited
-by all tasks in a codebase that uses the harness, unless the task sets the environment variable itself.
+by all tasks in a codebase that uses the stack, unless the task sets the environment variable itself.
 
 ### `build_cmd` or `build_cmds_cmd`
 
@@ -83,9 +84,9 @@ _`build_cmd`: String or array of strings for the build command_
 _`build_cmds_cmd`: String or array of strings for a command that generates the build command_
 
 `build_cmd` and `build_cmds_cmd` are mutually exclusive fields that declare the command for
-building software which uses this harness.
+building software which uses this stack.
 
-`build_cmd` defines the command to run when `minimal build` is invoked. It can be a shell-style
+`build_cmd` defines the command to run when [`mip build`](./cli-mip.md) is invoked. It can be a shell-style
 string or an array containing the executable followed by its arguments.
 
 ```ncl
@@ -125,10 +126,10 @@ stack {
 
 _Array of ProjectMatcher objects, optional_
 
-Defines a list of rules which detect when a harness is applicable to some codebase. This
-is the mechanism underlying `minimal init`.
+Defines a list of rules which detect when a stack is applicable to some codebase. This
+is the mechanism underlying [`mip init`](./cli-mip.md).
 
-A harness is considered applicable if any ProjectMatcher in the array matches.
+A stack is considered applicable if any ProjectMatcher in the array matches.
 
 Each matcher has the following fields, all optional:
 

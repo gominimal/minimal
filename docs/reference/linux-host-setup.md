@@ -1,4 +1,5 @@
 ---
+title: Linux host setup
 description: Preparing a Linux host to run minimald — the unprivileged user namespace the session sandbox needs, and the AppArmor profile that grants it on Ubuntu 24.04+.
 ---
 
@@ -22,7 +23,7 @@ DIAG hakoniwa container/process exited non-zero code=125 exit_code=None
   reason=write("/proc/self/uid_map", ..) => Operation not permitted (os error 1)
 ```
 
-`minimal attach` shows this as a session that closes immediately. The daemon
+`min attach` shows this as a session that closes immediately. The daemon
 also preflights this at startup: on a host that will refuse the namespace it
 logs a `sessions will fail to start` warning naming the restriction and this
 fix, so check the daemon log first. Confirm the host is the cause — this needs
@@ -66,7 +67,7 @@ AppArmor label, because on Ubuntu only a *labelled* program can be granted
 `userns`. Installing it neither sandboxes minimald nor weakens the host.
 
 It attaches to minimald at the paths it is normally installed to — `/usr/bin`,
-`/usr/local/bin`, and `~/.local/bin` (where [the installer](/reference/cli) puts
+`/usr/local/bin`, and `~/.local/bin` (where the installer puts
 it). A binary somewhere else — a dev build in `target/debug`, or a custom
 `MINIMAL_BIN` — needs that path named explicitly, because AppArmor matches
 profiles by executable path:
