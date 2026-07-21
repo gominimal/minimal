@@ -13,6 +13,12 @@ use minimal::GlobalArgs;
 pub struct TestDaemon {
     /// The underlying minimald test server. Exposed so tests can create
     /// sessions directly via `server.state` or connect a `TestClient`.
+    ///
+    // Each integration-test binary compiles this module separately and uses a
+    // different subset of it: `cli.rs` reads this field, `bug.rs` only needs
+    // the daemon listening at the socket path. `expect` would go unfulfilled in
+    // the `cli` binary, so the allow is the accurate annotation.
+    #[allow(dead_code)]
     pub server: minimald::test_harness::TestServer,
     temp: tempfile::TempDir,
 }

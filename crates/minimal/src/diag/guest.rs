@@ -136,10 +136,11 @@ pub async fn collect(
 /// header-only bomb bounded without letting incompressible padding distort the
 /// content ratio.
 async fn verify_nested_bundle(bytes: &[u8]) -> Result<(), String> {
+    // `clamp` cannot panic here: the floor is a compile-time constant below the
+    // ceiling (64 MiB < 1 GiB).
     let budget = (bytes.len() as u64)
         .saturating_mul(NESTED_EXPANSION_RATIO)
-        .max(NESTED_MIN_BUDGET)
-        .min(NESTED_MAX_DECOMPRESSED);
+        .clamp(NESTED_MIN_BUDGET, NESTED_MAX_DECOMPRESSED);
 
     let decoder = async_compression::tokio::bufread::ZstdDecoder::new(bytes);
     let mut entries = async_tar::Archive::new(decoder)
