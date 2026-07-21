@@ -44,6 +44,20 @@ pub fn is_sensitive_key(key: &str) -> bool {
         .any(|part| stripped.contains(part))
 }
 
+/// Resolves an env-var name against a caller-supplied allowlist of exact names
+/// and name prefixes, fail-closed: a sensitive-shaped name always loses, even
+/// when the allowlist admits it. `MINIMALD_TOKEN` matches a project prefix but
+/// must never leave the machine.
+///
+/// The *mechanic* is here so every bundle producer resolves the allowlist the
+/// same way; the *data* — which names a given producer considers safe — stays
+/// with the caller, per this crate's mechanics-vs-policy split.
+#[must_use]
+pub fn is_env_value_allowlisted(name: &str, exact: &[&str], prefixes: &[&str]) -> bool {
+    !is_sensitive_key(name)
+        && (exact.contains(&name) || prefixes.iter().any(|p| name.starts_with(p)))
+}
+
 /// Returns true when a table/object with this name holds env-var style values
 /// that must be masked wholesale.
 pub fn is_env_table_name(name: &str) -> bool {

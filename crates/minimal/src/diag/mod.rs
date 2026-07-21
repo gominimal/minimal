@@ -8,7 +8,6 @@
 //! daemons — diagnosing a wedged system must not change it.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Args;
@@ -28,10 +27,6 @@ pub struct BugArgs {
     pub output: Option<PathBuf>,
 }
 
-/// A collector timeout generous enough for slow disks, small enough that a
-/// hung collector can't stall the whole run.
-const COLLECTOR_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Process names (argv0 basenames) that mark a process as one of ours. This is
 /// minimal's policy — the *data*; the matching mechanic lives in
 /// [`diagnostics::procs`], which takes this list as an argument so the same
@@ -45,26 +40,12 @@ const PROCESS_MARKERS: &[&str] = &[
     "gvproxy",
 ];
 
-/// Runs one collector future with [`COLLECTOR_TIMEOUT`]; failure or timeout
-/// is recorded in the manifest and the run continues. A macro (not a
-/// function) so the future's borrow of the writer ends before the
-/// error-recording arms re-borrow it.
-macro_rules! collect_step {
-    ($w:expr, $name:expr, $fut:expr) => {{
-        let name: String = $name.into();
-        let started = std::time::Instant::now();
-        let result = tokio::time::timeout(COLLECTOR_TIMEOUT, $fut).await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => $w.error(name, format!("{e:#}"), started.elapsed()),
-            Err(_) => $w.error(
-                name,
-                format!("timed out after {COLLECTOR_TIMEOUT:?}"),
-                started.elapsed(),
-            ),
-        }
-    }};
-}
+// The collector-step contract — the deadline, the manifest recording, the
+// failure isolation — is `diagnostics::collect_step!`, shared with the daemon
+// bundle so the two cannot drift. The CLI takes the silent form: a collector
+// failure is already in the manifest and in the summary line `cmd_bug` prints,
+// and this binary's tracing goes to the user's terminal.
+use diagnostics::collect_step;
 
 pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::Error> {
     let created_at = chrono::Utc::now();
