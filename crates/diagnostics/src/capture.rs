@@ -44,6 +44,11 @@ pub enum CaptureError {
         timeout: Duration,
         partial: Capture,
     },
+    /// The command ran but exited non-zero and wrote nothing to stdout — no
+    /// usable output to salvage, so a caller can fall through to the next
+    /// source.
+    #[error("`{cmd}` exited unsuccessfully with no output")]
+    NonZero { cmd: String },
 }
 
 /// Runs `cmd args…` with stdin closed, capturing stdout and stderr until the
@@ -113,6 +118,29 @@ pub async fn command_capture(
     })
 }
 
+/// stdout of `cmd args…` when the command produced usable output: a clean
+/// exit, or a non-zero exit that still wrote to stdout — the `lsof`/`ss`
+/// convention, where exit 1 with a partial listing is evidence, not failure.
+/// [`Spawn`](CaptureError::Spawn) and [`Timeout`](CaptureError::Timeout)
+/// propagate so a caller can fall through to the next source; a silent
+/// non-zero exit is [`NonZero`](CaptureError::NonZero). This is the entry
+/// point the net/procs/power collectors run their command-shaped captures
+/// through.
+pub async fn command_stdout(
+    cmd: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, CaptureError> {
+    let capture = command_capture(cmd, args, timeout).await?;
+    if capture.status.is_some_and(|s| s.success()) || !capture.stdout.is_empty() {
+        Ok(String::from_utf8_lossy(&capture.stdout).into_owned())
+    } else {
+        Err(CaptureError::NonZero {
+            cmd: cmd.to_string(),
+        })
+    }
+}
+
 /// First line of `cmd args…` stdout, or `None` when the command can't run,
 /// fails, or times out. The one-liner for collectors that want a single
 /// fact from a tool (`uname -srvm`) and treat any failure as "unknown".
@@ -167,6 +195,25 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, CaptureError::Spawn { .. }), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn command_stdout_keeps_output_from_a_nonzero_exit() {
+        // The lsof/ss convention: exit 1 with a partial listing is evidence.
+        let out = command_stdout(
+            "sh",
+            &["-c", "echo listing; exit 1"],
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "listing\n");
+
+        // A silent non-zero exit has nothing to salvage.
+        let err = command_stdout("sh", &["-c", "exit 1"], Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CaptureError::NonZero { .. }), "got: {err}");
     }
 
     #[tokio::test]

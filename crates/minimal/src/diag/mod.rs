@@ -32,6 +32,19 @@ pub struct BugArgs {
 /// hung collector can't stall the whole run.
 const COLLECTOR_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Process names (argv0 basenames) that mark a process as one of ours. This is
+/// minimal's policy — the *data*; the matching mechanic lives in
+/// [`diagnostics::procs`], which takes this list as an argument so the same
+/// code serves the daemon-side capture.
+const PROCESS_MARKERS: &[&str] = &[
+    "min",
+    "minimal",
+    "minimald",
+    "minvmd",
+    "__krun-vmm",
+    "gvproxy",
+];
+
 /// Runs one collector future with [`COLLECTOR_TIMEOUT`]; failure or timeout
 /// is recorded in the manifest and the run continues. A macro (not a
 /// function) so the future's borrow of the writer ends before the
@@ -71,6 +84,34 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
     collect_step!(w, "host.system", collect::system(&mut w, &paths));
     collect_step!(w, "host.env", collect::env(&mut w));
     collect_step!(w, "host.dirs", dirs_report(&mut w, global));
+    // Incident collectors: the wedged-system captures. The mechanics live in
+    // `diagnostics`; minimal supplies the marker list and the "host" group.
+    collect_step!(
+        w,
+        "host.process-tree",
+        diagnostics::procs::process_tree(&mut w, "host", PROCESS_MARKERS)
+    );
+    collect_step!(
+        w,
+        "host.hang-triage",
+        diagnostics::procs::hang_triage(&mut w, "host", PROCESS_MARKERS)
+    );
+    collect_step!(
+        w,
+        "host.net.listening",
+        diagnostics::net::listening_sockets(&mut w, "host")
+    );
+    collect_step!(
+        w,
+        "host.net.interfaces",
+        diagnostics::net::interfaces(&mut w, "host")
+    );
+    collect_step!(
+        w,
+        "host.net.routes",
+        diagnostics::net::routes(&mut w, "host")
+    );
+    collect_step!(w, "host.power", diagnostics::power::power(&mut w, "host"));
     collect_step!(w, "config", collect::config(&mut w, &paths));
     collect_step!(w, "state", collect::state(&mut w, &paths));
     collect_step!(w, "logs", collect::logs(&mut w, &paths));
