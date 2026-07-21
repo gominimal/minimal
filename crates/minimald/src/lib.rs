@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+pub mod backpressure;
 pub mod channel_progress;
 pub mod connection;
 pub mod env;

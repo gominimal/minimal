@@ -11,6 +11,8 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
+#[cfg(target_os = "linux")]
+use crate::backpressure::EnobufsBackpressure;
 use crate::connection::Connection;
 use crate::sessions;
 
@@ -383,16 +385,26 @@ impl Listener for UnixListener {
 /// stalled a full session (a multi-descriptor TX-chain bug in libkrun's vsock
 /// device, fixed upstream by `0ecf4d5f7`); a socat relay was the prior
 /// workaround.
+///
+/// Accepted streams are wrapped in
+/// [`EnobufsBackpressure`](crate::backpressure::EnobufsBackpressure): the socket
+/// reports a full virtio TX virtqueue as a fatal `ENOBUFS` rather than as
+/// backpressure, which otherwise tears down the entire SSH connection
+/// mid-upload (see that type's docs). The UDS transport above is left
+/// unwrapped — `ENOBUFS` is not one of its failure modes, and keeping the
+/// wrapper off the native path keeps its behaviour byte-identical.
 #[cfg(target_os = "linux")]
 impl Listener for tokio_vsock::VsockListener {
-    type Stream = tokio_vsock::VsockStream;
+    type Stream = EnobufsBackpressure<tokio_vsock::VsockStream>;
     type Addr = tokio_vsock::VsockAddr;
 
     const TRANSPORT: &'static str = "vsock";
     const IS_LOCAL: bool = true;
 
     async fn accept(&self) -> std::io::Result<(Self::Stream, Self::Addr)> {
-        tokio_vsock::VsockListener::accept(self).await
+        tokio_vsock::VsockListener::accept(self)
+            .await
+            .map(|(stream, addr)| (EnobufsBackpressure::new(stream), addr))
     }
 }
 

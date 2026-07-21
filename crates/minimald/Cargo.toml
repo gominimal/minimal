@@ -83,7 +83,9 @@ tokio-rustls = { workspace = true, optional = true }
 # The two-namespace UC7 mesh integration test (`tests/mesh_uc7.rs`) drives a
 # tokio runtime and `setns(2)` directly.
 libc.workspace = true
-tokio.workspace = true
+# `test-util` (not in tokio's `full`) for `#[tokio::test(start_paused = true)]`:
+# lets the ENOBUFS backoff cadence and stall deadline elapse in virtual time.
+tokio = { workspace = true, features = ["test-util"] }
 # Parity test in `sessions/composables.rs` compares `SetupForPackages` output
 # to the composition-only path from a nickel-declared BuildSpec.
 decode.workspace = true
