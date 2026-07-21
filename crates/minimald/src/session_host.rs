@@ -23,6 +23,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tracing::Instrument as _;
 
 use crate::RequestedPty;
 use crate::session::SessionPaths;
@@ -361,10 +362,15 @@ impl Binding {
             control,
         };
 
-        (tx, tokio::spawn(binding.run()))
+        // The channel id ties every line this binding logs back to the
+        // connection span's `accepted connection`/`closed` lines — field
+        // analysis stalls without that correlation.
+        let span = tracing::info_span!("binding", channel = %binding.channel.id());
+        (tx, tokio::spawn(binding.run().instrument(span)))
     }
 
     async fn run(mut self) {
+        tracing::info!("binding attached to session channel");
         let (mut rs, ws) = self.channel.split();
         let mut w = ws.make_writer();
 
@@ -409,7 +415,12 @@ impl Binding {
                             // burst of bytes forwarded through the
                             // channel, v. noisy.
                             russh::ChannelMsg::WindowAdjusted { .. } => {}
-                            _ => tracing::warn!("skipping msg: {:?}", msg),
+                            // Duplicates of pre-attach requests the
+                            // connection handler already answered (russh
+                            // buffers them into the taken channel); noise on
+                            // every healthy attach, so keep them out of
+                            // info-level field bundles.
+                            _ => tracing::debug!("ignoring channel request on attached binding: {:?}", msg),
                         };
                     }
                 },
@@ -449,7 +460,7 @@ impl Binding {
             }
         };
 
-        tracing::debug!("Binding leaving mainloop due to {:?}", exit_reason);
+        tracing::info!(reason = ?exit_reason, "binding leaving mainloop");
 
         if exit_reason == MainloopExitReason::ProcessExited {
             // The shell process exited. For a bash shell, this usually meant someone pressed ctrl-d absent-mindedly.

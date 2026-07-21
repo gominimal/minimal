@@ -49,14 +49,7 @@ pub async fn stream_tar_zstd<W: AsyncWrite + Unpin + Send>(
 
     let build = {
         let dir = dir.to_path_buf();
-        tokio::spawn(async move {
-            let encoder = async_compression::tokio::write::ZstdEncoder::new(tx);
-            let mut tar = Builder::new(encoder);
-            add_dir_entries(&mut tar, &dir, "").await?;
-            let mut encoder = tar.into_inner().await.context("finalizing tar archive")?;
-            encoder.shutdown().await.context("flushing zstd encoder")?;
-            Ok::<(), anyhow::Error>(())
-        })
+        tokio::spawn(async move { build_tar_zstd(&dir, tx).await })
     };
 
     tokio::io::copy(&mut rx, &mut writer)
@@ -69,6 +62,30 @@ pub async fn stream_tar_zstd<W: AsyncWrite + Unpin + Send>(
         .context("shutting down upload stream")?;
 
     build.await.context("tar build task panicked")??;
+    Ok(())
+}
+
+/// Builds a zstd-compressed tar archive of `dir` into `writer`, finalizing
+/// the archive when done.
+///
+/// `async_tar::Builder` panics from its `Drop` impl if it is dropped without
+/// `finish()` or `into_inner()` having been called. When the upload channel
+/// closes mid-stream the entry writes fail, so the builder is always
+/// finalized here — even on the error path — and the underlying failure is
+/// surfaced as an error instead of crashing the worker thread.
+async fn build_tar_zstd<W: AsyncWrite + Unpin + Send + Sync>(
+    dir: &Path,
+    writer: W,
+) -> Result<(), anyhow::Error> {
+    let encoder = async_compression::tokio::write::ZstdEncoder::new(writer);
+    let mut tar = Builder::new(encoder);
+    let entries = add_dir_entries(&mut tar, dir, "").await;
+    // Finalize the builder regardless of whether adding entries succeeded, so
+    // its Drop impl never fires the "dropped without finalizing" panic.
+    let finalized = tar.into_inner().await;
+    entries?;
+    let mut encoder = finalized.context("finalizing tar archive")?;
+    encoder.shutdown().await.context("flushing zstd encoder")?;
     Ok(())
 }
 
@@ -210,6 +227,77 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A writer that accepts `remaining` bytes and then fails every write,
+    /// simulating the upload channel closing while the tar stream is still
+    /// being written.
+    struct FailingWriter {
+        remaining: usize,
+    }
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.remaining == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "channel closed",
+                )));
+            }
+            let n = buf.len().min(self.remaining);
+            self.remaining -= n;
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Fills `len` bytes with an incompressible LCG sequence so the zstd
+    /// encoder is forced to flush to the underlying writer mid-stream.
+    fn incompressible(seed: u64, len: usize) -> Vec<u8> {
+        let mut s = seed;
+        (0..len)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (s >> 33) as u8
+            })
+            .collect()
+    }
+
+    /// Regression test for the async-tar "Builder dropped without finalizing"
+    /// panic: when the writer fails mid-stream, building must surface an error
+    /// rather than dropping the un-finalized builder and panicking.
+    #[tokio::test]
+    async fn build_surfaces_error_when_writer_fails_mid_stream() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for i in 0..64 {
+            std::fs::write(
+                dir.path().join(format!("f{i}.bin")),
+                incompressible(i as u64 + 1, 32 * 1024),
+            )
+            .unwrap();
+        }
+
+        let writer = FailingWriter { remaining: 1024 };
+        let result = build_tar_zstd(dir.path(), writer).await;
+        assert!(
+            result.is_err(),
+            "a mid-stream writer failure must surface as an error, not a panic"
+        );
+    }
 
     /// Streams a tar+zstd archive into a buffer, decompresses it, unpacks
     /// it into a tempdir, and returns the list of all file/symlink paths

@@ -9,6 +9,7 @@ mod common;
 
 use common::setup;
 use minimal::*;
+use minimald_rpc::{ListSessionsResponse, ResourcePool};
 use sessions::SessionId;
 
 use minimald::test_harness::unwrap_ready;
@@ -36,6 +37,37 @@ async fn version_succeeds_without_daemon() {
 }
 
 // --- ls ---
+
+#[test]
+fn ls_shows_shared_resource_pool() {
+    let resp = ListSessionsResponse {
+        resource_pool: Some(ResourcePool {
+            cpu_cores: 8,
+            memory_bytes: 16 * 1024 * 1024 * 1024,
+        }),
+        sessions: vec![minimald_rpc::ListSessionsEntry {
+            id: SessionId::nil(),
+            name: None,
+            attrs: None,
+        }],
+    };
+    let mut out = Vec::new();
+
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+    )
+    .unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.starts_with("RESOURCE POOL:  8 CPU cores · 16 GiB memory · shared by 1 session\n\n")
+    );
+}
 
 #[tokio::test]
 async fn ls_empty() {
@@ -101,6 +133,8 @@ async fn ls_json_empty() {
     .unwrap();
     let text = String::from_utf8(out).unwrap();
     let parsed: Value = serde_json::from_str(&text).expect("json output should be valid JSON");
+    assert!(parsed["resource_pool"]["cpu_cores"].as_u64().unwrap() > 0);
+    assert!(parsed["resource_pool"]["memory_bytes"].as_u64().unwrap() > 0);
     assert!(parsed["sessions"].is_array());
     assert!(parsed["sessions"].as_array().unwrap().is_empty());
 }
@@ -186,6 +220,7 @@ async fn activate_creates_session() {
         ingress: vec![],
         loadout: vec![],
         no_loadouts: false,
+        no_prompt: false,
         attach: false,
     };
     cmd_activate(&args, activate_args).await.unwrap();
@@ -223,6 +258,7 @@ async fn activate_uploads_project_files() {
         ingress: vec![],
         loadout: vec![],
         no_loadouts: false,
+        no_prompt: false,
         attach: false,
     };
     cmd_activate(&args, activate_args).await.unwrap();
@@ -263,7 +299,9 @@ async fn destroy_removes_session() {
     cmd_destroy(
         &args,
         DestroyArgs {
-            session: session_id.to_string(),
+            session: Some(session_id.to_string()),
+            all: false,
+            force: false,
         },
     )
     .await
@@ -284,7 +322,9 @@ async fn destroy_by_name() {
     cmd_destroy(
         &args,
         DestroyArgs {
-            session: "by-name".to_string(),
+            session: Some("by-name".to_string()),
+            all: false,
+            force: false,
         },
     )
     .await
@@ -297,11 +337,52 @@ async fn destroy_unknown_session_fails() {
     let result = cmd_destroy(
         &args,
         DestroyArgs {
-            session: "nonexistent".to_string(),
+            session: Some("nonexistent".to_string()),
+            all: false,
+            force: false,
         },
     )
     .await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn destroy_all_removes_every_session() {
+    let (daemon, args) = setup().await;
+    let _ = create_session(&daemon, "first").await;
+    let _ = create_session(&daemon, "second").await;
+
+    cmd_destroy(
+        &args,
+        DestroyArgs {
+            session: None,
+            all: true,
+            force: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut client = daemon.server.connect().await;
+    use minimald_rpc::ListSessions;
+    let resp = client.call::<ListSessions>(&()).await;
+    assert!(resp.sessions.is_empty());
+}
+
+#[tokio::test]
+async fn destroy_all_succeeds_when_there_are_no_sessions() {
+    let (_daemon, args) = setup().await;
+
+    cmd_destroy(
+        &args,
+        DestroyArgs {
+            session: None,
+            all: true,
+            force: true,
+        },
+    )
+    .await
+    .unwrap();
 }
 
 // --- stop ---

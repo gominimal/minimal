@@ -1,8 +1,9 @@
 [package]
 name = "mip"
-version = "0.4.1"
+version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 args.workspace = true
@@ -42,6 +43,7 @@ anyhow.workspace = true
 
 petgraph.workspace = true
 smallvec.workspace = true
+version.workspace = true
 
 [dev-dependencies]
 serial_test.workspace = true

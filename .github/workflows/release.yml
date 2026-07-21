@@ -21,6 +21,12 @@ on:
             skip_ci_verify:
                 type: boolean
                 default: false
+    # Push a version tag (vMAJOR.MINOR.PATCH, optionally a `-prerelease` suffix) to
+    # cut a real, versioned GitHub Release.
+    # Does not release to any channel but unstable.
+    push:
+        tags:
+            - "v[0-9]*.[0-9]*.[0-9]*"
 
 env:
     CARGO_TERM_COLOR: always
@@ -108,7 +114,11 @@ jobs:
                   remove_dotnet: true
                   remove_haskell: true
                   remove_tool_cache: true
+            # Full history + tags so crates/version's build.rs can figure out the version.
             - uses: actions/checkout@v7
+              with:
+                  fetch-depth: 0
+                  fetch-tags: true
             - name: Install dependencies
               run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
             - name: Add Rust target
@@ -206,20 +216,23 @@ jobs:
         env:
             CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         steps:
-            - uses: actions/checkout@v7
             - name: Free Disk Space
               # Static release build of the full workspace; the cargo target dir
-              # is the largest in any of the linux jobs. `remove_tool_cache: true`
-              # is safe even without a `dtolnay/rust-toolchain` step — the
-              # pre-installed Rust toolchain on ubuntu-latest lives in
-              # `~/.rustup` + `~/.cargo`, not `/opt/hostedtoolcache`, so
-              # `rustup target add` below still resolves.
+              # is the largest in any of the linux jobs.
+              #
+              # Runs BEFORE checkout: the action copies a `bc` binary into its
+              # working dir, which dirty's the checkout.
               uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
               with:
                   remove_android: true
                   remove_dotnet: true
                   remove_haskell: true
                   remove_tool_cache: true
+            # Full history + tags so crates/version's build.rs can figure out the version.
+            - uses: actions/checkout@v7
+              with:
+                  fetch-depth: 0
+                  fetch-tags: true
             - name: Install dependencies
               run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
             - name: Add Rust target
@@ -287,6 +300,9 @@ jobs:
               with:
                   # Don't leave git credentials on the persistent self-hosted runner.
                   persist-credentials: false
+                  # Full history + tags so crates/version's build.rs can figure out the version.
+                  fetch-depth: 0
+                  fetch-tags: true
             - name: Toolchain
               uses: dtolnay/rust-toolchain@stable
             - name: Provision libkrun (pinned own build)
@@ -624,6 +640,30 @@ jobs:
                   if-no-files-found: error
                   retention-days: 7
 
+    compute-version-string:
+        # Read the version straight out of a shipped binary so the GitHub Release
+        # NAME is exactly what `min -V` reports — one source of truth.
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        needs: [build-release-linux-amd64]
+        outputs:
+            version: ${{ steps.read.outputs.version }}
+        steps:
+            - name: Download minimald (amd64)
+              uses: actions/download-artifact@v8
+              with:
+                  name: minimald-linux-amd64
+            - name: Read version from the built binary
+              id: read
+              run: |
+                  set -euo pipefail
+                  chmod +x minimald-linux-amd64
+                  # "-V" => "minimald <version>"; take the version field.
+                  ver="$(./minimald-linux-amd64 -V | awk '{print $2}')"
+                  [ -n "$ver" ] || { echo "::error::could not read version from binary"; exit 1; }
+                  echo "version=$ver" >> "$GITHUB_OUTPUT"
+                  echo "resolved release version: $ver"
+
     release:
         runs-on: ubuntu-latest
         timeout-minutes: 30
@@ -636,6 +676,7 @@ jobs:
                 sign-macos-artifacts,
                 fetch-release-guest-artifacts,
                 build-release-initramfs,
+                compute-version-string,
             ]
         permissions:
             contents: write
@@ -644,11 +685,21 @@ jobs:
             - uses: actions/checkout@v7
             - name: Generate release info
               id: release_info
+              env:
+                  REF_TYPE: ${{ github.ref_type }}
+                  REF_NAME: ${{ github.ref_name }}
               run: |
+                  # A version-tag push releases AT that tag (e.g. v1.2.3). The
+                  # SHA-based dispatch/nightly flow keeps its release-<sha> tag, which
+                  # the installer bucket layout and channel pointers key off. Either
+                  # way the release NAME uses the version string (Create Release step).
                   SHORT_SHA=$(git rev-parse --short=8 HEAD)
                   echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
-                  echo "tag=release-$SHORT_SHA" >> $GITHUB_OUTPUT
-                  echo "name=minimal-$SHORT_SHA" >> $GITHUB_OUTPUT
+                  if [ "$REF_TYPE" = "tag" ]; then
+                    echo "tag=$REF_NAME" >> $GITHUB_OUTPUT
+                  else
+                    echo "tag=release-$SHORT_SHA" >> $GITHUB_OUTPUT
+                  fi
             - name: Download artifacts
               uses: actions/download-artifact@v8
               with:
@@ -693,17 +744,31 @@ jobs:
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
                   DRY_RUN: ${{ inputs.dry_run }}
+                  REL_TAG: ${{ steps.release_info.outputs.tag }}
+                  REL_TITLE: minimal ${{ needs.compute-version-string.outputs.version }}
+                  REF_TYPE: ${{ github.ref_type }}
+                  REF_NAME: ${{ github.ref_name }}
               run: |
                   tar -C artifacts/completions -czf artifacts/completions.tar.gz .
                   if [ "$DRY_RUN" = "true" ]; then
                     echo "::notice::dry_run — assembled release artifacts but skipping GitHub release create"
                     exit 0
                   fi
+                  # A pre-release version tag (e.g. v0.5.0-rc1, i.e. one with a `-`
+                  # suffix) is marked a GitHub prerelease so it doesn't show as
+                  # "Latest"; an exact vX.Y.Z becomes the latest release.
+                  extra=()
+                  if [ "$REF_TYPE" = "tag" ]; then
+                    case "$REF_NAME" in
+                      *-*) extra+=(--prerelease) ;;
+                    esac
+                  fi
                   cd artifacts/
-                  gh release create "${{ steps.release_info.outputs.tag }}" \
+                  gh release create "$REL_TAG" \
                     $(find . -maxdepth 1 -type f) \
                     --repo="${GITHUB_REPOSITORY}" \
-                    --title="${{ steps.release_info.outputs.name }}"
+                    --title="$REL_TITLE" \
+                    "${extra[@]}"
 
     stage-installer:
         # Publish the release into gs://minimal-one in the layout the curl|bash

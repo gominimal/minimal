@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 mod error;
 pub use error::Error;
 mod package_composable;
-pub use package_composable::{PackageComposable, StateWiring};
+pub use package_composable::{PackageComposable, PackageFsMapping, StateWiring};
 mod project_composable;
 pub use project_composable::ProjectComposable;
 mod tasks;
@@ -681,7 +681,24 @@ impl File {
                 sideload.link.fixup_relative(path);
             }
         }
-        // Parameters, if set, must declare defaults.
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Post-deserialize invariants: every declared param has a `default`,
+    /// unknown top-level fields are logged. Runs inside [`Self::init_toml`]
+    /// for the disk-load path, and is exposed publicly for the wire-load
+    /// path — an mfile arriving over the wire has already been through
+    /// serde but skipped this pass, and a peer that trusts the mfile
+    /// without running these checks would let a `[params.X]` without a
+    /// default fall through to graph construction, where the missing
+    /// default surfaces as a much later, much less actionable error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::MissingParamDefault`] if any `[params.X]` entry has
+    /// no `default` field.
+    pub fn validate(&self) -> Result<(), Error> {
         if let Some(params) = &self.params {
             for (n, s) in params.0.iter() {
                 if s.default.is_none() {
@@ -690,7 +707,7 @@ impl File {
             }
         }
         self.warn_unknown_fields();
-        Ok(self)
+        Ok(())
     }
 
     /// Loads the minimal file from the given directory path. The given

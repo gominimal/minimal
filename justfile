@@ -1,195 +1,206 @@
-# justfile — repo-wide task runner. Lives at the workspace root.
+# justfile — repo-wide task runner; the local twin of the frozen CI workflows
+# (docs/ci-strategy.md §8: CI YAML schedules, the logic lives here + scripts/).
+# OS-specific recipes carry [linux]/[macos] attributes — `just --list` shows
+# only this host's. The comment line directly above a recipe is its caption.
+
+scratch      := justfile_directory() / ".scratch"
+arch         := arch()
+musl-target  := arch + "-unknown-linux-musl"
+# Flat libkrun link/runtime prefix (Linux; macOS links the Homebrew install).
+krun-prefix  := env('HOME') / ".krun"
+# Guest networking features baked into the initramfs (networking-wg deferred).
+features     := "networking-proxy"
+kernel       := scratch / "vmlinuz"
+rootfs       := scratch / "rootfs.img"
+initramfs    := scratch / "initramfs.cpio"
+gvproxy      := scratch / "gvproxy"
+minvmd-bin   := justfile_directory() / "target/debug/minvmd"
+minimald-bin := justfile_directory() / "target/debug/minimald"
+# The CLI crate is `minimal`; its [[bin]] target is `min`.
+min-bin      := justfile_directory() / "target/debug/min"
+# State dir for the host-native minimald that `just up` runs on Linux.
+native-dir   := scratch / "native-state"
+
+# The workspace doesn't compile natively on macOS (minimald/lcache/mctx are
+# Linux-only): scope to the darwin-capable crates there; `just test-cross`
+# covers the rest. The Linux lanes run nextest's ci profile; macOS has none.
+scope      := if os() == "macos" { "-p minvmd -p sessions" } else { "--workspace" }
+ci-profile := if os() == "macos" { "" } else { "--profile ci" }
+e2e-env    := "E2E_VM=1 E2E_PROJECT_DIR=/tmp" + if os() == "linux" { " E2E_MINIMAL_ARGS=--minvmd" } else { "" }
+
+# Shared dev-stack env: target/debug on PATH so autospawn finds sibling
+# binaries; MINVMD_* are inert outside the VM recipes. 150s timeouts: the
+# generic guest kernel can spend 40-70s probing hardware before pid-1 starts,
+# overrunning the 60s READY / 75s autospawn / 30s lifecycle defaults.
+export PATH := justfile_directory() / "target/debug:" + env('PATH')
+export LD_LIBRARY_PATH := krun-prefix + if env('LD_LIBRARY_PATH', '') == '' { '' } else { ':' + env('LD_LIBRARY_PATH') }
+export MINVMD_KERNEL_PATH := kernel
+export MINVMD_ROOTFS_PATH := rootfs
+export MINVMD_INITRAMFS := initramfs
+export MINVMD_READY_TIMEOUT_SECS := env('MINVMD_READY_TIMEOUT_SECS', '150')
+export MINIMAL_SPAWN_TIMEOUT_SECS := env('MINIMAL_SPAWN_TIMEOUT_SECS', '150')
+export MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS := env('MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS', '150')
+
+[private]
+default:
+    @just --list
+
+# ── build & fetch ────────────────────────────────────────────────────────────
 #
-# Recipes are grouped by crate where they're crate-specific.
+# Prereqs — macOS: `brew install slp/krun/libkrun zstd jq`.
+# Linux: a KVM host with kvm-group membership, Rust + protoc + jq + cpio + zstd.
+# See crates/minvmd/README.md for the manual bring-up.
 
-scratch     := justfile_directory() / ".scratch"
-# Host CPU arch — drives the materialized guest artifacts and the musl target.
-# aarch64 on Apple Silicon; x86_64 on most Linux hosts.
-arch        := arch()
-musl-target := arch + "-unknown-linux-musl"
-# Flat libkrun link/runtime prefix (Linux only; macOS uses the Homebrew install).
-krun-prefix := env_var('HOME') / ".krun"
-# Guest minimald networking features baked into the initramfs (R4.x): the HTTPS
-# reverse proxy (mTLS). The WireGuard mesh peer (networking-wg) is disabled for
-# now (UC7 / UC2b-A deferred).
-features    := "networking-proxy"
-kernel      := scratch / "vmlinuz"
-rootfs      := scratch / "rootfs.img"
-initramfs   := scratch / "initramfs.cpio"
-gvproxy     := scratch / "gvproxy"
-minvmd-bin  := justfile_directory() / "target/debug/minvmd"
-# The CLI's binary target is `min` (crates/minimal/Cargo.toml [[bin]]); the
-# crate it comes from is still `minimal`, hence `cargo build -p minimal`.
-min-bin     := justfile_directory() / "target/debug/min"
-
-# Re-run any time the entitlements file or binary changes. Ad-hoc signing
-# (`-s -`) requires no Apple Developer membership; the binary only runs on the
-# host that signed it, which is correct for dev builds.
-
-# Build a release `minvmd` and code-sign it with the hypervisor entitlement.
-codesign-minvmd:
-    cargo build -p minvmd --release
-    codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - {{justfile_directory()}}/target/release/minvmd
-
-# ── minimal → minvmd → minimald bring-up (macOS/HVF or Linux/KVM) ───────────
+# Prebuilt from the public cache via the per-commit package index — nothing is
+# built or materialized locally (scripts/fetch-prebuilt.sh; pkgs commit pinned
+# in .minimal/minimal.toml).
 #
-# `just dm1` (macOS/HVF) and `just dm3` (Linux/KVM) bring the whole stack up
-# with full guest networking:
-#   1. materialize the guest kernel + generic rootfs into .scratch
-#   2. cross-compile minimald → initramfs /init WITH the networking features
-#   3. build minvmd (codesign on macOS), build the `min` CLI
-#   4. run `min ls`, which auto-spawns `minvmd run --detach`; minvmd boots
-#      the microVM whose initramfs pid-1 is minimald, which serves the session
-#      over the host UDS bridge.
-#
-# Prereqs:
-#   macOS  — `brew install slp/krun/libkrun`; the `minimal` shim on PATH.
-#   Linux  — a KVM host; durable `kvm` group membership (`sudo usermod -aG kvm
-#            $USER`, then re-login) so the autospawned minvmd can open /dev/kvm;
-#            a Rust toolchain + protoc + jq + cpio. libkrun is fetched by `dm3`.
-# See crates/minvmd/README.md for the manual equivalent.
-
-# macOS: via the `minimal` SHIM (~/.minimal/shim/bin/minimal — runs the CLI in a
-# VM; --output must stay under the repo). Distinct from the `min` binary this
-# repo builds. Linux: via fetch-artifact.sh (builds `mip` from source).
-
-# Materialize the guest kernel + generic rootfs into .scratch. Skips a fetch when
-# the artifact already exists; `just clean` first to force a refresh.
+# Fetch the prebuilt guest kernel + generic rootfs (`just clean` forces a refresh).
 artifacts:
-    #!/usr/bin/env sh
-    set -eu
-    mkdir -p {{scratch}}
-    # `minimal materialize` runs in a VM via the shim; on a cold cache its
-    # overlay-sync can transiently drop the output ("copying output file I/O
-    # error … No such file or directory"). Retry a few times before failing.
-    materialize() {
-      n=0
-      until minimal materialize --output "$1" --arch "$2" "$3"; do
-        n=$((n + 1))
-        [ "$n" -ge 3 ] && { echo "materialize $3 failed after $n attempts" >&2; return 1; }
-        echo "materialize $3 failed (attempt $n); retrying…" >&2
-        rm -f "$1"
-        sleep 2
-      done
-    }
-    case "$(uname -s)" in
-      Darwin)
-        [ -f {{kernel}} ] || materialize {{kernel}} {{arch}} virtio-kernel
-        [ -f {{rootfs}} ] || materialize {{rootfs}} {{arch}} minvmd-rootfs
-        ;;
-      Linux)
-        [ -f {{kernel}} ] || scripts/fetch-artifact.sh virtio-kernel {{kernel}} {{arch}}
-        [ -f {{rootfs}} ] || scripts/fetch-artifact.sh minvmd-rootfs {{rootfs}} {{arch}}
-        ;;
-      *) echo "unsupported host $(uname -s)" >&2; exit 1 ;;
-    esac
+    @mkdir -p {{scratch}}
+    @[ -f {{kernel}} ] || scripts/fetch-prebuilt.sh kernel {{kernel}} {{arch}}
+    @[ -f {{rootfs}} ] || scripts/fetch-prebuilt.sh rootfs {{rootfs}} {{arch}}
 
-# macOS uses the Homebrew install, so this is a no-op there.
-
-# Fetch libkrun + libkrunfw into the link/runtime prefix (Linux only).
+# Fetch prebuilt libkrun + libkrunfw into the link/runtime prefix.
+[linux]
 libkrun:
-    #!/usr/bin/env sh
-    set -eu
-    case "$(uname -s)" in
-      Linux) scripts/fetch-libkrun.sh {{krun-prefix}} {{arch}} ;;
-      *) echo "libkrun: macOS uses the Homebrew install; nothing to fetch" ;;
-    esac
+    scripts/fetch-prebuilt.sh krun {{krun-prefix}} {{arch}}
 
-# Uses `cross`/Docker for the musl toolchain.
+# Fetch the pinned gvproxy switch (guest egress + own-IP; missing = switchless boot).
+gvproxy:
+    @mkdir -p {{scratch}}
+    @[ -x {{gvproxy}} ] || scripts/fetch-gvproxy.sh {{gvproxy}}
 
-# Cross-compile minimald → initramfs /init with the networking features baked in.
+# Cross-compile minimald → initramfs /init with the networking features.
 initramfs:
     FEATURES={{features}} scripts/build-initramfs.sh {{initramfs}} {{musl-target}}
 
-# Not yet consumed by `minvmd run`; provided for the netns/relay e2e flows.
-
-# Fetch the pinned gvproxy switch binary into .scratch (skips if already present).
-gvproxy:
-    #!/usr/bin/env sh
-    set -eu
-    mkdir -p {{scratch}}
-    [ -x {{gvproxy}} ] || scripts/fetch-gvproxy.sh {{gvproxy}}
-
-# macOS: codesign with the hypervisor entitlement (must be the last thing to
-# touch the binary). Linux: build with the libkrun prefix exported so build.rs
-# links the real (non-stub) implementation.
-
-# Build minvmd (debug).
-minvmd-build: libkrun
-    #!/usr/bin/env sh
-    set -eu
-    case "$(uname -s)" in
-      Darwin)
-        cargo build -p minvmd --bin minvmd
-        codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - {{minvmd-bin}}
-        ;;
-      Linux)
-        export LIBKRUN_PREFIX="{{krun-prefix}}"
-        export LD_LIBRARY_PATH="{{krun-prefix}}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-        cargo build -p minvmd --bin minvmd
-        ;;
-      *) echo "unsupported host $(uname -s)" >&2; exit 1 ;;
-    esac
-
-# Build the `min` CLI (from the `minimal` crate; its [[bin]] target is `min`).
-minimal-cli:
-    cargo build -p minimal
-
-# Run the `min` CLI against the workspace's own debug build. Prepends
-# `target/debug/` to `$PATH` so `min`'s auto-spawn can find the sibling
-# `minimald` binary (it invokes it by name). Arguments after `just min` are
-# forwarded verbatim.
+# The ad-hoc (-s -) hypervisor-entitlement codesign must be the LAST touch:
+# any later cargo call that relinks minvmd drops it (EINVAL from krun_start_enter).
 #
-# Example:
-#   just min activate --loadout helix --attach
-#   just min loadout list
-#   just min dirs
+# Build minvmd (debug); codesign is the last touch.
+[macos]
+minvmd-build:
+    cargo build -p minvmd --bin minvmd --locked
+    codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - {{minvmd-bin}}
+
+# Build minvmd (debug); LIBKRUN_PREFIX links the real (non-stub) libkrun.
+[linux]
+minvmd-build: libkrun
+    LIBKRUN_PREFIX="{{krun-prefix}}" cargo build -p minvmd --bin minvmd --locked
+
+# Build the `min` CLI.
+minimal-cli:
+    cargo build -p minimal --locked
+
+# Build a host-native (glibc) minimald with the networking features (for `just up`).
+[linux]
+minimald-build:
+    cargo build -p minimald --features {{features}} --locked
+
+# ── run & inspect ────────────────────────────────────────────────────────────
+
+# Run the dev-built `min` CLI, args forwarded (e.g. `just min loadout list`).
 min *args:
-    cargo build -p minimal -p minimald
-    PATH="{{justfile_directory()}}/target/debug:$PATH" "{{min-bin}}" {{args}}
+    @cargo build {{ if os() == "macos" { "-p minimal" } else { "-p minimal -p minimald" } }} --locked
+    @"{{min-bin}}" {{args}}
 
-# Print `export` lines wiring the dev-built binaries and guest artifacts into
-# the environment — the same setup `dm1`/`dm3` do internally, for running
-# `min`/`minvmd` by hand against the built stack. Load into the current
-# shell with:  eval "$(just env)"
+# Print `export` lines for running the stack by hand: eval "$(just env)".
 env:
-    #!/usr/bin/env sh
-    set -eu
-    printf 'export MINVMD_KERNEL_PATH="%s"\n' '{{kernel}}'
-    printf 'export MINVMD_ROOTFS_PATH="%s"\n' '{{rootfs}}'
-    printf 'export MINVMD_INITRAMFS="%s"\n' '{{initramfs}}'
-    printf 'export MINVMD_BOOT_LOG="%s"\n' '{{scratch}}/boot.log'
-    printf 'export MINVMD_GVPROXY_BIN="%s"\n' '{{gvproxy}}'
-    printf 'export PATH="%s:$PATH"\n' '{{justfile_directory()}}/target/debug'
-    case "$(uname -s)" in
-      Linux) printf 'export LD_LIBRARY_PATH="%s${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\n' '{{krun-prefix}}' ;;
-    esac
+    @printf 'export %s="%s"\n' \
+      PATH "$PATH" LD_LIBRARY_PATH "$LD_LIBRARY_PATH" \
+      MINVMD_KERNEL_PATH "$MINVMD_KERNEL_PATH" MINVMD_ROOTFS_PATH "$MINVMD_ROOTFS_PATH" \
+      MINVMD_INITRAMFS "$MINVMD_INITRAMFS" \
+      MINVMD_GVPROXY_BIN "{{gvproxy}}" \
+      MINVMD_READY_TIMEOUT_SECS "$MINVMD_READY_TIMEOUT_SECS" \
+      MINIMAL_SPAWN_TIMEOUT_SECS "$MINIMAL_SPAWN_TIMEOUT_SECS"
 
-# Drop into a subshell with that environment loaded (exit to leave).
+# Subshell with the dev env loaded (exit to leave).
 shell:
-    #!/usr/bin/env sh
-    set -eu
-    eval "$(just env)"
-    echo "minimal dev shell: target/debug on PATH, MINVMD_* set (exit to leave)"
-    exec "${SHELL:-sh}"
+    @echo "minimal dev shell: target/debug on PATH, MINVMD_* set (exit to leave)"
+    @MINVMD_GVPROXY_BIN="{{gvproxy}}" "${SHELL:-sh}"
 
 # Report the supervised minvmd lifecycle state.
 status:
-    "{{minvmd-bin}}" status
+    @"{{minvmd-bin}}" status
 
 # Stop the supervised minvmd (SIGTERM → SIGKILL).
 stop:
-    "{{minvmd-bin}}" stop
+    @"{{minvmd-bin}}" stop
 
-# Remove only the bring-up artifacts this justfile manages (.scratch is a shared
-# scratchpad — do NOT blow the whole directory away).
+# Remove the bring-up artifacts this justfile manages (never all of .scratch).
 clean:
-    rm -f {{kernel}} {{rootfs}} {{initramfs}} {{gvproxy}} {{scratch}}/boot.log
+    rm -f {{kernel}} {{rootfs}} {{initramfs}} {{gvproxy}}
 
-# Run the curl|sh installer's test harness under every POSIX sh available. The
-# installer targets strict POSIX sh, so dash conformance is checked alongside sh
-# (spec docs/specs/07-spec-installer, Verification §2); shellcheck --shell=sh is
-# run when present.
+# Kill THIS checkout's stranded VM processes (they wedge the next VM's vsock bridge).
+reap:
+    scripts/reap-vms.sh
+
+# ── CI-parity gates ──────────────────────────────────────────────────────────
+
+# Fail fast with an install hint when a required tool is missing.
+_need tool hint:
+    @command -v {{tool}} >/dev/null 2>&1 || { echo "'{{tool}}' not found — install with: {{hint}}" >&2; exit 1; }
+
+_nextest: (_need "cargo-nextest" "cargo install cargo-nextest --locked")
+
+# Apply rustfmt across the workspace (the fixer for a red `just fmt-check`).
+fmt:
+    cargo fmt --all
+
+# CI: ci.yml `fmt`.
+fmt-check:
+    cargo fmt --all -- --check
+
+# CI: ci.yml `clippy` / the ci-macos.yml `unit` scope.
+clippy:
+    cargo clippy {{scope}} --all-targets --locked -- -D warnings
+
+# A local advisories failure may just mean newer RUSTSEC data than CI's last run.
+#
+# CI: ci.yml `cargo-deny` (advisories/bans/licenses/sources).
+deny: (_need "cargo-deny" "cargo install cargo-deny --locked")
+    cargo deny --all-features check
+
+# Unit + in-process integration tests. CI: every lane's core-tests suite.
+test: _nextest
+    cargo nextest run {{scope}} {{ci-profile}} --locked --no-tests=fail
+
+# Doctests — nextest can't run them, so they are their own surface.
+doctest:
+    cargo test {{scope}} --doc --locked
+
+# The old `cargo test -- --include-ignored` pre-PR surface; the env-gated
+# VM/netns harnesses self-skip here (`just test-vm` runs those for real).
+#
+# The #[ignore] tests GitHub runners can't run — NO CI lane covers these.
+[linux]
+test-ignored: _nextest
+    cargo nextest run --workspace --locked --profile ci --run-ignored ignored-only --no-tests=fail
+
+# COST: the first run compiles the workspace under emulation and can take an
+# hour+; later runs are incremental. HOME=/tmp: the container has no HOME.
+#
+# clippy + tests for the Linux-only crates from a Mac (musl in Docker; not minvmd).
+[macos]
+test-cross: (_need "cross" "cargo install cross --locked")
+    @docker info >/dev/null 2>&1 || { echo "docker daemon not running (cross needs it) — start Docker Desktop or OrbStack" >&2; exit 1; }
+    cross clippy --workspace --exclude minvmd --all-targets --target {{musl-target}} --locked -- -D warnings
+    CROSS_CONTAINER_OPTS="--env HOME=/tmp" cross test --workspace --exclude minvmd --target {{musl-target}} --locked
+
+# Not replicated: commitlint, the dogfood jobs, the installer lane (`just test-installer`).
+#
+# The local PR gate set, cheapest first.
+[linux]
+ci: fmt-check clippy deny test doctest test-ignored
+    @echo "ci: local PR gates green"
+
+# The local PR gate set, cheapest first (`just test-cross` covers the Linux-only crates).
+[macos]
+ci: fmt-check clippy deny test doctest
+    @echo "ci: local PR gates green"
+
+# Run the curl|sh installer's tests under every POSIX sh. CI: ci-shell-installer.yml.
 test-installer:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -205,118 +216,188 @@ test-installer:
         SH="$sh" "$sh" scripts/install_test.sh
     done
 
-# ── DM1 / DM2 / DM3 deployment-model bring-up ────────────────────────────────
+# Run the promotion provenance gate's test harness (stubbed `gh`, no network,
+# no auth); shellcheck runs when present.
+test-promote-gate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v shellcheck >/dev/null 2>&1; then
+        echo "== shellcheck =="
+        shellcheck scripts/verify-nightly-provenance.sh scripts/verify-nightly-provenance_test.sh
+    else
+        echo "== shellcheck not found, skipping static check =="
+    fi
+    echo "== running verify-nightly-provenance_test.sh =="
+    bash scripts/verify-nightly-provenance_test.sh
+
+# ── VM & e2e surfaces ────────────────────────────────────────────────────────
+
+# VM recipes need writable /dev/kvm on Linux; no-op on macOS (HVF).
+[macos]
+_kvm:
+
+[linux]
+_kvm:
+    @[ -e /dev/kvm ] && [ -w /dev/kvm ] || { echo "needs writable /dev/kvm (kvm group membership); one-off: sg kvm -c 'just <recipe>'" >&2; exit 1; }
+
+# minvmd's VM harnesses (tests/*_integration.rs). CI: `test-kvm` / macOS `e2e`.
+[macos]
+test-vm: _nextest artifacts initramfs
+    #!/usr/bin/env sh
+    set -eu
+    export MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state"
+    # CI's archive pattern: build EVERYTHING, codesign minvmd LAST (a later
+    # cargo call would relink it → entitlement lost), run from the archive.
+    cargo nextest archive -p minvmd --locked --archive-file "{{scratch}}/nextest-archive.tar.zst"
+    cargo build -p minvmd --bin minvmd --locked
+    cargo build -p minimal --bin min --locked
+    # Resolve the FFI-smoke binary from cargo itself (an mtime-sorted ls can
+    # pick a stale build config), BEFORE codesign — the last cargo call allowed.
+    testbin="$(cargo test -p minvmd --test krun_smoke_integration --no-run --locked --message-format=json 2>/dev/null \
+      | sed -n 's/.*"executable":"\([^"]*krun_smoke_integration[^"]*\)".*/\1/p' | head -1)"
+    [ -n "$testbin" ] && [ -x "$testbin" ] || { echo "krun_smoke_integration test binary not resolved via cargo" >&2; exit 1; }
+    codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - "{{minvmd-bin}}"
+    # The FFI smoke boots libkrun IN-PROCESS from the unsigned test binary:
+    # run it kernel-less and directly — never via cargo, never from the filterset.
+    env -u MINVMD_KERNEL_PATH -u MINVMD_ROOTFS_PATH -u MINVMD_INITRAMFS \
+      "$testbin" --include-ignored --nocapture
+    cargo-nextest nextest run --archive-file "{{scratch}}/nextest-archive.tar.zst" \
+      --workspace-remap "{{justfile_directory()}}" --profile vm \
+      --run-ignored all --no-tests=fail \
+      -E 'binary(/_integration$/) and not binary(/_root_integration$/) and not binary(krun_smoke_integration)'
+
+# minvmd's VM harnesses (tests/*_integration.rs). CI: ci-linux-kvm.yml `test-kvm`.
+[linux]
+test-vm: _nextest _kvm artifacts initramfs minvmd-build
+    MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state" LIBKRUN_PREFIX="{{krun-prefix}}" \
+      cargo nextest run -p minvmd --profile vm --run-ignored all --no-tests=fail \
+      -E 'binary(/_integration$/) and not binary(/_root_integration$/)'
+
+# minimald's netns/tap proofs (the tests sudo their own netns commands).
+# CI: ci-linux-native.yml `minimald-root-integration`. The AppArmor policy
+# can't unlock this surface — its namespaces come from hashed-path test
+# binaries and /usr/bin/unshare, which a per-binary profile can't cover.
+[linux]
+test-root-integration: _nextest gvproxy
+    @[ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "0" ] || { echo "this host restricts unprivileged user namespaces, which this surface needs from hashed-path test binaries (the AppArmor policy can't cover those); leave this lane to CI, or see docs/reference/linux-host-setup.md before relaxing the restriction host-wide" >&2; exit 1; }
+    MINIMALD_NETNS_TEST=1 GVPROXY_BIN="{{gvproxy}}" cargo nextest run -p minimald --profile ci --run-ignored all --no-tests=fail -E 'binary(/_root_integration$/)'
+
+# minvmd-build is LAST so its macOS codesign is the final touch on the binary.
 #
-# DM1: macOS (Apple Silicon) host + Linux VM(s) over Hypervisor.framework. This
-#      is the primary bring-up on macOS; on Linux it is a clean SKIP (use `dm3`
-#      for the native-Linux + VM equivalent over KVM).
-# DM2: native Linux, a host-native `minimald` (no VM), reachable over UDS at
-#      providers/local-0/ssh.sock — the same path the `min` CLI dials, so no
-#      bridge is needed. Own-IP is rootless (hakoniwa RustSlirp builds the tap
-#      inside the sandbox's own user+net namespace — no setcap).
-# DM3: native Linux + one Linux VM (minimald as initramfs pid-1 in libkrun). The
-#      Linux CLI dials providers/local-0/ssh.sock, which minvmd binds directly
-#      (the socket/path coordination fix, #690) — no bridge/symlink needed. Run
-#      under `sg kvm` if the shell lacks the kvm group.
+# The unified session e2e against the VM-backed daemon. CI: the session e2e steps.
+e2e: _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
+    {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/session-e2e.sh
 
-# On Linux this is a clean SKIP (use `dm3`). min auto-spawns `minvmd run
-# --detach`, so minvmd must be on PATH and the MINVMD_* artifact paths exported —
-# both are set here and inherited by the detached supervisor.
+# The SAME session e2e against a host-native minimald (no VM).
+# CI: ci-linux-native.yml `native-daemon-e2e`.
+[linux]
+e2e-native:
+    cargo build -p minimald --bin minimald -p minimal --bin min --locked
+    @just _userns-check
+    ./scripts/session-e2e.sh
 
-# DM1 — macOS host + Linux VM over Hypervisor.framework: bring the full stack up.
-dm1:
+# Boots switchless like CI's step — MINVMD_GVPROXY_BIN deliberately not set.
+#
+# Daemon lifecycle proof (run --detach → Running → stop → Stopped). CI: `lifecycle`.
+test-lifecycle: (_need "jq" "brew install jq (or apt install jq)") _kvm artifacts initramfs minvmd-build
+    XDG_STATE_HOME="{{scratch}}/test-state" ./scripts/minvmd-lifecycle.sh
+
+# Reaps between iterations — this WILL kill this checkout's live dev stack each pass.
+#
+# Nightly soak parity: N session-e2e reps (nightly-tests.yml runs 10).
+soak n="10": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
+    {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/soak-session-e2e.sh {{n}} "{{scratch}}/soak-logs"
+
+# ── stack bring-up ───────────────────────────────────────────────────────────
+#
+# `just up` = this host's default run mode; `just down` stops it.
+#   macOS: Linux VM over Hypervisor.framework (the only macOS mode).
+#   Linux: host-native minimald, no VM. `just up-kvm`: Linux + VM over KVM.
+# The CLI dials providers/local-0/ssh.sock in every mode; minvmd binds it
+# directly (#690), so no bridge is needed.
+
+# The daemon can reset the very first connect after boot/bind; retry briefly.
+_smoke *args:
     #!/usr/bin/env sh
-    set -eu
-    case "$(uname -s)" in
-      Darwin) ;;
-      *) echo "DM1 needs macOS (Hypervisor.framework). SKIP on $(uname -s); use 'just dm3' for native Linux + VM over KVM." ; exit 0 ;;
-    esac
-    echo "DM1 (macOS + Linux VM over HVF): bringing the stack up."
-    just artifacts gvproxy initramfs minvmd-build minimal-cli
-    export MINVMD_KERNEL_PATH="{{kernel}}"
-    export MINVMD_ROOTFS_PATH="{{rootfs}}"
-    export MINVMD_INITRAMFS="{{initramfs}}"
-    export MINVMD_BOOT_LOG="{{scratch}}/boot.log"
-    # Host gvproxy switch: minvmd spawns it for guest egress (root netns + own-IP
-    # PTasks). Best-effort — skipped if the binary is absent.
-    export MINVMD_GVPROXY_BIN="{{gvproxy}}"
-    export PATH="{{justfile_directory()}}/target/debug:$PATH"
-    "{{min-bin}}" ls
-
-# Build a host-native (glibc) minimald WITH the networking features, for DM2.
-minimald-build:
-    cargo build -p minimald --features {{features}}
-
-# DM3 — native Linux + one Linux VM. Boots the VM; minvmd binds the CLI socket.
-dm3: artifacts gvproxy initramfs minvmd-build minimal-cli
-    #!/usr/bin/env sh
-    set -eu
-    [ -e /dev/kvm ] || { echo "DM3 needs /dev/kvm (KVM host)"; exit 1; }
-    [ -w /dev/kvm ] || { echo "DM3: /dev/kvm not writable here; retry: sg kvm -c 'just dm3'"; exit 1; }
-    export MINVMD_KERNEL_PATH="{{kernel}}" MINVMD_ROOTFS_PATH="{{rootfs}}"
-    export MINVMD_INITRAMFS="{{initramfs}}" MINVMD_BOOT_LOG="{{scratch}}/boot.log"
-    export MINVMD_GVPROXY_BIN="{{gvproxy}}"
-    export PATH="{{justfile_directory()}}/target/debug:$PATH"
-    export LD_LIBRARY_PATH="{{krun-prefix}}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    # Boot the VM explicitly (the CLI's autospawn would also work, but an
-    # explicit boot keeps ordering clear and lets us raise the READY timeout).
-    # The generic guest kernel can spend 40-50s probing hardware before pid-1
-    # (minimald) even starts, which overruns minvmd's 60s READY default on a
-    # cold boot; give it headroom (overridable by the caller).
-    export MINVMD_READY_TIMEOUT_SECS="${MINVMD_READY_TIMEOUT_SECS:-150}"
-    "{{minvmd-bin}}" run --detach --timeout 75
-    # No socket bridge: since the socket/path coordination fix (#690) minvmd binds
-    # the CLI-facing <state>/providers/local-0/ssh.sock directly — exactly the path
-    # the `minimal` CLI dials. (The old `ln -sf` from a runtime-dir socket clobbered
-    # minvmd's own live socket, so every dial fell through to a failing autospawn.)
-    echo "DM3 up: VM booted; minimald reachable at providers/local-0/ssh.sock"
-    # The guest SSH server can reset the very first connect right after boot, so
-    # retry briefly rather than fail the recipe on that one-shot race.
-    ok=0
-    for _ in $(seq 1 5); do
-      if "{{min-bin}}" ls; then ok=1; break; fi
+    for _ in 1 2 3 4 5; do
+      MINVMD_GVPROXY_BIN="{{gvproxy}}" "{{min-bin}}" {{args}} ls && exit 0
       sleep 2
     done
-    [ "$ok" = 1 ] || { echo "DM3: min ls failed after retries" >&2; exit 1; }
+    echo "min ls failed after retries" >&2; exit 1
 
-# DM2 — native Linux, host-native minimald (no VM) over UDS. Runs minimald under
-# a dedicated state dir; the CLI reaches it with `--minimal-dir`, which (via the
-# autospawn gate) connects directly instead of booting a VM.
-dm2: minimald-build minimal-cli gvproxy
+# Bring the stack up: Linux VM over Hypervisor.framework (`min ls` autospawns minvmd).
+[macos]
+up: artifacts gvproxy initramfs minvmd-build minimal-cli && (_smoke)
+
+# Bring the stack up: host-native minimald, no VM (`just up-kvm` for the VM stack).
+[linux]
+up: minimald-build minimal-cli gvproxy && (_smoke "--minimal-dir" native-dir)
     #!/usr/bin/env sh
     set -eu
-    dir="{{scratch}}/dm2-state"
-    sock="$dir/providers/local-0/ssh.sock"
-    pidf="{{scratch}}/dm2-minimald.pid"
-    bin="{{justfile_directory()}}/target/debug/minimald"
-    mkdir -p "$dir"
-    # Own-IP is rootless: hakoniwa's RustSlirp builds each PTask's tap inside the
-    # sandbox's own user+net namespace, so the daemon needs no `setcap` / elevated
-    # privilege. (It does need an unprivileged-user-namespace-capable host.)
-    if [ -S "$sock" ] && [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then
-      echo "DM2 minimald already up: $sock"
+    sock="{{native-dir}}/providers/local-0/ssh.sock"
+    pidf="{{scratch}}/minimald.pid"
+    mkdir -p "{{native-dir}}"
+    # PID files survive reboots and PIDs get reused: only trust the pidfile if
+    # the PID is still THIS checkout's minimald (prefix match tolerates the
+    # "(deleted)" suffix a rebuilt binary leaves on /proc/<pid>/exe).
+    owns() { case "$(readlink "/proc/$1/exe" 2>/dev/null)" in "{{minimald-bin}}"*) return 0 ;; *) return 1 ;; esac; }
+    if [ -S "$sock" ] && [ -f "$pidf" ] && owns "$(cat "$pidf")"; then
+      echo "native minimald already up: $sock"
     else
-      # --gvproxy-bin points the per-host OwnIp switch at the pinned local gvproxy,
-      # so no system install (/usr/lib/minimal/bin/gvproxy) is required.
-      setsid "$bin" \
-        --minimal-state-dir "$dir" --minimal-cache-dir "$dir/cache" \
-        run --instance-num 0 --gvproxy-bin "{{gvproxy}}" > {{scratch}}/dm2-minimald.log 2>&1 &
+      rm -f "$sock" "$pidf"
+      setsid "{{minimald-bin}}" \
+        --minimal-state-dir "{{native-dir}}" --minimal-cache-dir "{{native-dir}}/cache" \
+        run --instance-num 0 --gvproxy-bin "{{gvproxy}}" > "{{scratch}}/minimald.log" 2>&1 &
       echo $! > "$pidf"
       for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.1; done
     fi
-    [ -S "$sock" ] || { echo "DM2 minimald failed to bind $sock; see {{scratch}}/dm2-minimald.log" >&2; exit 1; }
-    echo "DM2 up: host-native minimald at $sock (pid $(cat "$pidf"))"
-    echo "  own-IP: {{min-bin}} --minimal-dir $dir activate -n net1 --network own-ip . && \\"
-    echo "          {{min-bin}} --minimal-dir $dir attach net1   # curl http://example.com -> 200"
-    "{{min-bin}}" --minimal-dir "$dir" ls
+    [ -S "$sock" ] || { echo "minimald failed to bind $sock; see {{scratch}}/minimald.log" >&2; exit 1; }
+    # Warn-only: the daemon runs without the AppArmor profile, but every
+    # `activate` sandbox dies at uid_map EPERM until it's installed.
+    just _userns-check || true
+    echo "up: host-native minimald at $sock (pid $(cat "$pidf"))"
+    echo "  own-IP demo: min --minimal-dir {{native-dir}} activate -n net1 --network own-ip . && min --minimal-dir {{native-dir}} attach net1"
 
-# Stop the DM2 host-native minimald.
-dm2-down:
+# Bring the stack up: native Linux + one Linux VM over KVM (stop with `just stop`).
+[linux]
+up-kvm: _kvm artifacts gvproxy initramfs minvmd-build minimal-cli && (_smoke)
+    MINVMD_GVPROXY_BIN="{{gvproxy}}" "{{minvmd-bin}}" run --detach --timeout "$MINVMD_READY_TIMEOUT_SECS"
+    @echo "up-kvm: VM booted; minimald reachable at providers/local-0/ssh.sock"
+
+# Stop the stack `just up` started.
+[macos]
+down: stop
+
+# Stop the stack `just up` started (the host-native minimald).
+[linux]
+down:
     #!/usr/bin/env sh
     set -eu
-    pidf="{{scratch}}/dm2-minimald.pid"
-    [ -f "$pidf" ] || { echo "no DM2 minimald running"; exit 0; }
-    pid="$(cat "$pidf")"; kill "$pid" 2>/dev/null || true
+    pidf="{{scratch}}/minimald.pid"
+    [ -f "$pidf" ] || { echo "no native minimald running"; exit 0; }
+    pid="$(cat "$pidf")"
+    # Never signal a reused PID: the pidfile is only trusted if the process is
+    # still this checkout's minimald (see the matching check in `up`).
+    case "$(readlink "/proc/$pid/exe" 2>/dev/null)" in
+      "{{minimald-bin}}"*) ;;
+      *) rm -f "$pidf"; echo "stale pidfile (pid $pid is not this checkout's minimald); removed"; exit 0 ;;
+    esac
+    kill "$pid" 2>/dev/null || true
     for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
     kill -9 "$pid" 2>/dev/null || true; rm -f "$pidf"
-    echo "DM2 minimald stopped (pid $pid)"
+    echo "native minimald stopped (pid $pid)"
+
+# Ubuntu 24.04+ gates unprivileged userns behind AppArmor. The fix is the
+# installer's per-binary profile (grants userns to minimald ALONE — flipping
+# the sysctl hands it to everything). Details: docs/reference/linux-host-setup.md.
+[linux]
+_userns-check:
+    #!/usr/bin/env sh
+    set -eu
+    if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "0" ]; then exit 0; fi
+    if [ -e /etc/apparmor.d/minimald ] && grep -rqs "{{minimald-bin}}" /etc/apparmor.d/tunables 2>/dev/null; then exit 0; fi
+    echo "note: this host restricts unprivileged user namespaces (Ubuntu 24.04+);" >&2
+    echo "  minimald's session sandbox cannot start until its AppArmor profile is" >&2
+    echo "  installed — a one-time step that needs root:" >&2
+    echo "      sudo scripts/install-apparmor-profile.sh --path {{minimald-bin}}" >&2
+    exit 1

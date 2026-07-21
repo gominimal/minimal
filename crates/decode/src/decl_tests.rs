@@ -156,7 +156,7 @@ mod tests {
         let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
-                let {BuildSpec, HostPath, Test, ..} = import \"minimal.ncl\" in
+                let {BuildSpec, Test, ..} = import \"minimal.ncl\" in
                 {
                     class = 'Build,
                     cmd = \"/usr/bin/yes\",

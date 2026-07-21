@@ -19,7 +19,7 @@ use sessions::wire::primitives::{
     PendingId, WirePendingPatch, WirePendingVar, WireResolvedVar, WireSessionVar, WireSource,
     WireVarSpec,
 };
-use sessions::wire::request::{ContributionResponse, ContributionVerdict};
+use sessions::wire::request::ContributionResponse;
 
 // =====================================================================
 // Support
@@ -71,6 +71,7 @@ fn gated_var(name: &str, value: &str, loadout: &str) -> SessionVar {
         var: WireResolvedVar {
             name: name.to_owned(),
             value: value.to_owned(),
+            carries_user_data: true,
         },
         source: WireSource::UserLoadout {
             name: loadout.to_owned(),
@@ -150,7 +151,7 @@ fn empty_response() -> ContributionResponse {
 /// Empty pending → empty verdict echoing the session id.
 #[test]
 fn empty_response_produces_empty_verdict() {
-    let verdict = handle_response(
+    let (verdict, _) = handle_response(
         empty_response(),
         &[],
         UserPolicy::empty(),
@@ -176,6 +177,7 @@ fn specified_var_allow_listed_is_approved() {
             name: "EDITOR".into(),
             spec: WireVarSpec::Specified { value: "hx".into() },
             source: package_source("helix"),
+            carries_user_data: false,
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
@@ -183,7 +185,7 @@ fn specified_var_allow_listed_is_approved() {
     let vars_policy = VarsPolicy::empty().try_with_allow(["EDITOR"]).unwrap();
     let policy = UserPolicy::empty().with_vars(vars_policy);
 
-    let verdict = handle_response(
+    let (verdict, _) = handle_response(
         response,
         &[],
         policy,
@@ -213,6 +215,7 @@ fn inherit_var_resolves_against_env() {
             name: "LANG".into(),
             spec: WireVarSpec::Inherit,
             source: package_source("locales"),
+            carries_user_data: false,
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
@@ -221,7 +224,7 @@ fn inherit_var_resolves_against_env() {
         UserPolicy::empty().with_vars(VarsPolicy::empty().try_with_allow(["LANG"]).unwrap());
     let env = pinned_env(&[("LANG", "sjn_IV")]);
 
-    let verdict = handle_response(
+    let (verdict, _) = handle_response(
         response,
         &[],
         policy,
@@ -248,6 +251,7 @@ fn inherit_with_default_falls_back() {
                 default: "sjn_IV".into(),
             },
             source: package_source("locales"),
+            carries_user_data: false,
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
@@ -255,7 +259,7 @@ fn inherit_with_default_falls_back() {
     let policy =
         UserPolicy::empty().with_vars(VarsPolicy::empty().try_with_allow(["LANG"]).unwrap());
 
-    let verdict = handle_response(
+    let (verdict, _) = handle_response(
         response,
         &[],
         policy,
@@ -280,6 +284,7 @@ fn inherit_var_missing_env_errors() {
             name: "MUST_BE_SET".into(),
             spec: WireVarSpec::Inherit,
             source: package_source("strict"),
+            carries_user_data: false,
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
@@ -303,22 +308,26 @@ fn inherit_var_missing_env_errors() {
 /// but doesn't abort sibling items.
 #[test]
 fn policy_deny_per_item() {
+    // `Inherit` (not `Specified`) so the resolved vars have
+    // `carries_user_data = true` — the policy gate only fires on
+    // vars that move user env data into the sandbox; a hardcoded
+    // literal isn't a leak vector and would auto-approve.
     let response = ContributionResponse {
         session_id: session_id(),
         vars: vec![
             WirePendingVar {
                 id: PendingId::new(1),
                 name: "AWS_KEY".into(),
-                spec: WireVarSpec::Specified {
-                    value: "leaked".into(),
-                },
+                spec: WireVarSpec::Inherit,
                 source: package_source("evil"),
+                carries_user_data: false,
             },
             WirePendingVar {
                 id: PendingId::new(2),
                 name: "EDITOR".into(),
-                spec: WireVarSpec::Specified { value: "hx".into() },
+                spec: WireVarSpec::Inherit,
                 source: package_source("helix"),
+                carries_user_data: false,
             },
         ],
         patches: vec![],
@@ -331,13 +340,13 @@ fn policy_deny_per_item() {
         .unwrap();
     let policy = UserPolicy::empty().with_vars(vars_policy);
 
-    let verdict = handle_response(
+    let (verdict, _) = handle_response(
         response,
         &[],
         policy,
         &PanicHooks,
         ComposeOptions::default(),
-        &pinned_env(&[]),
+        &pinned_env(&[("AWS_KEY", "leaked"), ("EDITOR", "hx")]),
     )
     .unwrap();
 
@@ -353,7 +362,8 @@ fn policy_deny_per_item() {
     ));
 }
 
-/// `ignore` rule produces an Ignored verdict.
+/// `ignore` rule produces an Ignored verdict. `Inherit` (not
+/// `Specified`) so `carries_user_data` is true and the gate fires.
 #[test]
 fn policy_ignore_per_item() {
     let response = ContributionResponse {
@@ -361,8 +371,9 @@ fn policy_ignore_per_item() {
         vars: vec![WirePendingVar {
             id: PendingId::new(1),
             name: "_TMP".into(),
-            spec: WireVarSpec::Specified { value: "x".into() },
+            spec: WireVarSpec::Inherit,
             source: package_source("noisy"),
+            carries_user_data: false,
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
@@ -370,13 +381,13 @@ fn policy_ignore_per_item() {
     let vars_policy = VarsPolicy::empty().try_with_ignore(["_*"]).unwrap();
     let policy = UserPolicy::empty().with_vars(vars_policy);
 
-    let verdict = handle_response(
+    let (verdict, _) = handle_response(
         response,
         &[],
         policy,
         &PanicHooks,
         ComposeOptions::default(),
-        &pinned_env(&[]),
+        &pinned_env(&[("_TMP", "x")]),
     )
     .unwrap();
     assert!(matches!(verdict.vars[0], WireVarVerdict::Ignored { .. }));
@@ -386,30 +397,34 @@ fn policy_ignore_per_item() {
 /// `AllowOnce` produces an Approved verdict.
 #[test]
 fn hook_approves_unapproved() {
+    // `Inherit` so the var carries user data and reaches the hook.
     let response = ContributionResponse {
         session_id: session_id(),
         vars: vec![WirePendingVar {
             id: PendingId::new(1),
             name: "MY_VAR".into(),
-            spec: WireVarSpec::Specified { value: "v".into() },
+            spec: WireVarSpec::Inherit,
             source: package_source("p"),
+            carries_user_data: false,
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
     };
-    let verdict = handle_response(
+    let (verdict, _) = handle_response(
         response,
         &[],
         UserPolicy::empty(),
         &PassThroughHooks,
         ComposeOptions::default(),
-        &pinned_env(&[]),
+        &pinned_env(&[("MY_VAR", "v")]),
     )
     .unwrap();
     assert!(matches!(verdict.vars[0], WireVarVerdict::Approved { .. }));
 }
 
-/// Hook returns Abort → [`ComposeError::Aborted`].
+/// Hook returns Abort → [`ComposeError::Aborted`]. `Inherit` so
+/// `carries_user_data` is true and the var reaches the hook (a
+/// hardcoded literal would auto-approve at the gate).
 #[test]
 fn hook_abort_propagates() {
     let response = ContributionResponse {
@@ -417,8 +432,9 @@ fn hook_abort_propagates() {
         vars: vec![WirePendingVar {
             id: PendingId::new(1),
             name: "MY_VAR".into(),
-            spec: WireVarSpec::Specified { value: "v".into() },
+            spec: WireVarSpec::Inherit,
             source: package_source("p"),
+            carries_user_data: false,
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
@@ -429,7 +445,7 @@ fn hook_abort_propagates() {
         UserPolicy::empty(),
         &AbortHooks,
         ComposeOptions::default(),
-        &pinned_env(&[]),
+        &pinned_env(&[("MY_VAR", "v")]),
     )
     .unwrap_err();
     assert!(matches!(err, ComposeError::Aborted), "got: {err:?}");
@@ -463,7 +479,7 @@ fn patch_source_uses_gated_vars() {
     )];
     let policy = UserPolicy::empty().with_patches(PatchPolicy::empty().with_allow(["/**/*.toml"]));
 
-    let verdict = handle_response(
+    let (verdict, _) = handle_response(
         response,
         &gated,
         policy,
@@ -474,7 +490,7 @@ fn patch_source_uses_gated_vars() {
     .unwrap();
     assert_eq!(verdict.patches.len(), 1);
     match &verdict.patches[0] {
-        WirePatchVerdict::Approved { id, host_path } => {
+        WirePatchVerdict::Approved { id, host_path, .. } => {
             assert_eq!(*id, PendingId::new(1));
             assert!(host_path.as_str().ends_with("helix/themes/nord.toml"));
         }
@@ -499,6 +515,7 @@ fn patch_source_uses_batch_approved_vars() {
                 value: root.join("helix").to_string(),
             },
             source: package_source("helix"),
+            carries_user_data: false,
         }],
         patches: vec![WirePendingPatch {
             id: PendingId::new(2),
@@ -517,7 +534,7 @@ fn patch_source_uses_batch_approved_vars() {
         )
         .with_patches(PatchPolicy::empty().with_allow(["/**/*.toml"]));
 
-    let verdict = handle_response(
+    let (verdict, _) = handle_response(
         response,
         &[],
         policy,
@@ -531,6 +548,61 @@ fn patch_source_uses_batch_approved_vars() {
         verdict.patches[0],
         WirePatchVerdict::Approved { .. }
     ));
+}
+
+/// Companion to `patch_source_uses_batch_approved_vars` that
+/// actually exercises the vars-allow-list path. The parent uses a
+/// `Specified` var with `carries_user_data: false`, which the
+/// classifier short-circuits before the allow list ever runs — so
+/// a regression that broke `try_with_allow` (e.g. inverting
+/// deny/allow precedence, or dropping the allow check entirely)
+/// would leave that test green. This one ships an `Inherit`-shaped
+/// var (`carries_user_data: true`), forcing the classifier to
+/// consult the policy — flipping the allow rule off (or off-by-
+/// one on the glob) has to break the assertion here.
+#[test]
+fn allow_rule_gates_env_derived_var() {
+    let response = ContributionResponse {
+        session_id: session_id(),
+        vars: vec![WirePendingVar {
+            id: PendingId::new(1),
+            name: "HELIX_CONFIG".into(),
+            spec: WireVarSpec::Inherit,
+            source: package_source("helix"),
+            carries_user_data: true,
+        }],
+        patches: vec![],
+        lifecycle_hooks: vec![],
+    };
+    let policy = UserPolicy::empty().with_vars(
+        VarsPolicy::empty()
+            .try_with_allow(["HELIX_CONFIG"])
+            .unwrap(),
+    );
+
+    let (verdict, _) = handle_response(
+        response,
+        &[],
+        policy,
+        &PanicHooks,
+        ComposeOptions::default(),
+        // `Inherit` needs the env to actually resolve the value —
+        // pin it here so the test doesn't depend on the ambient
+        // shell.
+        &pinned_env(&[("HELIX_CONFIG", "/etc/helix")]),
+    )
+    .unwrap();
+    match &verdict.vars[0] {
+        WireVarVerdict::Approved { value, .. } => {
+            assert_eq!(value.name, "HELIX_CONFIG");
+            assert_eq!(value.value, "/etc/helix");
+            assert!(
+                value.carries_user_data,
+                "the resolved value came from env — provenance bit must survive",
+            );
+        }
+        other => panic!("expected Approved via allow rule, got: {other:?}"),
+    }
 }
 
 /// A multi-file glob fan-out yields one verdict per matched file;
@@ -566,7 +638,7 @@ fn multi_file_patch_yields_per_file_verdicts() {
             .with_deny(["/**/*.bak"]),
     );
 
-    let verdict = handle_response(
+    let (verdict, _) = handle_response(
         response,
         &[],
         policy,
@@ -627,7 +699,7 @@ fn lifecycle_hooks_are_dropped() {
             source: package_source("helix"),
         }],
     };
-    let verdict: ContributionVerdict = handle_response(
+    let (verdict, _) = handle_response(
         response,
         &[],
         UserPolicy::empty(),
@@ -667,7 +739,7 @@ fn patch_policy_ignore_produces_ignored_verdict() {
             .with_allow(["/**/*.toml"]),
     );
 
-    let verdict = handle_response(
+    let (verdict, _) = handle_response(
         response,
         &[],
         policy,
@@ -713,20 +785,24 @@ fn unapproved_vars_batched_into_one_hook_call() {
         }
     }
 
+    // `Inherit` on both so `carries_user_data` is true and the
+    // gate routes them to the hook — literals would auto-approve.
     let response = ContributionResponse {
         session_id: session_id(),
         vars: vec![
             WirePendingVar {
                 id: PendingId::new(1),
                 name: "ONE".into(),
-                spec: WireVarSpec::Specified { value: "1".into() },
+                spec: WireVarSpec::Inherit,
                 source: package_source("a"),
+                carries_user_data: false,
             },
             WirePendingVar {
                 id: PendingId::new(2),
                 name: "TWO".into(),
-                spec: WireVarSpec::Specified { value: "2".into() },
+                spec: WireVarSpec::Inherit,
                 source: package_source("b"),
+                carries_user_data: false,
             },
         ],
         patches: vec![],
@@ -737,13 +813,13 @@ fn unapproved_vars_batched_into_one_hook_call() {
         calls: RefCell::new(0),
         batch_sizes: RefCell::new(Vec::new()),
     };
-    let verdict = handle_response(
+    let (verdict, _) = handle_response(
         response,
         &[],
         UserPolicy::empty(),
         &hook,
         ComposeOptions::default(),
-        &pinned_env(&[]),
+        &pinned_env(&[("ONE", "1"), ("TWO", "2")]),
     )
     .unwrap();
 
@@ -784,24 +860,26 @@ fn hook_use_rule_with_updated_policy_approves() {
         }
     }
 
+    // `Inherit` so the var carries user data and reaches the hook.
     let response = ContributionResponse {
         session_id: session_id(),
         vars: vec![WirePendingVar {
             id: PendingId::new(1),
             name: "MY_VAR".into(),
-            spec: WireVarSpec::Specified { value: "v".into() },
+            spec: WireVarSpec::Inherit,
             source: package_source("p"),
+            carries_user_data: false,
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
     };
-    let verdict = handle_response(
+    let (verdict, _) = handle_response(
         response,
         &[],
         UserPolicy::empty(),
         &UseRuleHook,
         ComposeOptions::default(),
-        &pinned_env(&[]),
+        &pinned_env(&[("MY_VAR", "v")]),
     )
     .unwrap();
     assert!(matches!(verdict.vars[0], WireVarVerdict::Approved { .. }));
@@ -829,13 +907,15 @@ fn hook_use_rule_without_decision_errors_as_hook_contract() {
         }
     }
 
+    // `Inherit` so the var carries user data and reaches the hook.
     let response = ContributionResponse {
         session_id: session_id(),
         vars: vec![WirePendingVar {
             id: PendingId::new(1),
             name: "MY_VAR".into(),
-            spec: WireVarSpec::Specified { value: "v".into() },
+            spec: WireVarSpec::Inherit,
             source: package_source("p"),
+            carries_user_data: false,
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
@@ -846,7 +926,7 @@ fn hook_use_rule_without_decision_errors_as_hook_contract() {
         UserPolicy::empty(),
         &BadUseRuleHook,
         ComposeOptions::default(),
-        &pinned_env(&[]),
+        &pinned_env(&[("MY_VAR", "v")]),
     )
     .unwrap_err();
     assert!(
@@ -877,13 +957,15 @@ fn hook_wrong_decision_count_errors_as_hook_contract() {
         }
     }
 
+    // `Inherit` so the var carries user data and reaches the hook.
     let response = ContributionResponse {
         session_id: session_id(),
         vars: vec![WirePendingVar {
             id: PendingId::new(1),
             name: "MY_VAR".into(),
-            spec: WireVarSpec::Specified { value: "v".into() },
+            spec: WireVarSpec::Inherit,
             source: package_source("p"),
+            carries_user_data: false,
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
@@ -894,7 +976,7 @@ fn hook_wrong_decision_count_errors_as_hook_contract() {
         UserPolicy::empty(),
         &WrongCountHook,
         ComposeOptions::default(),
-        &pinned_env(&[]),
+        &pinned_env(&[("MY_VAR", "v")]),
     )
     .unwrap_err();
     assert!(
@@ -1004,7 +1086,7 @@ fn unapproved_files_batched_into_one_hook_call() {
         calls: RefCell::new(0),
         batch_sizes: RefCell::new(Vec::new()),
     };
-    let verdict = handle_response(
+    let (verdict, _) = handle_response(
         response,
         &[],
         UserPolicy::empty(),

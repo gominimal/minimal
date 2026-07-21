@@ -3,10 +3,9 @@
 # path through the `min` CLI — which abstracts where the daemon lives —
 # so the IDENTICAL proof runs against all three deployment targets:
 #
-#   Linux native (DM2)   minimald on the host          (no extra env)
-#   Linux KVM    (DM3)   minimald in a minvmd microVM  E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd
-#   macOS HVF    (DM1)   minimald in a minvmd microVM  E2E_VM=1 (macOS is always VM-backed)
-# (DM numbers are the deployment models in docs/specs/03-spec-networking.)
+#   Linux native   minimald on the host          (no extra env)
+#   Linux KVM      minimald in a minvmd microVM  E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd
+#   macOS HVF      minimald in a minvmd microVM  E2E_VM=1 (macOS is always VM-backed)
 #
 # Two proofs, in order, on EVERY lane:
 #
@@ -48,7 +47,7 @@
 #   - a codesigned/linkable `minvmd` on PATH (min spawns it by name)
 #   - MINVMD_KERNEL_PATH / MINVMD_ROOTFS_PATH / MINVMD_INITRAMFS
 #     (propagate through the `minvmd run --detach` re-exec)
-#   - MINVMD_BOOT_LOG (optional) to capture the guest console
+#   - MINVMD_BOOT_LOG (optional) to override the guest-console capture path
 #
 # Environment:
 #   E2E_MINIMAL_ARGS    global args for every `min` call (e.g. --minvmd)
@@ -86,7 +85,9 @@ SEEDED_MFILE=""
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
-  SEED_DIR="$(mktemp -d /tmp/mnl-e2e-proj.XXXXXX)"
+  # Short template on purpose: the basename is embedded in the task dir under
+  # the state root, inside the sun_path budget (see the workdir comment below).
+  SEED_DIR="$(mktemp -d /tmp/mnlp.XXXXXX)"
   PROJECT_DIR="$SEED_DIR"
 elif [ -n "$E2E_VM" ] && [ "$E2E_PROJECT_DIR" = "/tmp" ]; then
   # VM lanes pass /tmp; uploading all of /tmp is impractical, so seed a small
@@ -125,16 +126,32 @@ if [ -n "$SEED_DIR" ] || { [ ! -e "$PROJECT_DIR/minimal.toml" ] && [ ! -e "$PROJ
   [ -n "$SEED_DIR" ] || SEEDED_MFILE="$PROJECT_DIR/minimal.toml"
 fi
 
-# Fresh state under /tmp — NOT $TMPDIR: macOS's deep $TMPDIR would push
-# `.../minimal/providers/local-0/*.sock` past the 104-byte sun_path limit.
-# Post-#690, all daemon state (minvmd.toml, locks, the bridge socket) lives
-# under $XDG_STATE_HOME/minimal/providers/local-0 on every platform, so a
-# fresh dir guarantees the clean (no-daemon) cold-start on persistent
-# runners. XDG_CACHE_HOME is deliberately left alone so package pulls reuse
-# the host/CI cache across runs.
-WORK="$(mktemp -d /tmp/mnl-e2e.XXXXXX)"
+# Fresh state dir — a clean (no-daemon) cold-start on persistent runners:
+# post-#690, all daemon state (minvmd.toml, locks, the bridge socket) lives
+# under $XDG_STATE_HOME/minimal/providers/local-0 on every platform.
+# XDG_CACHE_HOME is deliberately left alone so package pulls reuse the
+# host/CI cache across runs — which pins where the state dir may live on a
+# Linux-native lane: minimald HARDLINKS built packages from the cache into
+# each session rootfs under the state dir, and hardlinks cannot cross
+# filesystems ("Invalid cross-device link" at session spawn on hosts with a
+# tmpfs /tmp). So on Linux the workdir lives under $HOME (same device as the
+# cache, like production's ~/.local/state), and doubles as the state root
+# directly — the extra /state hop is sun_path budget we cannot spare: the
+# deepest socket, tasks/<seed>-<ts>-<n>-<pid>/run/minenv_sock, fits 108 only
+# from a production-depth root. macOS stays on /tmp — NOT $TMPDIR, whose deep
+# paths overflow its 104-byte limit ($HOME-based paths do too; its lanes are
+# VM-backed, so the daemon and its hardlinks live inside the guest anyway).
+case "$(uname -s)" in
+  Darwin)
+    WORK="$(mktemp -d /tmp/mnl-e2e.XXXXXX)"
+    export XDG_STATE_HOME="$WORK/state"
+    ;;
+  *)
+    WORK="$(mktemp -d "$HOME/.mnl-e2e.XXXXXX")"
+    export XDG_STATE_HOME="$WORK"
+    ;;
+esac
 export XDG_RUNTIME_DIR="$WORK/runtime"
-export XDG_STATE_HOME="$WORK/state"
 mkdir -p "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME"
 chmod 700 "$XDG_RUNTIME_DIR"
 
@@ -180,7 +197,7 @@ fail() {
     | while read -r f; do echo "--- $f (tail) ---"; tail -40 "$f"; done
   if [ -n "$E2E_VM" ]; then
     echo "--- guest boot console (tail) ---"
-    tail -80 "${MINVMD_BOOT_LOG:-/nonexistent}" 2>/dev/null || echo "(no boot log — VM never started)"
+    tail -80 "${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-0/boot.log}" 2>/dev/null || echo "(no boot log — VM never started)"
   fi
   echo "::endgroup::"
   teardown

@@ -5,8 +5,8 @@ use minimald_rpc::{
     Errorable, GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
     GetSessionRecordRequest, GetSessionRecordResponse, GetVersion, GetVersionResponse,
     IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse,
-    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, Shutdown,
-    ShutdownRequest, ShutdownResponse, SubmitVerdict,
+    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool,
+    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -66,8 +66,8 @@ async fn serve_get_version(c: RuChannel<Msg>) {
     let res = GetVersion
         .handle_channel(c, async |_req| {
             Ok(GetVersionResponse {
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                long_version: env!("LONG_VERSION").to_string(),
+                version: version::VERSION.to_string(),
+                long_version: version::LONG_VERSION.to_string(),
                 stdlib_version: stdlib::VERSION.to_string(),
             })
         })
@@ -80,8 +80,12 @@ async fn serve_get_version(c: RuChannel<Msg>) {
 async fn serve_list_sessions(s: ServerStateHandle, c: RuChannel<Msg>) {
     let res = ListSessions
         .handle_channel(c, async |_req| {
+            let resource_pool = tokio::task::spawn_blocking(detect_resource_pool)
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             let mngr = s.sessions_manager().await;
             Ok(ListSessionsResponse {
+                resource_pool,
                 sessions: mngr
                     .list()
                     .await
@@ -114,6 +118,22 @@ async fn serve_list_sessions(s: ServerStateHandle, c: RuChannel<Msg>) {
     if let Err(e) = res {
         tracing::warn!("RPC handler for {} failed: {}", ListSessions::NAME, e);
     }
+}
+
+fn detect_resource_pool() -> Option<ResourcePool> {
+    let cpu_cores = std::thread::available_parallelism()
+        .ok()?
+        .get()
+        .try_into()
+        .ok()?;
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    let memory_bytes = system.total_memory();
+
+    (memory_bytes > 0).then_some(ResourcePool {
+        cpu_cores,
+        memory_bytes,
+    })
 }
 
 async fn serve_get_session_record(s: ServerStateHandle, c: RuChannel<Msg>) {
@@ -180,6 +200,12 @@ async fn serve_create_session(
 /// and retry, or abort) rather than a transport failure. An unknown id —
 /// including an actor that died between resolve and delivery — is a
 /// `NotFound`-flavoured `Errorable::Err`.
+///
+/// The actor refuses a re-`ConfigureLoadout` when it already holds a
+/// pending contribution awaiting `SubmitVerdict`; the client has to
+/// `AbortSession` and create a new session to retry. Without that guard
+/// a second call would clobber the stashed `PendingComposeState` and
+/// invalidate every `PendingId` the first caller received.
 async fn serve_configure_loadout(s: ServerStateHandle, c: RuChannel<Msg>) {
     let res = minimald_rpc::ConfigureLoadout
         .handle_channel(c, async |req: minimald_rpc::ConfigureLoadoutRequest| {
@@ -311,6 +337,12 @@ async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) {
             let mngr = s.sessions_manager().await;
             Ok(match mngr.shutdown(req.force).await {
                 Ok(()) => {
+                    // Close the file log first (both the native daemon and the
+                    // microVM): it flushes buffered records, and in the
+                    // microVM its write-open fd under the mountpoint would
+                    // otherwise defeat the clean unmount below. Records still
+                    // reach the console. A no-op for a foreground run.
+                    s.release_log().await;
                     // R2.1/R2.2: with the sessions drained, quiesce the state
                     // volume (syncfs + detach) before acknowledging, so a
                     // caller-driven VMM teardown right after the ack leaves a
@@ -349,6 +381,8 @@ async fn quiesce_state_volume_if_mounted(s: &ServerStateHandle) {
     if !s.state_volume_mounted().await {
         return;
     }
+    // The file log was already released by the shutdown handler, so its fd no
+    // longer holds the mountpoint busy.
     let mountpoint = s.minimal_state_dir().await;
     let quiesce = tokio::task::spawn_blocking(move || {
         crate::guest::quiesce_state_volume(mountpoint.as_utf8_path().as_str())
@@ -593,24 +627,58 @@ pub async fn handle_ssh_rpc(
         None => return Ok(()),
     };
 
+    // Adopt the client's propagated trace context into this dispatch's span:
+    // same trace id, fresh span id, the client's span as parent. Absent or
+    // malformed values mint fresh — propagation is a diagnostic aid and must
+    // never fail a request. Every record the handler emits carries the ids,
+    // so one trace_id grep joins the CLI's log with this daemon's.
+    use minimald_rpc::trace::{TRACEPARENT_ENV, TraceContext};
+    use tracing::Instrument as _;
+    let client_ctx = config
+        .env_vars
+        .get(TRACEPARENT_ENV)
+        .and_then(|v| TraceContext::parse_traceparent(v));
+    let ctx = client_ctx
+        .as_ref()
+        .map(TraceContext::child)
+        .unwrap_or_else(TraceContext::mint);
+    let span = tracing::info_span!(
+        "rpc",
+        rpc = name,
+        trace_id = %ctx.trace_id_hex(),
+        span_id = %ctx.span_id_hex(),
+        parent_span_id = tracing::field::Empty,
+    );
+    if let Some(client_ctx) = &client_ctx {
+        span.record(
+            "parent_span_id",
+            tracing::field::display(client_ctx.span_id_hex()),
+        );
+    }
+
     // Handle the named RPC (fire-and-forget; join handles are discarded).
+    macro_rules! serve {
+        ($fut:expr) => {
+            drop(spawn($fut.instrument(span.clone())))
+        };
+    }
     match name {
-        GetVersion::NAME => drop(spawn(serve_get_version(channel))),
-        ListSessions::NAME => drop(spawn(serve_list_sessions(s, channel))),
-        GetSessionRecord::NAME => drop(spawn(serve_get_session_record(s, channel))),
-        CreateSession::NAME => drop(spawn(serve_create_session(s, channel, ssh_username))),
-        minimald_rpc::ConfigureLoadout::NAME => drop(spawn(serve_configure_loadout(s, channel))),
-        SubmitVerdict::NAME => drop(spawn(serve_submit_verdict(s, channel))),
-        RenameSession::NAME => drop(spawn(serve_rename_session(s, channel))),
-        DestroySession::NAME => drop(spawn(serve_destroy_session(s, channel))),
-        Shutdown::NAME => drop(spawn(serve_shutdown(s, channel))),
-        AbortSession::NAME => drop(spawn(serve_abort_session(s, channel))),
-        GetSessionPolicy::NAME => drop(spawn(serve_get_session_policy(s, channel))),
-        GetMeshStatus::NAME => drop(spawn(serve_get_mesh_status(s, channel))),
-        STREAM_WORKSPACE_FILES => drop(spawn(serve_stream_workspace_files(s, config, channel))),
+        GetVersion::NAME => serve!(serve_get_version(channel)),
+        ListSessions::NAME => serve!(serve_list_sessions(s, channel)),
+        GetSessionRecord::NAME => serve!(serve_get_session_record(s, channel)),
+        CreateSession::NAME => serve!(serve_create_session(s, channel, ssh_username)),
+        minimald_rpc::ConfigureLoadout::NAME => serve!(serve_configure_loadout(s, channel)),
+        SubmitVerdict::NAME => serve!(serve_submit_verdict(s, channel)),
+        RenameSession::NAME => serve!(serve_rename_session(s, channel)),
+        DestroySession::NAME => serve!(serve_destroy_session(s, channel)),
+        Shutdown::NAME => serve!(serve_shutdown(s, channel)),
+        AbortSession::NAME => serve!(serve_abort_session(s, channel)),
+        GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
+        GetMeshStatus::NAME => serve!(serve_get_mesh_status(s, channel)),
+        STREAM_WORKSPACE_FILES => serve!(serve_stream_workspace_files(s, config, channel)),
         IssueClientCert::NAME => {
             #[cfg(feature = "networking-proxy")]
-            drop(spawn(serve_issue_client_cert(s, channel)));
+            serve!(serve_issue_client_cert(s, channel));
             #[cfg(not(feature = "networking-proxy"))]
             {
                 tracing::warn!(
@@ -618,7 +686,7 @@ pub async fn handle_ssh_rpc(
                      feature is not enabled; replying with an error"
                 );
                 drop(s);
-                drop(spawn(serve_issue_client_cert_unavailable(channel)));
+                serve!(serve_issue_client_cert_unavailable(channel));
             }
         }
         _ => unreachable!(),
@@ -757,8 +825,8 @@ mod tests {
 
         let resp = client.call::<GetVersion>(&()).await;
 
-        assert_eq!(resp.version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(resp.long_version, env!("LONG_VERSION"));
+        assert_eq!(resp.version, version::VERSION);
+        assert_eq!(resp.long_version, version::LONG_VERSION);
         assert_eq!(resp.stdlib_version, stdlib::VERSION);
     }
 
@@ -809,7 +877,7 @@ mod tests {
         for _ in 0..3 {
             let mut client = server.connect().await;
             let resp = client.call::<GetVersion>(&()).await;
-            assert_eq!(resp.version, env!("CARGO_PKG_VERSION"));
+            assert_eq!(resp.version, version::VERSION);
         }
     }
 
@@ -839,6 +907,7 @@ mod tests {
         );
 
         let list_sessions = client.call::<ListSessions>(&()).await;
+        assert!(list_sessions.resource_pool.is_some());
         assert_eq!(
             list_sessions.sessions,
             vec![ListSessionsEntry {

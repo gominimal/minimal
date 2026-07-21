@@ -1047,6 +1047,21 @@ impl Context {
                     )));
                 }
             }
+            AddDepMode::SessionPackages => {
+                if let Some(h) = doc["session"].as_table_mut() {
+                    did_edit |= upsert_toml_packages_list(h, "packages", &resolved);
+                } else {
+                    doc.insert(
+                        "session",
+                        Item::Table(toml_edit::Table::from_iter([(
+                            "packages",
+                            Item::Value(Value::Array(Array::from_iter(resolved.iter()))),
+                        )])),
+                    );
+                    did_edit = true;
+                }
+                println!("Added [{}] to session.packages", resolved.join(","));
+            }
         }
 
         if did_edit {
@@ -1066,6 +1081,8 @@ pub enum AddDepMode {
     RuntimePackages,
     /// Add the specified packages to a task with a given name.
     TaskPackages { name: String },
+    /// Add the specified packages to session.packages.
+    SessionPackages,
 }
 
 fn upsert_toml_packages_list<T: TableLike>(t: &mut T, key: &str, upsert: &[String]) -> bool {
@@ -1450,6 +1467,15 @@ mod tests {
         assert!(
             ctx.add_deps(&graph, ["missingggggg"], AddDepMode::BuildPackages)
                 .is_err()
+        );
+
+        // Add a package to the session.
+        ctx.add_deps(&graph, ["uroot"], AddDepMode::SessionPackages)
+            .unwrap();
+        assert!(
+            String::from_utf8(std::fs::read(&mfile_path).unwrap())
+                .unwrap()
+                .contains("[session]\npackages = [\"uroot\"]")
         );
     }
 

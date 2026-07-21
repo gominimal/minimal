@@ -8,6 +8,7 @@ members = [
     "crates/checkouts",
     "crates/common",
     "crates/decode",
+    "crates/diagnostics",
     "crates/graph",
     "crates/mctx",
     "crates/mfile",
@@ -20,17 +21,24 @@ members = [
     "crates/minimald",
     "crates/minimald-rpc",
     "crates/minvmd",
+    "crates/mlog",
     "crates/remote-client",
     "crates/remote-proto",
     "crates/sandbox2",
     "crates/sessions",
     "crates/stdlib",
     "crates/switch",
+    "crates/version",
 ]
 resolver = "3"
 
 package.edition = "2024"
 package.publish = false
+package.license = "Apache-2.0"
+# Shared base version for the workspace. This is the fallback the `version` crate
+# reports when no `v*` git tag is reachable; the real release version comes from
+# `git describe` at build time. See crates/version/build.rs.
+package.version = "0.5.0-rc1"
 
 [profile.release]
 strip = true
@@ -70,6 +78,7 @@ codespan-reporting = { version = "0.13", features = ["serialization"] } # Keep i
 constcat = "0.6"
 copy_dir = "0.1.3"
 chrono = {version = "0.4", features = ["serde", "std"]}
+dialoguer = { version = "0.11", default-features = false }
 dirs = "6"
 fd-lock = "4"
 either = { version = "1.16", default-features = false }
@@ -85,12 +94,14 @@ hex = "0.4"
 indicatif = "0.18"
 indoc = "^2.0"
 jaq-all = "0.2.0"
+json-subscriber = "0.3"
 libc = "0.2"
 lzma-rs = "0.3"
 
 # Revert back to crates.io dep once new version is released.
 nickel-lang-core = { git = "https://github.com/nickel-lang/nickel.git", rev = "e8a0ab95e52ab31ac9a8ae1a3bef854d8de73cea", default-features = false, features = ["format"] }
 
+opentelemetry-semantic-conventions = "0.32"
 nix = { version = "0.31", features = ["fs", "user"] }
 nutype = { version = "0.7", features = ["serde"] }
 object = { version = "0.39", default-features = false, features = ["archive", "elf", "read_core", "std"] }
@@ -147,27 +158,32 @@ walkdir = "2.5"
 
 petgraph = "0.8"
 
-# our crates
-args = { version = "0.0.1", path = "crates/args" }
-async-dialog = { version = "0.0.1", path = "crates/async-dialog" }
-graph = { version = "0.0.1", path = "crates/graph" }
-lcache = { version = "0.0.1", path = "crates/lcache" }
-rcache = { version = "0.0.1", path = "crates/rcache" }
-check = { version = "0.0.1", path = "crates/check" }
-checkouts = { version = "0.0.1", path = "crates/checkouts" }
-common = { version = "0.0.1", path = "crates/common" }
-decode = { version = "0.0.1", path = "crates/decode" }
-mctx = { version = "0.0.1", path = "crates/mctx" }
-minimald-rpc = { version = "0.0.1", path = "crates/minimald-rpc" }
-mfile = { version = "0.0.1", path = "crates/mfile" }
-op = { version = "0.0.1", path = "crates/op" }
-ot = { version = "0.0.1", path = "crates/ot" }
-orchestrator = { version = "0.0.1", path = "crates/orchestrator" }
-paths = { version = "0.0.1", path = "crates/paths" }
-remote-proto = { version = "0.0.1", path = "crates/remote-proto" }
-remote-client = { version = "0.0.1", path = "crates/remote-client" }
-sandbox2 = { version = "0.0.1", path = "crates/sandbox2" }
-sessions = { version = "0.0.1", path = "crates/sessions" }
-switch = { version = "0.0.1", path = "crates/switch" }
+# Our crates. These are path deps in a `publish = false` workspace, so no
+# `version` requirement is needed (or used) — cargo resolves them by path. Adding
+# one would just be a pin to keep in sync with each crate's own version.
+args = { path = "crates/args" }
+async-dialog = { path = "crates/async-dialog" }
+graph = { path = "crates/graph" }
+lcache = { path = "crates/lcache" }
+rcache = { path = "crates/rcache" }
+check = { path = "crates/check" }
+checkouts = { path = "crates/checkouts" }
+common = { path = "crates/common" }
+decode = { path = "crates/decode" }
+diagnostics = { path = "crates/diagnostics" }
+mctx = { path = "crates/mctx" }
+minimald-rpc = { path = "crates/minimald-rpc" }
+mlog = { path = "crates/mlog" }
+mfile = { path = "crates/mfile" }
+op = { path = "crates/op" }
+ot = { path = "crates/ot" }
+orchestrator = { path = "crates/orchestrator" }
+paths = { path = "crates/paths" }
+remote-proto = { path = "crates/remote-proto" }
+remote-client = { path = "crates/remote-client" }
+sandbox2 = { path = "crates/sandbox2" }
+sessions = { path = "crates/sessions" }
+switch = { path = "crates/switch" }
+version = { path = "crates/version" }
 
-stdlib = { version = "0.0.17", path = "crates/stdlib" }
+stdlib = { path = "crates/stdlib" }

@@ -29,8 +29,18 @@ pub const DEFAULT_DETACH_TIMEOUT_SECS: u64 = 8;
 ///
 /// - `detach`: if true, spawn the supervisor in the background and poll until
 ///   the VM is serving (up to `timeout_secs`).
-/// - `timeout_secs`: only used when `detach` is true; default 8 s.
-pub fn run(detach: bool, timeout_secs: u64) -> Result<()> {
+/// - `timeout_secs`: only meaningful under `--detach`; `None` when the flag was
+///   omitted. Rejected without `--detach` rather than silently ignored;
+///   defaults to [`DEFAULT_DETACH_TIMEOUT_SECS`] when detaching.
+pub fn run(detach: bool, timeout_secs: Option<u64>) -> Result<()> {
+    // `--timeout` only bounds the detach poll loop; foreground runs supervise
+    // the VMM child for its whole life and never consult it. Accepting it in
+    // foreground mode would silently ignore it, so reject the combination.
+    if !detach && timeout_secs.is_some() {
+        bail!("`--timeout` only applies with `--detach`");
+    }
+    let timeout_secs = timeout_secs.unwrap_or(DEFAULT_DETACH_TIMEOUT_SECS);
+
     #[cfg(minvmd_libkrun)]
     return run_supervisor(detach, timeout_secs);
 
@@ -70,6 +80,9 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     if let Some(dir) = crate::state::state_dir_override() {
         cmd.args(["--minimal-state-dir", dir.as_str()]);
     }
+    // Mark the child as detached so it routes tracing to the daily-rotated
+    // log file (`<state>/logs/minvmd.log`) instead of stdout.
+    cmd.env(crate::DETACHED_ENV, "1");
     // The supervisor's stderr goes to a log file, not /dev/null: it carries
     // the boot-failure diagnosis (the guest's mount-failure reason, image
     // disposition, repair guidance), and the failure messages below point at
@@ -488,10 +501,21 @@ mod tests {
     #[cfg(not(minvmd_libkrun))]
     #[test]
     fn run_bails_without_libkrun() {
-        let err = run(false, DEFAULT_DETACH_TIMEOUT_SECS).unwrap_err();
+        let err = run(false, None).unwrap_err();
         assert!(
             err.to_string().contains("requires libkrun"),
             "expected libkrun-required message, got: {err}"
+        );
+    }
+
+    #[cfg(not(minvmd_libkrun))]
+    #[test]
+    fn run_rejects_timeout_without_detach() {
+        let err = run(false, Some(5)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`--timeout` only applies with `--detach`"),
+            "expected --timeout guard message, got: {err}"
         );
     }
 }

@@ -136,7 +136,7 @@ impl Transitives {
                             Some(outputs.clone()),
                         );
                     }
-                    Source(_) | Local { .. } | HostPath(_) => {}
+                    Source(_) | Local { .. } => {}
                 }
             }
         }
@@ -163,7 +163,7 @@ impl Transitives {
                 (Build(bsr), true) => Some((bsr, None)),
                 (Subset(SubsetInput { from: bsr, outputs }), true) => Some((bsr, Some(outputs))),
                 (Build(_) | Subset(_), false) => None,
-                (Source(_) | HostPath(_) | Local { .. }, _) => None,
+                (Source(_) | Local { .. }, _) => None,
             })
             .chain(build.runtime_deps.iter().map(|dep| match dep {
                 RuntimeDep::Build(bsr) => (bsr, None),

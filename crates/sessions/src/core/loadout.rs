@@ -281,44 +281,69 @@ impl crate::core::compose::Composable for Loadout {
             name: self.name.into_inner(),
         };
 
-        // Resolve bare `Inherit` vars once here so downstream doesn't
-        // re-query `env` — makes the compose stateless w.r.t. the env
-        // closure. `InheritWithDefault` still hits `env` in
-        // `contribute_primitives`, since its default handling is
-        // where the whole point of that variant lives.
-        let vars = self
-            .vars
-            .into_iter()
-            .filter_map(|(name, value)| {
-                match resolve_inherit(&loadout_name, name.as_ref(), value, env) {
-                    Ok(Some(v)) => Some(Ok((name, v))),
-                    Ok(None) => None,
-                    Err(e) => Some(Err(e)),
-                }
-            })
-            .collect::<Result<_, _>>()?;
-        let vars_lenient = self
-            .vars_lenient
-            .into_iter()
-            .filter_map(|entry| {
-                let (name, value) = entry.into_parts();
-                match resolve_inherit(&loadout_name, name.as_ref(), value, env) {
-                    Ok(Some(v)) => Some(Ok(LenientVarEntry::new(name, v))),
-                    Ok(None) => None,
-                    Err(e) => Some(Err(e)),
-                }
-            })
-            .collect::<Result<_, _>>()?;
+        // Vars: resolve each declaration directly into a
+        // `ResolvedVar` that carries the correct
+        // [`ResolvedVar::carries_user_data`] bit. We can't route
+        // through `contribute_primitives` for vars because that
+        // path re-uses `ResolvedVar::resolve_with`, which loses the
+        // "this was originally Inherit" bit if a preceding pass
+        // rewrote it into `Specified` (the flattening approach
+        // resolve_inherit used to do). See
+        // [`resolve_var_declaration`] for the per-variant logic.
+        //
+        // Loadout-specific relaxation: bare `Inherit` that isn't in
+        // the host env is a **warn + drop**, not an error. A
+        // loadout that opportunistically inherits `TERM`/`COLORTERM`
+        // shouldn't fail activation just because the host doesn't
+        // set them.
+        let mut contribution = crate::core::compose::Contribution::new();
+        for (name, value) in self.vars {
+            if let Some(resolved) =
+                resolve_var_declaration(&loadout_name, name.as_ref(), value, env)?
+            {
+                let name_str = name.into_inner();
+                contribution.push_var(crate::core::source::ProvenancedVar::new(
+                    crate::core::primitives::ResolvedVar::from_env_value_or_literal(
+                        name_str,
+                        resolved.value,
+                        resolved.carries_user_data,
+                    ),
+                    source.clone(),
+                ));
+            }
+        }
+        for entry in self.vars_lenient {
+            let (name, value) = entry.into_parts();
+            if let Some(resolved) =
+                resolve_var_declaration(&loadout_name, name.as_ref(), value, env)?
+            {
+                let name_str = name.into_inner();
+                contribution.push_var(crate::core::source::ProvenancedVar::new(
+                    crate::core::primitives::ResolvedVar::from_env_value_or_literal(
+                        name_str,
+                        resolved.value,
+                        resolved.carries_user_data,
+                    ),
+                    source.clone(),
+                ));
+            }
+        }
 
-        let mut contribution = crate::core::compose::contribute_primitives(
+        // Packages / patches / hooks go through the shared
+        // `contribute_primitives` helper — it doesn't touch vars
+        // when the input is empty. Pass an empty vars map so the
+        // helper's var loop is a no-op.
+        let mut rest = crate::core::compose::contribute_primitives(
             &source,
             self.packages,
-            vars,
-            vars_lenient,
+            std::collections::BTreeMap::new(),
+            Vec::new(),
             self.patches,
             self.lifecycle_hooks,
             env,
         )?;
+        contribution.merge(std::mem::take(&mut rest)).ok();
+
         // Stamp the loadout's per-source `follow_symlinks` override
         // onto every patch it contributes. `None` is a no-op — patches
         // inherit `ComposeOptions::follow_symlinks` at expand time.
@@ -331,31 +356,51 @@ impl crate::core::compose::Composable for Loadout {
     }
 }
 
-/// Resolve a bare `Inherit` value against `env` once. Returns:
+/// A resolved var declaration + the `carries_user_data` bit that
+/// tells downstream whether the value came from the user's env or
+/// a source-side literal. Small helper struct to keep the shape of
+/// [`resolve_var_declaration`]'s return value obvious at the call
+/// site.
+struct ResolvedDeclaration {
+    value: String,
+    carries_user_data: bool,
+}
+
+/// Resolve one loadout var declaration into its final `(value,
+/// carries_user_data)` shape. Handles the three `VarValue` variants:
 ///
-/// - `Ok(Some(Specified(v)))` when the env lookup succeeds — the
-///   caller inserts a resolved value, and downstream never
-///   re-queries `env` for this var.
-/// - `Ok(None)` on `NotPresent`, with a `tracing::warn!` naming the
-///   loadout and var. Drops the entry from the contribution — a
-///   loadout opportunistically inheriting `TERM`/`COLORTERM` doesn't
-///   fail activation when the host doesn't have them set.
-/// - `Err(VarError::ResolutionFailure)` on other errors
-///   (`NotUnicode`), which bubbles to `ComposeError::VarResolution`
-///   at the caller — matches the shape `ResolvedVar::resolve_with`
-///   produces for the same env failure.
+/// - [`VarValue::Specified`] → literal value, `carries_user_data = false`.
+/// - [`VarValue::Inherit`] → env lookup:
+///     - `Ok(v)` → `carries_user_data = true`.
+///     - `NotPresent` → warn + drop (returns `Ok(None)`). A loadout
+///       opportunistically inheriting `TERM`/`COLORTERM` shouldn't
+///       fail activation when the host doesn't set them.
+///     - `NotUnicode` → `Err(VarError::ResolutionFailure)`.
+/// - [`VarValue::InheritWithDefault`] → env lookup:
+///     - `Ok(v)` → `carries_user_data = true`.
+///     - `NotPresent` → default, `carries_user_data = false` (no user
+///       data touched, the fallback isn't a leak vector).
+///     - `NotUnicode` → `Err(VarError::ResolutionFailure)`.
 ///
-/// Non-`Inherit` values (`Specified`, `InheritWithDefault`) pass
-/// through unchanged.
-fn resolve_inherit(
+/// The `carries_user_data` bit is the key contract this function
+/// upholds — the policy gate uses it to skip vars that don't move
+/// user data into the sandbox.
+fn resolve_var_declaration(
     loadout: &str,
     name: &str,
     value: VarValue,
     env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
-) -> Result<Option<VarValue>, crate::core::primitives::VarError> {
+) -> Result<Option<ResolvedDeclaration>, crate::core::primitives::VarError> {
     match value {
+        VarValue::Specified { value } => Ok(Some(ResolvedDeclaration {
+            value,
+            carries_user_data: false,
+        })),
         VarValue::Inherit => match env(name) {
-            Ok(v) => Ok(Some(VarValue::specified(v))),
+            Ok(value) => Ok(Some(ResolvedDeclaration {
+                value,
+                carries_user_data: true,
+            })),
             Err(std::env::VarError::NotPresent) => {
                 tracing::warn!(
                     loadout = %loadout,
@@ -369,7 +414,20 @@ fn resolve_inherit(
                 source,
             }),
         },
-        other => Ok(Some(other)),
+        VarValue::InheritWithDefault { default } => match env(name) {
+            Ok(value) => Ok(Some(ResolvedDeclaration {
+                value,
+                carries_user_data: true,
+            })),
+            Err(std::env::VarError::NotPresent) => Ok(Some(ResolvedDeclaration {
+                value: default,
+                carries_user_data: false,
+            })),
+            Err(source) => Err(crate::core::primitives::VarError::ResolutionFailure {
+                name: name.to_string(),
+                source,
+            }),
+        },
     }
 }
 

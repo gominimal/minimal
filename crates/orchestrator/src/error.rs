@@ -15,7 +15,9 @@ pub enum Error {
     Cache(CacheErr),
     /// An error during planning occurred.
     Plan(Graph, PlanErr),
-    /// An error occurred during the setup or execution of a sandbox.
+    /// An error occurred building a specific package.
+    BuildFailed(String, op::Error),
+    /// A generic error occurred during the setup or execution of a sandbox.
     Sandbox(sandbox2::Error),
     /// Other errors.
     Other(anyhow::Error),
@@ -63,6 +65,7 @@ impl fmt::Display for Error {
             Error::IO(e) => write!(f, "i/o error: {}", e),
             Error::Cache(e) => write!(f, "cache error: {}", e),
             Error::Plan(_, e) => write!(f, "plan error: {:?}", e),
+            Error::BuildFailed(name, e) => write!(f, "`{name}` failed to build: {e}"),
             Error::Sandbox(e) => write!(f, "sandbox error: {}", e),
             Error::Other(e) => write!(f, "other: {}", e),
         }
@@ -75,6 +78,7 @@ impl std::error::Error for Error {
             Error::IO(e) => Some(e),
             Error::Cache(e) => Some(e),
             Error::Plan(_, e) => Some(e),
+            Error::BuildFailed(_, e) => Some(e),
             Error::Sandbox(e) => Some(e),
             _ => None,
         }

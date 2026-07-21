@@ -4,8 +4,6 @@ use op::{PatchedBuild, Runnable};
 
 #[derive(Debug, clap::Args)]
 pub struct PatchedBuildArgs {
-    #[arg(long)]
-    remote_addr: Option<String>,
     package: String,
 }
 

@@ -20,6 +20,11 @@ on:
                 required: false
                 type: boolean
                 default: false
+            override_provenance:
+                description: "EMERGENCY ONLY — promote a version even if it was not built by the nightly workflow"
+                required: false
+                type: boolean
+                default: false
 
 env:
     # Single source of truth for the gate's approver allowlist.
@@ -52,6 +57,7 @@ jobs:
                   SHA_INPUT: ${{ inputs.sha }}
                   TARGET_INPUT: ${{ inputs.target }}
                   DRY_RUN: ${{ inputs.dry_run }}
+                  OVERRIDE_PROVENANCE: ${{ inputs.override_provenance }}
               run: |
                   set -euo pipefail
                   BODY="**Repo:** \`${REPO}\`
@@ -61,6 +67,7 @@ jobs:
                   **SHA input:** \`${SHA_INPUT:-<latest staged>}\`
                   **Target channel:** \`${TARGET_INPUT}\`
                   **Dry run:** \`${DRY_RUN}\`
+                  **Nightly-provenance override (EMERGENCY):** \`${OVERRIDE_PROVENANCE}\`
 
                   Comment **\`approved\`** to proceed or **\`denied\`** to cancel.
                   Closing this issue without an approval comment counts as denial.
@@ -81,7 +88,7 @@ jobs:
             - name: Notify Slack — approval required
               continue-on-error: true
               timeout-minutes: 5
-              uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+              uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
               with:
                   webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
                   webhook-type: incoming-webhook
@@ -156,6 +163,8 @@ jobs:
         permissions:
             contents: "read"
             id-token: "write"
+            # verify-nightly-provenance.sh lists nightly workflow runs.
+            actions: "read"
         steps:
             - uses: actions/checkout@v7
             - name: Authenticate to Google Cloud
@@ -172,6 +181,8 @@ jobs:
                   # to avoid shell template injection — see GitHub's hardening guide.
                   INPUT_SHA: ${{ inputs.sha }}
                   INPUT_TARGET: ${{ inputs.target }}
+                  OVERRIDE_PROVENANCE: ${{ inputs.override_provenance }}
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
               run: |
                   set -euo pipefail
                   # Trim leading/trailing whitespace; users often paste SHAs with stray spaces.
@@ -197,6 +208,15 @@ jobs:
                     # gs://minimal-one/versions/<sha>/components → <sha>
                     SHA="$(basename "$(dirname "$LATEST")")"
                     echo "Latest staged SHA: ${SHA}"
+                  fi
+
+                  # Only versions the nightly workflow actually built may be
+                  # promoted; the override exists for emergency hotfixes and is
+                  # surfaced in the approval issue above.
+                  if [ "$OVERRIDE_PROVENANCE" = "true" ]; then
+                    echo "WARNING: nightly-provenance check SKIPPED (override_provenance=true)."
+                  else
+                    scripts/verify-nightly-provenance.sh --sha "$SHA"
                   fi
 
                   # set-channel.sh verifies the version is actually staged before it

@@ -147,11 +147,6 @@ enum SessionInner {
             session_host::HostHandle,
             JoinHandle<Result<i32, std::io::Error>>,
         )>,
-        /// Lazily-built [`mctx::Context`] rooted at this session's workspace,
-        /// cached so repeated attach / task-exec paths don't re-parse the
-        /// workspace mfile. Boxed to keep the variant's inline size down
-        /// (`Context` runs into the several-hundred-byte range).
-        context: Option<Box<mctx::Context>>,
     },
 }
 
@@ -322,7 +317,6 @@ impl Session {
             SessionStatus::Active => SessionInner::Active {
                 composition: None,
                 host: None,
-                context: None,
             },
             SessionStatus::Pending => SessionInner::Draft { pending: None },
         };
@@ -435,7 +429,7 @@ impl Session {
                 let _ = r.send(self.paths().await);
             }
             SessionMessage::MakeContext(r) => {
-                let _ = r.send(self.context().await);
+                let _ = r.send(self.context(false).await);
             }
             SessionMessage::Attach(r, session_hnd, conn_username, channel, config) => {
                 let _ = r.send(
@@ -532,15 +526,33 @@ impl Session {
     /// Every failure leaves the actor alive and `Draft`: the caller decides
     /// whether to retry with a different contribution or tear the session
     /// down, so a compose error can't strand a half-built session.
+    ///
+    /// A re-`ConfigureLoadout` against a session that already holds
+    /// `Draft{pending: Some(_)}` is refused with `WouldBlock`: overwriting
+    /// the stashed [`PendingComposeState`] would invalidate every
+    /// `PendingId` the first caller received (they were valid moments ago,
+    /// but a fresh stash starts numbering from 0 again). The client must
+    /// `AbortSession` and create a new session to retry rather than
+    /// silently strand its outstanding verdict submission.
     async fn configure_loadout(
         &mut self,
         contribution: WireContribution,
     ) -> Result<Option<ContributionResponse>, std::io::Error> {
-        if matches!(self.inner, SessionInner::Active { .. }) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "session loadout is already configured",
-            ));
+        match &self.inner {
+            SessionInner::Active { .. } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "session loadout is already configured",
+                ));
+            }
+            SessionInner::Draft { pending: Some(_) } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "session already has a pending contribution awaiting SubmitVerdict; \
+                     abort it and create a new session to retry",
+                ));
+            }
+            SessionInner::Draft { pending: None } => {}
         }
         let object = self.record.object().await?;
         let workspace_path = object.workspace_path();
@@ -568,7 +580,6 @@ impl Session {
                 self.inner = SessionInner::Active {
                     composition: Some(Arc::new(composition)),
                     host: None,
-                    context: None,
                 };
                 // The session is Active now — publish its PTask route
                 // (R3.1/R3.6).
@@ -640,7 +651,6 @@ impl Session {
         self.inner = SessionInner::Active {
             composition: Some(Arc::new(composition)),
             host: None,
-            context: None,
         };
         // The session is Active now — publish its PTask route (R3.1/R3.6).
         #[cfg(target_os = "linux")]
@@ -815,7 +825,7 @@ impl Session {
         let ingress = record.policy.ingress.clone();
         Ok(session_host::SandboxLauncher {
             ctx: self
-                .context()
+                .context(true)
                 .await
                 .map_err(AttachError::ContextCreationFailed)?,
             network_mode,
@@ -842,25 +852,16 @@ impl Session {
         Ok(session_host::MockLauncher)
     }
 
-    /// Return this session's workspace-rooted [`mctx::Context`],
-    /// building it lazily the first time and cloning the cached
-    /// value on every subsequent call. The scaffold pass and mfile
-    /// parse happen once per actor lifetime. A `Draft` session has
-    /// no workspace to root a context in yet.
-    async fn context(&mut self) -> Result<mctx::Context, String> {
-        match &self.inner {
-            SessionInner::Draft { .. } => {
-                return Err("session is pending composition".to_string());
-            }
-            SessionInner::Active {
-                context: Some(ctx), ..
-            } => return Ok((**ctx).clone()),
-            SessionInner::Active { context: None, .. } => {}
+    /// Return this session's workspace-rooted [`mctx::Context`].
+    ///
+    /// This is NOT cached to enable session execution to change as the
+    /// `minimal.toml` file changes.
+    async fn context(&mut self, scaffold_if_missing: bool) -> Result<mctx::Context, String> {
+        if matches!(&self.inner, SessionInner::Draft { .. }) {
+            return Err("session is pending composition".to_string());
         }
-        let ctx = self.build_context().await?;
-        if let SessionInner::Active { context, .. } = &mut self.inner {
-            *context = Some(Box::new(ctx.clone()));
-        }
+
+        let ctx = self.build_context(scaffold_if_missing).await?;
         Ok(ctx)
     }
 
@@ -913,9 +914,11 @@ impl Session {
     /// a default scaffolded here on the way past.
     ///
     /// [`Config`]: mctx::Config
-    async fn build_context(&self) -> Result<mctx::Context, String> {
+    async fn build_context(&self, scaffold_if_missing: bool) -> Result<mctx::Context, String> {
         let wsp = self.record.object().await.unwrap().workspace_path();
-        self.scaffold_mfile_if_missing(&wsp)?;
+        if scaffold_if_missing {
+            self.scaffold_mfile_if_missing(&wsp)?;
+        }
         mctx::Context::new(self.workspace_config(&wsp)?).map_err(|e| e.to_string())
     }
 
@@ -1155,8 +1158,10 @@ mod tests {
     /// blow up: nothing is in flight on a bare `Draft`, so the attach
     /// configures it with an empty contribution on the way in and mints the
     /// shell as usual. Guards the `min activate` → `min attach` path against
-    /// a client that skipped `ConfigureLoadout`, and any internal caller that
-    /// only ever wanted a session to run something in.
+    /// a caller that never reached the compose step (a compose failure
+    /// leaves the actor `Draft` — attach has to still land it live), and
+    /// any internal caller that only ever wanted a session to run something
+    /// in.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn attach_to_an_unconfigured_session_configures_it_rather_than_failing() {
         use crate::test_harness::create_session_req;
@@ -1164,7 +1169,9 @@ mod tests {
 
         let server = TestServer::new().await;
         let mut client = server.connect().await;
-        // Bare `CreateSession` — no `ConfigureLoadout` follow-up.
+        // Bare `CreateSession` — no `ConfigureLoadout` follow-up. The
+        // session stays `Draft`; the attach path is the one that has
+        // to notice and configure it on the way in.
         let session_id = client
             .call::<CreateSession>(&create_session_req("bare-session", "/uwu"))
             .await

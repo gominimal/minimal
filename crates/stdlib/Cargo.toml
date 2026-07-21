@@ -1,7 +1,11 @@
 [package]
 name = "stdlib"
-version = "0.0.17"
+version = "0.0.18"
 rust-version = "1.91"
-license = "MIT OR Apache-2.0"
+license.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[dependencies]
+fd-lock.workspace = true
+tempfile.workspace = true

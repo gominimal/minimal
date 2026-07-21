@@ -12,14 +12,18 @@ use tokio::io::AsyncWriteExt as _;
 pub mod autospawn;
 pub mod client;
 pub mod config;
+pub mod diag;
 pub mod dirs;
 mod file_upload;
 pub mod git_remote;
 pub mod loadouts;
+pub mod prompt;
 
 #[derive(Parser)]
-#[command(name = "min", version = env!("CARGO_PKG_VERSION"), long_version = env!("LONG_VERSION"))]
-#[command(about = "The Minimal CLI")]
+#[command(name = "min", version = version::VERSION, long_version = version::LONG_VERSION)]
+#[command(
+    about = "min, the Minimal session CLI — create, attach to, and manage sandboxed development sessions"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -46,6 +50,14 @@ pub enum Command {
     Loadout(LoadoutArgs),
     /// Print important directories and file paths for debugging
     Dirs,
+    /// Collect a diagnostic bundle (logs, state, config) to send to the
+    /// minimal dev team.
+    ///
+    /// Writes `minimal-diag-<timestamp>.tar.zst` to the current directory.
+    /// Secret-shaped values (env vars, tokens) are redacted and session/
+    /// project file contents are never included — only name/size listings.
+    /// Works even when no daemon is running; never starts one.
+    Bug(diag::BugArgs),
     /// WireGuard mesh: join, leave, and inspect remote-access state
     #[cfg(feature = "remote-access")]
     Mesh(MeshArgs),
@@ -64,29 +76,30 @@ pub enum Command {
     /// Examples:
     ///
     ///   # Forward host port 18080 to the webserver inside the "dev" session:
-    ///   minimal ssh-forward dev 18080:127.0.0.1:80
+    ///   min ssh-forward dev 18080:127.0.0.1:80
     ///
     ///   # Then access it from the host:
     ///   curl http://localhost:18080/
     #[cfg(feature = "remote-access")]
     #[command(name = "ssh-forward", visible_alias = "forward")]
     SshForward(SshForwardArgs),
-    /// Obtain an mTLS client certificate from minimald for use with the HTTPS
-    /// reverse proxy (R4.4, R4.5).
+    /// Obtain an mTLS client certificate for the HTTPS reverse proxy
     ///
     /// Connects to minimald, generates a fresh client certificate signed by
-    /// the daemon's internal CA, and saves the certificate and private key to
-    /// `~/.config/minimal/client.pem` / `~/.config/minimal/client.key`. Also
-    /// saves the CA certificate to `~/.config/minimal/ca.pem` so tools like
-    /// `curl` can trust the HTTPS proxy.
+    /// the daemon's internal CA (R4.4, R4.5), and saves the certificate and
+    /// private key to `~/.config/minimal/client.pem` /
+    /// `~/.config/minimal/client.key`. Also saves the CA certificate to
+    /// `~/.config/minimal/ca.pem` so tools like `curl` can trust the HTTPS
+    /// proxy.
     ///
     /// Example:
     ///
-    ///   minimal login
+    ///   min login
     ///   curl --cacert ~/.config/minimal/ca.pem \
     ///        --cert ~/.config/minimal/client.pem \
     ///        --key  ~/.config/minimal/client.key \
     ///        https://localhost:7655/
+    #[command(verbatim_doc_comment)]
     Login(LoginArgs),
     /// Rename an existing session
     Rename(RenameArgs),
@@ -100,7 +113,7 @@ pub enum Command {
     Version,
     /// Generate shell completion script
     #[command(
-        long_about = "Generate a shell tab-completion script for the minimal CLI.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(min completions bash)"
+        long_about = "Generate a shell tab-completion script for the min CLI.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(min completions bash)"
     )]
     Completions(CompletionsArgs),
 }
@@ -165,17 +178,17 @@ pub enum MeshCommand {
     ///
     /// Example:
     ///
-    ///   minimal mesh join mesh.example.com:51820
+    ///   min mesh join mesh.example.com:51820
     #[command(verbatim_doc_comment)]
     Join(MeshJoinArgs),
     /// Leave the WireGuard mesh and drop this machine's local enrolment
     ///
-    /// Removes the local enrolment record written by `minimal mesh join`.
+    /// Removes the local enrolment record written by `min mesh join`.
     /// Peer entries on the remote minimald must be removed there (manual v1).
     ///
     /// Example:
     ///
-    ///   minimal mesh leave
+    ///   min mesh leave
     #[command(verbatim_doc_comment)]
     Leave,
     /// Show this minimald's mesh status: public key, advertised subnets, peers
@@ -185,7 +198,7 @@ pub enum MeshCommand {
     ///
     /// Example:
     ///
-    ///   minimal mesh status
+    ///   min mesh status
     #[command(verbatim_doc_comment)]
     Status,
 }
@@ -197,12 +210,16 @@ pub struct MeshJoinArgs {
     pub address: String,
 }
 
-/// Shared arguments all subcommands
-///
-/// The `Default` value is the no-flags invocation (no overrides, native
-/// backend) — what a bare `min <cmd>` resolves to, and what indirect
-/// entrypoints like the `git-remote-min` helper mode (which git invokes
-/// without any of our flags) use.
+// Shared arguments for all subcommands.
+//
+// The `Default` value is the no-flags invocation (no overrides, native
+// backend) — what a bare `min <cmd>` resolves to, and what indirect
+// entrypoints like the `git-remote-min` helper mode (which git invokes
+// without any of our flags) use.
+//
+// Deliberately NOT a doc comment: clap propagates a flattened struct's doc
+// comment into the parent command's long_about, which would replace the
+// top-level `min --help` description with this text.
 #[derive(Debug, Default, Args)]
 pub struct GlobalArgs {
     /// Use the given directory as the repository root, instead of the current
@@ -250,10 +267,18 @@ pub struct ActivateArgs {
     /// `[loadouts].default_loadouts` in the client config are ignored.
     #[arg(long = "loadout", value_name = "NAME")]
     pub loadout: Vec<String>,
-    /// Apply no loadouts at all — overrides both `--loadout` and the
-    /// config's `default_loadouts`.
+    /// Apply no loadouts at all (also skips the config's
+    /// `default_loadouts`). Conflicts with `--loadout`.
     #[arg(long, conflicts_with = "loadout")]
     pub no_loadouts: bool,
+    /// Fail instead of prompting when the daemon returns items the
+    /// user policy can't auto-decide. Useful for CI and other
+    /// non-interactive contexts — the error message includes a
+    /// `user_policy.toml` snippet that would make the activation
+    /// succeed. This mode is also selected implicitly when stdin
+    /// isn't attached to a terminal.
+    #[arg(long)]
+    pub no_prompt: bool,
     /// Automatically attach after creation
     #[arg(long)]
     pub attach: bool,
@@ -343,7 +368,14 @@ pub struct LsArgs {
 #[derive(Debug, Args)]
 pub struct DestroyArgs {
     /// Session identifier (UUID or session name)
-    pub session: String,
+    #[arg(required_unless_present = "all", conflicts_with = "all")]
+    pub session: Option<String>,
+    /// Destroy all sessions
+    #[arg(long)]
+    pub all: bool,
+    /// Skip confirmation when destroying all sessions
+    #[arg(long, short, requires = "all")]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -399,10 +431,10 @@ pub struct UpdateArgs {}
 pub struct ProxyArgs {
     /// UDS socket path to connect to
     #[arg(long)]
-    pub socket: String,
+    pub socket: Option<String>,
 }
 
-/// Arguments for `minimal ssh-forward`.
+/// Arguments for `min ssh-forward`.
 #[cfg(feature = "remote-access")]
 #[derive(Debug, Args)]
 pub struct SshForwardArgs {
@@ -416,7 +448,7 @@ pub struct SshForwardArgs {
     pub forward: String,
 }
 
-/// Arguments for `minimal login`.
+/// Arguments for `min login`.
 #[derive(Debug, Args)]
 pub struct LoginArgs {
     /// Override the directory where client cert files are written
@@ -432,7 +464,28 @@ pub struct CompletionsArgs {
     pub shell: Shell,
 }
 
+/// The process-wide trace context, minted once at command dispatch. The
+/// root span carries its ids into every log line, and the SSH client sends
+/// the same context to the daemon as a `TRACEPARENT` channel env request —
+/// one grep joins host and guest records.
+pub(crate) fn trace_context() -> &'static minimald_rpc::trace::TraceContext {
+    static CONTEXT: std::sync::OnceLock<minimald_rpc::trace::TraceContext> =
+        std::sync::OnceLock::new();
+    CONTEXT.get_or_init(minimald_rpc::trace::TraceContext::mint)
+}
+
 pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
+    use tracing::Instrument as _;
+    let ctx = trace_context();
+    let root = tracing::info_span!(
+        "cmd",
+        trace_id = %ctx.trace_id_hex(),
+        span_id = %ctx.span_id_hex(),
+    );
+    run_command(cli).instrument(root).await
+}
+
+async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     match cli.command {
         Command::Ls(args) => cmd_ls(&cli.global_args, args).await,
         Command::Activate(args) => cmd_activate(&cli.global_args, args).await,
@@ -446,13 +499,14 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
             command: LoadoutCommand::List(args),
         }) => loadouts::cmd_loadout_list(args, &cli.global_args),
         Command::Dirs => dirs::cmd_dirs(&cli.global_args),
+        Command::Bug(args) => diag::cmd_bug(&cli.global_args, args).await,
         #[cfg(feature = "remote-access")]
         Command::Mesh(MeshArgs { command }) => match command {
             MeshCommand::Status => cmd_mesh_status(&cli.global_args).await,
             MeshCommand::Join(args) => cmd_mesh_join(&cli.global_args, args),
             MeshCommand::Leave => cmd_mesh_leave(&cli.global_args),
         },
-        Command::Proxy(args) => cmd_proxy(args).await,
+        Command::Proxy(args) => cmd_proxy(&cli.global_args, args).await,
         #[cfg(feature = "remote-access")]
         Command::SshForward(args) => cmd_ssh_forward(&cli.global_args, args).await,
         Command::Login(args) => cmd_login(&cli.global_args, args).await,
@@ -548,10 +602,22 @@ async fn resolve_session(
 ///
 /// Intended for use as an SSH `ProxyCommand`: ssh writes to our stdin and
 /// reads from our stdout, while we bridge both directions to the UDS.
-pub async fn cmd_proxy(args: ProxyArgs) -> Result<(), anyhow::Error> {
-    let stream = tokio::net::UnixStream::connect(&args.socket)
+pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyhow::Error> {
+    let socket_path = match args.socket {
+        Some(socket_path) => socket_path,
+        None => {
+            ensure_daemon(global)?;
+            client::resolve_socket_path(global.minimal_dir.as_deref())
+                .context("Failed to resolve daemon socket path")?
+                .to_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+
+    let stream = tokio::net::UnixStream::connect(&socket_path)
         .await
-        .with_context(|| format!("connect to {}", args.socket))?;
+        .with_context(|| format!("connect to {}", socket_path))?;
 
     let (mut rx, mut tx) = stream.into_split();
     let mut stdin = tokio::io::stdin();
@@ -573,10 +639,10 @@ fn ensure_daemon(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         .context("Failed to ensure the minimald daemon is running")
 }
 
-/// Prompt the user with a yes/no question on stderr. Defaults to yes
-/// (empty input or Y/y/yes returns true; anything else returns false).
-fn confirm(question: &str) -> Result<bool, anyhow::Error> {
-    eprint!("{question} [Y/n] ");
+/// Prompt the user with a yes/no question on stderr.
+fn confirm(question: &str, default: bool) -> Result<bool, anyhow::Error> {
+    let prompt = if default { "[Y/n]" } else { "[y/N]" };
+    eprint!("{question} {prompt} ");
     std::io::stderr().flush().ok();
 
     let mut input = String::new();
@@ -584,9 +650,11 @@ fn confirm(question: &str) -> Result<bool, anyhow::Error> {
         .read_line(&mut input)
         .context("reading stdin")?;
     let trimmed = input.trim();
-    Ok(trimmed.is_empty()
-        || trimmed.eq_ignore_ascii_case("y")
-        || trimmed.eq_ignore_ascii_case("yes"))
+    Ok(if trimmed.is_empty() {
+        default
+    } else {
+        trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes")
+    })
 }
 
 /// List sessions via the `ListSessions` RPC.
@@ -618,6 +686,28 @@ pub fn format_ls(
             serde_json::to_string_pretty(resp).context("Failed to serialize session list")?;
         writeln!(out, "{json}")?;
         return Ok(());
+    }
+
+    if !args.raw
+        && let Some(pool) = &resp.resource_pool
+    {
+        let session_count = resp.sessions.len();
+        let core_label = if pool.cpu_cores == 1 { "core" } else { "cores" };
+        let session_label = if session_count == 1 {
+            "session"
+        } else {
+            "sessions"
+        };
+        writeln!(
+            out,
+            "RESOURCE POOL:  {} CPU {} · {} memory · shared by {} {}",
+            pool.cpu_cores,
+            core_label,
+            format_memory(pool.memory_bytes),
+            session_count,
+            session_label,
+        )?;
+        writeln!(out)?;
     }
 
     if resp.sessions.is_empty() {
@@ -671,122 +761,121 @@ pub fn format_ls(
     Ok(())
 }
 
-/// Default policy hook for `minimal activate`: auto-approves any
-/// item whose provenance is [`Source::Project`] or
-/// [`Source::Package`], and aborts on anything else.
-///
-/// Rationale: items reaching a hook are those the base
-/// [`UserPolicy`] couldn't auto-decide — with today's `Source`
-/// palette, that's exclusively project- and package-level
-/// contributions. Both come from the mfile / graph the user
-/// activated against, so activating the project implicitly
-/// consents to what it declares. A future [`Source`] variant we
-/// don't recognize hits the safe path (`Abort`) rather than
-/// getting silently allowed.
-///
-/// Once `minimal activate` grows a real `--policy` / `--allow`
-/// interface, this hook stays as the default when no explicit
-/// policy is provided.
-///
-/// [`Source::Project`]: sessions::core::source::Source::Project
-/// [`Source::Package`]: sessions::core::source::Source::Package
-/// [`UserPolicy`]: sessions::core::policy::UserPolicy
-struct ApproveProjectAndPackage;
+fn format_memory(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
 
-/// Return per-item [`AllowOnce`] decisions when every source in
-/// `sources` is a trusted daemon-side origin ([`Source::Project`]
-/// or [`Source::Package`]). `None` on any other source, which the
-/// caller maps to [`HookResult::Abort`].
-///
-/// [`AllowOnce`]: sessions::core::decision::ItemDecision::AllowOnce
-/// [`Source::Project`]: sessions::core::source::Source::Project
-/// [`Source::Package`]: sessions::core::source::Source::Package
-/// [`HookResult::Abort`]: sessions::core::hooks::HookResult::Abort
-fn decisions_for_trusted_sources<'a, I>(
-    sources: I,
-) -> Option<Vec<sessions::core::decision::ItemDecision>>
-where
-    I: IntoIterator<Item = &'a sessions::core::source::Source>,
-{
-    let mut decisions = Vec::new();
-    for source in sources {
-        match source {
-            sessions::core::source::Source::Project { .. }
-            | sessions::core::source::Source::Package { .. } => {
-                decisions.push(sessions::core::decision::ItemDecision::AllowOnce);
-            }
-            _ => return None,
+    if bytes >= GIB {
+        let gib = bytes as f64 / GIB as f64;
+        if bytes.is_multiple_of(GIB) {
+            format!("{gib:.0} GiB")
+        } else {
+            format!("{gib:.1} GiB")
         }
-    }
-    Some(decisions)
-}
-
-impl sessions::core::hooks::PolicyHooks for ApproveProjectAndPackage {
-    fn on_var_unapproved(
-        &self,
-        _policy: sessions::core::policy::VarsPolicy,
-        items: &[sessions::core::hooks::Unapproved<'_, str>],
-    ) -> sessions::core::hooks::HookResult<sessions::core::policy::VarsPolicy> {
-        decisions_for_trusted_sources(items.iter().map(|u| u.source()))
-            .map(sessions::core::hooks::HookResult::decided)
-            .unwrap_or(sessions::core::hooks::HookResult::Abort)
-    }
-
-    fn on_patch_unapproved(
-        &self,
-        _policy: sessions::core::policy::PatchPolicy,
-        items: &[sessions::core::hooks::Unapproved<'_, camino::Utf8Path>],
-    ) -> sessions::core::hooks::HookResult<sessions::core::policy::PatchPolicy> {
-        decisions_for_trusted_sources(items.iter().map(|u| u.source()))
-            .map(sessions::core::hooks::HookResult::decided)
-            .unwrap_or(sessions::core::hooks::HookResult::Abort)
+    } else {
+        format!("{} MiB", bytes / MIB)
     }
 }
 
-/// Phase 3 + final SubmitVerdict round-trip for a `Pending` session.
+/// Whether the operator can be prompted interactively. The prompt
+/// renders on stderr (so stderr must be a terminal) and reads
+/// keypresses from stdin (so stdin must be a terminal too). If
+/// either side is redirected we take the `--no-prompt` path — going
+/// interactive when stdin is a pipe just hangs `dialoguer` and then
+/// aborts with a much less helpful error than the `--no-prompt`
+/// snippet the operator actually wants to paste.
+fn can_prompt_interactively() -> bool {
+    dialoguer::console::user_attended() && dialoguer::console::user_attended_stderr()
+}
+
+/// Phase 3 gate: run the user policy + hooks over the daemon's
+/// pending items and produce the wire verdict (plus the final
+/// policy after any hook mutations). Does NOT talk to the daemon —
+/// the caller decides whether to actually submit or abort.
 ///
 /// `policy` is the user's own [`UserPolicy`](sessions::core::policy::UserPolicy)
 /// loaded from `user_policy.toml`; daemon-side pending items
 /// (packages, projects) are gated against it here on the client.
-async fn drive_pending_to_active(
-    client: &mut client::Client,
+/// `hooks` decides what happens when the policy can't auto-decide an
+/// item — see [`crate::prompt`] for the two implementations
+/// (interactive prompt vs. `--no-prompt` collect-and-abort).
+///
+/// Split from [`submit_verdict_and_wait`] so `NoPromptHook` — which
+/// fake-approves every item to keep both var and patch hooks firing
+/// — can be intercepted between "verdict computed" and "verdict
+/// submitted"; otherwise a `--no-prompt` run would submit a bogus
+/// approval on the wire.
+fn compute_verdict(
     response: sessions::wire::request::ContributionResponse,
     policy: sessions::core::policy::UserPolicy,
     options: sessions::core::compose::ComposeOptions,
+    hooks: &dyn sessions::core::hooks::PolicyHooks,
+) -> Result<
+    (
+        sessions::wire::request::ContributionVerdict,
+        sessions::core::policy::UserPolicy,
+    ),
+    sessions::core::compose::ComposeError,
+> {
+    sessions::client::handler::handle_response(response, &[], policy, hooks, options, &|name| {
+        std::env::var(name)
+    })
+}
+
+/// Ship the verdict to the daemon and wait for `Active`. Every
+/// failure path in here has to `send_abort` first — the daemon is
+/// parked in `Draft{pending}` and leaks the session slot otherwise.
+async fn submit_verdict_and_wait(
+    client: &mut client::Client,
+    session_id: sessions::SessionId,
+    verdict: sessions::wire::request::ContributionVerdict,
 ) -> Result<sessions::SessionId, anyhow::Error> {
     use minimald_rpc::SubmitVerdict;
-    use sessions::client::handler::handle_response;
     use sessions::wire::request::SessionStep;
 
-    let session_id = response.session_id;
-
-    let hooks = ApproveProjectAndPackage;
-    let verdict = match handle_response(response, &[], policy, &hooks, options, &|name| {
-        std::env::var(name)
-    }) {
-        Ok(v) => v,
+    let resp = match client.oneshot_rpc::<SubmitVerdict>(verdict).await {
+        Ok(r) => r,
         Err(e) => {
             send_abort(client, session_id).await;
-            bail!("Composition gating failed: {e}");
+            return Err(e).context("SubmitVerdict RPC failed");
         }
     };
-
-    let resp = client
-        .oneshot_rpc::<SubmitVerdict>(verdict)
-        .await
-        .context("SubmitVerdict RPC failed")?;
     let step = match resp {
         minimald_rpc::Errorable::Ok(s) => s,
         minimald_rpc::Errorable::Err { error } => {
+            send_abort(client, session_id).await;
             bail!("SubmitVerdict failed: {error}");
         }
     };
     match step {
         SessionStep::Active { id } => Ok(id),
         SessionStep::Fault { error } => {
+            send_abort(client, session_id).await;
             bail!("SubmitVerdict faulted: {error}");
         }
     }
+}
+
+/// The interactive-prompt caller's happy path: gate, then submit,
+/// then return the finalized id + policy. Any gating failure aborts
+/// the daemon-side session before propagating.
+async fn drive_pending_to_active(
+    client: &mut client::Client,
+    response: sessions::wire::request::ContributionResponse,
+    policy: sessions::core::policy::UserPolicy,
+    options: sessions::core::compose::ComposeOptions,
+    hooks: &dyn sessions::core::hooks::PolicyHooks,
+) -> Result<(sessions::SessionId, sessions::core::policy::UserPolicy), anyhow::Error> {
+    let session_id = response.session_id;
+    let (verdict, final_policy) = match compute_verdict(response, policy, options, hooks) {
+        Ok(v) => v,
+        Err(e) => {
+            send_abort(client, session_id).await;
+            bail!("Composition gating failed: {e}");
+        }
+    };
+    let id = submit_verdict_and_wait(client, session_id, verdict).await?;
+    Ok((id, final_policy))
 }
 
 /// Fire an `AbortSession` at the daemon for a `Pending` session the
@@ -847,10 +936,10 @@ fn offer_mfile_scaffold(
     // "yes" — and, when a config is discovered under `.minimal/`, the init
     // writer would clobber it. Only prompt on a real terminal; anywhere else
     // (and on a declined prompt) carry on without scaffolding.
-    if !std::io::stdin().is_terminal() || !confirm("Would you like to create one?")? {
+    if !std::io::stdin().is_terminal() || !confirm("Would you like to create one?", true)? {
         eprintln!(
             "Continuing without one; the session gets a default environment. \
-             Run 'minimal init' to give the project its own config."
+             Run 'min init' to give the project its own config."
         );
         return Ok(());
     }
@@ -930,7 +1019,9 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     // fail loudly on the client side without ever touching the
     // daemon.
     let cfg = config::read_client_config(global)?;
+    let policy_path = config::user_policy_path(global);
     let user_policy = config::read_user_policy(global)?;
+    let initial_policy = user_policy.clone();
     let compose_options = loadouts::compose_options_from_config(&cfg);
     let selection = loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts);
     let active = loadouts::resolve_active_loadouts(selection, &cfg, global)?;
@@ -938,8 +1029,8 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
         let names: Vec<&str> = active.iter().map(|l| l.name().as_ref()).collect();
         eprintln!("Applying loadouts: {}", names.join(", "));
     }
-    let contribution =
-        loadouts::compose_user_contribution(active, user_policy.clone(), compose_options)?;
+    let (contribution, user_policy) =
+        loadouts::compose_user_contribution(active, user_policy, compose_options)?;
 
     let mut client = connect_daemon(global).await?;
 
@@ -962,30 +1053,13 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     };
     let id = created.id;
 
-    // The session exists but has no loadout yet; composing it is a second
-    // round-trip because the daemon's composer reads the project config out
-    // of the session's workspace, not from a path on this machine.
-    let configured = client
-        .oneshot_rpc::<ConfigureLoadout>(ConfigureLoadoutRequest {
-            session_id: id,
-            contribution,
-        })
-        .await
-        .context("ConfigureLoadout RPC failed")?;
-    let configured = match configured {
-        minimald_rpc::Errorable::Ok(r) => r,
-        minimald_rpc::Errorable::Err { error } => {
-            bail!("ConfigureLoadout failed: {error}");
-        }
-    };
-    // The daemon may finalize immediately (`Ready`) or ask the
-    // client to gate items first (`Pending`).
-    if let minimald_rpc::ConfigureLoadoutResponse::Pending { response } = configured {
-        drive_pending_to_active(&mut client, response, user_policy, compose_options).await?;
-    }
-
     // Upload the project directory to the daemon so the session
-    // sandbox has the user's files available.
+    // workspace holds the user's files — `ConfigureLoadout`'s compose
+    // reads the mfile (and any local `packages/`, `stacks/`,
+    // `profiles/` used by graph resolution) off that workspace, so it
+    // has to run before `ConfigureLoadout`. `--sync none` opts out;
+    // the daemon then composes against an empty workspace and the
+    // caller is on their own for getting files there.
     match args.sync {
         SyncMode::None => {}
         SyncMode::Tarball => {
@@ -997,7 +1071,9 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
             // anywhere up the tree (#770).
             let upload_root = resolve_upload_root(&utf8_path);
             if upload_root != utf8_path {
-                eprintln!("Uploading from project root {upload_root} (resolved from {utf8_path})");
+                eprintln!(
+                    "Uploading from project root {upload_root} (resolved from {utf8_path})"
+                );
             }
             // Guard against accidentally uploading a non-VCS directory
             // (e.g. `~`): if the resolved project root is not a recognized
@@ -1025,6 +1101,112 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
             }
         }
     };
+
+    // The session exists but has no loadout yet; composing it is a
+    // second round-trip because the daemon's composer reads the
+    // project config out of the session's workspace, not from a path
+    // on this machine.
+    let configured = client
+        .oneshot_rpc::<ConfigureLoadout>(ConfigureLoadoutRequest {
+            session_id: id,
+            contribution,
+        })
+        .await
+        .context("ConfigureLoadout RPC failed")?;
+    let configured = match configured {
+        minimald_rpc::Errorable::Ok(r) => r,
+        minimald_rpc::Errorable::Err { error } => {
+            bail!("ConfigureLoadout failed: {error}");
+        }
+    };
+    // The daemon may finalize immediately (`Ready`) or ask the
+    // client to gate items first (`Pending`). On the pending path
+    // we run the user-policy prompt loop; on ready there's nothing
+    // to gate.
+    //
+    // Decide up front whether we can prompt: `--no-prompt` forces
+    // the abort path, and a non-TTY stderr triggers it implicitly
+    // (a script or CI run should never expect to read a keypress).
+    // Both fall through to `NoPromptHook`, which accumulates every
+    // item it would have prompted for so we can print a
+    // `user_policy.toml` snippet on the error path.
+    if let minimald_rpc::ConfigureLoadoutResponse::Pending { response } = configured {
+        let non_interactive = args.no_prompt || !can_prompt_interactively();
+        if non_interactive {
+            // NoPromptHook fake-approves every unapproved item so
+            // handle_response finishes both the var and patch gates
+            // and records everything in `summary`. If anything was
+            // recorded, we abort *before* actually shipping the
+            // verdict — the daemon must not see those fake
+            // approvals. Only when `summary` is empty (every daemon-
+            // sent item was already handled by the user's policy)
+            // do we submit and let the session go Active.
+            let session_id = response.session_id;
+            let hooks = prompt::NoPromptHook::new();
+            let verdict = match compute_verdict(response, user_policy, compose_options, &hooks) {
+                Ok((verdict, _final_policy)) => verdict,
+                Err(e) => {
+                    send_abort(&mut client, session_id).await;
+                    bail!("Composition gating failed: {e}");
+                }
+            };
+            let summary = hooks.into_summary();
+            if summary.count() > 0 {
+                send_abort(&mut client, session_id).await;
+                let count = summary.count();
+                let snippet = summary.as_toml_snippet();
+                bail!(
+                    "{count} item{s} would require interactive approval, but \
+                     --no-prompt was set (or stdin/stderr is not a terminal).\n\n\
+                     Add the following to {}:\n\n{snippet}\n\
+                     Then re-run this command.",
+                    policy_path.display(),
+                    s = if count == 1 { "" } else { "s" },
+                );
+            }
+            submit_verdict_and_wait(&mut client, session_id, verdict).await?;
+        } else {
+            // The hook stashes policy mutations in interior
+            // `RefCell`s so a `DenyPermanent` (which returns
+            // `HookResult::Abort` and can't pipe an
+            // `updated_policy` back through the composer) still
+            // survives to `into_final_policy`. We save
+            // unconditionally before propagating the result, so a
+            // deny-and-abort still writes the rule.
+            let hooks = prompt::InteractivePrompt::new(&policy_path, user_policy.clone());
+            let result = drive_pending_to_active(
+                &mut client,
+                response,
+                user_policy,
+                compose_options,
+                &hooks,
+            )
+            .await;
+            let final_policy = hooks.into_final_policy();
+            if final_policy != initial_policy {
+                // A `save_user_policy` failure is reported to
+                // stderr and *doesn't* propagate: if the activation
+                // itself also failed (`DenyPermanent` returns Err
+                // and still wants its rule saved; a real
+                // composition fault), `result?` below is what the
+                // operator needs to see. Blindly `?`ing the save
+                // would clobber that error with a spurious
+                // "updating user_policy.toml" message that hides
+                // the true failure.
+                match prompt::save_user_policy(&policy_path, &final_policy) {
+                    Ok(()) => eprintln!("Updated {}", policy_path.display()),
+                    Err(e) => eprintln!("warning: failed to update {}: {e}", policy_path.display()),
+                }
+            }
+            result?;
+        }
+    }
+
+    // On the Ready path (loadouts auto-decided; no prompt fired)
+    // `initial_policy` is only referenced inside the Pending branch
+    // above, so it appears unused to the compiler. Explicit `_` to
+    // squash the lint without dropping the useful name.
+    let _ = initial_policy;
 
     println!("{id}");
 
@@ -1269,7 +1451,7 @@ pub fn cmd_mesh_join(global: &GlobalArgs, args: MeshJoinArgs) -> Result<(), anyh
     );
     println!();
     println!("v1 uses manual key exchange. To complete the join:");
-    println!("  1. Run `minimal mesh status` on the remote host to read its public key.");
+    println!("  1. Run `min mesh status` on the remote host to read its public key.");
     println!("  2. Add this machine's WireGuard public key to the remote minimald's peers.");
     println!("  3. Add the remote's public key and endpoint to this machine's mesh config.");
     Ok(())
@@ -1302,20 +1484,80 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
 
     let mut client = connect_daemon(global).await?;
 
+    if args.all {
+        return destroy_all_sessions(&mut client, args.force).await;
+    }
+
+    let session = args
+        .session
+        .as_deref()
+        .context("a session or --all is required")?;
+    let record = resolve_session(&mut client, session).await?;
+
+    destroy_session(&mut client, record.id, record.name.as_deref()).await
+}
+
+async fn destroy_all_sessions(
+    client: &mut client::Client,
+    force: bool,
+) -> Result<(), anyhow::Error> {
+    use minimald_rpc::ListSessions;
+
+    let sessions = client
+        .oneshot_rpc::<ListSessions>(())
+        .await
+        .context("ListSessions RPC failed")?
+        .sessions;
+
+    if sessions.is_empty() {
+        println!("No active sessions.");
+        return Ok(());
+    }
+
+    if !force {
+        if !std::io::stdin().is_terminal() {
+            bail!("refusing to destroy all sessions without confirmation; pass --force")
+        }
+        if !confirm(&format!("Destroy all {} sessions?", sessions.len()), false)? {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let session_count = sessions.len();
+    let mut failures = 0;
+    for session in sessions {
+        if let Err(error) = destroy_session(client, session.id, session.name.as_deref()).await {
+            failures += 1;
+            eprintln!(
+                "Failed to destroy session {} ({}): {error:#}",
+                session.id,
+                session.name.as_deref().unwrap_or("-")
+            );
+        }
+    }
+
+    if failures > 0 {
+        bail!("failed to destroy {failures} of {session_count} sessions")
+    }
+
+    Ok(())
+}
+
+async fn destroy_session(
+    client: &mut client::Client,
+    id: sessions::SessionId,
+    name: Option<&str>,
+) -> Result<(), anyhow::Error> {
     use minimald_rpc::{DestroySession, DestroySessionRequest};
-    let record = resolve_session(&mut client, &args.session).await?;
 
     let resp = client
-        .oneshot_rpc::<DestroySession>(DestroySessionRequest { id: record.id })
+        .oneshot_rpc::<DestroySession>(DestroySessionRequest { id })
         .await
         .context("DestroySession RPC failed")?;
 
     if resp.ok().is_some() {
-        println!(
-            "Destroyed session {} ({})",
-            record.id,
-            record.name.as_deref().unwrap_or("-")
-        );
+        println!("Destroyed session {} ({})", id, name.unwrap_or("-"));
     } else {
         bail!("DestroySession returned an error from the daemon");
     }
@@ -1601,7 +1843,7 @@ fn run_init_flow(config: mctx::Config, skip_confirm: bool) -> Result<(), anyhow:
         eprint!("{}", plan.content);
         eprintln!("---");
         eprintln!();
-        if !confirm("Continue?")? {
+        if !confirm("Continue?", true)? {
             eprintln!("Aborted.");
             return Ok(());
         }
@@ -1611,13 +1853,6 @@ fn run_init_flow(config: mctx::Config, skip_confirm: bool) -> Result<(), anyhow:
         .with_context(|| format!("writing {}", plan.toml_path.display()))?;
 
     eprintln!("Created {}", plan.toml_path.display());
-    eprintln!();
-    eprintln!("Next steps:");
-    eprintln!("  minimal update      # pin package versions");
-    eprintln!("  minimal activate .  # create a session");
-    if plan.matched {
-        eprintln!("  minimal attach      # attach to the session");
-    }
 
     Ok(())
 }
@@ -1707,7 +1942,7 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
 /// not autospawn the daemon — it is a lightweight diagnostic that should
 /// report versions without starting a VM.
 pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
-    println!("Client: minimal {}", env!("LONG_VERSION"));
+    println!("Client: minimal {}", version::LONG_VERSION);
 
     let sock = match client::resolve_socket_path(global.minimal_dir.as_deref()) {
         Ok(p) => p,
@@ -1815,93 +2050,6 @@ mod tests {
         assert!(parse_ingress_mapping("18080").is_err());
         assert!(parse_ingress_mapping("notaport:80").is_err());
         assert!(parse_ingress_mapping("18080:80/icmp").is_err());
-    }
-
-    /// All-Project sources → one `AllowOnce` per item. Baseline
-    /// happy path for the client's default hook.
-    #[test]
-    fn decisions_for_trusted_sources_allows_all_project() {
-        let sources = [
-            sessions::core::source::Source::Project {
-                path: paths::HostPath::new("/proj"),
-            },
-            sessions::core::source::Source::Project {
-                path: paths::HostPath::new("/proj"),
-            },
-        ];
-        let d =
-            decisions_for_trusted_sources(sources.iter()).expect("all Project → Some decisions");
-        assert_eq!(d.len(), 2);
-        assert!(
-            d.iter()
-                .all(|x| matches!(x, sessions::core::decision::ItemDecision::AllowOnce))
-        );
-    }
-
-    /// All-Package sources → same as Project. Same posture: the
-    /// package came from the mfile / graph the user activated
-    /// against, so activation implicitly consents.
-    #[test]
-    fn decisions_for_trusted_sources_allows_all_package() {
-        let sources = [
-            sessions::core::source::Source::Package {
-                name: "go".to_string(),
-            },
-            sessions::core::source::Source::Package {
-                name: "postgres".to_string(),
-            },
-        ];
-        let d =
-            decisions_for_trusted_sources(sources.iter()).expect("all Package → Some decisions");
-        assert_eq!(d.len(), 2);
-    }
-
-    /// A mix of trusted sources still allows; the helper is
-    /// per-item and doesn't care whether the item is a Project or
-    /// Package one.
-    #[test]
-    fn decisions_for_trusted_sources_allows_mixed_project_and_package() {
-        let sources = [
-            sessions::core::source::Source::Project {
-                path: paths::HostPath::new("/proj"),
-            },
-            sessions::core::source::Source::Package {
-                name: "go".to_string(),
-            },
-        ];
-        let d = decisions_for_trusted_sources(sources.iter())
-            .expect("Project+Package → Some decisions");
-        assert_eq!(d.len(), 2);
-    }
-
-    /// A single UserLoadout-origin item mixed in aborts the whole
-    /// batch. `UserLoadout` items shouldn't reach a hook — user
-    /// items auto-decide against the base `UserPolicy` — so seeing
-    /// one here is a caller bug and we abort defensively.
-    #[test]
-    fn decisions_for_trusted_sources_aborts_on_user_loadout() {
-        let sources = [
-            sessions::core::source::Source::Project {
-                path: paths::HostPath::new("/proj"),
-            },
-            sessions::core::source::Source::UserLoadout {
-                name: "dev".to_string(),
-            },
-        ];
-        assert!(
-            decisions_for_trusted_sources(sources.iter()).is_none(),
-            "any UserLoadout source in the batch → None → Abort",
-        );
-    }
-
-    /// An empty source list is `Some(vec![])`. `HookResult::decided(vec![])`
-    /// is the shape the gate expects on the (unusual but legal) empty-
-    /// batch call.
-    #[test]
-    fn decisions_for_trusted_sources_empty_yields_empty_decisions() {
-        let sources: [sessions::core::source::Source; 0] = [];
-        let d = decisions_for_trusted_sources(sources.iter()).expect("empty → Some(empty)");
-        assert!(d.is_empty());
     }
 
     /// Regression: a config in the `.minimal/` layout must be detected so

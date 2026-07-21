@@ -76,18 +76,29 @@ pub(crate) fn compose_options_from_config(
         .with_follow_symlinks(cfg.loadouts.follow_symlinks)
 }
 
-/// Compose the given loadouts into a [`sessions::wire::request::WireContribution`]
-/// under the user's [`UserPolicy`] loaded from `user_policy.toml`.
-/// User-origin items auto-pass the allow step but the policy's
-/// `deny` / `ignore` rules still apply, so a loadout patch matching
-/// a deny rule fails the composition here rather than at the daemon.
+/// Compose the given loadouts into a
+/// [`sessions::wire::request::WireContribution`] under the user's
+/// [`UserPolicy`] loaded from `user_policy.toml`. User-origin items
+/// auto-pass the allow step but the policy's `deny` / `ignore` rules
+/// still apply, so a loadout patch matching a deny rule fails the
+/// composition here rather than at the daemon.
+///
+/// Returns the possibly-mutated policy alongside the wire
+/// contribution — a hook (interactive prompt) may have appended
+/// allow/ignore/deny rules and the caller wants to persist them.
 ///
 /// [`UserPolicy`]: sessions::core::policy::UserPolicy
 pub(crate) fn compose_user_contribution(
     loadouts: Vec<sessions::core::loadout::Loadout>,
     policy: sessions::core::policy::UserPolicy,
     options: sessions::core::compose::ComposeOptions,
-) -> Result<sessions::wire::request::WireContribution, anyhow::Error> {
+) -> Result<
+    (
+        sessions::wire::request::WireContribution,
+        sessions::core::policy::UserPolicy,
+    ),
+    anyhow::Error,
+> {
     let mut composer = sessions::client::composer::UserComposer::new();
     composer
         .add_all(loadouts)

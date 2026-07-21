@@ -277,27 +277,20 @@ impl Env {
         // branch — they aren't user-gate-able, so if we add a new
         // `SetupForPackages` field make sure to route it through
         // the same branch as `env_vars`/`fs_mappings`, not with these.
-        let (mut patch, legacy_state_dirs, mut pkg_env_vars) = if args.include_package_attr_wiring {
+        let (legacy_state_dirs, mut pkg_env_vars) = if args.include_package_attr_wiring {
             let SetupForPackages {
-                fs_mappings,
+                fs_mappings: _,
                 needs_dns: _,
                 needs_internet: _,
                 state_dirs,
                 env_vars,
             } = SetupForPackages::build(&graph, transitives.keys())
                 .map_err(std::io::Error::other)?;
-            (fs_mappings, state_dirs, env_vars)
+            (state_dirs, env_vars)
         } else {
-            (
-                EnvPatches::default(),
-                std::collections::HashSet::<String>::new(),
-                HashMap::new(),
-            )
+            (std::collections::HashSet::<String>::new(), HashMap::new())
         };
 
-        if let Some(p) = &args.patches {
-            patch.union(p);
-        }
         if let Some(vars) = &args.env_vars {
             for (k, v) in vars {
                 let value = match v {
@@ -372,7 +365,6 @@ impl Env {
             .unwrap(),
             state_dir: args.state_base_dir.clone(),
             working: args.cwd.clone(),
-            task_name: args.name.clone(),
             has_packages: transitives.keys().copied().collect(),
             ot: args.ot.clone(),
             ctx,
@@ -504,8 +496,6 @@ struct SessionChannel {
     /// The host directory the working directory.
     working: DaemonAbsPath,
 
-    /// The environment name, used when adding task packages.
-    task_name: String,
     /// Packages already materialized into the rootfs.
     has_packages: HashSet<BuildSpecRef>,
     ot: Option<OpTracker>,
@@ -526,7 +516,7 @@ impl SessionChannel {
     /// Dispatches a single `method%data` request line.
     async fn handle(&mut self, line: &str, stream: &mut UnixStream) {
         let add_dep = match line.split_once('%') {
-            Some(("add-session", pkgs)) => match self.parse_pkgs_line(pkgs) {
+            Some(("add-transient", pkgs)) => match self.parse_pkgs_line(pkgs) {
                 Err(n) => {
                     let _ = writeln!(stream, "error: no such package '{n}'");
                     None
@@ -556,19 +546,14 @@ impl SessionChannel {
                     Some((AddDepMode::RuntimePackages, pkgs))
                 }
             },
-            Some(("add-task", pkgs)) => match self.parse_pkgs_line(pkgs) {
+            Some(("add-session", pkgs)) => match self.parse_pkgs_line(pkgs) {
                 Err(n) => {
                     let _ = writeln!(stream, "error: no such package '{n}'");
                     None
                 }
                 Ok(pkgs) => {
                     self.install(&pkgs, stream).await;
-                    Some((
-                        AddDepMode::TaskPackages {
-                            name: self.task_name.clone(),
-                        },
-                        pkgs,
-                    ))
+                    Some((AddDepMode::SessionPackages, pkgs))
                 }
             },
             Some(("search", term)) => {
@@ -646,24 +631,6 @@ impl SessionChannel {
                 .filter(|bsr| !self.has_packages.contains(bsr)),
         ) {
             Ok(setup) => {
-                if !setup.fs_mappings.dir.is_empty() || !setup.fs_mappings.file.is_empty() {
-                    let _ = writeln!(
-                        stream,
-                        "msg:Error: A package needed for this install requires files from your host to be patched in,"
-                    );
-                    let _ = writeln!(
-                        stream,
-                        "msg:which cannot be performed within an existing session."
-                    );
-                    let _ = writeln!(stream, "msg:");
-                    let _ = writeln!(
-                        stream,
-                        "msg:Exit the session, add the package yourself, and then restart your session to work around this."
-                    );
-                    let _ = writeln!(stream, "error: Failed installation.");
-                    return;
-                }
-
                 for want_dir in setup.state_dirs {
                     if let Err(e) =
                         std::fs::create_dir_all(self.state_dir.as_utf8_path().join(want_dir))
@@ -1052,7 +1019,6 @@ mod tests {
                 Utf8PathBuf::try_from(cwd.path().to_path_buf()).unwrap(),
             )
             .unwrap(),
-            task_name: "test-task".to_string(),
             has_packages: HashSet::new(),
             ot: None,
             ctx,

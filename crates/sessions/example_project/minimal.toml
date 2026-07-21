@@ -1,7 +1,7 @@
 # A minimal.toml built for demoing `[session]` composition. The
-# `[session]` block contributes two packages and one project-level
-# var, giving a fresh attach three composed items to inspect —
-# each from a different source.
+# `[session]` block contributes three packages plus a handful of
+# project-level vars chosen to exercise every branch of the user-
+# policy prompt logic.
 #
 # Try it:
 #   cargo build -p minimal -p minimald
@@ -12,8 +12,8 @@
 #   # Project-declared package (Source::Project):
 #   mermaid-ascii -f "$DIAGRAM"
 #
-#   # Project-declared var (Source::Project):
-#   echo "$DIAGRAM"
+#   # Project-declared vars (Source::Project):
+#   echo "$DIAGRAM $LANG $TZ"
 #
 #   # Package-declared vars (Source::Package "go"): the `go`
 #   # package sets these via `env_state_wiring` — the composer
@@ -25,6 +25,32 @@
 # re-run — every command breaks. `mermaid-ascii` is `command not
 # found`; `$DIAGRAM`/`$GOCACHE`/`$GOMODCACHE` are all unset.
 # Composition is doing real work.
+#
+# ---
+#
+# What should prompt (and what shouldn't) on the first activation
+# after wiping `~/.config/minimal/user_policy.toml`:
+#
+#   DIAGRAM       — no prompt. Hardcoded literal; `carries_user_data`
+#                   is false, so the gate auto-approves without
+#                   touching the user's policy.
+#   LANG          — prompts if the host has `LANG` set (env-hit
+#                   path → `carries_user_data = true`). No prompt if
+#                   `LANG` is unset (fallback default → no user
+#                   data crosses the boundary).
+#   TZ            — usually no prompt. Most systems leave `TZ`
+#                   unset, so the fallback default `"UTC"` kicks in
+#                   and the gate skips it. Set `TZ=America/New_York`
+#                   in your shell and re-activate to see the prompt
+#                   path.
+#   GOCACHE       — no prompt. Package `env_state_wiring` values
+#   GOMODCACHE      are `Specified` (the package attr declares the
+#                   literal), so `carries_user_data` is false.
+#
+# `claude-code` also contributes a patch source that resolves to
+# `~/.claude`. If you don't have that directory the client emits a
+# synthetic `Ignored` verdict so the daemon doesn't reject the
+# whole activation with "verdict missing entry for pending patch".
 
 [upstream]
 repo = "https://github.com/gominimal/pkgs"
@@ -47,12 +73,24 @@ use = "shell"
 # the package's build attrs and routes them through the same
 # `PatchPolicy`/`VarsPolicy` gate every other contribution goes
 # through.
-packages = ["mermaid-ascii", "go"]
+packages = ["mermaid-ascii", "go", "claude-code"]
 
 [session.vars]
-# Referenced by the demo one-liner above. Specified rather than
-# inherited — every attach against this project should see the
-# same starting artifact. Reaches the sandbox environment via the
-# client's `ApproveProjectAndPackage` policy hook, which
-# auto-allows Project- and Package-sourced items.
+# Hardcoded literal — auto-approves at the gate because
+# `carries_user_data` is false (no env lookup happened, so nothing
+# from the host is crossing into the sandbox). The user's policy
+# is never consulted for this var.
 DIAGRAM = "arch.mmd"
+
+# Inherit-with-default: reads from the host env when set, falls
+# back to `C.UTF-8` otherwise. On most systems `LANG` is set, so
+# activation prompts once for approval. Add
+# `[vars] allow = ["LANG"]` (or hit "Allow permanent" at the
+# prompt) to skip the prompt on the next run.
+LANG = { inherit = true, default = "C.UTF-8" }
+
+# Same shape as `LANG`, but `TZ` is typically unset on Linux hosts
+# — so this branch usually takes the fallback path and no prompt
+# fires. Export `TZ=America/New_York` in your shell and re-run to
+# force the env-hit path.
+TZ = { inherit = true, default = "UTC" }

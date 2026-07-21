@@ -46,12 +46,6 @@ pub struct DepArgs {
     )]
     local_deps: bool,
 
-    /// Whether host path "build_deps" are in the graph
-    #[arg(
-        long,num_args(0..=1),default_missing_value("true"),default_value("false"),action=ArgAction::Set,
-    )]
-    hostpath_deps: bool,
-
     /// Whether "Needs" nodes and edges are in the graph
     #[arg(
         long,num_args(0..=1),default_missing_value("true"),default_value("false"),action = ArgAction::Set,
@@ -99,14 +93,12 @@ pub struct DepArgs {
 }
 
 /// Data per node in the package petgraph DiGraph (aka "weight") that identifies
-/// the type of node (BuildSpec, HostPath, Local, Need, Source) and holds
+/// the type of node (BuildSpec, Local, Need, Source) and holds
 /// its related data.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum NodeData {
     /// represents a BuildSpec/BuildDecl
     BuildSpec(BuildSpecRef),
-    /// Hostpath is a host filepath to go in the sandbox as an input
-    HostPath(PathBuf),
     /// Local is a local file (e.g. build.sh) to go in the sandbox as an input
     Local {
         full_path: PathBuf,
@@ -122,7 +114,7 @@ enum NodeData {
 /// Data per edge in the package petgraph DiGraph
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum EdgeData {
-    /// can link BuildSpec to a BuildSpec, HostPath, Local or Source input node
+    /// can link BuildSpec to a BuildSpec, Local or Source input node
     InputDep(InputDepEdge),
     /// can link a BuildSpec to a BuildSpec runtime dep node
     RuntimeDep(RuntimeDepEdge),
@@ -138,7 +130,7 @@ struct TraversalState {
     depth: i32,
 }
 
-/// Edge between a BuildSpec and an Input (BuildSpec, HostPath, Local or Source input node)
+/// Edge between a BuildSpec and an Input (BuildSpec, Local or Source input node)
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct InputDepEdge {
     /// applies if the target node is a BuildSpec, lists the named outputs it needs
@@ -202,15 +194,6 @@ fn pgraph_from(graph: &graph::Graph) -> Result<GraphData, Error> {
                     &mut pgraph,
                     &mut processed_nodes,
                     NodeData::BuildSpec(*ibsr),
-                );
-                let edge_data = EdgeData::InputDep(InputDepEdge::default());
-                pgraph.add_edge(node_index, inode_index, edge_data);
-            }
-            BuildDep::HostPath(hp) => {
-                let (inode_index, _) = add_uniq_node(
-                    &mut pgraph,
-                    &mut processed_nodes,
-                    NodeData::HostPath(hp.clone()),
                 );
                 let edge_data = EdgeData::InputDep(InputDepEdge::default());
                 pgraph.add_edge(node_index, inode_index, edge_data);
@@ -449,13 +432,6 @@ fn pgraph_copy_subset_for_node(
                             }
                         }
                     }
-                    NodeData::HostPath(path) => {
-                        if args.hostpath_deps {
-                            let (cpy_target, _) =
-                                add_uniq_node(cpy, copied_nodes, target_data.clone());
-                            cpy.add_edge(cpy_node_index, cpy_target, edge_data.clone());
-                        }
-                    }
                     NodeData::Local {
                         full_path,
                         filename,
@@ -601,10 +577,6 @@ fn mermaid_node_id(
         NodeData::Source(SourceNode { url, .. }) => {
             format!("Src:{url}")
         }
-        NodeData::HostPath(hp) => {
-            let label = hp.to_string_lossy();
-            format!("Hostpath:{label}")
-        }
         NodeData::Local { full_path, .. } => {
             let label = full_path.to_string_lossy();
             format!("Local:{label}")
@@ -684,12 +656,6 @@ fn gen_dot(pgraph: &DiGraph<NodeData, EdgeData>, graph: &Graph) -> Result<(), Er
             NodeData::Source(SourceNode { url, .. }) => {
                 println!(
                     "  \"{id}\" [label=\"Src {url}\", shape=rectangle, fillcolor=lightgreen];"
-                );
-            }
-            NodeData::HostPath(hp) => {
-                let label = hp.to_string_lossy();
-                println!(
-                    "  \"{id}\" [label=\"Hostpath {label}\", shape=rectangle, fillcolor=lightred];"
                 );
             }
             NodeData::Local {
@@ -849,7 +815,6 @@ mod tests {
             build_spec_deps,
             source_deps: false,
             local_deps: false,
-            hostpath_deps: false,
             needs: false,
             provides: false,
             bootstrap: false,
