@@ -1036,6 +1036,16 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     let (contribution, user_policy) =
         loadouts::compose_user_contribution(active, user_policy, compose_options)?;
 
+    // Resolve the upload root before opening the daemon connection:
+    // a malformed mfile in an ancestor should fail loudly before
+    // we create a session on the daemon, so we don't leak a draft
+    // session. Only needed for tarball sync — `--sync none` skips
+    // the upload entirely (#770).
+    let upload_root = match args.sync {
+        SyncMode::None => None,
+        SyncMode::Tarball => Some(resolve_upload_root(&utf8_path)?),
+    };
+
     let mut client = connect_daemon(global).await?;
 
     use minimald_rpc::{
@@ -1073,7 +1083,7 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
             // `minimal activate ./subdir` still uploads the whole
             // project. Falls back to `utf8_path` when no mfile is found
             // anywhere up the tree (#770).
-            let upload_root = resolve_upload_root(&utf8_path)?;
+            let upload_root = upload_root.expect("upload_root is set for SyncMode::Tarball above");
             if upload_root != utf8_path {
                 eprintln!("Uploading from project root {upload_root} (resolved from {utf8_path})");
             }
