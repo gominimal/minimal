@@ -186,8 +186,22 @@ pub async fn hang_triage<W: BundleSink>(
         }
     }
 
+    // The pid set actually captured. On Linux each pid is re-checked against
+    // its own cmdline immediately before its state is read: the table snapshot
+    // is stale the moment it is taken, and a pid recycled in between would put
+    // an unrelated process's kernel state and open files into the bundle —
+    // precisely the "someone else's activity" this collector filters out.
+    #[cfg(target_os = "linux")]
+    let mut captured: Vec<u32> = Vec::with_capacity(pids.len());
     #[cfg(target_os = "linux")]
     for &pid in &pids {
+        if !still_matches(pid, markers).await {
+            w.skip(
+                format!("{dest}/proc/{pid}.stack.txt"),
+                "pid no longer matches a marker (exited or recycled since the snapshot)",
+            );
+            continue;
+        }
         let text = linux_park_state(pid).await;
         w.add_bytes(
             &format!("{dest}/proc/{pid}.stack.txt"),
@@ -195,9 +209,19 @@ pub async fn hang_triage<W: BundleSink>(
             Redaction::None,
         )
         .await?;
+        captured.push(pid);
     }
+    #[cfg(not(target_os = "linux"))]
+    let captured = pids;
 
-    let pid_list = pids
+    if captured.is_empty() {
+        w.skip(
+            format!("{dest}/proc/lsof.txt"),
+            "no marker-matched pids still live to inspect",
+        );
+        return Ok(());
+    }
+    let pid_list = captured
         .iter()
         .map(u32::to_string)
         .collect::<Vec<_>>()
@@ -310,6 +334,24 @@ fn proc_scrape(markers: &[&str]) -> Result<(String, Vec<u32>), anyhow::Error> {
         }
     }
     Ok((text, pids))
+}
+
+/// True when `pid` still names a marker-matched process *right now*.
+///
+/// Hang triage reads kernel state and open-file paths, so identity has to be
+/// re-pinned immediately before the read rather than trusted from the table
+/// snapshot: if a matched process exits and its pid is recycled in between, the
+/// bundle would carry an unrelated process's fds and stack. An unreadable
+/// `cmdline` (the process is gone) is a non-match, so the capture is skipped.
+/// Async `/proc` read — no blocking on the collector's worker.
+#[cfg(target_os = "linux")]
+async fn still_matches(pid: u32, markers: &[&str]) -> bool {
+    let Ok(raw) = tokio::fs::read(format!("/proc/{pid}/cmdline")).await else {
+        return false;
+    };
+    raw.split(|b| *b == 0)
+        .find(|part| !part.is_empty())
+        .is_some_and(|argv0| argv0_matches(&String::from_utf8_lossy(argv0), markers))
 }
 
 /// Where a Linux process is parked: wait channel, current syscall, kernel

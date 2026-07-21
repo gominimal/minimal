@@ -154,7 +154,7 @@ fn mask_macs(text: &str) -> String {
 #[cfg(target_os = "linux")]
 async fn proc_net_listeners() -> String {
     let mut text = String::new();
-    for table in ["tcp", "tcp6", "udp", "unix"] {
+    for table in ["tcp", "tcp6", "udp", "udp6", "unix"] {
         let path = format!("/proc/net/{table}");
         text.push_str(&format!("=== {path} ===\n"));
         match tokio::fs::read_to_string(&path).await {
