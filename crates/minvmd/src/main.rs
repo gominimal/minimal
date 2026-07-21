@@ -156,8 +156,7 @@ fn init_tracing() -> Result<Option<tracing_appender::non_blocking::WorkerGuard>>
         .lossy(false)
         .finish(appender);
     tracing_subscriber::registry()
-        // ANSI escape codes are noise in a file.
-        .with(fmt::layer().with_ansi(false).with_writer(writer))
+        .with(mlog::json_file_layer(writer, "minvmd"))
         .with(filter)
         .init();
     tracing::info!(

@@ -8,7 +8,9 @@ license.workspace = true
 [dependencies]
 constcat.workspace = true
 chrono.workspace = true
+hex.workspace = true
 paths.workspace = true
+rand.workspace = true
 serde.workspace = true
 
 sessions.workspace = true

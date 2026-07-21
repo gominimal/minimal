@@ -33,6 +33,9 @@ tracing-subscriber.workspace = true
 # VM network mode and VM-wide egress policy (minimald itself is Linux-only and
 # cannot be imported here, but the wire-types crate is portable).
 minimald-rpc.workspace = true
+# The JSON file-log layer both daemons write through, so the on-disk log format
+# has one definition (Unit 4).
+mlog.workspace = true
 # Shared gvproxy-switch primitives (subnet/MAC/`-config` rendering) used by `net`.
 switch.workspace = true
 # Async gvproxy switch supervision in `net`: the background exit-detection task

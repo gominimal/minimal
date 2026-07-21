@@ -133,6 +133,7 @@ impl Client {
             .await
             .with_context(|| format!("open channel for {}", R::NAME))?;
 
+        send_traceparent(&channel).await;
         channel
             .request_subsystem(false, R::NAME)
             .await
@@ -168,6 +169,7 @@ impl Client {
             .channel_open_session()
             .await
             .context("open exec channel")?;
+        send_traceparent(&channel).await;
         channel
             .exec(true, command)
             .await
@@ -207,6 +209,7 @@ impl Client {
             .await
             .context("open channel for workspace file upload")?;
 
+        send_traceparent(&channel).await;
         channel
             .set_env(true, "MINIMAL_SESSION_ID", session_id.to_string())
             .await
@@ -265,6 +268,16 @@ pub fn resolve_socket_path(
     minimal_dir_override: Option<&std::path::Path>,
 ) -> std::io::Result<std::path::PathBuf> {
     Ok(resolve_provider_dir(minimal_dir_override)?.join(paths::SSH_SOCK_FILE))
+}
+
+/// Sends the process trace context as a `TRACEPARENT` channel env request.
+/// Best-effort and reply-less: trace propagation is a diagnostic aid, and a
+/// daemon predating the variable ignores unknown env names anyway.
+async fn send_traceparent(channel: &russh::Channel<russh::client::Msg>) {
+    use minimald_rpc::trace::TRACEPARENT_ENV;
+    let _ = channel
+        .set_env(false, TRACEPARENT_ENV, crate::trace_context().traceparent())
+        .await;
 }
 
 #[cfg(test)]

@@ -80,7 +80,7 @@ impl DaemonLogger {
                 .finish(appender);
             reload
                 .modify(|layer| {
-                    *layer = Some(fmt::layer().with_ansi(false).with_writer(writer).boxed());
+                    *layer = Some(mlog::json_file_layer(writer, "minimald").boxed());
                 })
                 .map_err(|e| MainError::Other(format!("installing file log layer: {e}")))?;
             // The release: reload the file layer back off, then drop the guard
