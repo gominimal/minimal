@@ -237,7 +237,102 @@ impl Client {
         }
         Ok(())
     }
+
+    /// Requests the daemon's diagnostic bundle (`min bug`): sends `req` on the
+    /// [`minimald_rpc::DIAG_BUNDLE_SUBSYSTEM`] subsystem and collects the
+    /// streamed tar+zstd archive, up to `max_bytes`.
+    ///
+    /// Returns `(bytes, truncated)`. Errors the daemon reports — before or
+    /// during streaming — arrive over extended-data stream 1 and become the
+    /// `Err` here, discarding any partial bundle; a refused subsystem request
+    /// means the daemon predates the RPC.
+    pub async fn download_diag_bundle(
+        &mut self,
+        req: &minimald_rpc::DiagBundleRequest,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, bool), anyhow::Error> {
+        let mut channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .context("open channel for diagnostic bundle")?;
+
+        send_traceparent(&channel).await;
+        channel
+            .request_subsystem(true, minimald_rpc::DIAG_BUNDLE_SUBSYSTEM)
+            .await
+            .context(
+                "request DiagBundleTarZst subsystem \
+                 (daemon may predate the diagnostics RPC — upgrade minimald)",
+            )?;
+
+        let body = serde_json::to_vec(req).context("serialize diag request")?;
+        channel
+            .data(&body[..])
+            .await
+            .context("write diag request")?;
+        channel.eof().await.context("half-close diag request")?;
+
+        // Data carries the archive; extended-data stream 1 carries the
+        // daemon's error message.
+        let mut bundle = Vec::new();
+        let mut daemon_error = Vec::new();
+        let mut truncated = false;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { data } => {
+                    if bundle.len() + data.len() > max_bytes {
+                        bundle.extend_from_slice(&data[..max_bytes - bundle.len()]);
+                        truncated = true;
+                        break;
+                    }
+                    bundle.extend_from_slice(&data);
+                }
+                russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                    // Cap the accumulated message: a daemon streaming only
+                    // extended data must not balloon the CLI past the bound
+                    // the archive itself respects.
+                    let room = DAEMON_ERROR_MAX.saturating_sub(daemon_error.len());
+                    daemon_error.extend_from_slice(&data[..room.min(data.len())]);
+                }
+                // The daemon refused the subsystem (`want_reply` failure). A
+                // healthy daemon replies `Success` then streams; a refusal
+                // means it doesn't serve this RPC — bail now rather than block
+                // on `wait()` until the caller's deadline, since a bare refusal
+                // doesn't close the channel.
+                russh::ChannelMsg::Failure => anyhow::bail!(
+                    "daemon refused the {} subsystem — it likely predates the \
+                     diagnostics RPC (upgrade minimald)",
+                    minimald_rpc::DIAG_BUNDLE_SUBSYSTEM
+                ),
+                _ => {}
+            }
+        }
+
+        // A daemon error can also arrive mid-stream (tar finalization failed
+        // after bytes were sent); a partial archive without the error would be
+        // a silently corrupt diagnostic.
+        if !daemon_error.is_empty() {
+            let msg = String::from_utf8_lossy(&daemon_error);
+            anyhow::bail!(
+                "daemon reported an error{}: {msg}",
+                if bundle.is_empty() {
+                    ""
+                } else {
+                    " after streaming a partial bundle"
+                }
+            );
+        }
+        if bundle.is_empty() {
+            anyhow::bail!("daemon sent no bundle");
+        }
+        Ok((bundle, truncated))
+    }
 }
+
+/// Cap on the accumulated daemon error message (extended-data stream 1) for a
+/// diagnostic-bundle download.
+const DAEMON_ERROR_MAX: usize = 64 * 1024;
 
 /// Resolve the provider-instance dir (`<state dir>/providers/local-0`) the
 /// daemon and CLI agree on: `--minimal-dir` when set, else the default
