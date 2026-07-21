@@ -259,3 +259,46 @@ async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
     );
     assert_eq!(manifest["errors"].as_array().unwrap().len(), 0, "no errors");
 }
+
+/// R5.1–R5.3: the incident collectors (net/procs/power) land in the bundle,
+/// and interface MACs are masked to their vendor OUI. No daemon needed — these
+/// capture host state.
+#[tokio::test]
+async fn incident_collectors_land_and_mask_macs() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config = tempfile::TempDir::new().unwrap();
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let out = out_dir.path().join("diag.tar.zst");
+    cmd_bug(&global_args(state.path(), config.path()), bug_args(&out))
+        .await
+        .unwrap();
+    let files = unpack(&out).await;
+
+    for suffix in [
+        "host/process-tree.txt",
+        "host/net/listening.txt",
+        "host/net/interfaces.txt",
+        "host/net/routes.txt",
+        "host/power.txt",
+    ] {
+        assert!(
+            find(&files, suffix).is_some(),
+            "missing incident capture: {suffix}"
+        );
+    }
+
+    // R5.1: no full MAC survives in the interfaces capture — every one is
+    // masked to its OUI, so a 17-char `xx:xx:xx:xx:xx:xx` token never appears.
+    let interfaces = String::from_utf8_lossy(find(&files, "host/net/interfaces.txt").unwrap());
+    for tok in interfaces.split_whitespace() {
+        let is_mac = tok.len() == 17
+            && tok.bytes().enumerate().all(|(i, b)| {
+                if i % 3 == 2 {
+                    b == b':'
+                } else {
+                    b.is_ascii_hexdigit()
+                }
+            });
+        assert!(!is_mac, "un-masked MAC leaked into interfaces.txt: {tok}");
+    }
+}

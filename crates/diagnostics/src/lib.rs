@@ -29,12 +29,18 @@ pub mod disk;
 pub mod listing;
 pub mod logs;
 pub mod manifest;
+#[cfg(unix)]
+pub mod net;
+#[cfg(unix)]
+pub mod power;
+#[cfg(unix)]
+pub mod procs;
 pub mod redact;
 #[cfg(unix)]
 pub mod system;
 
 pub use bundle::{BundleSink, BundleWriter, LOG_TAIL_CAP, open_regular_nofollow};
-pub use capture::{Capture, CaptureError, command_capture, first_stdout_line};
+pub use capture::{Capture, CaptureError, command_capture, command_stdout, first_stdout_line};
 #[cfg(unix)]
 pub use disk::{DiskUsage, disk_usage};
 pub use listing::{Listing, listing};
