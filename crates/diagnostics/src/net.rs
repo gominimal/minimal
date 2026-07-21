@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use crate::bundle::{BundleSink, BundleWriter};
+use crate::bundle::{BundleSink, BundleWriter, scoped};
 use crate::capture::{CaptureError, command_stdout};
 use crate::manifest::Redaction;
 
@@ -46,13 +46,40 @@ pub async fn listening_sockets<W: BundleSink>(
         #[cfg(target_os = "linux")]
         Err(cmd_err) => format!(
             "(commands unavailable: {cmd_err})\n{}",
-            proc_net_listeners().await
+            proc_net_text(PROC_NET_SOCKET_TABLES).await
         ),
         #[cfg(not(target_os = "linux"))]
         Err(cmd_err) => return Err(cmd_err.into()),
     };
     w.add_bytes(
         &format!("{dest}/net/listening.txt"),
+        text.as_bytes(),
+        Redaction::None,
+    )
+    .await
+}
+
+/// The `/proc/net` socket tables, in the order a reader wants them.
+pub const PROC_NET_SOCKET_TABLES: &[&str] = &["tcp", "tcp6", "udp", "udp6", "unix"];
+
+/// `<dest>/net/<name>.txt`: the named raw `/proc/net` tables, concatenated
+/// verbatim behind a `=== /proc/net/<table> ===` banner each.
+///
+/// The tool-based captures above are the host's picture; this is the picture a
+/// process has when there are no tools at all — the microVM rootfs ships no
+/// `ss`, `ip`, or `netstat`, so `/proc/net` *is* the network state there. Which
+/// tables land where is the caller's policy (`("routes", ["route",
+/// "fib_trie"])` is the binary-free routes-and-addresses capture); an
+/// unreadable table is recorded inline as data rather than failing the run.
+pub async fn proc_net_tables<W: BundleSink>(
+    w: &mut BundleWriter<W>,
+    dest: &str,
+    name: &str,
+    tables: &[&str],
+) -> Result<(), anyhow::Error> {
+    let text = proc_net_text(tables).await;
+    w.add_bytes(
+        &scoped(dest, &format!("net/{name}.txt")),
         text.as_bytes(),
         Redaction::None,
     )
@@ -150,11 +177,10 @@ fn mask_macs(text: &str) -> String {
 }
 
 /// Raw `/proc/net` tables — not parsed; the dev team decodes hex
-/// address:port pairs, and fidelity beats prettiness in a fallback.
-#[cfg(target_os = "linux")]
-async fn proc_net_listeners() -> String {
+/// address:port pairs, and fidelity beats prettiness.
+async fn proc_net_text(tables: &[&str]) -> String {
     let mut text = String::new();
-    for table in ["tcp", "tcp6", "udp", "udp6", "unix"] {
+    for table in tables {
         let path = format!("/proc/net/{table}");
         text.push_str(&format!("=== {path} ===\n"));
         match tokio::fs::read_to_string(&path).await {

@@ -246,6 +246,20 @@ impl<W: BundleSink> BundleWriter<W> {
     }
 }
 
+/// Joins a caller-supplied group with a collector's fixed relative path.
+///
+/// Collectors are parameterized by a `dest` group so the same mechanic can
+/// serve a CLI bundle (`"host"`) and a daemon one. An **empty** group means
+/// the entry sits at the bundle root, which the daemon's rootless stream uses
+/// — joining it blindly would emit an absolute `/net/routes.txt` tar path.
+pub(crate) fn scoped(dest: &str, rel: &str) -> String {
+    if dest.is_empty() {
+        rel.to_string()
+    } else {
+        format!("{dest}/{rel}")
+    }
+}
+
 /// Opens `src` for reading without following symlinks and verifies on the
 /// descriptor that it is a regular file — the shared no-follow discipline
 /// for every content read that ends up in a bundle.
