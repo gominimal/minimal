@@ -187,9 +187,19 @@ pub(crate) fn pick_session(
         })
         .collect();
 
-    let choice = inquire::Select::new("Select a session to attach:", items)
-        .prompt_skippable()
-        .context("session picker")?;
+    let choice = match inquire::Select::new("Select a session to attach:", items).prompt_skippable()
+    {
+        Ok(c) => c,
+        // `prompt_skippable` already maps Esc (OperationCanceled) to `Ok(None)`.
+        // Ctrl-C (OperationInterrupted) is NOT covered by it — and because we
+        // run crossterm in raw mode, Ctrl-C is captured by inquire rather than
+        // delivered as SIGINT, so we must handle it here or the user sees
+        // "session picker: The operation was interrupted by the user" instead
+        // of a clean abort. Treat it like Esc: a dismissal returns `Ok(None)`,
+        // and the caller surfaces "session selection cancelled".
+        Err(inquire::InquireError::OperationInterrupted) => return Ok(None),
+        Err(e) => return Err(e).context("session picker"),
+    };
     Ok(choice.map(|c| c.entry))
 }
 
