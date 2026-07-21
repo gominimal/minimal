@@ -42,9 +42,6 @@ const MAX_LOG_TAIL_BYTES: u64 = 64 * 1024 * 1024;
 const LOG_FILES_MAX: usize = 5;
 /// Entry cap for the recursive state-dir listing.
 const LISTING_MAX_ENTRIES: usize = 100_000;
-/// Per-collector deadline. A wedged daemon is exactly when this bundle is
-/// wanted, so no single collector may hold the stream open indefinitely.
-const COLLECTOR_TIMEOUT: Duration = Duration::from_secs(30);
 /// Duplex buffer between the bundle writer and the channel pump.
 const PIPE_BUF: usize = 256 * 1024;
 /// The gvproxy management endpoint, reachable only from inside the switch
@@ -62,9 +59,14 @@ const GVPROXY_MGMT: (&str, u16) = ("192.168.127.254", 8080);
 const PROC_MARKERS: &[&str] = &["minimald", "min", "minimal"];
 
 /// Env vars whose *values* are safe and useful to include verbatim; everything
-/// else is reported by name only. The daemon carries its own list rather than
-/// sharing the CLI's because the interesting names differ — this one answers
-/// "which mode booted, and why is logging off".
+/// else is reported by name only. Answers "which mode booted, and why is
+/// logging off".
+///
+/// The daemon owns this list separately from the CLI's because the two are
+/// independent policies, free to diverge as `PROC_MARKERS` already has — they
+/// happen to hold the same names today. The resolving mechanic, including the
+/// fail-closed sensitive-name override, is
+/// [`diagnostics::redact::is_env_value_allowlisted`].
 const ENV_VALUE_ALLOWLIST_EXACT: &[&str] = &["RUST_LOG", "HOME", "PATH", "TERM", "SHELL"];
 const ENV_VALUE_ALLOWLIST_PREFIXES: &[&str] = &["MINIMAL_", "MINIMALD_", "MINVMD_", "XDG_"];
 
@@ -72,33 +74,26 @@ const ENV_VALUE_ALLOWLIST_PREFIXES: &[&str] = &["MINIMAL_", "MINIMALD_", "MINVMD
 /// A sensitive-shaped name always loses to the allowlist — `MINIMALD_TOKEN`
 /// matches the project prefix but must never leave the machine.
 fn is_env_value_allowlisted(name: &str) -> bool {
-    if diagnostics::redact::is_sensitive_key(name) {
-        return false;
-    }
-    ENV_VALUE_ALLOWLIST_EXACT.contains(&name)
-        || ENV_VALUE_ALLOWLIST_PREFIXES
-            .iter()
-            .any(|p| name.starts_with(p))
+    diagnostics::redact::is_env_value_allowlisted(
+        name,
+        ENV_VALUE_ALLOWLIST_EXACT,
+        ENV_VALUE_ALLOWLIST_PREFIXES,
+    )
 }
 
-/// Runs one collector future with [`COLLECTOR_TIMEOUT`]; failure or timeout is
-/// recorded in the manifest and the run continues. A macro (not a function) so
-/// the future's borrow of the writer ends before the error-recording arms
-/// re-borrow it.
+/// Logs a failed collector. The daemon streams its bundle to a remote client,
+/// so its own log is the only place an operator watching this host sees that a
+/// collector fell over.
+fn warn_collector(collector: &str, error: &str) {
+    tracing::warn!(%collector, %error, "diag collector failed");
+}
+
+/// The daemon's [`diagnostics::collect_step!`] — the shared deadline, manifest
+/// recording, and failure isolation, with the daemon's logging attached.
 macro_rules! collect_step {
-    ($w:expr, $name:expr, $fut:expr) => {{
-        let name: String = $name.into();
-        let started = std::time::Instant::now();
-        let failure = match tokio::time::timeout(COLLECTOR_TIMEOUT, $fut).await {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(format!("{e:#}")),
-            Err(_) => Some(format!("timed out after {COLLECTOR_TIMEOUT:?}")),
-        };
-        if let Some(error) = failure {
-            tracing::warn!(collector = %name, %error, "diag collector failed");
-            $w.error(name, error, started.elapsed());
-        }
-    }};
+    ($w:expr, $name:expr, $fut:expr) => {
+        diagnostics::collect_step!($w, $name, $fut, warn_collector)
+    };
 }
 
 pub(crate) async fn serve_stream_diag_bundle(
