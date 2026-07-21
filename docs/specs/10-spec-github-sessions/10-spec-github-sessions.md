@@ -1,6 +1,6 @@
 ---
 id: spec-github-sessions
-title: "GitHub-integrated minimald sessions — branch-ready activate, in-session push, PR on exit"
+title: "GitHub-integrated minimald sessions — daemon-held auth, mediated repo access, PR on exit"
 kind: prd
 status: planned
 supersedes:
@@ -10,361 +10,404 @@ supersedes:
 
 ## Context
 
-`minimald` hosts isolated development **sessions**: a client (`min`) talks to the
-daemon over SSH-on-a-Unix-socket, and each session owns a workspace directory that a
-user attaches into for interactive work. Today a session is seeded either by a one-shot
-**tarball copy-up** of the client's directory (`min activate --sync tarball`, the
-default) or by a host→session `git push min://<session>` bridge. Neither path talks to
-GitHub: there is no GitHub API client, no credential store, no notion of which GitHub
-user a session belongs to, and no end-of-session action. Any GitHub work today is
-entirely manual — the user injects a token by hand and runs `git`/`gh` inside the
-sandbox.
+`minimald` hosts isolated development **sessions**: a client (`min`) talks to the daemon
+over SSH-on-a-Unix-socket, and each session owns a workspace directory that a user (or an
+agent such as Claude) attaches into for interactive work. Today a session is seeded either
+by a one-shot **tarball copy-up** of the client's directory or by a host→session
+`git push min://<session>` bridge. Neither path talks to GitHub: there is no GitHub API
+client, no credential store, no notion of which GitHub user a session belongs to, and no
+end-of-session action. Any GitHub work today is entirely manual — a token is injected by
+hand and `git`/`gh` are run inside the sandbox.
 
-This makes the single most common developer loop — *start work on a branch, commit,
-push, open a PR* — awkward in a session. This PRD defines the **user requirements** for
-first-class GitHub support so that branch-based development in a session is as easy as it
-is on a laptop, while keeping credentials short-lived and least-privilege.
+This makes the most common developer loop — *start work on a branch, commit, push, open a
+PR* — awkward, and it forces a live credential into the sandbox. This PRD defines the
+**user requirements** for first-class GitHub support so that branch-based development in a
+session is as easy as it is on a laptop, **without any GitHub token ever entering the
+sandbox**.
 
-The design is grounded in what a **public GitHub App** can grant (see
-[Authentication model](#authentication-model)): short-lived, repo-scoped, refreshable
-tokens obtained through the OAuth **device flow**, attributing work to the **real user**.
+### Security model (the load-bearing decision)
+
+**`minimald` is the GitHub App client.** It runs the OAuth **device flow**, holds the
+resulting user token in the daemon, and is the only component that ever touches it.
+
+**The token never enters the sandbox.** Git operations and GitHub API calls made from
+inside a session are proxied back to `minimald` over the existing trusted transport (a
+`min git` facade, and the same facade for GitHub MCP). `minimald` performs the
+authenticated operation on the token's behalf and returns the result. The agent gets
+**scoped repo access without ever holding the credential.**
+
+**Access dies with the sandbox.** Because access is mediated by a live RPC channel to
+`minimald`, when the sandbox exits its ability to reach GitHub ends with it — there is no
+lingering token on disk to leak or reuse. This is deliberately preferred over injecting a
+short-lived token, and over a man-in-the-middle **egress proxy** that would intercept git
+traffic to splice in credentials: the facade is an explicit, auditable request surface
+rather than transparent interception, and it binds access to the sandbox lifetime.
+
+The design is grounded in what a **public GitHub App** grants (see
+[Authentication model](#authentication-model)): a user-to-server token obtained through
+the device flow, attributing work to the **real user**, scoped to the repositories and
+permissions the task needs.
 
 ## Goals
 
-- **G1 — Branch-ready on activate.** A user can activate a session against a branch and,
-  once attached, the workspace is a real git repository already on that branch — whether
-  the branch already exists on the remote or is created fresh from a base branch.
-- **G2 — Push during a session.** A user can explicitly push commits from the session to
-  the branch on GitHub at any time, using their own identity.
+- **G1 — Branch-ready on activate.** Activating a session pre-primes one or more repos and
+  puts each on the requested branch (checked out if it exists, else created from a base),
+  so the workspace is a ready git repo the moment the user attaches.
+- **G2 — Push during a session.** A user or agent can explicitly push commits at any time
+  through the mediated facade, attributed to the real user.
 - **G3 — PR on exit (opt-in).** At the end of work the user is prompted to open a pull
-  request for their branch, and can accept or decline.
-- **G4 — Real-user attribution.** Commits and PRs are authored by the actual user, not a
-  bot, and appear in GitHub audit logs as that user.
-- **G5 — Least-privilege, short-lived credentials.** GitHub access is scoped to the one
-  repository the session targets, limited to the permissions actually needed, expires
-  quickly, and is never persisted in the workspace.
-- **G6 — Grounded & incremental.** Every requirement maps to an existing extension seam
-  in the codebase; nothing depends on capabilities GitHub does not offer.
+  request, and can accept or decline.
+- **G4 — Real-user attribution.** Commits and PRs are authored by the actual user and
+  appear in GitHub audit logs as that user.
+- **G5 — No credential in the sandbox.** The token lives only in `minimald`; the sandbox
+  reaches GitHub exclusively through the mediated facade, and that access ends when the
+  sandbox exits.
+- **G6 — Least privilege with consent.** Access is scoped to the declared repos and a
+  minimal permission set; the requested scopes are always shown to the user; the task spec
+  may narrow them further.
+- **G7 — Grounded & incremental.** Every requirement maps to an existing extension seam
+  in the codebase (notably the `git push min://` bridge as prior art for the facade);
+  nothing depends on capabilities GitHub does not offer.
 
 ## Non-goals
 
-- **NG1** — Multi-repository sessions. One primary repo per session (see
-  [Future work](#future-work)).
-- **NG2** — Multi-tenant hosted operation (`minhosted`/`mincloud`, server-held tokens,
-  session→user authorization at scale). Primary scope is today's **single-user,
-  local-transport `minimald`**. Hosted operation is a documented downstream dependency.
-- **NG3** — Bot/app-attributed automation identity. Attribution is the real user.
-- **NG4** — A general merge/review workflow (approvals, required checks, auto-merge).
-  We open a PR; we do not manage its lifecycle.
-- **NG5** — Hosting or proxying arbitrary git forges. GitHub.com (public GitHub) only;
-  GitHub Enterprise Server is out of scope for the MVP.
-- **NG6** — Replacing the existing tarball / `git push min://` seeding paths; GitHub
+- **NG1** — User-*selectable* fine-grained scope control at launch. We **show** the
+  requested scopes (the OAuth obligation), but a per-scope toggle UI is not shipping at
+  launch (see [Future work](#future-work)). "Show our work, don't make it user-selectable
+  out of the gates."
+- **NG2** — Multi-*user* / multi-tenant operation inside one daemon. Local is treated as a
+  single **anonymous user** with prior authentications associated to it. The agreed
+  scaling axis is **multiple `minimald`s per host**, not multi-tenancy within one; remote
+  multi-user needs more thought.
+- **NG3** — Bot/app-attributed automation identity. Attribution is the real user. (The
+  installation-token, `app[bot]` path is retained only as a possible future transport
+  mode.)
+- **NG4** — A general merge/review workflow (approvals, required checks, auto-merge). We
+  open a PR; we do not manage its lifecycle.
+- **NG5** — GitHub Enterprise Server. Public GitHub.com only for the MVP.
+- **NG6** — `workflows` scope. GitHub Actions workflow permission is **explicitly
+  excluded** from the default and is not requested at launch.
+- **NG7** — Replacing the existing tarball / `git push min://` seeding paths; GitHub
   support is additive.
 
 ## Personas
 
 - **Solo developer (primary).** Runs `min` on their own machine, works on their own or
-  their org's repos, wants the laptop git loop inside a session without hand-managing
-  tokens.
-- **Agent-in-session.** An automated coding agent (e.g. Claude) running inside a session
-  that needs the same credential to `git push` and open a PR on the user's behalf.
+  their org's repos, wants the laptop git loop inside a session without ever handling a
+  token.
+- **Agent-in-session (Claude).** An automated coding agent running inside a session that
+  is told `min git` exists and uses it to push/pull and to reach the GitHub API — with no
+  credential in its environment.
 
 ## User stories
 
-- **US1** — *As a developer, I activate a session against `owner/repo` on branch
-  `feat/x`; when I attach, the workspace is already cloned and checked out to `feat/x`
-  (created from `main` if it didn't exist), with an authenticated `origin`.*
-- **US2** — *As a developer already in a local checkout, I activate a session from it and
-  the session's `origin` is wired to authenticate as me so I can push and open PRs
-  without pasting a token.*
-- **US3** — *As a developer, while working in a session I run one command to push my
-  branch to GitHub, and the push is attributed to me.*
-- **US4** — *As a developer, when I finish a session I'm asked whether to open a PR from
-  my branch into its base; if I accept, the PR is created and authored by me.*
-- **US5** — *As a security-conscious user, the GitHub token in my session is limited to
-  the one repo, expires within hours, refreshes transparently for long sessions, and is
-  never written into my project files.*
-- **US6** — *As an agent running in a session, I can use the same credential helper as a
-  human to push and open PRs, with no token embedded in the repo.*
+- **US1** — *As a developer, I declare `owner/repo@feat/x` (and optionally more repos) in
+  my task spec; when I attach, each is cloned and on the right branch (created from `main`
+  if absent).*
+- **US2** — *As a developer already in a local checkout, I activate from it and its
+  `origin` is wired so I can push/PR as me, without pasting a token.*
+- **US3** — *As an agent, I run `min git push` / `min git pull`; the operation succeeds and
+  is attributed to the user, and I never see a token.*
+- **US4** — *As a developer, when I finish I'm asked whether to open a PR from my branch
+  into its base; if I accept, the PR is created and authored by me.*
+- **US5** — *As a security-conscious user, no GitHub credential ever lands in my sandbox,
+  and when the sandbox exits its GitHub access is gone.*
+- **US6** — *As a security-conscious user creating a second sandbox, I'm asked whether to
+  reuse my existing authentication or mint a fresh, separately-scoped one.*
+- **US7** — *As a developer, at launch I can see exactly which repositories and permissions
+  are being requested before I approve.*
 
 ## Current state (grounding)
 
 | Capability | Today | Reference |
 |---|---|---|
 | Session activate | `min activate` = `CreateSession` → `ConfigureLoadout` [→ `SubmitVerdict`] → tarball upload; **no git/branch/repo flags** | `crates/minimal/src/lib.rs:943,239` |
-| Seed workspace | Tarball copy-up (one-shot) or `git push min://<session>` (host→session) | `crates/minimal/src/file_upload.rs`, `crates/minimal/src/git_remote.rs`, `crates/minimald/src/exec.rs:746` |
+| git-over-our-transport (prior art for the facade) | `git push min://<session>` bridges git's pack protocol over the RPC/SSH transport into a session (`git-receive-pack`) | `crates/minimal/src/git_remote.rs`, `crates/minimald/src/exec.rs:746` |
 | GitHub API / PR | **None** anywhere | — |
-| git CLI available on host | Yes (used for package sources) | `crates/checkouts/src/repo.rs` |
+| git CLI on the daemon host | Yes (used for package sources) | `crates/checkouts/src/repo.rs` |
 | Credential injection | **Deferred** — `class='Credential` file mappings are dropped; only env-var inherit works | `crates/mfile/src/package_composable.rs:26`, `crates/graph/src/env_setup.rs:132` |
-| Network egress to github.com | Reachable by default (HostNet); policy gating exists (allow-all default) | `crates/sessions/src/lib.rs:20`, `crates/minimald/src/net/policy.rs` |
+| Daemon egress to github.com | Reachable (HostNet default); egress policy gating exists | `crates/sessions/src/lib.rs:20`, `crates/minimald/src/net/policy.rs` |
 | Identity / user auth | **None** — `username` is an unauthenticated label over trusted local transport | `crates/minimald/src/connection.rs:271` |
-| Lifecycle hooks | Schema exists (`on_activate`/`on_destroy`/`on_failure`); **execution deferred** (logged only) | `crates/sessions/src/core/lifecyclehook.rs`, `crates/minimald/src/session_host.rs:245` |
-| Extension seams | `SessionConfig.attrs`, client `config.toml`, `Session` CLI subcommand group, `MinHosted`/`MinCloud` placeholders | `crates/minimald-rpc/src/lib.rs:206`, `crates/sessions/src/client/config.rs`, `docs/session-domain-diag.md` |
+| Task spec / session config | Free-form `attrs` on `SessionConfig`/`Record`; project `minimal.toml` `[session]` block | `crates/minimald-rpc/src/lib.rs:206`, `crates/mfile/src/lib.rs:374` |
+| CLI extension points | `Session` subcommand group; client `config.toml` | `crates/minimal/src/lib.rs:117`, `crates/sessions/src/client/config.rs` |
+| Hosted providers | Named as placeholders (`MinHosted`/`MinCloud`) | `docs/session-domain-diag.md` |
 
-**Implication:** this is greenfield. The MVP introduces (a) a GitHub App + device-flow
-auth client on the `min` side, (b) a git credential mechanism that injects short-lived
-tokens into a session without persisting them, (c) branch-aware activation, and (d) a
-client-driven PR-on-exit prompt. It must **unblock the deferred secrets path** for
-credential injection.
+**Implication:** greenfield, but the transport already exists. The `git push min://` bridge
+proves that git's pack protocol can be tunnelled over `minimald`'s RPC channel; the `min
+git` facade is the inverse direction (sandbox → daemon → GitHub) of the same idea. The MVP
+adds (a) a device-flow auth client **in `minimald`** with a token store; (b) the `min git`
+facade + GitHub-MCP proxy; (c) multi-repo pre-priming from the task spec; (d) scope
+resolution/consent; and (e) a client-driven PR-on-exit prompt. It must **unblock the
+deferred secrets path** — but only inside the daemon, never into the sandbox.
 
 ## Authentication model
 
-Public GitHub offers exactly the primitives this PRD needs; the requirements below are
-built on them.
+**A GitHub App** (not an OAuth App) named e.g. "minimal", **installed** on the user's
+account or org — installation is what grants private-repo access and lets access be scoped
+to specific repositories.
 
-**A GitHub App** (not an OAuth App — GitHub steers new integrations to Apps) named e.g.
-"minimal". It is **installed** on a user's account or org, which is what grants access to
-private repos and lets us scope to specific repositories.
+**`minimald` is the OAuth client.** It runs the **device flow** (the `min` CLI is only the
+surface that shows the verification URL + `user_code`); the user approves in a browser; and
+`minimald` receives and stores a **user access token** (~8h) plus a rotating **refresh
+token** (~6mo), associated with the local anonymous user. `minimald` refreshes
+transparently, so long sessions keep working. Because it is a user-to-server token, every
+operation `minimald` performs with it is attributed to the **real user** (G4).
 
-**User-to-server tokens via the device flow** (headless-friendly): the `min` CLI runs the
-OAuth **device flow** once, the user approves in a browser, and `min` receives a
-**user access token** (default **8-hour** expiry) plus a **refresh token** (rotating,
-**6-month** expiry). Requests made with this token attribute commits and PRs to the
-**real user** (`GIT_AUTHOR` = user), satisfying G4. `min` refreshes transparently, so
-sessions longer than 8 hours keep working.
+**Mediated access, no token in the sandbox.** The sandbox never receives the token.
+Instead:
 
-**Roles.** There is **one registered GitHub App** ("minimal"), owned by the project. The
-**`min` CLI is the device-flow client**: it uses the App's *public* `client_id` (the
-device authorization grant needs no client secret or private key) to obtain a
-**user-to-server** token for the human at the terminal. The **`minimald` daemon performs
-no OAuth** in this single-user MVP — it receives already-minted short-lived tokens via
-the in-session credential helper, and no App private key is stored anywhere.
-Authenticating (device-flow *login*) is distinct from **installing** the App on a
-repo/org: login proves the user's identity; installation lets that user token reach the
-repo. Both are required for private repos (R1.4). `minimald`/a backend would act *as the
-App* (server-to-server installation tokens minted from the private key) only in the
-future hosted/bot path — NG3/FW2/FW5, not the MVP.
+- **`min git`** — a facade available inside the session that proxies git operations
+  (`push`, `pull`, `fetch`, `clone`, …) back to `minimald` over the trusted transport;
+  `minimald` runs the real, authenticated operation against GitHub and streams the result
+  back. Agents are told `min git` exists and use it in place of raw `git`.
+- **GitHub MCP** — GitHub API access (issues, PRs, reviews) uses the **same facade**: the
+  MCP calls route through `minimald`, which holds the token and enforces scope.
 
-**Least privilege.** The App requests only the permissions the loop needs:
+This means the sandbox does **not** need direct `github.com` egress for GitHub work; only
+`minimald` does. Access is bound to the live facade channel and ends when the sandbox exits
+(G5).
 
-| Permission | Level | Why |
+**Scopes (least privilege + consent).**
+
+| Permission | Default | Notes |
 |---|---|---|
-| `contents` | write | clone, fetch, push, create branches, commit |
-| `pull_requests` | write | open/update PRs |
+| `contents` | **read/write** | clone, fetch, push, branches, commits |
+| `pull_requests` | **read/write** | open/update PRs |
+| `issues` | **read/write** | standard dev work (via GitHub MCP) |
 | `metadata` | read | mandatory baseline |
-| `workflows` | write | **only** if the branch touches `.github/workflows/` (edge case; request lazily / document) |
+| `workflows` | **excluded** | not requested at launch (NG6) |
 
-A user-to-server token is intersected with what the user can access *and* where the App
-is installed, so scope is naturally bounded to the single target repo (G5, NG1).
+- **Decision rule.** If the **task spec declares explicit required scopes** (optionally
+  per repo), use them. Otherwise fall back to the **defaults above and prompt the user at
+  launch** to approve.
+- **Show, don't (yet) select.** The requested scopes are always **displayed** to the user
+  before approval (the OAuth obligation to show requested access). A per-scope toggle UI is
+  deferred (NG1).
+- **Reuse-or-mint.** On creating a **subsequent** sandbox, prompt the user to either
+  **reuse** the existing authentication or **mint a fresh** token — keeping per-sandbox
+  scoping possible for the security-conscious.
 
-**Git transport.** Tokens are used as the HTTP password:
-`https://x-access-token:<token>@github.com/<owner>/<repo>.git`. (The username field is a
-convention; GitHub ignores it when a valid token is supplied.)
-
-**PR creation.** `POST /repos/{owner}/{repo}/pulls` with the user token, so the PR is
+**Transport.** When `minimald` talks to GitHub it uses the token as the HTTP password:
+`https://x-access-token:<token>@github.com/<owner>/<repo>.git`. PR creation is
+`POST /repos/{owner}/{repo}/pulls`, run by `minimald` with the user token so the PR is
 authored by the user.
 
-**Why not the alternatives** (recorded for reviewers):
-
-- *Installation access token only* (server-to-server, 1-hour, re-minted from the App
-  private key): simplest, but attributes work to `minimal[bot]` — rejected by the
-  attribution decision (NG3). Retained as a possible transport-only credential for a
-  future headless/hosted mode.
-- *Fine-grained PAT pasted by the user*: worst UX, user-managed expiry — rejected.
+**Why not an egress proxy.** A MITM egress proxy could splice credentials into git traffic
+transparently, but that hides access behind interception and still exposes authenticated
+egress to sandbox code. The `min git` facade is an explicit, auditable request surface,
+keeps the token entirely in the daemon, and ties access to the sandbox lifetime.
 
 ## Requirements
 
-Requirement IDs are stable (`Rx.y`); do not renumber after approval.
+Requirement IDs (`Rx.y`) are stable once this spec is approved; this is a pre-approval
+revision, so IDs are still being settled.
 
-### R1 — Authentication & identity
+### R1 — Authentication & identity (daemon-held)
 
-- **R1.1** `min` MUST authenticate the user to GitHub via the GitHub App **device flow**,
-  storing the resulting user + refresh tokens in the client's existing credential
-  location (never in a repo/workspace).
-- **R1.2** `min` MUST refresh the user access token using the refresh token before/at
-  expiry, transparently to the session, for the duration of the session.
-- **R1.3** A first-class command MUST exist to sign in and show status, under the
-  existing `Session`/top-level CLI surface (e.g. `min github login` / `min github status`),
-  reporting the authenticated GitHub login and whether the App is installed on the target
-  repo.
-- **R1.4** If the App is **not installed** on the target repo/org, `min` MUST detect this
+- **R1.1** `minimald` MUST authenticate to GitHub via the GitHub App **device flow**, and
+  MUST store the resulting user + refresh tokens **in the daemon** (never in a
+  workspace/sandbox). The `min` CLI MUST surface the verification URL and `user_code`.
+- **R1.2** `minimald` MUST refresh the user access token transparently for the life of any
+  session using it; an expired refresh token MUST trigger re-auth rather than silent
+  failure.
+- **R1.3** Tokens MUST be associated with the local **anonymous user** (NG2). Prior
+  authentications MUST be reusable across sandboxes (subject to R6.4 reuse-or-mint).
+- **R1.4** A first-class command surface MUST exist to sign in and inspect status (e.g.
+  `min github login` / `min github status`), reporting the authenticated login, token
+  validity, and whether the App is installed on each target repo.
+- **R1.5** If the App is **not installed** on a target repo/org, the flow MUST detect this
   and guide the user to the installation URL rather than failing opaquely.
-- **R1.5** A session MUST record which authenticated GitHub identity it is associated with
-  (for display and for scoping the credential), carried via `SessionConfig`/`Record`
-  (`attrs` initially, promotable to typed fields).
 
-### R2 — Branch-aware activation
+### R2 — Repo pre-priming & branch-aware activation
 
-- **R2.1** `min activate` MUST accept a GitHub target: repository (`owner/repo`), a
-  working branch, and an optional base branch (default = repo default branch).
-- **R2.2** **Server-side clone mode:** given `owner/repo@branch`, the session MUST clone
-  the repo into its workspace using the user's short-lived token and prepare the branch
-  **checkout-or-create**: if `branch` exists on the remote, check it out; otherwise create
-  it from the base branch. When the user attaches, the workspace is already on `branch`
-  with an authenticated `origin` (G1, US1).
-- **R2.3** **Adopt-local mode:** when activating from an existing local checkout (today's
-  tarball path), the session MUST wire `origin` to authenticate as the user and reconcile
-  the branch (checkout-or-create the requested branch, defaulting to the checkout's
-  current branch) so the user can push/PR without pasting a token (US2). The existing
-  tarball/`git push min://` seeding MUST continue to work unchanged when no GitHub target
-  is given (NG6).
-- **R2.4** Branch creation MUST NOT push implicitly; a newly created branch exists only in
-  the workspace until an explicit push (see R3), consistent with the explicit-push model.
-- **R2.5** Activation MUST fail cleanly with an actionable message when the repo is
-  inaccessible, the token lacks scope, or the base branch does not exist — never leaving a
-  half-prepared workspace.
-- **R2.6** Reuse the existing git-CLI wrapper pattern (`crates/checkouts`) and the
-  established activate RPC sequence rather than introducing a new git library or transport.
+- **R2.1** The **task spec** MUST support a repo pre-priming field listing **one or more**
+  repositories to prepare in the session (monorepo splits or multi-repo working sets, e.g.
+  `min-vm-mac` + shim + `minimal`).
+- **R2.2** For each repo, activation MUST accept a working branch and an optional base
+  branch (default = repo default branch), and MUST prepare it **checkout-or-create**:
+  check out `branch` if it exists on the remote, else create it from the base. When the
+  user attaches, each repo is already on its branch with a working `origin` (G1).
+- **R2.3** **Server-side clone mode:** given `owner/repo@branch`, `minimald` clones the
+  repo into the workspace using the daemon-held token.
+- **R2.4** **Adopt-local mode:** when activating from an existing local checkout (the
+  tarball path), the session MUST wire `origin` to route through the facade and reconcile
+  the branch (checkout-or-create, defaulting to the checkout's current branch). Existing
+  tarball / `git push min://` seeding MUST keep working when no GitHub target is given
+  (NG7).
+- **R2.5** Branch creation MUST NOT push implicitly; a new branch exists only in the
+  workspace until an explicit push (R3).
+- **R2.6** Activation MUST fail cleanly and actionably (repo inaccessible, missing scope,
+  base branch absent, App not installed) without leaving a half-primed workspace.
+- **R2.7** Cloning MUST reuse the existing git-CLI wrapper pattern (`crates/checkouts`) and
+  the established activate RPC sequence.
 
-### R3 — In-session credential & push
+### R3 — Mediated repo access (`min git` + MCP)
 
-- **R3.1** A session targeting GitHub MUST expose a git credential inside the sandbox such
-  that plain `git fetch`/`git push origin` works with **no token written into the
-  workspace** (G5, US5, US6).
-- **R3.2** *(Recommended mechanism)* The credential SHOULD be delivered via a **git
-  credential helper** in the session that fetches a **fresh short-lived token on demand**
-  from `min`/the daemon over the existing trusted transport, so the token is never
-  persisted to disk and is always current. Env-var injection MAY be offered as a fallback,
-  with its weaker security documented.
-- **R3.3** Delivering a GitHub credential into a session MUST go through the credential
-  path (unblocking the deferred `class='Credential` secrets strategy), and MUST be subject
-  to the existing env/patch **policy gating** (allow/deny).
-- **R3.4** A first-class **explicit** push action MUST exist (e.g. `min session push`
-  and/or plain `git push origin` inside the session). Pushing MUST be explicit; the system
-  MUST NOT auto-push commits (G2, US3).
-- **R3.5** The session MUST have network egress to `github.com` (443). Where egress policy
-  is restrictive (`own-ip` allowlist), github.com MUST be allowed for GitHub-enabled
-  sessions.
+- **R3.1** A **`min git`** facade MUST be available inside the session that proxies git
+  operations (`push`, `pull`, `fetch`, `clone`, `remote`, …) to `minimald`, which performs
+  the authenticated operation. **No GitHub token may enter the sandbox** (G5).
+- **R3.2** The session MUST advertise `min git` to agents (e.g. surfaced in the agent's
+  in-sandbox instructions) so Claude uses it in place of raw `git`.
+- **R3.3** GitHub **MCP** access MUST use the same facade — API calls route through
+  `minimald`, which holds the token and enforces scope — so issues/PR/review tooling works
+  without a credential in the sandbox.
+- **R3.4** A **first-class explicit push** action MUST exist (`min git push` and/or a
+  `min session push` convenience). Pushing MUST be explicit; the system MUST NOT auto-push.
+- **R3.5** Mediated access MUST be **bound to the sandbox lifetime**: when the sandbox
+  exits, its facade channel and thus its GitHub access MUST end (G5).
+- **R3.6** `minimald` (not the sandbox) MUST have egress to `github.com`. The sandbox MUST
+  NOT require direct `github.com` egress for facade-mediated GitHub operations.
 
 ### R4 — Pull request on exit
 
-- **R4.1** At end of work, the user MUST be **prompted** whether to open a PR for the
-  session branch into its base; no PR is created without confirmation (G3, US4).
-- **R4.2** Because attach-shell exit is not observed by the daemon and no daemon exit hook
-  runs today, the prompt MUST be **client-driven** — triggered on `min attach` shell exit
-  and/or an explicit teardown command (e.g. `min session finish` / enhanced `min destroy`).
-- **R4.3** On confirmation, `min` MUST ensure the branch is pushed (R3) and create the PR
-  via the GitHub API using the **user token**, so the PR is authored by the user (G4).
-- **R4.4** The PR body SHOULD be pre-populated from the repo's PR template if present, and
-  the PR MAY default to **draft**; base defaults to the branch's base (R2.1).
-- **R4.5** If a PR already exists for the branch, `min` MUST detect it and offer to update
-  / surface it rather than erroring or duplicating.
-- **R4.6** Declining the prompt MUST leave the pushed branch intact (PR can be opened
-  later); the flow MUST be non-blocking to session teardown.
+- **R4.1** At end of work, the user MUST be **prompted** whether to open a PR for a session
+  branch into its base; no PR is created without confirmation (G3).
+- **R4.2** Because attach-shell exit is not observed by the daemon today, the prompt MUST
+  be **client-driven** — on `min attach` shell exit and/or an explicit teardown command
+  (e.g. `min session finish` / enhanced `min destroy`).
+- **R4.3** On confirmation, the branch MUST be pushed (via the facade) and the PR created
+  by `minimald` using the daemon-held user token, so the PR is authored by the user (G4).
+- **R4.4** The PR body SHOULD pre-populate from the repo's PR template if present; base
+  defaults to the branch's base; draft-vs-ready is an open question (OQ2).
+- **R4.5** If a PR already exists for the branch, the flow MUST detect and surface/update
+  it rather than duplicating.
+- **R4.6** Declining MUST leave the pushed branch intact and MUST NOT block teardown. In a
+  multi-repo session, the prompt MUST cover each repo with unpushed/PR-able work.
 
-### R5 — Security & token handling
+### R5 — Scopes & least privilege
 
-- **R5.1** Tokens MUST be **short-lived** (user token ≤ 8h) and **refreshable**; expired
-  refresh tokens MUST trigger re-auth (device flow) rather than silent failure.
-- **R5.2** Tokens MUST be **repo-scoped** to the single target repository and requested
-  with **least-privilege** permissions (see [Authentication model](#authentication-model)).
-- **R5.3** Tokens MUST NOT be written into the workspace, committed, or captured in the
-  session tarball; credential material MUST be excluded from any workspace sync.
-- **R5.4** Tokens MUST be **redacted** from logs and diagnostic bundles (extend the
-  existing redaction denylist that already knows `GITHUB_TOKEN`).
-- **R5.5** On session destroy, any in-session credential material MUST be
-  invalidated/removed (helper de-registered; no lingering token on disk).
+- **R5.1** The default scope set MUST be `contents:rw`, `pull_requests:rw`, `issues:rw`,
+  `metadata:read`; `workflows` MUST be excluded (NG6).
+- **R5.2** If the task spec declares explicit required scopes (optionally per repo), the
+  system MUST use them; otherwise it MUST apply the defaults and **prompt at launch**.
+- **R5.3** The requested scopes (and repos) MUST be **displayed** to the user before
+  approval. A per-scope selection UI is out of scope for launch (NG1).
+- **R5.4** Token scope MUST be bounded to the declared repositories (least repo) and the
+  resolved permission set (least privilege).
 
-### R6 — Configuration & CLI surface
+### R6 — Token lifecycle & security
 
-- **R6.1** GitHub targets on activate SHOULD be expressible as CLI flags (e.g.
-  `--repo owner/repo`, `--branch`, `--base`) and MAY be defaulted from a `[github]` section
-  in the client `config.toml` and/or the project `minimal.toml` `[session]` block.
-- **R6.2** New session/GitHub state SHOULD be carried first via `SessionConfig.attrs`
-  (already plumbed end-to-end and persisted) and promoted to typed fields once stable;
-  new persisted fields MUST be `#[serde(default)]` for back-compat.
-- **R6.3** New commands SHOULD live under the existing `Session` subcommand group (e.g.
-  `min session push`, `min session pr`) and a small `github` group for auth
-  (`min github login/status`).
+- **R6.1** The token MUST live only in `minimald`; it MUST NOT be written into the
+  workspace, the sandbox environment, the session tarball, or any sandbox-visible file.
+- **R6.2** Tokens MUST be short-lived and refreshable (R1.2), and MUST be **redacted** from
+  logs and diagnostic bundles (extend the existing redaction denylist).
+- **R6.3** On sandbox exit/destroy, the facade channel MUST close so mediated access ends;
+  no credential material may persist in the workspace (R3.5).
+- **R6.4** **Reuse-or-mint:** creating a subsequent sandbox MUST prompt to reuse the
+  existing authentication or mint a fresh, separately-scoped token, preserving per-sandbox
+  scoping.
 
-### R7 — Observability & errors
+### R7 — Configuration, task spec & CLI surface
 
-- **R7.1** Auth, clone/branch, push, and PR steps MUST emit structured `tracing` spans and
-  actionable, non-secret error messages (e.g. "App not installed on owner/repo", "token
-  lacks contents:write", "base branch main not found").
-- **R7.2** `min github status` MUST let a user self-diagnose: who they are, token validity,
-  App installation state, and the session's target repo/branch.
+- **R7.1** Repo pre-priming and optional per-repo scopes MUST be expressible in the **task
+  spec** (project `minimal.toml` `[session]` and/or the activation request); carried first
+  via `SessionConfig.attrs` and promotable to typed fields, with new persisted fields
+  `#[serde(default)]` for back-compat.
+- **R7.2** New commands SHOULD live under the existing `Session` group (`min session
+  push`/`pr`) plus a small `github` group (`min github login`/`status`); `min git` is the
+  in-sandbox facade.
+
+### R8 — Observability & errors
+
+- **R8.1** Auth, clone/branch, facade, push, and PR steps MUST emit structured `tracing`
+  spans and actionable, non-secret errors (e.g. "App not installed on owner/repo", "scope
+  contents:write not granted", "base branch main not found").
+- **R8.2** `min github status` MUST let a user self-diagnose: identity, token validity, App
+  installation state, and each session repo's target/branch/scope.
 
 ## UX flows
 
-**Activate (server-side clone):**
+**First-time auth (device flow owned by `minimald`):**
 
 ```
-min github login                      # one-time device-flow auth
-min activate --repo owner/repo --branch feat/x [--base main] --attach
-# → session clones owner/repo, checks out feat/x (created from main if absent),
-#   wires authenticated origin; user lands in the workspace on feat/x
+min github login
+# → minimald starts the device flow; min shows:
+#     "Open https://github.com/login/device and enter code ABCD-1234"
+# → user approves in browser; minimald stores the token (local anonymous user)
 ```
 
-**Activate (adopt local checkout):**
+**Activate with pre-primed repos + scope consent:**
 
 ```
-cd ~/code/repo                        # existing git checkout
-min activate --branch feat/x --attach
-# → tarball seeds the workspace; origin re-wired to authenticate as the user;
-#   branch reconciled (checkout-or-create feat/x)
+# task spec lists repos (and optionally per-repo scopes)
+min activate --attach
+# → if the spec declares scopes: used directly
+#   else: "This session will request  repos: owner/api@feat/x, owner/web@feat/x
+#          scopes: contents:rw, pull_requests:rw, issues:rw  [approve? y/N]"
+# → (subsequent sandbox) "Reuse existing GitHub auth, or mint a fresh one? [reuse/mint]"
+# → each repo cloned and on its branch; user attaches
 ```
 
-**Work & push:**
+**Work & push (no token in sandbox):**
 
 ```
-# inside the session
+# inside the session (human or agent)
 git commit -am "…"
-min session push                      # or: git push origin feat/x  (explicit only)
+min git push                 # proxied to minimald; attributed to the user
 ```
 
 **Exit → PR:**
 
 ```
-exit                                  # min attach detects shell exit
-# → "Open a PR for feat/x → main? [y/N]"  → on y: ensure pushed, create PR as the user
+exit
+# → "Open a PR for owner/api feat/x → main? [y/N]"
+#    on y: facade pushes, minimald creates the PR authored by the user
 ```
 
 ## Technical grounding & integration seams
 
-- **Auth client:** new device-flow + token-refresh module on the `min` side; tokens in the
-  client credential store. No server-held secrets in the single-user MVP.
-- **Activate:** extend `ActivateArgs` (`crates/minimal/src/lib.rs:239`) and the
-  `CreateSession`/`ConfigureLoadout` sequence; carry the GitHub target via
-  `SessionConfig.attrs` (`crates/minimald-rpc/src/lib.rs:206`). Perform clone + branch
-  server-side using the `crates/checkouts` git-CLI wrapper pattern.
-- **Credential injection:** unblock the deferred secrets path
-  (`crates/mfile/src/package_composable.rs:26`, `crates/graph/src/env_setup.rs:132`);
-  implement the on-demand credential helper over the existing trusted transport; enforce
-  via `crates/sessions/src/core/policy.rs`.
-- **Push:** a `Session` subcommand (`crates/minimal/src/lib.rs:117`) plus in-session
-  `git push` working through the credential helper.
+- **Auth in `minimald`:** device-flow + token-refresh + token store in the daemon; unblock
+  the deferred secrets path (`crates/mfile/src/package_composable.rs:26`,
+  `crates/graph/src/env_setup.rs:132`) **daemon-side only**, never into the sandbox.
+- **`min git` facade:** model on the existing git-over-transport bridge
+  (`crates/minimal/src/git_remote.rs`, `crates/minimald/src/exec.rs:746`) — the inverse
+  direction (sandbox → daemon → GitHub). Reuse the `crates/checkouts` git-CLI wrapper for
+  the daemon-side operations.
+- **Pre-priming & activation:** extend `ActivateArgs` (`crates/minimal/src/lib.rs:239`) and
+  the `CreateSession`/`ConfigureLoadout` sequence; carry repos/scopes via
+  `SessionConfig.attrs` (`crates/minimald-rpc/src/lib.rs:206`).
+- **Scope consent / reuse-or-mint:** client-side prompts in the activate flow
+  (`crates/minimal/src/lib.rs:943`), driven by resolved scopes from the task spec.
 - **PR on exit:** client-driven prompt around `min attach`/`min destroy`
-  (`crates/minimal/src/lib.rs:1109,1322`); GitHub API call from `min`. (A future headless
-  path could implement the deferred `on_destroy` lifecycle-hook executor —
-  `crates/sessions/src/core/lifecyclehook.rs`, `crates/minimald/src/session_host.rs:245`.)
-- **Egress:** ensure github.com reachable under restrictive policies
-  (`crates/minimald/src/net/policy.rs`).
+  (`crates/minimal/src/lib.rs:1109,1322`); the API call is made by `minimald` with the
+  token. (A future headless path could implement the deferred `on_destroy` lifecycle-hook
+  executor — `crates/sessions/src/core/lifecyclehook.rs`,
+  `crates/minimald/src/session_host.rs:245`.)
+- **Egress:** `minimald` needs `github.com` egress (`crates/minimald/src/net/policy.rs`);
+  the sandbox does not, for mediated operations.
 
 ## Future work
 
-- **FW1** Multi-repo sessions (NG1) — broader token scope, per-repo branch/PR handling.
-- **FW2** Multi-tenant hosted operation (`minhosted`/`mincloud`, NG2) — a real
-  session→GitHub authorization layer and server-held/short-lived installation tokens; the
-  `MinHosted`/`MinCloud` placeholders in `docs/session-domain-diag.md` are the anchor.
-  With no local `min` at a terminal, the device authorization grant is driven from the
-  hosted side (the `user_code` is shown in the session/web UI for the user to approve) —
-  same grant, different display surface.
-- **FW3** Headless PR-on-exit via the deferred `on_destroy` lifecycle-hook executor.
-- **FW4** GitHub Enterprise Server support (NG5).
-- **FW5** Optional bot/installation-token transport mode for automation identities (NG3).
+- **FW1** Remote / multi-user auth (NG2) — associating tokens beyond the local anonymous
+  user; the agreed scaling axis is **multiple `minimald`s per host**, not multi-tenancy
+  within one. `MinHosted`/`MinCloud` in `docs/session-domain-diag.md` are the anchor; in a
+  hosted model the same device grant is driven from the hosted side (`user_code` shown in
+  the session/web UI).
+- **FW2** User-selectable fine-grained scope control at launch (NG1).
+- **FW3** Dynamic per-task-launch scope requests (see OQ1 — an active POC).
+- **FW4** Headless PR-on-exit via the deferred `on_destroy` lifecycle-hook executor.
+- **FW5** GitHub Enterprise Server (NG5).
+- **FW6** Optional bot/installation-token transport mode for automation identities (NG3).
 
 ## Open questions
 
-- **OQ1** Command namespacing: a dedicated `min github …` group vs. folding into
-  `min session …`. (Recommendation: `min github login/status` for auth, `min session
-  push/pr` for session actions.)
-- **OQ2** Default PR as **draft** vs. ready-for-review.
-- **OQ3** Whether to request `workflows:write` up front or lazily only when a diff touches
-  `.github/workflows/`.
-- **OQ4** Exit-detection UX: prompt on every `min attach` exit vs. only on an explicit
-  `min session finish`.
+- **OQ1** Whether scopes can be **dynamically requested per task launch** (POC in
+  progress), rather than fixed at first auth.
+- **OQ2** How to **present the scope list back through the `min` client** — the exact
+  consent UX (and draft-vs-ready default for PRs).
+- **OQ3** Reuse-or-mint default and granularity (per-repo vs per-session).
 
 ## Appendix — GitHub token reference
 
-| Property | User-to-server (chosen) | Installation (alt) |
+| Property | User-to-server (chosen) | Installation (future/alt) |
 |---|---|---|
-| Obtain | OAuth **device flow** | App JWT → `POST /app/installations/{id}/access_tokens` |
-| Lifetime | **8h** token + rotating **6-month** refresh token | **1h**, not refreshable (re-mint) |
+| Client / holder | **`minimald`** (device flow) | `minimald`/backend (App JWT) |
+| Obtain | OAuth **device flow** | `POST /app/installations/{id}/access_tokens` |
+| Lifetime | ~8h token + rotating ~6mo refresh token | ~1h, not refreshable (re-mint) |
 | Attribution | **Real user** | `app[bot]` |
-| Repo scoping | Intersection of user access ∩ App install | `repositories`/`repository_ids` at mint |
-| Git usage | `https://x-access-token:<token>@github.com/owner/repo.git` | same |
-| Permissions needed | `contents:write`, `pull_requests:write`, `metadata:read`, (`workflows:write` if CI files) | same |
+| Repo scoping | user access ∩ App install ∩ declared repos | `repositories`/`repository_ids` at mint |
+| In sandbox? | **Never** — mediated via `min git` / MCP facade | Never |
+| Default scopes | `contents:rw`, `pull_requests:rw`, `issues:rw`, `metadata:read`; **no `workflows`** | same policy |
 
 ### Sources
 
@@ -373,5 +416,6 @@ exit                                  # min attach detects shell exit
 - Authenticating as a GitHub App installation — <https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation>
 - Generating a user access token for a GitHub App — <https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app>
 - Authenticating on behalf of a user (device flow / attribution) — <https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-with-a-github-app-on-behalf-of-a-user>
+- Device flow — <https://docs.github.com/en/apps/creating-github-apps/writing-code-for-a-github-app/building-a-cli-with-a-github-app>
 - Refreshing user access tokens — <https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/refreshing-user-access-tokens>
 - Choosing permissions for a GitHub App — <https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app>
