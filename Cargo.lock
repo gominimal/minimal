@@ -3708,13 +3708,12 @@ dependencies = [
  "graph",
  "hakoniwa",
  "indoc",
- "json-subscriber",
  "libc",
  "mctx",
  "mfile",
  "minimald-rpc",
+ "mlog",
  "op",
- "opentelemetry-semantic-conventions 0.32.1",
  "ot",
  "path-absolutize",
  "paths",
@@ -3775,10 +3774,9 @@ dependencies = [
  "clap",
  "clap_complete",
  "fd-lock",
- "json-subscriber",
  "libc",
  "minimald-rpc",
- "opentelemetry-semantic-conventions 0.32.1",
+ "mlog",
  "paths",
  "russh",
  "russh-sftp",
@@ -3860,6 +3858,19 @@ dependencies = [
  "pkcs8",
  "rand_core 0.10.1",
  "sha3 0.11.0",
+]
+
+[[package]]
+name = "mlog"
+version = "0.0.1"
+dependencies = [
+ "json-subscriber",
+ "opentelemetry-semantic-conventions 0.32.1",
+ "serde_json",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "version",
 ]
 
 [[package]]

@@ -80,7 +80,7 @@ impl DaemonLogger {
                 .finish(appender);
             reload
                 .modify(|layer| {
-                    *layer = Some(json_file_layer(writer).boxed());
+                    *layer = Some(mlog::json_file_layer(writer, "minimald").boxed());
                 })
                 .map_err(|e| MainError::Other(format!("installing file log layer: {e}")))?;
             // The release: reload the file layer back off, then drop the guard
@@ -116,31 +116,4 @@ fn build_appender(
         .max_log_files(14)
         .build(log_dir)
         .map_err(|e| MainError::IO(std::io::Error::other(e), "building rotating log appender"))
-}
-
-/// The JSON-lines layer for file logs: flat records (span fields flattened to
-/// the top level, so `trace_id`/`span_id`/`conn`/`channel` are top-level keys
-/// OTLP-mapped consumers can copy), plus static resource fields named by the
-/// OTEL semantic conventions. The console layer stays human-format; this is
-/// only for the files `min bug` collects and tools parse.
-fn json_file_layer<S>(
-    writer: tracing_appender::non_blocking::NonBlocking,
-) -> json_subscriber::fmt::Layer<S, tracing_appender::non_blocking::NonBlocking>
-where
-    S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
-{
-    let mut layer = json_subscriber::fmt::layer()
-        .with_writer(writer)
-        .flatten_span_list_on_top_level(true)
-        .with_current_span(false);
-    let inner = layer.inner_layer_mut();
-    inner.add_static_field(
-        opentelemetry_semantic_conventions::attribute::SERVICE_NAME,
-        "minimald".into(),
-    );
-    inner.add_static_field(
-        opentelemetry_semantic_conventions::attribute::SERVICE_VERSION,
-        version::LONG_VERSION.into(),
-    );
-    layer
 }

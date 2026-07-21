@@ -21,6 +21,7 @@ members = [
     "crates/minimald",
     "crates/minimald-rpc",
     "crates/minvmd",
+    "crates/mlog",
     "crates/remote-client",
     "crates/remote-proto",
     "crates/sandbox2",
@@ -172,6 +173,7 @@ decode = { path = "crates/decode" }
 diagnostics = { path = "crates/diagnostics" }
 mctx = { path = "crates/mctx" }
 minimald-rpc = { path = "crates/minimald-rpc" }
+mlog = { path = "crates/mlog" }
 mfile = { path = "crates/mfile" }
 op = { path = "crates/op" }
 ot = { path = "crates/ot" }
