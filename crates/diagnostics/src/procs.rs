@@ -18,6 +18,12 @@ use crate::redact::{is_sensitive_key, redaction_placeholder};
 
 /// Timeout for `ps`; a wedged process table must not eat the collector budget.
 const PS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-pid `sample` deadline on macOS. Samples run concurrently, so the macOS
+/// pass is bounded by this rather than by its sum across pids.
+#[cfg(target_os = "macos")]
+const SAMPLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for the single `lsof` over the whole matched set.
+const LSOF_TIMEOUT: Duration = Duration::from_secs(8);
 /// Cap on how many matched processes get the deep hang-triage treatment — a
 /// runaway match list must not turn a bundle into a profiling session.
 const HANG_TRIAGE_PIDS_MAX: usize = 8;
@@ -67,7 +73,14 @@ pub async fn process_tree<W: BundleSink>(
 
     #[cfg(target_os = "linux")]
     for pid in pids {
-        if let Some(status) = proc_status(pid) {
+        // Synchronous `/proc` reads go to a blocking thread for the same reason
+        // as the scrape in `process_table`. A join error means the reader task
+        // panicked; treat it as "no status", the same as an unreadable `/proc`.
+        let status = tokio::task::spawn_blocking(move || proc_status(pid))
+            .await
+            .ok()
+            .flatten();
+        if let Some(status) = status {
             w.add_bytes(
                 &format!("{dest}/proc/{pid}.status"),
                 status.as_bytes(),
@@ -101,13 +114,38 @@ pub async fn hang_triage<W: BundleSink>(
         return Ok(());
     }
 
+    // macOS: sample every pid concurrently. Sequential per-pid deadlines would
+    // sum past the caller's collector budget — and a wedged process, the case
+    // this capture exists for, is exactly when each sample runs long — so the
+    // pass is bounded by one deadline instead of their sum. Worst case for the
+    // whole collector: ps (5s) + samples (10s) + lsof (8s) ≈ 23s.
     #[cfg(target_os = "macos")]
-    for &pid in &pids {
-        let path = format!("{dest}/proc/{pid}.sample.txt");
-        let pid_s = pid.to_string();
-        match command_stdout("sample", &[&pid_s, "1", "10"], Duration::from_secs(15)).await {
-            Ok(text) => w.add_bytes(&path, text.as_bytes(), Redaction::None).await?,
-            Err(e) => w.skip(path, format!("sample failed: {e}")),
+    {
+        let mut set = tokio::task::JoinSet::new();
+        for &pid in &pids {
+            set.spawn(async move {
+                let pid_s = pid.to_string();
+                let out = command_stdout("sample", &[&pid_s, "1", "10"], SAMPLE_TIMEOUT).await;
+                (pid, out)
+            });
+        }
+        let mut samples = Vec::with_capacity(pids.len());
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(sample) => samples.push(sample),
+                // A panicked sample task is a bug, not a diagnostic outcome —
+                // record it rather than dropping the pid silently.
+                Err(e) => w.skip(format!("{dest}/proc/"), format!("sample task failed: {e}")),
+            }
+        }
+        // Completion order is nondeterministic; keep bundle order by pid.
+        samples.sort_by_key(|(pid, _)| *pid);
+        for (pid, result) in samples {
+            let path = format!("{dest}/proc/{pid}.sample.txt");
+            match result {
+                Ok(text) => w.add_bytes(&path, text.as_bytes(), Redaction::None).await?,
+                Err(e) => w.skip(path, format!("sample failed: {e}")),
+            }
         }
     }
 
@@ -128,7 +166,7 @@ pub async fn hang_triage<W: BundleSink>(
         .collect::<Vec<_>>()
         .join(",");
     let path = format!("{dest}/proc/lsof.txt");
-    match command_stdout("lsof", &["-nP", "-p", &pid_list], Duration::from_secs(10)).await {
+    match command_stdout("lsof", &["-nP", "-p", &pid_list], LSOF_TIMEOUT).await {
         Ok(text) => w.add_bytes(&path, text.as_bytes(), Redaction::None).await?,
         Err(e) => w.skip(path, format!("lsof unavailable: {e}")),
     }
@@ -145,8 +183,19 @@ async fn process_table(markers: &[&str]) -> Result<(String, Vec<u32>), anyhow::E
             #[cfg(target_os = "linux")]
             {
                 use anyhow::Context as _;
-                proc_scrape(markers)
-                    .with_context(|| format!("ps failed ({_ps_err}), /proc fallback also failed"))
+                // The scrape walks all of `/proc` synchronously, so it runs on a
+                // blocking thread: a wedged `/proc` must strand that thread, not
+                // the worker whose collector timeout is the failsafe. `ps` being
+                // absent (microVM pid-1, a starved host) is exactly when that
+                // read is most likely to hang.
+                let markers: Vec<String> = markers.iter().map(|m| (*m).to_string()).collect();
+                tokio::task::spawn_blocking(move || {
+                    let markers: Vec<&str> = markers.iter().map(String::as_str).collect();
+                    proc_scrape(&markers)
+                })
+                .await
+                .context("proc scrape worker")?
+                .with_context(|| format!("ps failed ({_ps_err}), /proc fallback also failed"))
             }
             #[cfg(not(target_os = "linux"))]
             {
