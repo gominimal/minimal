@@ -9,12 +9,18 @@
 //! External tools are host-side extras used when present: `ps` for the table
 //! (a `/proc` scrape stands in), macOS `sample`, and one `lsof` over the set.
 
+// `Cow` and the placeholder are only reachable from the Linux `/proc` scrape,
+// which is the one path with true argv boundaries to redact per element.
+#[cfg(target_os = "linux")]
+use std::borrow::Cow;
 use std::time::Duration;
 
 use crate::bundle::{BundleSink, BundleWriter};
 use crate::capture::command_stdout;
 use crate::manifest::Redaction;
-use crate::redact::{is_sensitive_key, redaction_placeholder};
+use crate::redact::is_sensitive_key;
+#[cfg(target_os = "linux")]
+use crate::redact::redaction_placeholder;
 
 /// Timeout for `ps`; a wedged process table must not eat the collector budget.
 const PS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,22 +44,53 @@ fn argv0_matches(args: &str, markers: &[&str]) -> bool {
     })
 }
 
-/// Scrubs an argv line token-wise: any `key=value` token whose key trips the
-/// [sensitive-key policy](is_sensitive_key) has its value replaced by the
-/// redaction placeholder, so a secret passed on a command line never rides out
-/// in the process table.
-fn scrub_argv(line: &str) -> String {
-    line.split(' ')
-        .map(|tok| match tok.split_once('=') {
-            Some((key, value)) if is_sensitive_key(key) => {
-                let placeholder =
-                    redaction_placeholder(&serde_json::Value::String(value.to_string()));
-                format!("{key}={}", placeholder.as_str().unwrap_or("<redacted>"))
-            }
-            _ => tok.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+/// Scrubs one *true* argv element: a `key=value` whose key trips the
+/// [sensitive-key policy](is_sensitive_key) has its entire value replaced by
+/// the redaction placeholder — spaces included, because the element boundary
+/// is known here.
+///
+/// Only the `/proc` scrape has real argv boundaries to work with, so this is
+/// Linux-only; everywhere else [`scrub_flattened`] takes over.
+#[cfg(target_os = "linux")]
+fn scrub_arg(arg: &str) -> Cow<'_, str> {
+    match arg.split_once('=') {
+        Some((key, value)) if is_sensitive_key(key) => {
+            let placeholder = redaction_placeholder(&serde_json::Value::String(value.to_string()));
+            Cow::Owned(format!(
+                "{key}={}",
+                placeholder.as_str().unwrap_or("<redacted>")
+            ))
+        }
+        _ => Cow::Borrowed(arg),
+    }
+}
+
+/// Scrubs a command line whose argv boundaries are already lost. `ps` joins
+/// arguments with spaces, so `--password=hunter two` is indistinguishable from
+/// a secret followed by a separate argument; masking only up to the first space
+/// would emit the tail of the value verbatim.
+///
+/// So this is **fail-closed**: once a sensitive `key=` appears, the remainder
+/// of the line goes with it. A truncated process line is a far smaller loss
+/// than a half-masked secret in a bundle that gets mailed out. Where the real
+/// boundaries survive — the `/proc` scrape, whose argv is NUL-separated —
+/// [`scrub_arg`] is used per element instead and nothing is over-redacted.
+fn scrub_flattened(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    for (i, tok) in line.split(' ').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        if let Some((key, _)) = tok.split_once('=')
+            && is_sensitive_key(key)
+        {
+            out.push_str(key);
+            out.push_str("=<redacted> <argv tail withheld: token boundaries unrecoverable>");
+            return out;
+        }
+        out.push_str(tok);
+    }
+    out
 }
 
 /// `<dest>/process-tree.txt`, plus on Linux `<dest>/proc/<pid>.status` for each
@@ -224,7 +261,9 @@ async fn ps_table(markers: &[&str]) -> Result<(String, Vec<u32>), anyhow::Error>
         };
         let args = fields.skip(5).collect::<Vec<_>>().join(" ");
         if argv0_matches(&args, markers) {
-            text.push_str(&scrub_argv(line));
+            // `ps` already flattened argv to a space-joined string, so this
+            // line must be scrubbed fail-closed.
+            text.push_str(&scrub_flattened(line));
             text.push('\n');
             pids.push(pid);
         }
@@ -253,9 +292,20 @@ fn proc_scrape(markers: &[&str]) -> Result<(String, Vec<u32>), anyhow::Error> {
         let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
             continue;
         };
-        let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
-        if argv0_matches(&cmdline, markers) {
-            let _ = writeln!(text, "{pid} {}", scrub_argv(cmdline.trim_end()));
+        // `/proc/<pid>/cmdline` is NUL-separated, so the true argv boundaries
+        // are still intact here. Scrub each element on its own — a secret
+        // containing spaces is masked whole, and nothing after it is lost.
+        let argv: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect();
+        let Some(argv0) = argv.first() else {
+            continue;
+        };
+        if argv0_matches(argv0, markers) {
+            let scrubbed: Vec<Cow<'_, str>> = argv.iter().map(|a| scrub_arg(a)).collect();
+            let _ = writeln!(text, "{pid} {}", scrubbed.join(" "));
             pids.push(pid);
         }
     }
@@ -328,21 +378,44 @@ mod tests {
         assert!(!argv0_matches("grep minimald /home/u/notes", MARKERS));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn scrub_argv_masks_sensitive_key_value_tokens_only() {
-        let scrubbed = scrub_argv("minvmd --flag MINIMAL_AUTH_TOKEN=s3cr3t --port 8080");
-        assert!(
-            !scrubbed.contains("s3cr3t"),
-            "secret value masked: {scrubbed}"
+    fn scrub_arg_masks_the_whole_value_including_spaces() {
+        // True argv boundaries: the entire value is masked, spaces and all.
+        assert_eq!(
+            scrub_arg("--password=hunter two"),
+            "--password=<redacted:len=10>",
+            "a value with spaces must not be half-masked"
         );
+        assert_eq!(
+            scrub_arg("--port=8080"),
+            "--port=8080",
+            "non-sensitive kept"
+        );
+        assert_eq!(scrub_arg("--flag"), "--flag", "non key=value untouched");
+    }
+
+    #[test]
+    fn scrub_flattened_is_fail_closed_once_a_secret_appears() {
+        // `ps` already lost the boundaries, so everything after the secret is
+        // withheld rather than risking the tail of the value.
+        let scrubbed = scrub_flattened("minvmd --flag MINIMAL_AUTH_TOKEN=hunter two --port 8080");
+        assert!(!scrubbed.contains("hunter"), "secret masked: {scrubbed}");
+        assert!(
+            !scrubbed.contains("two"),
+            "the tail of a spaced secret must not survive: {scrubbed}"
+        );
+        assert!(!scrubbed.contains("8080"), "fail-closed tail: {scrubbed}");
+        assert!(scrubbed.starts_with("minvmd --flag"), "{scrubbed}");
         assert!(
             scrubbed.contains("MINIMAL_AUTH_TOKEN=<redacted"),
-            "sensitive key masked in place: {scrubbed}"
+            "{scrubbed}"
         );
-        assert!(scrubbed.contains("--flag"), "flags untouched: {scrubbed}");
-        assert!(
-            scrubbed.contains("--port 8080"),
-            "non-sensitive kept: {scrubbed}"
-        );
+    }
+
+    #[test]
+    fn scrub_flattened_leaves_a_clean_line_alone() {
+        let line = "minimald run --detach --instance-num 0";
+        assert_eq!(scrub_flattened(line), line);
     }
 }

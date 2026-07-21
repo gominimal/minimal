@@ -15,6 +15,12 @@ use crate::manifest::Redaction;
 const POWER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Sleep/wake transitions kept from the (potentially huge) power log.
 const POWER_EVENTS_MAX: usize = 100;
+/// Journal lines read before filtering. The capture buffers the command's
+/// whole stdout, so the read is bounded at the source rather than after the
+/// fact; suspend/resume lines are sparse enough that the newest few thousand
+/// comfortably cover [`POWER_EVENTS_MAX`] transitions.
+#[cfg(not(target_os = "macos"))]
+const JOURNAL_LINES_MAX: &str = "5000";
 
 /// The last [`POWER_EVENTS_MAX`] of `events` — the whole slice when it is
 /// shorter. The full pmset/journal log runs to megabytes; only the tail of the
@@ -82,9 +88,13 @@ pub async fn power<W: BundleSink>(
     // journal.
     #[cfg(not(target_os = "macos"))]
     {
+        // `-n` bounds the read at the source: `command_stdout` buffers all of
+        // stdout before returning, and a whole boot's kernel journal can run to
+        // many megabytes of which we keep 100 lines. `-n` yields the *newest*
+        // lines, which is the end we filter for anyway.
         match command_stdout(
             "journalctl",
-            &["-b", "-k", "--no-pager", "-q"],
+            &["-b", "-k", "--no-pager", "-q", "-n", JOURNAL_LINES_MAX],
             POWER_TIMEOUT,
         )
         .await

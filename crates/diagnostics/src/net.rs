@@ -103,33 +103,50 @@ pub async fn routes<W: BundleSink>(
     .await
 }
 
-/// Masks the device-unique half of every MAC address, keeping the vendor OUI:
-/// `f0:18:98:aa:bb:cc` → `f0:18:98:<redacted>`. Token-wise (whitespace-
-/// delimited) so IPv6 shorthand like `fe80::aa:bb:cc:dd:ee:ff` — colon-
-/// adjacent, never a standalone six-group token — is left alone.
-fn mask_macs(text: &str) -> String {
-    fn is_mac(tok: &str) -> bool {
-        tok.len() == 17
-            && tok.bytes().enumerate().all(|(i, b)| match i % 3 {
-                2 => b == b':',
-                _ => b.is_ascii_hexdigit(),
-            })
-    }
-    text.lines()
-        .map(|line| {
-            line.split(' ')
-                .map(|tok| {
-                    if is_mac(tok) {
-                        format!("{}:<redacted>", &tok[..8])
-                    } else {
-                        tok.to_string()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
+/// True when `tok` is exactly a six-group MAC address.
+fn is_mac(tok: &str) -> bool {
+    tok.len() == 17
+        && tok.bytes().enumerate().all(|(i, b)| match i % 3 {
+            2 => b == b':',
+            _ => b.is_ascii_hexdigit(),
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+}
+
+/// Masks the device-unique half of every MAC address, keeping the vendor OUI:
+/// `f0:18:98:aa:bb:cc` → `f0:18:98:<redacted>`.
+///
+/// Tokens are maximal runs of non-whitespace and every original separator is
+/// preserved byte-for-byte — `ifconfig` indents with tabs while `ip` uses
+/// spaces, and splitting on `' '` alone would leave a tab-adjacent MAC
+/// (`ether\tf0:18:98:aa:bb:cc`) inside a larger token and emit it unmasked.
+/// Whole-token matching is what keeps IPv6 shorthand like
+/// `fe80::aa:bb:cc:dd:ee:ff` — colon-adjacent, never a standalone six-group
+/// token — untouched.
+fn mask_macs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        // Copy the run of separators verbatim (spaces, tabs, newlines).
+        let sep = rest
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(rest.len());
+        out.push_str(&rest[..sep]);
+        rest = &rest[sep..];
+        if rest.is_empty() {
+            break;
+        }
+        // Then the token itself.
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let tok = &rest[..end];
+        if is_mac(tok) {
+            out.push_str(&tok[..8]);
+            out.push_str(":<redacted>");
+        } else {
+            out.push_str(tok);
+        }
+        rest = &rest[end..];
+    }
+    out
 }
 
 /// Raw `/proc/net` tables — not parsed; the dev team decodes hex
@@ -170,5 +187,24 @@ mod tests {
             "IPv6 survives: {out}"
         );
         assert!(out.contains("192.168.1.10"), "IPv4 survives: {out}");
+    }
+
+    /// A MAC separated by a tab must mask too — `ifconfig` indents with tabs,
+    /// and splitting on `' '` alone would emit it verbatim.
+    #[test]
+    fn mask_macs_is_whitespace_delimited_not_space_delimited() {
+        let out = mask_macs("\tether\tf0:18:98:aa:bb:cc\n  ether  02:42:ac:11:00:02  \n");
+        assert!(
+            !out.contains("f0:18:98:aa:bb:cc"),
+            "tab-adjacent MAC: {out}"
+        );
+        assert!(out.contains("f0:18:98:<redacted>"), "{out}");
+        assert!(out.contains("02:42:ac:<redacted>"), "{out}");
+        // Separators survive byte-for-byte, so the capture still reads as the
+        // tool printed it.
+        assert_eq!(
+            out, "\tether\tf0:18:98:<redacted>\n  ether  02:42:ac:<redacted>  \n",
+            "original whitespace preserved"
+        );
     }
 }
