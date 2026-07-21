@@ -1094,7 +1094,7 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
             // proceed without prompting — `--sync none` remains available
             // for explicit opt-out (#770).
             let should_upload = file_upload::is_vcs_root(upload_root.as_std_path())
-                || !std::io::stdin().is_terminal()
+                || !can_prompt_interactively()
                 || confirm(
                     &format!(
                         "{upload_root} is not a version control repository root. \
