@@ -23,15 +23,24 @@ pub const TRACEPARENT_ENV: &str = "TRACEPARENT";
 pub struct TraceContext {
     trace_id: [u8; 16],
     span_id: [u8; 8],
+    /// W3C trace-flags byte. Version 00 defines only bit 0 (`sampled`);
+    /// carried verbatim so a parsed parent's sampling decision survives
+    /// `child()` and re-emission rather than being rewritten to sampled.
+    flags: u8,
 }
+
+/// The `sampled` trace-flags bit. `mint()` sets it: this system has no
+/// sampler, so every trace it originates is collected.
+const SAMPLED: u8 = 0x01;
 
 impl TraceContext {
     /// Mints a fresh context: random non-zero trace and span ids (all-zero
-    /// ids are invalid per W3C and mean "absent" in OTLP).
+    /// ids are invalid per W3C and mean "absent" in OTLP), sampled.
     pub fn mint() -> Self {
         Self {
             trace_id: non_zero_random(),
             span_id: non_zero_random(),
+            flags: SAMPLED,
         }
     }
 
@@ -43,6 +52,7 @@ impl TraceContext {
         Self {
             trace_id: self.trace_id,
             span_id: non_zero_random(),
+            flags: self.flags,
         }
     }
 
@@ -56,32 +66,53 @@ impl TraceContext {
         hex::encode(self.span_id)
     }
 
-    /// The W3C `traceparent` value: `00-{trace_id}-{span_id}-01`
-    /// (version 00, sampled).
+    /// The W3C `traceparent` value: `00-{trace_id}-{span_id}-{flags}`
+    /// (version 00). A minted context is sampled (`01`); a parsed one
+    /// re-emits its parent's flags unchanged.
     pub fn traceparent(&self) -> String {
-        format!("00-{}-{}-01", self.trace_id_hex(), self.span_id_hex())
+        format!(
+            "00-{}-{}-{:02x}",
+            self.trace_id_hex(),
+            self.span_id_hex(),
+            self.flags
+        )
     }
 
     /// Parses a version-00 `traceparent` value. Anything malformed — wrong
-    /// shape, wrong lengths, non-hex, all-zero ids — is `None`; the receiver
-    /// mints fresh instead of erroring (a diagnostic aid must never fail a
-    /// request).
+    /// shape, wrong lengths, non-hex, uppercase hex, all-zero ids — is `None`;
+    /// the receiver mints fresh instead of erroring (a diagnostic aid must
+    /// never fail a request). The flags byte is preserved (see
+    /// [`traceparent`](Self::traceparent)).
     pub fn parse_traceparent(value: &str) -> Option<Self> {
         let mut parts = value.split('-');
         let version = parts.next()?;
         let trace_hex = parts.next()?;
         let span_hex = parts.next()?;
-        let flags = parts.next()?;
-        if parts.next().is_some() || version != "00" || flags.len() != 2 {
+        let flags_hex = parts.next()?;
+        // W3C version-00 fields are lowercase hex. `hex::decode` and
+        // `from_str_radix` would also accept uppercase, so reject it
+        // explicitly to keep the parser as strict as the header contract.
+        let lowercase_hex = |s: &str| !s.bytes().any(|b| b.is_ascii_uppercase());
+        if parts.next().is_some()
+            || version != "00"
+            || flags_hex.len() != 2
+            || !lowercase_hex(trace_hex)
+            || !lowercase_hex(span_hex)
+            || !lowercase_hex(flags_hex)
+        {
             return None;
         }
-        u8::from_str_radix(flags, 16).ok()?;
+        let flags = u8::from_str_radix(flags_hex, 16).ok()?;
         let trace_id: [u8; 16] = hex::decode(trace_hex).ok()?.try_into().ok()?;
         let span_id: [u8; 8] = hex::decode(span_hex).ok()?.try_into().ok()?;
         if trace_id == [0u8; 16] || span_id == [0u8; 8] {
             return None;
         }
-        Some(Self { trace_id, span_id })
+        Some(Self {
+            trace_id,
+            span_id,
+            flags,
+        })
     }
 }
 
@@ -148,18 +179,27 @@ mod tests {
             "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331",
             // trailing part
             "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01-xx",
+            // uppercase trace id (W3C fields are lowercase hex)
+            "00-0AF7651916CD43DD8448EB211C80319C-b7ad6b7169203331-01",
+            // uppercase span id
+            "00-0af7651916cd43dd8448eb211c80319c-B7AD6B7169203331-01",
+            // uppercase flags
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-0A",
         ] {
             assert!(
                 TraceContext::parse_traceparent(bad).is_none(),
                 "should reject: {bad}"
             );
         }
-        // A valid value with different flags still parses (flags are hex).
-        assert!(
-            TraceContext::parse_traceparent(
-                "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00"
-            )
-            .is_some()
-        );
+    }
+
+    #[test]
+    fn parsed_flags_are_preserved_not_rewritten_to_sampled() {
+        // A non-sampled (`00`) parent must re-emit `00`, not be flipped to `01`.
+        let tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00";
+        let ctx = TraceContext::parse_traceparent(tp).unwrap();
+        assert_eq!(ctx.traceparent(), tp);
+        // child() keeps the trace and inherits the parent's flags.
+        assert!(ctx.child().traceparent().ends_with("-00"));
     }
 }
