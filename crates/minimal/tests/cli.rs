@@ -214,7 +214,7 @@ async fn activate_creates_session() {
 
     let activate_args = ActivateArgs {
         name: Some("test-session".to_string()),
-        path: project.path().to_string_lossy().to_string(),
+        path: Some(project.path().to_string_lossy().to_string()),
         sync: SyncMode::Tarball,
         network: CliNetworkMode::NoNet,
         ingress: vec![],
@@ -252,7 +252,7 @@ async fn activate_uploads_project_files() {
 
     let activate_args = ActivateArgs {
         name: Some("upload-test".to_string()),
-        path: project.path().to_string_lossy().to_string(),
+        path: Some(project.path().to_string_lossy().to_string()),
         sync: SyncMode::Tarball,
         network: CliNetworkMode::NoNet,
         ingress: vec![],
@@ -284,6 +284,56 @@ async fn activate_uploads_project_files() {
 
     let mfile = sftp.read("minimal.toml").await.unwrap();
     assert!(mfile.starts_with(b"# test"));
+}
+
+// --- activate honours -C / --repo-dir (#873) ---
+
+/// Regression (#873): with no positional path, `activate` must upload the
+/// directory named by the global `-C`/`--repo-dir`, not the process cwd.
+#[tokio::test]
+async fn activate_honours_repo_dir_flag() {
+    let (daemon, args) = setup().await;
+
+    // The `-C` target: a project with an mfile and a marker file.
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+    std::fs::write(project.path().join("marker.txt"), "from -C").unwrap();
+
+    // `-C` points at the project; the positional path is omitted, so the
+    // resolution must fall back to `repo_dir` rather than the cwd.
+    let args = GlobalArgs {
+        repo_dir: Some(project.path().to_path_buf()),
+        ..args
+    };
+
+    let activate_args = ActivateArgs {
+        name: Some("repo-dir-test".to_string()),
+        path: None,
+        sync: SyncMode::Tarball,
+        network: CliNetworkMode::NoNet,
+        ingress: vec![],
+        loadout: vec![],
+        no_loadouts: false,
+        no_prompt: false,
+        attach: false,
+    };
+    cmd_activate(&args, activate_args).await.unwrap();
+
+    // The uploaded workspace must hold the `-C` project's files.
+    let mut sftp_client = daemon.server.connect().await;
+    let session_id = {
+        use minimald_rpc::ListSessions;
+        let resp = sftp_client.call::<ListSessions>(&()).await;
+        assert_eq!(resp.sessions.len(), 1);
+        resp.sessions[0].id
+    };
+    let sftp = sftp_client.open_sftp(session_id).await;
+    let marker = sftp.read("marker.txt").await.unwrap();
+    assert_eq!(marker, b"from -C");
 }
 
 // --- destroy ---

@@ -249,9 +249,10 @@ pub struct ActivateArgs {
     /// Optional session name
     #[arg(long, short)]
     pub name: Option<String>,
-    /// Project path to activate (defaults to current directory)
-    #[arg(default_value = ".")]
-    pub path: String,
+    /// Project path to activate. When omitted, falls back to the global
+    /// `-C`/`--repo-dir`, then to the current directory. An explicit path
+    /// here wins over `-C`.
+    pub path: Option<String>,
     /// How to load project files into the session.
     #[arg(long, value_enum, default_value_t = SyncMode::Tarball)]
     pub sync: SyncMode,
@@ -981,12 +982,27 @@ fn resolve_upload_root(dir: &camino::Utf8Path) -> Result<camino::Utf8PathBuf, an
     }
 }
 
+/// Resolve the project directory an activation should target.
+///
+/// The positional `PATH` wins when given; otherwise the global
+/// `-C`/`--repo-dir` supplies it, mirroring how [`build_config`] roots the
+/// local build-system commands (`init`, `add`, `update`). Only when neither
+/// is set does it fall back to the current directory. Without this fallback
+/// `min -C /dir activate` silently uploaded the process cwd (#873).
+fn resolve_activate_path(path: Option<&str>, repo_dir: Option<&std::path::Path>) -> PathBuf {
+    match path {
+        Some(p) => PathBuf::from(p),
+        None => repo_dir.map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf),
+    }
+}
+
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
 
-    let project_path = std::fs::canonicalize(&args.path)
-        .with_context(|| format!("Cannot resolve project path '{}'", args.path))?;
+    let path_arg = resolve_activate_path(args.path.as_deref(), global.repo_dir.as_deref());
+    let project_path = std::fs::canonicalize(&path_arg)
+        .with_context(|| format!("Cannot resolve project path '{}'", path_arg.display()))?;
 
     let utf8_path = camino::Utf8PathBuf::from_path_buf(project_path)
         .map_err(|_| anyhow::anyhow!("Project path is not valid UTF-8"))?;
@@ -2042,6 +2058,27 @@ mod tests {
             hosts_file.contains(r#"q\"uote"#) && hosts_file.contains(r"back\\slash"),
             "path must reach ssh escaped, got: {hosts_file}"
         );
+    }
+
+    /// Regression (#873): `activate` must consult `-C`/`--repo-dir` when no
+    /// positional path is given, rather than silently defaulting to the cwd.
+    /// An explicit positional path still wins over `-C`.
+    #[test]
+    fn resolve_activate_path_prefers_positional_then_repo_dir_then_cwd() {
+        let repo = std::path::Path::new("/tmp/tiny-project");
+
+        // Explicit positional wins, even when `-C` is also set.
+        assert_eq!(
+            resolve_activate_path(Some("/explicit"), Some(repo)),
+            PathBuf::from("/explicit"),
+        );
+        // No positional: fall back to `-C` instead of the cwd.
+        assert_eq!(
+            resolve_activate_path(None, Some(repo)),
+            PathBuf::from("/tmp/tiny-project"),
+        );
+        // Neither set: the current directory.
+        assert_eq!(resolve_activate_path(None, None), PathBuf::from("."));
     }
 
     #[test]
