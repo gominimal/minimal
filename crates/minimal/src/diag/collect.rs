@@ -292,3 +292,102 @@ pub async fn provider_dirs(state: &Path) -> Result<Vec<(String, PathBuf)>, std::
     dirs.sort();
     Ok(dirs)
 }
+
+/// Non-log per-provider evidence: what the instance dir holds, its raw
+/// lifecycle state, and whether anything is still alive behind it (R7.6).
+///
+/// `run.log`/`boot.log` are deliberately *not* collected here — [`logs`]
+/// already tail-caps them for every discovered provider, and a second copy
+/// would be a duplicate archive entry.
+pub async fn provider_files(
+    w: &mut BundleWriter,
+    name: &str,
+    dir: &Path,
+) -> Result<(), anyhow::Error> {
+    // Shallow inventory of the instance dir: which sockets, locks, keys and
+    // images exist. Metadata only — the walk is synchronous, so it runs on a
+    // blocking thread like every other listing.
+    let listing_dir = dir.to_path_buf();
+    let listing = tokio::task::spawn_blocking(move || {
+        diagnostics::listing(&listing_dir, LISTING_MAX_ENTRIES)
+    })
+    .await
+    .context("provider listing worker")?;
+    let dest = format!("providers/{name}/dir-listing.txt");
+    match listing {
+        Ok(listing) => {
+            w.add_bytes(&dest, listing.text.as_bytes(), Redaction::ListingOnly)
+                .await?
+        }
+        Err(e) => w.skip(&dest, format!("unreadable: {e:#}")),
+    }
+
+    w.skip(
+        format!("providers/{name}/ssh_host_ed25519_key"),
+        "private key material — never collected",
+    );
+
+    // Lifecycle state, verbatim (nothing sensitive: enum + pid + timestamp).
+    let dest = format!("providers/{name}/minvmd.toml");
+    match tokio::fs::read(dir.join("minvmd.toml")).await {
+        Ok(bytes) => w.add_bytes(&dest, &bytes, Redaction::None).await?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => w.skip(&dest, format!("unreadable: {e}")),
+    }
+
+    let status_dir = dir.to_path_buf();
+    let status = tokio::task::spawn_blocking(move || provider_status(&status_dir))
+        .await
+        .context("provider status worker")?;
+    let json = serde_json::to_vec_pretty(&status).context("serializing provider status")?;
+    w.add_bytes(
+        &format!("providers/{name}/status.json"),
+        &json,
+        Redaction::None,
+    )
+    .await
+}
+
+#[derive(Serialize)]
+struct ProviderStatus {
+    /// Raw lifecycle from `minvmd.toml` — never repaired/written back.
+    state: Option<toml::Table>,
+    state_read_error: Option<String>,
+    /// A live minvmd (or its VMM child) holds `minvmd.lock`.
+    minvmd_alive: Option<bool>,
+    /// A live native minimald holds `minimald.lock`.
+    minimald_alive: Option<bool>,
+}
+
+/// Reads the provider's lifecycle state and probes the advisory locks.
+///
+/// Deliberately *not* `StateDir::effective_state()`, which repairs stale state
+/// by writing `Stopped` back — a diagnostic must never mutate what it reads.
+/// Synchronous (file locks and `std::fs`); callers run it on a blocking thread.
+fn provider_status(dir: &Path) -> ProviderStatus {
+    let state_dir = match minvmd::state::StateDir::new(dir.to_path_buf()) {
+        Ok(state_dir) => state_dir,
+        Err(e) => {
+            return ProviderStatus {
+                state: None,
+                state_read_error: Some(e.to_string()),
+                minvmd_alive: None,
+                minimald_alive: None,
+            };
+        }
+    };
+    let (state, state_read_error) = match std::fs::read_to_string(state_dir.state_path()) {
+        Ok(s) => match s.parse::<toml::Table>() {
+            Ok(table) => (Some(table), None),
+            Err(e) => (None, Some(e.to_string())),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+    ProviderStatus {
+        state,
+        state_read_error,
+        minvmd_alive: state_dir.daemon_alive().ok(),
+        minimald_alive: state_dir.minimald_alive().ok(),
+    }
+}
