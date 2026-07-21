@@ -963,17 +963,21 @@ fn offer_mfile_scaffold(
 /// workspace, walking up from `dir` to the nearest `minimal.toml` and using
 /// its repo root. Falls back to `dir` itself when no mfile is found, so a
 /// project without one still activates — the daemon fabricates a default
-/// config inside the session workspace. A malformed mfile also falls back
-/// to `dir`; the daemon surfaces the parse error when it loads the
-/// uploaded workspace.
-fn resolve_upload_root(dir: &camino::Utf8Path) -> camino::Utf8PathBuf {
+/// config inside the session workspace. Any other mfile error (malformed
+/// TOML, I/O) is propagated: a broken config in an ancestor should fail
+/// loudly rather than silently uploading a subdir with no config.
+fn resolve_upload_root(dir: &camino::Utf8Path) -> Result<camino::Utf8PathBuf, anyhow::Error> {
     match mfile::File::from_dir_recursive(dir.as_std_path()) {
         Ok(f) => match f.repo_path() {
-            Some(root) => camino::Utf8PathBuf::from_path_buf(root.to_path_buf())
-                .unwrap_or_else(|_| dir.to_path_buf()),
-            None => dir.to_path_buf(),
+            Some(root) => Ok(camino::Utf8PathBuf::from_path_buf(root.to_path_buf())
+                .unwrap_or_else(|_| dir.to_path_buf())),
+            None => Ok(dir.to_path_buf()),
         },
-        Err(_) => dir.to_path_buf(),
+        Err(mfile::Error::NotFound) => Ok(dir.to_path_buf()),
+        Err(e) => Err(anyhow::anyhow!(
+            "found a broken {name} while walking up from {dir}: {e}",
+            name = mfile::MFILE_NAME,
+        )),
     }
 }
 
@@ -1069,11 +1073,9 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
             // `minimal activate ./subdir` still uploads the whole
             // project. Falls back to `utf8_path` when no mfile is found
             // anywhere up the tree (#770).
-            let upload_root = resolve_upload_root(&utf8_path);
+            let upload_root = resolve_upload_root(&utf8_path)?;
             if upload_root != utf8_path {
-                eprintln!(
-                    "Uploading from project root {upload_root} (resolved from {utf8_path})"
-                );
+                eprintln!("Uploading from project root {upload_root} (resolved from {utf8_path})");
             }
             // Guard against accidentally uploading a non-VCS directory
             // (e.g. `~`): if the resolved project root is not a recognized
@@ -1083,10 +1085,13 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
             // for explicit opt-out (#770).
             let should_upload = file_upload::is_vcs_root(upload_root.as_std_path())
                 || !std::io::stdin().is_terminal()
-                || confirm(&format!(
-                    "{upload_root} is not a version control repository root. \
-                     Upload all files from this directory?"
-                ))?;
+                || confirm(
+                    &format!(
+                        "{upload_root} is not a version control repository root. \
+                         Upload all files from this directory?"
+                    ),
+                    false,
+                )?;
             if should_upload {
                 eprintln!("Uploading project files...");
                 client
@@ -2089,7 +2094,7 @@ mod tests {
     fn resolve_upload_root_returns_input_when_no_mfile() {
         let dir = tempfile::tempdir().unwrap();
         let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
-        assert_eq!(resolve_upload_root(path), path);
+        assert_eq!(resolve_upload_root(path).unwrap(), path);
     }
 
     /// `resolve_upload_root` walks up to the nearest mfile and returns its
@@ -2108,7 +2113,7 @@ mod tests {
         let subdir = root.join("nested/deep");
         std::fs::create_dir_all(&subdir).unwrap();
 
-        assert_eq!(resolve_upload_root(&subdir), root);
+        assert_eq!(resolve_upload_root(&subdir).unwrap(), root);
     }
 
     #[test]
@@ -2125,17 +2130,17 @@ mod tests {
         let subdir = root.join("nested");
         std::fs::create_dir_all(&subdir).unwrap();
 
-        assert_eq!(resolve_upload_root(&subdir), root);
+        assert_eq!(resolve_upload_root(&subdir).unwrap(), root);
     }
 
-    /// `from_dir_recursive` propagates parse errors up, so a malformed
-    /// mfile falls back to the input dir. The daemon surfaces the parse
-    /// error later when it loads the uploaded workspace.
+    /// A malformed mfile is a real error, not a "not found": propagate it
+    /// so the user sees the parse failure instead of silently uploading a
+    /// subdir with no config and letting the daemon fabricate a default.
     #[test]
-    fn resolve_upload_root_falls_back_on_malformed_mfile() {
+    fn resolve_upload_root_errors_on_malformed_mfile() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
         let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
-        assert_eq!(resolve_upload_root(path), path);
+        assert!(resolve_upload_root(path).is_err());
     }
 }
