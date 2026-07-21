@@ -154,5 +154,11 @@ in
         name = "build cost multiple",
         desc = "Hint to build infrastructure that this build is much more intensive than the typical, by some factor.",
         validate = Number,
+    },
+
+    redistributable = {
+        name = "redistributable",
+        desc = "Whether built artifacts of this package may be redistributed through a shared binary cache. Absent means true. Set false when the upstream license or terms forbid redistribution: build infrastructure then neither uploads, indexes, nor seals the artifacts, and consumers build the package locally from the upstream source.",
+        validate = Bool,
     }
 }

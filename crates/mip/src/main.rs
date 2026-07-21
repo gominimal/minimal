@@ -44,8 +44,8 @@ mod cmd_remote_build;
 use cmd_remote_build::{RemoteBuildArgs, cmd_remote_build};
 
 #[derive(Parser)]
-#[command(name = "minimal", version = version::VERSION, long_version = version::LONG_VERSION)]
-#[command(about = "The Minimal CLI")]
+#[command(name = "mip", version = version::VERSION, long_version = version::LONG_VERSION)]
+#[command(about = "mip, the Minimal package/build CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -67,11 +67,11 @@ enum Command {
     Init(InitArgs),
     /// Shows the status of Minimal in this codebase.
     Status(StatusArgs),
-    /// Launches a development shell. Shorthand for `minimal run shell`.
+    /// Launches a development shell. Shorthand for `mip run shell`.
     Shell,
-    /// Runs the build task. Shorthand for `minimal run build`.
+    /// Runs the build task. Shorthand for `mip run build`.
     Build,
-    /// Runs the test task. Shorthand for `minimal run test`.
+    /// Runs the test task. Shorthand for `mip run test`.
     Test,
     /// Materializes an output specified in `minimal.toml`.
     Materialize(MaterializeArgs),
@@ -104,13 +104,13 @@ enum Command {
     Dump(DumpArgs),
     /// Generates Graphviz source code of the dependency graph
     #[command(
-        long_about = "Generate an image of the dependency graph using graphviz's \"dot\" program.\n\n  minimal dep --input_deps_depth=0 -p file | dot -Tpng > deps.png"
+        long_about = "Generate an image of the dependency graph using graphviz's \"dot\" program.\n\n  mip dep --input-deps-depth=0 | dot -Tpng > deps.png"
     )]
     Dep(DepArgs),
 
     /// Generate shell completion script
     #[command(
-        long_about = "Generate a shell tab-completion script for the minimal CLI for your shell.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(minimal completions bash)"
+        long_about = "Generate a shell tab-completion script for the mip CLI for your shell.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(mip completions bash)"
     )]
     Completions(CompletionsArgs),
 }
