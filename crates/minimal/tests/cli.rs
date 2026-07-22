@@ -204,8 +204,11 @@ async fn activate_creates_session() {
     let (daemon, args) = setup().await;
 
     // Create a temp project dir with a minimal.toml so the
-    // missing-mfile prompt doesn't fire.
+    // missing-mfile prompt doesn't fire. Mark it as a VCS root so
+    // the non-VCS upload confirmation (#790) short-circuits instead
+    // of blocking on stdin when the test binary is attached to a TTY.
     let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
         "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
@@ -240,7 +243,11 @@ async fn activate_uploads_project_files() {
     let (daemon, args) = setup().await;
 
     // Create a temp project dir with a minimal.toml and some files.
+    // Mark it as a VCS root so the non-VCS upload confirmation (#790)
+    // short-circuits instead of blocking on stdin when the test
+    // binary is attached to a TTY.
     let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
         "# test\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",

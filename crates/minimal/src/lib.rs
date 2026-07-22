@@ -1090,10 +1090,11 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
             // Guard against accidentally uploading a non-VCS directory
             // (e.g. `~`): if the resolved project root is not a recognized
             // VCS root, warn and ask for confirmation before the recursive
-            // upload. On non-interactive stdin (CI, pipes, agents) we
-            // proceed without prompting — `--sync none` remains available
-            // for explicit opt-out (#770).
+            // upload. On non-interactive stdin (CI, pipes, agents) and under
+            // `--no-prompt` we proceed without prompting — `--sync none`
+            // remains available for explicit opt-out (#770).
             let should_upload = file_upload::is_vcs_root(upload_root.as_std_path())
+                || args.no_prompt
                 || !can_prompt_interactively()
                 || confirm(
                     &format!(
