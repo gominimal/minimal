@@ -25,7 +25,6 @@ use paths::DaemonAbsPath;
 use russh::keys::ssh_key;
 use sessions::SessionId;
 use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 use minimald_rpc::OneshotSshRpc;
@@ -209,17 +208,34 @@ impl TestClient {
     /// Panics on any transport or codec failure — appropriate for unit
     /// tests, which want loud failure rather than recovery.
     pub async fn call<R: OneshotSshRpc>(&mut self, req: &R::Request<'_>) -> R::Response {
-        let channel = self.handle.channel_open_session().await.unwrap();
-        channel.request_subsystem(false, R::NAME).await.unwrap();
+        let mut channel = self.handle.channel_open_session().await.unwrap();
+        channel.request_subsystem(true, R::NAME).await.unwrap();
 
         let body = serde_json::to_vec(req).expect("request serializes");
-        let mut stream = channel.into_stream();
-        stream.write_all(&body).await.unwrap();
-        stream.shutdown().await.unwrap();
+        channel.data_bytes(body).await.unwrap();
+        channel.eof().await.unwrap();
 
-        let mut response_buf = Vec::with_capacity(1024);
-        stream.read_to_end(&mut response_buf).await.unwrap();
-        serde_json::from_slice(&response_buf).expect("response deserializes")
+        let mut resp_buf = Vec::with_capacity(1024);
+        let mut err_buf = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { data } => resp_buf.extend_from_slice(&data),
+                russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                    err_buf.extend_from_slice(&data)
+                }
+                _ => {}
+            }
+        }
+
+        if !err_buf.is_empty() {
+            panic!(
+                "{} RPC failed on the daemon side: {}",
+                R::NAME,
+                String::from_utf8_lossy(&err_buf)
+            );
+        }
+
+        serde_json::from_slice(&resp_buf).expect("response deserializes")
     }
 
     /// Opens an SFTP session attached to the given minimald session.

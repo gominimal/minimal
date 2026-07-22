@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::spawn;
 
 use crate::{
@@ -39,29 +40,55 @@ trait ServeOneshot: OneshotSshRpc {
     /// Helper to deserialize the request and serialize the response
     /// down the given SSH channel, calling the provided async handler
     /// function to compute the response.
-    async fn handle_channel<F>(&self, c: RuChannel<Msg>, handler: F) -> Result<(), ConnectionError>
+    ///
+    /// On a handler error the message is written to SSH extended data
+    /// (stream 1) before the channel is closed, so the client sees a
+    /// legible error instead of an opaque EOF (#901).
+    async fn handle_channel<F>(
+        &self,
+        mut c: RuChannel<Msg>,
+        handler: F,
+    ) -> Result<(), ConnectionError>
     where
         F: for<'a> AsyncFnOnce(Self::Request<'a>) -> Result<Self::Response, ConnectionError>,
     {
-        let mut stream = c.into_stream();
-
+        // Read the request by draining Data messages until Eof or the
+        // channel closes. Using wait() directly (rather than into_stream)
+        // so the channel remains available for extended_data_bytes() and
+        // close() on the error path (#901).
         let mut buf = Vec::with_capacity(1024);
-        stream
-            .read_to_end(&mut buf)
-            .await
-            .map_err(russh::Error::from)?;
+        while let Some(msg) = c.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { data } => buf.extend_from_slice(&data),
+                russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
 
-        let request: Self::Request<'_> = serde_json::from_slice(&buf)?;
-        let response = handler(request).await?;
-        let response_bytes = serde_json::to_vec(&response)?;
+        // All error paths — JSON parse, handler, serialization — are funneled
+        // through the same match so the client always sees a legible message
+        // on extended data instead of an opaque EOF (#901).
+        let result: Result<Vec<u8>, ConnectionError> = async {
+            let request: Self::Request<'_> = serde_json::from_slice(&buf)?;
+            let response = handler(request).await?;
+            Ok(serde_json::to_vec(&response)?)
+        }
+        .await;
 
-        stream
-            .write_all(&response_bytes)
-            .await
-            .map_err(russh::Error::from)?;
-        stream.flush().await.map_err(russh::Error::from)?;
-        stream.shutdown().await.map_err(russh::Error::from)?;
-        Ok(())
+        match result {
+            Ok(response_bytes) => {
+                c.data_bytes(response_bytes)
+                    .await?;
+                c.eof().await?;
+                c.close().await?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = c.extended_data_bytes(1, e.to_string()).await;
+                let _ = c.close().await;
+                Err(e)
+            }
+        }
     }
 }
 
@@ -1477,6 +1504,48 @@ mod tests {
         assert!(super::safe_relative_path(StdPath::new(
             ".config/helix/config.toml"
         )));
+    }
+
+    /// When the daemon fails to parse a request (or the handler errors),
+    /// the error message must reach the client on extended data instead
+    /// of the client seeing an opaque EOF on the response stream (#901).
+    #[tokio::test]
+    async fn oneshot_rpc_surfaces_handler_errors_as_extended_data() {
+        use russh::ChannelMsg;
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // Send invalid JSON to a known subsystem: handle_channel will fail
+        // at serde_json::from_slice, which now writes the error to extended
+        // data before closing the channel.
+        let mut channel = client.open_subsystem(GetVersion::NAME, &[]).await;
+        channel
+            .data_bytes(b"not valid json".to_vec())
+            .await
+            .unwrap();
+        channel.eof().await.unwrap();
+
+        let mut err_buf = Vec::new();
+        let mut data_buf = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::ExtendedData { data, ext: 1 } => err_buf.extend_from_slice(&data),
+                ChannelMsg::Data { data } => data_buf.extend_from_slice(&data),
+                _ => {}
+            }
+        }
+
+        assert!(
+            !err_buf.is_empty(),
+            "expected an error on extended data, got data={:?}, err=empty",
+            String::from_utf8_lossy(&data_buf),
+        );
+        assert!(
+            data_buf.is_empty(),
+            "expected no response data on error, got {:?}",
+            String::from_utf8_lossy(&data_buf),
+        );
     }
 
     #[tokio::test]
