@@ -21,6 +21,27 @@ use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
 #[cfg(target_os = "linux")]
 const DEFAULT_VSOCK_PORT_BASE: u32 = 2222;
 
+/// Receive window installed on the guest's vsock listener, in bytes.
+///
+/// `virtio_transport_inc_rx_pkt` refuses an incoming packet — resetting the
+/// connection and setting `sk_err` to `ENOBUFS` — when either the peer overruns
+/// its credit (`buf_used + len > buf_alloc`) or the queued socket-buffer
+/// overhead does (`(queue_len + 1) * SKB_TRUESIZE(0) > buf_alloc`). At the
+/// 256 KiB default window the second ceiling lands at 455 queued skbs on arm64,
+/// where `SKB_TRUESIZE(0)` is 576 bytes. libkrun clamps each read to the credit
+/// still outstanding, so under receiver backpressure its packets shrink to
+/// roughly 540 bytes — below that per-skb overhead — and a workspace upload
+/// trips the overhead ceiling with kilobytes of window still unused.
+///
+/// 8 MiB is empirical headroom, not immunity. It does not change the ratio
+/// between the two ceilings; it keeps a normal upload out of the credit-starved
+/// tail where packets degenerate, and a larger upload or a slower reader can
+/// still reach it. The real fix belongs in libkrun, which should not shrink a
+/// packet below the per-skb overhead it costs to queue; this is the
+/// consumer-side mitigation.
+#[cfg(target_os = "linux")]
+const VSOCK_RX_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Env var `spawn_detached` sets on the child so `async_main` knows
 /// its stdio has been redirected to `/dev/null` and needs to swap
 /// the tracing writer over to a rolling log file.
@@ -715,6 +736,28 @@ async fn async_main() -> Result<(), MainError> {
         let port_num = DEFAULT_VSOCK_PORT_BASE + cli.listen_args().unwrap().instance_num;
         let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port_num))
             .map_err(|e| MainError::IO(e, "binding vsock port"))?;
+
+        // Widen the receive window before anything connects: `__vsock_create`
+        // copies `buffer_size` from the listening socket onto every socket it
+        // accepts, so this one call covers every session. Best effort — a
+        // daemon with the default window is the old, buggy behaviour, not a
+        // reason to refuse to boot.
+        match set_vsock_rx_window(&listener, VSOCK_RX_WINDOW_BYTES) {
+            Ok(effective) if effective >= VSOCK_RX_WINDOW_BYTES => {
+                tracing::debug!(bytes = effective, "raised the vsock receive window");
+            }
+            Ok(effective) => tracing::warn!(
+                requested = VSOCK_RX_WINDOW_BYTES,
+                effective,
+                "vsock receive window clamped below the requested size; large uploads may still \
+                 fail with ENOBUFS"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not raise the vsock receive window; large uploads may fail with ENOBUFS"
+            ),
+        }
+
         tracing::info!("Started listening on vsock:{port_num}");
 
         if let Err(e) = guest::emit_ready_marker(host_private_key.public_key()).await {
@@ -738,6 +781,70 @@ async fn async_main() -> Result<(), MainError> {
             .await
             .map_err(|e| MainError::IO(e, "serving on guest vsock"))
     }
+}
+
+/// Raises the AF_VSOCK receive window on `listener` to `bytes`, returning the
+/// window the kernel actually installed.
+///
+/// Two things make this less obvious than a single `setsockopt`:
+///
+/// - `SO_VM_SOCKETS_BUFFER_MAX_SIZE` has to be raised first.
+///   `vsock_update_buffer_size` clamps the requested size to `buffer_max_size`,
+///   whose default is the same 256 KiB as the size itself, so setting the size
+///   alone succeeds having changed nothing.
+/// - A clamped request is not an error. `setsockopt` returns 0 either way, so
+///   the caller only learns what it got by reading the value back.
+///
+/// Both options take a `u64` at level `AF_VSOCK`.
+#[cfg(target_os = "linux")]
+fn set_vsock_rx_window(listener: &VsockListener, bytes: u64) -> std::io::Result<u64> {
+    use std::os::fd::AsRawFd as _;
+
+    /// `SO_VM_SOCKETS_BUFFER_SIZE`, `include/uapi/linux/vm_sockets.h`.
+    const SO_VM_SOCKETS_BUFFER_SIZE: libc::c_int = 0;
+    /// `SO_VM_SOCKETS_BUFFER_MAX_SIZE`, ditto.
+    const SO_VM_SOCKETS_BUFFER_MAX_SIZE: libc::c_int = 2;
+
+    let fd = listener.as_raw_fd();
+
+    let set = |option: libc::c_int| {
+        // SAFETY: `fd` is borrowed from `listener`, which outlives this call.
+        // The option value is a live `u64` and the length passed is its own, so
+        // the kernel reads exactly the bytes that back it.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::AF_VSOCK,
+                option,
+                std::ptr::from_ref(&bytes).cast(),
+                size_of::<u64>() as libc::socklen_t,
+            )
+        };
+        (rc == 0)
+            .then_some(())
+            .ok_or_else(std::io::Error::last_os_error)
+    };
+
+    set(SO_VM_SOCKETS_BUFFER_MAX_SIZE)?;
+    set(SO_VM_SOCKETS_BUFFER_SIZE)?;
+
+    let mut effective: u64 = 0;
+    let mut len = size_of::<u64>() as libc::socklen_t;
+    // SAFETY: `fd` as above. `effective` and `len` are live for the duration of
+    // the call, and `len` describes the buffer the kernel writes into, which is
+    // `effective` itself.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::AF_VSOCK,
+            SO_VM_SOCKETS_BUFFER_SIZE,
+            std::ptr::from_mut(&mut effective).cast(),
+            &raw mut len,
+        )
+    };
+    (rc == 0)
+        .then_some(effective)
+        .ok_or_else(std::io::Error::last_os_error)
 }
 
 /// Whether this process is the microVM's init: the kernel runs the initramfs
