@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Build the trimmed libkrun.dylib for macOS from source, at the commit pinned
-# in vendor/libkrun/libkrun.lock, and stage it into PREFIX. This is the ONE
-# libkrun macOS CI links/boots against and the release ships — CI exercises
-# the exact dylib users receive, and no third-party bottle (the old slp/krun
-# Homebrew tap) is in the supply chain.
+# in vendor/libkrun/libkrun.lock plus every patch in vendor/libkrun/patches/,
+# and stage it into PREFIX. This is the ONE libkrun macOS CI links/boots
+# against and the release ships — CI exercises the exact dylib users receive,
+# and no third-party bottle (the old slp/krun Homebrew tap) is in the supply
+# chain.
 #
 # Trimmed build (this is exactly the Makefile's INIT_BLOB=0 config):
 #   -p libkrun            scope to the libkrun crate, so the src/input &
@@ -16,6 +17,12 @@
 #   --features blk,net    blk = rootfs disk (krun_add_disk2/3), net =
 #                         virtio-net. No gpu => no libepoxy/virglrenderer.
 #                         Hypervisor.framework is linked by src/vmm/build.rs.
+#
+# Patches: every *.patch in vendor/libkrun/patches/ is applied, in sorted
+# order, to the fetched tree before the build. Each is a fix carried against
+# the pin while it is upstream; a patch that no longer applies is a hard
+# error, never a skip — a silently-dropped patch would ship a dylib that
+# looks patched and is not. Drop the file when the fix lands in a new pin.
 #
 # The staged dylib's install name is set to @rpath/libkrun.1.dylib so anything
 # linking it (minvmd) records a relocatable load command from the start — the
@@ -62,6 +69,22 @@ actual="$(git -C "$WORK" rev-parse HEAD)"
 if [ "$actual" != "$COMMIT" ]; then
   echo "::error::fetched libkrun HEAD $actual != pinned commit $COMMIT" >&2
   exit 1
+fi
+
+# Apply the carried patches, in sorted order, on top of the verified commit.
+# `git apply` exits non-zero on any rejected hunk and, without --reject, leaves
+# the tree untouched — so a stale patch aborts the build instead of silently
+# producing an unpatched dylib.
+PATCHES="$ROOT/vendor/libkrun/patches"
+if [ -d "$PATCHES" ]; then
+  for patch in "$PATCHES"/*.patch; do
+    [ -e "$patch" ] || continue
+    echo "applying $(basename "$patch")"
+    if ! git -C "$WORK" apply --verbose "$patch"; then
+      echo "::error::$(basename "$patch") does not apply to libkrun $COMMIT ($VERSION); rebase or drop it" >&2
+      exit 1
+    fi
+  done
 fi
 
 echo "building trimmed libkrun (blk,net; no gpu, no init-blob)"
