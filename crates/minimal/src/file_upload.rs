@@ -5,6 +5,9 @@
 //! the encoder's internal buffer.
 
 use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Instant;
 
 use anyhow::Context as _;
 use async_tar::Builder;
@@ -33,14 +36,53 @@ fn is_default_excluded(name: &str) -> bool {
     DEFAULT_EXCLUDED_DIRS.contains(&name)
 }
 
-/// Streams a zstd-compressed tar archive of `dir` into `writer`.
+/// Wraps the upload writer and tallies the bytes it accepts, so a transfer
+/// that dies mid-stream can report how far it got. `tokio::io::copy` returns
+/// its byte count only on success, and the count at the moment of failure is
+/// exactly the figure that is missing when an upload fails (#869).
+struct CountingWriter<W> {
+    inner: W,
+    written: u64,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for CountingWriter<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &poll {
+            self.written += *n as u64;
+        }
+        poll
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Streams a zstd-compressed tar archive of `dir` into `writer`, returning the
+/// number of compressed bytes handed to `writer`.
 ///
 /// The tar builder writes directly into the zstd encoder which writes
 /// to `writer`, so the archive is never fully buffered in memory.
+///
+/// The count is of *compressed* bytes — the wire bytes — because that is what
+/// this side of the duplex can see (the pipe sits between the zstd encoder and
+/// `writer`) and because it is the figure a daemon-side count is directly
+/// comparable to. On failure the error carries that count and the elapsed
+/// time, so "died at 1%" and "died at 99%" are distinguishable without an
+/// instrumented kernel (#869).
 pub async fn stream_tar_zstd<W: AsyncWrite + Unpin + Send>(
     dir: &Path,
-    mut writer: W,
-) -> Result<(), anyhow::Error> {
+    writer: W,
+) -> Result<u64, anyhow::Error> {
     // async_tar::Builder requires W: Sync, but the SSH channel stream
     // is not Sync. Use a duplex pipe: the tar builder writes to one end
     // (in a background task), and we copy from the other end to writer.
@@ -52,17 +94,47 @@ pub async fn stream_tar_zstd<W: AsyncWrite + Unpin + Send>(
         tokio::spawn(async move { build_tar_zstd(&dir, tx).await })
     };
 
-    tokio::io::copy(&mut rx, &mut writer)
-        .await
-        .context("copying tar stream to channel")?;
-    writer.flush().await.context("flushing upload stream")?;
-    writer
-        .shutdown()
-        .await
-        .context("shutting down upload stream")?;
+    let started = Instant::now();
+    let mut writer = CountingWriter {
+        inner: writer,
+        written: 0,
+    };
+
+    let transfer = async {
+        tokio::io::copy(&mut rx, &mut writer)
+            .await
+            .context("copying tar stream to channel")?;
+        writer.flush().await.context("flushing upload stream")?;
+        writer
+            .shutdown()
+            .await
+            .context("shutting down upload stream")?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let bytes = writer.written;
+    let elapsed = started.elapsed();
+    transfer.with_context(|| {
+        format!("workspace upload failed after {bytes} compressed bytes in {elapsed:.2?}")
+    })?;
 
     build.await.context("tar build task panicked")??;
-    Ok(())
+
+    let secs = elapsed.as_secs_f64();
+    let mib_per_s = if secs > 0.0 {
+        bytes as f64 / secs / (1024.0 * 1024.0)
+    } else {
+        0.0
+    };
+    tracing::debug!(
+        bytes,
+        elapsed_ms = elapsed.as_millis() as u64,
+        mib_per_s,
+        "workspace upload streamed"
+    );
+
+    Ok(bytes)
 }
 
 /// Builds a zstd-compressed tar archive of `dir` into `writer`, finalizing
@@ -296,6 +368,52 @@ mod tests {
         assert!(
             result.is_err(),
             "a mid-stream writer failure must surface as an error, not a panic"
+        );
+    }
+
+    /// The returned count is of compressed wire bytes: exactly what landed in
+    /// the writer, not the (larger) size of the tar stream feeding the encoder.
+    #[tokio::test]
+    async fn stream_returns_compressed_byte_count() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("big.txt"), "a".repeat(64 * 1024)).unwrap();
+
+        let mut buf = Vec::new();
+        let bytes = stream_tar_zstd(dir.path(), &mut buf).await.unwrap();
+
+        assert_eq!(
+            bytes,
+            buf.len() as u64,
+            "count must match the bytes written"
+        );
+        assert!(
+            bytes < 64 * 1024,
+            "compressible input should yield a compressed count, got {bytes}"
+        );
+    }
+
+    /// A transfer that dies mid-stream must say how far it got: without the
+    /// byte count and elapsed time, "channel closed" cannot distinguish a
+    /// transport that failed immediately from one that failed at 98% (#869).
+    #[tokio::test]
+    async fn stream_error_reports_bytes_and_elapsed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for i in 0..64 {
+            std::fs::write(
+                dir.path().join(format!("f{i}.bin")),
+                incompressible(i as u64 + 1, 32 * 1024),
+            )
+            .unwrap();
+        }
+
+        let err = stream_tar_zstd(dir.path(), FailingWriter { remaining: 1024 })
+            .await
+            .unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("after 1024 compressed bytes in "),
+            "error must carry bytes transferred and elapsed time, got: {msg}"
         );
     }
 
