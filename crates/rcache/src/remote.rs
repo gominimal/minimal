@@ -344,6 +344,16 @@ impl<B: FetchBackend> RemoteCache<B> {
                 }
                 fetch_op.set_done();
 
+                // Same whole-record strictness as the local-copy load: the
+                // parser reads till EOF and would accept a body truncated
+                // mid-record as a shorter index — which the local write below
+                // would then launder into a well-formed (but incomplete) copy.
+                if !(buffer.len() as u64).is_multiple_of(crate::index_file::WIRE_RECORD_LEN) {
+                    return Err(Error::IO(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "fetched index length is not a whole number of records",
+                    )));
+                }
                 let index =
                     IndexFile::from_reader(&mut std::io::Cursor::new(buffer)).map_err(Error::IO)?;
 
@@ -770,6 +780,28 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rc.sha256(&spec_hash), None);
+    }
+
+    #[tokio::test]
+    async fn truncated_index_body_is_an_error_not_a_shorter_index() {
+        const OBJECT: &str = "github.com/gominimal/pkgs/0123abcd.shisha";
+        // A body cut mid-record but delivered as a complete response
+        // (Content-Length matches), e.g. a misbehaving mirror. The transport
+        // can't catch it; the whole-record check must.
+        let mut bytes = index_bytes_for(&SpecHash::from_bytes([0x07; 32]), [0x42; 32]);
+        bytes.extend_from_slice(&[0xAA; 32]); // half of a second record
+        let base = serve_objects(vec![(OBJECT.to_string(), bytes)]);
+
+        let source = IndexSource::Snapshot {
+            object: OBJECT.to_string(),
+        };
+        let err = RemoteCache::new_any_https(&base, None, None, source)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::IO(e) if e.kind() == std::io::ErrorKind::InvalidData),
+            "expected InvalidData, got {err:?}"
+        );
     }
 
     #[tokio::test]
