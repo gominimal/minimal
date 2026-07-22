@@ -1,18 +1,22 @@
 //! `min bug` — collect a diagnostic bundle for the minimal dev team.
 //!
 //! One command, one artifact: a `minimal-diag-<timestamp>.tar.zst` containing
-//! the logs, config (redacted), and state listings needed to root-cause
-//! field issues. Every collector is independent and failure-isolated: a
-//! fully broken install still yields a valid archive whose `manifest.json`
-//! explains what's missing. Nothing here mutates state or autospawns
-//! daemons — diagnosing a wedged system must not change it.
+//! the logs, config (redacted), state listings, process/network state, and
+//! per-provider daemon bundles needed to root-cause field issues. Every
+//! collector is independent and failure-isolated: a fully broken install
+//! still yields a valid archive whose `manifest.json` explains what's
+//! missing. Nothing here mutates state or autospawns daemons — diagnosing a
+//! wedged system must not change it.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Args;
 
 pub mod collect;
+pub mod guest;
+pub mod net;
 pub mod redact;
 
 use collect::DiagPaths;
@@ -25,6 +29,12 @@ pub struct BugArgs {
     /// Output path (default: ./minimal-diag-<timestamp>.tar.zst)
     #[arg(long, short)]
     pub output: Option<PathBuf>,
+    /// Skip contacting daemons; collect host-side state only
+    #[arg(long)]
+    pub no_guest: bool,
+    /// Deadline in seconds for each provider's daemon-bundle download
+    #[arg(long, default_value_t = 60)]
+    pub guest_timeout_secs: u64,
     /// Bytes of each log file to capture, counted from the end
     ///
     /// Raise this when the interesting window is older than the tail the
@@ -125,36 +135,73 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
     collect_step!(w, "host.power", diagnostics::power::power(&mut w, "host"));
     collect_step!(w, "config", collect::config(&mut w, &paths));
     collect_step!(w, "state", collect::state(&mut w, &paths));
+    // Log prefixes that matched nothing on the host come back rather than
+    // becoming skips here: whether "not under <state>/logs" also means "not in
+    // this bundle" is not known until the provider loop below has run.
+    let mut absent_log_prefixes = Vec::new();
     collect_step!(
         w,
         "logs",
-        collect::logs(&mut w, &paths, args.log_tail_bytes)
+        collect::logs(
+            &mut w,
+            &paths,
+            args.log_tail_bytes,
+            &mut absent_log_prefixes
+        )
     );
 
-    // Daemon-side state (socket probes, guest bundles, per-provider status)
-    // is collected over the daemon connection, not from the host bundle;
-    // record what exists so the manifest is honest about coverage. An
-    // unreadable providers dir is an error, not absence.
+    // ── Per-provider: files and liveness, then the staged socket probe, then
+    // (when the probe handshook and --no-guest wasn't given) the daemon's own
+    // bundle over the connection the probe already opened. An unreadable
+    // providers dir is an error, not absence.
     let providers_started = std::time::Instant::now();
-    match collect::provider_dirs(&paths.state).await {
-        Ok(providers) if providers.is_empty() => w.skip(
-            "providers/",
-            "no provider instances found — no daemon was ever spawned here",
-        ),
-        Ok(providers) => w.skip(
-            "providers/",
-            format!(
-                "{} provider instance(s) present — only run.log/boot.log captured; \
-                 daemon-side state not collected",
-                providers.len()
-            ),
-        ),
-        Err(e) => w.error(
-            "providers".to_string(),
-            format!("listing provider dirs: {e}"),
-            providers_started.elapsed(),
-        ),
+    // `None` is "the listing failed", which is not the same fact as an empty
+    // listing: one leaves provider existence unknown, the other settles it.
+    // The log skips below turn on that difference.
+    let providers = match collect::provider_dirs(&paths.state).await {
+        Ok(providers) => {
+            if providers.is_empty() {
+                w.skip(
+                    "providers/",
+                    "no provider instances found — no daemon was ever spawned here",
+                );
+            }
+            Some(providers)
+        }
+        Err(e) => {
+            w.error(
+                "providers".to_string(),
+                format!("listing provider dirs: {e}"),
+                providers_started.elapsed(),
+            );
+            None
+        }
+    };
+    let mut carriers: Vec<&str> = Vec::new();
+    let mut unconfirmed: Vec<&str> = Vec::new();
+    for (name, dir) in providers.iter().flatten() {
+        collect_step!(
+            w,
+            format!("providers.{name}"),
+            collect::provider_files(&mut w, name, dir)
+        );
+        match collect_guest(&mut w, &args, name, dir).await {
+            guest::GuestOutcome::BundleWithDaemonLogs => carriers.push(name),
+            guest::GuestOutcome::BundleUnconfirmed => unconfirmed.push(name),
+            guest::GuestOutcome::NoBundle => {}
+        }
     }
+
+    // The held-back log skips, now that the guest side has reported. A daemon
+    // that logs inside the microVM leaves nothing under `<state>/logs`, and
+    // saying so as plain absence would contradict the nested bundle this run
+    // just collected.
+    collect::explain_absent_log_prefixes(
+        &mut w,
+        &paths,
+        &absent_log_prefixes,
+        daemon_log_sources(providers.as_deref(), &carriers, &unconfirmed),
+    );
 
     let entries = w.entry_count();
     let errors = w.error_count();
@@ -174,6 +221,97 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
     );
     println!("Review the contents before sharing; send it to the minimal dev team.");
     Ok(())
+}
+
+/// Reduces what the provider loop learned to the single fact the held-back log
+/// skips are read against.
+///
+/// `providers` is `None` when the listing itself failed. A confirmed carrier
+/// outranks an unconfirmed one: if any nested bundle demonstrably holds the
+/// daemon's logs, naming it is true whatever the others managed.
+fn daemon_log_sources<'a>(
+    providers: Option<&[(String, PathBuf)]>,
+    carriers: &'a [&'a str],
+    unconfirmed: &'a [&'a str],
+) -> collect::DaemonLogSources<'a> {
+    match (providers, carriers, unconfirmed) {
+        (None, ..) => collect::DaemonLogSources::ProvidersUnknown,
+        (Some([]), ..) => collect::DaemonLogSources::NoProviders,
+        (Some(_), [], []) => collect::DaemonLogSources::NoneFetched,
+        (Some(_), [], names) => collect::DaemonLogSources::NestedUnconfirmed(names),
+        (Some(_), names, _) => collect::DaemonLogSources::Nested(names),
+    }
+}
+
+/// Probes one provider's daemon socket and, when it answers, nests the
+/// daemon's own bundle; otherwise falls back to the data volume image.
+///
+/// Never fails: every outcome — including "this collector itself broke" —
+/// becomes a manifest record. The download is not wrapped in
+/// [`collect_step!`]: it carries its own, longer `--guest-timeout-secs`
+/// deadline, since a large bundle over a slow bridge is not a hang.
+///
+/// Returns what the archive can now be said to hold for this provider, which
+/// is what the log collector's held-back skips are read against: not merely
+/// whether a bundle arrived, but whether it was confirmed to carry the
+/// daemon's own logs.
+async fn collect_guest(
+    w: &mut BundleWriter,
+    args: &BugArgs,
+    name: &str,
+    dir: &std::path::Path,
+) -> guest::GuestOutcome {
+    // `--no-guest` means "collect host-side state only" — the socket probe
+    // handshakes with the daemon (a GetVersion RPC), so it is a guest contact
+    // and must be skipped too, not just the bundle download (R7.4).
+    let started = std::time::Instant::now();
+    if args.no_guest {
+        if let Err(e) = guest::record_skipped(w, name, "guest collection skipped: --no-guest").await
+        {
+            w.error(format!("guest.{name}"), format!("{e:#}"), started.elapsed());
+        }
+        return guest::GuestOutcome::NoBundle;
+    }
+
+    let sock = dir.join(paths::SSH_SOCK_FILE);
+    let (probe, client) = net::probe_socket(&sock).await;
+    collect_step!(
+        w,
+        format!("providers.{name}.socket-probe"),
+        net::add_probe(w, name, &probe)
+    );
+
+    let started = std::time::Instant::now();
+    let result = match client {
+        // The daemon being unreachable is the volume fallback's marquee case:
+        // nothing else can say what the guest was doing when it died (R7.5).
+        None => match guest::record_skipped(
+            w,
+            name,
+            "guest collection skipped: daemon not reachable (see socket-probe.json)",
+        )
+        .await
+        {
+            Ok(()) => guest::volume_fallback(w, name, dir)
+                .await
+                .map(|()| guest::GuestOutcome::NoBundle),
+            Err(e) => Err(e),
+        },
+        Some(mut client) => {
+            guest::collect(
+                w,
+                name,
+                dir,
+                &mut client,
+                Duration::from_secs(args.guest_timeout_secs),
+            )
+            .await
+        }
+    };
+    result.unwrap_or_else(|e| {
+        w.error(format!("guest.{name}"), format!("{e:#}"), started.elapsed());
+        guest::GuestOutcome::NoBundle
+    })
 }
 
 /// Resolve every base path the collectors need, honoring the same overrides

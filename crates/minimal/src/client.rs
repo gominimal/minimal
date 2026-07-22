@@ -237,6 +237,147 @@ impl Client {
         }
         Ok(())
     }
+
+    /// Requests the daemon's diagnostic bundle (`min bug`): sends `req` on the
+    /// [`minimald_rpc::DIAG_BUNDLE_SUBSYSTEM`] subsystem and collects the
+    /// streamed tar+zstd archive, up to `max_bytes`.
+    ///
+    /// Returns `(bytes, truncated)`. Errors the daemon reports — before or
+    /// during streaming — arrive over extended-data stream 1 and become the
+    /// `Err` here, discarding any partial bundle; a refused subsystem request
+    /// means the daemon predates the RPC.
+    ///
+    /// Hitting `max_bytes` ends *collection*, not the conversation: the
+    /// daemon may already have queued an error behind the frames that tripped
+    /// the cap, so the channel is drained for
+    /// [`TRUNCATED_DRAIN_GRACE`] — payload discarded, extended data kept —
+    /// before returning. That window is deliberately short: a daemon still
+    /// streaming a runaway archive cannot be waited out without handing it
+    /// the caller's whole deadline, and losing an already-capped bundle to a
+    /// timeout is worse than missing a message that had not been sent yet.
+    /// So an error the daemon emits *after* the cap trips is not observed.
+    pub async fn download_diag_bundle(
+        &mut self,
+        req: &minimald_rpc::DiagBundleRequest,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, bool), anyhow::Error> {
+        let mut channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .context("open channel for diagnostic bundle")?;
+
+        send_traceparent(&channel).await;
+        channel
+            .request_subsystem(true, minimald_rpc::DIAG_BUNDLE_SUBSYSTEM)
+            .await
+            .context(
+                "request DiagBundleTarZst subsystem \
+                 (daemon may predate the diagnostics RPC — upgrade minimald)",
+            )?;
+
+        let body = serde_json::to_vec(req).context("serialize diag request")?;
+        channel
+            .data(&body[..])
+            .await
+            .context("write diag request")?;
+        channel.eof().await.context("half-close diag request")?;
+
+        // Data carries the archive; extended-data stream 1 carries the
+        // daemon's error message.
+        let mut bundle = Vec::new();
+        let mut daemon_error = Vec::new();
+        let mut truncated = false;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { data } => {
+                    if bundle.len() + data.len() > max_bytes {
+                        bundle.extend_from_slice(&data[..max_bytes - bundle.len()]);
+                        truncated = true;
+                        break;
+                    }
+                    bundle.extend_from_slice(&data);
+                }
+                russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                    append_daemon_error(&mut daemon_error, &data);
+                }
+                // The daemon refused the subsystem (`want_reply` failure). A
+                // healthy daemon replies `Success` then streams; a refusal
+                // means it doesn't serve this RPC — bail now rather than block
+                // on `wait()` until the caller's deadline, since a bare refusal
+                // doesn't close the channel.
+                russh::ChannelMsg::Failure => anyhow::bail!(
+                    "daemon refused the {} subsystem — it likely predates the \
+                     diagnostics RPC (upgrade minimald)",
+                    minimald_rpc::DIAG_BUNDLE_SUBSYSTEM
+                ),
+                _ => {}
+            }
+        }
+
+        // The cap stopped the collection loop, but an error the daemon put on
+        // the wire before that point may still be queued behind the frames
+        // that tripped it. Returning now would drop it and report a corrupt
+        // partial archive as a clean truncation. Payload is discarded here —
+        // the bundle is already at its cap — and only extended data is kept.
+        if truncated {
+            let drained = tokio::time::timeout(TRUNCATED_DRAIN_GRACE, async {
+                while let Some(msg) = channel.wait().await {
+                    if let russh::ChannelMsg::ExtendedData { data, ext: 1 } = msg {
+                        append_daemon_error(&mut daemon_error, &data);
+                    }
+                }
+            })
+            .await;
+            if drained.is_err() {
+                tracing::debug!(
+                    grace = ?TRUNCATED_DRAIN_GRACE,
+                    "daemon still streaming after the diag bundle cap; \
+                     stopped waiting for a trailing error"
+                );
+            }
+        }
+
+        // A daemon error can also arrive mid-stream (tar finalization failed
+        // after bytes were sent); a partial archive without the error would be
+        // a silently corrupt diagnostic.
+        if !daemon_error.is_empty() {
+            let msg = String::from_utf8_lossy(&daemon_error);
+            anyhow::bail!(
+                "daemon reported an error{}: {msg}",
+                if bundle.is_empty() {
+                    ""
+                } else {
+                    " after streaming a partial bundle"
+                }
+            );
+        }
+        if bundle.is_empty() {
+            anyhow::bail!("daemon sent no bundle");
+        }
+        Ok((bundle, truncated))
+    }
+}
+
+/// Cap on the accumulated daemon error message (extended-data stream 1) for a
+/// diagnostic-bundle download.
+const DAEMON_ERROR_MAX: usize = 64 * 1024;
+
+/// How long [`Client::download_diag_bundle`] keeps reading after the size cap
+/// trips, looking for an error the daemon already sent.
+///
+/// Sized for "already on the wire", not for "will finish streaming": a daemon
+/// with gigabytes still to write cannot be drained to completion without
+/// spending the caller's entire `--guest-timeout-secs`, which would turn a
+/// usable truncated bundle into a total loss.
+const TRUNCATED_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Appends `data` to the daemon's error message, bounded: a daemon streaming
+/// only extended data must not balloon the CLI past the bound the archive
+/// itself respects.
+fn append_daemon_error(buf: &mut Vec<u8>, data: &[u8]) {
+    let room = DAEMON_ERROR_MAX.saturating_sub(buf.len());
+    buf.extend_from_slice(&data[..room.min(data.len())]);
 }
 
 /// Resolve the provider-instance dir (`<state dir>/providers/local-0`) the
