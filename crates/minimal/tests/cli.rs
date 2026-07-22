@@ -220,7 +220,7 @@ async fn activate_creates_session() {
 
     let activate_args = ActivateArgs {
         name: Some("test-session".to_string()),
-        path: project.path().to_string_lossy().to_string(),
+        path: Some(project.path().to_string_lossy().to_string()),
         sync: SyncMode::Tarball,
         network: CliNetworkMode::NoNet,
         ingress: vec![],
@@ -262,7 +262,7 @@ async fn activate_uploads_project_files() {
 
     let activate_args = ActivateArgs {
         name: Some("upload-test".to_string()),
-        path: project.path().to_string_lossy().to_string(),
+        path: Some(project.path().to_string_lossy().to_string()),
         sync: SyncMode::Tarball,
         network: CliNetworkMode::NoNet,
         ingress: vec![],
@@ -297,6 +297,55 @@ async fn activate_uploads_project_files() {
 }
 
 // --- attach (smart resolution) ---
+
+/// `min activate` with no positional path but `-C/--repo-dir` set uploads
+/// from the repo-dir directory, not the process cwd (#873).
+#[tokio::test]
+async fn activate_uses_repo_dir_when_no_positional_path() {
+    let (daemon, mut global) = setup().await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+    std::fs::write(project.path().join("hello.txt"), "hello world").unwrap();
+
+    global.repo_dir = Some(project.path().to_path_buf());
+
+    let activate_args = ActivateArgs {
+        name: Some("repo-dir-test".to_string()),
+        path: None,
+        sync: SyncMode::Tarball,
+        network: CliNetworkMode::NoNet,
+        ingress: vec![],
+        loadout: vec![],
+        no_loadouts: false,
+        no_prompt: false,
+        attach: false,
+    };
+    cmd_activate(&global, activate_args).await.unwrap();
+
+    let mut client = daemon.server.connect().await;
+    use minimald_rpc::ListSessions;
+    let resp = client.call::<ListSessions>(&()).await;
+    assert_eq!(resp.sessions.len(), 1);
+    let session = &resp.sessions[0];
+
+    let project_canon = project.path().canonicalize().unwrap();
+    let session_path = session.project_path.as_ref().unwrap();
+    assert_eq!(
+        session_path.as_str(),
+        project_canon.to_str().unwrap(),
+        "session project_path should match -C/--repo-dir, not cwd"
+    );
+
+    let sftp = client.open_sftp(session.id).await;
+    let hello = sftp.read("hello.txt").await.unwrap();
+    assert_eq!(hello, b"hello world");
+}
 
 /// `min attach` with no session argument and `--no-input` errors cleanly when
 /// no sessions exist, rather than hanging or shelling out to ssh. The error
