@@ -97,12 +97,23 @@ separate 06:00 UTC nightly *test* tier, unrelated to releasing — see
 [`.github/workflows/promote.yml`](../../.github/workflows/promote.yml)
 (workflow name `promote-cli`) is the manual path that moves the `stable` (or
 `unstable`) pointer. Inputs: `sha` (defaults to the latest staged version in
-the bucket), `target`, `dry_run`. The `gate` job opens a promotion-approval
-GitHub issue, notifies Slack, and polls until someone on the workflow's
-approver allowlist (the initiating user is excluded) comments `approved` /
-`denied`; closing the issue without approval counts as denial. The `promote`
-job then runs set-channel.sh, which verifies the version is actually staged
-before flipping the pointer. Finally it dispatches a
+the bucket), `target`, `dry_run`, `override_provenance`. The `gate` job opens a
+promotion-approval GitHub issue, notifies Slack, and polls until someone on the
+workflow's approver allowlist (the initiating user is excluded) comments
+`approved` / `denied`; closing the issue without approval counts as denial.
+
+**nightly-provenance gate.** Before flipping the pointer, the `promote` job
+runs [`scripts/verify-nightly-provenance.sh --sha "$SHA"`](../../scripts/verify-nightly-provenance.sh),
+which queries GitHub Actions to confirm the version was built by
+`nightly.yml`. This rejects manually dispatched release.yml runs and tag-push
+builds — staging a version does not make it promotable. Only nightly-built
+versions pass by default, ensuring the stable channel only receives versions
+that completed the full nightly smoke suite. The `override_provenance`
+emergency input bypasses this gate when checked; use it only for documented
+emergency releases that skip the nightly path.
+
+The `promote` job then runs set-channel.sh, which verifies the version is
+actually staged before flipping the pointer. Finally it dispatches a
 `reference-docs-promoted` repository event so the published reference docs
 rebuild. The dispatch targets `gominimal/webapp` (which serves
 docs.minimal.dev); the gominimal-aw-bot App must be installed there for the
@@ -153,9 +164,14 @@ local install record, keeping user-modified files unless `--force`;
 
 **Promote to stable.**
 
-1. Actions → *promote-cli* → Run workflow with `target: stable` (optionally a
+1. **Verify the SHA was nightly-built.** The promote workflow rejects versions
+   not built by `nightly.yml` — manually dispatched or tag-staged SHAs will
+   fail the provenance gate after the multi-hour approval completes. If you
+   need to promote a non-nightly version in an emergency, check
+   `override_provenance` when dispatching.
+2. Actions → *promote-cli* → Run workflow with `target: stable` (optionally a
    specific staged `sha`; empty means the latest staged).
-2. A second person from the approver allowlist comments `approved` on the
+3. A second person from the approver allowlist comments `approved` on the
    auto-opened issue (the initiator cannot self-approve).
-3. set-channel.sh flips the `stable` pointer. Rollback is the same workflow
-   pointed at a previously staged version.
+4. The provenance check runs, then set-channel.sh flips the `stable` pointer.
+   Rollback is the same workflow pointed at a previously staged version.
