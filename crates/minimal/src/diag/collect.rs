@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use super::redact::is_env_value_allowlisted;
 use diagnostics::redact::{masked_process_env, redact_toml};
-use diagnostics::{BundleWriter, LOG_TAIL_CAP, Redaction, open_regular_nofollow};
+use diagnostics::{BundleWriter, Redaction, open_regular_nofollow};
 
 /// Cap on entries in a recursive state-dir listing; a runaway tree (huge
 /// session workspaces) is truncated with a marker line, not walked forever.
@@ -208,7 +208,13 @@ pub async fn state(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow
 /// How many rotated files per log prefix make it into the bundle.
 const LOG_FILES_PER_PREFIX: usize = 5;
 
-pub async fn logs(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow::Error> {
+/// `tail_bytes` is the per-file cap, already validated by the caller against
+/// [`diagnostics::MAX_LOG_TAIL_BYTES`].
+pub async fn logs(
+    w: &mut BundleWriter,
+    paths: &DiagPaths,
+    tail_bytes: u64,
+) -> Result<(), anyhow::Error> {
     let log_dir = paths.state.join("logs");
     // Absence and inaccessibility are different facts: "no log directory"
     // may only be claimed on a real NotFound, never on EACCES or I/O errors.
@@ -229,7 +235,7 @@ pub async fn logs(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow:
                 for path in files {
                     let name = path.file_name().unwrap_or_default().to_string_lossy();
                     let dest = format!("logs/{name}");
-                    if let Err(e) = w.add_file_tail(&dest, &path, LOG_TAIL_CAP).await {
+                    if let Err(e) = w.add_file_tail(&dest, &path, tail_bytes).await {
                         w.skip(&dest, format!("unreadable: {e}"));
                     }
                 }
@@ -246,7 +252,7 @@ pub async fn logs(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow:
         for log_name in ["run.log", "boot.log"] {
             let dest = format!("providers/{name}/{log_name}");
             match w
-                .add_file_tail(&dest, &dir.join(log_name), LOG_TAIL_CAP)
+                .add_file_tail(&dest, &dir.join(log_name), tail_bytes)
                 .await
             {
                 Ok(()) => {}

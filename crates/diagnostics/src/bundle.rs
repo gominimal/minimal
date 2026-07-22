@@ -21,6 +21,16 @@ use crate::manifest::{CollectedEntry, CollectorError, Manifest, Redaction, Skipp
 /// Default per-file tail cap for bundled logs.
 pub const LOG_TAIL_CAP: u64 = 5 * 1024 * 1024;
 
+/// Largest per-file tail cap [`BundleWriter::add_file_tail`] can honor.
+///
+/// The ceiling is structural, not politeness: `add_file_tail` seeks
+/// `-(cap as i64)` from the end, so a cap past `i64::MAX` is a nonsense seek,
+/// and any very large cap is an unbounded read into memory. A caller that
+/// takes this value from a user must *reject* anything above it rather than
+/// clamp — a silently clamped cap reports success while capturing less than
+/// was asked for, and the short log then reads as evidence.
+pub const MAX_LOG_TAIL_BYTES: u64 = 64 * 1024 * 1024;
+
 mod sealed {
     pub trait Sealed {}
     impl Sealed for tokio::fs::File {}
