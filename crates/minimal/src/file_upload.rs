@@ -5,11 +5,12 @@
 //! the encoder's internal buffer.
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use async_tar::Builder;
 use tokio::fs;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Directories always skipped during upload. A proper .gitignore
 /// implementation is tracked as a follow-up on #263.
@@ -22,6 +23,20 @@ const DEFAULT_EXCLUDED_DIRS: &[&str] = &["target", "node_modules"];
 /// Git worktrees/submodules use a `.git` *file* rather than a directory, so
 /// the check must accept either — `Path::exists` does.
 const VCS_MARKERS: &[&str] = &[".git", ".hg", ".svn", "CVS", ".jj"];
+
+/// Maximum time the upload may make no forward progress before it is
+/// abandoned with an error.
+///
+/// The upload writer is a russh `ChannelTx`, which parks on SSH window
+/// availability. When the guest-side vsock connection is reset mid-transfer,
+/// the peer never sends the window adjustment that would wake the writer, so
+/// the write blocks with no waker and the client hangs indefinitely (#886) —
+/// the same missed-wakeup failure class seen on the attach path (#588).
+/// Bounding each write (and the final flush/shutdown) by an idle deadline
+/// turns that silent hang into a surfaced error. Generous — a healthy channel
+/// drains 256 KiB chunks in milliseconds, so this only trips the pathological
+/// dead-peer case, never a slow-but-live transfer.
+const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Returns `true` if `dir` is the root of a recognized VCS repository
 /// (Git, Mercurial, Subversion, CVS, or Jujutsu).
@@ -52,17 +67,53 @@ pub async fn stream_tar_zstd<W: AsyncWrite + Unpin + Send>(
         tokio::spawn(async move { build_tar_zstd(&dir, tx).await })
     };
 
-    tokio::io::copy(&mut rx, &mut writer)
-        .await
-        .context("copying tar stream to channel")?;
-    writer.flush().await.context("flushing upload stream")?;
-    writer
-        .shutdown()
-        .await
-        .context("shutting down upload stream")?;
+    copy_with_idle_timeout(&mut rx, &mut writer).await?;
 
     build.await.context("tar build task panicked")??;
     Ok(())
+}
+
+/// Copies the tar stream from `rx` into `writer`, then flushes and shuts the
+/// writer down, bounding every write by [`UPLOAD_IDLE_TIMEOUT`].
+///
+/// Each `write_all` restarts the idle deadline, so a healthy transfer of any
+/// size proceeds unbounded while a writer that stops accepting bytes — a dead
+/// vsock peer whose window is never adjusted — surfaces as an error instead of
+/// parking forever (#886). Returning on error drops `rx`, which fails the tar
+/// builder's writes into the duplex and lets its task finish, so the caller's
+/// `build.await` cannot deadlock against a still-running builder.
+async fn copy_with_idle_timeout<R, W>(rx: &mut R, writer: &mut W) -> Result<(), anyhow::Error>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = rx.read(&mut buf).await.context("reading tar stream")?;
+        if n == 0 {
+            break;
+        }
+        with_idle_deadline(writer.write_all(&buf[..n]), "copying tar stream to channel").await?;
+    }
+    with_idle_deadline(writer.flush(), "flushing upload stream").await?;
+    with_idle_deadline(writer.shutdown(), "shutting down upload stream").await?;
+    Ok(())
+}
+
+/// Awaits `op`, bounding it by [`UPLOAD_IDLE_TIMEOUT`]. A timeout is reported
+/// as an error tagged with `what` so a stalled upload is diagnosable rather
+/// than silent.
+async fn with_idle_deadline<T>(
+    op: impl std::future::Future<Output = std::io::Result<T>>,
+    what: &'static str,
+) -> Result<T, anyhow::Error> {
+    match tokio::time::timeout(UPLOAD_IDLE_TIMEOUT, op).await {
+        Ok(result) => result.context(what),
+        Err(_) => Err(anyhow::anyhow!(
+            "{what}: upload made no progress for {UPLOAD_IDLE_TIMEOUT:?}; \
+             the transfer peer is likely gone"
+        )),
+    }
 }
 
 /// Builds a zstd-compressed tar archive of `dir` into `writer`, finalizing
@@ -263,6 +314,37 @@ mod tests {
         }
     }
 
+    /// A writer that accepts `remaining` bytes and then parks forever,
+    /// returning `Poll::Pending` without registering a waker — simulating a
+    /// russh `ChannelTx` whose vsock peer died without a window adjustment, so
+    /// the write can never make progress and is never woken.
+    struct StallingWriter {
+        remaining: usize,
+    }
+
+    impl AsyncWrite for StallingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.remaining == 0 {
+                return Poll::Pending;
+            }
+            let n = buf.len().min(self.remaining);
+            self.remaining -= n;
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
     /// Fills `len` bytes with an incompressible LCG sequence so the zstd
     /// encoder is forced to flush to the underlying writer mid-stream.
     fn incompressible(seed: u64, len: usize) -> Vec<u8> {
@@ -296,6 +378,30 @@ mod tests {
         assert!(
             result.is_err(),
             "a mid-stream writer failure must surface as an error, not a panic"
+        );
+    }
+
+    /// Regression test for #886: when the upload writer accepts some bytes and
+    /// then parks forever with no waker (a dead vsock peer whose window is
+    /// never adjusted), the upload must surface an error via the idle deadline
+    /// instead of hanging indefinitely. Runs on a paused clock so the runtime
+    /// auto-advances to the timeout the moment no task can make progress.
+    #[tokio::test(start_paused = true)]
+    async fn stream_times_out_when_writer_stalls_mid_stream() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for i in 0..64 {
+            std::fs::write(
+                dir.path().join(format!("f{i}.bin")),
+                incompressible(i as u64 + 1, 32 * 1024),
+            )
+            .unwrap();
+        }
+
+        let writer = StallingWriter { remaining: 1024 };
+        let result = stream_tar_zstd(dir.path(), writer).await;
+        assert!(
+            result.is_err(),
+            "a stalled upload must surface as an error, not hang indefinitely"
         );
     }
 
