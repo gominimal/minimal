@@ -21,6 +21,13 @@ use composables::{ProjectResolution, build_composables, run_composer};
 pub struct SessionInfo {
     pub id: SessionId,
     pub name: Option<String>,
+    /// The absolute host path the session was built from. Surfaced through
+    /// `ListSessions` so a client can match sessions against the current
+    /// working directory without a per-session `GetSessionRecord` round-trip.
+    pub project_path: paths::HostAbsPath,
+    /// The session's lifecycle status, surfaced so a client picker can
+    /// render a state glyph.
+    pub status: sessions::SessionStatus,
     pub attrs: Option<HostAttrs>,
 }
 
@@ -352,6 +359,8 @@ impl Manager {
                         out.push(SessionInfo {
                             id: record.id,
                             name: record.name.clone(),
+                            project_path: record.project_path.clone(),
+                            status: record.status,
                             attrs: match self.running.get(&record.id) {
                                 Some(h) => h.get_attrs().await,
                                 None => None,

@@ -56,6 +56,7 @@ version.workspace = true
 # libkrun).
 minvmd = { path = "../minvmd", default-features = false }
 ot.workspace = true
+inquire.workspace = true
 
 [dev-dependencies]
 minimald = { path = "../minimald", features = ["test-support"] }

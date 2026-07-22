@@ -31,6 +31,7 @@ async fn version_succeeds_without_daemon() {
         minimal_dir: Some(std::path::PathBuf::from("/nonexistent")),
         config_dir: None,
         minvmd: false,
+        no_input: false,
     };
     // Should print client version and note daemon is unreachable, but return Ok.
     cmd_version(&args).await.unwrap();
@@ -48,6 +49,8 @@ fn ls_shows_shared_resource_pool() {
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
             name: None,
+            project_path: Some(paths::HostAbsPath::try_new("/p").unwrap()),
+            status: sessions::SessionStatus::Active,
             attrs: None,
         }],
     };
@@ -293,6 +296,75 @@ async fn activate_uploads_project_files() {
     assert!(mfile.starts_with(b"# test"));
 }
 
+// --- attach (smart resolution) ---
+
+/// `min attach` with no session argument and `--no-input` errors cleanly when
+/// no sessions exist, rather than hanging or shelling out to ssh. The error
+/// surfaces before any ssh exec, so it is deterministic in a test environment.
+#[tokio::test]
+async fn attach_with_no_session_errors_when_no_sessions_exist() {
+    let (_daemon, mut global) = setup().await;
+    global.no_input = true;
+
+    let err = cmd_attach(
+        &global,
+        AttachArgs {
+            session: None,
+            command: None,
+        },
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("no sessions exist"),
+        "expected a 'no sessions' error, got: {err}"
+    );
+}
+
+/// `min attach` with no session argument and `--no-input` errors with a list
+/// of candidates when more than one session shares the current directory,
+/// rather than opening a picker. Both sessions are built from the same
+/// canonicalized tempdir so the cwd match is deterministic across platforms.
+#[tokio::test]
+async fn attach_with_no_session_errors_when_ambiguous_and_no_input() {
+    let (daemon, mut global) = setup().await;
+
+    // Two sessions built from the same directory make the choice ambiguous.
+    let cwd = tempfile::TempDir::new().unwrap();
+    let cwd_canon = cwd.path().canonicalize().unwrap();
+    let cwd_str = camino::Utf8PathBuf::from_path_buf(cwd_canon).unwrap();
+    let abs_path = paths::HostAbsPath::try_new(cwd_str).unwrap();
+    create_session_at(&daemon, "amb-1", abs_path.clone()).await;
+    create_session_at(&daemon, "amb-2", abs_path).await;
+
+    global.no_input = true;
+    // `--repo-dir` overrides the cwd used for matching; canonicalized by the
+    // resolver, it equals the sessions' project_path above.
+    global.repo_dir = Some(cwd.path().to_path_buf());
+
+    let err = cmd_attach(
+        &global,
+        AttachArgs {
+            session: None,
+            command: None,
+        },
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("Multiple sessions match"),
+        "expected an ambiguity error, got: {err}"
+    );
+    assert!(err.contains("amb-1"), "candidates list names: {err}");
+    assert!(err.contains("amb-2"), "candidates list names: {err}");
+    assert!(
+        err.contains("min attach <id>"),
+        "should suggest explicit attach, got: {err}"
+    );
+}
+
 // --- destroy ---
 
 #[tokio::test]
@@ -535,15 +607,25 @@ async fn create_pending_session(daemon: &common::TestDaemon, name: &str) -> Sess
 }
 
 async fn create_session(daemon: &common::TestDaemon, name: &str) -> SessionId {
-    let mut client = daemon.server.connect().await;
-
     let project_path =
         camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
     let abs_path = paths::HostAbsPath::try_new(project_path).unwrap();
+    create_session_at(daemon, name, abs_path).await
+}
+
+/// Like [`create_session`] but builds the session from `project_path` instead
+/// of the test process's current directory. Used to place sessions at a known
+/// path so smart-attach resolution can match against it deterministically.
+async fn create_session_at(
+    daemon: &common::TestDaemon,
+    name: &str,
+    project_path: paths::HostAbsPath,
+) -> SessionId {
+    let mut client = daemon.server.connect().await;
 
     let config = minimald_rpc::SessionConfig {
         name: Some(name.to_string()),
-        project_path: abs_path,
+        project_path,
         network: sessions::NetworkMode::NoNet,
         policy: Default::default(),
         attrs: Default::default(),
