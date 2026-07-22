@@ -84,6 +84,10 @@ FIXTURE_MAX_ZSTD=20000000
 # A warm activate is seconds; even a cold one (VM boot ≤150s, then the session
 # mint) fits well inside this, while the observed hangs ran 9-13 minutes.
 DEADLINE_SECS="${BULK_ACTIVATE_TIMEOUT_SECS:-420}"
+case "$DEADLINE_SECS" in
+  '' | *[!0-9]*) echo "BULK_ACTIVATE_TIMEOUT_SECS must be a positive integer, got: '$DEADLINE_SECS'" >&2; exit 2 ;;
+esac
+[ "$DEADLINE_SECS" -ge 1 ] || { echo "BULK_ACTIVATE_TIMEOUT_SECS must be >= 1, got: $DEADLINE_SECS" >&2; exit 2; }
 
 # Debug logging on either side of the transport makes #869 disappear (the issue
 # measured 4/4 passes under MINVMD_KRUN_LOG=debug, and RUST_LOG=debug on the
