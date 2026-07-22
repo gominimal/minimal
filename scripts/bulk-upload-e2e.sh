@@ -145,9 +145,13 @@ teardown() {
   fi
   rm -rf "$PROJECT_DIR" "$WORK"
 }
-trap 'teardown' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+CUR_PID=''
+cleanup_child() {
+  [ -n "$CUR_PID" ] && kill "$CUR_PID" 2>/dev/null
+}
+trap 'cleanup_child; teardown' EXIT
+trap 'cleanup_child; teardown; exit 130' INT
+trap 'cleanup_child; teardown; exit 143' TERM
 
 # Dump what a detached daemon hides: the CLI's own stderr, the daemon state/log
 # files, and on VM targets the guest console — where #869 prints its half of the
@@ -180,6 +184,7 @@ run_deadline() {
   shift
   "$@" </dev/null &
   local pid=$!
+  CUR_PID=$pid
   local waited=0
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$waited" -ge "$secs" ]; then
@@ -187,11 +192,13 @@ run_deadline() {
       sleep 5
       kill -KILL "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null
+      CUR_PID=''
       return 124
     fi
     sleep 1
     waited=$((waited + 1))
   done
+  CUR_PID=''
   wait "$pid"
 }
 
