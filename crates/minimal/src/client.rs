@@ -220,7 +220,7 @@ impl Client {
             .await
             .context("request WorkspaceFilesTarZst subsystem")?;
 
-        crate::file_upload::stream_tar_zstd(dir, channel.make_writer()).await?;
+        let bytes = crate::file_upload::stream_tar_zstd(dir, channel.make_writer()).await?;
 
         // Wait for the channel to close to signal that unpacking is done.
         let mut err = Vec::new();
@@ -231,7 +231,7 @@ impl Client {
         }
         if !err.is_empty() {
             anyhow::bail!(
-                "daemon failed to unpack project files: {}",
+                "daemon failed to unpack project files after {bytes} compressed bytes uploaded: {}",
                 String::from_utf8_lossy(&err)
             );
         }
