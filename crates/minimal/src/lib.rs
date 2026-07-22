@@ -1015,9 +1015,13 @@ fn offer_mfile_scaffold(
     // `confirm` treats empty/EOF input as "yes", so on non-interactive
     // stdin (CI, pipes, agents) it would silently default this scaffold to
     // "yes" — and, when a config is discovered under `.minimal/`, the init
-    // writer would clobber it. Only prompt on a real terminal; anywhere else
-    // (and on a declined prompt) carry on without scaffolding.
-    if !std::io::stdin().is_terminal() || !confirm("Would you like to create one?", true)? {
+    // writer would clobber it. Only prompt on a real terminal that hasn't
+    // been told to skip prompts (--no-input); anywhere else (and on a
+    // declined prompt) carry on without scaffolding.
+    if global.no_input
+        || !std::io::stdin().is_terminal()
+        || !confirm("Would you like to create one?", true)?
+    {
         eprintln!(
             "Continuing without one; the session gets a default environment. \
              Run 'min init' to give the project its own config."
@@ -1176,6 +1180,7 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
             // remains available for explicit opt-out (#770).
             let should_upload = file_upload::is_vcs_root(upload_root.as_std_path())
                 || args.no_prompt
+                || global.no_input
                 || !can_prompt_interactively()
                 || confirm(
                     &format!(
@@ -1228,7 +1233,7 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     // item it would have prompted for so we can print a
     // `user_policy.toml` snippet on the error path.
     if let minimald_rpc::ConfigureLoadoutResponse::Pending { response } = configured {
-        let non_interactive = args.no_prompt || !can_prompt_interactively();
+        let non_interactive = args.no_prompt || global.no_input || !can_prompt_interactively();
         if non_interactive {
             // NoPromptHook fake-approves every unapproved item so
             // handle_response finishes both the var and patch gates

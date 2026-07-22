@@ -122,12 +122,13 @@ fn state_glyph(status: sessions::SessionStatus) -> &'static str {
 /// The most recent activity timestamp on a session, for ordering the picker
 /// with the freshest session first. Falls back to `None` when the session has
 /// no recorded activity (never attached, or running on an older daemon that
-/// doesn't report attrs).
+/// doesn't report attrs). Picks the later of stdout/stdin so a session that
+/// received input after its last output still sorts first.
 fn last_activity(entry: &ListSessionsEntry) -> Option<chrono::DateTime<chrono::Utc>> {
     entry
         .attrs
         .as_ref()
-        .and_then(|a| a.last_stdout.or(a.last_stdin))
+        .and_then(|a| a.last_stdout.into_iter().chain(a.last_stdin).max())
 }
 
 /// Formats a single session as a picker row: `glyph  name | title · path`,
