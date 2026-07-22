@@ -3785,6 +3785,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 name = "minimald"
 version = "0.5.0-rc1"
 dependencies = [
+ "anyhow",
  "args",
  "async-compression",
  "async-dialog",
@@ -3794,11 +3795,13 @@ dependencies = [
  "bytes",
  "camino",
  "check",
+ "chrono",
  "clap",
  "clap_complete",
  "common",
  "constcat",
  "decode",
+ "diagnostics",
  "either",
  "fd-lock",
  "futures",

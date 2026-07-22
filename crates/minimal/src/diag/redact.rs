@@ -5,8 +5,6 @@
 //! applies the same behavior; what belongs to the CLI is only this policy:
 //! the allowlist of env names whose values are safe and useful verbatim.
 
-use diagnostics::redact::is_sensitive_key;
-
 /// Env vars whose *values* are safe and useful to include verbatim. Everything
 /// else is reported by name only.
 const ENV_VALUE_ALLOWLIST_EXACT: &[&str] = &["RUST_LOG", "HOME", "SHELL", "TERM", "PATH"];
@@ -16,13 +14,11 @@ const ENV_VALUE_ALLOWLIST_PREFIXES: &[&str] = &["XDG_", "MINIMAL_", "MINVMD_", "
 /// A sensitive-shaped name always loses to the allowlist — `MINIMAL_AUTH_TOKEN`
 /// matches the project prefix but must never leave the machine.
 pub fn is_env_value_allowlisted(name: &str) -> bool {
-    if is_sensitive_key(name) {
-        return false;
-    }
-    ENV_VALUE_ALLOWLIST_EXACT.contains(&name)
-        || ENV_VALUE_ALLOWLIST_PREFIXES
-            .iter()
-            .any(|p| name.starts_with(p))
+    diagnostics::redact::is_env_value_allowlisted(
+        name,
+        ENV_VALUE_ALLOWLIST_EXACT,
+        ENV_VALUE_ALLOWLIST_PREFIXES,
+    )
 }
 
 #[cfg(test)]

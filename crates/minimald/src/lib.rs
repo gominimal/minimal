@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 pub mod channel_progress;
 pub mod connection;
+mod diag;
 pub mod env;
 mod exec;
 #[cfg(target_os = "linux")]

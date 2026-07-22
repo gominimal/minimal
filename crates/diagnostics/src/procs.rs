@@ -15,7 +15,7 @@
 use std::borrow::Cow;
 use std::time::Duration;
 
-use crate::bundle::{BundleSink, BundleWriter};
+use crate::bundle::{BundleSink, BundleWriter, scoped};
 use crate::capture::command_stdout;
 use crate::manifest::Redaction;
 use crate::redact::is_sensitive_key;
@@ -75,7 +75,11 @@ fn scrub_arg(arg: &str) -> Cow<'_, str> {
 /// than a half-masked secret in a bundle that gets mailed out. Where the real
 /// boundaries survive — the `/proc` scrape, whose argv is NUL-separated —
 /// [`scrub_arg`] is used per element instead and nothing is over-redacted.
-fn scrub_flattened(line: &str) -> String {
+///
+/// Public because a process argv is not the only space-joined command line a
+/// bundle carries: the kernel boot line (`/proc/cmdline`) is one too, with the
+/// same ambiguity, and it must travel under the same rule.
+pub fn scrub_flattened(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     for (i, tok) in line.split(' ').enumerate() {
         if i > 0 {
@@ -102,7 +106,7 @@ pub async fn process_tree<W: BundleSink>(
 ) -> Result<(), anyhow::Error> {
     let (text, pids) = process_table(markers).await?;
     w.add_bytes(
-        &format!("{dest}/process-tree.txt"),
+        &scoped(dest, "process-tree.txt"),
         text.as_bytes(),
         Redaction::Keys,
     )
@@ -119,7 +123,7 @@ pub async fn process_tree<W: BundleSink>(
             .flatten();
         if let Some(status) = status {
             w.add_bytes(
-                &format!("{dest}/proc/{pid}.status"),
+                &scoped(dest, &format!("proc/{pid}.status")),
                 status.as_bytes(),
                 Redaction::None,
             )
@@ -129,6 +133,100 @@ pub async fn process_tree<W: BundleSink>(
     #[cfg(not(target_os = "linux"))]
     let _ = pids;
     Ok(())
+}
+
+/// `<dest>/proc.txt`: the whole process table — pid, ppid, RSS, command — with
+/// full (scrubbed) argv for marker-matched processes and `comm` alone for
+/// everyone else.
+///
+/// [`process_tree`] answers "where is our family"; this answers "what else is
+/// running", which is the question when the wedge is a task child or a
+/// neighbour eating the machine. Unrelated processes contribute their name and
+/// never their arguments — a support bundle is not a keylogger. Rows are
+/// ordered by pid, so two bundles from one incident diff cleanly.
+pub async fn all_processes<W: BundleSink>(
+    w: &mut BundleWriter<W>,
+    dest: &str,
+    markers: &[&str],
+) -> Result<(), anyhow::Error> {
+    let path = scoped(dest, "proc.txt");
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = markers;
+        w.skip(path, "a full process table needs /proc");
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use anyhow::Context as _;
+        // Hundreds of synchronous /proc reads on a busy host — off the caller's
+        // runtime, for the same reason as the scrape in `process_table`.
+        let owned: Vec<String> = markers.iter().map(|m| (*m).to_string()).collect();
+        let text = tokio::task::spawn_blocking(move || {
+            let markers: Vec<&str> = owned.iter().map(String::as_str).collect();
+            proc_table_text(&markers)
+        })
+        .await
+        .context("proc table worker")??;
+        w.add_bytes(&path, text.as_bytes(), Redaction::Keys).await
+    }
+}
+
+/// The `/proc` walk behind [`all_processes`].
+#[cfg(target_os = "linux")]
+fn proc_table_text(markers: &[&str]) -> Result<String, anyhow::Error> {
+    use anyhow::Context as _;
+    use std::fmt::Write as _;
+
+    let mut rows: Vec<(u32, String)> = std::fs::read_dir("/proc")
+        .context("reading /proc")?
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            // NUL-separated, so the true argv boundaries are intact and each
+            // element can be scrubbed on its own.
+            let argv: Vec<String> = std::fs::read(format!("/proc/{pid}/cmdline"))
+                .unwrap_or_default()
+                .split(|b| *b == 0)
+                .filter(|part| !part.is_empty())
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+                .collect();
+            let ours = argv
+                .first()
+                .is_some_and(|argv0| argv0_matches(argv0, markers));
+            let cmd = if ours {
+                argv.iter()
+                    .map(|arg| scrub_arg(arg))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                // `comm` is the process name only, never its arguments.
+                std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .map(|comm| comm.trim_end().to_string())
+                    .unwrap_or_default()
+            };
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+            let field = |key: &str| {
+                status
+                    .lines()
+                    .find(|line| line.starts_with(key))
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("-")
+                    .to_string()
+            };
+            Some((
+                pid,
+                format!("{pid}\t{}\t{}\t{cmd}", field("PPid:"), field("VmRSS:")),
+            ))
+        })
+        .collect();
+    rows.sort_unstable_by_key(|(pid, _)| *pid);
+
+    let mut text = String::from("pid\tppid\tvmrss_kb\tcmd\n");
+    for (_, row) in rows {
+        let _ = writeln!(text, "{row}");
+    }
+    Ok(text)
 }
 
 /// Hang triage for the matched family (capped at [`HANG_TRIAGE_PIDS_MAX`]):
@@ -141,11 +239,27 @@ pub async fn hang_triage<W: BundleSink>(
     dest: &str,
     markers: &[&str],
 ) -> Result<(), anyhow::Error> {
-    let (_, pids) = process_table(markers).await?;
-    let pids: Vec<u32> = pids.into_iter().take(HANG_TRIAGE_PIDS_MAX).collect();
+    hang_triage_including(w, dest, markers, &[]).await
+}
+
+/// [`hang_triage`] over the marker-matched family *plus* `always` — pids the
+/// caller knows first-hand are its own.
+///
+/// A daemon triaging itself has no marker to match on: its argv0 is whatever
+/// it was exec'd as (an installed `minimald`, a renamed binary, a test
+/// harness), and unlike a scraped pid its identity is not in question — it is
+/// the process running this code. So `always` pids are captured first, ahead
+/// of the cap, and skip the re-pin check the table snapshot needs.
+pub async fn hang_triage_including<W: BundleSink>(
+    w: &mut BundleWriter<W>,
+    dest: &str,
+    markers: &[&str],
+    always: &[u32],
+) -> Result<(), anyhow::Error> {
+    let pids = triage_pids(markers, always).await?;
     if pids.is_empty() {
         w.skip(
-            format!("{dest}/proc/"),
+            scoped(dest, "proc/"),
             "no marker-matched processes to hang-triage",
         );
         return Ok(());
@@ -159,7 +273,7 @@ pub async fn hang_triage<W: BundleSink>(
     #[cfg(target_os = "macos")]
     {
         let mut set = tokio::task::JoinSet::new();
-        for &pid in &pids {
+        for &(pid, _) in &pids {
             set.spawn(async move {
                 let pid_s = pid.to_string();
                 let out = command_stdout("sample", &[&pid_s, "1", "10"], SAMPLE_TIMEOUT).await;
@@ -172,13 +286,13 @@ pub async fn hang_triage<W: BundleSink>(
                 Ok(sample) => samples.push(sample),
                 // A panicked sample task is a bug, not a diagnostic outcome —
                 // record it rather than dropping the pid silently.
-                Err(e) => w.skip(format!("{dest}/proc/"), format!("sample task failed: {e}")),
+                Err(e) => w.skip(scoped(dest, "proc/"), format!("sample task failed: {e}")),
             }
         }
         // Completion order is nondeterministic; keep bundle order by pid.
         samples.sort_by_key(|(pid, _)| *pid);
         for (pid, result) in samples {
-            let path = format!("{dest}/proc/{pid}.sample.txt");
+            let path = scoped(dest, &format!("proc/{pid}.sample.txt"));
             match result {
                 Ok(text) => w.add_bytes(&path, text.as_bytes(), Redaction::None).await?,
                 Err(e) => w.skip(path, format!("sample failed: {e}")),
@@ -186,25 +300,26 @@ pub async fn hang_triage<W: BundleSink>(
         }
     }
 
-    // The pid set actually captured. On Linux each pid is re-checked against
-    // its own cmdline immediately before its state is read: the table snapshot
-    // is stale the moment it is taken, and a pid recycled in between would put
-    // an unrelated process's kernel state and open files into the bundle —
-    // precisely the "someone else's activity" this collector filters out.
+    // The pid set actually captured. On Linux a pid taken from the table is
+    // re-checked against its own cmdline immediately before its state is read:
+    // the snapshot is stale the moment it is taken, and a pid recycled in
+    // between would put an unrelated process's kernel state and open files into
+    // the bundle — precisely the "someone else's activity" this collector
+    // filters out.
     #[cfg(target_os = "linux")]
     let mut captured: Vec<u32> = Vec::with_capacity(pids.len());
     #[cfg(target_os = "linux")]
-    for &pid in &pids {
-        if !still_matches(pid, markers).await {
+    for &(pid, from_snapshot) in &pids {
+        if from_snapshot && !still_matches(pid, markers).await {
             w.skip(
-                format!("{dest}/proc/{pid}.stack.txt"),
+                scoped(dest, &format!("proc/{pid}.stack.txt")),
                 "pid no longer matches a marker (exited or recycled since the snapshot)",
             );
             continue;
         }
         let text = linux_park_state(pid).await;
         w.add_bytes(
-            &format!("{dest}/proc/{pid}.stack.txt"),
+            &scoped(dest, &format!("proc/{pid}.stack.txt")),
             text.as_bytes(),
             Redaction::None,
         )
@@ -212,11 +327,11 @@ pub async fn hang_triage<W: BundleSink>(
         captured.push(pid);
     }
     #[cfg(not(target_os = "linux"))]
-    let captured = pids;
+    let captured: Vec<u32> = pids.iter().map(|&(pid, _)| pid).collect();
 
     if captured.is_empty() {
         w.skip(
-            format!("{dest}/proc/lsof.txt"),
+            scoped(dest, "proc/lsof.txt"),
             "no marker-matched pids still live to inspect",
         );
         return Ok(());
@@ -226,12 +341,142 @@ pub async fn hang_triage<W: BundleSink>(
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let path = format!("{dest}/proc/lsof.txt");
+    let path = scoped(dest, "proc/lsof.txt");
     match command_stdout("lsof", &["-nP", "-p", &pid_list], LSOF_TIMEOUT).await {
         Ok(text) => w.add_bytes(&path, text.as_bytes(), Redaction::None).await?,
         Err(e) => w.skip(path, format!("lsof unavailable: {e}")),
     }
     Ok(())
+}
+
+/// The pid set a per-process capture covers: `always` first, then the
+/// marker-matched table, capped at [`HANG_TRIAGE_PIDS_MAX`]. The flag on each
+/// pid is "this identity came from a stale table snapshot", i.e. whether it
+/// must be re-pinned before its kernel state is read.
+async fn triage_pids(markers: &[&str], always: &[u32]) -> Result<Vec<(u32, bool)>, anyhow::Error> {
+    let (_, matched) = process_table(markers).await?;
+    let mut pids: Vec<(u32, bool)> = always.iter().map(|&pid| (pid, false)).collect();
+    pids.extend(
+        matched
+            .into_iter()
+            .filter(|pid| !always.contains(pid))
+            .map(|pid| (pid, true)),
+    );
+    pids.truncate(HANG_TRIAGE_PIDS_MAX);
+    Ok(pids)
+}
+
+/// `<dest>/proc/sockets.txt`: which of our processes holds which socket, in
+/// which state — every `socket:[inode]` fd of the family joined against the
+/// `/proc/net` tables.
+///
+/// This is the binary-free `lsof` equivalent, and on a microVM it is the only
+/// one: the guest rootfs ships no `lsof`, yet "who still holds the transport
+/// socket, and is anyone reading it" is the question a partial wedge turns on.
+/// The joined row is the raw table line, not a re-serialization of it.
+pub async fn open_sockets<W: BundleSink>(
+    w: &mut BundleWriter<W>,
+    dest: &str,
+    markers: &[&str],
+    always: &[u32],
+) -> Result<(), anyhow::Error> {
+    socket_join(w, &scoped(dest, "proc/sockets.txt"), markers, always).await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn socket_join<W: BundleSink>(
+    w: &mut BundleWriter<W>,
+    path: &str,
+    _markers: &[&str],
+    _always: &[u32],
+) -> Result<(), anyhow::Error> {
+    w.skip(path, "fd→socket-inode joins need /proc");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn socket_join<W: BundleSink>(
+    w: &mut BundleWriter<W>,
+    path: &str,
+    markers: &[&str],
+    always: &[u32],
+) -> Result<(), anyhow::Error> {
+    use std::fmt::Write as _;
+
+    let pids = triage_pids(markers, always).await?;
+    if pids.is_empty() {
+        w.skip(path, "no marker-matched processes holding sockets");
+        return Ok(());
+    }
+    let mut tables = Vec::with_capacity(crate::net::PROC_NET_SOCKET_TABLES.len());
+    for table in crate::net::PROC_NET_SOCKET_TABLES {
+        if let Ok(text) = tokio::fs::read_to_string(format!("/proc/net/{table}")).await {
+            tables.push((*table, text));
+        }
+    }
+    let sockets = index_by_inode(&tables);
+
+    let mut text = String::from("pid\tfd\tinode\ttable\tentry\n");
+    for (pid, _) in pids {
+        let Ok(mut entries) = tokio::fs::read_dir(format!("/proc/{pid}/fd")).await else {
+            let _ = writeln!(text, "{pid}\t-\t-\t-\t<fd directory unreadable>");
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Ok(target) = tokio::fs::read_link(entry.path()).await else {
+                continue;
+            };
+            let Some(inode) = socket_inode(&target.to_string_lossy()) else {
+                continue; // not a socket fd — files and pipes are `stack.txt`'s job
+            };
+            let fd = entry.file_name().to_string_lossy().into_owned();
+            let (table, row) = sockets
+                .get(&inode)
+                .map(|(t, l)| (t.as_str(), l.as_str()))
+                // A socket with no table row is itself a finding: it belongs to
+                // a family /proc/net does not list (netlink) or to a network
+                // namespace this process cannot see.
+                .unwrap_or(("?", "<no /proc/net entry>"));
+            let _ = writeln!(text, "{pid}\t{fd}\t{inode}\t{table}\t{row}");
+        }
+    }
+    w.add_bytes(path, text.as_bytes(), Redaction::None).await
+}
+
+/// The socket inode named by an fd's readlink target, e.g. `socket:[12345]`.
+#[cfg(any(target_os = "linux", test))]
+fn socket_inode(link_target: &str) -> Option<u64> {
+    link_target
+        .strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+/// The field index holding the socket inode in a `/proc/net` table row.
+/// `unix` has its own column layout; the IP tables share one.
+#[cfg(any(target_os = "linux", test))]
+fn inode_column(table: &str) -> usize {
+    if table == "unix" { 6 } else { 9 }
+}
+
+/// Indexes `(table, contents)` pairs by socket inode, keeping each row
+/// verbatim. Header rows fall out for free — their inode column is a label,
+/// not a number.
+#[cfg(any(target_os = "linux", test))]
+fn index_by_inode(tables: &[(&str, String)]) -> std::collections::BTreeMap<u64, (String, String)> {
+    tables
+        .iter()
+        .flat_map(|(table, text)| {
+            text.lines().filter_map(move |line| {
+                let inode = line.split_whitespace().nth(inode_column(table))?;
+                Some((
+                    inode.parse().ok()?,
+                    ((*table).to_string(), line.trim().to_string()),
+                ))
+            })
+        })
+        .collect()
 }
 
 /// Filtered `ps` output plus the matched pids; on Linux a `/proc` scrape stands
@@ -459,5 +704,48 @@ mod tests {
     fn scrub_flattened_leaves_a_clean_line_alone() {
         let line = "minimald run --detach --instance-num 0";
         assert_eq!(scrub_flattened(line), line);
+    }
+
+    #[test]
+    fn socket_inode_reads_only_socket_links() {
+        assert_eq!(socket_inode("socket:[12345]"), Some(12345));
+        assert_eq!(socket_inode("/run/minimald/ssh.sock"), None);
+        assert_eq!(socket_inode("pipe:[999]"), None);
+        assert_eq!(socket_inode("anon_inode:[eventpoll]"), None);
+    }
+
+    /// The join keys on the inode column, which differs between the IP tables
+    /// and `unix`; header rows must not become entries.
+    #[test]
+    fn index_by_inode_keys_both_table_layouts() {
+        let tcp = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 41001 1 ffff 100 0 0 10 0
+"
+        .to_string();
+        let unix = "\
+Num       RefCount Protocol Flags    Type St Inode Path
+ffff8880: 00000002 00000000 00010000 0001 01 41002 /run/minimald/ssh.sock
+"
+        .to_string();
+        let index = index_by_inode(&[("tcp", tcp), ("unix", unix)]);
+
+        assert_eq!(index.len(), 2, "headers are not entries: {index:?}");
+        let (table, row) = &index[&41001];
+        assert_eq!(table, "tcp");
+        assert!(row.contains("00000000:0016"), "row kept verbatim: {row}");
+        let (table, row) = &index[&41002];
+        assert_eq!(table, "unix");
+        assert!(row.ends_with("/run/minimald/ssh.sock"), "{row}");
+    }
+
+    #[tokio::test]
+    async fn triage_pids_puts_caller_pids_first_and_never_repins_them() {
+        // No process can match this marker, so the whole set comes from
+        // `always` — the daemon-triaging-itself case, where argv0 says nothing.
+        let pids = triage_pids(&["\u{1}no-such-binary"], &[4242])
+            .await
+            .unwrap();
+        assert_eq!(pids, vec![(4242, false)]);
     }
 }

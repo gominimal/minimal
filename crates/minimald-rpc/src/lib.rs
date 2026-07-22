@@ -635,10 +635,93 @@ impl OneshotSshRpc for GetMeshStatus {
     type Response = MeshStatus;
 }
 
+// ---------------------------------------------------------------------------
+// Diagnostic bundle (`min bug`).
+// ---------------------------------------------------------------------------
+
+/// Streaming RPC subsystem: the daemon's contribution to a `min bug`
+/// diagnostic bundle.
+///
+/// Not an [`OneshotSshRpc`]: the client writes one JSON-encoded
+/// [`DiagBundleRequest`] and half-closes, then the daemon streams back a
+/// zstd-compressed tar archive of its diagnostic bundle and closes. Errors hit
+/// before streaming starts are relayed over extended-data stream 1, so a client
+/// that reads zero payload bytes should surface the extended data as the
+/// failure reason.
+///
+/// Served identically by the native Linux minimald and the in-VM minimald
+/// behind the minvmd bridge — the archive's `meta.json` says which one
+/// answered.
+pub const DIAG_BUNDLE_SUBSYSTEM: &str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "DiagBundleTarZst");
+
+/// Request body for [`DIAG_BUNDLE_SUBSYSTEM`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagBundleRequest {
+    /// Per-log-file tail cap in bytes; `0` means the daemon's default. The
+    /// daemon clamps this to its own ceiling — the value is caller-controlled.
+    #[serde(default)]
+    pub log_tail_bytes: u64,
+    /// Include the recursive state-dir listing (names/sizes only).
+    #[serde(default = "default_true")]
+    pub include_state_listing: bool,
+}
+
+impl Default for DiagBundleRequest {
+    fn default() -> Self {
+        Self {
+            log_tail_bytes: 0,
+            include_state_listing: true,
+        }
+    }
+}
+
+/// The type is `#[non_exhaustive]`, so other crates cannot write a struct
+/// literal for it; these are how a client departs from the defaults.
+impl DiagBundleRequest {
+    #[must_use]
+    pub fn with_log_tail_bytes(mut self, bytes: u64) -> Self {
+        self.log_tail_bytes = bytes;
+        self
+    }
+
+    #[must_use]
+    pub fn with_state_listing(mut self, include: bool) -> Self {
+        self.include_state_listing = include;
+        self
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sessions::wire::request::{ContributionResponse, WireContribution};
+
+    /// An empty request body must decode with the documented defaults so a
+    /// bare `{}` probe (or an older client) still gets a full bundle.
+    #[test]
+    fn diag_bundle_request_defaults_from_empty_object() {
+        let req: DiagBundleRequest = serde_json::from_str("{}").expect("deserialize");
+        assert_eq!(req, DiagBundleRequest::default());
+        assert_eq!(req.log_tail_bytes, 0);
+        assert!(req.include_state_listing);
+    }
+
+    #[test]
+    fn diag_bundle_request_round_trips() {
+        let req = DiagBundleRequest::default()
+            .with_log_tail_bytes(1024)
+            .with_state_listing(false);
+        assert_eq!(round_trip(&req), req);
+        assert_eq!(
+            DIAG_BUNDLE_SUBSYSTEM, "minimald-v1-DiagBundleTarZst",
+            "subsystem name is wire contract; changing it breaks old clients"
+        );
+    }
 
     #[test]
     fn policy_types_are_present_and_serializable() {
