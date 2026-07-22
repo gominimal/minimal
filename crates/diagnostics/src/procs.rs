@@ -75,7 +75,11 @@ fn scrub_arg(arg: &str) -> Cow<'_, str> {
 /// than a half-masked secret in a bundle that gets mailed out. Where the real
 /// boundaries survive — the `/proc` scrape, whose argv is NUL-separated —
 /// [`scrub_arg`] is used per element instead and nothing is over-redacted.
-fn scrub_flattened(line: &str) -> String {
+///
+/// Public because a process argv is not the only space-joined command line a
+/// bundle carries: the kernel boot line (`/proc/cmdline`) is one too, with the
+/// same ambiguity, and it must travel under the same rule.
+pub fn scrub_flattened(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     for (i, tok) in line.split(' ').enumerate() {
         if i > 0 {

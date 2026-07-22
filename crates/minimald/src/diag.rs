@@ -292,6 +292,15 @@ struct Meta {
     in_microvm: bool,
     state_volume_mounted: bool,
     state_dir: String,
+    /// `/proc/version` verbatim — the guest kernel's identity, which nothing
+    /// else in any bundle carries. `diagnostics::system_info` has a `kernel`
+    /// field, but it is a *host* collector and shells out to `uname`, a binary
+    /// the microVM rootfs does not ship.
+    kernel: Option<String>,
+    /// The release parsed out of [`Meta::kernel`], for diffing two bundles.
+    kernel_release: Option<String>,
+    /// `/proc/cmdline`, key-scrubbed — see [`scrubbed_cmdline`].
+    kernel_cmdline: Option<String>,
 }
 
 async fn meta<W: BundleSink>(
@@ -299,6 +308,7 @@ async fn meta<W: BundleSink>(
     s: &ServerStateHandle,
 ) -> Result<(), anyhow::Error> {
     let uptime = tokio::fs::read_to_string("/proc/uptime").await.ok();
+    let kernel = proc_line("/proc/version").await;
     let info = Meta {
         version: version::VERSION,
         long_version: version::LONG_VERSION,
@@ -308,9 +318,66 @@ async fn meta<W: BundleSink>(
         in_microvm: s.in_microvm().await,
         state_volume_mounted: s.state_volume_mounted().await,
         state_dir: s.minimal_state_dir().await.to_string(),
+        kernel_release: kernel
+            .as_deref()
+            .and_then(kernel_release)
+            .map(str::to_owned),
+        kernel,
+        kernel_cmdline: proc_line("/proc/cmdline")
+            .await
+            .as_deref()
+            .map(scrubbed_cmdline),
     };
     let json = serde_json::to_vec_pretty(&info).context("serializing meta")?;
-    w.add_bytes("meta.json", &json, Redaction::None).await
+    // `Keys`, not `None`: `kernel_cmdline` goes through the same key-based
+    // scrub a process argv does, so this is no longer a verbatim capture.
+    w.add_bytes("meta.json", &json, Redaction::Keys).await
+}
+
+/// A one-line `/proc` file, trimmed; `None` when it cannot be read (a non-Linux
+/// host, a restricted `procfs`) — the same best-effort shape every other field
+/// in [`Meta`] has.
+async fn proc_line(path: &str) -> Option<String> {
+    tokio::fs::read_to_string(path)
+        .await
+        .ok()
+        .map(|text| text.trim_end().to_string())
+}
+
+/// The release out of a `/proc/version` banner: `6.12.94` from
+/// `Linux version 6.12.94 (u@h) (gcc ...) #1 SMP PREEMPT ...`.
+///
+/// The kernel writes that banner from one fixed format string
+/// (`linux_proc_banner`, `"%s version %s ..."` over `utsname()->sysname` and
+/// `->release`), so the third token is the release whenever the second is
+/// literally `version`; anything else is not a banner this understands and
+/// yields `None`. The parse rides *beside* the verbatim banner rather than
+/// replacing it — a wrong parse can then only cost a convenience, never
+/// evidence — and it earns its place because "which release is this" is the
+/// question a bundle-to-bundle diff asks, and eyeballing two banners full of
+/// toolchain and build-time noise is how that question gets answered wrongly.
+fn kernel_release(banner: &str) -> Option<&str> {
+    let mut tokens = banner.split_whitespace();
+    match (tokens.next(), tokens.next(), tokens.next()) {
+        (Some(_sysname), Some("version"), release) => release,
+        _ => None,
+    }
+}
+
+/// The kernel boot line as it may travel: key-scrubbed exactly as a process
+/// argv is.
+///
+/// The guest boot line today is `console=hvc0` plus an optional forwarded
+/// `RUST_LOG=<filter>`, and nothing secret can reach it — minvmd rejects a
+/// value with whitespace and documents the invariant, because `/proc/cmdline`
+/// is world-readable inside the guest. But that is an invariant about *this
+/// machine*, and the bundle leaves it: a boot parameter added later that
+/// happens to be secret-shaped would otherwise ship verbatim to whoever the
+/// archive is mailed to. So the same fail-closed `key=value` rule the
+/// flattened-argv capture uses applies here — it costs nothing on a clean line
+/// and withholds the tail of a dirty one.
+fn scrubbed_cmdline(raw: &str) -> String {
+    diagnostics::procs::scrub_flattened(raw)
 }
 
 async fn logs<W: BundleSink>(
@@ -722,6 +789,71 @@ mod tests {
                 "{name} must be masked, got: {value}"
             );
         }
+    }
+
+    /// The guest kernel's identity travels in `meta.json`, from `/proc` alone
+    /// — `uname` is a binary the microVM rootfs does not have. A kernel bump
+    /// under a fixed daemon version is a whole class of "why did this start
+    /// now", and no bundle carried the fact before.
+    #[tokio::test]
+    async fn meta_carries_the_guest_kernel_identity() {
+        let server = TestServer::new().await;
+        let files = fetch_bundle(&server).await;
+        let meta: serde_json::Value = serde_json::from_slice(&files["meta.json"]).unwrap();
+
+        let banner = meta["kernel"].as_str().expect("/proc/version is readable");
+        assert!(
+            banner.contains("version"),
+            "the raw banner travels: {banner}"
+        );
+        let release = meta["kernel_release"]
+            .as_str()
+            .expect("a banner yields a release");
+        assert!(
+            banner.contains(release),
+            "the parsed release must come out of the banner beside it: {banner}"
+        );
+        assert!(
+            meta["kernel_cmdline"].is_string(),
+            "the boot line rides along: {}",
+            meta["kernel_cmdline"]
+        );
+    }
+
+    /// The banner format is fixed by the kernel, so the release is the third
+    /// token — and the two releases of #869 must parse.
+    #[test]
+    fn kernel_release_reads_the_proc_version_banner() {
+        assert_eq!(
+            kernel_release(
+                "Linux version 6.12.43 (nix@builder) (gcc (GCC) 14.2.1) #1 SMP Thu Jul 3 00:00:00 UTC 2026"
+            ),
+            Some("6.12.43")
+        );
+        assert_eq!(
+            kernel_release("Linux version 6.12.94 (u@h) (clang 19.1.0) #1 SMP PREEMPT_DYNAMIC"),
+            Some("6.12.94")
+        );
+        // Not a banner: the verbatim `kernel` field is still the truth, so a
+        // parse that cannot recognize its input says nothing rather than
+        // guessing.
+        assert_eq!(kernel_release(""), None);
+        assert_eq!(kernel_release("Linux 6.12.94"), None);
+    }
+
+    /// `/proc/cmdline` carries a forwarded `RUST_LOG` and is world-readable in
+    /// the guest, but the bundle leaves the machine — so it travels under the
+    /// same fail-closed `key=value` rule an argv does.
+    #[test]
+    fn kernel_cmdline_is_scrubbed_before_it_travels() {
+        // Today's guest boot line, which the scrub must leave intact.
+        assert_eq!(
+            scrubbed_cmdline("console=hvc0 RUST_LOG=info,russh=debug,minimald=debug"),
+            "console=hvc0 RUST_LOG=info,russh=debug,minimald=debug"
+        );
+        let scrubbed = scrubbed_cmdline("console=hvc0 boot_token=s3cr3t quiet");
+        assert!(!scrubbed.contains("s3cr3t"), "got: {scrubbed}");
+        assert!(scrubbed.starts_with("console=hvc0"), "got: {scrubbed}");
     }
 
     /// The daemon's env policy: a project-prefixed name that is also
