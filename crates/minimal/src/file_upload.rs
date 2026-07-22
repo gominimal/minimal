@@ -15,6 +15,20 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 /// implementation is tracked as a follow-up on #263.
 const DEFAULT_EXCLUDED_DIRS: &[&str] = &["target", "node_modules"];
 
+/// Marker entries whose presence at a directory root indicates it is a
+/// version-control repository root. Used to decide whether the recursive
+/// upload is obviously intentional or needs a confirmation prompt (#770).
+///
+/// Git worktrees/submodules use a `.git` *file* rather than a directory, so
+/// the check must accept either — `Path::exists` does.
+const VCS_MARKERS: &[&str] = &[".git", ".hg", ".svn", "CVS", ".jj"];
+
+/// Returns `true` if `dir` is the root of a recognized VCS repository
+/// (Git, Mercurial, Subversion, CVS, or Jujutsu).
+pub fn is_vcs_root(dir: &Path) -> bool {
+    VCS_MARKERS.iter().any(|marker| dir.join(marker).exists())
+}
+
 fn is_default_excluded(name: &str) -> bool {
     DEFAULT_EXCLUDED_DIRS.contains(&name)
 }
@@ -421,5 +435,54 @@ mod tests {
             !paths.iter().any(|p| p.contains("node_modules/")),
             "node_modules/ should be excluded"
         );
+    }
+
+    #[test]
+    fn is_vcs_root_recognizes_git() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        assert!(is_vcs_root(dir.path()));
+    }
+
+    #[test]
+    fn is_vcs_root_recognizes_git_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".git"), "gitdir: /some/elsewhere\n").unwrap();
+        assert!(is_vcs_root(dir.path()));
+    }
+
+    #[test]
+    fn is_vcs_root_recognizes_mercurial() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".hg")).unwrap();
+        assert!(is_vcs_root(dir.path()));
+    }
+
+    #[test]
+    fn is_vcs_root_recognizes_subversion() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".svn")).unwrap();
+        assert!(is_vcs_root(dir.path()));
+    }
+
+    #[test]
+    fn is_vcs_root_recognizes_cvs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("CVS")).unwrap();
+        assert!(is_vcs_root(dir.path()));
+    }
+
+    #[test]
+    fn is_vcs_root_recognizes_jujutsu() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".jj")).unwrap();
+        assert!(is_vcs_root(dir.path()));
+    }
+
+    #[test]
+    fn is_vcs_root_false_for_plain_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "hello").unwrap();
+        assert!(!is_vcs_root(dir.path()));
     }
 }

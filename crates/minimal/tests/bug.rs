@@ -71,12 +71,14 @@ fn global_args(state: &Path, config: &Path) -> GlobalArgs {
         minimal_dir: Some(state.to_path_buf()),
         config_dir: Some(config.to_path_buf()),
         minvmd: false,
+        no_input: false,
     }
 }
 
 fn bug_args(out: &Path) -> BugArgs {
     BugArgs {
         output: Some(out.to_path_buf()),
+        log_tail_bytes: diagnostics::LOG_TAIL_CAP,
     }
 }
 
@@ -258,6 +260,52 @@ async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
         "absent boot.log is a skip: {skipped:?}"
     );
     assert_eq!(manifest["errors"].as_array().unwrap().len(), 0, "no errors");
+}
+
+/// The `--log-tail-bytes` cap reaches every log the collector bundles — the
+/// rotated host logs and the provider-scoped ones — and the manifest labels
+/// each capped file so a reader can tell a truncated log from a short one.
+#[tokio::test]
+async fn a_custom_tail_cap_applies_to_every_log() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config = tempfile::TempDir::new().unwrap();
+
+    let log_dir = state.path().join("logs");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    std::fs::write(log_dir.join("minimald.log.2026-07-21"), "x".repeat(500)).unwrap();
+    let provider = state.path().join("providers/local-0");
+    std::fs::create_dir_all(&provider).unwrap();
+    std::fs::write(provider.join("run.log"), "y".repeat(500)).unwrap();
+
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let out = out_dir.path().join("diag.tar.zst");
+    let mut args = bug_args(&out);
+    args.log_tail_bytes = 100;
+    cmd_bug(&global_args(state.path(), config.path()), args)
+        .await
+        .unwrap();
+
+    let files = unpack(&out).await;
+    for suffix in ["logs/minimald.log.2026-07-21", "providers/local-0/run.log"] {
+        let contents = find(&files, suffix).unwrap_or_else(|| panic!("missing {suffix}"));
+        assert_eq!(contents.len(), 100, "{suffix} honors the requested cap");
+    }
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
+    let capped: Vec<&serde_json::Value> = manifest["collected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["redaction"] == "tail-capped")
+        .collect();
+    assert_eq!(capped.len(), 2, "both logs recorded as tail-capped");
+    // Today the applied cap is only recoverable from a capped entry's own
+    // byte count; the manifest has no field naming it outright.
+    assert!(
+        capped.iter().all(|e| e["bytes"] == 100),
+        "a capped entry's size is the cap: {capped:?}"
+    );
 }
 
 /// R5.1–R5.3: the incident collectors (net/procs/power) land in the bundle,

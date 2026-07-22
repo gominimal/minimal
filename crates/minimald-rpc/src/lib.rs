@@ -127,10 +127,26 @@ pub struct RunningSessionAttrs {
 }
 
 /// An entry in the ListSessions response.
+///
+/// `project_path` and `status` mirror the fields of the same name on the
+/// session [`Record`](sessions::Record). They let a client resolve "which
+/// session was built from this directory" and render a state glyph in a
+/// picker without a follow-up `GetSessionRecord` round-trip per session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ListSessionsEntry {
     pub id: SessionId,
     pub name: Option<String>,
+    /// The absolute host path the session was built from. `None` on responses
+    /// from daemons that predate this field — clients treat such entries as
+    /// not matching the cwd but still listable/pickable. Always `Some` from a
+    /// current daemon, since [`Record`](sessions::Record) requires the path.
+    #[serde(default)]
+    pub project_path: Option<paths::HostAbsPath>,
+    /// The session's lifecycle status, used to render a state glyph in the
+    /// interactive picker. Defaults to `Active` for daemons that predate the
+    /// field so an older server still deserializes cleanly.
+    #[serde(default)]
+    pub status: sessions::SessionStatus,
     pub attrs: Option<RunningSessionAttrs>,
 }
 
@@ -785,6 +801,31 @@ mod tests {
             serde_json::from_str(r#"{"sessions":[]}"#).expect("deserialize");
         assert!(resp.resource_pool.is_none());
         assert!(resp.sessions.is_empty());
+    }
+
+    /// A daemon that predates `project_path` and `status` on
+    /// `ListSessionsEntry` omits both fields; the client must accept that
+    /// response (project_path → `None`, status → `Active`) rather than fail
+    /// deserialization.
+    #[test]
+    fn list_sessions_entry_accepts_response_without_project_path_and_status() {
+        let resp: ListSessionsResponse = serde_json::from_str(
+            r#"{"sessions":[{"id":"00000000-0000-0000-0000-000000000001","name":"old"}]}"#,
+        )
+        .expect("deserialize");
+        assert_eq!(resp.sessions.len(), 1);
+        let entry = &resp.sessions[0];
+        assert_eq!(
+            entry.id,
+            SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
+        );
+        assert_eq!(entry.name.as_deref(), Some("old"));
+        assert!(entry.project_path.is_none(), "missing project_path → None");
+        assert_eq!(
+            entry.status,
+            sessions::SessionStatus::Active,
+            "missing status → default Active"
+        );
     }
 
     #[test]

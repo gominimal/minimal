@@ -5,6 +5,7 @@
 //! selects how the VM attaches to the per-host gvproxy switch supervised by
 //! [`crate::net`] (R1.4, R1.5).
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 use minimald_rpc::{EgressPolicy, NetworkMode};
@@ -18,6 +19,22 @@ use crate::error::VmError;
 /// macOS, skips the drive-level sync, bounding the crash data-loss window
 /// without the throughput cost of full sync.
 pub const DISK_SYNC_ENV: &str = "MINVMD_DISK_SYNC";
+
+/// Host environment variable forwarded to the guest over the kernel command
+/// line, so the guest daemon's log filter can be set from the host. Skipped
+/// when it cannot survive the boot line, and it must never carry a secret —
+/// see `kernel_cmdline` for both.
+pub const GUEST_LOG_ENV: &str = "RUST_LOG";
+
+/// Kernel command line every microVM boots with: the console the guest's
+/// stdout/stderr reaches the host boot log through. `kernel_cmdline` extends it;
+/// nothing else in the boot line is optional.
+const BASE_KERNEL_CMDLINE: &str = "console=hvc0";
+
+/// The kernel's `COMMAND_LINE_SIZE` — the buffer the boot line (including its
+/// NUL terminator) must fit in. 2048 on both arm64 and x86_64, the two
+/// architectures libkrun boots.
+const COMMAND_LINE_SIZE: usize = 2048;
 
 /// Environment variable toggling `direct_io` (bypass the host page cache) on the
 /// data volume (spec R1.9). Accepts `true` / `1` (any other value is false).
@@ -209,11 +226,19 @@ impl VmConfig {
         // Initramfs boot: the kernel unpacks the initramfs into a RAM root and
         // runs its `/init` (no `root=`/`init=` cmdline). minimald-as-/init mounts
         // devtmpfs itself, then mounts the rootfs disk below and chroots into it.
+        //
+        // The boot line also carries the host's RUST_LOG to the guest daemon as
+        // an environment variable: the kernel command line is the only vector,
+        // since the guest `/init` is minimald itself and the kernel starts it
+        // with an empty environment (see `kernel_cmdline`). Bound to a local so
+        // the &str handed to `set_kernel` outlives the call.
+        let rust_log = std::env::var(GUEST_LOG_ENV).ok();
+        let cmdline = kernel_cmdline(rust_log.as_deref());
         ctx.set_kernel(
             &self.kernel_path,
             crate::image::kernel_format(),
             Some(&self.initramfs),
-            Some("console=hvc0"),
+            Some(cmdline.as_ref()),
         )?;
         // Attach the rootfs as a block device (/dev/vda) for the initramfs
         // `/init` to mount + chroot into; the kernel root is the initramfs.
@@ -295,6 +320,70 @@ impl VmConfig {
     }
 }
 
+/// Build the guest kernel command line, forwarding `RUST_LOG` when the host has
+/// one worth forwarding.
+///
+/// The microVM's `/init` **is** minimald, so the kernel starts it with an empty
+/// environment — nothing from the host process crosses the VM boundary, and the
+/// guest daemon's log level is otherwise unraisable from the host. The kernel
+/// hands init every `KEY=VALUE` boot token it does not recognise itself
+/// (`init/main.c`: `unknown_bootoption` → `envp_init`), so `RUST_LOG=<value>` on
+/// the command line arrives as an environment variable and reaches minimald's
+/// `EnvFilter::try_from_default_env()`.
+///
+/// Two things a caller setting `RUST_LOG` must know:
+///
+/// - It **replaces** minimald's default filter outright, including that
+///   default's `topiary=off` and `libcgroups=off` directives (see
+///   `crates/minimald/src/main.rs`). `RUST_LOG=debug` therefore also turns those
+///   subsystems on; repeat the directives in the value to keep them off.
+/// - The boot line is world-readable inside the guest as `/proc/cmdline`, so it
+///   must never carry a secret.
+///
+/// The value is injected rather than read from the process environment here, so
+/// this stays pure and unit-testable; the caller passes
+/// `std::env::var(GUEST_LOG_ENV).ok()`. A value that cannot survive the boot
+/// line is skipped (leaving [`BASE_KERNEL_CMDLINE`] byte-identical) with a
+/// warning, rather than corrupting the boot: whitespace would be split into
+/// separate boot tokens, an empty value carries nothing, and an over-long one
+/// would overrun [`COMMAND_LINE_SIZE`]. Commas are untouched —
+/// `info,russh=debug` is the normal form.
+// Only `apply` calls this, and `apply` needs libkrun; without it the crate is a
+// runtime-bailing stub, but the tests below still cover this on every target.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn kernel_cmdline(rust_log: Option<&str>) -> Cow<'static, str> {
+    let Some(value) = rust_log else {
+        return Cow::Borrowed(BASE_KERNEL_CMDLINE);
+    };
+
+    // `<base> RUST_LOG=<value>`: the three extra bytes are the separating space,
+    // the `=`, and the NUL the kernel's buffer must also hold.
+    let total_len = BASE_KERNEL_CMDLINE.len() + GUEST_LOG_ENV.len() + value.len() + 3;
+    let rejection = if value.is_empty() {
+        Some("value is empty")
+    } else if value.contains(char::is_whitespace) {
+        Some("value contains whitespace, which the kernel would split into separate boot tokens")
+    } else if total_len > COMMAND_LINE_SIZE {
+        Some("value would push the boot line past the kernel's COMMAND_LINE_SIZE")
+    } else {
+        None
+    };
+
+    match rejection {
+        Some(reason) => {
+            tracing::warn!(
+                env = GUEST_LOG_ENV,
+                value_len = value.len(),
+                reason,
+                "not forwarding the host log filter to the guest; the guest keeps minimald's \
+                 default filter",
+            );
+            Cow::Borrowed(BASE_KERNEL_CMDLINE)
+        }
+        None => Cow::Owned(format!("{BASE_KERNEL_CMDLINE} {GUEST_LOG_ENV}={value}")),
+    }
+}
+
 /// Resolve the data-volume `(direct_io, sync_mode)` from the R1.9 environment
 /// tunables ([`DISK_DIRECT_IO_ENV`], [`DISK_SYNC_ENV`]). Defaults: `direct_io =
 /// false`, `sync_mode = Relaxed`.
@@ -341,6 +430,60 @@ fn resolve_disk_flags() -> (bool, crate::krun::SyncMode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_cmdline_without_a_host_filter_is_the_bare_console_line() {
+        // Byte-identical to the pre-forwarding boot line: no empty token, no
+        // trailing space.
+        assert_eq!(kernel_cmdline(None), "console=hvc0");
+    }
+
+    #[test]
+    fn kernel_cmdline_forwards_a_simple_filter() {
+        assert_eq!(kernel_cmdline(Some("debug")), "console=hvc0 RUST_LOG=debug");
+    }
+
+    #[test]
+    fn kernel_cmdline_preserves_comma_separated_directives() {
+        // The normal form of a real filter; commas are legal in a boot token.
+        assert_eq!(
+            kernel_cmdline(Some("info,russh=debug,minimald=debug")),
+            "console=hvc0 RUST_LOG=info,russh=debug,minimald=debug"
+        );
+    }
+
+    #[test]
+    fn kernel_cmdline_skips_a_filter_containing_whitespace() {
+        // The kernel would split these into separate boot tokens, silently
+        // corrupting the line, so the whole value is dropped.
+        assert_eq!(kernel_cmdline(Some("info, russh=debug")), "console=hvc0");
+        assert_eq!(kernel_cmdline(Some("info\trussh=debug")), "console=hvc0");
+    }
+
+    #[test]
+    fn kernel_cmdline_skips_an_empty_filter() {
+        assert_eq!(kernel_cmdline(Some("")), "console=hvc0");
+    }
+
+    #[test]
+    fn kernel_cmdline_skips_an_oversized_filter() {
+        let huge = "minimald=trace,".repeat(500);
+        assert!(huge.len() > COMMAND_LINE_SIZE);
+        assert_eq!(kernel_cmdline(Some(&huge)), "console=hvc0");
+    }
+
+    #[test]
+    fn kernel_cmdline_forwards_the_longest_filter_that_fits_the_kernel_buffer() {
+        // `console=hvc0 RUST_LOG=` is 22 bytes, so a 2025-byte value yields a
+        // 2047-byte line that fills COMMAND_LINE_SIZE exactly once NUL-terminated.
+        let longest = "d".repeat(2025);
+        let line = kernel_cmdline(Some(&longest));
+        assert_eq!(line.len(), COMMAND_LINE_SIZE - 1);
+        assert!(line.ends_with(&longest));
+
+        // One byte more must be skipped, not truncated.
+        assert_eq!(kernel_cmdline(Some(&"d".repeat(2026))), "console=hvc0");
+    }
 
     #[test]
     fn vm_config_stores_fields() {

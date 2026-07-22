@@ -165,7 +165,7 @@ Gotchas:
   --detach` / `status` / `stop` to exercise it. Kill a stray `boot` VM by PID
   (the `boot` parent + its hidden `__krun-vmm` child).
 - **Requires libkrun >= 1.19.0** (BLK=1 for `krun_add_disk2`, plus the vsock
-  TX-chain fix). The upstream `libkrun` package already pins 1.19.0.
+  TX-chain fix). The upstream `libkrun` package already pins 1.19.4.
 
 ## E2E tests (macOS)
 
