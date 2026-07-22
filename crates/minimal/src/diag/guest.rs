@@ -190,6 +190,7 @@ async fn verify_nested_bundle(bytes: &[u8]) -> Result<(), String> {
         if entry
             .path()
             .is_ok_and(|p| p.as_os_str() == std::ffi::OsStr::new("manifest.json"))
+            && entry.header().entry_type().is_file()
         {
             has_manifest = true;
         }
