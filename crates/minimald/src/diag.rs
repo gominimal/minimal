@@ -36,8 +36,26 @@ use crate::server::ServerStateHandle;
 /// two-field JSON object; anything larger is a client bug or an attempt to
 /// make the daemon buffer for free.
 const MAX_REQUEST_BYTES: u64 = 8 * 1024;
+/// Longest wait for that body to arrive and the channel to half-close.
+///
+/// Bounding the *size* of the request is not the same as bounding the *wait*
+/// for it: a client that writes half an object and then holds the channel open
+/// sends nothing more and never signals EOF, so the read below would park
+/// forever. Nothing else reclaims it — the daemon deliberately runs with
+/// `inactivity_timeout: None` (a live attach must not be reaped), and the SSH
+/// keepalives it uses instead only detect a peer that has *stopped answering*,
+/// not one that answers and stays silent. The body is a two-field object
+/// written immediately after the subsystem opens, so this is a generous
+/// allowance for a slow link rather than a working deadline.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Ceiling on the caller-controlled per-log tail.
 const MAX_LOG_TAIL_BYTES: u64 = 64 * 1024 * 1024;
+/// Ceiling on a single session file read into memory (`index.json`, a
+/// `record.json`). Both are daemon-written JSON — a record is a few kilobytes
+/// and the index scales with the session count — so this is orders of
+/// magnitude of headroom, and its job is only to keep a file the daemon did
+/// not write and cannot bound from becoming an allocation it cannot survive.
+const MAX_SESSION_FILE_BYTES: u64 = 8 * 1024 * 1024;
 /// Rotated log files bundled, newest first.
 const LOG_FILES_MAX: usize = 5;
 /// Entry cap for the recursive state-dir listing.
@@ -120,7 +138,7 @@ pub(crate) async fn serve_stream_diag_bundle(
 /// and its parse — happens up front, so a client that reads zero payload bytes
 /// can treat the extended data as the whole story.
 async fn stream_diag_bundle(s: &ServerStateHandle, c: &mut RuChannel<Msg>) -> Result<(), String> {
-    let req = read_request(c).await?;
+    let req = read_request(c.make_reader(), REQUEST_TIMEOUT).await?;
 
     // `async_tar::Builder` requires `W: Sync`; the channel writer is not. Same
     // duplex-pipe pattern as the workspace-files upload, reversed direction.
@@ -160,15 +178,29 @@ async fn stream_diag_bundle(s: &ServerStateHandle, c: &mut RuChannel<Msg>) -> Re
     Ok(())
 }
 
-/// Reads the request body, bounded: one byte past the limit is enough to know
-/// the body is oversized, and refusing there means an unbounded client write
-/// can never become an unbounded daemon allocation.
-async fn read_request(c: &mut RuChannel<Msg>) -> Result<DiagBundleRequest, String> {
+/// Reads the request body, bounded in both dimensions: one byte past the size
+/// limit is enough to know the body is oversized, and [`REQUEST_TIMEOUT`]
+/// bounds the wait, so neither an unbounded client write nor an unbounded
+/// client silence can become an unbounded daemon commitment.
+///
+/// Takes the reader rather than the channel so the deadline is exercisable
+/// against an arbitrary `AsyncRead`; the caller supplies `deadline` for the
+/// same reason. Cancelling this future is safe — unlike the archive writes it
+/// precedes, it owns nothing that must be finalized.
+async fn read_request(
+    reader: impl tokio::io::AsyncRead,
+    deadline: Duration,
+) -> Result<DiagBundleRequest, String> {
     let mut buf = Vec::with_capacity(256);
-    c.make_reader()
-        .take(MAX_REQUEST_BYTES + 1)
-        .read_to_end(&mut buf)
+    // Both halves need their own binding, not a chained temporary: `pin!`
+    // anchors the reader (so callers owe no `Unpin`), and `read_to_end` borrows
+    // the capped reader, which must therefore outlive the future built from it.
+    let reader = std::pin::pin!(reader);
+    let mut capped = reader.take(MAX_REQUEST_BYTES + 1);
+    let read = capped.read_to_end(&mut buf);
+    tokio::time::timeout(deadline, read)
         .await
+        .map_err(|_| format!("diag request not received within {deadline:?}"))?
         .map_err(|e| format!("reading diag request: {e}"))?;
     if buf.len() as u64 > MAX_REQUEST_BYTES {
         return Err(format!(
@@ -485,33 +517,70 @@ async fn sessions<W: BundleSink>(
     let sessions_dir = state_dir.join("sessions");
     // The index maps short directory names to session UUIDs — no user data, so
     // it travels verbatim.
-    match tokio::fs::read(sessions_dir.join("index.json")).await {
-        Ok(bytes) => {
+    match read_session_file(&sessions_dir.join("index.json")).await {
+        Ok(Some(bytes)) => {
             w.add_bytes("sessions/index.json", &bytes, Redaction::None)
                 .await?
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(anyhow::anyhow!("reading sessions/index.json: {e}")),
+        // No index at all: this daemon has never created a session, so there
+        // are no per-session directories to walk either.
+        Ok(None) => return Ok(()),
+        // An unreadable index is not a reason to withhold the records it
+        // indexes, so this notes the omission and carries on.
+        Err(e) => w.skip("sessions/index.json", format!("unreadable: {e:#}")),
     }
-    let Ok(mut entries) = tokio::fs::read_dir(&sessions_dir).await else {
-        return Ok(());
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if !entry.file_type().await.is_ok_and(|t| t.is_dir()) {
-            continue;
+    // Enumeration failing is a fact about the bundle, not an empty directory:
+    // a `sessions/` that denies listing (execute without read) still answers
+    // an open of `index.json` by name, so silently returning here would ship
+    // the index with every record missing and nothing saying why.
+    let mut entries = match tokio::fs::read_dir(&sessions_dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            w.skip(
+                "sessions/*/record.json",
+                format!("session directory could not be listed: {e}"),
+            );
+            return Ok(());
         }
+    };
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            // Same contract mid-walk: the records already collected stand, and
+            // the ones that will now never be reached are accounted for.
+            Err(e) => {
+                w.skip(
+                    "sessions/*/record.json (remainder)",
+                    format!("listing stopped early: {e}"),
+                );
+                break;
+            }
+        };
         let short = entry.file_name().to_string_lossy().into_owned();
+        // `file_type` here is the dirent's own — a symlink reports as a
+        // symlink, never as the directory it points at.
+        match entry.file_type().await {
+            Ok(t) if t.is_dir() => {}
+            // `index.json` and anything else that is not a session directory.
+            Ok(_) => continue,
+            Err(e) => {
+                w.skip(format!("sessions/{short}/"), format!("unstattable: {e}"));
+                continue;
+            }
+        }
         // An absent file is always explainable (the manifest contract): a
         // genuinely-missing record is silent, but a read failure or an
         // unparseable-and-withheld record leaves a note in its place rather
         // than vanishing.
-        let raw = match tokio::fs::read(entry.path().join("record.json")).await {
-            Ok(raw) => raw,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+        let raw = match read_session_file(&entry.path().join("record.json")).await {
+            Ok(Some(raw)) => raw,
+            Ok(None) => continue,
             Err(e) => {
                 w.skip(
                     format!("sessions/{short}/record.json"),
-                    format!("unreadable: {e}"),
+                    format!("unreadable: {e:#}"),
                 );
                 continue;
             }
@@ -537,6 +606,46 @@ async fn sessions<W: BundleSink>(
         }
     }
     Ok(())
+}
+
+/// Reads one session JSON file whole, bounded by [`MAX_SESSION_FILE_BYTES`]
+/// and without following a symlink. `Ok(None)` means genuinely absent;
+/// everything else — over the cap, a symlink, a directory, an I/O error — is an
+/// `Err` the caller turns into a manifest note.
+///
+/// Session records are the one place this collector reads a whole file into
+/// memory, and `add_file_tail`'s discipline does not apply: a record has to
+/// arrive complete to be parsed and redacted, so it cannot be tail-capped. The
+/// cap is therefore a refusal rather than a truncation — the daemon is
+/// answering a remote request, and a file it did not write should cost it a
+/// skipped entry, not the process.
+async fn read_session_file(path: &Path) -> Result<Option<Vec<u8>>, anyhow::Error> {
+    let (file, _meta) = match diagnostics::open_regular_nofollow(path).await {
+        Ok(open) => open,
+        Err(e) if io_kind(&e) == Some(std::io::ErrorKind::NotFound) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // One byte past the cap: enough to know it was exceeded, and the read
+    // never allocates more than that whatever the file claims to be.
+    let mut bytes = Vec::new();
+    file.take(MAX_SESSION_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("reading {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_SESSION_FILE_BYTES,
+        "over the {MAX_SESSION_FILE_BYTES}-byte session-file cap"
+    );
+    Ok(Some(bytes))
+}
+
+/// The `io::ErrorKind` behind an [`anyhow::Error`], if one is in its chain.
+/// The `diagnostics` helpers attach context, so the kind is a source rather
+/// than the error itself.
+fn io_kind(e: &anyhow::Error) -> Option<std::io::ErrorKind> {
+    e.chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map(std::io::Error::kind)
 }
 
 /// The daemon's own environment, values masked by the allowlist policy above.
@@ -977,6 +1086,125 @@ mod tests {
             .expect("a redacted session record should be bundled");
         let value: serde_json::Value = serde_json::from_slice(record).unwrap();
         assert_eq!(value["name"], "diag-test", "non-secret fields survive");
+    }
+
+    /// An unreadable `sessions/` is a fact about the bundle, not an empty
+    /// directory. Execute-without-read still resolves `index.json` by name, so
+    /// without this the bundle ships the index with every record it points at
+    /// missing and nothing saying why.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unlistable_sessions_dir_is_recorded_not_silent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let server = TestServer::new().await;
+        let state_dir = server.state.minimal_state_dir().await;
+        let sessions_dir = state_dir.as_utf8_path().as_std_path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(sessions_dir.join("index.json"), b"{}").unwrap();
+        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o111)).unwrap();
+        // Root ignores the mode bits, so on a root test runner the fixture is
+        // not a fixture and there is nothing to assert.
+        let reproduced = std::fs::read_dir(&sessions_dir).is_err();
+
+        let files = fetch_bundle(&server).await;
+        // Restore before any assertion can leave the tempdir unremovable.
+        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !reproduced {
+            return;
+        }
+
+        assert!(
+            files.contains_key("sessions/index.json"),
+            "the index opens by name even when the directory will not list"
+        );
+        let skipped = manifest(&files)["skipped"].to_string();
+        assert!(
+            skipped.contains("could not be listed"),
+            "the omission is explained, not silent: {skipped}"
+        );
+    }
+
+    /// A `record.json` the daemon did not write costs a manifest note, never an
+    /// allocation: it cannot be tail-capped (a record must arrive whole to be
+    /// redacted), so the bound is a refusal.
+    #[tokio::test]
+    async fn an_oversized_session_record_is_refused_not_buffered() {
+        let server = TestServer::new().await;
+        let state_dir = server.state.minimal_state_dir().await;
+        let sessions_dir = state_dir.as_utf8_path().as_std_path().join("sessions");
+        let dir = sessions_dir.join("bigsess");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(sessions_dir.join("index.json"), b"{}").unwrap();
+        std::fs::write(
+            dir.join("record.json"),
+            vec![b'x'; (MAX_SESSION_FILE_BYTES + 1) as usize],
+        )
+        .unwrap();
+
+        let files = fetch_bundle(&server).await;
+        assert!(
+            !files.keys().any(|k| k.starts_with("sessions/bigsess")),
+            "the oversized record must not travel: {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
+        let skipped = manifest(&files)["skipped"].to_string();
+        assert!(
+            skipped.contains("session-file cap"),
+            "the refusal names its bound: {skipped}"
+        );
+    }
+
+    /// The same read is no-follow, so a `record.json` replaced by a symlink
+    /// cannot steer an unrelated daemon-readable file into the bundle.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_session_record_is_refused() {
+        /// Distinctive enough that finding it anywhere in the archive is
+        /// proof the target was read, not a coincidence.
+        const MARKER: &str = "symlink-target-must-not-travel";
+
+        let server = TestServer::new().await;
+        let state_dir = server.state.minimal_state_dir().await;
+        let sessions_dir = state_dir.as_utf8_path().as_std_path().join("sessions");
+        let dir = sessions_dir.join("linksess");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(sessions_dir.join("index.json"), b"{}").unwrap();
+        let secret = state_dir.as_utf8_path().as_std_path().join("host.key");
+        std::fs::write(&secret, MARKER).unwrap();
+        std::os::unix::fs::symlink(&secret, dir.join("record.json")).unwrap();
+
+        let files = fetch_bundle(&server).await;
+        assert!(
+            !files
+                .values()
+                .any(|c| c.windows(MARKER.len()).any(|w| w == MARKER.as_bytes())),
+            "the symlink target must not travel"
+        );
+        let skipped = manifest(&files)["skipped"].to_string();
+        assert!(
+            skipped.contains("linksess/record.json"),
+            "the refusal is recorded: {skipped}"
+        );
+    }
+
+    /// R6.3, the other dimension: bounding the request's *size* does not bound
+    /// the *wait* for it. A client that writes half an object and then holds
+    /// the channel open never sends EOF, and nothing else reclaims the task —
+    /// the daemon runs `inactivity_timeout: None` by design, and its keepalives
+    /// only notice a peer that has stopped answering, not one that answers and
+    /// stays silent.
+    #[tokio::test]
+    async fn a_request_that_never_ends_is_abandoned_on_the_deadline() {
+        // Kept alive for the whole call: dropping it would deliver the EOF
+        // whose absence is the point.
+        let (mut client, server) = tokio::io::duplex(64);
+        client.write_all(b"{\"log_tail_bytes\":").await.unwrap();
+
+        let err = read_request(server, Duration::from_millis(200))
+            .await
+            .expect_err("an unterminated body must not be waited on forever");
+        assert!(err.contains("not received within"), "got: {err}");
     }
 
     /// R6.4: a request that fails before streaming starts yields extended data
