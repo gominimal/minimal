@@ -114,11 +114,8 @@ emergency releases that skip the nightly path.
 
 The `promote` job then runs set-channel.sh, which verifies the version is
 actually staged before flipping the pointer. Finally it dispatches a
-`reference-docs-promoted` repository event so the published reference docs
-rebuild. The dispatch targets `gominimal/webapp` (which serves
-docs.minimal.dev); the gominimal-aw-bot App must be installed there for the
-token mint to succeed, and webapp's reference-sync workflow consumes the
-event.
+`reference-docs-promoted` repository event that triggers a rebuild of the
+published reference docs at docs.minimal.dev.
 
 ## prune-releases.yml — GitHub Release housekeeping
 
