@@ -115,11 +115,11 @@ PROJECT_DIR="$(mktemp -d /tmp/mnlb.XXXXXX)"
 # XDG_CACHE_HOME is deliberately left alone so package pulls stay warm.
 case "$(uname -s)" in
   Darwin)
-    WORK="$(mktemp -d /tmp/mnl-bulk.XXXXXX)"
+    WORK="$(mktemp -d /tmp/mnl-bulk.XXXXXX)" || { echo "::error::mktemp failed for WORK" >&2; exit 1; }
     export XDG_STATE_HOME="$WORK/state"
     ;;
   *)
-    WORK="$(mktemp -d "$HOME/.mnl-bulk.XXXXXX")"
+    WORK="$(mktemp -d "$HOME/.mnl-bulk.XXXXXX")" || { echo "::error::mktemp failed for WORK" >&2; exit 1; }
     export XDG_STATE_HOME="$WORK"
     ;;
 esac
