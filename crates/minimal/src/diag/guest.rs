@@ -320,7 +320,20 @@ pub async fn volume_fallback(
     match result {
         Ok(Ok(out)) => {
             let harvested = harvest_dir(w, &dest_dir, &tmp.path().join("logs")).await;
-            if harvested == 0 {
+            // Only treat as successful if debugfs succeeded (zero exit) AND files
+            // were harvested; a nonzero exit means the dump may be partial/corrupt.
+            if !out.status.success() {
+                let code = out.status.code().unwrap_or(-1);
+                let first_err = String::from_utf8_lossy(&out.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("no stderr")
+                    .to_string();
+                w.skip(
+                    &dest_dir,
+                    format!("debugfs exited with code {code} ({first_err}); {hint}"),
+                );
+            } else if harvested == 0 {
                 let first_err = String::from_utf8_lossy(&out.stderr)
                     .lines()
                     .next()
