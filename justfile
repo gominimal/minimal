@@ -136,6 +136,14 @@ clean:
 reap:
     scripts/reap-vms.sh
 
+# Run before landing a guest-kernel bump (the `virtio-linux` version in pkgs, or
+# the `locked_commit` that pulls it in): stable-tree commits touching vsock,
+# virtio and the guest console — the surface the guest control plane rides on.
+# `just kernel-review --pkgs ~/code/pkgs` reads both versions from a checkout.
+# Review a guest-kernel bump (`just kernel-review 6.12.43 6.12.94`). Needs `gh`.
+kernel-review *args:
+    scripts/kernel-bump-review.sh {{args}}
+
 # ── CI-parity gates ──────────────────────────────────────────────────────────
 
 # Fail fast with an install hint when a required tool is missing.
