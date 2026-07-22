@@ -320,6 +320,17 @@ impl<B: FetchBackend> RemoteCache<B> {
                     object: object.clone(),
                 });
             }
+            // Any other error status must not fall through to body parsing:
+            // an error page is not an index, and an empty error body would
+            // "parse" as an empty index, masking the outage.
+            (status, _) if !index_resp.is_success() => {
+                return Err(match index_resp.error_for_status() {
+                    Err(e) => Error::Backend(e),
+                    Ok(_) => Error::IO(std::io::Error::other(format!(
+                        "index fetch failed with HTTP {status}"
+                    ))),
+                });
+            }
             _ => {
                 // Progress total only; a plain-HTTPS backend may omit
                 // Content-Length (chunked transfer), so don't panic on None.
@@ -759,6 +770,35 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rc.sha256(&spec_hash), None);
+    }
+
+    #[tokio::test]
+    async fn index_fetch_error_status_is_an_error_not_an_empty_index() {
+        use std::io::{Read, Write};
+        // A server that 500s with an empty body: the worst case, since an
+        // empty body "parses" as an empty index.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = stream.flush();
+            }
+        });
+        let base = format!("http://{addr}/");
+
+        let err = RemoteCache::new_any_https(&base, None, None, IndexSource::Root)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Backend(_)),
+            "expected Backend error, got {err:?}"
+        );
     }
 
     #[tokio::test]
