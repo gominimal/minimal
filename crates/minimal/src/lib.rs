@@ -1090,10 +1090,11 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
             // Guard against accidentally uploading a non-VCS directory
             // (e.g. `~`): if the resolved project root is not a recognized
             // VCS root, warn and ask for confirmation before the recursive
-            // upload. On non-interactive stdin (CI, pipes, agents) we
-            // proceed without prompting — `--sync none` remains available
-            // for explicit opt-out (#770).
+            // upload. On non-interactive stdin (CI, pipes, agents) and under
+            // `--no-prompt` we proceed without prompting — `--sync none`
+            // remains available for explicit opt-out (#770).
             let should_upload = file_upload::is_vcs_root(upload_root.as_std_path())
+                || args.no_prompt
                 || !can_prompt_interactively()
                 || confirm(
                     &format!(
@@ -2100,9 +2101,18 @@ mod tests {
 
     /// With no mfile anywhere up the tree, `resolve_upload_root` returns the
     /// input directory unchanged — the original activate behaviour.
+    ///
+    /// The temp dir is rooted directly in `$HOME` rather than `$TMPDIR`: the
+    /// upward walk stops at `$HOME`, so this is the only placement where "no
+    /// mfile up the tree" is guaranteed. Under `$TMPDIR` the walk escapes to
+    /// whatever encloses it — with `TMPDIR` inside a checkout of this repo it
+    /// finds the repo's own `minimal.toml` and the test fails.
     #[test]
     fn resolve_upload_root_returns_input_when_no_mfile() {
-        let dir = tempfile::tempdir().unwrap();
+        let Some(home) = std::env::home_dir() else {
+            return; // no HOME: no walk boundary to anchor the test to
+        };
+        let dir = tempfile::tempdir_in(&home).unwrap();
         let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
         assert_eq!(resolve_upload_root(path).unwrap(), path);
     }
