@@ -15,6 +15,7 @@
 //! - [`capture`] — bounded subprocess output capture for command-shaped
 //!   collectors
 //! - [`logs`] — newest-first selection of rotated log files
+//! - [`kmsg`] — the kernel ring buffer, read without `dmesg`
 //! - [`disk`] — filesystem capacity probes
 //! - [`system`] — host identity/capability probe (OS, kernel, KVM, disks)
 //!
@@ -26,6 +27,8 @@ pub mod bundle;
 pub mod capture;
 #[cfg(unix)]
 pub mod disk;
+#[cfg(unix)]
+pub mod kmsg;
 pub mod listing;
 pub mod logs;
 pub mod manifest;

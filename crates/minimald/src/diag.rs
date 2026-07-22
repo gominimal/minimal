@@ -218,6 +218,15 @@ async fn build_bundle(
 
     collect_step!(w, "meta", meta(&mut w, s));
     collect_step!(w, "logs", logs(&mut w, &state_dir, log_tail_cap(req)));
+    // The kernel's own log, beside the daemon's and under the same caller cap.
+    // A guest bundle has no other kernel evidence: `console=hvc0` lands in the
+    // *host's* `boot.log`, which is recreated per boot and tail-capped, so on a
+    // long-lived VM the banner is gone from there before it is ever wanted.
+    collect_step!(
+        w,
+        "kmsg",
+        diagnostics::kmsg::kmsg_tail(&mut w, "", log_tail_cap(req))
+    );
     collect_step!(
         w,
         "state-listing",
@@ -854,6 +863,28 @@ mod tests {
         let scrubbed = scrubbed_cmdline("console=hvc0 boot_token=s3cr3t quiet");
         assert!(!scrubbed.contains("s3cr3t"), "got: {scrubbed}");
         assert!(scrubbed.starts_with("console=hvc0"), "got: {scrubbed}");
+    }
+
+    /// Kernel messages must be in the guest bundle or explained in its
+    /// manifest. `/dev/kmsg` is absent in a container and root-only on many
+    /// hosts, so which of the two lands is the environment's call — being
+    /// silent is not an option either way.
+    #[tokio::test]
+    async fn kernel_ring_buffer_is_collected_or_explained() {
+        let server = TestServer::new().await;
+        let files = fetch_bundle(&server).await;
+        let manifest = manifest(&files);
+
+        let recorded = format!("{}{}", manifest["collected"], manifest["skipped"]);
+        assert!(
+            recorded.contains("logs/kmsg.txt"),
+            "the ring buffer is present or accounted for: {recorded}"
+        );
+        assert_eq!(
+            files.contains_key("logs/kmsg.txt"),
+            manifest["collected"].to_string().contains("logs/kmsg.txt"),
+            "the manifest and the archive must agree on whether it is there"
+        );
     }
 
     /// The daemon's env policy: a project-prefixed name that is also
