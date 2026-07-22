@@ -26,15 +26,22 @@ runs:
           exit 1
         fi
         script_hash="$(shasum -a 256 scripts/build-libkrun-macos.sh | cut -d' ' -f1)"
+        # Hash the carried patches (name + content, in apply order) so editing,
+        # adding, or removing a patch invalidates the build. `shasum` over each
+        # file emits `<hash>  <path>`; sort pins a stable order, then a final
+        # digest folds them into one value. No patches => digest of empty input,
+        # still deterministic.
+        patches_hash="$(find vendor/libkrun/patches -name '*.patch' -type f -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | cut -d' ' -f1)"
         {
           echo "commit=$commit"
-          # The prefix embeds BOTH build inputs (pinned commit + build-script
-          # hash) so the persistent mini rebuilds when either changes — the
-          # same invalidation the actions/cache key gives GitHub-hosted
-          # runners. Stale sibling prefixes on the mini are inert (nothing
-          # references them) and may be deleted by hand.
-          echo "prefix=$HOME/.cache/minimal-ci/libkrun/$commit-${script_hash:0:12}"
+          # The prefix embeds ALL build inputs (pinned commit + build-script
+          # hash + patches hash) so the persistent mini rebuilds when any
+          # changes — the same invalidation the actions/cache key gives
+          # GitHub-hosted runners. Stale sibling prefixes on the mini are inert
+          # (nothing references them) and may be deleted by hand.
+          echo "prefix=$HOME/.cache/minimal-ci/libkrun/$commit-${script_hash:0:12}-${patches_hash:0:12}"
           echo "script_hash=$script_hash"
+          echo "patches_hash=$patches_hash"
         } >> "$GITHUB_OUTPUT"
     - name: Cache built libkrun (GitHub-hosted)
       # The mini needs no cache action: the input-keyed prefix under $HOME
@@ -43,7 +50,7 @@ runs:
       uses: actions/cache@v6
       with:
         path: ~/.cache/minimal-ci/libkrun
-        key: libkrun-macos-${{ runner.arch }}-${{ steps.pin.outputs.commit }}-${{ steps.pin.outputs.script_hash }}
+        key: libkrun-macos-${{ runner.arch }}-${{ steps.pin.outputs.commit }}-${{ steps.pin.outputs.script_hash }}-${{ steps.pin.outputs.patches_hash }}
     - name: Build libkrun from source (on miss)
       shell: bash
       env:
