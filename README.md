@@ -1,34 +1,47 @@
-# Minimal
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/public/minimal-mark-light.svg">
+    <img src="docs/public/minimal-mark-dark.svg" alt="Minimal logo" width="120">
+  </picture>
+</p>
 
-Minimal provides VM-based development sandboxes and a secure package manager for the dev tools used inside them.
+<h1 align="center">Minimal</h1>
 
-New here? Welcome! [Installation](#installation) and [Getting Started](#getting-started) will have you working in a sandbox in a few minutes, and we'd love to hear how it goes — questions and ideas are always welcome in [Discussions](https://github.com/gominimal/minimal/discussions).
+<p align="center"><strong>Dev Environments, Contained</strong><br>Isolated, reproducible development sandboxes and a secure package manager that give your whole team identical environments, while keeping AI agents off the laptop.</p>
 
-## Contents
+<p align="center">
+  <a href="https://docs.minimal.dev/">Documentation</a> ·
+  <a href="#getting-started">Getting Started</a> ·
+  <a href="docs/reference/loadouts.md">Loadouts</a> ·
+  <a href="docs/architecture.md">Architecture</a> ·
+  <a href="https://github.com/gominimal/minimal/discussions">Discussions</a>
+</p>
 
-- [Features](#features)
-- [Supported Platforms](#supported-platforms)
-- [Installation](#installation)
-- [Getting Started](#getting-started)
-  - [Create a new project with Minimal](#create-a-new-project-with-minimal)
-  - [Work on an existing project in a Minimal sandbox](#work-on-an-existing-project-in-a-minimal-sandbox)
-  - [Add a Minimal Loadout with your preferred tools and configurations](#add-a-minimal-loadout-with-your-preferred-tools-and-configurations)
-- [Tech Stack](#tech-stack)
-- [Documentation](#documentation)
-- [Building and Testing](#building-and-testing)
-- [Contributing](#contributing)
-  - [Contributor License Agreement](#contributor-license-agreement)
-- [Code of Conduct](#code-of-conduct)
-- [Security](#security)
-- [License](#license)
+<p align="center">
 
-## Features
+[![CI](https://github.com/gominimal/minimal/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gominimal/minimal/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-online-blue)](https://docs.minimal.dev/)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.com/invite/qgX8sm6X7G)
+[![Built with Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](https://www.rust-lang.org/)
 
-Minimal repeatably creates Linux, terminal-based development sandboxes populated with exactly the toolsets and agents you need, as specified in your `minimal.toml` blueprint.
+</p>
 
-The tool executables (compilers, agents, shells, etc.) available in these sandboxes come from Minimal's [curated package registry](https://github.com/gominimal/pkgs/), which is refreshed daily. Simply add a `minimal.toml` to your project's git repo and all your teammates will have identical development environments that isolate AI agents from their laptops. Updating the shared `minimal.toml` to reference the freshest tool versions is just a `min update` away. No more outdated wiki pages for dev-env setup, and no more version drift across your team.
+---
 
-Per-developer [Loadouts](#add-a-minimal-loadout-with-your-preferred-tools-and-configurations) can be included in each development environment, so everyone can work efficiently using the editors, terminal multiplexers, and configs that match their hard-earned muscle memory.
+## What is Minimal?
+
+Minimal is a declarative, content-addressed build system and development-environment manager. It repeatably builds Linux, terminal-based development sandboxes, each populated with exactly the toolsets and agents a project needs, all declared in a single `minimal.toml` blueprint. A sandbox runs natively on Linux via unprivileged user namespaces and inside a lightweight libkrun microVM on macOS, so the same environment travels across your team's machines. Commit that blueprint to your repository and every teammate gets an identical environment, one that keeps AI agents sealed inside the sandbox and off the host laptop.
+
+The executables inside a sandbox (git, claude-code, compilers, shells, and more) are delivered by Minimal's secure package manager from a curated registry that is refreshed daily. Because packages are addressed by content rather than mutable version tags and builds are hermetic, the same blueprint resolves to the same environment on every machine. Moving the whole team to the freshest tool versions is one `min update`, which re-pins the blueprint in place. No more stale setup wikis, no more version drift.
+
+Per-developer Loadouts then layer each person's own editors, terminal multiplexers, and configs on top of that shared toolchain, so the environment stays identical for everyone while you keep the muscle memory you have earned.
+
+> Full documentation lives at [docs.minimal.dev](https://docs.minimal.dev/).
+
+<p align="center">
+  <img src="docs/public/loadout-demo.gif" alt="Activating the minimal dev loadout: packages, EDITOR=vim, a themed prompt, and a once-only MOTD banner" width="720">
+</p>
 
 ## Supported Platforms
 
@@ -37,7 +50,7 @@ Minimal works on:
 - macOS on ARM64 (Apple Silicon)
 - Ubuntu and Debian Linux on ARM64 and x86_64, with a Linux kernel >= 5.10. Rootless user-namespace creation must be enabled for non-VM usage.
 
-Not on one of these platforms yet? Tell us what you'd like to see supported in [Discussions](https://github.com/gominimal/minimal/discussions) — it helps us prioritize.
+Not on one of these platforms yet? Tell us what you'd like to see supported in [Discussions](https://github.com/gominimal/minimal/discussions). It helps us prioritize.
 
 ## Installation
 
@@ -77,7 +90,7 @@ min activate --attach .
 git init
 
 # develop specs, generate & test code, push to git, etc.
-# agents can add tools from the Minimal Public Registry dynamically with "min add"
+# agents can add build/runtime dependencies from the Minimal Public Registry with "min add"
 claude
 
 exit
@@ -144,7 +157,28 @@ exit
 
 ### Add a Minimal Loadout with your preferred tools and configurations
 
-TBD
+The project's `minimal.toml` describes what every contributor's session
+needs; a **loadout** carries what *you* want on top: your editor, terminal
+multiplexer, shell config, and dotfiles. Loadouts are single TOML files under
+`~/.config/minimal/loadouts/`:
+
+```toml
+# ~/.config/minimal/loadouts/dev.toml
+name        = "dev"
+description = "helix + zellij with my dotfiles"
+packages    = ["helix", "zellij"]
+
+[vars]
+EDITOR = "hx"
+TERM   = { inherit = true, default = "xterm-256color" }
+```
+
+Apply one with `min activate --loadout dev --attach .`, or list it in
+`default_loadouts` under `[loadouts]` in `~/.config/minimal/config.toml` to have it join every
+session automatically. `min loadout list` shows what's available. The full
+schema (file patches, lifecycle hooks, environment-variable inheritance,
+composition rules) is in the
+[loadouts reference](docs/reference/loadouts.md).
 
 ## Tech Stack
 
@@ -154,26 +188,38 @@ Sandboxes: a pure Rust client, daemon, and VM manager. The sandbox VM is powered
 
 ## Documentation
 
-- [Architecture overview](docs/architecture.md) — how the crates fit together
-- [CLI reference](docs/reference/cli.md) — every `min` command
-- [`minimal.toml` reference](docs/reference/minimal-dot-toml.md) — the project blueprint format
-- [Linux host setup](docs/reference/linux-host-setup.md) — kernel and namespace requirements
+- [Architecture overview](docs/architecture.md): how the crates fit together
+- [CLI reference](docs/reference/cli.md): every `min` command
+- [`minimal.toml` reference](docs/reference/minimal-dot-toml.md): the project blueprint format
+- [Linux host setup](docs/reference/linux-host-setup.md): kernel and namespace requirements
 - More guides live in [docs/](docs/)
 
 ## Building and Testing
 
-Minimal is a Rust workspace. From a checkout:
+Minimal is a Cargo workspace, and the `just` recipes are the easiest way to
+build and test it: they apply the correct per-OS scope for you. That matters
+most on macOS, where the full workspace does not build yet (`minimald`'s
+sandbox stack is Linux-only), so the recipes scope to what does.
 
 ```shell
-cargo build            # debug build (faster to build)
-cargo build --release  # optimized build (slower to build, faster to run)
-cargo test             # run the test suite
+just ci      # the full pre-PR gate: fmt, clippy, cargo-deny, tests, doctests
+just test    # run the test suite
+just clippy  # lint
 ```
+
+`just --list` shows every recipe (builds, VM bring-up, e2e, and more). On
+Linux you can also drive Cargo directly against the whole workspace
+(`cargo build`, `cargo test`); on macOS prefer the recipes so you never have
+to scope crates by hand. Binaries land at
+`target/debug/{min,mip,minimald,minvmd}` (or `target/release/`). Building the
+entire package registry is heavy: 8 cores and at least 16 GB of RAM are
+recommended. See [AGENTS.md](AGENTS.md#platform-matrix) for the platform
+matrix.
 
 ### Ubuntu 24.04+ hosts
 
 Sessions run in an unprivileged user namespace, which Ubuntu 24.04 blocks by
-default (`kernel.apparmor_restrict_unprivileged_userns=1`) — every session dies
+default (`kernel.apparmor_restrict_unprivileged_userns=1`), so every session dies
 at `uid_map` with `Operation not permitted`. Install the AppArmor profile that
 grants `minimald` the `userns` permission:
 
@@ -190,13 +236,13 @@ See [docs/reference/linux-host-setup.md](docs/reference/linux-host-setup.md).
 
 ## Contributing
 
-We'd love your help, and you don't need to be a Rust expert to pitch in — bug reports, docs fixes, and feature ideas are all valued contributions. Please [open an Issue](https://github.com/gominimal/minimal/issues/new/choose) (or start a [Discussion](https://github.com/gominimal/minimal/discussions/new/choose) if it's large in scope) to outline the improvements you're seeking.
+We'd love your help, and you don't need to be a Rust expert to pitch in: bug reports, docs fixes, and feature ideas are all valued contributions. Please [open an Issue](https://github.com/gominimal/minimal/issues/new/choose) (or start a [Discussion](https://github.com/gominimal/minimal/discussions/new/choose) if it's large in scope) to outline the improvements you're seeking.
 
 If you want to contribute code, docs, etc., please head over to [CONTRIBUTING.md](./CONTRIBUTING.md) for the development workflow and what we look for in a contribution.
 
 ### Contributor License Agreement
 
-Before we can merge your first pull request, you'll need to accept our **Individual Contributor License Agreement (ICLA)**. This is a one-time, ~30 second step: [CLA Assistant](https://cla-assistant.io/) will post a link on your PR, you click through, sign in with GitHub, and you're done — you're then covered for all future contributions to this repository.
+Before we can merge your first pull request, you'll need to accept our **Individual Contributor License Agreement (ICLA)**. This is a one-time, ~30 second step: [CLA Assistant](https://cla-assistant.io/) will post a link on your PR, you click through, sign in with GitHub, and you're done. You're then covered for all future contributions to this repository.
 
 If you're contributing on your employer's time, or with code your employer might own, your employer will also need a **Corporate CLA (CCLA)** on file listing you as an authorized contributor. See [CONTRIBUTING.md](./CONTRIBUTING.md) for details, or email **security@minimal.dev** if you need help getting one set up.
 
@@ -204,7 +250,7 @@ Full text: [ICLA](./legal/ICLA.md) · [CCLA](./legal/CCLA.md)
 
 ## Code of Conduct
 
-We want everyone to feel welcome here, whatever your background or experience level. This project follows the [Contributor Covenant](./CODE_OF_CONDUCT.md); by participating — contributing code, filing issues, or joining discussions — you agree to uphold it.
+We want everyone to feel welcome here, whatever your background or experience level. This project follows the [Contributor Covenant](./CODE_OF_CONDUCT.md); by participating (contributing code, filing issues, or joining discussions) you agree to uphold it.
 
 ## Security
 
@@ -212,4 +258,4 @@ If you believe you've found a security vulnerability, please email **security@mi
 
 ## License
 
-This project is licensed under the [Apache License Version 2.0](LICENSE) — see the [LICENSE](LICENSE) file for details.
+This project is licensed under the [Apache License Version 2.0](LICENSE). See the [LICENSE](LICENSE) file for details.
