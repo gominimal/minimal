@@ -5,6 +5,13 @@
 # vsock-bridge wedge class) that a single PR-lane run cannot surface. Reports
 # a pass/fail tally and exits non-zero if ANY iteration failed.
 #
+# Then, once, the bulk host→guest upload proof (scripts/bulk-upload-e2e.sh):
+# no session-e2e iteration pushes enough data through the guest vsock to catch
+# the transport-reset class (https://github.com/gominimal/minimal/issues/869),
+# which needs a project that is large AFTER compression. It runs on the same
+# VM-backed setup the caller already provides, does its own (probabilistic)
+# iterations, and cleans up after itself. Its result gates the exit status too.
+#
 # The caller sets the VM up exactly as the KVM lane does — minvmd + minimal
 # on PATH, MINVMD_KERNEL_PATH / MINVMD_ROOTFS_PATH / MINVMD_INITRAMFS set,
 # libkrun on the loader path — and passes the VM knobs through the
@@ -51,7 +58,17 @@ for i in $(seq 1 "$ITER"); do
 done
 # Final reap is handled by the EXIT trap.
 
-echo "soak complete: $pass passed, $fail failed (of $ITER)"
+echo "::group::bulk host→guest upload proof"
+reap
+if MINVMD_BOOT_LOG="$LOGDIR/boot-bulk.log" "$ROOT/scripts/bulk-upload-e2e.sh"; then
+  bulk=OK
+else
+  bulk=FAILED
+  echo "::warning::bulk upload proof FAILED"
+fi
+echo "::endgroup::"
+
+echo "soak complete: $pass passed, $fail failed (of $ITER); bulk upload proof: $bulk"
 # Require every iteration to have run AND passed — a short-circuited loop that
 # ran zero iterations must not report success.
-[ "$fail" -eq 0 ] && [ "$pass" -eq "$ITER" ]
+[ "$fail" -eq 0 ] && [ "$pass" -eq "$ITER" ] && [ "$bulk" = OK ]
