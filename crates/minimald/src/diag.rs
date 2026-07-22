@@ -522,9 +522,10 @@ async fn sessions<W: BundleSink>(
             w.add_bytes("sessions/index.json", &bytes, Redaction::None)
                 .await?
         }
-        // No index at all: this daemon has never created a session, so there
-        // are no per-session directories to walk either.
-        Ok(None) => return Ok(()),
+        // A missing index doesn't mean we can skip the walk: orphan session
+        // records may still exist (e.g., an interrupted write), so note the
+        // missing file and continue to the directory enumeration.
+        Ok(None) => w.skip("sessions/index.json", "not present"),
         // An unreadable index is not a reason to withhold the records it
         // indexes, so this notes the omission and carries on.
         Err(e) => w.skip("sessions/index.json", format!("unreadable: {e:#}")),
