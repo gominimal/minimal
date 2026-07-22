@@ -525,6 +525,7 @@ async fn serve_stream_workspace_files(
     mut c: RuChannel<Msg>,
 ) {
     if let Err(msg) = unpack_workspace_files(&s, &config, &mut c).await {
+        tracing::debug!(error = %msg, "workspace unpack failed");
         let _ = c.extended_data_bytes(1, msg).await;
     }
     let _ = c.close().await;
