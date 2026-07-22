@@ -9,6 +9,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt as _;
 
+mod attach;
 pub mod autospawn;
 pub mod client;
 pub mod config;
@@ -24,9 +25,13 @@ pub mod prompt;
 #[command(
     about = "min, the Minimal session CLI — create, attach to, and manage sandboxed development sessions"
 )]
+#[command(subcommand_required = false)]
 pub struct Cli {
+    // Optional: a bare `min` (no subcommand) resolves or activates a session
+    // for the current directory — see `cmd_default`. Keeps every named
+    // subcommand reachable unchanged when one is supplied.
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 
     #[command(flatten)]
     pub global_args: GlobalArgs,
@@ -242,6 +247,13 @@ pub struct GlobalArgs {
     /// only backend.
     #[arg(long, global = true)]
     pub minvmd: bool,
+    /// Skip interactive prompts that need a terminal (e.g. the session
+    /// picker shown by bare `min` or `min attach` with no session argument).
+    /// When a choice is ambiguous, the command errors with a list of
+    /// candidates instead of opening a picker. Implied when stdin/stdout is
+    /// not a terminal.
+    #[arg(long, global = true, default_value_t = false)]
+    pub no_input: bool,
 }
 
 #[derive(Debug, Args)]
@@ -348,8 +360,11 @@ fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyhow::Error> 
 
 #[derive(Debug, Args)]
 pub struct AttachArgs {
-    /// Session identifier (UUID or session name)
-    pub session: String,
+    /// Session identifier (UUID or session name). When omitted, `min attach`
+    /// resolves a session from the current working directory (or the only
+    /// existing session), and opens an interactive picker if the choice is
+    /// ambiguous. See `--no-input` to skip the picker in scripts.
+    pub session: Option<String>,
     /// Command to exec in the session context (non-interactive)
     #[arg(long, short)]
     pub command: Option<String>,
@@ -487,45 +502,111 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
 
 async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     match cli.command {
-        Command::Ls(args) => cmd_ls(&cli.global_args, args).await,
-        Command::Activate(args) => cmd_activate(&cli.global_args, args).await,
-        Command::Attach(args) => cmd_attach(&cli.global_args, args).await,
-        Command::Destroy(args) => cmd_destroy(&cli.global_args, args).await,
-        Command::Stop(args) => cmd_stop(&cli.global_args, args).await,
-        Command::Session(SessionArgs {
+        None => cmd_default(&cli.global_args).await,
+        Some(Command::Ls(args)) => cmd_ls(&cli.global_args, args).await,
+        Some(Command::Activate(args)) => cmd_activate(&cli.global_args, args).await,
+        Some(Command::Attach(args)) => cmd_attach(&cli.global_args, args).await,
+        Some(Command::Destroy(args)) => cmd_destroy(&cli.global_args, args).await,
+        Some(Command::Stop(args)) => cmd_stop(&cli.global_args, args).await,
+        Some(Command::Session(SessionArgs {
             command: SessionCommand::Policy(args),
-        }) => cmd_session_policy(&cli.global_args, args).await,
-        Command::Loadout(LoadoutArgs {
+        })) => cmd_session_policy(&cli.global_args, args).await,
+        Some(Command::Loadout(LoadoutArgs {
             command: LoadoutCommand::List(args),
-        }) => loadouts::cmd_loadout_list(args, &cli.global_args),
-        Command::Dirs => dirs::cmd_dirs(&cli.global_args),
-        Command::Bug(args) => diag::cmd_bug(&cli.global_args, args).await,
+        })) => loadouts::cmd_loadout_list(args, &cli.global_args),
+        Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
+        Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
         #[cfg(feature = "remote-access")]
-        Command::Mesh(MeshArgs { command }) => match command {
+        Some(Command::Mesh(MeshArgs { command })) => match command {
             MeshCommand::Status => cmd_mesh_status(&cli.global_args).await,
             MeshCommand::Join(args) => cmd_mesh_join(&cli.global_args, args),
             MeshCommand::Leave => cmd_mesh_leave(&cli.global_args),
         },
-        Command::Proxy(args) => cmd_proxy(&cli.global_args, args).await,
+        Some(Command::Proxy(args)) => cmd_proxy(&cli.global_args, args).await,
         #[cfg(feature = "remote-access")]
-        Command::SshForward(args) => cmd_ssh_forward(&cli.global_args, args).await,
-        Command::Login(args) => cmd_login(&cli.global_args, args).await,
-        Command::Version => cmd_version(&cli.global_args).await,
-        Command::Rename(args) => cmd_rename(&cli.global_args, args).await,
-        Command::Init(args) => cmd_init(&cli.global_args, args)
+        Some(Command::SshForward(args)) => cmd_ssh_forward(&cli.global_args, args).await,
+        Some(Command::Login(args)) => cmd_login(&cli.global_args, args).await,
+        Some(Command::Version) => cmd_version(&cli.global_args).await,
+        Some(Command::Rename(args)) => cmd_rename(&cli.global_args, args).await,
+        Some(Command::Init(args)) => cmd_init(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
-        Command::Add(args) => cmd_add(&cli.global_args, args)
+        Some(Command::Add(args)) => cmd_add(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
-        Command::Update(args) => cmd_update(&cli.global_args, args)
+        Some(Command::Update(args)) => cmd_update(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
-        Command::Completions(CompletionsArgs { shell }) => {
+        Some(Command::Completions(CompletionsArgs { shell })) => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
             Ok(())
+        }
+    }
+}
+
+/// The default action for a bare `min` (no subcommand): get the operator into
+/// a session for the current directory with the least ceremony.
+///
+/// - No sessions exist → [`cmd_activate`] a new one with `--attach`, so a
+///   fresh `min` lands the user in a shell.
+/// - A session built from the current directory exists → attach to it
+///   (auto-resolve, or picker if ambiguous).
+/// - Otherwise → attach to the only session, or open a picker over all.
+///
+/// Shares smart resolution with `min attach` (no session arg) via
+/// [`resolve_smart_attach`]; the only difference is the `NoSessions` case,
+/// which activates here instead of erroring.
+async fn cmd_default(global: &GlobalArgs) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref())
+        .context("Failed to resolve daemon socket path")?;
+
+    let mut client = client::Client::connect(&sock)
+        .await
+        .context("Failed to connect to minimald")?;
+
+    match resolve_smart_attach(&mut client, global).await? {
+        Some(entry) => {
+            tracing::info!(
+                session_id = %entry.id,
+                session_name = ?entry.name,
+                "bare `min`: attaching to resolved session"
+            );
+            // Drop the listing connection before shelling out; the ssh child
+            // holds its own proxy connection to the daemon.
+            drop(client);
+            attach_to_session(&sock, entry.id, None).await
+        }
+        None => {
+            // No sessions exist: activate a new one for the current directory
+            // and chain into attach, mirroring `min activate --attach`. Honor
+            // `--repo-dir` (`-C`) so `min -C /path` activates for /path, not
+            // the process's actual cwd — matching the attach side, which uses
+            // `cwd_host_path(global)` for its cwd comparison.
+            drop(client);
+            let path = match global.repo_dir.as_deref() {
+                Some(dir) => dir.to_string_lossy().to_string(),
+                None => ".".to_string(),
+            };
+            let activate_args = ActivateArgs {
+                name: None,
+                path,
+                sync: SyncMode::Tarball,
+                network: CliNetworkMode::HostNet,
+                ingress: Vec::new(),
+                loadout: Vec::new(),
+                no_loadouts: false,
+                // A non-interactive caller (--no-input, CI, a script) can't
+                // answer the activation policy prompt; `cmd_activate` already
+                // falls back to the `--no-prompt` path when stderr isn't a
+                // terminal, so mirror that here rather than forcing a hang.
+                no_prompt: global.no_input || !can_prompt_interactively(),
+                attach: true,
+            };
+            cmd_activate(global, activate_args).await
         }
     }
 }
@@ -934,9 +1015,13 @@ fn offer_mfile_scaffold(
     // `confirm` treats empty/EOF input as "yes", so on non-interactive
     // stdin (CI, pipes, agents) it would silently default this scaffold to
     // "yes" — and, when a config is discovered under `.minimal/`, the init
-    // writer would clobber it. Only prompt on a real terminal; anywhere else
-    // (and on a declined prompt) carry on without scaffolding.
-    if !std::io::stdin().is_terminal() || !confirm("Would you like to create one?", true)? {
+    // writer would clobber it. Only prompt on a real terminal that hasn't
+    // been told to skip prompts (--no-input); anywhere else (and on a
+    // declined prompt) carry on without scaffolding.
+    if global.no_input
+        || !std::io::stdin().is_terminal()
+        || !confirm("Would you like to create one?", true)?
+    {
         eprintln!(
             "Continuing without one; the session gets a default environment. \
              Run 'min init' to give the project its own config."
@@ -1090,10 +1175,12 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
             // Guard against accidentally uploading a non-VCS directory
             // (e.g. `~`): if the resolved project root is not a recognized
             // VCS root, warn and ask for confirmation before the recursive
-            // upload. On non-interactive stdin (CI, pipes, agents) we
-            // proceed without prompting — `--sync none` remains available
-            // for explicit opt-out (#770).
+            // upload. On non-interactive stdin (CI, pipes, agents) and under
+            // `--no-prompt` we proceed without prompting — `--sync none`
+            // remains available for explicit opt-out (#770).
             let should_upload = file_upload::is_vcs_root(upload_root.as_std_path())
+                || args.no_prompt
+                || global.no_input
                 || !can_prompt_interactively()
                 || confirm(
                     &format!(
@@ -1146,7 +1233,7 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     // item it would have prompted for so we can print a
     // `user_policy.toml` snippet on the error path.
     if let minimald_rpc::ConfigureLoadoutResponse::Pending { response } = configured {
-        let non_interactive = args.no_prompt || !can_prompt_interactively();
+        let non_interactive = args.no_prompt || global.no_input || !can_prompt_interactively();
         if non_interactive {
             // NoPromptHook fake-approves every unapproved item so
             // handle_response finishes both the var and patch gates
@@ -1228,7 +1315,7 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     if args.attach {
         // Chain into attach.
         let attach_args = AttachArgs {
-            session: id.to_string(),
+            session: Some(id.to_string()),
             command: None,
         };
         return cmd_attach(global, attach_args).await;
@@ -1281,6 +1368,11 @@ fn host_key_opts(known_hosts: &std::path::Path) -> [String; 2] {
 /// Attach to an existing session. Both interactive and `--command` paths
 /// shell out to `ssh` — the daemon's shell_request handler mints a PTY-backed
 /// session shell, and ssh handles termios/PTY management for us.
+///
+/// When `args.session` is `None`, the session is resolved from the current
+/// working directory (or the only existing session), opening an interactive
+/// picker when the choice is ambiguous; see [`attach::resolve_for_attach`]
+/// and [`resolve_smart_attach`].
 pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
 
@@ -1291,15 +1383,73 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
         .await
         .context("Failed to connect to minimald")?;
 
-    let record = resolve_session(&mut client, &args.session).await?;
+    let (id, name) = match args.session {
+        Some(ref s) => {
+            let r = resolve_session(&mut client, s).await?;
+            (r.id, r.name)
+        }
+        None => match resolve_smart_attach(&mut client, global).await? {
+            Some(entry) => (entry.id, entry.name),
+            None => bail!("no sessions exist; use 'min activate' to create one"),
+        },
+    };
 
     tracing::info!(
-        session_id = %record.id,
-        session_name = ?record.name,
+        session_id = %id,
+        session_name = ?name,
         "found session"
     );
 
-    // Shell out to ssh for both interactive and --command attachment.
+    attach_to_session(&sock, id, args.command).await
+}
+
+/// Resolve a session to attach to when the user supplied no explicit session
+/// reference. Lists sessions, matches against the current working directory,
+/// and either attaches directly (unambiguous), opens the interactive picker
+/// (ambiguous), or errors (ambiguous but non-interactive).
+///
+/// Returns `Ok(None)` when no sessions exist at all — the caller decides
+/// whether that is an error (`min attach`) or a cue to activate a new session
+/// (bare `min`).
+async fn resolve_smart_attach(
+    client: &mut client::Client,
+    global: &GlobalArgs,
+) -> Result<Option<minimald_rpc::ListSessionsEntry>, anyhow::Error> {
+    use minimald_rpc::ListSessions;
+
+    let resp = client
+        .oneshot_rpc::<ListSessions>(())
+        .await
+        .context("ListSessions RPC failed")?;
+    let cwd = attach::cwd_host_path(global)?;
+    match attach::resolve_for_attach(&resp.sessions, &cwd) {
+        attach::SmartResolve::NoSessions => Ok(None),
+        attach::SmartResolve::Attach(entry) => Ok(Some(entry)),
+        attach::SmartResolve::Pick(cands) => {
+            if global.no_input || !attach::can_pick_interactively() {
+                bail!(attach::ambiguous_no_input_message(&cands, &cwd));
+            }
+            match attach::pick_session(&cands, &cwd)? {
+                Some(entry) => Ok(Some(entry)),
+                None => bail!("session selection cancelled"),
+            }
+        }
+    }
+}
+
+/// Shell out to `ssh` to attach to `id`. Both the interactive (no `command`)
+/// and `--command` (non-interactive exec) paths route through here; the
+/// daemon's shell_request handler mints a PTY-backed shell, and ssh handles
+/// termios/PTY management.
+///
+/// Split from [`cmd_attach`] so the bare-`min` default dispatch
+/// ([`cmd_default`]) and the smart-resolution picker can attach without
+/// re-resolving an entry they already hold.
+async fn attach_to_session(
+    sock: &std::path::Path,
+    id: sessions::SessionId,
+    command: Option<String>,
+) -> Result<(), anyhow::Error> {
     // ProxyCommand points at our own `proxy` subcommand so we don't
     // depend on socat or nc being installed.
     let exe = std::env::current_exe().context("cannot determine current exe")?;
@@ -1312,7 +1462,7 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
     let [strict, known_hosts_file] = host_key_opts(&sock.with_file_name(paths::KNOWN_HOSTS_FILE));
 
     let mut ssh = std::process::Command::new("ssh");
-    ssh.env("MINIMAL_SESSION_ID", record.id.to_string()).args([
+    ssh.env("MINIMAL_SESSION_ID", id.to_string()).args([
         "-o",
         "SendEnv=MINIMAL_SESSION_ID",
         "-o",
@@ -1329,14 +1479,14 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
     // automated networking tests); without it ssh skips the PTY and the daemon
     // rejects the shell. The `--command` path is a non-interactive exec and
     // needs no PTY.
-    if args.command.is_none() {
+    if command.is_none() {
         ssh.arg("-tt");
     }
     ssh.arg("local-0");
 
     // If a command was provided, pass it to ssh (non-interactive exec).
     // Otherwise, ssh opens an interactive shell via shell_request.
-    if let Some(ref cmd) = args.command {
+    if let Some(cmd) = command {
         ssh.arg(cmd);
     }
 
@@ -2100,9 +2250,18 @@ mod tests {
 
     /// With no mfile anywhere up the tree, `resolve_upload_root` returns the
     /// input directory unchanged — the original activate behaviour.
+    ///
+    /// The temp dir is rooted directly in `$HOME` rather than `$TMPDIR`: the
+    /// upward walk stops at `$HOME`, so this is the only placement where "no
+    /// mfile up the tree" is guaranteed. Under `$TMPDIR` the walk escapes to
+    /// whatever encloses it — with `TMPDIR` inside a checkout of this repo it
+    /// finds the repo's own `minimal.toml` and the test fails.
     #[test]
     fn resolve_upload_root_returns_input_when_no_mfile() {
-        let dir = tempfile::tempdir().unwrap();
+        let Some(home) = std::env::home_dir() else {
+            return; // no HOME: no walk boundary to anchor the test to
+        };
+        let dir = tempfile::tempdir_in(&home).unwrap();
         let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
         assert_eq!(resolve_upload_root(path).unwrap(), path);
     }

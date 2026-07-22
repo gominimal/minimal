@@ -17,7 +17,7 @@ pub mod collect;
 pub mod redact;
 
 use collect::DiagPaths;
-use diagnostics::{BundleWriter, Redaction};
+use diagnostics::{BundleWriter, LOG_TAIL_CAP, MAX_LOG_TAIL_BYTES, Redaction};
 
 use crate::GlobalArgs;
 
@@ -26,6 +26,36 @@ pub struct BugArgs {
     /// Output path (default: ./minimal-diag-<timestamp>.tar.zst)
     #[arg(long, short)]
     pub output: Option<PathBuf>,
+    /// Bytes of each log file to capture, counted from the end
+    ///
+    /// Raise this when the interesting window is older than the tail the
+    /// default buys you. A daemon at `RUST_LOG=debug` can outrun any cap —
+    /// most of that volume is dependency chatter, not minimal's own records —
+    /// and the current day's file is not size-rotated, so a fixed tail can
+    /// start well after the incident.
+    #[arg(long, default_value_t = LOG_TAIL_CAP, value_parser = parse_log_tail_bytes)]
+    pub log_tail_bytes: u64,
+}
+
+/// Parses `--log-tail-bytes`, refusing anything the bundle writer cannot
+/// honor.
+///
+/// Refusing rather than clamping is the point. A clamp reports success while
+/// quietly capturing less than was asked for, so the resulting short log
+/// reads as a fact about the system instead of a fact about the flag — the
+/// exact shape of mistake that makes a diagnostic bundle actively misleading.
+fn parse_log_tail_bytes(raw: &str) -> Result<u64, String> {
+    let bytes: u64 = raw
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a whole number of bytes"))?;
+    match bytes {
+        0 => Err("must be at least 1 byte; 0 would collect empty log files".to_string()),
+        b if b > MAX_LOG_TAIL_BYTES => Err(format!(
+            "{b} exceeds the maximum of {MAX_LOG_TAIL_BYTES} bytes ({} MiB)",
+            MAX_LOG_TAIL_BYTES / (1024 * 1024)
+        )),
+        b => Ok(b),
+    }
 }
 
 /// A collector timeout generous enough for slow disks, small enough that a
@@ -114,7 +144,11 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
     collect_step!(w, "host.power", diagnostics::power::power(&mut w, "host"));
     collect_step!(w, "config", collect::config(&mut w, &paths));
     collect_step!(w, "state", collect::state(&mut w, &paths));
-    collect_step!(w, "logs", collect::logs(&mut w, &paths));
+    collect_step!(
+        w,
+        "logs",
+        collect::logs(&mut w, &paths, args.log_tail_bytes)
+    );
 
     // Daemon-side state (socket probes, guest bundles, per-provider status)
     // is collected over the daemon connection, not from the host bundle;
@@ -187,4 +221,62 @@ async fn dirs_report(w: &mut BundleWriter, global: &GlobalArgs) -> Result<(), an
     let report = crate::dirs::report(global);
     w.add_bytes("host/dirs.txt", report.as_bytes(), Redaction::None)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser as _;
+
+    /// Parses `min bug`'s arguments the way the real CLI does, so these
+    /// assertions cover the `value_parser` wiring and not just the function.
+    #[derive(Debug, clap::Parser)]
+    struct Harness {
+        #[command(flatten)]
+        args: BugArgs,
+    }
+
+    fn parse(argv: &[&str]) -> Result<BugArgs, clap::Error> {
+        Harness::try_parse_from(std::iter::once("bug").chain(argv.iter().copied())).map(|h| h.args)
+    }
+
+    /// The flag tracks the shared default rather than restating it, so
+    /// raising `LOG_TAIL_CAP` raises what an unflagged `min bug` collects.
+    #[test]
+    fn omitting_the_flag_uses_the_shared_default() {
+        assert_eq!(parse(&[]).unwrap().log_tail_bytes, LOG_TAIL_CAP);
+    }
+
+    #[test]
+    fn a_cap_within_the_contract_is_accepted_verbatim() {
+        for bytes in [1, LOG_TAIL_CAP, MAX_LOG_TAIL_BYTES] {
+            let args = parse(&["--log-tail-bytes", &bytes.to_string()]).unwrap();
+            assert_eq!(args.log_tail_bytes, bytes, "{bytes} must survive intact");
+        }
+    }
+
+    /// The whole point of the flag's validation: an over-large cap fails the
+    /// command rather than being quietly reduced to the ceiling.
+    #[test]
+    fn an_over_large_cap_is_rejected_not_clamped() {
+        for bytes in [MAX_LOG_TAIL_BYTES + 1, u64::MAX] {
+            let Err(err) = parse(&["--log-tail-bytes", &bytes.to_string()]) else {
+                panic!("{bytes} is above the ceiling and must be rejected, not clamped");
+            };
+            let err = err.to_string();
+            assert!(
+                err.contains(&MAX_LOG_TAIL_BYTES.to_string()) && err.contains("exceeds"),
+                "the error must name the ceiling it broke: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_or_non_numeric_cap_is_rejected() {
+        // 0 is the wire contract's "use the default" sentinel; taken
+        // literally here it would bundle empty logs labelled tail-capped.
+        assert!(parse(&["--log-tail-bytes", "0"]).is_err());
+        assert!(parse(&["--log-tail-bytes", "5MiB"]).is_err());
+        assert!(parse(&["--log-tail-bytes", "-1"]).is_err());
+    }
 }
