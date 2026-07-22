@@ -231,7 +231,7 @@ impl Client {
         }
         if !err.is_empty() {
             anyhow::bail!(
-                "daemon failed to unpack project files after {bytes} bytes uploaded: {}",
+                "daemon failed to unpack project files after {bytes} compressed bytes uploaded: {}",
                 String::from_utf8_lossy(&err)
             );
         }
