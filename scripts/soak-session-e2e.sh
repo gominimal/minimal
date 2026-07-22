@@ -29,7 +29,14 @@ esac
 [ "$ITER" -ge 1 ] || { echo "iterations must be >= 1, got: $ITER" >&2; exit 2; }
 
 LOGDIR="${2:-$(mktemp -d /tmp/mnl-soak.XXXXXX)}"
-mkdir -p "$LOGDIR"
+mkdir -p "$LOGDIR" || { echo "cannot create boot-log dir: '$LOGDIR'" >&2; exit 2; }
+# Absolutise: MINVMD_BOOT_LOG is consumed by minvmd as given (vmm_child.rs takes
+# the env value verbatim), and both child harnesses cd into their own project
+# dir before any `min` call, so a relative LOGDIR would resolve against that dir
+# instead. minvmd only warns and boots on when the console file cannot be
+# created, so the guest log — the half of #869 worth having — would vanish
+# silently, exactly when a failing run needs it.
+LOGDIR="$(cd "$LOGDIR" && pwd)"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Reap leftovers a failed boot may strand (the detached __krun-vmm grandchild
