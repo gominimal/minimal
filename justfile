@@ -304,9 +304,15 @@ test-lifecycle: (_need "jq" "brew install jq (or apt install jq)") _kvm artifact
 
 # Reaps between iterations — this WILL kill this checkout's live dev stack each pass.
 #
-# Nightly soak parity: N session-e2e reps (nightly-tests.yml runs 10).
+# Nightly soak parity: N session-e2e reps (nightly-tests.yml runs 10), then `just bulk-upload`.
 soak n="10": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/soak-session-e2e.sh {{n}} "{{scratch}}/soak-logs"
+
+# Each pass uploads a 49 MiB project (~13 MB on the wire) and destroys its session.
+#
+# Bulk host→guest upload proof (#869): N `min activate`s of a large, compressible project.
+bulk-upload n="5": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
+    {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/bulk-upload-e2e.sh {{n}}
 
 # ── stack bring-up ───────────────────────────────────────────────────────────
 #
