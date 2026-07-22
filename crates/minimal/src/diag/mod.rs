@@ -29,9 +29,10 @@ pub struct BugArgs {
     /// Bytes of each log file to capture, counted from the end
     ///
     /// Raise this when the interesting window is older than the tail the
-    /// default buys you. A daemon running at `RUST_LOG=debug` fills 5 MiB in
-    /// minutes, and the current day's file is not size-rotated, so the
-    /// default tail can start well after the incident.
+    /// default buys you. A daemon at `RUST_LOG=debug` can outrun any cap —
+    /// most of that volume is dependency chatter, not minimal's own records —
+    /// and the current day's file is not size-rotated, so a fixed tail can
+    /// start well after the incident.
     #[arg(long, default_value_t = LOG_TAIL_CAP, value_parser = parse_log_tail_bytes)]
     pub log_tail_bytes: u64,
 }
@@ -239,8 +240,10 @@ mod tests {
         Harness::try_parse_from(std::iter::once("bug").chain(argv.iter().copied())).map(|h| h.args)
     }
 
+    /// The flag tracks the shared default rather than restating it, so
+    /// raising `LOG_TAIL_CAP` raises what an unflagged `min bug` collects.
     #[test]
-    fn omitting_the_flag_keeps_the_historical_tail() {
+    fn omitting_the_flag_uses_the_shared_default() {
         assert_eq!(parse(&[]).unwrap().log_tail_bytes, LOG_TAIL_CAP);
     }
 

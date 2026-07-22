@@ -19,7 +19,21 @@ use tokio::io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use crate::manifest::{CollectedEntry, CollectorError, Manifest, Redaction, SkippedEntry};
 
 /// Default per-file tail cap for bundled logs.
-pub const LOG_TAIL_CAP: u64 = 5 * 1024 * 1024;
+///
+/// Sized against the shipping file format (`mlog`'s JSON-lines, measured at
+/// ~214 B/record on a real capture), so this holds order 157k records per
+/// file — about 6x what 5 MiB held. The wire cost of the increase is close to
+/// nothing: log text compresses ~70x inside the bundle's zstd stream, so five
+/// rotated files go from ~0.3 MiB to ~2.2 MiB of archive.
+///
+/// The real cost is uncompressed: `add_file_tail` buffers a whole tail in
+/// memory, and a bundle collects up to ~16 log files, so this value also sets
+/// peak allocation per file and bounds extraction at ~512 MiB. That is what
+/// keeps it here rather than higher — at `RUST_LOG=debug` no cap "holds the
+/// incident" anyway (a measured burst produced 36 MB of records in eight
+/// seconds, nearly all of it dependency chatter), so a larger default buys
+/// linear history for linear extraction cost, not a categorical win.
+pub const LOG_TAIL_CAP: u64 = 32 * 1024 * 1024;
 
 /// Largest per-file tail cap [`BundleWriter::add_file_tail`] can honor.
 ///
@@ -30,6 +44,12 @@ pub const LOG_TAIL_CAP: u64 = 5 * 1024 * 1024;
 /// clamp — a silently clamped cap reports success while capturing less than
 /// was asked for, and the short log then reads as evidence.
 pub const MAX_LOG_TAIL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The default has to leave room to ask for more, or a caller-facing knob
+/// validated against [`MAX_LOG_TAIL_BYTES`] becomes downward-only. Enforced at
+/// compile time so raising [`LOG_TAIL_CAP`] past the halfway mark cannot land
+/// silently.
+const _: () = assert!(LOG_TAIL_CAP * 2 <= MAX_LOG_TAIL_BYTES);
 
 mod sealed {
     pub trait Sealed {}
