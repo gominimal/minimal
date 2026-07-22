@@ -13,7 +13,11 @@ use russh::{
     server::{Msg, Session},
 };
 use sessions::SessionId;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::task::spawn;
 
 use crate::{
@@ -62,8 +66,8 @@ trait ServeOneshot: OneshotSshRpc {
 
 impl<T: OneshotSshRpc> ServeOneshot for T {}
 
-async fn serve_get_version(c: RuChannel<Msg>) {
-    let res = GetVersion
+async fn serve_get_version(c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    GetVersion
         .handle_channel(c, async |_req| {
             Ok(GetVersionResponse {
                 version: version::VERSION.to_string(),
@@ -71,14 +75,14 @@ async fn serve_get_version(c: RuChannel<Msg>) {
                 stdlib_version: stdlib::VERSION.to_string(),
             })
         })
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", GetVersion::NAME, e);
-    }
+        .await
 }
 
-async fn serve_list_sessions(s: ServerStateHandle, c: RuChannel<Msg>) {
-    let res = ListSessions
+async fn serve_list_sessions(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    ListSessions
         .handle_channel(c, async |_req| {
             let resource_pool = tokio::task::spawn_blocking(detect_resource_pool)
                 .await
@@ -116,10 +120,7 @@ async fn serve_list_sessions(s: ServerStateHandle, c: RuChannel<Msg>) {
                     .collect(),
             })
         })
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", ListSessions::NAME, e);
-    }
+        .await
 }
 
 fn detect_resource_pool() -> Option<ResourcePool> {
@@ -138,9 +139,12 @@ fn detect_resource_pool() -> Option<ResourcePool> {
     })
 }
 
-async fn serve_get_session_record(s: ServerStateHandle, c: RuChannel<Msg>) {
+async fn serve_get_session_record(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
     use crate::sessions::SessionKeyPredicate;
-    let res = GetSessionRecord
+    GetSessionRecord
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
             Ok(GetSessionRecordResponse {
@@ -153,11 +157,13 @@ async fn serve_get_session_record(s: ServerStateHandle, c: RuChannel<Msg>) {
                     .map_err(|e| ConnectionError::Internal(e.to_string()))?,
             })
         })
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", GetSessionRecord::NAME, e);
-    }
+        .await
 }
+
+/// Stand-in for `session_name` on the lifecycle records when the session
+/// carries no user-assigned name. `SessionConfig::name` is `None` for an
+/// anonymous session, and an absent field reads like a logging bug.
+const ANONYMOUS_SESSION: &str = "<anonymous>";
 
 /// `CreateSession`: allocates the session's record and brings its actor
 /// up, replying with the assigned id. The loadout is composed separately,
@@ -166,13 +172,24 @@ async fn serve_create_session(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
     ssh_username: Option<String>,
-) {
-    let res = CreateSession
+) -> Result<(), ConnectionError> {
+    CreateSession
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
+            // Read the name off the config before it is handed to the
+            // manager: the success record below needs it, and the reply
+            // carries only the assigned id.
+            let session_name = req.config.name.clone();
 
             Ok(match mngr.create_session(req.config, ssh_username).await {
-                Ok(id) => Errorable::Ok(minimald_rpc::CreateSessionResponse { id }),
+                Ok(id) => {
+                    tracing::info!(
+                        session_id = %id,
+                        session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
+                        "session created"
+                    );
+                    Errorable::Ok(minimald_rpc::CreateSessionResponse { id })
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
                     error: "A session with that name already exists".to_string(),
                 },
@@ -185,10 +202,7 @@ async fn serve_create_session(
                 Err(e) => return Err(ConnectionError::Internal(e.to_string())),
             })
         })
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", CreateSession::NAME, e);
-    }
+        .await
 }
 
 /// `ConfigureLoadout`: composes a created session's loadout from the
@@ -208,8 +222,11 @@ async fn serve_create_session(
 /// `AbortSession` and create a new session to retry. Without that guard
 /// a second call would clobber the stashed `PendingComposeState` and
 /// invalidate every `PendingId` the first caller received.
-async fn serve_configure_loadout(s: ServerStateHandle, c: RuChannel<Msg>) {
-    let res = minimald_rpc::ConfigureLoadout
+async fn serve_configure_loadout(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    minimald_rpc::ConfigureLoadout
         .handle_channel(c, async |req: minimald_rpc::ConfigureLoadoutRequest| {
             let mngr = s.sessions_manager().await;
             let handle = mngr
@@ -231,14 +248,7 @@ async fn serve_configure_loadout(s: ServerStateHandle, c: RuChannel<Msg>) {
                 },
             })
         })
-        .await;
-    if let Err(e) = res {
-        tracing::warn!(
-            "RPC handler for {} failed: {}",
-            minimald_rpc::ConfigureLoadout::NAME,
-            e
-        );
-    }
+        .await
 }
 
 /// `SubmitVerdict`: the client's per-item decisions for a `Pending`
@@ -250,8 +260,11 @@ async fn serve_configure_loadout(s: ServerStateHandle, c: RuChannel<Msg>) {
 /// with no live session — including an actor that died between
 /// resolve and delivery — maps to `Fault { UnknownSessionId }` here;
 /// other `io::Error`s bubble up as `ConnectionError::Internal`.
-async fn serve_submit_verdict(s: ServerStateHandle, c: RuChannel<Msg>) {
-    let res = SubmitVerdict
+async fn serve_submit_verdict(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    SubmitVerdict
         .handle_channel(
             c,
             async |req: sessions::wire::request::ContributionVerdict| {
@@ -275,18 +288,18 @@ async fn serve_submit_verdict(s: ServerStateHandle, c: RuChannel<Msg>) {
                 }
             },
         )
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", SubmitVerdict::NAME, e);
-    }
+        .await
 }
 
 /// `RenameSession`: resolves the session's actor (spinning it up from
 /// disk if needed) and lets it persist the new name and relink its
 /// PTask hostname. A name collision surfaces as the store's
 /// `AlreadyExists` in the `Errorable::Err` text.
-async fn serve_rename_session(s: ServerStateHandle, c: RuChannel<Msg>) {
-    let res = RenameSession
+async fn serve_rename_session(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    RenameSession
         .handle_channel(c, async |req| {
             let res = async {
                 match s
@@ -310,31 +323,46 @@ async fn serve_rename_session(s: ServerStateHandle, c: RuChannel<Msg>) {
                 }),
             }
         })
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", RenameSession::NAME, e);
-    }
+        .await
 }
 
-async fn serve_destroy_session(s: ServerStateHandle, c: RuChannel<Msg>) {
-    let res = DestroySession
+async fn serve_destroy_session(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    DestroySession
         .handle_channel(c, async |req| {
-            let res = s.sessions_manager().await.delete_session(req.id).await;
-            match res {
-                Ok(()) => Ok(Errorable::Ok(DestroySessionResponse)),
+            let mngr = s.sessions_manager().await;
+            // Resolve the name before the delete — the request carries only
+            // the id, and once the record is gone there is nothing left to
+            // resolve it against. Purely for the record below, so a failed
+            // lookup degrades to the anonymous stand-in rather than failing
+            // a destroy that would otherwise succeed.
+            let session_name = mngr
+                .get_record(SessionKeyPredicate::Id(req.id))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|record| record.name);
+            match mngr.delete_session(req.id).await {
+                Ok(()) => {
+                    tracing::info!(
+                        session_id = %req.id,
+                        session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
+                        "session destroyed"
+                    );
+                    Ok(Errorable::Ok(DestroySessionResponse))
+                }
                 Err(e) => Ok(Errorable::Err {
                     error: e.to_string(),
                 }),
             }
         })
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", DestroySession::NAME, e);
-    }
+        .await
 }
 
-async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) {
-    let res = Shutdown
+async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    Shutdown
         .handle_channel(c, async |req: ShutdownRequest| {
             let mngr = s.sessions_manager().await;
             Ok(match mngr.shutdown(req.force).await {
@@ -361,10 +389,7 @@ async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) {
                 Err(()) => ShutdownResponse::SessionsLive,
             })
         })
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", Shutdown::NAME, e);
-    }
+        .await
 }
 
 /// Quiesce the guest state volume during shutdown (R2.2). No-op unless the
@@ -406,8 +431,11 @@ async fn quiesce_state_volume_if_mounted(_s: &ServerStateHandle) {}
 /// deletes a `Draft` session's record and stops, or refuses an
 /// `Active` session with `InvalidInput` (use `DestroySession`).
 /// Unknown ids are `NotFound`.
-async fn serve_abort_session(s: ServerStateHandle, c: RuChannel<Msg>) {
-    let res = AbortSession
+async fn serve_abort_session(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    AbortSession
         .handle_channel(c, async |req| {
             let res = async {
                 match s
@@ -431,14 +459,14 @@ async fn serve_abort_session(s: ServerStateHandle, c: RuChannel<Msg>) {
                 }),
             }
         })
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", AbortSession::NAME, e);
-    }
+        .await
 }
 
-async fn serve_get_session_policy(s: ServerStateHandle, c: RuChannel<Msg>) {
-    let res = GetSessionPolicy
+async fn serve_get_session_policy(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    GetSessionPolicy
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
             let predicate = match req {
@@ -458,10 +486,7 @@ async fn serve_get_session_policy(s: ServerStateHandle, c: RuChannel<Msg>) {
                 Some(record) => Ok(Errorable::Ok(record.policy)),
             }
         })
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", GetSessionPolicy::NAME, e);
-    }
+        .await
 }
 
 /// Signs a fresh client certificate for the `minimal login` flow and returns
@@ -469,8 +494,11 @@ async fn serve_get_session_policy(s: ServerStateHandle, c: RuChannel<Msg>) {
 /// the HTTPS reverse proxy. Only compiled when the `networking-proxy` feature
 /// is enabled.
 #[cfg(feature = "networking-proxy")]
-async fn serve_issue_client_cert(s: ServerStateHandle, c: RuChannel<Msg>) {
-    let res = IssueClientCert
+async fn serve_issue_client_cert(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    IssueClientCert
         .handle_channel(c, async |req: IssueClientCertRequest| {
             let ca = s.cert_authority().await;
             match ca.sign_client_cert(&req.subject_cn) {
@@ -484,18 +512,15 @@ async fn serve_issue_client_cert(s: ServerStateHandle, c: RuChannel<Msg>) {
                 }),
             }
         })
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", IssueClientCert::NAME, e);
-    }
+        .await
 }
 
 /// Replies to an `IssueClientCert` request with a readable error when the
 /// `networking-proxy` feature is compiled out, so the client sees "feature not
 /// enabled" instead of an opaque EOF/channel-close on the response stream.
 #[cfg(not(feature = "networking-proxy"))]
-async fn serve_issue_client_cert_unavailable(c: RuChannel<Msg>) {
-    let res = IssueClientCert
+async fn serve_issue_client_cert_unavailable(c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    IssueClientCert
         .handle_channel(c, async |_req: IssueClientCertRequest| {
             Ok(Errorable::Err {
                 error: "minimald was built without the networking-proxy feature; \
@@ -503,38 +528,82 @@ async fn serve_issue_client_cert_unavailable(c: RuChannel<Msg>) {
                     .to_string(),
             })
         })
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", IssueClientCert::NAME, e);
-    }
+        .await
 }
 
-async fn serve_get_mesh_status(s: ServerStateHandle, c: RuChannel<Msg>) {
-    let res = GetMeshStatus
+async fn serve_get_mesh_status(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    GetMeshStatus
         .handle_channel(c, async |_req| Ok(s.mesh_status().await))
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", GetMeshStatus::NAME, e);
-    }
+        .await
 }
 
 pub(crate) const STREAM_WORKSPACE_FILES: &str =
     constcat::concat!(RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
 
+/// Tallies the bytes pulled through an [`AsyncRead`] into a shared counter.
+///
+/// The counter is shared rather than returned because the reader is
+/// swallowed by the decompressor and then by the tar unpacker: when the
+/// transfer dies mid-stream those layers surface an error and drop the
+/// reader, and the tally is the only surviving evidence of how far the
+/// upload got.
+struct CountingReader<R> {
+    inner: R,
+    count: Arc<AtomicU64>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+        // Only a successful read grows `filled`; a pending or failed poll
+        // leaves it untouched, so the delta is exactly what this poll
+        // delivered regardless of which arm we are in.
+        let read = buf.filled().len().saturating_sub(before);
+        self.count.fetch_add(read as u64, Ordering::Relaxed);
+        polled
+    }
+}
+
 async fn serve_stream_workspace_files(
     s: ServerStateHandle,
     config: ChannelConfig,
     mut c: RuChannel<Msg>,
-) {
-    if let Err(msg) = unpack_workspace_files(&s, &config, &mut c).await {
-        tracing::debug!(error = %msg, "workspace unpack failed");
-        let _ = c.extended_data_bytes(1, msg).await;
-    }
+) -> Result<(), ConnectionError> {
+    // Shared with the counting reader so the tally outlives the unpack on
+    // both arms. Bytes-at-failure is the number that separates "the upload
+    // never started" from "the upload died three-quarters of the way in".
+    let received = Arc::new(AtomicU64::new(0));
+    let unpacked = unpack_workspace_files(&s, &config, &mut c, &received).await;
+    // Compressed bytes off the wire, not the unpacked tree: it is the
+    // figure a client-side upload size can be compared against directly.
+    let bytes_received = received.load(Ordering::Relaxed);
+
+    let outcome = match unpacked {
+        Ok(()) => {
+            tracing::info!(bytes_received, "workspace upload complete");
+            Ok(())
+        }
+        Err(msg) => {
+            tracing::warn!(bytes_received, error = %msg, "workspace upload failed");
+            let _ = c.extended_data_bytes(1, msg.clone()).await;
+            Err(ConnectionError::Internal(msg))
+        }
+    };
     let _ = c.close().await;
+    outcome
 }
 
 /// Unpacks the zstd-compressed tarball streamed over `c` into the
-/// workspace directory of the session named by the channel environment.
+/// workspace directory of the session named by the channel environment,
+/// tallying the wire bytes it consumes into `received`.
 ///
 /// On failure, returns the human-readable message to relay back to the
 /// client over the channel's extended-data stream.
@@ -542,6 +611,7 @@ async fn unpack_workspace_files(
     s: &ServerStateHandle,
     config: &ChannelConfig,
     c: &mut RuChannel<Msg>,
+    received: &Arc<AtomicU64>,
 ) -> Result<(), String> {
     let session_id_str = config
         .env_vars
@@ -561,8 +631,17 @@ async fn unpack_workspace_files(
         .await
         .map_err(|e| format!("session is gone: {e}"))?;
 
+    // Emitted once the upload has a destination and before a single byte is
+    // pulled, so a transfer that wedges mid-stream still leaves a record
+    // saying which session it was for. Its pair is the complete/failed
+    // record in the caller.
+    tracing::info!(session_id = %session_id, "workspace upload started");
+
     let reader = async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(
-        c.make_reader(),
+        CountingReader {
+            inner: c.make_reader(),
+            count: Arc::clone(received),
+        },
     ));
     async_tar::Archive::new(reader)
         .unpack(paths.working.as_utf8_path())
@@ -570,6 +649,28 @@ async fn unpack_workspace_files(
         .map_err(|e| format!("unpack failed: {e}"))?;
 
     Ok(())
+}
+
+/// Runs one dispatched RPC to completion, bracketing it with the pair of
+/// records that let a reader reconstruct what the daemon did on a
+/// connection from the log alone.
+///
+/// Start-and-finish rather than finish-only. Finish-only halves the volume
+/// but cannot distinguish an RPC still in flight from one that was never
+/// dispatched, and "started, never finished" is precisely the shape of a
+/// hang — the case this logging exists to catch. Both records are emitted
+/// inside the caller's `rpc` span, so each carries `rpc`, `trace_id` and
+/// `span_id` from that span plus `conn`/`transport` from the enclosing
+/// connection span, without repeating any of them as event fields.
+async fn served(fut: impl Future<Output = Result<(), ConnectionError>>) {
+    tracing::info!("rpc dispatched");
+    let started = std::time::Instant::now();
+    let outcome = fut.await;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match outcome {
+        Ok(()) => tracing::info!(outcome = "ok", duration_ms, "rpc served"),
+        Err(e) => tracing::warn!(outcome = "err", duration_ms, error = %e, "rpc failed"),
+    }
 }
 
 /// Handles an RPC going over an SSH subsystem channel.
@@ -660,9 +761,12 @@ pub async fn handle_ssh_rpc(
     }
 
     // Handle the named RPC (fire-and-forget; join handles are discarded).
+    // `served` brackets each handler with its dispatch/outcome records —
+    // the span alone emits nothing, so without them the ids minted above
+    // never reach the log.
     macro_rules! serve {
         ($fut:expr) => {
-            drop(spawn($fut.instrument(span.clone())))
+            drop(spawn(served($fut).instrument(span.clone())))
         };
     }
     match name {
@@ -819,6 +923,30 @@ mod tests {
             "expected an unknown-session error on stderr, got {:?}",
             String::from_utf8_lossy(&stderr),
         );
+    }
+
+    /// The upload's `bytes_received` field is only worth logging if it is
+    /// exact, so pull a payload through in many small polls and check the
+    /// tally accumulates across them rather than recording the last read.
+    #[tokio::test]
+    async fn counting_reader_tallies_every_byte_pulled_through() {
+        let payload: Vec<u8> = (0..8192u32).map(|i| i as u8).collect();
+        let count = Arc::new(AtomicU64::new(0));
+        let mut sunk = Vec::new();
+
+        let read = tokio::io::copy(
+            &mut CountingReader {
+                inner: payload.as_slice(),
+                count: Arc::clone(&count),
+            },
+            &mut sunk,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sunk, payload);
+        assert_eq!(read, payload.len() as u64);
+        assert_eq!(count.load(Ordering::Relaxed), payload.len() as u64);
     }
 
     #[tokio::test]
