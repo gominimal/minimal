@@ -101,12 +101,13 @@ impl IndexSource {
         }
     }
 
-    /// File name for the locally-cached copy of this index. Snapshots use the
-    /// final path component (`<commit>.shisha`), unique by commit hash.
-    fn local_filename(&self) -> &str {
+    /// File name for the locally-cached copy of this index. Snapshots flatten
+    /// the full object key so distinct snapshots never share a local file,
+    /// even when different repos pin the same commit hash.
+    fn local_filename(&self) -> String {
         match self {
-            IndexSource::Root => INDEX_FILENAME,
-            IndexSource::Snapshot { object } => object.rsplit('/').next().unwrap_or(object),
+            IndexSource::Root => INDEX_FILENAME.to_string(),
+            IndexSource::Snapshot { object } => object.replace('/', "_"),
         }
     }
 }
@@ -248,20 +249,50 @@ impl<B: FetchBackend> RemoteCache<B> {
                 (_, None) => false,
             };
             if fresh {
-                tracing::debug!("Re-using local copy of {}", source.object());
-                return Ok(Self {
-                    backend,
-                    index: IndexFile::from_reader(
-                        &mut std::fs::File::open(&l_idx_path).map_err(Error::IO)?,
-                    )
-                    .map_err(Error::IO)?,
-                    dir: index_dir,
-                    base: url,
-                    ot,
-                    // Loading from local cache means we never asked GCS for
-                    // the current generation. into_writer must refetch.
-                    gcs_generation: None,
-                });
+                // A bad copy falls through to a refetch instead of wedging
+                // every subsequent run on it. The wire parser reads records
+                // till EOF and would silently accept a copy truncated
+                // mid-record as a shorter index, so add the strictness a
+                // whole file allows: its length must be a whole number of
+                // records. (Truncation at an exact record boundary is
+                // indistinguishable in-format; the atomic write below is the
+                // guard against truncation ever landing.)
+                let load = |path: &std::path::Path| -> std::io::Result<IndexFile> {
+                    let mut f = std::fs::File::open(path)?;
+                    if !f
+                        .metadata()?
+                        .len()
+                        .is_multiple_of(crate::index_file::WIRE_RECORD_LEN)
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "length is not a whole number of records",
+                        ));
+                    }
+                    IndexFile::from_reader(&mut f)
+                };
+                match load(&l_idx_path) {
+                    Ok(index) => {
+                        tracing::debug!("Re-using local copy of {}", source.object());
+                        return Ok(Self {
+                            backend,
+                            index,
+                            dir: index_dir,
+                            base: url,
+                            ot,
+                            // Loading from local cache means we never asked GCS
+                            // for the current generation. into_writer must
+                            // refetch.
+                            gcs_generation: None,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "local copy of {} unreadable: {e}; refetching",
+                            source.object()
+                        )
+                    }
+                }
             }
         }
 
@@ -305,11 +336,19 @@ impl<B: FetchBackend> RemoteCache<B> {
                 let index =
                     IndexFile::from_reader(&mut std::io::Cursor::new(buffer)).map_err(Error::IO)?;
 
+                // Best-effort local caching, via temp file + rename so a crash
+                // or concurrent reader never observes a partial file.
                 if let Some(index_dir) = index_dir.as_ref() {
-                    let l_idx_path = index_dir.join(source.local_filename());
-                    index
-                        .write_to(&mut std::fs::File::create(&l_idx_path).map_err(Error::IO)?)
-                        .unwrap();
+                    let write_atomic = || -> std::io::Result<()> {
+                        let mut tmp = tempfile::NamedTempFile::new_in(index_dir)?;
+                        index.write_to(tmp.as_file_mut())?;
+                        tmp.persist(index_dir.join(source.local_filename()))
+                            .map_err(|e| e.error)?;
+                        Ok(())
+                    };
+                    if let Err(e) = write_atomic() {
+                        tracing::warn!("failed to cache {} locally: {e}", source.object());
+                    }
                 }
                 index
             }
@@ -689,7 +728,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let stale = std::time::SystemTime::now()
             - std::time::Duration::from_secs(INDEX_EXPIRY_SECONDS + 60);
-        for name in ["0123abcd.shisha", INDEX_FILENAME] {
+        for name in ["github.com_gominimal_pkgs_0123abcd.shisha", INDEX_FILENAME] {
             let path = dir.path().join(name);
             std::fs::write(&path, index_bytes_for(&spec_hash, sha256)).unwrap();
             let f = std::fs::File::options().write(true).open(&path).unwrap();
@@ -720,6 +759,35 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rc.sha256(&spec_hash), None);
+    }
+
+    #[tokio::test]
+    async fn corrupt_local_snapshot_copy_is_refetched_not_fatal() {
+        const OBJECT: &str = "github.com/gominimal/pkgs/0123abcd.shisha";
+        let spec_hash = SpecHash::from_bytes([0x07; 32]);
+        let sha256: [u8; 32] = [0x42; 32];
+        let base = serve_objects(vec![(
+            OBJECT.to_string(),
+            index_bytes_for(&spec_hash, sha256),
+        )]);
+
+        // Seed a corrupt local copy (a write cut short by a crash — not a
+        // whole number of records). Snapshot copies never expire, so recovery
+        // must come from the load-time whole-record check, not an age check.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("github.com_gominimal_pkgs_0123abcd.shisha"),
+            b"truncated",
+        )
+        .unwrap();
+
+        let source = IndexSource::Snapshot {
+            object: OBJECT.to_string(),
+        };
+        let rc = RemoteCache::new_any_https(&base, Some(dir.path().to_path_buf()), None, source)
+            .await
+            .unwrap();
+        assert_eq!(rc.sha256(&spec_hash), Some(sha256));
     }
 
     #[tokio::test]
