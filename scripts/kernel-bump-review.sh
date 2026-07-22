@@ -72,6 +72,11 @@
 # often, never once too few. The size of the full range is reported alongside,
 # so "0 commits" is always distinguishable from "0 commits looked at".
 #
+# That reasoning holds only while the old tag is an ancestor of the new one, so
+# both versions must name the same stable branch; a cross-series pair (6.6.94 ->
+# 6.12.94) is refused rather than reported on. Review a series bump one branch
+# at a time.
+#
 # OUTPUT
 #
 #   ! <stable-sha> <upstream-sha> <date> <subject>
@@ -208,6 +213,28 @@ done
 
 OLD_TAG="v${OLD_VERSION#v}"
 NEW_TAG="v${NEW_VERSION#v}"
+
+# Both tags have to sit on the same stable branch. The scan below walks the NEW
+# tag's history through a committer-date window, which equals "the diff between
+# the tags" only while the old tag is an ancestor of the new one. Across series
+# they are not: `compare v6.6.94...v6.12.94` reports status=diverged, behind_by
+# 17883, with a merge base back in 2023 — so the window keeps the handful of
+# 6.12.y commits that happen to fall inside it and silently drops everything the
+# intervening series carried. That yields a short, plausible, wrong report,
+# which is the exact failure this tool exists to prevent. Refuse instead.
+series_of() {
+    local v="${1#v}" rest
+    rest="${v#*.}"
+    printf '%s.%s' "${v%%.*}" "${rest%%.*}"
+}
+OLD_SERIES=$(series_of "$OLD_VERSION")
+NEW_SERIES=$(series_of "$NEW_VERSION")
+[ "$OLD_SERIES" = "$NEW_SERIES" ] \
+    || die "$OLD_TAG and $NEW_TAG are on different stable branches ($OLD_SERIES.y vs $NEW_SERIES.y).
+  This tool reviews one stable branch at a time: the range is a committer-date
+  window over the new tag's history, which is only the true diff when the old
+  tag is an ancestor of the new one. A cross-series report would understate the
+  change. Review the bump one series at a time."
 
 # "<sha>\t<committer-date>" for a tag, or a loud death. This is the request that
 # catches a wrong repo, a nonexistent version, a typo, or no network.
