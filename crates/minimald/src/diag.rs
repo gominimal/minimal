@@ -30,6 +30,7 @@ use diagnostics::redact::{masked_process_env, redact_json};
 use diagnostics::{BundleSink, BundleWriter, LOG_TAIL_CAP, Redaction};
 
 use crate::ChannelConfig;
+use crate::connection::ConnectionError;
 use crate::server::ServerStateHandle;
 
 /// Longest request body accepted before the read is abandoned. The body is a
@@ -124,11 +125,16 @@ pub(crate) async fn serve_stream_diag_bundle(
     s: ServerStateHandle,
     _config: ChannelConfig,
     mut c: RuChannel<Msg>,
-) {
-    if let Err(msg) = stream_diag_bundle(&s, &mut c).await {
-        let _ = c.extended_data_bytes(1, msg).await;
-    }
+) -> Result<(), ConnectionError> {
+    let outcome = match stream_diag_bundle(&s, &mut c).await {
+        Ok(()) => Ok(()),
+        Err(msg) => {
+            let _ = c.extended_data_bytes(1, msg.clone()).await;
+            Err(ConnectionError::Internal(msg))
+        }
+    };
     let _ = c.close().await;
+    outcome
 }
 
 /// Reads the request, then streams the bundle. On failure returns the
