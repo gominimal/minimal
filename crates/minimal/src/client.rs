@@ -493,18 +493,31 @@ impl Client {
         // post-unpack close from a dropped connection (#901). Without this
         // check a connection drop mid-unpack looks identical to a successful
         // close — empty err, Ok(()) — and cmd_activate proceeds with an
-        // empty workspace.
+        // empty workspace. An idle-progress backstop guards against a wedged
+        // transport that never delivers a Close — generous, since a
+        // legitimate unpack of a large archive may produce no channel
+        // messages for a while (#886).
+        const DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
         let mut err = Vec::new();
         let mut saw_close = false;
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
-                    append_daemon_error(&mut err, &data);
+        loop {
+            match tokio::time::timeout(DRAIN_IDLE_TIMEOUT, channel.wait()).await {
+                Ok(Some(msg)) => match msg {
+                    russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                        append_daemon_error(&mut err, &data);
+                    }
+                    russh::ChannelMsg::Eof | russh::ChannelMsg::Close => {
+                        saw_close = true;
+                    }
+                    _ => {}
+                },
+                Ok(None) => break,
+                Err(_) => {
+                    anyhow::bail!(
+                        "upload drain stalled: no message from daemon for \
+                         {DRAIN_IDLE_TIMEOUT:?} (connection may be gone)"
+                    );
                 }
-                russh::ChannelMsg::Eof | russh::ChannelMsg::Close => {
-                    saw_close = true;
-                }
-                _ => {}
             }
         }
         if !err.is_empty() {
