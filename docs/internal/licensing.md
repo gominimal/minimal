@@ -26,12 +26,32 @@ statically linked into our binaries. They are pulled in transitively via
 the `nickel-lang-core` git dependency; we do not depend on them
 directly.
 
-Stance: document and accept. LGPL-3.0 §4 (via GPL-3.0 §6) requires that
-users can relink the covered work against a modified version of the
-library. The complete corresponding source is public (this repository
-plus the pinned crate sources recorded in `Cargo.lock`), and anyone can
-rebuild the binaries with a modified malachite, which satisfies the
-relinking requirement for our current distribution model.
+Stance: document and accept. LGPL-3.0 §4(d)(0) requires conveying both
+the Minimal Corresponding Source (the LGPL library source) and the
+Corresponding Application Code (everything else needed to relink) in a
+form suitable for relinking, via one of the GPLv3 §6 conveyance methods.
+
+**Source-conveyance mechanism:** We rely on GPLv3 §6(d) — providing a
+network location from which to download the Corresponding Source. The
+malachite crates are published on crates.io at pinned versions recorded
+in `Cargo.lock`. Note that `Cargo.lock` itself only records registry
+URLs and checksums; it does not convey the sources. The actual
+conveyance depends on crates.io remaining available and retaining those
+versions.
+
+**Relinking form:** This repository (Corresponding Application Code) is
+public, and anyone can rebuild the binaries with a modified malachite by
+editing `Cargo.toml` to override the dependency. The statically linked
+binary format does not impede relinking because users have the complete
+application source.
+
+**Risk acknowledgment:** If crates.io were to remove the pinned
+malachite versions, the §6(d) conveyance would fail. For distribution
+channels requiring stronger guarantees (e.g., air-gapped environments or
+long-term archival), vendoring malachite sources under `vendor/` or
+providing a §6(b) written offer valid for three years would be required.
+Neither is currently implemented; the current stance is acceptable for
+our distribution model (source-available binaries rebuilt on demand).
 
 ### hakoniwa: linking exception, Linux-only
 
