@@ -13,6 +13,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 toml.workspace = true
+tempfile.workspace = true
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

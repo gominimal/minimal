@@ -166,6 +166,57 @@ pub fn provider_instance_dir(state_dir: &DaemonAbsPath, instance: u32) -> Daemon
     sub_path!(state_dir, "providers").sub_path_unchecked(&format!("local-{instance}"))
 }
 
+/// Removes any existing [`KNOWN_HOSTS_FILE`] entries for `host` at `port` from
+/// the file at `path`, so that a subsequent append records exactly one current
+/// entry instead of growing the file by a line on every daemon spawn
+/// (gominimal/minimal#782).
+///
+/// russh's `learn_known_hosts_path` appends unconditionally. Both native
+/// `minimald` and `minvmd` (from the guest boot beacon) call it once per spawn
+/// to record the daemon's host key under the `local-<instance>` hostname, so
+/// without this prune the per-instance `known_hosts` grows without bound — and
+/// because the VM guest regenerates its host key on every boot (its key lives
+/// on tmpfs), the accumulating lines are stale distinct keys, not harmless
+/// duplicates. Prune the prior entry first, then append the fresh one, and the
+/// file holds a single up-to-date key across stop/start cycles.
+///
+/// Matching is by the OpenSSH host marker `learn_known_hosts_path` writes as a
+/// line's first field: the bare `host` at the default port 22, or `[host]:port`
+/// otherwise. Lines for any other host are preserved verbatim, so an unrelated
+/// entry is never dropped. A missing file is a no-op success, and the file is
+/// rewritten only when a matching entry was actually removed.
+///
+/// # Errors
+///
+/// Returns any I/O error other than "file not found" from reading or rewriting
+/// `path`.
+pub fn prune_known_hosts_entries(path: &Path, host: &str, port: u16) -> std::io::Result<()> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let marker = if port == 22 {
+        host.to_owned()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    let mut kept = String::with_capacity(existing.len());
+    let mut removed = false;
+    for line in existing.lines() {
+        if line.split_whitespace().next() == Some(marker.as_str()) {
+            removed = true;
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    if removed {
+        std::fs::write(path, kept)?;
+    }
+    Ok(())
+}
+
 /// Returns minimal's default config directory, `<config>/minimal`.
 ///
 /// The base is `$XDG_CONFIG_HOME` when set to an absolute path, otherwise
@@ -1533,6 +1584,41 @@ mod tests {
             provider_instance_dir(&state, 3).as_str(),
             "/state/minimal/providers/local-3",
         );
+    }
+
+    #[test]
+    fn prune_known_hosts_removes_only_matching_host_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("known_hosts");
+        std::fs::write(
+            &path,
+            "local-0 ssh-ed25519 AAAAoldkey1\n\
+             other-host ssh-ed25519 BBBBkeep\n\
+             local-0 ssh-ed25519 AAAAoldkey2\n",
+        )
+        .unwrap();
+        prune_known_hosts_entries(&path, "local-0", 22).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "other-host ssh-ed25519 BBBBkeep\n",
+        );
+    }
+
+    #[test]
+    fn prune_known_hosts_matches_bracketed_marker_for_non_default_port() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("known_hosts");
+        std::fs::write(&path, "[local-0]:2222 ssh-ed25519 AAAAkey\n").unwrap();
+        prune_known_hosts_entries(&path, "local-0", 2222).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[test]
+    fn prune_known_hosts_is_noop_when_file_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("known_hosts");
+        prune_known_hosts_entries(&path, "local-0", 22).unwrap();
+        assert!(!path.exists());
     }
 
     #[test]
