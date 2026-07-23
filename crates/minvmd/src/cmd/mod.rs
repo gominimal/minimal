@@ -370,6 +370,16 @@ pub(crate) fn read_ready_beacon<R: std::io::BufRead>(
                         tracing::warn!(error = %e, "failed to parse SSH host key from beacon");
                     }
                     Ok(pubkey) => {
+                        // `learn_known_hosts_path` appends unconditionally; drop
+                        // any prior entry for this host first so the file records
+                        // exactly one current key instead of growing a line per
+                        // spawn (#782). Best-effort: a prune failure must not
+                        // abort boot (R2.3).
+                        if let Err(e) =
+                            paths::prune_known_hosts_entries(known_hosts_path, "local-0", 22)
+                        {
+                            tracing::warn!(error = %e, "failed to prune stale known_hosts entries");
+                        }
                         match russh::keys::known_hosts::learn_known_hosts_path(
                             // TODO: pass instance_num through once multi-instance is needed
                             "local-0",
@@ -621,6 +631,39 @@ mod beacon_tests {
             BootBeacon::MountFailed {
                 reason: "no reason given".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn read_ready_beacon_replaces_prior_host_key_without_growth() {
+        use russh::keys::{Algorithm, PrivateKey, key::safe_rng};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let known_hosts_path = tmp.path().join("known_hosts");
+
+        // Two spawns, each carrying a freshly generated host key — the VM guest
+        // regenerates its key on every boot (its key lives on tmpfs). The file
+        // must record only the latest key on a single line, not grow by a line
+        // per spawn (#782).
+        let mut latest = String::new();
+        for _ in 0..2 {
+            let key = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
+            latest = key.public_key().to_openssh().unwrap();
+            let beacon = format!("READY\n{latest}\n");
+            let mut reader = Cursor::new(beacon.into_bytes());
+            read_ready_beacon(&mut reader, &known_hosts_path)
+                .expect("read_ready_beacon must succeed with valid beacon");
+        }
+
+        let contents = std::fs::read_to_string(&known_hosts_path).unwrap();
+        assert_eq!(
+            contents.lines().filter(|l| !l.trim().is_empty()).count(),
+            1,
+            "known_hosts must hold exactly one entry after repeated spawns, got: {contents:?}",
+        );
+        assert!(
+            contents.contains(&latest),
+            "known_hosts must hold the latest host key, got: {contents:?}",
         );
     }
 }

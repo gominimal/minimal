@@ -643,11 +643,22 @@ async fn async_main() -> Result<(), MainError> {
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
     let host_private_key = config.host_key()?;
+    let known_hosts = sub_path!(cli.client_instance_dir(), "known_hosts");
+    let ssh_host = format!("local-{}", cli.instance_num());
+    // `learn_known_hosts_path` appends unconditionally; drop any prior entry for
+    // this host so repeated daemon spawns record one current key instead of
+    // growing known_hosts without bound (#782). Best-effort: a prune failure
+    // must not block startup.
+    if let Err(e) =
+        paths::prune_known_hosts_entries(known_hosts.as_utf8_path().as_std_path(), &ssh_host, 22)
+    {
+        tracing::warn!(error = %e, "failed to prune stale known_hosts entries");
+    }
     russh::keys::known_hosts::learn_known_hosts_path(
-        &format!("local-{}", cli.instance_num()),
+        &ssh_host,
         22,
         host_private_key.public_key(),
-        sub_path!(cli.client_instance_dir(), "known_hosts").as_utf8_path(),
+        known_hosts.as_utf8_path(),
     )?;
 
     // Preflight (advisory): every session sandbox starts by unsharing an
