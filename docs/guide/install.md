@@ -20,7 +20,7 @@ curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh
 ### Verify
 
 ```shell
-mip --version
+min --version
 ```
 
 If installed correctly, it will provide you with the version.
@@ -64,7 +64,7 @@ curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh
 ### Verify
 
 ```shell
-mip --version
+min --version
 ```
 
 If installed correctly, it will provide you with the version.
