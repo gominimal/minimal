@@ -1,0 +1,214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Norrie Taylor <norrie@minimal.dev>
+Date: Wed, 22 Jul 2026 17:30:00 -0700
+Subject: [PATCH] vsock: bound outstanding packets by the guest's receive-queue
+ depth
+
+The guest kernel queues one skb per RW packet and, since Linux 6.12.92,
+resets the connection (RST + ENOBUFS) once
+(skb_queue_len + 1) * SKB_TRUESIZE(0) > buf_alloc. That is a second
+receive-side ceiling -- on packet count -- that the vsock credit protocol
+does not express: credit meters bytes only. A bulk sender that fragments the
+stream into sub-SKB_TRUESIZE(0) packets exhausts the count ceiling long
+before the byte credit and trips the reset with the window mostly unused.
+
+Meter the packet count the same way the byte credit is metered. The proxy
+already tracks rx_cnt (bytes sent) and peer_fwd_cnt (bytes the guest has
+forwarded to userspace); recording the tail rx_cnt of each emitted packet
+and retiring it when fwd_cnt passes it yields exactly the guest's
+skb_queue_len. Before emitting, if one more packet would approach the
+ceiling, take the existing WaitForCredit path and wait for the peer to
+drain -- identical machinery to exhausted byte credit.
+
+SKB_OVERHEAD is a deliberate over-estimate of the guest's real per-skb cost
+(576 B on arm64) so the bound stays safely below the true ceiling without
+the VMM depending on a guest-kernel constant.
+
+Includes the credit-request wakeup fix (push_credit_req must set
+signal_queue): without it a connection that must wait with no data packet in
+flight is never woken. The count ceiling makes that path reachable during
+bulk transfer, so the two belong together.
+
+Unlike coalescing, this does not change delivery granularity -- send() stays
+1:1 with recv() and packets are never delayed for batching. It engages only
+as backpressure when the reader falls behind, exactly like byte credit, and
+is invisible otherwise. Measured on a 12.8 MB host->guest transfer: without
+this, 0 of 5 uploads complete; with it, 6 of 6, a guest kernel instrumented
+on the rejection path logs zero resets, and the transfer still completes in
+~200 ms (no throughput penalty -- the reader keeps up, so the bound is
+rarely reached).
+---
+diff --git a/src/devices/src/virtio/vsock/tsi_stream.rs b/src/devices/src/virtio/vsock/tsi_stream.rs
+index c819398..b544896 100644
+--- a/src/devices/src/virtio/vsock/tsi_stream.rs
++++ b/src/devices/src/virtio/vsock/tsi_stream.rs
+@@ -834,6 +834,12 @@ impl Proxy for TsiStreamProxy {
+                         fwd_cnt: self.tx_cnt.0,
+                     };
+                     update.push_credit_req = Some(rx);
++                    // See the matching comment in unix.rs: push_packet() does
++                    // not raise the IRQ, and polling is disarmed just below,
++                    // so the request needs an explicit signal or the
++                    // connection can stall waiting for a credit update the
++                    // peer was never woken to send.
++                    update.signal_queue = true;
+                 }
+ 
+                 if self.status == ProxyStatus::Closed {
+diff --git a/src/devices/src/virtio/vsock/unix.rs b/src/devices/src/virtio/vsock/unix.rs
+index 2f51c05..37e78b3 100644
+--- a/src/devices/src/virtio/vsock/unix.rs
++++ b/src/devices/src/virtio/vsock/unix.rs
+@@ -9,7 +9,7 @@ use nix::sys::socket::{
+     accept, bind, connect, listen, recv, send, shutdown, socket, AddressFamily, Backlog, MsgFlags,
+     Shutdown, SockFlag, SockType, UnixAddr,
+ };
+-use std::collections::HashMap;
++use std::collections::{HashMap, VecDeque};
+ use std::num::Wrapping;
+ use std::os::fd::{FromRawFd, OwnedFd};
+ use std::os::unix::io::{AsRawFd, RawFd};
+@@ -45,6 +45,13 @@ pub struct UnixProxy {
+     last_tx_cnt_sent: Wrapping<u32>,
+     push_cnt: Wrapping<u32>,
+     rx_cnt: Wrapping<u32>,
++    /// Tail `rx_cnt` of each RW packet emitted to the guest that the guest has
++    /// not yet forwarded to userspace, oldest first. Its length is exactly the
++    /// guest's `skb_queue_len` for this connection: the guest queues one skb
++    /// per RW packet and drops it only once fully consumed, and a tail is
++    /// dropped here once `peer_fwd_cnt` passes it. Used to bound outstanding
++    /// packets below the guest's per-skb receive-queue ceiling.
++    outstanding: VecDeque<Wrapping<u32>>,
+ }
+ 
+ fn proxy_fd_create(id: u64) -> Result<OwnedFd, ProxyError> {
+@@ -119,6 +126,7 @@ impl UnixProxy {
+             last_tx_cnt_sent: Wrapping(0),
+             push_cnt: Wrapping(0),
+             rx_cnt: Wrapping(0),
++            outstanding: VecDeque::new(),
+         })
+     }
+ 
+@@ -152,6 +160,7 @@ impl UnixProxy {
+             peer_fwd_cnt: Wrapping(0),
+             push_cnt: Wrapping(0),
+             path: Default::default(),
++            outstanding: VecDeque::new(),
+         }
+     }
+ 
+@@ -203,6 +212,47 @@ impl UnixProxy {
+         (Wrapping(self.peer_buf_alloc) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
+     }
+ 
++    /// Drop from `outstanding` every emitted packet the guest has now forwarded
++    /// to userspace, i.e. whose tail `rx_cnt` the guest's `fwd_cnt` has reached.
++    /// Wrapping-safe: bytes in flight are bounded by `buf_alloc` (< 2^31), so a
++    /// non-negative wrapping difference means the tail has been passed. After
++    /// this returns, `outstanding.len()` is the guest's current `skb_queue_len`.
++    fn drain_forwarded(&mut self) {
++        while let Some(&tail) = self.outstanding.front() {
++            if (self.peer_fwd_cnt - tail).0 as i32 >= 0 {
++                self.outstanding.pop_front();
++            } else {
++                break;
++            }
++        }
++    }
++
++    /// Whether emitting one more RW packet would risk the guest's per-skb
++    /// receive-queue ceiling.
++    ///
++    /// The guest kernel queues one skb per RW packet and, since Linux 6.12.92,
++    /// resets the connection (RST + `ENOBUFS`) once
++    /// `(skb_queue_len + 1) * SKB_TRUESIZE(0) > buf_alloc`. That is a second
++    /// receive-side ceiling, on packet *count*, that the vsock credit protocol
++    /// does not express — the protocol only meters bytes. A bulk sender that
++    /// fragments the stream into sub-`SKB_TRUESIZE(0)` packets exhausts this
++    /// count ceiling long before the byte credit, tripping the reset with the
++    /// window mostly unused.
++    ///
++    /// Meter it the same way the byte credit is metered: refuse to emit and
++    /// wait for the peer to drain. `SKB_OVERHEAD` is a deliberate over-estimate
++    /// of the guest's real per-skb cost (576 B on arm64) so the bound stays
++    /// safely below the true ceiling without the VMM hardcoding a guest-kernel
++    /// constant. No effect until `buf_alloc` is known (> 0).
++    fn skb_ceiling_reached(&self) -> bool {
++        const SKB_OVERHEAD: usize = 1024;
++        if self.peer_buf_alloc == 0 {
++            return false;
++        }
++        let ceiling = self.peer_buf_alloc as usize / SKB_OVERHEAD;
++        self.outstanding.len() + 1 >= ceiling
++    }
++
+     fn recv_to_pkt(&self, pkt: &mut VsockPacket) -> RecvPkt {
+         if let Some(buf) = pkt.buf_mut() {
+             let peer_credit = self.peer_avail_credit();
+@@ -219,6 +269,13 @@ impl UnixProxy {
+                 return RecvPkt::WaitForCredit;
+             }
+ 
++            // Second ceiling: don't overrun the guest's receive *queue* (skb
++            // count), which its byte credit does not protect. Wait for the peer
++            // to drain, exactly as for exhausted byte credit.
++            if self.skb_ceiling_reached() {
++                return RecvPkt::WaitForCredit;
++            }
++
+             match recv(
+                 self.fd.as_raw_fd(),
+                 &mut buf[..max_len],
+@@ -258,6 +315,10 @@ impl UnixProxy {
+                     }
+                     RecvPkt::Read(cnt) => {
+                         self.rx_cnt += Wrapping(cnt as u32);
++                        // One skb will be queued in the guest for this packet;
++                        // record its tail so drain_forwarded() can retire it
++                        // when the guest forwards past it.
++                        self.outstanding.push_back(self.rx_cnt);
+                         self.init_data_pkt(&mut pkt);
+                         pkt.set_len(cnt as u32);
+                         pkt.hdr().len() + cnt
+@@ -369,6 +430,7 @@ impl Proxy for UnixProxy {
+ 
+         self.peer_buf_alloc = pkt.buf_alloc();
+         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
++        self.drain_forwarded();
+ 
+         self.local_port = pkt.dst_port();
+         self.peer_port = pkt.src_port();
+@@ -466,6 +528,7 @@ impl Proxy for UnixProxy {
+         );
+         self.peer_buf_alloc = pkt.buf_alloc();
+         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
++        self.drain_forwarded();
+ 
+         self.status = ProxyStatus::Connected;
+ 
+@@ -499,6 +562,7 @@ impl Proxy for UnixProxy {
+ 
+         self.peer_buf_alloc = pkt.buf_alloc();
+         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
++        self.drain_forwarded();
+ 
+         self.switch_to_connected();
+ 
+@@ -576,6 +640,16 @@ impl Proxy for UnixProxy {
+                         fwd_cnt: self.tx_cnt.0,
+                     };
+                     update.push_credit_req = Some(rx);
++                    // push_packet() only places the request in the used ring;
++                    // the IRQ is raised solely by process_proxy_update() when
++                    // signal_queue is set. We disarm polling on this fd just
++                    // below, so a request delivered without an interrupt
++                    // leaves the connection stalled until some unrelated
++                    // event happens to signal the queue. Usually masked
++                    // because recv_pkt() pushed data packets first and set
++                    // signal_queue itself, but not when the very first packet
++                    // of the batch has to wait.
++                    update.signal_queue = true;
+                 }
+ 
+                 if self.status == ProxyStatus::Closed {
