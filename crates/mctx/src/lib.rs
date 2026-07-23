@@ -553,11 +553,13 @@ impl Context {
             Ok(v) => v
                 .parse::<u32>()
                 .map_err(|e| RemoteError::Config(format!("MINIMAL_FETCH_RETRIES: {e}")))?,
-            Err(_) => self
+            Err(std::env::VarError::NotPresent) => self
                 .mfile
                 .cache
                 .fetch_retries
                 .unwrap_or(rcache::DEFAULT_FETCH_RETRIES),
+            // A set-but-garbled override must be loud, like any other bad value.
+            Err(e) => return Err(RemoteError::Config(format!("MINIMAL_FETCH_RETRIES: {e}"))),
         };
         let res = res.map(|rc| rc.with_fetch_retries(fetch_retries));
         tracing::trace!("remote cache init took {:?}", start.elapsed());
