@@ -26,7 +26,7 @@ The most common upstream is our public packages registry:
 [upstream] # Source of software & tooling
 repo = "https://github.com/gominimal/pkgs"
 branch = "main"
-# locked_commit is set after the first `mip update`
+# locked_commit is filled in automatically after the first upstream refresh
 ```
 
 For more information, check out the [minimal.toml page](../reference/minimal-dot-toml.md) in the References section.
