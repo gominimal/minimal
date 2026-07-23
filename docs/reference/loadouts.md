@@ -1,6 +1,6 @@
 ---
 title: Loadouts
-description: Per-developer loadout reference — the loadout TOML schema, config-directory layout, min CLI flags, client config, and how loadouts compose into sessions.
+description: Per-developer loadout reference: the loadout TOML schema, config-directory layout, min CLI flags, client config, and how loadouts compose into sessions.
 ---
 
 # Loadouts
@@ -9,8 +9,8 @@ A loadout is a per-developer bundle of packages, environment variables, file
 patches, and lifecycle hooks that the [`min` session CLI](./cli-min.md) layers
 into the sessions it activates. The project's
 [`minimal.toml`](./minimal-dot-toml.md) describes what every contributor's
-session needs; a loadout carries what *you* want on top — your editor,
-terminal multiplexer, shell config, and dotfiles — so each development
+session needs; a loadout carries what *you* want on top (your editor,
+terminal multiplexer, shell config, and dotfiles) so each development
 environment comes up matching your muscle memory.
 
 Loadouts apply to sessions (`min activate`); they are not used by task
@@ -21,7 +21,7 @@ sandboxes ([`mip run`](./cli-mip.md)), which have their own
 > **packages** and **vars** take effect inside the session today. **Patches**
 > and **lifecycle hooks** are parsed, validated, and composed into the
 > session's configuration, but the session launcher does not yet apply them
-> inside the sandbox — the daemon holds them with the session and logs each
+> inside the sandbox; the daemon holds them with the session and logs each
 > one as deferred. The schema below documents all four so files written
 > now stay valid as the remaining plumbing lands.
 
@@ -48,7 +48,7 @@ The filename stem **is** the loadout's identifier:
 - Names are trimmed and must be non-empty, with no `/`, `\`, or NUL
   characters.
 
-The directory is not created automatically — create it and drop
+The directory is not created automatically; create it and drop
 `<name>.toml` files there to get started.
 
 ## Example
@@ -145,7 +145,7 @@ COLORTERM = { inherit = true }               # inherit from the host env
 - `{ inherit = true }` passes the variable through from the environment of
   the `min` process on the host. If the host doesn't have it set, the
   variable is dropped from the session (with a warning) rather than failing
-  activation — so opportunistically inheriting things like `TERM` is safe.
+  activation, so opportunistically inheriting things like `TERM` is safe.
 - `{ inherit = true, default = "..." }` inherits, falling back to `default`
   when the host doesn't have the variable set.
 
@@ -187,7 +187,7 @@ fans out into one patch per pattern, sharing the `dest`):
   `$NAME` / `${NAME}` references resolve against the session's
   already-resolved variables (declared in `[vars]`); referencing an
   undefined name is an error. `$$` is a literal `$`.
-- After expansion the path must be absolute — anchor home-relative sources
+- After expansion the path must be absolute; anchor home-relative sources
   with `~/` or `$HOME/`.
 - Glob patterns must have a literal directory prefix to walk from:
   `~/dotfiles/**/*.lua` is fine, a bare `**/*.pem` is rejected.
@@ -211,8 +211,8 @@ matches; see [`follow_symlinks`](#follow_symlinks) and the
 
 _Optional_
 
-Each hook groups up to three scripts — `on_activate`, `on_destroy`, and
-`on_failure` — and at least one must be present. An optional `description`
+Each hook groups up to three scripts (`on_activate`, `on_destroy`, and
+`on_failure`), and at least one must be present. An optional `description`
 labels the hook. Scripts are either inline or a path to a file:
 
 ```toml
@@ -251,9 +251,9 @@ from two flags:
 
 Resolution order:
 
-1. `--no-loadouts` — nothing is applied, regardless of configuration.
-2. One or more `--loadout NAME` — exactly the named loadouts are applied.
-3. Neither flag — the `[loadouts].default_loadouts` list from the
+1. `--no-loadouts`: nothing is applied, regardless of configuration.
+2. One or more `--loadout NAME`: exactly the named loadouts are applied.
+3. Neither flag: the `[loadouts].default_loadouts` list from the
    [client config](#client-config) is applied (which may be empty).
 
 Loadouts are resolved and composed **before** the CLI contacts the daemon:
@@ -264,7 +264,7 @@ applied, the CLI prints `Applying loadouts: <names>` to stderr.
 Activation is also when loadout contents are captured: the files are read
 once, inherited vars are resolved against the host environment, and the
 composed result is what the session runs with. Editing a loadout file
-does not change sessions that already exist — destroy and re-activate to
+does not change sessions that already exist; destroy and re-activate to
 pick up the edit.
 
 ## Client config {#client-config}
@@ -314,11 +314,11 @@ project's contribution (the `[session]` block of the project's
 `minimal.toml`, plus per-package contributions) into the session's final
 configuration. Merge semantics across all contributors:
 
-- **Packages** deduplicate — set semantics, there is no value to disagree
+- **Packages** deduplicate: set semantics, there is no value to disagree
   on.
 - **Vars** with the same name and the same resolved value deduplicate.
   The same name with *different* values is a hard conflict that fails the
-  composition — there is no override precedence between loadouts and the
+  composition; there is no override precedence between loadouts and the
   project. The error's hint applies: add the name to your policy's
   `ignore` list to drop all contributors of that variable.
 - **Patches** with the same destination and different sources are likewise
@@ -330,26 +330,26 @@ Two loadouts with the same name cannot be applied together.
 Loadout contributions are gated by the user's policy
 (`<config>/minimal/user_policy.toml`): items you declare yourself
 automatically pass the `allow` check, but the policy's `deny` and `ignore`
-rules still apply — a loadout patch matching a `deny` pattern fails the
+rules still apply: a loadout patch matching a `deny` pattern fails the
 composition on the client, before the daemon is involved. A missing policy
 file means an empty policy; a fresh install activates fine without it.
 
 ## Vars in the attach shell
 
 The interactive shell minted by [`min attach`](./cli-min.md#attach) is
-`bash --noprofile -l` — a login shell that sources **no** startup files
+`bash --noprofile -l`, a login shell that sources **no** startup files
 (not `/etc/profile`, `~/.bash_profile`, or `~/.bashrc`), so rc-file
 patches cannot influence it. Interactive setup travels through the
 environment instead, i.e. through `[vars]`:
 
-- **Prompt** — the session launcher seeds a baseline environment
+- **Prompt**: the session launcher seeds a baseline environment
   (currently a stock `PS1`) before merging in the composed vars, and a
   composed var overwrites a baseline entry with the same name. Setting
   `PS1` in `[vars]` therefore replaces the stock prompt. This baseline is
   a layer *beneath* composition, not a contributor: the no-override
   conflict rule above arbitrates between contributors and does not apply
   to the launcher's defaults.
-- **Banner / MOTD** — bash evaluates `PROMPT_COMMAND` from the
+- **Banner / MOTD**: bash evaluates `PROMPT_COMMAND` from the
   environment before the first interactive prompt, so a once-only banner
   can ship as a payload var plus a self-unsetting trigger:
 
