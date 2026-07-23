@@ -533,7 +533,9 @@ impl Context {
                 v.parse::<mfile::IndexSourceMode>()
                     .map_err(|e| RemoteError::Config(format!("MINIMAL_INDEX_SOURCE: {e}")))?,
             ),
-            Err(_) => None,
+            Err(std::env::VarError::NotPresent) => None,
+            // A set-but-garbled override must be loud, like any other bad value.
+            Err(e) => return Err(RemoteError::Config(format!("MINIMAL_INDEX_SOURCE: {e}"))),
         };
         let config = self
             .mfile
