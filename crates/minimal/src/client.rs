@@ -624,11 +624,27 @@ fn append_daemon_error(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(&data[..room.min(data.len())]);
 }
 
-/// Resolve the provider-instance dir (`<state dir>/providers/local-0`) the
-/// daemon and CLI agree on: `--minimal-dir` when set, else the default
-/// minimal state dir.
+/// The provider kind the CLI should talk to, given `--provider`/`--minvmd`.
+///
+/// The native minimald and minvmd backends now occupy distinct provider dirs,
+/// so connecting — not just spawning — must pick the right one. macOS is always
+/// minvmd-backed regardless of the flag; keying on the compile target keeps the
+/// in-guest CLI (Linux, native) and the host CLI (macOS, minvmd) each pointed at
+/// the dir their local daemon actually uses.
+pub(crate) fn client_provider_kind(use_minvmd: bool) -> paths::ProviderKind {
+    if use_minvmd || cfg!(target_os = "macos") {
+        paths::ProviderKind::Minvmd
+    } else {
+        paths::ProviderKind::Minimald
+    }
+}
+
+/// Resolve the provider-instance dir (`<state dir>/providers/local-<kind>0`) the
+/// daemon and CLI agree on: `--minimal-dir` when set, else the default minimal
+/// state dir. `use_minvmd` selects the backend's dir (see [`client_provider_kind`]).
 pub(crate) fn resolve_provider_dir(
     minimal_dir_override: Option<&std::path::Path>,
+    use_minvmd: bool,
 ) -> std::io::Result<std::path::PathBuf> {
     let base = match minimal_dir_override {
         Some(dir) => {
@@ -640,19 +656,22 @@ pub(crate) fn resolve_provider_dir(
         }
         None => paths::minimal_state_dir(),
     };
-    Ok(paths::provider_instance_dir(&base, 0)
-        .as_utf8_path()
-        .as_std_path()
-        .to_path_buf())
+    Ok(
+        paths::provider_instance_dir(&base, client_provider_kind(use_minvmd), 0)
+            .as_utf8_path()
+            .as_std_path()
+            .to_path_buf(),
+    )
 }
 
-/// Resolve the daemon socket path: `<provider dir>/ssh.sock`. Both backends
-/// (native minimald and the minvmd bridge) serve the same endpoint, so the
-/// backend choice only matters for spawning, not for connecting.
+/// Resolve the daemon socket path: `<provider dir>/ssh.sock`. Each backend
+/// serves this endpoint under its own provider dir, so `use_minvmd` must select
+/// the same backend the daemon was spawned as.
 pub fn resolve_socket_path(
     minimal_dir_override: Option<&std::path::Path>,
+    use_minvmd: bool,
 ) -> std::io::Result<std::path::PathBuf> {
-    Ok(resolve_provider_dir(minimal_dir_override)?.join(paths::SSH_SOCK_FILE))
+    Ok(resolve_provider_dir(minimal_dir_override, use_minvmd)?.join(paths::SSH_SOCK_FILE))
 }
 
 /// Sends the process trace context as a `TRACEPARENT` channel env request.
@@ -685,10 +704,19 @@ mod tests {
 
     #[test]
     fn socket_path_honors_override() {
-        let sock = resolve_socket_path(Some(Path::new("/tmp/minimal-test"))).unwrap();
+        let sock = resolve_socket_path(Some(Path::new("/tmp/minimal-test")), false).unwrap();
         assert_eq!(
             sock,
-            Path::new("/tmp/minimal-test/providers/local-0/ssh.sock")
+            Path::new("/tmp/minimal-test/providers/local-minimald0/ssh.sock")
+        );
+    }
+
+    #[test]
+    fn socket_path_selects_the_minvmd_dir() {
+        let sock = resolve_socket_path(Some(Path::new("/tmp/minimal-test")), true).unwrap();
+        assert_eq!(
+            sock,
+            Path::new("/tmp/minimal-test/providers/local-minvmd0/ssh.sock")
         );
     }
 

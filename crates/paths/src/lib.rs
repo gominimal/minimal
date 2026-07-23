@@ -151,19 +151,55 @@ pub fn minimal_state_dir() -> DaemonAbsPath {
 /// native minimald or by the minvmd host↔guest bridge — one endpoint either way.
 pub const SSH_SOCK_FILE: &str = "ssh.sock";
 /// File name of the SSH `known_hosts` in a provider instance dir, recording the
-/// daemon's host key under the `local-<instance>` hostname. Written at startup
-/// by native minimald, and by minvmd from the guest's boot beacon.
+/// daemon's host key under the `local-<kind><instance>` hostname. Written at
+/// startup by native minimald, and by minvmd from the guest's boot beacon.
 pub const KNOWN_HOSTS_FILE: &str = "known_hosts";
 /// Native minimald's single-instance lock, held for the daemon's lifetime.
 pub const MINIMALD_LOCK_FILE: &str = "minimald.lock";
 /// The minvmd supervisor's alive lock, held for the daemon's lifetime.
 pub const MINVMD_LOCK_FILE: &str = "minvmd.lock";
 
-/// `<state_dir>/providers/local-<instance>` — the directory holding the
+/// Which local daemon backend ("provider") an instance directory belongs to.
+///
+/// The kind is embedded in the instance name so the native host minimald and
+/// the minvmd microVM backends occupy distinct provider dirs — and distinct SSH
+/// host-key identities — rather than colliding on a shared `local-<N>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKind {
+    /// Native host minimald (DM2).
+    Minimald,
+    /// minimald inside the minvmd microVM (DM1).
+    Minvmd,
+}
+
+impl ProviderKind {
+    /// The tag embedded in the instance name (`local-<tag><instance>`).
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            ProviderKind::Minimald => "minimald",
+            ProviderKind::Minvmd => "minvmd",
+        }
+    }
+}
+
+/// The provider-instance name, `local-<kind><instance>` (e.g. `local-minimald0`,
+/// `local-minvmd0`). Used both as the `providers/<name>` directory name and as
+/// the SSH host-key identity recorded in `known_hosts`.
+#[must_use]
+pub fn provider_instance_name(kind: ProviderKind, instance: u32) -> String {
+    format!("local-{}{instance}", kind.tag())
+}
+
+/// `<state_dir>/providers/local-<kind><instance>` — the directory holding the
 /// sockets, locks, and state files a client needs to reach one local daemon
 /// instance.
-pub fn provider_instance_dir(state_dir: &DaemonAbsPath, instance: u32) -> DaemonAbsPath {
-    sub_path!(state_dir, "providers").sub_path_unchecked(&format!("local-{instance}"))
+pub fn provider_instance_dir(
+    state_dir: &DaemonAbsPath,
+    kind: ProviderKind,
+    instance: u32,
+) -> DaemonAbsPath {
+    sub_path!(state_dir, "providers").sub_path_unchecked(&provider_instance_name(kind, instance))
 }
 
 /// Removes any existing [`KNOWN_HOSTS_FILE`] entries for `host` at `port` from
@@ -1577,12 +1613,16 @@ mod tests {
     fn provider_instance_dir_layout() {
         let state = DaemonAbsPath::try_new("/state/minimal").unwrap();
         assert_eq!(
-            provider_instance_dir(&state, 0).as_str(),
-            "/state/minimal/providers/local-0",
+            provider_instance_dir(&state, ProviderKind::Minimald, 0).as_str(),
+            "/state/minimal/providers/local-minimald0",
         );
         assert_eq!(
-            provider_instance_dir(&state, 3).as_str(),
-            "/state/minimal/providers/local-3",
+            provider_instance_dir(&state, ProviderKind::Minimald, 3).as_str(),
+            "/state/minimal/providers/local-minimald3",
+        );
+        assert_eq!(
+            provider_instance_dir(&state, ProviderKind::Minvmd, 0).as_str(),
+            "/state/minimal/providers/local-minvmd0",
         );
     }
 

@@ -15,7 +15,7 @@ struct Cli {
     command: Command,
 
     /// Override the state dir base (default: $XDG_STATE_HOME/minimal).
-    /// Runtime files live under `<dir>/providers/local-0/`.
+    /// Runtime files live under `<dir>/providers/local-minvmd0/`.
     #[arg(long, global = true)]
     minimal_state_dir: Option<paths::CwdRelative<paths::Daemon>>,
 }

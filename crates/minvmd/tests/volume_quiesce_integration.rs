@@ -90,7 +90,7 @@ impl TestEnv {
         // `volume::resolve_data_volume_path()` default: the provider dir
         // under `paths::minimal_state_dir()` (XDG_STATE_HOME honoured).
         self.state_home
-            .join("minimal/providers/local-0/data-vol.raw")
+            .join("minimal/providers/local-minvmd0/data-vol.raw")
     }
 }
 

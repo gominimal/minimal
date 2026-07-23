@@ -94,7 +94,11 @@ impl Cli {
 
     /// Returns the path to the directory containing sockets/info about this daemon for clients.
     pub fn client_instance_dir(&self) -> DaemonAbsPath {
-        paths::provider_instance_dir(&self.minimal_state_dir(), self.instance_num())
+        paths::provider_instance_dir(
+            &self.minimal_state_dir(),
+            paths::ProviderKind::Minimald,
+            self.instance_num(),
+        )
     }
 
     /// Returns fragments of the command-line arguments which should be passed to an ssh invocation in
@@ -120,7 +124,7 @@ impl Cli {
                         .to_string(),
                 ),
             ],
-            format!("local-{}", self.instance_num()),
+            paths::provider_instance_name(paths::ProviderKind::Minimald, self.instance_num()),
         )
     }
 
@@ -175,7 +179,7 @@ pub struct GlobalArgs {
 #[derive(Debug, Args)]
 pub struct ListenArgs {
     /// Instance number for this minimald; determines client-relevant paths under
-    /// `<minimal_state_dir>/providers/local-<instance-num>`.
+    /// `<minimal_state_dir>/providers/local-minimald<instance-num>`.
     ///
     /// The SSH socket is accessible as `ssh.sock`.
     #[arg(long, default_value_t = 0)]
@@ -579,8 +583,10 @@ async fn async_main() -> Result<(), MainError> {
     // it. Keyed on being the VM init — pid-1 owns its /run — NOT on the
     // `--vsock` flag: a native (possibly non-root) `--vsock` daemon may not
     // be able to write /run at all and keeps the provider-dir lock.
+    let instance_name =
+        paths::provider_instance_name(paths::ProviderKind::Minimald, cli.instance_num());
     let instance_lock_path = if is_minimal_microvm() {
-        DaemonAbsPath::try_new(format!("/run/minimald-local-{}.lock", cli.instance_num()))
+        DaemonAbsPath::try_new(format!("/run/minimald-{instance_name}.lock"))
             .expect("static /run lock path is absolute")
     } else {
         cli.client_instance_dir()
@@ -594,8 +600,7 @@ async fn async_main() -> Result<(), MainError> {
         Ok(guard) => guard,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
             return Err(MainError::Other(format!(
-                "minimald local-{} is already running (instance lock held)",
-                cli.instance_num()
+                "minimald {instance_name} is already running (instance lock held)"
             )));
         }
         Err(e) => return Err(MainError::IO(e, "acquiring instance lock")),
@@ -605,7 +610,10 @@ async fn async_main() -> Result<(), MainError> {
         .set_len(0)
         .and_then(|()| writeln!(&*instance_guard, "{}", std::process::id()));
 
-    // A minvmd bridge binds the same ssh.sock; don't steal a live VM's socket.
+    // Native minimald and minvmd now own distinct provider dirs
+    // (`local-minimald<N>` vs `local-minvmd<N>`), so they no longer share a
+    // socket. This stays as a defensive guard for the unusual case of a minvmd
+    // instance pointed at *this* dir: don't steal a live VM's ssh.sock.
     if lock_held(
         cli.client_instance_dir()
             .sub_path_unchecked(paths::MINVMD_LOCK_FILE)
@@ -615,8 +623,7 @@ async fn async_main() -> Result<(), MainError> {
     .map_err(|e| MainError::IO(e, "probing minvmd lock"))?
     {
         return Err(MainError::Other(format!(
-            "a minvmd VM is serving local-{}'s socket; stop it first (`minvmd stop`)",
-            cli.instance_num()
+            "a minvmd VM is serving {instance_name}'s socket; stop it first (`minvmd stop`)"
         )));
     }
 
@@ -644,18 +651,19 @@ async fn async_main() -> Result<(), MainError> {
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
     let host_private_key = config.host_key()?;
     let known_hosts = sub_path!(cli.client_instance_dir(), "known_hosts");
-    let ssh_host = format!("local-{}", cli.instance_num());
     // `learn_known_hosts_path` appends unconditionally; drop any prior entry for
     // this host so repeated daemon spawns record one current key instead of
     // growing known_hosts without bound (#782). Best-effort: a prune failure
     // must not block startup.
-    if let Err(e) =
-        paths::prune_known_hosts_entries(known_hosts.as_utf8_path().as_std_path(), &ssh_host, 22)
-    {
+    if let Err(e) = paths::prune_known_hosts_entries(
+        known_hosts.as_utf8_path().as_std_path(),
+        &instance_name,
+        22,
+    ) {
         tracing::warn!(error = %e, "failed to prune stale known_hosts entries");
     }
     russh::keys::known_hosts::learn_known_hosts_path(
-        &ssh_host,
+        &instance_name,
         22,
         host_private_key.public_key(),
         known_hosts.as_utf8_path(),

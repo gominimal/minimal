@@ -28,7 +28,7 @@ async fn git_push_through_min_binary_lands_commit_in_workspace() {
     // point XDG_STATE_HOME at a tempdir and serve the UDS where
     // `resolve_socket_path(None)` will look.
     let state_home = tempfile::TempDir::new().unwrap();
-    let sock_dir = state_home.path().join("minimal/providers/local-0");
+    let sock_dir = state_home.path().join("minimal/providers/local-minimald0");
     std::fs::create_dir_all(&sock_dir).unwrap();
 
     let server = TestServer::new().await;

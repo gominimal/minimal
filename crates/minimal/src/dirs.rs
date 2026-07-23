@@ -42,6 +42,7 @@ pub(crate) fn report(global: &GlobalArgs) -> String {
             .as_utf8_path()
             .as_std_path()
             .to_path_buf(),
+        provider: crate::client::client_provider_kind(global.use_minvmd()),
     };
     format_dir_rows(&build_dir_rows(&dirs))
 }
@@ -65,6 +66,9 @@ struct DirsLookup {
     state: PathBuf,
     /// `<cache>/minimal`.
     cache: PathBuf,
+    /// The backend whose provider dir the CLI would connect to, so the SSH
+    /// socket row names the right `providers/local-<kind>0` path.
+    provider: paths::ProviderKind,
 }
 
 /// Which top-level group the mesh-enrolment row prints under. Values
@@ -157,7 +161,10 @@ fn build_dir_rows(dirs: &DirsLookup) -> Vec<DirRow> {
         (
             "State",
             "SSH socket",
-            Some(dirs.state.join("providers/local-0/ssh.sock")),
+            Some(dirs.state.join(format!(
+                "providers/{}/ssh.sock",
+                paths::provider_instance_name(dirs.provider, 0)
+            ))),
             None,
         )
             .into_row(),
@@ -287,6 +294,7 @@ mod tests {
             mesh_group: MeshGroup::Config,
             state: PathBuf::from("/home/u/.local/state/minimal"),
             cache: PathBuf::from("/home/u/.cache/minimal"),
+            provider: paths::ProviderKind::Minimald,
         };
         let rows = build_dir_rows(&dirs);
         let shape: Vec<(&str, &str, String)> = rows
@@ -349,7 +357,7 @@ mod tests {
                 (
                     "State",
                     "SSH socket",
-                    "/home/u/.local/state/minimal/providers/local-0/ssh.sock".to_string()
+                    "/home/u/.local/state/minimal/providers/local-minimald0/ssh.sock".to_string()
                 ),
                 ("Cache", "Cache dir", "/home/u/.cache/minimal".to_string()),
                 (
@@ -371,6 +379,7 @@ mod tests {
             mesh_group: MeshGroup::Config,
             state: PathBuf::from("/s"),
             cache: PathBuf::from("/x"),
+            provider: paths::ProviderKind::Minimald,
         };
         let rows = build_dir_rows(&dirs);
         let daemon_logs = rows.iter().find(|r| r.name == "Daemon logs").unwrap();
@@ -410,6 +419,7 @@ mod tests {
             mesh_group: MeshGroup::State,
             state: PathBuf::from("/override"),
             cache: PathBuf::from("/x"),
+            provider: paths::ProviderKind::Minimald,
         };
         let rows = build_dir_rows(&dirs);
         let mesh = rows.iter().find(|r| r.name == "Mesh enrolment").unwrap();

@@ -29,7 +29,7 @@ teardown() {
   minvmd stop >/dev/null 2>&1 || true
   # Drop the resource config this proof persisted so it cannot alter the
   # session-e2e boot that runs next on the same default state dir.
-  rm -f "${XDG_STATE_HOME:-$HOME/.local/state}/minimal/providers/local-0/config.toml"
+  rm -f "${XDG_STATE_HOME:-$HOME/.local/state}/minimal/providers/local-minvmd0/config.toml"
   rm -rf "$WORK"
 }
 trap teardown EXIT

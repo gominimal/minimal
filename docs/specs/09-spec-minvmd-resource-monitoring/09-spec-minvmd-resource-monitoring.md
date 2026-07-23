@@ -277,7 +277,7 @@ exhaustion when a guest workload exits non-zero.
   cgroup `memory.events` / in-guest `df`, i.e. an in-guest agent. The host-side
   proxies (RSS, sparse allocation) are unmeasurable and were removed; the reliable
   reactive signal is the supervisor exit hint (R3.2).
-- **Multi-VM config**: single `local-0` instance, per the v0.1 single-VM stance.
+- **Multi-VM config**: single `local-minvmd0` instance, per the v0.1 single-VM stance.
 
 ## Design Considerations
 

@@ -8,8 +8,9 @@ use minimal::GlobalArgs;
 
 /// A running minimald test server plus the tempdir backing it.
 ///
-/// The UDS socket is placed at `<tempdir>/providers/local-0/ssh.sock` so
-/// that `resolve_socket_path(Some(tempdir), false)` finds it.
+/// The UDS socket is placed at `<tempdir>/providers/local-minimald0/ssh.sock`
+/// so that `resolve_socket_path(Some(tempdir), false)` finds it (the native
+/// minimald provider dir the CLI resolves without `--provider local-minvmd`).
 pub struct TestDaemon {
     /// The underlying minimald test server. Exposed so tests can create
     /// sessions directly via `server.state` or connect a `TestClient`.
@@ -29,7 +30,7 @@ impl TestDaemon {
         let server = minimald::test_harness::TestServer::new().await;
         let temp = tempfile::TempDir::new().unwrap();
 
-        let sock_dir = temp.path().join("providers/local-0");
+        let sock_dir = temp.path().join("providers/local-minimald0");
         std::fs::create_dir_all(&sock_dir).unwrap();
         let sock = sock_dir.join("ssh.sock");
         server.listen_on_uds(&sock).await;
