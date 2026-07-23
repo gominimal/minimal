@@ -1,6 +1,6 @@
 ---
 title: Release pipeline
-description: How releases are built, staged, smoke-tested, promoted, and installed — release.yml, nightly.yml, promote.yml, prune-releases.yml, and the curl|sh installer.
+description: How releases are built, staged, smoke-tested, promoted, and installed: release.yml, nightly.yml, promote.yml, prune-releases.yml, and the curl|sh installer.
 ---
 
 > This is internal documentation. It is not published to the docs site.
@@ -16,17 +16,17 @@ Staging is inert; flipping a pointer is the single, cheap, reversible action
 that ships (or rolls back) a version. All GCS writes authenticate via GitHub
 OIDC / Workload Identity Federation.
 
-## release.yml — build, sign, stage
+## release.yml: build, sign, stage
 
 [`.github/workflows/release.yml`](../../.github/workflows/release.yml) runs on
 manual `workflow_dispatch` (inputs: `dry_run`, `skip_ci_verify`), via
 `workflow_call` from nightly.yml, or on a `vMAJOR.MINOR.PATCH[-suffix]` tag
 push.
 
-**verify-ci gate.** The `verify-ci` job requires the five lane aggregators —
+**verify-ci gate.** The `verify-ci` job requires the five lane aggregators,
 `ci-success`, `ci-linux-native-success`, `ci-linux-kvm-success`,
 `ci-macos-success`, `ci-shell-installer-success` (the required checks on
-`main`; see [docs/ci-strategy.md](../ci-strategy.md)) — to have reported
+`main`; see [docs/ci-strategy.md](../ci-strategy.md)), to have reported
 success on the exact commit being released. `skip_ci_verify` is an admin
 override for green-but-unreported commits.
 
@@ -53,13 +53,13 @@ override for green-but-unreported commits.
 - `build-release-initramfs`: packs the guest initramfs (minimald as pid-1)
   from the same shipped musl `minimald` binaries.
 - `compute-version-string`: reads the version out of a built binary so the
-  GitHub Release name matches `min -V` exactly.
+  GitHub Release name matches `minimald -V` exactly.
 
 **release job.** Downloads everything, generates shell completions for `mip`,
 `min`, and `minimald`, then:
 
 - uploads a legacy `minimalone-<sha>.tar.zst` bundle to
-  `gs://minimal-shim/archives/` — retained for backward compatibility with
+  `gs://minimal-shim/archives/`, retained for backward compatibility with
   the legacy `minimal-shim` archive path, pending retirement once installs
   resolve through the versioned `minimal-one` layout (below);
 - creates the GitHub Release (tag `release-<sha>`, or the pushed `v*` tag; a
@@ -70,29 +70,29 @@ override for green-but-unreported commits.
 
 - [`scripts/stage-release.sh`](../../scripts/stage-release.sh) uploads the
   artifacts and a `components` manifest (one row per component/os/arch with
-  its SHA-256, kind, and install destination — the authoritative per-platform
+  its SHA-256, kind, and install destination: the authoritative per-platform
   component list) to immutable `gs://minimal-one/versions/<short-sha>/`;
 - a version-pinned copy of [`scripts/install.sh`](../../scripts/install.sh)
   is uploaded next to them, so each version's install path is self-contained;
 - [`scripts/set-channel.sh`](../../scripts/set-channel.sh) points the
   `unstable` channel at the new version. `unstable` auto-advances on every
-  release — no gate.
+  release: no gate.
 
-## nightly.yml — daily cut + smoke + nightly channel
+## nightly.yml: daily cut + smoke + nightly channel
 
 [`.github/workflows/nightly.yml`](../../.github/workflows/nightly.yml) runs at
 10:00 UTC. A `check` job skips the rebuild when HEAD is already staged (public
 HEAD request on the version's `components` manifest), then invokes release.yml
 via `workflow_call`. Three smoke jobs run the shared session e2e
 ([`scripts/session-e2e.sh`](../../scripts/session-e2e.sh)) against the
-**shipped** artifacts — native Linux daemon, Linux + KVM microVM, and the
-signed macOS binaries assembled in the installer layout — feeding a
+**shipped** artifacts (native Linux daemon, Linux + KVM microVM, and the
+signed macOS binaries assembled in the installer layout), feeding a
 skip-tolerant `smoke-success` aggregator. Only then does `promote-nightly`
 flip the `nightly` pointer via set-channel.sh. `nightly-tests.yml` is the
-separate 06:00 UTC nightly *test* tier, unrelated to releasing — see
+separate 06:00 UTC nightly *test* tier, unrelated to releasing; see
 [docs/ci-strategy.md](../ci-strategy.md).
 
-## promote.yml — gated promotion to stable
+## promote.yml: gated promotion to stable
 
 [`.github/workflows/promote.yml`](../../.github/workflows/promote.yml)
 (workflow name `promote-cli`) is the manual path that moves the `stable` (or
@@ -106,7 +106,7 @@ workflow's approver allowlist (the initiating user is excluded) comments
 runs [`scripts/verify-nightly-provenance.sh --sha "$SHA"`](../../scripts/verify-nightly-provenance.sh),
 which queries GitHub Actions to confirm the version was built by
 `nightly.yml`. This rejects manually dispatched release.yml runs and tag-push
-builds — staging a version does not make it promotable. Only nightly-built
+builds. Staging a version does not make it promotable. Only nightly-built
 versions pass by default, ensuring the stable channel only receives versions
 that completed the full nightly smoke suite. The `override_provenance`
 emergency input bypasses this gate when checked; use it only for documented
@@ -117,7 +117,7 @@ actually staged before flipping the pointer. Finally it dispatches a
 `reference-docs-promoted` repository event that triggers a rebuild of the
 published reference docs at docs.minimal.dev.
 
-## prune-releases.yml — GitHub Release housekeeping
+## prune-releases.yml: GitHub Release housekeeping
 
 [`.github/workflows/prune-releases.yml`](../../.github/workflows/prune-releases.yml)
 runs at 04:17 UTC on Mondays and Fridays (plus manual dispatch, which defaults
@@ -129,14 +129,14 @@ their tags once they age out (default: older than 2 months, always keeping the
 installer serves from GCS, so pruning removes redundant copies, not live
 install targets.
 
-## install.sh — channel → version → components
+## install.sh: channel → version → components
 
 [`scripts/install.sh`](../../scripts/install.sh) is the strict-POSIX `curl |
 sh` installer. Against `https://storage.googleapis.com/minimal-one` it fetches
 the channel pointer (default `stable`), resolves the version, fetches the
 immutable `versions/<version>/components` manifest (refusing an unknown
 `# format:` header), and for each row matching the host os/arch downloads,
-SHA-256-verifies, and atomically installs the file — the on-disk hash is the
+SHA-256-verifies, and atomically installs the file. The on-disk hash is the
 skip oracle, so reruns only touch changed components, and a running daemon is
 stopped before an executable is swapped. Per-platform sets (from
 stage-release.sh's `COMPONENTS` table): Linux amd64/arm64 get `bin/min`,
@@ -162,7 +162,7 @@ local install record, keeping user-modified files unless `--force`;
 **Promote to stable.**
 
 1. **Verify the SHA was nightly-built.** The promote workflow rejects versions
-   not built by `nightly.yml` — manually dispatched or tag-staged SHAs will
+   not built by `nightly.yml`: manually dispatched or tag-staged SHAs will
    fail the provenance gate after the multi-hour approval completes. If you
    need to promote a non-nightly version in an emergency, check
    `override_provenance` when dispatching.
