@@ -19,15 +19,14 @@ description: In-sandbox min helper commands: add packages, search, check configu
 
 Installs tools & dependencies into the running sandbox. With no flag, packages
 are installed for the current sandbox session only; `minimal.toml` is not
-modified. With a flag, the named packages are also recorded as a build,
-runtime, or task dependency in `minimal.toml`.
+modified. With a flag, the named packages are also recorded as a session,
+runtime, or build dependency in `minimal.toml`.
 
 | Flag | Description |
 |------|-------------|
-| `--session` | Install for this sandbox session only, without editing `minimal.toml` (the default when no flag is given) |
+| `--session` | Also add packages to the `[session]` `packages` list in `minimal.toml` |
 | `--runtime` | Also add packages to `stack.runtime_packages` |
 | `--build` | Also add packages to `stack.build_packages` |
-| `--task` | Also add packages to the current task's `packages` list |
 
 `min add` is the in-sandbox equivalent of the [`mip add`](./cli-mip.md#add) command.
 

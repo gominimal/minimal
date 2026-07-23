@@ -5,23 +5,24 @@ description: Overview of the Minimal command-line binaries (min, mip, minimald, 
 
 # CLI Reference
 
-Minimal ships as a small set of binaries split across two planes:
+Minimal's primary command-line tool is **`min`**, the session CLI: it creates,
+attaches to, and manages sandboxed development sessions. `min` talks to the
+`minimald` host daemon, which creates and supervises sessions. On macOS (and
+optionally on Linux), `minimald` runs inside a Linux microVM managed by the
+`minvmd` daemon.
 
-- **The session plane** manages sandboxed development sessions. The `min`
-  CLI talks to the `minimald` host daemon, which creates and supervises
-  sessions. On macOS (and optionally on Linux), `minimald` runs inside a
-  Linux microVM managed by the `minvmd` daemon.
-- **The package/build plane** evaluates declarative package configuration
-  (`minimal.toml` plus Nickel files), builds packages in clean rooms,
-  runs tasks in sandboxes, and manages the content-addressed artifact
-  cache. This is the `mip` CLI.
+Underneath, Minimal has a declarative package/build engine that evaluates
+`minimal.toml` plus Nickel files, builds packages in clean rooms, runs tasks in
+sandboxes, and manages a content-addressed artifact cache. Most users interact
+with it only through `min` and their `minimal.toml`. Advanced users on Linux can
+drive it directly with the **`mip`** CLI.
 
 ## Binaries
 
 | Binary | Role | Reference |
 |--------|------|-----------|
 | `min` | Session CLI: create, attach to, and manage sandboxed dev sessions | [min](./cli-min.md) |
-| `mip` | Package/build CLI: build packages, run tasks, manage the cache | [mip](./cli-mip.md) |
+| `mip` | Package/build CLI (advanced, Linux-only): build packages, run tasks, manage the cache directly | [mip](./cli-mip.md) |
 | `minimald` | Host daemon: serves sessions to `min` over SSH-on-UDS | [minimald](./cli-minimald.md) |
 | `minvmd` | VM daemon: boots the Linux microVM that hosts `minimald` | [minvmd](./cli-minvmd.md) |
 

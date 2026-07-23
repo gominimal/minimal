@@ -5,10 +5,14 @@ description: Reference for the mip package/build CLI: build packages, run tasks,
 
 # `mip` - package/build CLI
 
-`mip` is the Minimal package/build CLI. It reads a project's
-[`minimal.toml`](./minimal-dot-toml.md), builds packages in clean rooms,
-runs [tasks](./tasks.md) in sandboxes, and manages the content-addressed
-local cache.
+`mip` (short for "Minimal in-process") is the Minimal package/build CLI. It
+reads a project's [`minimal.toml`](./minimal-dot-toml.md), builds packages in
+clean rooms, runs [tasks](./tasks.md) in sandboxes, and manages the
+content-addressed local cache.
+
+> **Advanced tool.** `mip` is Linux-only and aimed at advanced users driving
+> the package/build plane directly. Most workflows are better served by the
+> [`min` session CLI](./cli-min.md).
 
 Generated from `--help` at `d9f20165`.
 
