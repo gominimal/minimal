@@ -58,6 +58,9 @@ jobs:
                         - "Cargo.lock"
                         # The toolchain pin: a rustc bump must re-run the Rust lanes.
                         - "rust-toolchain.toml"
+                        # The guest pin: a kernel / rootfs / libkrun bump must
+                        # boot the VM on HVF (parity with the KVM lane's filter).
+                        - ".minimal/minimal.toml"
                         - ".github/workflows/ci-macos.yml"
                         - "scripts/**"
                         # Composite actions this lane's setup runs through — without
