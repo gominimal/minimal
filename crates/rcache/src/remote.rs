@@ -233,6 +233,53 @@ impl RemoteCache<AnyBackend> {
         )
         .await
     }
+
+    /// Builds a reader following a project's resolved [`mfile::CacheConfig`]:
+    /// per-commit snapshot with root fallback, snapshot only, or the root
+    /// index. The policy is decided by `mfile::File::cache_config`; this
+    /// executes it — including the fallback — so every caller gets the same
+    /// behavior.
+    pub async fn new_any_configured(
+        url: AnyUrl,
+        gcs_storage: Option<Storage>,
+        index_dir: Option<PathBuf>,
+        ot: Option<OpTracker>,
+        config: &mfile::CacheConfig,
+    ) -> Result<Self, Error<AnyRespError>> {
+        let (source, fallback) = match config {
+            mfile::CacheConfig::GlobalIndex => (IndexSource::Root, false),
+            mfile::CacheConfig::CommitIndex { object } => (
+                IndexSource::Snapshot {
+                    object: object.clone(),
+                },
+                true,
+            ),
+            mfile::CacheConfig::CommitIndexOnly { object } => (
+                IndexSource::Snapshot {
+                    object: object.clone(),
+                },
+                false,
+            ),
+        };
+        if let IndexSource::Snapshot { object } = &source {
+            tracing::debug!("cache index: per-commit snapshot {object}");
+        }
+        let res = Self::new_any(
+            url.clone(),
+            gcs_storage.clone(),
+            index_dir.clone(),
+            ot.clone(),
+            source,
+        )
+        .await;
+        match res {
+            Err(Error::SnapshotMissing { object }) if fallback => {
+                tracing::info!("per-commit index {object} not found; using root index");
+                Self::new_any(url, gcs_storage, index_dir, ot, IndexSource::Root).await
+            }
+            other => other,
+        }
+    }
 }
 
 impl<B: FetchBackend> RemoteCache<B> {
@@ -842,6 +889,49 @@ mod tests {
             object: OBJECT.to_string(),
         };
         let err = RemoteCache::new_any_https(&base, None, None, source)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::SnapshotMissing { object } if object == OBJECT),
+            "expected SnapshotMissing for {OBJECT}, got {err:?}"
+        );
+    }
+
+    fn https_url(base: &str) -> AnyUrl {
+        AnyUrl::Https(ReqwestUrl::from(reqwest::Url::parse(base).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn configured_auto_falls_back_to_root_when_snapshot_is_missing() {
+        const OBJECT: &str = "github.com/gominimal/pkgs/0123abcd.shisha";
+        let spec_hash = SpecHash::from_bytes([0x07; 32]);
+        let sha256: [u8; 32] = [0x42; 32];
+        // Only the root index exists: auto mode must land on it.
+        let base = serve_index(Some(index_bytes_for(&spec_hash, sha256)));
+
+        let config = mfile::CacheConfig::CommitIndex {
+            object: OBJECT.to_string(),
+        };
+        let rc = RemoteCache::new_any_configured(https_url(&base), None, None, None, &config)
+            .await
+            .unwrap();
+        assert_eq!(rc.sha256(&spec_hash), Some(sha256));
+    }
+
+    #[tokio::test]
+    async fn configured_pinned_missing_snapshot_is_an_error_not_a_fallback() {
+        const OBJECT: &str = "github.com/gominimal/pkgs/0123abcd.shisha";
+        // The root index exists and could serve the spec — pinned mode must
+        // NOT fall back to it.
+        let base = serve_index(Some(index_bytes_for(
+            &SpecHash::from_bytes([0x07; 32]),
+            [0x42; 32],
+        )));
+
+        let config = mfile::CacheConfig::CommitIndexOnly {
+            object: OBJECT.to_string(),
+        };
+        let err = RemoteCache::new_any_configured(https_url(&base), None, None, None, &config)
             .await
             .unwrap_err();
         assert!(
