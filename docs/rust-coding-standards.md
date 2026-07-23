@@ -36,6 +36,7 @@ validating constructor and keeps the inner value unconstructable elsewhere.
 ## Async & Concurrency
 
 - No blocking in async context. No std::fs, std::thread::sleep, blocking network, or sync Mutex held across .await, use tokio::fs, tokio::time::sleep, tokio::sync::Mutex.
+- No `tokio::task::block_in_place`. It interacts poorly with `hakoniwa`; move blocking work to `tokio::task::spawn_blocking` or a dedicated thread.
 - Don't reach for `Arc<Mutex<T>>` reflexively. Plain `Arc<T>` suffices if `T` is immutable after construction. Spawned tasks must satisfy `Send + 'static`, design data flow accordingly.
 
 ## Logging

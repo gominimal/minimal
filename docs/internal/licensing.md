@@ -61,19 +61,6 @@ obligations. Its footprint is Linux-only: it is used by `sandbox2` and
 `minimald`, and no longer reaches macOS builds since `mctx` was
 decoupled from it in #721.
 
-## nickel-lang git dependencies and crates.io
-
-`nickel-lang-core` (and its sibling crates) are consumed as git
-dependencies pinned to a rev recorded in `Cargo.lock`. crates.io only
-accepts packages whose dependencies are themselves published registry
-versions, so a workspace crate carrying these git deps could not be
-published there as-is.
-
-That is fine: the workspace sets `package.publish = false` and its
-crates are not intended for crates.io. Publishing would only become a
-prerequisite if that changed, and would require released nickel-lang
-versions first.
-
 ## Redistributed binaries in darwin release artifacts
 
 The macOS (darwin/arm64) release artifacts redistribute two prebuilt
