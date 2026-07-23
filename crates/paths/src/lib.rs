@@ -154,6 +154,60 @@ pub const SSH_SOCK_FILE: &str = "ssh.sock";
 /// daemon's host key under the `local-<instance>` hostname. Written at startup
 /// by native minimald, and by minvmd from the guest's boot beacon.
 pub const KNOWN_HOSTS_FILE: &str = "known_hosts";
+/// Remove any existing `known_hosts` lines in `path` whose host field is
+/// `host`, so a freshly recorded key for that host replaces — rather than
+/// accumulates alongside — the prior entry.
+///
+/// `russh`'s `learn_known_hosts_path` only ever appends, so without pruning
+/// first, a daemon that re-records its host key on every spawn grows the file
+/// without bound; and when the guest rotates its key on each boot the file also
+/// keeps every stale key. Call this immediately before `learn_known_hosts_path`
+/// (issue #782).
+///
+/// A missing file is not an error (nothing to prune), and the file is left
+/// byte-for-byte untouched when no line matches. The host field is the first
+/// whitespace-delimited token; both the bare `host` (port 22) and the
+/// `[host]:port` forms `russh` emits are matched.
+///
+/// # Errors
+///
+/// Returns any I/O error from reading or rewriting the file, except a
+/// not-found read, which is treated as an empty file and yields `Ok`.
+pub fn prune_known_hosts_host(path: impl AsRef<Path>, host: &str) -> std::io::Result<()> {
+    let path = path.as_ref();
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let kept: Vec<&str> = contents
+        .lines()
+        .filter(|line| !known_hosts_line_matches_host(line, host))
+        .collect();
+    // Nothing matched: leave the file (and its exact bytes) untouched.
+    if kept.len() == contents.lines().count() {
+        return Ok(());
+    }
+    let rewritten = if kept.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", kept.join("\n"))
+    };
+    std::fs::write(path, rewritten)
+}
+
+/// Whether a single `known_hosts` line's host field equals `host`, matching
+/// both the bare `host` and the bracketed `[host]:port` forms.
+fn known_hosts_line_matches_host(line: &str, host: &str) -> bool {
+    line.split_whitespace().next().is_some_and(|field| {
+        field == host
+            || field
+                .strip_prefix('[')
+                .and_then(|rest| rest.split_once("]:"))
+                .is_some_and(|(bracketed, _)| bracketed == host)
+    })
+}
+
 /// Native minimald's single-instance lock, held for the daemon's lifetime.
 pub const MINIMALD_LOCK_FILE: &str = "minimald.lock";
 /// The minvmd supervisor's alive lock, held for the daemon's lifetime.
@@ -1600,5 +1654,81 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    #[test]
+    fn known_hosts_line_match_covers_bare_and_bracketed_forms() {
+        assert!(known_hosts_line_matches_host(
+            "local-0 ssh-ed25519 AAAA",
+            "local-0"
+        ));
+        assert!(known_hosts_line_matches_host(
+            "[local-0]:2222 ssh-ed25519 AAAA",
+            "local-0"
+        ));
+        assert!(!known_hosts_line_matches_host(
+            "local-1 ssh-ed25519 AAAA",
+            "local-0"
+        ));
+        assert!(!known_hosts_line_matches_host("", "local-0"));
+    }
+
+    #[test]
+    fn prune_removes_only_the_named_host_and_bounds_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KNOWN_HOSTS_FILE);
+
+        // Simulate the pre-fix accumulation: three appended entries for the
+        // same host (as `learn_known_hosts_path` would leave), plus one entry
+        // for an unrelated host that must survive.
+        std::fs::write(
+            &path,
+            "local-0 ssh-ed25519 AAAAold1\n\
+             local-0 ssh-ed25519 AAAAold2\n\
+             other-host ssh-ed25519 AAAAkeep\n\
+             local-0 ssh-ed25519 AAAAold3\n",
+        )
+        .unwrap();
+
+        prune_known_hosts_host(&path, "local-0").unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "other-host ssh-ed25519 AAAAkeep\n");
+    }
+
+    #[test]
+    fn prune_to_empty_yields_a_zero_byte_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KNOWN_HOSTS_FILE);
+        // The steady state: the per-instance file holds only this host's
+        // entries, so a pre-record prune empties it entirely.
+        std::fs::write(
+            &path,
+            "local-0 ssh-ed25519 AAAAold1\nlocal-0 ssh-ed25519 AAAAold2\n",
+        )
+        .unwrap();
+        prune_known_hosts_host(&path, "local-0").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[test]
+    fn prune_is_a_noop_when_file_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KNOWN_HOSTS_FILE);
+        prune_known_hosts_host(&path, "local-0").unwrap();
+        assert!(!path.exists(), "prune must not create the file");
+    }
+
+    #[test]
+    fn prune_leaves_file_untouched_when_nothing_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KNOWN_HOSTS_FILE);
+        // No trailing newline: proves the untouched path preserves exact bytes.
+        std::fs::write(&path, "other-host ssh-ed25519 AAAAkeep").unwrap();
+        prune_known_hosts_host(&path, "local-0").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "other-host ssh-ed25519 AAAAkeep"
+        );
     }
 }

@@ -643,11 +643,19 @@ async fn async_main() -> Result<(), MainError> {
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
     let host_private_key = config.host_key()?;
+    let host = format!("local-{}", cli.instance_num());
+    let known_hosts = sub_path!(cli.client_instance_dir(), "known_hosts");
+    let known_hosts = known_hosts.as_utf8_path();
+    // Drop any prior entry for this host before re-recording, so the file does
+    // not grow one line per daemon spawn — `learn_known_hosts_path` only
+    // appends (issue #782).
+    paths::prune_known_hosts_host(known_hosts, &host)
+        .map_err(|e| MainError::IO(e, "pruning stale known_hosts entries"))?;
     russh::keys::known_hosts::learn_known_hosts_path(
-        &format!("local-{}", cli.instance_num()),
+        &host,
         22,
         host_private_key.public_key(),
-        sub_path!(cli.client_instance_dir(), "known_hosts").as_utf8_path(),
+        known_hosts,
     )?;
 
     // Preflight (advisory): every session sandbox starts by unsharing an

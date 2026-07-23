@@ -370,6 +370,15 @@ pub(crate) fn read_ready_beacon<R: std::io::BufRead>(
                         tracing::warn!(error = %e, "failed to parse SSH host key from beacon");
                     }
                     Ok(pubkey) => {
+                        // Drop any prior entry for this host before re-recording:
+                        // `learn_known_hosts_path` only appends, and the guest
+                        // rotates its host key on each boot, so without this the
+                        // file grows unbounded and keeps every stale key
+                        // (issue #782). A prune failure is non-fatal, matching
+                        // the beacon's best-effort key handling (R2.3).
+                        if let Err(e) = paths::prune_known_hosts_host(known_hosts_path, "local-0") {
+                            tracing::warn!(error = %e, "failed to prune stale known_hosts entries");
+                        }
                         match russh::keys::known_hosts::learn_known_hosts_path(
                             // TODO: pass instance_num through once multi-instance is needed
                             "local-0",
