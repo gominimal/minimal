@@ -223,10 +223,14 @@ impl Client {
         crate::file_upload::stream_tar_zstd(dir, channel.make_writer()).await?;
 
         // Wait for the channel to close to signal that unpacking is done.
+        // The daemon relays any unpack failure on extended-data stream 1 and
+        // only then closes, so accumulate that stream under the same cap the
+        // diagnostic download uses — a daemon spraying extended data must not
+        // be able to balloon the client's memory.
         let mut err = Vec::new();
         while let Some(msg) = channel.wait().await {
             if let russh::ChannelMsg::ExtendedData { data, ext: 1 } = msg {
-                err.extend_from_slice(&data);
+                append_daemon_error(&mut err, &data);
             }
         }
         if !err.is_empty() {
@@ -359,8 +363,9 @@ impl Client {
     }
 }
 
-/// Cap on the accumulated daemon error message (extended-data stream 1) for a
-/// diagnostic-bundle download.
+/// Cap on the accumulated daemon error message (extended-data stream 1) a
+/// streaming RPC will buffer — shared by the diagnostic-bundle download and
+/// the workspace-file upload.
 const DAEMON_ERROR_MAX: usize = 64 * 1024;
 
 /// How long [`Client::download_diag_bundle`] keeps reading after the size cap
@@ -425,6 +430,19 @@ async fn send_traceparent(channel: &russh::Channel<russh::client::Msg>) {
 mod tests {
     use super::{Client, resolve_socket_path};
     use std::path::Path;
+
+    /// The daemon-error accumulator is bounded: a daemon that sprays extended
+    /// data on stream 1 (during a diagnostic download or a workspace upload)
+    /// must not be able to grow the client's buffer past the cap.
+    #[test]
+    fn append_daemon_error_is_capped() {
+        let mut buf = Vec::new();
+        let chunk = vec![b'x'; 8 * 1024];
+        for _ in 0..64 {
+            super::append_daemon_error(&mut buf, &chunk);
+        }
+        assert_eq!(buf.len(), super::DAEMON_ERROR_MAX);
+    }
 
     #[test]
     fn socket_path_honors_override() {
