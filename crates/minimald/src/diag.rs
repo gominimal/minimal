@@ -61,11 +61,23 @@ const MAX_SESSION_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const LOG_FILES_MAX: usize = 5;
 /// Entry cap for the recursive state-dir listing.
 const LISTING_MAX_ENTRIES: usize = 100_000;
-/// Ceiling on the whole client-facing transfer. Every collector is deadlined
-/// individually, but those deadlines only bound work — a client that holds the
-/// channel open and stops reading it parks the pump instead, and through the
-/// bounded duplex that stalls collection and finalization behind it. This is
-/// the bound on the peer rather than on ourselves.
+/// Idleness bound on the client-facing transfer: the longest the pump may make
+/// *no* progress before it is abandoned, not a ceiling on the whole transfer.
+///
+/// A whole-transfer bound is wrong here. Every collector is deadlined
+/// individually, but `build_bundle` runs up to fifteen of them back to back, so
+/// a legitimately slow-but-progressing bundle on a wedged host — the very host a
+/// diagnostic bundle is wanted from — can outlast any fixed total while the
+/// client reads every byte. What actually needs bounding is a stall: a client
+/// that holds the channel open and stops reading parks the pump, and through the
+/// bounded duplex that stalls collection and finalization behind it. So the
+/// deadline resets on every chunk that moves and only fires when nothing moves
+/// for this long.
+///
+/// Progress is measured on the compressed bytes reaching the channel, so this
+/// primarily bounds a client that has stopped reading, and as a backstop a build
+/// that emits nothing at all for this long — not the total collection time, which
+/// a healthy client is welcome to outlast as long as bytes keep flowing.
 const STREAM_TIMEOUT: Duration = Duration::from_secs(300);
 /// Duplex buffer between the bundle writer and the channel pump.
 const PIPE_BUF: usize = 256 * 1024;
@@ -159,14 +171,7 @@ async fn stream_diag_bundle(s: &ServerStateHandle, c: &mut RuChannel<Msg>) -> Re
     // cancelling the builder is not (see `build_bundle`). On expiry the `drop`
     // below turns the build task's next write into `BrokenPipe`, so it unwinds
     // through its own error path instead of parking on the full duplex.
-    let copy_result =
-        match tokio::time::timeout(STREAM_TIMEOUT, tokio::io::copy(&mut rx, &mut writer)).await {
-            Ok(r) => r,
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("client stopped reading the bundle for {STREAM_TIMEOUT:?}"),
-            )),
-        };
+    let copy_result = pump_until_idle(&mut rx, &mut writer, STREAM_TIMEOUT).await;
     let shutdown_result = writer.shutdown().await;
     // The read half must be gone before waiting on the build task: if the copy
     // failed mid-stream (client vanished) the task is still writing, and only a
@@ -182,6 +187,49 @@ async fn stream_diag_bundle(s: &ServerStateHandle, c: &mut RuChannel<Msg>) -> Re
     }
     shutdown_result.map_err(|e| format!("closing diag stream: {e}"))?;
     Ok(())
+}
+
+/// Pumps `reader` into `writer` under an *idleness* deadline: the copy is
+/// abandoned only when a single read-or-write step makes no progress for
+/// `idle`, and the clock resets on every chunk that moves. A slow-but-
+/// progressing transfer therefore runs as long as it keeps moving bytes, while
+/// a genuine stall — a client that stops reading and parks the write, or a
+/// wedged builder that never produces the next chunk — is still bounded.
+///
+/// The expiry error deliberately does not attribute the stall to either side:
+/// from here a parked read (builder) and a parked write (client) are
+/// indistinguishable, and only one of them is the peer's fault.
+async fn pump_until_idle<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    idle: Duration,
+) -> std::io::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let stalled = || {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("diag bundle transfer made no progress for {idle:?}"),
+        )
+    };
+    let mut buf = vec![0u8; PIPE_BUF];
+    let mut copied: u64 = 0;
+    loop {
+        let n = match tokio::time::timeout(idle, reader.read(&mut buf)).await {
+            Ok(r) => r?,
+            Err(_) => return Err(stalled()),
+        };
+        if n == 0 {
+            return Ok(copied);
+        }
+        match tokio::time::timeout(idle, writer.write_all(&buf[..n])).await {
+            Ok(r) => r?,
+            Err(_) => return Err(stalled()),
+        }
+        copied += n as u64;
+    }
 }
 
 /// Reads the request body, bounded in both dimensions: one byte past the size
@@ -1272,6 +1320,53 @@ mod tests {
                 .to_string()
                 .contains("state-listing.txt"),
             "an omission is recorded"
+        );
+    }
+
+    /// A transfer that keeps moving bytes runs to completion even when its total
+    /// duration far exceeds the idle bound — the regression the idle watchdog
+    /// fixes. Short real durations with a wide gap-to-idle margin keep it quick
+    /// and stable: sixteen 30 ms-spaced chunks span ~480 ms, past the 400 ms
+    /// idle bound, while each gap sits an order of magnitude under it, so only a
+    /// pathological scheduler stall could trip a false timeout.
+    #[tokio::test]
+    async fn pump_survives_a_slow_but_progressing_transfer() {
+        let idle = Duration::from_millis(400);
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        let feeder = tokio::spawn(async move {
+            for _ in 0..16 {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                if tx.write_all(b"chunk").await.is_err() {
+                    return;
+                }
+            }
+        });
+        let mut sink = tokio::io::sink();
+        let copied = pump_until_idle(&mut rx, &mut sink, idle)
+            .await
+            .expect("a progressing transfer must not time out");
+        assert_eq!(copied, 16 * b"chunk".len() as u64);
+        feeder.await.unwrap();
+    }
+
+    /// When no byte moves for the idle bound the pump gives up, and the error
+    /// names a stall without blaming either side.
+    #[tokio::test]
+    async fn pump_times_out_on_a_stalled_reader() {
+        let idle = Duration::from_millis(150);
+        // Hold the write half open but never write: reads block, so the idle
+        // deadline is the only thing that ends the pump.
+        let (_tx, mut rx) = tokio::io::duplex(64);
+        let mut sink = tokio::io::sink();
+        let err = pump_until_idle(&mut rx, &mut sink, idle)
+            .await
+            .expect_err("a stalled transfer must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        let msg = err.to_string();
+        assert!(msg.contains("no progress"), "{msg}");
+        assert!(
+            !msg.contains("client"),
+            "the stall message must not assign blame: {msg}"
         );
     }
 }
