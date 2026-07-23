@@ -513,8 +513,11 @@ impl<B: FetchBackend> RemoteCache<B> {
     }
 
     /// Failures worth retrying: transport errors, error statuses, and hash
-    /// mismatches (a complete-but-wrong body, e.g. from a misbehaving
-    /// mirror). Local I/O errors and a spec absent from the index are not.
+    /// mismatches. A mismatch on a 200 is deliberately transient: the
+    /// observed mirror failure mode is a complete response carrying wrong
+    /// bytes, gone on refetch. Persistent corruption pays the backoff and
+    /// then surfaces as the same loud HashMismatch. Local I/O errors and a
+    /// spec absent from the index are not retried.
     fn is_transient(e: &Error<<B::Response as FetchResponse>::Error>) -> bool {
         matches!(
             e,
