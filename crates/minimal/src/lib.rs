@@ -539,6 +539,11 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
 }
 
 async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
+    // Adopt any pre-split `providers/local-<N>` dirs into the kind-tagged scheme
+    // once per invocation, before any command resolves a provider dir, so an
+    // upgraded CLI finds an existing instance rather than orphaning it.
+    client::migrate_legacy_provider_dirs(cli.global_args.minimal_dir.as_deref());
+
     match cli.command {
         None => cmd_default(&cli.global_args).await,
         Some(Command::Ls(args)) => cmd_ls(&cli.global_args, args).await,

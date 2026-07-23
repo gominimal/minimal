@@ -562,6 +562,11 @@ async fn async_main() -> Result<(), MainError> {
         }
     };
 
+    // Adopt any pre-split `providers/local-<N>` dir into the kind-tagged scheme
+    // before resolving our own instance dir, so an upgraded daemon reuses its
+    // existing state instead of orphaning it.
+    paths::migrate_legacy_provider_dirs(&cli.minimal_state_dir());
+
     // The host-key path lives under the instance dir; ensure it exists for
     // both the UDS and vsock paths.
     if let Err(e) = std::fs::create_dir_all(cli.client_instance_dir())

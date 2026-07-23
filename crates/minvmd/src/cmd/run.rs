@@ -53,6 +53,11 @@ pub fn run(detach: bool, timeout_secs: Option<u64>) -> Result<()> {
 
 #[cfg(minvmd_libkrun)]
 fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
+    // Adopt any pre-split `providers/local-<N>` dir into the kind-tagged scheme
+    // before resolving our own `local-minvmd0` dir, so an upgraded host reuses
+    // its existing VM state (data volume, boot log) instead of orphaning it.
+    paths::migrate_legacy_provider_dirs(&crate::state::state_base_dir());
+
     // R2.4: fail fast with an actionable error if the hypervisor backend is
     // unavailable (Linux: /dev/kvm). No-op on macOS. Runs in the foreground
     // caller so the user sees the error directly, even under --detach.

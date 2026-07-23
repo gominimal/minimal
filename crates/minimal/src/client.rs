@@ -639,6 +639,33 @@ pub(crate) fn client_provider_kind(use_minvmd: bool) -> paths::ProviderKind {
     }
 }
 
+/// The minimal state-dir root the CLI resolves paths under: `--minimal-dir`
+/// when set (made absolute), else the platform default.
+fn resolve_state_base(
+    minimal_dir_override: Option<&std::path::Path>,
+) -> std::io::Result<paths::DaemonAbsPath> {
+    match minimal_dir_override {
+        Some(dir) => {
+            let abs = std::path::absolute(dir)?;
+            let utf8 = abs
+                .to_str()
+                .ok_or_else(|| std::io::Error::other("--minimal-dir is not valid UTF-8"))?;
+            paths::DaemonAbsPath::try_new(utf8).map_err(std::io::Error::other)
+        }
+        None => Ok(paths::minimal_state_dir()),
+    }
+}
+
+/// Adopt any pre-split `providers/local-<N>` dirs into the kind-tagged scheme
+/// before the CLI resolves a provider dir, so an upgraded client finds an
+/// existing instance instead of missing it. Best-effort: a bad `--minimal-dir`
+/// is left for the resolve/connect path to report.
+pub(crate) fn migrate_legacy_provider_dirs(minimal_dir_override: Option<&std::path::Path>) {
+    if let Ok(base) = resolve_state_base(minimal_dir_override) {
+        paths::migrate_legacy_provider_dirs(&base);
+    }
+}
+
 /// Resolve the provider-instance dir (`<state dir>/providers/local-<kind>0`) the
 /// daemon and CLI agree on: `--minimal-dir` when set, else the default minimal
 /// state dir. `use_minvmd` selects the backend's dir (see [`client_provider_kind`]).
@@ -646,16 +673,7 @@ pub(crate) fn resolve_provider_dir(
     minimal_dir_override: Option<&std::path::Path>,
     use_minvmd: bool,
 ) -> std::io::Result<std::path::PathBuf> {
-    let base = match minimal_dir_override {
-        Some(dir) => {
-            let abs = std::path::absolute(dir)?;
-            let utf8 = abs
-                .to_str()
-                .ok_or_else(|| std::io::Error::other("--minimal-dir is not valid UTF-8"))?;
-            paths::DaemonAbsPath::try_new(utf8).map_err(std::io::Error::other)?
-        }
-        None => paths::minimal_state_dir(),
-    };
+    let base = resolve_state_base(minimal_dir_override)?;
     Ok(
         paths::provider_instance_dir(&base, client_provider_kind(use_minvmd), 0)
             .as_utf8_path()
