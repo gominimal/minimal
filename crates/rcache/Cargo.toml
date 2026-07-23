@@ -22,5 +22,6 @@ tempfile.workspace = true
 
 common = { workspace = true }
 graph = { workspace = true }
+mfile = { workspace = true }
 lcache = { workspace = true }
 ot = { workspace = true }

@@ -585,6 +585,95 @@ pub struct Stdlib {
     pub minimum_version: Option<String>,
 }
 
+/// The `[cache]` section: how this project reads the shared remote cache.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CacheSettings {
+    /// Which index object the cache reader loads. Defaults to
+    /// [`IndexSourceMode::Auto`].
+    pub index_source: Option<IndexSourceMode>,
+    /// How many times a transient artifact-fetch failure is retried
+    /// (exponential backoff). Defaults to the reader's built-in value.
+    pub fetch_retries: Option<u32>,
+}
+
+/// Selects which remote-cache index object the reader loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexSourceMode {
+    /// The upstream pin's per-commit index snapshot when it exists, falling
+    /// back to the global root index when it doesn't.
+    Auto,
+    /// The per-commit snapshot only; a missing snapshot is an error.
+    Pinned,
+    /// The global root index only.
+    Root,
+}
+
+impl std::str::FromStr for IndexSourceMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "pinned" => Ok(Self::Pinned),
+            "root" => Ok(Self::Root),
+            other => Err(format!(
+                "unknown index source {other:?} (expected \"auto\", \"pinned\" or \"root\")"
+            )),
+        }
+    }
+}
+
+/// How the remote-cache reader should locate its index. Resolved centrally
+/// from the project file and its upstream pin ([`File::cache_config`]) so the
+/// fetch layer follows instructions without policy of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheConfig {
+    /// Read the global mutable root index.
+    GlobalIndex,
+    /// Read the immutable per-commit snapshot `object`; if it doesn't exist,
+    /// fall back to the global root index.
+    CommitIndex { object: String },
+    /// Read the immutable per-commit snapshot `object`; if it doesn't exist,
+    /// fail rather than fall back.
+    CommitIndexOnly { object: String },
+}
+
+/// Object key of the per-commit index snapshot for a repo + commit:
+/// `<host>/<owner>/<repo>/<commit>.shisha`, matching the publisher's keying.
+pub fn commit_index_object(repo_url: &str, commit_sha: &str) -> String {
+    format!("{}/{commit_sha}.shisha", repo_slug(repo_url))
+}
+
+/// Stable `host/owner/repo` slug for a repo URL: query/fragment, scheme,
+/// credentials, trailing `/` and any `.git` suffix stripped; scp-like syntax
+/// (`git@host:owner/repo`) normalized to `host/owner/repo`.
+fn repo_slug(repo_url: &str) -> String {
+    let url = match repo_url.find(['?', '#']) {
+        Some(idx) => &repo_url[..idx],
+        None => repo_url,
+    };
+    let rest = match url.split_once("://") {
+        Some((_, rest)) => {
+            // Credentials end at the first `@` in the authority. Path
+            // components may legitimately contain `@` and are preserved.
+            let authority_end = rest.find('/').unwrap_or(rest.len());
+            match rest[..authority_end].find('@') {
+                Some(at) => &rest[at + 1..],
+                None => rest,
+            }
+        }
+        None => match (url.find('@'), url.find(':')) {
+            // scp-like `user@host:path` -> `host/path`
+            (Some(at), Some(colon)) if at < colon => {
+                return repo_slug(&format!("{}/{}", &url[at + 1..colon], &url[colon + 1..]));
+            }
+            _ => url,
+        },
+    };
+    let trimmed = rest.trim_end_matches('/');
+    trimmed.strip_suffix(".git").unwrap_or(trimmed).to_string()
+}
+
 /// Which directory layout this layer/repo used for minimal configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Layout {
@@ -629,6 +718,9 @@ pub struct File {
     /// Configuration relevant to the standard library.
     #[serde(default)]
     pub stdlib: Stdlib,
+    /// How this project reads the shared remote cache.
+    #[serde(default)]
+    pub cache: CacheSettings,
     /// Project-level session contribution: packages, vars, patches,
     /// and lifecycle hooks that apply to every session activated on
     /// this project. Consumed by the `ProjectComposable` at
@@ -974,6 +1066,41 @@ impl File {
             )
         })
     }
+
+    /// Resolves how the remote-cache reader should locate its index:
+    /// `[cache] index_source` (or `override_mode`, which wins when set —
+    /// typically an environment variable) applied to the upstream pin.
+    ///
+    /// `auto`, the default, selects the upstream pin's per-commit snapshot
+    /// with root fallback, degrading to the root index when there is no git
+    /// upstream or no locked commit.
+    pub fn cache_config(
+        &self,
+        override_mode: Option<IndexSourceMode>,
+    ) -> Result<CacheConfig, String> {
+        let mode = override_mode
+            .or(self.cache.index_source)
+            .unwrap_or(IndexSourceMode::Auto);
+
+        let snapshot = self.upstream.as_ref().and_then(|u| match &u.link {
+            LinkConfig::Git {
+                repo,
+                locked_commit: Some(commit),
+                ..
+            } => Some(commit_index_object(repo, commit)),
+            _ => None,
+        });
+
+        match (mode, snapshot) {
+            (IndexSourceMode::Root, _) => Ok(CacheConfig::GlobalIndex),
+            (IndexSourceMode::Auto, Some(object)) => Ok(CacheConfig::CommitIndex { object }),
+            (IndexSourceMode::Auto, None) => Ok(CacheConfig::GlobalIndex),
+            (IndexSourceMode::Pinned, Some(object)) => Ok(CacheConfig::CommitIndexOnly { object }),
+            (IndexSourceMode::Pinned, None) => Err(
+                "index_source \"pinned\" requires a git upstream with a locked_commit".to_string(),
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1076,6 +1203,7 @@ mod tests {
                 )]
                 .into(),
                 stdlib: Default::default(),
+                cache: Default::default(),
                 session: None,
                 extra: HashMap::new(),
                 mfile_path: None,
@@ -1524,5 +1652,86 @@ mod tests {
         .unwrap();
         let session = mf.session.expect("populated block parses");
         assert!(session.extra.contains_key("weird_new_thing"));
+    }
+
+    #[test]
+    fn repo_slug_normalizes_common_url_forms() {
+        for url in [
+            "https://github.com/gominimal/pkgs",
+            "https://github.com/gominimal/pkgs.git",
+            "https://github.com/gominimal/pkgs/",
+            "https://oauth2:tok@github.com/gominimal/pkgs.git",
+            "ssh://git@github.com/gominimal/pkgs.git",
+            "git@github.com:gominimal/pkgs.git",
+            "https://github.com/gominimal/pkgs?ref=x#frag",
+        ] {
+            assert_eq!(repo_slug(url), "github.com/gominimal/pkgs", "{url}");
+        }
+    }
+
+    #[test]
+    fn cache_config_resolves_modes_against_the_pin() {
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        let pinned: File = toml::from_str(&format!(
+            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nlocked_commit = \"{SHA}\"\n"
+        ))
+        .unwrap();
+        let object = format!("github.com/gominimal/pkgs/{SHA}.shisha");
+
+        // Default is auto: snapshot with fallback.
+        assert_eq!(
+            pinned.cache_config(None).unwrap(),
+            CacheConfig::CommitIndex {
+                object: object.clone()
+            }
+        );
+        // Override wins over the (unset) file setting.
+        assert_eq!(
+            pinned.cache_config(Some(IndexSourceMode::Root)).unwrap(),
+            CacheConfig::GlobalIndex
+        );
+        assert_eq!(
+            pinned.cache_config(Some(IndexSourceMode::Pinned)).unwrap(),
+            CacheConfig::CommitIndexOnly { object }
+        );
+
+        // No locked commit: auto degrades to the root index, pinned errors.
+        let unpinned: File =
+            toml::from_str("[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n").unwrap();
+        assert_eq!(
+            unpinned.cache_config(None).unwrap(),
+            CacheConfig::GlobalIndex
+        );
+        assert!(
+            unpinned
+                .cache_config(Some(IndexSourceMode::Pinned))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cache_config_reads_the_file_setting_and_override_beats_it() {
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        let mf: File = toml::from_str(&format!(
+            r#"
+            [upstream]
+            repo = "https://github.com/gominimal/pkgs"
+            locked_commit = "{SHA}"
+
+            [cache]
+            index_source = "root"
+            fetch_retries = 5
+            "#
+        ))
+        .unwrap();
+        assert_eq!(mf.cache.fetch_retries, Some(5));
+        assert_eq!(mf.cache.index_source, Some(IndexSourceMode::Root));
+        assert_eq!(mf.cache_config(None).unwrap(), CacheConfig::GlobalIndex);
+        assert_eq!(
+            mf.cache_config(Some(IndexSourceMode::Pinned)).unwrap(),
+            CacheConfig::CommitIndexOnly {
+                object: format!("github.com/gominimal/pkgs/{SHA}.shisha")
+            }
+        );
     }
 }

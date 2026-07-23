@@ -33,6 +33,12 @@ pub enum Error<BE: std::fmt::Debug> {
     ArchiveError(archive::ArchiveError),
     /// The sha256 hash that was requested differed from what was written/downloaded.
     HashMismatch { want: String, got: String },
+    /// The requested per-commit index snapshot does not exist.
+    SnapshotMissing { object: String },
+    /// The cache configuration could not be resolved or followed.
+    Config(String),
+    /// A fetch returned an error status.
+    Fetch { status: usize },
 }
 
 impl<BE: std::fmt::Debug> std::fmt::Display for Error<BE> {
@@ -69,12 +75,57 @@ pub struct RemoteCache<B: FetchBackend> {
     /// we have). Used by [`Self::into_writer`] to skip a refetch when
     /// transitioning to a writer.
     gcs_generation: Option<i64>,
+
+    /// How many times a transient artifact-fetch failure is retried (the
+    /// initial attempt not counted). See [`Self::with_fetch_retries`].
+    fetch_retries: u32,
 }
 
 pub const INDEX_FILENAME: &str = "index.shisha";
 const INDEX_EXPIRY_SECONDS: u64 = 5 * 60; // how long a fetch of the remote index is considered fresh for
 
+/// Default retry count for transient artifact-fetch failures.
+pub const DEFAULT_FETCH_RETRIES: u32 = 3;
+/// First retry delay; doubles with each subsequent retry.
+const FETCH_BACKOFF_BASE: Duration = Duration::from_millis(500);
+
+/// Which index object a [`RemoteCache`] reader loads. The choice is made by
+/// the caller (see `mfile::File::cache_config`); this layer only executes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexSource {
+    /// The global mutable root index (`index.shisha`). Absent (404) means an
+    /// empty index: a fresh cache with nothing published yet.
+    Root,
+    /// An immutable per-commit snapshot object
+    /// (`<host>/<owner>/<repo>/<commit>.shisha`). Absent is
+    /// [`Error::SnapshotMissing`]; the caller decides whether to retry with
+    /// [`IndexSource::Root`].
+    Snapshot { object: String },
+}
+
+impl IndexSource {
+    /// The object name to fetch, relative to the cache base URL.
+    fn object(&self) -> &str {
+        match self {
+            IndexSource::Root => INDEX_FILENAME,
+            IndexSource::Snapshot { object } => object,
+        }
+    }
+
+    /// File name for the locally-cached copy of this index. Snapshots flatten
+    /// the full object key so distinct snapshots never share a local file,
+    /// even when different repos pin the same commit hash.
+    fn local_filename(&self) -> String {
+        match self {
+            IndexSource::Root => INDEX_FILENAME.to_string(),
+            IndexSource::Snapshot { object } => object.replace('/', "_"),
+        }
+    }
+}
+
 impl RemoteCache<Client> {
+    /// Always reads the root index: this constructor serves writer-adjacent
+    /// paths, for which the root object is authoritative.
     #[tracing::instrument(skip_all, err)]
     pub async fn new_over_https<URL: Into<ReqwestUrl>>(
         url: URL,
@@ -86,12 +137,14 @@ impl RemoteCache<Client> {
             .build()?;
         let url = url.into();
 
-        Self::new(backend, url, index_dir, ot).await
+        Self::new(backend, url, index_dir, ot, IndexSource::Root).await
     }
 }
 
 impl RemoteCache<Storage> {
     /// Instantiates a new remote cache using the given GCS client + bucket.
+    /// Always reads the root index: this constructor serves writer-adjacent
+    /// paths, for which the root object is authoritative.
     #[tracing::instrument(skip_all, fields(bucket_id = %bucket_id), err)]
     pub async fn new_with_gcs_bucket(
         storage: Storage,
@@ -104,7 +157,7 @@ impl RemoteCache<Storage> {
             object: "".to_string(),
         };
 
-        Self::new(storage, url, index_dir, ot).await
+        Self::new(storage, url, index_dir, ot, IndexSource::Root).await
     }
 
     /// Convert this reader into a writer, reusing the already-fetched index
@@ -142,6 +195,7 @@ impl RemoteCache<AnyBackend> {
         gcs_storage: Option<Storage>,
         index_dir: Option<PathBuf>,
         ot: Option<OpTracker>,
+        source: IndexSource,
     ) -> Result<Self, Error<AnyRespError>> {
         let backend = match &url {
             AnyUrl::Gcs(_) => AnyBackend::Gcs(Box::new(
@@ -155,7 +209,7 @@ impl RemoteCache<AnyBackend> {
                 AnyBackend::Https(client)
             }
         };
-        Self::new(backend, url, index_dir, ot).await
+        Self::new(backend, url, index_dir, ot, source).await
     }
 
     /// Convenience reader over a plain-HTTPS base-URL string (public GCS bucket
@@ -167,47 +221,142 @@ impl RemoteCache<AnyBackend> {
         url: &str,
         index_dir: Option<PathBuf>,
         ot: Option<OpTracker>,
+        source: IndexSource,
     ) -> Result<Self, Error<AnyRespError>> {
         let parsed = reqwest::Url::parse(url).map_err(AnyRespError::InvalidUrl)?;
-        Self::new_any(AnyUrl::Https(ReqwestUrl::from(parsed)), None, index_dir, ot).await
+        Self::new_any(
+            AnyUrl::Https(ReqwestUrl::from(parsed)),
+            None,
+            index_dir,
+            ot,
+            source,
+        )
+        .await
+    }
+
+    /// Builds a reader following a project's resolved [`mfile::CacheConfig`]:
+    /// per-commit snapshot with root fallback, snapshot only, or the root
+    /// index. The policy is decided by `mfile::File::cache_config`; this
+    /// executes it — including the fallback — so every caller gets the same
+    /// behavior.
+    pub async fn new_any_configured(
+        url: AnyUrl,
+        gcs_storage: Option<Storage>,
+        index_dir: Option<PathBuf>,
+        ot: Option<OpTracker>,
+        config: &mfile::CacheConfig,
+    ) -> Result<Self, Error<AnyRespError>> {
+        let (source, fallback) = match config {
+            mfile::CacheConfig::GlobalIndex => (IndexSource::Root, false),
+            mfile::CacheConfig::CommitIndex { object } => (
+                IndexSource::Snapshot {
+                    object: object.clone(),
+                },
+                true,
+            ),
+            mfile::CacheConfig::CommitIndexOnly { object } => (
+                IndexSource::Snapshot {
+                    object: object.clone(),
+                },
+                false,
+            ),
+        };
+        if let IndexSource::Snapshot { object } = &source {
+            tracing::debug!("cache index: per-commit snapshot {object}");
+        }
+        let res = Self::new_any(
+            url.clone(),
+            gcs_storage.clone(),
+            index_dir.clone(),
+            ot.clone(),
+            source,
+        )
+        .await;
+        match res {
+            Err(Error::SnapshotMissing { object }) if fallback => {
+                tracing::info!("per-commit index {object} not found; using root index");
+                Self::new_any(url, gcs_storage, index_dir, ot, IndexSource::Root).await
+            }
+            other => other,
+        }
     }
 }
 
 impl<B: FetchBackend> RemoteCache<B> {
-    /// Creates a new remote cache based on the given backend and URL.
+    /// Creates a new remote cache based on the given backend and URL, loading
+    /// the index object selected by `source`.
     pub async fn new(
         backend: B,
         url: B::Url,
         index_dir: Option<PathBuf>,
         ot: Option<OpTracker>,
+        source: IndexSource,
     ) -> Result<Self, Error<<B::Response as FetchResponse>::Error>> {
-        // Fast path: Use locally-cached index if its recent
+        // Fast path: use the locally-cached index. The mutable root index is
+        // trusted for INDEX_EXPIRY_SECONDS; snapshots are immutable, so any
+        // cached copy is current.
         if let Some(id) = index_dir.as_ref() {
-            let l_idx_path = id.join(INDEX_FILENAME);
-            if let Ok(stat) = std::fs::metadata(&l_idx_path)
-                && let Ok(modified) = stat.modified()
-                && let Ok(elapsed) = modified.elapsed()
-                && elapsed.as_secs() <= INDEX_EXPIRY_SECONDS
-            {
-                tracing::debug!("Re-using remote index (fetched {}s ago)", elapsed.as_secs());
-                return Ok(Self {
-                    backend,
-                    index: IndexFile::from_reader(
-                        &mut std::fs::File::open(&l_idx_path).map_err(Error::IO)?,
-                    )
-                    .map_err(Error::IO)?,
-                    dir: index_dir,
-                    base: url,
-                    ot,
-                    // Loading from local cache means we never asked GCS for
-                    // the current generation. into_writer must refetch.
-                    gcs_generation: None,
-                });
+            let l_idx_path = id.join(source.local_filename());
+            let age = std::fs::metadata(&l_idx_path)
+                .and_then(|stat| stat.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok());
+            let fresh = match (&source, age) {
+                (IndexSource::Root, Some(elapsed)) => elapsed.as_secs() <= INDEX_EXPIRY_SECONDS,
+                (IndexSource::Snapshot { .. }, Some(_)) => true,
+                (_, None) => false,
+            };
+            if fresh {
+                // A bad copy falls through to a refetch instead of wedging
+                // every subsequent run on it. The wire parser reads records
+                // till EOF and would silently accept a copy truncated
+                // mid-record as a shorter index, so add the strictness a
+                // whole file allows: its length must be a whole number of
+                // records. (Truncation at an exact record boundary is
+                // indistinguishable in-format; the atomic write below is the
+                // guard against truncation ever landing.)
+                let load = |path: &std::path::Path| -> std::io::Result<IndexFile> {
+                    let mut f = std::fs::File::open(path)?;
+                    if !f
+                        .metadata()?
+                        .len()
+                        .is_multiple_of(crate::index_file::WIRE_RECORD_LEN)
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "length is not a whole number of records",
+                        ));
+                    }
+                    IndexFile::from_reader(&mut f)
+                };
+                match load(&l_idx_path) {
+                    Ok(index) => {
+                        tracing::debug!("Re-using local copy of {}", source.object());
+                        return Ok(Self {
+                            backend,
+                            index,
+                            dir: index_dir,
+                            base: url,
+                            ot,
+                            // Loading from local cache means we never asked GCS
+                            // for the current generation. into_writer must
+                            // refetch.
+                            gcs_generation: None,
+                            fetch_retries: DEFAULT_FETCH_RETRIES,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "local copy of {} unreadable: {e}; refetching",
+                            source.object()
+                        )
+                    }
+                }
             }
         }
 
         let fetch_start = Instant::now();
-        let index_req = backend.get(url.join(INDEX_FILENAME).unwrap())?;
+        let index_req = backend.get(url.join(source.object()).unwrap())?;
 
         let fetch_op = OpTracker::new_with_root(&ot).with_op(Operation::FetchIndex);
 
@@ -215,10 +364,30 @@ impl<B: FetchBackend> RemoteCache<B> {
         let mut index_resp = backend.execute(index_req).await?;
         // Capture the GCS generation, if the backend exposes one. Reads
         // need to do this before consuming chunks because the response
-        // metadata may not survive the body read in some impls.
-        let gcs_generation = index_resp.generation();
-        let index = match index_resp.status_code() {
-            404 => IndexFile::default(),
+        // metadata may not survive the body read in some impls. Writers
+        // compare-and-swap against the root index object, so a snapshot's
+        // generation must never seed that path: None forces into_writer
+        // to refetch the root.
+        let gcs_generation = match &source {
+            IndexSource::Root => index_resp.generation(),
+            IndexSource::Snapshot { .. } => None,
+        };
+        let index = match (index_resp.status_code(), &source) {
+            (404, IndexSource::Root) => IndexFile::default(),
+            (404, IndexSource::Snapshot { object }) => {
+                return Err(Error::SnapshotMissing {
+                    object: object.clone(),
+                });
+            }
+            // Any other error status must not fall through to body parsing:
+            // an error page is not an index, and an empty error body would
+            // "parse" as an empty index, masking the outage.
+            (status, _) if !index_resp.is_success() => {
+                return Err(match index_resp.error_for_status() {
+                    Err(e) => Error::Backend(e),
+                    Ok(_) => Error::Fetch { status },
+                });
+            }
             _ => {
                 // Progress total only; a plain-HTTPS backend may omit
                 // Content-Length (chunked transfer), so don't panic on None.
@@ -232,14 +401,32 @@ impl<B: FetchBackend> RemoteCache<B> {
                 }
                 fetch_op.set_done();
 
+                // Same whole-record strictness as the local-copy load: the
+                // parser reads till EOF and would accept a body truncated
+                // mid-record as a shorter index — which the local write below
+                // would then launder into a well-formed (but incomplete) copy.
+                if !(buffer.len() as u64).is_multiple_of(crate::index_file::WIRE_RECORD_LEN) {
+                    return Err(Error::IO(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "fetched index length is not a whole number of records",
+                    )));
+                }
                 let index =
                     IndexFile::from_reader(&mut std::io::Cursor::new(buffer)).map_err(Error::IO)?;
 
+                // Best-effort local caching, via temp file + rename so a crash
+                // or concurrent reader never observes a partial file.
                 if let Some(index_dir) = index_dir.as_ref() {
-                    let l_idx_path = index_dir.join(INDEX_FILENAME);
-                    index
-                        .write_to(&mut std::fs::File::create(&l_idx_path).map_err(Error::IO)?)
-                        .unwrap();
+                    let write_atomic = || -> std::io::Result<()> {
+                        let mut tmp = tempfile::NamedTempFile::new_in(index_dir)?;
+                        index.write_to(tmp.as_file_mut())?;
+                        tmp.persist(index_dir.join(source.local_filename()))
+                            .map_err(|e| e.error)?;
+                        Ok(())
+                    };
+                    if let Err(e) = write_atomic() {
+                        tracing::warn!("failed to cache {} locally: {e}", source.object());
+                    }
                 }
                 index
             }
@@ -256,7 +443,17 @@ impl<B: FetchBackend> RemoteCache<B> {
             base: url,
             ot,
             gcs_generation,
+            fetch_retries: DEFAULT_FETCH_RETRIES,
         })
+    }
+
+    /// Sets how many times a transient artifact-fetch failure (transport
+    /// error, error status, hash mismatch) is retried with exponential
+    /// backoff before surfacing. The initial attempt is not counted; 0
+    /// disables retries. Defaults to [`DEFAULT_FETCH_RETRIES`].
+    pub fn with_fetch_retries(mut self, retries: u32) -> Self {
+        self.fetch_retries = retries;
+        self
     }
 
     /// Returns true if the build for the given spec hash is present in the cache.
@@ -270,7 +467,67 @@ impl<B: FetchBackend> RemoteCache<B> {
         self.index.sha256(spec_hash)
     }
 
-    /// Download the given spec hash into the local cache.
+    /// Fetches the artifact for `sha256` into a temp file and verifies its
+    /// content hash. One attempt; retry policy lives in [`Self::materialize`].
+    async fn fetch_verified(
+        &self,
+        sha256: [u8; 32],
+        op: &OpTracker,
+    ) -> Result<std::fs::File, Error<<B::Response as FetchResponse>::Error>> {
+        let req = self.backend.get(
+            self.base
+                .join(&format!("{}.zst", hex::encode(sha256)))
+                .unwrap(),
+        )?;
+
+        let mut resp = self.backend.execute(req).await?;
+        // An error status must not reach the hasher: an error page is not an
+        // artifact, and hashing it reports corruption where there is none.
+        if !resp.is_success() {
+            let status = resp.status_code();
+            return Err(match resp.error_for_status() {
+                Err(e) => Error::Backend(e),
+                Ok(_) => Error::Fetch { status },
+            });
+        }
+        // Progress total only; tolerate a missing Content-Length (see above).
+        op.set_length(resp.content_length().unwrap_or(0));
+
+        let mut w = common::Tee::new(
+            tempfile::tempfile().map_err(Error::IO)?,
+            common::HashWriter(sha2::Sha256::new()),
+        );
+        while let Some(chunk) = resp.chunk().await? {
+            op.increment(chunk.len() as u64);
+            w.write_all(&chunk).map_err(Error::IO)?;
+        }
+        let (tar_file, hasher) = w.into_inner();
+        let got_sha256 = hasher.0.finalize();
+        if got_sha256 != sha256 {
+            return Err(Error::HashMismatch {
+                want: hex::encode(sha256),
+                got: hex::encode(got_sha256),
+            });
+        }
+        Ok(tar_file)
+    }
+
+    /// Failures worth retrying: transport errors, error statuses, and hash
+    /// mismatches. A mismatch on a 200 is deliberately transient: the
+    /// observed mirror failure mode is a complete response carrying wrong
+    /// bytes, gone on refetch. Persistent corruption pays the backoff and
+    /// then surfaces as the same loud HashMismatch. Local I/O errors and a
+    /// spec absent from the index are not retried.
+    fn is_transient(e: &Error<<B::Response as FetchResponse>::Error>) -> bool {
+        matches!(
+            e,
+            Error::Backend(_) | Error::Fetch { .. } | Error::HashMismatch { .. }
+        )
+    }
+
+    /// Download the given spec hash into the local cache. Transient fetch
+    /// failures are retried up to [`Self::with_fetch_retries`] times with
+    /// exponential backoff; extraction is not retried.
     #[tracing::instrument(skip_all, fields(span_name = %span_name), err)]
     pub async fn materialize(
         &self,
@@ -285,33 +542,23 @@ impl<B: FetchBackend> RemoteCache<B> {
         });
 
         let start = Instant::now();
-        let req = self.backend.get(
-            self.base
-                .join(&format!("{}.zst", hex::encode(sha256)))
-                .unwrap(),
-        )?;
-
-        // Fetch the remote archive into a temporary file and seek to the beginning for decoding.
-        let mut resp = self.backend.execute(req).await?;
-        // Progress total only; tolerate a missing Content-Length (see above).
-        materialize_op.set_length(resp.content_length().unwrap_or(0));
-
-        let mut w = common::Tee::new(
-            tempfile::tempfile().map_err(Error::IO)?,
-            common::HashWriter(sha2::Sha256::new()),
-        );
-        while let Some(chunk) = resp.chunk().await? {
-            materialize_op.increment(chunk.len() as u64);
-            w.write_all(&chunk).map_err(Error::IO)?;
-        }
-        let (mut tar_file, hasher) = w.into_inner();
-        let got_sha256 = hasher.0.finalize();
-        if got_sha256 != sha256 {
-            return Err(Error::HashMismatch {
-                want: hex::encode(sha256),
-                got: hex::encode(got_sha256),
-            });
-        }
+        let mut attempt = 0u32;
+        let mut tar_file = loop {
+            attempt += 1;
+            match self.fetch_verified(sha256, &materialize_op).await {
+                Ok(f) => break f,
+                Err(e) if attempt <= self.fetch_retries && Self::is_transient(&e) => {
+                    let delay = FETCH_BACKOFF_BASE * 2u32.pow(attempt - 1);
+                    tracing::warn!(
+                        "fetching {} failed (attempt {attempt} of {}): {e}; retrying in {delay:?}",
+                        hex::encode(sha256),
+                        self.fetch_retries + 1,
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => return Err(e),
+            }
+        };
 
         tar_file
             .seek(std::io::SeekFrom::Start(0))
@@ -363,20 +610,35 @@ mod tests {
     #[derive(Debug)]
     struct MockResponse {
         data: Vec<u8>,
+        status: usize,
         consumed: bool,
+    }
+
+    impl MockResponse {
+        fn ok(data: Vec<u8>) -> Self {
+            Self {
+                data,
+                status: 200,
+                consumed: false,
+            }
+        }
     }
 
     impl FetchResponse for MockResponse {
         type Error = std::io::Error;
 
         fn error_for_status(self) -> Result<Self, Self::Error> {
-            Ok(self)
+            if self.is_success() {
+                Ok(self)
+            } else {
+                Err(std::io::Error::other(format!("HTTP {}", self.status)))
+            }
         }
         fn is_success(&self) -> bool {
-            true
+            (200..300).contains(&self.status)
         }
         fn status_code(&self) -> usize {
-            200
+            self.status
         }
         fn content_length(&self) -> Option<u64> {
             Some(self.data.len() as u64)
@@ -393,9 +655,32 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
+    /// Per-URL queues of (status, body) responses.
+    type ScriptedResponses = std::collections::HashMap<String, Vec<(usize, Vec<u8>)>>;
+
+    #[derive(Debug, Default)]
     struct MockBackend {
         responses: std::collections::HashMap<String, Vec<u8>>,
+        /// Responses served before `responses` takes over. Lets a test
+        /// script failures-then-success.
+        scripted: std::sync::Mutex<ScriptedResponses>,
+        /// Total executed requests; an Arc so tests can keep counting after
+        /// the backend moves into the RemoteCache.
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl MockBackend {
+        fn new(responses: std::collections::HashMap<String, Vec<u8>>) -> Self {
+            Self {
+                responses,
+                ..Default::default()
+            }
+        }
+
+        fn script(self, url: &str, seq: Vec<(usize, Vec<u8>)>) -> Self {
+            self.scripted.lock().unwrap().insert(url.to_string(), seq);
+            self
+        }
     }
 
     impl FetchBackend for MockBackend {
@@ -407,11 +692,19 @@ mod tests {
             Ok(url)
         }
         async fn execute(&self, req: MockUrl) -> Result<MockResponse, std::io::Error> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(seq) = self.scripted.lock().unwrap().get_mut(&req.0)
+                && !seq.is_empty()
+            {
+                let (status, data) = seq.remove(0);
+                return Ok(MockResponse {
+                    data,
+                    status,
+                    consumed: false,
+                });
+            }
             let data = self.responses.get(&req.0).cloned().unwrap_or_default();
-            Ok(MockResponse {
-                data,
-                consumed: false,
-            })
+            Ok(MockResponse::ok(data))
         }
     }
 
@@ -437,13 +730,15 @@ mod tests {
         );
 
         let rc = RemoteCache::new(
-            MockBackend { responses },
+            MockBackend::new(responses),
             MockUrl("mock://cache".to_string()),
             None,
             None,
+            IndexSource::Root,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .with_fetch_retries(0);
 
         let tmp = tempfile::tempdir().unwrap();
         let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
@@ -470,10 +765,11 @@ mod tests {
         responses.insert(format!("mock://cache/{}", INDEX_FILENAME), index_bytes);
 
         let rc = RemoteCache::new(
-            MockBackend { responses },
+            MockBackend::new(responses),
             MockUrl("mock://cache".to_string()),
             None,
             None,
+            IndexSource::Root,
         )
         .await
         .unwrap();
@@ -483,12 +779,12 @@ mod tests {
         assert_eq!(rc.sha256(&SpecHash::from_bytes([0x11; 32])), None);
     }
 
-    /// A throwaway single-purpose HTTP/1.1 server that answers `GET
-    /// /index.shisha` with `index` (200) or 404s it when `index` is `None`, and
-    /// 404s everything else. Returns the base URL (with the required trailing
-    /// `/`). Used to exercise the real reqwest transport behind
-    /// `AnyBackend::Https` end-to-end (not a mock backend).
-    fn serve_index(index: Option<Vec<u8>>) -> String {
+    /// A throwaway single-purpose HTTP/1.1 server that answers `GET /<path>`
+    /// with the matching entry in `objects` (200) and 404s everything else.
+    /// Returns the base URL (with the required trailing `/`). Used to exercise
+    /// the real reqwest transport behind `AnyBackend::Https` end-to-end (not a
+    /// mock backend).
+    fn serve_objects(objects: Vec<(String, Vec<u8>)>) -> String {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -498,10 +794,12 @@ mod tests {
                 let mut buf = [0u8; 2048];
                 let _ = stream.read(&mut buf);
                 let req = String::from_utf8_lossy(&buf);
-                let wants_index = req.starts_with("GET /index.shisha ");
-                let (status, body): (&str, &[u8]) = match (&index, wants_index) {
-                    (Some(bytes), true) => ("200 OK", bytes),
-                    _ => ("404 Not Found", b""),
+                let hit = objects
+                    .iter()
+                    .find(|(path, _)| req.starts_with(&format!("GET /{path} ")));
+                let (status, body): (&str, &[u8]) = match hit {
+                    Some((_, bytes)) => ("200 OK", bytes),
+                    None => ("404 Not Found", b""),
                 };
                 let head = format!(
                     "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -513,6 +811,21 @@ mod tests {
             }
         });
         format!("http://{addr}/")
+    }
+
+    fn serve_index(index: Option<Vec<u8>>) -> String {
+        serve_objects(match index {
+            Some(bytes) => vec![(INDEX_FILENAME.to_string(), bytes)],
+            None => vec![],
+        })
+    }
+
+    fn index_bytes_for(spec_hash: &SpecHash, sha256: [u8; 32]) -> Vec<u8> {
+        let mut index = IndexFile::default();
+        index.extend(std::iter::once((spec_hash.clone(), sha256)));
+        let mut bytes = Vec::new();
+        index.write_to(&mut bytes).unwrap();
+        bytes
     }
 
     #[tokio::test]
@@ -528,7 +841,9 @@ mod tests {
 
         // Reads the index over real HTTPS-shaped transport (AnyBackend::Https ->
         // reqwest get/execute/chunk/content_length), then parses it.
-        let rc = RemoteCache::new_any_https(&base, None, None).await.unwrap();
+        let rc = RemoteCache::new_any_https(&base, None, None, IndexSource::Root)
+            .await
+            .unwrap();
         assert_eq!(rc.sha256(&spec_hash), Some(sha256));
         assert_eq!(rc.sha256(&SpecHash::from_bytes([0x99; 32])), None);
     }
@@ -538,13 +853,370 @@ mod tests {
         // A 404 on the index must yield an empty (not errored) cache, matching
         // the GCS path — a fresh bucket/mirror has no index yet.
         let base = serve_index(None);
-        let rc = RemoteCache::new_any_https(&base, None, None).await.unwrap();
+        let rc = RemoteCache::new_any_https(&base, None, None, IndexSource::Root)
+            .await
+            .unwrap();
         assert_eq!(rc.sha256(&SpecHash::from_bytes([0x07; 32])), None);
     }
 
     #[tokio::test]
+    async fn snapshot_source_fetches_the_per_commit_object() {
+        const OBJECT: &str = "github.com/gominimal/pkgs/0123abcd.shisha";
+        let spec_hash = SpecHash::from_bytes([0x07; 32]);
+        let sha256: [u8; 32] = [0x42; 32];
+        // Only the snapshot object exists; the root index deliberately 404s,
+        // proving the reader asked for the snapshot.
+        let base = serve_objects(vec![(
+            OBJECT.to_string(),
+            index_bytes_for(&spec_hash, sha256),
+        )]);
+
+        let source = IndexSource::Snapshot {
+            object: OBJECT.to_string(),
+        };
+        let rc = RemoteCache::new_any_https(&base, None, None, source)
+            .await
+            .unwrap();
+        assert_eq!(rc.sha256(&spec_hash), Some(sha256));
+    }
+
+    #[tokio::test]
+    async fn snapshot_source_404_is_snapshot_missing_not_empty() {
+        const OBJECT: &str = "github.com/gominimal/pkgs/0123abcd.shisha";
+        // Root index exists but the snapshot doesn't: the reader must surface
+        // SnapshotMissing (letting the caller decide on fallback), not
+        // silently read root or treat 404 as an empty index.
+        let base = serve_index(Some(index_bytes_for(
+            &SpecHash::from_bytes([0x07; 32]),
+            [0x42; 32],
+        )));
+
+        let source = IndexSource::Snapshot {
+            object: OBJECT.to_string(),
+        };
+        let err = RemoteCache::new_any_https(&base, None, None, source)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::SnapshotMissing { object } if object == OBJECT),
+            "expected SnapshotMissing for {OBJECT}, got {err:?}"
+        );
+    }
+
+    fn https_url(base: &str) -> AnyUrl {
+        AnyUrl::Https(ReqwestUrl::from(reqwest::Url::parse(base).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn configured_auto_falls_back_to_root_when_snapshot_is_missing() {
+        const OBJECT: &str = "github.com/gominimal/pkgs/0123abcd.shisha";
+        let spec_hash = SpecHash::from_bytes([0x07; 32]);
+        let sha256: [u8; 32] = [0x42; 32];
+        // Only the root index exists: auto mode must land on it.
+        let base = serve_index(Some(index_bytes_for(&spec_hash, sha256)));
+
+        let config = mfile::CacheConfig::CommitIndex {
+            object: OBJECT.to_string(),
+        };
+        let rc = RemoteCache::new_any_configured(https_url(&base), None, None, None, &config)
+            .await
+            .unwrap();
+        assert_eq!(rc.sha256(&spec_hash), Some(sha256));
+    }
+
+    #[tokio::test]
+    async fn configured_pinned_missing_snapshot_is_an_error_not_a_fallback() {
+        const OBJECT: &str = "github.com/gominimal/pkgs/0123abcd.shisha";
+        // The root index exists and could serve the spec — pinned mode must
+        // NOT fall back to it.
+        let base = serve_index(Some(index_bytes_for(
+            &SpecHash::from_bytes([0x07; 32]),
+            [0x42; 32],
+        )));
+
+        let config = mfile::CacheConfig::CommitIndexOnly {
+            object: OBJECT.to_string(),
+        };
+        let err = RemoteCache::new_any_configured(https_url(&base), None, None, None, &config)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::SnapshotMissing { object } if object == OBJECT),
+            "expected SnapshotMissing for {OBJECT}, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_local_cache_never_expires_but_root_does() {
+        const OBJECT: &str = "github.com/gominimal/pkgs/0123abcd.shisha";
+        let spec_hash = SpecHash::from_bytes([0x07; 32]);
+        let sha256: [u8; 32] = [0x42; 32];
+
+        // Seed the local index dir with copies older than the root expiry.
+        let dir = tempfile::tempdir().unwrap();
+        let stale = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(INDEX_EXPIRY_SECONDS + 60);
+        for name in ["github.com_gominimal_pkgs_0123abcd.shisha", INDEX_FILENAME] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, index_bytes_for(&spec_hash, sha256)).unwrap();
+            let f = std::fs::File::options().write(true).open(&path).unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(stale))
+                .unwrap();
+        }
+
+        // Nothing is served remotely: a fetch attempt can only 404.
+        let base = serve_objects(vec![]);
+
+        // The snapshot copy is immutable, so its age doesn't matter.
+        let source = IndexSource::Snapshot {
+            object: OBJECT.to_string(),
+        };
+        let rc = RemoteCache::new_any_https(&base, Some(dir.path().to_path_buf()), None, source)
+            .await
+            .unwrap();
+        assert_eq!(rc.sha256(&spec_hash), Some(sha256));
+
+        // The root copy is past expiry: the reader refetches, and the 404
+        // yields an empty index rather than the stale local entries.
+        let rc = RemoteCache::new_any_https(
+            &base,
+            Some(dir.path().to_path_buf()),
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rc.sha256(&spec_hash), None);
+    }
+
+    #[tokio::test]
+    async fn truncated_index_body_is_an_error_not_a_shorter_index() {
+        const OBJECT: &str = "github.com/gominimal/pkgs/0123abcd.shisha";
+        // A body cut mid-record but delivered as a complete response
+        // (Content-Length matches), e.g. a misbehaving mirror. The transport
+        // can't catch it; the whole-record check must.
+        let mut bytes = index_bytes_for(&SpecHash::from_bytes([0x07; 32]), [0x42; 32]);
+        bytes.extend_from_slice(&[0xAA; 32]); // half of a second record
+        let base = serve_objects(vec![(OBJECT.to_string(), bytes)]);
+
+        let source = IndexSource::Snapshot {
+            object: OBJECT.to_string(),
+        };
+        let err = RemoteCache::new_any_https(&base, None, None, source)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::IO(e) if e.kind() == std::io::ErrorKind::InvalidData),
+            "expected InvalidData, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_fetch_error_status_is_an_error_not_an_empty_index() {
+        use std::io::{Read, Write};
+        // A server that 500s with an empty body: the worst case, since an
+        // empty body "parses" as an empty index.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = stream.flush();
+            }
+        });
+        let base = format!("http://{addr}/");
+
+        let err = RemoteCache::new_any_https(&base, None, None, IndexSource::Root)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Backend(_)),
+            "expected Backend error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_local_snapshot_copy_is_refetched_not_fatal() {
+        const OBJECT: &str = "github.com/gominimal/pkgs/0123abcd.shisha";
+        let spec_hash = SpecHash::from_bytes([0x07; 32]);
+        let sha256: [u8; 32] = [0x42; 32];
+        let base = serve_objects(vec![(
+            OBJECT.to_string(),
+            index_bytes_for(&spec_hash, sha256),
+        )]);
+
+        // Seed a corrupt local copy (a write cut short by a crash — not a
+        // whole number of records). Snapshot copies never expire, so recovery
+        // must come from the load-time whole-record check, not an age check.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("github.com_gominimal_pkgs_0123abcd.shisha"),
+            b"truncated",
+        )
+        .unwrap();
+
+        let source = IndexSource::Snapshot {
+            object: OBJECT.to_string(),
+        };
+        let rc = RemoteCache::new_any_https(&base, Some(dir.path().to_path_buf()), None, source)
+            .await
+            .unwrap();
+        assert_eq!(rc.sha256(&spec_hash), Some(sha256));
+    }
+
+    /// A real (tiny) artifact archive, so the success path can extract it.
+    fn tiny_artifact() -> (Vec<u8>, [u8; 32]) {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), b"hi").unwrap();
+        let (mut f, sha256) = archive::compress_dir(dir.path(), None, &None).unwrap();
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes).unwrap();
+        (bytes, sha256)
+    }
+
+    /// Mock responses wired so `spec_hash` resolves through the index to a
+    /// real artifact at the returned URL.
+    fn artifact_fixture() -> (SpecHash, String, std::collections::HashMap<String, Vec<u8>>) {
+        let spec_hash = SpecHash::from_bytes([0xAA; 32]);
+        let (artifact, sha256) = tiny_artifact();
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(
+            format!("mock://cache/{INDEX_FILENAME}"),
+            index_bytes_for(&spec_hash, sha256),
+        );
+        let art_url = format!("mock://cache/{}.zst", hex::encode(sha256));
+        responses.insert(art_url.clone(), artifact);
+        (spec_hash, art_url, responses)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn materialize_retries_transient_failures_then_succeeds() {
+        let (spec_hash, art_url, responses) = artifact_fixture();
+        // Two transient failures — an error status, then a complete-but-wrong
+        // body — before the real artifact.
+        let backend = MockBackend::new(responses).script(
+            &art_url,
+            vec![
+                (503, b"bad gateway".to_vec()),
+                (200, b"wrong bytes".to_vec()),
+            ],
+        );
+        let calls = backend.calls.clone();
+
+        let rc = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        rc.materialize(&spec_hash, &cache, "pkg").await.unwrap();
+        // One index fetch + three artifact attempts (503, mismatch, success).
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn materialize_exhausts_retries_and_surfaces_the_last_error() {
+        let (spec_hash, art_url, mut responses) = artifact_fixture();
+        // Every attempt sees a complete-but-wrong body.
+        responses.insert(art_url, b"always wrong".to_vec());
+        let backend = MockBackend::new(responses);
+        let calls = backend.calls.clone();
+
+        let rc = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap()
+        .with_fetch_retries(1);
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        let err = rc.materialize(&spec_hash, &cache, "pkg").await.unwrap_err();
+        assert!(
+            matches!(err, Error::HashMismatch { .. }),
+            "expected HashMismatch after exhausted retries, got {err:?}"
+        );
+        // One index fetch + two artifact attempts (initial + one retry).
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn materialize_error_status_is_not_hashed() {
+        let (spec_hash, art_url, responses) = artifact_fixture();
+        let backend = MockBackend::new(responses)
+            .script(&art_url, vec![(500, b"<html>error page</html>".to_vec())]);
+        let calls = backend.calls.clone();
+
+        let rc = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap()
+        .with_fetch_retries(0);
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        let err = rc.materialize(&spec_hash, &cache, "pkg").await.unwrap_err();
+        // A backend/status error, not HashMismatch: the error page never
+        // reached the hasher.
+        assert!(
+            matches!(err, Error::Backend(_) | Error::Fetch { .. }),
+            "expected a status error, got {err:?}"
+        );
+        // One index fetch + a single artifact attempt: 0 retries fails fast.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn materialize_not_found_is_not_retried() {
+        let (_, _, responses) = artifact_fixture();
+        let backend = MockBackend::new(responses);
+        let calls = backend.calls.clone();
+
+        let rc = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        let err = rc
+            .materialize(&SpecHash::from_bytes([0x11; 32]), &cache, "absent")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound), "got {err:?}");
+        // Only the index fetch: an absent spec is deterministic, no attempts.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn new_any_https_rejects_malformed_url() {
-        let err = RemoteCache::new_any_https("not a url", None, None)
+        let err = RemoteCache::new_any_https("not a url", None, None, IndexSource::Root)
             .await
             .unwrap_err();
         assert!(

@@ -13,6 +13,7 @@ nickel-lang-core.workspace = true
 object.workspace = true
 regex.workspace = true
 tokio.workspace = true
+url.workspace = true
 moka.workspace = true
 tracing.workspace = true
 

@@ -730,6 +730,7 @@ dependencies = [
  "regex",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -5274,6 +5275,7 @@ dependencies = [
  "graph",
  "hex",
  "lcache",
+ "mfile",
  "mockall",
  "ot",
  "reqwest",

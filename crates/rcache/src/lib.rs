@@ -1,7 +1,7 @@
 //! Remote cache implementation for fetching/uploading build artifacts over the network.
 
 mod remote;
-pub use remote::{Error, INDEX_FILENAME, RemoteCache};
+pub use remote::{DEFAULT_FETCH_RETRIES, Error, INDEX_FILENAME, IndexSource, RemoteCache};
 
 mod remote_writer;
 pub use remote_writer::RemoteCacheWriter;
