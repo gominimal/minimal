@@ -25,6 +25,9 @@ use common::SpecHash;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
+/// Size of one wire record (see the format description above).
+pub(crate) const WIRE_RECORD_LEN: u64 = 68;
+
 fn read_wire_kv<R: Read>(reader: &mut R) -> std::io::Result<(SpecHash, IndexEntry)> {
     let mut buf = [0u8; 32];
     reader.read_exact(&mut buf[..])?;

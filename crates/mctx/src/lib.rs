@@ -481,7 +481,10 @@ impl Context {
     /// Builds and returns a remote cache reader for the configured cache
     /// location. [Config] has already resolved where artifacts come from — a GCS
     /// bucket (the default) or an HTTPS mirror (honouring
-    /// `MINIMAL_REMOTE_CACHE_URL`) — so this just wires up the matching backend.
+    /// `MINIMAL_REMOTE_CACHE_URL`) — and the minimal file resolves *which index
+    /// object* to read ([`mfile::File::cache_config`], overridable via
+    /// `MINIMAL_INDEX_SOURCE`), so this just wires up the matching backend and
+    /// follows those instructions.
     ///
     /// `auth` selects authenticated vs. anonymous GCS access (the buildbot / mip
     /// upload path reads authed; anonymous CI reads use the public path). It's
@@ -521,8 +524,31 @@ impl Context {
         } else {
             None
         };
-        let res =
-            RemoteCache::new_any(url, gcs_storage, index_dir, self.daemon.config.ot.clone()).await;
+
+        // Rollout lever: overrides the file setting while per-commit reads
+        // bed in. Retire (env var first, then likely the file setting) once
+        // snapshot reads are the settled default.
+        let override_mode = match std::env::var("MINIMAL_INDEX_SOURCE") {
+            Ok(v) => Some(
+                v.parse::<mfile::IndexSourceMode>()
+                    .map_err(|e| RemoteError::Config(format!("MINIMAL_INDEX_SOURCE: {e}")))?,
+            ),
+            Err(std::env::VarError::NotPresent) => None,
+            // A set-but-garbled override must be loud, like any other bad value.
+            Err(e) => return Err(RemoteError::Config(format!("MINIMAL_INDEX_SOURCE: {e}"))),
+        };
+        let config = self
+            .mfile
+            .cache_config(override_mode)
+            .map_err(RemoteError::Config)?;
+        let res = RemoteCache::new_any_configured(
+            url,
+            gcs_storage,
+            index_dir,
+            self.daemon.config.ot.clone(),
+            &config,
+        )
+        .await;
         tracing::trace!("remote cache init took {:?}", start.elapsed());
         res
     }
