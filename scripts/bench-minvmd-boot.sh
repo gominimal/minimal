@@ -90,7 +90,8 @@ done
 
 [ "${#samples[@]}" -gt 0 ] || { echo "no successful boots" >&2; exit 1; }
 
-sorted=($(printf '%s\n' "${samples[@]}" | sort -n))
+sorted=()
+while IFS= read -r line; do sorted+=("$line"); done < <(printf '%s\n' "${samples[@]}" | sort -n)
 c="${#sorted[@]}"
 printf 'boot-to-READY (ms): min=%d median=%d max=%d  (n=%d)\n' \
   "${sorted[0]}" "${sorted[$((c / 2))]}" "${sorted[$((c - 1))]}" "$c"
