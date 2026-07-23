@@ -31,9 +31,9 @@ You can force the CLI to build artifacts locally using a combination of the `--n
 When a task is invoked, its configuration is used to setup and launch a task sandbox. This sandbox wires:
 
  - Files representing the packages requested and their runtime dependencies. The packages requested for a task includes
-   any that are explicitly defined on the task, and those defined by the repository stack (if set).
+   any that are explicitly defined on the task, those defined on the task's [profile](./profiles.md) (or the default profile if set), and those defined by the repository stack (if set).
  - The repository's files and directories, from the repository root downward, but not above it.
- - A `/state` directory, which can be shared between tasks & task invocations by specifying a task `state_key`. Packages managers
+ - A `/state` directory, which can be shared between tasks and task invocations by specifying a task `state_key`. Package managers
    are typically wired to cache source downloads and intermediate build artifacts in this directory.
  - Pinhole filesystem mappings, as declared by packages. For instance, the `claude-code` package wires the `~/.claude` directory into task sandboxes so claude-code
    can maintain state and access its API key.

@@ -8,7 +8,7 @@ To enable declarative, reproducible, and understandable software in Minimal, all
 we refer to as the _software supply chain_.
 
 The lowest layer of the software supply chain is your codebase, within which you invoke commands in the Minimal CLI. Each layer
-depends on configuration & software in the layer above it, which is itself a codebase. Each codebase links to the layer above it
+depends on configuration and software in the layer above it, which is itself a codebase. Each codebase links to the layer above it
 via the `[upstream]` section in the [`minimal.toml`](../reference/minimal-dot-toml.md) file:
 
 ```toml
@@ -46,7 +46,7 @@ For readers familiar with Nix/Nixpkgs, package build-specs are similar to Nix de
 
 ## Everything is (composable) configuration
 
-In addition to declaring packages, each software supply chain layer also declares [stacks](./stacks.md). Each layer inherits and can override definitions from the layers above it. Your codebase can use packages from the public registry while defining its own stacks, and an organization's internal registry can add private packages on top of the public one.
+In addition to declaring packages, each software supply chain layer also declares [stacks](./stacks.md) and [profiles](./profiles.md). Each layer inherits and can override definitions from the layers above it. Your codebase can use packages from the public registry while defining its own stacks or profiles, and an organization's internal registry can add private packages on top of the public one.
 
 This composability means you can:
 

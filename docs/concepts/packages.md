@@ -14,8 +14,8 @@ A Minimal package is available anywhere it is called for:
 
  - A package declared on a [task](../reference/tasks.md) will always be installed in the environment the task runs.
  - A package declared as an input to a [build spec](../reference/build-specs.md) will always be present in the build sandbox.
- - A package declared on a [stack](./stacks.md) will always be present
-   in the tasks or builds that use the stack.
+ - A package declared on a [stack](./stacks.md) or [profile](./profiles.md) will always be present
+   in the tasks or builds that use the stack or profile.
 
 
 ## Defining packages {#definition}
@@ -38,7 +38,7 @@ building the package (and the recipes for building all its transitive dependenci
 that the exact package described in your repository or [software supply chain](./software-supply-chain.md) is used anywhere it is
 requested, as well as providing a reliable key for fetching packages remotely.
 
-When Minimal needs a package, it is first downloaded locally from a remote binary cache. If it's not available locally, it will be downloaded remotely. If remote fetch is disabled, then it will be built locally. Minimal defaults to building things locally if it cannot locate specific items.
+When Minimal needs a package, it first checks the local cache. If the package is not present locally, Minimal fetches it from the remote binary cache. If the remote fetch is disabled or the package is unavailable there, Minimal builds it locally.
 
 ## Package builds
 
