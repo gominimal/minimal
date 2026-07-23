@@ -21,6 +21,12 @@ Generated from `--help` at `e5ce5fb8`.
 
 ## Commands
 
+Two commands bring the VM up. `run` (alias `start`) is the
+lifecycle-managed supervisor: it drives the daemon's state transitions and
+supports `--detach` for background operation, so it is the usual entry
+point. `boot` is a lower-level bring-up that skips lifecycle state, used
+mainly for diagnostics.
+
 ### `boot`
 
 ```
@@ -30,7 +36,7 @@ minvmd boot [--foreground]
 Boots the microVM and waits until the guest is up. `--foreground` stays
 in the foreground until the VMM child exits.
 
-### `run`
+### `run` (alias: `start`)
 
 ```
 minvmd run [--detach] [--timeout <SECONDS>]

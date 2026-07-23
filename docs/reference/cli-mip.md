@@ -65,7 +65,7 @@ Refreshes local checkouts of upstream packages and the standard library.
 ### `add` {#add}
 
 ```
-mip add <--runtime|--build|--task <TASK>> [PACKAGES]...
+mip add <--runtime|--build|--task <TASK>> <PACKAGES>...
 ```
 
 Add a new tool or dependency. Exactly one placement flag is required:

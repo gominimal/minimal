@@ -7,8 +7,10 @@ description: Reference for the min session CLI: create, attach to, and manage sa
 
 `min` is the Minimal session CLI. It talks to the `minimald` daemon (see
 [minimald](./cli-minimald.md)) to create, attach to, and manage sandboxed
-development sessions. If the daemon is not running, `min` starts it
-automatically.
+development sessions. Most commands start the daemon automatically when it
+isn't running (`bug` is the exception): natively on Linux, or inside the
+[`minvmd`](./cli-minvmd.md) microVM host daemon on macOS (and on Linux
+under `--minvmd`).
 
 Generated from `--help` at `60e19f60`.
 
@@ -85,14 +87,6 @@ min stop [-f|--force]
 Shuts down the `minimald` daemon. `--force` shuts down even if active
 sessions exist.
 
-### `session policy`
-
-```
-min session policy <SESSION>
-```
-
-Prints the effective networking policy for a session as JSON.
-
 ### `loadout list` (alias: `ls`)
 
 ```
@@ -136,26 +130,6 @@ name always loses to the allowlist), and every other env var is reported
 by name only. Session and project file contents are never included, only
 name/size listings. Review the archive before sharing.
 
-### `login`
-
-```
-min login [--cert-dir <DIR>]
-```
-
-Obtains an mTLS client certificate from `minimald` for use with the HTTPS
-reverse proxy. Generates a fresh client certificate signed by the
-daemon's internal CA and writes `client.pem`, `client.key`, and the CA's
-`ca.pem` to `~/.config/minimal/` (override with `--cert-dir`), so tools
-like `curl` can authenticate to and trust the proxy:
-
-```
-min login
-curl --cacert ~/.config/minimal/ca.pem \
-     --cert ~/.config/minimal/client.pem \
-     --key  ~/.config/minimal/client.key \
-     https://localhost:7655/
-```
-
 ### `rename`
 
 ```
@@ -168,7 +142,7 @@ Renames an existing session.
 
 ```
 min init [-y|--yes]
-min add <--runtime|--build|--task <TASK>> [PACKAGES]...
+min add <--runtime|--build|--task <TASK>> <PACKAGES>...
 min update
 ```
 
@@ -218,10 +192,3 @@ conversation across it; no external `ssh` or `socat` involved. Only the
 two pack services (`git-upload-pack`, `git-receive-pack`) are accepted.
 If the daemon is not running, the helper starts it, using default global
 flags (git invokes helpers without any of `min`'s own flags).
-
-## Feature-gated commands: `mesh`, `ssh-forward`
-
-The `mesh` (WireGuard mesh enrolment) and `ssh-forward` (SSH
-port-forward) subcommands exist only in builds compiled with the
-off-by-default `remote-access` cargo feature. They are not present in
-shipped binaries and are not documented here.

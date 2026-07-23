@@ -18,9 +18,8 @@ Generated from `--help` at `e5ce5fb8`.
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--minimal-state-dir <PATH>` | | Override the directory where state is stored (default: `$XDG_STATE_DIR/minimal`) |
-| `--minimal-cache-dir <PATH>` | | Override the directory where artifacts are cached (default: `$XDG_CACHE_DIR/minimal`) |
-| `--num-parallel-builds <N>` | `-n` | Configure the number of parallel builds (currently accepted but ignored; see [Known issues](#known-issues)) |
+| `--minimal-state-dir <PATH>` | | Override the directory where state is stored (default: `$XDG_STATE_HOME/minimal`) |
+| `--minimal-cache-dir <PATH>` | | Override the directory where artifacts are cached (default: `$XDG_CACHE_HOME/minimal`) |
 
 ## Commands
 
@@ -52,4 +51,4 @@ Generates a shell tab-completion script for `minimald`. Supported shells:
 ## Known issues
 
 - [#820](https://github.com/gominimal/minimal/issues/820): `minimald`
-  accepts but ignores `-n`/`--num-parallel-builds` and `--stdlib-dir`.
+  accepts but ignores `--stdlib-dir`.
