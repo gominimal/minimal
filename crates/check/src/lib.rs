@@ -71,6 +71,7 @@ impl tokio::io::AsyncWrite for SharedBuf {
 mod naming;
 mod outputs;
 mod profile;
+mod sources;
 mod stack;
 
 use outputs::{MissingRuntimeDeps, OutputTypesValid};
@@ -567,7 +568,7 @@ async fn check_package(
             };
         }
 
-        let (r1, r2, r3, r4, r5, r6, r7, r8, r9, r10) = tokio::join!(
+        let (r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11) = tokio::join!(
             run_checker!(naming::SpecNameMatchesDir),
             run_checker!(naming::SpecNameValid),
             run_checker!(naming::CycleBreakerNaming),
@@ -578,8 +579,9 @@ async fn check_package(
             run_checker!(BuildScriptIsExecutable),
             run_checker!(BuildScriptDisallowedPatterns),
             run_checker!(StandaloneTestCheck),
+            run_checker!(sources::SourceUrlsValid),
         );
-        for r in [r1, r2, r3, r4, r5, r6, r7, r8, r9, r10] {
+        for r in [r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11] {
             out.push(r.map_err(|e| Error::Other(anyhow!(e)))?);
         }
     }
