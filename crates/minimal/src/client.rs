@@ -624,7 +624,7 @@ fn append_daemon_error(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(&data[..room.min(data.len())]);
 }
 
-/// The provider kind the CLI should talk to, given `--provider`/`--minvmd`.
+/// The provider kind the CLI should talk to, given `--provider`.
 ///
 /// The native minimald and minvmd backends now occupy distinct provider dirs,
 /// so connecting — not just spawning — must pick the right one. macOS is always

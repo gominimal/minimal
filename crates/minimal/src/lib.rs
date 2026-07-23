@@ -256,10 +256,6 @@ pub struct GlobalArgs {
     /// backend.
     #[arg(long, global = true, value_name = "PROVIDER")]
     pub provider: Option<Provider>,
-    /// Deprecated alias for `--provider local-minvmd`, kept for backward
-    /// compatibility and hidden from help. Prefer `--provider local-minvmd`.
-    #[arg(long, global = true, hide = true, conflicts_with = "provider")]
-    pub minvmd: bool,
     /// Skip interactive prompts that need a terminal (e.g. the session
     /// picker shown by bare `min` or `min attach` with no session argument).
     /// When a choice is ambiguous, the command errors with a list of
@@ -270,10 +266,10 @@ pub struct GlobalArgs {
 }
 
 impl GlobalArgs {
-    /// Whether the minvmd microVM backend (DM1) is selected, via either
-    /// `--provider local-minvmd` or the deprecated `--minvmd` alias.
+    /// Whether the minvmd microVM backend (DM1) is selected via
+    /// `--provider local-minvmd`.
     pub fn use_minvmd(&self) -> bool {
-        self.minvmd || matches!(self.provider, Some(Provider::LocalMinvmd))
+        matches!(self.provider, Some(Provider::LocalMinvmd))
     }
 }
 
@@ -2439,21 +2435,6 @@ mod tests {
         use clap::Parser as _;
         let cli = Cli::try_parse_from(["min", "ls"]).unwrap();
         assert!(!cli.global_args.use_minvmd());
-    }
-
-    #[test]
-    fn deprecated_minvmd_flag_still_selects_the_vm_backend() {
-        use clap::Parser as _;
-        let cli = Cli::try_parse_from(["min", "--minvmd", "ls"]).unwrap();
-        assert!(cli.global_args.use_minvmd());
-    }
-
-    #[test]
-    fn provider_and_deprecated_minvmd_flag_conflict() {
-        use clap::Parser as _;
-        assert!(
-            Cli::try_parse_from(["min", "--provider", "local-minimald", "--minvmd", "ls"]).is_err()
-        );
     }
 
     #[test]
