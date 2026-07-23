@@ -38,6 +38,7 @@ fd-lock.workspace = true
 futures.workspace = true
 hakoniwa.workspace = true
 libc.workspace = true
+nix.workspace = true
 russh.workspace = true
 russh-sftp.workspace = true
 path-absolutize.workspace = true

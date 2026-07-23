@@ -285,7 +285,8 @@ pub struct ConfigureLoadoutRequest {
     pub session_id: SessionId,
     /// Client-side Phase 1 contribution. Defaulted (empty) by
     /// callers that aren't composing a session, which take the
-    /// empty-contribution fast path to [`ConfigureLoadoutResponse::Ready`].
+    /// empty-contribution fast path to
+    /// [`ConfigureLoadoutResponse::Materialized`].
     #[serde(default)]
     pub contribution: sessions::wire::request::WireContribution,
 }
@@ -293,18 +294,29 @@ pub struct ConfigureLoadoutRequest {
 /// The response for a [`ConfigureLoadout`] RPC.
 ///
 /// Both variants are part of the Phase 2 flow and reachable on the
-/// wire: `Ready` when the daemon's composer finalizes in one shot,
-/// `Pending` when it collects items the client must gate before
-/// composition completes (the client follows up via `SubmitVerdict`).
+/// wire: `Materialized` when the daemon's composer finalizes in one
+/// shot (the session record is now
+/// [`Materializing`](sessions::SessionStatus::Materializing), not
+/// yet `Active`), `Pending` when it collects items the client must
+/// gate before composition completes (the client follows up via
+/// `SubmitVerdict`).
+///
+/// In both `Materialized` branches the client still has to upload
+/// patches and call `FinalizeSession` before the session is
+/// attachable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConfigureLoadoutResponse {
-    /// No items need user gating; the session is finalized and
-    /// callers can immediately use it.
-    Ready,
-    /// Items need client-side gating. The session stays in flight;
-    /// the client follows up with `SubmitVerdict` carrying the same
-    /// id.
+    /// No items need user gating; composition is complete and the
+    /// session record has advanced to
+    /// [`Materializing`](sessions::SessionStatus::Materializing).
+    /// The client still has to upload the composition's patches
+    /// and call `FinalizeSession` before the session becomes
+    /// attachable.
+    Materialized,
+    /// Items need client-side gating. The session stays in
+    /// [`Pending`](sessions::SessionStatus::Pending); the client
+    /// follows up with `SubmitVerdict` carrying the same id.
     Pending {
         /// Pending items the client must gate.
         response: sessions::wire::request::ContributionResponse,
@@ -315,6 +327,38 @@ impl OneshotSshRpc for ConfigureLoadout {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ConfigureLoadout");
     type Request<'a> = ConfigureLoadoutRequest;
     type Response = Errorable<ConfigureLoadoutResponse>;
+}
+
+/// An RPC to promote a `Materializing` session to `Active`.
+///
+/// The client uploads composition patches to the daemon via
+/// `WorkspacePatchesTarZst`, then calls this RPC to signal "every
+/// side-channel upload is in and I'm ready for the session to be
+/// attachable." The daemon checks for the patches-ready marker
+/// under `<workspace>/patches/` and refuses to finalize if the
+/// upload never completed.
+///
+/// Idempotent: calling on an already-`Active` session returns
+/// success. Refused with `InvalidInput` on `Pending` sessions
+/// (configure the loadout first) or `Materializing` sessions
+/// missing the patches marker.
+pub struct FinalizeSession;
+
+/// The request for a [`FinalizeSession`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FinalizeSessionRequest {
+    /// The session to finalize.
+    pub session_id: SessionId,
+}
+
+/// The response for a [`FinalizeSession`] RPC — a unit-shaped ack.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FinalizeSessionResponse;
+
+impl OneshotSshRpc for FinalizeSession {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "FinalizeSession");
+    type Request<'a> = FinalizeSessionRequest;
+    type Response = Errorable<FinalizeSessionResponse>;
 }
 
 /// An RPC to rename an existing session.
@@ -389,9 +433,11 @@ impl OneshotSshRpc for Shutdown {
 }
 
 /// Resume a `Pending` session with the client's per-item
-/// [`ContributionVerdict`]. Terminal — the daemon promotes the
-/// record `Pending → Active` and replies with
-/// [`SessionStep::Active`](sessions::wire::request::SessionStep::Active).
+/// [`ContributionVerdict`]. The daemon promotes the record
+/// `Pending → Materializing` and replies with
+/// [`SessionStep::Materialized`](sessions::wire::request::SessionStep::Materialized);
+/// the client still has to upload patches and call
+/// `FinalizeSession` before the session is attachable.
 /// A `Fault` reply carries a structured
 /// [`WireError`](sessions::wire::errors::WireError) —
 /// `UnknownSessionId` for a verdict against no stashed session,
@@ -849,11 +895,11 @@ mod tests {
     }
 
     #[test]
-    fn configure_loadout_response_ready_round_trips() {
-        let resp = ConfigureLoadoutResponse::Ready;
+    fn configure_loadout_response_materialized_round_trips() {
+        let resp = ConfigureLoadoutResponse::Materialized;
         assert_eq!(round_trip(&resp), resp);
         let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains(r#""kind":"ready""#), "got: {json}");
+        assert!(json.contains(r#""kind":"materialized""#), "got: {json}");
     }
 
     #[test]

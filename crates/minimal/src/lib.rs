@@ -116,6 +116,14 @@ pub enum Command {
     Update(UpdateArgs),
     /// Print CLI and daemon version information
     Version,
+    /// Demo the client's activity spinner (development aid).
+    ///
+    /// Draws the same build-hold-fade spinner used by the file-upload
+    /// phases of `min activate` so you can eyeball timing and layout
+    /// without triggering a real upload. Stops after `--seconds` or
+    /// on Ctrl-C, whichever comes first.
+    #[command(hide = true)]
+    Spin(SpinArgs),
     /// Generate shell completion script
     #[command(
         long_about = "Generate a shell tab-completion script for the min CLI.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(min completions bash)"
@@ -443,6 +451,14 @@ pub struct AddKind {
 pub struct UpdateArgs {}
 
 #[derive(Debug, Args)]
+pub struct SpinArgs {
+    /// How long to keep the spinner visible before auto-exiting.
+    /// Ctrl-C cuts it short.
+    #[arg(long, default_value_t = 10)]
+    pub seconds: u64,
+}
+
+#[derive(Debug, Args)]
 pub struct ProxyArgs {
     /// UDS socket path to connect to
     #[arg(long)]
@@ -527,6 +543,7 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::SshForward(args)) => cmd_ssh_forward(&cli.global_args, args).await,
         Some(Command::Login(args)) => cmd_login(&cli.global_args, args).await,
         Some(Command::Version) => cmd_version(&cli.global_args).await,
+        Some(Command::Spin(args)) => cmd_spin(&cli.global_args, args).await,
         Some(Command::Rename(args)) => cmd_rename(&cli.global_args, args).await,
         Some(Command::Init(args)) => cmd_init(&cli.global_args, args)
             .await
@@ -929,7 +946,7 @@ async fn submit_verdict_and_wait(
         }
     };
     match step {
-        SessionStep::Active { id } => Ok(id),
+        SessionStep::Materialized { id } => Ok(id),
         SessionStep::Fault { error } => {
             send_abort(client, session_id).await;
             bail!("SubmitVerdict faulted: {error}");
@@ -938,15 +955,26 @@ async fn submit_verdict_and_wait(
 }
 
 /// The interactive-prompt caller's happy path: gate, then submit,
-/// then return the finalized id + policy. Any gating failure aborts
-/// the daemon-side session before propagating.
+/// then return the finalized id + policy + the verdict that was
+/// submitted. The verdict is returned so the caller can pick the
+/// approved daemon-side patches out for upload — those files were
+/// only surfaced during Phase 3 and won't otherwise be available
+/// to the client-side upload step. Any gating failure aborts the
+/// daemon-side session before propagating.
 async fn drive_pending_to_active(
     client: &mut client::Client,
     response: sessions::wire::request::ContributionResponse,
     policy: sessions::core::policy::UserPolicy,
     options: sessions::core::compose::ComposeOptions,
     hooks: &dyn sessions::core::hooks::PolicyHooks,
-) -> Result<(sessions::SessionId, sessions::core::policy::UserPolicy), anyhow::Error> {
+) -> Result<
+    (
+        sessions::SessionId,
+        sessions::core::policy::UserPolicy,
+        Vec<(std::path::PathBuf, paths::SandboxRelPath)>,
+    ),
+    anyhow::Error,
+> {
     let session_id = response.session_id;
     let (verdict, final_policy) = match compute_verdict(response, policy, options, hooks) {
         Ok(v) => v,
@@ -955,8 +983,34 @@ async fn drive_pending_to_active(
             bail!("Composition gating failed: {e}");
         }
     };
+    // Extract the approved-patch destinations before submit consumes
+    // the verdict — avoids cloning the whole wire type (both vars
+    // and patches Vecs plus their owned strings) just so the caller
+    // can walk one field of it after the fact.
+    let approved_patches: Vec<_> = approved_patches_from_verdict(&verdict).collect();
     let id = submit_verdict_and_wait(client, session_id, verdict).await?;
-    Ok((id, final_policy))
+    Ok((id, final_policy, approved_patches))
+}
+
+/// Collect the sandbox destinations of every `Approved` patch
+/// verdict — the daemon-side patches the client just approved and
+/// now needs to upload. `Ignored`/`Denied` verdicts contribute
+/// nothing to the composition, so they're not uploaded.
+fn approved_patches_from_verdict(
+    verdict: &sessions::wire::request::ContributionVerdict,
+) -> impl Iterator<Item = (std::path::PathBuf, paths::SandboxRelPath)> + '_ {
+    verdict.patches.iter().filter_map(|v| match v {
+        sessions::wire::policy::WirePatchVerdict::Approved {
+            host_path,
+            destination,
+            ..
+        } => Some((
+            host_path.as_utf8_path().as_std_path().to_path_buf(),
+            destination.clone(),
+        )),
+        sessions::wire::policy::WirePatchVerdict::Ignored { .. }
+        | sessions::wire::policy::WirePatchVerdict::Denied { .. } => None,
+    })
 }
 
 /// Fire an `AbortSession` at the daemon for a `Pending` session the
@@ -973,6 +1027,71 @@ async fn send_abort(client: &mut client::Client, session_id: sessions::SessionId
         }
         Err(e) => {
             eprintln!("AbortSession RPC failed: {e}");
+        }
+    }
+}
+
+/// Best-effort destroy for a `Materializing` session the client
+/// couldn't finalize (patch upload failed, network blip, etc.).
+/// Unlike `AbortSession`, `DestroySession` works on any status
+/// past `Pending`. Errors are logged, not propagated — the caller
+/// is already reporting a primary error.
+///
+/// Bounded by a hard timeout: the same network conditions that
+/// caused the primary error (wedged daemon, half-open SSH channel,
+/// a VM whose bridge accepted but whose guest never answered) can
+/// make the RPC hang indefinitely, which would swallow the
+/// operator-visible primary error we're supposed to be racing
+/// back to `cmd_activate`.
+async fn best_effort_destroy(client: &mut client::Client, session_id: sessions::SessionId) {
+    /// Ceiling on how long we let a cleanup RPC run. Chosen well
+    /// above a healthy `DestroySession` (single-digit milliseconds
+    /// on a UDS) so the timeout only fires against pathologies.
+    const DESTROY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    use minimald_rpc::DestroySession;
+    let call = client
+        .oneshot_rpc::<DestroySession>(minimald_rpc::DestroySessionRequest { id: session_id });
+    match tokio::time::timeout(DESTROY_TIMEOUT, call).await {
+        Ok(Ok(minimald_rpc::Errorable::Ok(_))) => {}
+        Ok(Ok(minimald_rpc::Errorable::Err { error })) => {
+            eprintln!("DestroySession failed while cleaning up: {error}");
+        }
+        Ok(Err(e)) => {
+            eprintln!("DestroySession RPC failed while cleaning up: {e}");
+        }
+        Err(_) => {
+            eprintln!(
+                "DestroySession timed out after {DESTROY_TIMEOUT:?} while cleaning up \
+                 session {session_id}; the session may still be present on the daemon \
+                 (run `min destroy {session_id}` to clean up manually)",
+            );
+        }
+    }
+}
+
+/// Upload the composition's patches (if any) and finalize the
+/// session. The session is `Materializing` at entry; `Active` on
+/// success. On upload/finalize failure the session is left in
+/// `Materializing` — the caller is responsible for destroying it.
+async fn upload_and_finalize(
+    client: &mut client::Client,
+    session_id: sessions::SessionId,
+    patches: &[(std::path::PathBuf, paths::SandboxRelPath)],
+) -> Result<(), anyhow::Error> {
+    client
+        .upload_patches(session_id, patches)
+        .await
+        .context("Failed to upload composition patches")?;
+
+    use minimald_rpc::{FinalizeSession, FinalizeSessionRequest};
+    let resp = client
+        .oneshot_rpc::<FinalizeSession>(FinalizeSessionRequest { session_id })
+        .await
+        .context("FinalizeSession RPC failed")?;
+    match resp {
+        minimald_rpc::Errorable::Ok(_) => Ok(()),
+        minimald_rpc::Errorable::Err { error } => {
+            bail!("FinalizeSession failed: {error}");
         }
     }
 }
@@ -1190,7 +1309,6 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
                     false,
                 )?;
             if should_upload {
-                eprintln!("Uploading project files...");
                 client
                     .upload_workspace_files(id, upload_root.as_std_path())
                     .await
@@ -1203,6 +1321,24 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
             }
         }
     };
+
+    // Collect the client-side patches (from loadouts, already gated
+    // in Phase 1) *before* the wire contribution moves into the
+    // ConfigureLoadout RPC. These land in the final Composition
+    // whether the response is `Materialized` or `Pending`, so the
+    // client is authoritative for them. Any daemon-side patches
+    // that come back through a `Pending` response's `SubmitVerdict`
+    // get appended below.
+    let mut collected_patches: Vec<(std::path::PathBuf, paths::SandboxRelPath)> = contribution
+        .patches
+        .iter()
+        .map(|p| {
+            (
+                p.patch.host_path.as_utf8_path().as_std_path().to_path_buf(),
+                p.patch.destination.clone(),
+            )
+        })
+        .collect();
 
     // The session exists but has no loadout yet; composing it is a
     // second round-trip because the daemon's composer reads the
@@ -1266,6 +1402,7 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
                     s = if count == 1 { "" } else { "s" },
                 );
             }
+            collected_patches.extend(approved_patches_from_verdict(&verdict));
             submit_verdict_and_wait(&mut client, session_id, verdict).await?;
         } else {
             // The hook stashes policy mutations in interior
@@ -1284,6 +1421,9 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
                 &hooks,
             )
             .await;
+            if let Ok((_, _, ref approved)) = result {
+                collected_patches.extend(approved.iter().cloned());
+            }
             let final_policy = hooks.into_final_policy();
             if final_policy != initial_policy {
                 // A `save_user_policy` failure is reported to
@@ -1309,6 +1449,22 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     // above, so it appears unused to the compiler. Explicit `_` to
     // squash the lint without dropping the useful name.
     let _ = initial_policy;
+
+    // Upload composition patches and finalize the session. This
+    // has to happen before attach is allowed — a Materializing
+    // session isn't attachable, and the launcher reads patches
+    // from `<workspace>/patches/`. Dedup by sandbox destination:
+    // the composer's post-gate check guarantees any duplicates
+    // are exact matches (same source), so collapsing is safe.
+    collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
+    collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
+    if let Err(e) = upload_and_finalize(&mut client, id, &collected_patches).await {
+        // Best-effort teardown: the session is stuck in
+        // Materializing on the daemon. Destroy it so the operator's
+        // `min ls` doesn't fill with half-finalized sessions.
+        best_effort_destroy(&mut client, id).await;
+        return Err(e);
+    }
 
     println!("{id}");
 
@@ -2097,6 +2253,32 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
     let ensure_pkgs = ctx.scaffolding_packages()?;
     ctx.download_if_available(&graph, ensure_pkgs).await?;
 
+    Ok(())
+}
+
+/// Draw the client's activity spinner on stderr for `args.seconds`
+/// (or until Ctrl-C), then clear it. Ticks the byte counter as it
+/// runs so the `{bytes}` / `{bytes_per_sec}` placeholders in the
+/// spinner template look alive instead of stuck at zero — makes it
+/// easier to eyeball the animation next to realistic template
+/// content.
+pub async fn cmd_spin(_global: &GlobalArgs, args: SpinArgs) -> Result<(), anyhow::Error> {
+    use std::time::Duration;
+    let bar = client::add_spinner_bar("Spinner demo");
+    let deadline = tokio::time::sleep(Duration::from_secs(args.seconds));
+    tokio::pin!(deadline);
+    // ~80 KB/s of fake throughput. Below indicatif's rate-average
+    // window smoothing so the reported `{bytes_per_sec}` stays
+    // legible instead of dancing every tick.
+    let mut fake_throughput = tokio::time::interval(Duration::from_millis(50));
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut deadline => break,
+            _ = fake_throughput.tick() => bar.inc(4096),
+        }
+    }
+    bar.finish_and_clear();
     Ok(())
 }
 

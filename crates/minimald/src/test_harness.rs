@@ -400,28 +400,33 @@ pub fn create_session_req(name: &str, project: &str) -> minimald_rpc::CreateSess
 /// for a caller that expects its contribution to compose in one shot.
 pub fn unwrap_ready(resp: minimald_rpc::ConfigureLoadoutResponse) {
     match resp {
-        minimald_rpc::ConfigureLoadoutResponse::Ready => {}
+        minimald_rpc::ConfigureLoadoutResponse::Materialized => {}
         minimald_rpc::ConfigureLoadoutResponse::Pending { .. } => {
             panic!("expected Ready variant, got Pending")
         }
     }
 }
 
-/// Drive the client half of the whole create flow — `CreateSession` plus
-/// the `ConfigureLoadout` that finalizes it — and return the session's id.
+/// Drive the client half of the whole create flow — `CreateSession`,
+/// `ConfigureLoadout`, and `FinalizeSession` — and return the
+/// session's id. The result is an `Active` session ready to attach.
 ///
-/// A session isn't usable until its loadout is configured (a `Draft` refuses
-/// attach and context creation), so any test that goes on to *use* the
-/// session wants this rather than a bare `CreateSession`. The workspace is
-/// left empty, so the loadout composes to an empty `Ready` in one shot; a
-/// test that wants a project in the mix seeds the workspace in between and
-/// calls the two RPCs itself.
+/// The workspace is left empty (so the composition has no patches
+/// and no upload is needed) and the composition itself is empty
+/// (empty client contribution + empty project mfile), so
+/// `ConfigureLoadout` returns `Materialized` in one shot and
+/// `FinalizeSession` succeeds against an empty patches dir. A test
+/// that wants a project in the mix seeds the workspace in between
+/// and drives the RPCs itself.
 pub async fn create_configured_session(
     client: &mut TestClient,
     name: &str,
     project: &str,
 ) -> SessionId {
-    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, FinalizeSession,
+        FinalizeSessionRequest,
+    };
     let id = client
         .call::<CreateSession>(&create_session_req(name, project))
         .await
@@ -436,5 +441,17 @@ pub async fn create_configured_session(
             .await
             .unwrap(),
     );
+    // Empty composition → no patches. FinalizeSession short-
+    // circuits the marker check in that case (there's nothing to
+    // upload), so calling it directly is fine.
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(_) => {}
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("FinalizeSession failed in create_configured_session: {error}");
+        }
+    }
     id
 }

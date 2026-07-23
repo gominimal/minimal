@@ -657,6 +657,7 @@ async fn create_session_at(
 
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
+        FinalizeSession, FinalizeSessionRequest,
     };
     let id = match client
         .call::<CreateSession>(&CreateSessionRequest { config })
@@ -667,8 +668,9 @@ async fn create_session_at(
             panic!("CreateSession failed: {error}")
         }
     };
-    // Finalize the session's loadout, as `min activate` does: its workspace
-    // is empty, so this composes to an empty `Ready` in one shot.
+    // Configure the loadout, then finalize — the workspace is
+    // empty so the composition has no patches and Finalize takes
+    // the empty-composition short-circuit past the marker check.
     match client
         .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
             session_id: id,
@@ -679,6 +681,15 @@ async fn create_session_at(
         minimald_rpc::Errorable::Ok(r) => unwrap_ready(r),
         minimald_rpc::Errorable::Err { error } => {
             panic!("ConfigureLoadout failed: {error}")
+        }
+    }
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(_) => {}
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("FinalizeSession failed: {error}")
         }
     }
     id

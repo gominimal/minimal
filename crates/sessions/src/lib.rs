@@ -293,7 +293,21 @@ pub enum SessionStatus {
     /// rename continue to load.
     #[serde(alias = "draft")]
     Pending,
-    /// Composition complete; the record is ready to apply.
+    /// Composition finalized but the session isn't attachable yet:
+    /// the client is still uploading the composition's patches to
+    /// the daemon-side workspace. Transitions to [`Self::Active`]
+    /// when the client calls `FinalizeSession` — which the daemon
+    /// gates on the patches-ready marker being present. Attach
+    /// refuses `Materializing` sessions.
+    ///
+    /// A daemon restart wipes the in-memory composition, so any
+    /// `Materializing` record left on disk after restart is
+    /// unresumable; the manager reaps them at startup for the same
+    /// reason it reaps unresumable `Pending` records.
+    Materializing,
+    /// Composition complete and every side-channel upload is on
+    /// disk; the record is ready to apply and the session is
+    /// attachable.
     #[default]
     Active,
 }

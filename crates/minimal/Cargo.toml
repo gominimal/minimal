@@ -33,6 +33,7 @@ constcat.workspace = true
 diagnostics.workspace = true
 dialoguer.workspace = true
 dirs.workspace = true
+indicatif.workspace = true
 nix.workspace = true
 mctx.workspace = true
 mfile.workspace = true

@@ -2,11 +2,12 @@
 use minimald_rpc::IssueClientCertResponse;
 use minimald_rpc::{
     AbortSession, AbortSessionResponse, CreateSession, DestroySession, DestroySessionResponse,
-    Errorable, GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
-    GetSessionRecordRequest, GetSessionRecordResponse, GetVersion, GetVersionResponse,
-    IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse,
-    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool,
-    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
+    Errorable, FinalizeSession, FinalizeSessionResponse, GetMeshStatus, GetSessionPolicy,
+    GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse,
+    GetVersion, GetVersionResponse, IssueClientCert, IssueClientCertRequest, ListSessions,
+    ListSessionsEntry, ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
+    RenameSessionResponse, ResourcePool, Shutdown, ShutdownRequest, ShutdownResponse,
+    SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -239,7 +240,7 @@ async fn serve_configure_loadout(
                 });
             };
             Ok(match h.configure_loadout(req.contribution).await {
-                Ok(None) => Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Ready),
+                Ok(None) => Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Materialized),
                 Ok(Some(response)) => {
                     Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Pending { response })
                 }
@@ -288,6 +289,37 @@ async fn serve_submit_verdict(
                 }
             },
         )
+        .await
+}
+
+/// `FinalizeSession`: promotes a `Materializing` session to
+/// `Active`. Gated on the patches-ready marker being present
+/// under `<workspace>/patches/`; a missing marker (client crashed
+/// mid-upload, or skipped the patches upload entirely) surfaces
+/// as `Errorable::Err`. Idempotent on already-Active sessions.
+async fn serve_finalize_session(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    FinalizeSession
+        .handle_channel(c, async |req| {
+            let mngr = s.sessions_manager().await;
+            let handle = mngr
+                .get_session(SessionKeyPredicate::Id(req.session_id))
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            let Some(h) = handle else {
+                return Ok(Errorable::Err {
+                    error: format!("no session with ID `{}`", req.session_id.as_ref()),
+                });
+            };
+            Ok(match h.finalize().await {
+                Ok(()) => Errorable::Ok(FinalizeSessionResponse),
+                Err(e) => Errorable::Err {
+                    error: e.to_string(),
+                },
+            })
+        })
         .await
 }
 
@@ -543,6 +575,33 @@ async fn serve_get_mesh_status(
 pub(crate) const STREAM_WORKSPACE_FILES: &str =
     constcat::concat!(RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
 
+pub(crate) const STREAM_WORKSPACE_PATCHES: &str =
+    constcat::concat!(RPC_SUBSYSTEM_PREFIX, "WorkspacePatchesTarZst");
+
+/// Marker file the patches unpacker drops after a successful
+/// atomic swap. `FinalizeSession` checks for its presence before
+/// promoting a session from `Materializing` to `Active`, so a
+/// client-side crash between upload and finalize can't leave the
+/// session `Active` without patches on disk. See the "why the
+/// marker exists" note in `finalize_session_handler`.
+pub(crate) const PATCHES_READY_MARKER: &str = ".patches_ready";
+
+/// Per-entry size cap on incoming patch archives. Legitimate patch files are
+/// dotfiles (KB to a few MB); this ceiling is generous but bounded so a peer
+/// forging a tar header can't push `Vec::with_capacity` into an allocation
+/// error (panic → task abort) or trigger the allocator's OOM handler
+/// (aborts the whole daemon).
+const MAX_PATCH_ENTRY_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Total bytes held in memory across every in-flight patch write in a single
+/// `WorkspacePatchesTarZst` unpack. The per-entry cap alone isn't a memory
+/// bound — the concurrency knob multiplies through it, so on a many-core
+/// host without this the ceiling would be tens of GiB. Fixed at 1 GiB
+/// regardless of core count: legitimate patch payloads are small dotfile
+/// trees; the ceiling exists as an adversarial-input backstop, not as a
+/// throughput knob.
+const MAX_UNPACK_INFLIGHT_BYTES: usize = 1024 * 1024 * 1024;
+
 /// Tallies the bytes pulled through an [`AsyncRead`] into a shared counter.
 ///
 /// The counter is shared rather than returned because the reader is
@@ -601,18 +660,40 @@ async fn serve_stream_workspace_files(
     outcome
 }
 
-/// Unpacks the zstd-compressed tarball streamed over `c` into the
-/// workspace directory of the session named by the channel environment,
-/// tallying the wire bytes it consumes into `received`.
-///
-/// On failure, returns the human-readable message to relay back to the
-/// client over the channel's extended-data stream.
-async fn unpack_workspace_files(
+async fn serve_stream_workspace_patches(
+    s: ServerStateHandle,
+    config: ChannelConfig,
+    mut c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    let outcome = match unpack_workspace_patches(&s, &config, &mut c).await {
+        Ok(()) => Ok(()),
+        Err(msg) => {
+            let _ = c.extended_data_bytes(1, msg.clone()).await;
+            Err(ConnectionError::Internal(msg))
+        }
+    };
+    let _ = c.close().await;
+    outcome
+}
+
+/// Look up the session for an upload channel: pulls the session id
+/// out of the channel env, resolves the live actor via the manager,
+/// and returns its paths. Shared by both `WorkspaceFilesTarZst` and
+/// `WorkspacePatchesTarZst`.
+async fn upload_session_paths(
     s: &ServerStateHandle,
     config: &ChannelConfig,
-    c: &mut RuChannel<Msg>,
-    received: &Arc<AtomicU64>,
-) -> Result<(), String> {
+) -> Result<crate::session::SessionPaths, String> {
+    Ok(upload_session_handle(s, config).await?.1)
+}
+
+/// Same lookup as [`upload_session_paths`] but returns the session
+/// handle too, so callers that need per-session serialization can
+/// grab a lock without a second manager round-trip.
+async fn upload_session_handle(
+    s: &ServerStateHandle,
+    config: &ChannelConfig,
+) -> Result<(crate::session::SessionHandle, crate::session::SessionPaths), String> {
     let session_id_str = config
         .env_vars
         .get(crate::MINIMAL_SESSION_ID_ENV)
@@ -630,12 +711,27 @@ async fn unpack_workspace_files(
         .paths()
         .await
         .map_err(|e| format!("session is gone: {e}"))?;
+    Ok((session_handle, paths))
+}
 
+/// Unpacks the zstd-compressed tarball streamed over `c` into the
+/// workspace directory of the session named by the channel environment,
+/// tallying the wire bytes it consumes into `received`.
+///
+/// On failure, returns the human-readable message to relay back to the
+/// client over the channel's extended-data stream.
+async fn unpack_workspace_files(
+    s: &ServerStateHandle,
+    config: &ChannelConfig,
+    c: &mut RuChannel<Msg>,
+    received: &Arc<AtomicU64>,
+) -> Result<(), String> {
+    let paths = upload_session_paths(s, config).await?;
     // Emitted once the upload has a destination and before a single byte is
     // pulled, so a transfer that wedges mid-stream still leaves a record
     // saying which session it was for. Its pair is the complete/failed
     // record in the caller.
-    tracing::info!(session_id = %session_id, "workspace upload started");
+    tracing::info!("workspace upload started");
 
     let reader = async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(
         CountingReader {
@@ -673,6 +769,350 @@ async fn served(fut: impl Future<Output = Result<(), ConnectionError>>) {
     }
 }
 
+/// Unpacks the composition-patches tarball streamed over `c`.
+///
+/// The unpack is **atomic**: entries land in a `<patches_dir>.tmp`
+/// staging dir first, then get swapped into place via rename once
+/// the stream ends cleanly. A mid-stream failure leaves the tmp
+/// tree behind (removed on the next successful run) but never
+/// pollutes `patches/`.
+///
+/// Every archive entry's path is validated against traversal —
+/// `SandboxRelPath::try_new` already rejects absolute paths and
+/// `..` components on the client side, but the client is untrusted
+/// so we re-check the wire form here. Absolute + traversal paths
+/// are dropped with an error before any file is written.
+///
+/// On success, drops [`PATCHES_READY_MARKER`] under the patches
+/// dir. `FinalizeSession` uses that marker as its precondition
+/// for the `Materializing → Active` transition, so this write
+/// order matters: marker only appears once every patch is on disk.
+#[tracing::instrument(level = "debug", skip_all)]
+async fn unpack_workspace_patches(
+    s: &ServerStateHandle,
+    config: &ChannelConfig,
+    c: &mut RuChannel<Msg>,
+) -> Result<(), String> {
+    use std::path::Path as StdPath;
+
+    let (session_handle, paths) = upload_session_handle(s, config).await?;
+    let patches_dir = paths.patches.as_utf8_path().as_std_path().to_path_buf();
+
+    // Per-upload unique staging path so two concurrent uploads for
+    // the same session never share a staging tree. The nanosecond
+    // clock is fine as a discriminator — the per-session upload
+    // lock below serializes the swap, so we don't need a strong
+    // guarantee against collisions, only against name reuse across
+    // the two in-flight tasks.
+    let staging_dir = {
+        let mut d = patches_dir.clone();
+        let suffix = format!(
+            ".upload.{}.tmp",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        let name = d
+            .file_name()
+            .map(|n| {
+                let mut n = n.to_os_string();
+                n.push(&suffix);
+                n
+            })
+            .unwrap_or_else(|| format!("patches{suffix}").into());
+        d.set_file_name(name);
+        d
+    };
+
+    // Fresh directory. `remove_dir_all` first is defensive against
+    // an earlier `SystemTime` collision — extremely unlikely, but
+    // cheap to guard against.
+    let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+    tokio::fs::create_dir_all(&staging_dir)
+        .await
+        .map_err(|e| format!("creating patch staging dir: {e}"))?;
+
+    // Zstd decode + tar walk + per-entry unpack. Tar itself is a
+    // stream format so decoding entries is sequential, but writing
+    // the entry bodies to disk is where the cost actually is (a
+    // serial loop over `fs::write` capped at ~190 MB/s per entry).
+    // We buffer each body in memory and hand the write off to a
+    // spawned task, so up to N files land on disk in parallel. The
+    // concurrency cap keeps memory bounded (bodies live only until
+    // the write completes) and prevents saturating the runtime's
+    // blocking pool.
+    let reader = async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(
+        c.make_reader(),
+    ));
+    let archive = async_tar::Archive::new(reader);
+    // Manual iteration so we can reject `..` per-entry before any
+    // bytes hit disk. `Archive::unpack` walks entries itself but
+    // has no per-entry validation hook.
+    use futures::StreamExt as _;
+    use tokio::io::AsyncReadExt as _;
+    let mut entries = archive
+        .entries()
+        .map_err(|e| format!("reading patch tar entries: {e}"))?;
+    let write_concurrency = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    // Byte-budget semaphore: each in-flight body reserves permits
+    // proportional to its size, and can't reserve if the total
+    // in-flight bytes would exceed `MAX_UNPACK_INFLIGHT_BYTES`. This
+    // is *the* backpressure — reserved *before* the body read, so a
+    // slow disk pumps back into the tar decoder (into the pipe,
+    // into the SSH channel) instead of into RAM. The concurrency
+    // count guard below is a secondary limit to keep the blocking
+    // pool from getting saturated by many small entries. `Arc`ed so
+    // the spawned write tasks own their permits.
+    let byte_budget = Arc::new(tokio::sync::Semaphore::new(MAX_UNPACK_INFLIGHT_BYTES));
+    // `JoinSet` (not `FuturesUnordered<JoinHandle>`) so we can
+    // `abort_all` in-flight writes on any error return. Dropping a
+    // `JoinHandle` only detaches the task — writes queued when we
+    // fail would otherwise keep running under `staging_dir`,
+    // racing the next upload's `remove_dir_all` at the top of this
+    // function and burning blocking-pool slots for results nobody
+    // reads.
+    //
+    // `unpack_loop` returns Err on any per-entry problem;
+    // `abort_and_drain` afterward cancels stragglers regardless of
+    // outcome so no writes outlive this function.
+    let mut inflight: tokio::task::JoinSet<Result<(), String>> = tokio::task::JoinSet::new();
+    let loop_result: Result<(), String> = async {
+        while let Some(entry) = entries.next().await {
+            let mut entry = entry.map_err(|e| format!("reading patch tar entry: {e}"))?;
+            let entry_path = entry
+                .path()
+                .map_err(|e| format!("decoding entry path: {e}"))?
+                .into_owned();
+            if !safe_relative_path(&entry_path) {
+                return Err(format!(
+                    "patch archive entry rejected: `{}` contains an absolute path or a `..` component",
+                    entry_path.display()
+                ));
+            }
+            // Reject a patch destination that would clobber the
+            // patches-ready marker. Marker + user patch would
+            // otherwise race, and `materialize_patches_into_home`
+            // would silently copy the emptied marker into the
+            // sandbox home, zeroing whatever the user had there.
+            if entry_path == StdPath::new(PATCHES_READY_MARKER) {
+                return Err(format!(
+                    "patch archive entry rejected: `{}` collides with the daemon's \
+                     patches-ready marker filename",
+                    entry_path.display()
+                ));
+            }
+            // Patches are individual files copied verbatim into the
+            // sandbox home. The client's uploader
+            // (`Client::upload_patches` → `TarZstArchive::add_file`)
+            // only ever emits `EntryType::Regular` — symlink sources
+            // are read through (their target's bytes get archived as
+            // a regular file, dropping the link relation on the
+            // client side, on purpose) and directory sources fan
+            // out into per-file Regular entries. Every non-Regular
+            // entry type is out of scope: we do not create
+            // directories, symlinks, hardlinks, or device nodes in
+            // the sandbox home from a patch archive. Blindly running
+            // `tokio::fs::write` for any of those would silently
+            // land an empty file at that path — a directory entry
+            // would then break `create_dir_all(parent)` for its
+            // children, and a symlink entry would drop the link
+            // target on the floor. Fail loudly instead.
+            let entry_type = entry.header().entry_type();
+            if !matches!(
+                entry_type,
+                async_tar::EntryType::Regular | async_tar::EntryType::Continuous
+            ) {
+                return Err(format!(
+                    "patch archive entry rejected: `{}` is {:?}; only regular files are \
+                     supported",
+                    entry_path.display(),
+                    entry_type,
+                ));
+            }
+            let entry_size = entry.header().size().unwrap_or(0);
+            // Per-entry cap: refuses forged headers that would push
+            // `Vec::with_capacity` into an allocation panic or OOM
+            // (allocator abort → whole daemon down) before we ever
+            // reserve budget.
+            if entry_size > MAX_PATCH_ENTRY_BYTES {
+                return Err(format!(
+                    "patch archive entry rejected: `{}` declares {entry_size} bytes, \
+                     exceeds the {MAX_PATCH_ENTRY_BYTES}-byte per-entry cap",
+                    entry_path.display()
+                ));
+            }
+
+            // Concurrency backpressure: bound the number of writes
+            // in flight before we spawn the next one. Kept alongside
+            // the byte budget below so a batch of tiny entries can't
+            // saturate the blocking pool.
+            while inflight.len() >= write_concurrency {
+                match inflight.join_next().await {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(e))) => return Err(e),
+                    Some(Err(join_err)) => {
+                        return Err(format!("write task panicked: {join_err}"))
+                    }
+                    None => break,
+                }
+            }
+
+            // Byte-budget backpressure: reserve permits equal to
+            // the entry size *before* the body read, so a stalled
+            // fs::write can't let bodies pile up in RAM ahead of
+            // it. Zero-byte entries take one permit — semaphores
+            // can't acquire zero, but the practical peak is still
+            // dominated by real-body permits.
+            let permit_bytes = std::cmp::max(entry_size as usize, 1);
+            let permit = Arc::clone(&byte_budget)
+                .acquire_many_owned(permit_bytes as u32)
+                .await
+                .map_err(|e| format!("byte-budget semaphore closed: {e}"))?;
+
+            let mut body = Vec::with_capacity(entry_size as usize);
+            entry
+                .read_to_end(&mut body)
+                .await
+                .map_err(|e| format!("reading body of `{}`: {e}", entry_path.display()))?;
+
+            let dest = staging_dir.join(&entry_path);
+            let path_display = entry_path.display().to_string();
+            inflight.spawn(async move {
+                if let Some(parent) = dest.parent() {
+                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                        format!("creating parent dir for `{path_display}`: {e}")
+                    })?;
+                }
+                tokio::fs::write(&dest, &body)
+                    .await
+                    .map_err(|e| format!("writing `{path_display}`: {e}"))?;
+                // Explicit drop keeps the permit alive across the
+                // fs::write so the byte budget only frees up after
+                // the buffer is genuinely gone.
+                drop(body);
+                drop(permit);
+                Ok::<_, String>(())
+            });
+        }
+        // Drain any tasks still in flight.
+        while let Some(res) = inflight.join_next().await {
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(join_err) if join_err.is_cancelled() => {}
+                Err(join_err) => return Err(format!("write task panicked: {join_err}")),
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    if loop_result.is_err() {
+        // Cancel and drain every straggler write before returning.
+        // `abort_all` only marks tasks; the drain awaits each
+        // cancellation so no fs::write outlives this function and
+        // races the next upload's `remove_dir_all`.
+        inflight.abort_all();
+        while inflight.join_next().await.is_some() {}
+    }
+    loop_result?;
+
+    // Serialize the swap + marker-write against any other
+    // in-flight `WorkspacePatchesTarZst` upload for this same
+    // session. Two concurrent uploads would otherwise race on
+    // `patches_dir` — one's `RENAME_EXCHANGE` could observe an
+    // unexpected mid-swap state, or the marker could get written
+    // pointing at the wrong upload's contents. The staging phase
+    // above ran without the lock (all writes went to a per-upload
+    // unique dir), so we only pay the serialization cost across
+    // the seconds-of-work install step, not the minutes-of-work
+    // unpack.
+    let _swap_guard = session_handle.patches_upload_lock().lock_owned().await;
+
+    // Install the new tree. Two shapes depending on whether a
+    // prior `patches/` exists:
+    //
+    // 1. **Prior tree present** — `renameat2(RENAME_EXCHANGE)` swaps
+    //    the staging tree and the live tree atomically. At every
+    //    instant an on-disk lookup sees exactly one of the two
+    //    trees, and each carries a valid marker (the old one from
+    //    the prior successful unpack, the new one written below).
+    //    A `FinalizeSession` racing the swap can't observe a gap
+    //    where `patches/` doesn't exist or where the marker is
+    //    absent, only "old contents + old marker" or "new contents
+    //    + new marker."  We swap the trees first (contents on
+    //    disk), then delete the old contents that ended up under
+    //    `staging_dir` after the swap, then write the new marker
+    //    over the old one.
+    // 2. **First install** — no prior tree, so `RENAME_EXCHANGE`
+    //    fails with `ENOENT`. Plain `rename` is atomic in this
+    //    case (nothing to displace), so we fall through to it.
+    //
+    // Go through `common::renameat2` (a direct `renameat2(2)`
+    // syscall wrapper) rather than `nix::fcntl::renameat2`: nix
+    // gates that wrapper behind `target_env = "gnu"`, but `minimald`
+    // is also cross-compiled for static musl (the guest initramfs),
+    // where the nix item is configured out.
+    let swap_result = tokio::task::spawn_blocking({
+        let staging_dir = staging_dir.clone();
+        let patches_dir = patches_dir.clone();
+        move || {
+            common::renameat2::renameat2_cwd(
+                &staging_dir,
+                &patches_dir,
+                common::renameat2::RENAME_EXCHANGE,
+            )
+        }
+    })
+    .await
+    .map_err(|e| format!("atomic-swap task panicked: {e}"))?;
+    match swap_result {
+        Ok(()) => {
+            // `staging_dir` now holds the previous `patches/` tree
+            // (post-exchange). Drop it — a partial cleanup here is
+            // fine; the next unpack's leading `remove_dir_all`
+            // covers it.
+            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        }
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+            // No prior tree — the `RENAME_EXCHANGE` requires both
+            // sides to exist. Plain rename is atomic when the
+            // destination doesn't exist yet.
+            tokio::fs::rename(&staging_dir, &patches_dir)
+                .await
+                .map_err(|e| format!("swapping patches dir into place: {e}"))?;
+        }
+        Err(e) => {
+            return Err(format!("atomic-swap of patches dir failed: {e}"));
+        }
+    }
+
+    // Marker last, so `patches/`'s newly-swapped contents can never
+    // coexist with a stale marker. If we crash between the swap and
+    // this write, the next upload's swap replaces the whole tree
+    // and rewrites the marker — FinalizeSession is what fails safe,
+    // not this handler.
+    let marker = patches_dir.join(StdPath::new(PATCHES_READY_MARKER));
+    tokio::fs::write(&marker, b"")
+        .await
+        .map_err(|e| format!("writing patches-ready marker: {e}"))?;
+
+    Ok(())
+}
+
+/// Returns true if `p` is a relative path with no `..` components.
+/// Enforced on every wire-supplied archive entry name.
+fn safe_relative_path(p: &std::path::Path) -> bool {
+    if p.is_absolute() {
+        return false;
+    }
+    !p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
 /// Handles an RPC going over an SSH subsystem channel.
 ///
 /// This method takes ownership of the ssh channel, including
@@ -700,6 +1140,7 @@ pub async fn handle_ssh_rpc(
         | CreateSession::NAME
         | minimald_rpc::ConfigureLoadout::NAME
         | SubmitVerdict::NAME
+        | FinalizeSession::NAME
         | RenameSession::NAME
         | DestroySession::NAME
         | Shutdown::NAME
@@ -707,6 +1148,7 @@ pub async fn handle_ssh_rpc(
         | GetSessionPolicy::NAME
         | GetMeshStatus::NAME
         | STREAM_WORKSPACE_FILES
+        | STREAM_WORKSPACE_PATCHES
         | minimald_rpc::DIAG_BUNDLE_SUBSYSTEM
         | IssueClientCert::NAME => {
             let mut conn_lock = c.lock().await;
@@ -777,6 +1219,7 @@ pub async fn handle_ssh_rpc(
         CreateSession::NAME => serve!(serve_create_session(s, channel, ssh_username)),
         minimald_rpc::ConfigureLoadout::NAME => serve!(serve_configure_loadout(s, channel)),
         SubmitVerdict::NAME => serve!(serve_submit_verdict(s, channel)),
+        FinalizeSession::NAME => serve!(serve_finalize_session(s, channel)),
         RenameSession::NAME => serve!(serve_rename_session(s, channel)),
         DestroySession::NAME => serve!(serve_destroy_session(s, channel)),
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
@@ -784,6 +1227,7 @@ pub async fn handle_ssh_rpc(
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
         GetMeshStatus::NAME => serve!(serve_get_mesh_status(s, channel)),
         STREAM_WORKSPACE_FILES => serve!(serve_stream_workspace_files(s, config, channel)),
+        STREAM_WORKSPACE_PATCHES => serve!(serve_stream_workspace_patches(s, config, channel)),
         minimald_rpc::DIAG_BUNDLE_SUBSYSTEM => {
             serve!(crate::diag::serve_stream_diag_bundle(s, config, channel))
         }
@@ -951,6 +1395,88 @@ mod tests {
         assert_eq!(sunk, payload);
         assert_eq!(read, payload.len() as u64);
         assert_eq!(count.load(Ordering::Relaxed), payload.len() as u64);
+    }
+
+    /// `WorkspacePatchesTarZst` unpacks each entry under
+    /// `<workspace>/patches/<archive-path>` and drops the ready
+    /// marker on success. Guards the write ordering
+    /// (staging-dir → atomic rename → marker) that FinalizeSession
+    /// depends on.
+    #[tokio::test]
+    async fn stream_workspace_patches_unpacks_and_writes_marker() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let payload = tar_zst(&[
+            (".config/helix/config.toml", b"theme = 'nord'\n"),
+            (".config/other.toml", b"key = 'value'\n"),
+        ])
+        .await;
+
+        let channel = client
+            .open_subsystem(
+                STREAM_WORKSPACE_PATCHES,
+                &[(MINIMAL_SESSION_ID_ENV, &session_id.to_string())],
+            )
+            .await;
+        let mut stream = channel.into_stream();
+        stream.write_all(&payload).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut trailing = Vec::new();
+        stream.read_to_end(&mut trailing).await.unwrap();
+
+        let mngr = server.state.sessions_manager().await;
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("session should be retrievable");
+        let paths = handle.paths().await.unwrap();
+        let patches = paths.patches.as_utf8_path();
+
+        assert_eq!(
+            tokio::fs::read(patches.join(".config/helix/config.toml"))
+                .await
+                .unwrap(),
+            b"theme = 'nord'\n",
+        );
+        assert_eq!(
+            tokio::fs::read(patches.join(".config/other.toml"))
+                .await
+                .unwrap(),
+            b"key = 'value'\n",
+        );
+        assert!(
+            tokio::fs::try_exists(patches.join(PATCHES_READY_MARKER))
+                .await
+                .unwrap(),
+            "patches-ready marker must be written on successful unpack",
+        );
+    }
+
+    /// Unit test on the daemon-side traversal guard — the piece
+    /// covering a malicious peer that hand-crafts a raw tar with
+    /// `..` entries (the client's own `async_tar` builder refuses
+    /// to construct one, and `SandboxRelPath::try_new` already
+    /// rejects them at the wire-schema level, so this is a
+    /// defense-in-depth check for the "hand-crafted bytes"
+    /// scenario the earlier layers don't cover).
+    #[test]
+    fn safe_relative_path_rejects_absolute_and_traversal() {
+        use std::path::Path as StdPath;
+        // Absolute — must reject.
+        assert!(!super::safe_relative_path(StdPath::new("/etc/foo")));
+        // `..` at any position — must reject.
+        assert!(!super::safe_relative_path(StdPath::new("../evil")));
+        assert!(!super::safe_relative_path(StdPath::new("a/../b")));
+        assert!(!super::safe_relative_path(StdPath::new("a/b/..")));
+        // Ordinary relative paths — must accept.
+        assert!(super::safe_relative_path(StdPath::new("a")));
+        assert!(super::safe_relative_path(StdPath::new("a/b/c")));
+        assert!(super::safe_relative_path(StdPath::new(
+            ".config/helix/config.toml"
+        )));
     }
 
     #[tokio::test]

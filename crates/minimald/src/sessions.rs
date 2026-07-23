@@ -180,6 +180,17 @@ impl Manager {
     ) -> Result<ManagerHandle, std::io::Error> {
         let store = Store::init(minimal_state_dir.clone()).await?;
 
+        // Reap unresumable on-disk records left over from a prior
+        // daemon lifetime. Both `Pending` (compose in flight — the
+        // in-memory `PendingComposeState` didn't survive the
+        // restart) and `Materializing` (composition ready but
+        // patches upload state is lost) are meaningless without
+        // in-memory context, so the record can't be brought back
+        // to a working state. Delete them here rather than let
+        // them linger and confuse `min ls` / hold their names
+        // hostage.
+        reap_unresumable_records(&store).await?;
+
         // Build the daemon-scoped mctx state once at startup. Each
         // `CreateSession` will build a per-session `Context` on top of
         // this via `Context::from_daemon` rather than repeating the
@@ -230,6 +241,51 @@ impl Manager {
         tokio::spawn(mngr.mainloop());
         Ok(handle)
     }
+}
+
+/// Delete on-disk records whose status is unresumable after a
+/// daemon restart. See [`Manager::init`] for why `Pending` and
+/// `Materializing` records fall into this category. A delete
+/// failure is logged and skipped — a leftover record wastes a
+/// name until it's cleaned up manually but shouldn't block
+/// startup.
+async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(), std::io::Error> {
+    let handles = store.handles().await?;
+    for handle in handles {
+        let record = match handle.record().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %handle.id(),
+                    error = %e,
+                    "reap: could not read record; skipping",
+                );
+                continue;
+            }
+        };
+        match record.status {
+            sessions::SessionStatus::Pending | sessions::SessionStatus::Materializing => {
+                let id = *handle.id();
+                let status = record.status;
+                if let Err(e) = handle.delete().await {
+                    tracing::warn!(
+                        session_id = %id,
+                        error = %e,
+                        ?status,
+                        "reap: failed to delete unresumable record",
+                    );
+                } else {
+                    tracing::info!(
+                        session_id = %id,
+                        ?status,
+                        "reap: deleted unresumable record left over from a prior daemon lifetime",
+                    );
+                }
+            }
+            sessions::SessionStatus::Active => {}
+        }
+    }
+    Ok(())
 }
 
 impl Manager {
@@ -816,17 +872,27 @@ mod tests {
     }
 
     /// [`create_active_session`] with a caller-supplied config.
+    /// Drives the whole `CreateSession → ConfigureLoadout →
+    /// FinalizeSession` sequence in-process so the returned
+    /// session's record is `Active` (attachable, hostname
+    /// registered). No patches for these fixtures, so the
+    /// composition-empty short-circuit in `finalize` covers the
+    /// marker precondition.
     async fn create_active_session_with(
         mngr: &ManagerHandle,
         config: minimald_rpc::SessionConfig,
     ) -> SessionId {
         let id = mngr.create_session(config, None).await.unwrap();
-        let response = session(mngr, id)
-            .await
+        let handle = session(mngr, id).await;
+        let response = handle
             .configure_loadout(WireContribution::default())
             .await
             .expect("configuring an empty loadout should succeed");
         assert!(response.is_none(), "an empty loadout should finalize");
+        handle
+            .finalize()
+            .await
+            .expect("finalize should succeed for a patchless composition");
         id
     }
 
@@ -959,13 +1025,17 @@ mod tests {
             "an already-gated client contribution needs no verdict, so the \
              loadout should finalize in one shot",
         );
+        // Compose returned `Materialized` — the record status is
+        // `Materializing`, not `Active`. Attach requires an
+        // explicit `FinalizeSession` after any patches have
+        // uploaded; this fixture doesn't drive that step.
         assert_eq!(
             mngr.get_record(SessionKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .expect("the record should survive")
                 .status,
-            sessions::SessionStatus::Active,
+            sessions::SessionStatus::Materializing,
         );
     }
 
@@ -1044,15 +1114,19 @@ mod tests {
             .submit_verdict(approve_all(id, &response))
             .await
             .expect("the verdict should be accepted");
-        assert_eq!(step, SessionStep::Active { id });
+        assert_eq!(step, SessionStep::Materialized { id });
 
+        // SubmitVerdict promotes Pending → Materializing, not
+        // Pending → Active. The client still has to upload
+        // patches (there are none for this fixture) and call
+        // FinalizeSession before the record advances to Active.
         assert_eq!(
             mngr.get_record(SessionKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .expect("the record should survive promotion")
                 .status,
-            sessions::SessionStatus::Active,
+            sessions::SessionStatus::Materializing,
         );
         let comp = handle
             .peek_composition()
@@ -1165,7 +1239,7 @@ mod tests {
             .submit_verdict(approve_all(id, &response))
             .await
             .expect("the corrected verdict should be accepted");
-        assert_eq!(step, SessionStep::Active { id });
+        assert_eq!(step, SessionStep::Materialized { id });
     }
 
     /// Renaming a session that owns no PTask hostname route (NoNet here)
@@ -1355,13 +1429,16 @@ mod tests {
             response.is_none(),
             "a project package needs no client gate, so the loadout finalizes"
         );
+        // Compose advances the record to `Materializing`, not
+        // `Active` — see the note on
+        // `create_session_accepts_non_empty_client_contribution`.
         assert_eq!(
             mngr.get_record(SessionKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .expect("the record should survive")
                 .status,
-            sessions::SessionStatus::Active,
+            sessions::SessionStatus::Materializing,
         );
     }
 

@@ -156,6 +156,15 @@ _nextest: (_need "cargo-nextest" "cargo install cargo-nextest --locked")
 fmt:
     cargo fmt --all
 
+# Autofix pass: fmt, clippy --fix, fmt again. Clippy's `--fix` can shuffle
+# whitespace during its rewrites, so the trailing `cargo fmt` normalizes
+# whatever landed. `--allow-dirty` skips the clean-worktree check — the
+# usual case here is running mid-edit with staged/unstaged work.
+fix:
+    cargo fmt --all
+    cargo clippy {{scope}} --all-targets --fix --allow-dirty -- -D warnings
+    cargo fmt --all
+
 # CI: ci.yml `fmt`.
 fmt-check:
     cargo fmt --all -- --check

@@ -239,8 +239,7 @@ fn log_session_contents(
             host_source = %patch.host_path(),
             sandbox_dest = %patch.destination(),
             source = ?sessions::core::source::Provenanced::source(sp),
-            deferred = true,
-            "session content (patch: file-upload plumbing deferred)",
+            "session content (patch: materialized into session home at FinalizeSession)",
         );
     }
     for h in comp.lifecycle_hooks() {
@@ -1731,6 +1730,7 @@ mod tests {
                 working: DaemonAbsPath::root(),
                 cache: DaemonAbsPath::root(),
                 home: DaemonAbsPath::root(),
+                patches: DaemonAbsPath::root(),
             },
             DEFAULT_SIZE,
             None,
@@ -1797,6 +1797,7 @@ mod tests {
                 working: DaemonAbsPath::root(),
                 cache: DaemonAbsPath::root(),
                 home: DaemonAbsPath::root(),
+                patches: DaemonAbsPath::root(),
             },
             DEFAULT_SIZE,
             None,
@@ -1882,6 +1883,7 @@ mod tests {
             working: DaemonAbsPath::root(),
             cache: DaemonAbsPath::root(),
             home: DaemonAbsPath::root(),
+            patches: DaemonAbsPath::root(),
         }
     }
 

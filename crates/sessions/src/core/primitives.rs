@@ -984,6 +984,22 @@ impl PatchDest {
         if path.as_str().is_empty() {
             return Err(PatchError::EmptyDest);
         }
+        // Destinations are semantically relative to the sandbox user's
+        // home directory, so a leading `~/` is redundant — the package
+        // author who writes `path = "~/.claude"` in their mfile means
+        // "place `.claude` under sandbox home", not "place a literal
+        // `~` directory there." Strip the prefix once, here, so
+        // downstream consumers (tar packing, materialize) don't
+        // create paths like `/home/~/.claude`. A bare `~` becomes an
+        // empty path and re-hits the empty-dest check below.
+        let path: Utf8PathBuf = match path.as_str().strip_prefix("~/") {
+            Some(rest) => rest.into(),
+            None if path.as_str() == "~" => Utf8PathBuf::new(),
+            None => path,
+        };
+        if path.as_str().is_empty() {
+            return Err(PatchError::EmptyDest);
+        }
         // Walk components: drop CurDir, fail on ParentDir, keep the
         // rest. RootDir (an absolute path) is allowed through here so
         // SandboxRelPath::try_new can produce its own AbsoluteDestPath
@@ -1590,6 +1606,37 @@ mod tests {
         assert!(matches!(
             PatchDest::try_new("foo/../bar"),
             Err(PatchError::DestTraversal(_))
+        ));
+    }
+
+    #[test]
+    fn patchdest_strips_leading_home_tilde() {
+        // Package authors write `path = "~/.claude"` in their mfile
+        // meaning "map onto sandbox home"; destinations are already
+        // home-relative, so the tilde is redundant and must not
+        // survive into the tar entry or materialize target (else
+        // files land at `/home/~/.claude/...` inside the sandbox).
+        let cases = [
+            ("~/.claude", ".claude"),
+            ("~/foo/bar", "foo/bar"),
+            ("~/", ""), // empty after strip → EmptyDest below
+        ];
+        for (input, expected) in cases {
+            if expected.is_empty() {
+                assert!(
+                    matches!(PatchDest::try_new(input), Err(PatchError::EmptyDest)),
+                    "input {input} should reject as empty after tilde strip",
+                );
+            } else {
+                let dest = PatchDest::try_new(input).expect(input);
+                assert_eq!(dest.as_sandbox_path().as_str(), expected, "input: {input}");
+            }
+        }
+        // Bare `~` is also nonsensical as a destination — home root
+        // itself isn't a file target — so it rejects as empty too.
+        assert!(matches!(
+            PatchDest::try_new("~"),
+            Err(PatchError::EmptyDest)
         ));
     }
 

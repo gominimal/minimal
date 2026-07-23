@@ -310,13 +310,18 @@ mod tests {
                 )
             })
             .collect();
-        // Dir mapping: source has `/**` for walker fan-out, dest is
-        // the bare path (walker computes per-file dests).
-        assert_eq!(by_source.get("~/.claude/**").copied(), Some("~/.claude"));
-        // File mapping: source == dest.
+        // Dir mapping: source keeps `~/` because expansion happens
+        // at gate time; dest strips the leading `~/` because it's
+        // always sandbox-home-relative by construction
+        // (`PatchDest::try_new` normalizes it out — a literal `~`
+        // directory would otherwise land inside the sandbox home as
+        // `/home/~/.claude/…`).
+        assert_eq!(by_source.get("~/.claude/**").copied(), Some(".claude"));
+        // File mapping: source keeps `~/` for gate-time expansion;
+        // dest is the same path with the tilde prefix stripped.
         assert_eq!(
             by_source.get("~/.config/claude/settings.json").copied(),
-            Some("~/.config/claude/settings.json"),
+            Some(".config/claude/settings.json"),
         );
         for pp in contribution.patches() {
             assert_eq!(pp.source(), &expected_source);
@@ -346,8 +351,9 @@ mod tests {
             );
             assert_eq!(
                 patch.patch().dest().as_sandbox_path().as_str(),
-                "~/.claude",
-                "dest should be the trimmed dir path",
+                ".claude",
+                "dest should be the trimmed dir path with the leading `~/` stripped \
+                 by PatchDest::try_new (destinations are already home-relative)",
             );
         }
     }

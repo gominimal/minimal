@@ -109,6 +109,32 @@ pub enum Conflict {
         /// contributor wanted copied.
         disagreeing_sources: Vec<(Source, String)>,
     },
+    /// Two patches want to occupy the same tree node from opposite
+    /// sides: one contributor's destination is a component-boundary
+    /// prefix of another's, so one wants to place a file where the
+    /// other expects a directory (or vice versa). Distinct
+    /// destinations, so `PatchSourceMismatch` doesn't fire — but
+    /// `materialize_patches_into_home` can't create both at Finalize
+    /// time (whichever `fs::copy` runs second fails). Caught here so
+    /// the operator gets a Compose-time error naming both
+    /// contributors instead of a mid-Finalize `NotADirectory` /
+    /// `IsADirectory` fault that leaves the session stuck in
+    /// `Materializing`.
+    PatchDestPrefixCollision {
+        /// The shorter destination — the one that would land as a
+        /// file directly under `<home>`.
+        shorter: paths::SandboxRelPath,
+        /// The longer destination, whose parent-chain includes
+        /// `shorter` as a directory.
+        longer: paths::SandboxRelPath,
+        /// The provenance of both contributors.
+        ///
+        /// Boxed to keep [`Conflict`] — and the two error enums that
+        /// embed it, [`Error`] and [`ComposeError`] — under the
+        /// `result_large_err` size threshold; this array is by far the
+        /// largest payload across every conflict variant.
+        contributors: Box<[(Source, paths::SandboxRelPath); 2]>,
+    },
 }
 
 impl fmt::Display for Conflict {
@@ -150,6 +176,27 @@ impl fmt::Display for Conflict {
                     "\nhint: add a pattern matching the conflicting source path(s) \
                      above to your patch policy's ignore list to drop both, \
                      or remove one of the contributors"
+                )
+            }
+            Self::PatchDestPrefixCollision {
+                shorter,
+                longer,
+                contributors,
+            } => {
+                write!(
+                    f,
+                    "patch destinations `{shorter}` and `{longer}` collide: \
+                     one wants a file where the other expects a directory"
+                )?;
+                for (source, dest) in contributors.iter() {
+                    write!(f, "\n  - `{dest}` (from {source})")?;
+                }
+                write!(
+                    f,
+                    "\nhint: pick destinations that don't nest — e.g. move the \
+                     file target under a distinct name, or add a pattern \
+                     matching one contributor's source to your patch policy's \
+                     ignore list to drop it"
                 )
             }
         }
@@ -223,6 +270,75 @@ fn check_patch_mismatches<'a, T: Provenanced + 'a>(
             disagreeing_sources: collect_contributions(group, &pattern),
         })
         .map_or(Ok(()), Err)
+}
+
+/// Reject two patches whose destinations are prefixes of one another
+/// on a path-component boundary — `foo` vs `foo/bar` — since
+/// `materialize_patches_into_home` can't create the shorter as a
+/// file *and* the longer as `<shorter>/<tail>`. Caught here so the
+/// operator sees a compose-time conflict listing both contributors,
+/// rather than a mid-`FinalizeSession` `NotADirectory`/`IsADirectory`
+/// I/O error that leaves the session stuck in `Materializing`.
+///
+/// O(n²) worst-case, matching the existing `check_patch_mismatches`
+/// shape — the batches this runs against are small (a few dozen at
+/// most in practice).
+fn check_patch_prefix_collisions<'a, T: Provenanced + 'a>(
+    items: impl IntoIterator<Item = &'a T> + Clone,
+    dest: impl Fn(&T) -> &paths::SandboxRelPath,
+) -> Result<(), Conflict> {
+    let all: Vec<&'a T> = items.into_iter().collect();
+    for (i, a) in all.iter().enumerate() {
+        let a_dest = dest(a);
+        for b in &all[i + 1..] {
+            let b_dest = dest(b);
+            if a_dest == b_dest {
+                // Same-destination collisions are the
+                // `PatchSourceMismatch` case: same source is a dup
+                // (fine), different source is that other conflict
+                // (fires from `check_patch_mismatches`, not here).
+                continue;
+            }
+            let (shorter, longer, shorter_src, longer_src) =
+                if is_component_prefix(a_dest.as_utf8_path(), b_dest.as_utf8_path()) {
+                    (a_dest, b_dest, a.source(), b.source())
+                } else if is_component_prefix(b_dest.as_utf8_path(), a_dest.as_utf8_path()) {
+                    (b_dest, a_dest, b.source(), a.source())
+                } else {
+                    continue;
+                };
+            return Err(Conflict::PatchDestPrefixCollision {
+                shorter: shorter.clone(),
+                longer: longer.clone(),
+                contributors: Box::new([
+                    (shorter_src.clone(), shorter.clone()),
+                    (longer_src.clone(), longer.clone()),
+                ]),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// True iff `shorter` is a component-boundary prefix of `longer`
+/// (both relative, equal-length is not a prefix — that would be
+/// same-destination, covered by `check_patch_mismatches`). Component
+/// boundary so `foo` doesn't wrongly match `foobar` (only `foo/bar`).
+fn is_component_prefix(shorter: &camino::Utf8Path, longer: &camino::Utf8Path) -> bool {
+    let mut s = shorter.components();
+    let mut l = longer.components();
+    loop {
+        match (s.next(), l.next()) {
+            // Matched component: keep comparing the rest.
+            (Some(a), Some(b)) if a == b => {}
+            // `shorter` has an unmatched component (differs here, or is
+            // the longer path), or both ran out at equal length — either
+            // way `shorter` is not a *proper* component prefix.
+            (Some(_), _) | (None, None) => return false,
+            // `shorter` ran out while `longer` has more: proper prefix.
+            (None, Some(_)) => return true,
+        }
+    }
 }
 
 /// Bucket `items` by `key`, preserving the order in which keys are
@@ -1109,6 +1225,9 @@ impl Composition {
             |p| p.patch().destination(),
             |p| p.patch().host_path().as_str(),
         )?;
+        check_patch_prefix_collisions(self.patches.iter().chain(incoming_patches.iter()), |p| {
+            p.patch().destination()
+        })?;
         Ok(())
     }
 }
@@ -1527,6 +1646,7 @@ pub(crate) fn compose_contribution(
         |p| p.patch().destination(),
         |p| p.patch().host_path().as_str(),
     )?;
+    check_patch_prefix_collisions(gated_patches.iter(), |p| p.patch().destination())?;
     let final_policy = UserPolicy::empty()
         .with_vars(vars_policy)
         .with_patches(patches_policy);
@@ -2825,6 +2945,106 @@ mod tests {
                 }
                 other => panic!("unexpected: {other:?}"),
             }
+        }
+
+        // ---------------- check_patch_prefix_collisions ----------------
+
+        #[test]
+        fn prefix_collision_sibling_dests_ok() {
+            // Nothing overlaps: two files in the same dir don't
+            // collide, they just coexist under `<home>/config/`.
+            let items = vec![
+                pp("/etc/foo", "config/foo", project_source()),
+                pp("/etc/bar", "config/bar", user_source()),
+            ];
+            assert!(
+                check_patch_prefix_collisions(&items, |p| p.patch().dest().as_sandbox_path())
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn prefix_collision_same_dest_ok() {
+            // Exact-equal destinations are the
+            // `PatchSourceMismatch` case, not this one. This check
+            // must not fire on them regardless of whether the
+            // sources agree.
+            let items = vec![
+                pp("/etc/foo", "config/foo", project_source()),
+                pp("/etc/foo", "config/foo", user_source()),
+            ];
+            assert!(
+                check_patch_prefix_collisions(&items, |p| p.patch().dest().as_sandbox_path())
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn prefix_collision_shared_string_prefix_ok() {
+            // Component boundary matters: `foo` isn't a prefix of
+            // `foobar` — those are just two independent files at the
+            // same level.
+            let items = vec![
+                pp("/etc/foo", "foo", project_source()),
+                pp("/etc/foobar", "foobar", user_source()),
+            ];
+            assert!(
+                check_patch_prefix_collisions(&items, |p| p.patch().dest().as_sandbox_path())
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn prefix_collision_nested_dests_errors() {
+            // Concrete example: one contributor wants a file at
+            // `foo`, another wants a file at `foo/bar`. Materialize
+            // would fail on whichever ran second.
+            let items = vec![
+                pp("/etc/foo.txt", "foo", project_source()),
+                pp(
+                    "/etc/bar.txt",
+                    "foo/bar",
+                    Source::UserLoadout { name: "dev".into() },
+                ),
+            ];
+            let err = check_patch_prefix_collisions(&items, |p| p.patch().dest().as_sandbox_path())
+                .unwrap_err();
+            match err {
+                Conflict::PatchDestPrefixCollision {
+                    shorter,
+                    longer,
+                    contributors,
+                } => {
+                    assert_eq!(shorter.as_utf8_path().as_str(), "foo");
+                    assert_eq!(longer.as_utf8_path().as_str(), "foo/bar");
+                    assert_eq!(contributors.len(), 2);
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn prefix_collision_input_order_independent() {
+            // The check fires whichever order the two destinations
+            // appear in the batch. Guards against a future
+            // refactor that only compares "later against earlier".
+            let a = pp("/etc/foo.txt", "foo", project_source());
+            let b = pp(
+                "/etc/bar.txt",
+                "foo/bar",
+                Source::UserLoadout { name: "dev".into() },
+            );
+            assert!(
+                check_patch_prefix_collisions(&[a.clone(), b.clone()], |p| p
+                    .patch()
+                    .dest()
+                    .as_sandbox_path())
+                .is_err()
+            );
+            assert!(
+                check_patch_prefix_collisions(&[b, a], |p| p.patch().dest().as_sandbox_path())
+                    .is_err()
+            );
         }
 
         // ---------------- dedupe_by_name ----------------

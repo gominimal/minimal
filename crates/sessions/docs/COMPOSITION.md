@@ -9,8 +9,10 @@ sequence** spanning two processes:
    alongside the client's wire contribution, and emits anything
    that needs user gating.
 3. **Client gates** those pending items against the user policy.
-4. **Daemon assembles** the final `Composition` and hands it to the
-   apply layer.
+4. **Daemon assembles** the final `Composition`, the client streams
+   the composition's approved patch files up to the daemon, and the
+   daemon materializes them into the sandbox home before promoting
+   the session to `Active`.
 
 User policy is enforced **only on the client**. The daemon never
 runs user policy; it forwards items needing approval and applies the
@@ -19,8 +21,10 @@ verdicts that come back.
 ## End-to-end flow
 
 The daemon-side compose runs off the project files in the session's
-*daemon-side workspace*, so `min activate` splits into three
-sequential RPCs:
+*daemon-side workspace*, and the composition's approved patches
+must land on the daemon's disk before the session is attachable —
+so `min activate` splits into four sequential RPCs bracketed by
+two file-tree uploads:
 
 ```mermaid
 sequenceDiagram
@@ -34,15 +38,20 @@ sequenceDiagram
     Note over C: Composition → WireContribution (composition_to_wire)
     C->>D: CreateSession (name, project_path, network, policy, attrs)
     D-->>C: CreateSessionResponse { id }
-    C->>D: WorkspaceFilesTarZst upload (SFTP-shaped, into daemon workspace tree)
+    C->>D: WorkspaceFilesTarZst upload (into daemon workspace tree)
     C->>D: ConfigureLoadout { session_id, contribution }
     Note over D: Phase 2 — collect project + package contributions off workspace mfile, route pending items
     D-->>C: ConfigureLoadoutResponse::Pending carrying ContributionResponse
     Note over C: Phase 3 — policy gate pending items, produce verdicts
     C->>D: SubmitVerdict carrying ContributionVerdict
-    Note over D: Phase 4 — apply verdicts, assemble Composition, promote record to Active
-    D-->>C: SessionStep::Active { id }
-    Note over D: Launcher consumes the Composition at shell-mint time (deferred)
+    Note over D: Phase 4a — apply verdicts, assemble Composition, promote record Pending → Materializing
+    D-->>C: SessionStep::Materialized { id }
+    Note over C: Phase 4b — collect approved patch (host_path, dest) pairs from contribution + verdict
+    C->>D: WorkspacePatchesTarZst upload (into <workspace>/patches/ atomically, marker written last)
+    C->>D: FinalizeSession { session_id }
+    Note over D: Phase 4c — check marker, copy patches into sandbox home, promote Materializing → Active
+    D-->>C: FinalizeSessionResponse (empty)
+    Note over D: Launcher consumes the Composition at shell-mint time
 ```
 
 Each phase consumes the previous phase's output and produces the
@@ -50,8 +59,8 @@ next phase's input. There is no loop: the daemon batches every
 pending item into one `ContributionResponse`, and the client
 batches every verdict into one `ContributionVerdict`.
 
-**Why three RPCs, not one.** `CreateSession` only allocates the id;
-compose runs later in `ConfigureLoadout`. The intervening
+**Why the split.** `CreateSession` only allocates the id; compose
+runs later in `ConfigureLoadout`. The intervening
 `WorkspaceFilesTarZst` upload is what stages the project's
 `minimal.toml` — plus any local `packages/`, `stacks/`, `profiles/`
 directories a project defines *for itself*, though most projects
@@ -65,11 +74,22 @@ carried in the tar. Merging create and configure into a single
 RPC would leave the compose without a workspace mfile to start
 from, so `find_mfile` would fall through to "no project
 contribution" and every project-declared package (whether local
-or upstream-supplied) would silently vanish. The client's
-`cmd_activate` unconditionally follows this order, even for
-`--sync none` (which just skips the upload — Phase 2 then
-composes against a bare workspace and only whatever wire
-contribution came from Phase 1 survives).
+or upstream-supplied) would silently vanish.
+
+The second upload + `FinalizeSession` exists because the finalized
+`Composition` names patch source files that live on the *client's*
+host filesystem (e.g. `~/.claude/**`, or a loadout's `~/.zshrc`).
+The daemon can't reach those paths itself, so the client is
+authoritative for streaming them up before the sandbox home can be
+populated. Splitting the finalize step means an attach against a
+session whose patches never arrived is refused (see
+`SessionStatus::Materializing` below) rather than silently
+succeeding into an empty home. The client's `cmd_activate`
+unconditionally follows this order, even for `--sync none` (which
+just skips the *first* upload — Phase 2 then composes against a
+bare workspace and only whatever wire contribution came from
+Phase 1 survives; the patches upload still runs against the
+resulting composition).
 
 **A re-`ConfigureLoadout` against a session with a pending stash is
 refused with `WouldBlock`.** Overwriting the stashed
@@ -203,14 +223,26 @@ order: items the policy auto-decides are emitted in input order,
 items routed through the hook land at the end. The daemon must
 correlate by `id`, not slice position.
 
-### Phase 4 — Daemon assembles and hands off
+### Phase 4 — Daemon assembles, client uploads patches, daemon finalizes
 
-**Ready path.** On `ComposeOutcome::Ready`, the daemon already
-holds a finalized `Composition` (built directly inside
-`SessionComposer::compose`). The record persists as `Active` in
-one write, the `Composition` is retained on the live session
-actor (`SessionInner::Active { composition, ... }`) for the
-launcher, and `ConfigureLoadoutResponse::Ready` ships.
+Phase 4 has three sub-steps: the daemon assembles the finalized
+`Composition` (**4a**), the client streams the composition's
+approved patch files onto the daemon disk (**4b**), and the daemon
+copies those files into the sandbox home and flips the record to
+`Active` (**4c**). The record status walks
+`Pending → Materializing → Active` — attach is refused until the
+record reaches `Active`, so a client that dies mid-flow never
+lands the operator on an empty-home shell.
+
+#### Phase 4a — Assemble the Composition
+
+**Materialized path.** On `ComposeOutcome::Ready`, the daemon
+already holds a finalized `Composition` (built directly inside
+`SessionComposer::compose`). The record is written as
+`Materializing` (not `Active`) in one store write, the
+`Composition` is retained on the live session actor
+(`SessionInner::Active { composition, ... }`) for the launcher,
+and `ConfigureLoadoutResponse::Materialized` ships.
 
 **Pending path.** On `ComposeOutcome::Pending`, the daemon
 stashes the matching `PendingComposeState` on the session actor
@@ -240,13 +272,17 @@ runs Phase 3 and sends a `ContributionVerdict` over the
    Some(_) }`.
 3. Merges the stashed `client_contribution` via
    `Composition::extend_from_wire` — same cross-process conflict
-   checks as the Ready path.
-4. Promotes the record `Pending → Active` via `store.save`.
+   checks as the Materialized path.
+4. Promotes the record `Pending → Materializing` via `store.save`
+   (not `Active` — that comes in Phase 4c after the client has
+   uploaded patches).
 5. Replaces the actor's `SessionInner::Draft { pending: Some(_) }`
-   with `SessionInner::Active { composition, ... }`, which is
-   also what drops the stash — it survives every failure path
-   above and only goes away on a successful finalization.
-6. Replies with `SessionStep::Active { id }`.
+   with `SessionInner::Active { composition, ... }`. Note the
+   asymmetry: the actor is `Active` (has a composition in memory)
+   while the on-disk record is `Materializing` — the record's
+   status tracks *external* attachability, the actor's `inner`
+   tracks *whether compose has produced a Composition*.
+6. Replies with `SessionStep::Materialized { id }`.
 
 **Resume stash is in-memory only.** A `Draft` actor spawned from
 an on-disk `Pending` record (daemon restart, or the session was
@@ -256,40 +292,127 @@ created before a crash) has `pending: None` — nothing to resume.
 new session to retry. Survival across restarts is a separate
 concern.
 
+#### Phase 4b — Client uploads the composition's patches
+
+The finalized `Composition` names patch source files by their
+host paths. Only the client can reach those paths, so it's
+authoritative for the upload. `cmd_activate` collects the
+`(host_path, sandbox_destination)` pairs from two sources:
+
+- `contribution.patches` — patches contributed by client-side
+  loadouts, which never round-tripped through the daemon.
+- `approved_patches_from_verdict(&verdict)` — patches the daemon
+  surfaced as pending in Phase 3 and the user approved during
+  Phase 3 gating.
+
+Deduplicated by destination (the composer's cross-process check
+guarantees duplicates are exact matches with identical sources),
+the pairs stream up over the `WorkspacePatchesTarZst` subsystem.
+The daemon unpacks each entry into `<workspace>/patches/<dest>`
+via a staging-dir + atomic rename: entries land in
+`<workspace>/patches.tmp/`, and only on a clean stream end does
+the daemon `rename(patches.tmp → patches)` and then write the
+zero-byte `.patches_ready` marker. A mid-stream failure leaves
+`patches.tmp` behind for the next attempt to overwrite — the
+real `patches/` tree is never partial.
+
+Per-entry validation on the daemon side:
+
+- **Traversal**: every entry's path is checked with
+  `safe_relative_path` (rejects absolute paths and any `..`
+  component) before any byte lands on disk. `SandboxRelPath`
+  already rejects these on the wire, but the daemon re-checks
+  because the client is not trusted.
+- **Marker collision**: an entry whose path exactly equals
+  `PATCHES_READY_MARKER` (`.patches_ready`) is rejected — writing
+  it would first race the marker write, and then
+  `materialize_patches_into_home` would silently copy the emptied
+  marker into the sandbox home, zeroing whatever the user had
+  there.
+- **Size cap**: entries larger than `MAX_PATCH_ENTRY_BYTES` (1
+  GiB) are rejected before allocation, so a peer forging a tar
+  header can't drive `Vec::with_capacity` to `usize::MAX` (panic)
+  or trigger the allocator's OOM handler (whole-daemon abort).
+
+Body writes are dispatched onto a `JoinSet` capped at
+`available_parallelism()` tasks so unrelated small files land in
+parallel, and any error aborts every in-flight task before
+propagating so no writes outlive the failing upload.
+
+#### Phase 4c — FinalizeSession
+
+The client calls `FinalizeSession` once the patches upload has
+returned cleanly. The daemon:
+
+1. Refuses if the actor is `Materializing` on-disk but the
+   in-memory `SessionInner` has no `composition` — this catches
+   a `Materializing` record whose actor was respawned from disk
+   after a daemon restart (the composition lives in memory
+   only). See the "restart-orphaned records are reaped or
+   refused" invariant below.
+2. If the `Composition` has patches, checks that
+   `<workspace>/patches/.patches_ready` exists on disk. Missing
+   → `InvalidInput` with an instruction to upload patches and
+   retry. Composition-with-no-patches short-circuits this check
+   (nothing to upload).
+3. Runs `materialize_patches_into_home`: for each
+   `SessionPatch`, copies
+   `<workspace>/patches/<destination>` to
+   `<home>/<destination>`, creating parents as needed. Done once
+   at finalize (not on every attach) so subsequent attaches see
+   the same tree without re-copying and any in-sandbox
+   modifications persist.
+4. Promotes the record `Materializing → Active` via `store.save`
+   and registers the PTask hostname so the session is reachable.
+5. Replies with `FinalizeSessionResponse` (empty).
+
+Already-`Active` sessions are a no-op: `FinalizeSession` is
+idempotent under a client retry after a lost ack.
+
 **Apply.** Whichever path produced the `Composition`, the launcher
 consumes it when the session's shell is minted: packages and vars
-are fed into the sandbox `Env` today; patches and lifecycle hooks
-are held on `SessionInner::Active { composition, ... }` and
-logged at `info!` with `deferred = true` — the file-upload
-plumbing (patches) and in-sandbox exec plumbing (hooks) are still
-to land. Operator visibility is intact even before the plumbing
-does: `log_session_contents` in `crates/minimald/src/session_host.rs`
+are fed into the sandbox `Env`; patches (already materialized into
+the sandbox home during Phase 4c) contribute file mappings that
+the launcher's rootfs setup picks up; lifecycle hooks are held on
+`SessionInner::Active { composition, ... }` and logged at `info!`
+with `deferred = true` — the in-sandbox exec plumbing for hooks
+is still to land. Operator visibility is intact:
+`log_session_contents` in `crates/minimald/src/session_host.rs`
 enumerates every composition item with its provenance.
 
 **Response shape.** `CreateSession` returns
 `CreateSessionResponse { id }`. `ConfigureLoadout` returns either
-`ConfigureLoadoutResponse::Ready` (composition finalized in one
-shot) or `ConfigureLoadoutResponse::Pending { response }` (client
-must gate before the session activates). The `id` is allocated
-before the configure step, so file uploads and any other
-session-scoped RPC can target the session immediately.
+`ConfigureLoadoutResponse::Materialized` (composition finalized in
+one shot) or `ConfigureLoadoutResponse::Pending { response }`
+(client must gate before the composition assembles). `SubmitVerdict`
+returns `SessionStep::Materialized { id }` on success.
+`WorkspacePatchesTarZst` is a channel subsystem, not a JSON RPC —
+it carries a zstd-compressed tar stream and closes on completion;
+errors return via the channel's stderr. `FinalizeSession` returns
+`FinalizeSessionResponse` (empty). The `id` is allocated at
+`CreateSession` time, so every follow-up RPC and upload targets
+the same session.
 
-**State guards.** A session in `SessionStatus::Pending` is not
-attachable via a shell: the attach path routes through
-`configure_loadout` if the session is still `Draft`, and
-propagates the compose error otherwise. Metadata-only RPCs
+**State guards.** A session in `SessionStatus::Pending` or
+`SessionStatus::Materializing` is not attachable via a shell:
+the attach path routes through `configure_loadout` if the
+session is still `Draft`, and rejects `Materializing` records
+with `AttachError::SessionPending`. Metadata-only RPCs
 (`GetSessionRecord`, `ListSessions`, `RenameSession`,
-`DestroySession`) keep working over a Pending session.
+`DestroySession`) keep working over both non-Active states so
+operators can see and clean up sessions stuck mid-activation.
 
 **Empty-contribution fast path.** When the client's wire
 contribution is `default()` AND the daemon's workspace has no
 mfile (or the mfile's project/package contributions are all
-empty), Phase 2 emits no pending items, no
-`Composition::extend_from_wire` merge produces content, and the
-record persists as `Active` and returns via `Ready` in one
-round-trip. This is the path exercised by internal callers today
-(sftp, exec, session-recovery), which skip both the upload step
-and any user contribution.
+empty), Phase 2 emits no pending items,
+`Composition::extend_from_wire` merges nothing, and the record
+persists as `Materializing` in one shot with an empty
+`Composition`. The composition has no patches, so Phase 4b is a
+no-op and `FinalizeSession` short-circuits the marker check and
+finalizes immediately. Internal callers today (sftp, exec,
+session-recovery) skip the file upload, skip user contribution,
+and drive this compressed path directly.
 
 `Composition`'s fields: `vars: Vec<SessionVar>`, `patches:
 Vec<SessionPatch>`, `packages: Vec<ProvenancedPackage>`,
@@ -502,9 +625,14 @@ overload:
   Phase 1, `handle_response`'s `env("HOME")` in Phase 3). The
   `SessionComposer` (Phase 2/4 daemon side) has no fallback —
   daemon `~/...` patterns must resolve from the client's wire vars.
-  `PatchDest` is always relative to the sandbox user's home; `~`
-  and absolute paths are rejected at construction. Patterns retain
-  their `~` form in returned policies, so save/load is lossless.
+  `PatchDest` is always relative to the sandbox user's home;
+  absolute paths and `..` components are rejected at construction.
+  A leading `~/` prefix on the destination is **silently stripped**:
+  destinations are already home-relative, so a package author who
+  writes `path = "~/.claude"` in their mfile means "place `.claude`
+  under sandbox home", not "place a literal `~` directory there." A
+  bare `~` re-hits the empty-dest check. Patterns retain their `~`
+  form in returned policies, so save/load is lossless.
 - **Conflict detection is post-gate.** Per-domain rules:
   - **Vars**: same name + same resolved value → both kept (no
     conflict); same name + different values → `Conflict::VarValueMismatch`.
@@ -531,6 +659,80 @@ overload:
   fatal-on-conflict with a hook the user can answer) is not
   implemented; the `Result`-returning merge shape is the place it
   would land.
+- **Client is authoritative for the patches upload.** Patch source
+  files live on the client's host filesystem, so after a successful
+  Phase 4a the client streams the composition's approved patches
+  up via `WorkspacePatchesTarZst` and calls `FinalizeSession`. The
+  daemon can't reach those paths itself, so there's no daemon-side
+  fallback if the client bails — the session sits at
+  `Materializing` and is not attachable until `FinalizeSession`
+  clears the marker check. The client's `cmd_activate` runs the
+  upload + finalize as a single transaction; on error it
+  `best_effort_destroy`s the session so operators don't accumulate
+  stuck `Materializing` records.
+- **`Materializing` records don't survive daemon restart.** The
+  `SessionInner::Active { composition, .. }` state that Phase 4a
+  produces is memory-only: the composition isn't persisted to the
+  record, only the *status* is. A `Materializing` record whose
+  actor is respawned from disk after a restart has no
+  in-memory composition to check against, so `Manager::init`
+  runs `reap_unresumable_records` at startup and deletes any
+  `Pending` or `Materializing` record it finds (with an `info!`
+  log). If a race lets one through, `finalize` refuses with an
+  `InvalidInput` fault ("session is Materializing but has no
+  in-memory composition") so the operator sees the problem
+  instead of silently attaching to an empty-home shell.
+- **Patches unpack is atomic; the marker is the precondition.**
+  Entries land in `<workspace>/patches.tmp/` first; only on a
+  clean stream end does the daemon install the new tree at
+  `<workspace>/patches/` and write the `.patches_ready` marker.
+  `FinalizeSession` checks the marker before promoting the
+  record. A mid-stream failure leaves `patches.tmp` behind for
+  the next attempt to overwrite; the real `patches/` tree is
+  never partial and the marker never lies.
+
+  The install uses `renameat2(RENAME_EXCHANGE)` when a prior
+  `patches/` tree exists — the kernel swaps the two directories
+  atomically, so a `FinalizeSession` racing the swap sees either
+  "old contents + old marker" or "new contents + new marker,"
+  never a gap where `patches/` is absent or where the marker
+  points at content that isn't there. First install (no prior
+  tree) falls through to a plain `rename`, which is atomic when
+  the destination doesn't exist. The old contents (which end up
+  under the staging path after the exchange) are cleaned up
+  best-effort afterward.
+
+  Two concurrent uploads for the *same* session don't corrupt
+  each other. Each upload writes to a per-upload unique staging
+  directory (`patches.upload.<nanos>.tmp`), so the unpack phases
+  never share disk state. The install-and-marker step then takes
+  a per-session mutex (`SessionHandle::patches_upload_lock`), so
+  only one upload at a time is running the `RENAME_EXCHANGE +
+  marker write` critical section — the second upload's swap
+  observes the first's finished tree as its "old contents" and
+  overwrites cleanly. The lock is held only across the
+  seconds-of-work install step, never across the
+  minutes-of-work unpack, so throughput is unaffected.
+
+  The marker filename is reserved: an incoming patch entry whose
+  path exactly equals `PATCHES_READY_MARKER` is rejected by the
+  unpacker, since otherwise `materialize_patches_into_home` would
+  silently copy the emptied marker into the sandbox home.
+- **Peer-supplied entry sizes are capped, and a per-run byte
+  budget bounds total in-flight memory.** Two limits stack:
+  - `MAX_PATCH_ENTRY_BYTES` (1 GiB) refuses any single tar entry
+    whose declared size would push `Vec::with_capacity` into an
+    allocation panic or OOM (allocator abort → whole-daemon down).
+  - `MAX_UNPACK_INFLIGHT_BYTES` (1 GiB) is a `Semaphore` acquired
+    *before* each body is read from the tar stream. If the total
+    bytes held across in-flight write tasks would exceed the
+    budget, the tar loop parks — pumping backpressure through the
+    pipe into the SSH channel — instead of piling additional
+    bodies into RAM.
+  Peak daemon memory during unpack is therefore bounded by the
+  budget, *not* multiplied by CPU count. Legitimate patch
+  payloads are small dotfile trees; both ceilings exist as
+  adversarial-input backstops, not throughput knobs.
 - **Internal invariants panic, not error.** `compute_dest` panics on
   precondition violation. These are bug signals, not recoverable.
 - **Terminating failure modes:** `Denied` (explicit policy reject),
