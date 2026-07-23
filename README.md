@@ -80,9 +80,13 @@ In this example we'll create a new git repo from within a Minimal sandbox, using
 mkdir -p ~/projects/foo
 cd ~/projects/foo
 
-# create and update a minimal.toml file
+# create a minimal.toml file
 min init
-min add --session git gh claude-code
+
+# declare your session's tools by editing the scaffolded [session] table in
+# minimal.toml; extend its packages list (don't add a second [session] table):
+#   [session] # min attach
+#   packages = ["base", "vim", "git", "gh", "claude-code"]
 
 # start and enter a sandbox, which copies up the CWD file tree into the sandbox
 min activate --attach .
@@ -104,9 +108,13 @@ Once you have created the PAT, copied it into your keychain (e.g. `security add-
 mkdir -p ~/projects/foo
 cd ~/projects/foo
 
-# create and update a minimal.toml file
+# create a minimal.toml file
 min init
-min add --session git gh claude-code mermaid-cli kittyview less emacs
+
+# declare your session's tools by editing the scaffolded [session] table in
+# minimal.toml; extend its packages list (don't add a second [session] table):
+#   [session] # min attach
+#   packages = ["base", "vim", "git", "gh", "claude-code", "mermaid-cli", "kittyview", "less", "emacs"]
 
 # copy the GitHub PAT to your clipboard from your macOS keychain
 security find-generic-password -w -s "PAT-foo-repo" -a "my-mac-user-name" | pbcopy
