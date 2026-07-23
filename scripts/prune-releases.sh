@@ -118,6 +118,9 @@ for row in "${rows[@]}"; do
     fi
 
     # Only consider tags the caller asked for (default: the auto-cut release-*).
+    # $MATCH is a deliberate glob pattern (default `release-*`), so it must
+    # stay unquoted to match as a glob rather than a literal.
+    # shellcheck disable=SC2254
     case "$tag" in
         $MATCH) ;;
         *) skipped=$((skipped + 1)); continue ;;

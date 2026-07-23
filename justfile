@@ -233,6 +233,12 @@ test-installer:
         SH="$sh" "$sh" scripts/install_test.sh
     done
 
+# Shellcheck EVERY script under scripts/ (not just the installer's two files).
+# The reviewed harness the frozen ci-shell-installer.yml can't widen to; CI runs
+# the same check through crates/common/tests/shell_lint.rs (part of `just test`).
+lint-shell:
+    bash scripts/lint-shell.sh
+
 # Run the promotion provenance gate's test harness (stubbed `gh`, no network,
 # no auth); shellcheck runs when present.
 test-promote-gate:
