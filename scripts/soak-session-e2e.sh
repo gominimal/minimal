@@ -15,7 +15,7 @@
 # The caller sets the VM up exactly as the KVM lane does — minvmd + minimal
 # on PATH, MINVMD_KERNEL_PATH / MINVMD_ROOTFS_PATH / MINVMD_INITRAMFS set,
 # libkrun on the loader path — and passes the VM knobs through the
-# environment (E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd E2E_PROJECT_DIR=/tmp),
+# environment (E2E_VM=1 E2E_MINIMAL_ARGS="--provider local-minvmd" E2E_PROJECT_DIR=/tmp),
 # same as the lane invocation. Each iteration runs session-e2e.sh, which
 # creates its own fresh XDG state, so every pass is a clean cold start.
 #

@@ -286,6 +286,7 @@ mod tests {
             repo_dir: None,
             minimal_dir: None,
             config_dir: Some(PathBuf::from("/definitely/does/not/exist")),
+            provider: None,
             minvmd: false,
             no_input: false,
         };
@@ -307,6 +308,7 @@ mod tests {
             repo_dir: None,
             minimal_dir: None,
             config_dir: Some(tmp.path().to_path_buf()),
+            provider: None,
             minvmd: false,
             no_input: false,
         };

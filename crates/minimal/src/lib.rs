@@ -250,10 +250,15 @@ pub struct GlobalArgs {
     /// state and cache dirs, not `~/Library/Application Support`.
     #[arg(long, global = true)]
     pub config_dir: Option<PathBuf>,
-    /// Linux: run minimald inside the minvmd microVM (DM1) instead of natively
-    /// on the host (DM2, the default). No effect on macOS, where minvmd is the
-    /// only backend.
-    #[arg(long, global = true)]
+    /// Select the daemon backend that hosts sessions. On Linux, `local-native`
+    /// (the default) runs minimald on the host; `local-minvmd` runs it inside
+    /// the minvmd microVM (DM1). No effect on macOS, where minvmd is the only
+    /// backend.
+    #[arg(long, global = true, value_name = "PROVIDER")]
+    pub provider: Option<Provider>,
+    /// Deprecated alias for `--provider local-minvmd`, kept for backward
+    /// compatibility and hidden from help. Prefer `--provider local-minvmd`.
+    #[arg(long, global = true, hide = true, conflicts_with = "provider")]
     pub minvmd: bool,
     /// Skip interactive prompts that need a terminal (e.g. the session
     /// picker shown by bare `min` or `min attach` with no session argument).
@@ -262,6 +267,14 @@ pub struct GlobalArgs {
     /// not a terminal.
     #[arg(long, global = true, default_value_t = false)]
     pub no_input: bool,
+}
+
+impl GlobalArgs {
+    /// Whether the minvmd microVM backend (DM1) is selected, via either
+    /// `--provider local-minvmd` or the deprecated `--minvmd` alias.
+    pub fn use_minvmd(&self) -> bool {
+        self.minvmd || matches!(self.provider, Some(Provider::LocalMinvmd))
+    }
 }
 
 #[derive(Debug, Args)]
@@ -302,6 +315,19 @@ pub struct ActivateArgs {
     /// Automatically attach after creation
     #[arg(long)]
     pub attach: bool,
+}
+
+/// Which daemon backend ("provider") hosts sessions.
+///
+/// On Linux the default is the host-native daemon (DM2); `local-minvmd` runs
+/// `minimald` inside the minvmd microVM (DM1) instead. On macOS minvmd is the
+/// only backend, so the choice has no effect there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Provider {
+    /// Linux: run minimald natively on the host (the default).
+    LocalNative,
+    /// Run minimald inside the minvmd microVM.
+    LocalMinvmd,
 }
 
 /// Configuration for file sync during activation.
@@ -733,7 +759,7 @@ pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyho
 
 /// Ensure the minimald daemon is running, autospawning it if necessary.
 fn ensure_daemon(global: &GlobalArgs) -> Result<(), anyhow::Error> {
-    autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref())
+    autospawn::ensure_daemon_running(global.use_minvmd(), global.minimal_dir.as_deref())
         .context("Failed to ensure the minimald daemon is running")
 }
 
@@ -1898,7 +1924,7 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
     // Cheap and bounded (a state-file read, or a connect to a local socket that
     // refuses at once when nothing listens), so it runs inline rather than on
     // the blocking pool — unlike the shutdown wait below, which sleep-polls.
-    if !autospawn::is_daemon_running(global.minvmd, global.minimal_dir.as_deref())
+    if !autospawn::is_daemon_running(global.use_minvmd(), global.minimal_dir.as_deref())
         .context("Failed to determine whether the daemon is running")?
     {
         println!("Daemon is not running.");
@@ -1906,7 +1932,7 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
     }
 
     // Racy by nature: the daemon may go down between the probe and this connect
-    // (or `--minvmd` may point the probe and the client at different backends),
+    // (or `--provider` may point the probe and the client at different backends),
     // so a connect failure is still a real error, not something to swallow.
     let mut client = connect_daemon(global).await?;
 
@@ -1926,7 +1952,7 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
             // The wait polls the lifecycle file on a sleep loop, so it goes on
             // the blocking pool rather than stalling an async worker for up to
             // 20s (rust-coding-standards: no blocking in an async context).
-            let (use_minvmd, minimal_dir) = (global.minvmd, global.minimal_dir.clone());
+            let (use_minvmd, minimal_dir) = (global.use_minvmd(), global.minimal_dir.clone());
             tokio::task::spawn_blocking(move || {
                 autospawn::wait_for_daemon_stopped(use_minvmd, minimal_dir.as_deref())
             })
@@ -2373,6 +2399,42 @@ mod tests {
         assert!(
             hosts_file.contains(r#"q\"uote"#) && hosts_file.contains(r"back\\slash"),
             "path must reach ssh escaped, got: {hosts_file}"
+        );
+    }
+
+    #[test]
+    fn provider_local_minvmd_selects_the_vm_backend() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["min", "--provider", "local-minvmd", "ls"]).unwrap();
+        assert!(cli.global_args.use_minvmd());
+    }
+
+    #[test]
+    fn provider_local_native_is_the_host_backend() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["min", "--provider", "local-native", "ls"]).unwrap();
+        assert!(!cli.global_args.use_minvmd());
+    }
+
+    #[test]
+    fn no_provider_defaults_to_the_host_backend() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["min", "ls"]).unwrap();
+        assert!(!cli.global_args.use_minvmd());
+    }
+
+    #[test]
+    fn deprecated_minvmd_flag_still_selects_the_vm_backend() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["min", "--minvmd", "ls"]).unwrap();
+        assert!(cli.global_args.use_minvmd());
+    }
+
+    #[test]
+    fn provider_and_deprecated_minvmd_flag_conflict() {
+        use clap::Parser as _;
+        assert!(
+            Cli::try_parse_from(["min", "--provider", "local-native", "--minvmd", "ls"]).is_err()
         );
     }
 

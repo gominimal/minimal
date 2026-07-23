@@ -26,7 +26,7 @@ native-dir   := scratch / "native-state"
 # covers the rest. The Linux lanes run nextest's ci profile; macOS has none.
 scope      := if os() == "macos" { "-p minvmd -p sessions" } else { "--workspace" }
 ci-profile := if os() == "macos" { "" } else { "--profile ci" }
-e2e-env    := "E2E_VM=1 E2E_PROJECT_DIR=/tmp" + if os() == "linux" { " E2E_MINIMAL_ARGS=--minvmd" } else { "" }
+e2e-env    := "E2E_VM=1 E2E_PROJECT_DIR=/tmp" + if os() == "linux" { " E2E_MINIMAL_ARGS='--provider local-minvmd'" } else { "" }
 
 # Shared dev-stack env: target/debug on PATH so autospawn finds sibling
 # binaries; MINVMD_* are inert outside the VM recipes. 150s timeouts: the

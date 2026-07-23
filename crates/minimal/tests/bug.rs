@@ -73,6 +73,7 @@ fn global_args(state: &Path, config: &Path) -> GlobalArgs {
         repo_dir: None,
         minimal_dir: Some(state.to_path_buf()),
         config_dir: Some(config.to_path_buf()),
+        provider: None,
         minvmd: false,
         no_input: false,
     }

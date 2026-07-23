@@ -30,6 +30,7 @@ async fn version_succeeds_without_daemon() {
         repo_dir: None,
         minimal_dir: Some(std::path::PathBuf::from("/nonexistent")),
         config_dir: None,
+        provider: None,
         minvmd: false,
         no_input: false,
     };

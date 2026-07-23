@@ -10,7 +10,7 @@ interactive teardown a user performs.
 
 Usage: e2e-attach-pty.py <add_tool> <argv...>
   <add_tool>  package to `min add` (also its binary + `--version` subject)
-  <argv...>   the command to spawn under the pty, e.g. `min --minvmd attach <sid>`
+  <argv...>   the command to spawn under the pty, e.g. `min --provider local-minvmd attach <sid>`
 
 Prints the full captured terminal output on stdout. Exits 0 iff the attach
 process exited 0.

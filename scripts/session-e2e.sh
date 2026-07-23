@@ -4,7 +4,7 @@
 # so the IDENTICAL proof runs against all three deployment targets:
 #
 #   Linux native   minimald on the host          (no extra env)
-#   Linux KVM      minimald in a minvmd microVM  E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd
+#   Linux KVM      minimald in a minvmd microVM  E2E_VM=1 E2E_MINIMAL_ARGS="--provider local-minvmd"
 #   macOS HVF      minimald in a minvmd microVM  E2E_VM=1 (macOS is always VM-backed)
 #
 # Two proofs, in order, on EVERY lane:
@@ -50,7 +50,7 @@
 #   - MINVMD_BOOT_LOG (optional) to override the guest-console capture path
 #
 # Environment:
-#   E2E_MINIMAL_ARGS    global args for every `min` call (e.g. --minvmd)
+#   E2E_MINIMAL_ARGS    global args for every `min` call (e.g. --provider local-minvmd)
 #   E2E_PROJECT_DIR     project to activate (default: a self-seeded throwaway
 #                       dir; VM lanes pass /tmp)
 #   E2E_ACTIVATE_ARGS   extra args for `min activate` (e.g. a future
