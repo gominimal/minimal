@@ -61,12 +61,15 @@ const MAX_SESSION_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const LOG_FILES_MAX: usize = 5;
 /// Entry cap for the recursive state-dir listing.
 const LISTING_MAX_ENTRIES: usize = 100_000;
-/// Ceiling on the whole client-facing transfer. Every collector is deadlined
-/// individually, but those deadlines only bound work — a client that holds the
-/// channel open and stops reading it parks the pump instead, and through the
-/// bounded duplex that stalls collection and finalization behind it. This is
-/// the bound on the peer rather than on ourselves.
-const STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long a single write to the client may stall before the stream is
+/// abandoned. This bounds a *non-reading* peer, not total transfer time: the
+/// pump resets it on every write that makes progress, so a slow-but-advancing
+/// build — up to fifteen 30s [`diagnostics::COLLECTOR_TIMEOUT`] collectors,
+/// ~450s worst case — streams to completion, while a client that stops
+/// draining the channel (backpressure fills the duplex and parks the next
+/// write) trips it. A whole-transfer wall-clock cap, by contrast, would kill a
+/// legitimate slow run and wrongly blame the client for it.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Duplex buffer between the bundle writer and the channel pump.
 const PIPE_BUF: usize = 256 * 1024;
 /// The gvproxy management endpoint, reachable only from inside the switch
@@ -155,18 +158,35 @@ async fn stream_diag_bundle(s: &ServerStateHandle, c: &mut RuChannel<Msg>) -> Re
     };
 
     let mut writer = c.make_writer();
-    // Bounded here rather than around the build: cancelling the pump is safe,
-    // cancelling the builder is not (see `build_bundle`). On expiry the `drop`
-    // below turns the build task's next write into `BrokenPipe`, so it unwinds
-    // through its own error path instead of parking on the full duplex.
-    let copy_result =
-        match tokio::time::timeout(STREAM_TIMEOUT, tokio::io::copy(&mut rx, &mut writer)).await {
-            Ok(r) => r,
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("client stopped reading the bundle for {STREAM_TIMEOUT:?}"),
-            )),
+    // A hand-rolled pump so the deadline is per-write, not whole-transfer:
+    // reading from the build task is left unbounded (its collectors self-bound
+    // via `COLLECTOR_TIMEOUT`, so a slow-but-progressing build must not be
+    // killed), while each write to the client is bounded. A stalled write means
+    // the client stopped draining the channel — backpressure that fills the
+    // duplex and parks collection behind it — which is the non-reading-client
+    // DoS this bound exists for. The bound is on the pump rather than the build
+    // because cancelling the pump is safe and cancelling the builder is not
+    // (see `build_bundle`): on a stall the `drop` below turns the build task's
+    // next write into `BrokenPipe`, so it unwinds through its own error path
+    // instead of parking on the full duplex.
+    let mut buf = vec![0u8; PIPE_BUF];
+    let copy_result = loop {
+        let n = match rx.read(&mut buf).await {
+            Ok(0) => break Ok(()), // EOF: the build task finished and dropped tx.
+            Ok(n) => n,
+            Err(e) => break Err(e),
         };
+        match tokio::time::timeout(STREAM_IDLE_TIMEOUT, writer.write_all(&buf[..n])).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => break Err(e),
+            Err(_) => {
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("client read no bundle data for {STREAM_IDLE_TIMEOUT:?}"),
+                ));
+            }
+        }
+    };
     let shutdown_result = writer.shutdown().await;
     // The read half must be gone before waiting on the build task: if the copy
     // failed mid-stream (client vanished) the task is still writing, and only a

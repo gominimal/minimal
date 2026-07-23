@@ -366,6 +366,28 @@ async fn triage_pids(markers: &[&str], always: &[u32]) -> Result<Vec<(u32, bool)
     Ok(pids)
 }
 
+/// Re-pins a [`triage_pids`] result immediately before its per-pid `/proc`
+/// state is read. A pid from the caller-supplied `always` set
+/// (`from_snapshot == false`) is trusted unchanged — it is the caller's own
+/// process and its identity is not in question. A pid drawn from the table
+/// snapshot (`from_snapshot == true`) is re-checked against `markers` and
+/// dropped if it no longer matches: the snapshot is stale the moment it is
+/// taken, and a pid recycled in between would otherwise attribute an unrelated
+/// process's open sockets to our family. This is the same gate
+/// [`hang_triage_including`] applies inline; [`socket_join`] shares it so the
+/// fd→socket join cannot splice in a foreign process's sockets.
+#[cfg(target_os = "linux")]
+async fn repin_live(pids: Vec<(u32, bool)>, markers: &[&str]) -> Vec<u32> {
+    let mut live = Vec::with_capacity(pids.len());
+    for (pid, from_snapshot) in pids {
+        if from_snapshot && !still_matches(pid, markers).await {
+            continue;
+        }
+        live.push(pid);
+    }
+    live
+}
+
 /// `<dest>/proc/sockets.txt`: which of our processes holds which socket, in
 /// which state — every `socket:[inode]` fd of the family joined against the
 /// `/proc/net` tables.
@@ -408,6 +430,11 @@ async fn socket_join<W: BundleSink>(
         w.skip(path, "no marker-matched processes holding sockets");
         return Ok(());
     }
+    // Re-pin before reading any fds: a snapshot pid recycled since the table
+    // would otherwise splice an unrelated process's sockets into the join. The
+    // caller's own `always` pids are trusted without a re-read — same gate as
+    // `hang_triage_including`.
+    let pids = repin_live(pids, markers).await;
     let mut tables = Vec::with_capacity(crate::net::PROC_NET_SOCKET_TABLES.len());
     for table in crate::net::PROC_NET_SOCKET_TABLES {
         if let Ok(text) = tokio::fs::read_to_string(format!("/proc/net/{table}")).await {
@@ -417,7 +444,7 @@ async fn socket_join<W: BundleSink>(
     let sockets = index_by_inode(&tables);
 
     let mut text = String::from("pid\tfd\tinode\ttable\tentry\n");
-    for (pid, _) in pids {
+    for pid in pids {
         let Ok(mut entries) = tokio::fs::read_dir(format!("/proc/{pid}/fd")).await else {
             let _ = writeln!(text, "{pid}\t-\t-\t-\t<fd directory unreadable>");
             continue;
@@ -747,5 +774,17 @@ ffff8880: 00000002 00000000 00010000 0001 01 41002 /run/minimald/ssh.sock
             .await
             .unwrap();
         assert_eq!(pids, vec![(4242, false)]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn repin_live_trusts_caller_pids_and_drops_stale_snapshot_pids() {
+        // A caller-named (`always`) pid arrives as (pid, false): it is kept
+        // without any /proc re-read, so pid 4242 — which need not exist —
+        // survives, proving its identity was never re-pinned. A snapshot pid
+        // arrives as (pid, true); u32::MAX exceeds any pid_max, so its
+        // /proc/<pid>/cmdline is unreadable, the re-pin fails, and it drops.
+        let live = repin_live(vec![(4242, false), (u32::MAX, true)], MARKERS).await;
+        assert_eq!(live, vec![4242]);
     }
 }
