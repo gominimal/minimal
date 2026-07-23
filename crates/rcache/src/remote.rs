@@ -37,6 +37,8 @@ pub enum Error<BE: std::fmt::Debug> {
     SnapshotMissing { object: String },
     /// The cache configuration could not be resolved or followed.
     Config(String),
+    /// A fetch returned an error status.
+    Fetch { status: usize },
 }
 
 impl<BE: std::fmt::Debug> std::fmt::Display for Error<BE> {
@@ -73,10 +75,19 @@ pub struct RemoteCache<B: FetchBackend> {
     /// we have). Used by [`Self::into_writer`] to skip a refetch when
     /// transitioning to a writer.
     gcs_generation: Option<i64>,
+
+    /// How many times a transient artifact-fetch failure is retried (the
+    /// initial attempt not counted). See [`Self::with_fetch_retries`].
+    fetch_retries: u32,
 }
 
 pub const INDEX_FILENAME: &str = "index.shisha";
 const INDEX_EXPIRY_SECONDS: u64 = 5 * 60; // how long a fetch of the remote index is considered fresh for
+
+/// Default retry count for transient artifact-fetch failures.
+pub const DEFAULT_FETCH_RETRIES: u32 = 3;
+/// First retry delay; doubles with each subsequent retry.
+const FETCH_BACKOFF_BASE: Duration = Duration::from_millis(500);
 
 /// Which index object a [`RemoteCache`] reader loads. The choice is made by
 /// the caller (see `mfile::File::cache_config`); this layer only executes it.
@@ -284,6 +295,7 @@ impl<B: FetchBackend> RemoteCache<B> {
                             // for the current generation. into_writer must
                             // refetch.
                             gcs_generation: None,
+                            fetch_retries: DEFAULT_FETCH_RETRIES,
                         });
                     }
                     Err(e) => {
@@ -326,9 +338,7 @@ impl<B: FetchBackend> RemoteCache<B> {
             (status, _) if !index_resp.is_success() => {
                 return Err(match index_resp.error_for_status() {
                     Err(e) => Error::Backend(e),
-                    Ok(_) => Error::IO(std::io::Error::other(format!(
-                        "index fetch failed with HTTP {status}"
-                    ))),
+                    Ok(_) => Error::Fetch { status },
                 });
             }
             _ => {
@@ -386,7 +396,17 @@ impl<B: FetchBackend> RemoteCache<B> {
             base: url,
             ot,
             gcs_generation,
+            fetch_retries: DEFAULT_FETCH_RETRIES,
         })
+    }
+
+    /// Sets how many times a transient artifact-fetch failure (transport
+    /// error, error status, hash mismatch) is retried with exponential
+    /// backoff before surfacing. The initial attempt is not counted; 0
+    /// disables retries. Defaults to [`DEFAULT_FETCH_RETRIES`].
+    pub fn with_fetch_retries(mut self, retries: u32) -> Self {
+        self.fetch_retries = retries;
+        self
     }
 
     /// Returns true if the build for the given spec hash is present in the cache.
@@ -400,7 +420,64 @@ impl<B: FetchBackend> RemoteCache<B> {
         self.index.sha256(spec_hash)
     }
 
-    /// Download the given spec hash into the local cache.
+    /// Fetches the artifact for `sha256` into a temp file and verifies its
+    /// content hash. One attempt; retry policy lives in [`Self::materialize`].
+    async fn fetch_verified(
+        &self,
+        sha256: [u8; 32],
+        op: &OpTracker,
+    ) -> Result<std::fs::File, Error<<B::Response as FetchResponse>::Error>> {
+        let req = self.backend.get(
+            self.base
+                .join(&format!("{}.zst", hex::encode(sha256)))
+                .unwrap(),
+        )?;
+
+        let mut resp = self.backend.execute(req).await?;
+        // An error status must not reach the hasher: an error page is not an
+        // artifact, and hashing it reports corruption where there is none.
+        if !resp.is_success() {
+            let status = resp.status_code();
+            return Err(match resp.error_for_status() {
+                Err(e) => Error::Backend(e),
+                Ok(_) => Error::Fetch { status },
+            });
+        }
+        // Progress total only; tolerate a missing Content-Length (see above).
+        op.set_length(resp.content_length().unwrap_or(0));
+
+        let mut w = common::Tee::new(
+            tempfile::tempfile().map_err(Error::IO)?,
+            common::HashWriter(sha2::Sha256::new()),
+        );
+        while let Some(chunk) = resp.chunk().await? {
+            op.increment(chunk.len() as u64);
+            w.write_all(&chunk).map_err(Error::IO)?;
+        }
+        let (tar_file, hasher) = w.into_inner();
+        let got_sha256 = hasher.0.finalize();
+        if got_sha256 != sha256 {
+            return Err(Error::HashMismatch {
+                want: hex::encode(sha256),
+                got: hex::encode(got_sha256),
+            });
+        }
+        Ok(tar_file)
+    }
+
+    /// Failures worth retrying: transport errors, error statuses, and hash
+    /// mismatches (a complete-but-wrong body, e.g. from a misbehaving
+    /// mirror). Local I/O errors and a spec absent from the index are not.
+    fn is_transient(e: &Error<<B::Response as FetchResponse>::Error>) -> bool {
+        matches!(
+            e,
+            Error::Backend(_) | Error::Fetch { .. } | Error::HashMismatch { .. }
+        )
+    }
+
+    /// Download the given spec hash into the local cache. Transient fetch
+    /// failures are retried up to [`Self::with_fetch_retries`] times with
+    /// exponential backoff; extraction is not retried.
     #[tracing::instrument(skip_all, fields(span_name = %span_name), err)]
     pub async fn materialize(
         &self,
@@ -415,33 +492,23 @@ impl<B: FetchBackend> RemoteCache<B> {
         });
 
         let start = Instant::now();
-        let req = self.backend.get(
-            self.base
-                .join(&format!("{}.zst", hex::encode(sha256)))
-                .unwrap(),
-        )?;
-
-        // Fetch the remote archive into a temporary file and seek to the beginning for decoding.
-        let mut resp = self.backend.execute(req).await?;
-        // Progress total only; tolerate a missing Content-Length (see above).
-        materialize_op.set_length(resp.content_length().unwrap_or(0));
-
-        let mut w = common::Tee::new(
-            tempfile::tempfile().map_err(Error::IO)?,
-            common::HashWriter(sha2::Sha256::new()),
-        );
-        while let Some(chunk) = resp.chunk().await? {
-            materialize_op.increment(chunk.len() as u64);
-            w.write_all(&chunk).map_err(Error::IO)?;
-        }
-        let (mut tar_file, hasher) = w.into_inner();
-        let got_sha256 = hasher.0.finalize();
-        if got_sha256 != sha256 {
-            return Err(Error::HashMismatch {
-                want: hex::encode(sha256),
-                got: hex::encode(got_sha256),
-            });
-        }
+        let mut attempt = 0u32;
+        let mut tar_file = loop {
+            attempt += 1;
+            match self.fetch_verified(sha256, &materialize_op).await {
+                Ok(f) => break f,
+                Err(e) if attempt <= self.fetch_retries && Self::is_transient(&e) => {
+                    let delay = FETCH_BACKOFF_BASE * 2u32.pow(attempt - 1);
+                    tracing::warn!(
+                        "fetching {} failed (attempt {attempt} of {}): {e}; retrying in {delay:?}",
+                        hex::encode(sha256),
+                        self.fetch_retries + 1,
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => return Err(e),
+            }
+        };
 
         tar_file
             .seek(std::io::SeekFrom::Start(0))
@@ -493,20 +560,35 @@ mod tests {
     #[derive(Debug)]
     struct MockResponse {
         data: Vec<u8>,
+        status: usize,
         consumed: bool,
+    }
+
+    impl MockResponse {
+        fn ok(data: Vec<u8>) -> Self {
+            Self {
+                data,
+                status: 200,
+                consumed: false,
+            }
+        }
     }
 
     impl FetchResponse for MockResponse {
         type Error = std::io::Error;
 
         fn error_for_status(self) -> Result<Self, Self::Error> {
-            Ok(self)
+            if self.is_success() {
+                Ok(self)
+            } else {
+                Err(std::io::Error::other(format!("HTTP {}", self.status)))
+            }
         }
         fn is_success(&self) -> bool {
-            true
+            (200..300).contains(&self.status)
         }
         fn status_code(&self) -> usize {
-            200
+            self.status
         }
         fn content_length(&self) -> Option<u64> {
             Some(self.data.len() as u64)
@@ -523,9 +605,29 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     struct MockBackend {
         responses: std::collections::HashMap<String, Vec<u8>>,
+        /// Per-URL queue of (status, body) served before `responses` takes
+        /// over. Lets a test script failures-then-success.
+        scripted: std::sync::Mutex<std::collections::HashMap<String, Vec<(usize, Vec<u8>)>>>,
+        /// Total executed requests; an Arc so tests can keep counting after
+        /// the backend moves into the RemoteCache.
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl MockBackend {
+        fn new(responses: std::collections::HashMap<String, Vec<u8>>) -> Self {
+            Self {
+                responses,
+                ..Default::default()
+            }
+        }
+
+        fn script(self, url: &str, seq: Vec<(usize, Vec<u8>)>) -> Self {
+            self.scripted.lock().unwrap().insert(url.to_string(), seq);
+            self
+        }
     }
 
     impl FetchBackend for MockBackend {
@@ -537,11 +639,19 @@ mod tests {
             Ok(url)
         }
         async fn execute(&self, req: MockUrl) -> Result<MockResponse, std::io::Error> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(seq) = self.scripted.lock().unwrap().get_mut(&req.0)
+                && !seq.is_empty()
+            {
+                let (status, data) = seq.remove(0);
+                return Ok(MockResponse {
+                    data,
+                    status,
+                    consumed: false,
+                });
+            }
             let data = self.responses.get(&req.0).cloned().unwrap_or_default();
-            Ok(MockResponse {
-                data,
-                consumed: false,
-            })
+            Ok(MockResponse::ok(data))
         }
     }
 
@@ -567,14 +677,15 @@ mod tests {
         );
 
         let rc = RemoteCache::new(
-            MockBackend { responses },
+            MockBackend::new(responses),
             MockUrl("mock://cache".to_string()),
             None,
             None,
             IndexSource::Root,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .with_fetch_retries(0);
 
         let tmp = tempfile::tempdir().unwrap();
         let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
@@ -601,7 +712,7 @@ mod tests {
         responses.insert(format!("mock://cache/{}", INDEX_FILENAME), index_bytes);
 
         let rc = RemoteCache::new(
-            MockBackend { responses },
+            MockBackend::new(responses),
             MockUrl("mock://cache".to_string()),
             None,
             None,
@@ -860,6 +971,151 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rc.sha256(&spec_hash), Some(sha256));
+    }
+
+    /// A real (tiny) artifact archive, so the success path can extract it.
+    fn tiny_artifact() -> (Vec<u8>, [u8; 32]) {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), b"hi").unwrap();
+        let (mut f, sha256) = archive::compress_dir(dir.path(), None, &None).unwrap();
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes).unwrap();
+        (bytes, sha256)
+    }
+
+    /// Mock responses wired so `spec_hash` resolves through the index to a
+    /// real artifact at the returned URL.
+    fn artifact_fixture() -> (SpecHash, String, std::collections::HashMap<String, Vec<u8>>) {
+        let spec_hash = SpecHash::from_bytes([0xAA; 32]);
+        let (artifact, sha256) = tiny_artifact();
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(
+            format!("mock://cache/{INDEX_FILENAME}"),
+            index_bytes_for(&spec_hash, sha256),
+        );
+        let art_url = format!("mock://cache/{}.zst", hex::encode(sha256));
+        responses.insert(art_url.clone(), artifact);
+        (spec_hash, art_url, responses)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn materialize_retries_transient_failures_then_succeeds() {
+        let (spec_hash, art_url, responses) = artifact_fixture();
+        // Two transient failures — an error status, then a complete-but-wrong
+        // body — before the real artifact.
+        let backend = MockBackend::new(responses).script(
+            &art_url,
+            vec![
+                (503, b"bad gateway".to_vec()),
+                (200, b"wrong bytes".to_vec()),
+            ],
+        );
+        let calls = backend.calls.clone();
+
+        let rc = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        rc.materialize(&spec_hash, &cache, "pkg").await.unwrap();
+        // One index fetch + three artifact attempts (503, mismatch, success).
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn materialize_exhausts_retries_and_surfaces_the_last_error() {
+        let (spec_hash, art_url, mut responses) = artifact_fixture();
+        // Every attempt sees a complete-but-wrong body.
+        responses.insert(art_url, b"always wrong".to_vec());
+        let backend = MockBackend::new(responses);
+        let calls = backend.calls.clone();
+
+        let rc = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap()
+        .with_fetch_retries(1);
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        let err = rc.materialize(&spec_hash, &cache, "pkg").await.unwrap_err();
+        assert!(
+            matches!(err, Error::HashMismatch { .. }),
+            "expected HashMismatch after exhausted retries, got {err:?}"
+        );
+        // One index fetch + two artifact attempts (initial + one retry).
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn materialize_error_status_is_not_hashed() {
+        let (spec_hash, art_url, responses) = artifact_fixture();
+        let backend = MockBackend::new(responses)
+            .script(&art_url, vec![(500, b"<html>error page</html>".to_vec())]);
+        let calls = backend.calls.clone();
+
+        let rc = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap()
+        .with_fetch_retries(0);
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        let err = rc.materialize(&spec_hash, &cache, "pkg").await.unwrap_err();
+        // A backend/status error, not HashMismatch: the error page never
+        // reached the hasher.
+        assert!(
+            matches!(err, Error::Backend(_) | Error::Fetch { .. }),
+            "expected a status error, got {err:?}"
+        );
+        // One index fetch + a single artifact attempt: 0 retries fails fast.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn materialize_not_found_is_not_retried() {
+        let (_, _, responses) = artifact_fixture();
+        let backend = MockBackend::new(responses);
+        let calls = backend.calls.clone();
+
+        let rc = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        let err = rc
+            .materialize(&SpecHash::from_bytes([0x11; 32]), &cache, "absent")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound), "got {err:?}");
+        // Only the index fetch: an absent spec is deterministic, no attempts.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

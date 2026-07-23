@@ -565,6 +565,18 @@ impl Context {
             }
             other => other,
         };
+
+        let fetch_retries = match std::env::var("MINIMAL_FETCH_RETRIES") {
+            Ok(v) => v
+                .parse::<u32>()
+                .map_err(|e| RemoteError::Config(format!("MINIMAL_FETCH_RETRIES: {e}")))?,
+            Err(_) => self
+                .mfile
+                .cache
+                .fetch_retries
+                .unwrap_or(rcache::DEFAULT_FETCH_RETRIES),
+        };
+        let res = res.map(|rc| rc.with_fetch_retries(fetch_retries));
         tracing::trace!("remote cache init took {:?}", start.elapsed());
         res
     }

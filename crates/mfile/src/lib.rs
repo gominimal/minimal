@@ -591,6 +591,9 @@ pub struct CacheSettings {
     /// Which index object the cache reader loads. Defaults to
     /// [`IndexSourceMode::Auto`].
     pub index_source: Option<IndexSourceMode>,
+    /// How many times a transient artifact-fetch failure is retried
+    /// (exponential backoff). Defaults to the reader's built-in value.
+    pub fetch_retries: Option<u32>,
 }
 
 /// Selects which remote-cache index object the reader loads.
@@ -1717,9 +1720,11 @@ mod tests {
 
             [cache]
             index_source = "root"
+            fetch_retries = 5
             "#
         ))
         .unwrap();
+        assert_eq!(mf.cache.fetch_retries, Some(5));
         assert_eq!(mf.cache.index_source, Some(IndexSourceMode::Root));
         assert_eq!(mf.cache_config(None).unwrap(), CacheConfig::GlobalIndex);
         assert_eq!(
