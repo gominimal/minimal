@@ -15,6 +15,7 @@ This documentation site is itself built and maintained using Claude Code inside 
 interactive = true
 packages = ["claude-code", "base"]
 exec = "claude"
+patches.dir."~/.claude" = "read-write"
 ```
 
 Run it with:

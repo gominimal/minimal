@@ -57,4 +57,4 @@ exec = "ruff check ."
 
 ## Available packages
 
-The [Minimal Public Package Registry](https://github.com/gominimal/pkgs/tree/main/packages) contains 150+ packages including compilers, interpreters, build tools, and common CLI utilities.
+The [Minimal Public Package Registry](https://github.com/gominimal/pkgs/tree/main/packages) contains hundreds of packages including compilers, interpreters, build tools, and common CLI utilities.
