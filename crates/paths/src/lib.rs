@@ -1622,6 +1622,21 @@ mod tests {
     }
 
     #[test]
+    fn prune_known_hosts_leaves_file_untouched_when_nothing_matches() {
+        // No line names the target host: nothing is removed and the no-write
+        // path (`if removed`) must leave the file byte-identical, not rewrite
+        // it. Guards the optimization that avoids churning the file on every
+        // spawn when there is no stale entry to prune.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("known_hosts");
+        let original = "other-host ssh-ed25519 AAAAkeep\n\
+                        [local-9]:2222 ssh-ed25519 CCCCkeep\n";
+        std::fs::write(&path, original).unwrap();
+        prune_known_hosts_entries(&path, "local-0", 22).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
     fn minimal_state_dir_honors_xdg_state_home() {
         // Only this test reads XDG_STATE_HOME; restore to avoid surprising a
         // developer's environment leaking into other assertions.
