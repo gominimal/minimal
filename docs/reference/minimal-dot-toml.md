@@ -1,6 +1,6 @@
 ---
 title: minimal.toml
-description: Schema reference for the minimal.toml configuration file — upstream, stack, defaults, tasks, and outputs sections.
+description: Schema reference for the minimal.toml configuration file: upstream, stack, defaults, tasks, and outputs sections.
 ---
 
 # `minimal.toml`
@@ -62,7 +62,7 @@ locked_commit = "<commit hash>"
 `locked_commit` is automatically updated when [`mip update`](./cli-mip.md) is
 run: it re-resolves `branch` to its current HEAD and rewrites the
 `locked_commit` of the upstream (and of every sideload) in `minimal.toml` in
-place — expect a diff on these fields after running it.
+place; expect a diff on these fields after running it.
 
 #### `[[upstream.sideload]]` - Additional software sideloaded into your supply chain {#sideload}
 
@@ -148,15 +148,15 @@ vars = { KEY = "value" }        # oci-image only; alias: `env_vars`
 
 #### Fields
 
-- **`type`** (alias: `ty`) — The output kind, either `oci-image` or `raw-file`. Defaults to `oci-image` when omitted.
-- **`packages`** — Packages to include in the materialized output. When omitted or empty, defaults to `["base"]`.
-- **`arch`** — Target architecture for OCI images. Common values: `amd64`, `arm64`. The CLI flag [`--arch`](./cli-mip.md#materialize) overrides this; if neither is set, the host architecture is used.
-- **`path`** — _(`raw-file` only)_ Path, relative to the package file tree, of the single file to extract. Required for `raw-file` outputs; supplying it on an `oci-image` output is an error.
-- **`entrypoint`** — _(`oci-image` only)_ OCI image entrypoint. May be a string (`"/app/server"`) or a list (`["/bin/sh", "-c"]`).
-- **`cmd`** — _(`oci-image` only)_ OCI image default command. Same string-or-list shape as `entrypoint`.
-- **`vars`** (alias: `env_vars`) — _(`oci-image` only)_ Environment variables baked into the image as a `KEY = "value"` table.
+- **`type`** (alias: `ty`): The output kind, either `oci-image` or `raw-file`. Defaults to `oci-image` when omitted.
+- **`packages`**: Packages to include in the materialized output. When omitted or empty, defaults to `["base"]`.
+- **`arch`**: Target architecture for OCI images. Common values: `amd64`, `arm64`. The CLI flag [`--arch`](./cli-mip.md#materialize) overrides this; if neither is set, the host architecture is used.
+- **`path`**: _(`raw-file` only)_ Path, relative to the package file tree, of the single file to extract. Required for `raw-file` outputs; supplying it on an `oci-image` output is an error.
+- **`entrypoint`**: _(`oci-image` only)_ OCI image entrypoint. May be a string (`"/app/server"`) or a list (`["/bin/sh", "-c"]`).
+- **`cmd`**: _(`oci-image` only)_ OCI image default command. Same string-or-list shape as `entrypoint`.
+- **`vars`** (alias: `env_vars`): _(`oci-image` only)_ Environment variables baked into the image as a `KEY = "value"` table.
 
-Setting an `oci-image`-only field (`entrypoint`, `cmd`, `vars`) on a `raw-file` output — or setting `path` on an `oci-image` output — is rejected when the `minimal.toml` is parsed.
+Setting an `oci-image`-only field (`entrypoint`, `cmd`, `vars`) on a `raw-file` output, or setting `path` on an `oci-image` output, is rejected when the `minimal.toml` is parsed.
 
 #### Examples
 

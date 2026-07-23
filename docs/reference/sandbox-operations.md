@@ -1,6 +1,6 @@
 ---
 title: Sandbox operations
-description: In-sandbox min helper commands — add packages, search, check configuration, and run tasks from within a sandbox.
+description: In-sandbox min helper commands: add packages, search, check configuration, and run tasks from within a sandbox.
 ---
 
 # `min` commands
@@ -18,7 +18,7 @@ description: In-sandbox min helper commands — add packages, search, check conf
 ### `add [FLAG] <PACKAGES...>` {#add}
 
 Installs tools & dependencies into the running sandbox. With no flag, packages
-are installed for the current sandbox session only — `minimal.toml` is not
+are installed for the current sandbox session only; `minimal.toml` is not
 modified. With a flag, the named packages are also recorded as a build,
 runtime, or task dependency in `minimal.toml`.
 

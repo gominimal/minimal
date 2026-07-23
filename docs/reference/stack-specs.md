@@ -1,6 +1,6 @@
 ---
 title: Stacks
-description: Stack spec schema for defining build system stacks in Nickel — packages, build commands, env vars, and project detection rules.
+description: Stack spec schema for defining build system stacks in Nickel: packages, build commands, env vars, and project detection rules.
 ---
 
 # Stacks

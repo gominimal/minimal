@@ -1,9 +1,9 @@
 ---
 title: mip CLI
-description: Reference for the mip package/build CLI — build packages, run tasks, materialize outputs, and manage the local cache.
+description: Reference for the mip package/build CLI: build packages, run tasks, materialize outputs, and manage the local cache.
 ---
 
-# `mip` — package/build CLI
+# `mip` - package/build CLI
 
 `mip` is the Minimal package/build CLI. It reads a project's
 [`minimal.toml`](./minimal-dot-toml.md), builds packages in clean rooms,
@@ -72,8 +72,8 @@ Add a new tool or dependency. Exactly one placement flag is required:
 
 | Flag | Description |
 |------|-------------|
-| `--runtime` | Add as a runtime dependency — your program needs this package anywhere it runs |
-| `--build` | Add as a build dependency — your program needs this package to build |
+| `--runtime` | Add as a runtime dependency: your program needs this package anywhere it runs |
+| `--build` | Add as a build dependency: your program needs this package to build |
 | `--task <TASK>` | Add to a task's package list |
 
 ### `init`
@@ -109,7 +109,7 @@ Materializes an output specified in an
 | `--output <PATH>` | `-o` | **(required)** The output file to write |
 | `--arch <ARCH>` | | Override the architecture used when building the output (e.g. `amd64`, `arm64`); takes precedence over the `arch` field in `minimal.toml` and the host default |
 
-Supported output types include `oci-image` — a Linux OCI image archive
+Supported output types include `oci-image`, a Linux OCI image archive
 containing the configured packages, suitable for `docker load` or pushing
 to a registry.
 
@@ -176,7 +176,6 @@ Generates Graphviz source code of the dependency graph, e.g.
 | `--build-spec-deps <BOOL>` | | `true` | Include build spec `build_deps` (does not affect runtime deps) |
 | `--source-deps <BOOL>` | | `false` | Include source code `build_deps` |
 | `--local-deps <BOOL>` | | `false` | Include local (`build.sh`) input deps |
-| `--hostpath-deps <BOOL>` | | `false` | Include host path `build_deps` |
 | `--needs <BOOL>` | | `false` | Include "Needs" nodes and edges |
 | `--provides <BOOL>` | | `false` | Include "Provides" edges and "Needs" nodes |
 | `--bootstrap <BOOL>` | | `false` | Include replace-on-cycle/prebuilts/bootstrap |

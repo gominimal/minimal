@@ -1,6 +1,6 @@
 ---
 title: Build specs
-description: Build spec schema for defining Minimal packages in Nickel — build_deps, runtime_deps, commands, outputs, tests, and metadata.
+description: Build spec schema for defining Minimal packages in Nickel: build_deps, runtime_deps, commands, outputs, tests, and metadata.
 ---
 
 # Build specs

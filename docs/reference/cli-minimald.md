@@ -1,9 +1,9 @@
 ---
 title: minimald daemon
-description: Ops reference for the minimald host daemon — serves sandboxed sessions to the min CLI over SSH-on-UDS.
+description: Ops reference for the minimald host daemon: serves sandboxed sessions to the min CLI over SSH-on-UDS.
 ---
 
-# `minimald` — host daemon
+# `minimald` - host daemon
 
 `minimald` is the Minimal host daemon. It creates and supervises the
 sandboxed sessions that the [min CLI](./cli-min.md) connects to, speaking
@@ -20,7 +20,7 @@ Generated from `--help` at `e5ce5fb8`.
 |------|-------|-------------|
 | `--minimal-state-dir <PATH>` | | Override the directory where state is stored (default: `$XDG_STATE_DIR/minimal`) |
 | `--minimal-cache-dir <PATH>` | | Override the directory where artifacts are cached (default: `$XDG_CACHE_DIR/minimal`) |
-| `--num-parallel-builds <N>` | `-n` | Configure the number of parallel builds (currently accepted but ignored — see [Known issues](#known-issues)) |
+| `--num-parallel-builds <N>` | `-n` | Configure the number of parallel builds (currently accepted but ignored; see [Known issues](#known-issues)) |
 
 ## Commands
 
@@ -51,5 +51,5 @@ Generates a shell tab-completion script for `minimald`. Supported shells:
 
 ## Known issues
 
-- [#820](https://github.com/gominimal/minimal/issues/820) — `minimald`
+- [#820](https://github.com/gominimal/minimal/issues/820): `minimald`
   accepts but ignores `-n`/`--num-parallel-builds` and `--stdlib-dir`.

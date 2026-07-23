@@ -1,6 +1,6 @@
 ---
 title: Tasks
-description: Full task schema reference — packages, exec/bash commands, state_key, env_vars, patches, profiles, args, and interactive mode.
+description: Full task schema reference: packages, exec/bash commands, state_key, env_vars, patches, profiles, args, and interactive mode.
 ---
 
 # Tasks
@@ -42,7 +42,7 @@ exec = ["pnpm", "build"]
 ```
 
 When `exec` names a command without an absolute path (or a `./` prefix), the
-command is resolved to `/bin/<command>` inside the sandbox — in the examples
+command is resolved to `/bin/<command>` inside the sandbox; in the examples
 above, `pnpm` runs as `/bin/pnpm`.
 
 `bash` describes a bash command that should run when the task is launched.

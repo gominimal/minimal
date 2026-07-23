@@ -1,6 +1,6 @@
 ---
 title: CLI Reference
-description: Overview of the Minimal command-line binaries — min, mip, minimald, and minvmd — and where each is documented.
+description: Overview of the Minimal command-line binaries (min, mip, minimald, and minvmd) and where each is documented.
 ---
 
 # CLI Reference
@@ -20,10 +20,10 @@ Minimal ships as a small set of binaries split across two planes:
 
 | Binary | Role | Reference |
 |--------|------|-----------|
-| `min` | Session CLI — create, attach to, and manage sandboxed dev sessions | [min](./cli-min.md) |
-| `mip` | Package/build CLI — build packages, run tasks, manage the cache | [mip](./cli-mip.md) |
-| `minimald` | Host daemon — serves sessions to `min` over SSH-on-UDS | [minimald](./cli-minimald.md) |
-| `minvmd` | VM daemon — boots the Linux microVM that hosts `minimald` | [minvmd](./cli-minvmd.md) |
+| `min` | Session CLI: create, attach to, and manage sandboxed dev sessions | [min](./cli-min.md) |
+| `mip` | Package/build CLI: build packages, run tasks, manage the cache | [mip](./cli-mip.md) |
+| `minimald` | Host daemon: serves sessions to `min` over SSH-on-UDS | [minimald](./cli-minimald.md) |
+| `minvmd` | VM daemon: boots the Linux microVM that hosts `minimald` | [minvmd](./cli-minvmd.md) |
 
 ## Platform availability
 
@@ -33,7 +33,7 @@ Minimal ships as a small set of binaries split across two planes:
   prebuilt Linux amd64 `minvmd` is attached to each GitHub Release; arm64
   must build from source).
 - **macOS**: installs ship `min` and `minvmd` only. `minimald` always runs
-  inside the microVM, and the package/build plane runs there with it —
+  inside the microVM, and the package/build plane runs there with it;
   there is no native macOS `mip`.
 - `mip run` (and its `shell`/`build`/`test` shorthands) executes tasks in
   Linux sandboxes and is available on Linux only.

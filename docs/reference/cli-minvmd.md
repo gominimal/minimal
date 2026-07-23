@@ -1,9 +1,9 @@
 ---
 title: minvmd daemon
-description: Ops reference for the minvmd VM daemon — boots and supervises the Linux microVM that hosts minimald.
+description: Ops reference for the minvmd VM daemon: boots and supervises the Linux microVM that hosts minimald.
 ---
 
-# `minvmd` — VM daemon
+# `minvmd` - VM daemon
 
 `minvmd` is the host daemon that brings up a Linux microVM via libkrun
 (macOS/HVF or Linux/KVM) and supervises the
@@ -93,5 +93,5 @@ Generates a shell tab-completion script. Supported shells: `bash`, `zsh`,
 
 ## Known issues
 
-- [#823](https://github.com/gominimal/minimal/issues/823) —
+- [#823](https://github.com/gominimal/minimal/issues/823):
   `minvmd run --timeout` is silently ignored without `--detach`.
