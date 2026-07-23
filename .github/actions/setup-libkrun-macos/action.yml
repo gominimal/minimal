@@ -30,8 +30,11 @@ runs:
         # adding, or removing a patch invalidates the build. `shasum` over each
         # file emits `<hash>  <path>`; sort pins a stable order, then a final
         # digest folds them into one value. No patches => digest of empty input,
-        # still deterministic.
-        patches_hash="$(find vendor/libkrun/patches -name '*.patch' -type f -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | cut -d' ' -f1)"
+        # still deterministic. The dir may be ABSENT (git drops empty dirs once
+        # the last patch is removed); guard with `-d` so a missing directory
+        # yields empty input rather than a non-zero `find` that pipefail turns
+        # into a step failure.
+        patches_hash="$( { [ -d vendor/libkrun/patches ] && find vendor/libkrun/patches -name '*.patch' -type f -exec shasum -a 256 {} + || true; } | sort | shasum -a 256 | cut -d' ' -f1)"
         {
           echo "commit=$commit"
           # The prefix embeds ALL build inputs (pinned commit + build-script

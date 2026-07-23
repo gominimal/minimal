@@ -296,6 +296,30 @@ async fn activate_uploads_project_files() {
     assert!(mfile.starts_with(b"# test"));
 }
 
+/// A workspace upload whose unpack fails on the daemon must surface as an
+/// `Err`, not a silent success. The daemon relays the failure on
+/// extended-data stream 1 and only then closes the channel; the client reads
+/// to that close, so the failure cannot be swallowed. Regression test for the
+/// silent-upload-failure half of #824.
+#[tokio::test]
+async fn upload_workspace_files_surfaces_daemon_unpack_error() {
+    let (_daemon, args) = setup().await;
+    let mut client = connect_daemon(&args).await.unwrap();
+
+    // A well-formed but unknown session id: the daemon can't resolve a
+    // destination for the upload, reports the failure, and closes.
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::write(project.path().join("hello.txt"), "hello world").unwrap();
+
+    let result = client
+        .upload_workspace_files(SessionId::nil(), project.path())
+        .await;
+    assert!(
+        result.is_err(),
+        "upload to an unknown session must fail, not report success: {result:?}"
+    );
+}
+
 // --- attach (smart resolution) ---
 
 /// `min attach` with no session argument and `--no-input` errors cleanly when
