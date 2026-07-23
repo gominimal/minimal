@@ -37,9 +37,8 @@ so a loadout adds to the project rather than silently replacing parts of it.
 [loadout reference](../reference/loadouts.md).)
 
 One boundary worth stating up front: loadouts apply to **sessions**
-(`min activate`). They do not apply to task sandboxes run through the package
-and build CLI, `mip`, which carry their own packages and environment through
-the task schema.
+(`min activate`). They do not apply to task sandboxes, which carry their own
+packages and environment through the task schema.
 
 ## Where loadouts live
 
