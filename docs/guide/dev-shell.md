@@ -1,80 +1,95 @@
 ---
-description: Launch an isolated interactive development shell with only declared tools. Covers customization, host file access, and environment variables.
+description: Enter an isolated interactive development session with only your declared tools. Covers customization, host file access, and environment variables.
 ---
 
 # Dev shell
 
-Minimal sandboxes your development environment the same way it sandboxes builds and agents. Launch an interactive shell with only the tools you declare, isolated from your host system. Useful for running ad-hoc commands, debugging, or working interactively with your project's toolchain.
+Your dev shell in Minimal is a **session**: a long-lived, isolated development environment for a project, driven by the `min` CLI. It gives you an interactive shell with only the tools you declare, isolated from your host system. Use it for everyday development, running ad-hoc commands, debugging, or working interactively with your project's toolchain.
 
 ## Launch a shell
 
-If your `minimal.toml` has a `shell` task defined (which `mip init` creates by default), you can launch it with:
+From your project directory, activate a session and attach to it in one step:
 
 ```shell
-$ mip shell
+$ min activate --attach .
 ```
 
-This is shorthand for `mip run shell`.
+This creates a session for the project and drops you into its interactive shell. The path argument defaults to the current directory, so `min activate --attach` on its own works too.
 
-## What's in the sandbox?
+Your project files are mapped into the session at the same path, so edits you make inside the shell are reflected on the host.
 
-The shell sandbox inherits all packages from your [stack](../concepts/stacks.md), plus any packages listed in the task definition. A typical shell task looks like:
+## What's in the session?
+
+A session's tools come from the project's `[session]` block in `minimal.toml`. List the packages every contributor should have when working on this codebase:
 
 ```toml
-[tasks.shell]
-interactive = true
-packages = ["base", "git", "curl"]
-exec = "bash -l"
+[session]
+packages = ["git", "curl", "ripgrep"]
 ```
 
-Inside the sandbox, you have access to your project's source code and all declared tools, but nothing else from the host system. The shell cannot globally install software, read unrelated files, or modify your system. This ensures every developer gets the same isolated environment.
+Inside the session you have access to your project's source code and exactly these declared tools, but nothing else from the host system. The session cannot globally install software, read unrelated files, or modify your system. Every developer working on the project gets the same isolated environment.
 
-## Customizing your shell
+## Customizing your session
 
 ### Add more tools
 
-You can add packages to your shell from the command line:
-
-```shell
-$ mip add --task shell ripgrep jq nano
-```
-
-This updates your `minimal.toml` automatically. You can also edit the shell task directly:
+Add packages to the project's `[session]` block so everyone picks them up:
 
 ```toml
-[tasks.shell]
-interactive = true
-packages = ["base", "git", "curl", "nano", "jq", "ripgrep"]
-exec = "bash -l"
+[session]
+packages = ["git", "curl", "ripgrep", "jq", "nano"]
 ```
 
-If you need a package mid-session, you can use the [`min` command](../reference/sandbox-operations.md#add) to install it without restarting your
-shell or agent.
+If you need a package mid-session, without editing config or restarting your shell, run `min add` from inside the running session:
+
+```shell
+$ min add nano
+```
+
+This installs the tool into the running session. See the [`min` in-sandbox commands](../reference/sandbox-operations.md#add) for the full helper reference.
 
 ### Access host files
 
-By default, Minimal mounts your current working directory into the sandbox. Your project files are available at the same path inside the shell, and changes you make are reflected on the host.
-
-For files outside your project directory, use `patches` to map them in:
+By default, only your project directory is available inside the session. To bring specific host files or directories in, declare `patches` in the `[session]` block. Each patch names a `source` on the host and a `dest` under the session user's home directory:
 
 ```toml
-[tasks.shell]
-packages = ["base", "git"]
-exec = "bash -l"
-patches.file."~/.gitconfig" = "read-only"
-patches.dir."~/.ssh" = "read-only"
+[session]
+packages = ["git"]
+patches = [
+    { source = "~/.gitconfig", dest = "~/.gitconfig" },
+    { source = "~/.ssh",       dest = "~/.ssh" },
+]
 ```
 
 ### Set environment variables
 
-The sandbox starts with a clean environment. Host environment variables are not passed through by default. You can set variables explicitly or inherit them from the host:
+The session starts with a clean environment; host environment variables are not passed through by default. Set variables explicitly, or inherit them from the host, under `[session.vars]`:
 
 ```toml
-[tasks.shell]
-packages = ["base", "git"]
-exec = "bash -l"
-env_vars.EDITOR = "nano"
-env_vars.AWS_PROFILE = { inherit = true }
+[session.vars]
+EDITOR = "nano"
+AWS_PROFILE = { inherit = true }
 ```
 
-Setting a string value like `EDITOR = "nano"` defines a fixed variable. Using `{ inherit = true }` passes through the value from your host environment, which is useful for credentials or configuration that varies per developer.
+A string value like `EDITOR = "nano"` defines a fixed variable. Using `{ inherit = true }` passes through the value from your host environment, which is useful for credentials or configuration that varies per developer.
+
+### Run setup on activation
+
+To run setup steps when a session comes up, declare lifecycle hooks in the `[session]` block:
+
+```toml
+[[session.lifecycle_hooks]]
+on_activate = { type = "inline", value = "cargo fetch >/dev/null 2>&1 || true" }
+```
+
+## Session lifecycle
+
+Exit the shell to detach; the session keeps running in the background. To reattach, list, or tear down sessions:
+
+```shell
+$ min attach     # reattach to a session (resolves from the current directory)
+$ min ls         # list sessions
+$ min destroy    # terminate a session
+```
+
+For running one-shot commands in their own sandbox rather than an interactive session, see [Tasks](./tasks.md).

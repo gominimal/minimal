@@ -6,6 +6,8 @@ description: Run builds and tests in sandboxed environments using stacks. Covers
 
 Minimal builds your code reproducibly inside a sandbox, using a [stack](../concepts/stacks.md) to wire up the right tools and build commands for your language or build system.
 
+A build is a **one-shot** command that runs in its own fresh sandbox and exits, driven by the `mip` CLI. That is different from an interactive [dev session](./dev-shell.md), which is a long-lived environment you attach to with `min` for interactive development.
+
 ## Running a build
 
 ```shell

@@ -1,62 +1,62 @@
 ---
-description: Sandbox AI coding agents like Claude Code in isolated environments with declared tools and host credentials.
+description: Run AI coding agents like Claude Code inside an isolated session with declared tools and host credentials.
 ---
 
 # Agent shell
 
-Minimal can sandbox AI coding agents the same way it sandboxes your builds and dev tools. Define a task with the agent's package, and it runs in an isolated environment with access to your source code and only the tools you declare.
+Minimal can sandbox AI coding agents the same way it sandboxes your dev tools: an agent runs inside a [session](./dev-shell.md), with access to your source code and only the tools and host state you declare.
 
 ## Example: Claude Code
 
-This documentation site is itself built and maintained using Claude Code inside Minimal. Here is the task definition from its `minimal.toml`:
+This documentation site is itself built and maintained using Claude Code inside a Minimal session. Add the agent's package to the project's `[session]` block, and grant it the host state it needs with a patch:
 
 ```toml
-[tasks.claude]
-interactive = true
+[session]
 packages = ["claude-code", "base"]
-exec = "claude"
-patches.dir."~/.claude" = "read-write"
+patches = [
+    { source = "~/.claude", dest = "~/.claude" },
+]
 ```
 
-Run it with:
+Then activate the session and run the agent inside it:
 
 ```shell
-$ mip run claude
+$ min activate --attach .
+$ claude
 ```
 
-Claude Code launches inside a sandbox with your project's source code, `~/.claude` state files, and a read-only system containing the `claude-code` binary and core utilities from `base`. The sandbox has no additional access to anything on your host system unless you explicitly declare it.
+Claude Code launches inside the session with your project's source code, its `~/.claude` state, and a read-only system containing the `claude-code` binary and core utilities from `base`. The session has no additional access to anything on your host system unless you explicitly declare it.
 
 ## Adding more tools
 
-Agents often need additional tools to be effective. Add packages to the task just like any other:
+Agents often need additional tools to be effective. Add packages to the `[session]` block just like any other:
 
 ```toml
-[tasks.claude]
+[session]
 packages = ["claude-code", "base", "git", "curl"]
-exec = "claude"
 ```
 
 ## Passing through host credentials
 
-Use `patches` to give the agent access to host files it needs, like authentication state:
+Use `patches` to give the agent access to host files it needs, like authentication state. Each patch maps a host `source` to a `dest` under the session user's home directory:
 
 ```toml
-[tasks.claude]
+[session]
 packages = ["claude-code", "base", "git"]
-exec = "claude"
-patches.file."~/.gitconfig" = "read-only"
-patches.dir."~/.ssh" = "read-only"
+patches = [
+    { source = "~/.claude",    dest = "~/.claude" },
+    { source = "~/.gitconfig", dest = "~/.gitconfig" },
+    { source = "~/.ssh",       dest = "~/.ssh" },
+]
 ```
 
-Environment variables can be inherited from the host as well:
+Environment variables can be inherited from the host as well, under `[session.vars]`:
 
 ```toml
-[tasks.claude]
-packages = ["claude-code", "base"]
-exec = "claude"
-env_vars.ANTHROPIC_API_KEY = { inherit = true }
+[session.vars]
+ANTHROPIC_API_KEY = { inherit = true }
 ```
 
 ## Why sandbox agents?
 
-Running an AI agent in a Minimal sandbox means it can only access the tools and files you declare. It cannot install arbitrary software, read unrelated files, or modify your system. This is the same isolation model that Minimal applies to builds and dev shells, applied to agents.
+Running an AI agent in a Minimal session means it can only access the tools and files you declare. It cannot install arbitrary software, read unrelated files, or modify your system. This is the same isolation model that Minimal applies to builds and dev shells, applied to agents.

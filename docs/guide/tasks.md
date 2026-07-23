@@ -6,14 +6,16 @@ description: Define named tasks in minimal.toml that run commands in sandboxed e
 
 Tasks define commands that run in a [sandbox](../concepts/sandboxing.md) with exactly your declared dependencies. Every developer on your team runs the same task in the same environment.
 
+A task is a **one-shot** command that runs in its own fresh sandbox and exits, driven by the `mip` CLI. That makes it different from an interactive [dev session](./dev-shell.md), which is a long-lived environment you attach to with `min`. Reach for a task to run builds, tests, linters, and deploys; reach for a session for interactive development.
+
 ## Defining a task
 
 Tasks are defined in your `minimal.toml` and run with `mip run <name>`:
 
 ```toml
-[tasks.claude]
-packages = ["claude-code", "base"]
-exec = "claude"
+[tasks.lint]
+packages = ["python", "ruff"]
+exec = "ruff check ."
 
 [tasks.greet]
 bash = "echo Hello from $(uname -s) && date"
