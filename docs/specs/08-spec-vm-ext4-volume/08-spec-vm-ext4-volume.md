@@ -17,17 +17,17 @@ cache and the staging trees must live on the same filesystem. Today both sit on
 the per-boot `/run` tmpfs inside the guest (`minimal_state_dir = /run/minimal`,
 `minimal_cache_dir = /run/minimal/cache`; `crates/minimald/src/main.rs:302-305`).
 The tmpfs is mounted unsized, defaulting to ~½ guest RAM, and overflows with
-`StorageFull` unpacking large packages — driving a stop-gap RAM bump to 4096 MiB
+`StorageFull` unpacking large packages, driving a stop-gap RAM bump to 4096 MiB
 aarch64 / 2048 MiB x86_64 (`crates/minvmd/src/cmd/mod.rs:73-90`). All session
 state dies with the VM.
 
 The hardlink topology is confirmed in the code:
 
-- Session/task rootfs staging: `crates/minimald/src/env.rs:282-284` — hardlinks
+- Session/task rootfs staging: `crates/minimald/src/env.rs:282-284`, hardlinks
   from cache into `/tasks/<session>/` via `common::hardlink_dir_contents`.
-- Package-build rootfs staging: `crates/op/src/specs.rs:284` — same primitive
+- Package-build rootfs staging: `crates/op/src/specs.rs:284`, same primitive
   into `/sandboxes/<build>/`.
-- The primitive: `crates/common/src/lib.rs:209-224` — tolerates only
+- The primitive: `crates/common/src/lib.rs:209-224`, tolerates only
   `AlreadyExists`, propagates every other error including `EXDEV` as
   `HardlinkFailed`. There is no cross-device fallback.
 
@@ -64,8 +64,8 @@ moves session state off RAM onto durable storage.
 
 The disk topology is two RAW virtio-blk devices:
 
-- `/dev/vda` — base rootfs, read-only, shared, content-addressed (unchanged).
-- `/dev/vdb` — per-VM writable RAW ext4, carries `minimal_state_dir =
+- `/dev/vda`, base rootfs, read-only, shared, content-addressed (unchanged).
+- `/dev/vdb`, per-VM writable RAW ext4, carries `minimal_state_dir =
   /var/lib/minimal` (cache, `tasks/`, `sandboxes/`, `sessions/`).
 
 Provisioning is guest-driven on first boot: the host creates a sparse raw file;
@@ -74,14 +74,14 @@ found (idempotent). Subsequent boots detect the filesystem and skip mkfs.
 
 Host provisioning is a single idempotent function, `ensure_sparse_raw(path,
 size)`: the materialization strategy is decoupled from the guest boot path not by
-an abstraction but by the contract itself — the guest keys exclusively off
+an abstraction but by the contract itself, the guest keys exclusively off
 superblock detection, never off a "disk is blank" assumption. A future Phase-2
 reflink/CoW provisioner is therefore a pure host-side swap (a different way to
 create the image at that path) with no guest or boot-path change (informed by
 #583); it does not need a trait to be introduced up front.
 
-Clean shutdown requires a quiesce step — the guest `syncfs` + volume unmount
-before VMM teardown — because today every stop is an unclean unmount: `minvmd
+Clean shutdown requires a quiesce step, the guest `syncfs` + volume unmount
+before VMM teardown, because today every stop is an unclean unmount: `minvmd
 stop` SIGTERMs libkrun directly (`crates/minvmd/src/cmd/stop.rs:71-113`)
 without invoking the Shutdown RPC that landed in #613. With user data now on the
 volume, unclean unmount must produce a bounded, recoverable failure (ext4 journal
@@ -100,7 +100,7 @@ replay), not silent data loss.
 4. Clean shutdown quiesces the volume (guest syncfs + unmount) before VMM
    teardown; the writable disk is attached with flush/sync semantics; an unclean
    shutdown is recoverable via ext4 journal replay.
-5. Volume mount/attach failure when session state exists is loud — no silent
+5. Volume mount/attach failure when session state exists is loud, no silent
    tmpfs fallback, no false READY.
 6. A corrupt `sessions/index.json` self-heals from per-session `record.json`
    files, not by failing startup.
@@ -126,12 +126,12 @@ replay), not silent data loss.
 ## Demoable Units of Work
 
 > Requirement IDs use the format **R{unit}.{seq}** (R1.1, R1.2 for Unit 1;
-> R2.1 for Unit 2). These IDs are referenced directly by the planner — do
+> R2.1 for Unit 2). These IDs are referenced directly by the planner, do
 > not renumber after approval.
 
 ---
 
-### Unit 1: Per-VM writable volume — host provisioning + guest attachment + state dir relocation
+### Unit 1: Per-VM writable volume - host provisioning + guest attachment + state dir relocation
 
 **Purpose:** Resolve the `EXDEV` failure by placing the cache and rootfs-staging
 trees on a shared writable ext4 volume. Introduces the host provisioner, the
@@ -140,26 +140,26 @@ trees on a shared writable ext4 volume. Introduces the host provisioner, the
 **Depends on:** None
 
 **Affected areas:**
-- `crates/minvmd/src/krun/raw.rs` — `krun_add_disk3` FFI declaration
-- `crates/minvmd/src/krun/ctx.rs` — `Context::add_disk_with_sync` wrapper
-- `crates/minvmd/src/volume.rs` (new) — `ensure_sparse_raw` + `resolve_data_volume_path`
-- `crates/minvmd/src/vm.rs` — attach `/dev/vdb` via `add_disk_with_sync`
-- `crates/minimald/src/guest.rs` — `mount_state_volume("/dev/vdb")` in `enter_rootfs`
-- `crates/minimald/src/main.rs` — state dir paths → `/var/lib/minimal`
-- `scripts/build-rootfs.sh` or `scripts/stage-release.sh` — `/var/lib/minimal` mountpoint + `e2fsprogs` in closure
+- `crates/minvmd/src/krun/raw.rs`, `krun_add_disk3` FFI declaration
+- `crates/minvmd/src/krun/ctx.rs`, `Context::add_disk_with_sync` wrapper
+- `crates/minvmd/src/volume.rs` (new), `ensure_sparse_raw` + `resolve_data_volume_path`
+- `crates/minvmd/src/vm.rs`, attach `/dev/vdb` via `add_disk_with_sync`
+- `crates/minimald/src/guest.rs`, `mount_state_volume("/dev/vdb")` in `enter_rootfs`
+- `crates/minimald/src/main.rs`, state dir paths → `/var/lib/minimal`
+- `scripts/build-rootfs.sh` or `scripts/stage-release.sh`, `/var/lib/minimal` mountpoint + `e2fsprogs` in closure
 
 **Baseline:**
 - `krun/raw.rs` declares `krun_add_disk2` (no sync control); `krun_add_disk3`
-  (`libkrun.h:278-284`, `direct_io` + `sync_mode`) is not yet declared — **NOT
+  (`libkrun.h:278-284`, `direct_io` + `sync_mode`) is not yet declared, **NOT
   YET IN CODEBASE**.
-- `vm.rs` calls `ctx.add_disk("root", &self.rootfs_path, DiskFormat::Raw, true)` —
-  one disk, no second disk — **WRITABLE VOLUME NOT YET ATTACHED**.
+- `vm.rs` calls `ctx.add_disk("root", &self.rootfs_path, DiskFormat::Raw, true)`,
+  one disk, no second disk, **WRITABLE VOLUME NOT YET ATTACHED**.
 - `main.rs:302-305` sets `minimal_state_dir = /run/minimal`, `minimal_cache_dir
-  = /run/minimal/cache` — **STILL ON TMPFS**.
+  = /run/minimal/cache`, **STILL ON TMPFS**.
 - `guest.rs:139-221` mounts only `/dev/vda` read-only, then transitions to the
-  new root — **NO WRITABLE VOLUME MOUNT STEP**.
+  new root, **NO WRITABLE VOLUME MOUNT STEP**.
 - `DiskFormat` enum has only `Raw = 0` (`krun/raw.rs:40-44`); `QCOW2` is a
-  comment, not a variant — **ALREADY SATISFIES the Raw-only constraint**.
+  comment, not a variant, **ALREADY SATISFIES the Raw-only constraint**.
 
 **Functional Requirements:**
 
@@ -168,7 +168,7 @@ trees on a shared writable ext4 volume. Introduces the host provisioner, the
   `krun_add_disk3(ctx_id: u32, block_id: *const c_char, disk_path: *const
   c_char, disk_format: u32, read_only: bool, direct_io: bool, sync_mode: u32)
   -> i32`. **Note:** `sync_mode` is a `uint32_t` tri-state
-  (`KRUN_SYNC_{NONE=0,RELAXED=1,FULL=2}`), *not* a `bool` — an earlier draft of
+  (`KRUN_SYNC_{NONE=0,RELAXED=1,FULL=2}`), *not* a `bool`, an earlier draft of
   this spec was wrong; a `SyncMode` `#[repr(u32)]` enum models it. A `// SAFETY:`
   comment shall document all caller preconditions. No `Qcow2` variant shall be
   added to `DiskFormat`; the comment at `raw.rs:39` remains a comment.
@@ -185,7 +185,7 @@ trees on a shared writable ext4 volume. Introduces the host provisioner, the
   ```
   that creates a sparse raw file at the **literal `path`** (sized via
   `ftruncate`/`File::set_len`, which is sparse on both APFS and ext4) when it is
-  missing, and leaves an existing image untouched (never resized in place —
+  missing, and leaves an existing image untouched (never resized in place,
   shrinking would truncate a guest-formatted ext4, and growing the file does not
   grow the filesystem). `VolumeError` shall be a `thiserror`-derived typed enum.
   A companion `resolve_data_volume_path()` shall resolve the image path from
@@ -193,7 +193,7 @@ trees on a shared writable ext4 volume. Introduces the host provisioner, the
   default beside minvmd's state dir (`<state>/data-vol.raw`, honouring
   `XDG_STATE_HOME`). The default volume size is a named constant defaulting to
   32 GiB, overridable via `MINVMD_VOLUME_BYTES`. No trait/abstraction is
-  introduced — a future Phase-2 provisioner swaps the creation strategy behind
+  introduced, a future Phase-2 provisioner swaps the creation strategy behind
   this same function/path contract (see Design Considerations and Non-Goals).
 
 - **R1.4**: `crates/minvmd/src/vm.rs` shall call `ctx.add_disk_with_sync` after
@@ -209,7 +209,7 @@ trees on a shared writable ext4 volume. Introduces the host provisioner, the
   function and call it from `enter_rootfs` immediately after the `/dev/vda` RO
   mount and before the `MS_MOVE` root transition. The function:
   - Opens the device and probes for a valid ext4 superblock (reads the magic
-    number at byte offset 1080: `0x53EF`). This is the idempotency gate — mkfs
+    number at byte offset 1080: `0x53EF`). This is the idempotency gate, mkfs
     runs only when the superblock is absent or corrupt.
   - If no valid superblock is found, shells out to `mkfs.ext4 -F <device>` and
     logs the result. A failure here is fatal: return the error.
@@ -234,7 +234,7 @@ trees on a shared writable ext4 volume. Introduces the host provisioner, the
   `MINVMD_DISK_DIRECT_IO` (default `false`), matching the `MINVMD_VOLUME_BYTES`
   override pattern (R1.3). The defaults preserve the durability posture argued in
   Design Considerations (`relaxed` honours `VIRTIO_BLK_F_FLUSH` so ext4 journal
-  ordering holds — bounding the crash data-loss window — without `full`'s
+  ordering holds, bounding the crash data-loss window, without `full`'s
   drive-level flush; `direct_io=false` is correct for guest ext4). The knobs
   exist so the throughput cost of that posture can be measured (Proof Artifact 4)
   rather than assumed, and tuned per platform without a rebuild. Note the coupling
@@ -247,43 +247,43 @@ trees on a shared writable ext4 volume. Introduces the host provisioner, the
 
 1. **Test:** An integration test (`crates/minvmd/tests/` or `crates/minimald/tests/`)
    boots the VM, runs a build that hardlinks from the cache into a sandbox staging
-   tree, and asserts the build succeeds with no `EXDEV` error — demonstrates the
+   tree, and asserts the build succeeds with no `EXDEV` error, demonstrates the
    same-FS constraint is satisfied.
 2. **CLI:** `minvmd boot --foreground` on macOS/HVF starts the VM, the guest
-   mounts `/dev/vdb`, and the READY marker arrives — confirms the second disk is
+   mounts `/dev/vdb`, and the READY marker arrives, confirms the second disk is
    attached, formatted, and mounted before the guest signals readiness.
 3. **Test (sparse-raw gate):** Provision the volume, record host block usage
    (`stat` `st_blocks`, not `st_size`), then inside the guest (a) write N GiB to
-   the raw block device and assert host `st_blocks` grew by ≈N GiB — confirming
+   the raw block device and assert host `st_blocks` grew by ≈N GiB, confirming
    **allocate-on-write** sparsity; and (b) discard that range (`fstrim` /
    `mount -o discard` / `BLKDISCARD`) and record whether host `st_blocks` falls
-   back — characterizing **reclaim-on-discard** through libkrun's virtio-blk.
+   back, characterizing **reclaim-on-discard** through libkrun's virtio-blk.
    This is a **decision gate**: allocate-on-write is required (fail the sprint if
    the host allocates the full `MINVMD_VOLUME_BYTES` up front); reclaim-on-discard
    is observed and recorded, and a non-reclaiming result triggers reopening the
    qcow2 evaluation (#647).
 
-   - **macOS/HVF/APFS — DONE (both PASS, 2026-07-07, libkrun 1.19.0).**
+   - **macOS/HVF/APFS, DONE (both PASS, 2026-07-07, libkrun 1.19.0).**
      Allocate-on-write: 2 GiB guest write → host image `4 KiB → exactly 2048
      MiB`. Reclaim: `BLKDISCARD [0,2 GiB)` → host image `2048 MiB → 0`. virtio-blk
      advertises discard (`discard_max_bytes` ≈ 2 TiB, granularity 4096). (Reclaim
      was driven via an injected static `BLKDISCARD` helper because the current
      rootfs lacks `fstrim`/`mkfs`; R1.7 removes that workaround.)
-   - **Linux/KVM — REQUIRED, runs in CI (not runnable on a macOS host — no
+   - **Linux/KVM, REQUIRED, runs in CI (not runnable on a macOS host, no
      `/dev/kvm`).** Re-run both halves on a Linux/KVM host over its host FS
      (ext4/xfs). Allocate-on-write is expected to hold on any sparse-capable FS;
      reclaim depends on the host FS `FALLOC_FL_PUNCH_HOLE` support **and** the
-     KVM virtio-blk backend, which is a different code path from HVF — it must be
+     KVM virtio-blk backend, which is a different code path from HVF; it must be
      verified, not inferred from the macOS result.
 4. **Test (sync/direct_io throughput):** Time a write workload against `/dev/vdb`
    under each `MINVMD_DISK_SYNC` × `MINVMD_DISK_DIRECT_IO` combination (R1.9), so
    the default posture is chosen from data. Does not gate merge.
 
-   - **macOS/HVF/APFS — DONE (2026-07-07).** Sync-heavy (`O_DSYNC`/block):
+   - **macOS/HVF/APFS, DONE (2026-07-07).** Sync-heavy (`O_DSYNC`/block):
      `none` 4.7 GB/s, `relaxed` 3.1 GB/s, `full` 254 MB/s (~12–18× slower);
      `direct_io=true` halves `relaxed` to 1.2 GB/s. → default `relaxed` +
      `direct_io=false`.
-   - **Linux/KVM — REQUIRED, runs in CI.** On Linux, libkrun documents
+   - **Linux/KVM, REQUIRED, runs in CI.** On Linux, libkrun documents
      `KRUN_SYNC_RELAXED` as **identical to full sync** (the macOS drive-flush
      relaxation does not apply), so the three-point curve collapses to two
      (`none` vs `relaxed≡full`). The `relaxed` default stays correct (durable)
@@ -302,16 +302,16 @@ loud rather than silently degraded.
 **Depends on:** Unit 1
 
 **Affected areas:**
-- `crates/minimald/src/server.rs` — Shutdown RPC handler
-- `crates/minimald/src/guest.rs` — quiesce logic (syncfs + remount-ro/umount); loud mount failure
-- `crates/minimald/src/main.rs` — no silent tmpfs fallback on mount failure; READY gated
-- `crates/minvmd/src/cmd/stop.rs` — invoke Shutdown RPC before SIGTERM
+- `crates/minimald/src/server.rs`, Shutdown RPC handler
+- `crates/minimald/src/guest.rs`, quiesce logic (syncfs + remount-ro/umount); loud mount failure
+- `crates/minimald/src/main.rs`, no silent tmpfs fallback on mount failure; READY gated
+- `crates/minvmd/src/cmd/stop.rs`, invoke Shutdown RPC before SIGTERM
 
 **Baseline:**
-- `stop.rs:71-113` sends SIGTERM to the libkrun process and waits up to 5 s —
+- `stop.rs:71-113` sends SIGTERM to the libkrun process and waits up to 5 s,
   **NO SHUTDOWN RPC INVOCATION**.
 - The Shutdown RPC (#613) tears down sessions but performs **NO VOLUME SYNCFS
-  OR UNMOUNT** — `server.rs:342-395` drains connections, then the process exits.
+  OR UNMOUNT**, `server.rs:342-395` drains connections, then the process exits.
 - `guest.rs:139-221` has no quiesce step and no mount-failure guard.
 - `main.rs:302-305` does not check that the volume is mounted before emitting
   READY.
@@ -360,10 +360,10 @@ loud rather than silently degraded.
 **Proof Artifacts:**
 
 1. **Test:** A test sends `minvmd stop` to a running VM, then confirms the volume
-   image is mountable (ext4 journal clean) on the host after teardown — demonstrates
+   image is mountable (ext4 journal clean) on the host after teardown, demonstrates
    the quiesce path flushed the journal.
 2. **Test:** A test boots a VM with a missing or incorrectly-sized `/dev/vdb` and
-   asserts that no `READY` marker arrives within the boot timeout — demonstrates
+   asserts that no `READY` marker arrives within the boot timeout, demonstrates
    R2.4 and R2.5 (loud failure, no silent fallback).
 
 ---
@@ -378,21 +378,21 @@ the host-side mapping from session id to volume image.
 **Depends on:** Unit 1, Unit 2
 
 **Affected areas:**
-- `crates/sessions/src/store.rs` — corrupt index self-heal
-- `crates/minimald/src/guest.rs` or boot path — `sessions/` exemption from reset
-- `crates/minimald/src/rpc.rs` — upload-on-resume semantics
-- `crates/minvmd/src/provider_index.rs` (new) — session → image → VM map
+- `crates/sessions/src/store.rs`, corrupt index self-heal
+- `crates/minimald/src/guest.rs` or boot path, `sessions/` exemption from reset
+- `crates/minimald/src/rpc.rs`, upload-on-resume semantics
+- `crates/minvmd/src/provider_index.rs` (new), session → image → VM map
 
 **Baseline:**
 - `sessions/store.rs:382-396`: `Store::new` already calls `self_heal()` after
-  loading the index — **SELF-HEAL MECHANISM EXISTS**. However, `serde_json::from_reader`
+  loading the index, **SELF-HEAL MECHANISM EXISTS**. However, `serde_json::from_reader`
   at line 386 propagates a deserialization error directly (no catch-and-rebuild)
-  — a corrupt `index.json` hard-fails at startup, after READY.
+, a corrupt `index.json` hard-fails at startup, after READY.
 - `sessions/` is currently inside `/run/minimal`; no boot-time reset logic is
   needed today because the tmpfs is ephemeral. With the persistent volume,
   `providers/` must continue to reset while `sessions/` must not.
 - `rpc.rs:402-410` unpacks a zstd-compressed tar into `paths.working` via
-  `async_tar::Archive::unpack` — **NO NON-EMPTY CHECK, NO STAGED SWAP, NO
+  `async_tar::Archive::unpack`, **NO NON-EMPTY CHECK, NO STAGED SWAP, NO
   ATOMICITY GUARANTEE**.
 - No host-side session → volume index exists.
 
@@ -422,8 +422,8 @@ the host-side mapping from session id to volume image.
   - If `force=true` is set, unpack into a staging directory adjacent to the
     worktree, then atomically swap staging and worktree with `renameat2(2)`
     using the `RENAME_EXCHANGE` flag (supported by ext4 on the volume). Plain
-    `rename(2)` cannot replace a non-empty worktree — it fails with `ENOTEMPTY`
-    — whereas `RENAME_EXCHANGE` swaps the two directories in a single atomic
+    `rename(2)` cannot replace a non-empty worktree, it fails with `ENOTEMPTY`
+, whereas `RENAME_EXCHANGE` swaps the two directories in a single atomic
     step regardless of their contents. After the swap, the pre-upload worktree
     content sits at the staging path and is removed. A mid-stream unpack failure
     leaves the partial tree in staging (not the live worktree); the next upload
@@ -437,7 +437,7 @@ the host-side mapping from session id to volume image.
   `ProviderIndex` struct that persists a JSON map keyed by `SessionId` (UUIDv7,
   globally unique) with `VolumeEntry` values. `VolumeEntry` holds
   `{ image_path: PathBuf, vm_id: String }` and does **not** repeat the session
-  id — the id lives only in the map key. It shall implement
+  id, the id lives only in the map key. It shall implement
   `insert(session_id, VolumeEntry)`, `get_by_session(&SessionId) -> Option<&VolumeEntry>`,
   and `remove(&SessionId)` operations, and `flush` (atomic rename-based JSON
   write). The index file shall be stored at
@@ -454,11 +454,11 @@ the host-side mapping from session id to volume image.
 
 1. **Test:** A test writes a deliberately corrupt `sessions/index.json` to the
    volume, boots the VM, and asserts `minimald` reaches READY without error and
-   the session count recovered from `record.json` matches expectation — demonstrates
+   the session count recovered from `record.json` matches expectation, demonstrates
    R3.1.
 2. **Test:** A test uploads a workspace to a non-empty worktree without `force=true`
    and asserts the RPC returns an error; uploads with `force=true` succeed and the
-   prior worktree content is atomically replaced — demonstrates R3.3.
+   prior worktree content is atomically replaced, demonstrates R3.3.
 
 ---
 
@@ -466,8 +466,8 @@ the host-side mapping from session id to volume image.
 
 - **Phase 2 (host-FS reflink CoW) and Phase 3 (single writable root).** Deferred.
   The `ensure_sparse_raw` function/path contract (R1.3) and guest
-  superblock-detection (R1.5) keep Phase 2 a pure host-side swap — a different
-  image-creation strategy behind the same function — with no guest/boot-path
+  superblock-detection (R1.5) keep Phase 2 a pure host-side swap, a different
+  image-creation strategy behind the same function, with no guest/boot-path
   change; but note it
   carries a Linux host-FS prerequisite: APFS `clonefile` works by default on
   macOS, whereas ext4 has no reflink, so a Linux host would need xfs-with-reflink
@@ -487,12 +487,12 @@ the host-side mapping from session id to volume image.
 - **Reducing the guest RAM stop-gap.** The 4096/2048 MiB tmpfs-headroom default
   (`crates/minvmd/src/cmd/mod.rs`) is left as-is. A reduced baseline is only safe
   once a failed volume mount is fatal (no silent tmpfs fallback) *and* the floor
-  is measured against real in-VM build memory pressure — neither is settled here,
+  is measured against real in-VM build memory pressure, neither is settled here,
   so the reduction is deferred to a separate memory-pressure spec.
 - **Automatic host-image reclamation (periodic `fstrim`).** The guest does not
   proactively issue TRIM/discard, so the RAW backing file only shrinks when a
   discard is issued (`mount -o discard` / manual `fstrim`); ext4 still reuses its
-  own free blocks in place, so the *filesystem* never runs out of space — only
+  own free blocks in place, so the *filesystem* never runs out of space, only
   the host image can grow toward its `MINVMD_VOLUME_BYTES` high-water mark.
   Follow-up (Tom, #658 review): if that host-side growth becomes a problem, add a
   periodic guest `fstrim` (e.g. a cron) to punch the freed blocks back to the
@@ -503,7 +503,7 @@ the host-side mapping from session id to volume image.
 ### Why two disks rather than a read-write root
 
 Keeping the base rootfs read-only and shared avoids per-VM image divergence and
-simplifies rootfs upgrades (clone the new base, migrate state — no `qemu-img
+simplifies rootfs upgrades (clone the new base, migrate state, no `qemu-img
 rebase` risk). The writable volume is the only entity that varies per VM.
 
 ### Sparse-raw provisioning, and why not qcow2
@@ -512,14 +512,14 @@ The writable volume is a sparse RAW file: `ftruncate`/`fallocate(KEEP_SIZE)` to
 `MINVMD_VOLUME_BYTES`, host allocates blocks only as the guest writes them.
 Sparsity has two independent behaviours, treated separately (Proof Artifact 3):
 
-- **Allocate-on-write** is required and expected to hold — APFS (`ftruncate`) and
+- **Allocate-on-write** is required and expected to hold, APFS (`ftruncate`) and
   Linux (`fallocate KEEP_SIZE`) both back the file lazily, so the host never pays
   the full 32 GiB up front. If a platform allocates eagerly, that is a
   sprint-blocking failure.
 - **Reclaim-on-delete** is *not* assumed. ext4 frees blocks internally, but the
   RAW backing file only shrinks if the guest issues discard (`-o discard` /
   `fstrim`), libkrun's virtio-blk forwards UNMAP as `fallocate(PUNCH_HOLE)`, and
-  the host FS punches holes — a chain that is unverified here. Proof Artifact 3
+  the host FS punches holes, a chain that is unverified here. Proof Artifact 3
   measures it. If it works, images stay near live-data size; if it does not, the
   image is bounded by its high-water mark ≤ `MINVMD_VOLUME_BYTES` and the default
   is sized for that ceiling. Broken reclaim under heavy build/GC churn is the
@@ -528,14 +528,14 @@ Sparsity has two independent behaviours, treated separately (Proof Artifact 3):
 Two qcow2 alternatives were raised in review and are deferred, not dismissed:
 
 - **qcow2 data disk (self-sparse, compactable).** qcow2 stores only allocated
-  clusters and can be compacted offline without the guest-discard chain — a
+  clusters and can be compacted offline without the guest-discard chain, a
   cleaner space-reclamation story than RAW. Cost: it needs a `Qcow2`
   `DiskFormat` variant plus verification that the pinned macOS libkrun block
   backend actually drives qcow2, and it adds a metadata-corruption layer on hard
   kill (repair = `qemu-img check -r` on top of ext4 fsck). RAW carries neither
   risk and is already supported.
 - **qcow2 base + per-VM overlay (backing file).** Attaching only the overlay
-  collapses the model to a single writable root — this is Phase 3 topology, and
+  collapses the model to a single writable root; this is Phase 3 topology, and
   it depends on libkrun honouring qcow2 *backing files*, the exact verification
   gate #647 flagged. It is also the weakest crash-safety story: the overlay's
   qcow2 metadata must survive hard kill on top of the guest journal, so the
@@ -544,7 +544,7 @@ Two qcow2 alternatives were raised in review and are deferred, not dismissed:
 
 The decision gate is Proof Artifact 3: RAW ships if allocate-on-write holds and
 reclaim is either functional or bounded acceptably; a failing reclaim result is
-what reopens qcow2 — with measurement, not assertion.
+what reopens qcow2, with measurement, not assertion.
 
 ### Guest-side mkfs vs host-side mkfs
 
@@ -558,7 +558,7 @@ raw block device.
 
 `krun_add_disk2` has no sync control (`crates/minvmd/src/krun/raw.rs:143-149`).
 `krun_add_disk3` adds a `direct_io` flag and a `sync_mode` **`u32` tri-state**
-(`KRUN_SYNC_{NONE,RELAXED,FULL}`; `libkrun.h:278-284`) — not the `bool` an earlier
+(`KRUN_SYNC_{NONE,RELAXED,FULL}`; `libkrun.h:278-284`), not the `bool` an earlier
 draft assumed. The writable volume is attached with `sync_mode=RELAXED` (R1.9),
 which honours `VIRTIO_BLK_F_FLUSH` so the ext4 journal's write ordering is
 preserved (replay works after unclean shutdown) while skipping the drive-level
@@ -568,7 +568,7 @@ to the guest journal). Both are validated by Proof Artifact 4 on macOS.
 
 ### Platform differences (macOS/HVF vs Linux/KVM)
 
-This spec targets both hosts, and two behaviours diverge — Proof Artifacts 3 and
+This spec targets both hosts, and two behaviours diverge, Proof Artifacts 3 and
 4 must therefore run on each (macOS done; Linux/KVM required in CI):
 
 - **`sync_mode` collapses on Linux.** libkrun documents `RELAXED` as "relax
@@ -576,7 +576,7 @@ This spec targets both hosts, and two behaviours diverge — Proof Artifacts 3 a
   sync**." So the macOS three-point durability/throughput curve (`none` <
   `relaxed` < `full`) has only two effective points on Linux (`none`,
   `relaxed≡full`). The `RELAXED` default stays correct (durable) everywhere, but
-  on Linux there is no cheap-flush middle mode — honouring flush always pays
+  on Linux there is no cheap-flush middle mode, honouring flush always pays
   full-sync cost.
 - **Reclaim depends on the host FS + backend.** The macOS reclaim result rides
   APFS hole-punching under the HVF virtio-blk backend. Linux/KVM is a different
@@ -596,7 +596,7 @@ window, bounded to ≤ `commit=5s` seconds of data.
 ### Sessions directory exempt from boot reset
 
 `providers/` is reset on each boot (established in PR #573 commit `ee5299cc`)
-because provider registrations are ephemeral. `sessions/` must not be reset —
+because provider registrations are ephemeral. `sessions/` must not be reset,
 it is the source of truth for persistent workbenches. The guard in R3.2 makes
 this explicit. Any future reset logic must not glob `*` under `minimal_state_dir`
 without excluding `sessions/` and `cache/`.
@@ -604,7 +604,7 @@ without excluding `sessions/` and `cache/`.
 ### Upload-on-resume atomicity
 
 The current upload path (`rpc.rs:402-410`) is a streaming tar unpack directly
-into `paths.working` — no staging, no atomicity. With a persistent worktree this
+into `paths.working`, no staging, no atomicity. With a persistent worktree this
 is a data-corruption risk: a mid-stream failure leaves a partial mix. R3.3
 introduces a staged-swap: unpack into `.working.upload-staging`, then rename. The
 staging directory is adjacent to the live worktree on the same volume, making
@@ -643,7 +643,7 @@ staging directory is adjacent to the live worktree on the same volume, making
    sessions (user data) share one volume and therefore one `sync_mode` (R1.9). On
    macOS `relaxed` measured cheap (Proof Artifact 4), so the coupling costs little
    there. On Linux, where `relaxed≡full`, honouring flush is always full-sync
-   cost — if that proves too slow for cache churn, the levers are `none` (accept
+   cost, if that proves too slow for cache churn, the levers are `none` (accept
    losing the cache on hard crash, keep sessions safe by other means) or splitting
    the volume so cache and sessions get different `sync_mode`s. Not in scope this
    sprint; the R1.9 knob keeps the option open.
@@ -657,7 +657,7 @@ staging directory is adjacent to the live worktree on the same volume, making
 - **`fallocate(FALLOC_FL_KEEP_SIZE)`** creates a sparse file on Linux; macOS
   does not support `fallocate`, so `ftruncate` (which also creates a sparse/thin
   file on APFS and HFS+) is the portable fallback.
-- **Session UUIDv7** — globally unique, monotonically ordered by creation time.
+- **Session UUIDv7**: globally unique, monotonically ordered by creation time.
   The `ProviderIndex` key is the session UUIDs, ensuring no collision across VMs
   or host reboots.
 - **krun_add_disk3 is in libkrun ≥ 1.19.0.** The installed version is confirmed
@@ -682,10 +682,10 @@ staging directory is adjacent to the live worktree on the same volume, making
 |------|-----|-----------|----------------------|
 | R1 | R1.4, R1.5, R1.6 | Test | In-VM build that hardlinks from cache into sandbox staging exits 0 (no `EXDEV`) |
 | R1 | R1.5 | CLI | `minvmd boot --foreground` on macOS/HVF: VM reaches READY with `/dev/vdb` mounted |
-| R1 | R1.3, R1.4 | Test (gate) — **macOS ✅** | Allocate-on-write host `st_blocks` grows ≈N GiB (required); reclaim-on-discard recorded. macOS/APFS: 2 GiB write → 2048 MiB, `BLKDISCARD` → 0 |
-| R1 | R1.3, R1.4 | Test (gate) — **Linux/KVM (CI)** | Same gate on a Linux/KVM host over ext4/xfs; reclaim verified through the KVM virtio-blk backend, not inferred from macOS |
-| R1 | R1.9 | Test (measure) — **macOS ✅** | Timed across `MINVMD_DISK_SYNC` × `MINVMD_DISK_DIRECT_IO`. macOS: none 4.7 / relaxed 3.1 / full 0.25 GB/s → default relaxed+direct_io=false |
-| R1 | R1.9 | Test (measure) — **Linux/KVM (CI)** | Same sweep; `RELAXED≡FULL` on Linux, so measure `none` vs `full` to confirm full-sync cost is acceptable |
+| R1 | R1.3, R1.4 | Test (gate), **macOS ✅** | Allocate-on-write host `st_blocks` grows ≈N GiB (required); reclaim-on-discard recorded. macOS/APFS: 2 GiB write → 2048 MiB, `BLKDISCARD` → 0 |
+| R1 | R1.3, R1.4 | Test (gate), **Linux/KVM (CI)** | Same gate on a Linux/KVM host over ext4/xfs; reclaim verified through the KVM virtio-blk backend, not inferred from macOS |
+| R1 | R1.9 | Test (measure), **macOS ✅** | Timed across `MINVMD_DISK_SYNC` × `MINVMD_DISK_DIRECT_IO`. macOS: none 4.7 / relaxed 3.1 / full 0.25 GB/s → default relaxed+direct_io=false |
+| R1 | R1.9 | Test (measure), **Linux/KVM (CI)** | Same sweep; `RELAXED≡FULL` on Linux, so measure `none` vs `full` to confirm full-sync cost is acceptable |
 | R2 | R2.3, R2.1 | Test | `minvmd stop` on a running VM → host can mount volume image with clean ext4 journal |
 | R2 | R2.4, R2.5 | Test | VM boot with missing/corrupt `/dev/vdb` produces no `READY` marker within boot timeout |
 | R3 | R3.1 | Test | Corrupt `sessions/index.json` → `minimald` reaches READY; sessions recovered from `record.json` |

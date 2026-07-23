@@ -1,6 +1,6 @@
 ---
 id: 486
-title: "WireGuard implementation choice — wireguard-go vs boringtun for Unit 4"
+title: "WireGuard implementation choice, wireguard-go vs boringtun for Unit 4"
 status: partial
 date: 2026-06-20
 budget_hours: 2
@@ -20,7 +20,7 @@ tags:
 # Question
 
 For Unit 4's WireGuard mesh (R4.1), should `minimald` embed wireguard-go (via
-cgo, requiring a Go toolchain — already needed for gvproxy source build) or
+cgo, requiring a Go toolchain, already needed for gvproxy source build) or
 boringtun (pure Rust, no additional toolchain dependency)? Which is more
 production-ready for the subnet-router model minimald requires?
 
@@ -53,14 +53,14 @@ production adoption at the subnet-router level.
 
 ### wireguard-go
 
-- **Source:** `golang.zx2c4.com/wireguard` — the canonical Go implementation,
+- **Source:** `golang.zx2c4.com/wireguard`, the canonical Go implementation,
   authored by WireGuard's creator Jason A. Donenfeld. The `github.com/WireGuard/
   wireguard-go` repository shows continuous commit activity with multiple commits
   per month and is the upstream reference for third-party integrations.
 - **Tailscale deployment:** Tailscale operates a derivative stack
   (`github.com/tailscale/wireguard-go`) in production across millions of devices.
-  Their subnet-router feature — where a peer advertises a local subnet (e.g.
-  `192.168.1.0/24`) to the rest of the mesh via AllowedIPs — is central to their
+  Their subnet-router feature, where a peer advertises a local subnet (e.g.
+  `192.168.1.0/24`) to the rest of the mesh via AllowedIPs, is central to their
   product and is the exact model minimald requires. This is the strongest
   evidence of production maturity for the subnet-router pattern.
 - **Integration into non-Go binaries:** wireguard-go is a Go program. Embedding
@@ -98,7 +98,7 @@ production adoption at the subnet-router level.
   identically: set `AllowedIPs = 100.64.0.0/16` (the gvproxy switch subnet) on
   remote peers. The implementation-level difference between the two is nil for
   this use case. Tailscale's "battle-tested subnet-router" advantage lies in
-  their coordination and ACL layer — not in wireguard-go itself — which minimald
+  their coordination and ACL layer, not in wireguard-go itself, which minimald
   does not need in v1 (manual key exchange per R4.1).
 - **Rust integration:** `cargo add boringtun` in the workspace `Cargo.toml`.
   The `Tunn` struct wraps a WireGuard tunnel with a standard read/write
@@ -123,7 +123,7 @@ correct, but carries a critical nuance:
   a C compiler (`gcc`/`clang`) on the host, and the corresponding
   cross-compilation C compiler for every target architecture. Cross-compiling a
   cgo shared library to `linux/arm64` from a `linux/amd64` host requires an
-  `aarch64-linux-gnu-gcc` toolchain — a separate installation step not needed
+  `aarch64-linux-gnu-gcc` toolchain, a separate installation step not needed
   for gvproxy. This is a materially different CI surface than the Go used for
   gvproxy.
 
@@ -158,7 +158,7 @@ with no impact on binary size or startup time when unconfigured.
 
 **boringtun is the recommended choice for minimald v1.**
 
-The hypothesis is partially supported — wireguard-go is more battle-tested at
+The hypothesis is partially supported, wireguard-go is more battle-tested at
 Tailscale's scale, and Go toolchain presence does reduce the raw toolchain
 footprint for cgo. However, the hypothesis underestimates two factors:
 
@@ -178,9 +178,9 @@ boringtun's integration advantages for a Rust project:
 
 | Dimension | wireguard-go (cgo) | wireguard-go (subprocess) | boringtun |
 |---|---|---|---|
-| Integration complexity | High — Go wrapper + FFI | Medium — process lifecycle | Low — Cargo dependency |
-| R4.7 feature flag | Hard — cgo link-time | Medium — spawn-time gate | Easy — Cargo feature |
-| Cross-compilation | High — C cross-compiler | Medium — separate binary | Low — Rust toolchain |
+| Integration complexity | High, Go wrapper + FFI | Medium, process lifecycle | Low, Cargo dependency |
+| R4.7 feature flag | Hard, cgo link-time | Medium, spawn-time gate | Easy, Cargo feature |
+| Cross-compilation | High, C cross-compiler | Medium, separate binary | Low, Rust toolchain |
 | Process count | Same (in-proc) | +1 (alongside gvproxy) | Same (in-proc) |
 | Production subnet-router | Tailscale-scale | Tailscale-scale | Cloudflare/Mullvad-scale |
 | Maintenance risk | Low | Low | Low–Medium (gap resolved in 2026) |

@@ -25,7 +25,7 @@ delayed `stop()` call) evaluates `!stopping.swap(true)` as `true` and sends
 SIGTERM to `self.pid`. Between the supervisor's reap and that signal, the OS
 may have recycled the PID, causing the signal to land on an unrelated process.
 
-`signal_child` silences `ESRCH` — correctly hiding "process already gone" —
+`signal_child` silences `ESRCH`, correctly hiding "process already gone",
 but does nothing for the recycle case where the PID now resolves to a live,
 unrelated process. The window is documented in-code but not closed
 (informed by #550).
@@ -34,7 +34,7 @@ unrelated process. The window is documented in-code but not closed
 
 Replace raw-PID `kill(2)` with `pidfd_send_signal(2)` (Linux ≥ 5.1). A pidfd
 refers to the exact process instance opened at spawn; after the process exits,
-`pidfd_send_signal` always returns `ESRCH` — it never resolves to a recycled
+`pidfd_send_signal` always returns `ESRCH`; it never resolves to a recycled
 PID. This closes the recycle hazard structurally without altering the
 supervision-task coordination logic.
 
@@ -52,7 +52,7 @@ supervision-task coordination logic.
 
 ## Demoable Units of Work
 
-### Unit 1 — Replace raw-PID signalling with pidfd in GvproxySwitch
+### Unit 1 - Replace raw-PID signalling with pidfd in GvproxySwitch
 
 **R1.1** `GvproxySwitch::supervise()` calls `pidfd_open(pid, 0)` immediately
 after extracting the child PID (before spawning the supervision task) and stores
@@ -68,12 +68,12 @@ is silenced identically to the existing `signal_child` behaviour; unexpected
 errors (`EPERM`, `EINVAL`) are logged via `tracing::warn!`.
 
 **R1.3** `stop()` and `GvproxySwitch::Drop` signal via `signal_pidfd`. The
-`stopping` atomic and its acquire/release ordering are unchanged — they continue
+`stopping` atomic and its acquire/release ordering are unchanged, they continue
 to classify exits as intentional vs. unexpected in `supervise_switch`.
 
 **R1.4** A new test `pidfd_signal_to_reaped_child_returns_esrch` spawns a
 short-lived child, opens its pidfd immediately, awaits the child's reap, then
-calls `pidfd_send_signal` and asserts the return is `ESRCH` — confirming the
+calls `pidfd_send_signal` and asserts the return is `ESRCH`, confirming the
 pidfd path never resolves to a recycled process after the child exits. Existing
 tests `stop_terminates_supervised_child` and
 `drop_sigkills_supervised_child_without_blocking` stay green.
@@ -111,5 +111,5 @@ passes. This test does not exist on the base branch and fails (test not found)
 before the PR lands.
 
 **Proof artifact 2 (File):**
-`grep -q 'pidfd' crates/minvmd/src/net.rs` — fails on the base branch (the
+`grep -q 'pidfd' crates/minvmd/src/net.rs`, fails on the base branch (the
 string is absent), passes after the PR lands.

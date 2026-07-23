@@ -23,7 +23,7 @@ equivalent write happens inside the VM into `/run/minimal/…` (a tmpfs the host
 SSH client never sees), so the first SSH connection to a fresh VM triggers a
 host-key warning or interactive TOFU prompt.
 
-(informed by #409 — the KVM READY marker implementation that established the
+(informed by #409, the KVM READY marker implementation that established the
 current one-line beacon protocol and the boot.rs / run.rs duplication)
 
 ## Introduction/Overview
@@ -51,13 +51,13 @@ SSH client finds it before the first connection attempt.
 
 ## Demoable Units of Work
 
-### Unit 1 — Beacon enrichment (minimald, guest side)
+### Unit 1 - Beacon enrichment (minimald, guest side)
 
-**R1.1** — The beacon emission is extended from one line to two: `READY\n`
+**R1.1**, The beacon emission is extended from one line to two: `READY\n`
 followed by the SSH host public key in OpenSSH authorized_keys format on a
 second line, terminated by `\n`.
 
-**R1.2** — In the vsock boot path, the beacon emitter receives the SSH host
+**R1.2**, In the vsock boot path, the beacon emitter receives the SSH host
 public key already loaded from the host configuration; no redundant key load
 is introduced.
 
@@ -69,24 +69,24 @@ is introduced.
   followed by `b"\n"`. This test does not pass against the current
   single-line implementation.
 
-### Unit 2 — Key reception and known_hosts write (minvmd, host side)
+### Unit 2 - Key reception and known_hosts write (minvmd, host side)
 
-**R2.1** — Both `minvmd boot` and the `minvmd run` supervisor read a second
+**R2.1**, Both `minvmd boot` and the `minvmd run` supervisor read a second
 line from the beacon connection immediately after validating `READY`.
 
-**R2.2** — If the second beacon line contains a valid SSH public key, `minvmd`
+**R2.2**, If the second beacon line contains a valid SSH public key, `minvmd`
 records it in `known_hosts` at
 `$XDG_STATE_HOME/minimal/providers/local-0/known_hosts` for hostname `local-0`
 at port 22, using the same known-hosts API path already used by the native
 (non-VM) `minimald` flow.
 
-**R2.3** — If the second line is absent, empty, or fails to parse as an SSH
+**R2.3**, If the second line is absent, empty, or fails to parse as an SSH
 public key, `minvmd` logs a warning and proceeds; the boot is not aborted.
 
-**R2.4** — The `providers/local-0/` directory hierarchy is created before
+**R2.4**, The `providers/local-0/` directory hierarchy is created before
 writing `known_hosts`.
 
-**R2.5** — `russh` is promoted from `[dev-dependencies]` to `[dependencies]`
+**R2.5**, `russh` is promoted from `[dev-dependencies]` to `[dependencies]`
 in `minvmd/Cargo.toml` so the production code can call
 `russh::keys::known_hosts::learn_known_hosts_path`.
 
@@ -115,7 +115,7 @@ in `minvmd/Cargo.toml` so the production code can call
 
 **Why extend the beacon protocol instead of a file channel?**
 The marker Unix socket is the only reliable synchronization point between guest
-and host at boot time — it is already used for the `READY` signal and is kept
+and host at boot time; it is already used for the `READY` signal and is kept
 alive for the duration of the read. A file-based channel would require a shared
 filesystem or a new vsock port; both add complexity. A second line on the
 existing connection is the simplest extension that fits the established pattern.
@@ -179,8 +179,8 @@ extension is additive and backward-compatible.
 
 ## Verification
 
-1. `cargo test -p minimald` — the `emit_ready_marker` unit test (R1.1) passes.
-2. `cargo test -p minvmd` — the READY-marker integration test (R2.1–R2.4)
+1. `cargo test -p minimald`, the `emit_ready_marker` unit test (R1.1) passes.
+2. `cargo test -p minvmd`, the READY-marker integration test (R2.1–R2.4)
    passes; the expected key entry is present in the temp `known_hosts`.
 3. End-to-end: `minvmd run` followed by a fresh SSH connect with
    `ssh -o UserKnownHostsFile=<path> local-0` succeeds with no host-key prompt.

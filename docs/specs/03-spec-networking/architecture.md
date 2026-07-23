@@ -1,12 +1,12 @@
 ---
 id: arch-networking
-title: "minimald networking — PTask network modes, DNS, egress/ingress, WireGuard mesh — architecture"
+title: "minimald networking, PTask network modes, DNS, egress/ingress, WireGuard mesh, architecture"
 kind: architecture
 status: shipped
 tracking-issue: 478
 ---
 
-# minimald networking — architecture
+# minimald networking - architecture
 
 ## Chosen approach
 
@@ -24,7 +24,7 @@ a per-VM gvproxy in the prior `spec-minvmd-networking-gvproxy` specification
 (#404); this architecture extends that pattern to DM2 and adds the full
 per-PTask policy, DNS, and remote-access layers on top.
 
-### Unit 1 — gvproxy switch and PTask network modes
+### Unit 1 - gvproxy switch and PTask network modes
 
 **`sandbox2::Config`** gains a `network_mode: NetworkMode` field replacing
 `disable_networking: bool`. The `NetworkMode` enum has three variants:
@@ -71,11 +71,11 @@ Considerations"), not downloaded at runtime. A Go build step is added to CI.
 The binary is verified by SHA-256 before use.
 
 **UC6 (same-host PTask-to-PTask):** Two `OwnIp` PTasks on the same switch
-reach each other directly — the traffic stays within the gvproxy process,
+reach each other directly, the traffic stays within the gvproxy process,
 never touching the kernel's IP routing. Subject to each PTask's ingress policy
 (Unit 2).
 
-### Unit 2 — egress, ingress policy, and VM-wide controls
+### Unit 2 - egress, ingress policy, and VM-wide controls
 
 Policy types live in `crates/minimald-rpc` (shared between the server and
 clients) as `#[non_exhaustive]` enums:
@@ -96,7 +96,7 @@ pub struct IngressPolicy {
 `minimald` translates these into gvproxy's filter/port-forward API at PTask
 launch via gvproxy's HTTP management endpoint (default `192.168.127.254:8080`,
 the well-known gvproxy gateway IP). This is gvproxy's native API surface and
-requires no custom protocol — the dynamic port-mapping API is resolved as the
+requires no custom protocol, the dynamic port-mapping API is resolved as the
 HTTP-on-gateway approach (see assumption ledger, `dynamic-portmap-api-http`).
 
 **VM-wide egress (UC5):** `minvmd`'s VM specification gains a `vm_egress`
@@ -108,14 +108,14 @@ boundary).
 returns the effective `EgressPolicy` and `IngressPolicy` for a named session.
 The response is a structured type; it is consumed by `minimal session policy`.
 
-### Unit 3 — DNS hostname management
+### Unit 3 - DNS hostname management
 
 `minimald` maintains a hostname registry keyed by session name. Registration
 format: `<session-name>.<host-id>.min.local`, where `<host-id>` is a stable
 configurable short name for the `minimald` instance.
 
 The **DNS resolution mechanism** is the one genuine open design decision this
-architecture cannot settle from the repository working tree — it depends on
+architecture cannot settle from the repository working tree, it depends on
 target-OS behaviour (see assumption `dns-hostname-mechanism`, needs-spike
 below). Both candidate paths are architecturally uniform from `minimald`'s
 perspective: `minimald` writes hostnames to either a local resolver
@@ -126,7 +126,7 @@ Unit 3 begins after the spike resolves this question.
 `127.0.0.1` for local-only instances or the host's configured network
 interface address for DM5.
 
-### Unit 4 — WireGuard mesh and remote browser access
+### Unit 4 - WireGuard mesh and remote browser access
 
 `minimald` embeds a WireGuard peer via a feature-flagged `wg` module. When
 the mesh configuration is present, `minimald` joins the mesh as a
@@ -194,7 +194,7 @@ Option<EgressPolicy>` to `VmConfig`. The existing gvproxy child from
 `spec-minvmd-networking-gvproxy` (#404) is extended to serve as the shared
 switch for all PTask attachments inside that VM.
 
-New `net.rs`: `NetworkMode`, `spawn_gvproxy`, `VmEgressPolicy` — aligned with
+New `net.rs`: `NetworkMode`, `spawn_gvproxy`, `VmEgressPolicy`, aligned with
 the stub design from spec #404 but extended for the full switch role.
 
 ### `crates/minimal/src/`
@@ -225,7 +225,7 @@ platform uniformity and direct PTask-to-PTask routing at no extra cost.
 ### Retaining `disable_networking: bool` and adding `OwnIp` as a separate flag
 
 Rejected. The trimodal enum encodes the three mutually exclusive states as
-exactly that — a three-variant enum, not two booleans that can be
+exactly that, a three-variant enum, not two booleans that can be
 independently set into an illegal combination. The Rust coding standards
 require making illegal states unrepresentable.
 
@@ -242,7 +242,7 @@ Distillery search (project: minimal) against concepts from this spec returned:
   `NetworkMode` enum, `spawn_gvproxy`, and
   `check_network_policy` stub are all re-usable as foundation for Unit 1 and
   Unit 2. This architecture depends on #404's implementation landing first (or
-  being subsumed by this work — see note in Unit 1).
+  being subsumed by this work, see note in Unit 1).
 - **`sandbox2/config.rs` pr#110** (cgroups without systemd): surfaced a prior
   constraint that `sandbox2` must degrade gracefully when cgroups/systemd are
   absent. The same resilience principle applies to netns creation: `minimald`
@@ -265,16 +265,16 @@ proposed here is the typed replacement for that placeholder.
 | `ownip-ptask-fd-pass` | OwnIp PTasks attach to gvproxy via unix socket SCM_RIGHTS fd-pass on DM2; via vsock shuttle on DM1/3/4 | settled | spec R1.5; consistent with the vsock shuttle already described in arch-minvmd-host-daemon; DM2 has direct host access so SCM_RIGHTS is the simplest mechanism |
 | `minvmd-owns-vm-gvproxy` | On DM1/3/4, minvmd owns the gvproxy process that serves the libkrun VM; minimald owns the gvproxy that serves DM2 PTasks | settled | spec R1.4; prior arch-minvmd-host-daemon delegates network lifecycle to the VM supervisor; minimald is the process that creates and destroys DM2 PTasks |
 | `dynamic-portmap-api-http` | Dynamic port-mapping requests from within a PTask (R2.4) use HTTP to gvproxy's management endpoint at the gateway IP | settled | spec § "Technical Considerations" references gvproxy's port-forward API; gvproxy's management HTTP endpoint is its standard API surface for port mapping; accessible from any OwnIp PTask without additional infrastructure |
-| `dm2-uc5-collapse` | VM-wide egress (UC5) is a configuration error on DM2 (native Linux, no VM boundary); UC5 collapses to UC3 on DM2 | settled | spec R2.5 explicitly states this; DM2 has no VM boundary — `vm_egress` applies only when minvmd owns the VM |
-| `gvproxy-source-build` | gvproxy ships as a pinned **pre-built** release binary (gvisor-tap-vsock v0.8.9), fetched and verified against checked-in SHA-256 digests in `vendor/gvproxy/gvproxy.lock` via `scripts/fetch-gvproxy.sh` — not built from source | settled (maintainer decision; supersedes the spec's source-build preference) | spec § "Technical Considerations" lists a SHA-256-verified pre-built binary as the accepted alternative; chosen to avoid a Go toolchain + module-proxy egress in the build sandbox; supply-chain risk mitigated by pinned upstream digests (#495) |
+| `dm2-uc5-collapse` | VM-wide egress (UC5) is a configuration error on DM2 (native Linux, no VM boundary); UC5 collapses to UC3 on DM2 | settled | spec R2.5 explicitly states this; DM2 has no VM boundary, `vm_egress` applies only when minvmd owns the VM |
+| `gvproxy-source-build` | gvproxy ships as a pinned **pre-built** release binary (gvisor-tap-vsock v0.8.9), fetched and verified against checked-in SHA-256 digests in `vendor/gvproxy/gvproxy.lock` via `scripts/fetch-gvproxy.sh`, not built from source | settled (maintainer decision; supersedes the spec's source-build preference) | spec § "Technical Considerations" lists a SHA-256-verified pre-built binary as the accepted alternative; chosen to avoid a Go toolchain + module-proxy egress in the build sandbox; supply-chain risk mitigated by pinned upstream digests (#495) |
 | `https-proxy-hyper-rustls` | The Unit 4 HTTPS reverse proxy uses hyper/axum for HTTP and rustls for TLS, matching the workspace's existing ecosystem | settled | spec § "Technical Considerations"; `rustls` is listed as a no-OpenSSL-dependency choice; `hyper`/`axum` are named as consistent with workspace deps |
 | `dns-hostname-mechanism` | The system resolver supports PTask hostname registration without root privilege per-invocation via either `*.localhost` wildcard (rootless on macOS; requires systemd-resolved or NetworkManager on Linux) or a one-time `/etc/resolver`-equivalent setup | needs-spike | spec Open Questions item 1: "Decision needed before Unit 3 implementation begins"; whether `*.localhost` wildcard resolution is reliably available on common Linux distributions (Ubuntu, Fedora, Arch, Debian) is not settleable from the repo working tree; R3.4 requires rootless per-invocation operation |
 | `wireguard-implementation` | Unit 4 WireGuard implementation is **boringtun** (pure Rust); wireguard-go subprocess is the v2 escalation path if peer coordination is needed or boringtun stalls | settled | spike #486 concluded boringtun for v1: clean Cargo feature-flag support for R4.7, zero additional build-chain dependencies, sufficient production maturity (Cloudflare WARP, Mullvad VPN) for the AllowedIPs-based subnet-router model; cgo path substantially more complex than hypothesised; maintainer confirmed on #478 (informed by #486) |
 
-ALREADY EXISTS: `sandbox2::Config::disable_networking: bool` — covers R1.2 (NoNet) and R1.3 (HostNet) in boolean form. The trimodal enum refactor replaces this field, preserving its semantics for the two existing modes.
+ALREADY EXISTS: `sandbox2::Config::disable_networking: bool`, covers R1.2 (NoNet) and R1.3 (HostNet) in boolean form. The trimodal enum refactor replaces this field, preserving its semantics for the two existing modes.
 
-ALREADY EXISTS: `sandbox2::Config::setup_dns_config: bool` — synthesises `/etc/resolv.conf` inside sandboxes. Retained unchanged; orthogonal to UC2 per-PTask hostname registration.
+ALREADY EXISTS: `sandbox2::Config::setup_dns_config: bool`, synthesises `/etc/resolv.conf` inside sandboxes. Retained unchanged; orthogonal to UC2 per-PTask hostname registration.
 
 ALREADY EXISTS: `minimald` embeds `russh` for PTask re-attach over SSH/UDS. R4.9 (SSH port-forwarding fallback) reuses this transport with no new dependency.
 
-ALREADY EXISTS: `minvmd::lifecycle` pure state machine, `StartingGuard` RAII pattern, VMM child supervision — all re-usable as-is for the gvproxy lifecycle extension in DM1/3/4 (informed by arch-minvmd-host-daemon).
+ALREADY EXISTS: `minvmd::lifecycle` pure state machine, `StartingGuard` RAII pattern, VMM child supervision, all re-usable as-is for the gvproxy lifecycle extension in DM1/3/4 (informed by arch-minvmd-host-daemon).

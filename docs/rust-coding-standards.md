@@ -3,7 +3,7 @@
 ## Functional over Imperative
 
 - Iterator chains over manual loops. map, filter, collect, try_fold, flat_map instead of for with mutable accumulators. Use for only when side effects dominate or control flow makes a chain awkward.
-- Combinators on Option/Result. map, and_then, ok_or, unwrap_or_else, map_err — not match that reconstructs the same enum.
+- Combinators on Option/Result. map, and_then, ok_or, unwrap_or_else, map_err, not match that reconstructs the same enum.
 - Immutable by default. Only mut when required. Building a Vec by push? Try .collect().
 - No index-based iteration. .iter(), .enumerate(), .zip(), .windows(), .chunks() over for i in 0..xs.len().
 
@@ -13,7 +13,7 @@
 - `impl IntoIterator<Item = T>` for consuming a sequence; `impl Iterator<Item = T>` for returning one (avoid allocating).
 - Make illegal states unrepresentable. Encode invariants in the type system: enums for mutually exclusive states (not bool flags + Options), non-empty collections via Vec1 or `(T, Vec<T>)`, parsed types instead of
 validated-then-passed-as-string. If a function can't be called in some state, that state shouldn't typecheck.
-- Newtypes for domain values (struct UserId(u64)) over bare primitives. Use the https://crates.io/crates/nutype crate when the type needs trivial invariants enforced (non-empty, range bounds, regex, trimmed, etc.) — it generates the
+- Newtypes for domain values (struct UserId(u64)) over bare primitives. Use the https://crates.io/crates/nutype crate when the type needs trivial invariants enforced (non-empty, range bounds, regex, trimmed, etc.), it generates the
 validating constructor and keeps the inner value unconstructable elsewhere.
 - Default only when the default is meaningful.
 - `Cow<'_, str>` for sometimes-owned, sometimes-borrowed values.
@@ -35,12 +35,12 @@ validating constructor and keeps the inner value unconstructable elsewhere.
 
 ## Async & Concurrency
 
-- No blocking in async context. No std::fs, std::thread::sleep, blocking network, or sync Mutex held across .await — use tokio::fs, tokio::time::sleep, tokio::sync::Mutex.
-- Don't reach for `Arc<Mutex<T>>` reflexively. Plain `Arc<T>` suffices if `T` is immutable after construction. Spawned tasks must satisfy `Send + 'static` — design data flow accordingly.
+- No blocking in async context. No std::fs, std::thread::sleep, blocking network, or sync Mutex held across .await, use tokio::fs, tokio::time::sleep, tokio::sync::Mutex.
+- Don't reach for `Arc<Mutex<T>>` reflexively. Plain `Arc<T>` suffices if `T` is immutable after construction. Spawned tasks must satisfy `Send + 'static`, design data flow accordingly.
 
 ## Logging
 
-- Use tracing — no println!/eprintln! outside user-facing CLI output. Structured fields and spans, not interpolated strings: tracing::info!(pkg = %name, "building"), not info!("building {name}").
+- Use tracing, no println!/eprintln! outside user-facing CLI output. Structured fields and spans, not interpolated strings: tracing::info!(pkg = %name, "building"), not info!("building {name}").
 
 ## Conventions
 
@@ -48,7 +48,7 @@ validating constructor and keeps the inner value unconstructable elsewhere.
 - unsafe requires a // SAFETY: comment covering every caller invariant.
 - #[must_use] on Result-shaped returns, builders, and anything where silently dropping the value is a bug.
 - #[non_exhaustive] on public enums/structs that may grow.
-- Private by default. Widen to pub(crate) before pub. Curate the public API via pub use at the crate root — internal module paths shouldn't be part of the public surface.
+- Private by default. Widen to pub(crate) before pub. Curate the public API via pub use at the crate root, internal module paths shouldn't be part of the public surface.
 - Testing: behavior, not implementation; one concept per test; insta for snapshot-shaped output; integration tests under tests/ for cross-crate flows.
 - No dead code, commented-out code, or ownerless TODOs.
 - Dependencies: prefer std, then crates already in the workspace, then crates listed on https://blessed.rs before reaching elsewhere. Versions are pinned in the workspace Cargo.toml; crate-level Cargo.tomls inherit via workspace = true,

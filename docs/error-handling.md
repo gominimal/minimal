@@ -2,11 +2,11 @@
 
 New Rust crates need a consistent error-handling convention. The prior pattern
 hand-writes `Display`, `From`, and `std::error::Error` impls for every error
-enum — high boilerplate, easy to drift across crates. User-facing errors must
+enum: high boilerplate, easy to drift across crates. User-facing errors must
 stay actionable, not just structurally tidy. Two layers, chosen by the role of
 the code, satisfy that.
 
-## Library crates — structured errors via `thiserror`
+## Library crates - structured errors via `thiserror`
 
 - `#[derive(Debug, thiserror::Error)]` on error enums.
 - `#[error("...")]` generates `Display`; `#[from]` generates `From`. This
@@ -76,12 +76,12 @@ pub enum Error {
 }
 ```
 
-## Application / binary code — opaque propagation via `anyhow`
+## Application / binary code - opaque propagation via `anyhow`
 
 Use `anyhow` where the specific error type does not matter and errors are only
 propagated upward. This is the common case in application (non-library) code.
 
-## User-facing CLIs — `color_eyre` instead of `anyhow`
+## User-facing CLIs - `color_eyre` instead of `anyhow`
 
 For CLIs that surface errors to a human, use `color_eyre` for better-formatted
 error reports. `eyre` is a fork of `anyhow` and fills the same
@@ -91,7 +91,7 @@ boundary.
 ## Rationale
 
 `thiserror` (library, structured) and `anyhow` / `eyre` (application, opaque)
-solve different problems and compose — they are complementary, not
+solve different problems and compose; they are complementary, not
 alternatives. `thiserror` does not compromise actionable messages: it only
 removes the `Display` / `From` boilerplate; the message strings remain fully
 under our control.

@@ -1,13 +1,13 @@
 ---
 id: spec-networking
-title: "minimald networking — PTask network modes, DNS, egress/ingress, WireGuard mesh"
+title: "minimald networking, PTask network modes, DNS, egress/ingress, WireGuard mesh"
 kind: spec
 status: shipped
 tracking-issue: 478
 supersedes:
 ---
 
-# minimald networking — PTask network modes, DNS, egress/ingress, WireGuard mesh
+# minimald networking - PTask network modes, DNS, egress/ingress, WireGuard mesh
 
 ## Context
 
@@ -30,25 +30,25 @@ on any path covered by this spec.
 
 The five deployment models (DM1–DM5) from the requirements document are:
 
-- **DM1** — macOS + one or more libkrun Linux VMs, each with `minimald`
-- **DM2** — native Linux, `minimald` on the host directly
-- **DM3** — native Linux + one or more Linux VMs, each with `minimald`
-- **DM4** — DM2 + DM3 combined
-- **DM5** — any of the above with a network-accessible, authenticated `minimald`
+- **DM1**: macOS + one or more libkrun Linux VMs, each with `minimald`
+- **DM2**: native Linux, `minimald` on the host directly
+- **DM3**: native Linux + one or more Linux VMs, each with `minimald`
+- **DM4**: DM2 + DM3 combined
+- **DM5**: any of the above with a network-accessible, authenticated `minimald`
 
 ## Introduction/Overview
 
 The networking stack delivers seven use cases:
 
-- **UC1** — PTask network isolation modes: no-net, host-net, or own-IP.
-- **UC2** — DNS hostnames for PTasks and network-accessible `minimald`
+- **UC1**: PTask network isolation modes: no-net, host-net, or own-IP.
+- **UC2**: DNS hostnames for PTasks and network-accessible `minimald`
   instances; local (UC2a) and remote (UC2b) browser access by hostname.
-- **UC3** — Per-PTask egress policy: subnet/DNS allowlists for own-IP PTasks.
-- **UC4** — Ingress port mapping for own-IP PTasks (static + dynamic); default
+- **UC3**: Per-PTask egress policy: subnet/DNS allowlists for own-IP PTasks.
+- **UC4**: Ingress port mapping for own-IP PTasks (static + dynamic); default
   deny-external.
-- **UC5** — VM-wide egress controls (DM1, DM3, DM4); collapses to UC3 on DM2.
-- **UC6** — Local PTask-to-PTask: TCP/UDP between PTasks on the same host.
-- **UC7 + UC2b** — WireGuard mesh for authenticated remote PTask-to-PTask and
+- **UC5**: VM-wide egress controls (DM1, DM3, DM4); collapses to UC3 on DM2.
+- **UC6**: Local PTask-to-PTask: TCP/UDP between PTasks on the same host.
+- **UC7 + UC2b**: WireGuard mesh for authenticated remote PTask-to-PTask and
   laptop-to-PTask access; HTTPS reverse proxy for no-client remote browser.
 
 The shared infrastructure is **one gvproxy process per host**. On native Linux
@@ -160,10 +160,10 @@ extended network-mode types in `crates/minimald-rpc/`
 
 1. **Test:** Integration test (`crates/minimald/tests/` or `crates/minvmd/tests/`)
    starts two `OwnIp` PTasks and asserts a TCP connect from PTask A to PTask B's
-   switch IP succeeds — demonstrates UC6 same-host PTask-to-PTask.
+   switch IP succeeds, demonstrates UC6 same-host PTask-to-PTask.
 2. **Test:** Integration test starts a `NoNet` PTask and asserts that a TCP
    connect attempt from within it to `8.8.8.8:80` fails with connection
-   refused or ENETUNREACH — demonstrates UC1 no-net isolation.
+   refused or ENETUNREACH, demonstrates UC1 no-net isolation.
 
 ---
 
@@ -217,14 +217,14 @@ types, gvproxy filter/portfwd API integration
 
 1. **Test:** Integration test starts an `OwnIp` PTask with an egress allowlist
    permitting only `tcp` to a specific test IP. Asserts that a TCP connect to the
-   allowed IP succeeds and a connect to a different IP fails — demonstrates UC3
+   allowed IP succeeds and a connect to a different IP fails, demonstrates UC3
    egress enforcement.
 2. **Test:** Integration test configures a static ingress mapping on an `OwnIp`
    PTask, starts a listener inside it, and asserts that `connect("127.0.0.1",
-   external_port)` from the host reaches the in-PTask listener — demonstrates
+   external_port)` from the host reaches the in-PTask listener, demonstrates
    UC4 ingress port mapping.
 3. **CLI:** `minimal session policy <id>` returns the effective egress/ingress
-   policy JSON for a running session — demonstrates the R2.6 read-only RPC.
+   policy JSON for a running session, demonstrates the R2.6 read-only RPC.
 
 ---
 
@@ -258,7 +258,7 @@ DNS integration), new hostname manager module, host-side DNS configuration path
   resolution mechanism is `*.min.internal` + a **host-side egress proxy** (Open
   Question 1, B5): resolution and routing both stay host-side. A client points
   `HTTP(S)_PROXY` (or a PAC file) at the proxy, which routes each request to the
-  right PTask by its `Host:` header through an in-memory registry — both a
+  right PTask by its `Host:` header through an in-memory registry, both a
   `HostNet` and an `OwnIp` PTask to `127.0.0.1` (a `HostNet` PTask's listeners are
   on host loopback; an `OwnIp` PTask is reached through its gvproxy-published
   loopback port, R2.3/R3.1), with the client-supplied port selecting the target.
@@ -291,15 +291,15 @@ DNS integration), new hostname manager module, host-side DNS configuration path
    request bearing its `Host:` header through the host-side egress proxy, and
    assert it routes to the registered target; after the PTask exits, assert the
    proxy returns a gateway error rather than a stale route. No
-   `getaddrinfo`/host-resolver dependency — the proxy contract is asserted
-   directly — demonstrating the R3.1/R3.6 registration lifecycle.
+   `getaddrinfo`/host-resolver dependency, the proxy contract is asserted
+   directly, demonstrating the R3.1/R3.6 registration lifecycle.
 2. **CLI:** with an own-IP PTask that publishes a port (ingress `<external>:<internal>`,
    R2.3), `curl -x http://127.0.0.1:7654 http://<session-name>.<host-id>.min.internal:<external>/`
-   from the local host returns HTTP 200 from a webserver running inside the PTask —
+   from the local host returns HTTP 200 from a webserver running inside the PTask,
    demonstrates UC2a local browser access (hostname → published loopback port).
 3. **CLI:** `curl http://<session-name>.<host-id>.min.internal:<port>/` from the
    local host returns HTTP 200 from a webserver running inside a `HostNet` PTask
-   (hostname resolves to `127.0.0.1`) — demonstrates UC2 hostname-driven access
+   (hostname resolves to `127.0.0.1`), demonstrates UC2 hostname-driven access
    for host-net PTask services (R3.6).
 
 ---
@@ -368,33 +368,33 @@ management)
 1. **Test:** Integration test with two `minimald` instances in separate test
    network namespaces, WireGuard mesh configured, asserts that a TCP connect from
    a PTask on instance A to a PTask on instance B (via their switch IPs across the
-   mesh tunnel) succeeds — demonstrates UC7 remote PTask-to-PTask.
+   mesh tunnel) succeeds, demonstrates UC7 remote PTask-to-PTask.
 2. **CLI:** From a laptop in the mesh, `curl http://<session-name>.<host-id>.min.internal/`
    returns HTTP 200 from a webserver in an own-IP PTask on a remote host, routed
-   over the WireGuard tunnel — demonstrates UC2b option A remote mesh access.
+   over the WireGuard tunnel, demonstrates UC2b option A remote mesh access.
 3. **CLI:** `minimal ssh-forward <session> 8080:127.0.0.1:80` with the WireGuard
    feature flag disabled establishes a TCP tunnel; `curl http://localhost:8080/`
-   returns HTTP 200 from a webserver inside the PTask — demonstrates the SSH
+   returns HTTP 200 from a webserver inside the PTask, demonstrates the SSH
    fallback for restricted networks (R4.9).
 
 ---
 
 ## Non-Goals
 
-- **macOS native (no-VM) PTask networking** — on macOS, PTasks run inside a
+- **macOS native (no-VM) PTask networking**: on macOS, PTasks run inside a
   libkrun VM; the gvproxy switch architecture applies but the VM boundary is
   managed by `minvmd`. No native-macOS no-VM PTask path is added by this spec.
-- **Root privilege networking** — any mechanism requiring ongoing root per-invocation
+- **Root privilege networking**: any mechanism requiring ongoing root per-invocation
   is out of scope.
-- **IPv6 within the gvproxy switch** — the initial implementation uses IPv4.
+- **IPv6 within the gvproxy switch**: the initial implementation uses IPv4.
   IPv6 is a follow-up.
-- **Commercial WireGuard coordination** — the mesh substrate is self-hosted;
+- **Commercial WireGuard coordination**: the mesh substrate is self-hosted;
   Tailscale cloud or other coordination services are out of scope.
-- **QUIC / HTTP/3 in the reverse proxy** — initial proxy supports HTTP/1.1 and
+- **QUIC / HTTP/3 in the reverse proxy**: initial proxy supports HTTP/1.1 and
   WebSockets; HTTP/2 and HTTP/3 are follow-ups.
-- **Port mapping for HostNet or NoNet PTasks** — ingress port mapping (UC4) is
+- **Port mapping for HostNet or NoNet PTasks**: ingress port mapping (UC4) is
   only defined for `OwnIp` PTasks.
-- **Multi-user `minimald` tenancy** — this spec handles a single-user `minimald`
+- **Multi-user `minimald` tenancy**, this spec handles a single-user `minimald`
   per host; multi-tenant policy isolation is a follow-up.
 
 ## Design Considerations
@@ -410,14 +410,14 @@ gvproxy is acceptable for a developer-workstation workload
 
 ### DNS resolution: `*.min.internal` + host-side egress proxy (decided)
 
-R3.3 required a hostname-resolution mechanism. The networking spec's B5 model —
-**`*.min.internal` + a host-side egress proxy** — settles it, keeping both
+R3.3 required a hostname-resolution mechanism. The networking spec's B5 model,
+**`*.min.internal` + a host-side egress proxy**, settles it, keeping both
 resolution and routing host-side. This re-scope (2026-06-23) supersedes spike
 #485's earlier systemd-resolved synthesis finding, which assumed a host resolver
 the sandbox (hakoniwa) and microVM (libkrun) runtimes do not have:
 
 - The host-side egress proxy is the single discriminator. A client points
-  `HTTP(S)_PROXY` (or a PAC file) at it — the zero-root cross-platform path — and
+  `HTTP(S)_PROXY` (or a PAC file) at it, the zero-root cross-platform path, and
   the proxy routes each request to the right PTask by its `Host:` header,
   consulting an in-memory hostname registry `minimald` maintains: a `HostNet`
   PTask to `127.0.0.1`, an `OwnIp` PTask to its gvproxy switch IP through the
@@ -432,8 +432,8 @@ the sandbox (hakoniwa) and microVM (libkrun) runtimes do not have:
   #502 (the B8 minimald HTTPS/mTLS reverse proxy) extends by terminating TLS in
   front of it.
 
-The rejected alternative — a one-time `/etc/resolver` (macOS) or resolver
-config (Linux) — has a simpler per-session path but requires a documented
+The rejected alternative, a one-time `/etc/resolver` (macOS) or resolver
+config (Linux), has a simpler per-session path but requires a documented
 privileged setup step, which conflicts with the rootless goal; it remains the
 macOS root-write fallback, not the default.
 
@@ -453,7 +453,7 @@ as a configuration error on DM2 (R2.5).
 ### SSH port-forwarding as a restricted-network fallback
 
 `minimald` embeds `russh` for PTask re-attach (SSH over UDS/TCP). SSH
-`LocalForward`-style port-forwarding reuses that authenticated transport — no
+`LocalForward`-style port-forwarding reuses that authenticated transport, no
 credential setup beyond `minimal login` is required. The WireGuard mesh
 (R4.1–R4.3) is the primary remote-access path for UC2b and UC7; SSH
 port-forwarding (R4.9) is the fallback for networks where WireGuard's UDP cannot
@@ -487,7 +487,7 @@ access in restricted environments.
    re-scoped 2026-06-23, superseding spike #485):** `*.min.internal` + a
    **host-side egress proxy**. Resolution and routing both stay host-side: the
    proxy routes by `Host:` header / `CONNECT` authority through an in-memory
-   registry, and the host resolver is never consulted — so the mechanism needs
+   registry, and the host resolver is never consulted, so the mechanism needs
    no systemd (the sandbox and microVM runtimes have none) and the TLD is an
    opaque label. Clients reach the proxy via `HTTP(S)_PROXY`/PAC, the zero-root
    cross-platform path; `/etc/resolver` (macOS root write) remains the rejected

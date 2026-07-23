@@ -7,17 +7,17 @@ execution engine, and developer environment.
 
 The crates fall into two groups:
 
-- **Core crates** power the deep internals — most of the library crates.
+- **Core crates** power the deep internals, most of the library crates.
   Declarative evaluation (`mfile`, `decode`, `checkouts`, `stdlib`), the
   dependency graph and build machinery (`graph`, `orchestrator`, `sandbox2`,
   `lcache`, `rcache`, `op`), and the session/composition primitives
   (`sessions`, `switch`). They expose no stable external interface; they exist
   to be wired together.
-- **Product-surface crates** — typically the binaries — give users a stable
+- **Product-surface crates**: typically the binaries, give users a stable
   interface: `mip` (the package/build CLI), `min` (the session CLI), `minimald`
   (the session daemon), and `minvmd` (the microVM host daemon).
 
-What that surface exposes is two things — **running sessions and tasks** and
+What that surface exposes is two things: **running sessions and tasks** and
 **building packages**. The rest of this document walks through each, then maps
 every crate.
 
@@ -82,7 +82,7 @@ against user policy; the daemon collects project- and package-level
 contributions and routes anything needing approval back to the client; the
 client gates those pending items and returns verdicts; the daemon assembles the
 final `Composition` (vars, file patches, packages, lifecycle hooks) for the
-apply layer. User policy is enforced only on the client — the daemon never runs
+apply layer. User policy is enforced only on the client; the daemon never runs
 it. The **sessions** crate holds these primitives; the full data flow is
 documented in [Sessions composition](arch/sessions-composition.md) (source: `crates/sessions/docs/COMPOSITION.md`).
 
@@ -104,7 +104,7 @@ carries the guest's SSH host public key
 Session networking is built on **gvproxy** (gvisor-tap-vsock): one gvproxy per
 host acts as a userspace virtual switch serving VMs and own-IP sandboxes as
 switch clients, with no root privilege required. Sessions choose a network
-mode — no-net, host-net, or own-IP (a dedicated IP on the virtual subnet) —
+mode: no-net, host-net, or own-IP (a dedicated IP on the virtual subnet),
 with DNS naming, egress policy, and ingress port-mapping layered on top. The
 **switch** crate holds the shared primitives (subnet arithmetic, MAC
 derivation, vsock wire constants, gvproxy config rendering) used by both
@@ -126,7 +126,7 @@ sessions and cached artifacts a life beyond a single VM boot. See
 Built artifacts can be fetched from (and uploaded to) a remote cache so
 machines share build results:
 
-- **rcache**: remote cache implementation — fetching/uploading build artifacts
+- **rcache**: remote cache implementation, fetching/uploading build artifacts
   over the network.
 - **remote-proto**: protobuf wire types for the Remote Execution Service (RES).
 - **remote-client**: client that drives the Remote Execution Service against
@@ -143,15 +143,15 @@ Notable crates, in roughly the order the build pipeline drives them:
 |---|---|
 | `mfile` | Finds and parses `minimal.toml`, the entry-point of a project's minimal configuration. |
 | `decode` | Parses a `Layer` of declarative config (typically a codebase of Nickel files) into an in-memory representation. |
-| `stdlib` | The embedded Minimal standard library — the base layer of Nickel code every evaluation builds on. |
+| `stdlib` | The embedded Minimal standard library, the base layer of Nickel code every evaluation builds on. |
 | `checkouts` | Maintains git checkouts of upstream layer repositories at pinned versions, so `decode` can evaluate the full layer chain. |
 | `graph` | The in-memory dependency graph of packages, built from decode's objects; its `planner` module computes build orderings. |
 | `lcache` | Manages the local cache of built artifacts, content-addressed and keyed by blake3 hash. |
 | `mctx` | Provides a 'minimal context': a higher-level API bringing the main features together. Both CLIs and `minimald` drive the build machinery through it. |
-| `op` | Complex operations over the graph or packages — anything complex enough to warrant its own place/process-name. |
+| `op` | Complex operations over the graph or packages, anything complex enough to warrant its own place/process-name. |
 | `orchestrator` | Owns runtime orchestration of package builds. |
 | `sandbox2` | Sandboxed build/task execution API using Linux namespaces. |
-| `check` | Lints Minimal configuration — `minimal.toml`, packages, profiles, and stacks. |
+| `check` | Lints Minimal configuration: `minimal.toml`, packages, profiles, and stacks. |
 | `mip` | The package/build CLI entry-point. |
 
 ### Overall operation
@@ -167,7 +167,7 @@ Notable crates, in roughly the order the build pipeline drives them:
 3. These decoded structures are loaded into a single in-memory representation,
    the dependency graph (`graph` crate).
 4. From here, the next steps depend on what is being called for by the
-   user/API — typically through `mctx`, which owns the wiring from
+   user/API, typically through `mctx`, which owns the wiring from
    configuration discovery through decoding, graph construction, and cache
    lookup.
 

@@ -21,9 +21,9 @@ The user-facing command is **`min`**: the `minimal` CLI component's manifest
 release-artifact names keep the crate name `minimal`).
 
 This spec describes **the fallback installer only**: a single POSIX-sh script
-served for `curl … | sh`. The intended primary paths are native, platform-specific packages —
+served for `curl … | sh`. The intended primary paths are native, platform-specific packages,
 Homebrew (`brew`), Debian/Ubuntu (`apt`/`.deb`), Arch (`pacman`/AUR), and
-similar — which integrate with system update tooling, signing, and uninstall.
+similar, which integrate with system update tooling, signing, and uninstall.
 
 The curl|bash installer exists to cover the gap for platforms and users those
 packages do not yet reach, and to bootstrap the others. It must therefore be
@@ -83,9 +83,9 @@ on tools present by default on every target: a downloader (`curl` **or**
 
 ## Demoable Units of Work
 
-### Unit 1 — Environment probing (downloader, hasher, platform)
+### Unit 1 - Environment probing (downloader, hasher, platform)
 
-**R1.1** — The script selects a downloader at runtime: prefer `curl`, else
+**R1.1**, The script selects a downloader at runtime: prefer `curl`, else
 `wget`, else exit with a clear error. Both wrappers enforce HTTPS and a TLS 1.2
 floor and refuse redirect downgrades:
 
@@ -96,33 +96,33 @@ curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL "$url" -o "$out"
 wget --https-only --secure-protocol=TLSv1_2 -qO "$out" "$url"
 ```
 
-**R1.2** — The script selects a SHA-256 implementation at runtime: prefer
+**R1.2**, The script selects a SHA-256 implementation at runtime: prefer
 `sha256sum`, else `shasum -a 256`, else `openssl dgst -sha256`. Each wrapper
 emits the bare lowercase hex digest on stdout (no filename, no leading marker).
 
-**R1.3** — The host platform is derived from `uname -s` (→ `linux`/`darwin`) and
+**R1.3**, The host platform is derived from `uname -s` (→ `linux`/`darwin`) and
 `uname -m`, with arch normalized so the same CPU has one name across platforms:
 `amd64|x86_64 → amd64`, `arm64|aarch64 → arm64`. An unrecognized OS or arch
 exits with a clear error.
 
-**R1.4** — Tool discovery uses `command -v`, never `which`.
+**R1.4**, Tool discovery uses `command -v`, never `which`.
 
-### Unit 2 — Target → version → manifest resolution
+### Unit 2 - Target → version → manifest resolution
 
-**R2.1** — The script takes an optional first argument, the **target**,
+**R2.1**, The script takes an optional first argument, the **target**,
 defaulting to `stable`. The target is validated against `^[A-Za-z0-9._-]+$`
 before use; a value containing any other character exits with an error.
 
-**R2.2** — The script fetches `<BUCKET>/<target>` to obtain a version string.
+**R2.2**, The script fetches `<BUCKET>/<target>` to obtain a version string.
 The result is validated against `^[A-Za-z0-9._-]+$` (command substitution having
 already stripped the trailing newline); a malformed value exits with an error.
 `<BUCKET>` is hardcoded into the script, but can be overridden with an environment
 variable `MINIMAL_OVERRIDE_INSTALLER_BUCKET`.
 
-**R2.3** — The script fetches `<BUCKET>/versions/<VERSION>/components` — the
-components manifest — into a temp file. A fetch failure exits with an error.
+**R2.3**, The script fetches `<BUCKET>/versions/<VERSION>/components`, the
+components manifest, into a temp file. A fetch failure exits with an error.
 
-**R2.4** — The manifest's `# format:` header is read; if it names a format
+**R2.4**, The manifest's `# format:` header is read; if it names a format
 version the installer does not support, it exits with an actionable error rather
 than misparsing.
 
@@ -133,9 +133,9 @@ than misparsing.
 - **Test**: A manifest whose `# format:` line names an unsupported version exits
   non-zero with a message naming the supported version.
 
-### Unit 3 — Manifest format and field extraction
+### Unit 3 - Manifest format and field extraction
 
-**R3.1** — The manifest is a flat, line-oriented table: `#`-prefixed comment
+**R3.1**, The manifest is a flat, line-oriented table: `#`-prefixed comment
 lines and blank lines are ignored; every data line is one component variant with
 fields separated by runs of whitespace (so columns may be space-padded for
 readability). Column order is fixed and documented in the header:
@@ -146,21 +146,21 @@ minimald     linux   x86_64   1.4.2    3a7b…    file    bin/minimald      mini
 minimald     darwin  arm64    1.4.2    2c26…    file    bin/minimald      minimald/1.4.2/minimald-darwin-arm64
 ```
 
-- `component` — logical name (primary key with `os`/`arch`).
-- `os`/`arch` — normalized platform (matches R1.3 output).
-- `version` — component version (informational; the artifact identity is the
+- `component`, logical name (primary key with `os`/`arch`).
+- `os`/`arch`, normalized platform (matches R1.3 output).
+- `version`, component version (informational; the artifact identity is the
   hash).
-- `sha256` — lowercase hex digest of the artifact at `src`.
-- `kind` — `file` for a directly-placed file, or `symlink` for a symbolic
+- `sha256`, lowercase hex digest of the artifact at `src`.
+- `kind`, `file` for a directly-placed file, or `symlink` for a symbolic
   link the installer creates (R5.6). The column exists so further kinds
   (e.g. archives) can be added without a format break.
-- `dest` — install destination as `<prefix-token>/<subpath>` (see R4).
-- `src` — download path **relative to the bucket root** (not to `stable/`).
-  For `symlink` rows, `src` is instead the **link target** — a path the OS
-  resolves relative to the link's own directory — and `sha256` is the
+- `dest`, install destination as `<prefix-token>/<subpath>` (see R4).
+- `src`, download path **relative to the bucket root** (not to `stable/`).
+  For `symlink` rows, `src` is instead the **link target**, a path the OS
+  resolves relative to the link's own directory, and `sha256` is the
   literal placeholder `-` (there is no artifact to hash).
 
-**R3.2** — No field ever contains whitespace; this invariant is what makes
+**R3.2**, No field ever contains whitespace; this invariant is what makes
 `awk` field-splitting safe. Extraction uses exact field equality, never
 substring `grep`:
 
@@ -173,7 +173,7 @@ awk -v c="$comp" -v o="$os" -v a="$arch" \
   '!/^#/ && NF && $1==c && $2==o && $3==a {print $6}' "$manifest"
 ```
 
-**R3.3** — Parsing uses `awk` (which splits on whitespace runs), never
+**R3.3**, Parsing uses `awk` (which splits on whitespace runs), never
 `cut -d' '` (which treats each space as a delimiter and breaks on padding).
 
 **Proof artifacts**:
@@ -182,10 +182,10 @@ awk -v c="$comp" -v o="$os" -v a="$arch" \
   platform-filter query returns exactly the expected component names for a given
   `os`/`arch`, and the per-field query returns the expected `dest`/`src`/`sha256`.
 
-### Unit 4 — Destination prefix resolution and path safety
+### Unit 4 - Destination prefix resolution and path safety
 
-**R4.1** — The `dest` prefix token is mapped to an absolute directory through a
-fixed `case` — **never** shell-expanded or `eval`ed from the manifest string:
+**R4.1**, The `dest` prefix token is mapped to an absolute directory through a
+fixed `case`, **never** shell-expanded or `eval`ed from the manifest string:
 
 | token   | resolves to                                             |
 |---------|---------------------------------------------------------|
@@ -194,15 +194,15 @@ fixed `case` — **never** shell-expanded or `eval`ed from the manifest string:
 | `state` | `${XDG_STATE_HOME:-$HOME/.local/state}/minimal`         |
 | `cache` | `${XDG_CACHE_HOME:-$HOME/.cache}/minimal`               |
 
-An unknown token exits with an error. (Note the correct XDG variable names —
-`XDG_DATA_HOME`/`XDG_STATE_HOME`/`XDG_CACHE_HOME` — and that `~/.local/bin` has
+An unknown token exits with an error. (Note the correct XDG variable names,
+`XDG_DATA_HOME`/`XDG_STATE_HOME`/`XDG_CACHE_HOME`, and that `~/.local/bin` has
 no XDG variable, hence the `MINIMAL_BIN` override.)
 
-**R4.2** — The `dest` subpath is rejected before use if it is absolute (`/…`) or
+**R4.2**, The `dest` subpath is rejected before use if it is absolute (`/…`) or
 contains a `..` component, preventing a manifest from writing outside the
 resolved prefix.
 
-**R4.3** — The resolved destination directory is created with `mkdir -p` before
+**R4.3**, The resolved destination directory is created with `mkdir -p` before
 any write.
 
 **Proof artifacts**:
@@ -213,12 +213,12 @@ any write.
   resolves under that temp dir; with it unset, it resolves under
   `$HOME/.local/share/minimal`.
 
-### Unit 5 — Skip-check, download, verify, atomic install
+### Unit 5 - Skip-check, download, verify, atomic install
 
-**R5.1** — For each applicable component, if the resolved destination file
+**R5.1**, For each applicable component, if the resolved destination file
 already exists **and** its on-disk SHA-256 equals the manifest `sha256`, the
-component is skipped with no download. The on-disk file — not any recorded
-state — is the source of truth for "already installed".
+component is skipped with no download. The on-disk file, not any recorded
+state, is the source of truth for "already installed".
 
 A macOS `bin` file is the one exception: it is ad-hoc code-signed after download
 (R5.4 / Security), which rewrites the Mach-O so its installed bytes no longer
@@ -227,20 +227,20 @@ a component whose on-disk hash equals the **installed hash it recorded last run
 for the same manifest `sha256`** (R6.1). Keying on the manifest hash is
 load-bearing: a new release changes `sha256`, so the recorded row no longer
 matches the current `want` and the (now stale) signed file is re-downloaded
-instead of being wrongly judged up to date — the signed bytes would otherwise
+instead of being wrongly judged up to date, the signed bytes would otherwise
 still equal the old recorded installed hash forever. The record is only ever a
 positive-match optimization; a deleted or tampered file matches nothing and is
 reinstalled.
 
-**R5.2** — Otherwise the artifact is downloaded from `<BUCKET>/<src>` to a
+**R5.2**, Otherwise the artifact is downloaded from `<BUCKET>/<src>` to a
 temp sibling **in the destination directory** (`<dest>.tmp.$$`), so the final
 rename is same-filesystem and atomic.
 
-**R5.3** — The downloaded temp file's SHA-256 is compared to the manifest
+**R5.3**, The downloaded temp file's SHA-256 is compared to the manifest
 `sha256`; on mismatch the temp file is removed and the run exits non-zero
 naming the component. The partially-written file is never installed.
 
-**R5.4** — For files installed to a prefix token of `bin`, the temp file is
+**R5.4**, For files installed to a prefix token of `bin`, the temp file is
 `chmod +x`ed **before** the rename, so it appears already-executable at its
 final path. The install is completed with `mv -f <dest>.tmp.$$ <dest>`
 (atomic within one filesystem).
@@ -258,34 +258,34 @@ got=$(sha256 "$target.tmp.$$")
 mv -f "$target.tmp.$$" "$target"
 ```
 
-**R5.5** — Installing a new version over a **running daemon** wedges it: the
+**R5.5**, Installing a new version over a **running daemon** wedges it: the
 daemon goes on serving from the old image while the newly-installed `min` speaks
 to it. Before the first component file is replaced, the installer therefore runs
-`<bin>/min stop --force` — the `min` **already on disk**, which is the build that
+`<bin>/min stop --force`, the `min` **already on disk**, which is the build that
 matches the daemon it started and is the one about to be overwritten. `--force`
 because an upgrade must not be blocked by live sessions, and because a prompt is
 not available in a `curl … | sh` pipeline.
 
 The step is **best-effort and silent**, output discarded and exit status ignored:
 "no `min` installed yet" (a fresh install), "no daemon running" (`min stop`
-merely connects — it never autospawns — so this is a failed connect and nothing
+merely connects; it never autospawns, so this is a failed connect and nothing
 more), and "the installed `min` is too old to know `stop --force`" are all just
 *nothing to stop*, and none may fail an install whose binaries are otherwise
-fine. Only `<bin>/min` is ever run — never a `min` found on `$PATH`, which is not
+fine. Only `<bin>/min` is ever run, never a `min` found on `$PATH`, which is not
 this installer's footprint.
 
 It is attempted **at most once per run**, and only from the path that actually
 replaces a file: a rerun where every component is already up to date, or a run
 that dies fetching or checksum-verifying, must leave a healthy daemon running.
 
-**R5.6** — A `kind = symlink` component places a symbolic link at `dest`
+**R5.6**, A `kind = symlink` component places a symbolic link at `dest`
 pointing at `src` (the link target, see R3.1). The target is validated with
-the same discipline as a `dest` subpath (R4.2) — never absolute, no `..`
-component — so a manifest can only point a link within the tree of its own
+the same discipline as a `dest` subpath (R4.2), never absolute, no `..`
+component, so a manifest can only point a link within the tree of its own
 prefix. The link itself is the skip oracle: a symlink already at `dest`
 whose `readlink` equals `src` is up to date. Installation mirrors
 R5.2/R5.4's atomicity: the link is created as a temp sibling (`ln -s`) and
-`mv -f`ed over whatever holds the path — notably a stale regular file from
+`mv -f`ed over whatever holds the path, notably a stale regular file from
 a release that shipped the component as a copy. Nothing is downloaded for a
 symlink row either way. The record row (R6.1) carries `link:<target>` in
 both hash columns in place of digests.
@@ -300,7 +300,7 @@ both hash columns in place of digests.
 - **Test** (macOS staleness): after a signed-`bin` install, a rerun against the
   *same* manifest performs zero downloads and no re-sign, but a rerun against a
   manifest whose `sha256` for that component *changed* re-downloads and re-signs
-  it — the recorded installed hash does not mask a new release.
+  it, the recorded installed hash does not mask a new release.
 - **Test** (R5.5): a fresh install stops nothing (no `min` on disk yet) and an
   up-to-date rerun stops nothing (nothing replaced); an upgrade whose components
   are stale runs the on-disk `min` with exactly `stop --force`, once, however
@@ -310,27 +310,27 @@ both hash columns in place of digests.
   installer's output, and completes the upgrade.
 - **Test** (R5.6): a `symlink` component lands as a symlink at its `dest`
   pointing at the manifest target, with no download; a rerun skips it, and a
-  retargeted link is repaired on the next run — still with no download.
+  retargeted link is repaired on the next run, still with no download.
 
-### Unit 6 — Install record and PATH advisory
+### Unit 6 - Install record and PATH advisory
 
-**R6.1** — After a successful run the installer writes a record of what it
-installed to `<state>/installed` — the resolved
+**R6.1**, After a successful run the installer writes a record of what it
+installed to `<state>/installed`, the resolved
 `(component, dest, manifest-sha256, installed-sha256)` rows for this platform,
 tab-delimited. `manifest-sha256` is the artifact's `sha256` from the manifest;
 `installed-sha256` is the SHA-256 of the bytes actually on disk, which equals
 `manifest-sha256` except for a macOS-signed `bin` file. Pairing the two is what
 lets the R5.1 signed-file skip stay correct across releases (skip only while the
 manifest still wants that artifact). A `symlink` row (R5.6) records
-`link:<target>` in both hash columns instead of digests — the `link:` prefix
+`link:<target>` in both hash columns instead of digests, the `link:` prefix
 cannot collide with a hex digest and is what the uninstaller keys on (R7.3).
 The record also enables uninstall (Units 7–8) and surfaces prefix drift if
 `XDG_*` variables change between runs.
 
-**R6.2** — If the resolved `bin` directory is not on `$PATH` **in the
+**R6.2**, If the resolved `bin` directory is not on `$PATH` **in the
 installing session**, the installer prints an advisory: the Unit 9 rc hook only
 takes effect in new shells, so the advisory tells the user to restart their
-shell or export `PATH` now. The installer never *silently* edits an rc file —
+shell or export `PATH` now. The installer never *silently* edits an rc file,
 the only rc edit it makes is Unit 9's announced, marker-fenced block (R9.2).
 
 **Proof artifacts**:
@@ -340,14 +340,14 @@ the only rc edit it makes is Unit 9's announced, marker-fenced block (R9.2).
 - **Test**: With the `bin` prefix absent from `PATH`, the advisory is printed;
   with it present, it is not.
 
-### Unit 9 — Shell integration: PATH, shell-init files, completions
+### Unit 9 - Shell integration: PATH, shell-init files, completions
 
 The goal: after one install and one new shell, `min` is on `PATH` and
 tab-completes, in bash, zsh, and fish. Everything this unit writes is either an
 install-record row (so Units 7–8 remove it for free) or a marker-fenced rc
 block (so uninstall can strip it precisely).
 
-**R9.1** — After the component loop, the installer **generates** (never
+**R9.1**, After the component loop, the installer **generates** (never
 downloads) one init file per shell family under `<data>/shell-init/`:
 `bash.sh`, `zsh.sh`, and `fish.fish`. Each file:
 
@@ -355,11 +355,11 @@ downloads) one init file per shell family under `<data>/shell-init/`:
   (`${MINIMAL_BIN:-$HOME/.local/bin}`), and
 - guards at shell startup: only if the dir exists and is not already in
   `PATH` is it prepended (`case ":$PATH:"` for POSIX shells,
-  `fish_add_path --prepend` for fish) — so sourcing is idempotent and becomes a
+  `fish_add_path --prepend` for fish), so sourcing is idempotent and becomes a
   no-op once the user manages `PATH` themselves.
 
 `zsh.sh` additionally adds the zsh completions dir (R9.3) to `fpath` and runs
-`compinit` — and then **self-heals a lying dump**: `compinit` trusts its cached
+`compinit`, and then **self-heals a lying dump**: `compinit` trusts its cached
 `.zcompdump` whenever the dump's (zsh version, completion-file count) header
 matches, a check that misses real changes (one completions dir replacing
 another with the same file count). If `min` is still unregistered after
@@ -371,7 +371,7 @@ install record (R6.1) with the on-disk digest in **both** hash columns (no
 manifest hash exists for generated content), so reruns replace them and
 uninstall removes them like any component.
 
-**R9.2** — The installer hooks the rc file of the user's login shell
+**R9.2**, The installer hooks the rc file of the user's login shell
 (`basename "$SHELL"`) with a block sourcing the matching init file, fenced by
 the exact markers `# >>> minimal >>>` / `# <<< minimal <<<`:
 
@@ -384,17 +384,17 @@ the exact markers `# >>> minimal >>>` / `# <<< minimal <<<`:
 
 The markers are the installer's to **own**, not merely to detect: a file whose
 marker block already sources the current init file is never touched again
-(reruns add nothing), but a marker block with any other content is *stale* —
+(reruns add nothing), but a marker block with any other content is *stale*,
 notably the pre-rewrite installer's, which used the same markers around a line
-sourcing `~/.minimal/shim/shell-init/…` — and is replaced (stripped via the
+sourcing `~/.minimal/shim/shell-init/…`, and is replaced (stripped via the
 R9.4 filter, then re-appended), or PATH and completions silently break on every
 upgraded machine. Either edit is always announced, never silent, and the result
 always carries exactly one marker block. The sourced line itself is guarded
 (`[ -f … ] && . …` / `if test -f …`), so an rc file that outlives an uninstall
 stays harmless.
 
-A *malformed* block — a start marker with no matching end marker, i.e. a hand
-edit — is never repaired by force: stripping it would truncate everything from
+A *malformed* block, a start marker with no matching end marker, i.e. a hand
+edit, is never repaired by force: stripping it would truncate everything from
 the marker to end-of-file, and appending after it would set up exactly that
 truncation for a later strip. The file is left byte-for-byte untouched and the
 installer warns, naming the file and printing the line to add by hand.
@@ -404,10 +404,10 @@ are already correctly installed, so an rc file that cannot be appended (or a
 config dir that cannot be created) must not turn the run into a failure. The
 installer prints a warning naming the file (`failed to hook minimal shell
 support (… is not writable)`) plus the exact line to add by hand, continues,
-and still exits 0 — and the R6.2 `PATH` advisory still fires.
+and still exits 0, and the R6.2 `PATH` advisory still fires.
 
-**R9.3** — Tab completions are generated by **running the just-installed
-binary** — `<bin>/min completions <shell>` — so they always match the installed
+**R9.3**, Tab completions are generated by **running the just-installed
+binary**, `<bin>/min completions <shell>`, so they always match the installed
 version, and are written atomically (temp sibling + `mv`) to each shell's
 user-level completion dir:
 
@@ -423,30 +423,30 @@ recorded in the install record like the init files. The whole step is
 installed, and completions regenerate on the next run. Specifically:
 
 - an unwritable completion dir (these are shared, user-owned locations that can
-  pre-exist unwritable — e.g. a root-owned `~/.config/fish/completions`) is
+  pre-exist unwritable, e.g. a root-owned `~/.config/fish/completions`) is
   probed before generating and skipped with a warning naming the dir;
 - failure to execute the binary (or empty output) warns and moves on;
 - if `<bin>/min` was not part of the manifest, the step is skipped with a
   notice;
 - the shell's own redirection errors are suppressed (writes run in a subshell
-  with stderr nulled — a command-level `2>/dev/null` cannot catch them), so the
+  with stderr nulled, a command-level `2>/dev/null` cannot catch them), so the
   user sees the installer's warning, never a raw `Permission denied` line.
 
 Writing the zsh completion file also **drops a pre-existing
 `${ZDOTDIR:-$HOME}/.zcompdump`** (announced, best-effort like the rest of the
 step): the dump is a pure, regenerable cache, and its staleness check cannot
-see `_min` change when the completion-file count stays equal — the upgrade
+see `_min` change when the completion-file count stays equal, the upgrade
 from the pre-rewrite installer hits exactly that, leaving `min` completion
 dead in every new shell until an unrelated `fpath` change. Dropping the cache
 forces a real rescan on the next zsh startup (the `zsh.sh` self-heal in R9.1
 is the belt-and-braces for dumps that go stale later).
 
-**R9.4** — Uninstall (Units 7–8) undoes shell integration completely:
+**R9.4**, Uninstall (Units 7–8) undoes shell integration completely:
 
 - the generated init and completion files are ordinary record rows, removed by
   the hash-verified walk (R7.3);
 - the marker-fenced block is stripped from every rc file the installer may
-  have edited (all candidates from the R9.2 table are tried — `$SHELL` may have
+  have edited (all candidates from the R9.2 table are tried, `$SHELL` may have
   changed since install; a file without markers is never rewritten), via an
   awk filter to a temp sibling + atomic `mv` (`sed -i` is not portable); a file
   whose start marker lacks its end marker is kept untouched with a warning
@@ -454,7 +454,7 @@ is the belt-and-braces for dumps that go stale later).
   and the walk continues to the remaining candidates;
 - the emptied `shell-init` and completion dirs (and their possibly
   installer-created parents) are pruned with the same `rmdir`-only discipline
-  as R8.1 — they are shared locations, never `rm -rf`ed;
+  as R8.1: they are shared locations, never `rm -rf`ed;
 - `${ZDOTDIR:-$HOME}/.zcompdump` is dropped (announced), but **only when the
   record shows zsh completions were installed**: the dump is the user's cache,
   and left behind it keeps a `min` registration whose function file is gone,
@@ -475,16 +475,16 @@ is the belt-and-braces for dumps that go stale later).
 - **Test**: `SHELL=…/zsh` hooks (and creates) `.zshrc`; `…/fish` hooks
   `config.fish`; an unrecognized shell falls back to `~/.profile`.
 - **Test**: an rc file carrying the pre-rewrite installer's marker block
-  (sourcing `~/.minimal/shim/shell-init/…`) has it replaced — the run announces
+  (sourcing `~/.minimal/shim/shell-init/…`) has it replaced, the run announces
   the replacement, exactly one marker block remains, it sources the current
   init file, no shim reference survives, and user content on both sides of the
   old block is preserved; a rerun then rewrites nothing. A pre-existing
-  `.zcompdump` is dropped by that upgrade (announced), and the rerun — with no
-  dump present — announces no drop.
+  `.zcompdump` is dropped by that upgrade (announced), and the rerun, with no
+  dump present, announces no drop.
 - **Test**: the generated `zsh.sh` carries the compinit self-heal (checks
   `_comps[min]` against the `_min` file).
 - **Test**: an rc file with a start marker but no end marker is left untouched
-  by both install and uninstall — each warns naming the file, appends nothing,
+  by both install and uninstall, each warns naming the file, appends nothing,
   preserves the content after the stray marker, and exits 0.
 - **Test**: with a read-only `~/.bashrc`, the install still exits 0, prints the
   `failed to hook minimal shell support` warning and the manual line, leaves
@@ -506,7 +506,7 @@ is the belt-and-braces for dumps that go stale later).
 ## Non-Goals
 
 - **Uninstall.** ~~The install record (R6.1) is written to enable it later; the
-  uninstall command itself is out of scope.~~ Now specified below — see
+  uninstall command itself is out of scope.~~ Now specified below, see
   [Uninstaller](#uninstaller). The install record (R6.1) is the sole authority
   for what to remove.
 - **Multi-file / archive components.** v1 handles `kind = file` single files
@@ -520,8 +520,8 @@ is the belt-and-braces for dumps that go stale later).
 
 **Why POSIX `sh`, not bash.** macOS ships bash 3.2 (frozen over GPLv3) and
 Debian/Ubuntu's `/bin/sh` is `dash`; users are told to pipe to either `bash` or
-`sh`. Targeting strict POSIX `sh` — single `=` in `[ ]`, `printf` over
-`echo -e`, `case` over `[[ =~ ]]`, no arrays — is the only way one script runs
+`sh`. Targeting strict POSIX `sh`, single `=` in `[ ]`, `printf` over
+`echo -e`, `case` over `[[ =~ ]]`, no arrays, is the only way one script runs
 across all of them. Correctness is enforced in CI (see Verification).
 
 **Why a flat table, not JSON/YAML.** The installer must parse the manifest with
@@ -531,7 +531,7 @@ grep/sed JSON parsing is fragile. A whitespace-delimited table is what `awk`
 parses natively with zero dependencies. YAML has no portable CLI parser at all.
 
 **Why not a `source`-able manifest.** Sourcing a fetched `KEY=value` file is
-remote code execution — anyone who can write the bucket runs code as the
+remote code execution, anyone who can write the bucket runs code as the
 installer. The manifest is strictly *data*; prefix tokens are mapped through a
 `case`, never expanded.
 
@@ -578,7 +578,7 @@ architecture record; design rationale is captured above.
   `grep -P` (no macOS), `readlink -f`/`realpath` (not on older macOS), `stat`
   (incompatible BSD/GNU flags), and GNU `date -d` are not used anywhere. Plain
   flagless `readlink` (used only to verify `symlink` rows, R5.6) is fine: it is
-  present on macOS/BSD, GNU coreutils, and busybox — only the `-f` canonicalize
+  present on macOS/BSD, GNU coreutils, and busybox, only the `-f` canonicalize
   flag is the portability trap.
 - **`mktemp` for the manifest** uses `mktemp -d 2>/dev/null || mktemp -d -t
   minimal` to bridge BSD/GNU template differences, with a `trap … EXIT` cleanup.
@@ -592,7 +592,7 @@ architecture record; design rationale is captured above.
 - **Input validation at every boundary.** The target argument (R2.1), the
   fetched version string (R2.2), and every `dest` subpath (R4.2) are validated
   before being used in a URL or filesystem path, closing path-traversal vectors.
-  The manifest is treated as data only — no field is ever `eval`ed or expanded.
+  The manifest is treated as data only, no field is ever `eval`ed or expanded.
 - **No privilege escalation.** The installer never invokes `sudo` and writes only
   to user-owned directories.
 - **Future hardening (out of scope).** To defend against a compromised bucket
@@ -603,7 +603,7 @@ architecture record; design rationale is captured above.
 
 1. **Static**: `shellcheck --shell=sh` passes on the installer with no warnings.
 2. **Dash conformance**: the installer's test harness runs the script under
-   `dash` (and, where available, macOS `/bin/sh`) — not just `bash` — in CI.
+   `dash` (and, where available, macOS `/bin/sh`), not just `bash`, in CI.
 3. **Unit tests** (Units 1–6, 9) pass against fixture pointer files, manifests,
    and a stubbed bucket/downloader, asserting: downloader/hasher/platform
    selection; target and version validation; field extraction; prefix resolution
@@ -633,13 +633,13 @@ manifest `sha256` (see R5.1 and `install.sh`'s signing note). Uninstall reads on
 rerun skip check (R5.1) and is unused here.
 
 That record is a complete, self-contained inventory of the installer's
-footprint — downloaded components and the generated shell-init/completion files
+footprint, downloaded components and the generated shell-init/completion files
 alike (Unit 9 records what it writes). An uninstaller does not need the network,
 the bucket, the manifest, or even to know which version is installed: it walks
 the record and undoes it, then strips the marker-fenced rc block (R9.4), the one
 piece of footprint an rc file carries instead of the record. This
-mirrors the installer's guiding principle — **the recorded/on-disk hash is the
-oracle** — applied in reverse: only remove a file the installer wrote and that is
+mirrors the installer's guiding principle, **the recorded/on-disk hash is the
+oracle**, applied in reverse: only remove a file the installer wrote and that is
 still byte-for-byte what it wrote.
 
 ## Introduction/Overview
@@ -666,7 +666,7 @@ is idempotent: a second `--uninstall` finds no record and is a clean no-op.
 ## Goals
 
 1. A single `… | sh -s -- --uninstall` removes every file the installer placed
-   for this host, using only the local install record — no network, no bucket,
+   for this host, using only the local install record, no network, no bucket,
    no manifest.
 2. It never deletes a file the installer did not write, and never a file the user
    has since modified or replaced (unless `--force`).
@@ -687,23 +687,23 @@ is idempotent: a second `--uninstall` finds no record and is a clean no-op.
 
 ## Demoable Units of Work
 
-### Unit 7 — Uninstall dispatch and record walk
+### Unit 7 - Uninstall dispatch and record walk
 
-**R7.1** — When the first argument is `--uninstall`, the script enters uninstall
-mode **before** target validation (R2.1) — `--uninstall` otherwise passes the
+**R7.1**, When the first argument is `--uninstall`, the script enters uninstall
+mode **before** target validation (R2.1), `--uninstall` otherwise passes the
 target charset and would be fetched as a bogus target. In this mode the downloader
 probe (R1.1) is skipped/made lazy: an uninstall must succeed on a host with no
 `curl`/`wget`. The SHA-256 tool (R1.2), platform probe (R1.3), and prefix
 resolution (R4.1) are still required. `--uninstall` is mutually exclusive with a
 target argument.
 
-**R7.2** — The record is located at `<state>/installed` via the same
+**R7.2**, The record is located at `<state>/installed` via the same
 `resolve_prefix state` used to write it (R6.1), so an `XDG_STATE_HOME` set at
 uninstall time resolves identically. If the record is absent, the uninstaller
-prints "nothing to uninstall (no install record at …)" and exits **0** — absence
+prints "nothing to uninstall (no install record at …)" and exits **0**, absence
 is success, not an error.
 
-**R7.3** — Each record row is parsed with tab as the field separator
+**R7.3**, Each record row is parsed with tab as the field separator
 (`awk -F'\t'` / `read -r … <TAB>`), never default whitespace splitting, because a
 `dest` under a `$HOME` containing spaces is legal. Taking `dest` and
 `installed-hash` from each `(component, dest, manifest-hash, installed-hash)` row:
@@ -721,13 +721,13 @@ A row whose hash columns carry `link:<target>` (R5.6) is a symlink the
 installer created, and the regular-file rules above invert for it: `dest` is
 removed when it is still a symlink whose `readlink` equals `<target>` (removal
 is of the link itself, never what it points at); a symlink pointing elsewhere
-was retargeted by the user — kept unless `--force`; and anything that is not a
+was retargeted by the user, kept unless `--force`; and anything that is not a
 symlink is foreign and always kept.
 
-**R7.4** — The comparison is against the recorded `installed-hash`, **not** the
+**R7.4**, The comparison is against the recorded `installed-hash`, **not** the
 manifest `sha256` (which the uninstaller does not have offline). This is what
-lets a macOS ad-hoc-signed `bin` file — whose on-disk bytes diverge from the
-manifest — still match and be recognized as ours.
+lets a macOS ad-hoc-signed `bin` file, whose on-disk bytes diverge from the
+manifest, still match and be recognized as ours.
 
 **Proof artifacts**:
 
@@ -741,10 +741,10 @@ manifest — still match and be recognized as ours.
   since install is kept and removed only under `--force`; a regular file now
   occupying the recorded path is kept even with `--force`.
 
-### Unit 8 — Record teardown, directory pruning, and purge
+### Unit 8 - Record teardown, directory pruning, and purge
 
-**R8.1** — After the walk, the record file is removed **only if the footprint is
-fully gone** — every recorded file removed or already absent. If anything was
+**R8.1**, After the walk, the record file is removed **only if the footprint is
+fully gone**, every recorded file removed or already absent. If anything was
 kept (a modified file under R7.3, or a foreign path), the record is **retained**
 so a later `--force` or manual cleanup still has the inventory to work from;
 re-running is idempotent because already-removed rows re-classify as
@@ -757,19 +757,19 @@ prefixes resolve to `.../minimal` subdirectories the installer owns, and the
 when empty and otherwise left untouched. Pruning failures (a non-empty dir) are
 ignored, not fatal.
 
-**R8.2** — `--purge` additionally removes the `minimal`-owned trees in full —
+**R8.2**, `--purge` additionally removes the `minimal`-owned trees in full,
 the resolved `data`, `state`, and `cache` directories and everything under them
-(build cache included) — because those live at fixed `.../minimal` paths the tool
+(build cache included), because those live at fixed `.../minimal` paths the tool
 owns exclusively. `--purge` never touches the shared `bin` directory beyond the
 empty-`rmdir` of R8.1, and never removes individual files outside those
 `minimal`-owned roots.
 
-**R8.3** — `--dry-run` (accepted in uninstall mode) prints each planned removal
-and prune, prefixed to make it unmistakable, and touches nothing — no file
+**R8.3**, `--dry-run` (accepted in uninstall mode) prints each planned removal
+and prune, prefixed to make it unmistakable, and touches nothing, no file
 removed, record left intact. It composes with `--force`/`--purge` to preview
 their effect.
 
-**R8.4** — The run prints a summary: counts of *removed*, *already-absent*,
+**R8.4**, The run prints a summary: counts of *removed*, *already-absent*,
 *kept (modified)*, and *kept (not a regular file)*, plus which directories were
 pruned. A run that kept files because they were modified still exits **0** (it did
 what was asked); only an unexpected internal failure is non-zero.
@@ -787,7 +787,7 @@ what was asked); only an unexpected internal failure is non-zero.
 ## Non-Goals (uninstaller)
 
 - **Reconstructing the footprint from the manifest.** The local record is the
-  only authority. If it is missing, uninstall is a no-op — the uninstaller never
+  only authority. If it is missing, uninstall is a no-op, the uninstaller never
   fetches a manifest and deletes by guessing which paths *would have* been
   written, which could clobber unrelated files at those paths.
 - ~~Removing PATH edits.~~ Superseded by Unit 9: the installer hooks rc files
@@ -805,7 +805,7 @@ what was asked); only an unexpected internal failure is non-zero.
 **Why a mode of `install.sh`, not a separate script.** One published URL, one
 script to keep POSIX-clean and shellcheck-green, and direct reuse of
 `resolve_prefix`, the SHA-256 wrapper, and the path-safety `case`s. The cost is a
-small dispatch at the top of `main`; the alternative — a second script — would
+small dispatch at the top of `main`; the alternative, a second script, would
 duplicate all of environment probing and drift out of sync.
 
 **Hash-verify before delete.** The symmetric counterpart to the install skip
@@ -831,7 +831,7 @@ behind explicit `--purge` and confined to the `.../minimal` roots the tool owns.
   re-derive paths from any network input. As defense in depth it still refuses to
   remove a `file`-row `dest` that is not a regular file (R7.3), so a symlink
   swapped in at a recorded path is not followed into deleting something else;
-  for `link:` rows, removal targets the link itself — `rm` never follows it —
+  for `link:` rows, removal targets the link itself, `rm` never follows it,
   and only when it still points at the recorded target.
 - **No privilege escalation.** Like the installer, uninstall runs as the user and
   writes only under user-owned prefixes; it never invokes `sudo`.

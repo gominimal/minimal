@@ -20,8 +20,8 @@ for the exceptions explained below.
 
 ### malachite family: document-and-accept
 
-Five crates — `malachite`, `malachite-base`, `malachite-float`,
-`malachite-nz`, `malachite-q` — are licensed LGPL-3.0-only and are
+Five crates (`malachite`, `malachite-base`, `malachite-float`,
+`malachite-nz`, `malachite-q`) are licensed LGPL-3.0-only and are
 statically linked into our binaries. They are pulled in transitively via
 the `nickel-lang-core` git dependency; we do not depend on them
 directly.
@@ -31,7 +31,7 @@ the Minimal Corresponding Source (the LGPL library source) and the
 Corresponding Application Code (everything else needed to relink) in a
 form suitable for relinking, via one of the GPLv3 §6 conveyance methods.
 
-**Source-conveyance mechanism:** We rely on GPLv3 §6(d) — providing a
+**Source-conveyance mechanism:** We rely on GPLv3 §6(d), providing a
 network location from which to download the Corresponding Source. The
 malachite crates are published on crates.io at pinned versions recorded
 in `Cargo.lock`. Note that `Cargo.lock` itself only records registry
@@ -80,9 +80,9 @@ The macOS (darwin/arm64) release artifacts redistribute two prebuilt
 Apache-2.0 components, pinned in `vendor/`:
 
 - libkrun v1.19.4 (`vendor/libkrun/libkrun.lock`), shipped as
-  `libkrun.1.dylib` — https://github.com/containers/libkrun
+  `libkrun.1.dylib`, https://github.com/containers/libkrun
 - gvproxy v0.8.9 from gvisor-tap-vsock
-  (`vendor/gvproxy/gvproxy.lock`) —
+  (`vendor/gvproxy/gvproxy.lock`),
   https://github.com/containers/gvisor-tap-vsock
 
 Apache-2.0 redistribution requires retaining the license and notices;

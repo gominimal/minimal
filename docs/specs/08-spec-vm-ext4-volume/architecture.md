@@ -1,12 +1,12 @@
 ---
 id: arch-vm-ext4-volume
-title: Per-VM writable ext4 volume — architecture
+title: Per-VM writable ext4 volume, architecture
 kind: architecture
 status: shipped
 tracking-issue: 583
 ---
 
-# Per-VM writable ext4 volume — architecture
+# Per-VM writable ext4 volume - architecture
 
 ## Chosen approach
 
@@ -19,12 +19,12 @@ constraint by construction. The disk topology is two RAW virtio-blk devices:
 
 The host creates a sparse raw file (`ensure_sparse_raw`); the guest formats it
 on first boot via `mkfs.ext4` keyed on ext4 superblock detection (byte offset
-1080 magic `0x53EF`) — idempotent, platform-portable (macOS has no `mke2fs`).
+1080 magic `0x53EF`), idempotent, platform-portable (macOS has no `mke2fs`).
 Subsequent boots detect the superblock and skip mkfs.
 
 Clean shutdown is a guest `syncfs` + `umount` driven by `minvmd stop`
 invoking the existing Shutdown RPC before SIGTERM. A failed `/dev/vdb` mount
-is loud — `MOUNT_FAILED` marker, no READY, no silent tmpfs fallback — once
+is loud, `MOUNT_FAILED` marker, no READY, no silent tmpfs fallback, once
 session state (user data) lives on the volume.
 
 This is a three-crate change: `minvmd` (FFI, host provisioning, VM lifecycle),
@@ -55,7 +55,7 @@ same function-and-path contract with no guest or boot-path change.
   C strings, ctx_id validity, call-duration lifetime of pointers).
 
 - `SyncMode` `#[repr(u32)]` enum: `None = 0`, `Relaxed = 1`, `Full = 2`.
-  Models the `KRUN_SYNC_*` tri-state exactly — `sync_mode` is `uint32_t`,
+  Models the `KRUN_SYNC_*` tri-state exactly, `sync_mode` is `uint32_t`,
   not a bool (an earlier spec draft was incorrect on this point).
 
 No `Qcow2` variant is added to `DiskFormat`; the comment at `raw.rs:39`
@@ -67,13 +67,13 @@ remains a comment.
   delegates to `krun_add_disk3` via the same CString construction and
   `check_backend` error translation as the existing `add_disk`.
 
-ALREADY EXISTS: `krun_add_disk2` FFI — `crates/minvmd/src/krun/raw.rs:178-185`.
+ALREADY EXISTS: `krun_add_disk2` FFI, `crates/minvmd/src/krun/raw.rs:178-185`.
 Foundation for disk attach; `krun_add_disk3` adds sync/direct-io control.
 
-ALREADY EXISTS: `Context::add_disk` — `crates/minvmd/src/krun/ctx.rs:224-251`.
+ALREADY EXISTS: `Context::add_disk`, `crates/minvmd/src/krun/ctx.rs:224-251`.
 Foundation for the new `add_disk_with_sync` (parallel method, same patterns).
 
-ALREADY EXISTS: `DiskFormat::Raw = 0` — `crates/minvmd/src/krun/raw.rs:40-44`.
+ALREADY EXISTS: `DiskFormat::Raw = 0`, `crates/minvmd/src/krun/raw.rs:40-44`.
 The Raw-only constraint is already satisfied.
 
 ### Volume provisioning (`crates/minvmd/src/volume.rs`, new)
@@ -81,7 +81,7 @@ The Raw-only constraint is already satisfied.
 - `pub fn ensure_sparse_raw(path: &Path, size_bytes: u64) -> Result<(), VolumeError>`:
   creates a sparse raw file at `path` via `File::set_len` (lazy allocation on
   both APFS and ext4) when absent; leaves an existing image untouched. Never
-  resizes in place — shrinking would truncate a live guest ext4.
+  resizes in place, shrinking would truncate a live guest ext4.
   `VolumeError` is a `thiserror`-derived typed enum (informed by ADR-0001).
 
 - `pub fn resolve_data_volume_path() -> PathBuf`: reads
@@ -95,7 +95,7 @@ The Raw-only constraint is already satisfied.
 
 - `VmConfig::apply()` (the `#[cfg(minvmd_libkrun)]` path): after the existing
   `ctx.add_disk("root", &self.rootfs_path, DiskFormat::Raw, true)` call, adds:
-  1. `ensure_sparse_raw(&self.data_volume_path, volume_bytes)` — idempotent,
+  1. `ensure_sparse_raw(&self.data_volume_path, volume_bytes)`, idempotent,
      safe to call whether the file exists or not.
   2. `ctx.add_disk_with_sync("data", &self.data_volume_path, DiskFormat::Raw, false, direct_io, sync_mode)`.
   Sync parameters come from `MINVMD_DISK_SYNC` (`none`|`relaxed`|`full`,
@@ -116,7 +116,7 @@ New functions:
       handing `mkfs.ext4` a nonsensical block count.
     - **Trailing margin:** size the filesystem ~1 MiB (`MKFS_MARGIN_BYTES`)
       below the device via an explicit block count, so it survives libkrun's
-      backing-file trailer shave. Found via a 3-boot persistence test — without
+      backing-file trailer shave. Found via a 3-boot persistence test, without
       the margin the volume fails to re-mount on the next boot.
     - **No lazy-init storm:** `-E lazy_itable_init=0,lazy_journal_init=0` zeroes
       the inode table and journal at format time instead of via a background
@@ -124,7 +124,7 @@ New functions:
       with a reduced inode ratio (`-i 65536`) the eager init stays cheap.
 
     A mkfs failure is fatal (returns `Err`). mkfs runs only when no ext4
-    signature is present — never when one exists, so a persistent session disk
+    signature is present, never when one exists, so a persistent session disk
     is never reformatted out from under its data.
   - If the magic word is **present**: mounts the existing filesystem; the ext4
     journal replays any unclean-shutdown state on mount. Never mkfs. If the
@@ -161,17 +161,17 @@ currently at `main.rs:302-305`):
 `emit_mount_failed_marker().await` and exits (or loops in degraded mode
 matching the existing no-rootfs path). No code path substitutes `/run/minimal`
 on a volume failure. The existing rootfs-failure path
-(`enter_rootfs` returning `Err` → simple READY loop) is unchanged — that
+(`enter_rootfs` returning `Err` → simple READY loop) is unchanged, that
 covers the initramfs-only recovery case where no rootfs is attached.
 
 ### Shutdown quiesce (`crates/minimald/src/server.rs`)
 
 Shutdown RPC handler: call `quiesce_state_volume()` after all sessions are
 drained and before the process exits. Apply a 10-second timeout (caller
-proceeds regardless — the journal replay backstop handles the unclean-unmount
+proceeds regardless, the journal replay backstop handles the unclean-unmount
 case). A quiesce error is logged as a warning, not surfaced to the caller.
 
-ALREADY EXISTS: Shutdown RPC infrastructure — merged via PR #613 (informed by
+ALREADY EXISTS: Shutdown RPC infrastructure, merged via PR #613 (informed by
 #613). `server.rs` already drains sessions; only the syncfs/unmount step is new.
 
 ### Stop command (`crates/minvmd/src/cmd/stop.rs`)
@@ -183,7 +183,7 @@ RPC via a minimald_rpc client (already a workspace dependency) within a
 10-second timeout. Log any RPC failure and proceed to SIGTERM/SIGKILL
 regardless (the existing 5-second SIGTERM → SIGKILL escalation is unchanged).
 
-ALREADY EXISTS: Host→guest vsock bridge (VSOCK_BRIDGE_PORT) — `crates/minvmd/src/vm.rs`
+ALREADY EXISTS: Host→guest vsock bridge (VSOCK_BRIDGE_PORT), `crates/minvmd/src/vm.rs`
 via `VmConfig::apply()`. `stop.rs` uses the same host UDS path this bridge
 exposes to reach in-VM `minimald`.
 
@@ -199,7 +199,7 @@ exposes to reach in-VM `minimald`.
 - Proceed; `Store::new` may still fail on I/O errors (directory creation,
   file-open), but never on a corrupt JSON document alone.
 
-ALREADY EXISTS: `Store::self_heal()` — `crates/sessions/src/store.rs:369-382`.
+ALREADY EXISTS: `Store::self_heal()`, `crates/sessions/src/store.rs:369-382`.
 The rebuild mechanism exists; only the corrupt-JSON fallback at `Store::new`
 is missing.
 
@@ -228,7 +228,7 @@ removed. This makes explicit the behavior already present on branch #573 commit
 - **force=false to an empty worktree:** proceeds as today (direct unpack,
   no staging needed).
 
-ALREADY EXISTS: `unpack_workspace_files` — `crates/minimald/src/rpc.rs:384-413`,
+ALREADY EXISTS: `unpack_workspace_files`, `crates/minimald/src/rpc.rs:384-413`,
 landed via PR #423. The zstd-decompression and tar-unpack pipeline is in
 place; atomicity semantics and the non-empty check are new.
 
@@ -242,7 +242,7 @@ place; atomicity semantics and the non-empty check are new.
 - Session lifecycle events: `minimald` emits session-created and
   session-destroyed events over a persistent guest→host vsock connection (new
   `SessionLifecycle` RPC direction, using the same vsock guest-outbound
-  mechanism as the boot-marker port — connect, keep open, stream events).
+  mechanism as the boot-marker port, connect, keep open, stream events).
   `minvmd` receives and updates `ProviderIndex`. Full multi-VM routing
   (`attach`/`activate` dispatch to the owning VM) is #311 scope; this spec
   only creates and maintains the index so that routing is not blocked later.
@@ -295,11 +295,11 @@ crash-recovery data-loss window. `full` is preserved as a tunable via
 | Slug | Statement | Bucket | Evidence / citation | Depends-on |
 |---|---|---|---|---|
 | krun-add-disk3-signature | `krun_add_disk3` signature at `libkrun.h:278-284` matches the expected Rust binding; `sync_mode` is `uint32_t` (not `bool`), values 0/1/2 (NONE/RELAXED/FULL) | settled | Verified against libkrun 1.19.0 header; macOS/HVF throughput run confirmed in spec Proof Artifact 4 (2026-07-07, informed by #583) | R1.1, R1.2 |
-| sparse-raw-allocate-on-write | Sparse raw file (`File::set_len` / `ftruncate`) allocates blocks lazily on both APFS (macOS) and Linux host filesystems; the host never pre-allocates the full volume size | settled | APFS: confirmed — 2 GiB guest write → host image grows from 4 KiB to exactly 2048 MiB (spec Proof Artifact 3, macOS run, 2026-07-07, informed by #583); Linux: documented behavior of `ftruncate` + `fallocate(KEEP_SIZE)` on sparse-capable filesystems; CI Proof Artifact 3 Linux run verifies empirically | R1.3, R1.4 |
+| sparse-raw-allocate-on-write | Sparse raw file (`File::set_len` / `ftruncate`) allocates blocks lazily on both APFS (macOS) and Linux host filesystems; the host never pre-allocates the full volume size | settled | APFS: confirmed, 2 GiB guest write → host image grows from 4 KiB to exactly 2048 MiB (spec Proof Artifact 3, macOS run, 2026-07-07, informed by #583); Linux: documented behavior of `ftruncate` + `fallocate(KEEP_SIZE)` on sparse-capable filesystems; CI Proof Artifact 3 Linux run verifies empirically | R1.3, R1.4 |
 | rename-exchange-ext4 | `renameat2(RENAME_EXCHANGE)` is supported by the ext4 guest filesystem and available in the guest kernel image | settled | Linux kernel: RENAME_EXCHANGE added in Linux 3.15; ext4 documented support; the same virtio-linux guest kernel already enables modern features (user namespaces, hakoniwa sandbox builds) requiring ≥ Linux 3.8 | R3.3 |
 | shutdown-rpc-reachable | The Shutdown RPC is reachable from `minvmd stop` via the existing host UDS ↔ guest vsock bridge | settled | `VmConfig::apply()` registers the host UDS → guest vsock bridge at VSOCK_BRIDGE_PORT; Shutdown RPC handler exists in `server.rs` merged via PR #613 (informed by #613); `stop.rs` reaches the same host UDS via `sock::resolve_uds_path()` | R2.3 |
 | syncfs-bounded-flush | `syncfs(2)` on the `/var/lib/minimal` mount causes the ext4 journal to flush to the block device within a bounded time well under the 10-second quiesce timeout | settled | Linux semantics: `syncfs` is a blocking syscall that waits for all dirty pages and journal entries to reach the underlying block device; ext4 journal is sized (default 128 MiB) to flush quickly at modern I/O rates | R2.1, R2.2 |
-| lifecycle-vsock-persistent | A persistent guest→host vsock connection for `SessionLifecycle` events is feasible using the same mechanism as `BOOT_MARKER_PORT` | needs-spike | Contradicted by #588: libkrun's vsock device wedges when a guest→host connection overlaps a host→guest one. The boot-marker is safe only because it is connect→write→**close** *before* the SSH bridge is used; a connection held open for the VM's lifetime overlaps every host→guest SSH/attach and hits the wedge continuously — not just at boot. This is the same failure mode that red-lit autospawn-e2e on #672 (an awaited best-effort expose serialized vsock use and dodged the wedge; detaching it exposed it as `ssh connect: Disconnected`). The lifecycle channel needs a wedge-safe transport — a one-shot/serialized guest→host emit or a host-initiated poll — not a held-open socket. Spike the transport before R3.5 planning. | R3.5 |
+| lifecycle-vsock-persistent | A persistent guest→host vsock connection for `SessionLifecycle` events is feasible using the same mechanism as `BOOT_MARKER_PORT` | needs-spike | Contradicted by #588: libkrun's vsock device wedges when a guest→host connection overlaps a host→guest one. The boot-marker is safe only because it is connect→write→**close** *before* the SSH bridge is used; a connection held open for the VM's lifetime overlaps every host→guest SSH/attach and hits the wedge continuously, not just at boot. This is the same failure mode that red-lit autospawn-e2e on #672 (an awaited best-effort expose serialized vsock use and dodged the wedge; detaching it exposed it as `ssh connect: Disconnected`). The lifecycle channel needs a wedge-safe transport, a one-shot/serialized guest→host emit or a host-initiated poll, not a held-open socket. Spike the transport before R3.5 planning. | R3.5 |
 
 ## Knowledge gaps
 
@@ -316,7 +316,7 @@ for atomic directory replacement.
 **Open spike: `SessionLifecycle` vsock transport (`lifecycle-vsock-persistent`).**
 The libkrun vsock device wedges under concurrent guest→host and host→guest
 connections (#588). A held-open guest→host lifecycle socket would collide with
-the host→guest SSH/attach bridge continuously — the same failure that broke
+the host→guest SSH/attach bridge continuously, the same failure that broke
 autospawn-e2e on #672. Spike a wedge-safe transport (one-shot/serialized emit,
 or host-initiated poll) before committing R3.5 to a persistent connection.
 

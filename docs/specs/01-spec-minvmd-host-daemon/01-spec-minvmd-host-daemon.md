@@ -23,7 +23,7 @@ The crate already exists in the workspace at `crates/minvmd/` with FFI
 bindings (`src/krun/raw.rs`), safe wrappers (`src/krun/ctx.rs`), typed
 errors (`src/error.rs`), a build script for libkrun linking, macOS
 entitlements, and a CLI skeleton. Unit 1's requirements (R1.2, R1.3)
-are acceptance criteria for the existing scaffolding — they validate
+are acceptance criteria for the existing scaffolding, they validate
 that the code already landed meets the spec's safety and error-handling
 standards; they are not new-from-scratch deliverables. This spec covers
 the remaining work to make the daemon functional end-to-end: VM boot
@@ -77,11 +77,11 @@ that macOS imposes. The daemon:
 
 > Requirement IDs use the format **R{unit}.{seq}** (R1.1, R1.2 for
 > Unit 1; R2.1 for Unit 2). These IDs are referenced directly by the
-> planner — do not renumber after approval.
+> planner, do not renumber after approval.
 
 ### Unit 1: Crate scaffold, FFI wrappers, libkrun smoke test
 
-**Purpose:** Land the bones — crate, FFI bindings, build script, codesign
+**Purpose:** Land the bones, crate, FFI bindings, build script, codesign
 step. Boot a libkrun context to the marker "VM started, exited cleanly"
 with no rootfs work.
 
@@ -121,10 +121,10 @@ with no rootfs work.
 
 1. **File:** `crates/minvmd/src/krun/raw.rs` contains FFI declarations
    for `krun_create_ctx`, `krun_set_vm_config`, `krun_set_exec`,
-   `krun_start_enter`, `krun_free_ctx` with `// SAFETY:` comments —
+   `krun_start_enter`, `krun_free_ctx` with `// SAFETY:` comments,
    demonstrates the FFI scaffold and safety discipline.
 2. **CLI:** `MINVMD_E2E=1 cargo test -p minvmd --test krun_smoke_integration -- --include-ignored`
-   exits 0 on a Mac with libkrun installed — demonstrates end-to-end
+   exits 0 on a Mac with libkrun installed, demonstrates end-to-end
    FFI bring-up.
 
 ---
@@ -135,7 +135,7 @@ with no rootfs work.
 that reaches userspace and writes a "READY" marker to vsock from its
 guest workload. libkrun's built-in init (`/init.krun`) runs as PID 1,
 mounts `/proc`, `/sys`, `/dev`, and execs the workload set via
-`krun_set_exec` — so the rootfs needs no init system (no OpenRC).
+`krun_set_exec`, so the rootfs needs no init system (no OpenRC).
 
 **Depends on:** Unit 1
 
@@ -148,8 +148,8 @@ mounts `/proc`, `/sys`, `/dev`, and execs the workload set via
 - **R2.1**: The kernel artifact shall be the `vmlinuz` output of the
   `virtio-linux` minimal package; on aarch64 the artifact is `Image.gz`,
   on x86_64 `bzImage`. Path resolution shall happen at runtime via a
-  `MINVMD_KERNEL_PATH` env var. The kernel shall be loaded directly — no EFI
-  firmware, no disk image — via `krun_set_kernel` with the arch-appropriate
+  `MINVMD_KERNEL_PATH` env var. The kernel shall be loaded directly, no EFI
+  firmware, no disk image, via `krun_set_kernel` with the arch-appropriate
   libkrun format: `KRUN_KERNEL_FORMAT_PE_GZ` for the aarch64 `Image.gz` (the
   aarch64 loader implements only `RAW` and `PE_GZ`; `IMAGE_GZ` is x86_64-only
   and returns `KernelFormatUnsupported` on aarch64) and `KRUN_KERNEL_FORMAT_ELF`
@@ -163,7 +163,7 @@ mounts `/proc`, `/sys`, `/dev`, and execs the workload set via
   overlays the guest workload (`/sbin/minvmd-stub-init`) plus its runtime
   closure (socat and the sha256-pinned `readline` + `libncursesw` apks it
   dynamically links). The result is a directory consumed by `krun_set_root` as
-  virtio-fs — no disk image. (translated from plan: step R2.2)
+  virtio-fs, no disk image. (translated from plan: step R2.2)
 - **R2.3**: `minvmd boot` (parent) shall configure the libkrun context
   via the safe wrappers, then fork-exec a hidden
   `minvmd __krun-vmm` child that calls `krun_start_enter`. The child shall set
@@ -189,20 +189,20 @@ mounts `/proc`, `/sys`, `/dev`, and execs the workload set via
 
 1. **CLI:** `MINVMD_KERNEL_PATH=<path> MINVMD_ROOTFS_PATH=<path> minvmd boot --foreground`
    boots and prints `vm-up` to stdout within 5 s, and a host-side reader
-   on the vsock marker socket reads `READY` — demonstrates kernel+rootfs
+   on the vsock marker socket reads `READY`, demonstrates kernel+rootfs
    come up.
 2. **Test:** `tests/boot_integration.rs` (gated `MINVMD_E2E=1`, `#[ignore]`)
-   asserts the marker round-trip end-to-end — demonstrates automated
+   asserts the marker round-trip end-to-end, demonstrates automated
    boot verification.
 
 ---
 
 ### Unit 3: UDS↔vsock bridge for `ssh.sock`
 
-**Purpose:** The product feature — a host UDS the CLI talks to, bridged
+**Purpose:** The product feature, a host UDS the CLI talks to, bridged
 by libkrun to the in-VM vsock port where `minimald` listens.
 Bidirectional, transport-agnostic, multiple concurrent connections.
-**minvmd does not relay bytes itself** — libkrun owns the host UDS and
+**minvmd does not relay bytes itself**, libkrun owns the host UDS and
 the vsock forwarding.
 
 **Depends on:** Unit 2
@@ -237,7 +237,7 @@ permissions), guest-side vsock stub
 - **R3.5**: On guest unavailability, host connect/exchange shall fail at
   the libkrun bridge; `minvmd` shall `tracing::warn!` where observable,
   and `minimal`'s provider discovery shall treat the failed connect as
-  "stale provider — prune and continue". The TSI ~62-concurrent-connection
+  "stale provider, prune and continue". The TSI ~62-concurrent-connection
   cap shall be documented as a comment near the vsock registration.
   (translated from plan: step R3.5)
 
@@ -246,19 +246,19 @@ permissions), guest-side vsock stub
 1. **Test:** `tests/bridge_e2e.rs` (gated `MINVMD_E2E=1`, `#[ignore]`)
    boots a VM whose guest listens on vsock `VSOCK_PORT`, opens 5
    concurrent host UDS connections, each writes a distinct payload and
-   reads it back. All 5 succeed — demonstrates libkrun-multiplexed
+   reads it back. All 5 succeed, demonstrates libkrun-multiplexed
    bidirectional bridging. (Removed in the auto-discovery migration: it
    bridged the Stage-1 socat-echo stub that minimald-as-pid1 replaced
    with a direct SSH session server; session coverage of the bridge is
    now `tests/minimald_session_integration.rs`.)
 2. **CLI:** With a stub `minimald` reachable on vsock `VSOCK_PORT`,
    running `nc -U $XDG_RUNTIME_DIR/minimal/minimald.sock` from the host
-   yields the empty `list-sessions` response end-to-end — demonstrates
+   yields the empty `list-sessions` response end-to-end, demonstrates
    the host→guest path.
 
 ---
 
-### Unit 4: Lifecycle daemon — auto-spawn, status, stop
+### Unit 4: Lifecycle daemon - auto-spawn, status, stop
 
 **Purpose:** Daemon UX. `minimal` calling `minvmd` for the first time
 auto-spawns it; subsequent calls reuse; `minvmd status` introspects;
@@ -310,36 +310,36 @@ auto-spawns it; subsequent calls reuse; `minvmd status` introspects;
 
 1. **Test:** `crates/minvmd/src/lifecycle.rs` includes table-driven
    `#[test]`s for every legal and illegal transition;
-   `cargo test -p minvmd lifecycle::` passes — demonstrates the pure
+   `cargo test -p minvmd lifecycle::` passes, demonstrates the pure
    state machine.
 2. **CLI:** `minvmd stop && minvmd status --json` prints
-   `{"state":"stopped",...}` and exits 1 — demonstrates stop + status
+   `{"state":"stopped",...}` and exits 1, demonstrates stop + status
    semantics.
 3. **CLI:** From a clean state (no minvmd running), `minimal ls` on a
    Mac succeeds within 8 s and a subsequent `minvmd status` reports
-   `running`; a second `minimal ls` completes in < 500 ms — demonstrates
+   `running`; a second `minimal ls` completes in < 500 ms, demonstrates
    auto-spawn + warm reuse.
 
 ## Non-Goals
 
-- **Networking** — gated on #160. v0.1 VMs have no net device.
-- **Multi-VM / multi-tenant** — single named VM (`default`); multi-VM
+- **Networking**: gated on #160. v0.1 VMs have no net device.
+- **Multi-VM / multi-tenant**: single named VM (`default`); multi-VM
   is a v0.2+ concern.
-- **`minvmd init` / OCI image fetch / cosign verification** — kernel and
+- **`minvmd init` / OCI image fetch / cosign verification**, kernel and
   rootfs paths are passed in via env.
-- **Virtiofs / live host mounts** — per reference-impl lessons (TCC +
+- **Virtiofs / live host mounts**: per reference-impl lessons (TCC +
   provenance xattr issues), v0.1 has zero live mounts.
-- **`brew services` registration** — auto-spawn from the CLI suffices
+- **`brew services` registration**, auto-spawn from the CLI suffices
   for v0.1.
-- **PTY supervision / session sandboxing** — those live in `minimald`.
+- **PTY supervision / session sandboxing**: those live in `minimald`.
 - **OS suspend/resume of the VM, RAM resizing, vcpu hot-add.**
-- **Lifting code from reference impl** — patterns only, no vendoring.
+- **Lifting code from reference impl**: patterns only, no vendoring.
 
 ## Design Considerations
 
 ### Process model
 
-`krun_start_enter` never returns on success — it `exit()`s with the
+`krun_start_enter` never returns on success, it `exit()`s with the
 guest workload's exit code. This forces a parent/child split:
 
 ```text
@@ -351,7 +351,7 @@ minvmd run                       (parent — supervisor)
 ```
 
 Parent owns: `state.toml`, `lifecycle.lock`, and lifecycle supervision.
-The host UDS is **not** a parent-owned accept loop — libkrun binds and
+The host UDS is **not** a parent-owned accept loop, libkrun binds and
 forwards it (registered via `krun_add_vsock_port2` before the child
 enters), so neither parent nor child runs a userspace byte relay. Child
 owns: libkrun context, kernel/rootfs paths. They communicate via a
@@ -368,12 +368,12 @@ hold under this model.
 
 ### Hard lessons baked in
 
-- **No `$HOME` virtiofs** — TCC + provenance xattr issues on macOS.
-- **TSI ~62 concurrent connection cap** — fine for v0.1 (< 10
+- **No `$HOME` virtiofs**, TCC + provenance xattr issues on macOS.
+- **TSI ~62 concurrent connection cap**: fine for v0.1 (< 10
   concurrent), documented near the vsock registration.
-- **Error fidelity** — never collapse `Backend { op, source }` into a
+- **Error fidelity**: never collapse `Backend { op, source }` into a
   `String`; the errno survives via `io::Error::from_raw_os_error`.
-- **Stubs are sticky** — every stub shall `panic!`/`bail!`/`unimplemented!`
+- **Stubs are sticky**: every stub shall `panic!`/`bail!`/`unimplemented!`
   explicitly; no silent no-ops.
 
 ## Repository Standards
@@ -426,17 +426,17 @@ hold under this model.
 
 ## Technical Considerations
 
-- **libkrun linking** — pinned to a known-good version (v1.18.0).
+- **libkrun linking**: pinned to a known-good version (v1.18.0).
   `build.rs` emits `cargo:rustc-link-search` and
   `cargo:rustc-link-arg=-Wl,-rpath` pointing at `/opt/homebrew/lib`
   with a `LIBKRUN_PREFIX` env override.
-- **Hidden `__krun-vmm` subcommand** — not in `--help`;
+- **Hidden `__krun-vmm` subcommand**, not in `--help`;
   verified-via-auth-token; the only entry point that calls
   `krun_start_enter`.
-- **State file format** — TOML with serde; one file per VM (in v0.1,
+- **State file format**: TOML with serde; one file per VM (in v0.1,
   only `default`). Lifecycle enum is
   `NotProvisioned | Stopped | Starting | Running | Stopping`.
-- **Auto-spawn from `minimal`** — implementation lives in
+- **Auto-spawn from `minimal`**, implementation lives in
   `crates/minimal/src/autospawn.rs`, gated
   `#[cfg(any(target_os = "macos", target_os = "linux"))]` and invoked from
   `main.rs`. Enabled on both macOS and Linux.
@@ -446,7 +446,7 @@ hold under this model.
 - Single entitlement: `com.apple.security.hypervisor`. No network, no
   file-access-outside-home.
 - Host UDS perms: mode 0600, owner-only.
-- No authentication on the bridge — access is mode-gated. Do not expose
+- No authentication on the bridge, access is mode-gated. Do not expose
   the bridge over TCP without rethinking auth.
 - Single-use auth token between parent `minvmd run` and child
   `minvmd __krun-vmm`: written to state dir mode 0600, verified by
