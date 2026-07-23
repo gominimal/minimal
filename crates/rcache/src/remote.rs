@@ -655,12 +655,15 @@ mod tests {
         }
     }
 
+    /// Per-URL queues of (status, body) responses.
+    type ScriptedResponses = std::collections::HashMap<String, Vec<(usize, Vec<u8>)>>;
+
     #[derive(Debug, Default)]
     struct MockBackend {
         responses: std::collections::HashMap<String, Vec<u8>>,
-        /// Per-URL queue of (status, body) served before `responses` takes
-        /// over. Lets a test script failures-then-success.
-        scripted: std::sync::Mutex<std::collections::HashMap<String, Vec<(usize, Vec<u8>)>>>,
+        /// Responses served before `responses` takes over. Lets a test
+        /// script failures-then-success.
+        scripted: std::sync::Mutex<ScriptedResponses>,
         /// Total executed requests; an Arc so tests can keep counting after
         /// the backend moves into the RemoteCache.
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
