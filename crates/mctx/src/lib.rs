@@ -15,9 +15,7 @@ use common::{SpecOrigin, Target};
 use google_cloud_storage::client::Storage as GcsStorage;
 use lcache::CacheBinProvider;
 use ot::OpTracker;
-use rcache::{
-    Error as RemoteError, IndexSource, RemoteBinProvider, RemoteCache, RemoteCacheWriter,
-};
+use rcache::{Error as RemoteError, RemoteBinProvider, RemoteCache, RemoteCacheWriter};
 
 mod error;
 pub use error::Error;
@@ -527,6 +525,9 @@ impl Context {
             None
         };
 
+        // Rollout lever: overrides the file setting while per-commit reads
+        // bed in. Retire (env var first, then likely the file setting) once
+        // snapshot reads are the settled default.
         let override_mode = match std::env::var("MINIMAL_INDEX_SOURCE") {
             Ok(v) => Some(
                 v.parse::<mfile::IndexSourceMode>()
@@ -534,37 +535,18 @@ impl Context {
             ),
             Err(_) => None,
         };
-        let (source, fallback) = match self
+        let config = self
             .mfile
             .cache_config(override_mode)
-            .map_err(RemoteError::Config)?
-        {
-            mfile::CacheConfig::GlobalIndex => (IndexSource::Root, false),
-            mfile::CacheConfig::CommitIndex { object } => (IndexSource::Snapshot { object }, true),
-            mfile::CacheConfig::CommitIndexOnly { object } => {
-                (IndexSource::Snapshot { object }, false)
-            }
-        };
-        if let IndexSource::Snapshot { object } = &source {
-            tracing::debug!("cache index: per-commit snapshot {object}");
-        }
-
-        let ot = self.daemon.config.ot.clone();
-        let res = RemoteCache::new_any(
-            url.clone(),
-            gcs_storage.clone(),
-            index_dir.clone(),
-            ot.clone(),
-            source,
+            .map_err(RemoteError::Config)?;
+        let res = RemoteCache::new_any_configured(
+            url,
+            gcs_storage,
+            index_dir,
+            self.daemon.config.ot.clone(),
+            &config,
         )
         .await;
-        let res = match res {
-            Err(RemoteError::SnapshotMissing { object }) if fallback => {
-                tracing::info!("per-commit index {object} not found; using root index");
-                RemoteCache::new_any(url, gcs_storage, index_dir, ot, IndexSource::Root).await
-            }
-            other => other,
-        };
         tracing::trace!("remote cache init took {:?}", start.elapsed());
         res
     }
