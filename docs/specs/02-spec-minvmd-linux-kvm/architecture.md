@@ -1,12 +1,12 @@
 ---
 id: arch-minvmd-linux-kvm
-title: "minvmd Linux KVM backend — architecture"
+title: "minvmd Linux KVM backend, architecture"
 kind: architecture
-status: planned
+status: shipped
 tracking-issue: 397
 ---
 
-# minvmd Linux KVM backend — architecture
+# minvmd Linux KVM backend - architecture
 
 ## Chosen approach
 
@@ -22,20 +22,20 @@ check gates the daemon start. The existing macOS e2e test files (`boot_integrati
 a KVM-capable Linux runner.
 
 The process model, socket model, and lifecycle state machine from
-`arch-minvmd-host-daemon` (informed by arch-minvmd-host-daemon) are unchanged —
+`arch-minvmd-host-daemon` (informed by arch-minvmd-host-daemon) are unchanged,
 all three are already platform-agnostic.
 
 ### Why this is a mechanical change, not an architecture decision
 
 libkrun exports the **same C API** on macOS (Hypervisor.framework) and
 Linux (KVM). The platform difference is internal to the library. At the FFI
-boundary, `krun/raw.rs` and `krun/ctx.rs` need no API-level changes — the
+boundary, `krun/raw.rs` and `krun/ctx.rs` need no API-level changes, the
 `extern "C"` block carries no platform qualifier and the safe wrappers are
 already correct. Enabling Linux nonetheless requires removing the
 `#[cfg(target_os = "macos")]` guards on `pub mod krun`, `kernel_format()`,
 and `VmConfig::apply()`, and adding a Linux linker-setup branch in
 `build.rs`. The change is mechanical because those guards are not
-expressing a meaningful platform split — they exist only because the macOS
+expressing a meaningful platform split, they exist only because the macOS
 implementation came first. Extending to Linux therefore requires:
 
 1. **Build script** (`build.rs`): add a Linux linker-setup branch. The
@@ -47,7 +47,7 @@ implementation came first. Extending to Linux therefore requires:
 2. **Module gating** (`lib.rs`): remove the `#[cfg(target_os = "macos")]`
    guard on `pub mod krun` so the FFI module is compiled on Linux.
 3. **Kernel format** (`image.rs`): remove the `#[cfg(target_os = "macos")]`
-   guard on `kernel_format()`. The function body is unchanged — Linux and
+   guard on `kernel_format()`. The function body is unchanged, Linux and
    macOS use the same libkrun kernel format conventions.
 4. **VmConfig::apply** (`vm.rs`): remove the `#[cfg(target_os = "macos")]`
    guard. The method body is unchanged.
@@ -74,7 +74,7 @@ architecture (informed by arch-minvmd-host-daemon).
 
 Alternative A (add a Cargo feature flag `kvm-backend`) was considered and
 rejected. The `#[cfg]` guards exist only because the build was macOS-only
-at inception — they are not expressing a meaningful feature split.
+at inception; they are not expressing a meaningful feature split.
 Introducing a feature adds complexity (CI matrix, feature-combination
 tests, documentation) for no benefit: both KVM and Hypervisor.framework
 are supported by the same libkrun library with the same API. Removing the
@@ -100,7 +100,7 @@ via the link attribute already present.
 
 ### `crates/minvmd/src/image.rs`
 
-`kernel_format()` becomes unconditional. The function body is unchanged —
+`kernel_format()` becomes unconditional. The function body is unchanged,
 `aarch64` returns `KernelFormat::Raw`; `x86_64` returns `KernelFormat::Elf`.
 These are the correct values for the libkrun KVM backend as well.
 
@@ -155,7 +155,7 @@ host daemon". macOS-specific subcommand messaging removed.
 `#![cfg(target_os = "macos")]` file-level attribute removed. Each test
 remains `#[ignore]` by default; the `MINVMD_E2E=1` + env-var gate is
 unchanged. The test bodies require no change. (`bridge_e2e.rs` was later
-removed in the auto-discovery migration — superseded by
+removed in the auto-discovery migration, superseded by
 `minimald_session_integration.rs`.)
 
 ### `.github/workflows/` (new CI job)
@@ -164,7 +164,7 @@ A Linux KVM e2e job on a self-hosted KVM-capable runner (GCP nested-virt or
 equivalent). It provisions libkrun ≥ 1.19.0, materializes the kernel +
 rootfs + initramfs from Minimal packages, sets `MINVMD_E2E=1`, and runs
 `cargo test -p minvmd -- --include-ignored`. The job is required (no
-`continue-on-error`) from the moment it is introduced — failures must
+`continue-on-error`) from the moment it is introduced, failures must
 block merges to close the Linux-host support gap.
 
 ## Alternatives considered
@@ -172,7 +172,7 @@ block merges to close the Linux-host support gap.
 ### Option A: Cargo feature flag `kvm-backend`
 
 Rejected. The existing `#[cfg(target_os = "macos")]` guards are not a
-meaningful feature split — they exist only because the macOS implementation
+meaningful feature split, they exist only because the macOS implementation
 came first. A feature flag would add CI matrix complexity and require
 users to pass `--features kvm-backend` on Linux for no expressive benefit.
 Removing the guards is the simpler and correct approach.

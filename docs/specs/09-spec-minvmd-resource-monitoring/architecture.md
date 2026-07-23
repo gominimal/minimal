@@ -1,12 +1,12 @@
 ---
 id: arch-minvmd-resource-monitoring
-title: minvmd resource monitoring, configuration, and warnings — architecture
+title: minvmd resource monitoring, configuration, and warnings, architecture
 kind: architecture
-status: planned
+status: shipped
 tracking-issue: 747
 ---
 
-# minvmd resource monitoring, configuration, and warnings — architecture
+# minvmd resource monitoring, configuration, and warnings - architecture
 
 ## Chosen approach
 
@@ -15,13 +15,13 @@ inside the supervised VMM child process (`State.vmm_pid`), so the host can both
 *observe* it (sample the PID) and *configure* it (persist boot parameters read on
 the next launch).
 
-1. **Sampler** (`metrics.rs`) — `sample(pid)` reads host-visible CPU %, resident
+1. **Sampler** (`metrics.rs`), `sample(pid)` reads host-visible CPU %, resident
    bytes, and cumulative disk read/write for the VMM PID via the `sysinfo` crate.
    Cross-platform (macOS/HVF, Linux/KVM) with no per-OS branch. `status --json`
    samples only for a running VM and emits a typed `StatusReport` with a
    `metrics` object (or `null`).
 
-2. **Config** (`config.rs` + `cmd/config.rs`) — `ResourceConfig { vcpus, ram_mib }`
+2. **Config** (`config.rs` + `cmd/config.rs`), `ResourceConfig { vcpus, ram_mib }`
    persists to `config.toml` in the provider-instance dir, **separate from the
    runtime `State`** so a stop/crash reset cannot wipe it. `effective_vcpus()` /
    `effective_ram_mib()` resolve `env ?? config ?? default`; `vmm_child` boots
@@ -29,7 +29,7 @@ the next launch).
    records the resolved boot-time values (`State.booted_*`), and `status` reports
    *those* for a live VM.
 
-3. **Warnings** — proactive only: over-allocation vs host cores/memory, the
+3. **Warnings**: proactive only: over-allocation vs host cores/memory, the
    x86_64 MMIO hole, and a host-derived vCPU ceiling (logical cores minus a
    two-core host reserve), all checked at `config set`;
    plus a supervisor post-exit resource hint on a guest workload's non-zero exit.
@@ -45,28 +45,28 @@ are motivated below.
 
 ### New files
 
-- `crates/minvmd/src/metrics.rs` — `VmMetrics`, `sample(pid) -> Option<VmMetrics>`
+- `crates/minvmd/src/metrics.rs`, `VmMetrics`, `sample(pid) -> Option<VmMetrics>`
   (raw host-visible sampling only; no pressure thresholds).
-- `crates/minvmd/src/config.rs` — `ResourceConfig { vcpus: Option<u8>, ram_mib:
+- `crates/minvmd/src/config.rs`, `ResourceConfig { vcpus: Option<u8>, ram_mib:
   Option<u32> }` with `read(dir)` / `write(dir)` (atomic).
-- `crates/minvmd/src/cmd/config.rs` — `run_show(json)`, `run_set(vcpus, ram_mib)`,
+- `crates/minvmd/src/cmd/config.rs`, `run_show(json)`, `run_set(vcpus, ram_mib)`,
   `HostCapacity::probe()`, pure `validate_resources`.
-- `crates/minvmd/tests/config_cli_integration.rs` — CLI e2e (no VM required).
+- `crates/minvmd/tests/config_cli_integration.rs`, CLI e2e (no VM required).
 
 ### Changed surfaces
 
-- `state.rs` — extract `pub(crate) fn atomic_write_toml<T: Serialize>(target,
+- `state.rs`, extract `pub(crate) fn atomic_write_toml<T: Serialize>(target,
   value)`; `write_state` delegates to it (behaviour unchanged). Shared with
   `ResourceConfig::write`.
-- `cmd/mod.rs` — `DEFAULT_VM_VCPUS`, `VM_VCPUS_ENV`, `env_ram_mib`/`env_vcpus`
+- `cmd/mod.rs`, `DEFAULT_VM_VCPUS`, `VM_VCPUS_ENV`, `env_ram_mib`/`env_vcpus`
   (private), `persisted_resource_config`, `effective_ram_mib`/`effective_vcpus`.
   `vm_ram_mib()` is removed (its two callers move to `effective_ram_mib`).
-- `cmd/status.rs` — inline `json!` → `#[derive(Serialize)] StatusReport { …,
+- `cmd/status.rs`, inline `json!` → `#[derive(Serialize)] StatusReport { …,
   metrics }`; pure `build_report`; metrics sampled only when running.
-- `cmd/vmm_child.rs` — `VmConfig::new(effective_vcpus(), effective_ram_mib(), …)`.
-- `cmd/run.rs` — abnormal-exit resource hint before the existing `bail!`.
-- `main.rs` — `Command::Config { action: ConfigAction::{Show, Set} }`.
-- `Cargo.toml` (workspace + crate) — `sysinfo` dependency.
+- `cmd/vmm_child.rs`, `VmConfig::new(effective_vcpus(), effective_ram_mib(), …)`.
+- `cmd/run.rs`, abnormal-exit resource hint before the existing `bail!`.
+- `main.rs`, `Command::Config { action: ConfigAction::{Show, Set} }`.
+- `Cargo.toml` (workspace + crate), `sysinfo` dependency.
 
 ### `status --json` schema delta
 
@@ -107,7 +107,7 @@ is added:
   monotonic high-water mark, not guest ext4 free space, so a disk threshold fires
   too late or never (false negative), and its `MINVMD_VOLUME_BYTES` advice is a
   no-op on an existing image. Accurate df/cgroup warnings need an in-guest agent
-  (`minimal-vm-mac` does exactly this in-guest) — out of scope. The reliable
+  (`minimal-vm-mac` does exactly this in-guest), out of scope. The reliable
   reactive signal kept is the supervisor's abnormal-exit hint.
 
 ## Assumption ledger

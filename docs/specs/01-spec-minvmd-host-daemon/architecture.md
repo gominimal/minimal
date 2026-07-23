@@ -1,23 +1,23 @@
 ---
 id: arch-minvmd-host-daemon
-title: "minvmd macOS VM provider host daemon — architecture"
+title: "minvmd macOS VM provider host daemon, architecture"
 kind: architecture
-status: planned
+status: shipped
 ---
 
-# minvmd macOS VM provider host daemon — architecture
+# minvmd macOS VM provider host daemon - architecture
 
 ## Chosen approach
 
 `minvmd` is a thin lifecycle-and-transport daemon that bridges macOS to
 the Linux-native `minimald` via libkrun's Hypervisor.framework backend.
 The architecture follows the plan's three-process model and the session
-domain model in `docs/session-domain-diag.md`
+domain model in `docs/internal/session-domain-diag.md`
 (translated from plan: Process model).
 
 ### Process model
 
-`krun_start_enter` never returns on success — it calls `exit()` with the
+`krun_start_enter` never returns on success, it calls `exit()` with the
 guest workload's exit code. This forces a parent/child split
 (translated from plan: Process model):
 
@@ -31,14 +31,14 @@ minvmd run                       (parent — supervisor)
 
 - **Parent** (`minvmd run`): owns `state.toml`, `lifecycle.lock`, lifecycle
   supervision, and the `--detach` readiness gate. Does **not** own a byte
-  relay — libkrun binds and forwards the host UDS itself.
+  relay, libkrun binds and forwards the host UDS itself.
 - **Child** (`minvmd __krun-vmm`): hidden subcommand; configures the
   libkrun context (kernel, rootfs, vsock ports, vm config), then calls
   `krun_start_enter` which diverges. Authenticated to the parent via a
   single-use token in the state directory (mode 0600, deleted on first read).
 - **Guest**: Alpine minirootfs. libkrun's built-in `/init.krun` is pid-1
   (mounts `/proc`, `/sys`, `/dev`); it execs the workload set via
-  `krun_set_exec` — `minimald`, or the v0.1 vsock stub. No init system in the
+  `krun_set_exec`, `minimald`, or the v0.1 vsock stub. No init system in the
   rootfs.
 
 ### Socket model (libkrun-owned, no host relay)
@@ -55,7 +55,7 @@ process listening on vsock `VSOCK_PORT`. `minvmd` carries no
 per-connection state and runs no userspace byte relay.
 
 The provider-owns-socket and connect-and-prune discovery rules from
-`docs/session-domain-diag.md` hold under this model: the host UDS *is*
+`docs/internal/session-domain-diag.md` hold under this model: the host UDS *is*
 the provider socket. A stale socket after a crash fails connect-and-check
 and is pruned by `minimal`.
 
@@ -81,7 +81,7 @@ commit, preventing stuck `Starting` states after crashes
 ### Platform gating
 
 All libkrun-touching code is behind `#[cfg(target_os = "macos")]`. On
-Linux, the crate compiles to a runtime-bailing stub — the `krun` module
+Linux, the crate compiles to a runtime-bailing stub, the `krun` module
 is excluded entirely, and the CLI entry point `bail!`s if invoked. This
 keeps the existing Linux-only CI green (translated from plan: R1.1).
 
@@ -94,7 +94,7 @@ on macOS.
 On macOS, `crates/minimal` checks `state.toml` before connecting to the
 provider UDS. If no `minvmd` is running, it spawns
 `minvmd run --detach` and waits (with timeout, default 8 s) for the UDS to
-accept connections. On Linux this path is a no-op — `minimald` runs
+accept connections. On Linux this path is a no-op, `minimald` runs
 natively (translated from plan: R4.5).
 
 ## Data and interface changes
@@ -116,13 +116,13 @@ natively (translated from plan: R4.5).
 
 ### New FFI surface in `krun/raw.rs`
 
-`krun_add_vsock_port2` (Unit 3) — the host-initiated vsock bridge
+`krun_add_vsock_port2` (Unit 3), the host-initiated vsock bridge
 registration. This supplements the existing `krun_add_vsock_port` which
 is the guest-initiated variant.
 
 ### New workspace dependency
 
-`fd-lock` — file-descriptor-based advisory locking for `lifecycle.lock`.
+`fd-lock`, file-descriptor-based advisory locking for `lifecycle.lock`.
 Workspace-pinned in `Cargo.toml`.
 
 ### Changes to `crates/minimal`
@@ -135,7 +135,7 @@ auto-spawn check: read `state.toml`, conditionally spawn
 
 v0.1 uses a vsock stub (R3.4). The real `minimald` swap-in (vsock-native
 listener via `impl AsyncRead + AsyncWrite`) is a follow-up in
-`crates/minimald` — confirmed by the `minimald` crate owner as option (b)
+`crates/minimald`, confirmed by the `minimald` crate owner as option (b)
 (informed by gominimal/minimal#280).
 
 ## Alternatives considered
@@ -158,7 +158,7 @@ model Option A vs Option B).
 
 ### Direct `minimald` on macOS (no VM)
 
-Not viable — `minimald` depends on Linux namespaces for sandbox isolation.
+Not viable, `minimald` depends on Linux namespaces for sandbox isolation.
 macOS has no equivalent. The VM boundary is the minimum viable isolation
 layer.
 
