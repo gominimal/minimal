@@ -17,14 +17,6 @@ Loadouts apply to sessions (`min activate`); they are not used by task
 sandboxes ([`mip run`](./cli-mip.md)), which have their own
 `packages`/`env_vars`/`patches` schema described in [Tasks](./tasks.md).
 
-> **Current limitations**: of the four things a loadout can contribute,
-> **packages** and **vars** take effect inside the session today. **Patches**
-> and **lifecycle hooks** are parsed, validated, and composed into the
-> session's configuration, but the session launcher does not yet apply them
-> inside the sandbox; the daemon holds them with the session and logs each
-> one as deferred. The schema below documents all four so files written
-> now stay valid as the remaining plumbing lands.
-
 ## Where loadouts live
 
 Each loadout is a single TOML file at:
@@ -35,8 +27,7 @@ Each loadout is a single TOML file at:
 
 `<config>` is the platform user config directory: `$XDG_CONFIG_HOME` on Linux
 (or `$HOME/.config` when unset); macOS also uses `$HOME/.config` for
-consistency with Minimal's state and cache dirs, not
-`~/Library/Application Support`. The global
+consistency with Minimal's state and cache dirs. The global
 [`--config-dir`](./cli-min.md#global-flags) flag overrides the base, and
 `min dirs` prints the resolved loadouts directory.
 
@@ -63,13 +54,13 @@ packages    = ["helix", "zellij"]
 
 patches = [
     # Helix: single config files plus a themes directory.
-    { dest = "~/.config/helix/config.toml", source = "~/dotfiles/helix/config.toml" },
-    { dest = "~/.config/helix/languages.toml", source = "~/dotfiles/helix/languages.toml" },
-    { dest = "~/.config/helix/themes/", source = "~/dotfiles/helix/themes/**/*.toml" },
+    { dest = ".config/helix/config.toml", source = "~/dotfiles/helix/config.toml" },
+    { dest = ".config/helix/languages.toml", source = "~/dotfiles/helix/languages.toml" },
+    { dest = ".config/helix/themes/", source = "~/dotfiles/helix/themes/**/*.toml" },
 
     # Zellij: single config file plus a layouts directory.
-    { dest = "~/.config/zellij/config.kdl", source = "~/dotfiles/zellij/config.kdl" },
-    { dest = "~/.config/zellij/layouts/", source = "~/dotfiles/zellij/layouts/**/*.kdl" },
+    { dest = ".config/zellij/config.kdl", source = "~/dotfiles/zellij/config.kdl" },
+    { dest = ".config/zellij/layouts/", source = "~/dotfiles/zellij/layouts/**/*.kdl" },
 ]
 
 [vars]
@@ -123,7 +114,7 @@ packages = ["helix", "zellij"]
 ```
 
 Names are not checked at activation: an unknown package composes cleanly
-and fails later, when the session sandbox first spawns, with
+and fails later, when the session first spawns, with
 `no such package: <name>`.
 
 ### `[vars]` - Environment variables
@@ -169,14 +160,14 @@ value = "x"
 
 _Optional_
 
-Each row names a `source` on the host and a `dest` inside the session
-sandbox, with an optional `description`.
+Each row names a `source` on the host and a `dest` inside the session,
+with an optional `description`.
 
 ```toml
 patches = [
-    { dest = "~/.psqlrc", source = "~/dotfiles/psqlrc" },
+    { dest = ".psqlrc", source = "~/dotfiles/psqlrc" },
     { dest = "certs/",    source = ["~/ca/root.pem", "~/ca/dev.pem"] },
-    { dest = "~/.config/nvim/", source = "~/dotfiles/nvim/**/*.lua" },
+    { dest = ".config/nvim/", source = "~/dotfiles/nvim/**/*.lua" },
 ]
 ```
 
@@ -197,9 +188,8 @@ fans out into one patch per pattern, sharing the `dest`):
   dotfile tree the host may not have is safe. Other enumeration failures
   (permission denied, unreadable entries) still fail the composition.
 
-**`dest`** is interpreted relative to the sandbox user's home directory; a
-leading `~/` refers to that same home. Absolute paths and `..` components
-are rejected. For a single-file source, `dest` is the destination file
+**`dest`** is interpreted relative to the session user's home directory.
+Absolute paths and `..` components are rejected. For a single-file source, `dest` is the destination file
 path; for multi-file sources (lists, globs), `dest` is the destination
 directory.
 
