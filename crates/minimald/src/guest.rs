@@ -650,6 +650,118 @@ pub fn mount_dev() {
     mount_if_absent("/dev", "devtmpfs", "devtmpfs");
 }
 
+const NANOS_IN_SECOND: u64 = 1_000_000_000;
+
+/// How far the guest's `CLOCK_REALTIME` may sit from the host's before we step
+/// it, in nanoseconds.
+///
+/// The guest clock only ticks while the VM is scheduled, so it falls behind
+/// whenever the host suspends or the VM is descheduled for long — that gap is
+/// what these updates repair, and it is seconds to hours, not milliseconds.
+const CLOCK_STEP_THRESHOLD_NS: u64 = 80_000_000;
+
+/// The `CLOCK_REALTIME` value to set given a host update + the guest's time. None
+/// means its not worth updating (close enough).
+fn clock_step_target(host_ns: u64, guest_ns: u64) -> Option<nix::sys::time::TimeSpec> {
+    if host_ns.abs_diff(guest_ns) <= CLOCK_STEP_THRESHOLD_NS {
+        return None;
+    }
+    Some(nix::sys::time::TimeSpec::new(
+        (host_ns / NANOS_IN_SECOND) as libc::time_t,
+        (host_ns % NANOS_IN_SECOND) as libc::c_long,
+    ))
+}
+
+/// Listens forever for host time updates and steps the guest's `CLOCK_REALTIME`
+/// onto the host's whenever the two have drifted apart.
+///
+/// This is the guest half of libkrun's timesync worker
+/// ([`timesync.rs`](https://github.com/containers/libkrun/blob/main/src/devices/src/virtio/vsock/timesync.rs)),
+/// which libkrun initializes on macOS hosts only. It sends an AF_VSOCK
+/// **datagram** — eight bytes, the host's nanoseconds since the epoch, little
+/// endian — to a fixed port (123) every 60 s, and immediately after it notices
+/// the host slept. Without this the guest clock stops for the duration of a
+/// host suspend and every later timestamp is wrong: TLS handshakes fail on
+/// not-yet-valid certificates and build systems see sources "from the future".
+///
+/// Runs until the socket fails, hence the [`Infallible`] success type: every
+/// `Ok` path loops. Callers spawn it and log the error. Malformed datagrams
+/// (anything but exactly 8 bytes) are skipped, not fatal — one bad packet is
+/// not a reason to stop tracking the host clock.
+///
+/// [`AsyncFd`]: tokio::io::unix::AsyncFd
+/// [`Infallible`]: std::convert::Infallible
+pub async fn run_timekeep_listener(port: u32) -> std::io::Result<std::convert::Infallible> {
+    use nix::sys::socket::{AddressFamily, MsgFlags, SockFlag, SockType, bind, recv, socket};
+    use nix::time::{ClockId, clock_gettime, clock_settime};
+    use std::os::fd::AsRawFd as _;
+    use tokio::io::unix::AsyncFd;
+    use tokio_vsock::VMADDR_CID_ANY;
+
+    // Non-blocking from birth: `AsyncFd` only reports readiness, the recv below
+    // is ours to issue, and a blocking one would stall a runtime worker.
+    let sock = socket(
+        AddressFamily::Vsock,
+        SockType::Datagram,
+        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+        None,
+    )?;
+    // The host addresses the guest by its own CID, which the guest does not need
+    // to know: `VMADDR_CID_ANY` binds the port on whatever CID we were given.
+    bind(sock.as_raw_fd(), &VsockAddr::new(VMADDR_CID_ANY, port))?;
+    let sock = AsyncFd::new(sock)?;
+    tracing::info!(port, "listening for host time updates on vsock");
+
+    // `clock_settime` needs CAP_SYS_TIME. The microVM's pid-1 has it, but a
+    // native daemon handed --timekeep-listener-port may not, and updates arrive
+    // every 60s — warn on the first denial and stay quiet after that.
+    let mut warned_settime = false;
+
+    loop {
+        let mut ready = sock.readable().await?;
+        let mut buf = [0u8; 8];
+        let received = match ready.try_io(|sock| {
+            recv(sock.as_raw_fd(), &mut buf, MsgFlags::empty()).map_err(std::io::Error::from)
+        }) {
+            // Spurious readiness; `try_io` cleared it, so wait for the next.
+            Err(_would_block) => continue,
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(Err(e)) => return Err(e),
+        };
+        if received != 8 {
+            tracing::warn!(received, "ignoring malformed time update");
+            continue;
+        }
+
+        let host_ns = u64::from_le_bytes(buf);
+        let guest = clock_gettime(ClockId::CLOCK_REALTIME)?;
+        let guest_ns = guest.tv_sec() as u64 * NANOS_IN_SECOND + guest.tv_nsec() as u64;
+        let drift_ns = host_ns.abs_diff(guest_ns);
+        let Some(host_ts) = clock_step_target(host_ns, guest_ns) else {
+            tracing::trace!(drift_ns, "guest clock still tracks the host");
+            continue;
+        };
+
+        match clock_settime(ClockId::CLOCK_REALTIME, host_ts) {
+            Ok(()) => {
+                tracing::info!(drift_ns, "stepped the guest clock onto the host's");
+                warned_settime = false;
+            }
+            Err(e) if !warned_settime => {
+                warned_settime = true;
+                tracing::warn!(
+                    error = %e,
+                    drift_ns,
+                    "could not set the guest clock (needs CAP_SYS_TIME); \
+                     suppressing further failures for this listener",
+                );
+            }
+            Err(e) => tracing::debug!(error = %e, drift_ns, "could not set the guest clock"),
+        }
+    }
+}
+
 /// Brings up egress for the guest **root** netns (where `minimald` itself runs)
 /// by attaching a primary `eth0` tap to the host gvproxy over the vsock shuttle.
 ///
@@ -929,6 +1041,70 @@ fn mount_if_absent(target: &str, source: &str, fstype: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Small drift is left alone: the host sends every 60s, and stepping the
+    /// clock for sub-threshold noise would rewrite it on every update.
+    #[test]
+    fn a_clock_within_the_threshold_is_not_stepped() {
+        let guest_ns = 1_700_000_000 * NANOS_IN_SECOND;
+        assert_eq!(clock_step_target(guest_ns, guest_ns), None);
+        // Either side of the guest, right up to the threshold itself.
+        assert_eq!(
+            clock_step_target(guest_ns + CLOCK_STEP_THRESHOLD_NS, guest_ns),
+            None
+        );
+        assert_eq!(
+            clock_step_target(guest_ns - CLOCK_STEP_THRESHOLD_NS, guest_ns),
+            None
+        );
+    }
+
+    /// The suspend case the worker exists for, in both directions: a guest that
+    /// slept through host time, and (after a step) one that ran ahead of it.
+    #[test]
+    fn a_drifted_clock_is_stepped_onto_the_host_time() {
+        let guest_ns = 1_700_000_000 * NANOS_IN_SECOND;
+
+        // Guest is an hour behind: adopt the host's time exactly.
+        let host_ns = guest_ns + 3600 * NANOS_IN_SECOND;
+        let step = clock_step_target(host_ns, guest_ns).expect("an hour of drift is a step");
+        assert_eq!(step.tv_sec(), 1_700_003_600);
+        assert_eq!(step.tv_nsec(), 0);
+
+        // Guest is ahead of the host: stepping backwards is still correct.
+        let host_ns = guest_ns - 3600 * NANOS_IN_SECOND;
+        let step = clock_step_target(host_ns, guest_ns).expect("an hour of drift is a step");
+        assert_eq!(step.tv_sec(), 1_699_996_400);
+        assert_eq!(step.tv_nsec(), 0);
+
+        // One nanosecond past the threshold is already a step.
+        let host_ns = guest_ns + CLOCK_STEP_THRESHOLD_NS + 1;
+        assert!(clock_step_target(host_ns, guest_ns).is_some());
+    }
+
+    /// The host's nanoseconds split into whole seconds plus a sub-second
+    /// remainder — a `timespec` whose `tv_nsec` overflowed a second would be
+    /// EINVAL from `clock_settime`.
+    #[test]
+    fn host_nanoseconds_split_into_seconds_and_a_sub_second_remainder() {
+        let guest_ns = 0;
+        let host_ns = 1_700_000_000 * NANOS_IN_SECOND + 999_999_999;
+        let step = clock_step_target(host_ns, guest_ns).expect("decades of drift is a step");
+        assert_eq!(step.tv_sec(), 1_700_000_000);
+        assert_eq!(step.tv_nsec(), 999_999_999);
+    }
+
+    /// The wire format libkrun's timesync worker writes: 8 bytes, little
+    /// endian, nanoseconds since the epoch.
+    #[test]
+    fn a_time_update_datagram_decodes_little_endian() {
+        let host_ns = 1_700_000_000 * NANOS_IN_SECOND + 123_456_789;
+        assert_eq!(u64::from_le_bytes(host_ns.to_le_bytes()), host_ns);
+        assert_eq!(
+            u64::from_le_bytes([0x15, 0xcd, 0x5b, 0x07, 0x00, 0x00, 0x00, 0x00]),
+            123_456_789,
+        );
+    }
 
     #[test]
     fn ext4_superblock_probe_detects_magic() {

@@ -210,6 +210,14 @@ pub struct ListenArgs {
     #[clap(hide = true)]
     mk_mount_state_volume: Option<String>,
 
+    /// Vsock port to listen on for time updates. This listens for updates emitted by
+    /// libkrun's timesync worker: https://github.com/libkrun/libkrun/blob/main/src/devices/src/virtio/vsock/timesync.rs#L16.
+    ///
+    /// This worker is only initialized for a MacOS host.
+    #[arg(long)]
+    #[clap(hide = true)]
+    timekeep_listener_port: Option<u32>,
+
     /// Daemonize: spawn minimald in a new session (setsid) and return once the
     /// SSH socket accepts connections, or an 8s timeout elapses. Used by the
     /// `min` CLI to auto-start a native daemon on Linux.
@@ -399,6 +407,12 @@ async fn async_main() -> Result<(), MainError> {
                 mount_rootfs: Some("/dev/vda".to_string()),
                 mk_mount_state_volume: Some("/dev/vdb".to_string()),
                 detach: false,
+                timekeep_listener_port: if cfg!(target_arch = "aarch64") {
+                    // Libkrun shares the time as datagrams down vsock 123 on MacOS.
+                    Some(123)
+                } else {
+                    None
+                },
                 // In-VM (DM1/3/4) the PTask attaches to the host gvproxy over the
                 // vsock shuttle, so no in-guest gvproxy binary path is needed.
                 gvproxy_bin: None,
@@ -718,6 +732,21 @@ async fn async_main() -> Result<(), MainError> {
             "sessions will fail to start: this host refuses the unprivileged user \
              namespace every session sandbox needs"
         );
+    }
+
+    // Track the host's wall clock, when configured.
+    if let Some(port) = cli.listen_args().unwrap().timekeep_listener_port {
+        tokio::spawn(async move {
+            match guest::run_timekeep_listener(port).await {
+                // `Infallible`: the listener only ever returns by failing.
+                Ok(never) => match never {},
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    port,
+                    "host time updates unavailable; the guest clock will drift",
+                ),
+            }
+        });
     }
 
     // If we got this far we need to launch minimald.
