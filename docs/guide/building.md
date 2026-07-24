@@ -6,7 +6,7 @@ description: Run builds and tests in sandboxed environments using stacks. Covers
 
 Minimal builds your code reproducibly inside a sandbox, using a [stack](../concepts/stacks.md) to wire up the right tools and build commands for your language or build system.
 
-A build is a **one-shot** command that runs in its own fresh sandbox and exits, driven by the `mip` CLI. That is different from an interactive [dev session](./dev-shell.md), which is a long-lived environment you attach to with `min` for interactive development.
+A build is a **one-shot** command that runs in its own fresh sandbox and exits, driven by the `mip` CLI (Linux-only; on macOS, work inside a [dev session](./dev-shell.md) instead). That is different from an interactive dev session, which is a long-lived environment you attach to with `min` for interactive development.
 
 ## Running a build
 
@@ -14,7 +14,7 @@ A build is a **one-shot** command that runs in its own fresh sandbox and exits, 
 $ mip build
 ```
 
-This is shorthand for `mip run build`. The stack configured in your `minimal.toml` determines what happens. For example, a Rust stack runs `cargo build --release`, while a pnpm stack runs `pnpm install && pnpm build`.
+This is shorthand for `mip run build`. The stack configured in your `minimal.toml` determines what happens. For example, a Rust stack runs `cargo build --release`, while a pnpm stack runs roughly `pnpm install && pnpm build`.
 
 ## How stacks work
 
@@ -39,15 +39,15 @@ Most projects need additional dependencies beyond what the stack provides. Decla
 ```toml
 [stack]
 use = "rust"
-build_packages = ["protobuf-compiler", "perl"]
+build_packages = ["protobuf", "perl"]
 runtime_packages = ["openssl"]
 ```
 
 Or add them with the CLI:
 
 ```shell
-$ mip add --build protobuf-compiler
-$ mip add --runtime openssl
+$ min add --build protobuf
+$ min add --runtime openssl
 ```
 
 ## Running tests
@@ -58,7 +58,7 @@ Similarly to `mip build`, you can run your test suite with:
 $ mip test
 ```
 
-This is shorthand for `mip run test`, and uses the test command defined by your stack.
+This is shorthand for `mip run test`, and runs the `test` task from your `minimal.toml`; define one with `[tasks.test]`. Stacks provide a default `build` task only.
 
 ## Persisting build state
 

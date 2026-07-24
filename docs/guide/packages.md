@@ -8,14 +8,14 @@ Minimal makes it easy to add tools and dependencies to your project. Where a pac
 
 ## Build and runtime dependencies
 
-Build and runtime dependencies belong to your build plane and are managed with `mip add`:
+Build and runtime dependencies belong to your build plane and are managed with `min add`:
 
 ```shell
 # Add as a build dependency (needed to compile your code)
-$ mip add --build protobuf-compiler
+$ min add --build protobuf
 
 # Add as a runtime dependency (needed wherever your code runs)
-$ mip add --runtime openssl
+$ min add --runtime openssl
 ```
 
 Each command updates your `minimal.toml` automatically.
@@ -25,7 +25,7 @@ Each command updates your `minimal.toml` automatically.
 ```toml
 [stack]
 use = "rust"
-build_packages = ["protobuf-compiler", "perl"]
+build_packages = ["protobuf", "perl"]
 ```
 
 **Runtime dependencies** are packages that must be present wherever the built software runs:
@@ -49,10 +49,10 @@ To add a tool to a running session without editing config, run `min add <package
 
 ## Task-specific packages
 
-Packages can also be scoped to individual [tasks](../reference/tasks.md), where they are only available when that task runs. Add them with `mip add --task <name>`:
+Packages can also be scoped to individual [tasks](../reference/tasks.md), where they are only available when that task runs. Add them with `min add --task <name>`:
 
 ```shell
-$ mip add --task lint ruff
+$ min add --task lint ruff
 ```
 
 ```toml

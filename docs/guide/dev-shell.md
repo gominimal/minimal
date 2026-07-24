@@ -16,7 +16,7 @@ $ min activate --attach .
 
 This creates a session for the project and drops you into its interactive shell. The path argument defaults to the current directory, so `min activate --attach` on its own works too.
 
-Your project files are mapped into the session at the same path, so edits you make inside the shell are reflected on the host.
+Your project files are uploaded into the session's workspace, so the shell starts with a copy of your project. Edits you make inside stay in the session; bring them back to the host by pushing them out with `git push min://<session>` (or by committing inside the session and pulling from it).
 
 ## What's in the session?
 
@@ -27,7 +27,7 @@ A session's tools come from the project's `[session]` block in `minimal.toml`. L
 packages = ["git", "curl", "ripgrep"]
 ```
 
-Inside the session you have access to your project's source code and exactly these declared tools, but nothing else from the host system. The session cannot globally install software, read unrelated files, or modify your system. Every developer working on the project gets the same isolated environment.
+Inside the session you have access to your project's source code and these declared tools (plus any [loadouts](../concepts/loadouts.md) you apply and the packages the project's stack declares), but nothing else from the host system. The session cannot globally install software, read unrelated files, or modify your system. Every developer working on the project gets the same isolated environment.
 
 ## Customizing your session
 
@@ -40,13 +40,13 @@ Add packages to the project's `[session]` block so everyone picks them up:
 packages = ["git", "curl", "ripgrep", "jq", "nano"]
 ```
 
-If you need a package mid-session, without editing config or restarting your shell, run `min add` from inside the running session:
+If you need a package mid-session, without editing config by hand or restarting your shell, run `min add` from inside the running session:
 
 ```shell
 $ min add nano
 ```
 
-This installs the tool into the running session. See the [`min` in-sandbox commands](../reference/sandbox-operations.md#add) for the full helper reference.
+This installs the tool into the running session and records it in the project's `[session]` `packages` list, so the next activation gets it too. See the [`min` in-sandbox commands](../reference/sandbox-operations.md#add) for the full helper reference.
 
 ### Access host files
 
@@ -87,9 +87,9 @@ on_activate = { type = "inline", value = "cargo fetch >/dev/null 2>&1 || true" }
 Exit the shell to detach; the session keeps running in the background. To reattach, list, or tear down sessions:
 
 ```shell
-$ min attach     # reattach to a session (resolves from the current directory)
-$ min ls         # list sessions
-$ min destroy    # terminate a session
+$ min attach              # reattach to a session (resolves from the current directory)
+$ min ls                  # list sessions
+$ min destroy <session>   # terminate a session by name or id (or --all)
 ```
 
 For running one-shot commands in their own sandbox rather than an interactive session, see [Tasks](./tasks.md).
