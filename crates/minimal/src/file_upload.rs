@@ -135,8 +135,9 @@ where
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
                             let _ = tokio::io::copy(&mut rx, &mut tokio::io::sink()).await;
-                            return Err(anyhow::Error::from(e)
-                                .context("copying tar stream to writer"));
+                            return Err(
+                                anyhow::Error::from(e).context("copying tar stream to writer")
+                            );
                         }
                         Err(_) => {
                             let _ = tokio::io::copy(&mut rx, &mut tokio::io::sink()).await;
