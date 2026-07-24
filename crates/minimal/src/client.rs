@@ -507,7 +507,6 @@ impl Client {
                 _ => {}
             }
         }
-        }
         if !err.is_empty() {
             anyhow::bail!(
                 "daemon failed to unpack {what}s: {}",
