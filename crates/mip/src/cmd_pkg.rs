@@ -1,9 +1,7 @@
-use std::collections::HashMap;
-
 use futures::channel::mpsc;
 use graph::Graph;
 use mctx::{Cache, Context, Error};
-use orchestrator::{BuildEvent, BuildEventInner};
+use orchestrator::{BuildEvent, BuildLineKind, BuildRenderer};
 use tracing::{info, trace};
 
 #[derive(Debug, clap::Args)]
@@ -35,22 +33,14 @@ pub async fn cmd_pkg(args: PkgArgs, ctx: &mut Context) -> Result<(), Error> {
         let (tx, mut rx) = mpsc::unbounded::<BuildEvent>();
         tokio::spawn(async move {
             use futures::StreamExt;
-            let mut names: HashMap<usize, String> = HashMap::new();
-            while let Some(log) = rx.next().await {
-                match log.inner {
-                    BuildEventInner::Start { name, .. } => {
-                        names.insert(log.idx, name);
-                    }
-                    BuildEventInner::Stop => {}
-                    BuildEventInner::Log { is_stderr, line } => {
-                        let name = names[&log.idx].clone();
-                        if is_stderr {
-                            tracing::warn!(target: "build", name = %name, "{}", line);
-                        } else {
-                            tracing::info!(target: "build", name = %name, "{}", line);
-                        }
-                    }
-                    BuildEventInner::Hydrate { .. } => {}
+            let mut renderer = BuildRenderer::new(true);
+            while let Some(event) = rx.next().await {
+                let Some(line) = renderer.render(event) else {
+                    continue;
+                };
+                match line.kind {
+                    BuildLineKind::Stderr => tracing::warn!(target: "build", "{}", line.text),
+                    BuildLineKind::Status => tracing::info!(target: "build", "{}", line.text),
                 }
             }
         });

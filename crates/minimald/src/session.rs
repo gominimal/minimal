@@ -1,4 +1,5 @@
 use crate::channel_progress::ChannelProgress;
+use crate::session_sop::{BuildUpdate, SideOp};
 use crate::sessions::{SessionControl, WeakManagerHandle, composables};
 use crate::store::SessionRecordHandle;
 use crate::{
@@ -22,6 +23,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::RwLock;
+use tokio::sync::mpsc::WeakSender;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -196,6 +198,8 @@ enum SessionInner {
             session_host::HostHandle,
             JoinHandle<Result<i32, std::io::Error>>,
         )>,
+        /// Side operations.
+        sops: Vec<SideOp>,
     },
 }
 
@@ -263,6 +267,16 @@ enum SessionMessage {
     /// record.
     Destroy(oneshot::Sender<Result<(), std::io::Error>>),
     GetRecord(oneshot::Sender<Record>),
+    /// Hand back an `Arc` clone of this session's patches-upload lock, see
+    /// [`Session::patches_upload_lock`].
+    GetPatchesUploadLock(oneshot::Sender<Arc<Mutex<()>>>),
+    /// Kick off a background package build as a session side-op. Replies with
+    /// the receiver end of the build's event stream.
+    StartBuild {
+        rebuild: bool,
+        pkgs: Vec<String>,
+        reply: oneshot::Sender<Result<mpsc::Receiver<BuildUpdate>, std::io::Error>>,
+    },
     /// Test-only inspection: an `Arc` clone of the held [`Composition`]
     /// (`None` in `Draft`, or `Active` without one post-restart). Lets tests
     /// assert composition contents without disturbing the lifecycle.
@@ -307,6 +321,11 @@ pub struct Session {
     /// Session state machine.
     inner: SessionInner,
 
+    /// Serializes `WorkspacePatchesTarZst` uploads for this session: two
+    /// concurrent uploads would race on the single `<workspace>/patches/`
+    /// tree and step on each other.
+    patches_upload_lock: Arc<Mutex<()>>,
+
     /// A non-owning handle to the [`Manager`](crate::sessions::Manager), used to
     /// build the [`SessionControl`] handed to each [`Binding`] so a shell-exit
     /// "delete" tears this session down through the manager (record removal and
@@ -314,6 +333,11 @@ pub struct Session {
     /// actor-initiated termination. Weak by design — see
     /// [`crate::sessions::Manager::weak_self`].
     manager: WeakManagerHandle,
+
+    /// A non-owning handle to this session, handed to the runtime objects
+    /// we spawns (e.g. build [`SideOp`]s) so they can reach back into
+    /// the session.
+    weak_self: WeakSessionHandle,
 }
 
 impl Session {
@@ -323,6 +347,7 @@ impl Session {
         seed: SessionConfig,
         receiver: mpsc::Receiver<SessionMessage>,
         inner: SessionInner,
+        weak_self: WeakSessionHandle,
     ) -> Self {
         let SessionConfig {
             minimal_state_dir,
@@ -343,7 +368,9 @@ impl Session {
             net_switch,
             tracker: OpTracker::new_root(),
             inner,
+            patches_upload_lock: Arc::new(Mutex::new(())),
             manager,
+            weak_self,
             #[cfg(target_os = "linux")]
             hostnames,
         }
@@ -371,6 +398,7 @@ impl Session {
             SessionStatus::Active => SessionInner::Active {
                 composition: None,
                 host: None,
+                sops: vec![],
             },
             SessionStatus::Pending => SessionInner::Draft { pending: None },
             // `Materializing` records are only meaningful across a
@@ -410,7 +438,10 @@ impl Session {
         };
 
         let (sender, receiver) = mpsc::channel(8);
-        let actor = Self::assemble(conf, receiver, inner);
+        // A weak self-handle so the actor can hand its own mailbox to the
+        // runtime objects it spawns without a caller threading it in.
+        let weak_self = WeakSessionHandle(sender.downgrade());
+        let actor = Self::assemble(conf, receiver, inner, weak_self);
 
         // Register the PTask hostname before the actor goes live, so the
         // route exists by the time the caller can observe the session
@@ -420,10 +451,7 @@ impl Session {
         actor.register_hostname(obj.record());
 
         tokio::spawn(actor.mainloop());
-        Ok(SessionHandle {
-            sender,
-            patches_upload_lock: Arc::new(Mutex::new(())),
-        })
+        Ok(SessionHandle(sender))
     }
 
     /// Register this session's PTask hostname (R3.1/R3.6). Both HostNet and
@@ -581,14 +609,14 @@ impl Session {
                 });
             }
             SessionMessage::Stop(r) => {
-                self.stop_host().await;
+                self.stop_running().await;
                 #[cfg(target_os = "linux")]
                 self.deregister_hostname().await;
                 let _ = r.send(());
                 return ControlFlow::Break(Teardown::ManagerInitiated);
             }
             SessionMessage::Destroy(r) => {
-                self.stop_host().await;
+                self.stop_running().await;
                 // Withdraw the hostname before the fallible record delete, so
                 // a delete failure leaves a stale on-disk record (repairable
                 // on restart) but never a stale routing entry pointing at a
@@ -597,6 +625,16 @@ impl Session {
                 self.deregister_hostname().await;
                 let _ = r.send(self.record.clone().delete().await);
                 return ControlFlow::Break(Teardown::ManagerInitiated);
+            }
+            SessionMessage::GetPatchesUploadLock(r) => {
+                let _ = r.send(Arc::clone(&self.patches_upload_lock));
+            }
+            SessionMessage::StartBuild {
+                rebuild,
+                pkgs,
+                reply,
+            } => {
+                let _ = reply.send(self.start_build(rebuild, pkgs).await);
             }
             SessionMessage::GetRecord(r) => {
                 let _ = r.send(self.record.record().await.unwrap());
@@ -682,6 +720,7 @@ impl Session {
                 self.inner = SessionInner::Active {
                     composition: Some(Arc::new(composition)),
                     host: None,
+                    sops: vec![],
                 };
                 Ok(None)
             }
@@ -753,6 +792,7 @@ impl Session {
         self.inner = SessionInner::Active {
             composition: Some(Arc::new(composition)),
             host: None,
+            sops: vec![],
         };
         Ok(SessionStep::Materialized { id: record.id })
     }
@@ -887,19 +927,47 @@ impl Session {
         }
     }
 
-    /// Tears down the running host, if any, waiting for the process to be reaped
-    /// and the sandbox guard to be dropped before returning.
-    async fn stop_host(&mut self) {
-        let host = match &mut self.inner {
-            SessionInner::Active { host, .. } => host.take(),
+    /// Kicks off a background package build as a side-op and registers it on
+    /// this session, returning the receiver end of its event stream. The build
+    /// runs against a fresh workspace-rooted context (rebuilt per call so it
+    /// tracks `minimal.toml` edits).
+    ///
+    /// The returned receiver closes when the build ends.
+    async fn start_build(
+        &mut self,
+        rebuild: bool,
+        pkgs: Vec<String>,
+    ) -> Result<mpsc::Receiver<BuildUpdate>, std::io::Error> {
+        let ctx = self.context(false).await.map_err(std::io::Error::other)?;
+        let (sop, rx) = SideOp::spawn_build(self.weak_self.clone(), rebuild, pkgs, ctx, 64).await?;
+        match &mut self.inner {
+            SessionInner::Active { sops, .. } => sops.push(sop),
+            SessionInner::Draft { .. } => {
+                sop.shutdown().await;
+                unreachable!("`context()` already rejected a `Draft`");
+            }
+        }
+        Ok(rx)
+    }
+
+    /// Tears down any runtime objects, such as the host or side ops. Shutdown
+    /// of these objects is complete once awaited.
+    async fn stop_running(&mut self) {
+        let inner = match &mut self.inner {
+            SessionInner::Active { host, sops, .. } => Some((host.take(), std::mem::take(sops))),
             SessionInner::Draft { .. } => None,
         };
-        if let Some((host, task)) = host {
-            // Signal the process to die, then await the runtime loop so the
-            // sandbox files backing its rootfs are released before the caller
-            // removes the session's directory tree.
-            let _ = host.kill().await;
-            let _ = task.await;
+        if let Some((host, mut sops)) = inner {
+            for s in sops.drain(..) {
+                s.shutdown().await;
+            }
+            if let Some((host, task)) = host {
+                // Signal the process to die, then await the runtime loop so the
+                // sandbox files backing its rootfs are released before the caller
+                // removes the session's directory tree.
+                let _ = host.kill().await;
+                let _ = task.await;
+            }
         }
     }
 
@@ -1101,7 +1169,7 @@ impl Session {
     #[cfg(not(test))]
     async fn session_launcher(
         &mut self,
-        _session: SessionHandle,
+        session: SessionHandle,
         record: &Record,
     ) -> Result<session_host::SandboxLauncher, AttachError> {
         // R2.1: reject a policy that is incompatible with the network mode
@@ -1123,6 +1191,9 @@ impl Session {
             net_switch: Arc::clone(&self.net_switch),
             ingress,
             composition: self.composition(),
+            // A weak handle so in-sandbox `min build` can drive session
+            // side-ops without keeping the actor alive past teardown.
+            session: session.downgrade(),
         })
     }
 
@@ -1249,37 +1320,65 @@ impl Session {
 
 /// The handle to the session.
 #[derive(Debug, Clone)]
-pub struct SessionHandle {
-    sender: mpsc::Sender<SessionMessage>,
-    /// Serializes `WorkspacePatchesTarZst` uploads for this session: two
-    /// concurrent uploads would race on the single `<workspace>/patches/`
-    /// tree, and neither one's atomic-swap install would happen against a
-    /// known baseline (one could wipe the other's freshly-installed tree
-    /// and see its own `RENAME_EXCHANGE` return an unexpected state).
-    /// Held only across the whole unpack + install + marker-write, so an
-    /// idle session never contends on it. `Arc<Mutex>` (not
-    /// `parking_lot`) because the critical section awaits.
-    patches_upload_lock: Arc<Mutex<()>>,
-}
+pub struct SessionHandle(mpsc::Sender<SessionMessage>);
 
 impl SessionHandle {
+    /// Returns a non-owning handle to this session.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakSessionHandle {
+        WeakSessionHandle(self.0.downgrade())
+    }
+
+    /// Handle to the per-session patches-upload lock, owned by the session
+    /// actor.
+    ///
+    /// Workspace patches are accumulated in a fixed per-session directory,
+    /// so this lock is used to serialize `WorkspacePatchesTarZst` RPCs so
+    /// they dont race and stomp each other.
+    pub async fn patches_upload_lock(&self) -> Result<Arc<Mutex<()>>, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .0
+            .send(SessionMessage::GetPatchesUploadLock(send))
+            .await;
+        recv.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
+        })
+    }
+
+    /// Kicks off a background package build as a session side-op, returning the
+    /// receiver end of the build's event stream. Events flow until the build
+    /// finishes (success or cancellation), at which point the channel closes.
+    /// A `Draft` session is refused with `InvalidInput`; a dead actor maps to
+    /// `NotConnected`.
+    pub async fn start_build(
+        &self,
+        rebuild: bool,
+        pkgs: Vec<String>,
+    ) -> Result<mpsc::Receiver<BuildUpdate>, std::io::Error> {
+        let (reply, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .0
+            .send(SessionMessage::StartBuild {
+                rebuild,
+                pkgs,
+                reply,
+            })
+            .await;
+        recv.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
+        })?
+    }
+
     /// Returns paths on the daemon backing various internals of the session.
     /// A dead actor (self-terminated abort/failed-verdict/create-failure, or
     /// mid-teardown) maps to `NotConnected` — callers race actor death.
-    /// Handle to the per-session patches-upload lock. Held by
-    /// `WorkspacePatchesTarZst` for the whole unpack + install +
-    /// marker-write, so two concurrent uploads for the same session
-    /// can't race on the single `<workspace>/patches/` tree. Idle
-    /// sessions never contend on it. Cheap to clone (an `Arc`
-    /// bump).
-    pub fn patches_upload_lock(&self) -> Arc<Mutex<()>> {
-        Arc::clone(&self.patches_upload_lock)
-    }
-
     pub async fn paths(&self) -> Result<SessionPaths, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.sender.send(SessionMessage::GetPaths(send)).await;
+        let _ = self.0.send(SessionMessage::GetPaths(send)).await;
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
         })
@@ -1290,7 +1389,7 @@ impl SessionHandle {
     pub async fn get_attrs(&self) -> Option<HostAttrs> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.sender.send(SessionMessage::GetHostAttrs(send)).await;
+        let _ = self.0.send(SessionMessage::GetHostAttrs(send)).await;
         recv.await.ok().flatten()
     }
 
@@ -1298,7 +1397,7 @@ impl SessionHandle {
     pub async fn context(&self) -> Result<mctx::Context, String> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.sender.send(SessionMessage::MakeContext(send)).await;
+        let _ = self.0.send(SessionMessage::MakeContext(send)).await;
         recv.await
             .unwrap_or_else(|_| Err("session actor is gone".to_string()))
     }
@@ -1310,7 +1409,7 @@ impl SessionHandle {
     pub(crate) async fn record(&self) -> Result<Record, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.sender.send(SessionMessage::GetRecord(send)).await;
+        let _ = self.0.send(SessionMessage::GetRecord(send)).await;
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
         })
@@ -1328,7 +1427,7 @@ impl SessionHandle {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
-            .sender
+            .0
             .send(SessionMessage::ConfigureLoadout(contribution, send))
             .await;
         recv.await.unwrap_or_else(|_| {
@@ -1354,7 +1453,7 @@ impl SessionHandle {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
-            .sender
+            .0
             .send(SessionMessage::SubmitVerdict(Box::new((verdict, send))))
             .await;
         recv.await.unwrap_or_else(|_| {
@@ -1373,7 +1472,7 @@ impl SessionHandle {
     pub(crate) async fn finalize(&self) -> Result<(), std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.sender.send(SessionMessage::Finalize(send)).await;
+        let _ = self.0.send(SessionMessage::Finalize(send)).await;
         recv.await.unwrap_or_else(|_| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -1388,7 +1487,7 @@ impl SessionHandle {
     pub(crate) async fn abort(&self) -> Result<(), std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.sender.send(SessionMessage::Abort(send)).await;
+        let _ = self.0.send(SessionMessage::Abort(send)).await;
         recv.await.unwrap_or_else(|_| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -1403,7 +1502,7 @@ impl SessionHandle {
     pub(crate) async fn is_busy(&self) -> bool {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.sender.send(SessionMessage::IsBusy(send)).await;
+        let _ = self.0.send(SessionMessage::IsBusy(send)).await;
         recv.await.unwrap_or(false)
     }
 
@@ -1413,10 +1512,7 @@ impl SessionHandle {
     #[cfg(test)]
     pub(crate) async fn peek_composition(&self) -> Option<Arc<Composition>> {
         let (send, recv) = oneshot::channel();
-        let _ = self
-            .sender
-            .send(SessionMessage::PeekComposition(send))
-            .await;
+        let _ = self.0.send(SessionMessage::PeekComposition(send)).await;
         recv.await.ok().flatten()
     }
 
@@ -1426,10 +1522,7 @@ impl SessionHandle {
     pub(crate) async fn rename(&self, new_name: String) -> Result<(), std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self
-            .sender
-            .send(SessionMessage::Rename(new_name, send))
-            .await;
+        let _ = self.0.send(SessionMessage::Rename(new_name, send)).await;
         recv.await.unwrap_or_else(|_| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -1444,7 +1537,7 @@ impl SessionHandle {
     pub(crate) async fn stop(&self) {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.sender.send(SessionMessage::Stop(send)).await;
+        let _ = self.0.send(SessionMessage::Stop(send)).await;
         // If the actor died before acking, it is stopped all the same.
         let _ = recv.await;
     }
@@ -1456,7 +1549,7 @@ impl SessionHandle {
     pub(crate) async fn destroy(&self) -> Result<(), std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.sender.send(SessionMessage::Destroy(send)).await;
+        let _ = self.0.send(SessionMessage::Destroy(send)).await;
         recv.await.unwrap_or(Ok(()))
     }
 
@@ -1469,7 +1562,7 @@ impl SessionHandle {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
-            .sender
+            .0
             .send(SessionMessage::Attach(
                 send,
                 self.clone(),
@@ -1487,6 +1580,32 @@ impl SessionHandle {
                 "session actor terminated before the attach completed",
             ))),
         }
+    }
+}
+
+/// A non-owning handle to the [`Session`] actor.
+#[derive(Debug, Clone)]
+pub struct WeakSessionHandle(WeakSender<SessionMessage>);
+
+impl WeakSessionHandle {
+    /// Promotes to a strong [`SessionHandle`], or `None` if the session actor
+    /// has already shut down (all strong senders dropped).
+    #[must_use]
+    pub fn upgrade(&self) -> Option<SessionHandle> {
+        Some(SessionHandle(self.0.upgrade()?))
+    }
+
+    /// A dangling handle whose actor is already gone (`upgrade` always yields
+    /// `None`). Test-only: lets fixtures that never exercise the session
+    /// round-trip satisfy an `EnvArgs`/`SessionChannel` that now requires a
+    /// handle, without standing up a live actor.
+    #[cfg(test)]
+    pub(crate) fn dangling() -> Self {
+        let (tx, _rx) = mpsc::channel::<SessionMessage>(1);
+        let weak = tx.downgrade();
+        // Drop the only strong sender so `upgrade()` returns `None`.
+        drop(tx);
+        Self(weak)
     }
 }
 

@@ -824,6 +824,9 @@ pub(crate) struct SandboxLauncher {
     /// Composition to merge into the launcher's baseline packages and
     /// vars. Patches and lifecycle hooks are ignored today.
     pub(crate) composition: Option<std::sync::Arc<sessions::core::compose::Composition>>,
+    /// Weak handle back to the owning session actor, for  `min` commands
+    /// (e.g. `min build`) to drive session side-ops.
+    pub(crate) session: crate::session::WeakSessionHandle,
 }
 
 /// Rolls back a native-own-IP phase-1 switch attach if the launch is abandoned
@@ -896,6 +899,7 @@ impl SessionLauncher for SandboxLauncher {
         // the sandbox env below.
         let session_name = name.clone();
         let composition = self.composition;
+        let session = self.session;
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
         // doesn't stall the async executor.
@@ -1027,7 +1031,7 @@ impl SessionLauncher for SandboxLauncher {
             let mut env = crate::env::Env::build(
                 ctx,
                 graph,
-                crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache)
+                crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache, session)
                     .with_packages(packages)
                     .with_resolved_env_vars(env_vars)
                     // Session envs source package attrs (env_state_wiring,

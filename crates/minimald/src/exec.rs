@@ -1,5 +1,5 @@
-//! SSH `exec` request handling: spawns a process and bridges its stdio
-//! over an SSH channel.
+//! SSH `exec` request handling: Launching tasks defined in the session,
+//! git recieve-pack, and launching side ops.
 //!
 //! Process spawning is abstracted via the [`Exec`] / [`Process`] traits
 //! so the bridge logic can be exercised with a mock in tests without
@@ -807,31 +807,156 @@ pub(crate) async fn handle_exec(
         }
     };
 
-    let task = match argv.strip_prefix("min run ") {
+    let rem = match argv.strip_prefix("min ") {
+        Some(c) => c,
         None => {
-            tracing::warn!(%session_id, "execution request rejected: expected `min run <task name>`");
+            tracing::warn!(%session_id, "execution request rejected: expected `min ` prefix");
             session.channel_failure(id)?;
             return Ok(());
         }
-        Some(t) => t,
-    }.to_string();
-    session.channel_success(id)?;
+    }
+    .to_string();
 
-    spawn(async move {
-        let exec_task = ExecTask {
-            conn,
-            serv,
-            session: session_handle,
-            channel_id: id,
-            exec: TaskExec {
-                args: None,
-                task: task.to_string(),
-            },
-        };
-        exec_task.run(channel).await;
-    });
+    let mut c = rem.split(' ');
+    match c.next() {
+        None => {
+            tracing::warn!(%session_id, "execution request rejected: expected `min <sub command>`");
+            session.channel_failure(id)?;
+            return Ok(());
+        }
+        Some("run") => {
+            // `min run` with no task name would leave `strip_prefix("run ")`
+            // as `None` (and a trailing-space `min run ` as empty) — reject
+            // both before acking, rather than panicking on `.unwrap()`.
+            let task = rem.strip_prefix("run ").unwrap_or("").trim();
+            if task.is_empty() {
+                tracing::warn!(%session_id, "execution request rejected: expected `min run <task name>`");
+                session.channel_failure(id)?;
+                return Ok(());
+            }
+            let task = task.to_string();
+            session.channel_success(id)?;
+
+            spawn(async move {
+                let exec_task = ExecTask {
+                    conn,
+                    serv,
+                    session: session_handle,
+                    channel_id: id,
+                    exec: TaskExec { args: None, task },
+                };
+                exec_task.run(channel).await;
+            });
+        }
+        Some("build") => {
+            session.channel_success(id)?;
+            // Everything after the sub-command is the build's args
+            // (`--verbose` / `--rebuild` / package names).
+            let build_args = rem.strip_prefix("build").unwrap_or("").trim().to_string();
+            spawn(async move {
+                run_build_exec(session_handle, id, channel, build_args).await;
+            });
+        }
+        Some(other) => {
+            tracing::warn!(%session_id, "execution request rejected: unexpected min sub-command `{other}`");
+            session.channel_failure(id)?;
+            return Ok(());
+        }
+    };
 
     Ok(())
+}
+
+/// Streams a `min build [--verbose] [--rebuild] [pkgs...]` exec over the SSH
+/// channel. Kicks off a session side-op build based on an existing session.
+async fn run_build_exec(
+    session: SessionHandle,
+    channel_id: ChannelId,
+    channel: Channel<Msg>,
+    args: String,
+) {
+    use orchestrator::{BuildLineKind, BuildRenderer};
+
+    let mut verbose = false;
+    let mut rebuild = false;
+    let mut pkgs: Vec<String> = Vec::new();
+    for token in args.split_whitespace() {
+        match token {
+            "--verbose" => verbose = true,
+            "--rebuild" => rebuild = true,
+            _ => pkgs.push(token.to_string()),
+        }
+    }
+
+    // Same channel-half handling as `ExecTask::run`: stdout on the data
+    // stream, stderr on SSH extended-data type 1.
+    let (_rs, ws) = channel.split();
+    let mut w = ws.make_writer();
+    let mut e = ws.make_writer_ext(Some(1));
+
+    let exit_status = match session.start_build(rebuild, pkgs).await {
+        Ok(mut events) => {
+            use crate::session_sop::{BuildOutcome, BuildUpdate};
+            let mut renderer = BuildRenderer::new(verbose);
+            let mut outcome = None;
+            while let Some(update) = events.recv().await {
+                let event = match update {
+                    BuildUpdate::Event(event) => event,
+                    BuildUpdate::Finished(o) => {
+                        outcome = Some(o);
+                        continue;
+                    }
+                };
+                let Some(line) = renderer.render(event) else {
+                    continue;
+                };
+                let out: &mut (dyn AsyncWrite + Unpin + Send) = match line.kind {
+                    BuildLineKind::Stderr => &mut e,
+                    BuildLineKind::Status => &mut w,
+                };
+                if let Err(err) = out.write_all(format!("{}\n", line.text).as_bytes()).await {
+                    // No reader on the channel — the client went away. Stop
+                    // streaming; the side-op keeps running independently.
+                    tracing::warn!(%channel_id, error = %err, "min build: channel write failed");
+                    break;
+                }
+            }
+            // Map the propagated outcome to an exit code, reporting a
+            // failure/cancellation on the SSH stderr stream. Only success
+            // exits 0.
+            match outcome {
+                Some(BuildOutcome::Success) => 0,
+                Some(BuildOutcome::Failed(msg)) => {
+                    let _ = e
+                        .write_all(format!("build failed: {msg}\n").as_bytes())
+                        .await;
+                    1
+                }
+                Some(BuildOutcome::Cancelled) => {
+                    let _ = e.write_all(b"build cancelled\n").await;
+                    130
+                }
+                None => {
+                    let _ = e
+                        .write_all(b"build ended without reporting an outcome\n")
+                        .await;
+                    1
+                }
+            }
+        }
+        Err(err) => {
+            let _ = e
+                .write_all(format!("minimald: failed to start build: {err}\n").as_bytes())
+                .await;
+            1
+        }
+    };
+
+    let _ = w.flush().await;
+    let _ = e.flush().await;
+    let _ = ws.eof().await;
+    let _ = ws.exit_status(exit_status).await; // otherwise considered -1
+    let _ = ws.close().await; // needed to release the remote
 }
 
 async fn handle_git_receive(

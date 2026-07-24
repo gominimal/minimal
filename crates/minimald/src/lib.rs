@@ -13,6 +13,7 @@ pub mod rpc;
 pub mod server;
 mod session;
 pub mod session_host;
+pub mod session_sop;
 mod sessions;
 mod sftp;
 mod store;

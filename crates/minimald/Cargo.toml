@@ -47,6 +47,7 @@ serde_json.workspace = true
 sysinfo.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
 vt100-ctt.workspace = true
 
 tokio.workspace = true
@@ -70,6 +71,7 @@ graph.workspace = true
 mctx.workspace = true
 mfile.workspace = true
 minimald-rpc.workspace = true
+orchestrator.workspace = true
 op.workspace = true
 ot.workspace = true
 paths.workspace = true
