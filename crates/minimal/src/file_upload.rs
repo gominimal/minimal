@@ -929,7 +929,7 @@ mod tests {
         let writer = StallingWriter { accepted: 0 };
         let result = stream_tar_zstd(dir.path(), writer).await;
         assert!(result.is_err(), "a stalled writer must surface as an error");
-        let msg = result.unwrap_err().to_string();
+        let msg = format!("{:#}", result.unwrap_err());
         assert!(
             msg.contains("stalled"),
             "expected a stall error, got: {msg}"
