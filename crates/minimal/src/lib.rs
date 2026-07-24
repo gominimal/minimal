@@ -278,9 +278,10 @@ pub struct ActivateArgs {
     /// Optional session name
     #[arg(long, short)]
     pub name: Option<String>,
-    /// Project path to activate (defaults to current directory)
-    #[arg(default_value = ".")]
-    pub path: String,
+    /// Project path to activate. Defaults to the directory set by
+    /// `-C`/`--repo-dir`, or the current working directory when neither
+    /// is given.
+    pub path: Option<String>,
     /// How to load project files into the session.
     #[arg(long, value_enum, default_value_t = SyncMode::Tarball)]
     pub sync: SyncMode,
@@ -626,18 +627,14 @@ async fn cmd_default(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         }
         None => {
             // No sessions exist: activate a new one for the current directory
-            // and chain into attach, mirroring `min activate --attach`. Honor
-            // `--repo-dir` (`-C`) so `min -C /path` activates for /path, not
-            // the process's actual cwd — matching the attach side, which uses
-            // `cwd_host_path(global)` for its cwd comparison.
+            // (or -C/--repo-dir if set) and chain into attach, mirroring
+            // `min activate --attach`. `cmd_activate` resolves the path from
+            // `global.repo_dir` when no positional is given, matching the
+            // attach side's `cwd_host_path(global)`.
             drop(client);
-            let path = match global.repo_dir.as_deref() {
-                Some(dir) => dir.to_string_lossy().to_string(),
-                None => ".".to_string(),
-            };
             let activate_args = ActivateArgs {
                 name: None,
-                path,
+                path: None,
                 sync: SyncMode::Tarball,
                 network: CliNetworkMode::HostNet,
                 ingress: Vec::new(),
@@ -1216,8 +1213,14 @@ fn resolve_upload_root(dir: &camino::Utf8Path) -> Result<camino::Utf8PathBuf, an
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
 
-    let project_path = std::fs::canonicalize(&args.path)
-        .with_context(|| format!("Cannot resolve project path '{}'", args.path))?;
+    let effective_path = match (&args.path, &global.repo_dir) {
+        (Some(p), _) => std::path::PathBuf::from(p),
+        (None, Some(dir)) => dir.clone(),
+        (None, None) => std::path::PathBuf::from("."),
+    };
+
+    let project_path = std::fs::canonicalize(&effective_path)
+        .with_context(|| format!("Cannot resolve project path '{}'", effective_path.display()))?;
 
     let utf8_path = camino::Utf8PathBuf::from_path_buf(project_path)
         .map_err(|_| anyhow::anyhow!("Project path is not valid UTF-8"))?;
