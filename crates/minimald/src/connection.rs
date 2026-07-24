@@ -125,6 +125,17 @@ pub struct Connection {
     /// State specific to an SSH channel.
     channels: BTreeMap<ChannelId, Channel>,
 
+    /// Session ids created via `CreateSession` over this connection.
+    /// When the connection closes, any of these still left in an
+    /// unfinalized state — `Pending` (never got a `SubmitVerdict`) or
+    /// `Materializing` (never got a `FinalizeSession`) — are reaped, so
+    /// a client that dropped mid-activation (e.g. Ctrl-C at the
+    /// composition-gating prompt) doesn't strand a half-built session
+    /// that holds its name hostage. Finalized (`Active`) sessions are
+    /// long-lived and outlive the connection, so they are never reaped
+    /// here.
+    created_sessions: Vec<SessionId>,
+
     serv: ServerStateHandle,
 }
 
@@ -149,6 +160,7 @@ impl Connection {
             auth: if is_local { Auth::Local } else { Auth::Pending },
             ssh_username: None,
             channels: BTreeMap::new(),
+            created_sessions: Vec::new(),
             serv,
         })));
 
@@ -196,6 +208,19 @@ pub struct ConnectionHandle(Arc<Mutex<Connection>>);
 impl ConnectionHandle {
     pub fn lock(&self) -> impl Future<Output = MutexGuard<'_, Connection>> {
         self.0.lock()
+    }
+
+    /// Record a session created via `CreateSession` over this connection,
+    /// so an unfinalized one can be reaped when the connection closes.
+    pub async fn record_created_session(&self, id: SessionId) {
+        self.0.lock().await.created_sessions.push(id);
+    }
+
+    /// Drain and return the ids of every session created over this
+    /// connection. Called once at connection teardown to decide which
+    /// half-built sessions to reap.
+    pub async fn take_created_sessions(&self) -> Vec<SessionId> {
+        std::mem::take(&mut self.0.lock().await.created_sessions)
     }
 }
 

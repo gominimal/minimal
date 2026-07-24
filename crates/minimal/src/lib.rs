@@ -1120,6 +1120,59 @@ async fn upload_and_finalize(
     }
 }
 
+/// Guard that tears down a half-built session if the user interrupts the
+/// activation with Ctrl-C.
+///
+/// `dialoguer`/`console` re-raise SIGINT to this process on a Ctrl-C at
+/// the composition-gating prompt (console `unix_term.rs`). With no
+/// handler installed the default disposition kills `min` mid-prompt —
+/// before the abort-cleanup that [`drive_pending_to_active`] runs — so
+/// the daemon is left holding a `Pending` session that blocks its name.
+/// [`arm_activation_interrupt`] installs a SIGINT handler (keeping the
+/// process alive past console's re-raise) that best-effort
+/// `AbortSession`s the in-flight session over a fresh connection — the
+/// activation borrows the primary one — then exits. The daemon's
+/// connection-close reap is the backstop if the abort can't be
+/// delivered.
+///
+/// Dropping the guard cancels the handler, so a Ctrl-C after the session
+/// is safely `Active` (e.g. during the `--attach` hand-off) no longer
+/// tears it down.
+struct ActivationInterrupt {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ActivationInterrupt {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn arm_activation_interrupt(
+    global: &GlobalArgs,
+    session_id: sessions::SessionId,
+) -> ActivationInterrupt {
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
+    let task = tokio::spawn(async move {
+        // Only the first Ctrl-C is intercepted; a second falls through to
+        // the default disposition so a wedged cleanup can still be killed.
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        eprintln!("\nAborting activation; cleaning up session {session_id}…");
+        if let Ok(sock) = sock
+            && let Ok(mut client) = client::Client::connect(&sock).await
+        {
+            use minimald_rpc::{AbortSession, AbortSessionRequest};
+            let _ = client
+                .oneshot_rpc::<AbortSession>(AbortSessionRequest { id: session_id })
+                .await;
+        }
+        std::process::exit(130);
+    });
+    ActivationInterrupt { task }
+}
+
 /// Whether the project already has a `minimal.toml`, in either the root
 /// (`<project>/minimal.toml`) or `.minimal/`
 /// (`<project>/.minimal/minimal.toml`) layout.
@@ -1300,6 +1353,12 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
         }
     };
     let id = created.id;
+
+    // From here the session exists on the daemon in an unfinalized state.
+    // Arm a Ctrl-C guard so an interrupt during the (blocking) gating
+    // prompt tears it down instead of orphaning it in `Pending` — see
+    // [`ActivationInterrupt`]. Disarmed once the session is `Active`.
+    let interrupt_guard = arm_activation_interrupt(global, id);
 
     // Upload the project directory to the daemon so the session
     // workspace holds the user's files — `ConfigureLoadout`'s compose
@@ -1495,6 +1554,11 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
         best_effort_destroy(&mut client, id).await;
         return Err(e);
     }
+
+    // The session is `Active` now — a Ctrl-C must no longer tear it down
+    // (the attach hand-off below and the user's own session are fair game
+    // for interrupts, but not this cleanup).
+    drop(interrupt_guard);
 
     println!("{id}");
 

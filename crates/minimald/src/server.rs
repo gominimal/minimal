@@ -470,7 +470,7 @@ impl Server {
             span.in_scope(|| tracing::info!(?peer, "accepted connection"));
             let from_stream =
                 Connection::from_stream(stream, russh_config.clone(), state.clone(), L::IS_LOCAL);
-            let (_conn_hnd, session_fut) = match from_stream.instrument(span.clone()).await {
+            let (conn_hnd, session_fut) = match from_stream.instrument(span.clone()).await {
                 Ok(conn) => conn,
                 Err(e) => {
                     // A handshake failure must not take the daemon down — in
@@ -484,6 +484,7 @@ impl Server {
             };
             // Log session errors instead of silently dropping the spawned
             // future, so a failed handshake is visible on any transport.
+            let reap_state = state.clone();
             session_set.spawn(
                 async move {
                     match session_fut.await {
@@ -507,6 +508,13 @@ impl Server {
                             }
                         }
                     }
+                    // The connection is gone. Reap any session it created that
+                    // never reached `Active` — a client that dropped
+                    // mid-activation (Ctrl-C at the gating prompt, a crash, a
+                    // network blip) would otherwise strand a `Pending` /
+                    // `Materializing` session that holds its name hostage.
+                    reap_unfinalized_sessions(&reap_state, conn_hnd.take_created_sessions().await)
+                        .await;
                 }
                 .instrument(span),
             );
@@ -567,6 +575,59 @@ async fn build_russh_config(
         keepalive_max: KEEPALIVE_MAX,
         ..Default::default()
     }))
+}
+
+/// Reap sessions a now-closed connection created but never finalized.
+///
+/// `ids` are the sessions [`CreateSession`](crate::rpc) allocated over
+/// the connection. Only those still `Pending` (never got a
+/// `SubmitVerdict`) or `Materializing` (never got a `FinalizeSession`)
+/// are deleted — a client that dropped mid-activation (Ctrl-C at the
+/// gating prompt, a crash, a network blip) would otherwise strand a
+/// half-built session that holds its name hostage until the next daemon
+/// restart. A finalized (`Active`) session is long-lived and must
+/// survive the connection that created it, so it is left untouched.
+/// Best-effort and never fatal: minimald is pid-1 in the guest.
+async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::sessions::SessionId>) {
+    if ids.is_empty() {
+        return;
+    }
+    let mngr = state.sessions_manager().await;
+    for id in ids {
+        // Re-read the status at teardown: a clean client abort already
+        // deleted the record (`get_record` → `None`), and a finalized
+        // session is `Active` — neither should be reaped here.
+        let status = match mngr.get_record(sessions::SessionKeyPredicate::Id(id)).await {
+            Ok(Some(record)) => record.status,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %id,
+                    error = %e,
+                    "could not read session status while reaping after connection close"
+                );
+                continue;
+            }
+        };
+        if !matches!(
+            status,
+            ::sessions::SessionStatus::Pending | ::sessions::SessionStatus::Materializing
+        ) {
+            continue;
+        }
+        match mngr.delete_session(id).await {
+            Ok(()) => tracing::info!(
+                session_id = %id,
+                ?status,
+                "reaped unfinalized session after its connection closed"
+            ),
+            Err(e) => tracing::warn!(
+                session_id = %id,
+                error = %e,
+                "failed to reap unfinalized session after connection close"
+            ),
+        }
+    }
 }
 
 /// Binds and serves minimald's two host-side proxies for the daemon's lifetime
@@ -808,5 +869,69 @@ mod tests {
             .expect("run must return after the grace period aborts lingering connections");
         assert!(res.unwrap().is_ok(), "run should return Ok after shutdown");
         drop(client);
+    }
+
+    /// A session left unfinalized when its creating connection closes —
+    /// the state an interrupted `min activate` (Ctrl-C at the gating
+    /// prompt) leaves on the daemon — is reaped, while a finalized
+    /// (`Active`) session created over that same connection survives.
+    #[tokio::test]
+    async fn dropping_a_connection_reaps_only_its_unfinalized_sessions() {
+        use crate::test_harness::{create_configured_session, create_session_req};
+        use minimald_rpc::{CreateSession, GetSessionRecord, GetSessionRecordRequest};
+
+        let dir = TempDir::new().unwrap();
+        let (run, sock) = spawn_server(&dir);
+
+        // Connection A: create a Pending session (no ConfigureLoadout) AND a
+        // fully-finalized Active session, then drop the connection.
+        let (pending_id, active_id) = {
+            let mut client = connect_uds(&sock).await;
+            let pending = client
+                .call::<CreateSession>(&create_session_req("interrupted", "/tmp"))
+                .await
+                .ok()
+                .expect("create pending session")
+                .id;
+            let active = create_configured_session(&mut client, "finalized", "/tmp").await;
+            (pending, active)
+            // `client` dropped here → connection closes → the server's
+            // per-connection task runs the teardown reap.
+        };
+
+        // The reap is asynchronous (it runs once the socket close is
+        // observed), so poll a fresh connection until the Pending record is
+        // gone. The Active record must remain throughout.
+        let mut client = connect_uds(&sock).await;
+        let mut reaped = false;
+        for _ in 0..100 {
+            let pending_gone = client
+                .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(pending_id))
+                .await
+                .record
+                .is_none();
+            if pending_gone {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            reaped,
+            "an unfinalized (Pending) session must be reaped when its creating connection closes",
+        );
+        assert!(
+            client
+                .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(active_id))
+                .await
+                .record
+                .is_some(),
+            "an Active session must survive the connection that created it",
+        );
+
+        let _ = client
+            .call::<Shutdown>(&ShutdownRequest { force: false })
+            .await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
     }
 }
