@@ -11,7 +11,7 @@ Learn more about stacks in [the reference section](../reference/stack-specs.md).
 
 ## Available stacks
 
-The [Minimal Public Package Registry](https://github.com/gominimal/pkgs) ships stacks for most common languages and build systems:
+The [Minimal Public Package Registry](https://github.com/gominimal/pkgs) ships stacks for most common languages and build systems. The registry is the source of truth; the highlights:
 
 | Stack | Detected by | Build command |
 |---------|-------------|---------------|
@@ -40,8 +40,8 @@ use = "<stack name>"
 
 Any stack defined in your codebase (or defined in any layer in your [software supply chain](./software-supply-chain.md)) can be used.
 
-When a stack is defined, any [task](../reference/tasks.md) will inherit the packages, default tasks, and other wiring
-declared in the stack.
+When a stack is defined, any [task](../reference/tasks.md) inherits the packages and environment the stack
+declares; the stack also contributes default tasks, such as `build`.
 
 ### Declaring additional dependencies
 
@@ -55,9 +55,9 @@ build_packages = ["perl"]
 runtime_packages = ["openssl"]
 ```
 
-Dependencies can also be added automatically using the [`mip add`](../reference/cli-mip.md) command.
+Dependencies can also be added automatically with `min add --build` or `min add --runtime` (see the [`min` reference](../reference/cli-min.md)).
 
 ### Automatic initialization
 
 Minimal will auto-detect the stack to use for most languages and package managers. To have the Minimal CLI detect an appropriate stack
-and pre-fill your codebase's [`minimal.toml`](../reference/minimal-dot-toml.md) file, run `mip init` in the root directory.
+and pre-fill your codebase's [`minimal.toml`](../reference/minimal-dot-toml.md) file, run `min init` in the root directory.
