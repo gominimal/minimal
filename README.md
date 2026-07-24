@@ -84,7 +84,8 @@ cd ~/projects/foo
 min init
 
 # declare your session's tools by editing the scaffolded [session] table in
-# minimal.toml; extend its packages list (don't add a second [session] table):
+# minimal.toml; extend its packages list from ["base", "vim"] (don't add a
+# second [session] table):
 #   [session] # min attach
 #   packages = ["base", "vim", "git", "gh", "claude-code"]
 
@@ -112,7 +113,8 @@ cd ~/projects/foo
 min init
 
 # declare your session's tools by editing the scaffolded [session] table in
-# minimal.toml; extend its packages list (don't add a second [session] table):
+# minimal.toml; extend its packages list from ["base", "vim"] (don't add a
+# second [session] table):
 #   [session] # min attach
 #   packages = ["base", "vim", "git", "gh", "claude-code", "mermaid-cli", "kittyview", "less", "emacs"]
 
