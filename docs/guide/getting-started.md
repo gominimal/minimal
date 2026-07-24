@@ -1,5 +1,5 @@
 ---
-description: Quickstart for Minimal: install the CLI, initialize a project, and define your toolchain and dependencies for local-first, sandboxed builds.
+description: "Quickstart for Minimal: install the CLI, initialize a project, and define your toolchain and dependencies for local-first, sandboxed builds."
 ---
 
 # Getting started with Minimal

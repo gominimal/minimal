@@ -9,7 +9,9 @@ description: Install Minimal on Linux (x86_64/aarch64) or macOS (Apple Silicon).
 ### Requirements
 
 - **x86_64** or **aarch64** architecture
-- Kernel support for user namespaces (most modern distributions)
+- Kernel 5.10 or later with unprivileged user namespaces enabled. Ubuntu 24.04
+  and later restrict them by default; see the
+  [Linux host setup guide](../reference/linux-host-setup.md) for the fix.
 
 ### Install
 
@@ -31,8 +33,7 @@ On macOS, Minimal boots a lightweight Linux microVM via libkrun on Apple's Hyper
 
 ### Requirements
 
-- **macOS Tahoe 26.2** or later
-- **Apple Silicon** (M1, M2, M3, M4). Intel Macs are not supported
+- **Apple Silicon** (M1 or later). Intel Macs are not supported
 
 ### Install
 
@@ -49,3 +50,23 @@ min --version
 ```
 
 If installed correctly, it will provide you with the version.
+
+## Upgrade
+
+Re-run the install command for your platform. The installer checks each
+installed component against the current release and re-downloads only the ones
+that changed, swapping them into place atomically.
+
+Note: upgrading restarts the Minimal daemon, which interrupts any sessions that
+are currently active. Detach first, or expect to reattach after the upgrade.
+
+## Uninstall
+
+```shell
+curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh -s -- --uninstall
+```
+
+This removes every file a previous install placed, including the shell
+integration. It accepts `--force` (also remove files you modified), `--purge`
+(also delete Minimal's data, state, and cache directories), and `--dry-run`
+(show what would be removed).
