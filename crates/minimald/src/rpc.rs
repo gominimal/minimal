@@ -171,6 +171,7 @@ const ANONYMOUS_SESSION: &str = "<anonymous>";
 /// by the `ConfigureLoadout` that follows.
 async fn serve_create_session(
     s: ServerStateHandle,
+    conn: ConnectionHandle,
     c: RuChannel<Msg>,
     ssh_username: Option<String>,
 ) -> Result<(), ConnectionError> {
@@ -184,6 +185,11 @@ async fn serve_create_session(
 
             Ok(match mngr.create_session(req.config, ssh_username).await {
                 Ok(id) => {
+                    // Tag the session to this connection so it is reaped if
+                    // the client drops before finalizing it (e.g. Ctrl-C at
+                    // the gating prompt) — see [`ConnectionHandle`] and the
+                    // teardown reap in `server.rs`.
+                    conn.record_created_session(id).await;
                     tracing::info!(
                         session_id = %id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
@@ -1216,7 +1222,7 @@ pub async fn handle_ssh_rpc(
         GetVersion::NAME => serve!(serve_get_version(channel)),
         ListSessions::NAME => serve!(serve_list_sessions(s, channel)),
         GetSessionRecord::NAME => serve!(serve_get_session_record(s, channel)),
-        CreateSession::NAME => serve!(serve_create_session(s, channel, ssh_username)),
+        CreateSession::NAME => serve!(serve_create_session(s, c.clone(), channel, ssh_username)),
         minimald_rpc::ConfigureLoadout::NAME => serve!(serve_configure_loadout(s, channel)),
         SubmitVerdict::NAME => serve!(serve_submit_verdict(s, channel)),
         FinalizeSession::NAME => serve!(serve_finalize_session(s, channel)),
