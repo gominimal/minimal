@@ -108,6 +108,10 @@ min_run() {
     __min_rpc "run" "$@"
 }
 
+min_build() {
+    __min_rpc "build" "$@"
+}
+
 min_check() {
     __min_rpc "check" "$@"
 }
@@ -127,7 +131,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             min_run "$@"
             ;;
         build)
-            min_run build
+            min_build "$@"
             ;;
         test)
             min_run test
@@ -145,6 +149,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             echo "Search for packages: min search <query>" >&2
             echo "Check minimal configuration: min check" >&2
             echo "Run a task: min run <task name>" >&2
+            echo "Build packages: min build [packages]" >&2
             echo "Try building a package (with potentially-stale dependencies): min patched-pkg <package name>" >&2
             exit 1
             ;;

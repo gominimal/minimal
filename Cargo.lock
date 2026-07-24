@@ -3816,6 +3816,7 @@ dependencies = [
  "mlog",
  "nix 0.31.3",
  "op",
+ "orchestrator",
  "ot",
  "path-absolutize",
  "paths",
@@ -3840,6 +3841,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
  "version",
  "vt100-ctt",
 ]

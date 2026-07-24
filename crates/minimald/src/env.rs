@@ -73,6 +73,10 @@ pub struct EnvArgs {
     network_mode: NetworkMode,
     own_ip_tap: Option<sandbox2::config::OwnIpTap>,
     own_ip_dns: Option<std::net::Ipv4Addr>,
+    /// Weak handle to the owning session actor, wired into the command channel
+    /// so in-sandbox `min` commands can drive session side-ops (e.g. builds).
+    /// Every session env has one — this `Env` is always session-scoped.
+    session: crate::session::WeakSessionHandle,
     /// When true (default), [`Env::build`] consumes package
     /// [`SetupForPackages`] output for `env_vars`/`fs_mappings`.
     /// When false, the caller supplies both via `env_vars` /
@@ -85,12 +89,14 @@ pub struct EnvArgs {
 
 impl EnvArgs {
     /// Creates args for an environment named `name`, with working directory
-    /// `cwd` and `/state` backed by `state_base_dir`.
+    /// `cwd` and `/state` backed by `state_base_dir`. `session` is a weak
+    /// handle to the owning session actor.
     pub fn new(
         name: impl Into<String>,
         cwd: impl Into<DaemonAbsPath>,
         home: impl Into<DaemonAbsPath>,
         state_base_dir: impl Into<DaemonAbsPath>,
+        session: crate::session::WeakSessionHandle,
     ) -> Self {
         Self {
             name: name.into(),
@@ -105,6 +111,7 @@ impl EnvArgs {
             network_mode: NetworkMode::HostNet,
             own_ip_tap: None,
             own_ip_dns: None,
+            session,
             include_package_attr_wiring: true,
         }
     }
@@ -367,6 +374,7 @@ impl Env {
             working: args.cwd.clone(),
             has_packages: transitives.keys().copied().collect(),
             ot: args.ot.clone(),
+            session: args.session.clone(),
             ctx,
             graph,
             rx,
@@ -499,6 +507,9 @@ struct SessionChannel {
     /// Packages already materialized into the rootfs.
     has_packages: HashSet<BuildSpecRef>,
     ot: Option<OpTracker>,
+    /// Weak handle to the owning session actor, used by session-scoped commands
+    /// (e.g. `min build`) to drive side-ops.
+    session: crate::session::WeakSessionHandle,
     rx: mpsc::Receiver<ChannelRequest>,
 }
 
@@ -571,6 +582,10 @@ impl SessionChannel {
             Some(("run", args)) => {
                 let (name, rest) = args.split_once(' ').unwrap_or((args, ""));
                 self.run_task(stream, name, rest).await;
+                None
+            }
+            Some(("build", args)) => {
+                self.run_build(stream, args).await;
                 None
             }
             _ => {
@@ -906,6 +921,68 @@ impl SessionChannel {
         }
     }
 
+    /// Implements `min build [--verbose] [--rebuild] pkgs...`: kicks off
+    /// a session side-op build and streams its progress back to the client
+    /// until the build completes.
+    async fn run_build(&mut self, stream: &mut UnixStream, args: &str) {
+        let mut flag_verbose = false;
+        let mut flag_rebuild = false;
+        let mut pkgs: Vec<String> = Vec::new();
+
+        for token in args.split_whitespace() {
+            match token {
+                "--verbose" => flag_verbose = true,
+                "--rebuild" => flag_rebuild = true,
+                _ => pkgs.push(token.to_string()),
+            }
+        }
+
+        let Some(session) = self.session.upgrade() else {
+            let _ = writeln!(stream, "error: session is gone");
+            return;
+        };
+
+        let mut events = match session.start_build(flag_rebuild, pkgs).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                let _ = writeln!(stream, "error: {e}");
+                return;
+            }
+        };
+
+        use crate::session_sop::{BuildOutcome, BuildUpdate};
+        let mut renderer = orchestrator::BuildRenderer::new(flag_verbose);
+        let mut outcome = None;
+        while let Some(update) = events.recv().await {
+            match update {
+                BuildUpdate::Event(event) => {
+                    if let Some(line) = renderer.render(event) {
+                        let _ = writeln!(stream, "msg:{}", line.text);
+                    }
+                }
+                BuildUpdate::Finished(o) => outcome = Some(o),
+            }
+        }
+
+        // Report the propagated outcome; only success claims completion.
+        match outcome {
+            Some(BuildOutcome::Success) => {
+                let _ = writeln!(stream, "msg:build finished");
+            }
+            Some(BuildOutcome::Failed(e)) => {
+                let _ = writeln!(stream, "error: build failed: {e}");
+            }
+            Some(BuildOutcome::Cancelled) => {
+                let _ = writeln!(stream, "error: build cancelled");
+            }
+            // The channel closed without a terminal update — the side-op died
+            // before reporting (e.g. the actor was torn down mid-build).
+            None => {
+                let _ = writeln!(stream, "error: build ended without reporting an outcome");
+            }
+        }
+    }
+
     /// Writes an [`mctx::Error`] to the client as `msg:` lines (preserving its
     /// multi-line, richly-formatted report) followed by an `error:` terminator.
     fn write_error(e: &Error, stream: &mut UnixStream) {
@@ -1021,6 +1098,7 @@ mod tests {
             .unwrap(),
             has_packages: HashSet::new(),
             ot: None,
+            session: crate::session::WeakSessionHandle::dangling(),
             ctx,
             graph,
             rx,

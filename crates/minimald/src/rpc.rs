@@ -1036,7 +1036,12 @@ async fn unpack_workspace_patches(
     // unique dir), so we only pay the serialization cost across
     // the seconds-of-work install step, not the minutes-of-work
     // unpack.
-    let _swap_guard = session_handle.patches_upload_lock().lock_owned().await;
+    let _swap_guard = session_handle
+        .patches_upload_lock()
+        .await
+        .map_err(|e| format!("session is gone: {e}"))?
+        .lock_owned()
+        .await;
 
     // Install the new tree. Two shapes depending on whether a
     // prior `patches/` exists:

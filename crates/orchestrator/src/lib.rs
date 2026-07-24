@@ -18,6 +18,9 @@ use tokio::{
 mod local_backend;
 pub use local_backend::{BuildEvent, BuildEventInner, LocalBackend};
 
+mod render;
+pub use render::{BuildLine, BuildLineKind, BuildRenderer};
+
 mod state;
 pub use state::{
     Deliverable, DeliverableInner, DeliverableRef, DeliverableState, State, StateHandle,
