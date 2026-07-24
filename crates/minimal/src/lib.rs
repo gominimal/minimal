@@ -1623,6 +1623,26 @@ async fn resolve_smart_attach(
     }
 }
 
+/// Guard for the interactive attach path: the PTY-backed session shell must be
+/// driven from a real terminal. When stdin is not a TTY there is nothing to
+/// drive the remote shell and no EOF ever reaches it through the forced `-tt`
+/// PTY, so ssh blocks indefinitely (#953). Fail fast with an actionable message
+/// instead of hanging.
+///
+/// Pure in its `stdin_is_tty` input so both branches are unit-testable without
+/// a controlled terminal.
+fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), anyhow::Error> {
+    if stdin_is_tty {
+        Ok(())
+    } else {
+        bail!(
+            "`min attach` needs an interactive terminal, but stdin is not a TTY. \
+             Run it from a terminal, or use `min attach --command <cmd>` to run a \
+             single command non-interactively."
+        )
+    }
+}
+
 /// Shell out to `ssh` to attach to `id`. Both the interactive (no `command`)
 /// and `--command` (non-interactive exec) paths route through here; the
 /// daemon's shell_request handler mints a PTY-backed shell, and ssh handles
@@ -1660,12 +1680,18 @@ async fn attach_to_session(
     ]);
 
     // The interactive path opens the in-sandbox session shell via the daemon's
-    // `shell_request`, which requires a PTY. Force one with `-tt` so the shell
-    // works even when our stdin is not a tty (e.g. driven from a script for
-    // automated networking tests); without it ssh skips the PTY and the daemon
-    // rejects the shell. The `--command` path is a non-interactive exec and
-    // needs no PTY.
+    // `shell_request`, which requires a PTY. Force one with `-tt` so ssh
+    // allocates it even when our stdin is a pty driven programmatically rather
+    // than the controlling terminal (as scripts/e2e-attach-pty.py does);
+    // without it ssh skips the PTY and the daemon rejects the shell. The
+    // `--command` path is a non-interactive exec and needs no PTY.
+    //
+    // But `-tt` over a *non-terminal* stdin is a trap: ssh still forces the
+    // remote PTY, yet the interactive shell reading it never sees an EOF from a
+    // redirected local stdin (`< /dev/null`, a pipe), so the command blocks
+    // forever (#953). Fail fast instead of hanging.
     if command.is_none() {
+        ensure_interactive_attach_tty(std::io::stdin().is_terminal())?;
         ssh.arg("-tt");
     }
     // The SSH host identity must match the known_hosts entry the daemon wrote,
@@ -2373,6 +2399,21 @@ pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Interactive attach over a non-terminal stdin must fail fast rather than
+    /// force `ssh -tt` into an indefinite block (#953). A real terminal (or a
+    /// pty driver) passes the guard so the shell can open.
+    #[test]
+    fn interactive_attach_requires_a_tty_on_stdin() {
+        let err = ensure_interactive_attach_tty(false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not a TTY") && err.contains("--command"),
+            "expected an actionable non-TTY error, got: {err}"
+        );
+        ensure_interactive_attach_tty(true).expect("a real terminal must pass the guard");
+    }
 
     /// A VM-backed provider dir carries the guest's recorded host key, so
     /// attach must verify against it rather than waive the check.
