@@ -33,7 +33,8 @@ Both feed the same session, and the daemon merges them into one final
 configuration when the session comes up. The project contribution and every
 applied loadout compose together as peers: there is no override precedence,
 so a loadout adds to the project rather than silently replacing parts of it.
-(For the exact merge and conflict rules, see the
+If two contributors disagree on the same value, activation fails with a
+conflict. (For the exact merge and conflict rules, see the
 [loadout reference](../reference/loadouts.md).)
 
 One boundary worth stating up front: loadouts apply to **sessions**
@@ -104,8 +105,8 @@ of them) with a `dest` inside the session:
 
 ```toml
 patches = [
-    { dest = "~/.config/helix/config.toml", source = "~/dotfiles/helix/config.toml" },
-    { dest = "~/.config/zellij/",           source = "~/dotfiles/zellij/**/*.kdl" },
+    { dest = ".config/helix/config.toml", source = "~/dotfiles/helix/config.toml" },
+    { dest = ".config/zellij/",           source = "~/dotfiles/zellij/**/*.kdl" },
 ]
 ```
 
@@ -115,10 +116,10 @@ that may not be present on every machine.
 
 ### Lifecycle hooks
 
-Hooks are scripts that run at session transition points: `on_activate` when
-the session comes up, `on_destroy` when it is torn down, and `on_failure`
-when activation fails. Use them to warm a cache, fetch grammars, or clean up
-after a failed start:
+Hooks are scripts declared to run at session transition points: `on_activate`
+when the session comes up, `on_destroy` when it is torn down, and `on_failure`
+when activation fails. Declare them to warm a cache, fetch grammars, or clean
+up after a failed start:
 
 ```toml
 [[lifecycle_hooks]]
@@ -126,7 +127,9 @@ description = "warm the grammar cache"
 on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || true" }
 ```
 
-Hooks from every applied loadout concatenate and run in declaration order.
+Hooks from every applied loadout concatenate in declaration order. Note that
+in the current release hooks are composed and recorded with the session, but
+executing them is not yet wired up.
 
 ### A complete example
 
@@ -139,8 +142,8 @@ description = "helix + zellij with my dotfiles"
 packages    = ["helix", "zellij"]
 
 patches = [
-    { dest = "~/.config/helix/config.toml", source = "~/dotfiles/helix/config.toml" },
-    { dest = "~/.config/zellij/",           source = "~/dotfiles/zellij/**/*.kdl" },
+    { dest = ".config/helix/config.toml", source = "~/dotfiles/helix/config.toml" },
+    { dest = ".config/zellij/",           source = "~/dotfiles/zellij/**/*.kdl" },
 ]
 
 [vars]
@@ -220,6 +223,8 @@ per-kind summary of what it contributes:
   NAME   DESCRIPTION                     CONTRIBUTES
 * dev    helix + zellij with my dotfiles 2 pkg / 2 var / 2 patch / 1 hook
   extra                                  1 pkg / 0 var / 0 patch / 0 hook
+
+* default (from `[loadouts].default_loadouts`)
 ```
 
 Loadouts named in `default_loadouts` are marked with a leading `*`, so the
