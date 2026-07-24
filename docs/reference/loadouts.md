@@ -1,6 +1,6 @@
 ---
 title: Loadouts
-description: Per-developer loadout reference: the loadout TOML schema, config-directory layout, min CLI flags, client config, and how loadouts compose into sessions.
+description: "Per-developer loadout reference: the loadout TOML schema, config-directory layout, min CLI flags, client config, and how loadouts compose into sessions."
 ---
 
 # Loadouts
@@ -14,8 +14,8 @@ terminal multiplexer, shell config, and dotfiles) so each development
 environment comes up matching your muscle memory.
 
 Loadouts apply to sessions (`min activate`); they are not used by task
-sandboxes ([`mip run`](./cli-mip.md)), which have their own
-`packages`/`env_vars`/`patches` schema described in [Tasks](./tasks.md).
+sandboxes, which have their own `packages`/`env_vars`/`patches` schema
+described in [Tasks](./tasks.md).
 
 ## Where loadouts live
 
@@ -69,7 +69,7 @@ VISUAL    = "hx"
 TERM      = { inherit = true, default = "xterm-256color" }
 COLORTERM = { inherit = true }
 
-# Warm helix's tree-sitter grammar cache the first time the session
+# Declared to warm helix's tree-sitter grammar cache when the session
 # comes up. Best-effort; failures don't tank activation.
 [[lifecycle_hooks]]
 on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || true" }
@@ -166,20 +166,21 @@ with an optional `description`.
 ```toml
 patches = [
     { dest = ".psqlrc", source = "~/dotfiles/psqlrc" },
-    { dest = "certs/",    source = ["~/ca/root.pem", "~/ca/dev.pem"] },
+    { dest = "certs/",    source = "~/ca/*.pem" },
     { dest = ".config/nvim/", source = "~/dotfiles/nvim/**/*.lua" },
 ]
 ```
 
 **`source`** is a host path or glob pattern, or a list of them (a list
-fans out into one patch per pattern, sharing the `dest`):
+fans out into one independent patch per entry, each sharing the `dest` --
+so list entries only make sense with per-entry dests or glob entries):
 
-- A leading `~` or `$HOME` expands to the host home directory. Other
-  `$NAME` / `${NAME}` references resolve against the session's
+- A leading `~` expands to the host home directory. `$NAME` / `${NAME}`
+  references (including `$HOME`) resolve against the session's
   already-resolved variables (declared in `[vars]`); referencing an
   undefined name is an error. `$$` is a literal `$`.
 - After expansion the path must be absolute; anchor home-relative sources
-  with `~/` or `$HOME/`.
+  with `~/`.
 - Glob patterns must have a literal directory prefix to walk from:
   `~/dotfiles/**/*.lua` is fine, a bare `**/*.pem` is rejected.
 - `..` components are rejected wherever they appear.
@@ -189,9 +190,10 @@ fans out into one patch per pattern, sharing the `dest`):
   (permission denied, unreadable entries) still fail the composition.
 
 **`dest`** is interpreted relative to the session user's home directory.
-Absolute paths and `..` components are rejected. For a single-file source, `dest` is the destination file
-path; for multi-file sources (lists, globs), `dest` is the destination
-directory.
+Absolute paths and `..` components are rejected. For a literal (non-glob)
+source, `dest` is used verbatim as the destination file path; for glob
+sources, `dest` is the destination directory and each match's path under
+the walk root is appended to it.
 
 By default the walker does not follow symlinks while enumerating glob
 matches; see [`follow_symlinks`](#follow_symlinks) and the
@@ -214,8 +216,9 @@ on_failure  = { type = "external", value = "./cleanup.sh" }
 
 External script paths must be relative (absolute paths are rejected at
 parse time) and are anchored to the configuration directory the file was
-loaded from. Hooks from multiple contributors concatenate and run in
-declaration order.
+loaded from. Hooks from multiple contributors concatenate in declaration
+order. Note: in the current release hooks are composed and recorded with
+the session, but executing them is not yet wired up.
 
 ### `follow_symlinks` - Symlink handling for patch sources {#follow_symlinks}
 
@@ -313,7 +316,8 @@ configuration. Merge semantics across all contributors:
   `ignore` list to drop all contributors of that variable.
 - **Patches** with the same destination and different sources are likewise
   a conflict.
-- **Lifecycle hooks** concatenate and run in declaration order.
+- **Lifecycle hooks** concatenate in declaration order (execution is not
+  yet wired up in the current release).
 
 Two loadouts with the same name cannot be applied together.
 
