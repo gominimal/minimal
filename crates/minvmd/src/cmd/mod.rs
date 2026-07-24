@@ -375,14 +375,16 @@ pub(crate) fn read_ready_beacon<R: std::io::BufRead>(
                         // exactly one current key instead of growing a line per
                         // spawn (#782). Best-effort: a prune failure must not
                         // abort boot (R2.3).
-                        if let Err(e) =
-                            paths::prune_known_hosts_entries(known_hosts_path, "local-0", 22)
-                        {
+                        if let Err(e) = paths::prune_known_hosts_entries(
+                            known_hosts_path,
+                            &paths::provider_instance_name(paths::ProviderKind::Minvmd, 0),
+                            22,
+                        ) {
                             tracing::warn!(error = %e, "failed to prune stale known_hosts entries");
                         }
                         match russh::keys::known_hosts::learn_known_hosts_path(
                             // TODO: pass instance_num through once multi-instance is needed
-                            "local-0",
+                            &paths::provider_instance_name(paths::ProviderKind::Minvmd, 0),
                             22,
                             &pubkey,
                             known_hosts_path,
@@ -545,8 +547,8 @@ mod beacon_tests {
         let contents =
             std::fs::read_to_string(&known_hosts_path).expect("known_hosts file must be created");
         assert!(
-            contents.contains("local-0"),
-            "known_hosts must contain 'local-0', got: {contents:?}"
+            contents.contains("local-minvmd0"),
+            "known_hosts must contain 'local-minvmd0', got: {contents:?}"
         );
         assert!(
             contents.contains(&openssh),

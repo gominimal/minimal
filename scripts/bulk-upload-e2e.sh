@@ -55,7 +55,7 @@
 # the nightly's whole job budget, and one is already conclusive.
 #
 # Environment (same knobs as scripts/session-e2e.sh, which this mirrors):
-#   E2E_MINIMAL_ARGS              global args for every `min` call (e.g. --minvmd)
+#   E2E_MINIMAL_ARGS              global args for every `min` call (e.g. --provider local-minvmd)
 #   E2E_VM                        set to 1 for VM-backed targets (extra teardown
 #                                 + guest boot log in the diagnostics)
 #   MINVMD_BOOT_LOG               optional override for the guest-console path
@@ -165,7 +165,7 @@ diagnostics() {
     | while read -r f; do echo "--- $f (tail) ---"; tail -40 "$f"; done
   if [ -n "$E2E_VM" ]; then
     echo "--- guest boot console (tail) ---"
-    tail -80 "${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-0/boot.log}" 2>/dev/null \
+    tail -80 "${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-minvmd0/boot.log}" 2>/dev/null \
       || echo "(no boot log — VM never started)"
   fi
   echo "::endgroup::"

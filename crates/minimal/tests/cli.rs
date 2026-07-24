@@ -30,7 +30,7 @@ async fn version_succeeds_without_daemon() {
         repo_dir: None,
         minimal_dir: Some(std::path::PathBuf::from("/nonexistent")),
         config_dir: None,
-        minvmd: false,
+        provider: None,
         no_input: false,
     };
     // Should print client version and note daemon is unreachable, but return Ok.

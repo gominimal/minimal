@@ -26,7 +26,7 @@ native-dir   := scratch / "native-state"
 # covers the rest. The Linux lanes run nextest's ci profile; macOS has none.
 scope      := if os() == "macos" { "-p minvmd -p sessions" } else { "--workspace" }
 ci-profile := if os() == "macos" { "" } else { "--profile ci" }
-e2e-env    := "E2E_VM=1 E2E_PROJECT_DIR=/tmp" + if os() == "linux" { " E2E_MINIMAL_ARGS=--minvmd" } else { "" }
+e2e-env    := "E2E_VM=1 E2E_PROJECT_DIR=/tmp" + if os() == "linux" { " E2E_MINIMAL_ARGS='--provider local-minvmd'" } else { "" }
 
 # Shared dev-stack env: target/debug on PATH so autospawn finds sibling
 # binaries; MINVMD_* are inert outside the VM recipes. 150s timeouts: the
@@ -342,8 +342,10 @@ bulk-upload n="5": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
 # `just up` = this host's default run mode; `just down` stops it.
 #   macOS: Linux VM over Hypervisor.framework (the only macOS mode).
 #   Linux: host-native minimald, no VM. `just up-kvm`: Linux + VM over KVM.
-# The CLI dials providers/local-0/ssh.sock in every mode; minvmd binds it
-# directly (#690), so no bridge is needed.
+# Each backend has its own provider dir: the native daemon dials
+# providers/local-minimald0/ssh.sock, the minvmd VM providers/local-minvmd0/ssh.sock
+# (minvmd binds it directly, #690, so no bridge is needed). Select the VM
+# backend with `--provider local-minvmd`.
 
 # The daemon can reset the very first connect after boot/bind; retry briefly.
 _smoke *args:
@@ -363,7 +365,7 @@ up: artifacts gvproxy initramfs minvmd-build minimal-cli && (_smoke)
 up: minimald-build minimal-cli gvproxy && (_smoke "--minimal-dir" native-dir)
     #!/usr/bin/env sh
     set -eu
-    sock="{{native-dir}}/providers/local-0/ssh.sock"
+    sock="{{native-dir}}/providers/local-minimald0/ssh.sock"
     pidf="{{scratch}}/minimald.pid"
     mkdir -p "{{native-dir}}"
     # PID files survive reboots and PIDs get reused: only trust the pidfile if
@@ -389,9 +391,9 @@ up: minimald-build minimal-cli gvproxy && (_smoke "--minimal-dir" native-dir)
 
 # Bring the stack up: native Linux + one Linux VM over KVM (stop with `just stop`).
 [linux]
-up-kvm: _kvm artifacts gvproxy initramfs minvmd-build minimal-cli && (_smoke)
+up-kvm: _kvm artifacts gvproxy initramfs minvmd-build minimal-cli && (_smoke "--provider" "local-minvmd")
     MINVMD_GVPROXY_BIN="{{gvproxy}}" "{{minvmd-bin}}" run --detach --timeout "$MINVMD_READY_TIMEOUT_SECS"
-    @echo "up-kvm: VM booted; minimald reachable at providers/local-0/ssh.sock"
+    @echo "up-kvm: VM booted; minimald reachable at providers/local-minvmd0/ssh.sock"
 
 # Stop the stack `just up` started.
 [macos]

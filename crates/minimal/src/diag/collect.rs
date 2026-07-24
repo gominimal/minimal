@@ -481,7 +481,7 @@ fn is_not_found(err: &anyhow::Error) -> bool {
         .any(|io| io.kind() == std::io::ErrorKind::NotFound)
 }
 
-// ── providers/local-<n>/ discovery ───────────────────────────────────────────
+// ── providers/local-<kind><n>/ discovery ───────────────────────────────────────────
 
 /// Provider instance dirs under `<state>/providers`, sorted. Empty when the
 /// providers dir doesn't exist (nothing was ever spawned); any other
@@ -706,8 +706,8 @@ mod tests {
             DaemonLogSources::ProvidersUnknown,
             DaemonLogSources::NoProviders,
             DaemonLogSources::NoneFetched,
-            DaemonLogSources::Nested(&["local-0"]),
-            DaemonLogSources::NestedUnconfirmed(&["local-0"]),
+            DaemonLogSources::Nested(&["local-minvmd0"]),
+            DaemonLogSources::NestedUnconfirmed(&["local-minvmd0"]),
         ];
 
         // minvmd is a host process wherever the providers are: nothing under
@@ -741,14 +741,15 @@ mod tests {
     /// told it holds recreates the dead end in the other direction.
     #[tokio::test]
     async fn only_a_confirmed_nested_bundle_is_named_as_the_carrier() {
-        let carrier = "providers/local-0/guest/daemon-diag.tar.zst";
+        let carrier = "providers/local-minvmd0/guest/daemon-diag.tar.zst";
 
-        let confirmed = reasons_for(DaemonLogSources::Nested(&["local-0"])).await;
+        let confirmed = reasons_for(DaemonLogSources::Nested(&["local-minvmd0"])).await;
         let reason = &confirmed["logs/minimald.log*"];
         assert!(reason.contains(carrier), "got: {reason}");
         assert!(reason.contains("are in this bundle"), "got: {reason}");
 
-        let unconfirmed = reasons_for(DaemonLogSources::NestedUnconfirmed(&["local-0"])).await;
+        let unconfirmed =
+            reasons_for(DaemonLogSources::NestedUnconfirmed(&["local-minvmd0"])).await;
         let reason = &unconfirmed["logs/minimald.log*"];
         assert!(reason.contains(carrier), "got: {reason}");
         assert!(reason.contains("could not confirm"), "got: {reason}");
@@ -801,7 +802,7 @@ mod tests {
         ])
         .await;
         w.add_bytes(
-            "providers/local-0/guest/daemon-diag.tar.zst",
+            "providers/local-minvmd0/guest/daemon-diag.tar.zst",
             &nested,
             Redaction::None,
         )
@@ -812,7 +813,7 @@ mod tests {
             &mut w,
             &paths,
             &absent,
-            DaemonLogSources::Nested(&["local-0"]),
+            DaemonLogSources::Nested(&["local-minvmd0"]),
         );
         w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
             .await
@@ -859,7 +860,8 @@ mod tests {
             "a host-only daemon's absence is still plain absence"
         );
         assert!(
-            reason("logs/minimald.log*").contains("providers/local-0/guest/daemon-diag.tar.zst"),
+            reason("logs/minimald.log*")
+                .contains("providers/local-minvmd0/guest/daemon-diag.tar.zst"),
             "the skip must name where the logs actually are"
         );
     }

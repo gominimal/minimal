@@ -670,7 +670,7 @@ pub(crate) mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let out = tmp.path().join("b.tar.zst");
         let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
-        volume_fallback(&mut w, "local-0", tmp.path())
+        volume_fallback(&mut w, "local-minvmd0", tmp.path())
             .await
             .unwrap();
         w.finish(chrono::Utc::now(), Duration::ZERO).await.unwrap();

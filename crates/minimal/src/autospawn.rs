@@ -96,7 +96,7 @@ fn classify(lifecycle: Lifecycle) -> Decision {
 /// On targets with no minvmd backend this is a no-op (see below).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn ensure_minvmd_running(minimal_dir: Option<&Path>) -> io::Result<()> {
-    let provider_dir = crate::client::resolve_provider_dir(minimal_dir)?;
+    let provider_dir = crate::client::resolve_provider_dir(minimal_dir, true)?;
     let state_dir = minvmd::state::StateDir::new(provider_dir)?;
 
     match classify(state_dir.effective_state()?.lifecycle) {
@@ -183,7 +183,7 @@ pub fn ensure_minvmd_running(_minimal_dir: Option<&Path>) -> io::Result<()> {
 /// `Stopped` still resolves rather than pinning the wait to its deadline.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn wait_for_minvmd_stopped(minimal_dir: Option<&Path>) -> io::Result<()> {
-    let provider_dir = crate::client::resolve_provider_dir(minimal_dir)?;
+    let provider_dir = crate::client::resolve_provider_dir(minimal_dir, true)?;
     let state_dir = minvmd::state::StateDir::new(provider_dir)?;
 
     let deadline = Instant::now() + Duration::from_secs(STOPPED_WAIT_SECS);
@@ -243,7 +243,7 @@ pub fn ensure_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io
     if use_minvmd {
         return ensure_minvmd_running(minimal_dir);
     }
-    let sock = crate::client::resolve_socket_path(minimal_dir)
+    let sock = crate::client::resolve_socket_path(minimal_dir, false)
         .map_err(|e| io::Error::other(format!("resolving native minimald socket path: {e}")))?;
     ensure_minimald_running(&sock, minimal_dir)
 }
@@ -280,7 +280,7 @@ pub fn is_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Re
     if use_minvmd {
         return is_minvmd_running(minimal_dir);
     }
-    let sock = crate::client::resolve_socket_path(minimal_dir)
+    let sock = crate::client::resolve_socket_path(minimal_dir, false)
         .map_err(|e| io::Error::other(format!("resolving native minimald socket path: {e}")))?;
     Ok(minimald_socket_live(&sock))
 }
@@ -304,7 +304,7 @@ pub fn is_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Re
 /// return as though the VM were already down.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn is_minvmd_running(minimal_dir: Option<&Path>) -> io::Result<bool> {
-    let provider_dir = crate::client::resolve_provider_dir(minimal_dir)?;
+    let provider_dir = crate::client::resolve_provider_dir(minimal_dir, true)?;
     let state_dir = minvmd::state::StateDir::new(provider_dir)?;
     Ok(state_dir.effective_state()?.lifecycle.is_active())
 }
@@ -402,7 +402,8 @@ mod tests {
 
     /// The state dir a `--minimal-dir` override resolves to.
     fn state_dir_for(minimal_dir: &std::path::Path) -> StateDir {
-        StateDir::new(crate::client::resolve_provider_dir(Some(minimal_dir)).unwrap()).unwrap()
+        StateDir::new(crate::client::resolve_provider_dir(Some(minimal_dir), true).unwrap())
+            .unwrap()
     }
 
     #[test]
@@ -504,7 +505,7 @@ mod tests {
     #[test]
     fn native_minimald_is_running_when_the_socket_accepts() {
         let tmp = tempfile::tempdir().unwrap();
-        let sock = crate::client::resolve_socket_path(Some(tmp.path())).unwrap();
+        let sock = crate::client::resolve_socket_path(Some(tmp.path()), false).unwrap();
         std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         assert!(is_daemon_running(false, Some(tmp.path())).unwrap());
@@ -517,7 +518,7 @@ mod tests {
     #[test]
     fn native_minimald_is_not_running_when_the_socket_file_is_stale() {
         let tmp = tempfile::tempdir().unwrap();
-        let sock = crate::client::resolve_socket_path(Some(tmp.path())).unwrap();
+        let sock = crate::client::resolve_socket_path(Some(tmp.path()), false).unwrap();
         std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
         drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
         assert!(
@@ -538,7 +539,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let long = tmp.path().join("d".repeat(120));
         std::fs::create_dir_all(&long).unwrap();
-        let sock = crate::client::resolve_socket_path(Some(&long)).unwrap();
+        let sock = crate::client::resolve_socket_path(Some(&long), false).unwrap();
         std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
         assert!(
             std::os::unix::net::UnixStream::connect(&sock)

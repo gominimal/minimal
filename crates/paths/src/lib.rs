@@ -151,19 +151,153 @@ pub fn minimal_state_dir() -> DaemonAbsPath {
 /// native minimald or by the minvmd host↔guest bridge — one endpoint either way.
 pub const SSH_SOCK_FILE: &str = "ssh.sock";
 /// File name of the SSH `known_hosts` in a provider instance dir, recording the
-/// daemon's host key under the `local-<instance>` hostname. Written at startup
-/// by native minimald, and by minvmd from the guest's boot beacon.
+/// daemon's host key under the `local-<kind><instance>` hostname. Written at
+/// startup by native minimald, and by minvmd from the guest's boot beacon.
 pub const KNOWN_HOSTS_FILE: &str = "known_hosts";
 /// Native minimald's single-instance lock, held for the daemon's lifetime.
 pub const MINIMALD_LOCK_FILE: &str = "minimald.lock";
 /// The minvmd supervisor's alive lock, held for the daemon's lifetime.
 pub const MINVMD_LOCK_FILE: &str = "minvmd.lock";
 
-/// `<state_dir>/providers/local-<instance>` — the directory holding the
+/// Which local daemon backend ("provider") an instance directory belongs to.
+///
+/// The kind is embedded in the instance name so the native host minimald and
+/// the minvmd microVM backends occupy distinct provider dirs — and distinct SSH
+/// host-key identities — rather than colliding on a shared `local-<N>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKind {
+    /// Native host minimald (DM2).
+    Minimald,
+    /// minimald inside the minvmd microVM (DM1).
+    Minvmd,
+}
+
+impl ProviderKind {
+    /// The tag embedded in the instance name (`local-<tag><instance>`).
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            ProviderKind::Minimald => "minimald",
+            ProviderKind::Minvmd => "minvmd",
+        }
+    }
+}
+
+/// The provider-instance name, `local-<kind><instance>` (e.g. `local-minimald0`,
+/// `local-minvmd0`). Used both as the `providers/<name>` directory name and as
+/// the SSH host-key identity recorded in `known_hosts`.
+#[must_use]
+pub fn provider_instance_name(kind: ProviderKind, instance: u32) -> String {
+    format!("local-{}{instance}", kind.tag())
+}
+
+/// `<state_dir>/providers/local-<kind><instance>` — the directory holding the
 /// sockets, locks, and state files a client needs to reach one local daemon
 /// instance.
-pub fn provider_instance_dir(state_dir: &DaemonAbsPath, instance: u32) -> DaemonAbsPath {
-    sub_path!(state_dir, "providers").sub_path_unchecked(&format!("local-{instance}"))
+pub fn provider_instance_dir(
+    state_dir: &DaemonAbsPath,
+    kind: ProviderKind,
+    instance: u32,
+) -> DaemonAbsPath {
+    sub_path!(state_dir, "providers").sub_path_unchecked(&provider_instance_name(kind, instance))
+}
+
+/// Migrate legacy `providers/local-<N>` instance dirs — the pre-split naming,
+/// from before the native minimald and minvmd backends had distinct identities
+/// — to the kind-tagged scheme (`local-minimald<N>` / `local-minvmd<N>`), so
+/// existing on-disk instances are not orphaned by the rename.
+///
+/// Each legacy dir's kind is inferred from its contents (see
+/// [`classify_legacy_provider_dir`]). Best-effort and idempotent: it never
+/// aborts the caller. Only genuine I/O failures (an unreadable providers dir, a
+/// failed rename) warn on stderr — these are rare and actionable. The benign
+/// "nothing to migrate here" outcomes are silent so the CLI, which runs this on
+/// every command, does not repeat a warning: a dir whose contents are ambiguous
+/// or empty, or whose kind-tagged target already exists, is simply left in
+/// place rather than clobbered or guessed at. Runs over every legacy dir found,
+/// not just instance 0.
+///
+/// This renames the directory only; it does not coordinate with a running
+/// daemon. A live daemon keeps serving via its already-open socket/lock inodes
+/// (which survive a dir rename on Unix), but stopping daemons before upgrading
+/// avoids the edge entirely.
+pub fn migrate_legacy_provider_dirs(state_dir: &DaemonAbsPath) {
+    let providers = sub_path!(state_dir, "providers");
+    let providers = providers.as_utf8_path().as_std_path();
+    let entries = match std::fs::read_dir(providers) {
+        Ok(entries) => entries,
+        // Nothing was ever spawned here — no migration to do.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            eprintln!(
+                "warning: could not scan {} for legacy provider dirs: {e}",
+                providers.display()
+            );
+            return;
+        }
+    };
+
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(instance) = legacy_instance_num(&name) else {
+            continue;
+        };
+
+        let path = entry.path();
+        // Ambiguous or empty contents: can't tell the backend apart, so leave it
+        // untouched. Silent — this recurs on every CLI invocation otherwise.
+        let Some(kind) = classify_legacy_provider_dir(&path) else {
+            continue;
+        };
+
+        let target_name = provider_instance_name(kind, instance);
+        let target = providers.join(&target_name);
+        // Target already claimed: don't clobber it. Silent, for the same reason.
+        if target.exists() {
+            continue;
+        }
+        if let Err(e) = std::fs::rename(&path, &target) {
+            eprintln!(
+                "warning: failed to migrate legacy provider dir {name} -> {target_name}: {e}"
+            );
+        }
+    }
+}
+
+/// Parse the instance number from a legacy `local-<N>` dir name, where `<N>` is
+/// one or more decimal digits. Returns `None` for the kind-tagged names
+/// (`local-minimald<N>` / `local-minvmd<N>`, whose suffix is not all digits)
+/// and for anything not of the `local-<digits>` shape.
+fn legacy_instance_num(name: &str) -> Option<u32> {
+    let suffix = name.strip_prefix("local-")?;
+    if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok()
+}
+
+/// Infer which backend a legacy provider dir belonged to from its contents.
+///
+/// A minvmd instance carries VM artifacts the native daemon never writes — its
+/// `minvmd.toml` state file, its alive lock, or the data-volume image. A native
+/// minimald dir carries an on-disk SSH host key (the guest daemon writes its key
+/// inside the VM, not the host dir) or its own lock. Returns `None` when both or
+/// neither class of marker is present, so the caller can skip rather than guess.
+fn classify_legacy_provider_dir(dir: &std::path::Path) -> Option<ProviderKind> {
+    let has = |file: &str| dir.join(file).exists();
+    let minvmd = has("minvmd.toml") || has(MINVMD_LOCK_FILE) || has("data-vol.raw");
+    let minimald = has("ssh_host_ed25519_key") || has(MINIMALD_LOCK_FILE);
+    match (minvmd, minimald) {
+        (true, false) => Some(ProviderKind::Minvmd),
+        (false, true) => Some(ProviderKind::Minimald),
+        _ => None,
+    }
 }
 
 /// Removes any existing [`KNOWN_HOSTS_FILE`] entries for `host` at `port` from
@@ -1577,13 +1711,153 @@ mod tests {
     fn provider_instance_dir_layout() {
         let state = DaemonAbsPath::try_new("/state/minimal").unwrap();
         assert_eq!(
-            provider_instance_dir(&state, 0).as_str(),
-            "/state/minimal/providers/local-0",
+            provider_instance_dir(&state, ProviderKind::Minimald, 0).as_str(),
+            "/state/minimal/providers/local-minimald0",
         );
         assert_eq!(
-            provider_instance_dir(&state, 3).as_str(),
-            "/state/minimal/providers/local-3",
+            provider_instance_dir(&state, ProviderKind::Minimald, 3).as_str(),
+            "/state/minimal/providers/local-minimald3",
         );
+        assert_eq!(
+            provider_instance_dir(&state, ProviderKind::Minvmd, 0).as_str(),
+            "/state/minimal/providers/local-minvmd0",
+        );
+    }
+
+    /// A tempdir turned into a `DaemonAbsPath` state root.
+    fn state_root(tmp: &tempfile::TempDir) -> DaemonAbsPath {
+        DaemonAbsPath::try_new(tmp.path().to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn migrate_renames_legacy_dirs_by_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let providers = tmp.path().join("providers");
+
+        // A legacy minvmd instance (its state file) and a legacy native
+        // minimald instance (its on-disk host key), at different numbers.
+        let vm = providers.join("local-0");
+        std::fs::create_dir_all(&vm).unwrap();
+        std::fs::write(vm.join("minvmd.toml"), "lifecycle = \"Stopped\"\n").unwrap();
+        let native = providers.join("local-2");
+        std::fs::create_dir_all(&native).unwrap();
+        std::fs::write(native.join("ssh_host_ed25519_key"), b"key").unwrap();
+
+        migrate_legacy_provider_dirs(&state_root(&tmp));
+
+        assert!(providers.join("local-minvmd0").join("minvmd.toml").exists());
+        assert!(!providers.join("local-0").exists());
+        assert!(
+            providers
+                .join("local-minimald2")
+                .join("ssh_host_ed25519_key")
+                .exists()
+        );
+        assert!(!providers.join("local-2").exists());
+    }
+
+    #[test]
+    fn migrate_skips_when_target_already_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let providers = tmp.path().join("providers");
+
+        let legacy = providers.join("local-0");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("minvmd.toml"), "x").unwrap();
+        // The kind-tagged target already exists — don't clobber it.
+        let target = providers.join("local-minvmd0");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep"), b"keep").unwrap();
+
+        migrate_legacy_provider_dirs(&state_root(&tmp));
+
+        assert!(
+            legacy.exists(),
+            "legacy dir left in place when target exists"
+        );
+        assert!(target.join("keep").exists(), "existing target untouched");
+    }
+
+    #[test]
+    fn migrate_leaves_new_scheme_and_ambiguous_dirs_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let providers = tmp.path().join("providers");
+
+        // Already-migrated names and non-provider entries must not be touched.
+        for kept in ["local-minvmd0", "local-minimald1", "remote-x"] {
+            std::fs::create_dir_all(providers.join(kept)).unwrap();
+        }
+        // A legacy dir with markers for BOTH backends is ambiguous -> skip.
+        let both = providers.join("local-0");
+        std::fs::create_dir_all(&both).unwrap();
+        std::fs::write(both.join("minvmd.toml"), "x").unwrap();
+        std::fs::write(both.join("ssh_host_ed25519_key"), b"k").unwrap();
+        // A legacy dir with no recognizable markers is skipped too.
+        let empty = providers.join("local-9");
+        std::fs::create_dir_all(&empty).unwrap();
+
+        migrate_legacy_provider_dirs(&state_root(&tmp));
+
+        for kept in ["local-minvmd0", "local-minimald1", "remote-x"] {
+            assert!(providers.join(kept).exists(), "{kept} must be left alone");
+        }
+        assert!(both.exists(), "ambiguous legacy dir left in place");
+        assert!(empty.exists(), "empty legacy dir left in place");
+        assert!(!providers.join("local-minvmd9").exists());
+        assert!(!providers.join("local-minimald9").exists());
+    }
+
+    #[test]
+    fn migrate_classifies_via_the_alternate_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let providers = tmp.path().join("providers");
+
+        // minvmd via its lock, minvmd via the data volume, minimald via its lock
+        // — none carry the primary `minvmd.toml` / `ssh_host_ed25519_key` marker.
+        let vm_lock_dir = providers.join("local-0");
+        std::fs::create_dir_all(&vm_lock_dir).unwrap();
+        std::fs::write(vm_lock_dir.join(MINVMD_LOCK_FILE), b"").unwrap();
+        let vm_volume_dir = providers.join("local-1");
+        std::fs::create_dir_all(&vm_volume_dir).unwrap();
+        std::fs::write(vm_volume_dir.join("data-vol.raw"), b"").unwrap();
+        let native_lock_dir = providers.join("local-2");
+        std::fs::create_dir_all(&native_lock_dir).unwrap();
+        std::fs::write(native_lock_dir.join(MINIMALD_LOCK_FILE), b"").unwrap();
+
+        migrate_legacy_provider_dirs(&state_root(&tmp));
+
+        assert!(providers.join("local-minvmd0").exists());
+        assert!(providers.join("local-minvmd1").exists());
+        assert!(providers.join("local-minimald2").exists());
+    }
+
+    #[test]
+    fn migrate_is_idempotent_on_a_second_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let providers = tmp.path().join("providers");
+        let legacy = providers.join("local-0");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("minvmd.toml"), "x").unwrap();
+
+        migrate_legacy_provider_dirs(&state_root(&tmp));
+        // A second pass finds only the kind-tagged name and does nothing.
+        migrate_legacy_provider_dirs(&state_root(&tmp));
+
+        assert!(providers.join("local-minvmd0").join("minvmd.toml").exists());
+        assert!(!providers.join("local-0").exists());
+    }
+
+    #[test]
+    fn legacy_instance_num_matches_only_all_digit_suffixes() {
+        assert_eq!(legacy_instance_num("local-0"), Some(0));
+        assert_eq!(legacy_instance_num("local-12"), Some(12));
+        // The kind-tagged names must never be treated as legacy.
+        assert_eq!(legacy_instance_num("local-minvmd0"), None);
+        assert_eq!(legacy_instance_num("local-minimald3"), None);
+        // Neither must anything else.
+        assert_eq!(legacy_instance_num("local-"), None);
+        assert_eq!(legacy_instance_num("remote-0"), None);
+        assert_eq!(legacy_instance_num("local-1a"), None);
     }
 
     #[test]

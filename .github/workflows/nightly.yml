@@ -241,7 +241,7 @@ jobs:
               env:
                   MINVMD_BOOT_LOG: ${{ runner.temp }}/cli-e2e-boot.log
                   MINVMD_GVPROXY_BIN: ${{ runner.temp }}/bin/gvproxy
-              run: E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd E2E_PROJECT_DIR=/tmp ./scripts/session-e2e.sh
+              run: E2E_VM=1 E2E_MINIMAL_ARGS="--provider local-minvmd" E2E_PROJECT_DIR=/tmp ./scripts/session-e2e.sh
             - name: Reap leftover VM processes
               # The autospawned minvmd can leak a __krun-vmm child on a failed
               # teardown; reap defensively (ported from test-kvm). The runner is

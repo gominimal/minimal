@@ -4,7 +4,7 @@
 # so the IDENTICAL proof runs against all three deployment targets:
 #
 #   Linux native   minimald on the host          (no extra env)
-#   Linux KVM      minimald in a minvmd microVM  E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd
+#   Linux KVM      minimald in a minvmd microVM  E2E_VM=1 E2E_MINIMAL_ARGS="--provider local-minvmd"
 #   macOS HVF      minimald in a minvmd microVM  E2E_VM=1 (macOS is always VM-backed)
 #
 # Two proofs, in order, on EVERY lane:
@@ -50,7 +50,7 @@
 #   - MINVMD_BOOT_LOG (optional) to override the guest-console capture path
 #
 # Environment:
-#   E2E_MINIMAL_ARGS    global args for every `min` call (e.g. --minvmd)
+#   E2E_MINIMAL_ARGS    global args for every `min` call (e.g. --provider local-minvmd)
 #   E2E_PROJECT_DIR     project to activate (default: a self-seeded throwaway
 #                       dir; VM lanes pass /tmp)
 #   E2E_ACTIVATE_ARGS   extra args for `min activate` (e.g. a future
@@ -128,7 +128,7 @@ fi
 
 # Fresh state dir — a clean (no-daemon) cold-start on persistent runners:
 # post-#690, all daemon state (minvmd.toml, locks, the bridge socket) lives
-# under $XDG_STATE_HOME/minimal/providers/local-0 on every platform.
+# under $XDG_STATE_HOME/minimal/providers/local-minvmd0 on every platform.
 # XDG_CACHE_HOME is deliberately left alone so package pulls reuse the
 # host/CI cache across runs — which pins where the state dir may live on a
 # Linux-native lane: minimald HARDLINKS built packages from the cache into
@@ -197,7 +197,7 @@ fail() {
     | while read -r f; do echo "--- $f (tail) ---"; tail -40 "$f"; done
   if [ -n "$E2E_VM" ]; then
     echo "--- guest boot console (tail) ---"
-    tail -80 "${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-0/boot.log}" 2>/dev/null || echo "(no boot log — VM never started)"
+    tail -80 "${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-minvmd0/boot.log}" 2>/dev/null || echo "(no boot log — VM never started)"
   fi
   echo "::endgroup::"
   teardown

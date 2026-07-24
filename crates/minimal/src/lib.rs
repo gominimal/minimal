@@ -250,11 +250,12 @@ pub struct GlobalArgs {
     /// state and cache dirs, not `~/Library/Application Support`.
     #[arg(long, global = true)]
     pub config_dir: Option<PathBuf>,
-    /// Linux: run minimald inside the minvmd microVM (DM1) instead of natively
-    /// on the host (DM2, the default). No effect on macOS, where minvmd is the
-    /// only backend.
-    #[arg(long, global = true)]
-    pub minvmd: bool,
+    /// Select the daemon backend that hosts sessions. On Linux, `local-minimald`
+    /// (the default) runs minimald on the host; `local-minvmd` runs it inside
+    /// the minvmd microVM (DM1). No effect on macOS, where minvmd is the only
+    /// backend.
+    #[arg(long, global = true, value_name = "PROVIDER")]
+    pub provider: Option<Provider>,
     /// Skip interactive prompts that need a terminal (e.g. the session
     /// picker shown by bare `min` or `min attach` with no session argument).
     /// When a choice is ambiguous, the command errors with a list of
@@ -262,6 +263,14 @@ pub struct GlobalArgs {
     /// not a terminal.
     #[arg(long, global = true, default_value_t = false)]
     pub no_input: bool,
+}
+
+impl GlobalArgs {
+    /// Whether the minvmd microVM backend (DM1) is selected via
+    /// `--provider local-minvmd`.
+    pub fn use_minvmd(&self) -> bool {
+        matches!(self.provider, Some(Provider::LocalMinvmd))
+    }
 }
 
 #[derive(Debug, Args)]
@@ -302,6 +311,19 @@ pub struct ActivateArgs {
     /// Automatically attach after creation
     #[arg(long)]
     pub attach: bool,
+}
+
+/// Which daemon backend ("provider") hosts sessions.
+///
+/// On Linux the default is the host-native daemon (DM2); `local-minvmd` runs
+/// `minimald` inside the minvmd microVM (DM1) instead. On macOS minvmd is the
+/// only backend, so the choice has no effect there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Provider {
+    /// Linux: run minimald natively on the host (the default).
+    LocalMinimald,
+    /// Run minimald inside the minvmd microVM.
+    LocalMinvmd,
 }
 
 /// Configuration for file sync during activation.
@@ -517,6 +539,11 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
 }
 
 async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
+    // Adopt any pre-split `providers/local-<N>` dirs into the kind-tagged scheme
+    // once per invocation, before any command resolves a provider dir, so an
+    // upgraded CLI finds an existing instance rather than orphaning it.
+    client::migrate_legacy_provider_dirs(cli.global_args.minimal_dir.as_deref());
+
     match cli.command {
         None => cmd_default(&cli.global_args).await,
         Some(Command::Ls(args)) => cmd_ls(&cli.global_args, args).await,
@@ -578,7 +605,7 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
 async fn cmd_default(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
 
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref())
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
         .context("Failed to resolve daemon socket path")?;
 
     let mut client = client::Client::connect(&sock)
@@ -630,7 +657,7 @@ async fn cmd_default(global: &GlobalArgs) -> Result<(), anyhow::Error> {
 
 /// Connect to the daemon, resolving the socket path from global args.
 pub async fn connect_daemon(global: &GlobalArgs) -> Result<client::Client, anyhow::Error> {
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref())
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
         .context("Failed to resolve daemon socket path")?;
 
     client::Client::connect(&sock)
@@ -705,7 +732,7 @@ pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyho
         Some(socket_path) => socket_path,
         None => {
             ensure_daemon(global)?;
-            client::resolve_socket_path(global.minimal_dir.as_deref())
+            client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
                 .context("Failed to resolve daemon socket path")?
                 .to_str()
                 .unwrap()
@@ -733,7 +760,7 @@ pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyho
 
 /// Ensure the minimald daemon is running, autospawning it if necessary.
 fn ensure_daemon(global: &GlobalArgs) -> Result<(), anyhow::Error> {
-    autospawn::ensure_daemon_running(global.minvmd, global.minimal_dir.as_deref())
+    autospawn::ensure_daemon_running(global.use_minvmd(), global.minimal_dir.as_deref())
         .context("Failed to ensure the minimald daemon is running")
 }
 
@@ -1532,7 +1559,7 @@ fn host_key_opts(known_hosts: &std::path::Path) -> [String; 2] {
 pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
 
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref())
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
         .context("Failed to resolve daemon socket path")?;
 
     let mut client = client::Client::connect(&sock)
@@ -1638,7 +1665,16 @@ async fn attach_to_session(
     if command.is_none() {
         ssh.arg("-tt");
     }
-    ssh.arg("local-0");
+    // The SSH host identity must match the known_hosts entry the daemon wrote,
+    // which it keys on the provider-instance name — the provider dir's basename
+    // (`local-minimald<N>` / `local-minvmd<N>`). Derive it from the socket path
+    // so the client and daemon can never disagree on the name.
+    let host_alias = sock
+        .parent()
+        .and_then(std::path::Path::file_name)
+        .and_then(|n| n.to_str())
+        .context("daemon socket path has no provider-dir parent")?;
+    ssh.arg(host_alias);
 
     // If a command was provided, pass it to ssh (non-interactive exec).
     // Otherwise, ssh opens an interactive shell via shell_request.
@@ -1898,7 +1934,7 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
     // Cheap and bounded (a state-file read, or a connect to a local socket that
     // refuses at once when nothing listens), so it runs inline rather than on
     // the blocking pool — unlike the shutdown wait below, which sleep-polls.
-    if !autospawn::is_daemon_running(global.minvmd, global.minimal_dir.as_deref())
+    if !autospawn::is_daemon_running(global.use_minvmd(), global.minimal_dir.as_deref())
         .context("Failed to determine whether the daemon is running")?
     {
         println!("Daemon is not running.");
@@ -1906,7 +1942,7 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
     }
 
     // Racy by nature: the daemon may go down between the probe and this connect
-    // (or `--minvmd` may point the probe and the client at different backends),
+    // (or `--provider` may point the probe and the client at different backends),
     // so a connect failure is still a real error, not something to swallow.
     let mut client = connect_daemon(global).await?;
 
@@ -1926,7 +1962,7 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
             // The wait polls the lifecycle file on a sleep loop, so it goes on
             // the blocking pool rather than stalling an async worker for up to
             // 20s (rust-coding-standards: no blocking in an async context).
-            let (use_minvmd, minimal_dir) = (global.minvmd, global.minimal_dir.clone());
+            let (use_minvmd, minimal_dir) = (global.use_minvmd(), global.minimal_dir.clone());
             tokio::task::spawn_blocking(move || {
                 autospawn::wait_for_daemon_stopped(use_minvmd, minimal_dir.as_deref())
             })
@@ -1991,7 +2027,7 @@ pub async fn cmd_ssh_forward(
 ) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
 
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref())
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
         .context("Failed to resolve daemon socket path")?;
 
     // Look up the session to validate it exists and to obtain its UUID for the
@@ -2026,6 +2062,14 @@ pub async fn cmd_ssh_forward(
     );
 
     let session_id = record.id.to_string();
+    // Host-key checking is disabled here, so the alias is cosmetic; still derive
+    // it from the provider dir (`local-minimald<N>` / `local-minvmd<N>`) to match
+    // the rest of the CLI rather than hard-coding a name.
+    let host_alias = sock
+        .parent()
+        .and_then(std::path::Path::file_name)
+        .and_then(|n| n.to_str())
+        .context("daemon socket path has no provider-dir parent")?;
     // Use `-N` (no command) so the foreground ssh keeps the tunnel alive after
     // `exec()` replaces this process. `-o ExitOnForwardFailure=yes` makes ssh
     // exit immediately if the local port cannot be bound rather than silently
@@ -2045,7 +2089,7 @@ pub async fn cmd_ssh_forward(
         "StrictHostKeyChecking=no",
         "-o",
         "UserKnownHostsFile=/dev/null",
-        "local-0",
+        host_alias,
     ]);
 
     // exec() replaces the process, so this call only returns on failure.
@@ -2291,7 +2335,8 @@ pub async fn cmd_spin(_global: &GlobalArgs, args: SpinArgs) -> Result<(), anyhow
 pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     println!("Client: minimal {}", version::LONG_VERSION);
 
-    let sock = match client::resolve_socket_path(global.minimal_dir.as_deref()) {
+    let sock = match client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+    {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Server: (daemon unreachable: {e})");
@@ -2332,7 +2377,7 @@ mod tests {
     fn host_key_opts_pin_to_an_adjacent_known_hosts() {
         let tmp = tempfile::tempdir().unwrap();
         let known_hosts = tmp.path().join(paths::KNOWN_HOSTS_FILE);
-        std::fs::write(&known_hosts, "local-0 ssh-ed25519 AAAA...\n").unwrap();
+        std::fs::write(&known_hosts, "local-minimald0 ssh-ed25519 AAAA...\n").unwrap();
 
         let [strict, hosts_file] = host_key_opts(&known_hosts);
         assert_eq!(strict, "StrictHostKeyChecking=yes");
@@ -2366,7 +2411,7 @@ mod tests {
         let dir = tmp.path().join(r#"sp ace q"uote back\slash"#);
         std::fs::create_dir_all(&dir).unwrap();
         let known_hosts = dir.join(paths::KNOWN_HOSTS_FILE);
-        std::fs::write(&known_hosts, "local-0 ssh-ed25519 AAAA...\n").unwrap();
+        std::fs::write(&known_hosts, "local-minimald0 ssh-ed25519 AAAA...\n").unwrap();
 
         let [strict, hosts_file] = host_key_opts(&known_hosts);
         assert_eq!(strict, "StrictHostKeyChecking=yes");
@@ -2374,6 +2419,27 @@ mod tests {
             hosts_file.contains(r#"q\"uote"#) && hosts_file.contains(r"back\\slash"),
             "path must reach ssh escaped, got: {hosts_file}"
         );
+    }
+
+    #[test]
+    fn provider_local_minvmd_selects_the_vm_backend() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["min", "--provider", "local-minvmd", "ls"]).unwrap();
+        assert!(cli.global_args.use_minvmd());
+    }
+
+    #[test]
+    fn provider_local_minimald_is_the_host_backend() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["min", "--provider", "local-minimald", "ls"]).unwrap();
+        assert!(!cli.global_args.use_minvmd());
+    }
+
+    #[test]
+    fn no_provider_defaults_to_the_host_backend() {
+        use clap::Parser as _;
+        let cli = Cli::try_parse_from(["min", "ls"]).unwrap();
+        assert!(!cli.global_args.use_minvmd());
     }
 
     #[test]

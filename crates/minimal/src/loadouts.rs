@@ -286,7 +286,7 @@ mod tests {
             repo_dir: None,
             minimal_dir: None,
             config_dir: Some(PathBuf::from("/definitely/does/not/exist")),
-            minvmd: false,
+            provider: None,
             no_input: false,
         };
         let out = resolve_active_loadouts(LoadoutSelection::None, &cfg, &global)
@@ -307,7 +307,7 @@ mod tests {
             repo_dir: None,
             minimal_dir: None,
             config_dir: Some(tmp.path().to_path_buf()),
-            minvmd: false,
+            provider: None,
             no_input: false,
         };
         let selection = LoadoutSelection::Cli(vec!["missing".to_string()]);

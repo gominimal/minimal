@@ -33,7 +33,7 @@ use serial_test::serial;
 use tempfile::TempDir;
 
 /// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
-/// `<tempdir>/minimal/providers/local-0/*.sock` would overflow sun_path (104).
+/// `<tempdir>/minimal/providers/local-minvmd0/*.sock` would overflow sun_path (104).
 fn short_state_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("mnl")
@@ -94,7 +94,9 @@ impl Guest {
     /// blocks until the `vm-up` (READY) line. Panics on boot timeout.
     fn boot() -> Guest {
         let state = short_state_dir();
-        let sock_path = state.path().join("minimal/providers/local-0/ssh.sock");
+        let sock_path = state
+            .path()
+            .join("minimal/providers/local-minvmd0/ssh.sock");
 
         let exe = minvmd_bin();
         let mut child = Command::new(exe)

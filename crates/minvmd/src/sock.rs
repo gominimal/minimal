@@ -1,10 +1,11 @@
 //! Host UDS path resolution and socket-directory management for the
 //! minimald bridge (R3.2).
 //!
-//! The bridge socket lives beside the minvmd state files in the
-//! provider-instance dir: `<minimal_state_dir>/providers/local-0/ssh.sock` —
-//! the same name native minimald binds, so clients see one endpoint
-//! regardless of backend.
+//! The bridge socket lives beside the minvmd state files in the minvmd
+//! provider-instance dir:
+//! `<minimal_state_dir>/providers/local-minvmd0/ssh.sock`. It mirrors the
+//! `ssh.sock` name native minimald binds under its own `local-minimald<N>`
+//! dir; the client selects the dir matching the requested backend.
 
 use std::io;
 use std::path::PathBuf;
@@ -147,7 +148,7 @@ mod tests {
         }
         assert_eq!(
             path,
-            PathBuf::from("/state/minimal/providers/local-0/ssh.sock"),
+            PathBuf::from("/state/minimal/providers/local-minvmd0/ssh.sock"),
         );
     }
 

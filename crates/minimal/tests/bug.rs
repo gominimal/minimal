@@ -73,7 +73,7 @@ fn global_args(state: &Path, config: &Path) -> GlobalArgs {
         repo_dir: None,
         minimal_dir: Some(state.to_path_buf()),
         config_dir: Some(config.to_path_buf()),
-        minvmd: false,
+        provider: None,
         no_input: false,
     }
 }
@@ -223,7 +223,7 @@ async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
             .unwrap();
     }
 
-    let provider = state.path().join("providers/local-0");
+    let provider = state.path().join("providers/local-minvmd0");
     std::fs::create_dir_all(&provider).unwrap();
     std::fs::write(provider.join("run.log"), "supervisor stderr\n").unwrap();
     // boot.log deliberately absent — recorded as a skip, not an error.
@@ -253,7 +253,7 @@ async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
         "newest-first rotation order: {collected_logs:?}"
     );
 
-    assert!(find(&files, "providers/local-0/run.log").is_some());
+    assert!(find(&files, "providers/local-minvmd0/run.log").is_some());
     assert!(find(&files, "providers/remote-x/run.log").is_none());
     let manifest: serde_json::Value =
         serde_json::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
@@ -261,7 +261,7 @@ async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
     assert!(
         skipped
             .iter()
-            .any(|s| s["what"] == "providers/local-0/boot.log" && s["reason"] == "absent"),
+            .any(|s| s["what"] == "providers/local-minvmd0/boot.log" && s["reason"] == "absent"),
         "absent boot.log is a skip: {skipped:?}"
     );
     assert_eq!(manifest["errors"].as_array().unwrap().len(), 0, "no errors");
@@ -278,7 +278,7 @@ async fn a_custom_tail_cap_applies_to_every_log() {
     let log_dir = state.path().join("logs");
     std::fs::create_dir_all(&log_dir).unwrap();
     std::fs::write(log_dir.join("minimald.log.2026-07-21"), "x".repeat(500)).unwrap();
-    let provider = state.path().join("providers/local-0");
+    let provider = state.path().join("providers/local-minvmd0");
     std::fs::create_dir_all(&provider).unwrap();
     std::fs::write(provider.join("run.log"), "y".repeat(500)).unwrap();
 
@@ -291,7 +291,10 @@ async fn a_custom_tail_cap_applies_to_every_log() {
         .unwrap();
 
     let files = unpack(&out).await;
-    for suffix in ["logs/minimald.log.2026-07-21", "providers/local-0/run.log"] {
+    for suffix in [
+        "logs/minimald.log.2026-07-21",
+        "providers/local-minvmd0/run.log",
+    ] {
         let contents = find(&files, suffix).unwrap_or_else(|| panic!("missing {suffix}"));
         assert_eq!(contents.len(), 100, "{suffix} honors the requested cap");
     }
@@ -376,15 +379,16 @@ async fn bug_with_daemon_nests_a_verified_guest_bundle() {
     // R7.1: every stage of the probe reached the live daemon, and the
     // connection it opened was the one the download reused.
     let probe: serde_json::Value =
-        serde_json::from_slice(find(&files, "local-0/socket-probe.json").expect("probe")).unwrap();
+        serde_json::from_slice(find(&files, "local-minimald0/socket-probe.json").expect("probe"))
+            .unwrap();
     for stage in ["stat", "connect", "handshake", "get_version"] {
         assert_eq!(probe[stage]["outcome"], "ok", "stage {stage}: {probe}");
     }
     assert!(probe["version"]["long_version"].is_string());
 
     // R7.6: liveness status for the discovered provider.
-    assert!(find(&files, "local-0/status.json").is_some());
-    assert!(find(&files, "local-0/dir-listing.txt").is_some());
+    assert!(find(&files, "local-minimald0/status.json").is_some());
+    assert!(find(&files, "local-minimald0/dir-listing.txt").is_some());
 
     // R7.3: the daemon bundle is nested raw (it decompresses on its own) and
     // carries the Unit 6 manifest.
@@ -438,7 +442,7 @@ async fn bug_with_daemon_nests_a_verified_guest_bundle() {
 async fn bug_with_stale_socket_reports_the_connect_stage_and_falls_back() {
     let state = tempfile::TempDir::new().unwrap();
     let config = tempfile::TempDir::new().unwrap();
-    let provider = state.path().join("providers/local-0");
+    let provider = state.path().join("providers/local-minvmd0");
     std::fs::create_dir_all(&provider).unwrap();
     drop(std::os::unix::net::UnixListener::bind(provider.join("ssh.sock")).unwrap());
     // A data volume the fallback can date, standing in for a real image.
@@ -452,7 +456,8 @@ async fn bug_with_stale_socket_reports_the_connect_stage_and_falls_back() {
 
     let files = unpack(&out).await;
     let probe: serde_json::Value =
-        serde_json::from_slice(find(&files, "local-0/socket-probe.json").expect("probe")).unwrap();
+        serde_json::from_slice(find(&files, "local-minvmd0/socket-probe.json").expect("probe"))
+            .unwrap();
     assert_eq!(probe["stat"]["outcome"], "ok");
     assert_ne!(probe["connect"]["outcome"], "ok");
     assert!(
@@ -505,5 +510,5 @@ async fn bug_no_guest_makes_no_daemon_contact() {
     assert!(find(&files, "socket-probe.json").is_none());
     assert!(find(&files, "daemon-diag.tar.zst").is_none());
     // Host-side per-provider collection still ran.
-    assert!(find(&files, "local-0/status.json").is_some());
+    assert!(find(&files, "local-minimald0/status.json").is_some());
 }

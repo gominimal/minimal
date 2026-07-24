@@ -1,7 +1,7 @@
 //! State persistence for `minvmd` (R4.1, R4.6).
 //!
-//! All runtime files live in the shared provider-instance directory
-//! (`<minimal_state_dir>/providers/local-0/`, see
+//! All runtime files live in the minvmd provider-instance directory
+//! (`<minimal_state_dir>/providers/local-minvmd0/`, see
 //! [`paths::provider_instance_dir`]):
 //!
 //! - `minvmd.toml` — serialised [`State`] (lifecycle, pid, timestamp).
@@ -59,9 +59,9 @@ pub fn state_base_dir() -> DaemonAbsPath {
 }
 
 /// The provider-instance dir holding all minvmd runtime files:
-/// `<minimal_state_dir>/providers/local-0`.
+/// `<minimal_state_dir>/providers/local-minvmd0`.
 pub fn provider_dir() -> PathBuf {
-    paths::provider_instance_dir(&state_base_dir(), 0)
+    paths::provider_instance_dir(&state_base_dir(), paths::ProviderKind::Minvmd, 0)
         .as_utf8_path()
         .as_std_path()
         .to_path_buf()
