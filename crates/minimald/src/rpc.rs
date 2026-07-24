@@ -18,8 +18,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::task::spawn;
 
 use crate::{
@@ -77,8 +76,7 @@ trait ServeOneshot: OneshotSshRpc {
 
         match result {
             Ok(response_bytes) => {
-                c.data_bytes(response_bytes)
-                    .await?;
+                c.data_bytes(response_bytes).await?;
                 c.eof().await?;
                 c.close().await?;
                 Ok(())
