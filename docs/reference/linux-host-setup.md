@@ -1,6 +1,6 @@
 ---
 title: Linux host setup
-description: Preparing a Linux host to run minimald: the unprivileged user namespace the session sandbox needs, and the AppArmor profile that grants it on Ubuntu 24.04+.
+description: "Preparing a Linux host to run minimald: the unprivileged user namespace the session sandbox needs, and the AppArmor profile that grants it on Ubuntu 24.04+."
 ---
 
 # Linux host setup
@@ -101,3 +101,11 @@ Only the host-native daemon (**DM2**) is affected. When minimald runs inside a
 minimal-managed microVM (**DM1** on macOS, **DM3** on Linux/KVM) the sandbox's
 user namespace is created in the guest, whose kernel carries no such
 restriction; the host's setting is irrelevant.
+
+## User namespaces disabled entirely
+
+Separately from the AppArmor restriction, a kernel built without
+`CONFIG_USER_NS`, or a host with `user.max_user_namespaces` set to `0`, cannot
+create user namespaces at all. The daemon's preflight reports this as its own
+error. The fix is distribution-specific: raise `user.max_user_namespaces` via
+sysctl, or use a kernel with user namespaces enabled.

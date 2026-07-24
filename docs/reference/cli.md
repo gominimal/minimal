@@ -29,7 +29,7 @@ drive it directly with the **`mip`** CLI.
 ## Platform availability
 
 - **Linux**: installs ship `min`, `mip`, and `minimald`. `minimald` runs
-  natively by default; `min --minvmd` routes sessions through the `minvmd`
+  natively by default; `min --provider local-minvmd` routes sessions through the `minvmd`
   microVM instead, which needs a separately obtained `minvmd` binary (a
   prebuilt Linux amd64 `minvmd` is attached to each GitHub Release; arm64
   must build from source).

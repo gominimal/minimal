@@ -1,6 +1,6 @@
 ---
 title: min CLI
-description: Reference for the min session CLI: create, attach to, and manage sandboxed development sessions, plus the git-remote-min helper.
+description: "Reference for the min session CLI: create, attach to, and manage sandboxed development sessions, plus the git-remote-min helper."
 ---
 
 # `min` - session CLI
@@ -8,11 +8,13 @@ description: Reference for the min session CLI: create, attach to, and manage sa
 `min` is the Minimal session CLI. It talks to the `minimald` daemon (see
 [minimald](./cli-minimald.md)) to create, attach to, and manage sandboxed
 development sessions. Most commands start the daemon automatically when it
-isn't running (`bug` is the exception): natively on Linux, or inside the
-[`minvmd`](./cli-minvmd.md) microVM host daemon on macOS (and on Linux
-under `--minvmd`).
+isn't running (`bug`, `stop`, and `version` are the exceptions): natively on
+Linux, or inside the [`minvmd`](./cli-minvmd.md) microVM host daemon on macOS
+(and on Linux under `--provider local-minvmd`). Running bare `min` with no
+subcommand resolves a session for the current directory (activating one if
+needed) and attaches to it.
 
-Generated from `--help` at `60e19f60`.
+Generated from `--help` at `3a05252c`.
 
 ## Global flags
 
@@ -23,7 +25,8 @@ These apply to every subcommand.
 | `--repo-dir <PATH>` | `-C` | Use the given directory as the repository root, instead of the current working directory |
 | `--minimal-dir <PATH>` | | Override the base directory used for operations (default: `~/.cache/minimal`) |
 | `--config-dir <PATH>` | | Override the user config directory; everything under `<config_dir>/minimal/` (`config.toml`, `loadouts/`, ...) resolves relative to it. Defaults to `$XDG_CONFIG_HOME` on Linux (or `$HOME/.config`); macOS also uses `$HOME/.config` |
-| `--minvmd` | | Linux: run `minimald` inside the `minvmd` microVM instead of natively on the host (the default). No effect on macOS, where `minvmd` is the only backend |
+| `--provider <PROVIDER>` | | Daemon backend that hosts sessions: `local-minimald` (Linux default, `minimald` natively on the host) or `local-minvmd` (`minimald` inside the `minvmd` microVM). No effect on macOS, where `minvmd` is the only backend |
+| `--no-input` | | Skip interactive prompts that need a terminal (such as the session picker); ambiguous choices error with a list of candidates instead. Implied when stdin/stdout is not a terminal |
 
 ## Commands
 
@@ -62,12 +65,16 @@ the current directory).
 ### `attach`
 
 ```
-min attach [-c <COMMAND>] <SESSION>
+min attach [-c <COMMAND>] [SESSION]
 ```
 
-Attaches to an existing session, identified by UUID or session name.
+Attaches to an existing session, identified by UUID or session name. When
+`SESSION` is omitted, `min attach` resolves a session from the current
+working directory (or the only existing session) and opens an interactive
+picker if the choice is ambiguous (`--no-input` errors instead).
 `-c/--command` execs a command in the session context non-interactively
-instead of opening an interactive shell.
+instead of opening an interactive shell; the daemon accepts only
+`min run <task name>` invocations on this channel, not arbitrary commands.
 
 ### `destroy`
 
@@ -165,7 +172,7 @@ Prints CLI and daemon version information.
 min completions <SHELL>
 ```
 
-Generates a shell tab-completion script. Supported shells: `bash`, `zsh`,
+Generates a shell tab-completion script. Supported shells include `bash`, `zsh`,
 `elvish`, `fish`. Usage: `source <(min completions bash)`.
 
 ## `git push min://` - the git remote helper

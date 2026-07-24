@@ -1,6 +1,6 @@
 ---
 title: minvmd daemon
-description: Ops reference for the minvmd VM daemon: boots and supervises the Linux microVM that hosts minimald.
+description: "Ops reference for the minvmd VM daemon: boots and supervises the Linux microVM that hosts minimald."
 ---
 
 # `minvmd` - VM daemon
@@ -8,16 +8,16 @@ description: Ops reference for the minvmd VM daemon: boots and supervises the Li
 `minvmd` is the host daemon that brings up a Linux microVM via libkrun
 (macOS/HVF or Linux/KVM) and supervises the
 [minimald](./cli-minimald.md) instance running inside it. On macOS it is
-the only session backend; on Linux it is selected with `min --minvmd`
+the only session backend; on Linux it is selected with `min --provider local-minvmd`
 (see [min](./cli-min.md)).
 
-Generated from `--help` at `e5ce5fb8`.
+Generated from `--help` at `3a05252c`.
 
 ## Global flags
 
 | Flag | Description |
 |------|-------------|
-| `--minimal-state-dir <PATH>` | Override the state dir base (default: `$XDG_STATE_HOME/minimal`). Runtime files live under `<dir>/providers/local-0/` |
+| `--minimal-state-dir <PATH>` | Override the state dir base (default: `$XDG_STATE_HOME/minimal`). Runtime files live under `<dir>/providers/local-minvmd0/` |
 
 ## Commands
 
@@ -94,10 +94,6 @@ Stops the running daemon gracefully.
 minvmd completions <SHELL>
 ```
 
-Generates a shell tab-completion script. Supported shells: `bash`, `zsh`,
+Generates a shell tab-completion script. Supported shells include `bash`, `zsh`,
 `elvish`, `fish`.
 
-## Known issues
-
-- [#823](https://github.com/gominimal/minimal/issues/823):
-  `minvmd run --timeout` is silently ignored without `--detach`.

@@ -1,6 +1,6 @@
 ---
 title: mip CLI
-description: Reference for the mip package/build CLI: build packages, run tasks, materialize outputs, and manage the local cache.
+description: "Reference for the mip package/build CLI: build packages, run tasks, materialize outputs, and manage the local cache."
 ---
 
 # `mip` - package/build CLI

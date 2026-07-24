@@ -1,6 +1,6 @@
 ---
 title: Tasks
-description: Full task schema reference: packages, exec/bash commands, state_key, env_vars, patches, profiles, args, and interactive mode.
+description: "Full task schema reference: packages, exec/bash commands, state_key, env_vars, patches, profiles, args, and interactive mode."
 ---
 
 # Tasks
@@ -52,6 +52,14 @@ above, `pnpm` runs as `/bin/pnpm`.
 bash = "echo \"hello\" > hello.txt"
 ```
 
+A third action, `echo`, prints a fixed string without composing a sandbox at
+all; useful for pointers and reminders:
+
+```toml
+[tasks.docs]
+echo = "Docs live at https://docs.minimal.dev"
+```
+
 When [args](#args) are set on the task, arguments can be substituted into the invocation using
 Nickel's string interpolation [syntax](https://nickel-lang.org/user-manual/syntax/#strings):
 
@@ -89,17 +97,15 @@ state_key = "dev" # Cache build artifacts under 'dev'
 
 ### `env_vars` - Environment variables to set
 
-_Optional, Alias `vars`_
+_Optional. `env_vars` is an alias of the canonical `vars` key; both parse_
 
 `env_vars` sets environment variables in the tasks' runtime environment. Variables
 set here take precedence over any inherited from the profile.
 
 ```toml
 [tasks.my_task]
-env_vars = {
-  CC = "gcc",
-  AWS_PROJECT = "zest",
-}
+env_vars.CC = "gcc"
+env_vars.AWS_PROJECT = "zest"
 ```
 
 Environment variables can also inherit their value from the parent process. To do this,
@@ -146,7 +152,7 @@ profile = "" # No profile applied to `my_task`
 
 ### `patches` - Map in files/directories from the system
 
-_Optional, Alias `patch`_
+_Optional. `patches` is an alias of the canonical `patch` key; both parse_
 
 `patches` configures files and directories to be mapped into the tasks' runtime environment.
 
@@ -163,7 +169,7 @@ mappings.
 
 If a mapped file or directory does not exist on the host, an empty file or directory is created.
 
-Mapped paths must be absolute or start with `~`, in which case the tilde is expanded to the user's
+Mapped paths must be absolute or start with `~/`, in which case the tilde is expanded to the user's
 home directory.
 
 ### `inherit_cwd` - Use parent working directory instead of repository root
@@ -187,10 +193,8 @@ being executed by the task.
 
 ```toml
 [tasks.greeter]
-args = {
-    name = "string",
-    greeting = "string",
-}
+args.name = "string"
+args.greeting = "string"
 exec = "echo %{greeting} %{name}"
 ```
 

@@ -1,12 +1,13 @@
 ---
 title: Sandbox operations
-description: In-sandbox min helper commands: add packages, search, check configuration, and run tasks from within a sandbox.
+description: "In-sandbox min helper commands: add packages, search, check configuration, and run tasks from within a sandbox."
 ---
 
 # `min` commands
 
-`min` helper commands are available within all task sandboxes. Task sandboxes
-(and therefore these commands) are Linux-only.
+`min` helper commands are available within task sandboxes (Linux-only) and
+inside [sessions](./cli-min.md), which install the same helper as
+`/usr/bin/min`.
 
 > **Naming note**: the in-sandbox `min` helper is a different tool from the
 > [`min` session CLI](./cli-min.md) that happens to share its name. Inside a
@@ -17,10 +18,13 @@ description: In-sandbox min helper commands: add packages, search, check configu
 
 ### `add [FLAG] <PACKAGES...>` {#add}
 
-Installs tools & dependencies into the running sandbox. With no flag, packages
-are installed for the current sandbox session only; `minimal.toml` is not
-modified. With a flag, the named packages are also recorded as a session,
-runtime, or build dependency in `minimal.toml`.
+Installs tools & dependencies into the running sandbox. The default differs
+by sandbox type: in a **session**, `min add <pkg>` with no flag defaults to
+`--session`, installing the package live and recording it in the `[session]`
+`packages` list of the project's `minimal.toml`; in a **task sandbox**, no
+flag installs for the current sandbox only and `minimal.toml` is not
+modified. With a flag, the named packages are recorded as a session, runtime,
+or build dependency in `minimal.toml`.
 
 | Flag | Description |
 |------|-------------|
@@ -28,7 +32,7 @@ runtime, or build dependency in `minimal.toml`.
 | `--runtime` | Also add packages to `stack.runtime_packages` |
 | `--build` | Also add packages to `stack.build_packages` |
 
-`min add` is the in-sandbox equivalent of the [`mip add`](./cli-mip.md#add) command.
+`min add` is the in-sandbox counterpart of [`mip add`](./cli-mip.md#add); note the flag surfaces differ (`mip add` requires one of `--runtime`, `--build`, or `--task <TASK>`).
 
 ### `search <TERM>`
 
