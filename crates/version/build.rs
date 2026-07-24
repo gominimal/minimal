@@ -15,9 +15,12 @@
 //! commits past `v1.2.3` sorts ABOVE `1.2.3` and BELOW the next release. Build
 //! metadata (anything after `+`) would instead be ignored in precedence, making
 //! every post-release build compare equal to the release. `<N>` is a numeric
-//! pre-release identifier, so more commits => higher version. `--match 'v*'`
-//! scopes describe to version tags so the many `release-<sha>` tags this repo
-//! also carries are ignored.
+//! pre-release identifier, so more commits => higher version. In CI, `<N>` is
+//! the workflow run number (`GITHUB_RUN_NUMBER`) rather than the git-describe
+//! commit count, so it matches the release/build number operators reference;
+//! the run number is monotonic, so ordering still holds. `--match 'v*'` scopes
+//! describe to version tags so the many `release-<sha>` tags this repo also
+//! carries are ignored.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -69,14 +72,19 @@ fn main() {
 fn to_semver(describe: &str, dirty: bool) -> String {
     let core = describe.strip_prefix('v').unwrap_or(describe);
     let mut out = match core.rsplitn(3, '-').collect::<Vec<_>>()[..] {
-        [hash, count, base]
-            if count.bytes().all(|b| b.is_ascii_digit())
+        [hash, commit_count, base]
+            if commit_count.bytes().all(|b| b.is_ascii_digit())
                 && hash
                     .strip_prefix('g')
                     .is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit())) =>
         {
             // A dev build `count` commits past tag `base`. Encode as a pre-release
-            // so it sorts above `base` but below the next release.
+            // so it sorts above `base` but below the next release. In CI, prefer
+            // the workflow run number over the git-describe commit count so the
+            // counter matches the release/build number operators reference; fall
+            // back to the commit count for local builds.
+            let run_number = ci_run_number();
+            let count = run_number.as_deref().unwrap_or(commit_count);
             if base.contains('-') {
                 // `base` already carries a pre-release (e.g. `0.5.0-rc1`); extend it,
                 // so `0.5.0-rc1.dev.N` > `0.5.0-rc1` and < `0.5.0`.
@@ -96,6 +104,20 @@ fn to_semver(describe: &str, dirty: bool) -> String {
         out.push_str("+dirty");
     }
     out
+}
+
+/// The CI build number to use in place of the git-describe commit count.
+///
+/// Reads `GITHUB_RUN_NUMBER` (set by GitHub Actions), so the counter in the
+/// version string matches the release/build number operators reference when
+/// triaging, rather than the git-describe "commits since tag" count. `None`
+/// outside CI, or when the value is empty or non-numeric, leaving the commit
+/// count in place. The run number is monotonic, so it preserves the pre-release
+/// ordering (higher build => higher version).
+fn ci_run_number() -> Option<String> {
+    let n = std::env::var("GITHUB_RUN_NUMBER").ok()?;
+    let n = n.trim();
+    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| n.to_string())
 }
 
 /// Increment the patch of a plain `X.Y.Z` (all-numeric) core, e.g. `1.2.3` ->
@@ -137,6 +159,10 @@ fn is_dirty() -> Option<bool> {
 /// Caveat: a raw *unstaged* edit touches neither HEAD nor the index, so the
 /// `.dirty` marker only refreshes on the next git operation (or source change).
 fn emit_rerun_triggers() {
+    // The version counter reads this in CI (see `ci_run_number`); recompute when
+    // it changes so a rebuilt binary reports the run number it was built under.
+    println!("cargo:rerun-if-env-changed=GITHUB_RUN_NUMBER");
+
     let Some(git_dir) = absolute_git_dir() else {
         // No git (e.g. a source tarball): nothing to watch; version is the fallback.
         return;
