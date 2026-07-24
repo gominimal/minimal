@@ -9,9 +9,13 @@
 # ran (conclusion "success", not "skipped"); otherwise this script exits
 # non-zero and the promotion fails before the channel pointer is touched.
 #
-# A no-op nightly run that skipped its build (the SHA was already staged) also
-# skips the smoke jobs, so it does NOT pass verification — the version must
-# have been smoked by a prior run that actually built and tested it.
+# The smoke-success aggregator is skip-tolerant by design (a no-op night or a
+# kill-switch skip still concludes "success"), so this script additionally
+# requires the Linux smoke jobs themselves to have run and passed. A no-op
+# nightly run that skipped its build (the SHA was already staged) skips those
+# jobs and does NOT pass verification — the version must have been smoked by a
+# run that actually built and tested it. smoke-macos alone may be skipped (the
+# RUN_MACOS_CI kill-switch).
 #
 # Usage:
 #   scripts/verify-nightly-provenance.sh --sha SHORTSHA [options]
@@ -92,14 +96,17 @@ run_id="${run_id%% *}"    # keep only run_id
 run_url="${match#* }"     # drop head_sha
 run_url="${run_url#* }"   # drop run_id, leaving html_url
 
-# Verify that smoke tests actually ran (not skipped). A no-op nightly run where
-# the check job found an already-staged version skips all build/smoke jobs; the
-# overall run still succeeds, but we must not promote a version that bypassed
-# the smoke test suite. The smoke-success aggregator job exists with conclusion
-# "success" only when the smoke jobs actually executed and passed.
-smoke_conclusion=$(gh api \
+# Verify that smoke tests actually ran and passed. The smoke-success aggregator
+# is `if: always()` and skip-tolerant: on a no-op nightly run (the SHA was
+# already staged, so build and smokes were all skipped) it still concludes
+# "success". Checking it alone would let an unsmoked version through, so the
+# Linux smoke jobs are checked individually below; smoke-success is still
+# required to catch failures and cancellations the aggregator does red on.
+smoke_jobs=$(gh api \
     "repos/${REPO}/actions/runs/${run_id}/jobs?per_page=100" \
-    --jq '.jobs[] | select(.name == "smoke-success") | .conclusion' 2>/dev/null || true)
+    --jq '.jobs[] | select(.name == "smoke-success" or .name == "smoke-linux-amd64" or .name == "smoke-linux-kvm") | "\(.name) \(.conclusion)"' 2>/dev/null || true)
+
+smoke_conclusion=$(printf '%s\n' "$smoke_jobs" | awk '$1 == "smoke-success" { print $2; exit }')
 
 if [ "$smoke_conclusion" != "success" ]; then
     if [ -z "$smoke_conclusion" ]; then
@@ -111,5 +118,18 @@ smoke tests must pass before promotion"
     fi
 fi
 
-printf 'verify-nightly-provenance: %s was built by %s run %s (smoke-success: %s)\n' \
+# The aggregator passed; now require the Linux smoke jobs to have actually run
+# and succeeded, so a no-op night (all smokes skipped) cannot wrap an unsmoked
+# SHA into a promotable run. smoke-macos is deliberately not required: the
+# RUN_MACOS_CI kill-switch may skip it, and smoke-success already reds on its
+# genuine failures.
+for job in smoke-linux-amd64 smoke-linux-kvm; do
+    conclusion=$(printf '%s\n' "$smoke_jobs" | awk -v j="$job" '$1 == j { print $2; exit }')
+    if [ "$conclusion" != "success" ]; then
+        die "version '$SHA' in ${WORKFLOW_FILE} run ${run_url} has ${job} with conclusion '${conclusion:-absent}' (not 'success'); \
+the smoke jobs must actually run and pass before promotion (a no-op nightly run does not count)"
+    fi
+done
+
+printf 'verify-nightly-provenance: %s was built by %s run %s (smoke-success: %s, linux smokes: success)\n' \
     "$SHA" "$WORKFLOW_FILE" "$run_url" "$smoke_conclusion" >&2

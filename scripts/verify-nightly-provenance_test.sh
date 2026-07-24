@@ -72,9 +72,12 @@ cat >"$GH_STUB_RUNS" <<EOF
 $sha_a 1001 https://example.test/runs/1
 $sha_b 1002 https://example.test/runs/2
 EOF
-# Default jobs response: smoke-success job with conclusion "success".
+# Default jobs response: "name conclusion" lines, aggregator and Linux smokes
+# all green.
 cat >"$GH_STUB_JOBS" <<EOF
-success
+smoke-success success
+smoke-linux-amd64 success
+smoke-linux-kvm success
 EOF
 : >"$GH_STUB_ARGS"
 
@@ -143,11 +146,34 @@ $sha_a 1001 https://example.test/runs/1
 $sha_b 1002 https://example.test/runs/2
 EOF
 
-# Skipped smoke-success: no-op runs where build was skipped don't run smokes.
-echo "skipped" >"$GH_STUB_JOBS"
+# Skipped smoke-success aggregator (defensive: the real no-op flow concludes
+# "success", covered below, but a skipped aggregator must also be rejected).
+echo "smoke-success skipped" >"$GH_STUB_JOBS"
 expect 1 "conclusion 'skipped'" "skipped smoke-success fails with clear message" \
     -- "$script" --sha dd20ee67 --repo acme/widgets
 expect 1 "smoke tests must pass" "skipped smoke-success mentions smoke tests must pass" \
+    -- "$script" --sha dd20ee67 --repo acme/widgets
+
+# The real no-op nightly shape: smoke-success is if: always() and concludes
+# "success" while every smoke job was skipped. Must NOT pass verification.
+cat >"$GH_STUB_JOBS" <<EOF
+smoke-success success
+smoke-linux-amd64 skipped
+smoke-linux-kvm skipped
+EOF
+expect 1 "smoke-linux-amd64 with conclusion 'skipped'" "no-op run (skipped smokes under green aggregator) fails" \
+    -- "$script" --sha dd20ee67 --repo acme/widgets
+expect 1 "no-op nightly run does not count" "no-op run failure explains itself" \
+    -- "$script" --sha dd20ee67 --repo acme/widgets
+
+# Kill-switch shape: smoke-macos skipped is tolerated when Linux smokes ran.
+cat >"$GH_STUB_JOBS" <<EOF
+smoke-success success
+smoke-linux-amd64 success
+smoke-linux-kvm success
+smoke-macos skipped
+EOF
+expect 0 "linux smokes: success" "macos kill-switch skip still passes with green linux smokes" \
     -- "$script" --sha dd20ee67 --repo acme/widgets
 
 # Missing smoke-success: malformed run without the aggregator job.
@@ -158,17 +184,21 @@ expect 1 "smoke tests must complete" "missing smoke-success mentions tests must 
     -- "$script" --sha dd20ee67 --repo acme/widgets
 
 # Failed smoke-success: smoke tests ran but failed.
-echo "failure" >"$GH_STUB_JOBS"
+echo "smoke-success failure" >"$GH_STUB_JOBS"
 expect 1 "conclusion 'failure'" "failed smoke-success fails with clear message" \
     -- "$script" --sha dd20ee67 --repo acme/widgets
 
 # Cancelled smoke-success: run was cancelled mid-flight.
-echo "cancelled" >"$GH_STUB_JOBS"
+echo "smoke-success cancelled" >"$GH_STUB_JOBS"
 expect 1 "conclusion 'cancelled'" "cancelled smoke-success fails with clear message" \
     -- "$script" --sha dd20ee67 --repo acme/widgets
 
 # Restore success for remaining tests.
-echo "success" >"$GH_STUB_JOBS"
+cat >"$GH_STUB_JOBS" <<EOF
+smoke-success success
+smoke-linux-amd64 success
+smoke-linux-kvm success
+EOF
 
 # ── gh failure propagation ───────────────────────────────────────────────────
 expect 22 "" "gh API failure propagates the failing exit code" \

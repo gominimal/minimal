@@ -60,8 +60,7 @@ override for green-but-unreported commits.
 
 - uploads a legacy `minimalone-<sha>.tar.zst` bundle to
   `gs://minimal-shim/archives/`, retained for backward compatibility with
-  the legacy `minimal-shim` archive path, pending retirement once installs
-  resolve through the versioned `minimal-one` layout (below);
+  the legacy `minimal-shim` archive path;
 - creates the GitHub Release (tag `release-<sha>`, or the pushed `v*` tag; a
   suffixed tag becomes a prerelease) with all binaries, guest artifacts, and
   `completions.tar.gz`.
@@ -104,11 +103,13 @@ workflow's approver allowlist (the initiating user is excluded) comments
 
 **nightly-provenance gate.** Before flipping the pointer, the `promote` job
 runs [`scripts/verify-nightly-provenance.sh --sha "$SHA"`](../../scripts/verify-nightly-provenance.sh),
-which queries GitHub Actions to confirm the version was built by
-`nightly.yml`. This rejects manually dispatched release.yml runs and tag-push
-builds. Staging a version does not make it promotable. Only nightly-built
-versions pass by default, ensuring the stable channel only receives versions
-that completed the full nightly smoke suite. The `override_provenance`
+which queries GitHub Actions to confirm the version was built by a successful
+`nightly.yml` run whose Linux smoke jobs actually ran and passed (the
+skip-tolerant `smoke-success` aggregator alone is not trusted, so a no-op
+nightly run that skipped its smokes cannot vouch for a SHA; `smoke-macos` may
+be skipped by the `RUN_MACOS_CI` kill-switch). This rejects manually
+dispatched release.yml runs and tag-push builds. Staging a version does not
+make it promotable. The `override_provenance`
 emergency input bypasses this gate when checked; use it only for documented
 emergency releases that skip the nightly path.
 
@@ -133,7 +134,10 @@ install targets.
 
 [`scripts/install.sh`](../../scripts/install.sh) is the strict-POSIX `curl |
 sh` installer. Against `https://storage.googleapis.com/minimal-one` it fetches
-the channel pointer (default `stable`), resolves the version, fetches the
+the channel pointer (default `stable`; the per-channel endpoints under
+`go.minimal.dev/<channel>` serve this same script with a
+`MINIMAL_INSTALL_TARGET_OVERRIDE=<channel>` line injected to pin the target),
+resolves the version, fetches the
 immutable `versions/<version>/components` manifest (refusing an unknown
 `# format:` header), and for each row matching the host os/arch downloads,
 SHA-256-verifies, and atomically installs the file. The on-disk hash is the
@@ -162,8 +166,9 @@ local install record, keeping user-modified files unless `--force`;
 **Promote to stable.**
 
 1. **Verify the SHA was nightly-built.** The promote workflow rejects versions
-   not built by `nightly.yml`: manually dispatched or tag-staged SHAs will
-   fail the provenance gate after the multi-hour approval completes. If you
+   not built and smoke-tested by `nightly.yml`: manually dispatched or
+   tag-staged SHAs fail the provenance gate after the multi-hour approval
+   completes, even if a later no-op nightly run carries the same SHA. If you
    need to promote a non-nightly version in an emergency, check
    `override_provenance` when dispatching.
 2. Actions → *promote-cli* → Run workflow with `target: stable` (optionally a
