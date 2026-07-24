@@ -59,14 +59,13 @@ it.
 You create a session by **activating** a project. From the project directory:
 
 ```console
-$ min activate --attach .
+$ min activate --attach
 ```
 
-`min activate` takes a project path that defaults to the current directory, so
-the trailing `.` is the project you are standing in. `--attach` drops you
-straight into a shell in the new session once it is ready. Without `--attach`,
-activation prints the new session's id and returns, leaving the session running
-in the background for you to attach to later.
+`min activate` takes a project path that defaults to the current directory.
+`--attach` drops you straight into a shell in the new session once it is ready.
+Without `--attach`, activation prints the new session's id and returns, leaving
+the session ready in the background for you to attach to later.
 
 A few things happen during activation:
 
@@ -90,8 +89,8 @@ Useful activation options:
   applies none.
 - `--no-prompt` fails instead of prompting when composition surfaces items your
   policy cannot auto-decide, printing a ready-to-paste policy snippet instead.
-  This mode is selected automatically when stdin or stderr is not a terminal, so
-  activation is safe to run from scripts and CI.
+  This mode is selected automatically when stdout or stderr is not a terminal,
+  so activation is safe to run from scripts and CI.
 
 To enter a session that already exists, **attach** to it by id or name:
 
@@ -99,15 +98,20 @@ To enter a session that already exists, **attach** to it by id or name:
 $ min attach my-session
 ```
 
-Attach opens an interactive shell inside the session. To run a single command
-non-interactively instead of opening a shell, pass `--command` (short `-c`):
+Attach opens an interactive shell inside the session, with your tools on `PATH`
+and the session's workspace (your project files, uploaded at activation) as your
+working directory. Exiting the shell detaches: the session keeps running in the
+background, and `min attach` rejoins it later. Changes you make inside stay in
+the session's workspace; bring them back to the host by pushing them out with
+`git push min://<session>`.
+
+To run a declared task non-interactively instead of opening a shell, pass
+`--command` (short `-c`). The command channel accepts only `min run <task name>`
+invocations; arbitrary commands need an interactive shell:
 
 ```console
-$ min attach my-session -c 'cargo test'
+$ min attach my-session -c 'min run test'
 ```
-
-Both forms run inside the session's sandbox, with your tools on `PATH` and your
-project directory mapped into the same path it has on the host.
 
 ## How a session is composed
 
@@ -117,8 +121,8 @@ mints your shell. The composition is a pipeline that spans the `min` client and
 the provider:
 
 1. **Your loadouts, composed on the client.** A loadout is a reusable bundle of
-   session contributions (environment variables, file mappings, and package
-   selections) kept in your user config. `min` composes the loadouts you
+   session contributions (environment variables, file mappings, package
+   selections, and lifecycle hooks) kept in your user config. `min` composes the loadouts you
    selected, resolving values and gating them against your user policy. See the
    [loadouts guide](./loadouts.md) for how to write and select them.
 2. **Your project config, collected on the provider.** The provider reads your
@@ -137,9 +141,11 @@ prompts you. Approved items, plus the selections that were already decided, are
 assembled into the final composition. The result carries four kinds of item:
 
 - **Variables**: environment variables set inside the session.
-- **File patches**: files mapped into the session's home.
+- **File patches**: files copied into the session's home when it is finalized.
 - **Packages**: the tools and libraries that make up the environment.
-- **Lifecycle hooks**: scripts the session runs at defined points.
+- **Lifecycle hooks**: scripts declared to run at defined points. Hooks are
+  composed and recorded today; executing them is not yet wired up in the
+  current release.
 
 A key principle: **your user policy is enforced only on the client.** The
 provider never runs your policy. It forwards the items that need a decision, and
@@ -187,12 +193,15 @@ Stop the provider itself:
 $ min stop
 ```
 
-`min stop` shuts down the `minimald` provider daemon. Because the provider hosts
-every session, stopping it ends them all; it refuses to shut down while sessions
-are active unless you pass `--force`. Contrast this with `min destroy`, which
-removes one session and leaves the provider running to host the rest. Because
-`min` auto-spawns a provider on demand, the next `min` command after a stop
-simply brings a fresh one back up.
+`min stop` shuts down the `minimald` provider daemon. Stopping the provider ends
+every running shell, but the sessions themselves survive: their records and
+workspaces persist, and a provider that comes back up re-hosts them (the extras
+composed from loadouts are rebuilt when you re-activate). The provider refuses
+to shut down while any session is busy (a live shell, or an activation in
+flight) unless you pass `--force`. Contrast this with `min destroy`, which
+removes one session entirely and leaves the provider running to host the rest.
+Because `min` auto-spawns a provider on demand, the next `min` command after a
+stop simply brings one back up.
 
 You can inspect a session's effective networking policy as JSON:
 
@@ -211,22 +220,21 @@ $ min loadout list
 A session is not itself a sandbox: it is the managed, named environment the
 provider hosts. But everything that runs *inside* a session runs in a
 **sandbox**, the low-level isolation primitive built from Linux user and mount
-namespaces. When you attach a shell, the provider composes a sandbox whose
-root filesystem is assembled from the package closure your session needs (each
-package's files hardlinked into place), mounts your project directory into it at
-its real path, sets the composed environment variables, and launches your shell
-there. The sandbox is how the session's isolation and reproducibility are
-actually delivered.
+namespaces. The first time you attach a shell, the provider composes a sandbox
+whose root filesystem is assembled from the package closure your session needs
+(each package's files hardlinked into place), mounts the session's workspace
+(your uploaded project files) into it, sets the composed environment variables,
+and launches your shell there. Detaching leaves that sandbox running;
+reattaching joins it. The sandbox is how the session's isolation and
+reproducibility are actually delivered.
 
-**Tasks** are the other thing that runs in a session's sandbox. A task is a
-command your project defines in its `minimal.toml`: a named, repeatable
-operation (a build step, a test run, a linter) that executes against a sandbox
-composed from the packages that task needs. If a needed package is not present,
-Minimal builds it or fetches it from a remote cache first, then runs the task in
-a freshly composed sandbox with your project directory mapped in. Running a
-command through `min attach --command` is the interactive counterpart: an
-arbitrary command executed in the session's sandbox rather than a predeclared
-task.
+**Tasks** run in sandboxes of their own. A task is a command your project
+defines in its `minimal.toml`: a named, repeatable operation (a build step, a
+test run, a linter) that executes in a freshly composed sandbox built from the
+packages that task needs. If a needed package is not present, Minimal builds it
+or fetches it from a remote cache first. Running `min attach -c 'min run
+<task>'` is the non-interactive way to trigger a declared task against a
+session; arbitrary commands need an interactive shell.
 
 The through-line: a **session** is the durable, named environment a provider
 hosts; a **sandbox** is the isolated execution context composed from a package
