@@ -412,6 +412,26 @@ impl Binding {
                                     modes: terminal_modes.to_vec(),
                                 })).await;
                             },
+                            // A mid-session terminal resize. Forward the new
+                            // dimensions down the same channel as the initial
+                            // pty-req so the consumer's `set_size` runs
+                            // `TIOCSWINSZ` on the master and re-sizes the vt100
+                            // parser; the kernel then delivers SIGWINCH to the
+                            // foreground process group. `window-change` carries
+                            // no term/modes, so leave those empty.
+                            russh::ChannelMsg::WindowChange {
+                                col_width,
+                                row_height,
+                                pix_width,
+                                pix_height,
+                            } => {
+                                let _ = self.stdin_tx.send(Either::Right(RequestedPty {
+                                    char_sizes: (col_width, row_height),
+                                    pixel_sizes: (pix_width, pix_height),
+                                    term: String::new(),
+                                    modes: Vec::new(),
+                                })).await;
+                            }
                             // Flow-control window updates fire on every
                             // burst of bytes forwarded through the
                             // channel, v. noisy.
@@ -1203,6 +1223,12 @@ impl SessionProcess for MockProcess {
 #[cfg(test)]
 pub(crate) const MOCK_EXIT_LINE: &str = "quit";
 
+/// The sentinel stdin line that makes [`MockLauncher`]'s program print its
+/// current terminal size (`stty size` → "rows cols") back over the channel, so
+/// a test can observe a `window-change`-driven `TIOCSWINSZ` land on the pty.
+#[cfg(test)]
+pub(crate) const MOCK_SIZE_LINE: &str = "size";
+
 /// A test [`SessionLauncher`] that wires a plain, un-sandboxed host process to a
 /// freshly opened PTY — so the [`Host`] runtime can be exercised end-to-end
 /// without building a real sandbox (which needs packages unavailable in the
@@ -1230,7 +1256,7 @@ impl SessionLauncher for MockLauncher {
         let pty = Pty::open(sz)?;
 
         let script = format!(
-            r#"while read line; do [ "$line" = {MOCK_EXIT_LINE} ] && exit 0; printf 'got:%s\n' "$line"; done"#
+            r#"while read line; do [ "$line" = {MOCK_EXIT_LINE} ] && exit 0; [ "$line" = {MOCK_SIZE_LINE} ] && stty size && continue; printf 'got:%s\n' "$line"; done"#
         );
         let mut command = std::process::Command::new("/bin/sh");
         command.arg("-c").arg(&script);

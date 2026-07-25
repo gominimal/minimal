@@ -292,6 +292,36 @@ impl TestClient {
         channel
     }
 
+    /// Like [`Self::open_shell`], but negotiates the pty at `initial`
+    /// `(col_width, row_height)`, issues an SSH `window-change` to `resized`
+    /// `(col_width, row_height)` *before* the shell request, then attaches.
+    ///
+    /// Exercises the pre-attach resize path: the resize has to update the
+    /// pending pty size so the session opens at `resized` rather than the
+    /// dimensions from the original `pty-req`.
+    pub async fn open_shell_resized(
+        &mut self,
+        session_id: SessionId,
+        initial: (u32, u32),
+        resized: (u32, u32),
+    ) -> russh::Channel<russh::client::Msg> {
+        let channel = self.handle.channel_open_session().await.unwrap();
+        channel
+            .set_env(true, crate::MINIMAL_SESSION_ID_ENV, session_id.to_string())
+            .await
+            .unwrap();
+        channel
+            .request_pty(true, "xterm", initial.0, initial.1, 0, 0, &[])
+            .await
+            .unwrap();
+        channel
+            .window_change(resized.0, resized.1, 0, 0)
+            .await
+            .unwrap();
+        channel.request_shell(true).await.unwrap();
+        channel
+    }
+
     /// Opens a fresh session channel, applies `env` and optionally a PTY,
     /// fires an `exec` request for `command`, writes `stdin`, then drains
     /// the channel to completion.

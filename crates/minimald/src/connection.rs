@@ -375,6 +375,34 @@ impl russh::server::Handler for ConnectionHandler {
         Ok(())
     }
 
+    /// SSH `window-change`: a terminal resize that arrives before the shell has
+    /// attached. Update the pending pty size so the session opens at the latest
+    /// dimensions. Once the shell attaches the channel is taken and further
+    /// resizes arrive as `ChannelMsg::WindowChange` in the session-host binding
+    /// loop instead, so a `None` pending config here is expected and ignored.
+    /// `window-change` never sets `want_reply`, so no channel reply is sent.
+    async fn window_change_request(
+        &mut self,
+        id: ChannelId,
+        col_width: u32,
+        row_height: u32,
+        pix_width: u32,
+        pix_height: u32,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        protocol_trace!(
+            "Got window_change_request on channel {id}: sz=({col_width}, {row_height}) p_sz=({pix_width}, {pix_height})",
+        );
+
+        if let Some(p) = self.0.lock().await.pending_config_mut(id)
+            && let Some(pty) = p.pty.as_mut()
+        {
+            pty.char_sizes = (col_width, row_height);
+            pty.pixel_sizes = (pix_width, pix_height);
+        }
+        Ok(())
+    }
+
     async fn exec_request(
         &mut self,
         id: ChannelId,

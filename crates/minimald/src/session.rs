@@ -1780,6 +1780,89 @@ mod tests {
         );
     }
 
+    /// Asks the mock program to print its terminal size (`stty size`).
+    async fn query_size(channel: &russh::Channel<russh::client::Msg>) {
+        channel
+            .data_bytes(format!("{}\n", crate::session_host::MOCK_SIZE_LINE).into_bytes())
+            .await
+            .unwrap();
+    }
+
+    /// Reads channel output until a complete `stty size` line ("rows cols")
+    /// arrives, returning `(rows, cols)`. Panics on timeout or early close.
+    async fn read_size(channel: &mut russh::Channel<russh::client::Msg>) -> (u16, u16) {
+        let mut buf = String::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), channel.wait()).await {
+                Ok(Some(ChannelMsg::Data { data })) => {
+                    buf.push_str(&String::from_utf8_lossy(&data));
+                    // Only scan complete lines (drop the trailing, possibly
+                    // partial segment) so a chunk split mid-number can't parse
+                    // as a spurious size.
+                    let mut lines: Vec<&str> = buf.split('\n').collect();
+                    lines.pop();
+                    for line in lines {
+                        let mut it = line.trim_end_matches('\r').split_whitespace();
+                        if let (Some(rows), Some(cols), None) = (it.next(), it.next(), it.next())
+                            && let (Ok(rows), Ok(cols)) = (rows.parse::<u16>(), cols.parse::<u16>())
+                        {
+                            return (rows, cols);
+                        }
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("channel closed before a size line arrived; got: {buf:?}"),
+                Err(_) => panic!("timed out waiting for a size line; got: {buf:?}"),
+            }
+        }
+    }
+
+    /// A mid-session terminal resize (SSH `window-change`) must reach the
+    /// running pty: the session host has to translate `ChannelMsg::WindowChange`
+    /// into a `TIOCSWINSZ` on the master so `stty size` inside the session
+    /// reports the new dimensions. Regression test for the binding loop dropping
+    /// every non-`RequestPty` channel message into a silent `debug` arm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn window_change_after_attach_resizes_the_pty() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        // `open_shell` negotiates an 80-col x 24-row pty, then attaches.
+        let mut channel = client.open_shell(session_id).await;
+
+        // The pty starts at the negotiated size (stty prints "rows cols").
+        query_size(&channel).await;
+        assert_eq!(read_size(&mut channel).await, (24, 80));
+
+        // Resize mid-session to 120 cols x 40 rows.
+        channel.window_change(120, 40, 0, 0).await.unwrap();
+
+        // The pty must now report the new size; before the fix the resize was
+        // dropped and this stayed (24, 80).
+        query_size(&channel).await;
+        assert_eq!(read_size(&mut channel).await, (40, 120));
+    }
+
+    /// A `window-change` that arrives *before* the shell attaches must update
+    /// the initial pty size, so the session opens at the latest dimensions.
+    /// Regression test for the connection handler having no `window_change_request`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn window_change_before_shell_sets_initial_pty_size() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        // Negotiate 80x24, then resize to 120x40 before the shell attaches.
+        let mut channel = client
+            .open_shell_resized(session_id, (80, 24), (120, 40))
+            .await;
+
+        // The pty must open at the resized dimensions, not the pty-req ones.
+        query_size(&channel).await;
+        assert_eq!(read_size(&mut channel).await, (40, 120));
+    }
+
     /// Selecting "delete" on the shell-exit prompt must tear the connection down
     /// *and* destroy the session (record removed), routed through the manager
     /// via the binding's weak handle.
