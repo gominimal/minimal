@@ -103,17 +103,13 @@ where
 
     const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-    // Drive build and copy concurrently. `build` runs on the
-    // caller task; the pipe read side pumps into `writer` on the
-    // same task via `tokio::join!` — no spawn, so no `'static`
-    // bound on W or on any of `build`'s captures.
-    //
-    // We can't use `try_join!` here: cancelling `build` mid-
-    // `append_data` would drop an unfinalized `async_tar::Builder`,
-    // which panics from its `Drop` impl. Instead, if `writer`
-    // errors or the idle-progress timeout fires, keep pulling
-    // bytes out of the pipe (into the void) so `build` can
-    // complete its `finish()` path and unwind normally (#886).
+    // Drive build and copy concurrently with `try_join!`. On error
+    // either side cancels the other: if the writer stalls, the build
+    // future is dropped — `TarZstArchive`'s `Drop` mem::forgets the
+    // inner `async_tar::Builder`, so no panic; if the build errors, the
+    // copy is dropped — the pipe and writer are cleaned up. Whichever
+    // side errors first surfaces, giving the root cause, not a
+    // secondary "broken pipe" from the other (#886).
     let build_fut = build(tx);
     let copy_fut = async {
         // Buffer the wire writes (#923): the encoder can emit many
@@ -126,7 +122,7 @@ where
         // stall on either the pipe read (tar builder stuck) or the
         // channel write (peer gone, window frozen) surfaces as an
         // error instead of an indefinite hang (#886).
-        let mut buf = [0u8; 64 * 1024];
+        let mut buf = [0u8; 8 * 1024];
         loop {
             match tokio::time::timeout(IDLE_TIMEOUT, rx.read(&mut buf)).await {
                 Ok(Ok(0)) => break,
@@ -134,41 +130,40 @@ where
                     match tokio::time::timeout(IDLE_TIMEOUT, w.write_all(&buf[..n])).await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
-                            let _ = tokio::io::copy(&mut rx, &mut tokio::io::sink()).await;
                             return Err(
                                 anyhow::Error::from(e).context("copying tar stream to writer")
                             );
                         }
                         Err(_) => {
-                            let _ = tokio::io::copy(&mut rx, &mut tokio::io::sink()).await;
                             anyhow::bail!(
-                                "upload stalled: channel write blocked for {IDLE_TIMEOUT:?} \n                                 (peer may be gone)"
+                                "upload stalled: channel write blocked for {IDLE_TIMEOUT:?} \
+                                 (peer may be gone)"
                             );
                         }
                     }
                 }
                 Ok(Err(e)) => {
-                    let _ = tokio::io::copy(&mut rx, &mut tokio::io::sink()).await;
                     return Err(anyhow::Error::from(e).context("reading from tar pipe"));
                 }
                 Err(_) => {
-                    let _ = tokio::io::copy(&mut rx, &mut tokio::io::sink()).await;
                     anyhow::bail!(
-                        "upload stalled: no data from tar builder for {IDLE_TIMEOUT:?} \n                         (read stalled)"
+                        "upload stalled: no data from tar builder for {IDLE_TIMEOUT:?} \
+                         (read stalled)"
                     );
                 }
             }
         }
-        w.flush().await.context("flushing upload writer")?;
-        w.shutdown().await.context("shutting down upload writer")?;
+        tokio::time::timeout(IDLE_TIMEOUT, w.flush())
+            .await
+            .map_err(|_| anyhow::anyhow!("upload stalled: flush blocked for {IDLE_TIMEOUT:?}"))?
+            .context("flushing upload writer")?;
+        tokio::time::timeout(IDLE_TIMEOUT, w.shutdown())
+            .await
+            .map_err(|_| anyhow::anyhow!("upload stalled: shutdown blocked for {IDLE_TIMEOUT:?}"))?
+            .context("shutting down upload writer")?;
         Ok::<_, anyhow::Error>(())
     };
-    let (build_res, copy_res) = tokio::join!(build_fut, copy_fut);
-    // Surface the writer's error first — a writer failure is
-    // usually the underlying cause and `build` will just report
-    // "broken pipe" as a secondary effect.
-    copy_res?;
-    build_res?;
+    tokio::try_join!(build_fut, copy_fut)?;
     Ok(())
 }
 
@@ -930,6 +925,29 @@ mod tests {
         let writer = StallingWriter { accepted: 0 };
         let result = stream_tar_zstd(dir.path(), writer).await;
         assert!(result.is_err(), "a stalled writer must surface as an error");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("stalled"),
+            "expected a stall error, got: {msg}"
+        );
+    }
+
+    /// `stream_via_pipe` must bail with an idle-progress timeout when the
+    /// build side never produces data, rather than hanging indefinitely
+    /// (#886). Exercises the read-stall branch: a build closure that holds
+    /// `tx` open but never writes, simulating a stuck builder (e.g. a
+    /// filesystem hang). `try_join!` cancels the build future on the read
+    /// timeout, so the test completes instead of deadlocking on `join!`.
+    #[tokio::test(start_paused = true)]
+    async fn stream_via_pipe_bails_when_builder_stalls() {
+        let result = stream_via_pipe(tokio::io::sink(), async |_tx| {
+            std::future::pending::<Result<(), anyhow::Error>>().await
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "a stalled builder must surface as an error"
+        );
         let msg = format!("{:#}", result.unwrap_err());
         assert!(
             msg.contains("stalled"),
