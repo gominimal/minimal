@@ -28,6 +28,7 @@ pub mod attrs;
 pub mod config;
 pub mod error;
 pub mod facade;
+pub mod gitops;
 pub mod scopes;
 pub mod secret;
 pub mod store;
