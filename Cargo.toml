@@ -103,7 +103,9 @@ lzma-rs = "0.3"
 nickel-lang-core = { git = "https://github.com/nickel-lang/nickel.git", rev = "e8a0ab95e52ab31ac9a8ae1a3bef854d8de73cea", default-features = false, features = ["format"] }
 
 opentelemetry-semantic-conventions = "0.32"
-nix = { version = "0.31", features = ["fs", "user"] }
+# `socket` + `time`: the guest's vsock timekeep listener binds an AF_VSOCK
+# datagram socket and steps CLOCK_REALTIME from the host's updates.
+nix = { version = "0.31", features = ["fs", "socket", "time", "user"] }
 nutype = { version = "0.7", features = ["serde"] }
 object = { version = "0.39", default-features = false, features = ["archive", "elf", "read_core", "std"] }
 oci-spec = "0.10"
