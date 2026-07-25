@@ -13,7 +13,40 @@ publish.workspace = true
 # reqwest/tokio dependencies as `optional = true` here.
 default = []
 
+# TEST-SUPPORT ships a programmable, in-process mock GitHub (`testing` module)
+# plus the `github-mock` binary: an OAuth device-flow + REST fake and an
+# auth-enforcing git smart-HTTP endpoint (backed by `git http-backend`) used to
+# exercise the daemon's auth/refresh/git paths without touching real GitHub.
+#
+# It is hand-rolled on the workspace tokio TCP stack, so it adds NO new external
+# runtime dependency beyond crates already in the lockfile (tokio, serde_json,
+# base64, tempfile). No production code depends on this feature.
+test-support = ["dep:tokio", "dep:base64", "dep:tempfile"]
+
 [dependencies]
 thiserror.workspace = true
 url.workspace = true
 zeroize.workspace = true
+
+# For the on-disk grant store (`store.rs`): JSON encoding plus timestamps for
+# token expiry/refresh bookkeeping. Local filesystem I/O only — no network
+# stack, so this stays compatible with the "no HTTP stack" promise above.
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Enabled only by `test-support` (see the feature note above).
+base64 = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# The out-of-process mock used by scripts/session-e2e.sh. Compiled only when the
+# `test-support` feature is on, so the default build (and its consumers) never
+# builds a binary or pulls the tokio HTTP stack.
+[[bin]]
+name = "github-mock"
+path = "src/bin/github-mock.rs"
+required-features = ["test-support"]
