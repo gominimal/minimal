@@ -172,7 +172,6 @@ impl SessionComposer {
             daemon_vars = vars.len(),
             daemon_patches = patches.len(),
             daemon_packages = packages.len(),
-            daemon_lifecycle_hooks = lifecycle_hooks.len(),
             "compose: daemon-side contribution collected",
         );
         if vars.is_empty() && patches.is_empty() {

@@ -62,6 +62,11 @@ impl Composable for ProjectComposable {
         let source = Source::Project {
             path: self.project_path,
         };
+        // Session transition scripts declared in a project `[session]`
+        // block are accepted and composed like any other primitive; the
+        // feature is gated off for this release purely at the output and
+        // execution layers (see `crates/minimald/src/session_host.rs`),
+        // not by dropping them here.
         contribute_primitives(
             &source,
             self.session.packages,
@@ -114,6 +119,9 @@ mod tests {
         assert_eq!(contribution.vars().len(), 2);
         assert_eq!(contribution.patches().len(), 1);
         assert_eq!(contribution.packages().len(), 2);
+        // A declared project hook is accepted and composed — the feature
+        // is disabled downstream (output + execution), not by dropping it
+        // here.
         assert_eq!(contribution.lifecycle_hooks().len(), 1);
 
         // Provenance is Source::Project everywhere, carrying the
