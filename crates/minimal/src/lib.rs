@@ -459,6 +459,9 @@ pub struct AddArgs {
 #[derive(Debug, Args)]
 #[group(required = true, multiple = false)]
 pub struct AddKind {
+    /// Add to sessions using the project
+    #[arg(long)]
+    pub session: bool,
     /// Add as a runtime dependency
     #[arg(long)]
     pub runtime: bool,
@@ -2345,6 +2348,11 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
             &graph,
             graph.top_levels.clone(),
             mctx::AddDepMode::TaskPackages { name: task },
+        )?,
+        AddKind { session: true, .. } => ctx.add_deps(
+            &graph,
+            graph.top_levels.clone(),
+            mctx::AddDepMode::SessionPackages,
         )?,
         _ => unreachable!(),
     }
