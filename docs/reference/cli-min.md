@@ -175,6 +175,31 @@ min completions <SHELL>
 Generates a shell tab-completion script. Supported shells include `bash`, `zsh`,
 `elvish`, `fish`. Usage: `source <(min completions bash)`.
 
+What it emits is a short *registration* shim, not a completion table: it teaches
+the shell to ask `min` itself what to offer. That indirection is what makes
+session arguments completable — `min attach <TAB>` lists live session names, and
+`min attach 019<TAB>` lists session IDs, neither of which exists at the time a
+static script would be written. Every argument documented as "UUID or session
+name" completes this way: `attach`, `destroy`, `rename`, `session policy`, and
+`ssh-forward`.
+
+Session completion is best-effort by design. It never starts a daemon — with
+none running there is nothing to list, and booting a VM on a keystroke would be
+a poor trade — and it gives up rather than make you wait if the daemon does not
+answer promptly. In both cases the shell simply offers nothing.
+
+To see the candidates without a shell in the loop, or to check completion
+against a non-default backend:
+
+```
+min complete-session-str [<prefix>]              # value<TAB>description per line
+min --provider local-minvmd complete-session-str # honours global args
+```
+
+The in-process completer cannot see global args (clap hands a value completer
+only the word being typed), so it always resolves the default backend; this
+hidden command is the way to check any other.
+
 ## `git push min://` - the git remote helper
 
 Installs of `min` lay down a `bin/git-remote-min` symlink pointing at the
