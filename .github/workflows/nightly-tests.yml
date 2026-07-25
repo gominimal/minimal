@@ -302,6 +302,10 @@ jobs:
       # for this job so `cargo miri` resolves the nightly installed below (same
       # mechanism the beta/nightly-rustc canaries use).
       RUSTUP_TOOLCHAIN: nightly
+      # graph's env_setup tests create directories; disable miri's isolation so
+      # those syscalls are permitted. miri still checks the graph/planner logic
+      # for undefined behavior — the reason to run it here.
+      MIRIFLAGS: -Zmiri-disable-isolation
     steps:
       - uses: actions/checkout@v7
         with:
