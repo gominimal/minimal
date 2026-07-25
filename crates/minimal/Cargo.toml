@@ -1,5 +1,6 @@
 [package]
 name = "minimal"
+rust-version.workspace = true
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

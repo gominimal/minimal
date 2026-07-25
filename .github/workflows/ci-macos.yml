@@ -14,6 +14,12 @@ on:
     pull_request:
         branches: ["main"]
     workflow_dispatch:
+    # Reusable so the nightly test tier can run the macOS/HVF e2e on a schedule
+    # (nightly-tests.yml `macos-e2e`). On a scheduled call `github.event_name`
+    # is the caller's event (not `pull_request`), so the lane's internal path
+    # filter is bypassed and the full hypervisor e2e runs. No secrets are used
+    # by this workflow, so the call needs none.
+    workflow_call:
 
 env:
     CARGO_TERM_COLOR: always

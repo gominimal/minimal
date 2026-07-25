@@ -35,6 +35,10 @@ resolver = "3"
 package.edition = "2024"
 package.publish = false
 package.license = "Apache-2.0"
+# Minimum supported Rust version, verified by the nightly `msrv` job
+# (`cargo hack check --rust-version`). Every crate inherits this via
+# `rust-version.workspace = true`; bump here, in one place, when the floor moves.
+package.rust-version = "1.91"
 # Shared base version for the workspace. This is the fallback the `version` crate
 # reports when no `v*` git tag is reachable; the real release version comes from
 # `git describe` at build time. See crates/version/build.rs.

@@ -1,0 +1,73 @@
+# zizmor configuration — governs the workflow-security lint run by the nightly
+# `hygiene` job (`zizmor .github/workflows/`).
+#
+# Two things live here:
+#   1. The `unpinned-uses` policy, set to `ref-pin`, which encodes this repo's
+#      deliberate pinning convention: actions are pinned to a tag/ref, and the
+#      security-sensitive ones (auth/token/slack/paths-filter) are additionally
+#      pinned to a full commit SHA by hand. zizmor's default blanket hash-pin
+#      would flag every `actions/checkout@v7`-style tag pin in the tree.
+#   2. Scoped, individually-justified ignores for a small set of pre-existing
+#      findings, all in the release pipeline (release/promote/nightly) plus
+#      commitlint. Each is intentional and lives in a manually- or
+#      schedule-triggered, trusted-ref workflow. They are suppressed here (not
+#      silently) so the hygiene run is green and actionable; revisit them if the
+#      release pipeline gets a dedicated hardening pass.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # Tag/ref pin is the floor; hand-applied SHA pins still satisfy it.
+        "*": ref-pin
+
+  excessive-permissions:
+    ignore:
+      # nightly.yml cuts a GitHub release and uses OIDC for the GCS auth in
+      # promote-nightly; contents:write + id-token:write are required, and the
+      # workflow is schedule/dispatch-only on a trusted ref.
+      - nightly.yml:25
+      - nightly.yml:26
+
+  secrets-inherit:
+    ignore:
+      # nightly.yml reuses release.yml (same repo) via `secrets: inherit`; the
+      # called workflow needs the release/signing secrets and this is an
+      # internal, first-party reuse.
+      - nightly.yml:68
+
+  github-app:
+    ignore:
+      # promote.yml mints a short-lived app token (SHA-pinned action) for the
+      # channel-pointer flip; the app installation is already scoped to this repo.
+      - promote.yml:243
+
+  cache-poisoning:
+    ignore:
+      # release.yml is tag/dispatch-triggered on trusted refs; rust-cache here is
+      # build-acceleration for signed artifacts whose provenance is verified
+      # downstream (verify-nightly-provenance).
+      - release.yml:135
+      - release.yml:247
+
+  template-injection:
+    ignore:
+      # `steps.release_info.outputs.short_sha` is a git short-SHA produced by an
+      # internal step of this same trusted workflow, not attacker-controllable.
+      - release.yml:811
+      - release.yml:823
+      - release.yml:831
+
+  artipacked:
+    ignore:
+      # Default-credential checkouts in trusted, non-fork release/promote/commit
+      # workflows. No untrusted code runs before these steps; the git token is
+      # not exfiltrated. (Hardening to `persist-credentials: false` per job is a
+      # separate release-pipeline pass.)
+      - commitlint.yml:20
+      - nightly.yml:45
+      - nightly.yml:415
+      - promote.yml:169
+      - release.yml:118
+      - release.yml:232
+      - release.yml:685
+      - release.yml:786

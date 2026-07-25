@@ -337,6 +337,36 @@ specific PR:
 
 Nightly failures should notify (issue-on-failure or Slack), not just rot in the Actions tab.
 
+**As implemented** (`nightly-tests.yml`), mapping each row to what actually runs:
+
+- **Extended e2e** — the `session-e2e-soak` job (10× serial reps) plus a **concurrency
+  stress** step (`scripts/stress-session-e2e.sh`, N sessions minted in parallel);
+  supervision/restart/kill lands as the auto-discovered
+  `crates/minvmd/tests/supervision_integration.rs` harness (restart cycle + dirty-kill
+  repair) and the restart cycle added to `scripts/minvmd-lifecycle.sh` — both of which run
+  on **Linux/KVM and macOS/HVF**, the latter via the `macos-e2e` job that reuses
+  `ci-macos.yml` through `workflow_call`.
+- **Toolchain canaries** — `beta-canary` and `nightly-rustc-canary` jobs, both
+  `continue-on-error`.
+- **`cargo-deny` advisories** — the `advisories` job (blocking → feeds `notify`).
+- **Latest-deps canary** — the `update-canary` job (`continue-on-error`).
+- **MSRV** — the `msrv` job, driven by `just msrv` (blocking → feeds `notify`); the floor
+  is declared once as `[workspace.package] rust-version` and inherited by every crate.
+- **miri** — the `miri` job over the pure logic/protocol crates (`just miri`).
+  **Non-blocking** (`continue-on-error`): miri is nightly-sensitive and slow, so it is read
+  in the run rather than gated. The concurrency-stress step is likewise non-fatal until it
+  has settled.
+- **Hygiene** — the `hygiene` job (`continue-on-error`); `zizmor`'s pin policy and the
+  documented finding ignores live in `.github/zizmor.yml`, `actionlint`'s runner-label
+  allowlist in `.github/actionlint.yaml`.
+- **Cache priming** — `session-e2e-soak` and the `msrv`/`miri` jobs restore+save their own
+  cache classes (`save-if` main-only) so a scheduled main run keeps them warm.
+
+Not in the table but present: the `installer` job re-runs the shell-installer suite nightly
+(reused from `ci-shell-installer.yml` via `workflow_call`), catching runner-image shell
+drift the path-scoped PR lane would miss. Blocking jobs (`advisories`, `session-e2e-soak`,
+`installer`, `msrv`, `macos-e2e`) feed `notify`; the canaries and `miri` deliberately do not.
+
 ---
 
 ## 7. Self-hosted Mac runner
@@ -395,11 +425,13 @@ that bevy (`cargo run -p ci`) and propolis (`cargo xtask phd`) use; here the jus
 | Process-mode e2e (Linux) | ✅ | ✅ | ✅ |
 | VM smoke e2e, Linux/KVM (hosted) | ✅ | ✅ | ✅ |
 | VM smoke e2e, macOS/HVF (self-hosted) | label / same-repo only | ✅ | ✅ |
-| Extended e2e, stress, supervision/restart | - | - | ✅ |
+| Extended e2e, supervision/restart (blocking) + concurrency stress (non-blocking) | - | - | ✅ |
 | beta/nightly rustc canaries | - | - | ✅ non-blocking |
-| MSRV (`cargo hack check --rust-version`) | optional | - | ✅ |
+| MSRV (`cargo hack check --rust-version`) | optional | - | ✅ blocking |
 | `cargo update` latest-deps canary | - | - | ✅ non-blocking |
-| miri (protocol crates), cargo-machete, actionlint/zizmor | - | - | ✅ |
+| miri (protocol crates) | - | - | ✅ non-blocking |
+| Hygiene: cargo-machete, actionlint/zizmor | - | - | ✅ non-blocking |
+| Shell-installer suite (runner-image drift) | path-scoped | - | ✅ blocking |
 | Cache write (`save-if`) | ❌ restore-only | ✅ | ✅ (primes caches) |
 
 ---

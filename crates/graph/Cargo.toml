@@ -2,7 +2,7 @@
 name = "graph"
 version = "0.0.1"
 edition.workspace = true
-rust-version = "1.91"
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 

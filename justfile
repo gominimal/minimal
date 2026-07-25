@@ -179,6 +179,23 @@ clippy:
 deny: (_need "cargo-deny" "cargo install cargo-deny --locked")
     cargo deny --all-features check
 
+# The declared MSRV floor (`package.rust-version` in the root Cargo.toml, inherited
+# by every crate) still type-checks. cargo-hack drives the check against the
+# declared version; the toolchain the check runs under is fetched by rustup.
+# CI: nightly-tests.yml `msrv` (blocking).
+msrv: (_need "cargo-hack" "cargo install cargo-hack --locked")
+    cargo hack check --rust-version --workspace --all-targets --locked
+
+# miri on the pure in-memory logic crates — no FFI, syscalls, or real IO. `graph`
+# (dependency graph + planner ordering/cycle detection) is the "supervision state
+# machines" surface of docs/ci-strategy.md §6 with real, miri-clean tests; crates
+# that touch the filesystem (common's file_cache) or have no tests (switch) are
+# deliberately excluded. Needs the nightly toolchain + miri component:
+#   rustup toolchain install nightly && rustup +nightly component add miri
+# CI: nightly-tests.yml `miri` (non-blocking). Widen the set as more crates prove clean.
+miri:
+    cargo +nightly miri test -p graph
+
 # Unit + in-process integration tests. CI: every lane's core-tests suite.
 test: _nextest
     cargo nextest run {{scope}} {{ci-profile}} --locked --no-tests=fail
@@ -336,6 +353,13 @@ soak n="10": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
 # Bulk host→guest upload proof (#869): N `min activate`s of a large, compressible project.
 bulk-upload n="5": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/bulk-upload-e2e.sh {{n}}
+
+# Mints N sessions CONCURRENTLY against one daemon (vs. the soak's N-serial reps),
+# then bulk-tears-down — the supervision-under-load surface of ci-strategy §6.
+#
+# Concurrency stress proof. CI: a non-fatal step in nightly-tests.yml `session-e2e-soak`.
+stress n="5": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
+    {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/stress-session-e2e.sh {{n}}
 
 # ── stack bring-up ───────────────────────────────────────────────────────────
 #
