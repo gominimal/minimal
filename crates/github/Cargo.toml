@@ -1,0 +1,19 @@
+[package]
+name = "github"
+version = "0.0.1"
+license = "MIT OR Apache-2.0"
+edition.workspace = true
+publish.workspace = true
+
+[features]
+# DEFAULT features are pure domain types with no I/O and no reqwest, so cheap
+# consumers (mfile, minimal) can depend on this crate without pulling an HTTP
+# stack. The device-flow + GitHub API `client` feature is added by a later task;
+# it will gate a `client` module behind `#[cfg(feature = "client")]` and add the
+# reqwest/tokio dependencies as `optional = true` here.
+default = []
+
+[dependencies]
+thiserror.workspace = true
+url.workspace = true
+zeroize.workspace = true

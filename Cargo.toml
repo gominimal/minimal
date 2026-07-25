@@ -9,6 +9,7 @@ members = [
     "crates/common",
     "crates/decode",
     "crates/diagnostics",
+    "crates/github",
     "crates/graph",
     "crates/mctx",
     "crates/mfile",
@@ -145,6 +146,7 @@ thiserror = "2"
 url = "2" # keep in sync with reqwest
 uuid = { version = "1.23", features = ["v4", "v7", "serde"] }
 vt100-ctt = { version = "0.17", default-features = false }
+zeroize = "1.9"
 zstd = "0.13"
 
 moka = { version = "0.12", default-features = false, features = ["sync"] }
@@ -166,6 +168,7 @@ checkouts = { path = "crates/checkouts" }
 common = { path = "crates/common" }
 decode = { path = "crates/decode" }
 diagnostics = { path = "crates/diagnostics" }
+github = { path = "crates/github" }
 mctx = { path = "crates/mctx" }
 minimald-rpc = { path = "crates/minimald-rpc" }
 mfile = { path = "crates/mfile" }
