@@ -324,6 +324,7 @@ enum BindingMsg {
     TeardownDueToProcessExit(Option<std::io::Error>),
     TeardownDueToSuperceded(Vec<u8>),
     TeardownDueToDetach(Vec<u8>),
+    TeardownDueToDaemonShutdown(Vec<u8>),
 }
 
 /// A connection between a [`Host`] and an SSH channel.
@@ -379,6 +380,7 @@ impl Binding {
             Detach,
             Superceded,
             ProcessExited,
+            Shutdown,
         }
 
         // Reading from the remote stops once it sends EOF;
@@ -447,6 +449,11 @@ impl Binding {
                             let _ = w.write_all(&unwind_codes).await;
                             let _ = w.write_all(b"\r\nDisconnecting - session attached to from a different connection\r\n").await;
                             break MainloopExitReason::Superceded;
+                        }
+                        BindingMsg::TeardownDueToDaemonShutdown(unwind_codes) => {
+                            let _ = w.write_all(&unwind_codes).await;
+                            let _ = w.write_all(b"\r\nDisconnecting - minimald is shutting down\r\n").await;
+                            break MainloopExitReason::Shutdown;
                         }
                         BindingMsg::TeardownDueToDetach(unwind_codes) => {
                             let _ = w.write_all(&unwind_codes).await;
@@ -560,7 +567,7 @@ pub(crate) struct Launched<P, G> {
 
 /// Actor messages to a [`Host`].
 enum Message {
-    Kill,
+    Kill(bool),
     Attach(Channel<Msg>, WinSize),
     GetAttrs(oneshot::Sender<HostAttrs>),
 
@@ -636,8 +643,8 @@ impl HostHandle {
         }
     }
 
-    pub async fn kill(&self) -> Result<(), ()> {
-        match self.sender.send(Message::Kill).await {
+    pub async fn kill(&self, for_shutdown: bool) -> Result<(), ()> {
+        match self.sender.send(Message::Kill(for_shutdown)).await {
             Ok(()) => Ok(()),
             Err(_e) => Err(()), // closed
         }
@@ -1412,7 +1419,17 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             // Read actor messages.
             Some(msg) = self.receiver.recv() => {
                 match msg {
-                    Message::Kill => {
+                    Message::Kill(for_shutdown) => {
+                        if for_shutdown
+                            && let Some((old_tx, old_join_hnd)) = self.remote.take() {
+                                // If there was a binding we just swapped out, tell it to
+                                // shut down and wait for it to finish.
+                                let _ = old_tx
+                                    .send(BindingMsg::TeardownDueToDaemonShutdown(self.unwind_codes()))
+                                    .await;
+                                let _ = old_join_hnd.await;
+                            }
+
                         if let Err(e) = self.process.kill() {
                             tracing::warn!(error = %e, "killing session process");
                         }
@@ -1811,7 +1828,10 @@ mod tests {
         .expect("failed to build host");
         let task = tokio::spawn(host.mainloop());
 
-        handle.kill().await.expect("kill should reach the host");
+        handle
+            .kill(false)
+            .await
+            .expect("kill should reach the host");
 
         // The mainloop must terminate (task resolves) without panicking. A
         // `JoinError` here would mean the host task panicked during teardown.
@@ -1991,7 +2011,7 @@ mod tests {
         );
 
         // Only now, on an explicit kill (destroy), is the network released.
-        handle.kill().await.expect("kill should reach the host");
+        handle.kill(true).await.expect("kill should reach the host");
         tokio::time::timeout(Duration::from_secs(10), task)
             .await
             .expect("mainloop should terminate after kill")

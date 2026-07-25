@@ -609,14 +609,14 @@ impl Session {
                 });
             }
             SessionMessage::Stop(r) => {
-                self.stop_running().await;
+                self.stop_running(true).await;
                 #[cfg(target_os = "linux")]
                 self.deregister_hostname().await;
                 let _ = r.send(());
                 return ControlFlow::Break(Teardown::ManagerInitiated);
             }
             SessionMessage::Destroy(r) => {
-                self.stop_running().await;
+                self.stop_running(false).await;
                 // Withdraw the hostname before the fallible record delete, so
                 // a delete failure leaves a stale on-disk record (repairable
                 // on restart) but never a stale routing entry pointing at a
@@ -952,7 +952,11 @@ impl Session {
 
     /// Tears down any runtime objects, such as the host or side ops. Shutdown
     /// of these objects is complete once awaited.
-    async fn stop_running(&mut self) {
+    ///
+    /// `for_shutdown` is threaded to the host's kill so attached clients get
+    /// the daemon-shutdown message (and a terminal reset) rather than a bare
+    /// disconnect when the session dies because the daemon is going away.
+    async fn stop_running(&mut self, for_shutdown: bool) {
         let inner = match &mut self.inner {
             SessionInner::Active { host, sops, .. } => Some((host.take(), std::mem::take(sops))),
             SessionInner::Draft { .. } => None,
@@ -965,7 +969,7 @@ impl Session {
                 // Signal the process to die, then await the runtime loop so the
                 // sandbox files backing its rootfs are released before the caller
                 // removes the session's directory tree.
-                let _ = host.kill().await;
+                let _ = host.kill(for_shutdown).await;
                 let _ = task.await;
             }
         }
