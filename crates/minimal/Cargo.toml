@@ -26,7 +26,20 @@ anyhow.workspace = true
 async-compression.workspace = true
 async-tar.workspace = true
 clap.workspace = true
-clap_complete.workspace = true
+# `unstable-dynamic` buys the completion engine behind `min`'s runtime session
+# completion. Three files depend on it:
+#
+#   completion.rs  `ArgValueCompleter` / `CompletionCandidate` — per-argument
+#                  candidates computed by the binary itself.
+#   main.rs        `CompleteEnv` — the entrypoint hook a completing shell
+#                  re-enters the binary through.
+#   lib.rs         `env::Shells` + `EnvCompleter::write_registration` — how
+#                  `min completions <shell>` renders the registration shim.
+#
+# Unstable in the semver sense: exempt from clap_complete's stability guarantee
+# and free to change under a minor bump. Those are the call sites to check when
+# it does.
+clap_complete = { workspace = true, features = ["unstable-dynamic"] }
 camino.workspace = true
 chrono.workspace = true
 constcat.workspace = true

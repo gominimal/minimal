@@ -1,7 +1,7 @@
 //! The minimal CLI which pairs/talks-with minimald.
 
 use anyhow::{Context as _, bail};
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
 use std::io::IsTerminal as _;
 use std::io::Write as _;
@@ -12,6 +12,7 @@ use tokio::io::AsyncWriteExt as _;
 mod attach;
 pub mod autospawn;
 pub mod client;
+pub mod completion;
 pub mod config;
 pub mod diag;
 pub mod dirs;
@@ -124,6 +125,17 @@ pub enum Command {
     /// on Ctrl-C, whichever comes first.
     #[command(hide = true)]
     Spin(SpinArgs),
+    /// Print session-identifier completion candidates (used by the shell).
+    ///
+    /// The completion path a shell actually takes runs in-process (see
+    /// `completion.rs`); this is the same candidate list on stdout, one
+    /// `value<TAB>description` per line. It exists to be debugged by hand and
+    /// scripted against, and to honour global args — `--provider`,
+    /// `--minimal-dir` — that the in-process completer cannot see.
+    ///
+    /// Never starts a daemon and never fails: no daemon means no output.
+    #[command(name = completion::COMPLETE_SESSION_STR, hide = true)]
+    CompleteSessionStr(CompleteSessionStrArgs),
     /// Generate shell completion script
     #[command(
         long_about = "Generate a shell tab-completion script for the min CLI.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(min completions bash)"
@@ -146,6 +158,7 @@ pub enum SessionCommand {
 #[derive(Debug, Args)]
 pub struct PolicyArgs {
     /// Session identifier (UUID or session name)
+    #[arg(add = completion::session_completer())]
     pub session: String,
 }
 
@@ -395,6 +408,7 @@ pub struct AttachArgs {
     /// resolves a session from the current working directory (or the only
     /// existing session), and opens an interactive picker if the choice is
     /// ambiguous. See `--no-input` to skip the picker in scripts.
+    #[arg(add = completion::session_completer())]
     pub session: Option<String>,
     /// Command to exec in the session context (non-interactive)
     #[arg(long, short)]
@@ -414,7 +428,11 @@ pub struct LsArgs {
 #[derive(Debug, Args)]
 pub struct DestroyArgs {
     /// Session identifier (UUID or session name)
-    #[arg(required_unless_present = "all", conflicts_with = "all")]
+    #[arg(
+        required_unless_present = "all",
+        conflicts_with = "all",
+        add = completion::session_completer()
+    )]
     pub session: Option<String>,
     /// Destroy all sessions
     #[arg(long)]
@@ -434,6 +452,7 @@ pub struct StopArgs {
 #[derive(Debug, Args)]
 pub struct RenameArgs {
     /// Session identifier (UUID or session name)
+    #[arg(add = completion::session_completer())]
     pub session: String,
     /// New name for the session
     pub new_name: String,
@@ -496,6 +515,7 @@ pub struct ProxyArgs {
 #[derive(Debug, Args)]
 pub struct SshForwardArgs {
     /// Session identifier (UUID or session name)
+    #[arg(add = completion::session_completer())]
     pub session: String,
     /// Port-forward specification: `<local-port>:<remote-host>:<remote-port>`
     ///
@@ -512,6 +532,13 @@ pub struct LoginArgs {
     /// (default: `~/.config/minimal/`).
     #[arg(long)]
     pub cert_dir: Option<PathBuf>,
+}
+
+/// Arguments for the hidden `min complete-session-str`.
+#[derive(Debug, Args)]
+pub struct CompleteSessionStrArgs {
+    /// Only offer candidates starting with this prefix (default: all).
+    pub prefix: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -585,12 +612,10 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Update(args)) => cmd_update(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
-        Some(Command::Completions(CompletionsArgs { shell })) => {
-            let mut cmd = Cli::command();
-            let name = cmd.get_name().to_string();
-            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
-            Ok(())
+        Some(Command::CompleteSessionStr(args)) => {
+            completion::cmd_complete_session_str(&cli.global_args, args).await
         }
+        Some(Command::Completions(CompletionsArgs { shell })) => cmd_completions(shell),
     }
 }
 
@@ -781,6 +806,47 @@ fn confirm(question: &str, default: bool) -> Result<bool, anyhow::Error> {
         trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes")
     })
 }
+
+/// Print the shell integration for `shell` on stdout.
+///
+/// This is a *registration* shim, not a completion table: a dozen lines that
+/// teach the shell to ask `min` itself what to complete, rather than the
+/// thousand-line static script this used to emit. That indirection is the
+/// whole point — session names and IDs only exist at runtime, so a table
+/// baked at install time cannot contain them (see `completion.rs`).
+///
+/// The installed file paths are unchanged, and so is
+/// `scripts/install.sh` (R9.3): zsh's shim still opens with `#compdef min`,
+/// so it autoloads from an fpath dir as `_min`, and bash's and fish's are
+/// still plain source-able files.
+///
+/// The shim calls `min` by bare name so it resolves through `PATH` — an
+/// upgrade that moves the binary keeps working, and the installer puts its
+/// bindir on `PATH` in the same breath as writing this file.
+fn cmd_completions(shell: Shell) -> Result<(), anyhow::Error> {
+    let name = shell.to_string();
+    let shells = clap_complete::env::Shells::builtins();
+    let completer = shells
+        .completer(&name)
+        .with_context(|| format!("no shell integration for `{name}`"))?;
+
+    let mut out = Vec::new();
+    completer
+        .write_registration(COMPLETE_VAR, "min", "min", "min", &mut out)
+        .context("render shell integration")?;
+
+    std::io::stdout()
+        .write_all(&out)
+        .context("write shell integration to stdout")?;
+    Ok(())
+}
+
+/// The environment variable a shell sets to ask `min` for completions.
+///
+/// clap_complete's default, named here because both ends have to agree: the
+/// shim emitted by [`cmd_completions`] sets it, and the `CompleteEnv` call in
+/// `main.rs` reads it.
+pub const COMPLETE_VAR: &str = "COMPLETE";
 
 /// List sessions via the `ListSessions` RPC.
 pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Error> {
