@@ -153,9 +153,15 @@ impl SessionComposer {
     ) -> Result<ComposeOutcome, ComposeError> {
         let Self {
             client,
-            contribution,
+            mut contribution,
             env: _,
         } = self;
+        // Packages may not supply patches, nor vars that carry user data
+        // (env-inherited values). Strip them before gating so they never
+        // reach the client as pending items or land in the Composition;
+        // an item a package shares with a project or loadout still
+        // composes in via that other source's own entry.
+        contribution.drop_package_supplied_patches_and_user_data_vars();
         let Contribution {
             vars,
             patches,
