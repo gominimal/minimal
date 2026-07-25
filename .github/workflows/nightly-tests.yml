@@ -269,7 +269,10 @@ jobs:
     # matching toolchain via rustup. BLOCKING — the declared floor is a promise
     # — so it feeds `notify`.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # cargo-hack --rust-version does a full cold workspace check under the 1.91
+    # toolchain (separate from the 1.97 build cache), which is slow on a first
+    # run; give it room so it isn't killed mid-compile.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
@@ -294,6 +297,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     continue-on-error: true
+    env:
+      # rust-toolchain.toml pins 1.97.0, which has no miri component; override it
+      # for this job so `cargo miri` resolves the nightly installed below (same
+      # mechanism the beta/nightly-rustc canaries use).
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v7
         with:
@@ -309,7 +317,7 @@ jobs:
       - name: cargo miri setup
         run: cargo miri setup
       - name: cargo miri test (pure crates)
-        # Mirrors `just miri`; nightly is the default toolchain here so no +nightly.
+        # Mirrors `just miri`; RUSTUP_TOOLCHAIN=nightly is set at job level.
         run: cargo miri test -p graph
 
   nightly-rustc-canary:
