@@ -186,14 +186,13 @@ deny: (_need "cargo-deny" "cargo install cargo-deny --locked")
 msrv: (_need "cargo-hack" "cargo install cargo-hack --locked")
     cargo hack check --rust-version --workspace --all-targets --locked
 
-# miri on `graph` (dependency graph + planner ordering/cycle detection) — the
-# core-logic "state machines" surface of docs/ci-strategy.md §6. Its env_setup
-# tests create dirs, so isolation is disabled; miri still checks the graph logic
-# for undefined behavior. Needs the nightly toolchain + miri component:
+# miri on `switch` — the vsock/subnet/MAC primitives (docs/ci-strategy.md §6
+# "vsock framing"). Zero deps + pure integer/IP tests, so it compiles and
+# interprets under miri in seconds. Needs the nightly toolchain + miri component:
 #   rustup toolchain install nightly && rustup +nightly component add miri
 # CI: nightly-tests.yml `miri` (non-blocking). Widen the set as more crates prove clean.
 miri:
-    MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p graph
+    cargo +nightly miri test -p switch
 
 # Unit + in-process integration tests. CI: every lane's core-tests suite.
 test: _nextest
