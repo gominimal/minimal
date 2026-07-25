@@ -6,7 +6,6 @@
 //! The [`Host`] struct holds the running state of an active session.
 
 use async_dialog::Selection;
-use either::Either;
 use russh::Channel;
 use russh::server::Msg;
 #[cfg(not(test))]
@@ -327,6 +326,18 @@ enum BindingMsg {
     TeardownDueToDaemonShutdown(Vec<u8>),
 }
 
+/// Messages from the binding (user terminal) to the shell process / host.
+enum StdinMsg {
+    Bytes(bytes::Bytes),
+    TerminalUpdate(RequestedPty),
+    WindowChange {
+        col_width: u32,
+        row_height: u32,
+        pix_width: u32,
+        pix_height: u32,
+    },
+}
+
 /// A connection between a [`Host`] and an SSH channel.
 ///
 /// The [`Binding`] is owned by the spawned async task, but the
@@ -336,7 +347,7 @@ struct Binding {
     /// The remote end of this binding.
     channel: Channel<Msg>,
     /// Channel the binding writes down to communicate stdin to the host.
-    stdin_tx: mpsc::Sender<Either<bytes::Bytes, RequestedPty>>,
+    stdin_tx: mpsc::Sender<StdinMsg>,
     /// Channel the [`Host`] uses to communicate with this [`Binding`].
     receiver: mpsc::Receiver<BindingMsg>,
     /// Capability to destroy the owning session, exercised when the user picks
@@ -350,7 +361,7 @@ impl Binding {
     /// which the owning [`Host`] should own to communicate with it.
     pub(crate) async fn spawn(
         channel: Channel<Msg>,
-        stdin_tx: mpsc::Sender<Either<bytes::Bytes, RequestedPty>>,
+        stdin_tx: mpsc::Sender<StdinMsg>,
         control: Option<SessionControl>,
     ) -> (mpsc::Sender<BindingMsg>, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(4);
@@ -394,7 +405,7 @@ impl Binding {
                     Some(msg) => {
                         match msg {
                             russh::ChannelMsg::Data{ data } => {
-                                let _ = self.stdin_tx.send(Either::Left(data)).await;
+                                let _ = self.stdin_tx.send(StdinMsg::Bytes(data)).await;
                             }
                             russh::ChannelMsg::RequestPty {
                                 want_reply: _,
@@ -405,12 +416,22 @@ impl Binding {
                                 pix_height,
                                 terminal_modes,
                             } => {
-                                let _ = self.stdin_tx.send(Either::Right(RequestedPty {
+                                let _ = self.stdin_tx.send(StdinMsg::TerminalUpdate(RequestedPty {
                                     char_sizes: (col_width, row_height),
                                     pixel_sizes: (pix_width, pix_height),
                                     term: term.to_string(),
                                     modes: terminal_modes.to_vec(),
                                 })).await;
+                            },
+                            russh::ChannelMsg::WindowChange{
+                                col_width,
+                                row_height,
+                                pix_width,
+                                pix_height,
+                            } => {
+                                let _ = self.stdin_tx.send(StdinMsg::WindowChange{
+                                    col_width, row_height, pix_width, pix_height,
+                                }).await;
                             },
                             // Flow-control window updates fire on every
                             // burst of bytes forwarded through the
@@ -718,10 +739,10 @@ pub(crate) struct Host<P: SessionProcess, G: Send + 'static> {
     // Writer for bytes coming from the remote - i.e. 'stdin' keystrokes
     // that need to get written to the pty. Clones of this sender are
     // given to [`Binding::spawn`].
-    remote_tx: mpsc::Sender<Either<bytes::Bytes, RequestedPty>>,
+    remote_tx: mpsc::Sender<StdinMsg>,
     // Recieve-end for bytes coming from the remote - i.e. 'stdin' keystrokes.
     // We process this end.
-    remote_rx: mpsc::Receiver<Either<bytes::Bytes, RequestedPty>>,
+    remote_rx: mpsc::Receiver<StdinMsg>,
 
     // Temporary buffer for reading from the pty master (i.e. 'stdout').
     stdout_buf: Vec<u8>,
@@ -1503,7 +1524,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             // pending writes to the pty are serviced async by their own select arm (below).
             Some(msg) = self.remote_rx.recv(), if self.stdin_buf.is_none() => {
                 match msg {
-                    Either::Left(b) => {
+                    StdinMsg::Bytes(b) => {
                         self.attrs.stdin_last = Some(SystemTime::now());
 
                         // ctrl-w
@@ -1526,8 +1547,16 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                             self.stdin_buf = Some((b, 0));
                         };
                     }
-                    Either::Right(sz) => {
+                    StdinMsg::TerminalUpdate(sz) => {
                         self.set_size(WinSize::from(&sz));
+                    },
+                    StdinMsg::WindowChange{ col_width, row_height, pix_height, pix_width } => {
+                        self.set_size(WinSize {
+                            rows: row_height as u16,
+                            cols: col_width as u16,
+                            xpixel: pix_width as u16,
+                            ypixel: pix_height as u16,
+                        });
                     },
                 }
             },
@@ -1770,7 +1799,7 @@ mod tests {
         let title = "hello-title";
         let osc = format!("\x1b]0;{title}\x07\n");
         stdin
-            .send(Either::Left(bytes::Bytes::from(osc.into_bytes())))
+            .send(StdinMsg::Bytes(bytes::Bytes::from(osc.into_bytes())))
             .await
             .expect("failed to send stdin");
 
@@ -1941,7 +1970,7 @@ mod tests {
 
         // Make the shell exit; the network must then be released.
         stdin
-            .send(Either::Left(bytes::Bytes::from(
+            .send(StdinMsg::Bytes(bytes::Bytes::from(
                 format!("{MOCK_EXIT_LINE}\n").into_bytes(),
             )))
             .await
@@ -1983,7 +2012,7 @@ mod tests {
         // A bare ctrl-w (0x17) is the detach chord. It must be consumed as a
         // detach signal rather than written to the pty.
         stdin
-            .send(Either::Left(bytes::Bytes::from(vec![0x17])))
+            .send(StdinMsg::Bytes(bytes::Bytes::from(vec![0x17])))
             .await
             .expect("failed to send ctrl-w");
 
@@ -1991,7 +2020,7 @@ mod tests {
         // stamps stdout activity. (If ctrl-w had been forwarded or had killed the
         // process, no echo would ever arrive.)
         stdin
-            .send(Either::Left(bytes::Bytes::from(b"ping\n".to_vec())))
+            .send(StdinMsg::Bytes(bytes::Bytes::from(b"ping\n".to_vec())))
             .await
             .expect("failed to send line after detach");
         tokio::time::timeout(Duration::from_secs(10), async {
