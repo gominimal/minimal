@@ -33,6 +33,18 @@ pub mod secret;
 pub mod store;
 pub mod types;
 
+// The GitHub REST client (user, App-installation check, default branch,
+// pull-request list/create/get). Gated behind `client` so the default,
+// I/O-free build never pulls in reqwest.
+#[cfg(feature = "client")]
+pub mod rest;
+
+// The OAuth device-flow client (start/poll/fetch-user, plus assembling a
+// complete `Grant`). Also gated behind `client`; independent of `rest` so the
+// two stay separately testable.
+#[cfg(feature = "client")]
+pub mod device_flow;
+
 // A programmable, in-process mock GitHub (OAuth device flow + REST + an
 // auth-enforcing git smart-HTTP endpoint) plus the `github-mock` binary. It is
 // test-only scaffolding — never a production dependency — so it is gated behind
@@ -41,7 +53,16 @@ pub mod types;
 pub mod testing;
 
 pub use config::GithubConfig;
+#[cfg(feature = "client")]
+pub use device_flow::{
+    AccessTokenPair, DeviceAuthorization, DeviceFlowClient, GithubUser, assemble_grant,
+};
 pub use error::Error;
+#[cfg(feature = "client")]
+pub use rest::{
+    Installation, InstallationAccount, PullRef, PullRequest, Repository, RestClient, StaticToken,
+    TokenProvider, User,
+};
 pub use scopes::{Permission, Scope, ScopeSet};
 pub use secret::SecretString;
 pub use store::{Grant, GrantState, GrantStore, GrantSummary};

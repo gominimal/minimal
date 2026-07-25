@@ -96,4 +96,55 @@ pub enum Error {
         /// The `attrs` key that was expected but not present.
         key: String,
     },
+
+    /// A GitHub REST call could not be sent, or was sent but the response
+    /// bytes could not be read off the wire (DNS, TCP, TLS, timeout). The
+    /// message comes from the underlying transport error's `Display`, which
+    /// never includes header values, so it is safe to surface (spec R8.1).
+    #[error("GitHub API request failed: {reason}")]
+    Request {
+        /// A human-readable description of the transport failure.
+        reason: String,
+    },
+
+    /// A GitHub REST response body did not decode into the expected shape.
+    #[error("GitHub API response could not be decoded: {reason}")]
+    Decode {
+        /// A human-readable description of the decode failure.
+        reason: String,
+    },
+
+    /// GitHub answered a REST call with a status this client does not map to
+    /// a more specific variant. The response body is deliberately not
+    /// included verbatim (only GitHub's own `message`, or a bounded excerpt),
+    /// so this stays safe to log (spec R8.1).
+    #[error("GitHub API returned HTTP {status}: {message}")]
+    UnexpectedStatus {
+        /// The HTTP status code GitHub returned.
+        status: u16,
+        /// GitHub's `message` field, or a short excerpt of the response body.
+        message: String,
+    },
+
+    /// The repository does not exist, or is not visible to the authenticated
+    /// identity (spec R2.6).
+    #[error("repository `{owner}/{repo}` not found or not accessible")]
+    RepoNotFound {
+        /// The repository owner (user or org).
+        owner: String,
+        /// The repository name.
+        repo: String,
+    },
+
+    /// The referenced pull request does not exist on `owner/repo` (spec
+    /// R4.5).
+    #[error("pull request #{number} not found on {owner}/{repo}")]
+    PullNotFound {
+        /// The repository owner (user or org).
+        owner: String,
+        /// The repository name.
+        repo: String,
+        /// The pull-request number that was requested.
+        number: u64,
+    },
 }
