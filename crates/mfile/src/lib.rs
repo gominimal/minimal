@@ -397,6 +397,22 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_hooks: Vec<sessions::core::lifecyclehook::LifecycleHook>,
 
+    /// GitHub repo pre-priming and scope configuration for sessions
+    /// activated on this project (spec 10: R2.1 repo list, R5.2 scope
+    /// override, R7.1 task-spec surface).
+    ///
+    /// Unlike the other fields on [`Session`], this block is **not**
+    /// materialized into the project's loadout/composable — there is
+    /// no GitHub-shaped primitive in
+    /// [`sessions::core::loadout::Loadout`]. It is read directly by
+    /// the `min` client at `activate` time (repo cloning, branch
+    /// checkout-or-create, scope consent) and carried into the
+    /// `CreateSession`/`ConfigureLoadout` RPC sequence via
+    /// `SessionConfig.attrs`, not sent as part of this struct. See
+    /// [`Session::is_empty`] for how this affects emptiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<SessionGithub>,
+
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]
     pub extra: HashMap<String, toml::Value>,
@@ -412,13 +428,19 @@ impl Session {
     /// Returns true iff no primitive-carrying field on the session
     /// is populated. Used by downstream callers (e.g. daemon-side
     /// composable construction) to decide whether a synthesized
-    /// [`Session`] has anything worth materializing.
+    /// [`Session`] has anything worth materializing into a
+    /// [`sessions::core::loadout::Loadout`]-shaped composable.
     ///
     /// `extra` is ignored — unknown fields don't count as
-    /// contributions.
+    /// contributions. `github` is also ignored for this specific
+    /// contract: it is never materialized into the composable (see
+    /// the field doc on [`Session::github`]) — it is read directly by
+    /// the `min` client at activate time, so a session block that
+    /// carries only a `github` block genuinely has nothing for the
+    /// composable to materialize.
     ///
     /// The exhaustive `let Self { ... } = self` destructure in the
-    /// body is what makes this drift-proof: if a sixth primitive
+    /// body is what makes this drift-proof: if another primitive
     /// lands on [`Session`], the pattern fails to compile until it's
     /// added here. Naming the method is orthogonal — kept as
     /// `is_empty` because that's the idiomatic Rust name for the
@@ -431,6 +453,7 @@ impl Session {
             vars_lenient,
             patches,
             lifecycle_hooks,
+            github: _,
             extra: _,
         } = self;
         packages.is_empty()
@@ -438,6 +461,135 @@ impl Session {
             && vars_lenient.is_empty()
             && patches.is_empty()
             && lifecycle_hooks.is_empty()
+    }
+}
+
+/// The `[session.github]` block: repo pre-priming and an optional
+/// session-wide scope override (spec 10: R2.1, R5.2, R7.1).
+///
+/// Fields here store **raw strings**, not the parsed `github` crate
+/// types: this keeps `mfile` deserialization back-compat-friendly (a
+/// malformed repo spec doesn't fail to parse the whole `minimal.toml`
+/// until something actually asks for the validated form) and keeps
+/// exactly one grammar for `owner/repo[@branch[:base]]` and scope
+/// strings — the one implemented by [`github::RepoSpec`] and
+/// [`github::ScopeSet`]. Use [`SessionGithub::scope_set`] and
+/// [`GithubRepo::repo_spec`]/[`GithubRepo::scope_set`] to validate.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct SessionGithub {
+    /// Repositories to pre-prime into the session (spec R2.1),
+    /// declared as `[[session.github.repos]]` entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<GithubRepo>,
+
+    /// Session-wide scope override, e.g. `"contents:rw,issues:read"`
+    /// (spec R5.2). Applies to every repo that doesn't set its own
+    /// `scopes`. Absent means: apply [`github::ScopeSet::defaults`]
+    /// and prompt (spec R5.2/R5.3). Parsed with the same grammar as
+    /// [`GithubRepo::scopes`] via [`SessionGithub::scope_set`]; the
+    /// `workflows` permission is rejected there (spec NG6), never
+    /// silently dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+
+    /// Any fields which are not understood by this version of minimal.
+    #[serde(flatten)]
+    pub extra: HashMap<String, toml::Value>,
+}
+
+impl SessionGithub {
+    /// Parses [`SessionGithub::scopes`] into a validated
+    /// [`github::ScopeSet`], if a session-wide override was set.
+    ///
+    /// Returns `Ok(None)` when no override is present — callers should
+    /// fall back to [`github::ScopeSet::defaults`] per spec R5.2.
+    /// Rejects unknown scopes, including `workflows` (spec NG6), and
+    /// malformed `scope:permission` entries.
+    pub fn scope_set(&self) -> Result<Option<github::ScopeSet>, github::Error> {
+        self.scopes
+            .as_deref()
+            .map(github::ScopeSet::from_attr_value)
+            .transpose()
+    }
+}
+
+/// A single `[[session.github.repos]]` entry (spec R2.1/R2.2/R5.2).
+///
+/// `repo`, `branch`, and `base` store raw strings so a `minimal.toml`
+/// with a malformed entry still parses as TOML; call
+/// [`GithubRepo::repo_spec`] to validate and get the typed
+/// [`github::RepoSpec`] the rest of the system uses.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct GithubRepo {
+    /// The repository, as `owner/name`. Required: unlike the other
+    /// fields on this entry, there is no sensible default, so a
+    /// missing `repo` fails TOML deserialization immediately with a
+    /// `missing field` error rather than deferring to
+    /// [`GithubRepo::repo_spec`].
+    pub repo: String,
+    /// The working branch to check out or create (spec R2.2). `None`
+    /// defers to adopt-local's current-branch default when this repo
+    /// is reconciled against an existing checkout.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// The base branch a new `branch` is created from, if `branch`
+    /// doesn't already exist on the remote (spec R2.2). Only
+    /// meaningful alongside `branch`; a `base` without a `branch` is
+    /// rejected by [`GithubRepo::repo_spec`] — it is not
+    /// representable in [`github::RepoSpec`] by construction.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Per-repo scope override (spec R5.2), taking precedence over
+    /// [`SessionGithub::scopes`] for this repo. Same grammar,
+    /// validated by [`GithubRepo::scope_set`].
+    #[serde(default)]
+    pub scopes: Option<String>,
+
+    /// Any fields which are not understood by this version of minimal.
+    #[serde(flatten)]
+    pub extra: HashMap<String, toml::Value>,
+}
+
+impl GithubRepo {
+    /// Validates and parses `repo`/`branch`/`base` into a
+    /// [`github::RepoSpec`], the single canonical grammar used
+    /// everywhere else in the codebase.
+    ///
+    /// Builds the canonical `owner/repo[@branch[:base]]` string and
+    /// delegates to [`github::RepoSpec`]'s `FromStr` rather than
+    /// re-implementing validation, so this and the `attrs` codec in
+    /// the `github` crate can never drift apart on what's valid.
+    pub fn repo_spec(&self) -> Result<github::RepoSpec, github::Error> {
+        use std::str::FromStr;
+
+        if self.branch.is_none() && self.base.is_some() {
+            return Err(github::Error::InvalidRepoSpec {
+                input: self.repo.clone(),
+                reason: "`base` requires `branch` to also be set".to_string(),
+            });
+        }
+
+        let mut encoded = self.repo.clone();
+        if let Some(branch) = &self.branch {
+            encoded.push('@');
+            encoded.push_str(branch);
+            if let Some(base) = &self.base {
+                encoded.push(':');
+                encoded.push_str(base);
+            }
+        }
+        github::RepoSpec::from_str(&encoded)
+    }
+
+    /// Parses this entry's scope override, if any, per
+    /// [`SessionGithub::scope_set`]'s contract (rejects `workflows`
+    /// and malformed entries; `Ok(None)` means "no per-repo override,
+    /// fall back to the session-wide scopes or the defaults").
+    pub fn scope_set(&self) -> Result<Option<github::ScopeSet>, github::Error> {
+        self.scopes
+            .as_deref()
+            .map(github::ScopeSet::from_attr_value)
+            .transpose()
     }
 }
 
@@ -785,6 +937,29 @@ impl File {
                 session.extra.keys().cloned().collect::<Vec<_>>().join(",")
             );
             was_unknown_fields = true;
+        }
+        if let Some(session) = &self.session
+            && let Some(github) = &session.github
+        {
+            if !github.extra.is_empty() {
+                tracing::warn!(
+                    "unknown fields in [session.github] section of {}: {}",
+                    MFILE_NAME,
+                    github.extra.keys().cloned().collect::<Vec<_>>().join(",")
+                );
+                was_unknown_fields = true;
+            }
+            for (i, repo) in github.repos.iter().enumerate() {
+                if !repo.extra.is_empty() {
+                    tracing::warn!(
+                        "unknown fields in [[session.github.repos]] entry {} of {}: {}",
+                        i,
+                        MFILE_NAME,
+                        repo.extra.keys().cloned().collect::<Vec<_>>().join(",")
+                    );
+                    was_unknown_fields = true;
+                }
+            }
         }
 
         for (task_name, task) in &self.tasks {
@@ -1490,6 +1665,181 @@ mod tests {
         assert_eq!(session.vars.len(), 3);
         assert_eq!(session.patches.len(), 2);
         assert_eq!(session.lifecycle_hooks.len(), 1);
+    }
+
+    /// A `[session]` block with no `github` key at all — the shape
+    /// every pre-spec-10 `minimal.toml` has — parses with
+    /// `session.github: None` unchanged (NG7 back-compat): adding the
+    /// optional field doesn't disturb an mfile that predates it.
+    #[test]
+    fn session_github_absent_is_back_compat() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session]
+            packages = ["rustc"]
+            "#
+        })
+        .unwrap();
+        let session = mf.session.expect("session block parses");
+        assert!(session.github.is_none());
+    }
+
+    /// A full `[session.github]` block — a session-wide `scopes`
+    /// override plus two `[[session.github.repos]]` entries, the
+    /// second with its own per-repo `scopes` override — parses, and
+    /// the validating accessors (`repo_spec`/`scope_set`) resolve to
+    /// the `github` crate's typed values, the single grammar used
+    /// everywhere else (spec 10: R2.1, R2.2, R5.2, R7.1).
+    #[test]
+    fn session_github_full_block_parses() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session.github]
+            scopes = "contents:rw,pull_requests:rw"
+
+            [[session.github.repos]]
+            repo = "octocat/hello"
+            branch = "feat/x"
+            base = "main"
+
+            [[session.github.repos]]
+            repo = "my-org/api"
+            branch = "feat/y"
+            scopes = "issues:read"
+            "#
+        })
+        .unwrap();
+
+        let session = mf.session.expect("session block parses");
+        let github = session.github.expect("github block parses");
+
+        assert_eq!(
+            github.scope_set().unwrap(),
+            Some(
+                github::ScopeSet::empty()
+                    .with(github::Scope::Contents, github::Permission::Write)
+                    .with(github::Scope::PullRequests, github::Permission::Write)
+            )
+        );
+
+        assert_eq!(github.repos.len(), 2);
+
+        let first = &github.repos[0];
+        let spec = first.repo_spec().unwrap();
+        assert_eq!(spec.owner(), "octocat");
+        assert_eq!(spec.repo(), "hello");
+        assert_eq!(spec.branch(), Some("feat/x"));
+        assert_eq!(spec.base(), Some("main"));
+        assert_eq!(first.scope_set().unwrap(), None);
+
+        let second = &github.repos[1];
+        assert_eq!(second.repo_spec().unwrap().to_string(), "my-org/api@feat/y");
+        assert_eq!(
+            second.scope_set().unwrap(),
+            Some(github::ScopeSet::empty().with(github::Scope::Issues, github::Permission::Read))
+        );
+    }
+
+    /// The `workflows` GitHub permission is unrepresentable in
+    /// [`github::Scope`] (spec NG6): the raw TOML parses fine —
+    /// `scopes` is stored as an opaque string on this struct — but the
+    /// validating accessor rejects it, both as a session-wide override
+    /// and as a per-repo override, rather than silently accepting or
+    /// dropping it.
+    #[test]
+    fn session_github_workflows_scope_rejected_at_validation() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session.github]
+            scopes = "contents:rw,workflows:rw"
+
+            [[session.github.repos]]
+            repo = "octocat/hello"
+            scopes = "workflows:read"
+            "#
+        })
+        .unwrap();
+        let github = mf.session.unwrap().github.unwrap();
+
+        let err = github
+            .scope_set()
+            .expect_err("session-wide workflows scope must be rejected");
+        assert!(err.to_string().contains("workflows"), "error was: {err}");
+
+        let err = github.repos[0]
+            .scope_set()
+            .expect_err("per-repo workflows scope must be rejected too");
+        assert!(err.to_string().contains("workflows"), "error was: {err}");
+    }
+
+    /// A `base` branch without a working `branch` is unrepresentable
+    /// in [`github::RepoSpec`] by construction; [`GithubRepo::repo_spec`]
+    /// rejects it explicitly (with an actionable reason) instead of
+    /// silently dropping `base` or guessing a branch.
+    #[test]
+    fn github_repo_base_without_branch_is_rejected() {
+        let repo = GithubRepo {
+            repo: "octocat/hello".to_string(),
+            branch: None,
+            base: Some("main".to_string()),
+            scopes: None,
+            extra: HashMap::new(),
+        };
+        let err = repo
+            .repo_spec()
+            .expect_err("base without branch must be rejected");
+        assert!(err.to_string().contains("base"), "error was: {err}");
+    }
+
+    /// Unknown fields inside `[session.github]` and inside a
+    /// `[[session.github.repos]]` entry land in their respective
+    /// `extra` maps for `warn_unknown_fields` to report, matching how
+    /// every other mfile section handles forward-compat.
+    #[test]
+    fn session_github_unknown_fields_land_in_extra() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session.github]
+            scopes = "contents:rw"
+            future_toplevel_field = "x"
+
+            [[session.github.repos]]
+            repo = "octocat/hello"
+            future_repo_field = "y"
+            "#
+        })
+        .unwrap();
+        let github = mf.session.unwrap().github.unwrap();
+        assert!(github.extra.contains_key("future_toplevel_field"));
+        assert!(github.repos[0].extra.contains_key("future_repo_field"));
+    }
+
+    /// A session whose only content is a `github` block is still
+    /// `is_empty() == true`: `github` is consumed by the `min` client
+    /// at activate time, not materialized into the project's
+    /// composable, so there is genuinely nothing for the composable to
+    /// build from. Guards the deliberate exclusion documented on
+    /// [`Session::is_empty`] and [`Session::github`].
+    #[test]
+    fn session_is_empty_ignores_github_block() {
+        let with_github_only = Session {
+            github: Some(SessionGithub {
+                repos: vec![GithubRepo {
+                    repo: "octocat/hello".to_string(),
+                    branch: Some("feat/x".to_string()),
+                    base: None,
+                    scopes: None,
+                    extra: HashMap::new(),
+                }],
+                scopes: None,
+                extra: HashMap::new(),
+            }),
+            ..Session::default()
+        };
+        assert!(
+            with_github_only.is_empty(),
+            "a github-only session block has nothing for the composable to materialize"
+        );
     }
 
     /// Unknown fields inside `[session]` land in `extra` for the
