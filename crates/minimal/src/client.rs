@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use minimald_rpc::OneshotSshRpc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Add a spinner-style progress bar to the process-global `MultiProgress`.
 /// Bars must be inserted before any style/message/tick configuration —
@@ -219,6 +218,11 @@ impl Client {
     ///
     /// The type parameter `R` picks the RPC from the wire contract; `request`
     /// is serialized to JSON and the response is deserialized from JSON.
+    ///
+    /// Uses `channel.wait()` rather than `channel.into_stream()` so that
+    /// extended-data (stream 1) — where the daemon writes handler errors
+    /// (#901) — is visible instead of silently discarded by the stream's
+    /// `AsyncRead` impl.
     pub async fn oneshot_rpc<R: OneshotSshRpc>(
         &mut self,
         request: R::Request<'_>,
@@ -226,28 +230,50 @@ impl Client {
     where
         <R as OneshotSshRpc>::Response: serde::de::DeserializeOwned,
     {
-        let channel = self
+        let mut channel = self
             .handle
             .channel_open_session()
             .await
             .with_context(|| format!("open channel for {}", R::NAME))?;
 
         send_traceparent(&channel).await;
+        // want_reply = true so an unknown subsystem (CLI/daemon version
+        // skew) surfaces as a Failure instead of the client writing into a
+        // channel nobody serves (#901).
         channel
-            .request_subsystem(false, R::NAME)
+            .request_subsystem(true, R::NAME)
             .await
             .with_context(|| format!("request subsystem {}", R::NAME))?;
 
         let body = serde_json::to_vec(&request).context("serialize request")?;
+        channel.data_bytes(body).await.context("write request")?;
+        channel.eof().await.context("shutdown write half")?;
 
-        let mut rpc = channel.into_stream();
-        rpc.write_all(&body).await.context("write request")?;
-        rpc.shutdown().await.context("shutdown write half")?;
-
+        // Drain the channel with wait() rather than into_stream() so that
+        // extended-data (stream 1) — where the daemon writes handler errors
+        // (#901) — is visible instead of silently discarded by the stream's
+        // AsyncRead impl.
         let mut resp_buf = Vec::with_capacity(256);
-        rpc.read_to_end(&mut resp_buf)
-            .await
-            .context("read response")?;
+        let mut err_buf = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { data } => {
+                    resp_buf.extend_from_slice(&data);
+                }
+                russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                    err_buf.extend_from_slice(&data);
+                }
+                _ => {}
+            }
+        }
+
+        if !err_buf.is_empty() {
+            anyhow::bail!(
+                "{} RPC failed on the daemon side: {}",
+                R::NAME,
+                String::from_utf8_lossy(&err_buf)
+            );
+        }
 
         serde_json::from_slice(&resp_buf)
             .with_context(|| format!("decode response for {}", R::NAME))
@@ -461,21 +487,36 @@ impl Client {
         let writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(channel.make_writer());
         stream(writer).await?;
 
-        // Wait for the channel to close to signal that unpacking is done.
-        // The daemon relays any unpack failure on extended-data stream 1 and
-        // only then closes, so accumulate that stream under the same cap the
-        // diagnostic download uses — a daemon spraying extended data must not
-        // be able to balloon the client's memory.
+        // Drain the channel: collect extended-data (stream 1) errors from
+        // the daemon under the same cap the diagnostic download uses, and
+        // track whether we see an explicit Eof/Close to distinguish a clean
+        // post-unpack close from a dropped connection (#901). Without this
+        // check a connection drop mid-unpack looks identical to a successful
+        // close — empty err, Ok(()) — and cmd_activate proceeds with an
+        // empty workspace.
         let mut err = Vec::new();
+        let mut saw_close = false;
         while let Some(msg) = channel.wait().await {
-            if let russh::ChannelMsg::ExtendedData { data, ext: 1 } = msg {
-                append_daemon_error(&mut err, &data);
+            match msg {
+                russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                    append_daemon_error(&mut err, &data);
+                }
+                russh::ChannelMsg::Eof | russh::ChannelMsg::Close => {
+                    saw_close = true;
+                }
+                _ => {}
             }
         }
         if !err.is_empty() {
             anyhow::bail!(
                 "daemon failed to unpack {what}s: {}",
                 String::from_utf8_lossy(&err)
+            );
+        }
+        if !saw_close {
+            anyhow::bail!(
+                "upload stream ended unexpectedly: the connection to the daemon \
+                 was lost before unpacking completed"
             );
         }
         Ok(())
