@@ -50,7 +50,7 @@ runs:
       # The mini needs no cache action: the input-keyed prefix under $HOME
       # persists across runs on its own.
       if: runner.environment == 'github-hosted'
-      uses: actions/cache@v6
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
       with:
         path: ~/.cache/minimal-ci/libkrun
         key: libkrun-macos-${{ runner.arch }}-${{ steps.pin.outputs.commit }}-${{ steps.pin.outputs.script_hash }}-${{ steps.pin.outputs.patches_hash }}

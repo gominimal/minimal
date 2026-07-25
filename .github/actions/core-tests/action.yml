@@ -27,7 +27,7 @@ runs:
         shared-key: ${{ inputs.shared-key }}
         save-if: ${{ inputs.save-if }}
     - name: Install nextest
-      uses: taiki-e/install-action@v2
+      uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2
       with:
         tool: nextest
     - name: Check Cargo.lock is up-to-date

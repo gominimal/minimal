@@ -6,18 +6,3 @@ self-hosted-runner:
     # GitHub-hosted arm64 image used by the release lane; newer than
     # actionlint 1.7.12's bundled label set.
     - ubuntu-26.04-arm
-
-# actionlint runs shellcheck over `run:` scripts. The findings below are
-# pre-existing, in the release pipeline, and intentional or cosmetic:
-#   - SC2086 on `>> $GITHUB_OUTPUT` — GITHUB_OUTPUT is always a space-free path;
-#     quoting is cosmetic (a codeowner release-hardening pass can add it).
-#   - SC2046 on `$(find . -maxdepth 1 -type f)` — deliberate word-splitting to
-#     pass each release artifact as its own arg to `gh release create`; quoting
-#     would break the release. A `# shellcheck disable` belongs inline, which is
-#     a release.yml edit out of scope here.
-# Scoped to release.yml so shellcheck stays fully active everywhere else.
-paths:
-  ".github/workflows/release.yml":
-    ignore:
-      - 'shellcheck reported issue in this script: SC2086'
-      - 'shellcheck reported issue in this script: SC2046'

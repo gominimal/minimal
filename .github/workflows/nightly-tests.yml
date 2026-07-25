@@ -27,10 +27,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check advisories
 
@@ -47,17 +47,19 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - name: Free Disk Space
-        uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+        uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 # v3
         with:
           remove_android: true
           remove_dotnet: true
           remove_haskell: true
           remove_tool_cache: true
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
       - name: Install build dependencies
         run: |
           sudo sh -c \
@@ -67,7 +69,7 @@ jobs:
         # build-initramfs.sh cross-compiles the guest minimald to static musl;
         # install the prebuilt cross like the KVM lane so it never falls back
         # to `cargo install cross` from source inside this blocking job.
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2
         with:
           tool: cross
       - name: Enable /dev/kvm access
@@ -84,7 +86,7 @@ jobs:
         # Shares the KVM lane's build cache key (same minvmd + CLI compile);
         # a scheduled run on main also writes it back, keeping it warm.
         id: cargo-cache
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/bin/
@@ -161,7 +163,7 @@ jobs:
           ./scripts/stress-session-e2e.sh 6
       - name: Save cargo + build artifacts cache (main only)
         if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/bin/
@@ -172,7 +174,7 @@ jobs:
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
       - name: Upload soak boot logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: soak-boot-logs
           path: ${{ runner.temp }}/soak-logs
@@ -188,11 +190,13 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: beta
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Beta toolchain
-        uses: dtolnay/rust-toolchain@beta
+        uses: dtolnay/rust-toolchain@4711ae3e97dd6376c8d5d5d51c89566406abaefa # beta
+        with:
+          toolchain: beta
       - name: Core workspace tests (beta)
         uses: ./.github/actions/core-tests
         with:
@@ -208,11 +212,13 @@ jobs:
     timeout-minutes: 40
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
       - name: cargo update (newest compatible deps)
         run: cargo update
       - name: Core workspace tests (updated deps)
@@ -242,14 +248,14 @@ jobs:
     timeout-minutes: 15
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Install cargo-machete + zizmor
         # Both are prebuilt binaries in taiki-e's manifest (zizmor is Rust,
         # from zizmorcore/zizmor). actionlint is NOT — it runs from its
         # pinned official image below.
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2
         with:
           tool: cargo-machete,zizmor
       - name: actionlint (workflow lint)
@@ -278,17 +284,19 @@ jobs:
     # run; give it room so it isn't killed mid-compile.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
       - name: Setup Rust (protoc + cache; primes the msrv cache on main)
         uses: ./.github/actions/setup-rust
         with:
           shared-key: msrv
       - name: Install cargo-hack
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2
         with:
           tool: cargo-hack
       - name: cargo hack check --rust-version
@@ -308,12 +316,13 @@ jobs:
       # mechanism the beta/nightly-rustc canaries use).
       RUSTUP_TOOLCHAIN: nightly
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Nightly toolchain + miri
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
         with:
+          toolchain: nightly
           components: miri
       - name: Setup Rust (protoc + cache; primes the miri cache on main)
         uses: ./.github/actions/setup-rust
@@ -335,11 +344,13 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: nightly
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+        with:
+          toolchain: nightly
       - name: Core workspace tests (nightly)
         uses: ./.github/actions/core-tests
         with:

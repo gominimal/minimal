@@ -47,7 +47,7 @@ jobs:
     outputs:
       native: ${{ steps.filter.outputs.native }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Detect relevant changes
@@ -100,7 +100,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Run core workspace tests
@@ -120,7 +120,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
@@ -139,7 +139,7 @@ jobs:
         # commit; carry it across runs so the e2e isn't dominated by pulls.
         # The e2e script resets XDG_STATE_HOME/XDG_RUNTIME_DIR but leaves
         # XDG_CACHE_HOME alone for exactly this reason.
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cache/minimal
           key: native-e2e-minimal-cache-${{ hashFiles('.minimal/minimal.toml') }}
@@ -169,7 +169,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
@@ -179,7 +179,7 @@ jobs:
       - name: Install nextest
         # Convention selection is a nextest filterset (binary(/_root_integration$/));
         # cargo test cannot select test targets by pattern.
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2
         with:
           tool: nextest
       - name: Enable unprivileged user namespaces

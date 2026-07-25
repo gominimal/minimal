@@ -45,7 +45,7 @@ jobs:
     outputs:
       kvm: ${{ steps.filter.outputs.kvm }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Detect relevant changes
@@ -95,18 +95,20 @@ jobs:
         # free on a fresh GitHub-hosted Ubuntu runner. `remove_tool_cache:
         # true` reclaims /opt/hostedtoolcache (~14 GB); the dtolnay step below
         # reinstalls the Rust toolchain we actually need.
-        uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+        uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 # v3
         with:
           remove_android: true
           remove_dotnet: true
           remove_haskell: true
           remove_tool_cache: true
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
       - name: Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
 
       - name: Install build dependencies
         # protoc + libprotobuf-dev: the `minimal` CLI (materialize) build. The
@@ -121,14 +123,14 @@ jobs:
                protobuf-compiler libprotobuf-dev cpio git'
 
       - name: Install cross + nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2
         with:
           tool: cross,nextest
 
       - name: Cache cargo + build artifacts
         # Restore-only; the save half (main only) runs at the end of the job.
         id: cargo-cache
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/bin/
@@ -182,7 +184,7 @@ jobs:
           tar czf testbed/libkrun-prefix.tgz -C "$LIBKRUN_PREFIX" .
 
       - name: Upload testbed
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: kvm-testbed
           path: testbed/
@@ -193,7 +195,7 @@ jobs:
         # PR branches restore but never write: multi-GB caches written by
         # every branch LRU-evict the main entries all PRs restore from.
         if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/bin/
@@ -213,12 +215,12 @@ jobs:
     runs-on: ubuntu-latest # x86_64; KVM-capable
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
       - name: Install nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2
         with:
           tool: nextest
 
@@ -238,7 +240,7 @@ jobs:
           ls -l /dev/kvm
 
       - name: Download testbed
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: kvm-testbed
           path: ${{ runner.temp }}/testbed
@@ -359,7 +361,7 @@ jobs:
 
       - name: Upload guest boot console logs
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: minvmd-linux-boot-log-x86_64
           path: |

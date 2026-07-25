@@ -21,12 +21,12 @@ on:
                 type: boolean
                 default: false
 
+# Least privilege at the top level; the elevated scopes the release cut needs
+# are granted only on the jobs that need them (`release`, `promote-nightly`).
+# A called workflow cannot hold a scope its caller's job doesn't grant, so the
+# `release` job below re-grants contents/id-token/checks for release.yml.
 permissions:
-    contents: write # release job cuts a GitHub release
-    id-token: write # OIDC for the GCS auth in promote-nightly
-    checks: read # release.yml's verify-ci gate reads check-run conclusions; a
-    # called workflow cannot hold a scope its caller doesn't grant, and an
-    # ungranted request fails the whole run at startup (startup_failure).
+    contents: read
 
 jobs:
     # Skip the build on no-op nights: a finished release stages an immutable
@@ -38,11 +38,15 @@ jobs:
     check:
         runs-on: ubuntu-latest
         timeout-minutes: 5
+        permissions:
+            contents: read
         outputs:
             sha: ${{ steps.check.outputs.sha }}
             should_release: ${{ steps.check.outputs.should_release }}
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
             - name: Determine whether HEAD is already staged
               id: check
               run: |
@@ -65,11 +69,15 @@ jobs:
         # inputs context is empty, so both expressions fall back to the
         # unforced/real-release path.
         if: ${{ needs.check.outputs.should_release == 'true' || inputs.dry_run == true }}
+        permissions:
+            contents: write # release.yml cuts a GitHub release
+            id-token: write # OIDC for the GCS staging auth
+            checks: read # release.yml's verify-ci gate reads check-run conclusions
         uses: ./.github/workflows/release.yml
         with:
             dry_run: ${{ inputs.dry_run || false }}
             skip_ci_verify: ${{ inputs.skip_ci_verify || false }}
-        secrets: inherit
+        secrets: inherit # zizmor: ignore[secrets-inherit] first-party same-repo reusable workflow needs the release/signing secrets
 
     # --- Smoke: prove the artifacts release.yml just built actually run before
     # the `nightly` channel is pointed at them. The workflow_call jobs above are
@@ -92,16 +100,16 @@ jobs:
         permissions:
             contents: read
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
             - name: Download shipped min
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: minimal-linux-amd64
                   path: ${{ runner.temp }}/bin
             - name: Download shipped minimald
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: minimald-linux-amd64
                   path: ${{ runner.temp }}/bin
@@ -125,7 +133,7 @@ jobs:
               # keyed by the pinned upstream commit; carry it across runs so the
               # smoke isn't dominated by pulls. The e2e resets XDG_STATE_HOME /
               # XDG_RUNTIME_DIR but leaves XDG_CACHE_HOME alone for this reason.
-              uses: actions/cache@v6
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
               with:
                   path: ~/.cache/minimal
                   key: smoke-amd64-minimal-cache-${{ hashFiles('.minimal/minimal.toml') }}
@@ -150,7 +158,7 @@ jobs:
         permissions:
             contents: read
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
             - name: Enable /dev/kvm access
@@ -177,23 +185,23 @@ jobs:
               # Pulls min, minvmd, mip and gvproxy (plus minimald, unused on the
               # host — it ships inside the initramfs). `*-linux-amd64` is a clean
               # glob here: only darwin artifacts carry the `temp-` prefix.
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   pattern: "*-linux-amd64"
                   path: ${{ runner.temp }}/bin
                   merge-multiple: true
             - name: Download shipped guest kernel
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: virtio-kernel-amd64
                   path: ${{ runner.temp }}/guest
             - name: Download shipped guest rootfs
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: minvmd-rootfs-amd64
                   path: ${{ runner.temp }}/guest
             - name: Download shipped guest initramfs
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: minimald-initramfs-amd64
                   path: ${{ runner.temp }}/guest
@@ -252,7 +260,7 @@ jobs:
                   sudo pkill -f __krun-vmm || true
             - name: Upload guest boot console log
               if: always()
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: smoke-linux-kvm-boot-log
                   path: ${{ runner.temp }}/cli-e2e-boot.log
@@ -279,42 +287,42 @@ jobs:
         permissions:
             contents: read
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   # Don't leave git credentials on the persistent self-hosted runner.
                   persist-credentials: false
             - name: Download signed CLI (min)
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: minimal-macos-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download signed minvmd
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: minvmd-macos-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download signed libkrun dylib
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: libkrun-macos-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download signed gvproxy
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: gvproxy-darwin-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download shipped guest kernel
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: virtio-kernel-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download shipped guest rootfs
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: minvmd-rootfs-arm64
                   path: ${{ runner.temp }}/dl
             - name: Download shipped guest initramfs
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: minimald-initramfs-arm64
                   path: ${{ runner.temp }}/dl
@@ -372,7 +380,7 @@ jobs:
                   pkill -f gvproxy 2>/dev/null || true
             - name: Upload guest boot console log
               if: always()
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: smoke-macos-boot-log
                   path: ${{ runner.temp }}/cli-e2e-boot.log
@@ -412,11 +420,13 @@ jobs:
             contents: read
             id-token: write
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
             - name: Authenticate to Google Cloud (installer bucket)
               # Same project + workload-identity pool as release.yml's
               # stage-installer job; grants write to gs://minimal-one.
-              uses: google-github-actions/auth@v3
+              uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
               with:
                   project_id: "524228262772"
                   workload_identity_provider: "projects/524228262772/locations/global/workloadIdentityPools/github/providers/gominimal"
