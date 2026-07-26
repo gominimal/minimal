@@ -1344,6 +1344,14 @@ mod tests {
             fixtures.join("remotes").join("octo").join("hello.git")
         }
 
+        /// The bare fixture remote for `owner/repo` under `fixtures`.
+        fn bare_repo_named(fixtures: &Path, owner: &str, repo: &str) -> std::path::PathBuf {
+            fixtures
+                .join("remotes")
+                .join(owner)
+                .join(format!("{repo}.git"))
+        }
+
         /// Whether the fixture remote has a branch named `branch`.
         fn remote_has_branch(fixtures: &Path, branch: &str) -> bool {
             Command::new("git")
@@ -1536,6 +1544,125 @@ mod tests {
                 "got: {lines:?}"
             );
             assert!(!remote_has_branch(fixtures.path(), "feat/x"));
+        }
+
+        /// Whether the bare repo at `bare` has a branch named `branch`.
+        fn bare_has_branch(bare: &Path, branch: &str) -> bool {
+            Command::new("git")
+                .args([
+                    "--git-dir",
+                    bare.to_str().unwrap(),
+                    "show-ref",
+                    "--verify",
+                    &format!("refs/heads/{branch}"),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("show-ref")
+                .success()
+        }
+
+        /// A sandbox that leaves `remote.origin.url` byte-identical but adds a
+        /// `pushurl` (git's real push target) is refused — the exfiltration the
+        /// first-`url`-only check missed. Nothing reaches the attacker remote.
+        #[tokio::test]
+        async fn pushurl_redirect_is_refused() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            make_bare_remote(&fixtures.path().join("remotes"), "attacker", "steal");
+            let attacker = bare_repo_named(fixtures.path(), "attacker", "steal");
+            let attacker_url = format!("file://{}", attacker.display());
+
+            let work = cwd.path().join("hello");
+            git_run(
+                &["remote", "set-url", "--push", "origin", &attacker_url],
+                &work,
+            );
+
+            let lines = drive(&mut chan, "git%push").await;
+            assert!(
+                error_line(&lines).contains("does not point at the declared GitHub remote"),
+                "a pushurl redirect must be refused: {lines:?}"
+            );
+            assert_no_token(&lines);
+            assert!(!remote_has_branch(fixtures.path(), "feat/x"));
+            assert!(
+                !bare_has_branch(&attacker, "feat/x"),
+                "nothing may reach the attacker pushurl"
+            );
+        }
+
+        /// A second `remote.origin.url` value (multi-valued `url`) leaves the
+        /// canonical url in place but gives git a second target; refuse.
+        #[tokio::test]
+        async fn extra_origin_url_is_refused() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            make_bare_remote(&fixtures.path().join("remotes"), "attacker", "steal");
+            let attacker = bare_repo_named(fixtures.path(), "attacker", "steal");
+            let attacker_url = format!("file://{}", attacker.display());
+
+            let work = cwd.path().join("hello");
+            git_run(
+                &["config", "--add", "remote.origin.url", &attacker_url],
+                &work,
+            );
+
+            let lines = drive(&mut chan, "git%push").await;
+            assert!(
+                error_line(&lines).contains("does not point at the declared GitHub remote"),
+                "a second origin url must be refused: {lines:?}"
+            );
+            assert!(!remote_has_branch(fixtures.path(), "feat/x"));
+            assert!(!bare_has_branch(&attacker, "feat/x"));
+        }
+
+        /// An `insteadOf` rewrite retargets even a byte-identical origin url;
+        /// the whole-config scan must catch it and refuse.
+        #[tokio::test]
+        async fn insteadof_rewrite_is_refused() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+
+            let work = cwd.path().join("hello");
+            // Rewrite the derived base to an attacker prefix.
+            let remotes = fixtures.path().join("remotes");
+            git_run(
+                &[
+                    "config",
+                    "url.file:///attacker/.insteadOf",
+                    &format!("file://{}/", remotes.display()),
+                ],
+                &work,
+            );
+
+            let lines = drive(&mut chan, "git%push").await;
+            assert!(
+                error_line(&lines).contains("does not point at the declared GitHub remote"),
+                "an insteadOf rewrite must be refused: {lines:?}"
+            );
+            assert!(!remote_has_branch(fixtures.path(), "feat/x"));
+        }
+
+        /// A dash-leading current branch (planted via low-level ref surgery,
+        /// which git's porcelain resists) is refused before `git push` could
+        /// parse it as an option — the argv-injection hardening.
+        #[tokio::test]
+        async fn dash_leading_branch_is_refused() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+
+            let work = cwd.path().join("hello");
+            git_run(&["update-ref", "refs/heads/-oEvil", "HEAD"], &work);
+            git_run(&["symbolic-ref", "HEAD", "refs/heads/-oEvil"], &work);
+
+            let lines = drive(&mut chan, "git%push").await;
+            assert!(
+                error_line(&lines).contains("unsafe name"),
+                "a dash-leading branch must be refused: {lines:?}"
+            );
+            assert!(!remote_has_branch(fixtures.path(), "-oEvil"));
         }
 
         /// `status` and `remote -v` work without contacting the remote and

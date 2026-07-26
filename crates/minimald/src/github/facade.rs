@@ -52,19 +52,31 @@
 //! # Origin verification (defense-in-depth, with a known residual race)
 //!
 //! The session workspace is sandbox-visible, so in-sandbox code can rewrite
-//! `.git/config` — including `remote.origin.url`. Because the credential
-//! helper `github::gitops` installs answers for whatever host `git` contacts,
-//! a rewritten origin could otherwise coax a token-bearing `git` into
-//! authenticating against an attacker-chosen `https://` host. Before every
-//! authenticated operation that uses `origin`, [`verify_origin`] therefore
-//! requires the working tree's configured origin URL to be byte-identical to
-//! the URL this module derives from the daemon's configured git base
-//! ([`remote_url`]) and fails closed otherwise. This is check-then-use over a
-//! shared filesystem, so a sandbox racing a rewrite into the window between
-//! the check and git's own config read can still win; closing that race needs
-//! `gitops` to pin `remote.origin.url` via its runtime `GIT_CONFIG_*`
-//! injection (recorded follow-up for the gitops layer). The exposure is
-//! bounded to the grant's own scoped token; it cannot widen repo access.
+//! `.git/config`. Because the credential helper `github::gitops` installs
+//! answers for whatever host `git` contacts, a rewritten remote could
+//! otherwise coax a token-bearing `git` into authenticating against an
+//! attacker-chosen `https://` host. Before every authenticated operation that
+//! uses `origin`, [`verify_origin`] therefore inspects the **whole** config
+//! and fails closed unless it finds a single, canonical `origin` url that is
+//! byte-identical to the URL this module derives ([`remote_url`]).
+//!
+//! Crucially, byte-matching the first `url` line is not enough: git's real
+//! connect target is governed by more of that same sandbox-writable file. So
+//! [`parse_origin_config`] rejects every redirect vector that would leave the
+//! canonical url intact while retargeting git — a `[remote "origin"] pushurl`
+//! (a separate push target), a second `url` value (multi-valued `url`), and
+//! any `url.<base>.insteadOf`/`pushInsteadOf` rewrite (which retargets even a
+//! byte-identical url). Section-header parsing is tolerant of whitespace and
+//! the legacy `[remote.origin]` form so a noncanonical-but-valid header cannot
+//! smuggle an extra `url`/`pushurl` past the scan.
+//!
+//! What remains is a pure check-then-use race over a shared filesystem: a
+//! sandbox that races a rewrite into the window between the check and git's own
+//! config read can still win. Closing that race needs `gitops` to pin
+//! `remote.origin.url` and disable url-rewriting through its runtime
+//! `GIT_CONFIG_*` injection (a recorded follow-up for the gitops layer). The
+//! exposure is bounded to the grant's own scoped token; it cannot widen repo
+//! access.
 //!
 //! Every span here is `github.facade` with fields limited to `repo` and
 //! `grant_id` (see the conventions in `super::state`).
@@ -177,6 +189,19 @@ pub(crate) enum FacadeError {
     /// A grant is bound but the session declares no repos to operate on.
     #[error("no repos are declared for this session")]
     NoDeclaredRepos,
+
+    /// The working tree's current branch name begins with `-`, so handing it
+    /// to `git push` risks having it parsed as an option rather than a branch
+    /// (argv injection). Refuse rather than run a token-bearing push on it
+    /// (defense-in-depth; the branch name is not secret).
+    #[error(
+        "current branch `{branch}` has an unsafe name (leading `-`); \
+         rename it before pushing"
+    )]
+    UnsafeBranchName {
+        /// The offending branch name.
+        branch: String,
+    },
 
     /// Streaming plumbing failed (connection clone / blocking-task join).
     #[error("internal error while streaming git output: {source}")]
@@ -621,9 +646,13 @@ fn primed_dir(
     })
 }
 
-/// Requires the working tree's configured `origin` URL to be byte-identical
-/// to the daemon-derived remote URL, refusing the operation otherwise. See
-/// the module docs for the threat model and the known residual TOCTOU.
+/// Requires the working tree's configured `origin` to resolve to exactly the
+/// daemon-derived remote URL, refusing the operation otherwise. This is more
+/// than a byte-compare of the first `url` line: it fails closed on every
+/// sandbox-plantable redirect vector (`pushurl`, a second `url`, an
+/// `insteadOf`/`pushInsteadOf` rewrite) that would leave the canonical url
+/// intact while retargeting git. See the module docs for the threat model and
+/// the known residual TOCTOU.
 fn verify_origin(work: &Path, expected: &Url, repo: &RepoSpec) -> Result<(), FacadeError> {
     let mismatch = || FacadeError::OriginMismatch {
         owner: repo.owner().to_string(),
@@ -633,30 +662,108 @@ fn verify_origin(work: &Path, expected: &Url, repo: &RepoSpec) -> Result<(), Fac
         std::fs::read_to_string(work.join(".git").join("config")).map_err(|_source| mismatch())?;
     match configured_origin_url(&config) {
         Some(url) if url == expected.as_str() => Ok(()),
-        // Absent, unparsable, or different: fail closed either way.
+        // Absent, ambiguous, redirected, or different: fail closed either way.
         _ => Err(mismatch()),
     }
 }
 
-/// Extracts `remote.origin.url` from git config text: the first `url` entry
-/// inside the `[remote "origin"]` section. Deliberately strict — anything
-/// this can't recognize makes [`verify_origin`] fail closed.
-fn configured_origin_url(config: &str) -> Option<String> {
+/// The connect-relevant view of a `.git/config`, derived from the
+/// sandbox-writable file. Anything beyond a single canonical `origin.url` is a
+/// redirect vector that must make [`verify_origin`] fail closed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OriginConfig {
+    /// Every `url` value declared in `[remote "origin"]`, in file order. A
+    /// single entry is the only accepted shape; zero or several is hostile
+    /// (multi-valued `url` lets git pick a second target).
+    origin_urls: Vec<String>,
+    /// Whether `[remote "origin"]` declares a `pushurl` — a distinct target
+    /// git prefers for pushes, so a matching fetch `url` would not constrain
+    /// where a push connects.
+    origin_has_pushurl: bool,
+    /// Whether the config declares any `insteadOf`/`pushInsteadOf` rewrite
+    /// (an `[url "…"]` section that silently retargets even a byte-identical
+    /// origin url).
+    has_url_rewrite: bool,
+}
+
+/// Whether a section header names `[remote "origin"]`. Tolerant of surrounding
+/// whitespace and accepts both the canonical quoted subsection form and the
+/// legacy dotted `remote.origin` form; the quoted subsection is matched
+/// case-sensitively (as git does — `[remote "Origin"]` is a *different*
+/// remote), the legacy subsection case-insensitively.
+fn header_is_origin(header: &str) -> bool {
+    let header = header.trim();
+    if let Some((section, rest)) = header.split_once('"') {
+        // Quoted form: remote "origin"
+        let subsection = rest.rsplit_once('"').map_or(rest, |(inner, _)| inner);
+        return section.trim().eq_ignore_ascii_case("remote") && subsection == "origin";
+    }
+    if let Some((section, subsection)) = header.split_once('.') {
+        // Legacy dotted form: remote.origin
+        return section.trim().eq_ignore_ascii_case("remote")
+            && subsection.trim().eq_ignore_ascii_case("origin");
+    }
+    false
+}
+
+/// Parses the connect-relevant parts of git config text (see [`OriginConfig`]).
+///
+/// This is a conservative, fail-closed scanner, not a full git-config parser:
+/// it recognizes section headers and `key = value` lines, tracks the
+/// `[remote "origin"]` section for `url`/`pushurl`, and flags any
+/// `insteadOf`/`pushInsteadOf` key anywhere (those live in `[url "…"]`
+/// sections and are matched by key name, sidestepping header parsing). Full
+/// blank/comment lines are ignored; anything it cannot confidently read leaves
+/// the origin url unmatched, so [`verify_origin`] denies.
+fn parse_origin_config(config: &str) -> OriginConfig {
+    let mut parsed = OriginConfig::default();
     let mut in_origin = false;
-    for line in config.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_origin = line == "[remote \"origin\"]";
+    for raw in config.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
-        if in_origin && let Some(value) = line.strip_prefix("url") {
-            let value = value.trim_start();
-            if let Some(value) = value.strip_prefix('=') {
-                return Some(value.trim().to_string());
+        if let Some(rest) = line.strip_prefix('[') {
+            // Section header runs up to the closing `]`.
+            let header = rest.split(']').next().unwrap_or("");
+            in_origin = header_is_origin(header);
+            continue;
+        }
+        let (key, value) = match line.split_once('=') {
+            Some((key, value)) => (key.trim(), Some(value.trim())),
+            None => (line, None),
+        };
+        let key = key.to_ascii_lowercase();
+        if key == "insteadof" || key == "pushinsteadof" {
+            parsed.has_url_rewrite = true;
+        }
+        if in_origin {
+            match key.as_str() {
+                "url" => parsed.origin_urls.push(value.unwrap_or("").to_string()),
+                "pushurl" => parsed.origin_has_pushurl = true,
+                _ => {}
             }
         }
     }
-    None
+    parsed
+}
+
+/// The working tree's single canonical `origin` url, or `None` when the config
+/// is absent, ambiguous, or carries any redirect vector. Returning `Some`
+/// guarantees the caller that git's connect target for `origin` is exactly
+/// this url: there is one `url`, no `pushurl`, and no `insteadOf` rewrite.
+fn configured_origin_url(config: &str) -> Option<String> {
+    let parsed = parse_origin_config(config);
+    if parsed.has_url_rewrite || parsed.origin_has_pushurl {
+        // A redirect vector is present even if a canonical url also is: fail
+        // closed so `verify_origin` cannot be satisfied by a byte-match alone.
+        return None;
+    }
+    match parsed.origin_urls.as_slice() {
+        [only] => Some(only.clone()),
+        // Zero or several origin urls: no single well-defined connect target.
+        _ => None,
+    }
 }
 
 /// Runs the authorized operation in the session workspace (on the blocking
@@ -678,6 +785,13 @@ fn execute(
             verify_origin(&dir, remote, repo)?;
             let tree = Repo::open(dir, remote.as_str());
             let branch = tree.current_branch()?;
+            // A leading-dash branch name would be parsed as a git option once
+            // it reaches `git push … origin <branch>` (the gitops layer does
+            // not yet `--`-guard it); refuse here before any token-bearing
+            // process runs.
+            if branch.starts_with('-') {
+                return Err(FacadeError::UnsafeBranchName { branch });
+            }
             tree.push(token, &branch, |_, line| {
                 let _ = writeln!(out, "msg:{line}");
             })?;
@@ -981,6 +1095,107 @@ mod tests {
         assert_eq!(configured_origin_url("[core]\n\tbare = false\n"), None);
     }
 
+    /// The connect target is governed by more than the first `url` line; the
+    /// scanner must fail closed on every vector that redirects git while
+    /// leaving a byte-matching `url` in place (the reported exfiltration).
+    #[test]
+    fn configured_origin_url_rejects_redirect_vectors() {
+        let canonical = "[remote \"origin\"]\n\turl = https://github.com/octo/hello.git\n";
+
+        // A `pushurl` sends pushes elsewhere even though `url` still matches.
+        let pushurl = format!("{canonical}\tpushurl = https://attacker.example/x.git\n");
+        assert_eq!(configured_origin_url(&pushurl), None);
+
+        // A second `url` value: git may connect to the extra one.
+        let multi_url = format!("{canonical}\turl = https://attacker.example/x.git\n");
+        assert_eq!(configured_origin_url(&multi_url), None);
+
+        // An `insteadOf` rewrite retargets even a byte-identical `url`.
+        let insteadof = format!(
+            "{canonical}[url \"https://attacker.example/\"]\n\
+             \tinsteadOf = https://github.com/\n"
+        );
+        assert_eq!(configured_origin_url(&insteadof), None);
+
+        // A `pushInsteadOf` rewrite is just as dangerous for pushes.
+        let push_insteadof = format!(
+            "{canonical}[url \"https://attacker.example/\"]\n\
+             \tpushInsteadOf = https://github.com/\n"
+        );
+        assert_eq!(configured_origin_url(&push_insteadof), None);
+
+        // Sanity: the canonical config on its own still resolves.
+        assert_eq!(
+            configured_origin_url(canonical).as_deref(),
+            Some("https://github.com/octo/hello.git")
+        );
+    }
+
+    /// Key matching is case-insensitive and the origin section is recognized
+    /// through noncanonical-but-git-valid spelling, so redirect vectors cannot
+    /// be hidden behind whitespace or the legacy dotted header form.
+    #[test]
+    fn parse_origin_config_is_robust_to_spelling() {
+        // Extra header whitespace is still the origin section.
+        let spaced = "[remote  \"origin\"]\n\tURL = https://github.com/octo/hello.git\n";
+        assert_eq!(
+            configured_origin_url(spaced).as_deref(),
+            Some("https://github.com/octo/hello.git")
+        );
+
+        // A `pushurl` smuggled in via the legacy dotted header is still caught.
+        let legacy_pushurl = "[remote \"origin\"]\n\turl = https://github.com/octo/hello.git\n\
+             [remote.origin]\n\tpushurl = https://attacker.example/x.git\n";
+        assert_eq!(configured_origin_url(legacy_pushurl), None);
+
+        // `[remote "Origin"]` is a *different* remote (case-sensitive
+        // subsection), so its url is not counted as an origin url.
+        let other_case = "[remote \"Origin\"]\n\turl = https://attacker.example/x.git\n\
+             [remote \"origin\"]\n\turl = https://github.com/octo/hello.git\n";
+        assert_eq!(
+            configured_origin_url(other_case).as_deref(),
+            Some("https://github.com/octo/hello.git")
+        );
+
+        assert!(header_is_origin("remote \"origin\""));
+        assert!(header_is_origin("  remote   \"origin\"  "));
+        assert!(header_is_origin("remote.origin"));
+        assert!(!header_is_origin("remote \"Origin\""));
+        assert!(!header_is_origin("url \"https://x/\""));
+    }
+
+    /// Each redirect vector, planted in a real `.git/config`, makes
+    /// `verify_origin` refuse — proving the fix at the function boundary the
+    /// facade actually calls.
+    #[test]
+    fn verify_origin_rejects_planted_redirects() {
+        let repo: RepoSpec = "octo/hello".parse().unwrap();
+        let expected = Url::parse("https://github.com/octo/hello.git").unwrap();
+        let canonical = "[remote \"origin\"]\n\turl = https://github.com/octo/hello.git\n";
+
+        for redirect in [
+            "\tpushurl = https://attacker.example/x.git\n",
+            "\turl = https://attacker.example/x.git\n",
+            "[url \"https://attacker.example/\"]\n\tinsteadOf = https://github.com/\n",
+            "[url \"https://attacker.example/\"]\n\tpushInsteadOf = https://github.com/\n",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+            std::fs::write(
+                tmp.path().join(".git").join("config"),
+                format!("{canonical}{redirect}"),
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    verify_origin(tmp.path(), &expected, &repo),
+                    Err(FacadeError::OriginMismatch { .. })
+                ),
+                "planted redirect must be refused: {redirect}"
+            );
+        }
+    }
+
     #[test]
     fn verify_origin_fails_closed_on_mismatch_or_absence() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1034,6 +1249,10 @@ mod tests {
             }
             .to_string(),
             FacadeError::NoDeclaredRepos.to_string(),
+            FacadeError::UnsafeBranchName {
+                branch: "-oProxyCommand=evil".into(),
+            }
+            .to_string(),
         ];
         for message in messages {
             assert!(!message.is_empty());
