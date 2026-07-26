@@ -35,6 +35,12 @@
 //!   failure instead of an interactive hang, and `protocol.allow` is pinned to
 //!   the exact scheme of the configured remote so a malicious redirect cannot
 //!   switch git onto `file://`/`ext::` transports.
+//! * The operator's **global and system git config are denied** to every child
+//!   (`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` → `/dev/null`): a git spawned
+//!   here reads only the repo-local config of the directory it runs in, so the
+//!   "credentialed git reads only daemon-authored config" invariant holds by
+//!   construction, not merely because the inherited environment happens to be
+//!   clean of `insteadOf` rewrites or stray credential helpers.
 //!
 //! Finally, `git` is chatty, so all child stdout/stderr is streamed line-by-line
 //! through a [`scrub`]ber that masks the live token bytes with
@@ -258,8 +264,15 @@ fn build_git(scheme: &str, subargs: &[&str], token: Option<&str>) -> GitCommand 
         (format!("protocol.{scheme}.allow"), "always".to_string()),
     ];
 
-    let mut envs: Vec<(String, String)> =
-        vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
+    let mut envs: Vec<(String, String)> = vec![
+        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        // Deny the operator's global/system config: the child reads only the
+        // repo-local config of the daemon-controlled directory it runs in
+        // (see the module docs — this makes the isolation hold by
+        // construction).
+        ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
+        ("GIT_CONFIG_SYSTEM".to_string(), "/dev/null".to_string()),
+    ];
 
     if let Some(secret) = token {
         // Reset the accumulated helper list (clears inherited helpers such as a
@@ -923,6 +936,18 @@ mod tests {
         );
         assert!(helpers[1].contains(SECRET_ENV));
         assert!(!helpers[1].contains(token));
+
+        // The operator's global/system config is denied to the child, so the
+        // credentialed leg reads only the repo-local config of the directory
+        // it runs in (regression: this must hold by construction, not by the
+        // host environment happening to be clean).
+        for var in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"] {
+            assert_eq!(
+                value_of(var).as_deref(),
+                Some("/dev/null"),
+                "{var} must be pinned to /dev/null"
+            );
+        }
 
         // Debug is redaction-safe.
         let dbg = format!("{cmd:?}");
