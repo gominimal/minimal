@@ -18,9 +18,12 @@
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
 N="${1:-5}"
+case "$N" in
+  '' | *[!0-9]*) echo "N must be a positive integer, got: '$N'" >&2; exit 2 ;;
+esac
+[ "$N" -ge 1 ] || { echo "N must be >= 1, got: $N" >&2; exit 2; }
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 E2E_VM="${E2E_VM:-}"
-
 # Resolve + seed a SMALL pinned project to activate, exactly as session-e2e.sh
 # does: `min activate` uploads the dir, so it must carry a pinned [upstream] +
 # a light `shell` stack and stay small. All N activates share this one dir (each
