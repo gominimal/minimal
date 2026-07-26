@@ -172,7 +172,11 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
-      - name: Upload soak boot logs
+      - name: Upload soak boot logs + diagnostic bundles
+        # On a failed iteration or bulk-upload proof the e2e scripts drop a
+        # `min bug` diagnostic bundle (minimal-diag-*.tar.zst) into this same
+        # dir alongside the per-iteration boot logs, so a red nightly ships the
+        # daemon's own logs/state/config — not just scraped console tails.
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
