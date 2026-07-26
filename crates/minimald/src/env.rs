@@ -1938,13 +1938,16 @@ mod tests {
             );
         }
 
-        /// `clone` of a declared repo lands it in the workspace and checks
-        /// out its declared branch (created from base — never pushed).
+        /// `clone` of a declared repo lands it in the workspace via the
+        /// daemon-private mirror and checks out its declared branch (created
+        /// from base — never pushed). The finished tree presents the clean
+        /// canonical URL as `origin`, and no token bytes ever touch the disk.
         #[tokio::test]
         async fn clone_of_declared_repo_primes_the_workspace() {
             let attrs = bound_attrs(&["octo/hello@feat/x:main", "octo/second@feat/y"]);
             let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
-            make_bare_remote(&fixtures.path().join("remotes"), "octo", "second");
+            let remotes = fixtures.path().join("remotes");
+            make_bare_remote(&remotes, "octo", "second");
 
             let lines = drive(&mut chan, "git%clone octo/second").await;
 
@@ -1959,6 +1962,26 @@ mod tests {
                 lines.iter().any(|l| l.contains("created branch `feat/y`")),
                 "got: {lines:?}"
             );
+            assert_eq!(current_branch_of(&work), "feat/y");
+            // The clone was routed through the daemon-private mirror (the
+            // isolation regression: no token-bearing git may ever run in the
+            // sandbox-writable destination, so the network work happens here).
+            assert!(
+                fixtures
+                    .path()
+                    .join(".gh-mirror")
+                    .join("octo__second.git")
+                    .join("HEAD")
+                    .exists(),
+                "the clone must route through the daemon-private mirror"
+            );
+            // The worktree's origin is the clean canonical URL (R6.1) …
+            assert_eq!(
+                origin_url_of(&work),
+                git_base(&remotes).join("octo/second.git").unwrap().as_str()
+            );
+            // … and neither the workspace nor the mirror holds token bytes.
+            assert_no_token_on_disk(fixtures.path());
             // R2.5: branch creation must not push.
             assert!(
                 !Command::new("git")
@@ -1983,6 +2006,167 @@ mod tests {
             );
         }
 
+        /// `clone` of a declared branch that already exists on the remote
+        /// checks it out as a tracking branch (the checkout-not-create arc),
+        /// with the network work done in the mirror, not the worktree.
+        #[tokio::test]
+        async fn clone_checks_out_existing_remote_branch_as_tracking() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main", "octo/second@feat/y"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            let remotes = fixtures.path().join("remotes");
+            make_bare_remote(&remotes, "octo", "second");
+            let bare = bare_repo_named(fixtures.path(), "octo", "second");
+            git_run(&["branch", "feat/y", "main"], &bare);
+
+            let lines = drive(&mut chan, "git%clone octo/second").await;
+
+            assert_no_error(&lines);
+            assert_no_token(&lines);
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("checked out branch `feat/y`")),
+                "an existing remote branch must be checked out, not created: {lines:?}"
+            );
+            let work = workspace_dir(fixtures.path()).join("second");
+            assert_eq!(current_branch_of(&work), "feat/y");
+            assert_eq!(
+                upstream_of(&work, "feat/y"),
+                "origin/feat/y",
+                "an existing remote branch must come out tracking its origin ref"
+            );
+        }
+
+        /// The clone-leg isolation regression (the reviewed TOCTOU): even a
+        /// pre-tampered mirror — origin rewritten to an attacker remote, as if
+        /// a prior compromise had persisted state — is re-authored by the
+        /// daemon before the credentialed fetch, so the clone's token leg
+        /// contacts only the canonical remote and the worktree contains only
+        /// canonical content.
+        #[tokio::test]
+        async fn pre_tampered_mirror_is_reauthored_before_the_token_leg() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main", "octo/second@feat/y"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            let remotes = fixtures.path().join("remotes");
+            make_bare_remote(&remotes, "octo", "second");
+            make_bare_remote(&remotes, "attacker", "second");
+            let attacker = bare_repo_named(fixtures.path(), "attacker", "second");
+            // Distinguish the attacker's content from the canonical seed.
+            let attacker_tip = advance_main_of(fixtures.path(), &attacker, "stolen.txt");
+
+            // Plant the mirror ahead of time, origin pointed at the attacker.
+            let mirror = fixtures.path().join(".gh-mirror").join("octo__second.git");
+            std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+            git_run(
+                &["init", "-q", "--bare", mirror.to_str().unwrap()],
+                fixtures.path(),
+            );
+            let attacker_url = format!("file://{}", attacker.display());
+            git_run(&["config", "remote.origin.url", &attacker_url], &mirror);
+            git_run(
+                &[
+                    "config",
+                    "remote.origin.fetch",
+                    "+refs/heads/*:refs/heads/*",
+                ],
+                &mirror,
+            );
+
+            let lines = drive(&mut chan, "git%clone octo/second").await;
+
+            assert_no_error(&lines);
+            assert_no_token(&lines);
+            let work = workspace_dir(fixtures.path()).join("second");
+            assert!(
+                !work.join("stolen.txt").exists(),
+                "the clone must carry canonical content, not the tampered mirror's target"
+            );
+            let canonical_tip = rev_of(&bare_repo_named(fixtures.path(), "octo", "second"), "main");
+            assert_eq!(
+                rev_of(&work, "refs/remotes/origin/main"),
+                canonical_tip,
+                "the mirror must have been re-pointed at the canonical remote: {lines:?}"
+            );
+            assert_ne!(rev_of(&work, "refs/remotes/origin/main"), attacker_tip);
+        }
+
+        /// A sandbox-planted clone destination — carrying a hostile origin and
+        /// a credential-helper trap — is refused outright: the facade never
+        /// adopts, reads, or runs git in a pre-existing destination (the
+        /// fail-closed side of the clone TOCTOU fix).
+        #[tokio::test]
+        async fn attacker_planted_clone_destination_fails_closed() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main", "octo/second@feat/y"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            let remotes = fixtures.path().join("remotes");
+            make_bare_remote(&remotes, "octo", "second");
+
+            let planted = workspace_dir(fixtures.path()).join("second");
+            std::fs::create_dir_all(&planted).unwrap();
+            git_run(&["init", "-q", "-b", "main", "."], &planted);
+            let sink = fixtures.path().join("planted-helper-fired");
+            git_run(
+                &[
+                    "config",
+                    "credential.helper",
+                    &format!("!f() {{ echo fired > {}; }}; f", sink.display()),
+                ],
+                &planted,
+            );
+            git_run(
+                &[
+                    "config",
+                    "remote.origin.url",
+                    "https://evil.example/steal.git",
+                ],
+                &planted,
+            );
+
+            let lines = drive(&mut chan, "git%clone octo/second").await;
+
+            assert!(
+                error_line(&lines).contains("already exists"),
+                "a pre-existing destination must be refused: {lines:?}"
+            );
+            assert_no_token(&lines);
+            assert!(
+                !sink.exists(),
+                "no git may ever run inside a sandbox-planted destination"
+            );
+        }
+
+        /// A declared base branch missing on the remote fails cleanly (R2.6):
+        /// an actionable error, no half-primed directory in the workspace, and
+        /// no staging leftovers under the mirror root.
+        #[tokio::test]
+        async fn clone_with_missing_base_fails_clean_and_leaves_no_state() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main", "octo/second@feat/y:nope"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            let remotes = fixtures.path().join("remotes");
+            make_bare_remote(&remotes, "octo", "second");
+
+            let lines = drive(&mut chan, "git%clone octo/second").await;
+
+            assert!(
+                error_line(&lines).contains("base branch `nope` not found"),
+                "got: {lines:?}"
+            );
+            assert!(
+                !workspace_dir(fixtures.path()).join("second").exists(),
+                "a failed clone must leave nothing in the workspace"
+            );
+            let leftovers: Vec<String> = std::fs::read_dir(fixtures.path().join(".gh-mirror"))
+                .expect("mirror root exists")
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".tmp"))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "staging temp dirs must be cleaned up: {leftovers:?}"
+            );
+        }
+
         /// The commit `refname` resolves to in `dir` (empty on failure).
         fn rev_of(dir: &Path, refname: &str) -> String {
             let out = Command::new("git")
@@ -1994,21 +2178,63 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
 
-        /// Advances the canonical `octo/hello` remote's `main` by one commit
-        /// (pushed from a throwaway clone), returning the new tip sha. Models
-        /// upstream work that a later `fetch`/`pull` must bring in.
-        fn advance_canonical_main(fixtures: &Path) -> String {
-            let bare = bare_repo(fixtures);
-            let tmp = fixtures.join(".advance-main");
+        /// The branch `dir`'s HEAD is on (empty on failure).
+        fn current_branch_of(dir: &Path) -> String {
+            let out = Command::new("git")
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .current_dir(dir)
+                .stderr(Stdio::null())
+                .output()
+                .expect("rev-parse HEAD");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        /// The configured `remote.origin.url` of `dir` (empty on failure).
+        fn origin_url_of(dir: &Path) -> String {
+            let out = Command::new("git")
+                .args(["config", "remote.origin.url"])
+                .current_dir(dir)
+                .stderr(Stdio::null())
+                .output()
+                .expect("git config");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        /// The upstream `branch` tracks in `dir` (empty when it has none).
+        fn upstream_of(dir: &Path, branch: &str) -> String {
+            let out = Command::new("git")
+                .args([
+                    "rev-parse",
+                    "--abbrev-ref",
+                    &format!("{branch}@{{upstream}}"),
+                ])
+                .current_dir(dir)
+                .stderr(Stdio::null())
+                .output()
+                .expect("rev-parse upstream");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        /// Pushes one distinguishing commit (adding `marker`) to `bare`'s
+        /// `main` from a throwaway clone, returning the new tip sha.
+        fn advance_main_of(fixtures: &Path, bare: &Path, marker: &str) -> String {
+            let tmp = fixtures.join(format!(".advance-{}", marker.replace('/', "_")));
             git_run(
                 &["clone", "-q", bare.to_str().unwrap(), tmp.to_str().unwrap()],
                 fixtures,
             );
-            std::fs::write(tmp.join("upstream.txt"), b"upstream change\n").unwrap();
-            git_run(&["add", "upstream.txt"], &tmp);
-            git_run(&["commit", "-q", "-m", "upstream change"], &tmp);
+            std::fs::write(tmp.join(marker), b"marker\n").unwrap();
+            git_run(&["add", marker], &tmp);
+            git_run(&["commit", "-q", "-m", "marker"], &tmp);
             git_run(&["push", "-q", "origin", "main"], &tmp);
             rev_of(&tmp, "HEAD")
+        }
+
+        /// Advances the canonical `octo/hello` remote's `main` by one commit
+        /// (pushed from a throwaway clone), returning the new tip sha. Models
+        /// upstream work that a later `fetch`/`pull` must bring in.
+        fn advance_canonical_main(fixtures: &Path) -> String {
+            advance_main_of(fixtures, &bare_repo(fixtures), "upstream.txt")
         }
 
         /// An authorized `fetch` brings the canonical remote's new commits into

@@ -83,14 +83,32 @@
 //! * **Fetch/pull:** [`github::gitops`] fetches canonical → mirror with the
 //!   token (again reading only the mirror config), then the worktree is
 //!   updated from the mirror over the local, token-free leg.
+//! * **Clone:** the same discipline — *not* an exemption. The credentialed
+//!   leg fetches canonical → mirror (and resolves the remote default branch
+//!   with an `ls-remote` run *in the mirror*); the worktree is then built from
+//!   the mirror over local, token-free legs inside a temp directory under the
+//!   daemon-private mirror root and renamed into the workspace only once it is
+//!   complete. This matters because a fresh clone's `.git/config` becomes
+//!   sandbox-writable the instant the directory lands in the workspace:
+//!   running a token-bearing `ls-remote`/`fetch` in it *afterwards* (as an
+//!   earlier revision did for the branch checkout) reopens the exact TOCTOU
+//!   this design closes — a racing sandbox process rewrites `origin` between
+//!   the rename and the checkout's first network op. So nothing token-bearing
+//!   ever runs in the finished tree, full stop.
 //!
-//! Net invariant: **no `git` process that holds the token ever reads a config
-//! file the sandbox can write or reach via `include`.** The canonical URL is
-//! always the daemon's own derivation; a rewritten worktree
+//! Net invariant: **no `git` process that holds the token ever runs in — or
+//! resolves a remote name from — a directory the sandbox can write.** The
+//! canonical URL is always the daemon's own derivation; a rewritten worktree
 //! `origin`/`pushurl`/`insteadOf`/`include` is simply never consulted on the
-//! token leg, so it cannot redirect it or leak the token. `clone` is exempt
-//! from the mirror dance: it targets a fresh, not-yet-existing directory, so
-//! there is no pre-existing sandbox-controlled config for it to read.
+//! token leg, so it cannot redirect it or leak the token.
+//!
+//! The mirror-location half of the invariant — `<workspace-parent>/.gh-mirror`
+//! is writable by the daemon only — is owed by the launcher: the activation
+//! wiring that mounts the workspace into the sandbox MUST NOT bind the
+//! workspace's host *parent* (the session state dir) into the sandbox
+//! namespace. That wiring has not landed yet ([`SessionGithub::new`] is not
+//! reached from the production launcher); re-verify this property when it
+//! does.
 //!
 //! Every span here is `github.facade` with fields limited to `repo` and
 //! `grant_id` (see the conventions in `super::state`).
@@ -100,6 +118,7 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use github::attrs::GithubAttrs;
 use github::gitops::Repo;
@@ -209,14 +228,12 @@ pub(crate) enum FacadeError {
     #[error("no repos are declared for this session")]
     NoDeclaredRepos,
 
-    /// The working tree's current branch name begins with `-`, so handing it
-    /// to `git push` risks having it parsed as an option rather than a branch
-    /// (argv injection). Refuse rather than run a token-bearing push on it
+    /// A branch name that would be handed to git as a bare argument begins
+    /// with `-`, so git would parse it as an option rather than a branch
+    /// (argv injection). Covers the worktree's current branch on push and the
+    /// declared/derived branch on clone. Refuse rather than run any git on it
     /// (defense-in-depth; the branch name is not secret).
-    #[error(
-        "current branch `{branch}` has an unsafe name (leading `-`); \
-         rename it before pushing"
-    )]
+    #[error("branch `{branch}` has an unsafe name (leading `-`); rename it")]
     UnsafeBranchName {
         /// The offending branch name.
         branch: String,
@@ -698,22 +715,13 @@ fn path_arg(path: &Path) -> Result<&str, FacadeError> {
     })
 }
 
-/// Runs one **token-free, local-only** git step and streams its output as
-/// `msg:` lines. This is the isolation-critical counterpart to
-/// `github::gitops` (which holds the token): it carries no credential and
-/// cannot reach the network — transport is pinned to `file`, and the
-/// operator's global/system git config is disabled — so even when it must read
-/// a sandbox-writable working-tree config (the worktree-update legs) there is
-/// nothing for a hostile config to exfiltrate and nowhere off-host for it to
-/// redirect to. Hooks are disabled and optional locks skipped, mirroring
-/// `gitops`'s non-secret hardening.
-fn run_local_git(
-    cwd: &Path,
-    operation: &str,
-    subargs: &[&str],
-    out: &mut UnixStream,
-) -> Result<(), FacadeError> {
-    let output = Command::new("git")
+/// Builds the hardened, **token-free, local-only** git command shared by
+/// [`run_local_git`] and [`local_branch_exists`]: transport pinned to `file`,
+/// hooks disabled, the operator's global/system config denied, and no
+/// credential anywhere in its environment.
+fn local_git_command(cwd: &Path, subargs: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
         .arg("--no-optional-locks")
         // Pin transport to local files only and disable hooks. `-c` config is
         // propagated to any subprocess (e.g. the source repo's `upload-pack`)
@@ -734,12 +742,32 @@ fn run_local_git(
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|source| FacadeError::LocalGit {
-            operation: operation.to_string(),
-            detail: format!("could not run git: {source}"),
-        })?;
+        .stdin(Stdio::null());
+    command
+}
+
+/// Runs one **token-free, local-only** git step and streams its output as
+/// `msg:` lines. This is the isolation-critical counterpart to
+/// `github::gitops` (which holds the token): it carries no credential and
+/// cannot reach the network — transport is pinned to `file`, and the
+/// operator's global/system git config is disabled — so even when it must read
+/// a sandbox-writable working-tree config (the worktree-update legs) there is
+/// nothing for a hostile config to exfiltrate and nowhere off-host for it to
+/// redirect to. Hooks are disabled and optional locks skipped, mirroring
+/// `gitops`'s non-secret hardening.
+fn run_local_git(
+    cwd: &Path,
+    operation: &str,
+    subargs: &[&str],
+    out: &mut UnixStream,
+) -> Result<(), FacadeError> {
+    let output =
+        local_git_command(cwd, subargs)
+            .output()
+            .map_err(|source| FacadeError::LocalGit {
+                operation: operation.to_string(),
+                detail: format!("could not run git: {source}"),
+            })?;
 
     for line in String::from_utf8_lossy(&output.stderr).lines() {
         let _ = writeln!(out, "msg:{line}");
@@ -816,6 +844,225 @@ fn ensure_mirror(
         out,
     )?;
     Ok(dir)
+}
+
+/// Whether the daemon-private repo at `dir` has a local branch named `branch`.
+/// A quiet, token-free, local-only probe with the same hardening as
+/// [`run_local_git`]. Used only against the mirror, whose heads (after a
+/// fetch) are exactly the canonical remote's — so this doubles as the
+/// "does the branch exist on the remote?" check without another network op.
+fn local_branch_exists(dir: &Path, branch: &str) -> Result<bool, FacadeError> {
+    // Always probed as a fully-qualified ref, so a `-`-leading branch name can
+    // never be parsed as an option here.
+    let refname = format!("refs/heads/{branch}");
+    local_git_command(dir, &["rev-parse", "--verify", "--quiet", &refname])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .map_err(|source| FacadeError::LocalGit {
+            operation: "probe mirror branch".to_string(),
+            detail: format!("could not run git: {source}"),
+        })
+}
+
+/// The branch a fresh clone's worktree starts on (spec R2.2), decided
+/// daemon-side against the already-fetched mirror.
+#[derive(Debug)]
+enum CloneTarget {
+    /// The branch exists on the remote (present in the mirror after the
+    /// fetch); check it out tracking `origin/<branch>`.
+    Existing {
+        /// The remote branch to check out.
+        branch: String,
+    },
+    /// The branch is absent on the remote; create it locally from `base`,
+    /// with no upstream — it is never pushed implicitly (spec R2.5).
+    CreateFromBase {
+        /// The new local branch.
+        branch: String,
+        /// The remote branch it starts from.
+        base: String,
+    },
+}
+
+impl CloneTarget {
+    /// The branch the finished worktree ends up on.
+    fn branch(&self) -> &str {
+        match self {
+            Self::Existing { branch } | Self::CreateFromBase { branch, .. } => branch,
+        }
+    }
+}
+
+/// Resolves the [`CloneTarget`] for a declared repo: its declared branch if it
+/// exists on the remote; otherwise created from the declared base (or the
+/// remote's default branch); with no declared branch, the remote's default.
+///
+/// `mirror_tree` must be the **mirror**, already fetched: branch existence is
+/// a local probe against the mirror's heads, and the one network op — the
+/// default-branch `ls-remote` — runs in the mirror too, reading only its
+/// daemon-authored config (never the workspace's).
+fn clone_target(
+    mirror_tree: &Repo,
+    repo: &RepoSpec,
+    token: Option<&SecretString>,
+) -> Result<CloneTarget, FacadeError> {
+    let mirror = mirror_tree.work_dir();
+    let target = match repo.branch() {
+        Some(branch) if local_branch_exists(mirror, branch)? => CloneTarget::Existing {
+            branch: branch.to_string(),
+        },
+        Some(branch) => {
+            let base = match repo.base() {
+                Some(base) => base.to_string(),
+                None => mirror_tree.default_branch(token)?,
+            };
+            if !local_branch_exists(mirror, &base)? {
+                return Err(github::gitops::GitError::BaseBranchNotFound { branch: base }.into());
+            }
+            CloneTarget::CreateFromBase {
+                branch: branch.to_string(),
+                base,
+            }
+        }
+        None => CloneTarget::Existing {
+            branch: mirror_tree.default_branch(token)?,
+        },
+    };
+    // The branch name becomes a bare `git checkout` argument on the local leg;
+    // a leading dash would parse as an option (argv injection). The declared
+    // spec's ref validation is strict but does not exclude a leading `-`.
+    if target.branch().starts_with('-') {
+        return Err(FacadeError::UnsafeBranchName {
+            branch: target.branch().to_string(),
+        });
+    }
+    Ok(target)
+}
+
+/// A unique temp directory under the daemon-private mirror root for staging a
+/// clone's worktree — same filesystem as the workspace in production (both
+/// live under the session dir), so the finalizing rename is atomic.
+fn unique_clone_temp(root: &Path, repo: &RepoSpec) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    root.join(format!(
+        ".clone-{}__{}-{}-{nanos}.tmp",
+        repo.owner(),
+        repo.repo(),
+        std::process::id()
+    ))
+}
+
+/// Builds the sandbox-facing worktree for a fresh clone entirely inside a temp
+/// directory under the daemon-private mirror `root`, then renames it to `dest`
+/// in one step. Every git process here is local-only and token-free; the tree
+/// the sandbox eventually sees is complete — `origin` at the canonical URL,
+/// `target` checked out — *before* it becomes sandbox-reachable, so no later
+/// git step (least of all a token-bearing one) ever runs inside it. Failure at
+/// any step removes the temp and leaves the workspace untouched (spec R2.6).
+fn materialize_worktree(
+    root: &Path,
+    mirror: &Path,
+    canonical: &Url,
+    target: &CloneTarget,
+    dest: &Path,
+    repo: &RepoSpec,
+    out: &mut UnixStream,
+) -> Result<(), FacadeError> {
+    let temp = unique_clone_temp(root, repo);
+    if let Err(err) = build_worktree(&temp, mirror, canonical, target, out) {
+        let _ = fs::remove_dir_all(&temp);
+        return Err(err);
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|source| {
+            let _ = fs::remove_dir_all(&temp);
+            FacadeError::LocalGit {
+                operation: "prepare workspace".to_string(),
+                detail: format!("could not create the workspace directory: {source}"),
+            }
+        })?;
+    }
+    fs::rename(&temp, dest).map_err(|source| {
+        let _ = fs::remove_dir_all(&temp);
+        FacadeError::LocalGit {
+            operation: "finalize clone".to_string(),
+            detail: format!("could not move the clone into the workspace: {source}"),
+        }
+    })
+}
+
+/// The fallible steps of [`materialize_worktree`], separated so a failure at
+/// any point cleans up the temp directory exactly once.
+fn build_worktree(
+    temp: &Path,
+    mirror: &Path,
+    canonical: &Url,
+    target: &CloneTarget,
+    out: &mut UnixStream,
+) -> Result<(), FacadeError> {
+    let mirror_arg = path_arg(mirror)?;
+    let temp_arg = path_arg(temp)?;
+    // `--no-checkout`: the branch decision is already made in `target`.
+    // `--no-hardlinks`: never share object inodes between the daemon-private
+    // mirror and the soon-to-be-sandbox-writable tree.
+    run_local_git(
+        mirror,
+        "clone from mirror",
+        &[
+            "clone",
+            "--quiet",
+            "--no-checkout",
+            "--no-hardlinks",
+            "--origin",
+            "origin",
+            mirror_arg,
+            temp_arg,
+        ],
+        out,
+    )?;
+    // The finished tree presents the clean canonical URL as `origin` (R6.1:
+    // no credential material), exactly as a direct clone would — but no
+    // token-bearing git will ever read it back (see the module docs).
+    run_local_git(
+        temp,
+        "set clone origin",
+        &["remote", "set-url", "origin", canonical.as_str()],
+        out,
+    )?;
+    match target {
+        CloneTarget::Existing { branch } => {
+            let origin_ref = format!("origin/{branch}");
+            run_local_git(
+                temp,
+                "checkout",
+                &["checkout", "--quiet", "-B", branch, "--track", &origin_ref],
+                out,
+            )
+        }
+        CloneTarget::CreateFromBase { branch, base } => {
+            let origin_base = format!("origin/{base}");
+            // `--no-track`: a created branch has no upstream until explicitly
+            // pushed (spec R2.5) — the PR-able signal depends on it.
+            run_local_git(
+                temp,
+                "checkout",
+                &[
+                    "checkout",
+                    "--quiet",
+                    "-b",
+                    branch,
+                    "--no-track",
+                    &origin_base,
+                ],
+                out,
+            )
+        }
+    }
 }
 
 /// Runs the authorized operation (on the blocking pool), writing scrubbed
@@ -974,25 +1221,39 @@ fn execute(
         }
         GitVerbCmd::Clone { .. } => {
             // Always into `<working>/<repo-name>`; the root-prime layout is
-            // the activation flow's business, not the facade's. Clone targets a
-            // fresh directory, so there is no pre-existing sandbox-controlled
-            // config to read — no mirror indirection is needed.
+            // the activation flow's business, not the facade's. The clone runs
+            // the full mirror discipline: the moment a clone lands in the
+            // workspace its `.git/config` is sandbox-writable, so every
+            // token-bearing step (fetch, default-branch probe) happens in the
+            // daemon-private mirror *first*, and the worktree is materialized
+            // from the mirror over token-free local legs, appearing in the
+            // workspace fully formed (see the module docs).
             let dest = working.as_utf8_path().as_std_path().join(repo.repo());
-            let tree = Repo::clone(remote.as_str(), &dest, token, |_, line| {
+            if dest.exists() {
+                // Fail closed: whatever is here, the sandbox may have planted
+                // it (hostile config included). Never adopt or touch it.
+                return Err(github::gitops::GitError::DestinationExists {
+                    path: dest.display().to_string(),
+                }
+                .into());
+            }
+            let root = mirror_root(working)?;
+            let mirror = ensure_mirror(&root, repo, remote, &mut out)?;
+            let mirror_tree = Repo::open(mirror.clone(), remote.as_str());
+            // Credentialed leg: every canonical head → mirror. Runs in the
+            // mirror; reads only its daemon-authored config.
+            mirror_tree.fetch(token, |_, line| {
                 let _ = writeln!(out, "msg:{line}");
             })?;
+            let target = clone_target(&mirror_tree, repo, token)?;
+            materialize_worktree(&root, &mirror, remote, &target, &dest, repo, &mut out)?;
             let _ = writeln!(out, "msg:cloned {owner_repo} into `{}`", repo.repo());
-            if let Some(branch) = repo.branch() {
-                let outcome = tree.checkout_or_create(token, branch, repo.base(), |_, line| {
-                    let _ = writeln!(out, "msg:{line}");
-                })?;
-                let what = match outcome {
-                    github::gitops::CheckoutOutcome::Checkout => "checked out",
-                    github::gitops::CheckoutOutcome::CreatedFromBase => "created",
-                    // `CheckoutOutcome` is non-exhaustive.
-                    _ => "prepared",
+            if repo.branch().is_some() {
+                let what = match &target {
+                    CloneTarget::Existing { .. } => "checked out",
+                    CloneTarget::CreateFromBase { .. } => "created",
                 };
-                let _ = writeln!(out, "msg:{what} branch `{branch}`");
+                let _ = writeln!(out, "msg:{what} branch `{}`", target.branch());
             }
         }
     }
