@@ -11,6 +11,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::Connection;
+use crate::github::GithubService;
 use crate::sessions;
 
 /// The ed25519 host private key for the SSH server.
@@ -106,6 +107,14 @@ pub struct ServerState {
     config: Config,
     sessions: sessions::ManagerHandle,
 
+    /// The daemon's single GitHub composition root (spec 10), built once at
+    /// startup from [`github::GithubConfig::from_env`] and shared by every
+    /// `github`-RPC handler and session facade channel — see
+    /// [`ServerStateHandle::github`] and the module docs on
+    /// `crate::github::state`. Unconfigured (no GitHub App client id) is a
+    /// normal, fully-functional state: it never prevents daemon startup.
+    github: GithubService,
+
     /// Fired by the `Shutdown` RPC handler once the session manager has been
     /// torn down, telling [`Server::run`]'s accept loop to stop accepting,
     /// drain in-flight connections, and return so the process can exit.
@@ -174,6 +183,24 @@ impl ServerState {
             .build()
             .map_err(|e| std::io::Error::other(format!("mctx config: {e}")))?;
 
+        // GitHub composition root (spec 10): resolved once here so the whole
+        // daemon shares exactly one `GithubService`/`GrantManager` for its
+        // lifetime — single-flight refresh (spec R1.2) only holds with one
+        // manager. Unconfigured (no `MINIMALD_GITHUB_CLIENT_ID`) is a normal,
+        // fully-supported state (spec R1.1) and must never fail startup; only
+        // a malformed override (`MINIMALD_GITHUB_*_BASE_URL` not a valid URL)
+        // is a genuine misconfiguration worth failing loudly on.
+        let github_config = github::GithubConfig::from_env()
+            .map_err(|e| std::io::Error::other(format!("github config: {e}")))?;
+        let github = GithubService::new(
+            github_config,
+            minimal_state_dir
+                .as_utf8_path()
+                .as_std_path()
+                .join("github")
+                .join("grants"),
+        )?;
+
         Ok(Self {
             sessions: sessions::Manager::init(
                 minimal_state_dir,
@@ -182,6 +209,7 @@ impl ServerState {
                 net_switch,
             )
             .await?,
+            github,
             config,
             shutdown: CancellationToken::new(),
             host_key: None,
@@ -221,6 +249,16 @@ impl ServerStateHandle {
     /// Returns a handle to the sessions manager.
     pub async fn sessions_manager(&self) -> sessions::ManagerHandle {
         self.0.lock().await.sessions.clone()
+    }
+
+    /// Returns the daemon's single [`GithubService`] (spec 10). Every
+    /// `github`-RPC handler (`rpc.rs`) and session facade channel (`env.rs`)
+    /// must reach GitHub only through the clone this returns, never by
+    /// constructing a second `GithubService` — see the module docs on
+    /// `crate::github::state` for why that would defeat single-flight
+    /// refresh. Cheap to call and to clone.
+    pub async fn github(&self) -> GithubService {
+        self.0.lock().await.github.clone()
     }
 
     /// Returns a clone of the server shutdown token. [`Server::run`]'s accept

@@ -4,6 +4,7 @@ pub mod channel_progress;
 pub mod connection;
 pub mod env;
 mod exec;
+mod github;
 #[cfg(target_os = "linux")]
 pub mod guest;
 #[cfg(target_os = "linux")]

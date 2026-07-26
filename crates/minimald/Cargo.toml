@@ -50,6 +50,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+url.workspace = true
 
 # WireGuard mesh peer (Unit 4, R4.1/R4.7): compiled only under `networking-wg`.
 base64 = { workspace = true, optional = true }
@@ -60,6 +61,10 @@ args.workspace = true
 async-dialog.workspace = true
 check.workspace = true
 common.workspace = true
+# `client` pulls in the device-flow/refresh/REST HTTP stack (spec 10); the
+# default (pure-types) feature set alone can't drive GitHub, and this is the
+# daemon — the one process that is allowed to hold a token.
+github = { workspace = true, features = ["client"] }
 graph.workspace = true
 mctx.workspace = true
 mfile.workspace = true

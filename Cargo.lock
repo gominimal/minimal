@@ -3680,6 +3680,7 @@ dependencies = [
  "either",
  "fd-lock",
  "futures",
+ "github",
  "graph",
  "hakoniwa",
  "indoc",
@@ -3712,6 +3713,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "url",
  "version",
  "vt100-ctt",
 ]
