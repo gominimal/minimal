@@ -4,12 +4,12 @@
 //! The sandbox has no GitHub credential (spec G5/R6.1); instead the in-sandbox
 //! `min` helper forwards `min git <args>` as a `git%<args>` request line over
 //! the per-session UDS, and this module performs the real, authenticated git
-//! operation in the session's workspace on the daemon side, streaming scrubbed
-//! output back as `msg:` lines. Access is bound to the sandbox lifetime by
-//! construction: the dispatch lives on the channel actor that `crate::env::Env`
-//! aborts when the sandbox is torn down, and every request re-reads the
-//! session record from the live store (a destroyed session's record is gone),
-//! so nothing authorizes after destroy (spec R3.5/R6.3).
+//! operation on the daemon side, streaming scrubbed output back as `msg:`
+//! lines. Access is bound to the sandbox lifetime by construction: the
+//! dispatch lives on the channel actor that `crate::env::Env` aborts when the
+//! sandbox is torn down, and every request re-reads the session record from the
+//! live store (a destroyed session's record is gone), so nothing authorizes
+//! after destroy (spec R3.5/R6.3).
 //!
 //! # The argv gate is a security boundary
 //!
@@ -31,9 +31,9 @@
 //! repos and is required only when more than one is declared):
 //!
 //! ```text
-//! push   [owner/repo]      # push the current branch, set upstream
-//! pull   [owner/repo]      # fast-forward from upstream
-//! fetch  [owner/repo]      # fetch --prune from origin
+//! push   [owner/repo]      # push the current branch to the declared remote
+//! pull   [owner/repo]      # fast-forward the current branch from the remote
+//! fetch  [owner/repo]      # update remote-tracking refs from the remote
 //! status [owner/repo]      # current branch + ahead/behind of upstream
 //! remote [-v] [owner/repo] # show the declared origin URL
 //! clone  owner/repo        # clone a declared repo into the workspace
@@ -49,41 +49,57 @@
 //! `github::gitops`, which injects it env-only and scrubs it from all output;
 //! it never appears in this module's errors, spans, or `msg:` lines.
 //!
-//! # Origin verification (defense-in-depth, with a known residual race)
+//! # Isolating the credentialed leg (the security core)
 //!
-//! The session workspace is sandbox-visible, so in-sandbox code can rewrite
-//! `.git/config`. Because the credential helper `github::gitops` installs
-//! answers for whatever host `git` contacts, a rewritten remote could
-//! otherwise coax a token-bearing `git` into authenticating against an
-//! attacker-chosen `https://` host. Before every authenticated operation that
-//! uses `origin`, [`verify_origin`] therefore inspects the **whole** config
-//! and fails closed unless it finds a single, canonical `origin` url that is
-//! byte-identical to the URL this module derives ([`remote_url`]).
+//! The session workspace is sandbox-visible: in-sandbox code can rewrite a
+//! primed repo's `.git/config` at will, and `git` honours a large, open-ended
+//! set of config directives that redirect where a connection goes or splice
+//! material into it — `[include]`/`[includeIf]` (which pull in arbitrary
+//! attacker-authored config from any path), `credential.helper`,
+//! `http.<url>.extraHeader`, `url.<base>.insteadOf`/`pushInsteadOf`, and
+//! `remote.origin.url`/`pushurl`. Any one of these can point a token-bearing
+//! `git` at an attacker host or splice the token into a header. There is **no**
+//! way to make this safe by inspecting the config text first: an `[includeIf]`
+//! alone (path resolved and read only at git runtime) defeats any parser, and
+//! a check-then-use scan races the sandbox rewriting the file underneath it.
 //!
-//! Crucially, byte-matching the first `url` line is not enough: git's real
-//! connect target is governed by more of that same sandbox-writable file. So
-//! [`parse_origin_config`] rejects every redirect vector that would leave the
-//! canonical url intact while retargeting git — a `[remote "origin"] pushurl`
-//! (a separate push target), a second `url` value (multi-valued `url`), and
-//! any `url.<base>.insteadOf`/`pushInsteadOf` rewrite (which retargets even a
-//! byte-identical url). Section-header parsing is tolerant of whitespace and
-//! the legacy `[remote.origin]` form so a noncanonical-but-valid header cannot
-//! smuggle an extra `url`/`pushurl` past the scan.
+//! So the token-bearing operation never runs in — and never reads the config
+//! of — the sandbox working tree. Every push/pull/fetch is split into a
+//! token-free **local** leg and a credentialed **network** leg run against a
+//! **daemon-authored clean mirror** the sandbox cannot reach:
 //!
-//! What remains is a pure check-then-use race over a shared filesystem: a
-//! sandbox that races a rewrite into the window between the check and git's own
-//! config read can still win. Closing that race needs `gitops` to pin
-//! `remote.origin.url` and disable url-rewriting through its runtime
-//! `GIT_CONFIG_*` injection (a recorded follow-up for the gitops layer). The
-//! exposure is bounded to the grant's own scoped token; it cannot widen repo
-//! access.
+//! * The mirror is a bare repo under the session's daemon-side state
+//!   ([`mirror_root`] → `<workspace-parent>/.gh-mirror/<owner>__<repo>.git`), a
+//!   sibling of the sandbox-mounted workspace/home/state dirs that is itself
+//!   mounted nowhere into the sandbox. Its config is written only by the daemon
+//!   ([`ensure_mirror`] sets `remote.origin.url` to the canonical URL derived
+//!   daemon-side by [`remote_url`], never from sandbox input) — no `[include]`,
+//!   no `insteadOf`, no on-disk credential helper.
+//! * **Push:** the requested branch is transferred worktree → mirror over the
+//!   local, network-incapable leg ([`run_local_git`]: protocol pinned to
+//!   `file`, global/system config disabled, no token), then pushed mirror →
+//!   canonical URL by [`github::gitops`], which injects the token env-only and,
+//!   running in the mirror, reads only the daemon-authored mirror config.
+//! * **Fetch/pull:** [`github::gitops`] fetches canonical → mirror with the
+//!   token (again reading only the mirror config), then the worktree is
+//!   updated from the mirror over the local, token-free leg.
+//!
+//! Net invariant: **no `git` process that holds the token ever reads a config
+//! file the sandbox can write or reach via `include`.** The canonical URL is
+//! always the daemon's own derivation; a rewritten worktree
+//! `origin`/`pushurl`/`insteadOf`/`include` is simply never consulted on the
+//! token leg, so it cannot redirect it or leak the token. `clone` is exempt
+//! from the mirror dance: it targets a fresh, not-yet-existing directory, so
+//! there is no pre-existing sandbox-controlled config for it to read.
 //!
 //! Every span here is `github.facade` with fields limited to `repo` and
 //! `grant_id` (see the conventions in `super::state`).
 
+use std::fs;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use github::attrs::GithubAttrs;
 use github::gitops::Repo;
@@ -105,6 +121,11 @@ pub(crate) const NO_GITHUB_AUTH: &str = "this session has no GitHub authenticati
 /// rejection so the error is actionable without widening what it accepts.
 const SUPPORTED: &str = "supported: `min git push|pull|fetch|status [owner/repo]`, \
      `min git remote -v [owner/repo]`, `min git clone owner/repo`";
+
+/// Name of the daemon-only directory (a sibling of the sandbox-mounted
+/// workspace) that holds the clean per-repo mirrors. Hidden and prefixed so it
+/// cannot collide with a repo directory named after a declared repo.
+const MIRROR_DIR: &str = ".gh-mirror";
 
 /// Errors surfaced to the in-sandbox client as a single `error:` line (or
 /// `msg:` lines plus a terminator when multi-line). Every variant is
@@ -144,10 +165,22 @@ pub(crate) enum FacadeError {
     #[error(transparent)]
     Github(#[from] github::Error),
 
-    /// The daemon-side git operation failed. `gitops` errors embed only
-    /// token-scrubbed output.
+    /// The daemon-side credentialed git operation failed. `gitops` errors
+    /// embed only token-scrubbed output.
     #[error(transparent)]
     Git(#[from] github::gitops::GitError),
+
+    /// A daemon-side, token-free **local** git step (mirror setup, the local
+    /// ref transfer, or a worktree update) failed. These legs never hold a
+    /// token and never contact the network; the detail is a short, non-secret
+    /// summary.
+    #[error("local git step `{operation}` failed: {detail}")]
+    LocalGit {
+        /// The logical local step that failed.
+        operation: String,
+        /// A short, non-secret description of the failure.
+        detail: String,
+    },
 
     /// The selected repo has no primed working tree in this session's
     /// workspace.
@@ -156,20 +189,6 @@ pub(crate) enum FacadeError {
          run `min git clone {owner}/{name}` first"
     )]
     NotPrimed {
-        /// The repository owner.
-        owner: String,
-        /// The repository name.
-        name: String,
-    },
-
-    /// The working tree's configured `origin` does not match the URL derived
-    /// from the daemon's git base — refuse rather than hand a token-bearing
-    /// `git` an attacker-chosen remote (see the module docs).
-    #[error(
-        "origin of {owner}/{name} does not point at the declared GitHub \
-         remote; refusing to run an authenticated git operation on it"
-    )]
-    OriginMismatch {
         /// The repository owner.
         owner: String,
         /// The repository name.
@@ -203,6 +222,13 @@ pub(crate) enum FacadeError {
         branch: String,
     },
 
+    /// The daemon could not derive a mirror location outside the
+    /// sandbox-visible workspace (the workspace has no parent directory). Fail
+    /// closed rather than risk running the token leg near sandbox-writable
+    /// config.
+    #[error("could not derive a daemon-private mirror location for the session workspace")]
+    NoMirrorRoot,
+
     /// Streaming plumbing failed (connection clone / blocking-task join).
     #[error("internal error while streaming git output: {source}")]
     Stream {
@@ -216,7 +242,7 @@ pub(crate) enum FacadeError {
 /// optional `owner/repo` selector naming which declared repo to operate on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GitVerbCmd {
-    /// `push [owner/repo]` — push the current branch, setting its upstream.
+    /// `push [owner/repo]` — push the current branch to the declared remote.
     Push {
         /// Which declared repo to push, when more than one is declared.
         repo: Option<RepoSpec>,
@@ -226,7 +252,7 @@ pub(crate) enum GitVerbCmd {
         /// Which declared repo to pull.
         repo: Option<RepoSpec>,
     },
-    /// `fetch [owner/repo]` — fetch (with prune) from origin.
+    /// `fetch [owner/repo]` — update remote-tracking refs from the remote.
     Fetch {
         /// Which declared repo to fetch.
         repo: Option<RepoSpec>,
@@ -392,12 +418,12 @@ pub(crate) fn parse_git_argv(argv: &str) -> Result<GitVerbCmd, FacadeError> {
     }
 }
 
-/// Derives the clean (credential-free) remote URL for a declared repo from
-/// the daemon's configured git base: `<git_base>/<owner>/<repo>.git`.
+/// Derives the clean (credential-free) canonical remote URL for a declared
+/// repo from the daemon's configured git base: `<git_base>/<owner>/<repo>.git`.
 ///
-/// This is the single source of truth for what a primed working tree's
-/// `origin` must be — [`verify_origin`] compares against it byte-for-byte,
-/// so repo pre-priming must derive its clone URLs identically.
+/// This is the single source of truth for where the credentialed leg connects
+/// (spec R5.4): it comes from the session's declared repo, daemon-side, and is
+/// supplied explicitly to `git` — the sandbox's own `origin` is never used.
 fn remote_url(git_base: &Url, repo: &RepoSpec) -> Result<Url, FacadeError> {
     // `Url::join` resolves relative to the last `/`; guarantee the base is
     // treated as a directory so a slash-less override can't eat a path
@@ -646,129 +672,156 @@ fn primed_dir(
     })
 }
 
-/// Requires the working tree's configured `origin` to resolve to exactly the
-/// daemon-derived remote URL, refusing the operation otherwise. This is more
-/// than a byte-compare of the first `url` line: it fails closed on every
-/// sandbox-plantable redirect vector (`pushurl`, a second `url`, an
-/// `insteadOf`/`pushInsteadOf` rewrite) that would leave the canonical url
-/// intact while retargeting git. See the module docs for the threat model and
-/// the known residual TOCTOU.
-fn verify_origin(work: &Path, expected: &Url, repo: &RepoSpec) -> Result<(), FacadeError> {
-    let mismatch = || FacadeError::OriginMismatch {
-        owner: repo.owner().to_string(),
-        name: repo.repo().to_string(),
-    };
-    let config =
-        std::fs::read_to_string(work.join(".git").join("config")).map_err(|_source| mismatch())?;
-    match configured_origin_url(&config) {
-        Some(url) if url == expected.as_str() => Ok(()),
-        // Absent, ambiguous, redirected, or different: fail closed either way.
-        _ => Err(mismatch()),
-    }
-}
-
-/// The connect-relevant view of a `.git/config`, derived from the
-/// sandbox-writable file. Anything beyond a single canonical `origin.url` is a
-/// redirect vector that must make [`verify_origin`] fail closed.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct OriginConfig {
-    /// Every `url` value declared in `[remote "origin"]`, in file order. A
-    /// single entry is the only accepted shape; zero or several is hostile
-    /// (multi-valued `url` lets git pick a second target).
-    origin_urls: Vec<String>,
-    /// Whether `[remote "origin"]` declares a `pushurl` — a distinct target
-    /// git prefers for pushes, so a matching fetch `url` would not constrain
-    /// where a push connects.
-    origin_has_pushurl: bool,
-    /// Whether the config declares any `insteadOf`/`pushInsteadOf` rewrite
-    /// (an `[url "…"]` section that silently retargets even a byte-identical
-    /// origin url).
-    has_url_rewrite: bool,
-}
-
-/// Whether a section header names `[remote "origin"]`. Tolerant of surrounding
-/// whitespace and accepts both the canonical quoted subsection form and the
-/// legacy dotted `remote.origin` form; the quoted subsection is matched
-/// case-sensitively (as git does — `[remote "Origin"]` is a *different*
-/// remote), the legacy subsection case-insensitively.
-fn header_is_origin(header: &str) -> bool {
-    let header = header.trim();
-    if let Some((section, rest)) = header.split_once('"') {
-        // Quoted form: remote "origin"
-        let subsection = rest.rsplit_once('"').map_or(rest, |(inner, _)| inner);
-        return section.trim().eq_ignore_ascii_case("remote") && subsection == "origin";
-    }
-    if let Some((section, subsection)) = header.split_once('.') {
-        // Legacy dotted form: remote.origin
-        return section.trim().eq_ignore_ascii_case("remote")
-            && subsection.trim().eq_ignore_ascii_case("origin");
-    }
-    false
-}
-
-/// Parses the connect-relevant parts of git config text (see [`OriginConfig`]).
+/// The daemon-private directory that holds this session's clean mirrors: a
+/// sibling of the sandbox-mounted workspace (`<workspace-parent>/.gh-mirror`).
 ///
-/// This is a conservative, fail-closed scanner, not a full git-config parser:
-/// it recognizes section headers and `key = value` lines, tracks the
-/// `[remote "origin"]` section for `url`/`pushurl`, and flags any
-/// `insteadOf`/`pushInsteadOf` key anywhere (those live in `[url "…"]`
-/// sections and are matched by key name, sidestepping header parsing). Full
-/// blank/comment lines are ignored; anything it cannot confidently read leaves
-/// the origin url unmatched, so [`verify_origin`] denies.
-fn parse_origin_config(config: &str) -> OriginConfig {
-    let mut parsed = OriginConfig::default();
-    let mut in_origin = false;
-    for raw in config.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix('[') {
-            // Section header runs up to the closing `]`.
-            let header = rest.split(']').next().unwrap_or("");
-            in_origin = header_is_origin(header);
-            continue;
-        }
-        let (key, value) = match line.split_once('=') {
-            Some((key, value)) => (key.trim(), Some(value.trim())),
-            None => (line, None),
-        };
-        let key = key.to_ascii_lowercase();
-        if key == "insteadof" || key == "pushinsteadof" {
-            parsed.has_url_rewrite = true;
-        }
-        if in_origin {
-            match key.as_str() {
-                "url" => parsed.origin_urls.push(value.unwrap_or("").to_string()),
-                "pushurl" => parsed.origin_has_pushurl = true,
-                _ => {}
+/// In production `working` is `<session-dir>/tree`, so the parent is the
+/// session's own daemon-side state directory — unique per session, mounted
+/// nowhere into the sandbox, and removed when the session is destroyed. Fails
+/// closed with [`FacadeError::NoMirrorRoot`] if the workspace somehow has no
+/// parent, rather than fall back to any sandbox-reachable location.
+fn mirror_root(working: &DaemonAbsPath) -> Result<PathBuf, FacadeError> {
+    working
+        .as_utf8_path()
+        .as_std_path()
+        .parent()
+        .map(|parent| parent.join(MIRROR_DIR))
+        .ok_or(FacadeError::NoMirrorRoot)
+}
+
+/// Renders a path as `&str` for a git argument, failing closed on non-UTF-8
+/// (all daemon-side session paths are UTF-8 `DaemonAbsPath`s in practice).
+fn path_arg(path: &Path) -> Result<&str, FacadeError> {
+    path.to_str().ok_or_else(|| FacadeError::LocalGit {
+        operation: "resolve path".to_string(),
+        detail: format!("path is not valid UTF-8: {}", path.display()),
+    })
+}
+
+/// Runs one **token-free, local-only** git step and streams its output as
+/// `msg:` lines. This is the isolation-critical counterpart to
+/// `github::gitops` (which holds the token): it carries no credential and
+/// cannot reach the network — transport is pinned to `file`, and the
+/// operator's global/system git config is disabled — so even when it must read
+/// a sandbox-writable working-tree config (the worktree-update legs) there is
+/// nothing for a hostile config to exfiltrate and nowhere off-host for it to
+/// redirect to. Hooks are disabled and optional locks skipped, mirroring
+/// `gitops`'s non-secret hardening.
+fn run_local_git(
+    cwd: &Path,
+    operation: &str,
+    subargs: &[&str],
+    out: &mut UnixStream,
+) -> Result<(), FacadeError> {
+    let output = Command::new("git")
+        .arg("--no-optional-locks")
+        // Pin transport to local files only and disable hooks. `-c` config is
+        // propagated to any subprocess (e.g. the source repo's `upload-pack`)
+        // via `GIT_CONFIG_PARAMETERS`.
+        .args([
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .args(subargs)
+        .current_dir(cwd)
+        // No token here, ever. Disable the operator's global/system config so
+        // an inherited credential helper or `insteadOf` cannot fire, and never
+        // block on a credential prompt.
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| FacadeError::LocalGit {
+            operation: operation.to_string(),
+            detail: format!("could not run git: {source}"),
+        })?;
+
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        let _ = writeln!(out, "msg:{line}");
+    }
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = {
+        let trimmed = stderr.trim();
+        if trimmed.is_empty() {
+            match output.status.code() {
+                Some(code) => format!("git exited with status {code}"),
+                None => "git terminated by signal".to_string(),
             }
+        } else {
+            // The last stderr line is the most useful and carries no token
+            // (these legs never hold one).
+            trimmed.lines().next_back().unwrap_or(trimmed).to_string()
         }
-    }
-    parsed
+    };
+    Err(FacadeError::LocalGit {
+        operation: operation.to_string(),
+        detail,
+    })
 }
 
-/// The working tree's single canonical `origin` url, or `None` when the config
-/// is absent, ambiguous, or carries any redirect vector. Returning `Some`
-/// guarantees the caller that git's connect target for `origin` is exactly
-/// this url: there is one `url`, no `pushurl`, and no `insteadOf` rewrite.
-fn configured_origin_url(config: &str) -> Option<String> {
-    let parsed = parse_origin_config(config);
-    if parsed.has_url_rewrite || parsed.origin_has_pushurl {
-        // A redirect vector is present even if a canonical url also is: fail
-        // closed so `verify_origin` cannot be satisfied by a byte-match alone.
-        return None;
+/// Ensures a clean, daemon-authored bare mirror exists for `repo` under
+/// `root`, and returns its path. The mirror's `origin` is (re-)pointed at the
+/// `canonical` URL on every call so the config the token leg later reads is
+/// always the daemon's, never anything a prior sandbox action could have
+/// influenced. Created bare and empty; objects arrive only via explicit,
+/// daemon-issued transfers.
+fn ensure_mirror(
+    root: &Path,
+    repo: &RepoSpec,
+    canonical: &Url,
+    out: &mut UnixStream,
+) -> Result<PathBuf, FacadeError> {
+    fs::create_dir_all(root).map_err(|source| FacadeError::LocalGit {
+        operation: "create mirror root".to_string(),
+        detail: format!("{source}"),
+    })?;
+    // `owner`/`repo` are validated single path components (no `/`, no `..`),
+    // so this name cannot escape `root`.
+    let dir = root.join(format!("{}__{}.git", repo.owner(), repo.repo()));
+
+    if !dir.join("HEAD").exists() {
+        let dir_arg = path_arg(&dir)?;
+        run_local_git(
+            root,
+            "init mirror",
+            &["init", "--bare", "--quiet", dir_arg],
+            out,
+        )?;
     }
-    match parsed.origin_urls.as_slice() {
-        [only] => Some(only.clone()),
-        // Zero or several origin urls: no single well-defined connect target.
-        _ => None,
-    }
+    // `config` (not `remote add`/`set-url`) is idempotent and daemon-authored:
+    // it sets the value whether or not it already existed, so a partially
+    // initialised mirror still converges to the canonical origin.
+    run_local_git(
+        &dir,
+        "configure mirror origin",
+        &["config", "remote.origin.url", canonical.as_str()],
+        out,
+    )?;
+    run_local_git(
+        &dir,
+        "configure mirror fetch",
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/heads/*",
+        ],
+        out,
+    )?;
+    Ok(dir)
 }
 
-/// Runs the authorized operation in the session workspace (on the blocking
-/// pool), writing scrubbed output as `msg:` lines directly onto the
-/// connection clone.
+/// Runs the authorized operation (on the blocking pool), writing scrubbed
+/// output as `msg:` lines directly onto the connection clone. The credentialed
+/// legs go through `github::gitops` against the daemon-owned clean mirror; the
+/// token never touches the sandbox working tree's config (see the module docs).
 fn execute(
     cmd: &GitVerbCmd,
     repo: &RepoSpec,
@@ -781,42 +834,110 @@ fn execute(
     let owner_repo = format!("{}/{}", repo.owner(), repo.repo());
     match cmd {
         GitVerbCmd::Push { .. } => {
-            let dir = primed_dir(working, declared_repos, repo)?;
-            verify_origin(&dir, remote, repo)?;
-            let tree = Repo::open(dir, remote.as_str());
-            let branch = tree.current_branch()?;
+            let work = primed_dir(working, declared_repos, repo)?;
+            let branch = Repo::open(&work, remote.as_str()).current_branch()?;
             // A leading-dash branch name would be parsed as a git option once
-            // it reaches `git push … origin <branch>` (the gitops layer does
-            // not yet `--`-guard it); refuse here before any token-bearing
+            // it reaches `git push … <branch>`; refuse before any token-bearing
             // process runs.
             if branch.starts_with('-') {
                 return Err(FacadeError::UnsafeBranchName { branch });
             }
-            tree.push(token, &branch, |_, line| {
+
+            let mirror = ensure_mirror(&mirror_root(working)?, repo, remote, &mut out)?;
+            let work_arg = path_arg(&work)?;
+            let refspec = format!("+refs/heads/{branch}:refs/heads/{branch}");
+            // Local, token-free leg: copy the branch worktree → mirror. Runs in
+            // the mirror (clean config); the worktree is only a fetch *source*.
+            run_local_git(
+                &mirror,
+                "stage push",
+                &["fetch", "--no-tags", work_arg, refspec.as_str()],
+                &mut out,
+            )?;
+
+            // Credentialed leg: push mirror → canonical. `gitops` runs in the
+            // mirror and reads only the daemon-authored mirror config.
+            Repo::open(mirror.clone(), remote.as_str()).push(token, &branch, |_, line| {
                 let _ = writeln!(out, "msg:{line}");
             })?;
+
+            // Best-effort: reflect the push in the worktree's remote-tracking
+            // so the sandbox's own `git status` is sane. Purely local and
+            // token-free; failure here does not undo the successful push.
+            if let Ok(mirror_arg) = path_arg(&mirror) {
+                let track = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+                let _ = run_local_git(
+                    &work,
+                    "update tracking",
+                    &["fetch", mirror_arg, track.as_str()],
+                    &mut out,
+                );
+                let upstream = format!("origin/{branch}");
+                let _ = run_local_git(
+                    &work,
+                    "set upstream",
+                    &[
+                        "branch",
+                        "--set-upstream-to",
+                        upstream.as_str(),
+                        branch.as_str(),
+                    ],
+                    &mut out,
+                );
+            }
             let _ = writeln!(out, "msg:pushed `{branch}` to origin ({owner_repo})");
         }
-        GitVerbCmd::Pull { .. } => {
-            let dir = primed_dir(working, declared_repos, repo)?;
-            verify_origin(&dir, remote, repo)?;
-            let tree = Repo::open(dir, remote.as_str());
-            tree.pull(token, |_, line| {
+        GitVerbCmd::Fetch { .. } => {
+            let work = primed_dir(working, declared_repos, repo)?;
+            let mirror = ensure_mirror(&mirror_root(working)?, repo, remote, &mut out)?;
+            // Credentialed leg: canonical → mirror (mirror config only).
+            Repo::open(mirror.clone(), remote.as_str()).fetch(token, |_, line| {
                 let _ = writeln!(out, "msg:{line}");
             })?;
+            // Local, token-free leg: mirror → worktree remote-tracking refs.
+            let mirror_arg = path_arg(&mirror)?;
+            run_local_git(
+                &work,
+                "fetch",
+                &[
+                    "fetch",
+                    "--prune",
+                    mirror_arg,
+                    "+refs/heads/*:refs/remotes/origin/*",
+                ],
+                &mut out,
+            )?;
+            let _ = writeln!(out, "msg:fetched origin ({owner_repo})");
+        }
+        GitVerbCmd::Pull { .. } => {
+            let work = primed_dir(working, declared_repos, repo)?;
+            let branch = Repo::open(&work, remote.as_str()).current_branch()?;
+            let mirror = ensure_mirror(&mirror_root(working)?, repo, remote, &mut out)?;
+            // Credentialed leg: canonical → mirror (mirror config only).
+            Repo::open(mirror.clone(), remote.as_str()).fetch(token, |_, line| {
+                let _ = writeln!(out, "msg:{line}");
+            })?;
+            // Local, token-free legs: update the worktree's tracking ref from
+            // the mirror, then fast-forward the current branch onto it.
+            let mirror_arg = path_arg(&mirror)?;
+            let track = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+            run_local_git(
+                &work,
+                "pull (fetch)",
+                &["fetch", mirror_arg, track.as_str()],
+                &mut out,
+            )?;
+            let upstream = format!("refs/remotes/origin/{branch}");
+            run_local_git(
+                &work,
+                "pull (fast-forward)",
+                &["merge", "--ff-only", upstream.as_str()],
+                &mut out,
+            )?;
             let _ = writeln!(
                 out,
                 "msg:pulled origin into the current branch ({owner_repo})"
             );
-        }
-        GitVerbCmd::Fetch { .. } => {
-            let dir = primed_dir(working, declared_repos, repo)?;
-            verify_origin(&dir, remote, repo)?;
-            let tree = Repo::open(dir, remote.as_str());
-            tree.fetch(token, |_, line| {
-                let _ = writeln!(out, "msg:{line}");
-            })?;
-            let _ = writeln!(out, "msg:fetched origin ({owner_repo})");
         }
         GitVerbCmd::Status { .. } => {
             // Local-only probes: no token, no remote contact.
@@ -853,7 +974,9 @@ fn execute(
         }
         GitVerbCmd::Clone { .. } => {
             // Always into `<working>/<repo-name>`; the root-prime layout is
-            // the activation flow's business, not the facade's.
+            // the activation flow's business, not the facade's. Clone targets a
+            // fresh directory, so there is no pre-existing sandbox-controlled
+            // config to read — no mirror indirection is needed.
             let dest = working.as_utf8_path().as_std_path().join(repo.repo());
             let tree = Repo::clone(remote.as_str(), &dest, token, |_, line| {
                 let _ = writeln!(out, "msg:{line}");
@@ -1064,7 +1187,7 @@ mod tests {
         }
     }
 
-    // ---- URL derivation & origin verification ----
+    // ---- URL derivation & mirror-root isolation ----
 
     #[test]
     fn remote_url_joins_base_owner_repo() {
@@ -1083,150 +1206,15 @@ mod tests {
     }
 
     #[test]
-    fn configured_origin_url_reads_only_the_origin_section() {
-        let config = "[core]\n\trepositoryformatversion = 0\n\
-                      [remote \"other\"]\n\turl = https://example.com/decoy.git\n\
-                      [remote \"origin\"]\n\turl = https://github.com/octo/hello.git\n\
-                      \tfetch = +refs/heads/*:refs/remotes/origin/*\n";
+    fn mirror_root_is_a_sibling_of_the_workspace() {
+        let working =
+            DaemonAbsPath::try_new("/var/lib/minimald/sessions/abcd/tree").expect("abs path");
+        let root = mirror_root(&working).expect("workspace has a parent");
         assert_eq!(
-            configured_origin_url(config).as_deref(),
-            Some("https://github.com/octo/hello.git")
+            root,
+            std::path::Path::new("/var/lib/minimald/sessions/abcd").join(MIRROR_DIR),
+            "the mirror must live outside the sandbox-mounted workspace tree"
         );
-        assert_eq!(configured_origin_url("[core]\n\tbare = false\n"), None);
-    }
-
-    /// The connect target is governed by more than the first `url` line; the
-    /// scanner must fail closed on every vector that redirects git while
-    /// leaving a byte-matching `url` in place (the reported exfiltration).
-    #[test]
-    fn configured_origin_url_rejects_redirect_vectors() {
-        let canonical = "[remote \"origin\"]\n\turl = https://github.com/octo/hello.git\n";
-
-        // A `pushurl` sends pushes elsewhere even though `url` still matches.
-        let pushurl = format!("{canonical}\tpushurl = https://attacker.example/x.git\n");
-        assert_eq!(configured_origin_url(&pushurl), None);
-
-        // A second `url` value: git may connect to the extra one.
-        let multi_url = format!("{canonical}\turl = https://attacker.example/x.git\n");
-        assert_eq!(configured_origin_url(&multi_url), None);
-
-        // An `insteadOf` rewrite retargets even a byte-identical `url`.
-        let insteadof = format!(
-            "{canonical}[url \"https://attacker.example/\"]\n\
-             \tinsteadOf = https://github.com/\n"
-        );
-        assert_eq!(configured_origin_url(&insteadof), None);
-
-        // A `pushInsteadOf` rewrite is just as dangerous for pushes.
-        let push_insteadof = format!(
-            "{canonical}[url \"https://attacker.example/\"]\n\
-             \tpushInsteadOf = https://github.com/\n"
-        );
-        assert_eq!(configured_origin_url(&push_insteadof), None);
-
-        // Sanity: the canonical config on its own still resolves.
-        assert_eq!(
-            configured_origin_url(canonical).as_deref(),
-            Some("https://github.com/octo/hello.git")
-        );
-    }
-
-    /// Key matching is case-insensitive and the origin section is recognized
-    /// through noncanonical-but-git-valid spelling, so redirect vectors cannot
-    /// be hidden behind whitespace or the legacy dotted header form.
-    #[test]
-    fn parse_origin_config_is_robust_to_spelling() {
-        // Extra header whitespace is still the origin section.
-        let spaced = "[remote  \"origin\"]\n\tURL = https://github.com/octo/hello.git\n";
-        assert_eq!(
-            configured_origin_url(spaced).as_deref(),
-            Some("https://github.com/octo/hello.git")
-        );
-
-        // A `pushurl` smuggled in via the legacy dotted header is still caught.
-        let legacy_pushurl = "[remote \"origin\"]\n\turl = https://github.com/octo/hello.git\n\
-             [remote.origin]\n\tpushurl = https://attacker.example/x.git\n";
-        assert_eq!(configured_origin_url(legacy_pushurl), None);
-
-        // `[remote "Origin"]` is a *different* remote (case-sensitive
-        // subsection), so its url is not counted as an origin url.
-        let other_case = "[remote \"Origin\"]\n\turl = https://attacker.example/x.git\n\
-             [remote \"origin\"]\n\turl = https://github.com/octo/hello.git\n";
-        assert_eq!(
-            configured_origin_url(other_case).as_deref(),
-            Some("https://github.com/octo/hello.git")
-        );
-
-        assert!(header_is_origin("remote \"origin\""));
-        assert!(header_is_origin("  remote   \"origin\"  "));
-        assert!(header_is_origin("remote.origin"));
-        assert!(!header_is_origin("remote \"Origin\""));
-        assert!(!header_is_origin("url \"https://x/\""));
-    }
-
-    /// Each redirect vector, planted in a real `.git/config`, makes
-    /// `verify_origin` refuse — proving the fix at the function boundary the
-    /// facade actually calls.
-    #[test]
-    fn verify_origin_rejects_planted_redirects() {
-        let repo: RepoSpec = "octo/hello".parse().unwrap();
-        let expected = Url::parse("https://github.com/octo/hello.git").unwrap();
-        let canonical = "[remote \"origin\"]\n\turl = https://github.com/octo/hello.git\n";
-
-        for redirect in [
-            "\tpushurl = https://attacker.example/x.git\n",
-            "\turl = https://attacker.example/x.git\n",
-            "[url \"https://attacker.example/\"]\n\tinsteadOf = https://github.com/\n",
-            "[url \"https://attacker.example/\"]\n\tpushInsteadOf = https://github.com/\n",
-        ] {
-            let tmp = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
-            std::fs::write(
-                tmp.path().join(".git").join("config"),
-                format!("{canonical}{redirect}"),
-            )
-            .unwrap();
-            assert!(
-                matches!(
-                    verify_origin(tmp.path(), &expected, &repo),
-                    Err(FacadeError::OriginMismatch { .. })
-                ),
-                "planted redirect must be refused: {redirect}"
-            );
-        }
-    }
-
-    #[test]
-    fn verify_origin_fails_closed_on_mismatch_or_absence() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo: RepoSpec = "octo/hello".parse().unwrap();
-        let expected = Url::parse("https://github.com/octo/hello.git").unwrap();
-
-        // No .git/config at all.
-        assert!(matches!(
-            verify_origin(tmp.path(), &expected, &repo),
-            Err(FacadeError::OriginMismatch { .. })
-        ));
-
-        // A tampered origin.
-        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
-        std::fs::write(
-            tmp.path().join(".git").join("config"),
-            "[remote \"origin\"]\n\turl = https://evil.example/steal.git\n",
-        )
-        .unwrap();
-        assert!(matches!(
-            verify_origin(tmp.path(), &expected, &repo),
-            Err(FacadeError::OriginMismatch { .. })
-        ));
-
-        // The genuine origin passes.
-        std::fs::write(
-            tmp.path().join(".git").join("config"),
-            "[remote \"origin\"]\n\turl = https://github.com/octo/hello.git\n",
-        )
-        .unwrap();
-        assert!(verify_origin(tmp.path(), &expected, &repo).is_ok());
     }
 
     #[test]
@@ -1239,9 +1227,9 @@ mod tests {
                 name: "hello".into(),
             }
             .to_string(),
-            FacadeError::OriginMismatch {
-                owner: "octo".into(),
-                name: "hello".into(),
+            FacadeError::LocalGit {
+                operation: "stage push".into(),
+                detail: "fatal: could not read from remote repository".into(),
             }
             .to_string(),
             FacadeError::AmbiguousRepo {
@@ -1249,6 +1237,7 @@ mod tests {
             }
             .to_string(),
             FacadeError::NoDeclaredRepos.to_string(),
+            FacadeError::NoMirrorRoot.to_string(),
             FacadeError::UnsafeBranchName {
                 branch: "-oProxyCommand=evil".into(),
             }

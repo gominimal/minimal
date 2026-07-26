@@ -1301,6 +1301,19 @@ mod tests {
             }
         }
 
+        /// The workspace root for a github fixture channel. It lives one level
+        /// under `fixtures` so that its *parent* — where the facade places its
+        /// daemon-only `.gh-mirror` — is unique per test (no cross-test mirror
+        /// collision) and, in production, is the session's own state dir.
+        fn workspace_dir(fixtures: &Path) -> std::path::PathBuf {
+            fixtures.join("workspace")
+        }
+
+        /// The primed `octo/hello` working tree inside the fixture workspace.
+        fn worktree_dir(fixtures: &Path) -> std::path::PathBuf {
+            workspace_dir(fixtures).join("hello")
+        }
+
         /// Full fixture: bare remote for `octo/hello`, a primed working
         /// clone in the channel's workspace on branch `feat/x` with one
         /// unpushed commit, and a channel whose facade is wired to a live
@@ -1314,12 +1327,15 @@ mod tests {
             std::fs::create_dir_all(&remotes).unwrap();
             make_bare_remote(&remotes, "octo", "hello");
 
-            // Prime the workspace clone the way activation would: cloned
-            // from the *derived* URL so its origin matches what the facade
-            // verifies, then a local branch with unpushed work.
+            // Prime the workspace clone the way activation would: cloned from
+            // the *derived* URL, then a local branch with unpushed work. The
+            // sandbox may later rewrite this tree's `origin`; the facade never
+            // reads it on the token-bearing leg (see the facade module docs).
             let base = git_base(&remotes);
             let clone_url = base.join("octo/hello.git").unwrap();
-            let work = cwd.path().join("hello");
+            let workspace = workspace_dir(fixtures.path());
+            std::fs::create_dir_all(&workspace).unwrap();
+            let work = worktree_dir(fixtures.path());
             git_run(
                 &[
                     "clone",
@@ -1333,6 +1349,13 @@ mod tests {
             std::fs::write(work.join("work.txt"), b"session work\n").unwrap();
             git_run(&["add", "work.txt"], &work);
             git_run(&["commit", "-q", "-m", "session work"], &work);
+
+            // Point the channel's workspace at the fixture workspace root so
+            // the facade primes/mirrors under `fixtures/` (unique per test).
+            chan.working = DaemonAbsPath::try_new(
+                Utf8PathBuf::try_from(workspace).expect("utf-8 workspace path"),
+            )
+            .expect("absolute workspace path");
 
             let record = seeded_record(fixtures.path(), attrs).await;
             chan.github = Some(SessionGithub::for_tests(TEST_TOKEN, base, record));
@@ -1520,14 +1543,16 @@ mod tests {
             assert!(!remote_has_branch(fixtures.path(), "feat/x"));
         }
 
-        /// A sandbox-rewritten origin is refused before any authenticated
-        /// git process runs (the defense-in-depth check; see facade docs).
+        /// A sandbox-rewritten `origin` does **not** redirect the token-bearing
+        /// push: the credentialed leg ignores the worktree config entirely and
+        /// pushes to the daemon-derived canonical remote, so the push still
+        /// lands there (and never contacts the attacker URL).
         #[tokio::test]
-        async fn tampered_origin_is_refused() {
+        async fn tampered_origin_does_not_redirect_the_push() {
             let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
-            let (_state, _rootfs, cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
 
-            let work = cwd.path().join("hello");
+            let work = worktree_dir(fixtures.path());
             git_run(
                 &[
                     "remote",
@@ -1539,11 +1564,12 @@ mod tests {
             );
 
             let lines = drive(&mut chan, "git%push").await;
+            assert_no_error(&lines);
+            assert_no_token(&lines);
             assert!(
-                error_line(&lines).contains("does not point at the declared GitHub remote"),
-                "got: {lines:?}"
+                remote_has_branch(fixtures.path(), "feat/x"),
+                "the push must reach the canonical remote, not the tampered origin: {lines:?}"
             );
-            assert!(!remote_has_branch(fixtures.path(), "feat/x"));
         }
 
         /// Whether the bare repo at `bare` has a branch named `branch`.
@@ -1563,86 +1589,274 @@ mod tests {
                 .success()
         }
 
-        /// A sandbox that leaves `remote.origin.url` byte-identical but adds a
-        /// `pushurl` (git's real push target) is refused — the exfiltration the
-        /// first-`url`-only check missed. Nothing reaches the attacker remote.
+        /// Asserts the outcome shared by every exfil test: the push landed on
+        /// the canonical remote, no token bytes leaked to the sandbox, and the
+        /// attacker remote received nothing.
+        fn assert_push_only_reached_canonical(fixtures: &Path, lines: &[String], attacker: &Path) {
+            assert_no_error(lines);
+            assert_no_token(lines);
+            assert!(
+                remote_has_branch(fixtures, "feat/x"),
+                "the push must reach the canonical remote: {lines:?}"
+            );
+            assert!(
+                !bare_has_branch(attacker, "feat/x"),
+                "nothing may reach the attacker remote: {lines:?}"
+            );
+        }
+
+        /// No file anywhere under the daemon-only mirror root or the sandbox
+        /// worktree may ever contain token bytes (the env-only injection
+        /// invariant, proven end-to-end through the mirror machinery).
+        fn assert_no_token_on_disk(fixtures: &Path) {
+            fn scan(dir: &Path) {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    return;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let meta = match std::fs::symlink_metadata(&path) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    if meta.file_type().is_symlink() {
+                        continue;
+                    }
+                    if meta.is_dir() {
+                        scan(&path);
+                    } else if meta.is_file() {
+                        let bytes = std::fs::read(&path).unwrap_or_default();
+                        assert!(
+                            !bytes
+                                .windows(TEST_TOKEN.len())
+                                .any(|w| w == TEST_TOKEN.as_bytes()),
+                            "token bytes found on disk in {}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+            scan(&workspace_dir(fixtures));
+            scan(&fixtures.join(".gh-mirror"));
+        }
+
+        /// A `pushurl` (git's real push target) planted in the worktree config
+        /// does not redirect the token leg: the push reaches the canonical
+        /// remote and the attacker pushurl receives nothing.
         #[tokio::test]
-        async fn pushurl_redirect_is_refused() {
+        async fn pushurl_redirect_does_not_reach_attacker() {
             let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
-            let (_state, _rootfs, cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
             make_bare_remote(&fixtures.path().join("remotes"), "attacker", "steal");
             let attacker = bare_repo_named(fixtures.path(), "attacker", "steal");
             let attacker_url = format!("file://{}", attacker.display());
 
-            let work = cwd.path().join("hello");
+            let work = worktree_dir(fixtures.path());
             git_run(
                 &["remote", "set-url", "--push", "origin", &attacker_url],
                 &work,
             );
 
             let lines = drive(&mut chan, "git%push").await;
-            assert!(
-                error_line(&lines).contains("does not point at the declared GitHub remote"),
-                "a pushurl redirect must be refused: {lines:?}"
-            );
-            assert_no_token(&lines);
-            assert!(!remote_has_branch(fixtures.path(), "feat/x"));
-            assert!(
-                !bare_has_branch(&attacker, "feat/x"),
-                "nothing may reach the attacker pushurl"
-            );
+            assert_push_only_reached_canonical(fixtures.path(), &lines, &attacker);
+            assert_no_token_on_disk(fixtures.path());
         }
 
-        /// A second `remote.origin.url` value (multi-valued `url`) leaves the
-        /// canonical url in place but gives git a second target; refuse.
+        /// A second `remote.origin.url` value (multi-valued `url`) gives git a
+        /// second target in the worktree config; the token leg ignores it.
         #[tokio::test]
-        async fn extra_origin_url_is_refused() {
+        async fn extra_origin_url_does_not_reach_attacker() {
             let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
-            let (_state, _rootfs, cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
             make_bare_remote(&fixtures.path().join("remotes"), "attacker", "steal");
             let attacker = bare_repo_named(fixtures.path(), "attacker", "steal");
             let attacker_url = format!("file://{}", attacker.display());
 
-            let work = cwd.path().join("hello");
+            let work = worktree_dir(fixtures.path());
             git_run(
                 &["config", "--add", "remote.origin.url", &attacker_url],
                 &work,
             );
 
             let lines = drive(&mut chan, "git%push").await;
-            assert!(
-                error_line(&lines).contains("does not point at the declared GitHub remote"),
-                "a second origin url must be refused: {lines:?}"
-            );
-            assert!(!remote_has_branch(fixtures.path(), "feat/x"));
-            assert!(!bare_has_branch(&attacker, "feat/x"));
+            assert_push_only_reached_canonical(fixtures.path(), &lines, &attacker);
         }
 
-        /// An `insteadOf` rewrite retargets even a byte-identical origin url;
-        /// the whole-config scan must catch it and refuse.
+        /// An `url.<attacker>.insteadOf` rewrite retargets even a byte-identical
+        /// origin url — but only for a git that reads the worktree config, which
+        /// the token leg never does. The push reaches the canonical remote.
         #[tokio::test]
-        async fn insteadof_rewrite_is_refused() {
+        async fn insteadof_rewrite_does_not_reach_attacker() {
             let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
-            let (_state, _rootfs, cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            make_bare_remote(&fixtures.path().join("remotes"), "attacker", "steal");
+            let attacker = bare_repo_named(fixtures.path(), "attacker", "steal");
 
-            let work = cwd.path().join("hello");
-            // Rewrite the derived base to an attacker prefix.
+            let work = worktree_dir(fixtures.path());
             let remotes = fixtures.path().join("remotes");
+            // Rewrite the canonical base prefix to the attacker's repo.
             git_run(
                 &[
                     "config",
-                    "url.file:///attacker/.insteadOf",
-                    &format!("file://{}/", remotes.display()),
+                    &format!("url.file://{}/.insteadOf", attacker.display()),
+                    &format!("file://{}/octo/hello.git", remotes.display()),
                 ],
                 &work,
             );
 
             let lines = drive(&mut chan, "git%push").await;
-            assert!(
-                error_line(&lines).contains("does not point at the declared GitHub remote"),
-                "an insteadOf rewrite must be refused: {lines:?}"
+            assert_push_only_reached_canonical(fixtures.path(), &lines, &attacker);
+        }
+
+        /// A `pushInsteadOf` rewrite (push-only redirect) planted in the
+        /// worktree config is likewise never consulted on the token leg.
+        #[tokio::test]
+        async fn push_insteadof_rewrite_does_not_reach_attacker() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            make_bare_remote(&fixtures.path().join("remotes"), "attacker", "steal");
+            let attacker = bare_repo_named(fixtures.path(), "attacker", "steal");
+
+            let work = worktree_dir(fixtures.path());
+            let remotes = fixtures.path().join("remotes");
+            git_run(
+                &[
+                    "config",
+                    &format!("url.file://{}/.pushInsteadOf", attacker.display()),
+                    &format!("file://{}/octo/hello.git", remotes.display()),
+                ],
+                &work,
             );
-            assert!(!remote_has_branch(fixtures.path(), "feat/x"));
+
+            let lines = drive(&mut chan, "git%push").await;
+            assert_push_only_reached_canonical(fixtures.path(), &lines, &attacker);
+        }
+
+        /// A `[include]` directive in the worktree config — which pulls in an
+        /// arbitrary attacker-authored file that redirects `origin` — cannot
+        /// steer the token leg, which never reads the worktree config.
+        #[tokio::test]
+        async fn include_directive_redirect_does_not_reach_attacker() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            make_bare_remote(&fixtures.path().join("remotes"), "attacker", "steal");
+            let attacker = bare_repo_named(fixtures.path(), "attacker", "steal");
+            let attacker_url = format!("file://{}", attacker.display());
+
+            // An attacker-authored config the worktree pulls in via `[include]`.
+            let evil_cfg = fixtures.path().join("evil.gitconfig");
+            std::fs::write(
+                &evil_cfg,
+                format!(
+                    "[remote \"origin\"]\n\turl = {attacker_url}\n\tpushurl = {attacker_url}\n"
+                ),
+            )
+            .unwrap();
+
+            let work = worktree_dir(fixtures.path());
+            git_run(
+                &["config", "include.path", evil_cfg.to_str().expect("utf-8")],
+                &work,
+            );
+
+            let lines = drive(&mut chan, "git%push").await;
+            assert_push_only_reached_canonical(fixtures.path(), &lines, &attacker);
+        }
+
+        /// An `[includeIf "gitdir:…"]` directive (resolved only at git runtime,
+        /// so unparseable ahead of time) is equally powerless against the token
+        /// leg's config isolation.
+        #[tokio::test]
+        async fn includeif_directive_redirect_does_not_reach_attacker() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            make_bare_remote(&fixtures.path().join("remotes"), "attacker", "steal");
+            let attacker = bare_repo_named(fixtures.path(), "attacker", "steal");
+            let attacker_url = format!("file://{}", attacker.display());
+
+            let evil_cfg = fixtures.path().join("evil-if.gitconfig");
+            std::fs::write(
+                &evil_cfg,
+                format!(
+                    "[remote \"origin\"]\n\turl = {attacker_url}\n\tpushurl = {attacker_url}\n"
+                ),
+            )
+            .unwrap();
+
+            let work = worktree_dir(fixtures.path());
+            // Match any gitdir so the include always fires for this worktree.
+            git_run(
+                &[
+                    "config",
+                    "includeIf.gitdir:/.path",
+                    evil_cfg.to_str().expect("utf-8"),
+                ],
+                &work,
+            );
+
+            let lines = drive(&mut chan, "git%push").await;
+            assert_push_only_reached_canonical(fixtures.path(), &lines, &attacker);
+        }
+
+        /// A malicious `credential.helper` in the worktree config is never
+        /// invoked: no token-bearing git ever reads the worktree config, and
+        /// the local legs never authenticate. The helper would create a sink
+        /// file if it fired; it must not exist afterwards.
+        #[tokio::test]
+        async fn worktree_credential_helper_never_fires() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+
+            let sink = fixtures.path().join("cred-helper-fired");
+            let work = worktree_dir(fixtures.path());
+            git_run(
+                &[
+                    "config",
+                    "credential.helper",
+                    &format!("!f() {{ echo fired > {}; }}; f", sink.display()),
+                ],
+                &work,
+            );
+
+            let lines = drive(&mut chan, "git%push").await;
+            assert_no_error(&lines);
+            assert_no_token(&lines);
+            assert!(
+                remote_has_branch(fixtures.path(), "feat/x"),
+                "the push must still succeed to the canonical remote: {lines:?}"
+            );
+            assert!(
+                !sink.exists(),
+                "the worktree credential.helper must never be invoked"
+            );
+        }
+
+        /// An `http.extraHeader` planted in the worktree config (a header-splice
+        /// vector) never reaches the token leg's git, which reads only the
+        /// daemon-authored mirror config; the push still reaches the canonical
+        /// remote and no token leaks.
+        #[tokio::test]
+        async fn http_extraheader_in_worktree_is_ignored() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+
+            let work = worktree_dir(fixtures.path());
+            git_run(
+                &[
+                    "config",
+                    "http.https://github.com/.extraHeader",
+                    "Authorization: Basic ZXZpbA==",
+                ],
+                &work,
+            );
+
+            let lines = drive(&mut chan, "git%push").await;
+            assert_no_error(&lines);
+            assert_no_token(&lines);
+            assert!(
+                remote_has_branch(fixtures.path(), "feat/x"),
+                "the push must reach the canonical remote: {lines:?}"
+            );
         }
 
         /// A dash-leading current branch (planted via low-level ref surgery,
@@ -1651,9 +1865,9 @@ mod tests {
         #[tokio::test]
         async fn dash_leading_branch_is_refused() {
             let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
-            let (_state, _rootfs, cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
 
-            let work = cwd.path().join("hello");
+            let work = worktree_dir(fixtures.path());
             git_run(&["update-ref", "refs/heads/-oEvil", "HEAD"], &work);
             git_run(&["symbolic-ref", "HEAD", "refs/heads/-oEvil"], &work);
 
@@ -1729,14 +1943,14 @@ mod tests {
         #[tokio::test]
         async fn clone_of_declared_repo_primes_the_workspace() {
             let attrs = bound_attrs(&["octo/hello@feat/x:main", "octo/second@feat/y"]);
-            let (_state, _rootfs, cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
             make_bare_remote(&fixtures.path().join("remotes"), "octo", "second");
 
             let lines = drive(&mut chan, "git%clone octo/second").await;
 
             assert_no_error(&lines);
             assert_no_token(&lines);
-            let work = cwd.path().join("second");
+            let work = workspace_dir(fixtures.path()).join("second");
             assert!(
                 work.join(".git").exists(),
                 "clone must land in the workspace"
@@ -1766,6 +1980,84 @@ mod tests {
                     .status()
                     .unwrap()
                     .success()
+            );
+        }
+
+        /// The commit `refname` resolves to in `dir` (empty on failure).
+        fn rev_of(dir: &Path, refname: &str) -> String {
+            let out = Command::new("git")
+                .args(["rev-parse", refname])
+                .current_dir(dir)
+                .stderr(Stdio::null())
+                .output()
+                .expect("rev-parse");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        /// Advances the canonical `octo/hello` remote's `main` by one commit
+        /// (pushed from a throwaway clone), returning the new tip sha. Models
+        /// upstream work that a later `fetch`/`pull` must bring in.
+        fn advance_canonical_main(fixtures: &Path) -> String {
+            let bare = bare_repo(fixtures);
+            let tmp = fixtures.join(".advance-main");
+            git_run(
+                &["clone", "-q", bare.to_str().unwrap(), tmp.to_str().unwrap()],
+                fixtures,
+            );
+            std::fs::write(tmp.join("upstream.txt"), b"upstream change\n").unwrap();
+            git_run(&["add", "upstream.txt"], &tmp);
+            git_run(&["commit", "-q", "-m", "upstream change"], &tmp);
+            git_run(&["push", "-q", "origin", "main"], &tmp);
+            rev_of(&tmp, "HEAD")
+        }
+
+        /// An authorized `fetch` brings the canonical remote's new commits into
+        /// the worktree's remote-tracking refs via the daemon-owned mirror,
+        /// streams cleanly, and leaks no token.
+        #[tokio::test]
+        async fn authorized_fetch_updates_tracking() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            let new_tip = advance_canonical_main(fixtures.path());
+
+            let work = worktree_dir(fixtures.path());
+            assert_ne!(
+                rev_of(&work, "refs/remotes/origin/main"),
+                new_tip,
+                "precondition: the worktree has not seen the upstream commit yet"
+            );
+
+            let lines = drive(&mut chan, "git%fetch").await;
+            assert_no_error(&lines);
+            assert_no_token(&lines);
+            assert_eq!(
+                rev_of(&work, "refs/remotes/origin/main"),
+                new_tip,
+                "fetch must advance the worktree's origin/main via the mirror: {lines:?}"
+            );
+        }
+
+        /// An authorized `pull` fast-forwards the checked-out branch from the
+        /// canonical remote through the mirror, without a token in the sandbox.
+        #[tokio::test]
+        async fn authorized_pull_fast_forwards_current_branch() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+
+            // Put the worktree on `main` (tracking the canonical remote) and
+            // then advance the remote so there is something to fast-forward.
+            let work = worktree_dir(fixtures.path());
+            git_run(&["checkout", "-q", "main"], &work);
+            let new_tip = advance_canonical_main(fixtures.path());
+            assert_ne!(rev_of(&work, "HEAD"), new_tip);
+
+            let lines = drive(&mut chan, "git%pull").await;
+            assert_no_error(&lines);
+            assert_no_token(&lines);
+            assert_eq!(
+                rev_of(&work, "HEAD"),
+                new_tip,
+                "pull must fast-forward the current branch to the upstream tip: {lines:?}"
             );
         }
 
