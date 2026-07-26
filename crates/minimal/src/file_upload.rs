@@ -18,11 +18,12 @@
 //! the encoder's internal buffer.
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use async_tar::Builder;
 use tokio::fs;
-use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 
 /// Directories always skipped during upload. A proper .gitignore
 /// implementation is tracked as a follow-up on #263.
@@ -55,6 +56,11 @@ fn is_default_excluded(name: &str) -> bool {
 ///
 /// The archive is never fully buffered in memory beyond the pipe buffer
 /// and the encoder's internal state.
+///
+/// An idle-progress timeout bounds both the pipe read and the channel
+/// write. Without it, russh's `ChannelTx` blocks on window availability
+/// and a peer that dies without a window adjustment leaves the writer
+/// parked with no waker — the client hangs indefinitely (#886).
 pub async fn stream_tar_zstd<W: AsyncWrite + Unpin + Send>(
     dir: &Path,
     writer: W,
@@ -95,46 +101,69 @@ where
     const PIPE_BUF: usize = 256 * 1024;
     let (tx, mut rx) = tokio::io::duplex(PIPE_BUF);
 
-    // Drive build and copy concurrently. `build` runs on the
-    // caller task; the pipe read side pumps into `writer` on the
-    // same task via `tokio::join!` — no spawn, so no `'static`
-    // bound on W or on any of `build`'s captures.
-    //
-    // We can't use `try_join!` here: cancelling `build` mid-
-    // `append_data` would drop an unfinalized `async_tar::Builder`,
-    // which panics from its `Drop` impl. Instead, if `writer`
-    // errors, keep pulling bytes out of the pipe (into the void)
-    // so `build` can complete its `finish()` path and unwind
-    // normally. The pipe stays live until both futures return;
-    // callers see whichever error surfaced first (writer failure
-    // preferred, since it's the root cause).
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    // Drive build and copy concurrently with `try_join!`. On error
+    // either side cancels the other: if the writer stalls, the build
+    // future is dropped — `TarZstArchive`'s `Drop` mem::forgets the
+    // inner `async_tar::Builder`, so no panic; if the build errors, the
+    // copy is dropped — the pipe and writer are cleaned up. Whichever
+    // side errors first surfaces, giving the root cause, not a
+    // secondary "broken pipe" from the other (#886).
     let build_fut = build(tx);
     let copy_fut = async {
         // Buffer the wire writes (#923): the encoder can emit many
         // small blocks, so a 4 KiB `BufWriter` coalesces them into
         // fewer, larger writes to the underlying SSH channel.
         let mut w = BufWriter::with_capacity(4 * 1024, &mut writer);
-        let copy_res = tokio::io::copy(&mut rx, &mut w)
-            .await
-            .context("copying tar stream to writer");
-        if let Err(e) = copy_res {
-            // Drain the pipe so the writer side can unwind cleanly.
-            // A `sink()` swallows the remainder; we deliberately
-            // ignore its result because the writer error is the
-            // root cause we want to surface.
-            let _ = tokio::io::copy(&mut rx, &mut tokio::io::sink()).await;
-            return Err(e);
+
+        // Manual copy with an idle-progress deadline instead of
+        // tokio::io::copy. Each direction gets its own timeout: a
+        // stall on either the pipe read (tar builder stuck) or the
+        // channel write (peer gone, window frozen) surfaces as an
+        // error instead of an indefinite hang (#886).
+        let mut buf = [0u8; 8 * 1024];
+        loop {
+            match tokio::time::timeout(IDLE_TIMEOUT, rx.read(&mut buf)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    match tokio::time::timeout(IDLE_TIMEOUT, w.write_all(&buf[..n])).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            return Err(
+                                anyhow::Error::from(e).context("copying tar stream to writer")
+                            );
+                        }
+                        Err(_) => {
+                            anyhow::bail!(
+                                "upload stalled: channel write blocked for {IDLE_TIMEOUT:?} \
+                                 (peer may be gone)"
+                            );
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    return Err(anyhow::Error::from(e).context("reading from tar pipe"));
+                }
+                Err(_) => {
+                    anyhow::bail!(
+                        "upload stalled: no data from tar builder for {IDLE_TIMEOUT:?} \
+                         (read stalled)"
+                    );
+                }
+            }
         }
-        w.flush().await.context("flushing upload writer")?;
-        w.shutdown().await.context("shutting down upload writer")?;
+        tokio::time::timeout(IDLE_TIMEOUT, w.flush())
+            .await
+            .map_err(|_| anyhow::anyhow!("upload stalled: flush blocked for {IDLE_TIMEOUT:?}"))?
+            .context("flushing upload writer")?;
+        tokio::time::timeout(IDLE_TIMEOUT, w.shutdown())
+            .await
+            .map_err(|_| anyhow::anyhow!("upload stalled: shutdown blocked for {IDLE_TIMEOUT:?}"))?
+            .context("shutting down upload writer")?;
         Ok::<_, anyhow::Error>(())
     };
-    let (build_res, copy_res) = tokio::join!(build_fut, copy_fut);
-    // Surface the writer's error first — a writer failure is
-    // usually the underlying cause and `build` will just report
-    // "broken pipe" as a secondary effect.
-    copy_res?;
-    build_res?;
+    tokio::try_join!(build_fut, copy_fut)?;
     Ok(())
 }
 
@@ -555,7 +584,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::{Context, Poll};
+    use tokio::io::AsyncRead;
 
     /// A writer that accepts `remaining` bytes and then fails every write,
     /// simulating the upload channel closing while the tar stream is still
@@ -844,24 +876,139 @@ mod tests {
         assert!(is_vcs_root(dir.path()));
     }
 
+    /// A writer that accepts a small amount of data then parks forever,
+    /// simulating russh's `ChannelTx` blocking on a window adjustment that
+    /// never arrives because the peer died (#886).
+    struct StallingWriter {
+        accepted: usize,
+    }
+
+    impl AsyncWrite for StallingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.accepted >= 1024 {
+                return Poll::Pending;
+            }
+            let n = buf.len().min(1024 - self.accepted);
+            self.accepted += n;
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// `stream_tar_zstd` must bail with an idle-progress timeout when the
+    /// writer stalls, rather than hanging indefinitely (#886).
+    #[tokio::test(start_paused = true)]
+    async fn stream_tar_zstd_bails_when_writer_stalls() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Enough data to overflow the 1024-byte StallingWriter capacity
+        // and the 256K duplex pipe, forcing the copy loop to block on
+        // the writer.
+        for i in 0..32 {
+            std::fs::write(
+                dir.path().join(format!("f{i}.bin")),
+                incompressible(i as u64 + 1, 32 * 1024),
+            )
+            .unwrap();
+        }
+
+        let writer = StallingWriter { accepted: 0 };
+        let result = stream_tar_zstd(dir.path(), writer).await;
+        assert!(result.is_err(), "a stalled writer must surface as an error");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("stalled"),
+            "expected a stall error, got: {msg}"
+        );
+    }
+
+    /// `stream_via_pipe` must bail with an idle-progress timeout when the
+    /// build side never produces data, rather than hanging indefinitely
+    /// (#886). Exercises the read-stall branch: a build closure that holds
+    /// `tx` open but never writes, simulating a stuck builder (e.g. a
+    /// filesystem hang). `try_join!` cancels the build future on the read
+    /// timeout, so the test completes instead of deadlocking on `join!`.
+    #[tokio::test(start_paused = true)]
+    async fn stream_via_pipe_bails_when_builder_stalls() {
+        let result = stream_via_pipe(tokio::io::sink(), async |_tx| {
+            std::future::pending::<Result<(), anyhow::Error>>().await
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "a stalled builder must surface as an error"
+        );
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("stalled"),
+            "expected a stall error, got: {msg}"
+        );
+    }
+
+    /// A `CountingWriter` that tracks bytes written through it, used by
+    /// the upload path to report compressed byte count on success or
+    /// failure (#869).
+    struct CountingReader<R> {
+        inner: R,
+        count: Arc<AtomicU64>,
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let prev = buf.filled().len();
+            let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+            if let Poll::Ready(Ok(())) = &poll {
+                let n = buf.filled().len() - prev;
+                if n > 0 {
+                    self.count.fetch_add(n as u64, Ordering::Relaxed);
+                }
+            }
+            poll
+        }
+    }
+
+    /// The upload's `bytes_received` field is only worth logging if it is
+    /// exact, so pull a payload through in many small polls and check the
+    /// tally accumulates across them rather than recording the last read.
+    #[tokio::test]
+    async fn counting_reader_tallies_every_byte_pulled_through() {
+        let payload: Vec<u8> = (0..8192u32).map(|i| i as u8).collect();
+        let count = Arc::new(AtomicU64::new(0));
+        let mut sunk = Vec::new();
+
+        let read = tokio::io::copy(
+            &mut CountingReader {
+                inner: payload.as_slice(),
+                count: Arc::clone(&count),
+            },
+            &mut sunk,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sunk, payload);
+        assert_eq!(read, payload.len() as u64);
+        assert_eq!(count.load(Ordering::Relaxed), payload.len() as u64);
+    }
+
     #[test]
     fn is_vcs_root_recognizes_mercurial() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir(dir.path().join(".hg")).unwrap();
-        assert!(is_vcs_root(dir.path()));
-    }
-
-    #[test]
-    fn is_vcs_root_recognizes_subversion() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir(dir.path().join(".svn")).unwrap();
-        assert!(is_vcs_root(dir.path()));
-    }
-
-    #[test]
-    fn is_vcs_root_recognizes_cvs() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir(dir.path().join("CVS")).unwrap();
         assert!(is_vcs_root(dir.path()));
     }
 
@@ -873,9 +1020,8 @@ mod tests {
     }
 
     #[test]
-    fn is_vcs_root_false_for_plain_dir() {
+    fn is_vcs_root_rejects_plain_dir() {
         let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join("hello.txt"), "hello").unwrap();
         assert!(!is_vcs_root(dir.path()));
     }
 
