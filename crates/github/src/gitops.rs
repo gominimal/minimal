@@ -51,7 +51,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::secret::{SecretString, REDACTED};
+use crate::secret::{REDACTED, SecretString};
 
 /// Non-secret hardening flags applied to every `git` invocation, mirroring
 /// `crates/checkouts`: no optional index locks, and hooks disabled so a
@@ -724,7 +724,11 @@ impl Repo {
         branch: &str,
     ) -> Result<bool, GitError> {
         let out = require(
-            self.git_quiet("ls-remote", &["ls-remote", "--heads", "origin", branch], token)?,
+            self.git_quiet(
+                "ls-remote",
+                &["ls-remote", "--heads", "origin", branch],
+                token,
+            )?,
             "ls-remote",
         )?;
         Ok(!out.stdout.trim().is_empty())
@@ -756,7 +760,7 @@ impl Repo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secret::{SecretString, REDACTED};
+    use crate::secret::{REDACTED, SecretString};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -862,7 +866,11 @@ mod tests {
 
         // Exactly one env value carries the token, and it is the dedicated var.
         let secret_bearing: Vec<_> = cmd.envs.iter().filter(|(_, v)| v.contains(token)).collect();
-        assert_eq!(secret_bearing.len(), 1, "token appears in more than one place");
+        assert_eq!(
+            secret_bearing.len(),
+            1,
+            "token appears in more than one place"
+        );
         assert_eq!(secret_bearing[0].0, SECRET_ENV);
         assert_eq!(secret_bearing[0].1, token);
 
@@ -887,12 +895,16 @@ mod tests {
             .collect();
 
         // Protocol pinned to https; no config value carries the token.
-        assert!(config
-            .iter()
-            .any(|(k, v)| k == "protocol.allow" && v == "never"));
-        assert!(config
-            .iter()
-            .any(|(k, v)| k == "protocol.https.allow" && v == "always"));
+        assert!(
+            config
+                .iter()
+                .any(|(k, v)| k == "protocol.allow" && v == "never")
+        );
+        assert!(
+            config
+                .iter()
+                .any(|(k, v)| k == "protocol.https.allow" && v == "always")
+        );
         for (_, v) in &config {
             assert!(!v.contains(token), "token leaked into git config value");
         }
@@ -905,7 +917,10 @@ mod tests {
             .map(|(_, v)| v)
             .collect();
         assert_eq!(helpers.len(), 2, "expected reset + helper");
-        assert!(helpers[0].is_empty(), "first helper entry must reset the list");
+        assert!(
+            helpers[0].is_empty(),
+            "first helper entry must reset the list"
+        );
         assert!(helpers[1].contains(SECRET_ENV));
         assert!(!helpers[1].contains(token));
 
@@ -998,7 +1013,10 @@ mod tests {
         let bogus = format!("file://{}/does-not-exist.git", tmp.path().display());
 
         let err = Repo::clone(bogus, &dest, None, |_, _| {}).expect_err("clone must fail");
-        assert!(matches!(err, GitError::Failed { .. }), "unexpected: {err:?}");
+        assert!(
+            matches!(err, GitError::Failed { .. }),
+            "unexpected: {err:?}"
+        );
         assert!(!dest.exists(), "failed clone left a directory behind");
         // No leftover temp sibling either.
         let leftovers: Vec<String> = fs::read_dir(tmp.path())
@@ -1048,7 +1066,10 @@ mod tests {
             !streamed.contains(token),
             "token leaked to the stream callback: {streamed}"
         );
-        assert!(!out.stdout.contains(token), "token leaked into captured stdout");
+        assert!(
+            !out.stdout.contains(token),
+            "token leaked into captured stdout"
+        );
         assert!(out.stdout.contains(REDACTED));
     }
 
