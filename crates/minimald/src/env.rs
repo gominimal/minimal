@@ -35,6 +35,7 @@ use std::task::Poll;
 
 use camino::Utf8PathBuf;
 use futures::StreamExt;
+use github::facade::VERB_GIT;
 use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives};
 use mctx::{AddDepMode, Context, Error};
 use mfile::{EnvPatches, EnvVarValue};
@@ -47,6 +48,8 @@ use sessions::NetworkMode;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, spawn_blocking};
+
+use crate::github::facade::{NO_GITHUB_AUTH, SessionGithub};
 
 /// The min helper script installed at `/usr/bin/min` inside the sandbox.
 const MIN_SCRIPT: &str = include_str!("env_min_helper.sh");
@@ -73,6 +76,10 @@ pub struct EnvArgs {
     network_mode: NetworkMode,
     own_ip_tap: Option<sandbox2::config::OwnIpTap>,
     own_ip_dns: Option<std::net::Ipv4Addr>,
+    /// The session's GitHub facade state (spec R3), enabling the in-sandbox
+    /// `min git` verb on the command channel. `None` — the default — makes
+    /// every `git%` request fail closed with [`NO_GITHUB_AUTH`].
+    github: Option<SessionGithub>,
     /// When true (default), [`Env::build`] consumes package
     /// [`SetupForPackages`] output for `env_vars`/`fs_mappings`.
     /// When false, the caller supplies both via `env_vars` /
@@ -105,8 +112,22 @@ impl EnvArgs {
             network_mode: NetworkMode::HostNet,
             own_ip_tap: None,
             own_ip_dns: None,
+            github: None,
             include_package_attr_wiring: true,
         }
+    }
+
+    /// Wires the session's GitHub facade (spec R3): the daemon-held pieces
+    /// that let the channel actor authorize and run in-sandbox `min git`
+    /// requests. Without this, every `git%` request is refused.
+    // Not yet called by the production launcher — the `session_host` wiring
+    // lands with the activation tasks of the spec-10 DAG; the channel tests
+    // below are the usage proof in the meantime (mirrors `github::authz`).
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn with_github(mut self, github: SessionGithub) -> Self {
+        self.github = Some(github);
+        self
     }
 
     /// Opts out of consuming `env_vars` / `fs_mappings` from
@@ -367,6 +388,7 @@ impl Env {
             working: args.cwd.clone(),
             has_packages: transitives.keys().copied().collect(),
             ot: args.ot.clone(),
+            github: args.github,
             ctx,
             graph,
             rx,
@@ -499,6 +521,11 @@ struct SessionChannel {
     /// Packages already materialized into the rootfs.
     has_packages: HashSet<BuildSpecRef>,
     ot: Option<OpTracker>,
+    /// The session's GitHub facade state (spec R3). `None` fails every `git%`
+    /// request closed. Because this actor is aborted when the [`Env`] — and
+    /// with it the sandbox — is dropped, facade access is bound to the
+    /// sandbox lifetime with no extra mechanism (spec R3.5/R6.3).
+    github: Option<SessionGithub>,
     rx: mpsc::Receiver<ChannelRequest>,
 }
 
@@ -571,6 +598,10 @@ impl SessionChannel {
             Some(("run", args)) => {
                 let (name, rest) = args.split_once(' ').unwrap_or((args, ""));
                 self.run_task(stream, name, rest).await;
+                None
+            }
+            Some((VERB_GIT, argv)) => {
+                self.git_facade(argv, stream).await;
                 None
             }
             _ => {
@@ -906,6 +937,20 @@ impl SessionChannel {
         }
     }
 
+    /// Implements the in-sandbox `min git` facade verb (spec R3.1): proxies
+    /// the request to the daemon-held GitHub state, which authorizes it and
+    /// runs the authenticated operation in the session's workspace. A session
+    /// with no GitHub facade wired is refused fail-closed — the sandbox never
+    /// holds a credential either way (spec G5/R6.1).
+    async fn git_facade(&self, argv: &str, stream: &mut UnixStream) {
+        match &self.github {
+            Some(github) => github.handle_git(argv, &self.working, stream).await,
+            None => {
+                let _ = writeln!(stream, "error: {NO_GITHUB_AUTH}");
+            }
+        }
+    }
+
     /// Writes an [`mctx::Error`] to the client as `msg:` lines (preserving its
     /// multi-line, richly-formatted report) followed by an `error:` terminator.
     fn write_error(e: &Error, stream: &mut UnixStream) {
@@ -1021,6 +1066,7 @@ mod tests {
             .unwrap(),
             has_packages: HashSet::new(),
             ot: None,
+            github: None,
             ctx,
             graph,
             rx,
@@ -1107,5 +1153,500 @@ mod tests {
     fn state_dirs_from_env_vars_silently_drops_multi_component() {
         let env = HashMap::from([("WEIRD".to_string(), "/state/foo/bar".to_string())]);
         assert!(state_dirs_from_env_vars(&env).is_empty());
+    }
+
+    /// Channel-level tests for the `git%` facade verb (spec R3): drive real
+    /// `method%data` lines through [`SessionChannel::handle`] against
+    /// `file://` fixture remotes, with the session record held in a real
+    /// store actor so the facade's live-record reads are exercised.
+    mod git_facade {
+        use std::collections::BTreeMap;
+        use std::path::Path;
+        use std::process::{Command, Stdio};
+
+        use github::attrs::GithubAttrs;
+        use github::{GrantId, RepoSpec, ScopeSet};
+        use paths::HostAbsPath;
+        use sessions::{NetworkMode, Record, SessionId, SessionPolicy, SessionStatus};
+        use url::Url;
+
+        use super::*;
+        use crate::store::{SessionRecordHandle, Store};
+
+        /// A token planted in the facade for every test; nothing in any
+        /// streamed line may ever contain it.
+        const TEST_TOKEN: &str = "ghu_channel_test_secret_0xF00";
+
+        /// Runs `git` with a fixed identity, asserting success — fixture
+        /// plumbing only, never the code under test.
+        fn git_run(args: &[&str], cwd: &Path) {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "tester")
+                .env("GIT_AUTHOR_EMAIL", "tester@example.com")
+                .env("GIT_COMMITTER_NAME", "tester")
+                .env("GIT_COMMITTER_EMAIL", "tester@example.com")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("spawn git");
+            assert!(status.success(), "git {args:?} failed in {cwd:?}");
+        }
+
+        /// Creates a bare fixture remote for `owner/repo` under
+        /// `<remotes>/<owner>/<repo>.git` with one commit on `main`, laid out
+        /// exactly where the facade's `<git_base>/<owner>/<repo>.git`
+        /// derivation will look for it.
+        fn make_bare_remote(remotes: &Path, owner: &str, repo: &str) {
+            let seed = remotes.join(format!(".seed-{owner}-{repo}"));
+            std::fs::create_dir_all(&seed).expect("seed dir");
+            git_run(&["init", "-q", "-b", "main", "."], &seed);
+            std::fs::write(seed.join("README.md"), b"seed\n").expect("write readme");
+            git_run(&["add", "README.md"], &seed);
+            git_run(&["commit", "-q", "-m", "initial"], &seed);
+
+            let bare = remotes.join(owner).join(format!("{repo}.git"));
+            std::fs::create_dir_all(bare.parent().unwrap()).expect("owner dir");
+            git_run(
+                &[
+                    "clone",
+                    "-q",
+                    "--bare",
+                    seed.to_str().expect("utf-8"),
+                    bare.to_str().expect("utf-8"),
+                ],
+                remotes,
+            );
+        }
+
+        /// The `file://` git base whose `<owner>/<repo>.git` join lands on
+        /// the fixtures created by [`make_bare_remote`].
+        fn git_base(remotes: &Path) -> Url {
+            Url::parse(&format!("file://{}/", remotes.display())).expect("fixture base url")
+        }
+
+        /// Spawns a store actor holding one record with the given GitHub
+        /// attrs, returning the live handle the facade will re-read from.
+        async fn seeded_record(state: &Path, attrs: Option<&GithubAttrs>) -> SessionRecordHandle {
+            let store = Store::init(
+                DaemonAbsPath::try_new(Utf8PathBuf::try_from(state.to_path_buf()).unwrap())
+                    .unwrap(),
+            )
+            .await
+            .expect("store init");
+            let mut record_attrs = BTreeMap::new();
+            if let Some(attrs) = attrs {
+                attrs.encode_into(&mut record_attrs);
+            }
+            store
+                .create(Record {
+                    id: SessionId::nil(),
+                    name: Some("facade-test".to_string()),
+                    username: None,
+                    project_path: HostAbsPath::try_new("/tmp/facade-test-project").unwrap(),
+                    network: NetworkMode::default(),
+                    policy: SessionPolicy::default(),
+                    status: SessionStatus::default(),
+                    attrs: record_attrs,
+                })
+                .await
+                .expect("create record")
+        }
+
+        /// GitHub attrs binding a grant, declaring `repos`, with the default
+        /// scope set.
+        fn bound_attrs(repos: &[&str]) -> GithubAttrs {
+            GithubAttrs {
+                grant_id: Some(GrantId::new("grant-1").unwrap()),
+                repos: repos
+                    .iter()
+                    .map(|r| r.parse::<RepoSpec>().unwrap())
+                    .collect(),
+                scopes: Some(ScopeSet::defaults()),
+            }
+        }
+
+        /// Drives one request line through the channel and collects the
+        /// response lines.
+        async fn drive(chan: &mut SessionChannel, line: &str) -> Vec<String> {
+            let (mut ours, theirs) = UnixStream::pair().unwrap();
+            chan.handle(line, &mut ours).await;
+            drop(ours);
+            read_lines(&theirs)
+        }
+
+        fn assert_no_error(lines: &[String]) {
+            assert!(
+                !lines.iter().any(|l| l.starts_with("error:")),
+                "expected success, got: {lines:?}"
+            );
+        }
+
+        fn error_line(lines: &[String]) -> &str {
+            lines
+                .iter()
+                .find(|l| l.starts_with("error:"))
+                .unwrap_or_else(|| panic!("expected an error: line, got: {lines:?}"))
+        }
+
+        /// No streamed line — success or failure — may carry token bytes.
+        fn assert_no_token(lines: &[String]) {
+            for line in lines {
+                assert!(
+                    !line.contains(TEST_TOKEN),
+                    "token bytes leaked to the sandbox: {line}"
+                );
+            }
+        }
+
+        /// Full fixture: bare remote for `octo/hello`, a primed working
+        /// clone in the channel's workspace on branch `feat/x` with one
+        /// unpushed commit, and a channel whose facade is wired to a live
+        /// record carrying `attrs`.
+        async fn github_channel(
+            attrs: Option<&GithubAttrs>,
+        ) -> (TempDir, TempDir, TempDir, TempDir, SessionChannel) {
+            let (state, rootfs, cwd, mut chan) = setup_channel();
+            let fixtures = tempdir().unwrap();
+            let remotes = fixtures.path().join("remotes");
+            std::fs::create_dir_all(&remotes).unwrap();
+            make_bare_remote(&remotes, "octo", "hello");
+
+            // Prime the workspace clone the way activation would: cloned
+            // from the *derived* URL so its origin matches what the facade
+            // verifies, then a local branch with unpushed work.
+            let base = git_base(&remotes);
+            let clone_url = base.join("octo/hello.git").unwrap();
+            let work = cwd.path().join("hello");
+            git_run(
+                &[
+                    "clone",
+                    "-q",
+                    clone_url.as_str(),
+                    work.to_str().expect("utf-8"),
+                ],
+                fixtures.path(),
+            );
+            git_run(&["checkout", "-q", "-b", "feat/x"], &work);
+            std::fs::write(work.join("work.txt"), b"session work\n").unwrap();
+            git_run(&["add", "work.txt"], &work);
+            git_run(&["commit", "-q", "-m", "session work"], &work);
+
+            let record = seeded_record(fixtures.path(), attrs).await;
+            chan.github = Some(SessionGithub::for_tests(TEST_TOKEN, base, record));
+            (state, rootfs, cwd, fixtures, chan)
+        }
+
+        /// The bare fixture remote for `octo/hello` under `fixtures`.
+        fn bare_repo(fixtures: &Path) -> std::path::PathBuf {
+            fixtures.join("remotes").join("octo").join("hello.git")
+        }
+
+        /// Whether the fixture remote has a branch named `branch`.
+        fn remote_has_branch(fixtures: &Path, branch: &str) -> bool {
+            Command::new("git")
+                .args([
+                    "--git-dir",
+                    bare_repo(fixtures).to_str().unwrap(),
+                    "show-ref",
+                    "--verify",
+                    &format!("refs/heads/{branch}"),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("show-ref")
+                .success()
+        }
+
+        /// The core success arc: an authorized `git%push` streams `msg:`
+        /// lines, lands the branch on the remote, and leaks no token bytes.
+        #[tokio::test]
+        async fn authorized_push_succeeds_and_streams() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            assert!(!remote_has_branch(fixtures.path(), "feat/x"));
+
+            let lines = drive(&mut chan, "git%push").await;
+
+            assert_no_error(&lines);
+            assert_no_token(&lines);
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("msg:") && l.contains("pushed `feat/x`")),
+                "expected a streamed push summary, got: {lines:?}"
+            );
+            assert!(
+                remote_has_branch(fixtures.path(), "feat/x"),
+                "the push must actually land on the remote"
+            );
+        }
+
+        /// An explicit selector naming the (single) declared repo works too.
+        #[tokio::test]
+        async fn push_with_matching_selector_succeeds() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+
+            let lines = drive(&mut chan, "git%push octo/hello").await;
+
+            assert_no_error(&lines);
+            assert!(remote_has_branch(fixtures.path(), "feat/x"));
+        }
+
+        /// A repo outside the session's declared allow-list is denied by the
+        /// authz choke point, before any git process runs.
+        #[tokio::test]
+        async fn undeclared_repo_is_denied() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+
+            let lines = drive(&mut chan, "git%push evil/other").await;
+
+            let err = error_line(&lines);
+            assert!(
+                err.contains("repo evil/other not declared for this session"),
+                "expected the canonical RepoNotDeclared denial: {err}"
+            );
+            assert!(!remote_has_branch(fixtures.path(), "feat/x"));
+        }
+
+        /// A subcommand outside the allowlist is rejected by the argv gate.
+        #[tokio::test]
+        async fn disallowed_subcommand_is_denied() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, _cwd, _fixtures, mut chan) = github_channel(Some(&attrs)).await;
+
+            let lines = drive(&mut chan, "git%rev-parse HEAD").await;
+            assert!(
+                error_line(&lines).contains("not available through `min git`"),
+                "got: {lines:?}"
+            );
+        }
+
+        /// An allowlisted subcommand with a smuggled option is rejected —
+        /// and nothing reaches the remote.
+        #[tokio::test]
+        async fn smuggled_option_is_denied() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+
+            for argv in [
+                "git%push --force",
+                "git%-c credential.helper=evil push",
+                "git%fetch --upload-pack=/tmp/evil",
+                "git%--git-dir=/tmp/elsewhere push",
+            ] {
+                let lines = drive(&mut chan, argv).await;
+                assert!(
+                    error_line(&lines).contains("not permitted through `min git`"),
+                    "{argv} must be rejected: {lines:?}"
+                );
+            }
+            assert!(!remote_has_branch(fixtures.path(), "feat/x"));
+        }
+
+        /// A session whose record carries no GitHub attrs is refused with
+        /// the canonical no-auth message.
+        #[tokio::test]
+        async fn session_without_github_attrs_is_refused() {
+            let (_state, _rootfs, _cwd, _fixtures, mut chan) = github_channel(None).await;
+
+            let lines = drive(&mut chan, "git%push").await;
+            assert!(
+                error_line(&lines).contains("this session has no GitHub authentication"),
+                "got: {lines:?}"
+            );
+        }
+
+        /// A channel with no facade wired at all (every session today) is
+        /// refused with the same message — fail closed, byte-compatible.
+        #[tokio::test]
+        async fn unwired_channel_is_refused() {
+            let (_state, _rootfs, _cwd, mut chan) = setup_channel();
+
+            let lines = drive(&mut chan, "git%push").await;
+            assert_eq!(
+                error_line(&lines),
+                "error: this session has no GitHub authentication"
+            );
+        }
+
+        /// Insufficient scope (contents:read only) denies a push per the
+        /// authz choke point.
+        #[tokio::test]
+        async fn missing_scope_denies_push() {
+            let mut attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            attrs.scopes =
+                Some(ScopeSet::empty().with(github::Scope::Contents, github::Permission::Read));
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+
+            let lines = drive(&mut chan, "git%push").await;
+            assert!(
+                error_line(&lines).contains("contents:rw"),
+                "the denial must name the missing permission: {lines:?}"
+            );
+            assert!(!remote_has_branch(fixtures.path(), "feat/x"));
+        }
+
+        /// Once the session record is deleted (destroy), the facade
+        /// authorizes nothing (spec R3.5/R6.3).
+        #[tokio::test]
+        async fn deleted_record_ends_facade_access() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+
+            // Delete through a clone of the same live handle.
+            if let Some(github) = &chan.github {
+                github.record_handle_for_tests().delete().await.unwrap();
+            }
+
+            let lines = drive(&mut chan, "git%push").await;
+            assert!(
+                error_line(&lines).contains("session record unavailable"),
+                "a destroyed session must not authorize: {lines:?}"
+            );
+            assert!(!remote_has_branch(fixtures.path(), "feat/x"));
+        }
+
+        /// A sandbox-rewritten origin is refused before any authenticated
+        /// git process runs (the defense-in-depth check; see facade docs).
+        #[tokio::test]
+        async fn tampered_origin_is_refused() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+
+            let work = cwd.path().join("hello");
+            git_run(
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://evil.example/steal.git",
+                ],
+                &work,
+            );
+
+            let lines = drive(&mut chan, "git%push").await;
+            assert!(
+                error_line(&lines).contains("does not point at the declared GitHub remote"),
+                "got: {lines:?}"
+            );
+            assert!(!remote_has_branch(fixtures.path(), "feat/x"));
+        }
+
+        /// `status` and `remote -v` work without contacting the remote and
+        /// stream `msg:` lines.
+        #[tokio::test]
+        async fn local_only_verbs_report_without_a_remote() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, _cwd, _fixtures, mut chan) = github_channel(Some(&attrs)).await;
+
+            let lines = drive(&mut chan, "git%status").await;
+            assert_no_error(&lines);
+            assert!(
+                lines.iter().any(|l| l.contains("on branch `feat/x`")),
+                "got: {lines:?}"
+            );
+            assert!(
+                lines.iter().any(|l| l.contains("no upstream")),
+                "an unpushed branch must report no upstream: {lines:?}"
+            );
+
+            let lines = drive(&mut chan, "git%remote -v").await;
+            assert_no_error(&lines);
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("msg:origin\t") && l.contains("octo/hello.git")),
+                "got: {lines:?}"
+            );
+            assert_no_token(&lines);
+        }
+
+        /// A declared-but-unprimed repo gets an actionable error naming the
+        /// fix.
+        #[tokio::test]
+        async fn unprimed_repo_is_actionable() {
+            // Declare a second repo that has no working tree yet; naming it
+            // makes the facade look for its primed dir.
+            let attrs = bound_attrs(&["octo/hello@feat/x:main", "octo/second"]);
+            let (_state, _rootfs, _cwd, _fixtures, mut chan) = github_channel(Some(&attrs)).await;
+
+            let lines = drive(&mut chan, "git%push octo/second").await;
+            assert!(
+                error_line(&lines).contains("not primed in this session's workspace"),
+                "got: {lines:?}"
+            );
+        }
+
+        /// With several repos declared, an unselected operation must name
+        /// one.
+        #[tokio::test]
+        async fn multi_repo_requires_a_selector() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main", "octo/second"]);
+            let (_state, _rootfs, _cwd, _fixtures, mut chan) = github_channel(Some(&attrs)).await;
+
+            let lines = drive(&mut chan, "git%push").await;
+            assert!(
+                error_line(&lines).contains("name one explicitly"),
+                "got: {lines:?}"
+            );
+        }
+
+        /// `clone` of a declared repo lands it in the workspace and checks
+        /// out its declared branch (created from base — never pushed).
+        #[tokio::test]
+        async fn clone_of_declared_repo_primes_the_workspace() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main", "octo/second@feat/y"]);
+            let (_state, _rootfs, cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            make_bare_remote(&fixtures.path().join("remotes"), "octo", "second");
+
+            let lines = drive(&mut chan, "git%clone octo/second").await;
+
+            assert_no_error(&lines);
+            assert_no_token(&lines);
+            let work = cwd.path().join("second");
+            assert!(
+                work.join(".git").exists(),
+                "clone must land in the workspace"
+            );
+            assert!(
+                lines.iter().any(|l| l.contains("created branch `feat/y`")),
+                "got: {lines:?}"
+            );
+            // R2.5: branch creation must not push.
+            assert!(
+                !Command::new("git")
+                    .args([
+                        "--git-dir",
+                        fixtures
+                            .path()
+                            .join("remotes")
+                            .join("octo")
+                            .join("second.git")
+                            .to_str()
+                            .unwrap(),
+                        "show-ref",
+                        "--verify",
+                        "refs/heads/feat/y",
+                    ])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        /// The verb constant the helper script speaks and the dispatch arm
+        /// match on are the same crate-shared constant.
+        #[test]
+        fn dispatch_matches_the_shared_verb_constant() {
+            assert_eq!(VERB_GIT, "git");
+        }
     }
 }
