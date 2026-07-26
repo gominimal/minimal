@@ -1183,8 +1183,29 @@ fn hardlink_dir_contents(src_dir: &Path, dst_parent_dir: &Path) -> Result<(), Er
 /// hakoniwa, the remount succeeds even in nested sandboxes—without
 /// resorting to MountFallback (which can silently drop requested
 /// restrictions like RDONLY).
+///
+/// We union two views of the flags the kernel will enforce:
+///
+///  - [`statfs_locked_flags`]: `statfs()` on `path`, i.e. the `ST_*` flags of
+///    the *filesystem* the bind source lives on, and
+///  - [`mountinfo_locked_flags`]: the per-mount VFS options of the mount that
+///    actually contains `path`, read from `/proc/self/mountinfo`.
+///
+/// `statfs` alone is insufficient inside a layered container rootfs (e.g.
+/// Cloudflare Containers' virtiofs→overlay cascade): the mount the path sits on
+/// can carry a locked `nodev`/`noexec` that the source filesystem's `statfs`
+/// does not surface, and omitting it on the remount makes the kernel return
+/// EPERM. Reading the mount's own options from mountinfo is the authoritative
+/// view; we union with `statfs` so we never drop a flag either source reports.
 #[cfg(target_os = "linux")]
 fn locked_mount_flags(path: &Path) -> hakoniwa::MountOptions {
+    statfs_locked_flags(path) | mountinfo_locked_flags(path)
+}
+
+/// The `statfs()`-derived half of [`locked_mount_flags`]. Returns empty (with a
+/// warning) if `statfs` fails, e.g. the path does not exist.
+#[cfg(target_os = "linux")]
+fn statfs_locked_flags(path: &Path) -> hakoniwa::MountOptions {
     use nix::sys::statfs::statfs;
     use nix::sys::statvfs::FsFlags;
 
@@ -1214,6 +1235,111 @@ fn locked_mount_flags(path: &Path) -> hakoniwa::MountOptions {
         opts |= hakoniwa::MountOptions::NOEXEC;
     }
     opts
+}
+
+/// The `/proc/self/mountinfo`-derived half of [`locked_mount_flags`]: the VFS
+/// options of the most specific mount whose mount point is a path-prefix of
+/// `path`. Gated on `path.exists()` so a nonexistent path contributes nothing
+/// (matching the `statfs`-failure behaviour) rather than resolving to `/`.
+#[cfg(target_os = "linux")]
+fn mountinfo_locked_flags(path: &Path) -> hakoniwa::MountOptions {
+    if !path.exists() {
+        return hakoniwa::MountOptions::empty();
+    }
+    match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(contents) => parse_mountinfo_locked_flags(&contents, path),
+        Err(e) => {
+            tracing::warn!(
+                "reading /proc/self/mountinfo failed: {e}, not adding locked mount flags"
+            );
+            hakoniwa::MountOptions::empty()
+        }
+    }
+}
+
+/// Pure parser for [`mountinfo_locked_flags`], split out so it is testable
+/// without touching `/proc`. Picks the mount whose mount point is the
+/// longest-by-components path-prefix of `path` and maps its per-mount options
+/// (`ro`/`nosuid`/`nodev`/`noexec`) to [`hakoniwa::MountOptions`].
+///
+/// mountinfo line layout (per `Documentation/filesystems/proc.rst`):
+/// `ID PARENT MAJ:MIN ROOT MOUNTPOINT OPTIONS [OPTIONAL...] - FSTYPE SRC SUPEROPTS`.
+/// Field 4 (0-based) is the mount point (octal-escaped) and field 5 is the
+/// per-mount VFS options — the flags the kernel locks on a nested remount.
+#[cfg(target_os = "linux")]
+fn parse_mountinfo_locked_flags(mountinfo: &str, path: &Path) -> hakoniwa::MountOptions {
+    let mut best: Option<(usize, hakoniwa::MountOptions)> = None;
+    for line in mountinfo.lines() {
+        let mut fields = line.split(' ');
+        let mount_point = match fields.nth(4) {
+            Some(mp) => unescape_octal(mp),
+            None => continue,
+        };
+        let opts_field = match fields.next() {
+            Some(o) => o,
+            None => continue,
+        };
+        let mount_point = Path::new(&mount_point);
+        if !path_has_prefix(path, mount_point) {
+            continue;
+        }
+        let specificity = mount_point.components().count();
+        // On a tie, a later (more recently stacked) mount wins.
+        if best.as_ref().is_some_and(|(b, _)| specificity < *b) {
+            continue;
+        }
+        let mut opts = hakoniwa::MountOptions::empty();
+        for opt in opts_field.split(',') {
+            match opt {
+                "ro" => opts |= hakoniwa::MountOptions::RDONLY,
+                "nosuid" => opts |= hakoniwa::MountOptions::NOSUID,
+                "nodev" => opts |= hakoniwa::MountOptions::NODEV,
+                "noexec" => opts |= hakoniwa::MountOptions::NOEXEC,
+                _ => {}
+            }
+        }
+        best = Some((specificity, opts));
+    }
+    best.map_or_else(hakoniwa::MountOptions::empty, |(_, opts)| opts)
+}
+
+/// True when every component of `prefix` matches the leading components of
+/// `path` (so `/mnt` is a prefix of `/mnt/x` but not of `/mnt2`). `/` (a lone
+/// root component) is a prefix of every absolute path.
+#[cfg(target_os = "linux")]
+fn path_has_prefix(path: &Path, prefix: &Path) -> bool {
+    let mut p = path.components();
+    for c in prefix.components() {
+        if p.next() != Some(c) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Decode mountinfo's octal escapes (`\040` space, `\011` tab, `\012` newline,
+/// `\134` backslash) back to their bytes.
+#[cfg(target_os = "linux")]
+fn unescape_octal(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let is_octal = |c: u8| (b'0'..=b'7').contains(&c);
+        if b[i] == b'\\'
+            && i + 3 < b.len()
+            && is_octal(b[i + 1])
+            && is_octal(b[i + 2])
+            && is_octal(b[i + 3])
+        {
+            out.push((b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0'));
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Best-effort probe for whether this host can create network namespaces.
@@ -1373,6 +1499,69 @@ mod tests {
     fn locked_mount_flags_empty_on_statfs_failure() {
         let opts = locked_mount_flags(Path::new("/nonexistent-path-for-statfs-test"));
         assert!(opts.is_empty());
+    }
+
+    // The mountinfo half is what makes remounts survive a layered container
+    // rootfs (e.g. Cloudflare's virtiofs→overlay cascade), where statfs on the
+    // bind source under-reports the locked flags the kernel enforces.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_mountinfo_maps_per_mount_options() {
+        // Realistic two-line mountinfo: root rw, and a restricted mount the
+        // bind source lives under.
+        let mi = "22 1 0:20 / / rw,relatime shared:1 - ext4 /dev/root rw\n\
+                  30 22 0:25 / /mnt/src ro,nosuid,nodev,noexec shared:2 - overlay overlay ro\n";
+        let opts = parse_mountinfo_locked_flags(mi, Path::new("/mnt/src/pkg/file"));
+        assert!(opts.contains(hakoniwa::MountOptions::RDONLY));
+        assert!(opts.contains(hakoniwa::MountOptions::NOSUID));
+        assert!(opts.contains(hakoniwa::MountOptions::NODEV));
+        assert!(opts.contains(hakoniwa::MountOptions::NOEXEC));
+    }
+
+    // The most specific (longest-prefix) mount wins, and a sibling that shares
+    // a name prefix but not a path prefix (`/mnt2` vs `/mnt`) must not match.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_mountinfo_longest_prefix_wins_and_siblings_dont_match() {
+        let mi = "22 1 0:20 / / rw shared:1 - ext4 /dev/root rw\n\
+                  30 22 0:25 / /mnt rw shared:2 - ext4 /dev/x rw\n\
+                  31 30 0:26 / /mnt/src nodev shared:3 - ext4 /dev/y ro\n\
+                  32 22 0:27 / /mnt2 ro,noexec shared:4 - ext4 /dev/z ro\n";
+        let opts = parse_mountinfo_locked_flags(mi, Path::new("/mnt/src/a"));
+        assert!(opts.contains(hakoniwa::MountOptions::NODEV));
+        // Must not pick up /mnt2's ro,noexec.
+        assert!(!opts.contains(hakoniwa::MountOptions::RDONLY));
+        assert!(!opts.contains(hakoniwa::MountOptions::NOEXEC));
+    }
+
+    // No mount is a prefix (only `/` matches, and it is unrestricted) => empty.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_mountinfo_unrestricted_root_is_empty() {
+        let mi = "22 1 0:20 / / rw,relatime shared:1 - ext4 /dev/root rw\n";
+        let opts = parse_mountinfo_locked_flags(mi, Path::new("/home/u/work"));
+        assert!(opts.is_empty());
+    }
+
+    // Mount points with spaces are octal-escaped (`\040`) in mountinfo.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_mountinfo_unescapes_octal_mount_points() {
+        let mi = "22 1 0:20 / / rw shared:1 - ext4 /dev/root rw\n\
+                  30 22 0:25 / /mnt/with\\040space nodev shared:2 - ext4 /dev/x rw\n";
+        let opts = parse_mountinfo_locked_flags(mi, Path::new("/mnt/with space/inner"));
+        assert!(opts.contains(hakoniwa::MountOptions::NODEV));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unescape_octal_decodes_known_escapes() {
+        assert_eq!(unescape_octal(r"a\040b"), "a b");
+        assert_eq!(unescape_octal(r"tab\011x"), "tab\tx");
+        assert_eq!(unescape_octal(r"back\134slash"), r"back\slash");
+        assert_eq!(unescape_octal("/plain/path"), "/plain/path");
+        // A lone backslash not starting a 3-digit octal escape is preserved.
+        assert_eq!(unescape_octal(r"end\"), r"end\");
     }
 
     #[test]
