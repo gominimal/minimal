@@ -46,6 +46,13 @@ pub mod rest;
 #[cfg(feature = "client")]
 pub mod device_flow;
 
+// The token-refresh state machine (`GrantManager`): per-grant single-flight,
+// persist-before-use rotation, and the sticky needs-reauth transition. Gated
+// behind `client` with the rest of the HTTP stack, since its production
+// backend (`HttpRefreshBackend`) refreshes over HTTP.
+#[cfg(feature = "client")]
+pub mod refresh;
+
 // A programmable, in-process mock GitHub (OAuth device flow + REST + an
 // auth-enforcing git smart-HTTP endpoint) plus the `github-mock` binary. It is
 // test-only scaffolding — never a production dependency — so it is gated behind
@@ -59,6 +66,11 @@ pub use device_flow::{
     AccessTokenPair, DeviceAuthorization, DeviceFlowClient, GithubUser, assemble_grant,
 };
 pub use error::Error;
+#[cfg(feature = "client")]
+pub use refresh::{
+    GrantManager, GrantPhase, GrantTokenProvider, HttpRefreshBackend, RefreshBackend, RefreshError,
+    RefreshFailure, with_reauth_retry,
+};
 #[cfg(feature = "client")]
 pub use rest::{
     Installation, InstallationAccount, PullRef, PullRequest, Repository, RestClient, StaticToken,

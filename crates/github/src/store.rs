@@ -370,7 +370,24 @@ impl GrantStore {
             return Err(e);
         }
 
-        fs::rename(&tmp_path, &final_path)
+        fs::rename(&tmp_path, &final_path)?;
+        self.sync_dir()
+    }
+
+    /// `fsync`s the grants directory itself, making the just-completed
+    /// `rename(2)` durable. Without this, a power loss shortly after `save`
+    /// returns could resurrect the *previous* file — which, for a refresh-
+    /// token **rotation** (see `refresh.rs`), would mean a refresh token
+    /// GitHub has already invalidated: a bricked grant. No-op on non-Unix
+    /// targets (directories aren't openable there; this store's production
+    /// use is Linux/macOS only).
+    #[cfg(unix)]
+    fn sync_dir(&self) -> io::Result<()> {
+        fs::File::open(&self.dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    fn sync_dir(&self) -> io::Result<()> {
+        Ok(())
     }
 
     /// Reads back a single grant by id, or `None` if no grant with that id
