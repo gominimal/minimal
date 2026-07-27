@@ -50,6 +50,10 @@ jobs:
                   SHA="$(printf '%s' "$INPUT_SHA" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
                   # Default to the ref this workflow runs from (main HEAD).
                   [ -z "$SHA" ] && SHA="$REF_SHA"
+                  # Fail fast on a malformed sha. The webapp validates too and
+                  # degrades to the channel pointer, but only after burning a full
+                  # deploy — cheaper to reject junk here before dispatching.
+                  [[ "$SHA" =~ ^[0-9a-f]{7,40}$ ]] || { echo "::error::not a commit sha: ${SHA}"; exit 1; }
                   echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
                   echo "Docs hotfix will pin gominimal/webapp to ${SHA}"
 
