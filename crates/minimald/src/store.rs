@@ -47,6 +47,15 @@ enum StoreMessage {
         oneshot::Sender<Result<(), std::io::Error>>,
     ),
     SessionDelete(DiskSessionKey, oneshot::Sender<Result<(), std::io::Error>>),
+    CompositionLoad(
+        DiskSessionKey,
+        oneshot::Sender<Result<Option<sessions::core::compose::Composition>, std::io::Error>>,
+    ),
+    CompositionStore(
+        DiskSessionKey,
+        std::sync::Arc<sessions::core::compose::Composition>,
+        oneshot::Sender<Result<(), std::io::Error>>,
+    ),
 }
 
 /// The session store actor. Mediates reading, writing, and enumerating
@@ -131,6 +140,12 @@ impl Store {
             }
             StoreMessage::SessionDelete(k, r) => {
                 let _ = r.send(self.store.delete(&k));
+            }
+            StoreMessage::CompositionLoad(k, r) => {
+                let _ = r.send(self.store.load_composition(&k));
+            }
+            StoreMessage::CompositionStore(k, comp, r) => {
+                let _ = r.send(self.store.store_composition(&k, &comp));
             }
         }
     }
@@ -246,6 +261,44 @@ impl SessionRecordHandle {
             .h
             .sender
             .send(StoreMessage::SessionDelete(self.k.clone(), send))
+            .await;
+        recv.await.expect("corresponding store is dead")
+    }
+
+    /// Loads the persisted composition snapshot for this session, if
+    /// one exists. Returns `Ok(None)` when the sidecar is absent
+    /// (pre-sidecar session, or composition was never assembled). A
+    /// corrupt sidecar surfaces as an error so the caller can log it
+    /// and fall back to baseline.
+    pub async fn load_composition(
+        &self,
+    ) -> Result<Option<sessions::core::compose::Composition>, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        let _ = self
+            .h
+            .sender
+            .send(StoreMessage::CompositionLoad(self.k.clone(), send))
+            .await;
+        recv.await.expect("corresponding store is dead")
+    }
+
+    /// Atomically persists the composition snapshot for this session
+    /// (tmp + rename). Called at composition-assembly time so a
+    /// restart can re-apply the exact composition that was approved at
+    /// `min activate` time.
+    pub async fn store_composition(
+        &self,
+        composition: &sessions::core::compose::Composition,
+    ) -> Result<(), std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        let _ = self
+            .h
+            .sender
+            .send(StoreMessage::CompositionStore(
+                self.k.clone(),
+                std::sync::Arc::new(composition.clone()),
+                send,
+            ))
             .await;
         recv.await.expect("corresponding store is dead")
     }
