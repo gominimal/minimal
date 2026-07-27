@@ -1565,6 +1565,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "det-init"
+version = "0.5.0-rc1"
+dependencies = [
+ "libc",
+ "minimald",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "diagnostics"
 version = "0.0.1"
 dependencies = [
