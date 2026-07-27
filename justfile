@@ -239,6 +239,21 @@ test-installer:
 lint-shell:
     bash scripts/lint-shell.sh
 
+# Run the shipped-linkage rewriter's test harness (stubbed `patchelf`, no ELF
+# binaries); shellcheck runs when present. Runs anywhere — the script itself is
+# Linux-only, so this is the only way to exercise it on macOS.
+test-linkage:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v shellcheck >/dev/null 2>&1; then
+        echo "== shellcheck =="
+        shellcheck scripts/rewrite-linux-linkage.sh scripts/rewrite-linux-linkage_test.sh
+    else
+        echo "== shellcheck not found, skipping static check =="
+    fi
+    echo "== running rewrite-linux-linkage_test.sh =="
+    bash scripts/rewrite-linux-linkage_test.sh
+
 # Run the promotion provenance gate's test harness (stubbed `gh`, no network,
 # no auth); shellcheck runs when present.
 test-promote-gate:
