@@ -8,6 +8,7 @@
 
 use std::fmt;
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 
 /// MTU advertised to the switch and the tap devices. gvproxy's own default.
 pub const DEFAULT_MTU: u16 = 1500;
@@ -33,6 +34,48 @@ pub const DEFAULT_SUBNET: SwitchSubnet = SwitchSubnet {
     base: Ipv4Addr::new(100, 64, 0, 0),
     prefix: 16,
 };
+
+/// System-wide install path for the gvproxy ("gvisor-tap-vsock") switch
+/// binary: the final fallback when no user-local install exists. Fetched +
+/// SHA-256-verified by `scripts/fetch-gvproxy.sh` (issue #495).
+pub const DEFAULT_GVPROXY_BIN: &str = "/usr/lib/minimal/bin/gvproxy";
+
+/// Filename the installer stamps into the `bin/` prefix (see
+/// `scripts/stage-release.sh`: `bin/gvproxy`).
+const GVPROXY_FILE: &str = "gvproxy";
+
+/// The user-local bin directory the installer stamps into: `$MINIMAL_BIN`, else
+/// `$HOME/.local/bin`. Mirrors the installer's `bin` prefix resolution in
+/// `scripts/install.sh`. `None` when neither is set.
+fn installer_bin_dir() -> Option<PathBuf> {
+    if let Some(bin) = std::env::var("MINIMAL_BIN").ok().filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(bin));
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|home| PathBuf::from(home).join(".local/bin"))
+}
+
+/// Resolve the gvproxy binary an install placed on this host: an existing
+/// user-local install (`<bin-dir>/gvproxy`, where the curl|sh installer stamps
+/// it), else the system-wide [`DEFAULT_GVPROXY_BIN`].
+///
+/// One definition shared by `minimald` (which spawns gvproxy for native own-IP
+/// sessions) and `minvmd` (the host switch supervisor), so the two daemons and
+/// the installer agree on where gvproxy lives; daemon-specific overrides
+/// (config field, env var) layer on top in the callers. Never errors: the
+/// system path is returned as a last resort even if nothing exists there (the
+/// caller surfaces a spawn failure with that concrete path).
+#[must_use]
+pub fn installed_gvproxy_bin() -> PathBuf {
+    if let Some(local) = installer_bin_dir().map(|dir| dir.join(GVPROXY_FILE))
+        && local.exists()
+    {
+        return local;
+    }
+    PathBuf::from(DEFAULT_GVPROXY_BIN)
+}
 
 /// A subnet was constructed with a prefix outside the supported `8..=29` range —
 /// a configuration error, distinct from runtime address exhaustion.
@@ -274,5 +317,30 @@ mod tests {
         let yaml = render_gvproxy_config(SwitchSubnet::default(), &[]);
         assert!(yaml.contains("dhcpStaticLeases:\n    {}\n"));
         assert!(yaml.contains("subnet: \"100.64.0.0/16\""));
+    }
+
+    // Resolver tests mutate process-global env (MINIMAL_BIN), so serialise
+    // them to avoid races when `cargo test` runs them in parallel.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn installed_gvproxy_prefers_existing_user_local_install() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let want = tmp.path().join(GVPROXY_FILE);
+        std::fs::write(&want, b"gvproxy").unwrap();
+        unsafe { std::env::set_var("MINIMAL_BIN", tmp.path()) };
+        assert_eq!(installed_gvproxy_bin(), want);
+        unsafe { std::env::remove_var("MINIMAL_BIN") };
+    }
+
+    #[test]
+    fn installed_gvproxy_falls_back_to_system_path() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // MINIMAL_BIN points at an empty dir: no user-local gvproxy present.
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("MINIMAL_BIN", tmp.path()) };
+        assert_eq!(installed_gvproxy_bin(), PathBuf::from(DEFAULT_GVPROXY_BIN));
+        unsafe { std::env::remove_var("MINIMAL_BIN") };
     }
 }

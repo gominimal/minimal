@@ -113,32 +113,10 @@ pub fn resolve_initramfs_path() -> Result<PathBuf, VmError> {
     resolve_or_default("MINVMD_INITRAMFS", DEFAULT_INITRAMFS_FILE)
 }
 
-/// System-wide install path for the host gvproxy ("gvisor-tap-vsock") binary,
-/// used as the final fallback when `MINVMD_GVPROXY_BIN` is unset and no
-/// user-local install exists. Fetched + SHA-256-verified by
-/// `scripts/fetch-gvproxy.sh` (issue #495).
-pub const DEFAULT_GVPROXY_BIN: &str = "/usr/lib/minimal/bin/gvproxy";
-
-/// Filename the installer stamps into the `bin/` prefix (see
-/// `scripts/stage-release.sh`: `bin/gvproxy`).
-const GVPROXY_FILE: &str = "gvproxy";
-
-/// The user-local bin directory the installer stamps into: `$MINIMAL_BIN`, else
-/// `$HOME/.local/bin`. Mirrors the installer's `bin` prefix resolution in
-/// `scripts/install.sh`. `None` when neither is set.
-fn installer_bin_dir() -> Option<PathBuf> {
-    if let Some(bin) = std::env::var("MINIMAL_BIN").ok().filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(bin));
-    }
-    std::env::var("HOME")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map(|home| PathBuf::from(home).join(".local/bin"))
-}
-
-/// Resolve the host gvproxy binary path in three tiers: the `MINVMD_GVPROXY_BIN`
-/// override, then an existing user-local install (`<bin-dir>/gvproxy`, where the
-/// installer stamps it), then the system-wide [`DEFAULT_GVPROXY_BIN`].
+/// Resolve the host gvproxy binary path: the `MINVMD_GVPROXY_BIN` override,
+/// then the installed location — the user-local install the curl|sh installer
+/// stamps, else the system-wide `switch::DEFAULT_GVPROXY_BIN`
+/// ([`switch::installed_gvproxy_bin`], shared with minimald).
 ///
 /// Unlike the kernel/rootfs/initramfs resolvers this never errors: gvproxy is
 /// only spawned for an own-IP VM, so an absent override is the common case, and
@@ -146,21 +124,12 @@ fn installer_bin_dir() -> Option<PathBuf> {
 /// (the caller surfaces a spawn failure with that concrete path).
 #[must_use]
 pub fn resolve_gvproxy_path() -> PathBuf {
-    // Tier 1: explicit override, honoured verbatim.
-    if let Some(val) = std::env::var("MINVMD_GVPROXY_BIN")
+    // Explicit override, honoured verbatim.
+    std::env::var("MINVMD_GVPROXY_BIN")
         .ok()
         .filter(|v| !v.is_empty())
-    {
-        return PathBuf::from(val);
-    }
-    // Tier 2: user-local install from the curl|sh installer, if present.
-    if let Some(local) = installer_bin_dir().map(|dir| dir.join(GVPROXY_FILE))
-        && local.exists()
-    {
-        return local;
-    }
-    // Tier 3: system-wide install path (hardcoded fallback).
-    PathBuf::from(DEFAULT_GVPROXY_BIN)
+        .map(PathBuf::from)
+        .unwrap_or_else(switch::installed_gvproxy_bin)
 }
 
 #[cfg(test)]
@@ -274,7 +243,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         clear_gvproxy_env();
         let tmp = tempfile::tempdir().unwrap();
-        let want = tmp.path().join(GVPROXY_FILE);
+        let want = tmp.path().join("gvproxy");
         std::fs::write(&want, b"gvproxy").unwrap();
         // MINIMAL_BIN steers installer_bin_dir without touching HOME.
         unsafe { std::env::set_var("MINIMAL_BIN", tmp.path()) };
@@ -289,7 +258,10 @@ mod tests {
         // MINIMAL_BIN points at an empty dir: no user-local gvproxy present.
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("MINIMAL_BIN", tmp.path()) };
-        assert_eq!(resolve_gvproxy_path(), PathBuf::from(DEFAULT_GVPROXY_BIN));
+        assert_eq!(
+            resolve_gvproxy_path(),
+            PathBuf::from(switch::DEFAULT_GVPROXY_BIN)
+        );
         clear_gvproxy_env();
     }
 

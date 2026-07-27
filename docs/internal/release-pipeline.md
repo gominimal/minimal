@@ -144,7 +144,8 @@ SHA-256-verifies, and atomically installs the file. The on-disk hash is the
 skip oracle, so reruns only touch changed components, and a running daemon is
 stopped before an executable is swapped. Per-platform sets (from
 stage-release.sh's `COMPONENTS` table): Linux amd64/arm64 get `bin/min`,
-`bin/mip`, `bin/minimald`, a `git-remote-min` symlink, and the AppArmor
+`bin/mip`, `bin/minimald`, `bin/gvproxy` (the switch for native own-IP
+sessions), a `git-remote-min` symlink, and the AppArmor
 profile/tunable/loader under `data/`; macOS arm64 gets `bin/min`,
 `bin/minvmd`, `bin/gvproxy`, `lib/libkrun.1.dylib`, the `git-remote-min`
 symlink, and the guest payload (`data/{vmlinuz,rootfs.img,initramfs.cpio}`).

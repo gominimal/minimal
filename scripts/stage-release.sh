@@ -104,21 +104,26 @@ fi
 #     (the installer's completion generation runs `<bin>/min`, spec R9.3), while
 #     the component and artifact names keep the crate name.
 #
-# Linux hosts install just the three self-contained musl binaries. macOS hosts
-# additionally need minvmd + gvproxy and the guest microVM payload (kernel,
-# rootfs, initramfs) to boot Linux workloads under libkrun; macOS is arm64-only
-# here, and its guest is arm64, so it consumes the arm64 guest artifacts.
+# Linux hosts install the three self-contained musl binaries plus gvproxy, the
+# switch binary minimald spawns for native (DM2) own-IP sessions. macOS hosts
+# additionally need minvmd + the guest microVM payload (kernel, rootfs,
+# initramfs) to boot Linux workloads under libkrun; macOS is arm64-only here,
+# and its guest is arm64, so it consumes the arm64 guest artifacts. minvmd is
+# not yet staged for Linux hosts: it needs libkrun/libkrunfw and the guest
+# payload staged alongside it, and no arm64 minvmd is built yet (#980).
 COMPONENTS=(
     # Linux amd64
     "minimald|linux|amd64|file|bin/minimald|minimald-linux-amd64"
     "mip|linux|amd64|file|bin/mip|mip-linux-amd64"
     "minimal|linux|amd64|file|bin/min|minimal-linux-amd64"
     "git-remote-min|linux|amd64|symlink|bin/git-remote-min|min"
+    "gvproxy|linux|amd64|file|bin/gvproxy|gvproxy-linux-amd64"
     # Linux arm64
     "minimald|linux|arm64|file|bin/minimald|minimald-linux-arm64"
     "mip|linux|arm64|file|bin/mip|mip-linux-arm64"
     "minimal|linux|arm64|file|bin/min|minimal-linux-arm64"
     "git-remote-min|linux|arm64|symlink|bin/git-remote-min|min"
+    "gvproxy|linux|arm64|file|bin/gvproxy|gvproxy-linux-arm64"
     # macOS arm64 (darwin)
     "minimal|darwin|arm64|file|bin/min|minimal-macos-arm64"
     "git-remote-min|darwin|arm64|symlink|bin/git-remote-min|min"

@@ -30,11 +30,6 @@ pub enum HostKey {
     },
 }
 
-/// Default install path for the gvproxy ("gvisor-tap-vsock") switch binary,
-/// used when [`Config::gvproxy_bin`] is unset. The `GVPROXY_BIN` env var is
-/// scoped to the `#[ignore]` netns proof and is never consulted by the daemon.
-const DEFAULT_GVPROXY_BIN: &str = "/usr/lib/minimal/bin/gvproxy";
-
 /// Global Configuration for the minimald server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -42,7 +37,7 @@ pub struct Config {
     pub minimal_state_dir: DaemonAbsPath,
     pub minimal_cache_dir: DaemonAbsPath,
     /// Path to the gvproxy binary backing the per-host `OwnIp` switch. Defaults
-    /// to [`DEFAULT_GVPROXY_BIN`] when unset.
+    /// to the installed location (`switch::installed_gvproxy_bin`) when unset.
     #[serde(default)]
     pub gvproxy_bin: Option<PathBuf>,
     /// Whether this `minimald` runs inside a `minvmd` libkrun VM (DM1/3/4). When
@@ -61,12 +56,15 @@ pub struct Config {
 }
 
 impl Config {
-    /// Resolves the configured gvproxy binary path, falling back to the fixed
-    /// install path when unset.
+    /// Resolves the configured gvproxy binary path, falling back to the
+    /// installed location when unset: the user-local `bin/gvproxy` the curl|sh
+    /// installer stamps, else the system-wide `switch::DEFAULT_GVPROXY_BIN`.
+    /// The `GVPROXY_BIN` env var is scoped to the `#[ignore]` netns proof and
+    /// is never consulted by the daemon.
     fn gvproxy_bin_path(&self) -> PathBuf {
         self.gvproxy_bin
             .clone()
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_GVPROXY_BIN))
+            .unwrap_or_else(::switch::installed_gvproxy_bin)
     }
 
     /// Returns the SSH host key to use.
