@@ -1,6 +1,6 @@
 [package]
 name = "det-init"
-version = "0.0.1"
+version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
@@ -17,7 +17,12 @@ name = "det-init"
 path = "src/main.rs"
 
 [dependencies]
-minimald = { version = "0.0.1", path = "../minimald" }
+# Path dep with NO version requirement, deliberately. Pinning `version = "0.0.1"` here broke the
+# build the moment the workspace bumped to 0.5.0-rc1 — a self-inflicted drift trap that has nothing
+# to do with API compatibility (all six `guest::` fns we call were unchanged). Cargo resolves a
+# bare path dep to whatever is in the tree, so version bumps can never break us again; the API
+# surface is what actually matters and the compiler checks that.
+minimald = { path = "../minimald" }
 tokio.workspace = true
 libc.workspace = true
 tracing.workspace = true
