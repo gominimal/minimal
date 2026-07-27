@@ -743,6 +743,14 @@ where
 /// client previously set on this channel, fetches its workspace, accepts the
 /// request, and spawns an async task to take over the
 /// channel for the lifetime of the conversation.
+///
+/// Accepted forms are:
+///  * `git-receive-pack min://<session ID>` - handles a git receive-pack, routing
+///    with the trailing session ID
+///  * `min run <task>` - runs a task, routed via a `MINIMAL_SESSION_ID` env var
+///    that must be set on the channel by the client
+///  * `min package build <args>` - builds package(s), routed via a
+///    `MINIMAL_SESSION_ID` env var that must be set on the channel by the client
 pub(crate) async fn handle_exec(
     argv: &[u8],
     serv: ServerStateHandle,
@@ -848,11 +856,23 @@ pub(crate) async fn handle_exec(
                 exec_task.run(channel).await;
             });
         }
-        Some("build") => {
+        Some("package") => {
+            // `build` is the only `package` sub-command serviced here; a
+            // bare `min package`, an unknown sub-command, or a prefix match
+            // like `min package buildx` is refused before acking.
+            let rest = rem.strip_prefix("package").unwrap_or("").trim();
+            let Some(build_args) = rest
+                .strip_prefix("build")
+                .filter(|args| args.is_empty() || args.starts_with(' '))
+            else {
+                tracing::warn!(%session_id, "execution request rejected: expected `min package build [args...]`");
+                session.channel_failure(id)?;
+                return Ok(());
+            };
             session.channel_success(id)?;
             // Everything after the sub-command is the build's args
             // (`--verbose` / `--rebuild` / package names).
-            let build_args = rem.strip_prefix("build").unwrap_or("").trim().to_string();
+            let build_args = build_args.trim().to_string();
             spawn(async move {
                 run_build_exec(session_handle, id, channel, build_args).await;
             });
@@ -867,7 +887,7 @@ pub(crate) async fn handle_exec(
     Ok(())
 }
 
-/// Streams a `min build [--verbose] [--rebuild] [pkgs...]` exec over the SSH
+/// Streams a `min package build [--verbose] [--rebuild] [pkgs...]` exec over the SSH
 /// channel. Kicks off a session side-op build based on an existing session.
 async fn run_build_exec(
     session: SessionHandle,
@@ -917,7 +937,7 @@ async fn run_build_exec(
                 if let Err(err) = out.write_all(format!("{}\n", line.text).as_bytes()).await {
                     // No reader on the channel — the client went away. Stop
                     // streaming; the side-op keeps running independently.
-                    tracing::warn!(%channel_id, error = %err, "min build: channel write failed");
+                    tracing::warn!(%channel_id, error = %err, "min package build: channel write failed");
                     break;
                 }
             }
