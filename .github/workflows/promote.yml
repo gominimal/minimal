@@ -232,12 +232,14 @@ jobs:
                   # Export resolved SHA for the docs-rebuild dispatch step below.
                   echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
 
-            # Mint a short-lived token scoped to gominimal/docs via the
+            # Mint a short-lived token scoped to gominimal/webapp via the
             # gominimal-aw-bot GitHub App (org standard — App tokens over PATs, see
             # gominimal/min-aw ADR-0002). The default GITHUB_TOKEN cannot dispatch
             # other repos; this token carries the App's contents:write permission
-            # narrowed to the docs repo only.
-            - name: Mint docs-repo token (gominimal-aw-bot)
+            # narrowed to the webapp repo only. The standalone docs host was
+            # collapsed into the webapp (gominimal/webapp#470), which now runs the
+            # deploy-time docs sync, so promotions dispatch the rebuild there.
+            - name: Mint webapp-repo token (gominimal-aw-bot)
               id: docs-token
               if: ${{ inputs.dry_run != true }}
               uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
@@ -245,7 +247,7 @@ jobs:
                   app-id: ${{ vars.AW_BOT_APP_ID }}
                   private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
                   owner: gominimal
-                  repositories: docs
+                  repositories: webapp
 
             - name: Trigger docs rebuild
               env:
@@ -255,10 +257,10 @@ jobs:
               run: |
                   set -euo pipefail
                   if [ "$DRY_RUN" = "true" ]; then
-                    echo "[dry-run] would dispatch reference-docs-promoted to gominimal/docs for ${SHA}"
+                    echo "[dry-run] would dispatch reference-docs-promoted to gominimal/webapp for ${SHA}"
                   else
-                    gh api repos/gominimal/docs/dispatches \
+                    gh api repos/gominimal/webapp/dispatches \
                       -f event_type=reference-docs-promoted \
                       -F "client_payload[sha]=${SHA}"
-                    echo "Dispatched reference-docs-promoted to gominimal/docs for ${SHA}"
+                    echo "Dispatched reference-docs-promoted to gominimal/webapp for ${SHA}"
                   fi
