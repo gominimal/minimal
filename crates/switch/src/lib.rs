@@ -44,11 +44,11 @@ pub const DEFAULT_SUBNET: SwitchSubnet = SwitchSubnet {
 /// whichever came last win a `PATH` lookup — in either direction — so the
 /// binary carries a minimal-specific name even though the bytes are stock
 /// gvproxy (`scripts/fetch-gvproxy.sh` pins and SHA-256-verifies them).
-pub const GVPROXY_FILE: &str = "mingvproxy";
+pub const GVPROXY_FILE: &str = "gvproxy-min";
 
 /// System-wide install path for the switch binary: the final fallback when no
 /// user-local install exists.
-pub const DEFAULT_GVPROXY_BIN: &str = "/usr/lib/minimal/bin/mingvproxy";
+pub const DEFAULT_GVPROXY_BIN: &str = "/usr/lib/minimal/bin/gvproxy-min";
 
 /// The user-local bin directory the installer stamps into: `$MINIMAL_BIN`, else
 /// `$HOME/.local/bin`. Mirrors the installer's `bin` prefix resolution in
@@ -64,7 +64,7 @@ fn installer_bin_dir() -> Option<PathBuf> {
 }
 
 /// Resolve the switch binary an install placed on this host: an existing
-/// user-local install (`<bin-dir>/mingvproxy`, where the curl|sh installer
+/// user-local install (`<bin-dir>/gvproxy-min`, where the curl|sh installer
 /// stamps it), else the system-wide [`DEFAULT_GVPROXY_BIN`].
 ///
 /// One definition shared by `minimald` (which spawns the switch for native

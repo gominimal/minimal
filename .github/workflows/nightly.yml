@@ -140,7 +140,7 @@ jobs:
         # the SHIPPED minvmd and pass the session e2e over the vsock bridge, the
         # same proof ci-linux-kvm's `test-kvm` runs. Every moving part is a
         # downloaded release artifact: the native-glibc `minvmd`, the guest kernel
-        # + ext4 rootfs + initramfs, the pinned `mingvproxy` switch, and the
+        # + ext4 rootfs + initramfs, the pinned `gvproxy-min` switch, and the
         # shipped libkrun pair — laid out as a `lib/` sibling of `bin/` exactly as
         # scripts/install.sh drops it, so minvmd resolves libkrun through its
         # $ORIGIN/../lib RUNPATH and libkrun finds libkrunfw through its own
@@ -217,10 +217,10 @@ jobs:
                   mv "$BIN/minimal-linux-amd64" "$BIN/min"
                   mv "$BIN/minvmd-linux-amd64" "$BIN/minvmd"
                   mv "$BIN/mip-linux-amd64" "$BIN/mip"
-                  mv "$BIN/gvproxy-linux-amd64" "$BIN/mingvproxy"
+                  mv "$BIN/gvproxy-linux-amd64" "$BIN/gvproxy-min"
                   mv "$BIN/libkrun-linux-amd64.so" "$LIB/libkrun.so.1"
                   mv "$BIN/libkrunfw-linux-amd64.so" "$LIB/libkrunfw.so.5"
-                  chmod +x "$BIN/min" "$BIN/minvmd" "$BIN/mip" "$BIN/mingvproxy"
+                  chmod +x "$BIN/min" "$BIN/minvmd" "$BIN/mip" "$BIN/gvproxy-min"
                   echo "$BIN" >> "$GITHUB_PATH"
                   ldd "$BIN/minvmd"
                   if ldd "$BIN/minvmd" | grep -q "not found"; then
@@ -248,7 +248,7 @@ jobs:
               # session mint — dies with "Could not resolve host".
               env:
                   MINVMD_BOOT_LOG: ${{ runner.temp }}/cli-e2e-boot.log
-                  MINVMD_GVPROXY_BIN: ${{ runner.temp }}/bin/mingvproxy
+                  MINVMD_GVPROXY_BIN: ${{ runner.temp }}/bin/gvproxy-min
               run: E2E_VM=1 E2E_MINIMAL_ARGS="--provider local-minvmd" E2E_PROJECT_DIR=/tmp ./scripts/session-e2e.sh
             - name: Reap leftover VM processes
               # The autospawned minvmd can leak a __krun-vmm child on a failed
@@ -328,10 +328,10 @@ jobs:
                   path: ${{ runner.temp }}/dl
             - name: Assemble the installer layout
               # Reproduce the on-disk tree scripts/install.sh writes (spec 07):
-              # bin/{min,minvmd,mingvproxy}, lib/libkrun.1.dylib (bin's sibling,
+              # bin/{min,minvmd,gvproxy-min}, lib/libkrun.1.dylib (bin's sibling,
               # the @rpath target), data/{vmlinuz,rootfs.img,initramfs.cpio}. The
               # dylib basename MUST be libkrun.1.dylib — minvmd's load command is
-              # @rpath/libkrun.1.dylib. The switch installs as `mingvproxy`, not
+              # @rpath/libkrun.1.dylib. The switch installs as `gvproxy-min`, not
               # `gvproxy`: bin/ goes on PATH here exactly as ~/.local/bin is for a
               # real install, and the upstream name would collide with podman's.
               # Then bin/ joins PATH so `min` autospawns `minvmd` (which finds
@@ -345,12 +345,12 @@ jobs:
                   mkdir -p "$ROOT/bin" "$ROOT/lib" "$ROOT/data"
                   mv "$DL/minimal-macos-arm64" "$ROOT/bin/min"
                   mv "$DL/minvmd-macos-arm64" "$ROOT/bin/minvmd"
-                  mv "$DL/gvproxy-darwin-arm64" "$ROOT/bin/mingvproxy"
+                  mv "$DL/gvproxy-darwin-arm64" "$ROOT/bin/gvproxy-min"
                   mv "$DL/libkrun-macos-arm64.dylib" "$ROOT/lib/libkrun.1.dylib"
                   mv "$DL/vmlinuz-arm64" "$ROOT/data/vmlinuz"
                   mv "$DL/rootfs-arm64.img" "$ROOT/data/rootfs.img"
                   mv "$DL/initramfs-arm64.cpio" "$ROOT/data/initramfs.cpio"
-                  chmod +x "$ROOT/bin/min" "$ROOT/bin/minvmd" "$ROOT/bin/mingvproxy"
+                  chmod +x "$ROOT/bin/min" "$ROOT/bin/minvmd" "$ROOT/bin/gvproxy-min"
                   echo "$ROOT/bin" >> "$GITHUB_PATH"
             - name: Reap stale VM processes before the smoke
               # The mini is persistent and shared: a prior run's stray minvmd,
@@ -371,7 +371,7 @@ jobs:
                   MINVMD_ROOTFS_PATH: ${{ runner.temp }}/install/data/rootfs.img
                   MINVMD_INITRAMFS: ${{ runner.temp }}/install/data/initramfs.cpio
                   MINVMD_BOOT_LOG: ${{ runner.temp }}/cli-e2e-boot.log
-                  MINVMD_GVPROXY_BIN: ${{ runner.temp }}/install/bin/mingvproxy
+                  MINVMD_GVPROXY_BIN: ${{ runner.temp }}/install/bin/gvproxy-min
               run: E2E_VM=1 E2E_PROJECT_DIR=/tmp ./scripts/session-e2e.sh
             - name: Reap VM processes
               # Leave the shared mini clean for the next job (Guest teardown does

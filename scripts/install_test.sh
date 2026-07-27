@@ -944,9 +944,9 @@ check 0 "$rc" "data-only uninstall exits 0"
 want_ok "dump kept when no zsh completions were installed (R9.4)" \
     grep -q '# untouched user cache' "$H5/.zcompdump"
 
-# --- gvproxy -> mingvproxy rename migration --------------------------------
+# --- gvproxy -> gvproxy-min rename migration --------------------------------
 
-# The switch binary moved from bin/gvproxy to bin/mingvproxy (the bin prefix is
+# The switch binary moved from bin/gvproxy to bin/gvproxy-min (the bin prefix is
 # on PATH and podman/crc ship their own gvproxy). The old dest is in no
 # manifest any more, so nothing would ever revisit it — the install has to undo
 # it explicitly, on the same bytes-still-ours terms as uninstall.
@@ -963,11 +963,11 @@ printf 'gvproxy\t%s\t%s\t%s\n' "$H15/bin/gvproxy" "$gvren_h" "$gvren_h" >>"$gvre
 run gvren "$H15"
 check 0 "$rc" "rename-migration install exits 0"
 want_err "stale bin/gvproxy removed on upgrade" test -e "$H15/bin/gvproxy"
-want_ok "removal announced" grep -q "renamed to mingvproxy" "$OUT"
+want_ok "removal announced" grep -q "renamed to gvproxy-min" "$OUT"
 
 run gvren_rerun "$H15"
 check 0 "$rc" "rerun after migration exits 0"
-want_err "rerun says nothing about gvproxy" grep -q "renamed to mingvproxy" "$OUT"
+want_err "rerun says nothing about gvproxy" grep -q "renamed to gvproxy-min" "$OUT"
 
 # A gvproxy the user replaced (podman's, say) is NOT ours to delete: the hash
 # no longer matches what we recorded writing, so it is kept and reported.

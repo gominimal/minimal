@@ -782,7 +782,7 @@ fi
 # --- Unit 6: install record and PATH advisory ------------------------------
 
 # Migration: the switch binary used to install as `bin/gvproxy` and now installs
-# as `bin/mingvproxy` (the bin prefix is on PATH, and podman/crc ship their own
+# as `bin/gvproxy-min` (the bin prefix is on PATH, and podman/crc ship their own
 # `gvproxy` there). The renamed component is a *new* row, so the old file is no
 # longer referenced by any manifest and the record walk would never revisit it —
 # it would sit on PATH forever, which is the collision the rename exists to
@@ -802,9 +802,9 @@ remove_renamed_gvproxy() {
         # No dry-run branch: --dry-run is an uninstall-only option, and
         # uninstall is dispatched long before this runs.
         if [ "$(sha256 "$_dest")" != "$_want" ]; then
-            say "  gvproxy: kept $_dest (modified since install; now shipped as mingvproxy)"
+            say "  gvproxy: kept $_dest (modified since install; now shipped as gvproxy-min)"
         else
-            rm -f "$_dest" && say "  gvproxy: removed $_dest (renamed to mingvproxy)"
+            rm -f "$_dest" && say "  gvproxy: removed $_dest (renamed to gvproxy-min)"
         fi
     done <"$prev_record"
 }

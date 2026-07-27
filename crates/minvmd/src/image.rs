@@ -114,7 +114,7 @@ pub fn resolve_initramfs_path() -> Result<PathBuf, VmError> {
 }
 
 /// Resolve the host gvproxy binary path: the `MINVMD_GVPROXY_BIN` override,
-/// then the installed location — the user-local `bin/mingvproxy` the curl|sh
+/// then the installed location — the user-local `bin/gvproxy-min` the curl|sh
 /// installer stamps, else the system-wide `switch::DEFAULT_GVPROXY_BIN`
 /// ([`switch::installed_gvproxy_bin`], the definition shared with minimald).
 ///

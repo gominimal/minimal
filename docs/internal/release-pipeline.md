@@ -151,14 +151,14 @@ SHA-256-verifies, and atomically installs the file. The on-disk hash is the
 skip oracle, so reruns only touch changed components, and a running daemon is
 stopped before an executable is swapped. Per-platform sets (from
 stage-release.sh's `COMPONENTS` table): every platform gets the session stack —
-`bin/min`, `bin/minvmd`, `bin/mingvproxy`, a `git-remote-min` symlink, the
+`bin/min`, `bin/minvmd`, `bin/gvproxy-min`, a `git-remote-min` symlink, the
 libkrun the VM backend links (`lib/libkrun.so.1` + `lib/libkrunfw.so.5` on
 Linux, `lib/libkrun.1.dylib` on macOS), and the guest payload
 (`data/{vmlinuz,rootfs.img,initramfs.cpio}`) for its own arch. Linux
 additionally gets `bin/mip`, `bin/minimald`, and the AppArmor
 profile/tunable/loader under `data/`.
 
-The switch binary installs as **`mingvproxy`**, not `gvproxy`: the `bin` prefix
+The switch binary installs as **`gvproxy-min`**, not `gvproxy`: the `bin` prefix
 is `~/.local/bin`, which is on `PATH`, and podman/crc ship their own `gvproxy`
 there — under the upstream name whichever was installed last would win a `PATH`
 lookup, in either direction. The bytes are stock gvproxy;

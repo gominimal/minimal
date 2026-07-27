@@ -57,7 +57,7 @@ pub struct Config {
 
 impl Config {
     /// Resolves the configured gvproxy binary path, falling back to the
-    /// installed location when unset: the user-local `bin/mingvproxy` the
+    /// installed location when unset: the user-local `bin/gvproxy-min` the
     /// curl|sh installer stamps, else the system-wide path. The `GVPROXY_BIN`
     /// env var is scoped to the `#[ignore]` netns proof and is never consulted
     /// by the daemon.
