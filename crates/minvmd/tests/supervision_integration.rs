@@ -26,7 +26,7 @@
 
 use std::ffi::OsString;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serial_test::serial;
@@ -47,15 +47,38 @@ fn short_state_dir() -> tempfile::TempDir {
 }
 
 /// Run `minvmd <args>` isolated to `state` (both `HOME` and `XDG_STATE_HOME`),
-/// capturing output.
+/// capturing output. Bounded by a hard `SUBPROC_TIMEOUT`: every subcommand here
+/// is quick (`run --detach` carries its own `--timeout`; `status`/`stop` return
+/// in seconds), so a subprocess that overruns the cap means a wedged daemon.
+/// `Command::output()` would block forever there — past the polling deadlines,
+/// so the test would hang CI instead of failing — so we spawn, poll `try_wait`,
+/// and SIGKILL past the deadline to fail fast. Output stays small (status JSON),
+/// well under the pipe buffer, so reading after exit cannot deadlock.
+const SUBPROC_TIMEOUT: Duration = Duration::from_secs(120);
+
 fn minvmd(state: &Path, args: &[&str]) -> Output {
-    Command::new(minvmd_bin())
+    let mut child = Command::new(minvmd_bin())
         .args(args)
         .env("HOME", state)
         .env("XDG_STATE_HOME", state)
         .env_remove("MINVMD_VM_RAM_MIB")
-        .output()
-        .expect("spawning minvmd")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning minvmd");
+    let deadline = Instant::now() + SUBPROC_TIMEOUT;
+    loop {
+        if child.try_wait().expect("polling minvmd").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("minvmd {args:?} did not exit within {SUBPROC_TIMEOUT:?} (wedged daemon?)");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    child.wait_with_output().expect("collecting minvmd output")
 }
 
 fn json(out: &Output) -> serde_json::Value {

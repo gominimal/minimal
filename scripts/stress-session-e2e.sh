@@ -160,7 +160,10 @@ fi
 
 # And the daemon comes back cleanly: the next command autospawns a fresh one
 # that lists ZERO sessions (the concurrent set was torn down, not orphaned).
-after="$(mnl ls --raw 2>/dev/null || true)"
+if ! after="$(mnl ls --raw)"; then
+  echo "::error::failed to list sessions after teardown (daemon did not restart cleanly)"
+  fail
+fi
 if [ -n "$(printf '%s' "$after" | tr -d '[:space:]')" ]; then
   echo "::error::sessions survived 'min stop --force': '$after'"
   fail

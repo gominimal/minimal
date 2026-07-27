@@ -278,12 +278,12 @@ jobs:
 
   msrv:
     # MSRV floor check: every crate's declared rust-version (workspace-wide
-    # 1.91, inherited from [workspace.package]) must still type-check.
+    # 1.95, inherited from [workspace.package]) must still type-check.
     # cargo-hack drives `check` against each crate's rust-version, pulling the
-    # matching toolchain via rustup. BLOCKING — the declared floor is a promise
-    # — so it feeds `notify`.
+    # matching toolchain via rustup. Mirrors the `just msrv` recipe. BLOCKING —
+    # the declared floor is a promise — so it feeds `notify`.
     runs-on: ubuntu-latest
-    # cargo-hack --rust-version does a full cold workspace check under the 1.91
+    # cargo-hack --rust-version does a full cold workspace check under the 1.95
     # toolchain (separate from the 1.97 build cache), which is slow on a first
     # run; give it room so it isn't killed mid-compile.
     timeout-minutes: 60

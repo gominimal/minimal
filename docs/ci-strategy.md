@@ -350,8 +350,9 @@ Nightly failures should notify (issue-on-failure or Slack), not just rot in the 
   `continue-on-error`.
 - **`cargo-deny` advisories** — the `advisories` job (blocking → feeds `notify`).
 - **Latest-deps canary** — the `update-canary` job (`continue-on-error`).
-- **MSRV** — the `msrv` job, driven by `just msrv` (blocking → feeds `notify`); the floor
-  is declared once as `[workspace.package] rust-version` and inherited by every crate.
+- **MSRV** — the `msrv` job runs `cargo hack check --rust-version` directly (mirroring the
+  `just msrv` recipe; blocking → feeds `notify`); the floor is declared once as
+  `[workspace.package] rust-version` and inherited by every crate.
 - **miri** — the `miri` job over the pure logic/protocol crates (`just miri`).
   **Non-blocking** (`continue-on-error`): miri is nightly-sensitive and slow, so it is read
   in the run rather than gated. The concurrency-stress step is likewise non-fatal until it
