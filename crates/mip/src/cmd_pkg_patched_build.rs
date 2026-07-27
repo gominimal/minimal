@@ -3,11 +3,14 @@ use anyhow::anyhow;
 use op::{PatchedBuild, Runnable};
 
 #[derive(Debug, clap::Args)]
-pub struct PatchedBuildArgs {
+pub struct PkgPatchedBuildArgs {
     package: String,
 }
 
-pub async fn cmd_patched_build(args: PatchedBuildArgs, ctx: &mut Context) -> Result<(), Error> {
+pub async fn cmd_pkg_patched_build(
+    args: PkgPatchedBuildArgs,
+    ctx: &mut Context,
+) -> Result<(), Error> {
     crate::enforce_science_mode()?;
 
     let graph = ctx.graph_from_package_names([args.package])?;

@@ -25,7 +25,7 @@ stack {
   runtime_packages = ["node"],
   build_packages = ["pnpm", "base"],
 
-  # A command that generates the build command, i.e. commands executed by `mip build`.
+  # A command that generates the build command, i.e. commands executed by `mip run build`.
   build_cmds_cmd = [
     "/bin/bash",
     "-c",
@@ -86,7 +86,7 @@ _`build_cmds_cmd`: String or array of strings for a command that generates the b
 `build_cmd` and `build_cmds_cmd` are mutually exclusive fields that declare the command for
 building software which uses this stack.
 
-`build_cmd` defines the command to run when [`mip build`](./cli-mip.md) is invoked. It can be a shell-style
+`build_cmd` defines the command to run when [`mip run build`](./cli-mip.md#run) is invoked. It can be a shell-style
 string or an array containing the executable followed by its arguments.
 
 ```ncl

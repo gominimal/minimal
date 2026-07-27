@@ -23,7 +23,7 @@ enum OutputFormat {
 
 /// CLI options to control what goes in the generated graph
 #[derive(Debug, clap::Args)]
-pub struct DepArgs {
+pub struct PkgDepArgs {
     /// Packages left out of graph and not traversed. Overrides matching package entries
     #[arg(short, long, alias="exclude", value_delimiter=',', num_args=0..)]
     excludes: Option<Vec<String>>,
@@ -332,7 +332,7 @@ fn pgraph_copy_subset(
     graph: &Graph,
     pgraph: &DiGraph<NodeData, EdgeData>,
     bsname_to_node_index: &HashMap<String, NodeIndex>,
-    args: &DepArgs,
+    args: &PkgDepArgs,
 ) -> Result<DiGraph<NodeData, EdgeData>, Error> {
     // if the listest packages with -p reduce to just those node indices
     let node_indices = if !args.packages.is_empty() {
@@ -372,7 +372,7 @@ fn pgraph_copy_subset(
 fn pgraph_copy_subset_for_node(
     graph: &Graph,
     pgraph: &DiGraph<NodeData, EdgeData>,
-    args: &DepArgs,
+    args: &PkgDepArgs,
     node_index: NodeIndex,
     bsr: &BuildSpecRef,
     state: &TraversalState,
@@ -539,7 +539,7 @@ fn prune_edgeless(pgraph: &mut DiGraph<NodeData, EdgeData>) {
 }
 
 /// Prints graphviz DOT or Mermaid for the dependency graph as constrained by the CLI args to stdout.
-pub async fn cmd_dep(args: DepArgs, ctx: &mut Context) -> Result<(), Error> {
+pub async fn cmd_pkg_dep(args: PkgDepArgs, ctx: &mut Context) -> Result<(), Error> {
     let graph = if args.packages.is_empty() {
         ctx.graph_from_all_packages()
     } else {
@@ -810,7 +810,7 @@ mod tests {
         runtime_deps_depth: i32,
         excludes: Option<Vec<String>>,
     ) -> DiGraph<NodeData, EdgeData> {
-        let args = DepArgs {
+        let args = PkgDepArgs {
             excludes,
             build_spec_deps,
             source_deps: false,

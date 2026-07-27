@@ -5,7 +5,7 @@ description: Stacks wire Minimal to build codebases with specific languages and 
 # Stacks
 
 Stacks wire Minimal to operate a codebase with specific tools and commands. When you name a stack
-in your [`minimal.toml`](../reference/minimal-dot-toml.md) file, build-plane commands like `mip build` just work. Additionally, your [tasks](../reference/tasks.md) inherit these familiar tools and semantics automatically.
+in your [`minimal.toml`](../reference/minimal-dot-toml.md) file, build-plane commands like `mip run build` just work. Additionally, your [tasks](../reference/tasks.md) inherit these familiar tools and semantics automatically.
 
 Learn more about stacks in [the reference section](../reference/stack-specs.md).
 

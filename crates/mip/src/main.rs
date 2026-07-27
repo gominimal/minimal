@@ -8,24 +8,22 @@ use std::io;
 use std::path::PathBuf;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
+// `cmd_pkg` owns the `mip package` subcommand table and dispatches into the
+// `cmd_pkg_*` modules below.
 mod cmd_pkg;
-use cmd_pkg::{PkgArgs, cmd_pkg};
+mod cmd_pkg_build_plan;
+mod cmd_pkg_dep;
+mod cmd_pkg_patched_build;
+mod cmd_pkg_upload_cache;
+use cmd_pkg::{PkgCmd, cmd_pkg};
 mod cmd_check;
 use cmd_check::{CheckArgs, cmd_check};
-mod cmd_plan;
-use cmd_plan::{PlanArgs, cmd_plan};
 mod cmd_materialize;
 use cmd_materialize::{MaterializeArgs, cmd_materialize};
-mod cmd_upload_cache;
-use cmd_upload_cache::{UploadArgs, cmd_upload_cache};
-mod cmd_patched_build;
-use cmd_patched_build::{PatchedBuildArgs, cmd_patched_build};
 #[cfg(target_os = "linux")]
 mod cmd_run;
 #[cfg(target_os = "linux")]
 use cmd_run::{RunArgs, cmd_run, cmd_run_by_spec};
-mod cmd_dep;
-use cmd_dep::{DepArgs, cmd_dep};
 mod cmd_update;
 use cmd_update::{UpdateArgs, cmd_update};
 mod cmd_init;
@@ -45,7 +43,7 @@ use cmd_remote_build::{RemoteBuildArgs, cmd_remote_build};
 
 #[derive(Parser)]
 #[command(name = "mip", version = version::VERSION, long_version = version::LONG_VERSION)]
-#[command(about = "mip, the Minimal package/build CLI")]
+#[command(about = "Minimal-In-Process, the CLI for daemon-less Minimal operations")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -67,17 +65,11 @@ enum Command {
     Init(InitArgs),
     /// Shows the status of Minimal in this codebase.
     Status(StatusArgs),
-    /// Launches a development shell. Shorthand for `mip run shell`.
-    Shell,
-    /// Runs the build task. Shorthand for `mip run build`.
-    Build,
-    /// Runs the test task. Shorthand for `mip run test`.
-    Test,
     /// Materializes an output specified in `minimal.toml`.
     Materialize(MaterializeArgs),
-    /// Builds the specified package(s) in a clean room, making them available in the local cache.
-    #[clap(alias = "pkg")]
-    Package(PkgArgs),
+    /// Package management operations, such as building.
+    #[clap(subcommand, alias = "pkg", alias = "packages")]
+    Package(PkgCmd),
     /// Execute a command on a remote build server.
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
     Rexec(RexecArgs),
@@ -90,23 +82,9 @@ enum Command {
 
     /// Validates minimal configuration including packages, stacks, and profiles
     Check(CheckArgs),
-    /// Prints the build plan for the specified package(s)
-    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
-    Plan(PlanArgs),
-    /// Uploads the specified packages and their transitive needs to the cache.
-    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
-    UploadCache(UploadArgs),
-    /// Executes the build for a package, using stale dependencies.
-    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
-    PatchedBuild(PatchedBuildArgs),
     /// Dumps out information about the supply chain in a machine-readable format.
     #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
     Dump(DumpArgs),
-    /// Generates Graphviz source code of the dependency graph
-    #[command(
-        long_about = "Generate an image of the dependency graph using graphviz's \"dot\" program.\n\n  mip dep --input-deps-depth=0 | dot -Tpng > deps.png"
-    )]
-    Dep(DepArgs),
 
     /// Generate shell completion script
     #[command(
@@ -266,51 +244,11 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
     match command {
         Command::Package(args) => cmd_pkg(args, &mut ctx).await,
         Command::Check(args) => cmd_check(args, &mut ctx).await,
-        Command::Plan(args) => cmd_plan(args, &mut ctx).await,
         Command::Add(args) => cmd_add(args, &mut ctx).await,
-        Command::UploadCache(args) => cmd_upload_cache(args, &mut ctx).await,
         Command::Materialize(args) => cmd_materialize(args, &mut ctx).await,
-        Command::PatchedBuild(args) => cmd_patched_build(args, &mut ctx).await,
         #[cfg(target_os = "linux")]
         Command::Run(args) => cmd_run(args, &mut ctx).await,
-        Command::Shell => {
-            cmd_run(
-                RunArgs {
-                    variant: cmd_run::RunVariant::ByName {
-                        task_name: "shell".to_string(),
-                    },
-                    task_args: vec![],
-                },
-                &mut ctx,
-            )
-            .await
-        }
-        Command::Build => {
-            cmd_run(
-                RunArgs {
-                    variant: cmd_run::RunVariant::ByName {
-                        task_name: "build".to_string(),
-                    },
-                    task_args: vec![],
-                },
-                &mut ctx,
-            )
-            .await
-        }
-        Command::Test => {
-            cmd_run(
-                RunArgs {
-                    variant: cmd_run::RunVariant::ByName {
-                        task_name: "test".to_string(),
-                    },
-                    task_args: vec![],
-                },
-                &mut ctx,
-            )
-            .await
-        }
         Command::Update(args) => cmd_update(args, &mut ctx).await,
-        Command::Dep(args) => cmd_dep(args, &mut ctx).await,
         Command::Dump(args) => cmd_dump(args, &mut ctx).await,
         Command::Status(args) => cmd_status(args, &mut ctx).await,
         Command::Rexec(args) => cmd_rexec(args, &mut ctx).await,

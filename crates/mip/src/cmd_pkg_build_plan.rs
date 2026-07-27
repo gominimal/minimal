@@ -3,14 +3,14 @@ use lcache::CacheBinProvider;
 use mctx::{Cache, Context, Error};
 use rcache::RemoteBinProvider;
 
-#[derive(clap::Args)]
-pub struct PlanArgs {
+#[derive(Debug, clap::Args)]
+pub struct PkgBuildPlanArgs {
     /// Packages to plan
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args=0..)]
     packages: Vec<String>,
 }
 
-pub async fn cmd_plan(args: PlanArgs, ctx: &mut Context) -> Result<(), Error> {
+pub async fn cmd_pkg_build_plan(args: PkgBuildPlanArgs, ctx: &mut Context) -> Result<(), Error> {
     let graph = if !args.packages.is_empty() {
         ctx.graph_from_package_names(args.packages.clone())?
     } else {
