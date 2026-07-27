@@ -969,6 +969,33 @@ run gvren_rerun "$H15"
 check 0 "$rc" "rerun after migration exits 0"
 want_err "rerun says nothing about gvproxy" grep -q "renamed to gvproxy-min" "$OUT"
 
+# A manifest that STILL ships a `gvproxy` component is not a rename: the file
+# on disk is the one this very run installed, so the migration must not touch
+# it. Channels advance independently, so a post-rename installer WILL be
+# pointed at a pre-rename manifest — deleting there would leave the host with
+# no switch binary at all, on every single run.
+H17="$root/h17"; mkdir -p "$H17"
+run gvship_seed "$H17"
+check 0 "$rc" "still-ships-gvproxy seed install exits 0"
+gvship_rec="$H17/xdg-state/minimal/installed"
+printf 'shipped-gvproxy-body\n' >"$H17/bin/gvproxy"
+gvship_h="$(hash_file "$H17/bin/gvproxy")"
+printf 'gvproxy\t%s\t%s\t%s\n' "$H17/bin/gvproxy" "$gvship_h" "$gvship_h" >>"$gvship_rec"
+# Make THIS run install a gvproxy component too, as a pre-rename manifest does.
+printf 'shipped-gvproxy-body\n' >"$mock/versions/v1/gvproxy-linux-amd64"
+h_gv="$(hash_file "$mock/versions/v1/gvproxy-linux-amd64")"
+{
+    cat "$mock/versions/v1/components"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+        gvproxy linux amd64 v1 "$h_gv" file bin/gvproxy versions/v1/gvproxy-linux-amd64
+} >"$mock/versions/v1/components.new"
+mv "$mock/versions/v1/components.new" "$mock/versions/v1/components"
+run gvship "$H17"
+check 0 "$rc" "install against a manifest that still ships gvproxy exits 0"
+want_ok "the just-installed bin/gvproxy survives" test -f "$H17/bin/gvproxy"
+want_err "no removal is announced" grep -q "renamed to gvproxy-min" "$OUT"
+write_manifest 1
+
 # A gvproxy the user replaced (podman's, say) is NOT ours to delete: the hash
 # no longer matches what we recorded writing, so it is kept and reported.
 H16="$root/h16"; mkdir -p "$H16"

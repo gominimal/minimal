@@ -115,13 +115,17 @@ krun="$(resolve_real "$LIBDIR/$WANT_KRUN_SONAME")"
 krunfw="$(resolve_real "$LIBDIR/$WANT_KRUNFW_SONAME")"
 [ -f "$krunfw" ] || die "no $WANT_KRUNFW_SONAME under $LIBDIR"
 
-for lib in "$krun" "$krunfw"; do
-    want="$WANT_KRUN_SONAME"
-    case "$lib" in *krunfw*) want="$WANT_KRUNFW_SONAME" ;; esac
-    got="$(patchelf --print-soname "$lib" || true)"
-    [ "$got" = "$want" ] \
-        || die "$lib has soname '$got', expected '$want' (a major bump: update the lib/ dests in stage-release.sh)"
-done
+# Checked by explicit (file, expected-soname) pairs rather than by pattern-
+# matching the path: `case "$lib" in *krunfw*` tested the WHOLE resolved path,
+# so a lib dir whose own path contained "krunfw" picked the wrong expectation
+# and hard-failed a release citing a soname bump that never happened.
+check_soname() {
+    got="$(patchelf --print-soname "$1" || true)"
+    [ "$got" = "$2" ] \
+        || die "$1 has soname '$got', expected '$2' (a major bump: update the lib/ dests in stage-release.sh)"
+}
+check_soname "$krun" "$WANT_KRUN_SONAME"
+check_soname "$krunfw" "$WANT_KRUNFW_SONAME"
 
 # libkrun dlopen()s libkrunfw by soname; glibc searches the CALLING object's
 # RUNPATH, so this entry is what makes the shipped sibling resolvable.
@@ -140,6 +144,13 @@ libkrun_rpath="$(patchelf --print-rpath "$krun")"
 case ":$libkrun_rpath:" in
     *':$ORIGIN:'*) ;;
     *) die "$krun is missing the \$ORIGIN RUNPATH; its dlopen of $WANT_KRUNFW_SONAME will not find the shipped sibling" ;;
+esac
+# Same leak check minvmd gets above. The upstream .so carries whatever RUNPATH
+# its own build host baked in, and we prepend to it rather than replacing it —
+# so without this an absolute build path ships to users in a file nothing else
+# in the pipeline inspects.
+case "$libkrun_rpath" in
+    *.krun*) die "$krun RUNPATH leaks an ephemeral build prefix: $libkrun_rpath" ;;
 esac
 
 echo "minvmd  RUNPATH: $rpath"

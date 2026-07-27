@@ -8,7 +8,7 @@
 
 use std::fmt;
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// MTU advertised to the switch and the tap devices. gvproxy's own default.
 pub const DEFAULT_MTU: u16 = 1500;
@@ -50,6 +50,16 @@ pub const GVPROXY_FILE: &str = "gvproxy-min";
 /// user-local install exists.
 pub const DEFAULT_GVPROXY_BIN: &str = "/usr/lib/minimal/bin/gvproxy-min";
 
+/// The pre-rename system-wide path, still honoured when it exists and the
+/// current one does not.
+///
+/// This directory is not on `PATH`, so the collision that motivates
+/// [`GVPROXY_FILE`] never applied here — but an operator who provisioned the
+/// old path has no install record for us to migrate (`install.sh` only walks
+/// user-local rows), so renaming without this fallback would silently break
+/// own-IP on their hosts.
+const LEGACY_SYSTEM_GVPROXY_BIN: &str = "/usr/lib/minimal/bin/gvproxy";
+
 /// The user-local bin directory the installer stamps into: `$MINIMAL_BIN`, else
 /// `$HOME/.local/bin`. Mirrors the installer's `bin` prefix resolution in
 /// `scripts/install.sh`. `None` when neither is set.
@@ -81,7 +91,11 @@ pub fn installed_gvproxy_bin() -> PathBuf {
     {
         return local;
     }
-    PathBuf::from(DEFAULT_GVPROXY_BIN)
+    let system = PathBuf::from(DEFAULT_GVPROXY_BIN);
+    if !system.exists() && Path::new(LEGACY_SYSTEM_GVPROXY_BIN).exists() {
+        return PathBuf::from(LEGACY_SYSTEM_GVPROXY_BIN);
+    }
+    system
 }
 
 /// A subnet was constructed with a prefix outside the supported `8..=29` range —

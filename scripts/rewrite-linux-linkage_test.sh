@@ -140,6 +140,29 @@ rm -f "$root/nofw/lib/libkrunfw.so.5"
 run nofw
 check 1 "$rc" "a missing libkrunfw under the lib dir fails"
 
+# --- soname dispatch keys on the file, not the path ------------------------
+
+# A lib dir whose own path contains "krunfw" must not make libkrun be checked
+# against libkrunfw's soname. The old `case "$lib" in *krunfw*` matched the
+# whole resolved path and aborted the release citing a bump that never happened.
+scenario krunfwpath
+mv "$root/krunfwpath/lib" "$root/krunfwpath/libkrunfw-1.5"
+sed_dir="$root/krunfwpath/libkrunfw-1.5"
+PATH="$root/bin:$PATH" STUB_STATE="$root/krunfwpath/state" \
+    bash "$script" "$root/krunfwpath/minvmd" "$sed_dir" >"$root/out.krunfwpath" 2>&1
+check 0 "$?" "a lib dir path containing 'krunfw' still checks libkrun's own soname"
+
+# --- leaked build prefix in the SHIPPED libkrun ----------------------------
+
+# The upstream .so carries its own build host's RUNPATH and we prepend to it,
+# so the same leak check minvmd gets must apply here or an absolute build path
+# ships to users.
+scenario libleak
+printf '/home/builder/.krun/lib\n' >"$root/libleak/state/libkrun.so.1.rpath"
+run libleak
+check 1 "$rc" "a leaked build prefix in libkrun's own RUNPATH fails"
+if grep -q "ephemeral" "$OUT"; then ok "libkrun leak failure names the ephemeral prefix"; else bad "libkrun leak failure names the ephemeral prefix"; fi
+
 # --- libkrun with a pre-existing RUNPATH -----------------------------------
 
 # The upstream .so may already carry one; $ORIGIN is prepended, not substituted,

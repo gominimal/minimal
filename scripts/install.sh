@@ -160,6 +160,21 @@ resolve_prefix() {
 # replaces it.
 bindir="$(resolve_prefix bin)"
 
+# minvmd finds its libkrun through a BINARY-RELATIVE rpath (`$ORIGIN/../lib` on
+# Linux, `@loader_path/../lib` on macOS), so the `lib` prefix has to be a
+# sibling of the `bin` one. The two resolve from unrelated knobs (MINIMAL_BIN
+# vs XDG_LIB_HOME), so a host that sets only one silently ends up with a layout
+# no rpath can bridge — minvmd then dies at autospawn with "libkrun.so.1:
+# cannot open shared object file". Warn at install time, where the cause is
+# still obvious, rather than letting it surface as a VM that never boots.
+if [ "$(dirname "$bindir")/lib" != "$(resolve_prefix lib)" ]; then
+    say "warning: bin and lib prefixes are not siblings:"
+    say "    bin: $bindir"
+    say "    lib: $(resolve_prefix lib)"
+    say "  minvmd resolves libkrun at <bin>/../lib, so VM-backed sessions will"
+    say "  fail to start. Set MINIMAL_BIN and XDG_LIB_HOME to a matching pair."
+fi
+
 # --- Unit 9: shared shell-integration paths and markers ---------------------
 
 # Where the generated (not downloaded) shell-integration files live. Init
@@ -532,7 +547,13 @@ stop_running_daemon() {
     [ "$daemon_stop_tried" -eq 0 ] || return 0
     daemon_stop_tried=1
     [ -x "$bindir/min" ] || return 0
+    # Both backends, because both are now swappable components: bare `min stop`
+    # resolves the DEFAULT provider (local-minimald on Linux), so it would leave
+    # a running minvmd holding its socket while its binary and libkrun are
+    # replaced underneath it. `--provider` is a global arg, and stopping a
+    # backend that isn't running is a failed connect and nothing more.
     "$bindir/min" stop --force >/dev/null 2>&1 || true
+    "$bindir/min" --provider local-minvmd stop --force >/dev/null 2>&1 || true
 }
 
 # The prior run's install record (R6.1) maps each component to the hash of the
@@ -792,6 +813,14 @@ fi
 remove_renamed_gvproxy() {
     [ -f "$prev_record" ] || return 0
     _tab="$(printf '\t')"
+    # Only a RENAME justifies deleting the old path. If the manifest this run
+    # installed still ships a `gvproxy` component, the file on disk is the one
+    # we just placed — deleting it would leave the host with no switch binary
+    # at all, on every run. Channels advance independently, so a post-rename
+    # installer WILL be pointed at a pre-rename manifest.
+    if cut -f1 "$records" | grep -qx gvproxy; then
+        return 0
+    fi
     while IFS="$_tab" read -r _comp _dest _ _want; do
         [ "$_comp" = gvproxy ] || continue
         [ -n "$_dest" ] || continue
@@ -803,8 +832,15 @@ remove_renamed_gvproxy() {
         # uninstall is dispatched long before this runs.
         if [ "$(sha256 "$_dest")" != "$_want" ]; then
             say "  gvproxy: kept $_dest (modified since install; now shipped as gvproxy-min)"
+        elif rm -f "$_dest"; then
+            say "  gvproxy: removed $_dest (renamed to gvproxy-min)"
         else
-            rm -f "$_dest" && say "  gvproxy: removed $_dest (renamed to gvproxy-min)"
+            # Carry the row into this run's record so the next run retries.
+            # Without it the migration gets exactly one attempt — the record is
+            # replaced below — and a stale gvproxy would sit on PATH forever,
+            # which is the collision the rename exists to remove.
+            say "  gvproxy: could not remove $_dest; will retry on the next install"
+            printf '%s\t%s\t%s\t%s\n' "$_comp" "$_dest" "$_want" "$_want" >>"$records"
         fi
     done <"$prev_record"
 }

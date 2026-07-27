@@ -222,13 +222,28 @@ jobs:
                   mv "$BIN/libkrunfw-linux-amd64.so" "$LIB/libkrunfw.so.5"
                   chmod +x "$BIN/min" "$BIN/minvmd" "$BIN/mip" "$BIN/gvproxy-min"
                   echo "$BIN" >> "$GITHUB_PATH"
-                  ldd "$BIN/minvmd"
-                  if ldd "$BIN/minvmd" | grep -q "not found"; then
-                    echo "::error::shipped minvmd has unresolved libraries in the installer layout" >&2
+                  # Capture once, then match on the string. Piping into `grep -q`
+                  # under `set -o pipefail` can report the pipeline as SIGPIPE
+                  # (141) when grep exits early, which would make the guard below
+                  # silently evaluate false and pass a genuinely broken binary.
+                  ldd_out="$(ldd "$BIN/minvmd")"
+                  printf '%s\n' "$ldd_out"
+                  case "$ldd_out" in
+                    *"not found"*)
+                      echo "::error::shipped minvmd has unresolved libraries in the installer layout" >&2
+                      exit 1 ;;
+                  esac
+                  # ld.so expands $ORIGIN but does NOT normalize the rest of the
+                  # entry, so it reports <bin>/../lib/libkrun.so.1 verbatim.
+                  # Comparing raw strings against "$LIB/libkrun.so.1" could never
+                  # match; canonicalize both sides instead.
+                  resolved="$(printf '%s\n' "$ldd_out" | awk '/libkrun\.so\.1 =>/ {print $3; exit}')"
+                  if [ -z "$resolved" ] || [ ! -e "$resolved" ]; then
+                    echo "::error::shipped minvmd did not resolve libkrun at all (RUNPATH wrong)" >&2
                     exit 1
                   fi
-                  if ! ldd "$BIN/minvmd" | grep -q "$LIB/libkrun.so.1"; then
-                    echo "::error::shipped minvmd did not resolve libkrun from $LIB (RUNPATH wrong)" >&2
+                  if [ "$(readlink -f "$resolved")" != "$(readlink -f "$LIB/libkrun.so.1")" ]; then
+                    echo "::error::shipped minvmd resolved libkrun from $resolved, not $LIB (RUNPATH wrong)" >&2
                     exit 1
                   fi
             - name: Point the microVM env at the shipped guest artifacts

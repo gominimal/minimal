@@ -225,8 +225,10 @@ pub struct ListenArgs {
     detach: bool,
 
     /// Path to the gvproxy ("gvisor-tap-vsock") binary backing the per-host
-    /// `OwnIp` switch. Defaults to the fixed system install path when unset;
-    /// point it at a local build to run own-IP without a system install.
+    /// `OwnIp` switch. Defaults to the installed location when unset: the
+    /// user-local `bin/gvproxy-min` the installer stamps, else the system
+    /// install path. Point it at a local build to run own-IP without an
+    /// install.
     #[arg(long)]
     gvproxy_bin: Option<std::path::PathBuf>,
 }
