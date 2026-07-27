@@ -120,7 +120,9 @@ jobs:
                   fetch-depth: 0
                   fetch-tags: true
             - name: Install dependencies
-              run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
+              # patchelf: rewrites the shipped minvmd/libkrun RUNPATHs for the
+              # installer's bin/ + lib/ layout (scripts/rewrite-linux-linkage.sh).
+              run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler patchelf
             - name: Add Rust target
               run: rustup target add x86_64-unknown-linux-musl
             - name: Cache Rust build artifacts (dependency-pruned)
@@ -201,11 +203,41 @@ jobs:
               run: |
                   cargo build --release --locked -p minvmd --bin minvmd
                   mv target/release/minvmd target/release/minvmd-linux-amd64
+            - name: Rewrite + verify minvmd/libkrun linkage (RUNPATH)
+              # The Linux twin of the macOS @rpath rewrite: point minvmd at
+              # $ORIGIN/../lib (bin/minvmd -> lib/libkrun.so.1) and libkrun at
+              # $ORIGIN (its dlopen of libkrunfw.so.5 resolves against its OWN
+              # RUNPATH, not the executable's). Also hard-fails on a soname
+              # bump, which would silently break the lib/ dests in
+              # stage-release.sh.
+              run: ./scripts/rewrite-linux-linkage.sh target/release/minvmd-linux-amd64 "$LIBKRUN_PREFIX"
+            - name: Stage libkrun pair for upload
+              # Resolve the soname symlink chain to the real (now patched) files
+              # and copy them under platform-suffixed names, so merge-multiple's
+              # basename flatten does not collide with the arm64 build. The
+              # SONAME inside each file is unchanged; the installer stages them
+              # back under their soname (lib/libkrun.so.1, lib/libkrunfw.so.5).
+              run: |
+                  mkdir -p "$RUNNER_TEMP/libs"
+                  cp "$(readlink -f "$LIBKRUN_PREFIX/libkrun.so.1")"   "$RUNNER_TEMP/libs/libkrun-linux-amd64.so"
+                  cp "$(readlink -f "$LIBKRUN_PREFIX/libkrunfw.so.5")" "$RUNNER_TEMP/libs/libkrunfw-linux-amd64.so"
             - name: Upload binary (minvmd)
               uses: actions/upload-artifact@v7
               with:
                   name: minvmd-linux-amd64
                   path: target/release/minvmd-linux-amd64
+                  retention-days: 7
+            - name: Upload libkrun (linux-amd64)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: libkrun-linux-amd64
+                  path: ${{ runner.temp }}/libs/libkrun-linux-amd64.so
+                  retention-days: 7
+            - name: Upload libkrunfw (linux-amd64)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: libkrunfw-linux-amd64
+                  path: ${{ runner.temp }}/libs/libkrunfw-linux-amd64.so
                   retention-days: 7
 
     build-release-linux-arm64:
@@ -234,7 +266,8 @@ jobs:
                   fetch-depth: 0
                   fetch-tags: true
             - name: Install dependencies
-              run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
+              # patchelf: see the amd64 job — the shipped RUNPATH rewrite.
+              run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler patchelf
             - name: Add Rust target
               run: rustup target add aarch64-unknown-linux-musl
             - name: Cache Rust build artifacts (dependency-pruned)
@@ -282,6 +315,51 @@ jobs:
               with:
                   name: minimald-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/minimald-linux-arm64
+                  retention-days: 7
+            - name: Materialize libkrun prefix (upstream package)
+              # Mirrors the amd64 job: minvmd links libkrun's KVM backend
+              # dynamically, so it can't join the static-musl build above — it
+              # needs a native glibc build against a real libkrun. This runner
+              # IS aarch64, so the native target and the guest arch agree.
+              # Reuse the static mip just built (renamed above) rather than
+              # letting the fetch compile a second, debug mip to drive the
+              # cache pull.
+              uses: ./.github/actions/setup-libkrun-linux
+              with:
+                  arch: aarch64
+                  mip: ${{ github.workspace }}/target/aarch64-unknown-linux-musl/release/mip-linux-arm64
+            - name: Build native minvmd binary
+              # Native host target (aarch64-unknown-linux-gnu), NOT musl: links
+              # libkrun.so.1 with libkrunfw.so.5 dlopen'd at runtime, so unlike
+              # the three above it is not self-contained — the installer ships
+              # both under lib/ and the RUNPATH rewrite below points at them.
+              run: |
+                  cargo build --release --locked -p minvmd --bin minvmd
+                  mv target/release/minvmd target/release/minvmd-linux-arm64
+            - name: Rewrite + verify minvmd/libkrun linkage (RUNPATH)
+              run: ./scripts/rewrite-linux-linkage.sh target/release/minvmd-linux-arm64 "$LIBKRUN_PREFIX"
+            - name: Stage libkrun pair for upload
+              run: |
+                  mkdir -p "$RUNNER_TEMP/libs"
+                  cp "$(readlink -f "$LIBKRUN_PREFIX/libkrun.so.1")"   "$RUNNER_TEMP/libs/libkrun-linux-arm64.so"
+                  cp "$(readlink -f "$LIBKRUN_PREFIX/libkrunfw.so.5")" "$RUNNER_TEMP/libs/libkrunfw-linux-arm64.so"
+            - name: Upload binary (minvmd)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: minvmd-linux-arm64
+                  path: target/release/minvmd-linux-arm64
+                  retention-days: 7
+            - name: Upload libkrun (linux-arm64)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: libkrun-linux-arm64
+                  path: ${{ runner.temp }}/libs/libkrun-linux-arm64.so
+                  retention-days: 7
+            - name: Upload libkrunfw (linux-arm64)
+              uses: actions/upload-artifact@v7
+              with:
+                  name: libkrunfw-linux-arm64
+                  path: ${{ runner.temp }}/libs/libkrunfw-linux-arm64.so
                   retention-days: 7
 
     build-release-macos-arm64:

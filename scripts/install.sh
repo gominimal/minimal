@@ -781,6 +781,34 @@ fi
 
 # --- Unit 6: install record and PATH advisory ------------------------------
 
+# Migration: the switch binary used to install as `bin/gvproxy` and now installs
+# as `bin/mingvproxy` (the bin prefix is on PATH, and podman/crc ship their own
+# `gvproxy` there). The renamed component is a *new* row, so the old file is no
+# longer referenced by any manifest and the record walk would never revisit it —
+# it would sit on PATH forever, which is the collision the rename exists to
+# remove. Undo it here on the same terms as uninstall: remove it only when its
+# bytes are still exactly what we recorded writing, so a user who replaced that
+# path with their own gvproxy keeps it.
+remove_renamed_gvproxy() {
+    [ -f "$prev_record" ] || return 0
+    _tab="$(printf '\t')"
+    while IFS="$_tab" read -r _comp _dest _ _want; do
+        [ "$_comp" = gvproxy ] || continue
+        [ -n "$_dest" ] && [ -f "$_dest" ] || continue
+        # A symlink row, or one we did not write, is not ours to remove.
+        [ -L "$_dest" ] && continue
+        case "$_want" in link:*) continue ;; esac
+        # No dry-run branch: --dry-run is an uninstall-only option, and
+        # uninstall is dispatched long before this runs.
+        if [ "$(sha256 "$_dest")" != "$_want" ]; then
+            say "  gvproxy: kept $_dest (modified since install; now shipped as mingvproxy)"
+        else
+            rm -f "$_dest" && say "  gvproxy: removed $_dest (renamed to mingvproxy)"
+        fi
+    done <"$prev_record"
+}
+remove_renamed_gvproxy
+
 # R6.1 — persist the resolved (component, dest, installed-hash) rows for this
 # platform, replacing the prior record read during the loop. Enables a future
 # uninstall and surfaces prefix drift across XDG changes.

@@ -6,3 +6,6 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+tempfile.workspace = true

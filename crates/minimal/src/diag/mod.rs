@@ -77,6 +77,10 @@ const PROCESS_MARKERS: &[&str] = &[
     "minimald",
     "minvmd",
     "__krun-vmm",
+    // Both names: `mingvproxy` is what an install stamps into `bin/` (see
+    // `switch::GVPROXY_FILE`); a dev checkout and a system package still run
+    // the binary under its upstream name.
+    "mingvproxy",
     "gvproxy",
 ];
 

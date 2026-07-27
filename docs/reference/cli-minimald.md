@@ -36,7 +36,7 @@ Runs the minimald server in the foreground.
 | `--instance-num <N>` | Instance number for this minimald; determines client-relevant paths under `<minimal_state_dir>/providers/local-minimald<N>`. The SSH socket is accessible as `ssh.sock`. Default: `0` |
 | `--vsock` | Host the SSH socket over vsock instead of UDS; the vsock port is the default port base plus `instance_num` |
 | `--detach` | Daemonize: spawn minimald in a new session (setsid) and return once the SSH socket accepts connections, or an 8s timeout elapses. Used by the `min` CLI to auto-start a native daemon on Linux |
-| `--gvproxy-bin <PATH>` | Path to the gvproxy ("gvisor-tap-vsock") binary used for networking. Defaults to a typical system install path. |
+| `--gvproxy-bin <PATH>` | Path to the gvproxy ("gvisor-tap-vsock") binary used for networking. Defaults to the installed location: the user-local `bin/mingvproxy` the installer stamps, else the system install path. |
 
 ### `completions`
 

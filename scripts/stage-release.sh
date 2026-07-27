@@ -104,21 +104,48 @@ fi
 #     (the installer's completion generation runs `<bin>/min`, spec R9.3), while
 #     the component and artifact names keep the crate name.
 #
-# Linux hosts install just the three self-contained musl binaries. macOS hosts
-# additionally need minvmd + gvproxy and the guest microVM payload (kernel,
-# rootfs, initramfs) to boot Linux workloads under libkrun; macOS is arm64-only
-# here, and its guest is arm64, so it consumes the arm64 guest artifacts.
+# Every host — Linux and macOS alike — installs the full session stack: the
+# self-contained musl/native binaries, the `mingvproxy` switch, `minvmd`, the
+# libkrun pair it links, and the guest microVM payload (kernel, rootfs,
+# initramfs) needed to boot Linux workloads. The guest arch always matches the
+# host arch, so each platform consumes its own payload; macOS is arm64-only
+# here, so it consumes the arm64 one.
+#
+# The switch binary installs as `bin/mingvproxy`, NOT `bin/gvproxy`: the bin
+# prefix is `~/.local/bin`, which is on PATH, and podman/crc ship their own
+# `gvproxy` there. The bytes are stock gvproxy; only the installed name is
+# ours, and `switch::GVPROXY_FILE` is the resolver's matching definition.
 COMPONENTS=(
     # Linux amd64
     "minimald|linux|amd64|file|bin/minimald|minimald-linux-amd64"
     "mip|linux|amd64|file|bin/mip|mip-linux-amd64"
     "minimal|linux|amd64|file|bin/min|minimal-linux-amd64"
     "git-remote-min|linux|amd64|symlink|bin/git-remote-min|min"
+    "mingvproxy|linux|amd64|file|bin/mingvproxy|gvproxy-linux-amd64"
+    "minvmd|linux|amd64|file|bin/minvmd|minvmd-linux-amd64"
+    # libkrun + libkrunfw for the KVM backend, staged into lib/ (ie:
+    # minvmd/../lib) to mirror the macOS layout. The dest basenames MUST be the
+    # SONAMEs: minvmd's DT_NEEDED is `libkrun.so.1`, and libkrun dlopen()s
+    # `libkrunfw.so.5` by soname from its own directory. release.yml verifies
+    # both sonames and sets the matching RUNPATHs
+    # (scripts/rewrite-linux-linkage.sh) before upload.
+    "libkrun|linux|amd64|file|lib/libkrun.so.1|libkrun-linux-amd64.so"
+    "libkrunfw|linux|amd64|file|lib/libkrunfw.so.5|libkrunfw-linux-amd64.so"
+    "initramfs|linux|amd64|file|data/initramfs.cpio|initramfs-amd64.cpio"
+    "rootfs|linux|amd64|file|data/rootfs.img|rootfs-amd64.img"
+    "vmlinuz|linux|amd64|file|data/vmlinuz|vmlinuz-amd64"
     # Linux arm64
     "minimald|linux|arm64|file|bin/minimald|minimald-linux-arm64"
     "mip|linux|arm64|file|bin/mip|mip-linux-arm64"
     "minimal|linux|arm64|file|bin/min|minimal-linux-arm64"
     "git-remote-min|linux|arm64|symlink|bin/git-remote-min|min"
+    "mingvproxy|linux|arm64|file|bin/mingvproxy|gvproxy-linux-arm64"
+    "minvmd|linux|arm64|file|bin/minvmd|minvmd-linux-arm64"
+    "libkrun|linux|arm64|file|lib/libkrun.so.1|libkrun-linux-arm64.so"
+    "libkrunfw|linux|arm64|file|lib/libkrunfw.so.5|libkrunfw-linux-arm64.so"
+    "initramfs|linux|arm64|file|data/initramfs.cpio|initramfs-arm64.cpio"
+    "rootfs|linux|arm64|file|data/rootfs.img|rootfs-arm64.img"
+    "vmlinuz|linux|arm64|file|data/vmlinuz|vmlinuz-arm64"
     # macOS arm64 (darwin)
     "minimal|darwin|arm64|file|bin/min|minimal-macos-arm64"
     "git-remote-min|darwin|arm64|symlink|bin/git-remote-min|min"
@@ -128,7 +155,7 @@ COMPONENTS=(
     # Basename MUST be libkrun.1.dylib: minvmd's load command is @rpath/libkrun.1.dylib
     # and the release job adds a @loader_path/../lib rpath.
     "libkrun|darwin|arm64|file|lib/libkrun.1.dylib|libkrun-macos-arm64.dylib"
-    "gvproxy|darwin|arm64|file|bin/gvproxy|gvproxy-darwin-arm64"
+    "mingvproxy|darwin|arm64|file|bin/mingvproxy|gvproxy-darwin-arm64"
     "initramfs|darwin|arm64|file|data/initramfs.cpio|initramfs-arm64.cpio"
     "rootfs|darwin|arm64|file|data/rootfs.img|rootfs-arm64.img"
     "vmlinuz|darwin|arm64|file|data/vmlinuz|vmlinuz-arm64"

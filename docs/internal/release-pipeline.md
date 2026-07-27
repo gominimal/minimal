@@ -34,9 +34,16 @@ override for green-but-unreported commits.
 
 - `build-release-linux-{amd64,arm64}`: static musl builds of `mip`, `min`
   (package `minimal`), and `minimald`, one cargo invocation per package so the
-  fat-LTO links serialize. The amd64 job additionally builds a native-glibc
-  `minvmd` against a materialized libkrun prefix (there is currently no
-  `minvmd-linux-arm64` release artifact).
+  fat-LTO links serialize. Each job then builds a native-glibc `minvmd` against
+  a materialized libkrun prefix and uploads that prefix's `libkrun` +
+  `libkrunfw` pair, so a Linux install ships the VM backend rather than
+  depending on a system libkrun.
+  [`scripts/rewrite-linux-linkage.sh`](../../scripts/rewrite-linux-linkage.sh)
+  sets the two RUNPATHs the shipped layout needs (`minvmd` →
+  `$ORIGIN/../lib`, `libkrun` → `$ORIGIN`, the latter because its `dlopen` of
+  `libkrunfw` resolves against the *calling* object's RUNPATH) and hard-fails
+  on a soname bump, which would otherwise silently invalidate the `lib/` dests
+  in stage-release.sh.
 - `build-release-macos-arm64` (self-hosted Apple Silicon, gated on the
   `RUN_MACOS_CI` kill-switch): builds `minvmd` (libkrun /
   Hypervisor.framework) and `min`, rewrites minvmd's libkrun linkage to
@@ -143,11 +150,22 @@ immutable `versions/<version>/components` manifest (refusing an unknown
 SHA-256-verifies, and atomically installs the file. The on-disk hash is the
 skip oracle, so reruns only touch changed components, and a running daemon is
 stopped before an executable is swapped. Per-platform sets (from
-stage-release.sh's `COMPONENTS` table): Linux amd64/arm64 get `bin/min`,
-`bin/mip`, `bin/minimald`, a `git-remote-min` symlink, and the AppArmor
-profile/tunable/loader under `data/`; macOS arm64 gets `bin/min`,
-`bin/minvmd`, `bin/gvproxy`, `lib/libkrun.1.dylib`, the `git-remote-min`
-symlink, and the guest payload (`data/{vmlinuz,rootfs.img,initramfs.cpio}`).
+stage-release.sh's `COMPONENTS` table): every platform gets the session stack —
+`bin/min`, `bin/minvmd`, `bin/mingvproxy`, a `git-remote-min` symlink, the
+libkrun the VM backend links (`lib/libkrun.so.1` + `lib/libkrunfw.so.5` on
+Linux, `lib/libkrun.1.dylib` on macOS), and the guest payload
+(`data/{vmlinuz,rootfs.img,initramfs.cpio}`) for its own arch. Linux
+additionally gets `bin/mip`, `bin/minimald`, and the AppArmor
+profile/tunable/loader under `data/`.
+
+The switch binary installs as **`mingvproxy`**, not `gvproxy`: the `bin` prefix
+is `~/.local/bin`, which is on `PATH`, and podman/crc ship their own `gvproxy`
+there — under the upstream name whichever was installed last would win a `PATH`
+lookup, in either direction. The bytes are stock gvproxy;
+[`switch::GVPROXY_FILE`](../../crates/switch/src/lib.rs) is the resolver's
+matching definition, and install.sh removes a `bin/gvproxy` left by a
+pre-rename install when its bytes are still the ones we recorded writing.
+
 It also wires shell integration (PATH init files, `min` completions, one
 marker-fenced rc block). `--uninstall` reverses all of it offline from the
 local install record, keeping user-modified files unless `--force`;
