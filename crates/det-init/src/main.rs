@@ -34,7 +34,7 @@
 
 use std::ffi::CString;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use minimald::guest;
 
@@ -82,6 +82,25 @@ const READY_ATTEMPTS: u32 = 100; // 100 × 100ms = 10s
 /// Bounded wait for the observer to drain after SIGTERM before SIGKILL.
 const DRAIN_ATTEMPTS: u32 = 50; // 50 × 100ms = 5s
 const POLL: Duration = Duration::from_millis(100);
+
+/// Deadline for the SAMPLE itself, deliberately shorter than the host's VM timeout
+/// (`det-host-agent` passes `--timeout-secs`, default 120).
+///
+/// Why this exists: the feed is drained AFTER the sample returns (step 8). A sample that never
+/// returns therefore takes the ENTIRE feed with it — the host kills the VM, `drain_monitor` and
+/// `emit_feed_to_stdout` never run, and a run that should have been BLOCK is reported as
+/// `substrate_failed: empty observer capture`. The observer captured everything; it just never
+/// shipped. See gominimal/minimal-detonation#272.
+///
+/// That is not an exotic input. A poisoned package whose C2 is unreachable — sinkholed, firewalled,
+/// or a documentation-range IP — blocks on connect() exactly like this, so the better the network
+/// defense, the more likely the whole feed was lost. It is also a one-line evasion: append a sleep
+/// and the verdict degrades from BLOCK to ERROR after the payload has already run.
+///
+/// Killing the sample at this deadline costs only whatever the sample would have done AFTER the
+/// deadline; keeping the events it already produced is strictly better than losing all of them.
+/// MUST stay comfortably below the host timeout, or the VM dies first and this is moot.
+const SAMPLE_DEADLINE: Duration = Duration::from_secs(90);
 
 /// A top-level error, mirroring `minimald::main`'s shape.
 #[derive(Debug)]
@@ -319,10 +338,38 @@ async fn async_main() -> Result<(), MainError> {
         .map_err(|e| MainError::IO(e, "spawning the sample under droppriv"))?;
     let sample_pid = sample.id();
     tracing::info!(pid = sample_pid, "sample running as nobody");
-    let sample_rc = sample
-        .wait()
-        .map_err(|e| MainError::IO(e, "reaping the sample"))?;
-    tracing::info!(rc = ?sample_rc.code(), "sample exited");
+    // Bounded wait — see SAMPLE_DEADLINE. A hung sample must not cost us the feed, so on expiry
+    // we kill it and fall through to the drain rather than letting the host reap the whole VM.
+    let deadline = Instant::now() + SAMPLE_DEADLINE;
+    let sample_rc = loop {
+        match sample.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // SIGKILL: this is untrusted code that already ignored its chance to finish,
+                    // and a SIGTERM it can trap would just re-open the same hang.
+                    let _ = sample.kill();
+                    let _ = sample.wait(); // reap the zombie so the drain is not racing it
+                    tracing::warn!(
+                        pid = sample_pid,
+                        deadline_secs = SAMPLE_DEADLINE.as_secs(),
+                        "sample exceeded its deadline and was killed — draining the events it \
+                         produced so far (a hang no longer discards the whole feed; \
+                         gominimal/minimal-detonation#272)"
+                    );
+                    break None;
+                }
+                std::thread::sleep(POLL);
+            }
+            Err(e) => return Err(MainError::IO(e, "reaping the sample")),
+        }
+    };
+    match sample_rc {
+        Some(rc) => tracing::info!(rc = ?rc.code(), "sample exited"),
+        // Emitted on the console, which the host collects — so a timed-out run is
+        // distinguishable in triage from a genuine boot/attach failure.
+        None => tracing::warn!("sample TIMED OUT (killed); feed below is partial by construction"),
+    }
 
     // ── Drain the observer: SIGTERM asks it to flush the ringbuf, bounded ──
     drain_monitor(&mut monitor, mon_pid).await;
