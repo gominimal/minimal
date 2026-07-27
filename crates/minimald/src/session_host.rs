@@ -162,10 +162,10 @@ impl Pty {
 }
 
 /// Emit one `tracing::info!` per item the launcher folds into the
-/// session — packages, vars, patches, and lifecycle hooks —
-/// tagging each with its provenance so an operator can trace
-/// "where did `EDITOR=hx` come from?" back to the loadout /
-/// project / package that contributed it.
+/// session — packages, vars, and patches — tagging each with its
+/// provenance so an operator can trace "where did `EDITOR=hx` come
+/// from?" back to the loadout / project / package that contributed
+/// it.
 ///
 /// Baseline items (the launcher-defaults `PS1`, `base`, `coreutils`,
 /// `socat`) log with `source = "launcher-baseline"` so they can be
@@ -241,32 +241,36 @@ fn log_session_contents(
             "session content (patch: materialized into session home at FinalizeSession)",
         );
     }
-    for h in comp.lifecycle_hooks() {
-        let src = sessions::core::source::Provenanced::source(h);
-        let hook = h.hook();
-        [
-            ("on_activate", hook.on_activate()),
-            ("on_destroy", hook.on_destroy()),
-            ("on_failure", hook.on_failure()),
-        ]
-        .into_iter()
-        .filter_map(|(event, script)| script.map(|s| (event, s)))
-        .for_each(|(event, script)| {
-            let kind = match script {
-                sessions::core::lifecyclehook::HookScript::Inline(_) => "inline",
-                sessions::core::lifecyclehook::HookScript::External(_) => "external",
-            };
-            tracing::info!(
-                session = session_name,
-                domain = "lifecycle_hook",
-                event = event,
-                script_kind = kind,
-                source = ?src,
-                deferred = true,
-                "session content (lifecycle hook: exec plumbing deferred)",
-            );
-        });
-    }
+    // Session transition scripts are gated off for this release. A hook
+    // declared in a project `[session]` block is still accepted and
+    // composed into the session — it is disabled here, at the output
+    // layer, by suppressing the content-logging loop below (and it is
+    // never executed, as exec is deferred), rather than being refused at
+    // compose time. Restore the loop when the feature ships. (Hooks from
+    // loadouts are excluded earlier, before client-side composition — see
+    // `crates/minimal/src/loadouts.rs`.)
+    //
+    // for h in comp.lifecycle_hooks() {
+    //     let src = sessions::core::source::Provenanced::source(h);
+    //     let hook = h.hook();
+    //     [
+    //         ("on_activate", hook.on_activate()),
+    //         ("on_destroy", hook.on_destroy()),
+    //         ("on_failure", hook.on_failure()),
+    //     ]
+    //     .into_iter()
+    //     .filter_map(|(event, script)| script.map(|s| (event, s)))
+    //     .for_each(|(event, script)| {
+    //         let kind = match script {
+    //             sessions::core::lifecyclehook::HookScript::Inline(_) => "inline",
+    //             sessions::core::lifecyclehook::HookScript::External(_) => "external",
+    //         };
+    //         tracing::info!(
+    //             session = session_name,
+    //             ...
+    //         );
+    //     });
+    // }
 }
 
 /// Duplicate `fd` into a new close-on-exec `OwnedFd` via

@@ -185,6 +185,16 @@ impl Loadout {
         new
     }
 
+    /// Drop every lifecycle hook from this loadout, returning the
+    /// hookless loadout. Used to exclude session transition scripts
+    /// before composition while the feature is gated off for a release,
+    /// so a declared hook cannot participate in composition at all.
+    #[must_use]
+    pub fn without_lifecycle_hooks(mut self) -> Self {
+        self.lifecycle_hooks.clear();
+        self
+    }
+
     /// Override the composer's default follow-symlinks behavior for
     /// this loadout's patches.
     #[must_use]

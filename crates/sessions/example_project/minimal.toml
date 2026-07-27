@@ -54,10 +54,10 @@
 
 [upstream]
 repo = "https://github.com/gominimal/pkgs"
-branch = "main"
+branch = "unstable"
 # Reused from the workspace's own `minimal.toml` — guaranteed to
 # resolve as long as that pin does.
-locked_commit = "23193970569b93e5e7a980aa598c3342c386d33f"
+locked_commit = "75884ceb9d227e7c97642ccdfff01fecbb8380a1"
 
 [stack]
 use = "shell"
