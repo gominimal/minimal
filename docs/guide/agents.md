@@ -8,14 +8,11 @@ Minimal can sandbox AI coding agents the same way it sandboxes your dev tools: a
 
 ## Example: Claude Code
 
-This documentation site is itself built and maintained using Claude Code inside a Minimal session. Add the agent's package to the project's `[session]` block, and grant it the host state it needs with a patch:
+This documentation site is itself built and maintained using Claude Code inside a Minimal session. Add the agent's package to the project's `[session]` block:
 
 ```toml
 [session]
 packages = ["claude-code", "base"]
-patches = [
-    { source = "~/.claude", dest = "~/.claude" },
-]
 ```
 
 Then activate the session and run the agent inside it:
@@ -25,7 +22,7 @@ $ min activate --attach .
 $ claude
 ```
 
-Claude Code launches inside the session with your project's source code, its `~/.claude` state, and a read-only system containing the `claude-code` binary and core utilities from `base`. The session has no additional access to anything on your host system unless you explicitly declare it.
+Claude Code launches inside the session with your project's source code and a read-only system containing the `claude-code` binary and core utilities from `base`. The session has no additional access to anything on your host system unless you explicitly declare it.
 
 Note that sessions are driven interactively: attaching needs a terminal, and the non-interactive `min attach -c` channel accepts only `min run <task>` invocations. Launch the agent from inside an attached shell as shown above, rather than scripting it from the host.
 
@@ -46,7 +43,6 @@ Use `patches` to give the agent access to host files it needs, like authenticati
 [session]
 packages = ["claude-code", "base", "git"]
 patches = [
-    { source = "~/.claude",    dest = "~/.claude" },
     { source = "~/.gitconfig", dest = "~/.gitconfig" },
     { source = "~/.ssh",       dest = "~/.ssh" },
 ]
