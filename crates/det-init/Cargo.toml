@@ -1,0 +1,29 @@
+[package]
+name = "det-init"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# `det-init` is the minimal-detonation guest pid-1 (`/init`). It reuses
+# `minimald`'s public guest-boot library (mounts, rootfs entry, root egress,
+# VM shutdown) instead of forking minimald, then stands up the in-guest
+# BPF-LSM observer and runs the untrusted sample as `nobody` under it. It does
+# NOT run minimald's SSH server: a detonation is a one-shot, so the sample is
+# executed directly and the observer streams the event feed out. See
+# gominimal/minimal-detonation#194.
+
+[[bin]]
+name = "det-init"
+path = "src/main.rs"
+
+[dependencies]
+# Path dep with NO version requirement, deliberately. Pinning `version = "0.0.1"` here broke the
+# build the moment the workspace bumped to 0.5.0-rc1 — a self-inflicted drift trap that has nothing
+# to do with API compatibility (all six `guest::` fns we call were unchanged). Cargo resolves a
+# bare path dep to whatever is in the tree, so version bumps can never break us again; the API
+# surface is what actually matters and the compiler checks that.
+minimald = { path = "../minimald" }
+tokio.workspace = true
+libc.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

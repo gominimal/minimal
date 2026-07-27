@@ -8,6 +8,7 @@ members = [
     "crates/checkouts",
     "crates/common",
     "crates/decode",
+    "crates/det-init",
     "crates/diagnostics",
     "crates/graph",
     "crates/mctx",
