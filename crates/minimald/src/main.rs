@@ -210,10 +210,10 @@ pub struct ListenArgs {
     #[clap(hide = true)]
     mk_mount_state_volume: Option<String>,
 
-    /// Vsock port to listen on for time updates. This listens for updates emitted by
-    /// libkrun's timesync worker: https://github.com/libkrun/libkrun/blob/main/src/devices/src/virtio/vsock/timesync.rs#L16.
-    ///
-    /// This worker is only initialized for a MacOS host.
+    /// Vsock port to listen on for host time updates: 8-byte little-endian
+    /// nanoseconds-since-epoch stamps, dialed in by the host half in `minvmd`
+    /// (see `guest::run_timekeep_listener`). Only useful as a VM init process;
+    /// `None` leaves the guest clock free-running.
     #[arg(long)]
     #[clap(hide = true)]
     timekeep_listener_port: Option<u32>,
@@ -407,12 +407,10 @@ async fn async_main() -> Result<(), MainError> {
                 mount_rootfs: Some("/dev/vda".to_string()),
                 mk_mount_state_volume: Some("/dev/vdb".to_string()),
                 detach: false,
-                timekeep_listener_port: if cfg!(target_arch = "aarch64") {
-                    // Libkrun shares the time as datagrams down vsock 123 on MacOS.
-                    Some(123)
-                } else {
-                    None
-                },
+                // Host time updates arrive on a vsock stream we listen on, from
+                // minvmd. Always listen: the guest cannot see what the
+                // host runs.
+                timekeep_listener_port: Some(guest::TIMEKEEP_PORT),
                 // In-VM (DM1/3/4) the PTask attaches to the host gvproxy over the
                 // vsock shuttle, so no in-guest gvproxy binary path is needed.
                 gvproxy_bin: None,
