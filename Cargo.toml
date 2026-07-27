@@ -59,7 +59,7 @@ codegen-units = 16
 anyhow = "1.0"
 async-compression = { version = "0.4", features = ["tokio", "zstd", "zstdmt"] }
 async-tar = { version = "0.6", default-features = false, features = ["runtime-tokio"] }
-base64 = "0.22"
+base64 = "0.23"
 blake3 = { version = "1", features = ["serde"] }
 # WireGuard mesh peer (Unit 4, behind the `networking-wg` feature). Pure-Rust
 # WireGuard avoids a Go/cgo toolchain dependency (spec Design Considerations).
@@ -78,7 +78,7 @@ codespan-reporting = { version = "0.13", features = ["serialization"] } # Keep i
 constcat = "0.6"
 copy_dir = "0.1.3"
 chrono = {version = "0.4", features = ["serde", "std"]}
-dialoguer = { version = "0.11", default-features = false }
+dialoguer = { version = "0.12", default-features = false }
 dirs = "6"
 fd-lock = "4"
 either = { version = "1.16", default-features = false }
