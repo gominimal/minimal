@@ -1,0 +1,79 @@
+name: docs-hotfix
+
+# Refresh the public docs on gominimal/webapp from a chosen gominimal/minimal
+# sha WITHOUT cutting or promoting a binary release. Use this to push a docs
+# correction live between releases.
+#
+# Mechanism: the webapp's deploy-time sync (gominimal/webapp
+# deploy-cloudrun.yml, restored in gominimal/webapp#489) resolves the docs sha
+# in priority order MINIMAL_DOCS_SHA -> stable channel -> unstable channel ->
+# main. A `reference-docs-promoted` repository_dispatch sets MINIMAL_DOCS_SHA
+# from client_payload.sha, so this workflow pins that deploy to the given sha
+# and syncs the allow-listed doc sections (reference/, concepts/, guide->start/)
+# at it.
+#
+# Scope / durability: this triggers ONE webapp deploy at the chosen sha. A later
+# webapp deploy that is not driven by this dispatch falls back to the channel
+# pointer, so a hotfix is a bridge until the fix ships in the next promoted
+# release (after which the channel pointer carries it durably).
+
+on:
+    workflow_dispatch:
+        inputs:
+            sha:
+                description: "gominimal/minimal sha to sync docs from (empty = this workflow's ref)"
+                required: false
+                type: string
+                default: ""
+
+permissions:
+    contents: read
+
+concurrency:
+    group: docs-hotfix
+    cancel-in-progress: false
+
+jobs:
+    dispatch:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+        steps:
+            - name: Resolve sha
+              id: resolve
+              env:
+                  INPUT_SHA: ${{ inputs.sha }}
+                  REF_SHA: ${{ github.sha }}
+              run: |
+                  set -euo pipefail
+                  # Trim stray whitespace; SHAs are often pasted with spaces.
+                  SHA="$(printf '%s' "$INPUT_SHA" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+                  # Default to the ref this workflow runs from (main HEAD).
+                  [ -z "$SHA" ] && SHA="$REF_SHA"
+                  echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+                  echo "Docs hotfix will pin gominimal/webapp to ${SHA}"
+
+            # Mint a short-lived token scoped to gominimal/webapp via the
+            # gominimal-aw-bot GitHub App (org standard — App tokens over PATs,
+            # see gominimal/min-aw ADR-0002). The default GITHUB_TOKEN cannot
+            # dispatch other repos; this token carries the App's contents:write
+            # permission narrowed to the webapp repo only.
+            - name: Mint webapp-repo token (gominimal-aw-bot)
+              id: webapp-token
+              uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+              with:
+                  app-id: ${{ vars.AW_BOT_APP_ID }}
+                  private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
+                  owner: gominimal
+                  repositories: webapp
+
+            - name: Dispatch reference-docs-promoted
+              env:
+                  GH_TOKEN: ${{ steps.webapp-token.outputs.token }}
+                  SHA: ${{ steps.resolve.outputs.sha }}
+              run: |
+                  set -euo pipefail
+                  gh api repos/gominimal/webapp/dispatches \
+                    -f event_type=reference-docs-promoted \
+                    -F "client_payload[sha]=${SHA}"
+                  echo "Dispatched reference-docs-promoted to gominimal/webapp for ${SHA}"
