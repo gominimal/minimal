@@ -140,6 +140,38 @@ pub trait Loader {
     /// - Other I/O errors if the record cannot be read or the index cannot be
     ///   flushed.
     fn delete(&mut self, key: &Self::Key) -> Result<(), std::io::Error>;
+
+    /// Loads the persisted composition snapshot for the session at
+    /// `key`, if one exists. Returns `Ok(None)` when the sidecar is
+    /// absent (a session that predates the sidecar, or whose
+    /// composition was never assembled). A corrupt or unreadable
+    /// sidecar surfaces as an error so the caller can log it and
+    /// decide on a fallback.
+    ///
+    /// # Errors
+    ///
+    /// - `NotFound` if `key` is stale (same semantics as [`Self::save`]).
+    /// - I/O or deserialization errors if the sidecar exists but
+    ///   cannot be read or parsed.
+    fn load_composition(
+        &self,
+        key: &Self::Key,
+    ) -> Result<Option<crate::core::compose::Composition>, std::io::Error>;
+
+    /// Atomically persists the composition snapshot for the session
+    /// at `key` (tmp + rename, same crash-safety as [`Self::save`]).
+    /// Called at composition-assembly time so a restart can re-apply
+    /// the exact composition that was approved at `min activate` time.
+    ///
+    /// # Errors
+    ///
+    /// - `NotFound` if `key` is stale (same semantics as [`Self::save`]).
+    /// - I/O or serialization errors if the sidecar cannot be written.
+    fn store_composition(
+        &self,
+        key: &Self::Key,
+        composition: &crate::core::compose::Composition,
+    ) -> Result<(), std::io::Error>;
 }
 
 /// The concrete key used to identify sessions from [`DiskLoader`].
@@ -870,6 +902,68 @@ impl Loader for DiskLoader {
             Err(e) if e.kind() == NotFound => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    fn load_composition(
+        &self,
+        key: &Self::Key,
+    ) -> Result<Option<crate::core::compose::Composition>, std::io::Error> {
+        let short = self.live_short(key)?;
+        let path = self
+            .minimal_dir
+            .as_utf8_path()
+            .join("sessions")
+            .join(&short)
+            .join("composition.json");
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let wire: crate::wire::request::WireComposition = serde_json::from_slice(&bytes)
+                    .map_err(|e| {
+                        std::io::Error::other(format!(
+                            "parsing composition snapshot at {}: {e}",
+                            path.as_str()
+                        ))
+                    })?;
+                crate::core::compose::Composition::try_from(wire)
+                    .map(Some)
+                    .map_err(|e| {
+                        std::io::Error::other(format!(
+                            "reconstructing composition from snapshot at {}: {e}",
+                            path.as_str()
+                        ))
+                    })
+            }
+            Err(e) if e.kind() == NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn store_composition(
+        &self,
+        key: &Self::Key,
+        composition: &crate::core::compose::Composition,
+    ) -> Result<(), std::io::Error> {
+        let short = self.live_short(key)?;
+        let session_dir = self
+            .minimal_dir
+            .as_utf8_path()
+            .join("sessions")
+            .join(&short);
+        std::fs::create_dir_all(&session_dir)?;
+        let dest = session_dir.join("composition.json");
+        let tmp = session_dir.join("composition.json.tmp");
+
+        let wire = crate::wire::request::WireComposition::from(composition);
+        let json = serde_json::to_vec_pretty(&wire)
+            .map_err(|e| std::io::Error::other(format!("serializing composition snapshot: {e}")))?;
+        std::fs::write(&tmp, &json)?;
+
+        #[cfg(target_os = "linux")]
+        common::renameat2::renameat2_cwd(tmp.as_std_path(), dest.as_std_path(), 0)?;
+        #[cfg(not(target_os = "linux"))]
+        std::fs::rename(&tmp, &dest)?;
+
+        Ok(())
     }
 }
 

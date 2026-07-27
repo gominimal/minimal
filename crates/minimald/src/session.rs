@@ -66,6 +66,34 @@ async fn materialize_patches_into_home(
     Ok(())
 }
 
+/// Load the persisted composition snapshot for an `Active` session
+/// brought up from disk after a daemon restart. Returns `None` (with
+/// a warning log) when the sidecar is missing or corrupt. The
+/// launcher then falls back to its baseline set, preserving the
+/// "attach still works" property at the cost of the lost loadout
+/// contributions. This is the loud-fallback path: the operator sees
+/// the warning instead of a silent drop.
+async fn load_composition(record: &SessionRecordHandle) -> Option<Arc<Composition>> {
+    match record.load_composition().await {
+        Ok(Some(comp)) => Some(Arc::new(comp)),
+        Ok(None) => {
+            tracing::warn!(
+                session_id = %record.id(),
+                "no composition snapshot for Active session; falling back to baseline",
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %record.id(),
+                error = %e,
+                "failed to load composition snapshot; falling back to baseline",
+            );
+            None
+        }
+    }
+}
+
 /// The name a session's PTask hostname is registered under, doubling as the
 /// session host's display name: the session's assigned name, or the project
 /// directory's basename when unnamed.
@@ -185,8 +213,10 @@ enum SessionInner {
     /// on-disk `Active` record.
     Active {
         /// The finalized [`Composition`] this session was created with.
-        /// `None` after a daemon restart — the composition isn't persisted,
-        /// and the launcher falls back to its baseline set in that case.
+        /// `None` only when the sidecar is missing or corrupt on a
+        /// session brought up from disk after a daemon restart —
+        /// [`load_composition`] logs a warning and the launcher
+        /// falls back to its baseline set in that case.
         ///
         /// The launcher currently consumes only the composition's packages
         /// and vars. Patches (need file-upload plumbing) and lifecycle hooks
@@ -387,19 +417,23 @@ impl Session {
     /// Launches the actor for a session — the one path onto which every
     /// session actor is spawned. The initial state machine state is derived
     /// from the record alone: an `Active` record comes up ready to attach
-    /// (without a composition; it isn't persisted, so the launcher falls back
-    /// to its baseline set), a `Pending` one as an unconfigured `Draft`
-    /// awaiting `ConfigureLoadout`.
+    /// with its composition restored from the snapshot sidecar (or, if the
+    /// sidecar is missing or corrupt, with a logged warning and no
+    /// composition so the launcher falls back to its baseline set), a
+    /// `Pending` one as an unconfigured `Draft` awaiting `ConfigureLoadout`.
     pub(crate) async fn run(conf: SessionConfig) -> Result<SessionHandle, std::io::Error> {
         let obj = conf.record.object().await?;
         Self::create_dirs(&obj)?;
 
         let inner = match obj.record().status {
-            SessionStatus::Active => SessionInner::Active {
-                composition: None,
-                host: None,
-                sops: vec![],
-            },
+            SessionStatus::Active => {
+                let composition = load_composition(&conf.record).await;
+                SessionInner::Active {
+                    composition,
+                    host: None,
+                    sops: vec![],
+                }
+            }
             SessionStatus::Pending => SessionInner::Draft { pending: None },
             // `Materializing` records are only meaningful across a
             // matching in-memory composition, which is lost on
@@ -714,6 +748,13 @@ impl Session {
                 // (a session isn't attachable until then, so
                 // publishing the route would let something reach a
                 // launcher that can't materialize its patches).
+                //
+                // Persist the composition snapshot before the record
+                // write so a crash at any point leaves either a
+                // reaped session (Pending/Materializing records are
+                // reaped at startup) or an Active session with its
+                // sidecar intact.
+                self.record.store_composition(&composition).await?;
                 let mut record = object.record().clone();
                 record.status = SessionStatus::Materializing;
                 self.record.write(record.clone()).await?;
@@ -786,6 +827,11 @@ impl Session {
         // `FinalizeSession` after patches upload — see
         // [`Self::finalize`] for the transition and its
         // preconditions.
+        //
+        // Persist the composition snapshot before the record write
+        // (same crash-safety reasoning as the Materialized fast
+        // path above).
+        self.record.store_composition(&composition).await?;
         let mut record = self.record.record().await?;
         record.status = SessionStatus::Materializing;
         self.record.write(record.clone()).await?;
@@ -1989,6 +2035,100 @@ mod tests {
         assert!(
             flushed.contains("got:hello"),
             "reattaching should flush prior terminal state, got: {flushed:?}",
+        );
+    }
+
+    /// A session's composition persists across a daemon restart: the
+    /// sidecar written at composition-assembly time is read back when
+    /// the actor is respawned from disk, so the launcher sees the same
+    /// packages and vars instead of falling back to the baseline set.
+    /// This is the core fix for issue #849 — "session composition state
+    /// is in-memory only: daemon restart drops loadout packages/vars
+    /// for existing sessions."
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn composition_survives_actor_restart() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        // The actor was spawned during `create_configured_session`
+        // and holds the composition in memory. Verify it's present.
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("session should resolve while actor is running");
+        assert!(
+            handle.peek_composition().await.is_some(),
+            "freshly configured session should hold its composition in memory"
+        );
+
+        // Stop the actor and evict it from the running map so the
+        // next `get_session` spawns a fresh actor from the on-disk
+        // record — simulating a daemon restart.
+        handle.stop().await;
+        manager.evict(session_id).await;
+
+        // Re-resolve: spawns a new actor from disk. The composition
+        // should be restored from the sidecar, not None.
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("session should resolve after eviction");
+        assert!(
+            handle.peek_composition().await.is_some(),
+            "re-spawned session should have its composition restored from \
+             the sidecar, not fall back to baseline"
+        );
+    }
+
+    /// When the sidecar is missing (e.g. a session that predated the
+    /// sidecar, or a corrupt filesystem), the actor still spawns — but
+    /// with no composition, so the launcher falls back to its baseline
+    /// set. The operator sees a warning log rather than a silent drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_sidecar_falls_back_to_baseline() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("session should resolve");
+
+        // Delete the sidecar to simulate a pre-sidecar session or a
+        // corrupt filesystem. The composition sidecar lives at
+        // `<session-root>/composition.json`, a sibling of `record.json`;
+        // derive it from the workspace path (`<root>/tree`).
+        let paths = handle.paths().await.expect("paths should resolve");
+        let composition_file = paths
+            .working
+            .parent()
+            .expect("workspace path has a parent")
+            .join(&paths::DaemonRelPath::try_new("composition.json").unwrap());
+        tokio::fs::remove_file(composition_file.as_utf8_path())
+            .await
+            .expect("sidecar should exist to delete");
+
+        handle.stop().await;
+        manager.evict(session_id).await;
+
+        // Re-resolve: spawns from disk with no sidecar. The
+        // composition should be None — loud fallback to baseline.
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("session should resolve after eviction");
+        assert!(
+            handle.peek_composition().await.is_none(),
+            "session with a missing sidecar should fall back to baseline \
+             (composition None), not hold a stale composition"
         );
     }
 }

@@ -1232,6 +1232,38 @@ impl Composition {
     }
 }
 
+/// Reconstruct a [`Composition`] from a persisted
+/// [`WireComposition`](crate::wire::request::WireComposition)
+/// snapshot. The daemon writes the snapshot at composition-assembly
+/// time and reads it back at spawn-from-disk so a restart re-applies
+/// the exact composition that was approved at `min activate` time.
+///
+/// Fallible only on lifecycle hooks (a wire hook with no callbacks
+/// is rejected); vars, patches, and packages convert infallibly via
+/// their existing `From` impls.
+impl TryFrom<crate::wire::request::WireComposition> for Composition {
+    type Error = ComposeError;
+
+    fn try_from(wire: crate::wire::request::WireComposition) -> Result<Self, Self::Error> {
+        let hooks: Vec<ProvenancedHook> = wire
+            .lifecycle_hooks
+            .into_iter()
+            .map(|h| {
+                h.try_into().map_err(|e| ComposeError::InvalidWireItem {
+                    what: "lifecycle hook with no callbacks",
+                    context: format!("{e}"),
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            vars: wire.vars.into_iter().map(Into::into).collect(),
+            patches: wire.patches.into_iter().map(Into::into).collect(),
+            packages: wire.packages.into_iter().map(Into::into).collect(),
+            lifecycle_hooks: hooks,
+        })
+    }
+}
+
 /// Configuration for the compose pipeline.
 ///
 /// Defaults to symlink-safe behavior (no following) — appropriate for

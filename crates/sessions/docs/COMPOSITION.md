@@ -672,14 +672,14 @@ overload:
   stuck `Materializing` records.
 - **`Materializing` records don't survive daemon restart.** The
   `SessionInner::Active { composition, .. }` state that Phase 4a
-  produces is memory-only: the composition isn't persisted to the
-  record, only the *status* is. A `Materializing` record whose
-  actor is respawned from disk after a restart has no
-  in-memory composition to check against, so `Manager::init`
-  runs `reap_unresumable_records` at startup and deletes any
-  `Pending` or `Materializing` record it finds (with an `info!`
-  log). If a race lets one through, `finalize` refuses with an
-  `InvalidInput` fault ("session is Materializing but has no
+  produces is persisted to a `composition.json` sidecar alongside
+  `record.json` so a restart can restore it for `Active` sessions.
+  But a `Materializing` record means the patches upload hasn't
+  completed — the sidecar exists but the patches marker doesn't,
+  so `Manager::init` runs `reap_unresumable_records` at startup and
+  deletes any `Pending` or `Materializing` record it finds (with an
+  `info!` log). If a race lets one through, `finalize` refuses with
+  an `InvalidInput` fault ("session is Materializing but has no
   in-memory composition") so the operator sees the problem
   instead of silently attaching to an empty-home shell.
 - **Patches unpack is atomic; the marker is the precondition.**
