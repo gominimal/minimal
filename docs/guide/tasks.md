@@ -41,6 +41,11 @@ env_vars.RAILS_ENV = "production"
 env_vars.GITHUB_TOKEN = { inherit = true }
 ```
 
+`inherit = true` copies the value from your host environment into the task's
+sandbox, where every command the task runs can read it — including scripts the
+repository itself provides. Inherit sparingly, and prefer scoped, short-lived
+tokens over long-lived ambient credentials.
+
 ## Mapping host files
 
 Use `patches` to give a task access to specific files or directories on the host:
@@ -49,7 +54,11 @@ Use `patches` to give a task access to specific files or directories on the host
 [tasks.deploy]
 packages = ["railway"]
 exec = "railway up"
-patches.dir."~/.config/railway" = "read-write"
+patches.dir."~/.config/railway" = "read-only"
 ```
+
+Map host files `read-only` unless the task genuinely needs to write them: a
+`read-write` mapping lets anything the task runs modify those host files in
+place.
 
 See the [tasks reference](../reference/tasks.md) for the full schema.

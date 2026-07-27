@@ -55,6 +55,15 @@ Environment variables can be inherited from the host as well, under `[session.va
 ANTHROPIC_API_KEY = { inherit = true }
 ```
 
+Anything you pass through is available to the agent and to any code it runs: a
+patched `~/.ssh` means the agent can use your SSH keys, and an inherited
+`ANTHROPIC_API_KEY` is readable by every process in the session. Pass through
+the minimum the agent needs, and prefer scoped or short-lived credentials over
+long-lived ones. Activation helps you hold this line: each value inherited from
+your environment and each file patch is gated against your user policy, and
+anything your policy cannot decide is surfaced for approval before it enters
+the session.
+
 ## Why sandbox agents?
 
 Running an AI agent in a Minimal session means it can only access the tools and files you declare. It cannot install arbitrary software, read unrelated files, or modify your system. This is the same isolation model that Minimal applies to builds and dev shells, applied to agents.
