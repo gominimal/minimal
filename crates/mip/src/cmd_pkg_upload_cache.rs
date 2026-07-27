@@ -5,13 +5,16 @@ use ot::OpTracker;
 use std::sync::mpsc::channel;
 use tracing::info;
 
-#[derive(clap::Args)]
-pub struct UploadArgs {
+#[derive(Debug, clap::Args)]
+pub struct PkgUploadCacheArgs {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args=0..)]
     packages: Vec<String>,
 }
 
-pub async fn cmd_upload_cache(args: UploadArgs, ctx: &mut Context) -> Result<(), Error> {
+pub async fn cmd_pkg_upload_cache(
+    args: PkgUploadCacheArgs,
+    ctx: &mut Context,
+) -> Result<(), Error> {
     let op_root = ctx.op_tracker();
     let graph = if !args.packages.is_empty() {
         ctx.graph_from_package_names(args.packages.clone())?

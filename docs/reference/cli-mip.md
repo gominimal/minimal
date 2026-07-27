@@ -47,17 +47,6 @@ mip run [OPTIONS] --upstream <upstream> --task-spec <task_spec> [task_args]...
 | `--upstream <JSON>` | JSON stanza specifying the software supply chain; must be used with `--task-spec` |
 | `--task-spec <JSON>` | JSON stanza specifying a task inline; must be used with `--upstream` |
 
-### `shell`, `build`, `test`
-
-```
-mip shell
-mip build
-mip test
-```
-
-Shorthands for `mip run shell`, `mip run build`, and `mip run test`
-respectively. `shell` launches a development shell. *(Linux only)*
-
 ### `update`
 
 ```
@@ -117,10 +106,15 @@ Supported output types include `oci-image`, a Linux OCI image archive
 containing the configured packages, suitable for `docker load` or pushing
 to a registry.
 
-### `package` (alias: `pkg`)
+### `package` (aliases: `pkg`, `packages`)
+
+Package-level operations. Takes a subcommand; see `package build` and
+`package dep` below.
+
+#### `package build`
 
 ```
-mip package [OPTIONS] [PACKAGES]...
+mip package build [OPTIONS] [PACKAGES]...
 ```
 
 Builds the specified package(s) in a clean room, making them available in
@@ -130,6 +124,30 @@ the local cache.
 |------|-------|-------------|
 | `--verbose` | `-v` | Log stdout/stderr during the build |
 | `--rebuild` | | Always build the specified packages, even if they are already available |
+
+#### `package dep`
+
+```
+mip package dep [OPTIONS] [PACKAGES]...
+```
+
+Generates Graphviz source code of the dependency graph, e.g.
+`mip package dep --input-deps-depth=0 | dot -Tpng > deps.png`.
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--excludes <PKGS>` | `-e` | | Packages left out of the graph and not traversed |
+| `--build-spec-deps <BOOL>` | | `true` | Include build spec `build_deps` (does not affect runtime deps) |
+| `--source-deps <BOOL>` | | `false` | Include source code `build_deps` |
+| `--local-deps <BOOL>` | | `false` | Include local (`build.sh`) input deps |
+| `--needs <BOOL>` | | `false` | Include "Needs" nodes and edges |
+| `--provides <BOOL>` | | `false` | Include "Provides" edges and "Needs" nodes |
+| `--bootstrap <BOOL>` | | `false` | Include replace-on-cycle/prebuilts/bootstrap |
+| `--subtrees-only <BOOL>` | | `false` | Require non-zero subtree deps for runtime/input deps |
+| `--input-deps-depth <N>` | | `-1` | How deeply input dependencies are followed (`-1` = all) |
+| `--runtime-deps-depth <N>` | | `-1` | How deeply runtime dependencies are followed (`-1` = all) |
+| `--prune-edgeless <BOOL>` | | `false` | Discard graph nodes with no edges |
+| `--output-format <FMT>` | | `dot` | Output format: `dot` or `mermaid` |
 
 ### `cache clean`
 
@@ -164,30 +182,6 @@ Validates minimal configuration including packages, stacks, and profiles.
 
 If no type flags are specified, all types are checked. If filter names
 are given, any package, stack, or profile matching a name is checked.
-
-### `dep`
-
-```
-mip dep [OPTIONS] [PACKAGES]...
-```
-
-Generates Graphviz source code of the dependency graph, e.g.
-`mip dep --input-deps-depth=0 | dot -Tpng > deps.png`.
-
-| Flag | Short | Default | Description |
-|------|-------|---------|-------------|
-| `--excludes <PKGS>` | `-e` | | Packages left out of the graph and not traversed |
-| `--build-spec-deps <BOOL>` | | `true` | Include build spec `build_deps` (does not affect runtime deps) |
-| `--source-deps <BOOL>` | | `false` | Include source code `build_deps` |
-| `--local-deps <BOOL>` | | `false` | Include local (`build.sh`) input deps |
-| `--needs <BOOL>` | | `false` | Include "Needs" nodes and edges |
-| `--provides <BOOL>` | | `false` | Include "Provides" edges and "Needs" nodes |
-| `--bootstrap <BOOL>` | | `false` | Include replace-on-cycle/prebuilts/bootstrap |
-| `--subtrees-only <BOOL>` | | `false` | Require non-zero subtree deps for runtime/input deps |
-| `--input-deps-depth <N>` | | `-1` | How deeply input dependencies are followed (`-1` = all) |
-| `--runtime-deps-depth <N>` | | `-1` | How deeply runtime dependencies are followed (`-1` = all) |
-| `--prune-edgeless <BOOL>` | | `false` | Discard graph nodes with no edges |
-| `--output-format <FMT>` | | `dot` | Output format: `dot` or `mermaid` |
 
 ### `completions`
 
