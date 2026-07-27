@@ -116,6 +116,10 @@ that may not be present on every machine.
 
 ### Lifecycle hooks
 
+> **Coming soon.** Lifecycle hooks are not yet live: a hook declared in a
+> loadout is accepted, but the current release excludes it from composition
+> and nothing executes it. The declaration format below is what will ship.
+
 Hooks are scripts declared to run at session transition points: `on_activate`
 when the session comes up, `on_destroy` when it is torn down, and `on_failure`
 when activation fails. Declare them to warm a cache, fetch grammars, or clean
@@ -127,9 +131,7 @@ description = "warm the grammar cache"
 on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || true" }
 ```
 
-Hooks from every applied loadout concatenate in declaration order. Note that
-in the current release hooks are composed and recorded with the session, but
-executing them is not yet wired up.
+Hooks from every applied loadout concatenate in declaration order.
 
 ### A complete example
 
