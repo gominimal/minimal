@@ -20,6 +20,7 @@ pub mod net;
 pub(crate) mod rpc_client;
 pub mod sock;
 pub mod state;
+pub mod timekeep;
 pub mod vm;
 pub mod volume;
 

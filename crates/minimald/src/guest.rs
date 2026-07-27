@@ -672,66 +672,63 @@ fn clock_step_target(host_ns: u64, guest_ns: u64) -> Option<nix::sys::time::Time
     ))
 }
 
-/// Listens forever for host time updates and steps the guest's `CLOCK_REALTIME`
-/// onto the host's whenever the two have drifted apart.
+/// Vsock port the guest listens on for host time updates (see
+/// [`run_timekeep_listener`]).
 ///
-/// This is the guest half of libkrun's timesync worker
-/// ([`timesync.rs`](https://github.com/containers/libkrun/blob/main/src/devices/src/virtio/vsock/timesync.rs)),
-/// which libkrun initializes on macOS hosts only. It sends an AF_VSOCK
-/// **datagram** — eight bytes, the host's nanoseconds since the epoch, little
-/// endian — to a fixed port (123) every 60 s, and immediately after it notices
-/// the host slept. Without this the guest clock stops for the duration of a
-/// host suspend and every later timestamp is wrong: TLS handshakes fail on
-/// not-yet-valid certificates and build systems see sources "from the future".
+/// Sits next to [`BOOT_MARKER_PORT`] (7350) in the same private range. The host
+/// half in `minvmd` must register a bridge to this port, so the value is
+/// mirrored there — keep the two in step.
+pub const TIMEKEEP_PORT: u32 = 7351;
+
+/// How long a host timekeeper connection may stay silent before the guest
+/// treats it as dead. Several times the host's 60 s heartbeat, so an idle
+/// window this long means the peer is gone, not slow.
 ///
-/// Runs until the socket fails, hence the [`Infallible`] success type: every
-/// `Ok` path loops. Callers spawn it and log the error. Malformed datagrams
-/// (anything but exactly 8 bytes) are skipped, not fatal — one bad packet is
-/// not a reason to stop tracking the host clock.
+/// Connections are served one at a time, so this is what stops a peer that
+/// vanished *without* closing — a wedged bridge, a host end that never sends a
+/// FIN — from parking the listener in `read_exact` forever while the host's
+/// reconnect waits unaccepted in the backlog, leaving the guest clock
+/// uncorrected for the life of the VM.
+const TIMEKEEP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Serves one host timekeeper connection: a stream of 8-byte little-endian
+/// nanosecond-since-epoch stamps, each applied to the guest clock as it
+/// arrives. Returns `Ok(())` on a clean end-of-stream (including a half-frame
+/// at EOF, which just means the host closed mid-write) and after `idle_timeout`
+/// of silence — both mean "done with this peer, go accept the next".
 ///
-/// [`AsyncFd`]: tokio::io::unix::AsyncFd
-/// [`Infallible`]: std::convert::Infallible
-pub async fn run_timekeep_listener(port: u32) -> std::io::Result<std::convert::Infallible> {
-    use nix::sys::socket::{AddressFamily, MsgFlags, SockFlag, SockType, bind, recv, socket};
+/// `idle_timeout` is a parameter rather than a read of
+/// [`TIMEKEEP_IDLE_TIMEOUT`] so a test can drive the timeout path in
+/// milliseconds; the listener always passes the constant.
+///
+/// `warned_settime` is threaded from the accept loop so the `CAP_SYS_TIME`
+/// warning stays one-shot across reconnects rather than per connection.
+async fn serve_time_updates<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    idle_timeout: Duration,
+    warned_settime: &mut bool,
+) -> std::io::Result<()> {
     use nix::time::{ClockId, clock_gettime, clock_settime};
-    use std::os::fd::AsRawFd as _;
-    use tokio::io::unix::AsyncFd;
-    use tokio_vsock::VMADDR_CID_ANY;
+    use tokio::io::AsyncReadExt as _;
 
-    // Non-blocking from birth: `AsyncFd` only reports readiness, the recv below
-    // is ours to issue, and a blocking one would stall a runtime worker.
-    let sock = socket(
-        AddressFamily::Vsock,
-        SockType::Datagram,
-        SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
-        None,
-    )?;
-    // The host addresses the guest by its own CID, which the guest does not need
-    // to know: `VMADDR_CID_ANY` binds the port on whatever CID we were given.
-    bind(sock.as_raw_fd(), &VsockAddr::new(VMADDR_CID_ANY, port))?;
-    let sock = AsyncFd::new(sock)?;
-    tracing::info!(port, "listening for host time updates on vsock");
-
-    // `clock_settime` needs CAP_SYS_TIME. The microVM's pid-1 has it, but a
-    // native daemon handed --timekeep-listener-port may not, and updates arrive
-    // every 60s — warn on the first denial and stay quiet after that.
-    let mut warned_settime = false;
-
+    let mut buf = [0u8; 8];
     loop {
-        let mut ready = sock.readable().await?;
-        let mut buf = [0u8; 8];
-        let received = match ready.try_io(|sock| {
-            recv(sock.as_raw_fd(), &mut buf, MsgFlags::empty()).map_err(std::io::Error::from)
-        }) {
-            // Spurious readiness; `try_io` cleared it, so wait for the next.
-            Err(_would_block) => continue,
-            Ok(Ok(n)) => n,
+        match tokio::time::timeout(idle_timeout, reader.read_exact(&mut buf)).await {
+            Ok(Ok(_)) => {}
+            // Clean close, or a truncated final frame — either way the host is
+            // done talking; the accept loop waits for the next connection.
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Ok(Err(e)) => return Err(e),
-        };
-        if received != 8 {
-            tracing::warn!(received, "ignoring malformed time update");
-            continue;
+            // Silent for several heartbeats: drop this connection (any partial
+            // frame with it) so a reconnect can be accepted.
+            Err(_elapsed) => {
+                tracing::debug!(
+                    timeout_s = idle_timeout.as_secs(),
+                    "no host time update within the idle window; dropping the connection"
+                );
+                return Ok(());
+            }
         }
 
         let host_ns = u64::from_le_bytes(buf);
@@ -746,10 +743,10 @@ pub async fn run_timekeep_listener(port: u32) -> std::io::Result<std::convert::I
         match clock_settime(ClockId::CLOCK_REALTIME, host_ts) {
             Ok(()) => {
                 tracing::info!(drift_ns, "stepped the guest clock onto the host's");
-                warned_settime = false;
+                *warned_settime = false;
             }
-            Err(e) if !warned_settime => {
-                warned_settime = true;
+            Err(e) if !*warned_settime => {
+                *warned_settime = true;
                 tracing::warn!(
                     error = %e,
                     drift_ns,
@@ -758,6 +755,65 @@ pub async fn run_timekeep_listener(port: u32) -> std::io::Result<std::convert::I
                 );
             }
             Err(e) => tracing::debug!(error = %e, drift_ns, "could not set the guest clock"),
+        }
+    }
+}
+
+/// Listens forever for host time updates and steps the guest's `CLOCK_REALTIME`
+/// onto the host's whenever the two have drifted apart.
+///
+/// The guest clock only advances while the VM is scheduled, so it stops for the
+/// duration of a host suspend and every later timestamp is wrong: TLS
+/// handshakes fail on not-yet-valid certificates and build systems see sources
+/// "from the future". This listener is the repair.
+///
+/// **Wire protocol.** The guest *listens* on a vsock **stream** at `port`
+/// (`VMADDR_CID_ANY`, so it needs no knowledge of its own CID) and the host
+/// dials in — the same direction as the SSH bridge, and the reason this is a
+/// stream socket: AF_VSOCK **datagrams** do not exist on a stock kernel's
+/// virtio-vsock transport. They are a libkrun/TSI extension carried by the
+/// patched kernel libkrun ships, which we do not boot — the original design
+/// took libkrun's timesync worker
+/// ([`timesync.rs`](https://github.com/containers/libkrun/blob/main/src/devices/src/virtio/vsock/timesync.rs))
+/// at its word and bound `SOCK_DGRAM` on port 123, which can never receive
+/// anything under our guest kernel. A stream listener works on any kernel with
+/// vsock + virtio, at the cost of owning the host half ourselves (in `minvmd`).
+///
+/// Each update is 8 bytes: the host's nanoseconds since the epoch, little
+/// endian (libkrun's payload, kept). A connection carries any number of them
+/// back to back, so the host may hold one long-lived connection and write every
+/// 60 s, or dial per update; both work. Connections are served one at a time —
+/// there is a single host timekeeper, and serializing keeps the clock updates
+/// ordered.
+///
+/// Runs until the listening socket fails, hence the [`Infallible`] success
+/// type: every `Ok` path loops. Callers spawn it and log the error. A failure
+/// on an accepted connection ends only that connection.
+///
+/// [`Infallible`]: std::convert::Infallible
+pub async fn run_timekeep_listener(port: u32) -> std::io::Result<std::convert::Infallible> {
+    use tokio_vsock::{VMADDR_CID_ANY, VsockListener};
+
+    let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port))?;
+    tracing::info!(port, "listening for host time updates on vsock");
+
+    // `clock_settime` needs CAP_SYS_TIME. The microVM's pid-1 has it, but a
+    // native daemon handed --timekeep-listener-port may not, and updates arrive
+    // every 60s — warn on the first denial and stay quiet after that.
+    let mut warned_settime = false;
+
+    loop {
+        let (mut stream, peer) = listener.accept().await?;
+        tracing::debug!(
+            cid = peer.cid(),
+            port = peer.port(),
+            "host timekeeper connected"
+        );
+        match serve_time_updates(&mut stream, TIMEKEEP_IDLE_TIMEOUT, &mut warned_settime).await {
+            Ok(()) => tracing::debug!("host timekeeper disconnected"),
+            // One bad connection is not a reason to stop tracking the host
+            // clock: drop it and wait for the host to dial again.
+            Err(e) => tracing::warn!(error = %e, "host time update stream failed"),
         }
     }
 }
@@ -1094,16 +1150,60 @@ mod tests {
         assert_eq!(step.tv_nsec(), 999_999_999);
     }
 
-    /// The wire format libkrun's timesync worker writes: 8 bytes, little
-    /// endian, nanoseconds since the epoch.
+    /// The wire format of one update frame: 8 bytes, little endian,
+    /// nanoseconds since the epoch (libkrun's payload, kept when the transport
+    /// moved from a TSI datagram to a plain vsock stream).
     #[test]
-    fn a_time_update_datagram_decodes_little_endian() {
+    fn a_time_update_frame_decodes_little_endian() {
         let host_ns = 1_700_000_000 * NANOS_IN_SECOND + 123_456_789;
         assert_eq!(u64::from_le_bytes(host_ns.to_le_bytes()), host_ns);
         assert_eq!(
             u64::from_le_bytes([0x15, 0xcd, 0x5b, 0x07, 0x00, 0x00, 0x00, 0x00]),
             123_456_789,
         );
+    }
+
+    /// A connection carries back-to-back frames and ends cleanly at EOF —
+    /// including on a truncated final frame, which only means the host closed
+    /// mid-write.
+    ///
+    /// The stamps written are the guest's own current time, i.e. zero drift, so
+    /// the loop takes the no-step path: a test must never actually call
+    /// `clock_settime` (running as root, it would step the machine's clock).
+    #[tokio::test]
+    async fn a_stream_of_updates_is_read_frame_by_frame_to_eof() {
+        use nix::time::{ClockId, clock_gettime};
+
+        let now = clock_gettime(ClockId::CLOCK_REALTIME).unwrap();
+        let now_ns = now.tv_sec() as u64 * NANOS_IN_SECOND + now.tv_nsec() as u64;
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&now_ns.to_le_bytes());
+        stream.extend_from_slice(&now_ns.to_le_bytes());
+        // A half-written final frame: EOF mid-frame is a clean end, not an error.
+        stream.extend_from_slice(&now_ns.to_le_bytes()[..3]);
+
+        let mut warned = false;
+        serve_time_updates(&mut stream.as_slice(), TIMEKEEP_IDLE_TIMEOUT, &mut warned)
+            .await
+            .expect("a truncated trailing frame ends the stream cleanly");
+        assert!(!warned, "an in-threshold update never touches the clock");
+    }
+
+    /// A peer that goes silent without closing must not hold the listener:
+    /// connections are served one at a time, so the idle timeout is what lets
+    /// the host's reconnect be accepted. Driven with a millisecond window —
+    /// the timeout is a parameter precisely so this costs no wall-clock time.
+    #[tokio::test]
+    async fn a_silent_connection_is_dropped_after_the_idle_window() {
+        // `_writer` stays alive for the whole test: the stream is open and
+        // idle, which is the case under test — not EOF.
+        let (_writer, mut reader) = tokio::io::duplex(64);
+
+        let mut warned = false;
+        serve_time_updates(&mut reader, Duration::from_millis(10), &mut warned)
+            .await
+            .expect("an idle connection ends cleanly, like EOF");
     }
 
     #[test]
