@@ -794,7 +794,8 @@ remove_renamed_gvproxy() {
     _tab="$(printf '\t')"
     while IFS="$_tab" read -r _comp _dest _ _want; do
         [ "$_comp" = gvproxy ] || continue
-        [ -n "$_dest" ] && [ -f "$_dest" ] || continue
+        [ -n "$_dest" ] || continue
+        [ -f "$_dest" ] || continue
         # A symlink row, or one we did not write, is not ours to remove.
         [ -L "$_dest" ] && continue
         case "$_want" in link:*) continue ;; esac
