@@ -4,11 +4,12 @@ description: What a Minimal session is, how a provider creates and hosts one, an
 
 # Sessions
 
-A **session** is Minimal's isolated developer environment: a sandboxed place to
+A **session** is Minimal's isolated developer environment: a durable place to
 work on a project, with exactly the tools and configuration that project
 declares, and nothing else from your host leaking in unless you allow it. You
 create a session for a project, attach a shell to it, and do your work inside
-it. When you are done you tear it down.
+it; detach and the session keeps running in the background, ready to rejoin.
+When you are done you tear it down.
 
 Sessions are managed by `min`, the Minimal session CLI. This guide explains
 what a session is, the provider that hosts it, how one is created and entered,
@@ -25,18 +26,23 @@ each project its own isolated environment:
 - **Reproducible.** A session's tools come from Minimal packages, built or
   fetched deterministically from your project's declarative config. Two people
   who activate the same project get the same environment.
-- **Isolated.** The session runs in a sandbox. Your host filesystem, host
-  environment, and other projects are not visible inside it unless the project
-  or your policy brings them in.
+- **Isolated.** Everything that runs in a session runs in a sandbox. Your
+  host filesystem, host environment, and other projects are not visible inside
+  it unless the project or your policy brings them in.
 - **Declarative.** What a session contains is derived from files you commit
   (your `minimal.toml` and the packages it references), not from setup steps you
   run by hand and hope to remember.
+
+Declarative does not mean one-size-fits-all: **loadouts** let you bring your
+own tools — your editor, your shell configuration — into a session without
+those personal choices contaminating the project's declared environment. See
+the [loadouts guide](./loadouts.md).
 
 ## The provider and session model
 
 Two roles are in play whenever you use sessions:
 
-- A **session** is the isolated environment itself: a single sandboxed
+- A **session** is the durable environment itself: a single isolated
   workspace tied to one project directory.
 - A **provider** is the daemon that creates and hosts sessions. On Linux the
   provider is `minimald`, an SSH server that owns session lifecycle and hosts
@@ -85,6 +91,9 @@ Useful activation options:
 - `--network <MODE>` selects the network mode: `no-net`, `host-net` (the
   default), or `own-ip` (a dedicated IP on Minimal's virtual subnet). With
   `own-ip` you can also publish `--ingress EXT:INT[/PROTO]` port mappings.
+  Platform support is still uneven: `own-ip` does not currently work with the
+  native Linux provider, and on macOS `host-net` carries outbound traffic
+  only, because the session lives inside a VM.
 - `--loadout <NAME>` applies a named loadout (repeatable); `--no-loadouts`
   applies none.
 - `--no-prompt` fails instead of prompting when composition surfaces items your
@@ -143,9 +152,10 @@ assembled into the final composition. The result carries four kinds of item:
 - **Variables**: environment variables set inside the session.
 - **File patches**: files copied into the session's home when it is finalized.
 - **Packages**: the tools and libraries that make up the environment.
-- **Lifecycle hooks**: scripts declared to run at defined points. Hooks are
-  composed and recorded today; executing them is not yet wired up in the
-  current release.
+- **Lifecycle hooks**: scripts declared to run at defined points in a
+  session's life. Hooks are inert in the current release: a hook declared in
+  a project's `[session]` block is composed but never executed, and hooks
+  declared in loadouts are excluded from composition entirely.
 
 A key principle: **your user policy is enforced only on the client.** The
 provider never runs your policy. It forwards the items that need a decision, and
@@ -193,7 +203,7 @@ Stop the provider itself:
 $ min stop
 ```
 
-`min stop` shuts down the `minimald` provider daemon. Stopping the provider ends
+`min stop` shuts down the active provider. Stopping the provider ends
 every running shell, but the sessions themselves survive: their records and
 workspaces persist, and a provider that comes back up re-hosts them (the extras
 composed from loadouts are rebuilt when you re-activate). The provider refuses
@@ -232,7 +242,9 @@ reproducibility are actually delivered.
 defines in its `minimal.toml`: a named, repeatable operation (a build step, a
 test run, a linter) that executes in a freshly composed sandbox built from the
 packages that task needs. If a needed package is not present, Minimal builds it
-or fetches it from a remote cache first. Running `min attach -c 'min run
+or fetches it from a remote cache first. Loadouts contribute to the session's
+interactive shell only, never to tasks, so your personal tooling cannot
+influence a task's deterministic execution. Running `min attach -c 'min run
 <task>'` is the non-interactive way to trigger a declared task against a
 session; arbitrary commands need an interactive shell.
 
