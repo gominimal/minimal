@@ -26,7 +26,7 @@ native-dir   := scratch / "native-state"
 # covers the rest. The Linux lanes run nextest's ci profile; macOS has none.
 scope      := if os() == "macos" { "-p minvmd -p sessions" } else { "--workspace" }
 ci-profile := if os() == "macos" { "" } else { "--profile ci" }
-e2e-env    := "E2E_VM=1 E2E_PROJECT_DIR=/tmp" + if os() == "linux" { " E2E_MINIMAL_ARGS=--minvmd" } else { "" }
+e2e-env    := "E2E_VM=1 E2E_PROJECT_DIR=/tmp" + if os() == "linux" { " E2E_MINIMAL_ARGS='--provider local-minvmd'" } else { "" }
 
 # Shared dev-stack env: target/debug on PATH so autospawn finds sibling
 # binaries; MINVMD_* are inert outside the VM recipes. 150s timeouts: the
@@ -37,7 +37,6 @@ export LD_LIBRARY_PATH := krun-prefix + if env('LD_LIBRARY_PATH', '') == '' { ''
 export MINVMD_KERNEL_PATH := kernel
 export MINVMD_ROOTFS_PATH := rootfs
 export MINVMD_INITRAMFS := initramfs
-export MINVMD_BOOT_LOG := scratch / "boot.log"
 export MINVMD_READY_TIMEOUT_SECS := env('MINVMD_READY_TIMEOUT_SECS', '150')
 export MINIMAL_SPAWN_TIMEOUT_SECS := env('MINIMAL_SPAWN_TIMEOUT_SECS', '150')
 export MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS := env('MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS', '150')
@@ -111,7 +110,7 @@ env:
     @printf 'export %s="%s"\n' \
       PATH "$PATH" LD_LIBRARY_PATH "$LD_LIBRARY_PATH" \
       MINVMD_KERNEL_PATH "$MINVMD_KERNEL_PATH" MINVMD_ROOTFS_PATH "$MINVMD_ROOTFS_PATH" \
-      MINVMD_INITRAMFS "$MINVMD_INITRAMFS" MINVMD_BOOT_LOG "$MINVMD_BOOT_LOG" \
+      MINVMD_INITRAMFS "$MINVMD_INITRAMFS" \
       MINVMD_GVPROXY_BIN "{{gvproxy}}" \
       MINVMD_READY_TIMEOUT_SECS "$MINVMD_READY_TIMEOUT_SECS" \
       MINIMAL_SPAWN_TIMEOUT_SECS "$MINIMAL_SPAWN_TIMEOUT_SECS"
@@ -131,11 +130,19 @@ stop:
 
 # Remove the bring-up artifacts this justfile manages (never all of .scratch).
 clean:
-    rm -f {{kernel}} {{rootfs}} {{initramfs}} {{gvproxy}} {{scratch}}/boot.log
+    rm -f {{kernel}} {{rootfs}} {{initramfs}} {{gvproxy}}
 
 # Kill THIS checkout's stranded VM processes (they wedge the next VM's vsock bridge).
 reap:
     scripts/reap-vms.sh
+
+# Run before landing a guest-kernel bump (the `virtio-linux` version in pkgs, or
+# the `locked_commit` that pulls it in): stable-tree commits touching vsock,
+# virtio and the guest console — the surface the guest control plane rides on.
+# `just kernel-review --pkgs ~/code/pkgs` reads both versions from a checkout.
+# Review a guest-kernel bump (`just kernel-review 6.12.43 6.12.94`). Needs `gh`.
+kernel-review *args:
+    scripts/kernel-bump-review.sh {{args}}
 
 # ── CI-parity gates ──────────────────────────────────────────────────────────
 
@@ -147,6 +154,15 @@ _nextest: (_need "cargo-nextest" "cargo install cargo-nextest --locked")
 
 # Apply rustfmt across the workspace (the fixer for a red `just fmt-check`).
 fmt:
+    cargo fmt --all
+
+# Autofix pass: fmt, clippy --fix, fmt again. Clippy's `--fix` can shuffle
+# whitespace during its rewrites, so the trailing `cargo fmt` normalizes
+# whatever landed. `--allow-dirty` skips the clean-worktree check — the
+# usual case here is running mid-edit with staged/unstaged work.
+fix:
+    cargo fmt --all
+    cargo clippy {{scope}} --all-targets --fix --allow-dirty -- -D warnings
     cargo fmt --all
 
 # CI: ci.yml `fmt`.
@@ -162,6 +178,21 @@ clippy:
 # CI: ci.yml `cargo-deny` (advisories/bans/licenses/sources).
 deny: (_need "cargo-deny" "cargo install cargo-deny --locked")
     cargo deny --all-features check
+
+# The declared MSRV floor (`package.rust-version` in the root Cargo.toml, inherited
+# by every crate) still type-checks. cargo-hack drives the check against the
+# declared version; the toolchain the check runs under is fetched by rustup.
+# CI: nightly-tests.yml `msrv` (blocking).
+msrv: (_need "cargo-hack" "cargo install cargo-hack --locked")
+    cargo hack check --rust-version --workspace --all-targets --locked
+
+# miri on `switch` — the vsock/subnet/MAC primitives (docs/ci-strategy.md §6
+# "vsock framing"). Zero deps + pure integer/IP tests, so it compiles and
+# interprets under miri in seconds. Needs the nightly toolchain + miri component:
+#   rustup toolchain install nightly && rustup +nightly component add miri
+# CI: nightly-tests.yml `miri` (non-blocking). Widen the set as more crates prove clean.
+miri:
+    cargo +nightly miri test -p switch
 
 # Unit + in-process integration tests. CI: every lane's core-tests suite.
 test: _nextest
@@ -216,6 +247,26 @@ test-installer:
         echo "== running install_test.sh under $sh =="
         SH="$sh" "$sh" scripts/install_test.sh
     done
+
+# Shellcheck EVERY script under scripts/ (not just the installer's two files).
+# The reviewed harness the frozen ci-shell-installer.yml can't widen to; CI runs
+# the same check through crates/common/tests/shell_lint.rs (part of `just test`).
+lint-shell:
+    bash scripts/lint-shell.sh
+
+# Run the promotion provenance gate's test harness (stubbed `gh`, no network,
+# no auth); shellcheck runs when present.
+test-promote-gate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v shellcheck >/dev/null 2>&1; then
+        echo "== shellcheck =="
+        shellcheck scripts/verify-nightly-provenance.sh scripts/verify-nightly-provenance_test.sh
+    else
+        echo "== shellcheck not found, skipping static check =="
+    fi
+    echo "== running verify-nightly-provenance_test.sh =="
+    bash scripts/verify-nightly-provenance_test.sh
 
 # ── VM & e2e surfaces ────────────────────────────────────────────────────────
 
@@ -291,17 +342,32 @@ test-lifecycle: (_need "jq" "brew install jq (or apt install jq)") _kvm artifact
 
 # Reaps between iterations — this WILL kill this checkout's live dev stack each pass.
 #
-# Nightly soak parity: N session-e2e reps (nightly-tests.yml runs 10).
+# Nightly soak parity: N session-e2e reps (nightly-tests.yml runs 10), then `just bulk-upload`.
 soak n="10": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/soak-session-e2e.sh {{n}} "{{scratch}}/soak-logs"
+
+# Each pass uploads a 49 MiB project (~13 MB on the wire) and destroys its session.
+#
+# Bulk host→guest upload proof (#869): N `min activate`s of a large, compressible project.
+bulk-upload n="5": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
+    {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/bulk-upload-e2e.sh {{n}}
+
+# Mints N sessions CONCURRENTLY against one daemon (vs. the soak's N-serial reps),
+# then bulk-tears-down — the supervision-under-load surface of ci-strategy §6.
+#
+# Concurrency stress proof. CI: a non-fatal step in nightly-tests.yml `session-e2e-soak`.
+stress n="5": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
+    {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/stress-session-e2e.sh {{n}}
 
 # ── stack bring-up ───────────────────────────────────────────────────────────
 #
 # `just up` = this host's default run mode; `just down` stops it.
 #   macOS: Linux VM over Hypervisor.framework (the only macOS mode).
 #   Linux: host-native minimald, no VM. `just up-kvm`: Linux + VM over KVM.
-# The CLI dials providers/local-0/ssh.sock in every mode; minvmd binds it
-# directly (#690), so no bridge is needed.
+# Each backend has its own provider dir: the native daemon dials
+# providers/local-minimald0/ssh.sock, the minvmd VM providers/local-minvmd0/ssh.sock
+# (minvmd binds it directly, #690, so no bridge is needed). Select the VM
+# backend with `--provider local-minvmd`.
 
 # The daemon can reset the very first connect after boot/bind; retry briefly.
 _smoke *args:
@@ -321,7 +387,7 @@ up: artifacts gvproxy initramfs minvmd-build minimal-cli && (_smoke)
 up: minimald-build minimal-cli gvproxy && (_smoke "--minimal-dir" native-dir)
     #!/usr/bin/env sh
     set -eu
-    sock="{{native-dir}}/providers/local-0/ssh.sock"
+    sock="{{native-dir}}/providers/local-minimald0/ssh.sock"
     pidf="{{scratch}}/minimald.pid"
     mkdir -p "{{native-dir}}"
     # PID files survive reboots and PIDs get reused: only trust the pidfile if
@@ -347,9 +413,9 @@ up: minimald-build minimal-cli gvproxy && (_smoke "--minimal-dir" native-dir)
 
 # Bring the stack up: native Linux + one Linux VM over KVM (stop with `just stop`).
 [linux]
-up-kvm: _kvm artifacts gvproxy initramfs minvmd-build minimal-cli && (_smoke)
+up-kvm: _kvm artifacts gvproxy initramfs minvmd-build minimal-cli && (_smoke "--provider" "local-minvmd")
     MINVMD_GVPROXY_BIN="{{gvproxy}}" "{{minvmd-bin}}" run --detach --timeout "$MINVMD_READY_TIMEOUT_SECS"
-    @echo "up-kvm: VM booted; minimald reachable at providers/local-0/ssh.sock"
+    @echo "up-kvm: VM booted; minimald reachable at providers/local-minvmd0/ssh.sock"
 
 # Stop the stack `just up` started.
 [macos]

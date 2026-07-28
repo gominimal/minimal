@@ -1,8 +1,8 @@
 [package]
 name = "args"
 version = "0.0.1"
-rust-version = "1.91"
-license = "MIT OR Apache-2.0"
+rust-version.workspace = true
+license.workspace = true
 edition.workspace = true
 publish.workspace = true
 

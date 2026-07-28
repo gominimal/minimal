@@ -25,7 +25,6 @@ use paths::DaemonAbsPath;
 use russh::keys::ssh_key;
 use sessions::SessionId;
 use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 use minimald_rpc::OneshotSshRpc;
@@ -59,7 +58,7 @@ impl TestServer {
             in_microvm: false,
             state_volume_mounted: false,
         };
-        let state = ServerStateHandle::new(config).await.unwrap();
+        let state = ServerStateHandle::new(config, None).await.unwrap();
 
         let host_key = state.host_key().await.unwrap();
         let russh_config = Arc::new(russh::server::Config {
@@ -150,7 +149,7 @@ impl TestServer {
     }
 
     /// Seed a project mfile into a session's daemon-side workspace,
-    /// standing in for the client's workspace upload.
+    /// standing in for the client's `WorkspaceFilesTarZst` upload.
     ///
     /// The composer reads a session's project config out of its workspace,
     /// never from the record's `project_path` — that's a path on the
@@ -209,17 +208,34 @@ impl TestClient {
     /// Panics on any transport or codec failure — appropriate for unit
     /// tests, which want loud failure rather than recovery.
     pub async fn call<R: OneshotSshRpc>(&mut self, req: &R::Request<'_>) -> R::Response {
-        let channel = self.handle.channel_open_session().await.unwrap();
-        channel.request_subsystem(false, R::NAME).await.unwrap();
+        let mut channel = self.handle.channel_open_session().await.unwrap();
+        channel.request_subsystem(true, R::NAME).await.unwrap();
 
         let body = serde_json::to_vec(req).expect("request serializes");
-        let mut stream = channel.into_stream();
-        stream.write_all(&body).await.unwrap();
-        stream.shutdown().await.unwrap();
+        channel.data_bytes(body).await.unwrap();
+        channel.eof().await.unwrap();
 
-        let mut response_buf = Vec::with_capacity(1024);
-        stream.read_to_end(&mut response_buf).await.unwrap();
-        serde_json::from_slice(&response_buf).expect("response deserializes")
+        let mut resp_buf = Vec::with_capacity(1024);
+        let mut err_buf = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { data } => resp_buf.extend_from_slice(&data),
+                russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                    err_buf.extend_from_slice(&data)
+                }
+                _ => {}
+            }
+        }
+
+        if !err_buf.is_empty() {
+            panic!(
+                "{} RPC failed on the daemon side: {}",
+                R::NAME,
+                String::from_utf8_lossy(&err_buf)
+            );
+        }
+
+        serde_json::from_slice(&resp_buf).expect("response deserializes")
     }
 
     /// Opens an SFTP session attached to the given minimald session.
@@ -400,28 +416,33 @@ pub fn create_session_req(name: &str, project: &str) -> minimald_rpc::CreateSess
 /// for a caller that expects its contribution to compose in one shot.
 pub fn unwrap_ready(resp: minimald_rpc::ConfigureLoadoutResponse) {
     match resp {
-        minimald_rpc::ConfigureLoadoutResponse::Ready => {}
+        minimald_rpc::ConfigureLoadoutResponse::Materialized => {}
         minimald_rpc::ConfigureLoadoutResponse::Pending { .. } => {
             panic!("expected Ready variant, got Pending")
         }
     }
 }
 
-/// Drive the client half of the whole create flow — `CreateSession` plus
-/// the `ConfigureLoadout` that finalizes it — and return the session's id.
+/// Drive the client half of the whole create flow — `CreateSession`,
+/// `ConfigureLoadout`, and `FinalizeSession` — and return the
+/// session's id. The result is an `Active` session ready to attach.
 ///
-/// A session isn't usable until its loadout is configured (a `Draft` refuses
-/// attach and context creation), so any test that goes on to *use* the
-/// session wants this rather than a bare `CreateSession`. The workspace is
-/// left empty, so the loadout composes to an empty `Ready` in one shot; a
-/// test that wants a project in the mix seeds the workspace in between and
-/// calls the two RPCs itself.
+/// The workspace is left empty (so the composition has no patches
+/// and no upload is needed) and the composition itself is empty
+/// (empty client contribution + empty project mfile), so
+/// `ConfigureLoadout` returns `Materialized` in one shot and
+/// `FinalizeSession` succeeds against an empty patches dir. A test
+/// that wants a project in the mix seeds the workspace in between
+/// and drives the RPCs itself.
 pub async fn create_configured_session(
     client: &mut TestClient,
     name: &str,
     project: &str,
 ) -> SessionId {
-    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, FinalizeSession,
+        FinalizeSessionRequest,
+    };
     let id = client
         .call::<CreateSession>(&create_session_req(name, project))
         .await
@@ -436,5 +457,17 @@ pub async fn create_configured_session(
             .await
             .unwrap(),
     );
+    // Empty composition → no patches. FinalizeSession short-
+    // circuits the marker check in that case (there's nothing to
+    // upload), so calling it directly is fine.
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(_) => {}
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("FinalizeSession failed in create_configured_session: {error}");
+        }
+    }
     id
 }

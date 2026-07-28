@@ -23,8 +23,8 @@ use crate::core::source::{
 };
 use crate::wire::policy::{WirePatchVerdict, WireVarVerdict};
 use crate::wire::primitives::{
-    PendingId, WirePendingPatch, WirePendingVar, WireProvenancedHook, WireResolvedVar,
-    WireSessionPatch, WireSessionVar, WireVarSpec,
+    PendingId, WirePendingPatch, WirePendingVar, WireProvenancedHook, WireSessionPatch,
+    WireSessionVar, WireVarSpec,
 };
 
 /// Errors produced while a [`Composable`] materializes its
@@ -109,6 +109,32 @@ pub enum Conflict {
         /// contributor wanted copied.
         disagreeing_sources: Vec<(Source, String)>,
     },
+    /// Two patches want to occupy the same tree node from opposite
+    /// sides: one contributor's destination is a component-boundary
+    /// prefix of another's, so one wants to place a file where the
+    /// other expects a directory (or vice versa). Distinct
+    /// destinations, so `PatchSourceMismatch` doesn't fire — but
+    /// `materialize_patches_into_home` can't create both at Finalize
+    /// time (whichever `fs::copy` runs second fails). Caught here so
+    /// the operator gets a Compose-time error naming both
+    /// contributors instead of a mid-Finalize `NotADirectory` /
+    /// `IsADirectory` fault that leaves the session stuck in
+    /// `Materializing`.
+    PatchDestPrefixCollision {
+        /// The shorter destination — the one that would land as a
+        /// file directly under `<home>`.
+        shorter: paths::SandboxRelPath,
+        /// The longer destination, whose parent-chain includes
+        /// `shorter` as a directory.
+        longer: paths::SandboxRelPath,
+        /// The provenance of both contributors.
+        ///
+        /// Boxed to keep [`Conflict`] — and the two error enums that
+        /// embed it, [`Error`] and [`ComposeError`] — under the
+        /// `result_large_err` size threshold; this array is by far the
+        /// largest payload across every conflict variant.
+        contributors: Box<[(Source, paths::SandboxRelPath); 2]>,
+    },
 }
 
 impl fmt::Display for Conflict {
@@ -150,6 +176,27 @@ impl fmt::Display for Conflict {
                     "\nhint: add a pattern matching the conflicting source path(s) \
                      above to your patch policy's ignore list to drop both, \
                      or remove one of the contributors"
+                )
+            }
+            Self::PatchDestPrefixCollision {
+                shorter,
+                longer,
+                contributors,
+            } => {
+                write!(
+                    f,
+                    "patch destinations `{shorter}` and `{longer}` collide: \
+                     one wants a file where the other expects a directory"
+                )?;
+                for (source, dest) in contributors.iter() {
+                    write!(f, "\n  - `{dest}` (from {source})")?;
+                }
+                write!(
+                    f,
+                    "\nhint: pick destinations that don't nest — e.g. move the \
+                     file target under a distinct name, or add a pattern \
+                     matching one contributor's source to your patch policy's \
+                     ignore list to drop it"
                 )
             }
         }
@@ -223,6 +270,75 @@ fn check_patch_mismatches<'a, T: Provenanced + 'a>(
             disagreeing_sources: collect_contributions(group, &pattern),
         })
         .map_or(Ok(()), Err)
+}
+
+/// Reject two patches whose destinations are prefixes of one another
+/// on a path-component boundary — `foo` vs `foo/bar` — since
+/// `materialize_patches_into_home` can't create the shorter as a
+/// file *and* the longer as `<shorter>/<tail>`. Caught here so the
+/// operator sees a compose-time conflict listing both contributors,
+/// rather than a mid-`FinalizeSession` `NotADirectory`/`IsADirectory`
+/// I/O error that leaves the session stuck in `Materializing`.
+///
+/// O(n²) worst-case, matching the existing `check_patch_mismatches`
+/// shape — the batches this runs against are small (a few dozen at
+/// most in practice).
+fn check_patch_prefix_collisions<'a, T: Provenanced + 'a>(
+    items: impl IntoIterator<Item = &'a T> + Clone,
+    dest: impl Fn(&T) -> &paths::SandboxRelPath,
+) -> Result<(), Conflict> {
+    let all: Vec<&'a T> = items.into_iter().collect();
+    for (i, a) in all.iter().enumerate() {
+        let a_dest = dest(a);
+        for b in &all[i + 1..] {
+            let b_dest = dest(b);
+            if a_dest == b_dest {
+                // Same-destination collisions are the
+                // `PatchSourceMismatch` case: same source is a dup
+                // (fine), different source is that other conflict
+                // (fires from `check_patch_mismatches`, not here).
+                continue;
+            }
+            let (shorter, longer, shorter_src, longer_src) =
+                if is_component_prefix(a_dest.as_utf8_path(), b_dest.as_utf8_path()) {
+                    (a_dest, b_dest, a.source(), b.source())
+                } else if is_component_prefix(b_dest.as_utf8_path(), a_dest.as_utf8_path()) {
+                    (b_dest, a_dest, b.source(), a.source())
+                } else {
+                    continue;
+                };
+            return Err(Conflict::PatchDestPrefixCollision {
+                shorter: shorter.clone(),
+                longer: longer.clone(),
+                contributors: Box::new([
+                    (shorter_src.clone(), shorter.clone()),
+                    (longer_src.clone(), longer.clone()),
+                ]),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// True iff `shorter` is a component-boundary prefix of `longer`
+/// (both relative, equal-length is not a prefix — that would be
+/// same-destination, covered by `check_patch_mismatches`). Component
+/// boundary so `foo` doesn't wrongly match `foobar` (only `foo/bar`).
+fn is_component_prefix(shorter: &camino::Utf8Path, longer: &camino::Utf8Path) -> bool {
+    let mut s = shorter.components();
+    let mut l = longer.components();
+    loop {
+        match (s.next(), l.next()) {
+            // Matched component: keep comparing the rest.
+            (Some(a), Some(b)) if a == b => {}
+            // `shorter` has an unmatched component (differs here, or is
+            // the longer path), or both ran out at equal length — either
+            // way `shorter` is not a *proper* component prefix.
+            (Some(_), _) | (None, None) => return false,
+            // `shorter` ran out while `longer` has more: proper prefix.
+            (None, Some(_)) => return true,
+        }
+    }
 }
 
 /// Bucket `items` by `key`, preserving the order in which keys are
@@ -368,6 +484,32 @@ impl Contribution {
         dedupe_by_name(&mut self.packages, ProvenancedPackage::package);
         self.lifecycle_hooks.extend(other.lifecycle_hooks);
         Ok(())
+    }
+
+    /// Drop the items a *package* supplied that we refuse to compose:
+    /// every patch tagged [`Source::Package`], and every
+    /// [`Source::Package`] var that carries user data (an env-inherited
+    /// value — [`ResolvedVar::carries_user_data`]).
+    ///
+    /// A package var with a static (non-user) value, a package's request
+    /// for a package (the `packages` list), and every item from a
+    /// non-package source are all left untouched. Because vars and
+    /// patches are never deduped across sources (each contributor keeps
+    /// its own entry — see [`Self::merge`]), dropping the package's own
+    /// entry here still leaves any project- or loadout-supplied entry for
+    /// the same var name / patch destination intact: an item requested by
+    /// a package *and* something else still composes in, via that other
+    /// source.
+    ///
+    /// [`Source::Package`]: crate::core::source::Source::Package
+    /// [`ResolvedVar::carries_user_data`]: crate::core::primitives::ResolvedVar::carries_user_data
+    pub(crate) fn drop_package_supplied_patches_and_user_data_vars(&mut self) {
+        use crate::core::source::{Provenanced, Source};
+        self.patches
+            .retain(|p| !matches!(p.source(), Source::Package { .. }));
+        self.vars.retain(|v| {
+            !(matches!(v.source(), Source::Package { .. }) && v.var().carries_user_data())
+        });
     }
 
     /// True when no items have been contributed across any domain.
@@ -791,6 +933,15 @@ impl PendingVar {
         wire: WirePendingVar,
         env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
     ) -> Result<Self, ComposeError> {
+        // Preserve the `carries_user_data` bit the daemon computed.
+        // The daemon always ships pending vars as `Specified` (with
+        // the already-resolved value), so `ResolvedVar::resolve_with`
+        // alone would always return `carries_user_data = false` and
+        // the policy gate would silently skip every daemon-derived
+        // var. We OR the daemon's bit on top: if the daemon resolved
+        // an Inherit against its own env, that value crossed a trust
+        // boundary and the client should still gate it.
+        let daemon_says_carries_user_data = wire.carries_user_data;
         let resolved = ResolvedVar::resolve_with(wire.name, wire.spec.into(), env).map_err(
             |err| match err {
                 VarError::ResolutionFailure { name, source } => {
@@ -806,6 +957,16 @@ impl PendingVar {
                 },
             },
         )?;
+        // OR the two bits: user data flowed in if EITHER the daemon
+        // pulled from its env or the client's own `resolve_with`
+        // pulled from the client env. In the production path today
+        // the daemon always ships `Specified`, so the client's bit is
+        // always false and the daemon's is authoritative; the OR
+        // keeps `WirePendingVar` correct for direct-construction
+        // tests too.
+        let carries_user_data = daemon_says_carries_user_data || resolved.carries_user_data();
+        let (name, value) = resolved.into_parts();
+        let resolved = ResolvedVar::from_env_value_or_literal(name, value, carries_user_data);
         Ok(Self {
             id: wire.id,
             var: ProvenancedVar::new(resolved, wire.source.into()),
@@ -845,10 +1006,9 @@ impl PendingVar {
     #[must_use]
     pub(crate) fn into_approved_verdict(self) -> WireVarVerdict {
         let (resolved, _source) = self.var.into_parts();
-        let (name, value) = resolved.into_parts();
         WireVarVerdict::Approved {
             id: self.id,
-            value: WireResolvedVar { name, value },
+            value: resolved.into(),
         }
     }
 
@@ -893,12 +1053,17 @@ impl PendingPatchFile {
     }
 
     /// Consume and emit an Approved verdict carrying the canonical
-    /// target path back to the daemon.
+    /// target path and the client-computed per-file destination
+    /// back to the daemon. The daemon reuses `destination` verbatim
+    /// so a dir mapping's file fan-out lands at distinct sandbox
+    /// paths instead of collapsing onto the pending patch's base
+    /// dest.
     #[must_use]
     pub(crate) fn into_approved_verdict(self) -> WirePatchVerdict {
         WirePatchVerdict::Approved {
             id: self.id,
             host_path: self.file.target_path,
+            destination: self.file.dest,
         }
     }
 
@@ -1086,7 +1251,42 @@ impl Composition {
             |p| p.patch().destination(),
             |p| p.patch().host_path().as_str(),
         )?;
+        check_patch_prefix_collisions(self.patches.iter().chain(incoming_patches.iter()), |p| {
+            p.patch().destination()
+        })?;
         Ok(())
+    }
+}
+
+/// Reconstruct a [`Composition`] from a persisted
+/// [`WireComposition`](crate::wire::request::WireComposition)
+/// snapshot. The daemon writes the snapshot at composition-assembly
+/// time and reads it back at spawn-from-disk so a restart re-applies
+/// the exact composition that was approved at `min activate` time.
+///
+/// Fallible only on lifecycle hooks (a wire hook with no callbacks
+/// is rejected); vars, patches, and packages convert infallibly via
+/// their existing `From` impls.
+impl TryFrom<crate::wire::request::WireComposition> for Composition {
+    type Error = ComposeError;
+
+    fn try_from(wire: crate::wire::request::WireComposition) -> Result<Self, Self::Error> {
+        let hooks: Vec<ProvenancedHook> = wire
+            .lifecycle_hooks
+            .into_iter()
+            .map(|h| {
+                h.try_into().map_err(|e| ComposeError::InvalidWireItem {
+                    what: "lifecycle hook with no callbacks",
+                    context: format!("{e}"),
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            vars: wire.vars.into_iter().map(Into::into).collect(),
+            patches: wire.patches.into_iter().map(Into::into).collect(),
+            packages: wire.packages.into_iter().map(Into::into).collect(),
+            lifecycle_hooks: hooks,
+        })
     }
 }
 
@@ -1221,6 +1421,17 @@ pub(crate) fn gate_vars(
     let mut allowed: Vec<ProvenancedVar> = Vec::new();
     let mut unapproved: Vec<ProvenancedVar> = Vec::new();
     for pv in items {
+        // Vars whose value doesn't pull from the user's environment
+        // (hardcoded literals, or `inherit-with-default` that fell
+        // back to the default) aren't a data-leak vector, so the
+        // allow/deny/ignore rules don't apply — send straight to
+        // `allowed` without a policy check. The policy exists to
+        // gate user data crossing into the sandbox; there's no user
+        // data here.
+        if !pv.var().carries_user_data() {
+            allowed.push(pv);
+            continue;
+        }
         let name = pv.var().name().to_owned();
         match policy.check(&name, pv) {
             CheckOutcome::Decided(d) => apply_decision(d, &mut allowed, name_of, source_of)?,
@@ -1252,6 +1463,11 @@ pub(crate) fn gate_vars(
         for (pv, decision) in unapproved.into_iter().zip(decisions) {
             match decision {
                 ItemDecision::AllowOnce => allowed.push(pv),
+                // `IgnoreOnce` is the symmetric partner of `AllowOnce`:
+                // silently drop this item for this activation without
+                // adding a policy rule. Same downstream effect as a
+                // policy `ignore` match.
+                ItemDecision::IgnoreOnce => {}
                 ItemDecision::UseRule => {
                     let name = pv.var().name().to_owned();
                     match policy.check(&name, pv) {
@@ -1387,6 +1603,10 @@ pub(crate) fn gate_patches(
         for (pf, decision) in unapproved.into_iter().zip(decisions) {
             match decision {
                 ItemDecision::AllowOnce => allowed.push(pf),
+                // `IgnoreOnce` — silent drop for this activation
+                // without a policy rule. Mirrors the var-side arm
+                // above.
+                ItemDecision::IgnoreOnce => {}
                 ItemDecision::UseRule => {
                     let link = pf
                         .link_path
@@ -1484,6 +1704,7 @@ pub(crate) fn compose_contribution(
         |p| p.patch().destination(),
         |p| p.patch().host_path().as_str(),
     )?;
+    check_patch_prefix_collisions(gated_patches.iter(), |p| p.patch().destination())?;
     let final_policy = UserPolicy::empty()
         .with_vars(vars_policy)
         .with_patches(patches_policy);
@@ -1540,7 +1761,13 @@ pub(crate) fn contribution_to_pending(
         // Items reach this transform already resolved (the composer's
         // input is `ResolvedVar`); ship as a `Specified` spec so the
         // client treats the value verbatim instead of re-resolving
-        // against its env.
+        // against its env. Carry the `carries_user_data` bit
+        // separately so the client's policy gate knows whether the
+        // resolved value pulled from an environment (daemon-side
+        // env, but still a host env — the client policy applies
+        // uniformly to any env-derived value) or was a hardcoded
+        // literal / fallback default.
+        let carries_user_data = pv.var().carries_user_data();
         wire_vars.push(WirePendingVar {
             id,
             name: pv.var().name().to_string(),
@@ -1548,6 +1775,7 @@ pub(crate) fn contribution_to_pending(
                 value: pv.var().value().to_string(),
             },
             source: pv.source().clone().into(),
+            carries_user_data,
         });
         pending_vars.insert(id, pv);
     }
@@ -1616,11 +1844,15 @@ mod tests {
     }
 
     fn pv_value(name: &str, value: &str, source: Source) -> ProvenancedVar {
+        // Model an env-derived var so `carries_user_data` is true —
+        // otherwise the policy gate would auto-approve and every test
+        // that checks deny/ignore/allow semantics would trivially
+        // pass. Tests that specifically care about the
+        // hardcoded-literal path build their `ResolvedVar` directly
+        // with `VarValue::specified`.
         ProvenancedVar::new(
-            ResolvedVar::resolve_with(name.into(), VarValue::specified(value), |_| {
-                Err(std::env::VarError::NotPresent)
-            })
-            .unwrap(),
+            ResolvedVar::resolve_with(name.into(), VarValue::Inherit, |_| Ok(value.to_string()))
+                .unwrap(),
             source,
         )
     }
@@ -2773,6 +3005,106 @@ mod tests {
             }
         }
 
+        // ---------------- check_patch_prefix_collisions ----------------
+
+        #[test]
+        fn prefix_collision_sibling_dests_ok() {
+            // Nothing overlaps: two files in the same dir don't
+            // collide, they just coexist under `<home>/config/`.
+            let items = vec![
+                pp("/etc/foo", "config/foo", project_source()),
+                pp("/etc/bar", "config/bar", user_source()),
+            ];
+            assert!(
+                check_patch_prefix_collisions(&items, |p| p.patch().dest().as_sandbox_path())
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn prefix_collision_same_dest_ok() {
+            // Exact-equal destinations are the
+            // `PatchSourceMismatch` case, not this one. This check
+            // must not fire on them regardless of whether the
+            // sources agree.
+            let items = vec![
+                pp("/etc/foo", "config/foo", project_source()),
+                pp("/etc/foo", "config/foo", user_source()),
+            ];
+            assert!(
+                check_patch_prefix_collisions(&items, |p| p.patch().dest().as_sandbox_path())
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn prefix_collision_shared_string_prefix_ok() {
+            // Component boundary matters: `foo` isn't a prefix of
+            // `foobar` — those are just two independent files at the
+            // same level.
+            let items = vec![
+                pp("/etc/foo", "foo", project_source()),
+                pp("/etc/foobar", "foobar", user_source()),
+            ];
+            assert!(
+                check_patch_prefix_collisions(&items, |p| p.patch().dest().as_sandbox_path())
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn prefix_collision_nested_dests_errors() {
+            // Concrete example: one contributor wants a file at
+            // `foo`, another wants a file at `foo/bar`. Materialize
+            // would fail on whichever ran second.
+            let items = vec![
+                pp("/etc/foo.txt", "foo", project_source()),
+                pp(
+                    "/etc/bar.txt",
+                    "foo/bar",
+                    Source::UserLoadout { name: "dev".into() },
+                ),
+            ];
+            let err = check_patch_prefix_collisions(&items, |p| p.patch().dest().as_sandbox_path())
+                .unwrap_err();
+            match err {
+                Conflict::PatchDestPrefixCollision {
+                    shorter,
+                    longer,
+                    contributors,
+                } => {
+                    assert_eq!(shorter.as_utf8_path().as_str(), "foo");
+                    assert_eq!(longer.as_utf8_path().as_str(), "foo/bar");
+                    assert_eq!(contributors.len(), 2);
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn prefix_collision_input_order_independent() {
+            // The check fires whichever order the two destinations
+            // appear in the batch. Guards against a future
+            // refactor that only compares "later against earlier".
+            let a = pp("/etc/foo.txt", "foo", project_source());
+            let b = pp(
+                "/etc/bar.txt",
+                "foo/bar",
+                Source::UserLoadout { name: "dev".into() },
+            );
+            assert!(
+                check_patch_prefix_collisions(&[a.clone(), b.clone()], |p| p
+                    .patch()
+                    .dest()
+                    .as_sandbox_path())
+                .is_err()
+            );
+            assert!(
+                check_patch_prefix_collisions(&[b, a], |p| p.patch().dest().as_sandbox_path())
+                    .is_err()
+            );
+        }
+
         // ---------------- dedupe_by_name ----------------
 
         #[test]
@@ -3032,6 +3364,80 @@ mod tests {
             assert_eq!(left.lifecycle_hooks.len(), 2);
         }
 
+        // ---------------- package-supplied fs / user-data filter ----------------
+
+        /// A package may not supply patches, nor vars that carry user
+        /// data (env-inherited values). Both are dropped; a package's
+        /// static var and every non-package item survive.
+        #[test]
+        fn package_supplied_patches_and_user_data_vars_are_dropped() {
+            let pkg_src = || Source::Package { name: "go".into() };
+            let mut c = Contribution::new();
+            // Patches: one from a package (dropped), one from the project (kept).
+            c.push_patch(pp("pkg/src", "etc/pkg.conf", pkg_src()));
+            c.push_patch(pp("proj/src", "etc/proj.conf", project_source()));
+            // Vars: package env-inherited (dropped), package static (kept),
+            // project env-inherited (kept).
+            c.push_var(ProvenancedVar::new(
+                ResolvedVar::from_env_value("SECRET".into(), "s".into()),
+                pkg_src(),
+            ));
+            c.push_var(ProvenancedVar::new(
+                ResolvedVar::from_literal("GOFLAGS".into(), "-mod=mod".into()),
+                pkg_src(),
+            ));
+            c.push_var(pv_value("EDITOR", "hx", project_source()));
+
+            c.drop_package_supplied_patches_and_user_data_vars();
+
+            // Only the project patch survives.
+            assert_eq!(c.patches().len(), 1);
+            assert!(matches!(c.patches()[0].source(), Source::Project { .. }));
+
+            // The package's env-inherited var is gone; its static var and
+            // the project var remain.
+            let names: Vec<&str> = c.vars().iter().map(|v| v.var().name()).collect();
+            assert_eq!(names.len(), 2);
+            assert!(
+                names.contains(&"GOFLAGS"),
+                "package static var kept: {names:?}"
+            );
+            assert!(names.contains(&"EDITOR"), "project var kept: {names:?}");
+            assert!(
+                !names.contains(&"SECRET"),
+                "package user-data var dropped: {names:?}"
+            );
+        }
+
+        /// An item requested by a package *and* another source still
+        /// composes in: dropping the package's own entry leaves the
+        /// project/loadout entry (same patch dest / var name) intact,
+        /// because vars and patches are never deduped across sources.
+        #[test]
+        fn item_from_package_and_another_source_survives_via_the_other_source() {
+            let pkg_src = || Source::Package { name: "go".into() };
+            let mut c = Contribution::new();
+            // Same patch destination from a package and the project.
+            c.push_patch(pp("pkg/src", "etc/shared.conf", pkg_src()));
+            c.push_patch(pp("proj/src", "etc/shared.conf", project_source()));
+            // Same env-inherited var name from a package and a loadout.
+            c.push_var(ProvenancedVar::new(
+                ResolvedVar::from_env_value("TOKEN".into(), "t".into()),
+                pkg_src(),
+            ));
+            c.push_var(pv_value("TOKEN", "t", user_source()));
+
+            c.drop_package_supplied_patches_and_user_data_vars();
+
+            // The shared patch destination still composes — via the project.
+            assert_eq!(c.patches().len(), 1);
+            assert!(matches!(c.patches()[0].source(), Source::Project { .. }));
+            // The shared var still composes — via the loadout.
+            assert_eq!(c.vars().len(), 1);
+            assert!(matches!(c.vars()[0].source(), Source::UserLoadout { .. }));
+            assert_eq!(c.vars()[0].var().name(), "TOKEN");
+        }
+
         // ---------------- pure aggregation (no conflict check) ----------------
 
         /// Multiple disagreeing contributions across every domain are
@@ -3192,6 +3598,7 @@ mod tests {
                 var: WireResolvedVar {
                     name: name.into(),
                     value: value.into(),
+                    carries_user_data: true,
                 },
                 source: dev_loadout(),
             }
@@ -3260,6 +3667,7 @@ mod tests {
                     var: WireResolvedVar {
                         name: "EDITOR".into(),
                         value: "hx".into(),
+                        carries_user_data: true,
                     },
                     source: WireSource::UserLoadout { name: "dev".into() },
                 }],

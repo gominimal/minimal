@@ -116,7 +116,6 @@ impl From<(BuildSpecRef, HashSet<String>)> for SubsetInput {
 pub enum BuildDep {
     Build(BuildSpecRef),
     Source(SourceInput),
-    HostPath(PathBuf),
     Local {
         full_path: PathBuf,
         filename: String,

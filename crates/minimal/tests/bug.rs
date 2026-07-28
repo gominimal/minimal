@@ -1,14 +1,17 @@
 //! Integration tests for `min bug` (the diagnostic bundle command).
 //!
-//! Each test runs `cmd_bug` against temp state/config dirs and unpacks the
-//! resulting tarball to assert the bundle contract: what's collected, what's
-//! redacted, and what the manifest records for everything that's missing.
-//! No daemon is involved — the command must be useful on a machine where
-//! nothing was ever spawned.
+//! Each test runs `cmd_bug` against a real minimald `TestServer` (or a
+//! deliberately empty state dir) and unpacks the resulting tarball to assert
+//! the bundle contract: what's collected, what's redacted, what the manifest
+//! records for everything that's missing, and how the command degrades when
+//! the daemon is unreachable.
+
+mod common;
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use common::setup;
 use minimal::GlobalArgs;
 use minimal::diag::{BugArgs, cmd_bug};
 
@@ -70,13 +73,17 @@ fn global_args(state: &Path, config: &Path) -> GlobalArgs {
         repo_dir: None,
         minimal_dir: Some(state.to_path_buf()),
         config_dir: Some(config.to_path_buf()),
-        minvmd: false,
+        provider: None,
+        no_input: false,
     }
 }
 
 fn bug_args(out: &Path) -> BugArgs {
     BugArgs {
         output: Some(out.to_path_buf()),
+        no_guest: false,
+        guest_timeout_secs: 60,
+        log_tail_bytes: diagnostics::LOG_TAIL_CAP,
     }
 }
 
@@ -216,7 +223,7 @@ async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
             .unwrap();
     }
 
-    let provider = state.path().join("providers/local-0");
+    let provider = state.path().join("providers/local-minvmd0");
     std::fs::create_dir_all(&provider).unwrap();
     std::fs::write(provider.join("run.log"), "supervisor stderr\n").unwrap();
     // boot.log deliberately absent — recorded as a skip, not an error.
@@ -246,7 +253,7 @@ async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
         "newest-first rotation order: {collected_logs:?}"
     );
 
-    assert!(find(&files, "providers/local-0/run.log").is_some());
+    assert!(find(&files, "providers/local-minvmd0/run.log").is_some());
     assert!(find(&files, "providers/remote-x/run.log").is_none());
     let manifest: serde_json::Value =
         serde_json::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
@@ -254,8 +261,254 @@ async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
     assert!(
         skipped
             .iter()
-            .any(|s| s["what"] == "providers/local-0/boot.log" && s["reason"] == "absent"),
+            .any(|s| s["what"] == "providers/local-minvmd0/boot.log" && s["reason"] == "absent"),
         "absent boot.log is a skip: {skipped:?}"
     );
     assert_eq!(manifest["errors"].as_array().unwrap().len(), 0, "no errors");
+}
+
+/// The `--log-tail-bytes` cap reaches every log the collector bundles — the
+/// rotated host logs and the provider-scoped ones — and the manifest labels
+/// each capped file so a reader can tell a truncated log from a short one.
+#[tokio::test]
+async fn a_custom_tail_cap_applies_to_every_log() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config = tempfile::TempDir::new().unwrap();
+
+    let log_dir = state.path().join("logs");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    std::fs::write(log_dir.join("minimald.log.2026-07-21"), "x".repeat(500)).unwrap();
+    let provider = state.path().join("providers/local-minvmd0");
+    std::fs::create_dir_all(&provider).unwrap();
+    std::fs::write(provider.join("run.log"), "y".repeat(500)).unwrap();
+
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let out = out_dir.path().join("diag.tar.zst");
+    let mut args = bug_args(&out);
+    args.log_tail_bytes = 100;
+    cmd_bug(&global_args(state.path(), config.path()), args)
+        .await
+        .unwrap();
+
+    let files = unpack(&out).await;
+    for suffix in [
+        "logs/minimald.log.2026-07-21",
+        "providers/local-minvmd0/run.log",
+    ] {
+        let contents = find(&files, suffix).unwrap_or_else(|| panic!("missing {suffix}"));
+        assert_eq!(contents.len(), 100, "{suffix} honors the requested cap");
+    }
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
+    let capped: Vec<&serde_json::Value> = manifest["collected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["redaction"] == "tail-capped")
+        .collect();
+    assert_eq!(capped.len(), 2, "both logs recorded as tail-capped");
+    // Today the applied cap is only recoverable from a capped entry's own
+    // byte count; the manifest has no field naming it outright.
+    assert!(
+        capped.iter().all(|e| e["bytes"] == 100),
+        "a capped entry's size is the cap: {capped:?}"
+    );
+}
+
+/// R5.1–R5.3: the incident collectors (net/procs/power) land in the bundle,
+/// and interface MACs are masked to their vendor OUI. No daemon needed — these
+/// capture host state.
+#[tokio::test]
+async fn incident_collectors_land_and_mask_macs() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config = tempfile::TempDir::new().unwrap();
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let out = out_dir.path().join("diag.tar.zst");
+    cmd_bug(&global_args(state.path(), config.path()), bug_args(&out))
+        .await
+        .unwrap();
+    let files = unpack(&out).await;
+
+    for suffix in [
+        "host/process-tree.txt",
+        "host/net/listening.txt",
+        "host/net/interfaces.txt",
+        "host/net/routes.txt",
+        "host/power.txt",
+    ] {
+        assert!(
+            find(&files, suffix).is_some(),
+            "missing incident capture: {suffix}"
+        );
+    }
+
+    // R5.1: no full MAC survives in the interfaces capture — every one is
+    // masked to its OUI, so a 17-char `xx:xx:xx:xx:xx:xx` token never appears.
+    let interfaces = String::from_utf8_lossy(find(&files, "host/net/interfaces.txt").unwrap());
+    for tok in interfaces.split_whitespace() {
+        let is_mac = tok.len() == 17
+            && tok.bytes().enumerate().all(|(i, b)| {
+                if i % 3 == 2 {
+                    b == b':'
+                } else {
+                    b.is_ascii_hexdigit()
+                }
+            });
+        assert!(!is_mac, "un-masked MAC leaked into interfaces.txt: {tok}");
+    }
+}
+
+/// R7.1–R7.3: against a live daemon the probe completes every stage, the
+/// daemon's own bundle is nested raw and passes its bounded-decode checks,
+/// and the redaction guarantees hold across both layers.
+#[tokio::test]
+async fn bug_with_daemon_nests_a_verified_guest_bundle() {
+    let (_daemon, mut args) = setup().await;
+    let config = fake_config_dir();
+    args.config_dir = Some(config.path().to_path_buf());
+
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let out = out_dir.path().join("diag.tar.zst");
+    cmd_bug(&args, bug_args(&out)).await.unwrap();
+
+    let files = unpack(&out).await;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
+
+    // R7.1: every stage of the probe reached the live daemon, and the
+    // connection it opened was the one the download reused.
+    let probe: serde_json::Value =
+        serde_json::from_slice(find(&files, "local-minimald0/socket-probe.json").expect("probe"))
+            .unwrap();
+    for stage in ["stat", "connect", "handshake", "get_version"] {
+        assert_eq!(probe[stage]["outcome"], "ok", "stage {stage}: {probe}");
+    }
+    assert!(probe["version"]["long_version"].is_string());
+
+    // R7.6: liveness status for the discovered provider.
+    assert!(find(&files, "local-minimald0/status.json").is_some());
+    assert!(find(&files, "local-minimald0/dir-listing.txt").is_some());
+
+    // R7.3: the daemon bundle is nested raw (it decompresses on its own) and
+    // carries the Unit 6 manifest.
+    let nested = find(&files, "guest/daemon-diag.tar.zst").expect("nested guest bundle");
+    let nested_path = out_dir.path().join("nested.tar.zst");
+    std::fs::write(&nested_path, nested).unwrap();
+    let guest_files = unpack(&nested_path).await;
+    let guest_manifest: serde_json::Value =
+        serde_json::from_slice(find(&guest_files, "manifest.json").expect("guest manifest"))
+            .unwrap();
+    assert_eq!(guest_manifest["schema_version"], 1);
+    let guest_meta: serde_json::Value =
+        serde_json::from_slice(find(&guest_files, "meta.json").expect("guest meta")).unwrap();
+    assert_eq!(guest_meta["in_microvm"], false);
+
+    // The verification passed: no check recorded a failure against it.
+    let errors = manifest["errors"].as_array().unwrap();
+    assert!(
+        !errors
+            .iter()
+            .any(|e| e["collector"].as_str().unwrap().starts_with("guest.")),
+        "guest collection recorded an error: {errors:?}"
+    );
+
+    // Redaction holds across layers: the loadout canary appears nowhere, in
+    // the host bundle or the nested one, and key material is never collected.
+    for layer in [&files, &guest_files] {
+        for (path, contents) in layer.iter() {
+            assert!(
+                !contents
+                    .windows(b"canary-secret-value".len())
+                    .any(|window| window == b"canary-secret-value"),
+                "secret value leaked into the bundle at {path}"
+            );
+        }
+    }
+    assert!(find(&files, "client.key").is_none());
+    let skipped = manifest["skipped"].as_array().unwrap();
+    assert!(
+        skipped
+            .iter()
+            .any(|s| s["what"].as_str().unwrap().contains("client.key")),
+        "client.key skip must be recorded: {skipped:?}"
+    );
+}
+
+/// R7.1, R7.5: a socket file nothing listens on — the classic
+/// stale-socket-after-crash state — fails at the connect stage, and the
+/// volume fallback leaves its stall-dating record.
+#[tokio::test]
+async fn bug_with_stale_socket_reports_the_connect_stage_and_falls_back() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config = tempfile::TempDir::new().unwrap();
+    let provider = state.path().join("providers/local-minvmd0");
+    std::fs::create_dir_all(&provider).unwrap();
+    drop(std::os::unix::net::UnixListener::bind(provider.join("ssh.sock")).unwrap());
+    // A data volume the fallback can date, standing in for a real image.
+    std::fs::write(provider.join("data-vol.raw"), [0u8; 4096]).unwrap();
+
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let out = out_dir.path().join("diag.tar.zst");
+    cmd_bug(&global_args(state.path(), config.path()), bug_args(&out))
+        .await
+        .unwrap();
+
+    let files = unpack(&out).await;
+    let probe: serde_json::Value =
+        serde_json::from_slice(find(&files, "local-minvmd0/socket-probe.json").expect("probe"))
+            .unwrap();
+    assert_eq!(probe["stat"]["outcome"], "ok");
+    assert_ne!(probe["connect"]["outcome"], "ok");
+    assert!(
+        probe["handshake"]["outcome"]
+            .as_str()
+            .unwrap()
+            .starts_with("skipped"),
+        "the handshake must not be attempted after a failed connect: {probe}"
+    );
+
+    let error = find(&files, "guest/error.txt").expect("guest error note");
+    assert!(
+        String::from_utf8_lossy(error).contains("daemon not reachable"),
+        "got: {}",
+        String::from_utf8_lossy(error)
+    );
+
+    let volume: serde_json::Value =
+        serde_json::from_slice(find(&files, "guest/volume-meta.json").expect("volume meta"))
+            .unwrap();
+    assert_eq!(volume["exists"], true);
+    assert_eq!(volume["bytes"], 4096);
+    assert!(volume["mtime_unix"].is_u64(), "the stall-dating signal");
+    assert!(find(&files, "daemon-diag.tar.zst").is_none());
+}
+
+/// R7.4: `--no-guest` skips *all* daemon contact, including the probe — which
+/// handshakes — even when a healthy daemon is right there.
+#[tokio::test]
+async fn bug_no_guest_makes_no_daemon_contact() {
+    let (_daemon, args) = setup().await;
+
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let out = out_dir.path().join("diag.tar.zst");
+    let no_guest = BugArgs {
+        no_guest: true,
+        ..bug_args(&out)
+    };
+    cmd_bug(&args, no_guest).await.unwrap();
+
+    let files = unpack(&out).await;
+    let error = find(&files, "guest/error.txt").expect("guest skip note");
+    assert!(
+        String::from_utf8_lossy(error).contains("--no-guest"),
+        "got: {}",
+        String::from_utf8_lossy(error)
+    );
+    // No probe record: the probe handshakes, so its absence is the proof that
+    // nothing touched the daemon.
+    assert!(find(&files, "socket-probe.json").is_none());
+    assert!(find(&files, "daemon-diag.tar.zst").is_none());
+    // Host-side per-provider collection still ran.
+    assert!(find(&files, "local-minimald0/status.json").is_some());
 }

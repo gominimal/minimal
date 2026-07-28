@@ -3,8 +3,6 @@ id: 511
 title: "gvproxy v0.8.9 switch-attachment protocol for DM2 (tap-fd handshake)"
 status: proved
 date: 2026-06-21
-authors:
-  - gominimal-aw-bot[bot]
 budget_hours: 3
 actual_hours: 2.5
 related:
@@ -28,7 +26,7 @@ For gvproxy v0.8.9 on DM2 (native Linux), concretely:
 1. What is the host-switch **invocation + flags** to run one gvproxy serving
    multiple PTask clients?
 2. What is the **attachment handshake** for a tap-attached netns client to join
-   the switch — the wire protocol and whether a tap fd is SCM_RIGHTS-passed or a
+   the switch, the wire protocol and whether a tap fd is SCM_RIGHTS-passed or a
    socket connection is used?
 3. What is the **L2 / IP / route** setup inside two `OwnIp` netns so
    PTask-to-PTask TCP traverses the switch (UC6), and what makes a `NoNet` netns
@@ -160,7 +158,7 @@ The attachment is a **plain HTTP connection upgrade** over the unix socket:
    Host: localhost
 
    ```
-   (Path `"/connect"` is `types.ConnectPath`; the method can be GET or POST —
+   (Path `"/connect"` is `types.ConnectPath`; the method can be GET or POST,
    gvproxy ignores it and hijacks the conn immediately.)
 3. gvproxy's HTTP server calls `Hijack()` on the response writer. **No HTTP
    response is written back.** The raw `net.Conn` is handed to
@@ -203,7 +201,7 @@ async task tx: read(sock) → LE_u16(len) → read(frame) → write(tap_fd)
 
 gvproxy's switch learns the source MAC of every frame arriving on a port
 (`rxBuf()` inserts `eth.SourceAddress() → connID` into its CAM table). There is
-no explicit "hello" or registration frame — the first ARP request from the TAP
+no explicit "hello" or registration frame, the first ARP request from the TAP
 device teaches the switch the PTask's MAC.
 
 ### Protocol selection
@@ -588,28 +586,28 @@ Usage of /tmp/gvproxy:
 
 ## Source files read at v0.8.9 (commit dd4a4a5)
 
-- `cmd/gvproxy/main.go` — process lifecycle, listener setup, per-protocol
+- `cmd/gvproxy/main.go`, process lifecycle, listener setup, per-protocol
   accept loops (Qemu/Bess single-accept confirmed)
-- `cmd/gvproxy/config.go` — CLI flag parsing, YAML config merging, protocol
+- `cmd/gvproxy/config.go`, CLI flag parsing, YAML config merging, protocol
   selection logic, subnet default `192.168.127.0/24`
-- `cmd/gvproxy/config.yaml` — YAML format reference
-- `cmd/vm/main_linux.go` — reference client (`gvforwarder`): creates TAP,
+- `cmd/gvproxy/config.yaml`, YAML format reference
+- `cmd/vm/main_linux.go`, reference client (`gvforwarder`): creates TAP,
   dials unix socket, writes HTTP POST to `/connect`, relay loops confirmed
-- `pkg/types/paths.go` — `ConnectPath = "/connect"`
-- `pkg/types/configuration.go` — `Protocol` enum, `HyperKitProtocol` comment
+- `pkg/types/paths.go`, `ConnectPath = "/connect"`
+- `pkg/types/configuration.go`, `Protocol` enum, `HyperKitProtocol` comment
   ("handshake, then 16bits little endian size of packet, then the packet")
-- `pkg/transport/listen.go`, `listen_linux.go` — URI schemes: `unix://`,
+- `pkg/transport/listen.go`, `listen_linux.go`, URI schemes: `unix://`,
   `vsock://`, `unixpacket://`
-- `pkg/transport/dial_linux.go` — client dial: `unix://` returns path `/connect`
-- `pkg/virtualnetwork/mux.go` — `Mux()` registers `/connect` handler; hijack
+- `pkg/transport/dial_linux.go`, client dial: `unix://` returns path `/connect`
+- `pkg/virtualnetwork/mux.go`, `Mux()` registers `/connect` handler; hijack
   with no response; calls `Switch.Accept(conn, HyperKitProtocol)`
-- `pkg/virtualnetwork/services.go` — `ServicesMux()`: `/leases`, `/cam`,
+- `pkg/virtualnetwork/services.go`, `ServicesMux()`: `/leases`, `/cam`,
   `/stats`, `/services/forwarder/…` routes
-- `pkg/tap/switch.go` — `Accept()`, `rxStream()`, `txPkt()`: frame relay;
+- `pkg/tap/switch.go`, `Accept()`, `rxStream()`, `txPkt()`: frame relay;
   CAM table; no handshake beyond HTTP hijack
-- `pkg/tap/protocols.go` — `hyperkitProtocol`: `Buf()` = 2 bytes, `Write` =
+- `pkg/tap/protocols.go`, `hyperkitProtocol`: `Buf()` = 2 bytes, `Write` =
   `binary.LittleEndian.PutUint16`, `Read` = LE uint16
-- `pkg/tap/ip_pool.go` — DHCP IP pool: sequential scan for unallocated IPs;
+- `pkg/tap/ip_pool.go`, DHCP IP pool: sequential scan for unallocated IPs;
   `Reserve(ip, mac)` for static leases; `GetOrAssign(mac)` for dynamic
-- `pkg/services/forwarder/ports.go` — `Expose`/`Unexpose`/`Mux()`: the
+- `pkg/services/forwarder/ports.go`, `Expose`/`Unexpose`/`Mux()`: the
   `/expose` and `/unexpose` endpoints; JSON body format confirmed

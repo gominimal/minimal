@@ -2,7 +2,7 @@
 id: spec-minvmd-resource-monitoring
 title: "minvmd resource monitoring, configuration, and warnings"
 kind: spec
-status: planned
+status: shipped
 tracking-issue: 747
 supersedes:
 ---
@@ -14,7 +14,7 @@ supersedes:
 `minvmd status --json` reports `vcpus` and `ram_mib` as **static boot-time
 values** (R4.3 of the host-daemon spec): `vcpus` is the hardcoded literal `2` and
 `ram_mib` is `crate::cmd::vm_ram_mib()` (env `MINVMD_VM_RAM_MIB` or an
-arch-conditional default) — `crates/minvmd/src/cmd/status.rs:93-104`. There is no
+arch-conditional default), `crates/minvmd/src/cmd/status.rs:93-104`. There is no
 way to observe live resource utilisation during a session, and no way to change a
 VM's resource allocation short of setting an environment variable on the daemon.
 A code comment at that site already anticipates this work: *"A future change that
@@ -23,7 +23,7 @@ stores these in minvmd.toml can report the live VM's actual values."*
 The daemon already tracks everything needed to close the gap. The VM runs inside
 a supervised child process whose PID is persisted as `State.vmm_pid`
 (`crates/minvmd/src/state.rs:78`; written in `run.rs:414`), and libkrun runs the
-guest *inside* that host process — so the host-visible CPU / resident-memory /
+guest *inside* that host process, so the host-visible CPU / resident-memory /
 disk-I/O of `vmm_pid` reflects the VM. State is persisted as TOML in the
 provider-instance dir with an atomic tmp→fsync→rename writer
 (`state.rs:150-161`), and `VmConfig::validate_for` + `VmError::Configuration`
@@ -32,7 +32,7 @@ provider-instance dir with an atomic tmp→fsync→rename writer
 Prior art `minimal-vm-mac` confirms the shape but implements none of it in Rust:
 `minctl` samples the host VMM process by PID (`ps -p <pid>`), resource config is
 environment-variable-only with **no validation**, and warnings are reactive,
-in-guest, post-mortem — OOM via `/sys/fs/cgroup/memory.events` and disk-full via
+in-guest, post-mortem, OOM via `/sys/fs/cgroup/memory.events` and disk-full via
 `df … ≥95%`, each pointing the user at the knob to raise. This spec ports those
 ideas to a host-side, typed, tested implementation.
 
@@ -57,7 +57,7 @@ Three additions, all host-side:
    (requested value exceeds host cores/memory, straddles the x86_64 MMIO hole, or
    exceeds the host-derived vCPU ceiling), plus a supervisor post-exit resource
    hint on an abnormal VMM-child exit (a guest workload's non-zero exit). There is
-   **no** host-side reactive memory/disk *pressure* threshold — see the note below.
+   **no** host-side reactive memory/disk *pressure* threshold, see the note below.
 
 Configuration is kept in a **separate `config.toml`**, not in the runtime
 `State`: `State::stopped()` and `StartingGuard` reset runtime state on every stop
@@ -106,7 +106,7 @@ hint.
 ## Demoable Units of Work
 
 > Requirement IDs use the format **R{unit}.{seq}** (R1.1, R1.2 for Unit 1;
-> R2.1 for Unit 2). These IDs are referenced directly by the planner — do
+> R2.1 for Unit 2). These IDs are referenced directly by the planner, do
 > not renumber after approval.
 
 ---
@@ -119,14 +119,14 @@ process in `status --json` and `status` human output.
 **Depends on:** None
 
 **Affected areas:**
-- `Cargo.toml` (workspace), `crates/minvmd/Cargo.toml` — add the `sysinfo` dependency
-- `crates/minvmd/src/metrics.rs` (new) — sampler
-- `crates/minvmd/src/cmd/status.rs` — `StatusReport` DTO + `metrics` field
-- `crates/minvmd/src/lib.rs` — `pub mod metrics;`
+- `Cargo.toml` (workspace), `crates/minvmd/Cargo.toml`, add the `sysinfo` dependency
+- `crates/minvmd/src/metrics.rs` (new), sampler
+- `crates/minvmd/src/cmd/status.rs`, `StatusReport` DTO + `metrics` field
+- `crates/minvmd/src/lib.rs`, `pub mod metrics;`
 
 **Baseline:**
 - `status --json` emits an inline `serde_json::json!` with `state`, `vmm_pid`,
-  `uptime_seconds`, `vcpus: 2`, `ram_mib` — no live metrics (`status.rs:93-104`).
+  `uptime_seconds`, `vcpus: 2`, `ram_mib`, no live metrics (`status.rs:93-104`).
 - No `sysinfo`, no `/proc`/`getrusage` sampling exists anywhere in the crate.
 
 **Functional Requirements:**
@@ -146,10 +146,10 @@ process in `status --json` and `status` human output.
   unit-testable without a live VM.
 
 **Proof Artifacts:**
-1. **Test:** `metrics::tests::sample_of_self_returns_metrics` — `sample(std::process::id())`
+1. **Test:** `metrics::tests::sample_of_self_returns_metrics`, `sample(std::process::id())`
    returns `Some` with non-zero `resident_bytes`; `sample(0)` returns `None`.
 2. **Test:** `status::tests::report_schema_when_stopped_has_null_metrics`
-   — `build_report` for a stopped state serialises all six keys with `metrics: null`.
+, `build_report` for a stopped state serialises all six keys with `metrics: null`.
 3. **CLI:** on a running VM, `minvmd status --json | jq .metrics.resident_bytes`
    prints a non-null integer.
 
@@ -162,18 +162,18 @@ process in `status --json` and `status` human output.
 **Depends on:** None
 
 **Affected areas:**
-- `crates/minvmd/src/config.rs` (new) — `ResourceConfig` persistence
-- `crates/minvmd/src/state.rs` — extract `atomic_write_toml` helper; add
+- `crates/minvmd/src/config.rs` (new), `ResourceConfig` persistence
+- `crates/minvmd/src/state.rs`, extract `atomic_write_toml` helper; add
   `booted_vcpus`/`booted_ram_mib` runtime snapshot fields
-- `crates/minvmd/src/cmd/config.rs` (new) — `show`/`set` + validation
-- `crates/minvmd/src/cmd/mod.rs` — `effective_vcpus`/`effective_ram_mib`
-- `crates/minvmd/src/cmd/vmm_child.rs` — boot from effective values
-- `crates/minvmd/src/cmd/run.rs` — stamp booted snapshot into `Running` state
-- `crates/minvmd/src/main.rs` — `config` subcommand
-- `crates/minvmd/src/lib.rs` — `pub mod config;`
+- `crates/minvmd/src/cmd/config.rs` (new), `show`/`set` + validation
+- `crates/minvmd/src/cmd/mod.rs`, `effective_vcpus`/`effective_ram_mib`
+- `crates/minvmd/src/cmd/vmm_child.rs`, boot from effective values
+- `crates/minvmd/src/cmd/run.rs`, stamp booted snapshot into `Running` state
+- `crates/minvmd/src/main.rs`, `config` subcommand
+- `crates/minvmd/src/lib.rs`, `pub mod config;`
 
 **Baseline:**
-- `State` is `{ lifecycle, vmm_pid, started_at }` — no persisted resource params.
+- `State` is `{ lifecycle, vmm_pid, started_at }`, no persisted resource params.
   `vcpus`/`ram_mib` are a literal and `vm_ram_mib()` (`cmd/mod.rs:102`).
 - `vmm_child.rs` boots `VmConfig::new(2, vm_ram_mib(), …)`.
 
@@ -182,7 +182,7 @@ process in `status --json` and `status` human output.
 - **R2.1**: `crates/minvmd/src/config.rs` (new) shall define
   `ResourceConfig { vcpus: Option<u8>, ram_mib: Option<u32> }`
   (`Serialize`/`Deserialize`/`Default`), persisted to `config.toml` in the
-  provider-instance dir — **separate from `State`**, so a stop/crash reset cannot
+  provider-instance dir, **separate from `State`**, so a stop/crash reset cannot
   wipe it. `read` treats a missing file as the all-`None` default; `write` is
   atomic via the shared `crate::state::atomic_write_toml`.
 - **R2.2**: `crates/minvmd/src/cmd/mod.rs` shall provide `effective_vcpus() -> u8`
@@ -203,21 +203,21 @@ process in `status --json` and `status` human output.
 - **R2.6**: The `Running` state shall record the resolved boot-time `vcpus`/`ram_mib`
   as `State.booted_vcpus`/`booted_ram_mib` (runtime facts like `vmm_pid`, cleared
   on stop, `#[serde(default)]` for backward compatibility). `status` shall report
-  and warn against these live values for a running VM — **not** a later
-  `config set`'s next-boot resolution — falling back to `effective_*` only when
+  and warn against these live values for a running VM, **not** a later
+  `config set`'s next-boot resolution, falling back to `effective_*` only when
   stopped or when reading a pre-#747 state file with no snapshot.
 
 **Proof Artifacts:**
 1. **Test:** `config::tests::round_trips_through_toml` and
-   `missing_file_reads_as_default` — persistence contract;
-   `state::tests::pre_747_state_file_without_booted_fields_reads_as_none` —
+   `missing_file_reads_as_default`, persistence contract;
+   `state::tests::pre_747_state_file_without_booted_fields_reads_as_none`,
    backward compatibility.
 2. **Test:** `cmd::config::tests::{zero_vcpus_is_rejected, ram_below_floor_is_rejected}`
-   — structural validation.
+, structural validation.
 3. **CLI:** `minvmd config set --ram-mib 3072 && minvmd config show --json | jq
    .ram_mib` prints `3072` with `ram_mib_source: "config"`.
 4. **Test:** `status::tests::running_reports_booted_snapshot_not_next_boot_resolution`
-   — a running VM reports its booted cap, not the persisted next-boot value.
+, a running VM reports its booted cap, not the persisted next-boot value.
 
 ---
 
@@ -229,8 +229,8 @@ exhaustion when a guest workload exits non-zero.
 **Depends on:** Unit 2 (config surface + effective values)
 
 **Affected areas:**
-- `crates/minvmd/src/cmd/config.rs` — host-capacity + ceiling validation
-- `crates/minvmd/src/cmd/run.rs` — supervisor post-exit hint
+- `crates/minvmd/src/cmd/config.rs`, host-capacity + ceiling validation
+- `crates/minvmd/src/cmd/run.rs`, supervisor post-exit hint
 
 **Baseline:**
 - No host-capacity check anywhere; the supervisor bails on abnormal VMM-child
@@ -240,7 +240,7 @@ exhaustion when a guest workload exits non-zero.
 
 - **R3.1**: `minvmd config set` shall probe host capacity (logical cores via std,
   total memory via `sysinfo`) and emit **non-fatal** warnings when the request
-  exceeds host cores or memory, and — on `x86_64` — when `ram_mib` falls in the
+  exceeds host cores or memory, and, on `x86_64`, when `ram_mib` falls in the
   MMIO-hole range `3073..=6143`. It shall **reject** structurally unsafe values:
   `vcpus == 0`, `vcpus > max_vm_vcpus(host cores)` (the host's logical core
   count minus a two-core host reserve, floored at the default), and
@@ -249,7 +249,7 @@ exhaustion when a guest workload exits non-zero.
 - **R3.2**: `crates/minvmd/src/cmd/run.rs` shall, on an abnormal VMM-child exit
   **with a real exit code** (a guest workload's non-zero exit; a signal-kill from
   `minvmd stop` is excluded), print a resource hint naming `minvmd config set
-  --ram-mib/--vcpus` before it bails — the host-side analog of `minimal-entry`'s
+  --ram-mib/--vcpus` before it bails, the host-side analog of `minimal-entry`'s
   OOM post-mortem, and the only reliable reactive resource signal available
   without an in-guest agent.
 
@@ -261,23 +261,23 @@ exhaustion when a guest workload exits non-zero.
 
 **Proof Artifacts:**
 1. **Test:** `cmd::config::tests::over_core_and_over_mem_warn_but_succeed` and
-   `x86_mmio_hole_range_warns` — proactive warnings.
+   `x86_mmio_hole_range_warns`, proactive warnings.
 2. **Test:** `cmd::config::tests::{zero_vcpus_is_rejected, vcpus_over_host_derived_ceiling_is_rejected,
-   ram_below_floor_is_rejected}` — structural rejections.
-3. **Code:** `crates/minvmd/src/cmd/run.rs` — the abnormal-exit hint, guarded on a
+   ram_below_floor_is_rejected}`, structural rejections.
+3. **Code:** `crates/minvmd/src/cmd/run.rs`, the abnormal-exit hint, guarded on a
    real exit code.
 
 ## Non-Goals
 
-- **Live vcpu hot-add or RAM resize of a running VM** — resolved at boot only;
+- **Live vcpu hot-add or RAM resize of a running VM**: resolved at boot only;
   reaffirms `docs/specs/01-spec-minvmd-host-daemon/…:335`.
-- **Guest-internal per-process metrics** — needs an in-guest agent; metrics are
+- **Guest-internal per-process metrics**: needs an in-guest agent; metrics are
   host-VMM-process only.
-- **Reactive memory/disk pressure warnings** — accurate detection needs guest
+- **Reactive memory/disk pressure warnings**: accurate detection needs guest
   cgroup `memory.events` / in-guest `df`, i.e. an in-guest agent. The host-side
   proxies (RSS, sparse allocation) are unmeasurable and were removed; the reliable
   reactive signal is the supervisor exit hint (R3.2).
-- **Multi-VM config** — single `local-0` instance, per the v0.1 single-VM stance.
+- **Multi-VM config**: single `local-minvmd0` instance, per the v0.1 single-VM stance.
 
 ## Design Considerations
 
@@ -291,7 +291,7 @@ exhaustion when a guest workload exits non-zero.
 - **Effective resolution keeps the env override on top.** `MINVMD_VM_RAM_MIB`
   remains a per-boot escape hatch; `config set` supplies a persisted layer beneath
   it. `config show` reports this next-boot resolution (with a `source`), while a
-  running `status` reports the boot-time snapshot (R2.6) — so the two answer
+  running `status` reports the boot-time snapshot (R2.6), so the two answer
   different, correctly-scoped questions ("what will next boot use" vs "what is the
   live VM running").
 - **`status` reports the booted snapshot for a running VM (R2.6).** `State`
@@ -309,8 +309,8 @@ exhaustion when a guest workload exits non-zero.
 ## Open Questions
 
 - Resolved: the boot path stamps the resolved `vcpus`/`ram_mib` into
-  `State.booted_*` (R2.6), so `status` reflects the live VM exactly — including
-  env-override boots — rather than the next-boot resolution.
+  `State.booted_*` (R2.6), so `status` reflects the live VM exactly, including
+  env-override boots, rather than the next-boot resolution.
 - Should `config set` warn when it changes a value that differs from the currently
   *running* VM's booted snapshot ("takes effect on next boot; current VM still
   runs at N")? Not implemented; the `saved: … (takes effect on next boot)` line
@@ -338,13 +338,13 @@ exhaustion when a guest workload exits non-zero.
 |-----|------------|----------------------|
 | R1.1 | Test | `cargo test -p minvmd metrics::tests::sample_of_self_returns_metrics` |
 | R1.2/R1.3 | Test | `cargo test -p minvmd status::tests::report_schema_when_stopped_has_null_metrics` |
-| R1.3 | CLI | `minvmd status --json \| jq .metrics` — object when running, `null` when stopped |
+| R1.3 | CLI | `minvmd status --json \| jq .metrics`, object when running, `null` when stopped |
 | R1.3/R9.1 | E2E | `scripts/minvmd-lifecycle.sh` (KVM lane) asserts a live VM's `status --json` carries numeric `metrics.*` |
 | R2.1 | Test | `cargo test -p minvmd config::tests` |
 | R2.2 | Test | `cargo test -p minvmd cmd::config::tests::source_precedence_is_env_then_config_then_default` |
 | R2.3/R2.4 | CLI | `minvmd config set --ram-mib 3072 && minvmd config show --json` |
 | R2.5/R2.6 | E2E | `scripts/minvmd-lifecycle.sh` (KVM lane): `config set --ram-mib 3072` → `run --detach` → the running VM's `status --json` reports `ram_mib == 3072` (the persisted value, consumed at real boot) |
-| R2.5/R2.6/R9.1 | E2E (both VM lanes) | `crates/minvmd/tests/resource_vm_integration.rs` — auto-discovered on Linux/KVM **and** macOS/HVF: boots a VM, asserts `status --json` reports the persisted `ram_mib` plus live `metrics.*` |
+| R2.5/R2.6/R9.1 | E2E (both VM lanes) | `crates/minvmd/tests/resource_vm_integration.rs`, auto-discovered on Linux/KVM **and** macOS/HVF: boots a VM, asserts `status --json` reports the persisted `ram_mib` plus live `metrics.*` |
 | R2.6 | Test | `cargo test -p minvmd status::tests::running_reports_booted_snapshot_not_next_boot_resolution` + `state::tests::pre_747_state_file_without_booted_fields_reads_as_none` |
 | R3.1 | Test | `cargo test -p minvmd cmd::config::tests` (over-core/over-mem warn; zero/over-ceiling/sub-floor reject) |
 | R3.2 | Code | `crates/minvmd/src/cmd/run.rs` abnormal-exit hint (guarded on a real exit code) |

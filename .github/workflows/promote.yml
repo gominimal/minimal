@@ -20,6 +20,11 @@ on:
                 required: false
                 type: boolean
                 default: false
+            override_provenance:
+                description: "EMERGENCY ONLY — promote a version even if it was not built by the nightly workflow"
+                required: false
+                type: boolean
+                default: false
 
 env:
     # Single source of truth for the gate's approver allowlist.
@@ -52,6 +57,7 @@ jobs:
                   SHA_INPUT: ${{ inputs.sha }}
                   TARGET_INPUT: ${{ inputs.target }}
                   DRY_RUN: ${{ inputs.dry_run }}
+                  OVERRIDE_PROVENANCE: ${{ inputs.override_provenance }}
               run: |
                   set -euo pipefail
                   BODY="**Repo:** \`${REPO}\`
@@ -61,6 +67,7 @@ jobs:
                   **SHA input:** \`${SHA_INPUT:-<latest staged>}\`
                   **Target channel:** \`${TARGET_INPUT}\`
                   **Dry run:** \`${DRY_RUN}\`
+                  **Nightly-provenance override (EMERGENCY):** \`${OVERRIDE_PROVENANCE}\`
 
                   Comment **\`approved\`** to proceed or **\`denied\`** to cancel.
                   Closing this issue without an approval comment counts as denial.
@@ -156,10 +163,14 @@ jobs:
         permissions:
             contents: "read"
             id-token: "write"
+            # verify-nightly-provenance.sh lists nightly workflow runs.
+            actions: "read"
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
             - name: Authenticate to Google Cloud
-              uses: google-github-actions/auth@v3
+              uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
               with:
                   project_id: "524228262772"
                   workload_identity_provider: "projects/524228262772/locations/global/workloadIdentityPools/github/providers/gominimal"
@@ -172,6 +183,8 @@ jobs:
                   # to avoid shell template injection — see GitHub's hardening guide.
                   INPUT_SHA: ${{ inputs.sha }}
                   INPUT_TARGET: ${{ inputs.target }}
+                  OVERRIDE_PROVENANCE: ${{ inputs.override_provenance }}
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
               run: |
                   set -euo pipefail
                   # Trim leading/trailing whitespace; users often paste SHAs with stray spaces.
@@ -199,6 +212,15 @@ jobs:
                     echo "Latest staged SHA: ${SHA}"
                   fi
 
+                  # Only versions the nightly workflow actually built may be
+                  # promoted; the override exists for emergency hotfixes and is
+                  # surfaced in the approval issue above.
+                  if [ "$OVERRIDE_PROVENANCE" = "true" ]; then
+                    echo "WARNING: nightly-provenance check SKIPPED (override_provenance=true)."
+                  else
+                    scripts/verify-nightly-provenance.sh --sha "$SHA"
+                  fi
+
                   # set-channel.sh verifies the version is actually staged before it
                   # flips the pointer, and validates the target/version charset.
                   DRY_FLAG=""
@@ -212,20 +234,22 @@ jobs:
                   # Export resolved SHA for the docs-rebuild dispatch step below.
                   echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
 
-            # Mint a short-lived token scoped to gominimal/docs via the
+            # Mint a short-lived token scoped to gominimal/webapp via the
             # gominimal-aw-bot GitHub App (org standard — App tokens over PATs, see
             # gominimal/min-aw ADR-0002). The default GITHUB_TOKEN cannot dispatch
             # other repos; this token carries the App's contents:write permission
-            # narrowed to the docs repo only.
-            - name: Mint docs-repo token (gominimal-aw-bot)
+            # narrowed to the webapp repo only. The standalone docs host was
+            # collapsed into the webapp (gominimal/webapp#470), which now runs the
+            # deploy-time docs sync, so promotions dispatch the rebuild there.
+            - name: Mint webapp-repo token (gominimal-aw-bot)
               id: docs-token
               if: ${{ inputs.dry_run != true }}
-              uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+              uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3 # zizmor: ignore[github-app] token scoped to owner+repositories:docs (ADR-0002)
               with:
                   app-id: ${{ vars.AW_BOT_APP_ID }}
                   private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
                   owner: gominimal
-                  repositories: docs
+                  repositories: webapp
 
             - name: Trigger docs rebuild
               env:
@@ -235,10 +259,10 @@ jobs:
               run: |
                   set -euo pipefail
                   if [ "$DRY_RUN" = "true" ]; then
-                    echo "[dry-run] would dispatch reference-docs-promoted to gominimal/docs for ${SHA}"
+                    echo "[dry-run] would dispatch reference-docs-promoted to gominimal/webapp for ${SHA}"
                   else
-                    gh api repos/gominimal/docs/dispatches \
+                    gh api repos/gominimal/webapp/dispatches \
                       -f event_type=reference-docs-promoted \
                       -F "client_payload[sha]=${SHA}"
-                    echo "Dispatched reference-docs-promoted to gominimal/docs for ${SHA}"
+                    echo "Dispatched reference-docs-promoted to gominimal/webapp for ${SHA}"
                   fi

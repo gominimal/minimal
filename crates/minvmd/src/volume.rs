@@ -239,8 +239,8 @@ mod tests {
     #[test]
     fn data_volume_path_sits_in_provider_dir() {
         assert_eq!(
-            data_volume_path_in(Path::new("/state/minimal/providers/local-0")),
-            PathBuf::from("/state/minimal/providers/local-0/data-vol.raw"),
+            data_volume_path_in(Path::new("/state/minimal/providers/local-minvmd0")),
+            PathBuf::from("/state/minimal/providers/local-minvmd0/data-vol.raw"),
         );
     }
 

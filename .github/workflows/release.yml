@@ -55,7 +55,7 @@ jobs:
             contents: read
             checks: read
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
             - name: Verify required checks are green on this commit
@@ -108,16 +108,17 @@ jobs:
               # pre-installed Rust toolchain on ubuntu-latest lives in
               # `~/.rustup` + `~/.cargo`, not `/opt/hostedtoolcache`, so
               # `rustup target add` below still resolves.
-              uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+              uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 # v3
               with:
                   remove_android: true
                   remove_dotnet: true
                   remove_haskell: true
                   remove_tool_cache: true
             # Full history + tags so crates/version's build.rs can figure out the version.
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   fetch-depth: 0
+                  persist-credentials: false
                   fetch-tags: true
             - name: Install dependencies
               run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
@@ -132,7 +133,7 @@ jobs:
               # shrinking the entry so it survives; save-if keeps branch/dry-run
               # dispatches read-only so they don't churn the budget and evict
               # main's warm cache. Registry + git caches come for free.
-              uses: Swatinem/rust-cache@v2
+              uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 # zizmor: ignore[cache-poisoning] trusted-ref release build; save-if gates writes, provenance verified downstream
               with:
                   shared-key: release-amd64
                   save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -164,19 +165,19 @@ jobs:
                   mv min minimal-linux-amd64
                   mv minimald minimald-linux-amd64
             - name: Upload binary (mip)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: mip-linux-amd64
                   path: target/x86_64-unknown-linux-musl/release/mip-linux-amd64
                   retention-days: 7
             - name: Upload binary (minimal)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: minimal-linux-amd64
                   path: target/x86_64-unknown-linux-musl/release/minimal-linux-amd64
                   retention-days: 7
             - name: Upload binary (minimald)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: minimald-linux-amd64
                   path: target/x86_64-unknown-linux-musl/release/minimald-linux-amd64
@@ -202,7 +203,7 @@ jobs:
                   cargo build --release --locked -p minvmd --bin minvmd
                   mv target/release/minvmd target/release/minvmd-linux-amd64
             - name: Upload binary (minvmd)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: minvmd-linux-amd64
                   path: target/release/minvmd-linux-amd64
@@ -222,16 +223,17 @@ jobs:
               #
               # Runs BEFORE checkout: the action copies a `bc` binary into its
               # working dir, which dirty's the checkout.
-              uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+              uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 # v3
               with:
                   remove_android: true
                   remove_dotnet: true
                   remove_haskell: true
                   remove_tool_cache: true
             # Full history + tags so crates/version's build.rs can figure out the version.
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   fetch-depth: 0
+                  persist-credentials: false
                   fetch-tags: true
             - name: Install dependencies
               run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
@@ -244,7 +246,7 @@ jobs:
               # keeps branch/dry-run dispatches read-only. writes target/ and
               # reads ~/.cargo on the host, so rust-cache caches them the same as a
               # native build.
-              uses: Swatinem/rust-cache@v2
+              uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 # zizmor: ignore[cache-poisoning] trusted-ref release build; save-if gates writes, provenance verified downstream
               with:
                   shared-key: release-arm64
                   save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -266,19 +268,19 @@ jobs:
                   mv mip mip-linux-arm64
                   mv minimald minimald-linux-arm64
             - name: Upload binary (minimal)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: minimal-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/minimal-linux-arm64
                   retention-days: 7
             - name: Upload binary (mip)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: mip-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/mip-linux-arm64
                   retention-days: 7
             - name: Upload binary (minimald)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: minimald-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/minimald-linux-arm64
@@ -296,7 +298,7 @@ jobs:
         timeout-minutes: 45
         if: vars.RUN_MACOS_CI != 'false'
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   # Don't leave git credentials on the persistent self-hosted runner.
                   persist-credentials: false
@@ -304,7 +306,9 @@ jobs:
                   fetch-depth: 0
                   fetch-tags: true
             - name: Toolchain
-              uses: dtolnay/rust-toolchain@stable
+              uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+              with:
+                  toolchain: stable
             - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Build release minvmd binary
@@ -369,13 +373,13 @@ jobs:
                   codesign --verify --strict --verbose=2 target/release/minvmd-macos-arm64
                   codesign --verify --strict --verbose=2 target/release/minimal-macos-arm64
             - name: Upload binary (minvmd)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: minvmd-macos-arm64
                   path: target/release/minvmd-macos-arm64
                   retention-days: 7
             - name: Upload binary (minimal)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: minimal-macos-arm64
                   path: target/release/minimal-macos-arm64
@@ -391,11 +395,13 @@ jobs:
         runs-on: macos-latest
         timeout-minutes: 45
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
             - name: Toolchain
-              uses: dtolnay/rust-toolchain@stable
+              uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+              with:
+                  toolchain: stable
             - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Stage the dylib for signing
@@ -411,7 +417,7 @@ jobs:
               # it, re-signs with Developer ID, and re-uploads under the final
               # `libkrun-macos-arm64` name. The release job drops any leftover
               # `temp-` artifact so the ad-hoc copy never ships.
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: temp-libkrun-macos-arm64
                   path: ${{ runner.temp }}/temp-libkrun-macos-arm64.dylib
@@ -430,7 +436,7 @@ jobs:
         needs: [build-libkrun-macos-arm64, fetch-release-guest-artifacts]
         steps:
             - name: Download unsigned macOS artifacts (temp)
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   pattern: temp-*
                   path: ${{ runner.temp }}/unsigned
@@ -464,14 +470,14 @@ jobs:
                     codesign --verify --strict --verbose=2 "$f"
                   done
             - name: Upload signed libkrun dylib
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: libkrun-macos-arm64
                   path: ${{ runner.temp }}/signed/libkrun-macos-arm64.dylib
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload signed gvproxy (darwin-arm64)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: gvproxy-darwin-arm64
                   path: ${{ runner.temp }}/signed/gvproxy-darwin-arm64
@@ -497,7 +503,7 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 35
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
             # NOTE: the `arch` input is the kernel-style target arch
@@ -539,49 +545,49 @@ jobs:
               # Stashed as a `temp-` so sign-macos-artifacts (self-hosted) can sign it
               run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/temp-gvproxy-darwin-arm64" gvproxy-darwin
             - name: Upload kernel (amd64)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: virtio-kernel-amd64
                   path: ${{ runner.temp }}/vmlinuz-amd64
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload kernel (arm64)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: virtio-kernel-arm64
                   path: ${{ runner.temp }}/vmlinuz-arm64
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload rootfs (amd64)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: minvmd-rootfs-amd64
                   path: ${{ runner.temp }}/rootfs-amd64.img
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload rootfs (arm64)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: minvmd-rootfs-arm64
                   path: ${{ runner.temp }}/rootfs-arm64.img
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload gvproxy (linux-amd64)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: gvproxy-linux-amd64
                   path: ${{ runner.temp }}/gvproxy-linux-amd64
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload gvproxy (linux-arm64)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: gvproxy-linux-arm64
                   path: ${{ runner.temp }}/gvproxy-linux-arm64
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload gvproxy (darwin-arm64, temp/unsigned)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: temp-gvproxy-darwin-arm64
                   path: ${{ runner.temp }}/temp-gvproxy-darwin-arm64
@@ -600,18 +606,18 @@ jobs:
         timeout-minutes: 10
         needs: [build-release-linux-amd64, build-release-linux-arm64]
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
             - name: Install cpio
               run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cpio
             - name: Download minimald (amd64)
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: minimald-linux-amd64
                   path: prebuilt
             - name: Download minimald (arm64)
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: minimald-linux-arm64
                   path: prebuilt
@@ -626,14 +632,14 @@ jobs:
                   MINIMALD_BIN="$PWD/prebuilt/minimald-linux-arm64" \
                     ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs-arm64.cpio"
             - name: Upload initramfs (amd64)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: minimald-initramfs-amd64
                   path: ${{ runner.temp }}/initramfs-amd64.cpio
                   if-no-files-found: error
                   retention-days: 7
             - name: Upload initramfs (arm64)
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: minimald-initramfs-arm64
                   path: ${{ runner.temp }}/initramfs-arm64.cpio
@@ -650,7 +656,7 @@ jobs:
             version: ${{ steps.read.outputs.version }}
         steps:
             - name: Download minimald (amd64)
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: minimald-linux-amd64
             - name: Read version from the built binary
@@ -682,7 +688,9 @@ jobs:
             contents: write
             id-token: write
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
             - name: Generate release info
               id: release_info
               env:
@@ -694,14 +702,14 @@ jobs:
                   # the installer bucket layout and channel pointers key off. Either
                   # way the release NAME uses the version string (Create Release step).
                   SHORT_SHA=$(git rev-parse --short=8 HEAD)
-                  echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+                  echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
                   if [ "$REF_TYPE" = "tag" ]; then
-                    echo "tag=$REF_NAME" >> $GITHUB_OUTPUT
+                    echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
                   else
-                    echo "tag=release-$SHORT_SHA" >> $GITHUB_OUTPUT
+                    echo "tag=release-$SHORT_SHA" >> "$GITHUB_OUTPUT"
                   fi
             - name: Download artifacts
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   pattern: "*-*-*"
                   path: artifacts/
@@ -723,7 +731,7 @@ jobs:
                   artifacts/minimald-linux-amd64 completions zsh  > artifacts/completions/zsh/_minimald
                   artifacts/minimald-linux-amd64 completions fish > artifacts/completions/fish/minimald.fish
             - name: Authenticate to Google Cloud
-              uses: google-github-actions/auth@v3
+              uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
               with:
                   project_id: "289724348228"
                   workload_identity_provider: "projects/289724348228/locations/global/workloadIdentityPools/github/providers/gominimal"
@@ -764,6 +772,9 @@ jobs:
                     esac
                   fi
                   cd artifacts/
+                  # find output is intentionally word-split so each artifact becomes
+                  # its own positional arg to `gh release create`; quoting would break it.
+                  # shellcheck disable=SC2046
                   gh release create "$REL_TAG" \
                     $(find . -maxdepth 1 -type f) \
                     --repo="${GITHUB_REPOSITORY}" \
@@ -783,14 +794,16 @@ jobs:
             contents: read
             id-token: write
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
             - name: Generate release info
               id: release_info
               run: |
                   SHORT_SHA=$(git rev-parse --short=8 HEAD)
-                  echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+                  echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
             - name: Download artifacts
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   pattern: "*-*-*"
                   path: artifacts/
@@ -798,17 +811,19 @@ jobs:
             - name: Authenticate to Google Cloud (installer bucket)
               # Distinct project + workload-identity pool from the release job's
               # minimal-shim auth; this one grants write to gs://minimal-one.
-              uses: google-github-actions/auth@v3
+              uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
               with:
                   project_id: "524228262772"
                   workload_identity_provider: "projects/524228262772/locations/global/workloadIdentityPools/github/providers/gominimal"
             - name: Stage release into installer bucket
               # Upload versions/<sha>/{components,<artifacts>}. Inert on its own:
               # changes nothing users receive until a channel points at it.
+              env:
+                  SHORT_SHA: ${{ steps.release_info.outputs.short_sha }}
               run: |
                   scripts/stage-release.sh \
                     --artifacts-dir artifacts \
-                    --version "${{ steps.release_info.outputs.short_sha }}" \
+                    --version "$SHORT_SHA" \
                     --bucket gs://minimal-one
             - name: Stage the installer script into the versioned folder
               # Keep a version-pinned copy of the curl|sh installer next to the
@@ -816,17 +831,21 @@ jobs:
               # and self-contained. Same immutable cache header as the other
               # versions/<sha>/ artifacts. Done before the channel advances so the
               # versioned folder is complete when anything points at it.
+              env:
+                  SHORT_SHA: ${{ steps.release_info.outputs.short_sha }}
               run: |
                   gcloud storage cp \
                     --cache-control="public, max-age=31536000, immutable" \
                     scripts/install.sh \
-                    "gs://minimal-one/versions/${{ steps.release_info.outputs.short_sha }}/install.sh"
+                    "gs://minimal-one/versions/$SHORT_SHA/install.sh"
             - name: Point unstable channel at this release
               # `unstable` auto-advances to every fresh build — it is the
               # bleeding-edge channel, so no approval gate. Promotion to `stable`
               # is the manual, gated promote-cli workflow.
+              env:
+                  SHORT_SHA: ${{ steps.release_info.outputs.short_sha }}
               run: |
                   scripts/set-channel.sh \
                     --channel unstable \
-                    --version "${{ steps.release_info.outputs.short_sha }}" \
+                    --version "$SHORT_SHA" \
                     --bucket gs://minimal-one

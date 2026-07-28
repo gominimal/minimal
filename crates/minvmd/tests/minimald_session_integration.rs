@@ -33,7 +33,7 @@ use serial_test::serial;
 use tempfile::TempDir;
 
 /// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
-/// `<tempdir>/minimal/providers/local-0/*.sock` would overflow sun_path (104).
+/// `<tempdir>/minimal/providers/local-minvmd0/*.sock` would overflow sun_path (104).
 fn short_state_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("mnl")
@@ -94,7 +94,9 @@ impl Guest {
     /// blocks until the `vm-up` (READY) line. Panics on boot timeout.
     fn boot() -> Guest {
         let state = short_state_dir();
-        let sock_path = state.path().join("minimal/providers/local-0/ssh.sock");
+        let sock_path = state
+            .path()
+            .join("minimal/providers/local-minvmd0/ssh.sock");
 
         let exe = minvmd_bin();
         let mut child = Command::new(exe)
@@ -359,7 +361,7 @@ async fn run_session_exec(
         match resp.ok() {
             // The uploaded mfile declares only tasks, so nothing needs a
             // client gate and the loadout finalizes in one shot.
-            Some(ConfigureLoadoutResponse::Ready) => {}
+            Some(ConfigureLoadoutResponse::Materialized) => {}
             Some(ConfigureLoadoutResponse::Pending { .. }) => {
                 return Err("ConfigureLoadout returned Pending; \
                             this test's mfile gates nothing"
@@ -367,6 +369,43 @@ async fn run_session_exec(
             }
             None => return Err("ConfigureLoadout returned an error".to_string()),
         }
+    }
+
+    // FinalizeSession: promote the record `Materializing → Active` so the
+    // exec below passes minimald's status gate. The task-only mfile yields an
+    // empty composition, so there are no patches to upload first — but
+    // FinalizeSession is still required: the daemon takes the
+    // composition-has-no-patches shortcut past the patches-ready marker check
+    // and writes the record `Active`. (See crates/minvmd/examples/exec.rs.)
+    {
+        use minimald_rpc::{FinalizeSession, FinalizeSessionRequest};
+        let channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("open FinalizeSession channel: {e}"))?;
+        channel
+            .request_subsystem(false, FinalizeSession::NAME)
+            .await
+            .map_err(|e| format!("request_subsystem: {e}"))?;
+
+        let req = FinalizeSessionRequest { session_id };
+        let body = serde_json::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
+
+        let mut rpc = channel.into_stream();
+        rpc.write_all(&body)
+            .await
+            .map_err(|e| format!("write request: {e}"))?;
+        rpc.shutdown()
+            .await
+            .map_err(|e| format!("shutdown write half: {e}"))?;
+        let mut resp_buf = Vec::with_capacity(256);
+        rpc.read_to_end(&mut resp_buf)
+            .await
+            .map_err(|e| format!("read response: {e}"))?;
+        let resp: <FinalizeSession as OneshotSshRpc>::Response =
+            serde_json::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
+        resp.ok()
+            .ok_or_else(|| "FinalizeSession returned an error".to_string())?;
     }
 
     // Exec the command in that session.

@@ -1,7 +1,7 @@
 //! State persistence for `minvmd` (R4.1, R4.6).
 //!
-//! All runtime files live in the shared provider-instance directory
-//! (`<minimal_state_dir>/providers/local-0/`, see
+//! All runtime files live in the minvmd provider-instance directory
+//! (`<minimal_state_dir>/providers/local-minvmd0/`, see
 //! [`paths::provider_instance_dir`]):
 //!
 //! - `minvmd.toml` — serialised [`State`] (lifecycle, pid, timestamp).
@@ -59,9 +59,9 @@ pub fn state_base_dir() -> DaemonAbsPath {
 }
 
 /// The provider-instance dir holding all minvmd runtime files:
-/// `<minimal_state_dir>/providers/local-0`.
+/// `<minimal_state_dir>/providers/local-minvmd0`.
 pub fn provider_dir() -> PathBuf {
-    paths::provider_instance_dir(&state_base_dir(), 0)
+    paths::provider_instance_dir(&state_base_dir(), paths::ProviderKind::Minvmd, 0)
         .as_utf8_path()
         .as_std_path()
         .to_path_buf()
@@ -117,6 +117,18 @@ impl StateDir {
     pub fn new(dir: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
         Ok(Self { dir })
+    }
+
+    /// Bind to `dir` without creating it, for readers that must not change
+    /// what they observe — the diagnostic collector reports on providers,
+    /// including deleted ones, and [`StateDir::new`] would resurrect the
+    /// directory as a side effect of looking. Every path accessor and the
+    /// read-only liveness probes work unchanged; the lock-taking and
+    /// state-writing methods will fail on a missing directory, which is the
+    /// correct outcome for a caller that has not created one.
+    #[must_use]
+    pub fn open_existing(dir: PathBuf) -> Self {
+        Self { dir }
     }
 
     /// Default path: [`provider_dir`].

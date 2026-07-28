@@ -35,7 +35,7 @@ jobs:
         outputs:
             code: ${{ steps.filter.outputs.code }}
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
             - name: Detect non-docs changes
@@ -64,7 +64,7 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
             - name: Run rustfmt
@@ -76,7 +76,7 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 30
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
             - uses: ./.github/actions/setup-rust
@@ -100,19 +100,19 @@ jobs:
         timeout-minutes: 20
         steps:
             - name: Free Disk Space
-              uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+              uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 # v3
               with:
                   remove_android: true
                   remove_dotnet: true
                   remove_haskell: true
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
             - name: Cache Cargo state
               # Restore-only; the save half (main only) runs at the end of the
               # job, matching the KVM lane's cache policy.
               id: cargo-cache
-              uses: actions/cache/restore@v6
+              uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
               with:
                   path: ~/.local/state/minimal/state
                   key: dogfood-minimal-cargo-${{ hashFiles('**/Cargo.lock') }}
@@ -126,7 +126,7 @@ jobs:
               # bypassed to GCS at the edge (infra#277), so it stays fresh.
               # Trailing slash is required (`Url::join`). Rollback = delete
               # this `env` block.
-              uses: gominimal/run-task@v1
+              uses: gominimal/run-task@a5ed123f612b9774e3d6eaa7af45370e33aa1116 # v1
               env:
                   MINIMAL_REMOTE_CACHE_URL: https://cache.minimal.farm/
               with:
@@ -136,7 +136,7 @@ jobs:
               # PR branches restore but never write: caches written by every
               # branch LRU-evict the main entries all PRs restore from.
               if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
-              uses: actions/cache/save@v6
+              uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
               with:
                   path: ~/.local/state/minimal/state
                   key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
@@ -147,10 +147,10 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
-            - uses: EmbarkStudios/cargo-deny-action@v2
+            - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
 
     minimal-check:
         needs: [changes]
@@ -158,10 +158,10 @@ jobs:
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
-            - uses: gominimal/check@v1
+            - uses: gominimal/check@1a5fa19a2a93d25417d191d9b3e75de39c3eaf25 # v1
               with:
                   channel: unstable
 

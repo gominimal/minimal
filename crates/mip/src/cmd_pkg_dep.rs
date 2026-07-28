@@ -23,7 +23,7 @@ enum OutputFormat {
 
 /// CLI options to control what goes in the generated graph
 #[derive(Debug, clap::Args)]
-pub struct DepArgs {
+pub struct PkgDepArgs {
     /// Packages left out of graph and not traversed. Overrides matching package entries
     #[arg(short, long, alias="exclude", value_delimiter=',', num_args=0..)]
     excludes: Option<Vec<String>>,
@@ -45,12 +45,6 @@ pub struct DepArgs {
         long,num_args(0..=1),default_missing_value("true"),default_value("false"),action = ArgAction::Set,
     )]
     local_deps: bool,
-
-    /// Whether host path "build_deps" are in the graph
-    #[arg(
-        long,num_args(0..=1),default_missing_value("true"),default_value("false"),action=ArgAction::Set,
-    )]
-    hostpath_deps: bool,
 
     /// Whether "Needs" nodes and edges are in the graph
     #[arg(
@@ -99,14 +93,12 @@ pub struct DepArgs {
 }
 
 /// Data per node in the package petgraph DiGraph (aka "weight") that identifies
-/// the type of node (BuildSpec, HostPath, Local, Need, Source) and holds
+/// the type of node (BuildSpec, Local, Need, Source) and holds
 /// its related data.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum NodeData {
     /// represents a BuildSpec/BuildDecl
     BuildSpec(BuildSpecRef),
-    /// Hostpath is a host filepath to go in the sandbox as an input
-    HostPath(PathBuf),
     /// Local is a local file (e.g. build.sh) to go in the sandbox as an input
     Local {
         full_path: PathBuf,
@@ -122,7 +114,7 @@ enum NodeData {
 /// Data per edge in the package petgraph DiGraph
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum EdgeData {
-    /// can link BuildSpec to a BuildSpec, HostPath, Local or Source input node
+    /// can link BuildSpec to a BuildSpec, Local or Source input node
     InputDep(InputDepEdge),
     /// can link a BuildSpec to a BuildSpec runtime dep node
     RuntimeDep(RuntimeDepEdge),
@@ -138,7 +130,7 @@ struct TraversalState {
     depth: i32,
 }
 
-/// Edge between a BuildSpec and an Input (BuildSpec, HostPath, Local or Source input node)
+/// Edge between a BuildSpec and an Input (BuildSpec, Local or Source input node)
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct InputDepEdge {
     /// applies if the target node is a BuildSpec, lists the named outputs it needs
@@ -202,15 +194,6 @@ fn pgraph_from(graph: &graph::Graph) -> Result<GraphData, Error> {
                     &mut pgraph,
                     &mut processed_nodes,
                     NodeData::BuildSpec(*ibsr),
-                );
-                let edge_data = EdgeData::InputDep(InputDepEdge::default());
-                pgraph.add_edge(node_index, inode_index, edge_data);
-            }
-            BuildDep::HostPath(hp) => {
-                let (inode_index, _) = add_uniq_node(
-                    &mut pgraph,
-                    &mut processed_nodes,
-                    NodeData::HostPath(hp.clone()),
                 );
                 let edge_data = EdgeData::InputDep(InputDepEdge::default());
                 pgraph.add_edge(node_index, inode_index, edge_data);
@@ -349,7 +332,7 @@ fn pgraph_copy_subset(
     graph: &Graph,
     pgraph: &DiGraph<NodeData, EdgeData>,
     bsname_to_node_index: &HashMap<String, NodeIndex>,
-    args: &DepArgs,
+    args: &PkgDepArgs,
 ) -> Result<DiGraph<NodeData, EdgeData>, Error> {
     // if the listest packages with -p reduce to just those node indices
     let node_indices = if !args.packages.is_empty() {
@@ -389,7 +372,7 @@ fn pgraph_copy_subset(
 fn pgraph_copy_subset_for_node(
     graph: &Graph,
     pgraph: &DiGraph<NodeData, EdgeData>,
-    args: &DepArgs,
+    args: &PkgDepArgs,
     node_index: NodeIndex,
     bsr: &BuildSpecRef,
     state: &TraversalState,
@@ -447,13 +430,6 @@ fn pgraph_copy_subset_for_node(
                                     copied_nodes,
                                 );
                             }
-                        }
-                    }
-                    NodeData::HostPath(path) => {
-                        if args.hostpath_deps {
-                            let (cpy_target, _) =
-                                add_uniq_node(cpy, copied_nodes, target_data.clone());
-                            cpy.add_edge(cpy_node_index, cpy_target, edge_data.clone());
                         }
                     }
                     NodeData::Local {
@@ -563,7 +539,7 @@ fn prune_edgeless(pgraph: &mut DiGraph<NodeData, EdgeData>) {
 }
 
 /// Prints graphviz DOT or Mermaid for the dependency graph as constrained by the CLI args to stdout.
-pub async fn cmd_dep(args: DepArgs, ctx: &mut Context) -> Result<(), Error> {
+pub async fn cmd_pkg_dep(args: PkgDepArgs, ctx: &mut Context) -> Result<(), Error> {
     let graph = if args.packages.is_empty() {
         ctx.graph_from_all_packages()
     } else {
@@ -600,10 +576,6 @@ fn mermaid_node_id(
         }
         NodeData::Source(SourceNode { url, .. }) => {
             format!("Src:{url}")
-        }
-        NodeData::HostPath(hp) => {
-            let label = hp.to_string_lossy();
-            format!("Hostpath:{label}")
         }
         NodeData::Local { full_path, .. } => {
             let label = full_path.to_string_lossy();
@@ -684,12 +656,6 @@ fn gen_dot(pgraph: &DiGraph<NodeData, EdgeData>, graph: &Graph) -> Result<(), Er
             NodeData::Source(SourceNode { url, .. }) => {
                 println!(
                     "  \"{id}\" [label=\"Src {url}\", shape=rectangle, fillcolor=lightgreen];"
-                );
-            }
-            NodeData::HostPath(hp) => {
-                let label = hp.to_string_lossy();
-                println!(
-                    "  \"{id}\" [label=\"Hostpath {label}\", shape=rectangle, fillcolor=lightred];"
                 );
             }
             NodeData::Local {
@@ -844,12 +810,11 @@ mod tests {
         runtime_deps_depth: i32,
         excludes: Option<Vec<String>>,
     ) -> DiGraph<NodeData, EdgeData> {
-        let args = DepArgs {
+        let args = PkgDepArgs {
             excludes,
             build_spec_deps,
             source_deps: false,
             local_deps: false,
-            hostpath_deps: false,
             needs: false,
             provides: false,
             bootstrap: false,

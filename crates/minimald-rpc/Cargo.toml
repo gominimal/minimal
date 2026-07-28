@@ -1,13 +1,17 @@
 [package]
 name = "minimald-rpc"
+rust-version.workspace = true
 version = "0.0.1"
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 constcat.workspace = true
 chrono.workspace = true
+hex.workspace = true
 paths.workspace = true
+rand.workspace = true
 serde.workspace = true
 
 sessions.workspace = true

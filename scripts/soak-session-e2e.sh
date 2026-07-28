@@ -5,10 +5,17 @@
 # vsock-bridge wedge class) that a single PR-lane run cannot surface. Reports
 # a pass/fail tally and exits non-zero if ANY iteration failed.
 #
+# Then, once, the bulk host→guest upload proof (scripts/bulk-upload-e2e.sh):
+# no session-e2e iteration pushes enough data through the guest vsock to catch
+# the transport-reset class (https://github.com/gominimal/minimal/issues/869),
+# which needs a project that is large AFTER compression. It runs on the same
+# VM-backed setup the caller already provides, does its own (probabilistic)
+# iterations, and cleans up after itself. Its result gates the exit status too.
+#
 # The caller sets the VM up exactly as the KVM lane does — minvmd + minimal
 # on PATH, MINVMD_KERNEL_PATH / MINVMD_ROOTFS_PATH / MINVMD_INITRAMFS set,
 # libkrun on the loader path — and passes the VM knobs through the
-# environment (E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd E2E_PROJECT_DIR=/tmp),
+# environment (E2E_VM=1 E2E_MINIMAL_ARGS="--provider local-minvmd" E2E_PROJECT_DIR=/tmp),
 # same as the lane invocation. Each iteration runs session-e2e.sh, which
 # creates its own fresh XDG state, so every pass is a clean cold start.
 #
@@ -22,7 +29,14 @@ esac
 [ "$ITER" -ge 1 ] || { echo "iterations must be >= 1, got: $ITER" >&2; exit 2; }
 
 LOGDIR="${2:-$(mktemp -d /tmp/mnl-soak.XXXXXX)}"
-mkdir -p "$LOGDIR"
+mkdir -p "$LOGDIR" || { echo "cannot create boot-log dir: '$LOGDIR'" >&2; exit 2; }
+# Absolutise: MINVMD_BOOT_LOG is consumed by minvmd as given (vmm_child.rs takes
+# the env value verbatim), and both child harnesses cd into their own project
+# dir before any `min` call, so a relative LOGDIR would resolve against that dir
+# instead. minvmd only warns and boots on when the console file cannot be
+# created, so the guest log — the half of #869 worth having — would vanish
+# silently, exactly when a failing run needs it.
+LOGDIR="$(cd "$LOGDIR" && pwd)"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Reap leftovers a failed boot may strand (the detached __krun-vmm grandchild
@@ -51,7 +65,17 @@ for i in $(seq 1 "$ITER"); do
 done
 # Final reap is handled by the EXIT trap.
 
-echo "soak complete: $pass passed, $fail failed (of $ITER)"
+echo "::group::bulk host→guest upload proof"
+reap
+if MINVMD_BOOT_LOG="$LOGDIR/boot-bulk.log" "$ROOT/scripts/bulk-upload-e2e.sh"; then
+  bulk=OK
+else
+  bulk=FAILED
+  echo "::warning::bulk upload proof FAILED"
+fi
+echo "::endgroup::"
+
+echo "soak complete: $pass passed, $fail failed (of $ITER); bulk upload proof: $bulk"
 # Require every iteration to have run AND passed — a short-circuited loop that
 # ran zero iterations must not report success.
-[ "$fail" -eq 0 ] && [ "$pass" -eq "$ITER" ]
+[ "$fail" -eq 0 ] && [ "$pass" -eq "$ITER" ] && [ "$bulk" = OK ]

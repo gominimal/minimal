@@ -22,6 +22,7 @@ members = [
     "crates/minimald",
     "crates/minimald-rpc",
     "crates/minvmd",
+    "crates/mlog",
     "crates/remote-client",
     "crates/remote-proto",
     "crates/sandbox2",
@@ -34,6 +35,13 @@ resolver = "3"
 
 package.edition = "2024"
 package.publish = false
+package.license = "Apache-2.0"
+# Minimum supported Rust version, verified by the nightly `msrv` job
+# (`cargo hack check --rust-version`). Every crate inherits this via
+# `rust-version.workspace = true`; bump here, in one place, when the floor moves.
+# 1.95 is the dependency-driven floor (sysinfo 0.39 requires rustc 1.95); no
+# resolved dependency requires newer. The build toolchain pin is 1.97.0.
+package.rust-version = "1.95"
 # Shared base version for the workspace. This is the fallback the `version` crate
 # reports when no `v*` git tag is reachable; the real release version comes from
 # `git describe` at build time. See crates/version/build.rs.
@@ -56,9 +64,9 @@ codegen-units = 16
 
 [workspace.dependencies]
 anyhow = "1.0"
-async-compression = { version = "0.4", features = ["tokio", "zstd"] }
+async-compression = { version = "0.4", features = ["tokio", "zstd", "zstdmt"] }
 async-tar = { version = "0.6", default-features = false, features = ["runtime-tokio"] }
-base64 = "0.22"
+base64 = "0.23"
 blake3 = { version = "1", features = ["serde"] }
 # WireGuard mesh peer (Unit 4, behind the `networking-wg` feature). Pure-Rust
 # WireGuard avoids a Go/cgo toolchain dependency (spec Design Considerations).
@@ -66,23 +74,26 @@ boringtun = { version = "0.7", default-features = false }
 bytes = "1.11" # keep in sync with reqwest
 bzip2 = "0.6"
 camino = { version = "1", features = ["serde1"] }
-# Held at 4.5 (not 4.6): clap_derive 4.6 requires proc-macro2 >= 1.0.106, which
-# cannot unify with c2rust-bitfields 0.22's exact `proc-macro2 = "=1.0.103"` pin
-# (pulled in via hakoniwa's rustslirp feature -> tun-rs 2.8.3). clap_derive 4.5
-# needs only proc-macro2 ^1.0, letting the resolver settle on 1.0.103. Bump back
-# to 4.6 once tun-rs/c2rust relax that pin.
-clap = { version = "4.5", features = ["derive", "env", "string"] }
-clap_complete = { version = "4.5" }
+clap = { version = "4.6", features = ["derive", "env", "string"] }
+clap_complete = { version = "4.6" }
 codespan-reporting = { version = "0.13", features = ["serialization"] } # Keep in sync with nickel-lang-core
 constcat = "0.6"
 copy_dir = "0.1.3"
 chrono = {version = "0.4", features = ["serde", "std"]}
+dialoguer = { version = "0.12", default-features = false }
 dirs = "6"
 fd-lock = "4"
 either = { version = "1.16", default-features = false }
 flate2 = "1.1"
 futures = "0.3"
 generational-arena = {version = "0.2", features = ["serde"] }
+# The google-cloud-* / reqwest cluster resolves below its latest releases and
+# cannot be raised yet: reqwest >= 0.13.2 pulls js-sys >= 0.3.85, which requires
+# an exact `wasm-bindgen = "=0.2.108"`, while nickel-lang-core's `format` feature
+# reaches topiary-core -> topiary-tree-sitter-facade, which pins an exact
+# `wasm-bindgen = "=0.2.100"`. The two cannot unify, so `cargo update` leaves the
+# whole cluster pinned. Revisit when topiary relaxes that pin (0.7.3 still has
+# it; 0.6.2 moved to =0.2.103, but 0.7.x went back to =0.2.100).
 google-cloud-gax = "1.13"
 google-cloud-auth = "1.5"
 google-cloud-storage = "1.7"
@@ -91,14 +102,22 @@ http-body = "1"
 hex = "0.4"
 indicatif = "0.18"
 indoc = "^2.0"
+inquire = { version = "0.9", default-features = false, features = ["crossterm", "fuzzy"] }
 jaq-all = "0.2.0"
+json-subscriber = "0.3"
 libc = "0.2"
 lzma-rs = "0.3"
 
-# Revert back to crates.io dep once new version is released.
-nickel-lang-core = { git = "https://github.com/nickel-lang/nickel.git", rev = "e8a0ab95e52ab31ac9a8ae1a3bef854d8de73cea", default-features = false, features = ["format"] }
+# Tracked as a git rev, not the crates.io release: crates.io lags master by a
+# long way (0.18.0 is the newest published, and master has moved well past it).
+# Bump the rev to pick up upstream fixes; revisit crates.io only once its
+# releases catch up. Current rev is master @ 2026-07-26.
+nickel-lang-core = { git = "https://github.com/nickel-lang/nickel.git", rev = "0d306feb13ff38b154a3beb8dccaaa59cdd18ee8", default-features = false, features = ["format"] }
 
-nix = { version = "0.31", features = ["fs", "user"] }
+opentelemetry-semantic-conventions = "0.32"
+# `socket` + `time`: the guest's vsock timekeep listener binds an AF_VSOCK
+# datagram socket and steps CLOCK_REALTIME from the host's updates.
+nix = { version = "0.31", features = ["fs", "socket", "time", "user"] }
 nutype = { version = "0.7", features = ["serde"] }
 object = { version = "0.39", default-features = false, features = ["archive", "elf", "read_core", "std"] }
 oci-spec = "0.10"
@@ -122,7 +141,7 @@ resolv-conf = "0.7"
 russh = "0.62"
 russh-sftp = "2.1"
 serde_json = { version = "1.0" }
-serial_test = "3"
+serial_test = "4"
 sha2 = "0.11"
 shlex = "2.0"
 size = "0.5"
@@ -171,6 +190,7 @@ diagnostics = { path = "crates/diagnostics" }
 github = { path = "crates/github" }
 mctx = { path = "crates/mctx" }
 minimald-rpc = { path = "crates/minimald-rpc" }
+mlog = { path = "crates/mlog" }
 mfile = { path = "crates/mfile" }
 op = { path = "crates/op" }
 ot = { path = "crates/ot" }

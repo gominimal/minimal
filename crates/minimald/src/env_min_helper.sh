@@ -108,6 +108,24 @@ min_run() {
     __min_rpc "run" "$@"
 }
 
+min_package() {
+    local subcmd="$1"
+    shift
+
+    case "$subcmd" in
+        patched-build)
+            min_patched_pkg "$@"
+            ;;
+        build)
+            __min_rpc "build" "$@"
+            ;;
+        *)
+            echo "error: unknown subcommand '$subcmd'. Expected 'build' or 'patched-build'" >&2
+            return 1
+            ;;
+    esac
+}
+
 min_check() {
     __min_rpc "check" "$@"
 }
@@ -126,14 +144,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         run)
             min_run "$@"
             ;;
-        build)
-            min_run build
-            ;;
-        test)
-            min_run test
-            ;;
-        patched-pkg)
-            min_patched_pkg "$@"
+        package|pkg)
+            min_package "$@"
             ;;
         check)
             min_check "$@"
@@ -145,7 +157,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             echo "Search for packages: min search <query>" >&2
             echo "Check minimal configuration: min check" >&2
             echo "Run a task: min run <task name>" >&2
-            echo "Try building a package (with potentially-stale dependencies): min patched-pkg <package name>" >&2
+            echo "Build packages: min package build <packages>" >&2
+            echo "Try building a package (with potentially-stale dependencies): min package patched-build <package name>" >&2
             exit 1
             ;;
     esac

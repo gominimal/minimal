@@ -13,6 +13,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sessions::SessionId;
 
+pub mod trace;
+
 pub use sessions::{EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy};
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
@@ -125,10 +127,26 @@ pub struct RunningSessionAttrs {
 }
 
 /// An entry in the ListSessions response.
+///
+/// `project_path` and `status` mirror the fields of the same name on the
+/// session [`Record`](sessions::Record). They let a client resolve "which
+/// session was built from this directory" and render a state glyph in a
+/// picker without a follow-up `GetSessionRecord` round-trip per session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ListSessionsEntry {
     pub id: SessionId,
     pub name: Option<String>,
+    /// The absolute host path the session was built from. `None` on responses
+    /// from daemons that predate this field — clients treat such entries as
+    /// not matching the cwd but still listable/pickable. Always `Some` from a
+    /// current daemon, since [`Record`](sessions::Record) requires the path.
+    #[serde(default)]
+    pub project_path: Option<paths::HostAbsPath>,
+    /// The session's lifecycle status, used to render a state glyph in the
+    /// interactive picker. Defaults to `Active` for daemons that predate the
+    /// field so an older server still deserializes cleanly.
+    #[serde(default)]
+    pub status: sessions::SessionStatus,
     pub attrs: Option<RunningSessionAttrs>,
 }
 
@@ -207,7 +225,12 @@ pub struct SessionConfig {
     /// User-supplied name. `None` is anonymous; the daemon may render
     /// a short display name (e.g. `<user>-<project>-<uuid-suffix>`).
     pub name: Option<String>,
-    /// Absolute host path the session is built from.
+    /// Absolute host path the session is built from. Names a location
+    /// on the *client's* filesystem — the daemon uses it only for
+    /// display and audit. Project files reach the daemon-side
+    /// workspace out-of-band via the `WorkspaceFilesTarZst` SFTP-shaped
+    /// upload after `CreateSession` returns, before `ConfigureLoadout`
+    /// composes against them.
     pub project_path: paths::HostAbsPath,
     /// Network isolation mode.
     #[serde(default)]
@@ -249,10 +272,10 @@ impl OneshotSshRpc for CreateSession {
 /// Split from [`CreateSession`] because the composer reads the
 /// project config out of the session's *daemon-side workspace*, which
 /// only holds the project files once the client has streamed them up
-/// — the record's `project_path` is a path on the client's machine,
-/// which the daemon generally can't read. So the client creates the
-/// session, populates its workspace, and only then configures the
-/// loadout.
+/// via `WorkspaceFilesTarZst` — the record's `project_path` is a path
+/// on the client's machine, which the daemon generally can't read.
+/// So the client creates the session, populates its workspace, and
+/// only then configures the loadout.
 pub struct ConfigureLoadout;
 
 /// The request for a [`ConfigureLoadout`] RPC.
@@ -262,7 +285,8 @@ pub struct ConfigureLoadoutRequest {
     pub session_id: SessionId,
     /// Client-side Phase 1 contribution. Defaulted (empty) by
     /// callers that aren't composing a session, which take the
-    /// empty-contribution fast path to [`ConfigureLoadoutResponse::Ready`].
+    /// empty-contribution fast path to
+    /// [`ConfigureLoadoutResponse::Materialized`].
     #[serde(default)]
     pub contribution: sessions::wire::request::WireContribution,
 }
@@ -270,18 +294,29 @@ pub struct ConfigureLoadoutRequest {
 /// The response for a [`ConfigureLoadout`] RPC.
 ///
 /// Both variants are part of the Phase 2 flow and reachable on the
-/// wire: `Ready` when the daemon's composer finalizes in one shot,
-/// `Pending` when it collects items the client must gate before
-/// composition completes (the client follows up via `SubmitVerdict`).
+/// wire: `Materialized` when the daemon's composer finalizes in one
+/// shot (the session record is now
+/// [`Materializing`](sessions::SessionStatus::Materializing), not
+/// yet `Active`), `Pending` when it collects items the client must
+/// gate before composition completes (the client follows up via
+/// `SubmitVerdict`).
+///
+/// In both `Materialized` branches the client still has to upload
+/// patches and call `FinalizeSession` before the session is
+/// attachable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConfigureLoadoutResponse {
-    /// No items need user gating; the session is finalized and
-    /// callers can immediately use it.
-    Ready,
-    /// Items need client-side gating. The session stays in flight;
-    /// the client follows up with `SubmitVerdict` carrying the same
-    /// id.
+    /// No items need user gating; composition is complete and the
+    /// session record has advanced to
+    /// [`Materializing`](sessions::SessionStatus::Materializing).
+    /// The client still has to upload the composition's patches
+    /// and call `FinalizeSession` before the session becomes
+    /// attachable.
+    Materialized,
+    /// Items need client-side gating. The session stays in
+    /// [`Pending`](sessions::SessionStatus::Pending); the client
+    /// follows up with `SubmitVerdict` carrying the same id.
     Pending {
         /// Pending items the client must gate.
         response: sessions::wire::request::ContributionResponse,
@@ -292,6 +327,38 @@ impl OneshotSshRpc for ConfigureLoadout {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ConfigureLoadout");
     type Request<'a> = ConfigureLoadoutRequest;
     type Response = Errorable<ConfigureLoadoutResponse>;
+}
+
+/// An RPC to promote a `Materializing` session to `Active`.
+///
+/// The client uploads composition patches to the daemon via
+/// `WorkspacePatchesTarZst`, then calls this RPC to signal "every
+/// side-channel upload is in and I'm ready for the session to be
+/// attachable." The daemon checks for the patches-ready marker
+/// under `<workspace>/patches/` and refuses to finalize if the
+/// upload never completed.
+///
+/// Idempotent: calling on an already-`Active` session returns
+/// success. Refused with `InvalidInput` on `Pending` sessions
+/// (configure the loadout first) or `Materializing` sessions
+/// missing the patches marker.
+pub struct FinalizeSession;
+
+/// The request for a [`FinalizeSession`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FinalizeSessionRequest {
+    /// The session to finalize.
+    pub session_id: SessionId,
+}
+
+/// The response for a [`FinalizeSession`] RPC — a unit-shaped ack.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FinalizeSessionResponse;
+
+impl OneshotSshRpc for FinalizeSession {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "FinalizeSession");
+    type Request<'a> = FinalizeSessionRequest;
+    type Response = Errorable<FinalizeSessionResponse>;
 }
 
 /// An RPC to rename an existing session.
@@ -366,9 +433,11 @@ impl OneshotSshRpc for Shutdown {
 }
 
 /// Resume a `Pending` session with the client's per-item
-/// [`ContributionVerdict`]. Terminal — the daemon promotes the
-/// record `Pending → Active` and replies with
-/// [`SessionStep::Active`](sessions::wire::request::SessionStep::Active).
+/// [`ContributionVerdict`]. The daemon promotes the record
+/// `Pending → Materializing` and replies with
+/// [`SessionStep::Materialized`](sessions::wire::request::SessionStep::Materialized);
+/// the client still has to upload patches and call
+/// `FinalizeSession` before the session is attachable.
 /// A `Fault` reply carries a structured
 /// [`WireError`](sessions::wire::errors::WireError) —
 /// `UnknownSessionId` for a verdict against no stashed session,
@@ -835,6 +904,42 @@ impl RepoInstallationStatus {
             repo,
             installed,
             install_url,
+// Diagnostic bundle (`min bug`).
+// ---------------------------------------------------------------------------
+
+/// Streaming RPC subsystem: the daemon's contribution to a `min bug`
+/// diagnostic bundle.
+///
+/// Not an [`OneshotSshRpc`]: the client writes one JSON-encoded
+/// [`DiagBundleRequest`] and half-closes, then the daemon streams back a
+/// zstd-compressed tar archive of its diagnostic bundle and closes. Errors hit
+/// before streaming starts are relayed over extended-data stream 1, so a client
+/// that reads zero payload bytes should surface the extended data as the
+/// failure reason.
+///
+/// Served identically by the native Linux minimald and the in-VM minimald
+/// behind the minvmd bridge — the archive's `meta.json` says which one
+/// answered.
+pub const DIAG_BUNDLE_SUBSYSTEM: &str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "DiagBundleTarZst");
+
+/// Request body for [`DIAG_BUNDLE_SUBSYSTEM`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagBundleRequest {
+    /// Per-log-file tail cap in bytes; `0` means the daemon's default. The
+    /// daemon clamps this to its own ceiling — the value is caller-controlled.
+    #[serde(default)]
+    pub log_tail_bytes: u64,
+    /// Include the recursive state-dir listing (names/sizes only).
+    #[serde(default = "default_true")]
+    pub include_state_listing: bool,
+}
+
+impl Default for DiagBundleRequest {
+    fn default() -> Self {
+        Self {
+            log_tail_bytes: 0,
+            include_state_listing: true,
         }
     }
 }
@@ -1382,12 +1487,52 @@ impl OneshotSshRpc for GetSessionGitState {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionGitState");
     type Request<'a> = GetSessionGitStateRequest;
     type Response = Errorable<GetSessionGitStateResponse>;
+/// The type is `#[non_exhaustive]`, so other crates cannot write a struct
+/// literal for it; these are how a client departs from the defaults.
+impl DiagBundleRequest {
+    #[must_use]
+    pub fn with_log_tail_bytes(mut self, bytes: u64) -> Self {
+        self.log_tail_bytes = bytes;
+        self
+    }
+
+    #[must_use]
+    pub fn with_state_listing(mut self, include: bool) -> Self {
+        self.include_state_listing = include;
+        self
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use sessions::wire::request::{ContributionResponse, WireContribution};
+
+    /// An empty request body must decode with the documented defaults so a
+    /// bare `{}` probe (or an older client) still gets a full bundle.
+    #[test]
+    fn diag_bundle_request_defaults_from_empty_object() {
+        let req: DiagBundleRequest = serde_json::from_str("{}").expect("deserialize");
+        assert_eq!(req, DiagBundleRequest::default());
+        assert_eq!(req.log_tail_bytes, 0);
+        assert!(req.include_state_listing);
+    }
+
+    #[test]
+    fn diag_bundle_request_round_trips() {
+        let req = DiagBundleRequest::default()
+            .with_log_tail_bytes(1024)
+            .with_state_listing(false);
+        assert_eq!(round_trip(&req), req);
+        assert_eq!(
+            DIAG_BUNDLE_SUBSYSTEM, "minimald-v1-DiagBundleTarZst",
+            "subsystem name is wire contract; changing it breaks old clients"
+        );
+    }
 
     #[test]
     fn policy_types_are_present_and_serializable() {
@@ -1469,6 +1614,31 @@ mod tests {
         assert!(resp.sessions.is_empty());
     }
 
+    /// A daemon that predates `project_path` and `status` on
+    /// `ListSessionsEntry` omits both fields; the client must accept that
+    /// response (project_path → `None`, status → `Active`) rather than fail
+    /// deserialization.
+    #[test]
+    fn list_sessions_entry_accepts_response_without_project_path_and_status() {
+        let resp: ListSessionsResponse = serde_json::from_str(
+            r#"{"sessions":[{"id":"00000000-0000-0000-0000-000000000001","name":"old"}]}"#,
+        )
+        .expect("deserialize");
+        assert_eq!(resp.sessions.len(), 1);
+        let entry = &resp.sessions[0];
+        assert_eq!(
+            entry.id,
+            SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
+        );
+        assert_eq!(entry.name.as_deref(), Some("old"));
+        assert!(entry.project_path.is_none(), "missing project_path → None");
+        assert_eq!(
+            entry.status,
+            sessions::SessionStatus::Active,
+            "missing status → default Active"
+        );
+    }
+
     #[test]
     fn configure_loadout_request_round_trips_with_explicit_contribution() {
         let req = ConfigureLoadoutRequest {
@@ -1490,11 +1660,11 @@ mod tests {
     }
 
     #[test]
-    fn configure_loadout_response_ready_round_trips() {
-        let resp = ConfigureLoadoutResponse::Ready;
+    fn configure_loadout_response_materialized_round_trips() {
+        let resp = ConfigureLoadoutResponse::Materialized;
         assert_eq!(round_trip(&resp), resp);
         let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains(r#""kind":"ready""#), "got: {json}");
+        assert!(json.contains(r#""kind":"materialized""#), "got: {json}");
     }
 
     #[test]

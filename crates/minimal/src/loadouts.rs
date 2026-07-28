@@ -76,18 +76,39 @@ pub(crate) fn compose_options_from_config(
         .with_follow_symlinks(cfg.loadouts.follow_symlinks)
 }
 
-/// Compose the given loadouts into a [`sessions::wire::request::WireContribution`]
-/// under the user's [`UserPolicy`] loaded from `user_policy.toml`.
-/// User-origin items auto-pass the allow step but the policy's
-/// `deny` / `ignore` rules still apply, so a loadout patch matching
-/// a deny rule fails the composition here rather than at the daemon.
+/// Compose the given loadouts into a
+/// [`sessions::wire::request::WireContribution`] under the user's
+/// [`UserPolicy`] loaded from `user_policy.toml`. User-origin items
+/// auto-pass the allow step but the policy's `deny` / `ignore` rules
+/// still apply, so a loadout patch matching a deny rule fails the
+/// composition here rather than at the daemon.
+///
+/// Returns the possibly-mutated policy alongside the wire
+/// contribution — a hook (interactive prompt) may have appended
+/// allow/ignore/deny rules and the caller wants to persist them.
 ///
 /// [`UserPolicy`]: sessions::core::policy::UserPolicy
 pub(crate) fn compose_user_contribution(
     loadouts: Vec<sessions::core::loadout::Loadout>,
     policy: sessions::core::policy::UserPolicy,
     options: sessions::core::compose::ComposeOptions,
-) -> Result<sessions::wire::request::WireContribution, anyhow::Error> {
+) -> Result<
+    (
+        sessions::wire::request::WireContribution,
+        sessions::core::policy::UserPolicy,
+    ),
+    anyhow::Error,
+> {
+    // Session transition scripts declared in a loadout are not available
+    // in this release, so they are silently excluded here — before the
+    // loadouts reach the composer — rather than after composition. This
+    // keeps a declared hook from participating in composition at all.
+    // Drop the `without_lifecycle_hooks` map when the feature ships.
+    let loadouts: Vec<_> = loadouts
+        .into_iter()
+        .map(sessions::core::loadout::Loadout::without_lifecycle_hooks)
+        .collect();
+
     let mut composer = sessions::client::composer::UserComposer::new();
     composer
         .add_all(loadouts)
@@ -221,11 +242,10 @@ impl LoadoutRow {
                 name: entry.file_stem.clone(),
                 desc: l.description().unwrap_or("").to_string(),
                 counts: format!(
-                    "{} pkg / {} var / {} patch / {} hook",
+                    "{} pkg / {} var / {} patch",
                     l.packages().len(),
                     l.vars().len() + l.vars_lenient().len(),
                     l.patches().iter().count(),
-                    l.lifecycle_hooks().len(),
                 ),
             },
             Err(e) => Self {
@@ -275,7 +295,8 @@ mod tests {
             repo_dir: None,
             minimal_dir: None,
             config_dir: Some(PathBuf::from("/definitely/does/not/exist")),
-            minvmd: false,
+            provider: None,
+            no_input: false,
         };
         let out = resolve_active_loadouts(LoadoutSelection::None, &cfg, &global)
             .expect("None → Ok(empty), no I/O");
@@ -295,9 +316,50 @@ mod tests {
             repo_dir: None,
             minimal_dir: None,
             config_dir: Some(tmp.path().to_path_buf()),
-            minvmd: false,
+            provider: None,
+            no_input: false,
         };
         let selection = LoadoutSelection::Cli(vec!["missing".to_string()]);
         assert!(resolve_active_loadouts(selection, &cfg, &global).is_err());
+    }
+
+    /// A loadout that declares a session transition script still composes
+    /// cleanly: the hook is excluded before composition (see
+    /// [`compose_user_contribution`]), so it neither errors nor lands in
+    /// the wire contribution, while the loadout's other items compose
+    /// normally.
+    #[test]
+    fn loadout_lifecycle_hook_is_excluded_without_affecting_composition() {
+        let loadout: sessions::core::loadout::Loadout = toml::from_str(
+            r#"
+name = "dev"
+packages = ["helix"]
+
+[vars]
+EDITOR = "hx"
+
+[[lifecycle_hooks]]
+on_activate = { type = "inline", value = "echo activated" }
+"#,
+        )
+        .expect("loadout parses");
+        // Sanity: the hook really is present on the loadout we feed in.
+        assert_eq!(loadout.lifecycle_hooks().len(), 1);
+
+        let (wire, _policy) = compose_user_contribution(
+            vec![loadout],
+            sessions::core::policy::UserPolicy::empty(),
+            sessions::core::compose::ComposeOptions::default(),
+        )
+        .expect("composition succeeds despite the declared hook");
+
+        // The declared hook is silently excluded...
+        assert!(
+            wire.lifecycle_hooks.is_empty(),
+            "declared lifecycle hook must be excluded from the contribution"
+        );
+        // ...while the loadout's other items compose normally.
+        assert_eq!(wire.requested_packages.len(), 1);
+        assert_eq!(wire.vars.len(), 1);
     }
 }

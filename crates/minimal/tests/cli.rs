@@ -30,7 +30,8 @@ async fn version_succeeds_without_daemon() {
         repo_dir: None,
         minimal_dir: Some(std::path::PathBuf::from("/nonexistent")),
         config_dir: None,
-        minvmd: false,
+        provider: None,
+        no_input: false,
     };
     // Should print client version and note daemon is unreachable, but return Ok.
     cmd_version(&args).await.unwrap();
@@ -48,6 +49,8 @@ fn ls_shows_shared_resource_pool() {
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
             name: None,
+            project_path: Some(paths::HostAbsPath::try_new("/p").unwrap()),
+            status: sessions::SessionStatus::Active,
             attrs: None,
         }],
     };
@@ -204,8 +207,11 @@ async fn activate_creates_session() {
     let (daemon, args) = setup().await;
 
     // Create a temp project dir with a minimal.toml so the
-    // missing-mfile prompt doesn't fire.
+    // missing-mfile prompt doesn't fire. Mark it as a VCS root so
+    // the non-VCS upload confirmation (#790) short-circuits instead
+    // of blocking on stdin when the test binary is attached to a TTY.
     let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
         "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
@@ -214,12 +220,13 @@ async fn activate_creates_session() {
 
     let activate_args = ActivateArgs {
         name: Some("test-session".to_string()),
-        path: project.path().to_string_lossy().to_string(),
+        path: Some(project.path().to_string_lossy().to_string()),
         sync: SyncMode::Tarball,
         network: CliNetworkMode::NoNet,
         ingress: vec![],
         loadout: vec![],
         no_loadouts: false,
+        no_prompt: false,
         attach: false,
     };
     cmd_activate(&args, activate_args).await.unwrap();
@@ -239,7 +246,11 @@ async fn activate_uploads_project_files() {
     let (daemon, args) = setup().await;
 
     // Create a temp project dir with a minimal.toml and some files.
+    // Mark it as a VCS root so the non-VCS upload confirmation (#790)
+    // short-circuits instead of blocking on stdin when the test
+    // binary is attached to a TTY.
     let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
         "# test\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
@@ -251,12 +262,13 @@ async fn activate_uploads_project_files() {
 
     let activate_args = ActivateArgs {
         name: Some("upload-test".to_string()),
-        path: project.path().to_string_lossy().to_string(),
+        path: Some(project.path().to_string_lossy().to_string()),
         sync: SyncMode::Tarball,
         network: CliNetworkMode::NoNet,
         ingress: vec![],
         loadout: vec![],
         no_loadouts: false,
+        no_prompt: false,
         attach: false,
     };
     cmd_activate(&args, activate_args).await.unwrap();
@@ -282,6 +294,148 @@ async fn activate_uploads_project_files() {
 
     let mfile = sftp.read("minimal.toml").await.unwrap();
     assert!(mfile.starts_with(b"# test"));
+}
+
+/// A workspace upload whose unpack fails on the daemon must surface as an
+/// `Err`, not a silent success. The daemon relays the failure on
+/// extended-data stream 1 and only then closes the channel; the client reads
+/// to that close, so the failure cannot be swallowed. Regression test for the
+/// silent-upload-failure half of #824.
+#[tokio::test]
+async fn upload_workspace_files_surfaces_daemon_unpack_error() {
+    let (_daemon, args) = setup().await;
+    let mut client = connect_daemon(&args).await.unwrap();
+
+    // A well-formed but unknown session id: the daemon can't resolve a
+    // destination for the upload, reports the failure, and closes.
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::write(project.path().join("hello.txt"), "hello world").unwrap();
+
+    let result = client
+        .upload_workspace_files(SessionId::nil(), project.path())
+        .await;
+    assert!(
+        result.is_err(),
+        "upload to an unknown session must fail, not report success: {result:?}"
+    );
+}
+
+// --- attach (smart resolution) ---
+
+/// `min activate` with no positional path but `-C/--repo-dir` set uploads
+/// from the repo-dir directory, not the process cwd (#873).
+#[tokio::test]
+async fn activate_uses_repo_dir_when_no_positional_path() {
+    let (daemon, mut global) = setup().await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+    std::fs::write(project.path().join("hello.txt"), "hello world").unwrap();
+
+    global.repo_dir = Some(project.path().to_path_buf());
+
+    let activate_args = ActivateArgs {
+        name: Some("repo-dir-test".to_string()),
+        path: None,
+        sync: SyncMode::Tarball,
+        network: CliNetworkMode::NoNet,
+        ingress: vec![],
+        loadout: vec![],
+        no_loadouts: false,
+        no_prompt: false,
+        attach: false,
+    };
+    cmd_activate(&global, activate_args).await.unwrap();
+
+    let mut client = daemon.server.connect().await;
+    use minimald_rpc::ListSessions;
+    let resp = client.call::<ListSessions>(&()).await;
+    assert_eq!(resp.sessions.len(), 1);
+    let session = &resp.sessions[0];
+
+    let project_canon = project.path().canonicalize().unwrap();
+    let session_path = session.project_path.as_ref().unwrap();
+    assert_eq!(
+        session_path.as_str(),
+        project_canon.to_str().unwrap(),
+        "session project_path should match -C/--repo-dir, not cwd"
+    );
+
+    let sftp = client.open_sftp(session.id).await;
+    let hello = sftp.read("hello.txt").await.unwrap();
+    assert_eq!(hello, b"hello world");
+}
+
+/// `min attach` with no session argument and `--no-input` errors cleanly when
+/// no sessions exist, rather than hanging or shelling out to ssh. The error
+/// surfaces before any ssh exec, so it is deterministic in a test environment.
+#[tokio::test]
+async fn attach_with_no_session_errors_when_no_sessions_exist() {
+    let (_daemon, mut global) = setup().await;
+    global.no_input = true;
+
+    let err = cmd_attach(
+        &global,
+        AttachArgs {
+            session: None,
+            command: None,
+        },
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("no sessions exist"),
+        "expected a 'no sessions' error, got: {err}"
+    );
+}
+
+/// `min attach` with no session argument and `--no-input` errors with a list
+/// of candidates when more than one session shares the current directory,
+/// rather than opening a picker. Both sessions are built from the same
+/// canonicalized tempdir so the cwd match is deterministic across platforms.
+#[tokio::test]
+async fn attach_with_no_session_errors_when_ambiguous_and_no_input() {
+    let (daemon, mut global) = setup().await;
+
+    // Two sessions built from the same directory make the choice ambiguous.
+    let cwd = tempfile::TempDir::new().unwrap();
+    let cwd_canon = cwd.path().canonicalize().unwrap();
+    let cwd_str = camino::Utf8PathBuf::from_path_buf(cwd_canon).unwrap();
+    let abs_path = paths::HostAbsPath::try_new(cwd_str).unwrap();
+    create_session_at(&daemon, "amb-1", abs_path.clone()).await;
+    create_session_at(&daemon, "amb-2", abs_path).await;
+
+    global.no_input = true;
+    // `--repo-dir` overrides the cwd used for matching; canonicalized by the
+    // resolver, it equals the sessions' project_path above.
+    global.repo_dir = Some(cwd.path().to_path_buf());
+
+    let err = cmd_attach(
+        &global,
+        AttachArgs {
+            session: None,
+            command: None,
+        },
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("Multiple sessions match"),
+        "expected an ambiguity error, got: {err}"
+    );
+    assert!(err.contains("amb-1"), "candidates list names: {err}");
+    assert!(err.contains("amb-2"), "candidates list names: {err}");
+    assert!(
+        err.contains("min attach <id>"),
+        "should suggest explicit attach, got: {err}"
+    );
 }
 
 // --- destroy ---
@@ -526,15 +680,25 @@ async fn create_pending_session(daemon: &common::TestDaemon, name: &str) -> Sess
 }
 
 async fn create_session(daemon: &common::TestDaemon, name: &str) -> SessionId {
-    let mut client = daemon.server.connect().await;
-
     let project_path =
         camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
     let abs_path = paths::HostAbsPath::try_new(project_path).unwrap();
+    create_session_at(daemon, name, abs_path).await
+}
+
+/// Like [`create_session`] but builds the session from `project_path` instead
+/// of the test process's current directory. Used to place sessions at a known
+/// path so smart-attach resolution can match against it deterministically.
+async fn create_session_at(
+    daemon: &common::TestDaemon,
+    name: &str,
+    project_path: paths::HostAbsPath,
+) -> SessionId {
+    let mut client = daemon.server.connect().await;
 
     let config = minimald_rpc::SessionConfig {
         name: Some(name.to_string()),
-        project_path: abs_path,
+        project_path,
         network: sessions::NetworkMode::NoNet,
         policy: Default::default(),
         attrs: Default::default(),
@@ -542,6 +706,7 @@ async fn create_session(daemon: &common::TestDaemon, name: &str) -> SessionId {
 
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
+        FinalizeSession, FinalizeSessionRequest,
     };
     let id = match client
         .call::<CreateSession>(&CreateSessionRequest { config })
@@ -552,8 +717,9 @@ async fn create_session(daemon: &common::TestDaemon, name: &str) -> SessionId {
             panic!("CreateSession failed: {error}")
         }
     };
-    // Finalize the session's loadout, as `min activate` does: its workspace
-    // is empty, so this composes to an empty `Ready` in one shot.
+    // Configure the loadout, then finalize — the workspace is
+    // empty so the composition has no patches and Finalize takes
+    // the empty-composition short-circuit past the marker check.
     match client
         .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
             session_id: id,
@@ -564,6 +730,15 @@ async fn create_session(daemon: &common::TestDaemon, name: &str) -> SessionId {
         minimald_rpc::Errorable::Ok(r) => unwrap_ready(r),
         minimald_rpc::Errorable::Err { error } => {
             panic!("ConfigureLoadout failed: {error}")
+        }
+    }
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(_) => {}
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("FinalizeSession failed: {error}")
         }
     }
     id

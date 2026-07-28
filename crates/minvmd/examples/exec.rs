@@ -29,15 +29,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use minimald_rpc::{
     ConfigureLoadoutRequest, ConfigureLoadoutResponse, CreateSessionRequest, CreateSessionResponse,
-    Errorable, SessionConfig,
+    Errorable, FinalizeSessionRequest, FinalizeSessionResponse, SessionConfig,
 };
 
 /// SSH subsystem for the CreateSession RPC (mirrors minimald's
 /// `RPC_SUBSYSTEM_PREFIX` + "CreateSession").
 const CREATE_SESSION_SUBSYSTEM: &str = "minimald-v1-CreateSession";
-/// SSH subsystem for the ConfigureLoadout RPC, which finalizes the session
+/// SSH subsystem for the ConfigureLoadout RPC, which composes the session
 /// a `CreateSession` allocated.
 const CONFIGURE_LOADOUT_SUBSYSTEM: &str = "minimald-v1-ConfigureLoadout";
+/// SSH subsystem for the FinalizeSession RPC, which promotes a session
+/// from `Materializing` to `Active` and is required before exec.
+const FINALIZE_SESSION_SUBSYSTEM: &str = "minimald-v1-FinalizeSession";
 /// Env var minimald reads to scope an exec to a session.
 const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
 
@@ -226,13 +229,56 @@ async fn run_session_exec(
         let resp: Errorable<ConfigureLoadoutResponse> =
             serde_json::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
         match resp {
-            Errorable::Ok(ConfigureLoadoutResponse::Ready) => {}
+            Errorable::Ok(ConfigureLoadoutResponse::Materialized) => {
+                // Compose finished in one shot; fall through to the
+                // FinalizeSession call below.
+            }
             Errorable::Ok(ConfigureLoadoutResponse::Pending { .. }) => {
                 return Err("ConfigureLoadout returned Pending; \
-                            this example only handles Ready"
+                            this example only handles Materialized"
                     .to_string());
             }
             Errorable::Err { error } => return Err(format!("ConfigureLoadout failed: {error}")),
+        }
+    }
+
+    // FinalizeSession: promote the record `Materializing → Active`
+    // so exec/attach passes the daemon's status gate. This example
+    // has no patches to upload beforehand (empty contribution +
+    // empty workspace mfile → empty composition), so the
+    // `WorkspacePatchesTarZst` step the CLI performs isn't needed
+    // — but `FinalizeSession` still is: the daemon takes the
+    // composition-has-no-patches shortcut past the marker check
+    // and writes the record as `Active`.
+    {
+        let channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("open FinalizeSession channel: {e}"))?;
+        channel
+            .request_subsystem(false, FINALIZE_SESSION_SUBSYSTEM)
+            .await
+            .map_err(|e| format!("request_subsystem: {e}"))?;
+
+        let req = FinalizeSessionRequest { session_id };
+        let body = serde_json::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
+
+        let mut rpc = channel.into_stream();
+        rpc.write_all(&body)
+            .await
+            .map_err(|e| format!("write request: {e}"))?;
+        rpc.shutdown()
+            .await
+            .map_err(|e| format!("shutdown write half: {e}"))?;
+        let mut resp_buf = Vec::with_capacity(256);
+        rpc.read_to_end(&mut resp_buf)
+            .await
+            .map_err(|e| format!("read response: {e}"))?;
+        let resp: Errorable<FinalizeSessionResponse> =
+            serde_json::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
+        match resp {
+            Errorable::Ok(FinalizeSessionResponse) => {}
+            Errorable::Err { error } => return Err(format!("FinalizeSession failed: {error}")),
         }
     }
 

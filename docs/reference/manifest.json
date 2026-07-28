@@ -1,0 +1,16 @@
+{
+  "pages": [
+    "cli.md",
+    "cli-mip.md",
+    "cli-min.md",
+    "cli-minimald.md",
+    "cli-minvmd.md",
+    "minimal-dot-toml.md",
+    "tasks.md",
+    "loadouts.md",
+    "build-specs.md",
+    "stack-specs.md",
+    "sandbox-operations.md",
+    "linux-host-setup.md"
+  ]
+}

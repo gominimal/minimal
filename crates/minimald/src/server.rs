@@ -9,6 +9,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
 use crate::connection::Connection;
 use crate::github::GithubService;
@@ -101,6 +102,33 @@ impl Config {
     }
 }
 
+/// A one-shot closure that closes the daemon's file-log appender — reloading
+/// its tracing layer off and dropping the worker guard, flushing buffered
+/// records and releasing the file descriptor. Authored by the binary's
+/// `DaemonLogger` (which owns the reload handle and the guard); owned here
+/// and run once at shutdown via [`ServerStateHandle::release_log`], so no
+/// process-global mutable state is needed. In the microVM this must precede
+/// the volume quiesce — an open fd under the mountpoint defeats the clean
+/// unmount and leaves a dirty ext4 journal.
+pub struct DaemonLogRelease(Box<dyn FnOnce() + Send>);
+
+impl DaemonLogRelease {
+    /// Wraps the release action. Called by the binary's `DaemonLogger`.
+    pub fn new(release: impl FnOnce() + Send + 'static) -> Self {
+        Self(Box::new(release))
+    }
+
+    fn run(self) {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for DaemonLogRelease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DaemonLogRelease(..)")
+    }
+}
+
 /// A container for the state of the server.
 #[derive(Debug)]
 pub struct ServerState {
@@ -120,6 +148,10 @@ pub struct ServerState {
     /// drain in-flight connections, and return so the process can exit.
     shutdown: CancellationToken,
 
+    /// Closes the daemon's file-log appender at shutdown (before the volume
+    /// quiesce in the microVM). `None` for a foreground run with no file log.
+    log_release: Option<DaemonLogRelease>,
+
     /// Memoized SSH host key, after first successful load.
     host_key: Option<PrivateKey>,
 
@@ -138,7 +170,10 @@ pub struct ServerState {
 }
 
 impl ServerState {
-    pub async fn new(config: Config) -> Result<Self, std::io::Error> {
+    pub async fn new(
+        config: Config,
+        log_release: Option<DaemonLogRelease>,
+    ) -> Result<Self, std::io::Error> {
         let minimal_state_dir = config.minimal_state_dir.clone();
         let minimal_cache_dir = config.minimal_cache_dir.clone();
         // Construct the per-host switch once, here at daemon scope, so a single
@@ -212,6 +247,7 @@ impl ServerState {
             github,
             config,
             shutdown: CancellationToken::new(),
+            log_release,
             host_key: None,
             #[cfg(feature = "networking-proxy")]
             cert_authority,
@@ -227,8 +263,24 @@ pub struct ServerStateHandle(Arc<Mutex<ServerState>>);
 
 impl ServerStateHandle {
     /// Constructs a fresh handle wrapping a newly-initialized [`ServerState`].
-    pub(crate) async fn new(config: Config) -> Result<Self, std::io::Error> {
-        Ok(Self(Arc::new(Mutex::new(ServerState::new(config).await?))))
+    pub(crate) async fn new(
+        config: Config,
+        log_release: Option<DaemonLogRelease>,
+    ) -> Result<Self, std::io::Error> {
+        Ok(Self(Arc::new(Mutex::new(
+            ServerState::new(config, log_release).await?,
+        ))))
+    }
+
+    /// Runs and clears the daemon's file-log release (flushing records and
+    /// closing the appender's fd), so a subsequent volume quiesce is not
+    /// blocked by the open fd. A no-op after the first call, and for a
+    /// foreground run with no file log. Called by the Shutdown RPC.
+    pub async fn release_log(&self) {
+        let release = self.0.lock().await.log_release.take();
+        if let Some(release) = release {
+            release.run();
+        }
     }
 
     pub async fn host_key(&self) -> Result<PrivateKey, KeyError> {
@@ -282,10 +334,17 @@ impl ServerStateHandle {
         self.0.lock().await.config.state_volume_mounted
     }
 
-    /// The configured state dir (the quiesce target when in a microVM).
-    #[cfg(target_os = "linux")]
+    /// The configured state dir (the quiesce target when in a microVM, and the
+    /// root every diagnostic collector reads from).
     pub(crate) async fn minimal_state_dir(&self) -> DaemonAbsPath {
         self.0.lock().await.config.minimal_state_dir.clone()
+    }
+
+    /// Whether this daemon is the in-VM instance rather than a native one.
+    /// Recorded in the diagnostic bundle's `meta.json` so a reader knows which
+    /// of the two answered, and gates the guest-only gvproxy probe.
+    pub(crate) async fn in_microvm(&self) -> bool {
+        self.0.lock().await.config.in_microvm
     }
 
     /// Returns the daemon's TLS certificate authority (only with
@@ -388,6 +447,10 @@ impl Listener for tokio_vsock::VsockListener {
 /// so an unbounded wait could hang the process; this bounds it.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Monotonic id carried by each accepted connection's span, so a
+/// connection's accept, channel bindings, and close correlate across the log.
+static CONN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A listening minimald server.
 #[derive(Debug)]
 pub struct Server;
@@ -395,12 +458,16 @@ pub struct Server;
 impl Server {
     /// Launches minimald, accepting connections on the given listener and
     /// driving an SSH session over each until the listener errors.
-    pub async fn run<L: Listener>(config: Config, listener: L) -> Result<(), std::io::Error> {
+    pub async fn run<L: Listener>(
+        config: Config,
+        listener: L,
+        log_release: Option<DaemonLogRelease>,
+    ) -> Result<(), std::io::Error> {
         // `config` is moved into the state below; capture the deployment-model
         // flag the proxy startup needs first.
         #[cfg(target_os = "linux")]
         let in_microvm = config.in_microvm;
-        let state = ServerStateHandle::new(config).await?;
+        let state = ServerStateHandle::new(config, log_release).await?;
 
         // Start minimald's two host-side proxies (B5 egress :7654, B8 mTLS
         // :7655) for the server's lifetime and, in a microVM (DM1), publish them
@@ -432,31 +499,63 @@ impl Server {
                 () = shutdown.cancelled() => break,
                 accepted = listener.accept() => accepted?,
             };
-            tracing::info!(?peer, transport = L::TRANSPORT, "accepted connection");
-            let (_conn_hnd, session_fut) = match Connection::from_stream(
-                stream,
-                russh_config.clone(),
-                state.clone(),
-                L::IS_LOCAL,
-            )
-            .await
-            {
+            // One span per accepted connection: every record the connection
+            // and its channels emit carries `conn`, so accept, channel
+            // bindings, and close correlate across the log with a grep
+            // instead of manual id fields on each line.
+            let conn = CONN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let span = tracing::info_span!("conn", conn, transport = L::TRANSPORT);
+            span.in_scope(|| tracing::info!(?peer, "accepted connection"));
+            let from_stream =
+                Connection::from_stream(stream, russh_config.clone(), state.clone(), L::IS_LOCAL);
+            let (conn_hnd, session_fut) = match from_stream.instrument(span.clone()).await {
                 Ok(conn) => conn,
                 Err(e) => {
                     // A handshake failure must not take the daemon down — in
                     // the guest minimald is pid-1. Drop this connection and
                     // keep accepting.
-                    tracing::warn!(error = %e, transport = L::TRANSPORT, "SSH handshake failed; dropping connection");
+                    span.in_scope(
+                        || tracing::warn!(error = %e, "SSH handshake failed; dropping connection"),
+                    );
                     continue;
                 }
             };
             // Log session errors instead of silently dropping the spawned
             // future, so a failed handshake is visible on any transport.
-            session_set.spawn(async move {
-                if let Err(e) = session_fut.await {
-                    tracing::warn!(error = %e, transport = L::TRANSPORT, "session ended with error");
+            let reap_state = state.clone();
+            session_set.spawn(
+                async move {
+                    match session_fut.await {
+                        Ok(()) => tracing::info!("connection closed"),
+                        Err(e) => {
+                            // Abrupt hangups are how the CLI's oneshot RPC
+                            // connections and Ctrl-C'd attaches normally end;
+                            // framing them as errors makes routine traffic
+                            // read like a transport incident during field
+                            // analysis. Match on the rendered message: russh
+                            // wraps the underlying io error, and this is log
+                            // framing only.
+                            let msg = e.to_string();
+                            if msg.contains("early eof")
+                                || msg.contains("Broken pipe")
+                                || msg.contains("Disconnected")
+                            {
+                                tracing::info!(reason = %msg, "connection closed by peer");
+                            } else {
+                                tracing::warn!(error = %msg, "session ended with error");
+                            }
+                        }
+                    }
+                    // The connection is gone. Reap any session it created that
+                    // never reached `Active` — a client that dropped
+                    // mid-activation (Ctrl-C at the gating prompt, a crash, a
+                    // network blip) would otherwise strand a `Pending` /
+                    // `Materializing` session that holds its name hostage.
+                    reap_unfinalized_sessions(&reap_state, conn_hnd.take_created_sessions().await)
+                        .await;
                 }
-            });
+                .instrument(span),
+            );
         }
 
         // Shutdown requested: stop accepting (done — loop exited) and drain
@@ -514,6 +613,59 @@ async fn build_russh_config(
         keepalive_max: KEEPALIVE_MAX,
         ..Default::default()
     }))
+}
+
+/// Reap sessions a now-closed connection created but never finalized.
+///
+/// `ids` are the sessions [`CreateSession`](crate::rpc) allocated over
+/// the connection. Only those still `Pending` (never got a
+/// `SubmitVerdict`) or `Materializing` (never got a `FinalizeSession`)
+/// are deleted — a client that dropped mid-activation (Ctrl-C at the
+/// gating prompt, a crash, a network blip) would otherwise strand a
+/// half-built session that holds its name hostage until the next daemon
+/// restart. A finalized (`Active`) session is long-lived and must
+/// survive the connection that created it, so it is left untouched.
+/// Best-effort and never fatal: minimald is pid-1 in the guest.
+async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::sessions::SessionId>) {
+    if ids.is_empty() {
+        return;
+    }
+    let mngr = state.sessions_manager().await;
+    for id in ids {
+        // Re-read the status at teardown: a clean client abort already
+        // deleted the record (`get_record` → `None`), and a finalized
+        // session is `Active` — neither should be reaped here.
+        let status = match mngr.get_record(sessions::SessionKeyPredicate::Id(id)).await {
+            Ok(Some(record)) => record.status,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %id,
+                    error = %e,
+                    "could not read session status while reaping after connection close"
+                );
+                continue;
+            }
+        };
+        if !matches!(
+            status,
+            ::sessions::SessionStatus::Pending | ::sessions::SessionStatus::Materializing
+        ) {
+            continue;
+        }
+        match mngr.delete_session(id).await {
+            Ok(()) => tracing::info!(
+                session_id = %id,
+                ?status,
+                "reaped unfinalized session after its connection closed"
+            ),
+            Err(e) => tracing::warn!(
+                session_id = %id,
+                error = %e,
+                "failed to reap unfinalized session after connection close"
+            ),
+        }
+    }
 }
 
 /// Binds and serves minimald's two host-side proxies for the daemon's lifetime
@@ -674,6 +826,32 @@ mod tests {
         }
     }
 
+    /// The volume-log release must run exactly once no matter how many
+    /// times the Shutdown path invokes it, and a harness-style `None`
+    /// release must be a no-op.
+    #[tokio::test]
+    async fn log_release_runs_exactly_once() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let dir = TempDir::new().unwrap();
+        let count = Arc::new(AtomicU32::new(0));
+        let counted = count.clone();
+        let release = DaemonLogRelease::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        let state = ServerStateHandle::new(test_config(&dir), Some(release))
+            .await
+            .unwrap();
+        state.release_log().await;
+        state.release_log().await;
+        assert_eq!(count.load(Ordering::SeqCst), 1, "one-shot, then a no-op");
+
+        let none = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
+        none.release_log().await;
+    }
+
     /// Binds a UDS in `dir` and spawns `Server::run` against it, returning the
     /// run task's join handle alongside the socket path clients dial.
     fn spawn_server(
@@ -684,7 +862,7 @@ mod tests {
     ) {
         let sock = dir.path().join("minimald.sock");
         let listener = UnixListener::bind(&sock).unwrap();
-        let run = tokio::spawn(Server::run(test_config(dir), listener));
+        let run = tokio::spawn(Server::run(test_config(dir), listener, None));
         (run, sock)
     }
 
@@ -729,5 +907,69 @@ mod tests {
             .expect("run must return after the grace period aborts lingering connections");
         assert!(res.unwrap().is_ok(), "run should return Ok after shutdown");
         drop(client);
+    }
+
+    /// A session left unfinalized when its creating connection closes —
+    /// the state an interrupted `min activate` (Ctrl-C at the gating
+    /// prompt) leaves on the daemon — is reaped, while a finalized
+    /// (`Active`) session created over that same connection survives.
+    #[tokio::test]
+    async fn dropping_a_connection_reaps_only_its_unfinalized_sessions() {
+        use crate::test_harness::{create_configured_session, create_session_req};
+        use minimald_rpc::{CreateSession, GetSessionRecord, GetSessionRecordRequest};
+
+        let dir = TempDir::new().unwrap();
+        let (run, sock) = spawn_server(&dir);
+
+        // Connection A: create a Pending session (no ConfigureLoadout) AND a
+        // fully-finalized Active session, then drop the connection.
+        let (pending_id, active_id) = {
+            let mut client = connect_uds(&sock).await;
+            let pending = client
+                .call::<CreateSession>(&create_session_req("interrupted", "/tmp"))
+                .await
+                .ok()
+                .expect("create pending session")
+                .id;
+            let active = create_configured_session(&mut client, "finalized", "/tmp").await;
+            (pending, active)
+            // `client` dropped here → connection closes → the server's
+            // per-connection task runs the teardown reap.
+        };
+
+        // The reap is asynchronous (it runs once the socket close is
+        // observed), so poll a fresh connection until the Pending record is
+        // gone. The Active record must remain throughout.
+        let mut client = connect_uds(&sock).await;
+        let mut reaped = false;
+        for _ in 0..100 {
+            let pending_gone = client
+                .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(pending_id))
+                .await
+                .record
+                .is_none();
+            if pending_gone {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            reaped,
+            "an unfinalized (Pending) session must be reaped when its creating connection closes",
+        );
+        assert!(
+            client
+                .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(active_id))
+                .await
+                .record
+                .is_some(),
+            "an Active session must survive the connection that created it",
+        );
+
+        let _ = client
+            .call::<Shutdown>(&ShutdownRequest { force: false })
+            .await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
     }
 }

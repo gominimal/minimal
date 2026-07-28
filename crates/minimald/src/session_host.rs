@@ -6,7 +6,6 @@
 //! The [`Host`] struct holds the running state of an active session.
 
 use async_dialog::Selection;
-use either::Either;
 use russh::Channel;
 use russh::server::Msg;
 #[cfg(not(test))]
@@ -23,6 +22,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tracing::Instrument as _;
 
 use crate::RequestedPty;
 use crate::session::SessionPaths;
@@ -162,10 +162,10 @@ impl Pty {
 }
 
 /// Emit one `tracing::info!` per item the launcher folds into the
-/// session — packages, vars, patches, and lifecycle hooks —
-/// tagging each with its provenance so an operator can trace
-/// "where did `EDITOR=hx` come from?" back to the loadout /
-/// project / package that contributed it.
+/// session — packages, vars, and patches — tagging each with its
+/// provenance so an operator can trace "where did `EDITOR=hx` come
+/// from?" back to the loadout / project / package that contributed
+/// it.
 ///
 /// Baseline items (the launcher-defaults `PS1`, `base`, `coreutils`,
 /// `socat`) log with `source = "launcher-baseline"` so they can be
@@ -238,36 +238,39 @@ fn log_session_contents(
             host_source = %patch.host_path(),
             sandbox_dest = %patch.destination(),
             source = ?sessions::core::source::Provenanced::source(sp),
-            deferred = true,
-            "session content (patch: file-upload plumbing deferred)",
+            "session content (patch: materialized into session home at FinalizeSession)",
         );
     }
-    for h in comp.lifecycle_hooks() {
-        let src = sessions::core::source::Provenanced::source(h);
-        let hook = h.hook();
-        [
-            ("on_activate", hook.on_activate()),
-            ("on_destroy", hook.on_destroy()),
-            ("on_failure", hook.on_failure()),
-        ]
-        .into_iter()
-        .filter_map(|(event, script)| script.map(|s| (event, s)))
-        .for_each(|(event, script)| {
-            let kind = match script {
-                sessions::core::lifecyclehook::HookScript::Inline(_) => "inline",
-                sessions::core::lifecyclehook::HookScript::External(_) => "external",
-            };
-            tracing::info!(
-                session = session_name,
-                domain = "lifecycle_hook",
-                event = event,
-                script_kind = kind,
-                source = ?src,
-                deferred = true,
-                "session content (lifecycle hook: exec plumbing deferred)",
-            );
-        });
-    }
+    // Session transition scripts are gated off for this release. A hook
+    // declared in a project `[session]` block is still accepted and
+    // composed into the session — it is disabled here, at the output
+    // layer, by suppressing the content-logging loop below (and it is
+    // never executed, as exec is deferred), rather than being refused at
+    // compose time. Restore the loop when the feature ships. (Hooks from
+    // loadouts are excluded earlier, before client-side composition — see
+    // `crates/minimal/src/loadouts.rs`.)
+    //
+    // for h in comp.lifecycle_hooks() {
+    //     let src = sessions::core::source::Provenanced::source(h);
+    //     let hook = h.hook();
+    //     [
+    //         ("on_activate", hook.on_activate()),
+    //         ("on_destroy", hook.on_destroy()),
+    //         ("on_failure", hook.on_failure()),
+    //     ]
+    //     .into_iter()
+    //     .filter_map(|(event, script)| script.map(|s| (event, s)))
+    //     .for_each(|(event, script)| {
+    //         let kind = match script {
+    //             sessions::core::lifecyclehook::HookScript::Inline(_) => "inline",
+    //             sessions::core::lifecyclehook::HookScript::External(_) => "external",
+    //         };
+    //         tracing::info!(
+    //             session = session_name,
+    //             ...
+    //         );
+    //     });
+    // }
 }
 
 /// Duplicate `fd` into a new close-on-exec `OwnedFd` via
@@ -324,6 +327,19 @@ enum BindingMsg {
     TeardownDueToProcessExit(Option<std::io::Error>),
     TeardownDueToSuperceded(Vec<u8>),
     TeardownDueToDetach(Vec<u8>),
+    TeardownDueToDaemonShutdown(Vec<u8>),
+}
+
+/// Messages from the binding (user terminal) to the shell process / host.
+enum StdinMsg {
+    Bytes(bytes::Bytes),
+    TerminalUpdate(RequestedPty),
+    WindowChange {
+        col_width: u32,
+        row_height: u32,
+        pix_width: u32,
+        pix_height: u32,
+    },
 }
 
 /// A connection between a [`Host`] and an SSH channel.
@@ -335,7 +351,7 @@ struct Binding {
     /// The remote end of this binding.
     channel: Channel<Msg>,
     /// Channel the binding writes down to communicate stdin to the host.
-    stdin_tx: mpsc::Sender<Either<bytes::Bytes, RequestedPty>>,
+    stdin_tx: mpsc::Sender<StdinMsg>,
     /// Channel the [`Host`] uses to communicate with this [`Binding`].
     receiver: mpsc::Receiver<BindingMsg>,
     /// Capability to destroy the owning session, exercised when the user picks
@@ -349,7 +365,7 @@ impl Binding {
     /// which the owning [`Host`] should own to communicate with it.
     pub(crate) async fn spawn(
         channel: Channel<Msg>,
-        stdin_tx: mpsc::Sender<Either<bytes::Bytes, RequestedPty>>,
+        stdin_tx: mpsc::Sender<StdinMsg>,
         control: Option<SessionControl>,
     ) -> (mpsc::Sender<BindingMsg>, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(4);
@@ -361,10 +377,15 @@ impl Binding {
             control,
         };
 
-        (tx, tokio::spawn(binding.run()))
+        // The channel id ties every line this binding logs back to the
+        // connection span's `accepted connection`/`closed` lines — field
+        // analysis stalls without that correlation.
+        let span = tracing::info_span!("binding", channel = %binding.channel.id());
+        (tx, tokio::spawn(binding.run().instrument(span)))
     }
 
     async fn run(mut self) {
+        tracing::info!("binding attached to session channel");
         let (mut rs, ws) = self.channel.split();
         let mut w = ws.make_writer();
 
@@ -374,6 +395,7 @@ impl Binding {
             Detach,
             Superceded,
             ProcessExited,
+            Shutdown,
         }
 
         // Reading from the remote stops once it sends EOF;
@@ -387,7 +409,7 @@ impl Binding {
                     Some(msg) => {
                         match msg {
                             russh::ChannelMsg::Data{ data } => {
-                                let _ = self.stdin_tx.send(Either::Left(data)).await;
+                                let _ = self.stdin_tx.send(StdinMsg::Bytes(data)).await;
                             }
                             russh::ChannelMsg::RequestPty {
                                 want_reply: _,
@@ -398,18 +420,33 @@ impl Binding {
                                 pix_height,
                                 terminal_modes,
                             } => {
-                                let _ = self.stdin_tx.send(Either::Right(RequestedPty {
+                                let _ = self.stdin_tx.send(StdinMsg::TerminalUpdate(RequestedPty {
                                     char_sizes: (col_width, row_height),
                                     pixel_sizes: (pix_width, pix_height),
                                     term: term.to_string(),
                                     modes: terminal_modes.to_vec(),
                                 })).await;
                             },
+                            russh::ChannelMsg::WindowChange{
+                                col_width,
+                                row_height,
+                                pix_width,
+                                pix_height,
+                            } => {
+                                let _ = self.stdin_tx.send(StdinMsg::WindowChange{
+                                    col_width, row_height, pix_width, pix_height,
+                                }).await;
+                            },
                             // Flow-control window updates fire on every
                             // burst of bytes forwarded through the
                             // channel, v. noisy.
                             russh::ChannelMsg::WindowAdjusted { .. } => {}
-                            _ => tracing::warn!("skipping msg: {:?}", msg),
+                            // Duplicates of pre-attach requests the
+                            // connection handler already answered (russh
+                            // buffers them into the taken channel); noise on
+                            // every healthy attach, so keep them out of
+                            // info-level field bundles.
+                            _ => tracing::debug!("ignoring channel request on attached binding: {:?}", msg),
                         };
                     }
                 },
@@ -438,6 +475,11 @@ impl Binding {
                             let _ = w.write_all(b"\r\nDisconnecting - session attached to from a different connection\r\n").await;
                             break MainloopExitReason::Superceded;
                         }
+                        BindingMsg::TeardownDueToDaemonShutdown(unwind_codes) => {
+                            let _ = w.write_all(&unwind_codes).await;
+                            let _ = w.write_all(b"\r\nDisconnecting - minimald is shutting down\r\n").await;
+                            break MainloopExitReason::Shutdown;
+                        }
                         BindingMsg::TeardownDueToDetach(unwind_codes) => {
                             let _ = w.write_all(&unwind_codes).await;
                             let _ = w.write_all(b"\r\nDetaching due to ctrl-w.\r\n").await;
@@ -449,7 +491,7 @@ impl Binding {
             }
         };
 
-        tracing::debug!("Binding leaving mainloop due to {:?}", exit_reason);
+        tracing::info!(reason = ?exit_reason, "binding leaving mainloop");
 
         if exit_reason == MainloopExitReason::ProcessExited {
             // The shell process exited. For a bash shell, this usually meant someone pressed ctrl-d absent-mindedly.
@@ -550,7 +592,7 @@ pub(crate) struct Launched<P, G> {
 
 /// Actor messages to a [`Host`].
 enum Message {
-    Kill,
+    Kill(bool),
     Attach(Channel<Msg>, WinSize),
     GetAttrs(oneshot::Sender<HostAttrs>),
 
@@ -626,8 +668,8 @@ impl HostHandle {
         }
     }
 
-    pub async fn kill(&self) -> Result<(), ()> {
-        match self.sender.send(Message::Kill).await {
+    pub async fn kill(&self, for_shutdown: bool) -> Result<(), ()> {
+        match self.sender.send(Message::Kill(for_shutdown)).await {
             Ok(()) => Ok(()),
             Err(_e) => Err(()), // closed
         }
@@ -701,10 +743,10 @@ pub(crate) struct Host<P: SessionProcess, G: Send + 'static> {
     // Writer for bytes coming from the remote - i.e. 'stdin' keystrokes
     // that need to get written to the pty. Clones of this sender are
     // given to [`Binding::spawn`].
-    remote_tx: mpsc::Sender<Either<bytes::Bytes, RequestedPty>>,
+    remote_tx: mpsc::Sender<StdinMsg>,
     // Recieve-end for bytes coming from the remote - i.e. 'stdin' keystrokes.
     // We process this end.
-    remote_rx: mpsc::Receiver<Either<bytes::Bytes, RequestedPty>>,
+    remote_rx: mpsc::Receiver<StdinMsg>,
 
     // Temporary buffer for reading from the pty master (i.e. 'stdout').
     stdout_buf: Vec<u8>,
@@ -814,6 +856,9 @@ pub(crate) struct SandboxLauncher {
     /// Composition to merge into the launcher's baseline packages and
     /// vars. Patches and lifecycle hooks are ignored today.
     pub(crate) composition: Option<std::sync::Arc<sessions::core::compose::Composition>>,
+    /// Weak handle back to the owning session actor, for  `min` commands
+    /// (e.g. `min build`) to drive session side-ops.
+    pub(crate) session: crate::session::WeakSessionHandle,
 }
 
 /// Rolls back a native-own-IP phase-1 switch attach if the launch is abandoned
@@ -886,6 +931,7 @@ impl SessionLauncher for SandboxLauncher {
         // the sandbox env below.
         let session_name = name.clone();
         let composition = self.composition;
+        let session = self.session;
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
         // doesn't stall the async executor.
@@ -1017,7 +1063,7 @@ impl SessionLauncher for SandboxLauncher {
             let mut env = crate::env::Env::build(
                 ctx,
                 graph,
-                crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache)
+                crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache, session)
                     .with_packages(packages)
                     .with_resolved_env_vars(env_vars)
                     // Session envs source package attrs (env_state_wiring,
@@ -1398,7 +1444,17 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             // Read actor messages.
             Some(msg) = self.receiver.recv() => {
                 match msg {
-                    Message::Kill => {
+                    Message::Kill(for_shutdown) => {
+                        if for_shutdown
+                            && let Some((old_tx, old_join_hnd)) = self.remote.take() {
+                                // If there was a binding we just swapped out, tell it to
+                                // shut down and wait for it to finish.
+                                let _ = old_tx
+                                    .send(BindingMsg::TeardownDueToDaemonShutdown(self.unwind_codes()))
+                                    .await;
+                                let _ = old_join_hnd.await;
+                            }
+
                         if let Err(e) = self.process.kill() {
                             tracing::warn!(error = %e, "killing session process");
                         }
@@ -1472,7 +1528,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             // pending writes to the pty are serviced async by their own select arm (below).
             Some(msg) = self.remote_rx.recv(), if self.stdin_buf.is_none() => {
                 match msg {
-                    Either::Left(b) => {
+                    StdinMsg::Bytes(b) => {
                         self.attrs.stdin_last = Some(SystemTime::now());
 
                         // ctrl-w
@@ -1495,8 +1551,16 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                             self.stdin_buf = Some((b, 0));
                         };
                     }
-                    Either::Right(sz) => {
+                    StdinMsg::TerminalUpdate(sz) => {
                         self.set_size(WinSize::from(&sz));
+                    },
+                    StdinMsg::WindowChange{ col_width, row_height, pix_height, pix_width } => {
+                        self.set_size(WinSize {
+                            rows: row_height as u16,
+                            cols: col_width as u16,
+                            xpixel: pix_width as u16,
+                            ypixel: pix_height as u16,
+                        });
                     },
                 }
             },
@@ -1720,6 +1784,7 @@ mod tests {
                 working: DaemonAbsPath::root(),
                 cache: DaemonAbsPath::root(),
                 home: DaemonAbsPath::root(),
+                patches: DaemonAbsPath::root(),
             },
             DEFAULT_SIZE,
             None,
@@ -1738,7 +1803,7 @@ mod tests {
         let title = "hello-title";
         let osc = format!("\x1b]0;{title}\x07\n");
         stdin
-            .send(Either::Left(bytes::Bytes::from(osc.into_bytes())))
+            .send(StdinMsg::Bytes(bytes::Bytes::from(osc.into_bytes())))
             .await
             .expect("failed to send stdin");
 
@@ -1786,6 +1851,7 @@ mod tests {
                 working: DaemonAbsPath::root(),
                 cache: DaemonAbsPath::root(),
                 home: DaemonAbsPath::root(),
+                patches: DaemonAbsPath::root(),
             },
             DEFAULT_SIZE,
             None,
@@ -1795,7 +1861,10 @@ mod tests {
         .expect("failed to build host");
         let task = tokio::spawn(host.mainloop());
 
-        handle.kill().await.expect("kill should reach the host");
+        handle
+            .kill(false)
+            .await
+            .expect("kill should reach the host");
 
         // The mainloop must terminate (task resolves) without panicking. A
         // `JoinError` here would mean the host task panicked during teardown.
@@ -1871,6 +1940,7 @@ mod tests {
             working: DaemonAbsPath::root(),
             cache: DaemonAbsPath::root(),
             home: DaemonAbsPath::root(),
+            patches: DaemonAbsPath::root(),
         }
     }
 
@@ -1904,7 +1974,7 @@ mod tests {
 
         // Make the shell exit; the network must then be released.
         stdin
-            .send(Either::Left(bytes::Bytes::from(
+            .send(StdinMsg::Bytes(bytes::Bytes::from(
                 format!("{MOCK_EXIT_LINE}\n").into_bytes(),
             )))
             .await
@@ -1946,7 +2016,7 @@ mod tests {
         // A bare ctrl-w (0x17) is the detach chord. It must be consumed as a
         // detach signal rather than written to the pty.
         stdin
-            .send(Either::Left(bytes::Bytes::from(vec![0x17])))
+            .send(StdinMsg::Bytes(bytes::Bytes::from(vec![0x17])))
             .await
             .expect("failed to send ctrl-w");
 
@@ -1954,7 +2024,7 @@ mod tests {
         // stamps stdout activity. (If ctrl-w had been forwarded or had killed the
         // process, no echo would ever arrive.)
         stdin
-            .send(Either::Left(bytes::Bytes::from(b"ping\n".to_vec())))
+            .send(StdinMsg::Bytes(bytes::Bytes::from(b"ping\n".to_vec())))
             .await
             .expect("failed to send line after detach");
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -1974,7 +2044,7 @@ mod tests {
         );
 
         // Only now, on an explicit kill (destroy), is the network released.
-        handle.kill().await.expect("kill should reach the host");
+        handle.kill(true).await.expect("kill should reach the host");
         tokio::time::timeout(Duration::from_secs(10), task)
             .await
             .expect("mainloop should terminate after kill")

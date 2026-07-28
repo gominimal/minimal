@@ -51,10 +51,10 @@ pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
     eprintln!("Created {}", plan.toml_path.display());
     eprintln!();
     eprintln!("Next steps:");
-    eprintln!("  minimal update      # pin package versions");
-    eprintln!("  minimal run shell   # enter development shell");
+    eprintln!("  mip update      # pin package versions");
+    eprintln!("  mip run shell   # enter development shell");
     if plan.matched {
-        eprintln!("  minimal build       # build the project");
+        eprintln!("  mip build       # build the project");
     }
 
     Ok(())

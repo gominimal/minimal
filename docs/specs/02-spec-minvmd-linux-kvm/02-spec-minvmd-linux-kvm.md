@@ -2,7 +2,7 @@
 id: spec-minvmd-linux-kvm
 title: "minvmd Linux KVM backend"
 kind: spec
-status: planned
+status: shipped
 tracking-issue: 397
 supersedes:
 ---
@@ -22,8 +22,8 @@ UDS↔vsock bridge (via `krun_add_vsock_port2`), lifecycle daemon
 #374, merged 2026-06-11).
 
 Linux hosts today reach `minimald` over direct UDS with namespace (hakoniwa)
-sandboxing. When a user requests VM isolation on a Linux host — including GCP
-nested-virt instances with `/dev/kvm` — there is no `minvmd` path. This
+sandboxing. When a user requests VM isolation on a Linux host, including GCP
+nested-virt instances with `/dev/kvm`, there is no `minvmd` path. This
 spec adds it.
 
 libkrun supports both macOS (Hypervisor.framework) and Linux (KVM) through the
@@ -39,15 +39,15 @@ e2e on a Linux host. It builds on the package-served kernel and rootfs from
 #367, the minimald-as-pid-1 initramfs from #373, and the direct vsock
 session path from #374.
 
-**Networking** remains out of scope — owned by the minvmd networking issue
+**Networking** remains out of scope, owned by the minvmd networking issue
 (gvproxy/TSI userspace net).
 
 **Selection surface** (the mechanism by which a Linux session chooses VM
 isolation over namespace isolation) is treated as an open question (see Open
 Questions below). For this spec, VM isolation on Linux requires manually
 running `minvmd run --detach` before using `minimal`; the auto-spawn path in
-`minimal` stays a no-op on Linux. The full selection surface — per-session
-flag, loadout field, or policy — is deferred to a follow-up under #396.
+`minimal` stays a no-op on Linux. The full selection surface, per-session
+flag, loadout field, or policy, is deferred to a follow-up under #396.
 
 ## Introduction/Overview
 
@@ -55,14 +55,14 @@ flag, loadout field, or policy — is deferred to a follow-up under #396.
 removes that restriction: after landing, `minvmd run` on a Linux host with
 `/dev/kvm` boots a microVM (libkrun KVM backend), bridges a host UDS to the
 in-VM `minimald` over vsock, and the `minimal` CLI reaches `minimald`
-transparently — the same path as macOS, without any Hypervisor.framework
+transparently, the same path as macOS, without any Hypervisor.framework
 dependency.
 
-The Session Domain Model (`docs/session-domain-diag.md`) already shows a
+The Session Domain Model (`docs/internal/session-domain-diag.md`) already shows a
 "Local Linux deployment" where both `minimald` (direct namespace provider) and
 `minvmd` (VM provider) coexist on the same host, each exposing its own socket.
 This spec realizes the `minvmd` side of that diagram for Linux
-(informed by the session domain model in `docs/session-domain-diag.md`).
+(informed by the session domain model in `docs/internal/session-domain-diag.md`).
 
 ## Goals
 
@@ -93,16 +93,16 @@ This spec realizes the `minvmd` side of that diagram for Linux
 ## Demoable Units of Work
 
 > Requirement IDs use the format **R{unit}.{seq}** (R1.1, R1.2 for Unit 1;
-> R2.1 for Unit 2). These IDs are referenced directly by the planner — do
+> R2.1 for Unit 2). These IDs are referenced directly by the planner, do
 > not renumber after approval.
 
 ---
 
-### Unit 1: Un-gate libkrun from macOS — build and link on Linux
+### Unit 1: Un-gate libkrun from macOS - build and link on Linux
 
 **Purpose:** Make `crates/minvmd` compile cleanly on Linux by extending the
 build script and removing the `#[cfg(target_os = "macos")]` guards that gate
-the `krun` module and the VM configuration. No runtime change yet — the
+the `krun` module and the VM configuration. No runtime change yet, the
 daemon still bails on `boot` and `run` until Unit 2.
 
 **Depends on:** None
@@ -114,7 +114,7 @@ daemon still bails on `boot` and `run` until Unit 2.
 **Baseline:** `build.rs` is a no-op on Linux; `lib.rs` gates `pub mod krun`
 on `#[cfg(target_os = "macos")]`; `image::kernel_format()` and
 `VmConfig::apply()` are both macOS-only. All of this is **ALREADY IN PLACE**
-as the current macOS-only implementation — no new krun code is written;
+as the current macOS-only implementation, no new krun code is written;
 the guards are removed.
 
 **Functional Requirements:**
@@ -147,13 +147,13 @@ the guards are removed.
 **Proof Artifacts:**
 
 1. **CLI:** `cargo build -p minvmd` on a Linux host with libkrun installed
-   exits 0 — demonstrates the crate links cleanly against libkrun on Linux.
-2. **Test:** `cargo test -p minvmd` (excluding e2e tests) on Linux exits 0 —
+   exits 0, demonstrates the crate links cleanly against libkrun on Linux.
+2. **Test:** `cargo test -p minvmd` (excluding e2e tests) on Linux exits 0,
    demonstrates existing unit tests pass on Linux.
 
 ---
 
-### Unit 2: VMM child on Linux — KVM boot, READY marker, UDS↔vsock bridge
+### Unit 2: VMM child on Linux - KVM boot, READY marker, UDS↔vsock bridge
 
 **Purpose:** Make `minvmd boot` and `minvmd run` functional on Linux. Since
 libkrun's API is identical on both platforms, the Linux VMM child and boot
@@ -199,10 +199,10 @@ instead of Hypervisor.framework availability.
 **Proof Artifacts:**
 
 1. **CLI:** `MINVMD_KERNEL_PATH=<k> MINVMD_ROOTFS_PATH=<r> MINVMD_INITRAMFS=<i> minvmd boot --foreground`
-   on a Linux host with `/dev/kvm` prints `vm-up` within 10 s — demonstrates
+   on a Linux host with `/dev/kvm` prints `vm-up` within 10 s, demonstrates
    KVM boot + READY marker round-trip on Linux.
 2. **Test:** `MINVMD_E2E=1 cargo test -p minvmd --test boot_integration -- --include-ignored`
-   on a Linux host with `/dev/kvm` exits 0 — demonstrates the automated boot
+   on a Linux host with `/dev/kvm` exits 0, demonstrates the automated boot
    e2e passes (test is un-gated from macOS in Unit 3).
 
 ---
@@ -235,7 +235,7 @@ establish the Linux/KVM baseline.
   requirement as macOS).
 - **R3.3**: `tests/bridge_e2e.rs` shall be un-gated from macOS in the same
   way. The 5-concurrent-connection multiplexing test shall run on Linux.
-  (`bridge_e2e.rs` was later removed in the auto-discovery migration —
+  (`bridge_e2e.rs` was later removed in the auto-discovery migration,
   superseded by `minimald_session_integration.rs`.)
 - **R3.4**: The CI configuration shall add a Linux KVM e2e job. The job runs
   on a self-hosted Linux runner with `/dev/kvm` access (GCP nested-virt or
@@ -248,7 +248,7 @@ establish the Linux/KVM baseline.
   `scripts/bench-minvmd-boot.sh` (or a Linux-compatible equivalent) on the
   KVM runner with a sample of ≥ 10 boot cycles. The min/median/max latency
   shall be reported in the pull request description as a comment against the
-  ~75 ms macOS baseline. No performance gate is enforced — this is a
+  ~75 ms macOS baseline. No performance gate is enforced; this is a
   measurement and documentation requirement.
 
 **Proof Artifacts:**
@@ -258,7 +258,7 @@ establish the Linux/KVM baseline.
    session e2e passes on Linux over the host UDS→vsock bridge.
 2. **File:** The pull request description contains a latency table (min /
    median / max boot-to-READY) from the Linux/KVM benchmark run, cited
-   against the ~75 ms macOS baseline — demonstrates R3.5 was executed.
+   against the ~75 ms macOS baseline, demonstrates R3.5 was executed.
 
 ---
 
@@ -270,7 +270,7 @@ establish the Linux/KVM baseline.
   per-session flag, loadout field, or policy mechanism is deferred to a
   follow-up under #396. This explicitly defers the "interacts with the
   taskspec capability envelope" aspect from the tracking issue open question.
-- **Provider-interface formal spec.** The `docs/session-domain-diag.md`
+- **Provider-interface formal spec.** The `docs/internal/session-domain-diag.md`
   Provider contract ("every provider delivers a reachable `minimald` endpoint
   over UDS") is sufficient for this spec. A formal provider-interface spec
   covering CF Firecracker, GCP, Daytona, and other backends is a separate
@@ -293,7 +293,7 @@ removal of `#[cfg(target_os = "macos")]` attributes.
 ### No code-signing on Linux
 
 macOS requires a `codesign --entitlements minvmd.entitlements` step to grant
-`com.apple.security.hypervisor`. Linux has no equivalent requirement — KVM
+`com.apple.security.hypervisor`. Linux has no equivalent requirement, KVM
 access is controlled by `/dev/kvm` file permissions (typically `kvm` group
 membership or `chmod 666`). The `minvmd.entitlements` file and the `justfile`
 code-signing target are macOS-only and require no change.
@@ -312,7 +312,7 @@ runners provisioned via the infrastructure team use the configured path.
 
 ### Relation to the session domain model
 
-`docs/session-domain-diag.md` (informed by the session domain model) already
+`docs/internal/session-domain-diag.md` (informed by the session domain model) already
 models Linux as a coexistence scenario: `minimald` (direct namespace provider)
 and `minvmd` (VM provider) each expose their own UDS; `minimal` discovers both.
 This spec realizes the `minvmd` side of the Linux deployment diagram without
@@ -341,7 +341,7 @@ changing the `minimal`/`minimal` discovery logic.
    provider delivers a reachable `minimald` endpoint over UDS" is satisfied
    by this implementation (via the vsock bridge) and by the direct-native
    `minimald` path. Whether to formalize this as a spec for the provider
-   interface — covering CF Firecracker, GCP, Daytona, and other backends —
+   interface, covering CF Firecracker, GCP, Daytona, and other backends,
    is a separate question under #396. Not blocked by this spec.
 
 3. **libkrun version floor on Linux.** libkrun ≥ 1.19.0 is required on macOS
@@ -358,7 +358,7 @@ changing the `minimal`/`minimal` discovery logic.
 - **Marker socket nonce on Linux:** `/dev/urandom` is available on all Linux
   distributions; the nonce-generation logic in `cmd/boot.rs` (`run_macos`)
   is unchanged for Linux.
-- **`krun_start_enter` semantics on Linux:** Same as macOS — the call diverges
+- **`krun_start_enter` semantics on Linux:** Same as macOS, the call diverges
   on success by calling `exit()`. The VMM child process model
   (parent/supervisor + hidden `__krun-vmm` child) is unchanged.
 - **Existing unit tests:** `lifecycle.rs`, `state.rs`, `sock.rs`, and
@@ -385,8 +385,8 @@ kernel + rootfs + initramfs.
 
 | Unit | Gate | Command | Expected result |
 |------|------|---------|-----------------|
-| R1.5 | — | `cargo build -p minvmd` (Linux) | Exit 0 |
-| R1.5 | — | `cargo test -p minvmd` (Linux, unit tests) | All pass |
+| R1.5 | - | `cargo build -p minvmd` (Linux) | Exit 0 |
+| R1.5 | - | `cargo test -p minvmd` (Linux, unit tests) | All pass |
 | R2.3 | `MINVMD_E2E=1` + env vars | `minvmd boot --foreground` (Linux) | Prints `vm-up` ≤ 10 s |
 | R3.1 | `MINVMD_E2E=1` + env vars | `cargo test -p minvmd --test boot_integration -- --include-ignored` | Exit 0 |
 | R3.2 | `MINVMD_E2E=1` + env vars | `cargo test -p minvmd --test minimald_session_integration -- --include-ignored` | Exit 0 |

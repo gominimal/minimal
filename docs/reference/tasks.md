@@ -1,11 +1,12 @@
 ---
-description: Full task schema reference — packages, exec/bash commands, state_key, env_vars, patches, profiles, args, and interactive mode.
+title: Tasks
+description: "Full task schema reference: packages, exec/bash commands, state_key, env_vars, patches, profiles, args, and interactive mode."
 ---
 
 # Tasks
 
-Tasks are defined in a [`minimal.toml`](/reference/minimal-dot-toml) file, and describe
-a runtime environment + command invocations to be executed using [`minimal run <taskname>`](/reference/cli#run)
+Tasks are defined in a [`minimal.toml`](./minimal-dot-toml.md) file, and describe
+a runtime environment + command invocations to be executed using [`mip run <taskname>`](./cli-mip.md#run)
 
 ## Tasks schema
 
@@ -15,8 +16,8 @@ Tasks are defined in a `[tasks.<task-name>]` block in your minimal file.
 
 _Optional_
 
-`packages` lists additional [packages](/concepts/packages) which will be installed in the tasks'
-runtime environment. Packages listed here are in addition to any installed due to the profile or harness.
+`packages` lists additional [packages](https://docs.minimal.dev/concepts/packages) which will be installed in the tasks'
+runtime environment. Packages listed here are in addition to any installed due to the profile or stack.
 
 ```toml
 [tasks.my_task]
@@ -40,11 +41,23 @@ or as a program and its list of arguments:
 exec = ["pnpm", "build"]
 ```
 
+When `exec` names a command without an absolute path (or a `./` prefix), the
+command is resolved to `/bin/<command>` inside the sandbox; in the examples
+above, `pnpm` runs as `/bin/pnpm`.
+
 `bash` describes a bash command that should run when the task is launched.
 
 ```toml
 [tasks.my_task]
 bash = "echo \"hello\" > hello.txt"
+```
+
+A third action, `echo`, prints a fixed string without composing a sandbox at
+all; useful for pointers and reminders:
+
+```toml
+[tasks.docs]
+echo = "Docs live at https://docs.minimal.dev"
 ```
 
 When [args](#args) are set on the task, arguments can be substituted into the invocation using
@@ -54,6 +67,19 @@ Nickel's string interpolation [syntax](https://nickel-lang.org/user-manual/synta
 [tasks.greet]
 args.name = "string"
 bash = "echo \"Hello %{name}!\""
+```
+
+
+### `description` - Describe the task
+
+_Optional_
+
+`description` is a free-text description of the task, shown alongside the task
+name in [`mip status`](./cli-mip.md).
+
+```toml
+[tasks.my_task]
+description = "Run the dev server with hot reload"
 ```
 
 
@@ -71,17 +97,15 @@ state_key = "dev" # Cache build artifacts under 'dev'
 
 ### `env_vars` - Environment variables to set
 
-_Optional, Alias `vars`_
+_Optional. `env_vars` is an alias of the canonical `vars` key; both parse_
 
 `env_vars` sets environment variables in the tasks' runtime environment. Variables
 set here take precedence over any inherited from the profile.
 
 ```toml
 [tasks.my_task]
-env_vars = {
-  CC = "gcc",
-  AWS_PROJECT = "zest",
-}
+env_vars.CC = "gcc"
+env_vars.AWS_PROJECT = "zest"
 ```
 
 Environment variables can also inherit their value from the parent process. To do this,
@@ -128,7 +152,7 @@ profile = "" # No profile applied to `my_task`
 
 ### `patches` - Map in files/directories from the system
 
-_Optional, Alias `patch`_
+_Optional. `patches` is an alias of the canonical `patch` key; both parse_
 
 `patches` configures files and directories to be mapped into the tasks' runtime environment.
 
@@ -145,7 +169,7 @@ mappings.
 
 If a mapped file or directory does not exist on the host, an empty file or directory is created.
 
-Mapped paths must be absolute or start with `~`, in which case the tilde is expanded to the user's
+Mapped paths must be absolute or start with `~/`, in which case the tilde is expanded to the user's
 home directory.
 
 ### `inherit_cwd` - Use parent working directory instead of repository root
@@ -169,23 +193,36 @@ being executed by the task.
 
 ```toml
 [tasks.greeter]
-args = {
-    name = "string",
-    greeting = "string",
-}
+args.name = "string"
+args.greeting = "string"
 exec = "echo %{greeting} %{name}"
 ```
 
-All arguments become mandatory for invoking the task. In the example above, running the task `greeter`
-without its two arguments will trigger an error:
+Arguments without a default become mandatory for invoking the task. In the example above, running
+the task `greeter` without its two arguments will trigger an error:
 
 ```shell
-$> minimal run greeter
+$> mip run greeter
 error: the following required arguments were not provided:
   --name <name>
   --greeting <greeting>
 
-Usage: minimal run greeter --name <name> --greeting <greeting>
+Usage: mip run greeter --name <name> --greeting <greeting>
 ```
 
-Valid datatypes are `string`, `number`, and `boolean`.
+Each argument's datatype may be:
+
+- a scalar: `"string"`, `"number"`, or `"boolean"` (alias `"bool"`);
+- an array of a scalar type: `"Array string"`, `"Array number"`, `"Array boolean"`;
+- an enum of permitted values, written either as the string `"[a, b]"` or as a
+  TOML array `["a", "b"]`.
+
+Instead of a bare datatype string, an argument can be declared as a table with a
+`type` field plus optional `help` (a human-readable description) and `default`
+(making the argument optional):
+
+```toml
+[tasks.greeter]
+args.name = { type = "string", help = "who to greet", default = "world" }
+exec = "echo Hello %{name}"
+```

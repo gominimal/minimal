@@ -30,8 +30,13 @@ allow = [
     "bzip2-1.0.6",
 ]
 
+# LGPL exceptions, documented in docs/internal/licensing.md:
+# - hakoniwa: LGPL-3.0-only WITH LGPL-3.0-linking-exception — the linking
+#   exception permits static linking; Linux-only footprint (sandbox2/minimald).
+# - malachite family: LGPL-3.0-only, statically linked, pulled in via the
+#   nickel-lang-core git dependency; stance is document-and-accept (complete
+#   corresponding source is public and relinkable, satisfying LGPL-3.0 §4).
 exceptions = [
-    # Dummy comment for formatting
     { allow = ["LGPL-3.0-only WITH LGPL-3.0-linking-exception"], crate = "hakoniwa" },
     { allow = ["LGPL-3.0-only"], crate = "malachite" },
     { allow = ["LGPL-3.0-only"], crate = "malachite-base" },
@@ -70,6 +75,3 @@ skip = [
     # https://github.com/tweag/nickel/pull/2367
     { name = "itertools", version = "0.11.0" },
 ]
-
-[sources.allow-org]
-github = ["souk4711"]

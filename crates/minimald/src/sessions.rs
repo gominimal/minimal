@@ -21,6 +21,13 @@ use composables::{ProjectResolution, build_composables, run_composer};
 pub struct SessionInfo {
     pub id: SessionId,
     pub name: Option<String>,
+    /// The absolute host path the session was built from. Surfaced through
+    /// `ListSessions` so a client can match sessions against the current
+    /// working directory without a per-session `GetSessionRecord` round-trip.
+    pub project_path: paths::HostAbsPath,
+    /// The session's lifecycle status, surfaced so a client picker can
+    /// render a state glyph.
+    pub status: sessions::SessionStatus,
     pub attrs: Option<HostAttrs>,
 }
 
@@ -173,6 +180,17 @@ impl Manager {
     ) -> Result<ManagerHandle, std::io::Error> {
         let store = Store::init(minimal_state_dir.clone()).await?;
 
+        // Reap unresumable on-disk records left over from a prior
+        // daemon lifetime. Both `Pending` (compose in flight — the
+        // in-memory `PendingComposeState` didn't survive the
+        // restart) and `Materializing` (composition ready but
+        // patches upload state is lost) are meaningless without
+        // in-memory context, so the record can't be brought back
+        // to a working state. Delete them here rather than let
+        // them linger and confuse `min ls` / hold their names
+        // hostage.
+        reap_unresumable_records(&store).await?;
+
         // Build the daemon-scoped mctx state once at startup. Each
         // `CreateSession` will build a per-session `Context` on top of
         // this via `Context::from_daemon` rather than repeating the
@@ -223,6 +241,51 @@ impl Manager {
         tokio::spawn(mngr.mainloop());
         Ok(handle)
     }
+}
+
+/// Delete on-disk records whose status is unresumable after a
+/// daemon restart. See [`Manager::init`] for why `Pending` and
+/// `Materializing` records fall into this category. A delete
+/// failure is logged and skipped — a leftover record wastes a
+/// name until it's cleaned up manually but shouldn't block
+/// startup.
+async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(), std::io::Error> {
+    let handles = store.handles().await?;
+    for handle in handles {
+        let record = match handle.record().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %handle.id(),
+                    error = %e,
+                    "reap: could not read record; skipping",
+                );
+                continue;
+            }
+        };
+        match record.status {
+            sessions::SessionStatus::Pending | sessions::SessionStatus::Materializing => {
+                let id = *handle.id();
+                let status = record.status;
+                if let Err(e) = handle.delete().await {
+                    tracing::warn!(
+                        session_id = %id,
+                        error = %e,
+                        ?status,
+                        "reap: failed to delete unresumable record",
+                    );
+                } else {
+                    tracing::info!(
+                        session_id = %id,
+                        ?status,
+                        "reap: deleted unresumable record left over from a prior daemon lifetime",
+                    );
+                }
+            }
+            sessions::SessionStatus::Active => {}
+        }
+    }
+    Ok(())
 }
 
 impl Manager {
@@ -285,9 +348,14 @@ impl Manager {
         }
     }
 
-    /// Allocate a session's record and bring its actor up. The session is
-    /// live but unconfigured: `ConfigureLoadout` against the returned id
-    /// composes its loadout and finalizes it.
+    /// Allocate a session's record and bring its actor up as `Draft`.
+    /// Compose is *not* driven from here: the client's `cmd_activate` runs
+    /// its own workspace upload (`WorkspaceFilesTarZst`) after the
+    /// returned id, then sends a separate `ConfigureLoadout` RPC that the
+    /// actor handles to compose the loadout and promote itself to
+    /// `Active`. That split is load-bearing — the compose reads the
+    /// project mfile off the daemon-side workspace, which is only
+    /// populated once the upload has landed.
     ///
     /// If the actor can't be spawned the record is rolled back — the caller
     /// never received an id, so nothing else could ever reach the session to
@@ -347,6 +415,8 @@ impl Manager {
                         out.push(SessionInfo {
                             id: record.id,
                             name: record.name.clone(),
+                            project_path: record.project_path.clone(),
+                            status: record.status,
                             attrs: match self.running.get(&record.id) {
                                 Some(h) => h.get_attrs().await,
                                 None => None,
@@ -373,9 +443,11 @@ impl Manager {
                 r.handle(self.resolve_session(pred)).await;
             }
             // Create a session: allocate the record (as `Pending`) and spawn
-            // the session actor. The rest of the create flow — composing the
-            // loadout, promoting the record — belongs to the actor, driven
-            // by the `ConfigureLoadout` that follows.
+            // the session actor. Composing the loadout and promoting the
+            // record still belong to the actor; the RPC handler drives that
+            // step inline against the freshly-spawned actor, so the client
+            // sees the composition outcome in the same `CreateSession`
+            // response rather than a separate round-trip.
             ManagerMessage::CreateSession(msg) => {
                 let CreateSessionMsg {
                     config,
@@ -698,15 +770,12 @@ mod tests {
             .expect("session resolves")
     }
 
-    /// Seeds `contents` as the project mfile in the session's daemon-side
-    /// workspace, standing in for the client's workspace upload.
-    ///
-    /// The composer reads a session's project config out of its workspace,
-    /// never from the record's `project_path` — that's a path on the
-    /// *client's* machine, which the daemon generally can't read. So a test
-    /// that wants `configure_loadout` to see a project seeds it here, after
-    /// `create_session` and before configuring, exactly where a real client
-    /// streams its files up.
+    /// Writes `contents` as the project mfile in the session's daemon-side
+    /// workspace, standing in for the client's `WorkspaceFilesTarZst`
+    /// upload. The compose path reads the mfile off that workspace, so
+    /// tests that want `configure_loadout` to see a project seed it here
+    /// between `create_session` and `configure_loadout` — exactly the
+    /// spot a real client's upload lands in.
     async fn seed_workspace_mfile(mngr: &ManagerHandle, id: SessionId, contents: &str) {
         let paths = session(mngr, id).await.paths().await.unwrap();
         tokio::fs::write(
@@ -718,8 +787,8 @@ mod tests {
     }
 
     /// Creates a session, seeds `mfile` into its workspace, and configures
-    /// its loadout with an empty client contribution — the whole create flow
-    /// a client drives, in one call. Returns the manager and the id
+    /// its loadout with an empty client contribution — the whole create
+    /// flow a client drives, in one call. Returns the manager and the id
     /// alongside the compose outcome.
     async fn create_and_configure(
         mfile: &str,
@@ -776,6 +845,7 @@ mod tests {
                     value: sessions::wire::primitives::WireResolvedVar {
                         name: pv.name.clone(),
                         value: "info".into(),
+                        carries_user_data: true,
                     },
                 })
                 .collect(),
@@ -802,17 +872,27 @@ mod tests {
     }
 
     /// [`create_active_session`] with a caller-supplied config.
+    /// Drives the whole `CreateSession → ConfigureLoadout →
+    /// FinalizeSession` sequence in-process so the returned
+    /// session's record is `Active` (attachable, hostname
+    /// registered). No patches for these fixtures, so the
+    /// composition-empty short-circuit in `finalize` covers the
+    /// marker precondition.
     async fn create_active_session_with(
         mngr: &ManagerHandle,
         config: minimald_rpc::SessionConfig,
     ) -> SessionId {
         let id = mngr.create_session(config, None).await.unwrap();
-        let response = session(mngr, id)
-            .await
+        let handle = session(mngr, id).await;
+        let response = handle
             .configure_loadout(WireContribution::default())
             .await
             .expect("configuring an empty loadout should succeed");
         assert!(response.is_none(), "an empty loadout should finalize");
+        handle
+            .finalize()
+            .await
+            .expect("finalize should succeed for a patchless composition");
         id
     }
 
@@ -927,6 +1007,7 @@ mod tests {
             var: WireResolvedVar {
                 name: "EDITOR".into(),
                 value: "hx".into(),
+                carries_user_data: true,
             },
             source: WireSource::from(Source::UserLoadout {
                 name: "test".into(),
@@ -944,13 +1025,17 @@ mod tests {
             "an already-gated client contribution needs no verdict, so the \
              loadout should finalize in one shot",
         );
+        // Compose returned `Materialized` — the record status is
+        // `Materializing`, not `Active`. Attach requires an
+        // explicit `FinalizeSession` after any patches have
+        // uploaded; this fixture doesn't drive that step.
         assert_eq!(
             mngr.get_record(SessionKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .expect("the record should survive")
                 .status,
-            sessions::SessionStatus::Active,
+            sessions::SessionStatus::Materializing,
         );
     }
 
@@ -1029,15 +1114,19 @@ mod tests {
             .submit_verdict(approve_all(id, &response))
             .await
             .expect("the verdict should be accepted");
-        assert_eq!(step, SessionStep::Active { id });
+        assert_eq!(step, SessionStep::Materialized { id });
 
+        // SubmitVerdict promotes Pending → Materializing, not
+        // Pending → Active. The client still has to upload
+        // patches (there are none for this fixture) and call
+        // FinalizeSession before the record advances to Active.
         assert_eq!(
             mngr.get_record(SessionKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .expect("the record should survive promotion")
                 .status,
-            sessions::SessionStatus::Active,
+            sessions::SessionStatus::Materializing,
         );
         let comp = handle
             .peek_composition()
@@ -1150,7 +1239,7 @@ mod tests {
             .submit_verdict(approve_all(id, &response))
             .await
             .expect("the corrected verdict should be accepted");
-        assert_eq!(step, SessionStep::Active { id });
+        assert_eq!(step, SessionStep::Materialized { id });
     }
 
     /// Renaming a session that owns no PTask hostname route (NoNet here)
@@ -1310,7 +1399,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn configure_loadout_with_missing_mfile_still_succeeds() {
         let (_state, _cache, mngr) = manager().await;
-        // No `seed_workspace_mfile`: the workspace stays empty.
+        // No `seed_workspace_mfile`: the workspace stays empty, mirroring
+        // an activation against a directory with no `minimal.toml`.
         let id = mngr.create_session(sample_config(), None).await.unwrap();
         let response = session(&mngr, id)
             .await
@@ -1339,13 +1429,16 @@ mod tests {
             response.is_none(),
             "a project package needs no client gate, so the loadout finalizes"
         );
+        // Compose advances the record to `Materializing`, not
+        // `Active` — see the note on
+        // `create_session_accepts_non_empty_client_contribution`.
         assert_eq!(
             mngr.get_record(SessionKeyPredicate::Id(id))
                 .await
                 .unwrap()
                 .expect("the record should survive")
                 .status,
-            sessions::SessionStatus::Active,
+            sessions::SessionStatus::Materializing,
         );
     }
 

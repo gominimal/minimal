@@ -400,7 +400,6 @@ impl SubsetInput {
 pub enum BuildDep {
     Build(BuildRef),
     Source(SourceInput),
-    HostPath(PathBuf),
     Local {
         full_path: PathBuf,
         filename: String,
@@ -436,9 +435,6 @@ impl BuildDep {
             }
             ObjTy::Subset => Ok(Self::Subset(SubsetInput::from_term(&rt, program, acc)?)),
             ObjTy::Source => Ok(Self::Source(SourceInput::from_term(&rt, program)?)),
-            ObjTy::Path => Ok(BuildDep::HostPath(
-                Self::from_term_hostpath(&rt, program)?.into(),
-            )),
             ObjTy::Local => {
                 let (full_path, filename, file_hash) = Self::from_term_local(&rt, program)?;
                 Ok(BuildDep::Local {
@@ -460,45 +456,6 @@ impl BuildDep {
                 pos: rt.pos(program.pos_table()),
             }),
         }
-    }
-
-    fn from_term_hostpath(
-        rt: &NickelValue,
-        program: &mut Program<CacheImpl>,
-    ) -> Result<String, Error> {
-        let mut path: Option<String> = None;
-        if let Some(r) = crate::record_data_from_val(rt) {
-            r.fields
-                .iter()
-                .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
-                    match ident_and_loc.label() {
-                        "path" => {
-                            path = Some(
-                                String::deserialize(eval_if_closure(
-                                    field.value.as_ref().unwrap(),
-                                    program,
-                                )?)
-                                .unwrap(),
-                            );
-                            Ok(())
-                        }
-                        _ => Ok(()), // TODO: Should we error if we see an unknown field?
-                    }
-                })?;
-        }
-        let path = match path {
-            Some(path) => path,
-            None => {
-                return Err(Error::MissingField {
-                    files: program.files(),
-                    obj: ObjTy::Path,
-                    pos: rt.pos(program.pos_table()),
-                    field: "path",
-                });
-            }
-        };
-
-        Ok(path)
     }
 
     fn from_term_local(
@@ -1273,37 +1230,6 @@ mod tests {
     }
 
     #[test]
-    fn hostpath_input() {
-        let (term, mut program, _origin, _target) = Loader::new(
-            indoc! {
-                "
-                let {HostPath, ..} = import \"minimal.ncl\" in
-                {path = \"/bin/bash\"} | HostPath
-                "
-            }
-            .to_string(),
-            None,
-            &LoadOptions::for_test(),
-        )
-        .unwrap_or_else(|e| {
-            e.report_to_stderr();
-            panic!("load failed");
-        })
-        .finish()
-        .unwrap_or_else(|e| {
-            e.report_to_stderr();
-            panic!("finish failed");
-        });
-
-        let source = BuildDep::from_term(&term, &mut program, &mut ()).unwrap();
-
-        assert!(matches!(
-            source,
-            BuildDep::HostPath(p) if p.to_str().unwrap() == "/bin/bash",
-        ));
-    }
-
-    #[test]
     fn subset_input() {
         let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
@@ -1347,7 +1273,7 @@ mod tests {
         let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
-                let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
+                let {BuildSpec, OutputLib, ..} = import \"minimal.ncl\" in
                 {
         			name = \"single buildspec\",
         			build_deps = [],
@@ -1405,7 +1331,7 @@ mod tests {
         let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
-                let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
+                let {BuildSpec, OutputLib, ..} = import \"minimal.ncl\" in
                 {
         			name = \"simple\",
         			build_deps = [],
@@ -1439,7 +1365,7 @@ mod tests {
         let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
-                let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
+                let {BuildSpec, OutputLib, ..} = import \"minimal.ncl\" in
                 {
         			name = \"simple\",
         			build_deps = [],
@@ -1516,7 +1442,7 @@ mod tests {
         let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
-                let {BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
+                let {BuildSpec, OutputLib, ..} = import \"minimal.ncl\" in
                 {
         			name = \"buildspec\",
                     build_deps = [],
@@ -1691,7 +1617,7 @@ mod tests {
         let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
-                let {upstream, BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
+                let {upstream, BuildSpec, OutputLib, ..} = import \"minimal.ncl\" in
                 {
         			name = \"single buildspec\",
         			build_deps = [upstream \"upstream-pkg\"],
@@ -1730,7 +1656,7 @@ mod tests {
         let (term, mut program, _origin, _target) = Loader::new(
             indoc! {
                 "
-                let {subsetOf, upstream, BuildSpec, HostPath, OutputLib, ..} = import \"minimal.ncl\" in
+                let {subsetOf, upstream, BuildSpec, OutputLib, ..} = import \"minimal.ncl\" in
                 {
         			name = \"single buildspec\",
         			build_deps = [subsetOf (upstream \"upstream-pkg\") [\"libgcc\"]],

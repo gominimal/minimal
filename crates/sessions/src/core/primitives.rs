@@ -543,6 +543,17 @@ impl<'de> serde::Deserialize<'de> for VarValue {
 pub struct ResolvedVar {
     name: String,
     value: String,
+    /// Whether the resolved `value` came from the user's environment
+    /// (as opposed to a hardcoded literal or a fallback default).
+    /// Consumed by the policy gate: a var that doesn't pull user
+    /// data isn't a data-leak vector and skips the allow/deny/ignore
+    /// check entirely.
+    ///
+    /// - [`VarValue::Specified`] → `false`
+    /// - [`VarValue::Inherit`] (successful lookup) → `true`
+    /// - [`VarValue::InheritWithDefault`] with env-hit → `true`
+    /// - [`VarValue::InheritWithDefault`] falling back to default → `false`
+    carries_user_data: bool,
 }
 
 impl ResolvedVar {
@@ -558,10 +569,71 @@ impl ResolvedVar {
         &self.value
     }
 
+    /// Whether the resolved value came from the user's environment
+    /// (rather than from a hardcoded literal or a fallback default).
+    /// The policy gate uses this to skip vars that don't move user
+    /// data into the sandbox — nothing to gate.
+    #[must_use]
+    pub fn carries_user_data(&self) -> bool {
+        self.carries_user_data
+    }
+
+    /// Construct a [`ResolvedVar`] whose value came directly from a
+    /// host env lookup, so `carries_user_data` is true. Used by
+    /// callers that already ran their own env lookup and need to
+    /// hand the result downstream without losing the "user data"
+    /// bit — the loadout pre-inherit pass being the canonical
+    /// example.
+    #[must_use]
+    pub fn from_env_value(name: String, value: String) -> Self {
+        Self {
+            name,
+            value,
+            carries_user_data: true,
+        }
+    }
+
+    /// Construct a [`ResolvedVar`] whose value came from a source-
+    /// side literal or a fallback default — no user env data
+    /// involved, so `carries_user_data` is false.
+    #[must_use]
+    pub fn from_literal(name: String, value: String) -> Self {
+        Self {
+            name,
+            value,
+            carries_user_data: false,
+        }
+    }
+
+    /// Construct a [`ResolvedVar`] with an explicit
+    /// `carries_user_data` bit. Sugar over
+    /// [`Self::from_env_value`] / [`Self::from_literal`] for
+    /// callers that already have the bit computed and want a
+    /// single call site.
+    #[must_use]
+    pub fn from_env_value_or_literal(name: String, value: String, carries_user_data: bool) -> Self {
+        Self {
+            name,
+            value,
+            carries_user_data,
+        }
+    }
+
     /// Consume the [`ResolvedVar`] and return `(name, value)`.
     #[must_use]
     pub fn into_parts(self) -> (String, String) {
         (self.name, self.value)
+    }
+
+    /// Consume the [`ResolvedVar`] and return every field, including
+    /// the `carries_user_data` provenance bit. The wire-form
+    /// [`WireResolvedVar`] `From` impl uses this to preserve the bit
+    /// across serialization rather than defaulting it on the receiver.
+    ///
+    /// [`WireResolvedVar`]: crate::wire::primitives::WireResolvedVar
+    #[must_use]
+    pub fn into_parts_with_provenance(self) -> (String, String, bool) {
+        (self.name, self.value, self.carries_user_data)
     }
 
     /// Resolve a variable against an arbitrary environment-lookup function.
@@ -578,15 +650,18 @@ impl ResolvedVar {
     where
         F: FnOnce(&str) -> Result<String, std::env::VarError>,
     {
-        let resolved_value = match value {
-            VarValue::Specified { value } => value,
-            VarValue::Inherit => lookup(&name).map_err(|source| VarError::ResolutionFailure {
-                name: name.clone(),
-                source,
-            })?,
+        let (resolved_value, carries_user_data) = match value {
+            VarValue::Specified { value } => (value, false),
+            VarValue::Inherit => {
+                let v = lookup(&name).map_err(|source| VarError::ResolutionFailure {
+                    name: name.clone(),
+                    source,
+                })?;
+                (v, true)
+            }
             VarValue::InheritWithDefault { default } => match lookup(&name) {
-                Ok(value) => value,
-                Err(std::env::VarError::NotPresent) => default,
+                Ok(value) => (value, true),
+                Err(std::env::VarError::NotPresent) => (default, false),
                 Err(source @ std::env::VarError::NotUnicode(_)) => {
                     return Err(VarError::ResolutionFailure {
                         name: name.clone(),
@@ -598,6 +673,7 @@ impl ResolvedVar {
         Ok(Self {
             name,
             value: resolved_value,
+            carries_user_data,
         })
     }
 
@@ -633,6 +709,7 @@ impl From<crate::wire::primitives::WireResolvedVar> for ResolvedVar {
         Self {
             name: v.name,
             value: v.value,
+            carries_user_data: v.carries_user_data,
         }
     }
 }
@@ -904,6 +981,22 @@ impl PatchDest {
     /// [`PatchError::DestTraversal`] for paths containing `..` components.
     pub fn try_new(path: impl Into<Utf8PathBuf>) -> Result<Self, PatchError> {
         let path = path.into();
+        if path.as_str().is_empty() {
+            return Err(PatchError::EmptyDest);
+        }
+        // Destinations are semantically relative to the sandbox user's
+        // home directory, so a leading `~/` is redundant — the package
+        // author who writes `path = "~/.claude"` in their mfile means
+        // "place `.claude` under sandbox home", not "place a literal
+        // `~` directory there." Strip the prefix once, here, so
+        // downstream consumers (tar packing, materialize) don't
+        // create paths like `/home/~/.claude`. A bare `~` becomes an
+        // empty path and re-hits the empty-dest check below.
+        let path: Utf8PathBuf = match path.as_str().strip_prefix("~/") {
+            Some(rest) => rest.into(),
+            None if path.as_str() == "~" => Utf8PathBuf::new(),
+            None => path,
+        };
         if path.as_str().is_empty() {
             return Err(PatchError::EmptyDest);
         }
@@ -1513,6 +1606,37 @@ mod tests {
         assert!(matches!(
             PatchDest::try_new("foo/../bar"),
             Err(PatchError::DestTraversal(_))
+        ));
+    }
+
+    #[test]
+    fn patchdest_strips_leading_home_tilde() {
+        // Package authors write `path = "~/.claude"` in their mfile
+        // meaning "map onto sandbox home"; destinations are already
+        // home-relative, so the tilde is redundant and must not
+        // survive into the tar entry or materialize target (else
+        // files land at `/home/~/.claude/...` inside the sandbox).
+        let cases = [
+            ("~/.claude", ".claude"),
+            ("~/foo/bar", "foo/bar"),
+            ("~/", ""), // empty after strip → EmptyDest below
+        ];
+        for (input, expected) in cases {
+            if expected.is_empty() {
+                assert!(
+                    matches!(PatchDest::try_new(input), Err(PatchError::EmptyDest)),
+                    "input {input} should reject as empty after tilde strip",
+                );
+            } else {
+                let dest = PatchDest::try_new(input).expect(input);
+                assert_eq!(dest.as_sandbox_path().as_str(), expected, "input: {input}");
+            }
+        }
+        // Bare `~` is also nonsensical as a destination — home root
+        // itself isn't a file target — so it rejects as empty too.
+        assert!(matches!(
+            PatchDest::try_new("~"),
+            Err(PatchError::EmptyDest)
         ));
     }
 

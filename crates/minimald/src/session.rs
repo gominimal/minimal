@@ -1,4 +1,5 @@
 use crate::channel_progress::ChannelProgress;
+use crate::session_sop::{BuildUpdate, SideOp};
 use crate::sessions::{SessionControl, WeakManagerHandle, composables};
 use crate::store::SessionRecordHandle;
 use crate::{
@@ -22,8 +23,76 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::RwLock;
+use tokio::sync::mpsc::WeakSender;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
+
+/// Copy every `composition.patches()` entry from the staged
+/// `<workspace>/patches/<dest>` into the session's home dir at
+/// the same relative path. Called once by [`Session::finalize`]
+/// when the session goes `Active`; subsequent attaches see the
+/// populated home without re-copying.
+///
+/// Parent dirs are created as needed. A missing staged patch
+/// surfaces as an `io::Error` — the FinalizeSession precondition
+/// checked the patches-ready marker, so a missing file at this
+/// point is a bug (the marker was written but the file it should
+/// have gated on didn't land).
+async fn materialize_patches_into_home(
+    patches_dir: &DaemonAbsPath,
+    home_dir: &DaemonAbsPath,
+    composition: &Composition,
+) -> Result<(), std::io::Error> {
+    for sp in composition.patches() {
+        let dest = sp.patch().destination().as_utf8_path();
+        let src = patches_dir.as_utf8_path().join(dest);
+        let target = home_dir.as_utf8_path().join(dest);
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent.as_std_path()).await?;
+        }
+        tokio::fs::copy(src.as_std_path(), target.as_std_path())
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "materializing patch {} → {}: {e}",
+                        src.as_str(),
+                        target.as_str()
+                    ),
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// Load the persisted composition snapshot for an `Active` session
+/// brought up from disk after a daemon restart. Returns `None` (with
+/// a warning log) when the sidecar is missing or corrupt. The
+/// launcher then falls back to its baseline set, preserving the
+/// "attach still works" property at the cost of the lost loadout
+/// contributions. This is the loud-fallback path: the operator sees
+/// the warning instead of a silent drop.
+async fn load_composition(record: &SessionRecordHandle) -> Option<Arc<Composition>> {
+    match record.load_composition().await {
+        Ok(Some(comp)) => Some(Arc::new(comp)),
+        Ok(None) => {
+            tracing::warn!(
+                session_id = %record.id(),
+                "no composition snapshot for Active session; falling back to baseline",
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %record.id(),
+                error = %e,
+                "failed to load composition snapshot; falling back to baseline",
+            );
+            None
+        }
+    }
+}
 
 /// The name a session's PTask hostname is registered under, doubling as the
 /// session host's display name: the session's assigned name, or the project
@@ -51,9 +120,12 @@ pub enum AttachError {
     /// Configuring the loadout of an as-yet-unconfigured session, on the way
     /// into the attach, failed.
     LoadoutFailed(std::io::Error),
-    /// The session's composition is awaiting the client's contribution
-    /// verdict, so there is nothing to attach to yet. The client has to gate
-    /// the pending items (`SubmitVerdict`) before a shell can be minted.
+    /// The session isn't attachable yet. Either its composition is
+    /// still awaiting the client's contribution verdict
+    /// (`SubmitVerdict` hasn't landed), or its composition
+    /// finalized but the session is `Materializing` — the
+    /// client still owes a patches upload + `FinalizeSession`
+    /// before a shell can be minted.
     SessionPending,
 }
 
@@ -79,7 +151,8 @@ impl fmt::Display for AttachError {
             AttachError::LoadoutFailed(e) => write!(f, "configuring session loadout: {e}"),
             AttachError::SessionPending => write!(
                 f,
-                "session is awaiting its contribution verdict; cannot attach"
+                "session isn't attachable yet (still awaiting either \
+                 SubmitVerdict or FinalizeSession)"
             ),
         }
     }
@@ -91,6 +164,12 @@ pub struct SessionPaths {
     pub working: DaemonAbsPath,
     pub cache: DaemonAbsPath,
     pub home: DaemonAbsPath,
+    /// Where the daemon stages client-uploaded composition patches
+    /// (`WorkspacePatchesTarZst` unpacks under this dir, keyed by
+    /// the patch's sandbox-home-relative destination). Directory
+    /// may not exist yet — it's created on the first successful
+    /// upload.
+    pub patches: DaemonAbsPath,
 }
 
 /// Everything a [`Session`] actor needs at spawn time. Every session actor
@@ -134,8 +213,10 @@ enum SessionInner {
     /// on-disk `Active` record.
     Active {
         /// The finalized [`Composition`] this session was created with.
-        /// `None` after a daemon restart — the composition isn't persisted,
-        /// and the launcher falls back to its baseline set in that case.
+        /// `None` only when the sidecar is missing or corrupt on a
+        /// session brought up from disk after a daemon restart —
+        /// [`load_composition`] logs a warning and the launcher
+        /// falls back to its baseline set in that case.
         ///
         /// The launcher currently consumes only the composition's packages
         /// and vars. Patches (need file-upload plumbing) and lifecycle hooks
@@ -147,6 +228,8 @@ enum SessionInner {
             session_host::HostHandle,
             JoinHandle<Result<i32, std::io::Error>>,
         )>,
+        /// Side operations.
+        sops: Vec<SideOp>,
     },
 }
 
@@ -191,6 +274,11 @@ enum SessionMessage {
             oneshot::Sender<Result<SessionStep, std::io::Error>>,
         )>,
     ),
+    /// Promote a `Materializing` session to `Active`, gating on the
+    /// patches-ready marker under `<workspace>/patches/`. Idempotent
+    /// on an already-`Active` session; refused with `InvalidInput`
+    /// on `Pending` (configure the loadout first).
+    Finalize(oneshot::Sender<Result<(), std::io::Error>>),
     /// Abort a `Draft` session: delete its record and stop the actor.
     /// Refused with `InvalidInput` on an `Active` session (use `Destroy`).
     Abort(oneshot::Sender<Result<(), std::io::Error>>),
@@ -209,6 +297,16 @@ enum SessionMessage {
     /// record.
     Destroy(oneshot::Sender<Result<(), std::io::Error>>),
     GetRecord(oneshot::Sender<Record>),
+    /// Hand back an `Arc` clone of this session's patches-upload lock, see
+    /// [`Session::patches_upload_lock`].
+    GetPatchesUploadLock(oneshot::Sender<Arc<Mutex<()>>>),
+    /// Kick off a background package build as a session side-op. Replies with
+    /// the receiver end of the build's event stream.
+    StartBuild {
+        rebuild: bool,
+        pkgs: Vec<String>,
+        reply: oneshot::Sender<Result<mpsc::Receiver<BuildUpdate>, std::io::Error>>,
+    },
     /// Test-only inspection: an `Arc` clone of the held [`Composition`]
     /// (`None` in `Draft`, or `Active` without one post-restart). Lets tests
     /// assert composition contents without disturbing the lifecycle.
@@ -253,6 +351,11 @@ pub struct Session {
     /// Session state machine.
     inner: SessionInner,
 
+    /// Serializes `WorkspacePatchesTarZst` uploads for this session: two
+    /// concurrent uploads would race on the single `<workspace>/patches/`
+    /// tree and step on each other.
+    patches_upload_lock: Arc<Mutex<()>>,
+
     /// A non-owning handle to the [`Manager`](crate::sessions::Manager), used to
     /// build the [`SessionControl`] handed to each [`Binding`] so a shell-exit
     /// "delete" tears this session down through the manager (record removal and
@@ -260,6 +363,11 @@ pub struct Session {
     /// actor-initiated termination. Weak by design — see
     /// [`crate::sessions::Manager::weak_self`].
     manager: WeakManagerHandle,
+
+    /// A non-owning handle to this session, handed to the runtime objects
+    /// we spawns (e.g. build [`SideOp`]s) so they can reach back into
+    /// the session.
+    weak_self: WeakSessionHandle,
 }
 
 impl Session {
@@ -269,6 +377,7 @@ impl Session {
         seed: SessionConfig,
         receiver: mpsc::Receiver<SessionMessage>,
         inner: SessionInner,
+        weak_self: WeakSessionHandle,
     ) -> Self {
         let SessionConfig {
             minimal_state_dir,
@@ -289,7 +398,9 @@ impl Session {
             net_switch,
             tracker: OpTracker::new_root(),
             inner,
+            patches_upload_lock: Arc::new(Mutex::new(())),
             manager,
+            weak_self,
             #[cfg(target_os = "linux")]
             hostnames,
         }
@@ -306,23 +417,65 @@ impl Session {
     /// Launches the actor for a session — the one path onto which every
     /// session actor is spawned. The initial state machine state is derived
     /// from the record alone: an `Active` record comes up ready to attach
-    /// (without a composition; it isn't persisted, so the launcher falls back
-    /// to its baseline set), a `Pending` one as an unconfigured `Draft`
-    /// awaiting `ConfigureLoadout`.
+    /// with its composition restored from the snapshot sidecar (or, if the
+    /// sidecar is missing or corrupt, with a logged warning and no
+    /// composition so the launcher falls back to its baseline set), a
+    /// `Pending` one as an unconfigured `Draft` awaiting `ConfigureLoadout`.
     pub(crate) async fn run(conf: SessionConfig) -> Result<SessionHandle, std::io::Error> {
         let obj = conf.record.object().await?;
         Self::create_dirs(&obj)?;
 
         let inner = match obj.record().status {
-            SessionStatus::Active => SessionInner::Active {
-                composition: None,
-                host: None,
-            },
+            SessionStatus::Active => {
+                let composition = load_composition(&conf.record).await;
+                SessionInner::Active {
+                    composition,
+                    host: None,
+                    sops: vec![],
+                }
+            }
             SessionStatus::Pending => SessionInner::Draft { pending: None },
+            // `Materializing` records are only meaningful across a
+            // matching in-memory composition, which is lost on
+            // daemon restart. `Manager::init` runs
+            // `reap_unresumable_records` at startup to delete these
+            // before any actor spawns.
+            //
+            // If we still see one here — spawn racing the reap,
+            // reap's delete failing (permissions, EIO) and being
+            // logged-and-skipped, or a future code path adding a
+            // spawn that bypasses the reap — refuse to bring the
+            // actor up. Every alternative gets a session into a
+            // bad shape:
+            //
+            //   * `SessionInner::Draft { pending: None }` would let
+            //     `configure_loadout` accept a fresh contribution
+            //     while the on-disk status stays `Materializing`,
+            //     drifting the two into inconsistency.
+            //   * A stale `.patches_ready` from the prior upload
+            //     could then satisfy the *new* composition's
+            //     finalize marker check, materializing the wrong
+            //     patches into the sandbox home.
+            //   * `SessionInner::Active { composition: None }`
+            //     would let attach reach a shell against a session
+            //     that never actually finished materializing.
+            //
+            // Fail the spawn instead; the caller sees an error and
+            // the operator can destroy the stuck record explicitly.
+            SessionStatus::Materializing => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "session record is Materializing but has no in-memory composition \
+                     (restart-orphaned actor); destroy the session and re-activate",
+                ));
+            }
         };
 
         let (sender, receiver) = mpsc::channel(8);
-        let actor = Self::assemble(conf, receiver, inner);
+        // A weak self-handle so the actor can hand its own mailbox to the
+        // runtime objects it spawns without a caller threading it in.
+        let weak_self = WeakSessionHandle(sender.downgrade());
+        let actor = Self::assemble(conf, receiver, inner, weak_self);
 
         // Register the PTask hostname before the actor goes live, so the
         // route exists by the time the caller can observe the session
@@ -452,6 +605,9 @@ impl Session {
                 let (verdict, r) = *msg;
                 let _ = r.send(self.handle_verdict(verdict).await);
             }
+            SessionMessage::Finalize(r) => {
+                let _ = r.send(self.finalize().await);
+            }
             SessionMessage::Abort(r) => match &self.inner {
                 // Abort is Draft-only: delete the record, then stop. The
                 // record delete happens before the reply so a post-reply
@@ -487,14 +643,14 @@ impl Session {
                 });
             }
             SessionMessage::Stop(r) => {
-                self.stop_host().await;
+                self.stop_running(true).await;
                 #[cfg(target_os = "linux")]
                 self.deregister_hostname().await;
                 let _ = r.send(());
                 return ControlFlow::Break(Teardown::ManagerInitiated);
             }
             SessionMessage::Destroy(r) => {
-                self.stop_host().await;
+                self.stop_running(false).await;
                 // Withdraw the hostname before the fallible record delete, so
                 // a delete failure leaves a stale on-disk record (repairable
                 // on restart) but never a stale routing entry pointing at a
@@ -503,6 +659,16 @@ impl Session {
                 self.deregister_hostname().await;
                 let _ = r.send(self.record.clone().delete().await);
                 return ControlFlow::Break(Teardown::ManagerInitiated);
+            }
+            SessionMessage::GetPatchesUploadLock(r) => {
+                let _ = r.send(Arc::clone(&self.patches_upload_lock));
+            }
+            SessionMessage::StartBuild {
+                rebuild,
+                pkgs,
+                reply,
+            } => {
+                let _ = reply.send(self.start_build(rebuild, pkgs).await);
             }
             SessionMessage::GetRecord(r) => {
                 let _ = r.send(self.record.record().await.unwrap());
@@ -526,15 +692,33 @@ impl Session {
     /// Every failure leaves the actor alive and `Draft`: the caller decides
     /// whether to retry with a different contribution or tear the session
     /// down, so a compose error can't strand a half-built session.
+    ///
+    /// A re-`ConfigureLoadout` against a session that already holds
+    /// `Draft{pending: Some(_)}` is refused with `WouldBlock`: overwriting
+    /// the stashed [`PendingComposeState`] would invalidate every
+    /// `PendingId` the first caller received (they were valid moments ago,
+    /// but a fresh stash starts numbering from 0 again). The client must
+    /// `AbortSession` and create a new session to retry rather than
+    /// silently strand its outstanding verdict submission.
     async fn configure_loadout(
         &mut self,
         contribution: WireContribution,
     ) -> Result<Option<ContributionResponse>, std::io::Error> {
-        if matches!(self.inner, SessionInner::Active { .. }) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "session loadout is already configured",
-            ));
+        match &self.inner {
+            SessionInner::Active { .. } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "session loadout is already configured",
+                ));
+            }
+            SessionInner::Draft { pending: Some(_) } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "session already has a pending contribution awaiting SubmitVerdict; \
+                     abort it and create a new session to retry",
+                ));
+            }
+            SessionInner::Draft { pending: None } => {}
         }
         let object = self.record.object().await?;
         let workspace_path = object.workspace_path();
@@ -556,17 +740,29 @@ impl Session {
             // The composition is complete: promote the record
             // `Pending → Active` and hold the composition for the launcher.
             ComposeOutcome::Ready(composition) => {
+                // Compose finalized in one shot — the record is now
+                // `Materializing`, not yet `Active`. `Active` waits
+                // for `FinalizeSession` after the client has
+                // uploaded the composition's patches. Hostname
+                // registration is deferred to the same transition
+                // (a session isn't attachable until then, so
+                // publishing the route would let something reach a
+                // launcher that can't materialize its patches).
+                //
+                // Persist the composition snapshot before the record
+                // write so a crash at any point leaves either a
+                // reaped session (Pending/Materializing records are
+                // reaped at startup) or an Active session with its
+                // sidecar intact.
+                self.record.store_composition(&composition).await?;
                 let mut record = object.record().clone();
-                record.status = SessionStatus::Active;
+                record.status = SessionStatus::Materializing;
                 self.record.write(record.clone()).await?;
                 self.inner = SessionInner::Active {
                     composition: Some(Arc::new(composition)),
                     host: None,
+                    sops: vec![],
                 };
-                // The session is Active now — publish its PTask route
-                // (R3.1/R3.6).
-                #[cfg(target_os = "linux")]
-                self.register_hostname(&record);
                 Ok(None)
             }
             // The client must gate items before the composition completes.
@@ -624,35 +820,204 @@ impl Session {
             Err(e) => return Ok(SessionStep::Fault { error: e.into() }),
         };
 
-        // Promote the on-disk record `Pending → Active`. A write failure
-        // leaves both the record and the actor `Draft`, so the client can
-        // re-submit the same verdict once the store recovers.
+        // Promote the on-disk record `Pending → Materializing`. A
+        // write failure leaves both the record and the actor
+        // `Draft`, so the client can re-submit the same verdict
+        // once the store recovers. `Active` waits for a follow-up
+        // `FinalizeSession` after patches upload — see
+        // [`Self::finalize`] for the transition and its
+        // preconditions.
+        //
+        // Persist the composition snapshot before the record write
+        // (same crash-safety reasoning as the Materialized fast
+        // path above).
+        self.record.store_composition(&composition).await?;
         let mut record = self.record.record().await?;
-        record.status = SessionStatus::Active;
+        record.status = SessionStatus::Materializing;
         self.record.write(record.clone()).await?;
         self.inner = SessionInner::Active {
             composition: Some(Arc::new(composition)),
             host: None,
+            sops: vec![],
         };
-        // The session is Active now — publish its PTask route (R3.1/R3.6).
-        #[cfg(target_os = "linux")]
-        self.register_hostname(&record);
-        Ok(SessionStep::Active { id: record.id })
+        Ok(SessionStep::Materialized { id: record.id })
     }
 
-    /// Tears down the running host, if any, waiting for the process to be reaped
-    /// and the sandbox guard to be dropped before returning.
-    async fn stop_host(&mut self) {
-        let host = match &mut self.inner {
-            SessionInner::Active { host, .. } => host.take(),
+    /// Finalize a `Materializing` session: verify that the client
+    /// has uploaded its composition patches (marker present under
+    /// `<workspace>/patches/`), promote the record
+    /// `Materializing → Active`, and publish the PTask route so
+    /// the session becomes attachable.
+    ///
+    /// Idempotent: a session already in `Active` (client retried
+    /// after a network blip that lost the ack) returns success
+    /// without side effects. Refuses `Pending` or `Draft` sessions
+    /// with `WrongState`; refuses `Materializing` sessions without
+    /// a patches-ready marker with a "patches upload never
+    /// finished" fault.
+    async fn finalize(&mut self) -> Result<(), std::io::Error> {
+        let record = self.record.record().await?;
+        match record.status {
+            SessionStatus::Active => {
+                // Already finalized — retry is a no-op.
+                Ok(())
+            }
+            SessionStatus::Materializing => {
+                // Guard against a `Materializing` record whose
+                // actor didn't carry compose state through — the
+                // only path there is `Session::run` spawning from
+                // an on-disk `Materializing` record after a
+                // restart survived the reap in `Manager::init`
+                // (delete failed, log-and-skip). Without the
+                // in-memory composition we can't tell whether the
+                // patches were uploaded; `has_patches` below would
+                // trivially match `false` and skip the marker
+                // check, then `materialize_patches_into_home`
+                // would iterate an empty composition and no-op —
+                // silently promoting the session to `Active` with
+                // an empty home. Fault the finalize so the client
+                // sees the problem instead of the user attaching
+                // to a broken shell.
+                if !matches!(
+                    &self.inner,
+                    SessionInner::Active {
+                        composition: Some(_),
+                        ..
+                    }
+                ) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "session is Materializing but has no in-memory composition \
+                         (restart-orphaned actor); destroy the session and re-activate",
+                    ));
+                }
+
+                // Precondition: patches marker present on disk. The
+                // marker is the last thing the patches unpacker
+                // writes, so its presence proves every patch is
+                // staged. Without this check a client-side bug
+                // that skipped the patches upload would silently
+                // yield an Active session with a broken sandbox
+                // rootfs.
+                //
+                // Short-circuit: a composition with no patches has
+                // nothing for the client to upload, so the marker
+                // isn't required. Callers with empty compositions
+                // (internal ones — sftp/exec/session-recovery — and
+                // any project with no fs mappings) go straight
+                // through here.
+                let paths_obj = self.record.object().await?;
+                let patches_dir = paths_obj.patches_path();
+                let has_patches = matches!(
+                    &self.inner,
+                    SessionInner::Active {
+                        composition: Some(c),
+                        ..
+                    } if !c.patches().is_empty()
+                );
+                if has_patches {
+                    let marker = patches_dir
+                        .as_utf8_path()
+                        .join(crate::rpc::PATCHES_READY_MARKER);
+                    // Distinguish "marker absent" (client forgot the
+                    // upload; retry the upload + FinalizeSession)
+                    // from "we couldn't tell" (permissions, filesystem
+                    // I/O). Collapsing the latter into the former
+                    // sends the operator chasing an upload that
+                    // already succeeded when the real fault is a
+                    // broken workspace dir.
+                    let marker_present = tokio::fs::try_exists(&marker).await.map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("checking patches-ready marker at {}: {e}", marker.as_str()),
+                        )
+                    })?;
+                    if !marker_present {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "patches upload never completed; cannot finalize \
+                             (upload patches, then retry FinalizeSession)",
+                        ));
+                    }
+                }
+
+                // Materialize the composition's patches into the
+                // session's home dir. Done here — once — rather
+                // than on every attach so the sandbox home is
+                // populated exactly at the point the session
+                // becomes attachable, and subsequent attaches see
+                // the same tree without re-copying (which would
+                // clobber any in-sandbox modifications the user
+                // made in prior attaches). If the composition has
+                // no patches, this is a no-op.
+                if let SessionInner::Active {
+                    composition: Some(comp),
+                    ..
+                } = &self.inner
+                {
+                    let home = paths_obj.home_path();
+                    materialize_patches_into_home(&patches_dir, &home, comp).await?;
+                }
+
+                let mut record = record;
+                record.status = SessionStatus::Active;
+                self.record.write(record.clone()).await?;
+                #[cfg(target_os = "linux")]
+                self.register_hostname(&record);
+                Ok(())
+            }
+            SessionStatus::Pending => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "session is Pending; configure the loadout first",
+            )),
+        }
+    }
+
+    /// Kicks off a background package build as a side-op and registers it on
+    /// this session, returning the receiver end of its event stream. The build
+    /// runs against a fresh workspace-rooted context (rebuilt per call so it
+    /// tracks `minimal.toml` edits).
+    ///
+    /// The returned receiver closes when the build ends.
+    async fn start_build(
+        &mut self,
+        rebuild: bool,
+        pkgs: Vec<String>,
+    ) -> Result<mpsc::Receiver<BuildUpdate>, std::io::Error> {
+        let ctx = self.context(false).await.map_err(std::io::Error::other)?;
+        let (sop, rx) = SideOp::spawn_build(self.weak_self.clone(), rebuild, pkgs, ctx, 64).await?;
+        match &mut self.inner {
+            SessionInner::Active { sops, .. } => sops.push(sop),
+            SessionInner::Draft { .. } => {
+                sop.shutdown().await;
+                unreachable!("`context()` already rejected a `Draft`");
+            }
+        }
+        Ok(rx)
+    }
+
+    /// Tears down any runtime objects, such as the host or side ops. Shutdown
+    /// of these objects is complete once awaited.
+    ///
+    /// `for_shutdown` is threaded to the host's kill so attached clients get
+    /// the daemon-shutdown message (and a terminal reset) rather than a bare
+    /// disconnect when the session dies because the daemon is going away.
+    async fn stop_running(&mut self, for_shutdown: bool) {
+        let inner = match &mut self.inner {
+            SessionInner::Active { host, sops, .. } => Some((host.take(), std::mem::take(sops))),
             SessionInner::Draft { .. } => None,
         };
-        if let Some((host, task)) = host {
-            // Signal the process to die, then await the runtime loop so the
-            // sandbox files backing its rootfs are released before the caller
-            // removes the session's directory tree.
-            let _ = host.kill().await;
-            let _ = task.await;
+        if let Some((host, mut sops)) = inner {
+            for s in sops.drain(..) {
+                s.shutdown().await;
+            }
+            if let Some((host, task)) = host {
+                // Signal the process to die, then await the runtime loop so the
+                // sandbox files backing its rootfs are released before the caller
+                // removes the session's directory tree.
+                let _ = host.kill(for_shutdown).await;
+                let _ = task.await;
+            }
         }
     }
 
@@ -702,10 +1067,72 @@ impl Session {
         // Composition that comes back `Pending` is the one case we can't
         // resolve here — items need a client-side gate — and falls through to
         // the refusal below.
+        //
+        // The shortcut only works when the composition ends up with
+        // no patches. Patches require the client to run the
+        // `WorkspacePatchesTarZst` upload + `FinalizeSession`
+        // sequence, and this attach path has no way to obtain those
+        // files — nothing on the daemon side reaches back to the
+        // client to solicit an upload. If we ran `configure_loadout`
+        // and it produced patches, the record would be stuck at
+        // `Materializing` with no path to `Active` and every
+        // subsequent attach would hit the `SessionPending` refusal.
+        // So: run the configure, and if patches surfaced, roll the
+        // in-memory state back to `Draft { pending: None }` (the
+        // record's on-disk `Materializing` status still leaves it
+        // reachable for `DestroySession`) and refuse the attach with
+        // an actionable error naming the required explicit flow.
         if let SessionInner::Draft { pending: None } = &self.inner {
             self.configure_loadout(WireContribution::default())
                 .await
                 .map_err(AttachError::LoadoutFailed)?;
+            let has_patches = matches!(
+                &self.inner,
+                SessionInner::Active {
+                    composition: Some(c),
+                    ..
+                } if !c.patches().is_empty()
+            );
+            if has_patches {
+                // Refuse: this attach path can't run the
+                // upload + FinalizeSession sequence the composition
+                // requires. `finalize`'s per-op guard will refuse
+                // any later attempt against this Materializing
+                // record, so the operator has to destroy it and
+                // re-activate through `min activate`, which drives
+                // the full flow.
+                return Err(AttachError::LoadoutFailed(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "composition has patches that can only be uploaded via `min activate` \
+                     (ConfigureLoadout → WorkspacePatchesTarZst → FinalizeSession); \
+                     the attach shortcut can't drive that sequence — destroy this session \
+                     and re-activate through the CLI",
+                )));
+            }
+            // No patches: finalize inline so the shortcut still
+            // yields an attachable session. The marker check inside
+            // `finalize` is gated on `!composition.patches().is_empty()`,
+            // so an empty composition doesn't need the dir + marker
+            // to exist: `finalize` skips the check, `materialize`
+            // iterates zero patches, and the record is written as
+            // `Active`.
+            self.finalize().await.map_err(AttachError::LoadoutFailed)?;
+        }
+
+        // Attach is gated on `Active` — a Materializing session has
+        // a composition but its patches may not be on disk yet,
+        // and materializing without them would produce a broken
+        // sandbox rootfs. See [`Session::finalize`] for the
+        // transition.
+        {
+            let record = self
+                .record
+                .record()
+                .await
+                .map_err(AttachError::LoadoutFailed)?;
+            if record.status != SessionStatus::Active {
+                return Err(AttachError::SessionPending);
+            }
         }
 
         let host = match &mut self.inner {
@@ -792,7 +1219,7 @@ impl Session {
     #[cfg(not(test))]
     async fn session_launcher(
         &mut self,
-        _session: SessionHandle,
+        session: SessionHandle,
         record: &Record,
     ) -> Result<session_host::SandboxLauncher, AttachError> {
         // R2.1: reject a policy that is incompatible with the network mode
@@ -814,6 +1241,9 @@ impl Session {
             net_switch: Arc::clone(&self.net_switch),
             ingress,
             composition: self.composition(),
+            // A weak handle so in-sandbox `min build` can drive session
+            // side-ops without keeping the actor alive past teardown.
+            session: session.downgrade(),
         })
     }
 
@@ -838,9 +1268,31 @@ impl Session {
     ///
     /// This is NOT cached to enable session execution to change as the
     /// `minimal.toml` file changes.
+    ///
+    /// Gated on the same lifecycle status as [`Session::attach`]:
+    /// the on-disk record must be `Active`. `SessionInner::Active`
+    /// alone doesn't distinguish `Materializing` (composition done,
+    /// patches not yet uploaded and not yet materialized into the
+    /// sandbox home) from `Active` (fully ready). Building a
+    /// context and running a task against a `Materializing`
+    /// session would execute against an unpopulated home dir —
+    /// the exact lifecycle escape the `Materializing` state was
+    /// added to prevent.
     async fn context(&mut self, scaffold_if_missing: bool) -> Result<mctx::Context, String> {
         if matches!(&self.inner, SessionInner::Draft { .. }) {
             return Err("session is pending composition".to_string());
+        }
+        let record = self
+            .record
+            .record()
+            .await
+            .map_err(|e| format!("reading session record: {e}"))?;
+        if record.status != SessionStatus::Active {
+            return Err(format!(
+                "session isn't attachable yet (status is {:?}, need Active — \
+                 finish the upload + FinalizeSession sequence first)",
+                record.status,
+            ));
         }
 
         let ctx = self.build_context(scaffold_if_missing).await?;
@@ -911,6 +1363,7 @@ impl Session {
             working: obj.workspace_path(),
             cache: obj.cache_path(),
             home: obj.home_path(),
+            patches: obj.patches_path(),
         }
     }
 }
@@ -920,6 +1373,55 @@ impl Session {
 pub struct SessionHandle(mpsc::Sender<SessionMessage>);
 
 impl SessionHandle {
+    /// Returns a non-owning handle to this session.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakSessionHandle {
+        WeakSessionHandle(self.0.downgrade())
+    }
+
+    /// Handle to the per-session patches-upload lock, owned by the session
+    /// actor.
+    ///
+    /// Workspace patches are accumulated in a fixed per-session directory,
+    /// so this lock is used to serialize `WorkspacePatchesTarZst` RPCs so
+    /// they dont race and stomp each other.
+    pub async fn patches_upload_lock(&self) -> Result<Arc<Mutex<()>>, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .0
+            .send(SessionMessage::GetPatchesUploadLock(send))
+            .await;
+        recv.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
+        })
+    }
+
+    /// Kicks off a background package build as a session side-op, returning the
+    /// receiver end of the build's event stream. Events flow until the build
+    /// finishes (success or cancellation), at which point the channel closes.
+    /// A `Draft` session is refused with `InvalidInput`; a dead actor maps to
+    /// `NotConnected`.
+    pub async fn start_build(
+        &self,
+        rebuild: bool,
+        pkgs: Vec<String>,
+    ) -> Result<mpsc::Receiver<BuildUpdate>, std::io::Error> {
+        let (reply, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .0
+            .send(SessionMessage::StartBuild {
+                rebuild,
+                pkgs,
+                reply,
+            })
+            .await;
+        recv.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
+        })?
+    }
+
     /// Returns paths on the daemon backing various internals of the session.
     /// A dead actor (self-terminated abort/failed-verdict/create-failure, or
     /// mid-teardown) maps to `NotConnected` — callers race actor death.
@@ -987,10 +1489,13 @@ impl SessionHandle {
     }
 
     /// Submit the client's contribution verdict against a `Draft` session.
-    /// On success the actor promotes its record to `Active` and replies with
-    /// [`SessionStep::Active`]; structured failures (wrong state, an
-    /// unresumable verdict) come back as [`SessionStep::Fault`]. A dead
-    /// actor maps to `NotConnected` (the caller reads it as unknown-session).
+    /// On success the actor promotes its record from `Pending` to
+    /// `Materializing` and replies with [`SessionStep::Materialized`]; the
+    /// client still has to upload patches and call `FinalizeSession`
+    /// before the session becomes attachable. Structured failures
+    /// (wrong state, an unresumable verdict) come back as
+    /// [`SessionStep::Fault`]. A dead actor maps to `NotConnected`
+    /// (the caller reads it as unknown-session).
     pub(crate) async fn submit_verdict(
         &self,
         verdict: ContributionVerdict,
@@ -1001,6 +1506,23 @@ impl SessionHandle {
             .0
             .send(SessionMessage::SubmitVerdict(Box::new((verdict, send))))
             .await;
+        recv.await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "session actor is gone",
+            ))
+        })
+    }
+
+    /// Promote a `Materializing` session to `Active`, gating on the
+    /// patches-ready marker having been written by a completed
+    /// `WorkspacePatchesTarZst` upload. Idempotent on already-Active
+    /// sessions. See [`Session::finalize`] for the state-machine
+    /// contract.
+    pub(crate) async fn finalize(&self) -> Result<(), std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.0.send(SessionMessage::Finalize(send)).await;
         recv.await.unwrap_or_else(|_| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -1111,6 +1633,32 @@ impl SessionHandle {
     }
 }
 
+/// A non-owning handle to the [`Session`] actor.
+#[derive(Debug, Clone)]
+pub struct WeakSessionHandle(WeakSender<SessionMessage>);
+
+impl WeakSessionHandle {
+    /// Promotes to a strong [`SessionHandle`], or `None` if the session actor
+    /// has already shut down (all strong senders dropped).
+    #[must_use]
+    pub fn upgrade(&self) -> Option<SessionHandle> {
+        Some(SessionHandle(self.0.upgrade()?))
+    }
+
+    /// A dangling handle whose actor is already gone (`upgrade` always yields
+    /// `None`). Test-only: lets fixtures that never exercise the session
+    /// round-trip satisfy an `EnvArgs`/`SessionChannel` that now requires a
+    /// handle, without standing up a live actor.
+    #[cfg(test)]
+    pub(crate) fn dangling() -> Self {
+        let (tx, _rx) = mpsc::channel::<SessionMessage>(1);
+        let weak = tx.downgrade();
+        // Drop the only strong sender so `upgrade()` returns `None`.
+        drop(tx);
+        Self(weak)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1140,8 +1688,10 @@ mod tests {
     /// blow up: nothing is in flight on a bare `Draft`, so the attach
     /// configures it with an empty contribution on the way in and mints the
     /// shell as usual. Guards the `min activate` → `min attach` path against
-    /// a client that skipped `ConfigureLoadout`, and any internal caller that
-    /// only ever wanted a session to run something in.
+    /// a caller that never reached the compose step (a compose failure
+    /// leaves the actor `Draft` — attach has to still land it live), and
+    /// any internal caller that only ever wanted a session to run something
+    /// in.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn attach_to_an_unconfigured_session_configures_it_rather_than_failing() {
         use crate::test_harness::create_session_req;
@@ -1149,7 +1699,9 @@ mod tests {
 
         let server = TestServer::new().await;
         let mut client = server.connect().await;
-        // Bare `CreateSession` — no `ConfigureLoadout` follow-up.
+        // Bare `CreateSession` — no `ConfigureLoadout` follow-up. The
+        // session stays `Draft`; the attach path is the one that has
+        // to notice and configure it on the way in.
         let session_id = client
             .call::<CreateSession>(&create_session_req("bare-session", "/uwu"))
             .await
@@ -1483,6 +2035,100 @@ mod tests {
         assert!(
             flushed.contains("got:hello"),
             "reattaching should flush prior terminal state, got: {flushed:?}",
+        );
+    }
+
+    /// A session's composition persists across a daemon restart: the
+    /// sidecar written at composition-assembly time is read back when
+    /// the actor is respawned from disk, so the launcher sees the same
+    /// packages and vars instead of falling back to the baseline set.
+    /// This is the core fix for issue #849 — "session composition state
+    /// is in-memory only: daemon restart drops loadout packages/vars
+    /// for existing sessions."
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn composition_survives_actor_restart() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        // The actor was spawned during `create_configured_session`
+        // and holds the composition in memory. Verify it's present.
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("session should resolve while actor is running");
+        assert!(
+            handle.peek_composition().await.is_some(),
+            "freshly configured session should hold its composition in memory"
+        );
+
+        // Stop the actor and evict it from the running map so the
+        // next `get_session` spawns a fresh actor from the on-disk
+        // record — simulating a daemon restart.
+        handle.stop().await;
+        manager.evict(session_id).await;
+
+        // Re-resolve: spawns a new actor from disk. The composition
+        // should be restored from the sidecar, not None.
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("session should resolve after eviction");
+        assert!(
+            handle.peek_composition().await.is_some(),
+            "re-spawned session should have its composition restored from \
+             the sidecar, not fall back to baseline"
+        );
+    }
+
+    /// When the sidecar is missing (e.g. a session that predated the
+    /// sidecar, or a corrupt filesystem), the actor still spawns — but
+    /// with no composition, so the launcher falls back to its baseline
+    /// set. The operator sees a warning log rather than a silent drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_sidecar_falls_back_to_baseline() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("session should resolve");
+
+        // Delete the sidecar to simulate a pre-sidecar session or a
+        // corrupt filesystem. The composition sidecar lives at
+        // `<session-root>/composition.json`, a sibling of `record.json`;
+        // derive it from the workspace path (`<root>/tree`).
+        let paths = handle.paths().await.expect("paths should resolve");
+        let composition_file = paths
+            .working
+            .parent()
+            .expect("workspace path has a parent")
+            .join(&paths::DaemonRelPath::try_new("composition.json").unwrap());
+        tokio::fs::remove_file(composition_file.as_utf8_path())
+            .await
+            .expect("sidecar should exist to delete");
+
+        handle.stop().await;
+        manager.evict(session_id).await;
+
+        // Re-resolve: spawns from disk with no sidecar. The
+        // composition should be None — loud fallback to baseline.
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("session should resolve after eviction");
+        assert!(
+            handle.peek_composition().await.is_none(),
+            "session with a missing sidecar should fall back to baseline \
+             (composition None), not hold a stale composition"
         );
     }
 }

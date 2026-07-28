@@ -16,7 +16,11 @@
 //! 5. Registers the marker socket for `VSOCK_MARKER_PORT` (guest→host): the
 //!    guest workload connects to that vsock port and writes `READY\n`, which
 //!    libkrun bridges to the host UNIX socket where the parent listens.
-//! 6. Calls `krun_start_enter`, which boots the VM. On success libkrun
+//! 6. On macOS, registers the timekeep socket for `VSOCK_TIMEKEEP_PORT`
+//!    (host→guest) and starts the thread that sends the host wall clock to the
+//!    guest, so a host suspend does not leave the guest clock frozen
+//!    ([`crate::timekeep`]).
+//! 7. Calls `krun_start_enter`, which boots the VM. On success libkrun
 //!    `exit()`s with the guest workload's exit code and never returns here.
 //!
 //! Without libkrun this subcommand bails immediately with a "no libkrun" error.
@@ -83,11 +87,21 @@ fn run_vmm() -> Result<()> {
     cfg.apply(&mut ctx)
         .context("applying VmConfig to krun context")?;
 
-    // Optional early-boot console capture for diagnosing a stuck boot. Off by
-    // default; set `MINVMD_BOOT_LOG=<path>` to capture hvc0 to a host file.
-    if let Some(log_path) = std::env::var_os("MINVMD_BOOT_LOG") {
-        ctx.set_console_output(&log_path)
-            .context("setting console output log")?;
+    // Console capture (hvc0 → host file). `MINVMD_BOOT_LOG=<path>` overrides;
+    // the default is `<provider dir>/boot.log` — a silently-discarded console
+    // is exactly the evidence lost in wedged-boot/dead-transport incidents,
+    // and `min bug` bundles this file (tail-capped) per provider. Truncated
+    // each boot so it holds the current VM generation's console.
+    let boot_log = std::env::var_os("MINVMD_BOOT_LOG")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| crate::state::provider_dir().join("boot.log"));
+    // Capture is diagnostics, not a boot dependency: any failure — creating
+    // the file or wiring the console — warns and boots on, never propagates.
+    if let Err(e) = std::fs::File::create(&boot_log) {
+        tracing::warn!(path = %boot_log.display(), error = %e, "cannot create boot log; console discarded");
+    } else if let Err(e) = ctx.set_console_output(&boot_log) {
+        tracing::warn!(path = %boot_log.display(), error = %e, "cannot wire console to boot log; console discarded");
     }
 
     // Register the READY-marker vsock port (guest→host). The plain
@@ -97,6 +111,16 @@ fn run_vmm() -> Result<()> {
     // which libkrun bridges to the parent.
     ctx.add_vsock_port(VSOCK_MARKER_PORT, &marker_sock)
         .context("registering READY-marker vsock port")?;
+
+    // Host wall-clock updates (host→guest, `crate::timekeep`), macOS only.
+    //
+    // Best-effort: a VM that boots with a drifting clock beats one that does
+    // not boot, so every failure warns and carries on.
+    if cfg!(target_os = "macos")
+        && let Err(e) = start_timekeep(&mut ctx)
+    {
+        tracing::warn!(error = %e, "host time updates unavailable; the guest clock will drift");
+    }
 
     tracing::info!(
         port = VSOCK_MARKER_PORT,
@@ -110,4 +134,41 @@ fn run_vmm() -> Result<()> {
     // error so the parent can observe the child's non-zero exit.
     let err = ctx.start_enter();
     bail!("krun_start_enter returned unexpectedly: {err}");
+}
+
+/// Register the host→guest timekeep bridge and start the sender thread.
+///
+/// libkrun's vsock API takes a filesystem path and nothing else, so this
+/// goes via a temporary UDS path.
+///
+/// The sender starts here rather than after `start_enter`, which never
+/// returns. libkrun binds the socket while starting the VM and the guest
+/// listener appears later still, so the thread dials into a socket that does
+/// not exist yet and retries — by design.
+#[cfg(minvmd_libkrun)]
+fn start_timekeep(ctx: &mut crate::krun::Context) -> Result<()> {
+    use anyhow::Context as _;
+
+    let sock =
+        crate::timekeep::resolve_timekeep_sock().context("resolving the timekeep socket path")?;
+    // libkrun aborts the process on an over-long socket path instead of
+    // returning an error, so check before handing it over.
+    crate::sock::check_uds_path_len(&sock)?;
+    crate::sock::prepare_socket_dir(&sock)?;
+    // Drop a stale socket from a prior run; libkrun's listen-bind fails
+    // EEXIST otherwise (e.g. on a persistent runner).
+    crate::sock::remove_stale_socket(&sock)?;
+
+    ctx.add_vsock_port2(crate::timekeep::VSOCK_TIMEKEEP_PORT, &sock, true)
+        .context("registering the timekeep vsock port")?;
+    // Detached on purpose: the thread lives as long as the process, which
+    // libkrun `exit()`s when the guest ends.
+    let _sender = crate::timekeep::spawn(sock.clone()).context("spawning the timekeep sender")?;
+
+    tracing::info!(
+        port = crate::timekeep::VSOCK_TIMEKEEP_PORT,
+        sock = %sock.display(),
+        "registered host→guest timekeep bridge",
+    );
+    Ok(())
 }

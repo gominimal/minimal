@@ -46,6 +46,17 @@ pub enum WireVarVerdict {
 /// each is voted on independently. `id` correlates back to the
 /// pending patch; `host_path` is the canonical absolute path the
 /// daemon will copy from.
+///
+/// **On the destination:** the pending patch carries only the
+/// *base* destination the daemon staged — for a dir mapping like
+/// `~/.claude/**` that's `~/.claude`, shared across every file the
+/// walk enumerates. The client is the one that computes the
+/// per-file destination via `compute_dest` (base joined with the
+/// walker's path suffix under the walk root), so `Approved`
+/// carries it back on the wire; the daemon must not reuse the
+/// pending's base or every file in a dir mapping would collide on
+/// the same destination and the `check_patch_mismatches` invariant
+/// would fire.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WirePatchVerdict {
@@ -55,6 +66,11 @@ pub enum WirePatchVerdict {
         id: PendingId,
         /// Absolute host path of the matched file.
         host_path: paths::HostAbsPath,
+        /// Sandbox-home-relative destination the daemon should
+        /// stage this file at. Computed client-side so a dir
+        /// mapping's fan-out produces unique per-file dests instead
+        /// of collapsing every file onto the pending's shared base.
+        destination: paths::SandboxRelPath,
     },
     /// User policy or prompt rejected this file.
     Denied {
@@ -94,6 +110,7 @@ mod tests {
                 value: WireResolvedVar {
                     name: "EDITOR".into(),
                     value: "hx".into(),
+                    carries_user_data: true,
                 },
             },
             WireVarVerdict::Denied {
@@ -116,6 +133,7 @@ mod tests {
             WirePatchVerdict::Approved {
                 id: PendingId::new(1),
                 host_path: paths::HostAbsPath::try_new("/home/u/.gitconfig").unwrap(),
+                destination: paths::SandboxRelPath::try_new(".gitconfig").unwrap(),
             },
             WirePatchVerdict::Denied {
                 id: PendingId::new(2),

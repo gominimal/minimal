@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 pub mod channel_progress;
 pub mod connection;
+mod diag;
 pub mod env;
 mod exec;
 mod github;
@@ -13,6 +14,7 @@ pub mod rpc;
 pub mod server;
 mod session;
 pub mod session_host;
+pub mod session_sop;
 mod sessions;
 mod sftp;
 mod store;

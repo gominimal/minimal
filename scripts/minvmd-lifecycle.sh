@@ -29,7 +29,7 @@ teardown() {
   minvmd stop >/dev/null 2>&1 || true
   # Drop the resource config this proof persisted so it cannot alter the
   # session-e2e boot that runs next on the same default state dir.
-  rm -f "${XDG_STATE_HOME:-$HOME/.local/state}/minimal/providers/local-0/config.toml"
+  rm -f "${XDG_STATE_HOME:-$HOME/.local/state}/minimal/providers/local-minvmd0/config.toml"
   rm -rf "$WORK"
 }
 trap teardown EXIT
@@ -105,6 +105,32 @@ cat "$WORK/status-after.json"
 jq -e '.state == "stopped"' "$WORK/status-after.json"
 # Also confirm the documented non-zero exit for the stopped state.
 if minvmd status; then echo "::error::expected non-zero status exit after stop"; exit 1; fi
+echo "::endgroup::"
+
+# Restart cycle: a clean stop must leave state such that the NEXT boot on the
+# same state dir reaches Running again (guards the Stopped->Running re-entry and
+# the minvmd.toml reset on stop). The single detach->stop pass above does not
+# prove a daemon can be brought back up; this second cycle does — and it ships
+# to both the KVM and macOS lanes, which run this script.
+echo "::group::restart (run --detach again)"
+minvmd run --detach --timeout "$BOOT_TIMEOUT"
+for _ in $(seq 1 $((BOOT_TIMEOUT * 5))); do
+  minvmd status --json > "$WORK/status2.json" || true
+  if jq -e '.state == "running" and (.vmm_pid | type == "number")' "$WORK/status2.json" >/dev/null; then
+    break
+  fi
+  sleep 0.2
+done
+cat "$WORK/status2.json"
+jq -e '.state == "running" and (.vmm_pid | type == "number")' "$WORK/status2.json"
+echo "::endgroup::"
+
+echo "::group::stop (second)"
+minvmd stop
+minvmd status --json > "$WORK/status-after2.json" || true
+cat "$WORK/status-after2.json"
+jq -e '.state == "stopped"' "$WORK/status-after2.json"
+if minvmd status; then echo "::error::expected non-zero status exit after second stop"; exit 1; fi
 echo "::endgroup::"
 
 echo "daemon lifecycle OK"

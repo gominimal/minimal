@@ -87,8 +87,8 @@ impl clap::Args for RunArgs {
     fn augment_args(cmd: clap::Command) -> clap::Command {
         cmd.trailing_var_arg(true)
             .override_usage(
-                "minimal run [OPTIONS] <task_name> [task_args]...\n       \
-                 minimal run [OPTIONS] --upstream <upstream> --task-spec <task_spec> [task_args]...",
+                "mip run [OPTIONS] <task_name> [task_args]...\n       \
+                 mip run [OPTIONS] --upstream <upstream> --task-spec <task_spec> [task_args]...",
             )
             .arg(
                 clap::Arg::new("task_name")
@@ -148,7 +148,7 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
             let parsed_args = if !task.args.is_empty() {
                 Some(
                     task.args
-                        .parse_argv_named(&format!("minimal run {}", task_name), &args.task_args)
+                        .parse_argv_named(&format!("mip run {task_name}"), &args.task_args)
                         .map_err(|e| {
                             e.print().unwrap();
                             Error::Other(anyhow!(
@@ -169,7 +169,7 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
     }
 }
 
-/// Handles `minimal run --upstream ... --task-spec ...` without requiring a minimal.toml.
+/// Handles `mip run --upstream ... --task-spec ...` without requiring a minimal.toml.
 /// Called before Context::new in main, similar to how `cmd_init` is handled.
 pub async fn cmd_run_by_spec(
     mut upstream: mfile::LinkConfig,
@@ -222,7 +222,7 @@ pub async fn cmd_run_by_spec(
     let parsed_args = if !task.args.is_empty() {
         Some(
             task.args
-                .parse_argv_named("minimal run --task-spec ... ", &task_args)
+                .parse_argv_named("mip run --task-spec ... ", &task_args)
                 .map_err(|e| {
                     e.print().unwrap();
                     Error::Other(anyhow!("task called with invalid arguments",))

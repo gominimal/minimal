@@ -1,7 +1,7 @@
 # CI Strategy: Rust client / host-daemon / guest-daemon system (libkrun + KVM)
 
 > **How this maps to gominimal/minimal.** This is the design the CI refactor
-> ([#687](https://github.com/gominimal/minimal/issues/687)) implements — adopted
+> ([#687](https://github.com/gominimal/minimal/issues/687)) implements, adopted
 > policy, not aspiration. A few terms map to this repo's shape:
 >
 > - The strategy's single-workflow + `preflight` is realised as **five
@@ -13,14 +13,14 @@
 >   and macOS lanes (`cargo nextest archive` + prebuilt binaries → a
 >   toolchain-free test job; the mac mini compiles nothing, per §7); the same
 >   unified proof (`scripts/session-e2e.sh`) runs on all three targets.
-> - The strategy's `cargo xtask` is this repo's **justfile + `scripts/`** — the
+> - The strategy's `cargo xtask` is this repo's **justfile + `scripts/`**, the
 >   same "logic in reviewed code, YAML stays a thin scheduler" property (§10).
 > - Guest kernel/rootfs come prebuilt from the GCS channel via the
 >   `materialize` composite; the initramfs cross-compiles minimald to musl.
 > - VM/subsystem harnesses are selected by **binary-name suffix**
 >   (`*_integration.rs` non-root, `*_root_integration.rs` root) via the
 >   filtersets `binary(/_integration$/) and not binary(/_root_integration$/)`
->   and `binary(/_root_integration$/)` — not the strategy's `vm_e2e_` test-name
+>   and `binary(/_root_integration$/)`, not the strategy's `vm_e2e_` test-name
 >   prefix. (The `and not` matters: `_root_integration` also ends in
 >   `_integration`.) "e2e" is reserved
 >   for the full-CLI proofs that live under `scripts/` (e.g. `session-e2e.sh`);
@@ -28,12 +28,12 @@
 > - The nightly TEST tier is `nightly-tests.yml` (distinct from `nightly.yml`,
 >   which cuts the release channel).
 >
-> The test-extension contract (§10) is the load-bearing part for contributors —
-> see [CONTRIBUTING.md](../CONTRIBUTING.md).
+> The test-extension contract (§10) is the load-bearing part for contributors,
+> see [CONTRIBUTING.md](https://github.com/gominimal/minimal/blob/main/CONTRIBUTING.md).
 
 ---
 
-Research document — optimal CI shape on GitHub Actions for a Rust workspace targeting
+Research document, optimal CI shape on GitHub Actions for a Rust workspace targeting
 **x86_64 Linux** and **arm64 macOS**, with three components:
 
 | Component | Runs on | Notes |
@@ -54,7 +54,7 @@ triple** whose outputs (nextest archives, static guest binaries) are shared as a
 with the VM test jobs, which then need no Rust toolchain (in this repo the archive-replay
 pattern is only the KVM and macOS lanes; `core-tests` and the `ci`/native/release/nightly
 lanes run `cargo nextest run` directly). E2E runs at two
-levels: a **process-mode suite** (guest daemon as a plain process, no VM — runs anywhere)
+levels: a **process-mode suite** (guest daemon as a plain process, no VM, runs anywhere)
 and a **real-VM smoke suite** (libkrun boot + vsock round-trip) that runs on stock
 `ubuntu-latest` runners because **all x86_64 Linux hosted runners expose `/dev/kvm`**.
 macOS VM smoke requires a **self-hosted Apple Silicon machine** (hosted macOS runners
@@ -88,14 +88,14 @@ graph LR
 
 These five facts, all verified against primary sources, dictate the shape:
 
-1. **`/dev/kvm` is available on every x86_64 Linux hosted runner** — larger runners since
+1. **`/dev/kvm` is available on every x86_64 Linux hosted runner**, larger runners since
    Feb 2023, the standard 2-vCPU `ubuntu-latest` since Apr 2024
    ([changelog](https://github.blog/changelog/2024-04-02-github-actions-hardware-accelerated-android-virtualization-now-available/)).
    One permissions step is required (udev rule, §5). Live proof: **libkrun's own CI boots
    real microVMs with a guest agent over vsock on plain hosted runners, on every PR**
    ([integration_tests.yml](https://github.com/libkrun/libkrun/blob/main/.github/workflows/integration_tests.yml)).
    Caveat: GitHub has declined to document nested virt as supported
-   ([runner-images#12933](https://github.com/actions/runner-images/issues/12933)) —
+   ([runner-images#12933](https://github.com/actions/runner-images/issues/12933)),
    the Android-emulator ecosystem depends on it so regression risk is low, but nonzero.
 
 2. **arm64 Linux hosted runners (`ubuntu-24.04-arm`) have no `/dev/kvm`**
@@ -111,7 +111,7 @@ These five facts, all verified against primary sources, dictate the shape:
    ([runner-images#13505](https://github.com/actions/runner-images/issues/13505)).
    → Exercising libkrun/HVF on macOS in CI requires **bare-metal Apple Silicon**
    (self-hosted). This holds for *every* VM-based macOS provider (Tart, Orka, Anka,
-   GitLab, Cirrus hosted) — bare metal is the only way.
+   GitLab, Cirrus hosted), bare metal is the only way.
 
 4. **libkrun's vsock needs nothing from the CI host kernel.** libkrun implements
    virtio-vsock in userspace; the host side of every guest vsock port is a plain
@@ -125,8 +125,8 @@ These five facts, all verified against primary sources, dictate the shape:
 
 5. **The guest daemon is always a Linux binary**, even for macOS hosts (libkrun boots a
    Linux microVM there). Build it as a static musl binary per host arch:
-   - `x86_64-unknown-linux-musl` — natively on `ubuntu-latest` with `musl-tools`.
-   - `aarch64-unknown-linux-musl` — natively on `ubuntu-24.04-arm` (free for public
+   - `x86_64-unknown-linux-musl`, natively on `ubuntu-latest` with `musl-tools`.
+   - `aarch64-unknown-linux-musl`, natively on `ubuntu-24.04-arm` (free for public
      repos since Aug 2025, private standard runners since Jan 2026;
      [GA changelog](https://github.blog/changelog/2025-08-07-arm64-hosted-runners-for-public-repositories-are-now-generally-available/)).
      No cross toolchain, no Docker/`cross`, no zigbuild needed in CI.
@@ -143,26 +143,26 @@ Order tests by cost; push each test into the cheapest tier that can catch its fa
 |---|---|---|---|
 | 1 | `cargo fmt --check`, `cargo clippy --all-targets`, `cargo-deny` | any runner, no VM | seconds–2 min |
 | 2 | unit + integration tests (`cargo nextest run`), `cargo test --doc` | Linux + macOS runners | minutes, warm-cached |
-| 3 | **process-mode e2e** — guest daemon as a plain process, direct client connection | Linux runners, no KVM needed | minutes |
-| 4 | **VM smoke e2e** — boot real libkrun VM, client → vsock proxy → guest daemon round-trip, handful of scenarios | `ubuntu-latest` (KVM) + self-hosted Mac | ~5–10 min |
-| 5 | extended e2e — long scenarios, supervision/restart paths, stress, larger matrix | nightly | tens of minutes |
+| 3 | **process-mode e2e**, guest daemon as a plain process, direct client connection | Linux runners, no KVM needed | minutes |
+| 4 | **VM smoke e2e**, boot real libkrun VM, client → vsock proxy → guest daemon round-trip, handful of scenarios | `ubuntu-latest` (KVM) + self-hosted Mac | ~5–10 min |
+| 5 | extended e2e, long scenarios, supervision/restart paths, stress, larger matrix | nightly | tens of minutes |
 
 **Tier 3 is this project's structural advantage.** The Linux no-KVM fallback (guest daemon
 connects directly to the client) means the full client↔guest protocol, lifecycle, and
-supervision logic can be tested with zero virtualization — deterministic, fast, runnable
+supervision logic can be tested with zero virtualization, deterministic, fast, runnable
 on any runner. This is exactly gVisor's platform strategy (`systrap` everywhere, `kvm`
 where hardware allows: [platform guide](https://gvisor.dev/docs/architecture_guide/platforms/)).
 Firecracker and cloud-hypervisor have no such mode and carry permanent bare-metal fleets
 just to gate PRs; the process mode avoids that fate.
 
-**Write the e2e suite once, parametrized over transport** (process-direct vs VM+vsock) —
-gVisor-style target duplication — rather than maintaining two suites. Tier 4 then only
+**Write the e2e suite once, parametrized over transport** (process-direct vs VM+vsock),
+gVisor-style target duplication, rather than maintaining two suites. Tier 4 then only
 needs to prove the VM/vsock/boot path itself, so a *handful* of smoke scenarios suffices
 on PR; behavioral breadth lives in tier 3.
 
 **Tagging:** keep VM tests out of default `cargo nextest run` runs (this repo gates them
 with `#[ignore]` + an env var) and select them explicitly in the VM jobs with filtersets
-— here by binary-name suffix, `-E 'binary(/_integration$/)'`
+here by binary-name suffix, `-E 'binary(/_integration$/)'`
 ([nextest filtersets](https://nexte.st/docs/filtersets/)). Reference nextest CI profile
 (cloud-hypervisor uses `retries = 3` for flaky VM boots,
 [.config/nextest.toml](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/main/.config/nextest.toml)):
@@ -198,11 +198,11 @@ co-located object storage (Depot, Namespace).
 
 Configuration rules:
 
-- **`shared-key` per (target-triple × job class)** — rust-cache does not key on
+- **`shared-key` per (target-triple × job class)**, rust-cache does not key on
   `--target` automatically; jobs building different triples or feature sets must not
   share a key, and jobs building identically should (e.g. `build-linux` and
   `vm-smoke-linux` share, if the latter compiles anything at all).
-- **`save-if: ${{ github.ref == 'refs/heads/main' }}`** — PRs restore but never write.
+- **<span v-pre>`save-if: ${{ github.ref == 'refs/heads/main' }}`</span>**, PRs restore but never write.
   GitHub cache is branch-scoped (PRs read own branch + default branch only) and
   LRU-evicts at 10 GB (raisable since Nov 2025, but stay under it). PR churn writing
   caches evicts the main caches every PR actually wants.
@@ -230,15 +230,15 @@ artifacts:
    Test jobs need a same-revision checkout for fixtures, nothing else.
 2. **Guest musl binaries** built once per arch → artifact → consumed by VM-smoke jobs
    and the host-daemon packaging step.
-3. Doctests are the one thing nextest can't run — keep a cheap `cargo test --doc` step
+3. Doctests are the one thing nextest can't run, keep a cheap `cargo test --doc` step
    in the build job (compiles against the already-built lib).
 
 Avoid the classic redundancy traps:
 
-- Don't run `cargo build` then `cargo test` as separate compilations — test artifacts
+- Don't run `cargo build` then `cargo test` as separate compilations, test artifacts
   differ (`#[cfg(test)]`, dev-deps). The archive pattern sidesteps this.
 - **Identical flags everywhere**: `--locked` on every cargo invocation; uniform
-  `RUSTFLAGS` (or prefer `CARGO_BUILD_WARNINGS: deny` over `RUSTFLAGS: -Dwarnings` —
+  `RUSTFLAGS` (or prefer `CARGO_BUILD_WARNINGS: deny` over `RUSTFLAGS: -Dwarnings`,
   RUSTFLAGS participates in fingerprints and forks caches when it drifts between jobs).
 - **Feature unification**: always drive CI with the same feature set (`--workspace`
   with a fixed feature list). `cargo build -p foo` resolves different unified features
@@ -246,14 +246,14 @@ Avoid the classic redundancy traps:
   [cargo-hakari](https://crates.io/crates/cargo-hakari)'s workspace-hack is the escape hatch.
 - Install CI tools (nextest, cargo-deny) via
   [taiki-e/install-action](https://github.com/taiki-e/install-action) (prebuilt
-  binaries) — never `cargo install` in CI.
+  binaries), never `cargo install` in CI.
 - Toolchain: pin with `rust-toolchain.toml` + `dtolnay/rust-toolchain`.
 
 ### Embedding the guest binary
 
 Cargo's proper mechanism (artifact dependencies / `bindeps`,
 [RFC 3028](https://rust-lang.github.io/rfcs/3028-cargo-binary-dependencies.html)) is
-**still nightly-only with open musl cross-compile bugs** — not usable on a stable
+**still nightly-only with open musl cross-compile bugs**, not usable on a stable
 toolchain. The pattern every VMM project uses instead is *guest assets as external
 artifacts with a local-build fallback*:
 
@@ -263,7 +263,7 @@ artifacts with a local-build fallback*:
 - In CI the env var points at the downloaded artifact; locally, an `xtask` builds the
   guest for the current arch first and sets the var. (Firecracker downloads guest
   artifacts from S3; crosvm from GCS; propolis via an artifact TOML with
-  remote/local/CI-output sources — same shape.)
+  remote/local/CI-output sources, same shape.)
 
 ---
 
@@ -281,9 +281,9 @@ concurrency:
 
 | Job | Runner | Does | Est. (warm) |
 |---|---|---|---|
-| `fmt` | ubuntu-latest | `cargo fmt --check` — no cache, no deps | <1 min |
+| `fmt` | ubuntu-latest | `cargo fmt --check`, no cache, no deps | <1 min |
 | `clippy` | ubuntu-latest | `cargo clippy --workspace --all-targets --locked` (own cache key; clippy shares artifacts with `check`, not `build`) | 2–4 min |
-| `deny` | ubuntu-latest | `cargo-deny check` — **licenses/bans blocking; advisories `continue-on-error`** (Embark's own recommendation: a newly published advisory must not break unrelated PRs) | 1 min |
+| `deny` | ubuntu-latest | `cargo-deny check`, **licenses/bans blocking; advisories `continue-on-error`** (Embark's own recommendation: a newly published advisory must not break unrelated PRs) | 1 min |
 | `preflight` | ubuntu-latest | classify changed paths (cloud-hypervisor pattern); docs-only changes skip everything below | seconds |
 | `build-linux` | ubuntu-latest | workspace build, `nextest archive`, `cargo test --doc`, x86_64-musl guest → upload artifacts | 4–6 min |
 | `build-guest-arm64` | ubuntu-24.04-arm | aarch64-musl guest → artifact | 2–3 min |
@@ -307,9 +307,9 @@ libkrun):
 
 **Why `ci-ok` and `preflight` instead of workflow-level `paths:` filters:** a
 `paths:`-filtered workflow that is also a required check leaves PRs stuck at *"Waiting
-for status to be reported"*. An always-running join/aggregator as the required check —
+for status to be reported"*. An always-running join/aggregator as the required check,
 this repo uses **one per lane** (the five `*-success` aggregators), each with an
-in-workflow `changes` job deciding what to skip — avoids the deadlock entirely and makes
+in-workflow `changes` job deciding what to skip, avoids the deadlock entirely and makes
 adding/removing jobs a workflow-only change, not a branch-protection change.
 
 **Merge queue (optional but recommended once the team grows):** add `merge_group:` as a
@@ -337,14 +337,45 @@ specific PR:
 
 Nightly failures should notify (issue-on-failure or Slack), not just rot in the Actions tab.
 
+**As implemented** (`nightly-tests.yml`), mapping each row to what actually runs:
+
+- **Extended e2e** — the `session-e2e-soak` job (10× serial reps) plus a **concurrency
+  stress** step (`scripts/stress-session-e2e.sh`, N sessions minted in parallel);
+  supervision/restart/kill lands as the auto-discovered
+  `crates/minvmd/tests/supervision_integration.rs` harness (restart cycle + dirty-kill
+  repair) and the restart cycle added to `scripts/minvmd-lifecycle.sh` — both of which run
+  on **Linux/KVM and macOS/HVF**, the latter via the `macos-e2e` job that reuses
+  `ci-macos.yml` through `workflow_call`.
+- **Toolchain canaries** — `beta-canary` and `nightly-rustc-canary` jobs, both
+  `continue-on-error`.
+- **`cargo-deny` advisories** — the `advisories` job (blocking → feeds `notify`).
+- **Latest-deps canary** — the `update-canary` job (`continue-on-error`).
+- **MSRV** — the `msrv` job runs `cargo hack check --rust-version` directly (mirroring the
+  `just msrv` recipe; blocking → feeds `notify`); the floor is declared once as
+  `[workspace.package] rust-version` and inherited by every crate.
+- **miri** — the `miri` job over the pure logic/protocol crates (`just miri`).
+  **Non-blocking** (`continue-on-error`): miri is nightly-sensitive and slow, so it is read
+  in the run rather than gated. The concurrency-stress step is likewise non-fatal until it
+  has settled.
+- **Hygiene** — the `hygiene` job (`continue-on-error`); `zizmor`'s pin policy and the
+  documented finding ignores live in `.github/zizmor.yml`, `actionlint`'s runner-label
+  allowlist in `.github/actionlint.yaml`.
+- **Cache priming** — `session-e2e-soak` and the `msrv`/`miri` jobs restore+save their own
+  cache classes (`save-if` main-only) so a scheduled main run keeps them warm.
+
+Not in the table but present: the `installer` job re-runs the shell-installer suite nightly
+(reused from `ci-shell-installer.yml` via `workflow_call`), catching runner-image shell
+drift the path-scoped PR lane would miss. Blocking jobs (`advisories`, `session-e2e-soak`,
+`installer`, `msrv`, `macos-e2e`) feed `notify`; the canaries and `miri` deliberately do not.
+
 ---
 
 ## 7. Self-hosted Mac runner
 
-- **Hardware**: bare-metal Apple Silicon — a Mac mini in a closet, Scaleway/MacStadium
+- **Hardware**: bare-metal Apple Silicon, a Mac mini in a closet, Scaleway/MacStadium
   bare metal, or Cirrus persistent workers. EC2 Mac works but has a 24-hour minimum host
   allocation (poor fit for CI economics). Any macOS *VM* product cannot nest HVF (§2.3).
-- **Security — the critical one**: a self-hosted runner on a public repo must **never run
+- **Security, the critical one**: a self-hosted runner on a public repo must **never run
   fork PRs** (arbitrary code execution on your hardware, runner token theft). Gate
   `vm-smoke-macos` to trusted events: `push` to main, `merge_group`,
   `workflow_dispatch`, and same-repo PRs (`github.event.pull_request.head.repo.full_name
@@ -356,7 +387,7 @@ Nightly failures should notify (issue-on-failure or Slack), not just rot in the 
   a `post`/`if: always()` step killing leaked VMs and scrubbing temp dirs (podman ships
   `gha_mac_cleanup.sh` pre *and* post).
 - **darwin gotcha**: Unix socket paths (the host side of libkrun vsock ports) hit macOS's
-  104-byte `sun_path` limit — podman rejects `TMPDIR` ≥ 22 chars on darwin for exactly
+  104-byte `sun_path` limit, podman rejects `TMPDIR` ≥ 22 chars on darwin for exactly
   this reason. Keep the harness's socket dir short (`/tmp/x`), never under the default
   runner workspace path.
 - Build nothing on this machine: hosted `macos-15` builds the darwin binaries, the arm
@@ -368,16 +399,16 @@ Nightly failures should notify (issue-on-failure or Slack), not just rot in the 
 ## 8. Local/CI parity
 
 The failure mode to avoid is CI YAML drifting from what developers run. This project's CI
-steps involve real logic — building the guest for the right arch, wiring the
-`GUEST_DAEMON_PATH` env var, orchestrating VM smoke runs, collecting console logs — which
+steps involve real logic, building the guest for the right arch, wiring the
+`GUEST_DAEMON_PATH` env var, orchestrating VM smoke runs, collecting console logs, which
 is reviewed code, not a command list. This repo keeps that logic in the **justfile +
 `scripts/`** (the role the strategy assigns to `cargo xtask`):
 
-- `just up` / `just up-kvm` — build the stack and bring it up for the host (macOS and `up-kvm` boot the guest VM)
-- `scripts/session-e2e.sh` — the unified CLI session proof every target lane runs
-- `scripts/build-initramfs.sh` — the musl guest (minimald) initramfs build
+- `just up` / `just up-kvm`, build the stack and bring it up for the host (macOS and `up-kvm` boot the guest VM)
+- `scripts/session-e2e.sh`, the unified CLI session proof every target lane runs
+- `scripts/build-initramfs.sh`, the musl guest (minimald) initramfs build
 
-CI YAML stays a thin scheduler over the same recipes and scripts — the same "logic in
+CI YAML stays a thin scheduler over the same recipes and scripts, the same "logic in
 reviewed code" property as the [cargo-xtask pattern](https://github.com/matklad/cargo-xtask)
 that bevy (`cargo run -p ci`) and propolis (`cargo xtask phd`) use; here the justfile +
 `scripts/` fill that role.
@@ -393,22 +424,24 @@ that bevy (`cargo run -p ci`) and propolis (`cargo xtask phd`) use; here the jus
 | Workspace build + unit/integration tests (Linux x86_64, macOS arm64) | ✅ | ✅ | ✅ |
 | Doctests | ✅ | ✅ | ✅ |
 | Process-mode e2e (Linux) | ✅ | ✅ | ✅ |
-| VM smoke e2e — Linux/KVM (hosted) | ✅ | ✅ | ✅ |
-| VM smoke e2e — macOS/HVF (self-hosted) | label / same-repo only | ✅ | ✅ |
-| Extended e2e, stress, supervision/restart | — | — | ✅ |
-| beta/nightly rustc canaries | — | — | ✅ non-blocking |
-| MSRV (`cargo hack check --rust-version`) | optional | — | ✅ |
-| `cargo update` latest-deps canary | — | — | ✅ non-blocking |
-| miri (protocol crates), cargo-machete, actionlint/zizmor | — | — | ✅ |
+| VM smoke e2e, Linux/KVM (hosted) | ✅ | ✅ | ✅ |
+| VM smoke e2e, macOS/HVF (self-hosted) | label / same-repo only | ✅ | ✅ |
+| Extended e2e, supervision/restart (blocking) + concurrency stress (non-blocking) | - | - | ✅ |
+| beta/nightly rustc canaries | - | - | ✅ non-blocking |
+| MSRV (`cargo hack check --rust-version`) | optional | - | ✅ blocking |
+| `cargo update` latest-deps canary | - | - | ✅ non-blocking |
+| miri (protocol crates) | - | - | ✅ non-blocking |
+| Hygiene: cargo-machete, actionlint/zizmor | - | - | ✅ non-blocking |
+| Shell-installer suite (runner-image drift) | path-scoped | - | ✅ blocking |
 | Cache write (`save-if`) | ❌ restore-only | ✅ | ✅ (primes caches) |
 
 ---
 
-## 10. Extending CI without editing workflows — the agent & developer contract
+## 10. Extending CI without editing workflows - the agent & developer contract
 
 Contributors (human or agent) are required to ship tests and proofs with their work, but
 must never modify `.github/workflows/`. The industry answer is **not** appendable stub
-scripts — it is two mechanisms working together: freeze the workflow layer mechanically,
+scripts; it is two mechanisms working together: freeze the workflow layer mechanically,
 and make every test **discovered by convention, never registered**.
 
 ### 10.1 Freeze the workflow layer mechanically
@@ -417,18 +450,18 @@ Instructions alone ("don't touch GitHub Actions") are policy; enforce them struc
 
 - **CODEOWNERS**: the repo-wide `* @gominimal/minimalists` rule (so the minimalists team
   owns `.github/` along with everything else) plus branch protection "require code owner
-  review" — any PR touching workflows is un-mergeable without human sign-off, no matter
+  review", any PR touching workflows is un-mergeable without human sign-off, no matter
   who or what authored it. This is the standard control; GitHub already treats workflow
   edits as privileged (fork PRs modifying workflows don't run with secrets).
 - **Preflight guard**: the existing `preflight` job fails fast if a PR from an
-  agent-labeled branch modifies `.github/**` — cheap belt-and-suspenders, and it gives
+  agent-labeled branch modifies `.github/**`, cheap belt-and-suspenders, and it gives
   agents an immediate, legible error instead of a review-time rejection.
 - When humans *do* edit workflows: `actionlint` + `zizmor` (already in nightly) and
   SHA-pinned actions.
 
 The reason the YAML can stay frozen at all is §8: workflows are thin schedulers over the
-justfile recipes and `scripts/`. All logic that evolves — harness code, scenario wiring,
-artifact handling — lives in that reviewed code, like any other
+justfile recipes and `scripts/`. All logic that evolves, harness code, scenario wiring,
+artifact handling, lives in that reviewed code, like any other
 code. Agents *may* modify the harness; they may not modify the scheduler.
 
 ### 10.2 Every test is auto-discovered
@@ -448,22 +481,22 @@ map to a binary-name suffix + `just`/`scripts`, per the preamble):
 
 The discriminator between the last two rows is whether the test drives the
 `minimal` CLI through a full user workflow: if so it is *end-to-end* and lives as
-a script; otherwise — even booting a VM — it is an *integration* harness named
+a script; otherwise, even booting a VM, it is an *integration* harness named
 `*_integration.rs`.
 
 Naming conventions are load-bearing here, so guard them two ways: every VM job
 runs nextest with `--no-tests=fail`, so a filterset that matches nothing (typo'd
 suffix, renamed file) fails loudly instead of green-washing the PR; and a
-meta-test in each harness crate (`minvmd`, `minimald`) — a normal unit test in
-`core-tests` — asserts every file in *that crate's* `tests/` directory carries
+meta-test in each harness crate (`minvmd`, `minimald`), a normal unit test in
+`core-tests`, asserts every file in *that crate's* `tests/` directory carries
 the `_integration` / `_root_integration` suffix (with an allowlist for
 deliberately-mothballed files), so a misnamed harness can never silently fall
 out of CI. Ordinary `crates/<crate>/tests/*.rs` integration tests in other
-crates are unaffected — they run in the workspace suite, not the VM lanes.
+crates are unaffected; they run in the workspace suite, not the VM lanes.
 
 ### 10.3 Why one-file-per-scenario beats append-to-script stubs
 
-The tempting design — `scripts/e2e.sh` with a `# agents: append tests below` marker — is
+The tempting design, `scripts/e2e.sh` with a `# agents: append tests below` marker, is
 an anti-pattern:
 
 - **Merge conflicts by construction**: parallel agents all append to the same tail of the
@@ -476,11 +509,11 @@ an anti-pattern:
   the harness's timeouts, retries, and log capture for free.
 
 This is the pattern every discovery-based test system uses (cargo's target discovery,
-pytest collection, LLVM `lit`, rustc's `run-make` — a directory of self-contained cases,
+pytest collection, LLVM `lit`, rustc's `run-make`, a directory of self-contained cases,
 globbed by the runner). The stable extension points to advertise to agents are therefore:
-(a) cargo test locations — automatic; (b) the `*_integration.rs` VM-harness convention —
+(a) cargo test locations, automatic; (b) the `*_integration.rs` VM-harness convention,
 picked up by binary-suffix filterset; (c) the CLI proofs under `scripts/` (e.g.
-`session-e2e.sh`) and the justfile recipes that wrap them — code-reviewed, for when a
+`session-e2e.sh`) and the justfile recipes that wrap them, code-reviewed, for when a
 genuinely new *kind* of check is needed. That last one is the escape hatch that keeps the
 first two honest: new capabilities go through reviewed code, never through YAML.
 
@@ -495,47 +528,47 @@ first two honest: new capabilities go through reviewed code, never through YAML.
 - CI publishes the JUnit summary to `$GITHUB_STEP_SUMMARY` (libkrun's `--github-summary`
   flag is precedent), so per-PR test evidence is visible without downloading artifacts.
 - Optional soft gate: `preflight` warns (labels, doesn't fail) when a PR touches `src/`
-  without touching any test path — a nudge, with the real enforcement left to review.
+  without touching any test path, a nudge, with the real enforcement left to review.
 
 Document this contract in `CONTRIBUTING.md` / the agents' instruction file as a short
 table (test kind → location → local command), and point CI failure messages at it.
 
 ---
 
-## Appendix A — prior art (what named projects actually do)
+## Appendix A - prior art (what named projects actually do)
 
-- **libkrun** — full VM integration tests **on every PR** on hosted `ubuntu-26.04`
+- **libkrun**: full VM integration tests **on every PR** on hosted `ubuntu-26.04`
   (udev KVM step, musl-static `guest-agent` inside the VM, host/guest test halves over
   vsock, `--keep-all` log artifacts on `always()`); aarch64 on self-hosted; **no macOS VM
   job at all** (krunkit does build+unit only on `macos-latest`).
   [integration_tests.yml](https://github.com/libkrun/libkrun/blob/main/.github/workflows/integration_tests.yml)
-- **podman (libkrun provider)** — the best macOS answer: binaries built on hosted
+- **podman (libkrun provider)**: the best macOS answer: binaries built on hosted
   `macos-26`, artifacts downloaded by a self-hosted `mac-pool` runner group, matrix over
   `provider: [applehv, libkrun]`, pre/post cleanup scripts, path-filtered.
   [ci.yml](https://github.com/podman-container-tools/podman/blob/main/.github/workflows/ci.yml)
-- **cloud-hypervisor** — nextest-driven integration tests (retries=3, hard per-test
+- **cloud-hypervisor**: nextest-driven integration tests (retries=3, hard per-test
   kill) in containers with `/dev/kvm` passed in, on self-hosted bare metal; `preflight`
   change-classification job; everything PR/merge-queue gated.
   [ci.yaml](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/main/.github/workflows/ci.yaml),
   [nextest.toml](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/main/.config/nextest.toml)
-- **firecracker** — pytest harness on AWS bare metal (Buildkite): layered VM fixtures,
+- **firecracker**: pytest harness on AWS bare metal (Buildkite): layered VM fixtures,
   always-collect-cheap-artifacts, `nonci` markers exclude heavy tests from PR, perf/
   sanitizers scheduled. [tests/README](https://github.com/firecracker-microvm/firecracker/blob/main/tests/README.md)
-- **wasmtime** — PRs run smoke-only by default with `prtest:full` opt-in; **full CI in
+- **wasmtime**: PRs run smoke-only by default with `prtest:full` opt-in; **full CI in
   the merge queue**; daily cron exists to prime caches; cargo-audit daily, non-blocking.
   [main.yml](https://github.com/bytecodealliance/wasmtime/blob/main/.github/workflows/main.yml)
-- **tokio** — cheap `basics` job gates all expensive jobs via `needs:`; loom
+- **tokio**: cheap `basics` job gates all expensive jobs via `needs:`; loom
   model-checking label-gated on PRs, full on master; cargo-deny daily + on lockfile-touching PRs.
   [ci.yml](https://github.com/tokio-rs/tokio/blob/master/.github/workflows/ci.yml)
-- **rustls** — MSRV + cargo-deny blocking on PR; daily cron for internet-touching,
+- **rustls**: MSRV + cargo-deny blocking on PR; daily cron for internet-touching,
   post-quantum, and feature-powerset tests.
   [build.yml](https://github.com/rustls/rustls/blob/main/.github/workflows/build.yml),
   [daily-tests.yml](https://github.com/rustls/rustls/blob/main/.github/workflows/daily-tests.yml)
-- **gVisor** — same behavioral suite duplicated across `systrap` (no virt) and `kvm`
-  platforms — the precedent for this project's process-mode/VM-mode transport split.
+- **gVisor**: same behavioral suite duplicated across `systrap` (no virt) and `kvm`
+  platforms, the precedent for this project's process-mode/VM-mode transport split.
   [platforms](https://gvisor.dev/docs/architecture_guide/platforms/)
 
-## Appendix B — key sources
+## Appendix B - key sources
 
 **Runner capabilities**
 - KVM on all Linux x64 runners: https://github.blog/changelog/2024-04-02-github-actions-hardware-accelerated-android-virtualization-now-available/

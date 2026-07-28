@@ -1,13 +1,35 @@
-use std::collections::HashMap;
-
+use crate::cmd_pkg_build_plan::{PkgBuildPlanArgs, cmd_pkg_build_plan};
+use crate::cmd_pkg_dep::{PkgDepArgs, cmd_pkg_dep};
+use crate::cmd_pkg_patched_build::{PkgPatchedBuildArgs, cmd_pkg_patched_build};
+use crate::cmd_pkg_upload_cache::{PkgUploadCacheArgs, cmd_pkg_upload_cache};
 use futures::channel::mpsc;
 use graph::Graph;
 use mctx::{Cache, Context, Error};
-use orchestrator::{BuildEvent, BuildEventInner};
+use orchestrator::{BuildEvent, BuildLineKind, BuildRenderer};
 use tracing::{info, trace};
 
+#[derive(Debug, clap::Subcommand)]
+pub enum PkgCmd {
+    /// Builds the specified package(s) in a clean room, making them available in the local cache.
+    Build(PkgBuildArgs),
+    /// Prints the build plan for the specified package(s)
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    BuildPlan(PkgBuildPlanArgs),
+    /// Generates Graphviz source code of the dependency graph
+    #[command(
+        long_about = "Generate an image of the dependency graph using graphviz's \"dot\" program.\n\n  mip package dep --input-deps-depth=0 | dot -Tpng > deps.png"
+    )]
+    Dep(PkgDepArgs),
+    /// Executes the build for a package, using stale dependencies.
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    PatchedBuild(PkgPatchedBuildArgs),
+    /// Uploads the specified packages and their transitive needs to the cache.
+    #[clap(hide = !std::env::var("MINIMAL_SCIENCE_MODE").is_ok())]
+    UploadCache(PkgUploadCacheArgs),
+}
+
 #[derive(Debug, clap::Args)]
-pub struct PkgArgs {
+pub struct PkgBuildArgs {
     /// Whether to log stdout/stderr during the build
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
@@ -20,8 +42,18 @@ pub struct PkgArgs {
     packages: Vec<String>,
 }
 
-pub async fn cmd_pkg(args: PkgArgs, ctx: &mut Context) -> Result<(), Error> {
-    trace!("cmd_pkg");
+pub async fn cmd_pkg(sub_command: PkgCmd, ctx: &mut Context) -> Result<(), Error> {
+    match sub_command {
+        PkgCmd::Build(args) => cmd_pkg_build(args, ctx).await,
+        PkgCmd::BuildPlan(args) => cmd_pkg_build_plan(args, ctx).await,
+        PkgCmd::Dep(args) => cmd_pkg_dep(args, ctx).await,
+        PkgCmd::PatchedBuild(args) => cmd_pkg_patched_build(args, ctx).await,
+        PkgCmd::UploadCache(args) => cmd_pkg_upload_cache(args, ctx).await,
+    }
+}
+
+pub async fn cmd_pkg_build(args: PkgBuildArgs, ctx: &mut Context) -> Result<(), Error> {
+    trace!("cmd_pkg_build");
     let graph = if !args.packages.is_empty() {
         ctx.graph_from_package_names(args.packages.clone())?
     } else {
@@ -35,22 +67,14 @@ pub async fn cmd_pkg(args: PkgArgs, ctx: &mut Context) -> Result<(), Error> {
         let (tx, mut rx) = mpsc::unbounded::<BuildEvent>();
         tokio::spawn(async move {
             use futures::StreamExt;
-            let mut names: HashMap<usize, String> = HashMap::new();
-            while let Some(log) = rx.next().await {
-                match log.inner {
-                    BuildEventInner::Start { name, .. } => {
-                        names.insert(log.idx, name);
-                    }
-                    BuildEventInner::Stop => {}
-                    BuildEventInner::Log { is_stderr, line } => {
-                        let name = names[&log.idx].clone();
-                        if is_stderr {
-                            tracing::warn!(target: "build", name = %name, "{}", line);
-                        } else {
-                            tracing::info!(target: "build", name = %name, "{}", line);
-                        }
-                    }
-                    BuildEventInner::Hydrate { .. } => {}
+            let mut renderer = BuildRenderer::new(true);
+            while let Some(event) = rx.next().await {
+                let Some(line) = renderer.render(event) else {
+                    continue;
+                };
+                match line.kind {
+                    BuildLineKind::Stderr => tracing::warn!(target: "build", "{}", line.text),
+                    BuildLineKind::Status => tracing::info!(target: "build", "{}", line.text),
                 }
             }
         });

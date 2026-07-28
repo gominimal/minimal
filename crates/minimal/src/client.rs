@@ -10,7 +10,105 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use minimald_rpc::OneshotSshRpc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Add a spinner-style progress bar to the process-global `MultiProgress`.
+/// Bars must be inserted before any style/message/tick configuration —
+/// otherwise `ProgressBar::hidden`'s defaults would draw directly to stderr
+/// and MP's coordinated redraws couldn't reach the stale lines
+/// (`finish_and_clear` only wipes lines MP itself drew).
+///
+/// Animation: three quadrant-block glyphs (`▗`, then `▚`, then `▚`)
+/// appear one at a time from left to right, hold for ~1 s, then
+/// disappear one at a time from right to left. Every frame is padded
+/// to the same 5-character width so the trailing `{msg}` doesn't
+/// jitter horizontally as the animation grows and shrinks. The last
+/// entry in `tick_strings` is indicatif's "finished" state — kept
+/// blank so `bar.finish()` / `finish_and_clear` leave no trailing
+/// glyphs behind.
+pub(crate) fn add_spinner_bar(msg: &'static str) -> indicatif::ProgressBar {
+    const FRAMES: &[&str] = &[
+        // build
+        "     ",
+        "▗    ",
+        "▗ ▚  ",
+        "▗ ▚ ▚",
+        // hold ~1 s at 100 ms/tick
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        "▗ ▚ ▚",
+        // fade (mirrors the build, right-to-left)
+        "▗ ▚  ",
+        "▗    ",
+        "     ",
+        // finished
+        "     ",
+    ];
+    let bar = ot::global_progress().add(indicatif::ProgressBar::hidden());
+    bar.set_style(
+        indicatif::ProgressStyle::with_template("  {spinner} {msg} — {bytes} ({bytes_per_sec})")
+            .expect("valid template")
+            .tick_strings(FRAMES),
+    );
+    bar.set_message(msg);
+    bar.enable_steady_tick(Duration::from_millis(100));
+    bar
+}
+
+/// Add a file-count progress bar to the process-global `MultiProgress`.
+/// Same insertion-before-configuration rationale as [`add_spinner_bar`].
+///
+/// Bar rendering: a leading `▗` followed by up to [`PATCHES_BAR_TAIL_UNITS`]
+/// `" ▚"` units, growing left-to-right in proportion to `pos / len`.
+/// Sequence at increasing progress: `▗` → `▗ ▚ ▚` → `▗ ▚ ▚ ▚ ▚ ▚ ▚ ▚ ▚ ▚`
+/// → `▗ ▚ ▚ …`. Indicatif's built-in `{wide_bar}` renders one glyph per
+/// cell with no way to insert spaces between filled cells, so this
+/// registers a custom `{tail}` key and formats the string ourselves.
+/// The un-filled tail is padded with `"  "` (matching the width of a
+/// `" ▚"` unit) so `{pos}/{len}` etc. stay in a fixed column.
+fn add_patches_bar(total: u64) -> indicatif::ProgressBar {
+    /// Max number of `" ▚"` units at 100 % progress. Widen for a
+    /// longer bar; narrow for tighter terminals.
+    const PATCHES_BAR_TAIL_UNITS: usize = 30;
+
+    let bar = ot::global_progress().add(indicatif::ProgressBar::hidden());
+    bar.set_length(total);
+    bar.set_style(
+        indicatif::ProgressStyle::with_template(
+            "  {msg} {tail} {pos}/{len} patches ({per_sec}, {eta})",
+        )
+        .expect("valid template")
+        .with_key(
+            "tail",
+            |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+                let progress = state
+                    .len()
+                    .filter(|&l| l > 0)
+                    .map(|len| (state.pos() as f64) / (len as f64))
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+                let filled = (progress * PATCHES_BAR_TAIL_UNITS as f64).round() as usize;
+                let _ = w.write_str("▗");
+                for _ in 0..filled {
+                    let _ = w.write_str(" ▚");
+                }
+                // Pad each un-filled unit with two spaces so total
+                // rendered width stays constant across the animation.
+                for _ in 0..(PATCHES_BAR_TAIL_UNITS - filled) {
+                    let _ = w.write_str("  ");
+                }
+            },
+        ),
+    );
+    bar.set_message("Uploading composition patches");
+    bar
+}
 
 /// Max retries when connecting to the daemon UDS.
 const CONNECT_RETRIES: u32 = 20;
@@ -120,6 +218,11 @@ impl Client {
     ///
     /// The type parameter `R` picks the RPC from the wire contract; `request`
     /// is serialized to JSON and the response is deserialized from JSON.
+    ///
+    /// Uses `channel.wait()` rather than `channel.into_stream()` so that
+    /// extended-data (stream 1) — where the daemon writes handler errors
+    /// (#901) — is visible instead of silently discarded by the stream's
+    /// `AsyncRead` impl.
     pub async fn oneshot_rpc<R: OneshotSshRpc>(
         &mut self,
         request: R::Request<'_>,
@@ -127,27 +230,50 @@ impl Client {
     where
         <R as OneshotSshRpc>::Response: serde::de::DeserializeOwned,
     {
-        let channel = self
+        let mut channel = self
             .handle
             .channel_open_session()
             .await
             .with_context(|| format!("open channel for {}", R::NAME))?;
 
+        send_traceparent(&channel).await;
+        // want_reply = true so an unknown subsystem (CLI/daemon version
+        // skew) surfaces as a Failure instead of the client writing into a
+        // channel nobody serves (#901).
         channel
-            .request_subsystem(false, R::NAME)
+            .request_subsystem(true, R::NAME)
             .await
             .with_context(|| format!("request subsystem {}", R::NAME))?;
 
         let body = serde_json::to_vec(&request).context("serialize request")?;
+        channel.data_bytes(body).await.context("write request")?;
+        channel.eof().await.context("shutdown write half")?;
 
-        let mut rpc = channel.into_stream();
-        rpc.write_all(&body).await.context("write request")?;
-        rpc.shutdown().await.context("shutdown write half")?;
-
+        // Drain the channel with wait() rather than into_stream() so that
+        // extended-data (stream 1) — where the daemon writes handler errors
+        // (#901) — is visible instead of silently discarded by the stream's
+        // AsyncRead impl.
         let mut resp_buf = Vec::with_capacity(256);
-        rpc.read_to_end(&mut resp_buf)
-            .await
-            .context("read response")?;
+        let mut err_buf = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { data } => {
+                    resp_buf.extend_from_slice(&data);
+                }
+                russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                    err_buf.extend_from_slice(&data);
+                }
+                _ => {}
+            }
+        }
+
+        if !err_buf.is_empty() {
+            anyhow::bail!(
+                "{} RPC failed on the daemon side: {}",
+                R::NAME,
+                String::from_utf8_lossy(&err_buf)
+            );
+        }
 
         serde_json::from_slice(&resp_buf)
             .with_context(|| format!("decode response for {}", R::NAME))
@@ -168,6 +294,7 @@ impl Client {
             .channel_open_session()
             .await
             .context("open exec channel")?;
+        send_traceparent(&channel).await;
         channel
             .exec(true, command)
             .await
@@ -198,15 +325,155 @@ impl Client {
         session_id: sessions::SessionId,
         dir: &Path,
     ) -> Result<(), anyhow::Error> {
-        let subsystem =
-            constcat::concat!(minimald_rpc::RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
+        // Spinner-style bar: workspace file counts vary (and pre-walking to
+        // sum sizes would double the disk work), so we drive on
+        // wire-bytes-through-SSH with no fixed total. `finish_and_clear`
+        // wipes the bar off the terminal on success so it doesn't hang
+        // around above the next line.
+        let bar = add_spinner_bar("Uploading project files");
+        let bar_for_wrap = bar.clone();
+        let result = self
+            .stream_upload(
+                session_id,
+                constcat::concat!(minimald_rpc::RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst"),
+                "workspace file",
+                async |writer| {
+                    // `writer` is already `Box<dyn AsyncWrite + ...>`
+                    // from `stream_upload`, and `stream_tar_zstd` is
+                    // generic over `W: AsyncWrite + Unpin + Send` —
+                    // `ProgressWriter<Box<...>>` satisfies that
+                    // directly, no second heap allocation needed.
+                    let writer = crate::file_upload::ProgressWriter::new(writer, bar_for_wrap);
+                    crate::file_upload::stream_tar_zstd(dir, writer).await
+                },
+            )
+            .await;
+        bar.finish_and_clear();
+        result
+    }
 
+    /// Stream a zstd-compressed tarball of composition patches to the
+    /// daemon's `WorkspacePatchesTarZst` subsystem, which unpacks
+    /// each entry under `<workspace>/patches/<destination>`. The
+    /// launcher reads from that tree when materializing the session's
+    /// sandbox home.
+    ///
+    /// `patches` is a list of `(host_path, sandbox_destination)`
+    /// pairs pulled from the finalized [`Composition`]. An empty
+    /// list is a no-op — no channel is opened. Callers dedup by
+    /// destination first; the composer's post-gate
+    /// `check_patch_mismatches` guarantees no two Approved verdicts
+    /// share a destination with different sources, so any duplicates
+    /// here are exact matches and safe to collapse.
+    ///
+    /// The archive is streamed with `follow_symlinks: true` and
+    /// `mode_override: Some(0o644)` so a `/nix/store/…` link source
+    /// lands as a writable copy inside the sandbox.
+    ///
+    /// [`Composition`]: sessions::core::compose::Composition
+    pub async fn upload_patches(
+        &mut self,
+        session_id: sessions::SessionId,
+        patches: &[(std::path::PathBuf, paths::SandboxRelPath)],
+    ) -> Result<(), anyhow::Error> {
+        if patches.is_empty() {
+            return Ok(());
+        }
+        // File-count bar: we know the target up front, so the operator
+        // sees "N/M patches" instead of a spinner. Incremented inside
+        // the tar loop after each `add_file` returns — the file is
+        // fully queued into the encoder at that point, even if it
+        // hasn't been fully compressed or shipped yet.
+        let bar = add_patches_bar(patches.len() as u64);
+        let bar_for_loop = bar.clone();
+        let result = self
+            .stream_upload(
+                session_id,
+                constcat::concat!(minimald_rpc::RPC_SUBSYSTEM_PREFIX, "WorkspacePatchesTarZst"),
+                "composition patch",
+                async |writer| {
+                    // Route through the pipe helper because SSH channel
+                    // writers aren't Sync but `TarZstArchive` requires
+                    // Sync. The pipe's tx (a `DuplexStream`) is Sync;
+                    // its rx pumps into the channel writer on the same
+                    // task.
+                    crate::file_upload::stream_via_pipe(writer, async |tx| {
+                        let mut archive = crate::file_upload::TarZstArchive::new(tx);
+                        // Always finalize the archive, even on
+                        // build error: `async_tar::Builder` panics
+                        // from its `Drop` impl if dropped without
+                        // `finish()` (async-tar 0.6 builder.rs:668),
+                        // and `?`-propagation isn't a panic-unwind
+                        // so the Drop guard fires. If both branches
+                        // fail, prefer the build error — it's
+                        // usually the root cause (encoder writes
+                        // then error with "broken pipe" once the
+                        // upstream file read has already failed).
+                        let build_result: Result<(), anyhow::Error> = async {
+                            for (host_path, dest) in patches {
+                                archive
+                                    .add_file(
+                                        host_path,
+                                        dest.as_str(),
+                                        crate::file_upload::AddFileOptions {
+                                            mode_override: Some(0o644),
+                                        },
+                                    )
+                                    .await
+                                    .with_context(|| {
+                                        format!(
+                                            "adding patch {} → {}",
+                                            host_path.display(),
+                                            dest.as_str()
+                                        )
+                                    })?;
+                                bar_for_loop.inc(1);
+                            }
+                            Ok(())
+                        }
+                        .await;
+                        let finish_result = archive.finish().await;
+                        match (build_result, finish_result) {
+                            (Err(build), _) => Err(build),
+                            (Ok(()), r) => r,
+                        }
+                    })
+                    .await
+                },
+            )
+            .await;
+        bar.finish_and_clear();
+        result
+    }
+
+    /// Common plumbing behind [`Self::upload_workspace_files`] and
+    /// [`Self::upload_patches`]: open a channel, set the session-id
+    /// env var, request a subsystem, drive `stream` over the
+    /// channel's writer, wait for the daemon's channel close,
+    /// surface any stderr the daemon relayed.
+    async fn stream_upload<F>(
+        &mut self,
+        session_id: sessions::SessionId,
+        subsystem: &'static str,
+        what: &'static str,
+        stream: F,
+    ) -> Result<(), anyhow::Error>
+    where
+        // `channel.make_writer()` returns `impl AsyncWrite + 'static`,
+        // not a named type. Take a closure that receives that opaque
+        // writer and pumps the tar into it. `AsyncFnOnce` handles the
+        // .await for us.
+        F: for<'w> AsyncFnOnce(
+            Box<dyn tokio::io::AsyncWrite + Unpin + Send + 'w>,
+        ) -> Result<(), anyhow::Error>,
+    {
         let mut channel = self
             .handle
             .channel_open_session()
             .await
-            .context("open channel for workspace file upload")?;
+            .with_context(|| format!("open channel for {what} upload"))?;
 
+        send_traceparent(&channel).await;
         channel
             .set_env(true, "MINIMAL_SESSION_ID", session_id.to_string())
             .await
@@ -215,56 +482,278 @@ impl Client {
         channel
             .request_subsystem(true, subsystem)
             .await
-            .context("request WorkspaceFilesTarZst subsystem")?;
+            .with_context(|| format!("request {subsystem} subsystem"))?;
 
-        crate::file_upload::stream_tar_zstd(dir, channel.make_writer()).await?;
+        let writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(channel.make_writer());
+        stream(writer).await?;
 
-        // Wait for the channel to close to signal that unpacking is done.
+        // Drain the channel: collect extended-data (stream 1) errors from
+        // the daemon under the same cap the diagnostic download uses, and
+        // track whether we see an explicit Eof/Close to distinguish a clean
+        // post-unpack close from a dropped connection (#901). Without this
+        // check a connection drop mid-unpack looks identical to a successful
+        // close — empty err, Ok(()) — and cmd_activate proceeds with an
+        // empty workspace. An idle-progress backstop guards against a wedged
+        // transport that never delivers a Close — generous, since a
+        // legitimate unpack of a large archive may produce no channel
+        // messages for a while (#886).
+        const DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
         let mut err = Vec::new();
-        while let Some(msg) = channel.wait().await {
-            if let russh::ChannelMsg::ExtendedData { data, ext: 1 } = msg {
-                err.extend_from_slice(&data);
+        let mut saw_close = false;
+        loop {
+            match tokio::time::timeout(DRAIN_IDLE_TIMEOUT, channel.wait()).await {
+                Ok(Some(msg)) => match msg {
+                    russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                        append_daemon_error(&mut err, &data);
+                    }
+                    russh::ChannelMsg::Eof | russh::ChannelMsg::Close => {
+                        saw_close = true;
+                    }
+                    _ => {}
+                },
+                Ok(None) => break,
+                Err(_) => {
+                    anyhow::bail!(
+                        "upload drain stalled: no message from daemon for \
+                         {DRAIN_IDLE_TIMEOUT:?} (connection may be gone)"
+                    );
+                }
             }
         }
         if !err.is_empty() {
             anyhow::bail!(
-                "daemon failed to unpack project files: {}",
+                "daemon failed to unpack {what}s: {}",
                 String::from_utf8_lossy(&err)
+            );
+        }
+        if !saw_close {
+            anyhow::bail!(
+                "upload stream ended unexpectedly: the connection to the daemon \
+                 was lost before unpacking completed"
             );
         }
         Ok(())
     }
+
+    /// Requests the daemon's diagnostic bundle (`min bug`): sends `req` on the
+    /// [`minimald_rpc::DIAG_BUNDLE_SUBSYSTEM`] subsystem and collects the
+    /// streamed tar+zstd archive, up to `max_bytes`.
+    ///
+    /// Returns `(bytes, truncated)`. Errors the daemon reports — before or
+    /// during streaming — arrive over extended-data stream 1 and become the
+    /// `Err` here, discarding any partial bundle; a refused subsystem request
+    /// means the daemon predates the RPC.
+    ///
+    /// Hitting `max_bytes` ends *collection*, not the conversation: the
+    /// daemon may already have queued an error behind the frames that tripped
+    /// the cap, so the channel is drained for
+    /// [`TRUNCATED_DRAIN_GRACE`] — payload discarded, extended data kept —
+    /// before returning. That window is deliberately short: a daemon still
+    /// streaming a runaway archive cannot be waited out without handing it
+    /// the caller's whole deadline, and losing an already-capped bundle to a
+    /// timeout is worse than missing a message that had not been sent yet.
+    /// So an error the daemon emits *after* the cap trips is not observed.
+    pub async fn download_diag_bundle(
+        &mut self,
+        req: &minimald_rpc::DiagBundleRequest,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, bool), anyhow::Error> {
+        let mut channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .context("open channel for diagnostic bundle")?;
+
+        send_traceparent(&channel).await;
+        channel
+            .request_subsystem(true, minimald_rpc::DIAG_BUNDLE_SUBSYSTEM)
+            .await
+            .context(
+                "request DiagBundleTarZst subsystem \
+                 (daemon may predate the diagnostics RPC — upgrade minimald)",
+            )?;
+
+        let body = serde_json::to_vec(req).context("serialize diag request")?;
+        channel
+            .data(&body[..])
+            .await
+            .context("write diag request")?;
+        channel.eof().await.context("half-close diag request")?;
+
+        // Data carries the archive; extended-data stream 1 carries the
+        // daemon's error message.
+        let mut bundle = Vec::new();
+        let mut daemon_error = Vec::new();
+        let mut truncated = false;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { data } => {
+                    if bundle.len() + data.len() > max_bytes {
+                        bundle.extend_from_slice(&data[..max_bytes - bundle.len()]);
+                        truncated = true;
+                        break;
+                    }
+                    bundle.extend_from_slice(&data);
+                }
+                russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                    append_daemon_error(&mut daemon_error, &data);
+                }
+                // The daemon refused the subsystem (`want_reply` failure). A
+                // healthy daemon replies `Success` then streams; a refusal
+                // means it doesn't serve this RPC — bail now rather than block
+                // on `wait()` until the caller's deadline, since a bare refusal
+                // doesn't close the channel.
+                russh::ChannelMsg::Failure => anyhow::bail!(
+                    "daemon refused the {} subsystem — it likely predates the \
+                     diagnostics RPC (upgrade minimald)",
+                    minimald_rpc::DIAG_BUNDLE_SUBSYSTEM
+                ),
+                _ => {}
+            }
+        }
+
+        // The cap stopped the collection loop, but an error the daemon put on
+        // the wire before that point may still be queued behind the frames
+        // that tripped it. Returning now would drop it and report a corrupt
+        // partial archive as a clean truncation. Payload is discarded here —
+        // the bundle is already at its cap — and only extended data is kept.
+        if truncated {
+            let drained = tokio::time::timeout(TRUNCATED_DRAIN_GRACE, async {
+                while let Some(msg) = channel.wait().await {
+                    if let russh::ChannelMsg::ExtendedData { data, ext: 1 } = msg {
+                        append_daemon_error(&mut daemon_error, &data);
+                    }
+                }
+            })
+            .await;
+            if drained.is_err() {
+                tracing::debug!(
+                    grace = ?TRUNCATED_DRAIN_GRACE,
+                    "daemon still streaming after the diag bundle cap; \
+                     stopped waiting for a trailing error"
+                );
+            }
+        }
+
+        // A daemon error can also arrive mid-stream (tar finalization failed
+        // after bytes were sent); a partial archive without the error would be
+        // a silently corrupt diagnostic.
+        if !daemon_error.is_empty() {
+            let msg = String::from_utf8_lossy(&daemon_error);
+            anyhow::bail!(
+                "daemon reported an error{}: {msg}",
+                if bundle.is_empty() {
+                    ""
+                } else {
+                    " after streaming a partial bundle"
+                }
+            );
+        }
+        if bundle.is_empty() {
+            anyhow::bail!("daemon sent no bundle");
+        }
+        Ok((bundle, truncated))
+    }
 }
 
-/// Resolve the provider-instance dir (`<state dir>/providers/local-0`) the
-/// daemon and CLI agree on: `--minimal-dir` when set, else the default
-/// minimal state dir.
-pub(crate) fn resolve_provider_dir(
+/// Cap on the accumulated daemon error message (extended-data stream 1) a
+/// streaming RPC will buffer — shared by the diagnostic-bundle download and
+/// the workspace-file upload.
+const DAEMON_ERROR_MAX: usize = 64 * 1024;
+
+/// How long [`Client::download_diag_bundle`] keeps reading after the size cap
+/// trips, looking for an error the daemon already sent.
+///
+/// Sized for "already on the wire", not for "will finish streaming": a daemon
+/// with gigabytes still to write cannot be drained to completion without
+/// spending the caller's entire `--guest-timeout-secs`, which would turn a
+/// usable truncated bundle into a total loss.
+const TRUNCATED_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Appends `data` to the daemon's error message, bounded: a daemon streaming
+/// only extended data must not balloon the CLI past the bound the archive
+/// itself respects.
+fn append_daemon_error(buf: &mut Vec<u8>, data: &[u8]) {
+    let room = DAEMON_ERROR_MAX.saturating_sub(buf.len());
+    buf.extend_from_slice(&data[..room.min(data.len())]);
+}
+
+/// The provider kind the CLI should talk to, given `--provider`.
+///
+/// The native minimald and minvmd backends now occupy distinct provider dirs,
+/// so connecting — not just spawning — must pick the right one. macOS is always
+/// minvmd-backed regardless of the flag; keying on the compile target keeps the
+/// in-guest CLI (Linux, native) and the host CLI (macOS, minvmd) each pointed at
+/// the dir their local daemon actually uses.
+pub(crate) fn client_provider_kind(use_minvmd: bool) -> paths::ProviderKind {
+    if use_minvmd || cfg!(target_os = "macos") {
+        paths::ProviderKind::Minvmd
+    } else {
+        paths::ProviderKind::Minimald
+    }
+}
+
+/// The minimal state-dir root the CLI resolves paths under: `--minimal-dir`
+/// when set (made absolute), else the platform default.
+fn resolve_state_base(
     minimal_dir_override: Option<&std::path::Path>,
-) -> std::io::Result<std::path::PathBuf> {
-    let base = match minimal_dir_override {
+) -> std::io::Result<paths::DaemonAbsPath> {
+    match minimal_dir_override {
         Some(dir) => {
             let abs = std::path::absolute(dir)?;
             let utf8 = abs
                 .to_str()
                 .ok_or_else(|| std::io::Error::other("--minimal-dir is not valid UTF-8"))?;
-            paths::DaemonAbsPath::try_new(utf8).map_err(std::io::Error::other)?
+            paths::DaemonAbsPath::try_new(utf8).map_err(std::io::Error::other)
         }
-        None => paths::minimal_state_dir(),
-    };
-    Ok(paths::provider_instance_dir(&base, 0)
-        .as_utf8_path()
-        .as_std_path()
-        .to_path_buf())
+        None => Ok(paths::minimal_state_dir()),
+    }
 }
 
-/// Resolve the daemon socket path: `<provider dir>/ssh.sock`. Both backends
-/// (native minimald and the minvmd bridge) serve the same endpoint, so the
-/// backend choice only matters for spawning, not for connecting.
+/// Adopt any pre-split `providers/local-<N>` dirs into the kind-tagged scheme
+/// before the CLI resolves a provider dir, so an upgraded client finds an
+/// existing instance instead of missing it. Best-effort: a bad `--minimal-dir`
+/// is left for the resolve/connect path to report.
+pub(crate) fn migrate_legacy_provider_dirs(minimal_dir_override: Option<&std::path::Path>) {
+    if let Ok(base) = resolve_state_base(minimal_dir_override) {
+        paths::migrate_legacy_provider_dirs(&base);
+    }
+}
+
+/// Resolve the provider-instance dir (`<state dir>/providers/local-<kind>0`) the
+/// daemon and CLI agree on: `--minimal-dir` when set, else the default minimal
+/// state dir. `use_minvmd` selects the backend's dir (see [`client_provider_kind`]).
+pub(crate) fn resolve_provider_dir(
+    minimal_dir_override: Option<&std::path::Path>,
+    use_minvmd: bool,
+) -> std::io::Result<std::path::PathBuf> {
+    let base = resolve_state_base(minimal_dir_override)?;
+    Ok(
+        paths::provider_instance_dir(&base, client_provider_kind(use_minvmd), 0)
+            .as_utf8_path()
+            .as_std_path()
+            .to_path_buf(),
+    )
+}
+
+/// Resolve the daemon socket path: `<provider dir>/ssh.sock`. Each backend
+/// serves this endpoint under its own provider dir, so `use_minvmd` must select
+/// the same backend the daemon was spawned as.
 pub fn resolve_socket_path(
     minimal_dir_override: Option<&std::path::Path>,
+    use_minvmd: bool,
 ) -> std::io::Result<std::path::PathBuf> {
-    Ok(resolve_provider_dir(minimal_dir_override)?.join(paths::SSH_SOCK_FILE))
+    Ok(resolve_provider_dir(minimal_dir_override, use_minvmd)?.join(paths::SSH_SOCK_FILE))
+}
+
+/// Sends the process trace context as a `TRACEPARENT` channel env request.
+/// Best-effort and reply-less: trace propagation is a diagnostic aid, and a
+/// daemon predating the variable ignores unknown env names anyway.
+async fn send_traceparent(channel: &russh::Channel<russh::client::Msg>) {
+    use minimald_rpc::trace::TRACEPARENT_ENV;
+    let _ = channel
+        .set_env(false, TRACEPARENT_ENV, crate::trace_context().traceparent())
+        .await;
 }
 
 #[cfg(test)]
@@ -272,12 +761,34 @@ mod tests {
     use super::{Client, resolve_socket_path};
     use std::path::Path;
 
+    /// The daemon-error accumulator is bounded: a daemon that sprays extended
+    /// data on stream 1 (during a diagnostic download or a workspace upload)
+    /// must not be able to grow the client's buffer past the cap.
+    #[test]
+    fn append_daemon_error_is_capped() {
+        let mut buf = Vec::new();
+        let chunk = vec![b'x'; 8 * 1024];
+        for _ in 0..64 {
+            super::append_daemon_error(&mut buf, &chunk);
+        }
+        assert_eq!(buf.len(), super::DAEMON_ERROR_MAX);
+    }
+
     #[test]
     fn socket_path_honors_override() {
-        let sock = resolve_socket_path(Some(Path::new("/tmp/minimal-test"))).unwrap();
+        let sock = resolve_socket_path(Some(Path::new("/tmp/minimal-test")), false).unwrap();
         assert_eq!(
             sock,
-            Path::new("/tmp/minimal-test/providers/local-0/ssh.sock")
+            Path::new("/tmp/minimal-test/providers/local-minimald0/ssh.sock")
+        );
+    }
+
+    #[test]
+    fn socket_path_selects_the_minvmd_dir() {
+        let sock = resolve_socket_path(Some(Path::new("/tmp/minimal-test")), true).unwrap();
+        assert_eq!(
+            sock,
+            Path::new("/tmp/minimal-test/providers/local-minvmd0/ssh.sock")
         );
     }
 

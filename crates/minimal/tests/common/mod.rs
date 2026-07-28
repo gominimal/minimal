@@ -8,11 +8,18 @@ use minimal::GlobalArgs;
 
 /// A running minimald test server plus the tempdir backing it.
 ///
-/// The UDS socket is placed at `<tempdir>/providers/local-0/ssh.sock` so
-/// that `resolve_socket_path(Some(tempdir), false)` finds it.
+/// The UDS socket is placed at `<tempdir>/providers/local-minimald0/ssh.sock`
+/// so that `resolve_socket_path(Some(tempdir), false)` finds it (the native
+/// minimald provider dir the CLI resolves without `--provider local-minvmd`).
 pub struct TestDaemon {
     /// The underlying minimald test server. Exposed so tests can create
     /// sessions directly via `server.state` or connect a `TestClient`.
+    ///
+    // Each integration-test binary compiles this module separately and uses a
+    // different subset of it: `cli.rs` reads this field, `bug.rs` only needs
+    // the daemon listening at the socket path. `expect` would go unfulfilled in
+    // the `cli` binary, so the allow is the accurate annotation.
+    #[allow(dead_code)]
     pub server: minimald::test_harness::TestServer,
     temp: tempfile::TempDir,
 }
@@ -23,7 +30,7 @@ impl TestDaemon {
         let server = minimald::test_harness::TestServer::new().await;
         let temp = tempfile::TempDir::new().unwrap();
 
-        let sock_dir = temp.path().join("providers/local-0");
+        let sock_dir = temp.path().join("providers/local-minimald0");
         std::fs::create_dir_all(&sock_dir).unwrap();
         let sock = sock_dir.join("ssh.sock");
         server.listen_on_uds(&sock).await;
@@ -37,7 +44,8 @@ impl TestDaemon {
             repo_dir: None,
             minimal_dir: Some(self.temp.path().to_path_buf()),
             config_dir: None,
-            minvmd: false,
+            provider: None,
+            no_input: false,
         }
     }
 }

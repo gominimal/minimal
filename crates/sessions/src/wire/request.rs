@@ -17,6 +17,10 @@ use super::primitives::{
 };
 use crate::SessionId;
 
+/// Snapshot format version for [`WireComposition`]. Bumped when the
+/// on-disk shape changes in a way older daemons can't tolerate.
+const COMPOSITION_SNAPSHOT_VERSION: u32 = 1;
+
 /// The client's composed contribution, wire-shaped: var values
 /// resolved, patch sources expanded to concrete files, every item
 /// already gated by the user policy.
@@ -30,6 +34,56 @@ pub struct WireContribution {
     pub lifecycle_hooks: Vec<WireProvenancedHook>,
     /// Packages the client requested be brought in.
     pub requested_packages: Vec<WirePackageRef>,
+}
+
+/// Persisted composition snapshot, written by the daemon as a sidecar
+/// to [`record.json`](crate::store) at composition-assembly time so a
+/// restart can re-apply the exact [`Composition`] that was approved at
+/// `min activate` time.
+///
+/// Mirrors [`Composition`](crate::core::compose::Composition) via the
+/// same wire primitives used for the live RPC flow
+/// ([`WireContribution`], [`ContributionResponse`]). A `version` field
+/// gates the on-disk shape so a future format can evolve without
+/// ambiguity; the current and only version is
+/// [`COMPOSITION_SNAPSHOT_VERSION`] (1).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WireComposition {
+    /// Snapshot format version. Defaults to
+    /// [`COMPOSITION_SNAPSHOT_VERSION`] so sidecars written by daemons
+    /// that predate the field deserialize cleanly.
+    #[serde(default = "default_composition_version")]
+    pub version: u32,
+    /// Variables that survived the policy gate.
+    pub vars: Vec<WireSessionVar>,
+    /// Patches that survived the policy gate.
+    pub patches: Vec<WireSessionPatch>,
+    /// Packages contributed to the session (pass-through; no gate).
+    pub packages: Vec<WirePackageRef>,
+    /// Lifecycle hooks contributed to the session (pass-through; no
+    /// gate).
+    pub lifecycle_hooks: Vec<WireProvenancedHook>,
+}
+
+fn default_composition_version() -> u32 {
+    COMPOSITION_SNAPSHOT_VERSION
+}
+
+impl From<&crate::core::compose::Composition> for WireComposition {
+    fn from(c: &crate::core::compose::Composition) -> Self {
+        Self {
+            version: COMPOSITION_SNAPSHOT_VERSION,
+            vars: c.vars().iter().cloned().map(Into::into).collect(),
+            patches: c.patches().iter().cloned().map(Into::into).collect(),
+            packages: c.packages().iter().cloned().map(Into::into).collect(),
+            lifecycle_hooks: c
+                .lifecycle_hooks()
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect(),
+        }
+    }
 }
 
 /// Daemon → Client: items from the daemon-side closure (packages,
@@ -61,16 +115,25 @@ pub struct ContributionVerdict {
     pub patches: Vec<WirePatchVerdict>,
 }
 
-/// Daemon's reply to a `SubmitVerdict`: a terminal "session ready"
-/// signal or a protocol-level fault the transport layer didn't
+/// Daemon's reply to a `SubmitVerdict`: composition finalized (the
+/// record has moved from `Pending` to
+/// [`Materializing`](crate::SessionStatus::Materializing), not yet
+/// `Active`) or a protocol-level fault the transport layer didn't
 /// catch.
+///
+/// The client follows up with a patches upload
+/// (`WorkspacePatchesTarZst`) and then `FinalizeSession` to
+/// actually promote the record to
+/// [`Active`](crate::SessionStatus::Active). Only after that step
+/// is the session attachable.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionStep {
     /// Composition complete; the session record has been promoted to
-    /// [`Active`](crate::SessionStatus::Active) and is ready to use.
-    /// Terminal — the client doesn't follow up after receiving this.
-    Active {
+    /// [`Materializing`](crate::SessionStatus::Materializing). The
+    /// client must upload the composition's patches and call
+    /// `FinalizeSession` before the session is attachable.
+    Materialized {
         /// Daemon-assigned session id. Matches the id returned by
         /// the originating `CreateSessionResponse::Pending`.
         id: SessionId,
@@ -119,6 +182,7 @@ mod tests {
                 source: WireSource::Package {
                     name: "rust".into(),
                 },
+                carries_user_data: true,
             }],
             patches: vec![],
             lifecycle_hooks: vec![],
@@ -135,6 +199,7 @@ mod tests {
                 value: WireResolvedVar {
                     name: "RUSTC".into(),
                     value: "/usr/bin/rustc".into(),
+                    carries_user_data: true,
                 },
             }],
             patches: vec![WirePatchVerdict::Denied {
@@ -147,11 +212,11 @@ mod tests {
 
     #[test]
     fn session_step_round_trips_all_variants() {
-        let active = SessionStep::Active { id: session_id() };
+        let materialized = SessionStep::Materialized { id: session_id() };
         let fault = SessionStep::Fault {
             error: WireError::UnknownSessionId,
         };
-        assert_eq!(round_trip(&active), active);
+        assert_eq!(round_trip(&materialized), materialized);
         assert_eq!(round_trip(&fault), fault);
     }
 
@@ -165,5 +230,37 @@ mod tests {
             json.contains(r#""kind":"fault""#),
             "expected `kind` tag, got: {json}"
         );
+    }
+
+    #[test]
+    fn composition_snapshot_round_trips() {
+        let c = WireComposition {
+            version: 1,
+            vars: vec![super::WireSessionVar {
+                var: WireResolvedVar {
+                    name: "EDITOR".into(),
+                    value: "hx".into(),
+                    carries_user_data: false,
+                },
+                source: WireSource::UserLoadout { name: "dev".into() },
+            }],
+            patches: vec![],
+            packages: vec![super::WirePackageRef {
+                name: "helix".into(),
+                source: WireSource::UserLoadout { name: "dev".into() },
+            }],
+            lifecycle_hooks: vec![],
+        };
+        assert_eq!(round_trip(&c), c);
+    }
+
+    #[test]
+    fn composition_snapshot_defaults_version_to_one() {
+        // A sidecar written without the `version` field (e.g. by a
+        // hypothetical future writer that omits it) should default to
+        // version 1, not 0.
+        let json = r#"{"vars":[],"patches":[],"packages":[],"lifecycle_hooks":[]}"#;
+        let c: WireComposition = serde_json::from_str(json).unwrap();
+        assert_eq!(c.version, COMPOSITION_SNAPSHOT_VERSION);
     }
 }

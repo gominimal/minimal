@@ -4,7 +4,7 @@
 # so the IDENTICAL proof runs against all three deployment targets:
 #
 #   Linux native   minimald on the host          (no extra env)
-#   Linux KVM      minimald in a minvmd microVM  E2E_VM=1 E2E_MINIMAL_ARGS=--minvmd
+#   Linux KVM      minimald in a minvmd microVM  E2E_VM=1 E2E_MINIMAL_ARGS="--provider local-minvmd"
 #   macOS HVF      minimald in a minvmd microVM  E2E_VM=1 (macOS is always VM-backed)
 #
 # Two proofs, in order, on EVERY lane:
@@ -47,10 +47,10 @@
 #   - a codesigned/linkable `minvmd` on PATH (min spawns it by name)
 #   - MINVMD_KERNEL_PATH / MINVMD_ROOTFS_PATH / MINVMD_INITRAMFS
 #     (propagate through the `minvmd run --detach` re-exec)
-#   - MINVMD_BOOT_LOG (optional) to capture the guest console
+#   - MINVMD_BOOT_LOG (optional) to override the guest-console capture path
 #
 # Environment:
-#   E2E_MINIMAL_ARGS    global args for every `min` call (e.g. --minvmd)
+#   E2E_MINIMAL_ARGS    global args for every `min` call (e.g. --provider local-minvmd)
 #   E2E_PROJECT_DIR     project to activate (default: a self-seeded throwaway
 #                       dir; VM lanes pass /tmp)
 #   E2E_ACTIVATE_ARGS   extra args for `min activate` (e.g. a future
@@ -128,7 +128,7 @@ fi
 
 # Fresh state dir — a clean (no-daemon) cold-start on persistent runners:
 # post-#690, all daemon state (minvmd.toml, locks, the bridge socket) lives
-# under $XDG_STATE_HOME/minimal/providers/local-0 on every platform.
+# under $XDG_STATE_HOME/minimal/providers/local-minvmd0 on every platform.
 # XDG_CACHE_HOME is deliberately left alone so package pulls reuse the
 # host/CI cache across runs — which pins where the state dir may live on a
 # Linux-native lane: minimald HARDLINKS built packages from the cache into
@@ -197,7 +197,22 @@ fail() {
     | while read -r f; do echo "--- $f (tail) ---"; tail -40 "$f"; done
   if [ -n "$E2E_VM" ]; then
     echo "--- guest boot console (tail) ---"
-    tail -80 "${MINVMD_BOOT_LOG:-/nonexistent}" 2>/dev/null || echo "(no boot log — VM never started)"
+    tail -80 "${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-minvmd0/boot.log}" 2>/dev/null || echo "(no boot log — VM never started)"
+  fi
+  # Diagnostic bundle (`min bug`): the daemon's own logs/state/config, which the
+  # tail-dumps above can't reach (it runs detached, often in-guest). The daemon
+  # may be wedged or already gone, so bound the guest wait and fall back to a
+  # host-only bundle. Written next to the boot log — under a VM soak that dir is
+  # the job's uploaded soak-logs — so a failing nightly ships a real bundle, not
+  # just scraped tails. now_ms keeps per-iteration bundles from colliding.
+  echo "--- min bug (diagnostic bundle) ---"
+  bug_dir="${MINVMD_BOOT_LOG:+$(dirname "$MINVMD_BOOT_LOG")}"
+  bug_out="${bug_dir:-$WORK}/minimal-diag-session-$(now_ms).tar.zst"
+  if mnl bug --guest-timeout-secs 30 --output "$bug_out" >/dev/null 2>&1 \
+    || mnl bug --no-guest --output "$bug_out" >/dev/null 2>&1; then
+    echo "wrote diagnostic bundle: $bug_out ($(wc -c <"$bug_out" 2>/dev/null || echo '?') bytes)"
+  else
+    echo "(min bug produced no bundle)"
   fi
   echo "::endgroup::"
   teardown

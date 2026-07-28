@@ -6,9 +6,11 @@ use clap_complete::Shell;
 use paths::{CwdRelative, Daemon, DaemonAbsPath, sub_path};
 use std::io::Write as _;
 use tokio::{net::UnixListener, runtime::Builder};
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use minimald::server::{Config, HostKey, Server};
+
+mod logging;
+use logging::{DaemonLogger, LogMode};
 
 #[cfg(target_os = "linux")]
 use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
@@ -18,6 +20,27 @@ use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
 /// The actual port is `DEFAULT_VSOCK_PORT_BASE` + `instance_num`.
 #[cfg(target_os = "linux")]
 const DEFAULT_VSOCK_PORT_BASE: u32 = 2222;
+
+/// Receive window installed on the guest's vsock listener, in bytes.
+///
+/// `virtio_transport_inc_rx_pkt` refuses an incoming packet — resetting the
+/// connection and setting `sk_err` to `ENOBUFS` — when either the peer overruns
+/// its credit (`buf_used + len > buf_alloc`) or the queued socket-buffer
+/// overhead does (`(queue_len + 1) * SKB_TRUESIZE(0) > buf_alloc`). At the
+/// 256 KiB default window the second ceiling lands at 455 queued skbs on arm64,
+/// where `SKB_TRUESIZE(0)` is 576 bytes. libkrun clamps each read to the credit
+/// still outstanding, so under receiver backpressure its packets shrink to
+/// roughly 540 bytes — below that per-skb overhead — and a workspace upload
+/// trips the overhead ceiling with kilobytes of window still unused.
+///
+/// 8 MiB is empirical headroom, not immunity. It does not change the ratio
+/// between the two ceilings; it keeps a normal upload out of the credit-starved
+/// tail where packets degenerate, and a larger upload or a slower reader can
+/// still reach it. The real fix belongs in libkrun, which should not shrink a
+/// packet below the per-skb overhead it costs to queue; this is the
+/// consumer-side mitigation.
+#[cfg(target_os = "linux")]
+const VSOCK_RX_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Env var `spawn_detached` sets on the child so `async_main` knows
 /// its stdio has been redirected to `/dev/null` and needs to swap
@@ -71,7 +94,11 @@ impl Cli {
 
     /// Returns the path to the directory containing sockets/info about this daemon for clients.
     pub fn client_instance_dir(&self) -> DaemonAbsPath {
-        paths::provider_instance_dir(&self.minimal_state_dir(), self.instance_num())
+        paths::provider_instance_dir(
+            &self.minimal_state_dir(),
+            paths::ProviderKind::Minimald,
+            self.instance_num(),
+        )
     }
 
     /// Returns fragments of the command-line arguments which should be passed to an ssh invocation in
@@ -97,7 +124,7 @@ impl Cli {
                         .to_string(),
                 ),
             ],
-            format!("local-{}", self.instance_num()),
+            paths::provider_instance_name(paths::ProviderKind::Minimald, self.instance_num()),
         )
     }
 
@@ -112,7 +139,7 @@ impl Cli {
 enum Command {
     /// Generate shell completion script
     #[command(
-        long_about = "Generate a shell tab-completion script for the minimal daemon.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(minimal completions bash)"
+        long_about = "Generate a shell tab-completion script for the minimal daemon.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(minimald completions bash)"
     )]
     Completions(CompletionsArgs),
     /// Runs the minimald server in the foreground.
@@ -152,7 +179,7 @@ pub struct GlobalArgs {
 #[derive(Debug, Args)]
 pub struct ListenArgs {
     /// Instance number for this minimald; determines client-relevant paths under
-    /// `<minimal_state_dir>/providers/local-<instance-num>`.
+    /// `<minimal_state_dir>/providers/local-minimald<instance-num>`.
     ///
     /// The SSH socket is accessible as `ssh.sock`.
     #[arg(long, default_value_t = 0)]
@@ -183,15 +210,23 @@ pub struct ListenArgs {
     #[clap(hide = true)]
     mk_mount_state_volume: Option<String>,
 
+    /// Vsock port to listen on for host time updates: 8-byte little-endian
+    /// nanoseconds-since-epoch stamps, dialed in by the host half in `minvmd`
+    /// (see `guest::run_timekeep_listener`). Only useful as a VM init process;
+    /// `None` leaves the guest clock free-running.
+    #[arg(long)]
+    #[clap(hide = true)]
+    timekeep_listener_port: Option<u32>,
+
     /// Daemonize: spawn minimald in a new session (setsid) and return once the
     /// SSH socket accepts connections, or an 8s timeout elapses. Used by the
-    /// `minimal` CLI to auto-start a native (DM2) daemon on Linux.
+    /// `min` CLI to auto-start a native daemon on Linux.
     #[arg(long, default_value_t = false)]
     detach: bool,
 
     /// Path to the gvproxy ("gvisor-tap-vsock") binary backing the per-host
     /// `OwnIp` switch. Defaults to the fixed system install path when unset;
-    /// point it at a local build to run own-IP (DM2) without a system install.
+    /// point it at a local build to run own-IP without a system install.
     #[arg(long)]
     gvproxy_bin: Option<std::path::PathBuf>,
 }
@@ -348,66 +383,6 @@ fn lock_held(path: &std::path::Path) -> std::io::Result<bool> {
     }
 }
 
-/// Install the tracing subscriber. Foreground processes log to
-/// stdout; detached daemons (marked by [`DETACHED_ENV`]) write to
-/// `<state_dir>/logs/minimald.log`, daily-rotated. The returned
-/// [`WorkerGuard`] must outlive the process — dropping it flushes
-/// pending records and terminates the appender's worker thread.
-///
-/// [`WorkerGuard`]: tracing_appender::non_blocking::WorkerGuard
-fn init_tracing(
-    cli: &Cli,
-) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>, MainError> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("info")
-            .add_directive("topiary=off".parse().unwrap())
-            .add_directive("libcgroups=off".parse().unwrap())
-    });
-
-    let detached = std::env::var_os(DETACHED_ENV).is_some();
-    if !detached {
-        tracing_subscriber::registry()
-            .with(fmt::layer().with_writer(ot::StdoutWriter::new))
-            .with(filter)
-            .init();
-        return Ok(None);
-    }
-
-    // Under `<state_dir>/logs/` so `<state_dir>` itself stays
-    // dominated by the sockets, sessions, and providers it already
-    // owns. `create_dir_all` is idempotent — subsequent daemon
-    // starts don't churn.
-    let log_dir = cli
-        .minimal_state_dir()
-        .as_utf8_path()
-        .as_std_path()
-        .join("logs");
-    std::fs::create_dir_all(&log_dir)
-        .map_err(|e| MainError::IO(e, "creating minimald log directory"))?;
-    // Cap retained files so a long-running daemon doesn't accumulate
-    // logs indefinitely. Two weeks is comfortably longer than the
-    // usual "look at what happened yesterday" window and short enough
-    // that the on-disk footprint stays bounded.
-    let appender = tracing_appender::rolling::Builder::new()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("minimald.log")
-        .max_log_files(14)
-        .build(&log_dir)
-        .map_err(|e| MainError::IO(std::io::Error::other(e), "building rolling log appender"))?;
-    let (writer, guard) = tracing_appender::non_blocking(appender);
-    tracing_subscriber::registry()
-        // ANSI colors only make sense on a terminal; a file logger
-        // just gets noise from the escape sequences.
-        .with(fmt::layer().with_ansi(false).with_writer(writer))
-        .with(filter)
-        .init();
-    tracing::info!(
-        log_dir = %log_dir.display(),
-        "detached minimald: routing tracing output to daily-rotated log file",
-    );
-    Ok(Some(guard))
-}
-
 async fn async_main() -> Result<(), MainError> {
     // With `networking-proxy` on, both the `ring` (workspace rustls) and the
     // `aws-lc-rs` (google-cloud) providers are compiled in, so rustls cannot
@@ -432,6 +407,10 @@ async fn async_main() -> Result<(), MainError> {
                 mount_rootfs: Some("/dev/vda".to_string()),
                 mk_mount_state_volume: Some("/dev/vdb".to_string()),
                 detach: false,
+                // Host time updates arrive on a vsock stream we listen on, from
+                // minvmd. Always listen: the guest cannot see what the
+                // host runs.
+                timekeep_listener_port: Some(guest::TIMEKEEP_PORT),
                 // In-VM (DM1/3/4) the PTask attaches to the host gvproxy over the
                 // vsock shuttle, so no in-guest gvproxy binary path is needed.
                 gvproxy_bin: None,
@@ -457,15 +436,18 @@ async fn async_main() -> Result<(), MainError> {
         return Ok(());
     }
 
-    // Initialize tracing. Foreground runs (or the parent-side of a
-    // `--detach` re-exec) log to stdout. A child spawned by
-    // `spawn_detached` has its stdio null'd — detectable via the
-    // `MINIMALD_DETACHED` env var — so it routes tracing to a daily-
-    // rotated log file under the state directory instead. `_log_guard`
-    // is bound at function scope so the non-blocking appender's
-    // worker survives for the daemon's entire lifetime; dropping it
-    // would flush and terminate the appender prematurely.
-    let _log_guard = init_tracing(&cli)?;
+    // Install tracing. A foreground run logs to stdout only. A detached
+    // native daemon (stdio null'd, marked by `MINIMALD_DETACHED`) and the
+    // microVM pid-1 both log to a daily-rotated file, wired up by
+    // `logger.activate` once the log directory is final (below): immediately
+    // for the native daemon, after the state volume mounts for the microVM.
+    // The activation yields a release the server state runs at shutdown.
+    let log_mode = if is_minimal_microvm() || std::env::var_os(DETACHED_ENV).is_some() {
+        LogMode::File
+    } else {
+        LogMode::Console
+    };
+    let logger = DaemonLogger::install(log_mode)?;
 
     let listen_args = cli.listen_args().unwrap();
 
@@ -559,6 +541,44 @@ async fn async_main() -> Result<(), MainError> {
         return Err(MainError::IO(e, "creating minimal dir"));
     }
 
+    // The log directory is now final under `<state>/logs` — the native
+    // daemon's from the start, the microVM's now that the state volume is
+    // mounted and state relocated onto it, where `min bug`'s guest collector
+    // reads it. Point the file log at it; the release is handed to the server
+    // state and run at shutdown (in the microVM, before the quiesce — the
+    // appender's write-open fd would otherwise hold the volume busy and
+    // defeat the clean unmount). A foreground run's logger has no file and
+    // yields `None`. A failure here must not wedge the daemon (pid-1 in the
+    // microVM), so fall back to console-only.
+    let log_dir = cli
+        .minimal_state_dir()
+        .as_utf8_path()
+        .as_std_path()
+        .join("logs");
+    let log_release = match logger.activate(&log_dir) {
+        Ok(release) => {
+            if release.is_some() {
+                tracing::info!(
+                    log_dir = %log_dir.display(),
+                    "routing tracing output to daily-rotated log file",
+                );
+            }
+            release
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = ?e,
+                "could not open the daemon log file; continuing with console logging only",
+            );
+            None
+        }
+    };
+
+    // Adopt any pre-split `providers/local-<N>` dir into the kind-tagged scheme
+    // before resolving our own instance dir, so an upgraded daemon reuses its
+    // existing state instead of orphaning it.
+    paths::migrate_legacy_provider_dirs(&cli.minimal_state_dir());
+
     // The host-key path lives under the instance dir; ensure it exists for
     // both the UDS and vsock paths.
     if let Err(e) = std::fs::create_dir_all(cli.client_instance_dir())
@@ -580,8 +600,10 @@ async fn async_main() -> Result<(), MainError> {
     // it. Keyed on being the VM init — pid-1 owns its /run — NOT on the
     // `--vsock` flag: a native (possibly non-root) `--vsock` daemon may not
     // be able to write /run at all and keeps the provider-dir lock.
+    let instance_name =
+        paths::provider_instance_name(paths::ProviderKind::Minimald, cli.instance_num());
     let instance_lock_path = if is_minimal_microvm() {
-        DaemonAbsPath::try_new(format!("/run/minimald-local-{}.lock", cli.instance_num()))
+        DaemonAbsPath::try_new(format!("/run/minimald-{instance_name}.lock"))
             .expect("static /run lock path is absolute")
     } else {
         cli.client_instance_dir()
@@ -595,8 +617,7 @@ async fn async_main() -> Result<(), MainError> {
         Ok(guard) => guard,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
             return Err(MainError::Other(format!(
-                "minimald local-{} is already running (instance lock held)",
-                cli.instance_num()
+                "minimald {instance_name} is already running (instance lock held)"
             )));
         }
         Err(e) => return Err(MainError::IO(e, "acquiring instance lock")),
@@ -606,7 +627,10 @@ async fn async_main() -> Result<(), MainError> {
         .set_len(0)
         .and_then(|()| writeln!(&*instance_guard, "{}", std::process::id()));
 
-    // A minvmd bridge binds the same ssh.sock; don't steal a live VM's socket.
+    // Native minimald and minvmd now own distinct provider dirs
+    // (`local-minimald<N>` vs `local-minvmd<N>`), so they no longer share a
+    // socket. This stays as a defensive guard for the unusual case of a minvmd
+    // instance pointed at *this* dir: don't steal a live VM's ssh.sock.
     if lock_held(
         cli.client_instance_dir()
             .sub_path_unchecked(paths::MINVMD_LOCK_FILE)
@@ -616,8 +640,7 @@ async fn async_main() -> Result<(), MainError> {
     .map_err(|e| MainError::IO(e, "probing minvmd lock"))?
     {
         return Err(MainError::Other(format!(
-            "a minvmd VM is serving local-{}'s socket; stop it first (`minvmd stop`)",
-            cli.instance_num()
+            "a minvmd VM is serving {instance_name}'s socket; stop it first (`minvmd stop`)"
         )));
     }
 
@@ -644,11 +667,23 @@ async fn async_main() -> Result<(), MainError> {
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
     let host_private_key = config.host_key()?;
+    let known_hosts = sub_path!(cli.client_instance_dir(), "known_hosts");
+    // `learn_known_hosts_path` appends unconditionally; drop any prior entry for
+    // this host so repeated daemon spawns record one current key instead of
+    // growing known_hosts without bound (#782). Best-effort: a prune failure
+    // must not block startup.
+    if let Err(e) = paths::prune_known_hosts_entries(
+        known_hosts.as_utf8_path().as_std_path(),
+        &instance_name,
+        22,
+    ) {
+        tracing::warn!(error = %e, "failed to prune stale known_hosts entries");
+    }
     russh::keys::known_hosts::learn_known_hosts_path(
-        &format!("local-{}", cli.instance_num()),
+        &instance_name,
         22,
         host_private_key.public_key(),
-        sub_path!(cli.client_instance_dir(), "known_hosts").as_utf8_path(),
+        known_hosts.as_utf8_path(),
     )?;
 
     // Preflight (advisory): every session sandbox starts by unsharing an
@@ -697,6 +732,21 @@ async fn async_main() -> Result<(), MainError> {
         );
     }
 
+    // Track the host's wall clock, when configured.
+    if let Some(port) = cli.listen_args().unwrap().timekeep_listener_port {
+        tokio::spawn(async move {
+            match guest::run_timekeep_listener(port).await {
+                // `Infallible`: the listener only ever returns by failing.
+                Ok(never) => match never {},
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    port,
+                    "host time updates unavailable; the guest clock will drift",
+                ),
+            }
+        });
+    }
+
     // If we got this far we need to launch minimald.
     if !cli.listen_args().unwrap().vsock {
         // standard path, listening on UDS socket.
@@ -725,7 +775,7 @@ async fn async_main() -> Result<(), MainError> {
         );
         // TODO: When we have a daemonize command, daemonize here.
 
-        Server::run(config, listener)
+        Server::run(config, listener, log_release)
             .await
             .map_err(|e| MainError::IO(e, "serving on UDS"))
     } else {
@@ -737,6 +787,28 @@ async fn async_main() -> Result<(), MainError> {
         let port_num = DEFAULT_VSOCK_PORT_BASE + cli.listen_args().unwrap().instance_num;
         let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port_num))
             .map_err(|e| MainError::IO(e, "binding vsock port"))?;
+
+        // Widen the receive window before anything connects: `__vsock_create`
+        // copies `buffer_size` from the listening socket onto every socket it
+        // accepts, so this one call covers every session. Best effort — a
+        // daemon with the default window is the old, buggy behaviour, not a
+        // reason to refuse to boot.
+        match set_vsock_rx_window(&listener, VSOCK_RX_WINDOW_BYTES) {
+            Ok(effective) if effective >= VSOCK_RX_WINDOW_BYTES => {
+                tracing::debug!(bytes = effective, "raised the vsock receive window");
+            }
+            Ok(effective) => tracing::warn!(
+                requested = VSOCK_RX_WINDOW_BYTES,
+                effective,
+                "vsock receive window clamped below the requested size; large uploads may still \
+                 fail with ENOBUFS"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not raise the vsock receive window; large uploads may fail with ENOBUFS"
+            ),
+        }
+
         tracing::info!("Started listening on vsock:{port_num}");
 
         if let Err(e) = guest::emit_ready_marker(host_private_key.public_key()).await {
@@ -756,10 +828,74 @@ async fn async_main() -> Result<(), MainError> {
             }
         };
 
-        Server::run(config, listener)
+        Server::run(config, listener, log_release)
             .await
             .map_err(|e| MainError::IO(e, "serving on guest vsock"))
     }
+}
+
+/// Raises the AF_VSOCK receive window on `listener` to `bytes`, returning the
+/// window the kernel actually installed.
+///
+/// Two things make this less obvious than a single `setsockopt`:
+///
+/// - `SO_VM_SOCKETS_BUFFER_MAX_SIZE` has to be raised first.
+///   `vsock_update_buffer_size` clamps the requested size to `buffer_max_size`,
+///   whose default is the same 256 KiB as the size itself, so setting the size
+///   alone succeeds having changed nothing.
+/// - A clamped request is not an error. `setsockopt` returns 0 either way, so
+///   the caller only learns what it got by reading the value back.
+///
+/// Both options take a `u64` at level `AF_VSOCK`.
+#[cfg(target_os = "linux")]
+fn set_vsock_rx_window(listener: &VsockListener, bytes: u64) -> std::io::Result<u64> {
+    use std::os::fd::AsRawFd as _;
+
+    /// `SO_VM_SOCKETS_BUFFER_SIZE`, `include/uapi/linux/vm_sockets.h`.
+    const SO_VM_SOCKETS_BUFFER_SIZE: libc::c_int = 0;
+    /// `SO_VM_SOCKETS_BUFFER_MAX_SIZE`, ditto.
+    const SO_VM_SOCKETS_BUFFER_MAX_SIZE: libc::c_int = 2;
+
+    let fd = listener.as_raw_fd();
+
+    let set = |option: libc::c_int| {
+        // SAFETY: `fd` is borrowed from `listener`, which outlives this call.
+        // The option value is a live `u64` and the length passed is its own, so
+        // the kernel reads exactly the bytes that back it.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::AF_VSOCK,
+                option,
+                std::ptr::from_ref(&bytes).cast(),
+                size_of::<u64>() as libc::socklen_t,
+            )
+        };
+        (rc == 0)
+            .then_some(())
+            .ok_or_else(std::io::Error::last_os_error)
+    };
+
+    set(SO_VM_SOCKETS_BUFFER_MAX_SIZE)?;
+    set(SO_VM_SOCKETS_BUFFER_SIZE)?;
+
+    let mut effective: u64 = 0;
+    let mut len = size_of::<u64>() as libc::socklen_t;
+    // SAFETY: `fd` as above. `effective` and `len` are live for the duration of
+    // the call, and `len` describes the buffer the kernel writes into, which is
+    // `effective` itself.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::AF_VSOCK,
+            SO_VM_SOCKETS_BUFFER_SIZE,
+            std::ptr::from_mut(&mut effective).cast(),
+            &raw mut len,
+        )
+    };
+    (rc == 0)
+        .then_some(effective)
+        .ok_or_else(std::io::Error::last_os_error)
 }
 
 /// Whether this process is the microVM's init: the kernel runs the initramfs

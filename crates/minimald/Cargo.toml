@@ -1,8 +1,10 @@
 [package]
 name = "minimald"
+rust-version.workspace = true
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [features]
 # Enables the B8 HTTPS reverse proxy with mTLS termination (R4.4–R4.7) in front
@@ -23,10 +25,12 @@ ssh-forward = []
 test-support = []
 
 [dependencies]
+anyhow.workspace = true
 async-compression.workspace = true
 async-tar.workspace = true
 bytes.workspace = true
 camino.workspace = true
+chrono.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 constcat.workspace = true
@@ -35,6 +39,7 @@ fd-lock.workspace = true
 futures.workspace = true
 hakoniwa.workspace = true
 libc.workspace = true
+nix.workspace = true
 russh.workspace = true
 russh-sftp.workspace = true
 path-absolutize.workspace = true
@@ -43,12 +48,14 @@ serde_json.workspace = true
 sysinfo.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
 vt100-ctt.workspace = true
 
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
+mlog.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 
@@ -61,6 +68,7 @@ args.workspace = true
 async-dialog.workspace = true
 check.workspace = true
 common.workspace = true
+diagnostics.workspace = true
 # `client` pulls in the device-flow/refresh/REST HTTP stack (spec 10); the
 # default (pure-types) feature set alone can't drive GitHub, and this is the
 # daemon — the one process that is allowed to hold a token.
@@ -69,6 +77,7 @@ graph.workspace = true
 mctx.workspace = true
 mfile.workspace = true
 minimald-rpc.workspace = true
+orchestrator.workspace = true
 op.workspace = true
 ot.workspace = true
 paths.workspace = true

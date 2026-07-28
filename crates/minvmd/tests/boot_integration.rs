@@ -22,7 +22,7 @@ use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 /// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
-/// `<tempdir>/minimal/providers/local-0/*.sock` would overflow sun_path (104).
+/// `<tempdir>/minimal/providers/local-minvmd0/*.sock` would overflow sun_path (104).
 fn short_state_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("mnl")

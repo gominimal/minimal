@@ -19,9 +19,6 @@ pub fn cmd_dirs(global: &GlobalArgs) -> Result<(), anyhow::Error> {
 /// The `cmd_dirs` table as a string — also captured verbatim into `min bug`
 /// diagnostic bundles as `host/dirs.txt`.
 pub(crate) fn report(global: &GlobalArgs) -> String {
-    // Shown in the "Daemon logs" note to point users at today's
-    // rolling log file directly, e.g. `minimald.log.2026-07-08`.
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let dirs = DirsLookup {
         config: resolve_minimal_config_dir(global),
         mesh_enrolment: mesh_enrolment_path(global),
@@ -45,7 +42,7 @@ pub(crate) fn report(global: &GlobalArgs) -> String {
             .as_utf8_path()
             .as_std_path()
             .to_path_buf(),
-        today,
+        provider: crate::client::client_provider_kind(global.use_minvmd()),
     };
     format_dir_rows(&build_dir_rows(&dirs))
 }
@@ -57,7 +54,7 @@ struct DirsLookup {
     /// `<config>/minimal` — root for `config.toml`, `loadouts/`,
     /// mTLS certs.
     config: PathBuf,
-    /// The specific path `minimal mesh join` writes to. Kept separate
+    /// The specific path `min mesh join` writes to. Kept separate
     /// so a `--minimal-dir` override that redirects the mesh file
     /// (but not the loadouts subsystem) still shows up correctly.
     mesh_enrolment: PathBuf,
@@ -69,9 +66,9 @@ struct DirsLookup {
     state: PathBuf,
     /// `<cache>/minimal`.
     cache: PathBuf,
-    /// Today's date in `YYYY-MM-DD`, used only in the "Daemon logs"
-    /// note next to the rolling filename suffix.
-    today: String,
+    /// The backend whose provider dir the CLI would connect to, so the SSH
+    /// socket row names the right `providers/local-<kind>0` path.
+    provider: paths::ProviderKind,
 }
 
 /// Which top-level group the mesh-enrolment row prints under. Values
@@ -158,13 +155,16 @@ fn build_dir_rows(dirs: &DirsLookup) -> Vec<DirRow> {
             "State",
             "Daemon logs",
             Some(dirs.state.join("logs")),
-            Some(format!("daily-rotated: minimald.log.{}", dirs.today)),
+            Some("daily-rotated: minimald.log*, minvmd.log*".to_string()),
         )
             .into_row(),
         (
             "State",
             "SSH socket",
-            Some(dirs.state.join("providers/local-0/ssh.sock")),
+            Some(dirs.state.join(format!(
+                "providers/{}/ssh.sock",
+                paths::provider_instance_name(dirs.provider, 0)
+            ))),
             None,
         )
             .into_row(),
@@ -294,7 +294,7 @@ mod tests {
             mesh_group: MeshGroup::Config,
             state: PathBuf::from("/home/u/.local/state/minimal"),
             cache: PathBuf::from("/home/u/.cache/minimal"),
-            today: "2026-07-08".to_string(),
+            provider: paths::ProviderKind::Minimald,
         };
         let rows = build_dir_rows(&dirs);
         let shape: Vec<(&str, &str, String)> = rows
@@ -357,7 +357,7 @@ mod tests {
                 (
                     "State",
                     "SSH socket",
-                    "/home/u/.local/state/minimal/providers/local-0/ssh.sock".to_string()
+                    "/home/u/.local/state/minimal/providers/local-minimald0/ssh.sock".to_string()
                 ),
                 ("Cache", "Cache dir", "/home/u/.cache/minimal".to_string()),
                 (
@@ -369,24 +369,23 @@ mod tests {
         );
     }
 
-    /// The "Daemon logs" row's note interpolates `today` into the
-    /// rolling-file suffix so operators see the exact filename they
-    /// should look at.
+    /// The "Daemon logs" row's note names both daemons' rotated files so
+    /// operators know which filenames to look at.
     #[test]
-    fn build_dir_rows_daemon_logs_note_interpolates_date() {
+    fn build_dir_rows_daemon_logs_note_names_both_daemons() {
         let dirs = DirsLookup {
             config: PathBuf::from("/c"),
             mesh_enrolment: PathBuf::from("/c/mesh-enrolment"),
             mesh_group: MeshGroup::Config,
             state: PathBuf::from("/s"),
             cache: PathBuf::from("/x"),
-            today: "2030-01-15".to_string(),
+            provider: paths::ProviderKind::Minimald,
         };
         let rows = build_dir_rows(&dirs);
         let daemon_logs = rows.iter().find(|r| r.name == "Daemon logs").unwrap();
         assert_eq!(
             daemon_logs.note.as_deref(),
-            Some("daily-rotated: minimald.log.2030-01-15"),
+            Some("daily-rotated: minimald.log*, minvmd.log*"),
         );
     }
 
@@ -420,7 +419,7 @@ mod tests {
             mesh_group: MeshGroup::State,
             state: PathBuf::from("/override"),
             cache: PathBuf::from("/x"),
-            today: "_".to_string(),
+            provider: paths::ProviderKind::Minimald,
         };
         let rows = build_dir_rows(&dirs);
         let mesh = rows.iter().find(|r| r.name == "Mesh enrolment").unwrap();

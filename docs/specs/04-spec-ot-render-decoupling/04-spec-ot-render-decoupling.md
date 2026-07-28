@@ -1,13 +1,13 @@
 ---
 id: spec-ot-render-decoupling
-title: "ot render decoupling — separate operation state from indicatif, render per SSH channel"
+title: "ot render decoupling, separate operation state from indicatif, render per SSH channel"
 kind: spec
-status: planned
+status: shipped
 tracking-issue:
 supersedes:
 ---
 
-# ot render decoupling — separate operation state from indicatif, render per SSH channel
+# ot render decoupling - separate operation state from indicatif, render per SSH channel
 
 ## Context
 
@@ -18,22 +18,22 @@ when `minimal` was a one-shot CLI: a single process owned a single terminal.
 Today `ot` conflates three responsibilities inside one
 `Arc<Mutex<TrackerInner>>` (`crates/ot/src/lib.rs`):
 
-1. **Operation-tree state** — `depth`, `parent`, `children`, `op:
+1. **Operation-tree state**: `depth`, `parent`, `children`, `op:
    Option<Operation>`. The genuinely reusable part.
-2. **Progress data** — not actually stored; position/length live only inside
+2. **Progress data**: not actually stored; position/length live only inside
    the indicatif `ProgressBar`.
-3. **Rendering** — `set_op` directly builds an indicatif `ProgressBar` with a
+3. **Rendering**: `set_op` directly builds an indicatif `ProgressBar` with a
    hardcoded `ProgressStyle`, installs it into a process-global
    `static MP: MultiProgress`, which renders to **stderr** from indicatif's own
    thread. `StdoutWriter` exists only to `suspend()` that global render so
    plain logs do not collide with the bars.
 
-Two process-global statics — `static ROOT` and `static MP` — encode the
+Two process-global statics, `static ROOT` and `static MP`, encode the
 assumption "one process == one terminal."
 
 That assumption is now wrong. `minimal` is becoming a daemon (`minimald`) whose
 long-running sessions are driven over an in-process SSH server. Progress must be
-drawn to a **specific SSH channel** — one per session, each its own terminal,
+drawn to a **specific SSH channel**, one per session, each its own terminal,
 each an async `AsyncWrite` (`Binding` in `crates/minimald/src/session_host.rs`
 owns `ws.make_writer()`), none of them this process's stderr. There can be many
 concurrent.
@@ -45,7 +45,7 @@ nothing outside `ot` needs to change except **where the root comes from** and
 **who renders it**.
 
 A future move to the `strides` crate for rendering should require no change to
-the state core — only a new renderer.
+the state core, only a new renderer.
 
 ## Introduction/Overview
 
@@ -73,7 +73,7 @@ The `Operation` enum stays **semantic only**. All template/styling strings move
 out of the core and into the drivers, so each renderer (indicatif now, strides
 later, the daemon ANSI path) styles independently.
 
-## Layer 1 — pure state core
+## Layer 1 - pure state core
 
 `TrackerInner` drops the indicatif `ProgressBar` and stores progress numbers
 itself:
@@ -102,7 +102,7 @@ struct RootShared {
 ```
 
 Every mutator (`set_op`, `set_done`, `set_length`, `increment`) bumps `version`
-via `send_modify` — callable from sync code, so the synchronous build threads in
+via `send_modify`, callable from sync code, so the synchronous build threads in
 `op`/`graph` are unchanged and still wake the async renderer. `watch` (not
 `Notify`) is used so **any number of drivers** can observe one root: each holds
 its own `watch::Receiver`, every bump wakes all of them, and each tracks its own
@@ -120,10 +120,10 @@ session**.
 
 `ot` gains `tokio = { workspace = true, features = ["sync"] }` for `Notify` and
 the atomics' ergonomics. Pragmatic, matches the rest of the repo, async drivers
-wake cheaply. (The dependency-free alternative — an `Arc<dyn Fn()>` callback —
+wake cheaply. (The dependency-free alternative, an `Arc<dyn Fn()>` callback,
 was rejected as clunkier wiring for no real portability win here.)
 
-## Layer 2 — observation (the "handle to a slice of progress")
+## Layer 2 - observation (the "handle to a slice of progress")
 
 A driver never touches the live tree under its render loop. It takes an
 immutable snapshot (lock briefly, clone, release) and renders without holding
@@ -157,10 +157,10 @@ Drivers loop: render, then `rx.changed().await` (which also returns immediately
 if the version advanced since the last observation, so missed wakeups are
 impossible), then re-snapshot. A steady tick is still useful for spinner
 animation. `changed()` resolves to `Err` once every `OpTracker` handle for the
-tree is dropped, giving drivers a clean exit — and multiple receivers are fully
+tree is dropped, giving drivers a clean exit, and multiple receivers are fully
 supported, so a root may have more than one driver.
 
-## Layer 3 — drivers
+## Layer 3 - drivers
 
 A driver owns its I/O loop: wait for a change (or a tick) → `snapshot()` →
 paint.
@@ -170,9 +170,9 @@ paint.
   ids, update pos/len/message, `finish_and_clear` vanished ids). All the
   `ProgressStyle` templates from today's `set_op` move here. Preserves current
   CLI behavior and the `StdoutWriter`/`suspend` log coordination, with no
-  global — the shim owns its `MultiProgress`.
+  global, the shim owns its `MultiProgress`.
 
-- **Daemon path — a scoped, exclusive renderer (revised).** The earlier
+- **Daemon path, a scoped, exclusive renderer (revised).** The earlier
   `render_frame` + `BindingMsg::Progress` + `Host` `select!`-arm design (a
   progress overlay multiplexed into the PTY mainloop) is **superseded** by a
   simpler model: for the duration of one operation future, a renderer takes
@@ -194,7 +194,7 @@ paint.
     ```
     Internals: a `ChannelTerm` implementing indicatif's `TermLike` translates
     indicatif's sync cursor ops into ANSI bytes and pushes them onto an
-    **unbounded** `mpsc` (a sync→async bridge — indicatif draws from its own
+    **unbounded** `mpsc` (a sync→async bridge, indicatif draws from its own
     steady-tick OS threads, which must never block on an async write; unbounded
     because dropping a frame mid-sequence would corrupt the stateful cursor
     stream). A pump task drains the `mpsc` into `sink`. The primitive feeds a
@@ -205,7 +205,7 @@ paint.
     is flushed, return the output. Generic over `AsyncWrite` so it is unit-
     testable against a `tokio::io::duplex` pipe.
 
-  - **`minimald`: `ChannelProgress`** — the russh-concrete wrapper (keeps
+  - **`minimald`: `ChannelProgress`**, the russh-concrete wrapper (keeps
     `russh` out of `ot`):
     ```rust
     pub struct ChannelProgress { channel: Channel<Msg>, tracker: OpTracker, size: (u16, u16) }
@@ -220,7 +220,7 @@ paint.
     ```
     `make_writer(&self)` clones the channel's internal sender, and the pump only
     ever `write_all`/`flush`es (never `shutdown`), so dropping the writer does
-    not EOF the channel — handing it back is sound.
+    not EOF the channel, handing it back is sound.
 
   **Exclusive-ownership constraint.** While the future runs, the wrapped
   operation must **not** write its own text to the same sink: this is a
@@ -231,12 +231,12 @@ paint.
 
   **Wiring is deferred.** This step lands the reusable building block (the `ot`
   primitive + the `Channel<Msg>` wrapper) and tests it via the generic
-  `AsyncWrite` seam. Which call sites adopt it — and reconciling that the
+  `AsyncWrite` seam. Which call sites adopt it, and reconciling that the
   current progress-producing handlers (`run_check`, `run_patched_pkg`) write to
   a per-request `UnixStream` rather than a `Channel<Msg>`, plus plumbing the real
-  PTY `WinSize` down to supply `size` — is a separate follow-up.
+  PTY `WinSize` down to supply `size`, is a separate follow-up.
 
-- **`StridesDriver`** (future) — additive, Layers 1–2 untouched.
+- **`StridesDriver`** (future), additive, Layers 1–2 untouched.
 
 ## Migration plan
 
@@ -270,7 +270,7 @@ Each step compiles and keeps tests green.
 
 - Re-designing the local CLI progress UX (deferred).
 - Live operation output (build logs) interleaved with progress on the same sink
-  — the step-4 renderer is exclusive-ownership/compute-then-print; interleaving
+, the step-4 renderer is exclusive-ownership/compute-then-print; interleaving
   would need the indicatif-`suspend` shared-writer path (deferred).
 - Wiring the step-4 renderer into specific call sites and plumbing the real PTY
   `WinSize` to supply its `size` (deferred follow-up; step 4 lands the building

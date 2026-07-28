@@ -44,7 +44,12 @@ const END_SYNC_UPDATE: &[u8] = b"\x1b[?2026l";
 /// suspend bar drawing.
 static MP: OnceLock<MultiProgress> = OnceLock::new();
 
-fn global_progress() -> MultiProgress {
+/// Handle to the process-global `MultiProgress` — the one [`StdoutWriter`]
+/// suspends around plain stdout writes so bars and log lines don't clobber
+/// each other. Callers wiring their own bars (byte-count uploads, spinners
+/// for one-off phases) should [`MultiProgress::add`] them here so drawing
+/// stays coordinated with the rest of the CLI.
+pub fn global_progress() -> MultiProgress {
     MP.get_or_init(MultiProgress::new).clone()
 }
 
