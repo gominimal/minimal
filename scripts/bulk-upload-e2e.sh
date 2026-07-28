@@ -49,7 +49,7 @@
 # rate to 50%. Any single failure fails the whole run.
 #
 # #869 also sometimes HANGS the client outright rather than erroring
-# (https://github.com/gominimal/inbox/issues/335, observed at 9 and 13 minutes),
+# (observed at 9 and 13 minutes),
 # so every activate runs under a wall-clock deadline and a hang counts as a
 # failure. A hang also stops the loop — five deadlines back to back would burn
 # the nightly's whole job budget, and one is already conclusive.
@@ -327,7 +327,7 @@ for i in $(seq 1 "$ITER"); do
     # the run, and folding them into a collapsed group buries them.
     echo "::endgroup::"
     if [ "$rc" -eq 124 ]; then
-      echo "::error::iteration $i: 'min activate' still running after ${DEADLINE_SECS}s — the #869 hang (https://github.com/gominimal/inbox/issues/335)"
+      echo "::error::iteration $i: 'min activate' still running after ${DEADLINE_SECS}s — the #869 hang"
     elif [ "$rc" -eq 0 ]; then
       echo "::error::iteration $i: activate's last stdout line is not a session UUID: '$sid'"
     else
