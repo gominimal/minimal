@@ -3633,6 +3633,8 @@ dependencies = [
  "constcat",
  "diagnostics",
  "dirs",
+ "github",
+ "indicatif",
  "mctx",
  "mfile",
  "minimald",

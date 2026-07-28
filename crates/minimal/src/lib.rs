@@ -15,6 +15,7 @@ pub mod diag;
 pub mod dirs;
 mod file_upload;
 pub mod git_remote;
+pub mod github;
 pub mod loadouts;
 
 #[derive(Parser)]
@@ -42,6 +43,8 @@ pub enum Command {
     Stop(StopArgs),
     /// Session inspection subcommands
     Session(SessionArgs),
+    /// GitHub authentication: sign in, inspect status, and sign out (R1.4/R7.2)
+    Github(github::GithubArgs),
     /// Loadout management subcommands
     Loadout(LoadoutArgs),
     /// Print important directories and file paths for debugging
@@ -457,6 +460,7 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
         Command::Session(SessionArgs {
             command: SessionCommand::Policy(args),
         }) => cmd_session_policy(&cli.global_args, args).await,
+        Command::Github(args) => github::cmd_github(&cli.global_args, args).await,
         Command::Loadout(LoadoutArgs {
             command: LoadoutCommand::List(args),
         }) => loadouts::cmd_loadout_list(args, &cli.global_args),
