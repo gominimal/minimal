@@ -27,10 +27,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check advisories
 
@@ -40,22 +40,26 @@ jobs:
     # surface. Self-contained: builds minvmd + the CLI, materializes the
     # guest images, then loops scripts/soak-session-e2e.sh.
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 10 cold VM boots + build + bulk-upload + the concurrency-stress step below
+    # run long; 60 min was cutting it off mid-soak.
+    timeout-minutes: 90
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - name: Free Disk Space
-        uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+        uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 # v3
         with:
           remove_android: true
           remove_dotnet: true
           remove_haskell: true
           remove_tool_cache: true
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
       - name: Install build dependencies
         run: |
           sudo sh -c \
@@ -65,7 +69,7 @@ jobs:
         # build-initramfs.sh cross-compiles the guest minimald to static musl;
         # install the prebuilt cross like the KVM lane so it never falls back
         # to `cargo install cross` from source inside this blocking job.
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2
         with:
           tool: cross
       - name: Enable /dev/kvm access
@@ -82,7 +86,7 @@ jobs:
         # Shares the KVM lane's build cache key (same minvmd + CLI compile);
         # a scheduled run on main also writes it back, keeping it warm.
         id: cargo-cache
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/bin/
@@ -137,9 +141,29 @@ jobs:
         run: |
           export PATH="$PWD/target/debug:$PATH"
           ./scripts/soak-session-e2e.sh 10 "$RUNNER_TEMP/soak-logs"
+      - name: Session concurrency stress (N parallel sessions)
+        # Reuses the soak's VM setup (same images/binaries on PATH) to hammer the
+        # daemon's spawn/list/teardown paths under parallel load — coverage the
+        # N-serial soak can't give. continue-on-error until the concurrency proof
+        # has a few clean nightly runs behind it, so a flaky stress run cannot
+        # break the blocking soak; promote to fatal once it has settled.
+        continue-on-error: true
+        # Own step cap so a hung stress run can't consume the job's whole budget.
+        timeout-minutes: 15
+        env:
+          MINVMD_KERNEL_PATH: ${{ runner.temp }}/vmlinuz
+          MINVMD_ROOTFS_PATH: ${{ runner.temp }}/rootfs.img
+          MINVMD_INITRAMFS: ${{ runner.temp }}/initramfs.cpio
+          MINVMD_GVPROXY_BIN: ${{ runner.temp }}/gvproxy
+          E2E_VM: "1"
+          E2E_MINIMAL_ARGS: --provider local-minvmd
+          E2E_PROJECT_DIR: /tmp
+        run: |
+          export PATH="$PWD/target/debug:$PATH"
+          ./scripts/stress-session-e2e.sh 6
       - name: Save cargo + build artifacts cache (main only)
         if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/bin/
@@ -148,9 +172,13 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
-      - name: Upload soak boot logs
+      - name: Upload soak boot logs + diagnostic bundles
+        # On a failed iteration or bulk-upload proof the e2e scripts drop a
+        # `min bug` diagnostic bundle (minimal-diag-*.tar.zst) into this same
+        # dir alongside the per-iteration boot logs, so a red nightly ships the
+        # daemon's own logs/state/config — not just scraped console tails.
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: soak-boot-logs
           path: ${{ runner.temp }}/soak-logs
@@ -166,11 +194,13 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: beta
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Beta toolchain
-        uses: dtolnay/rust-toolchain@beta
+        uses: dtolnay/rust-toolchain@4711ae3e97dd6376c8d5d5d51c89566406abaefa # beta
+        with:
+          toolchain: beta
       - name: Core workspace tests (beta)
         uses: ./.github/actions/core-tests
         with:
@@ -186,11 +216,13 @@ jobs:
     timeout-minutes: 40
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
       - name: cargo update (newest compatible deps)
         run: cargo update
       - name: Core workspace tests (updated deps)
@@ -220,14 +252,14 @@ jobs:
     timeout-minutes: 15
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Install cargo-machete + zizmor
         # Both are prebuilt binaries in taiki-e's manifest (zizmor is Rust,
         # from zizmorcore/zizmor). actionlint is NOT — it runs from its
         # pinned official image below.
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2
         with:
           tool: cargo-machete,zizmor
       - name: actionlint (workflow lint)
@@ -244,19 +276,125 @@ jobs:
         if: always()
         run: zizmor .github/workflows/
 
+  msrv:
+    # MSRV floor check: every crate's declared rust-version (workspace-wide
+    # 1.95, inherited from [workspace.package]) must still type-check.
+    # cargo-hack drives `check` against each crate's rust-version, pulling the
+    # matching toolchain via rustup. Mirrors the `just msrv` recipe. BLOCKING —
+    # the declared floor is a promise — so it feeds `notify`.
+    runs-on: ubuntu-latest
+    # cargo-hack --rust-version does a full cold workspace check under the 1.95
+    # toolchain (separate from the 1.97 build cache), which is slow on a first
+    # run; give it room so it isn't killed mid-compile.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - name: Setup Rust (protoc + cache; primes the msrv cache on main)
+        uses: ./.github/actions/setup-rust
+        with:
+          shared-key: msrv
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2
+        with:
+          tool: cargo-hack
+      - name: cargo hack check --rust-version
+        run: cargo hack check --rust-version --workspace --all-targets --locked
+
+  miri:
+    # miri on `switch` — the vsock/subnet/MAC primitives (docs/ci-strategy.md §6
+    # "vsock framing"). It has zero dependencies and pure integer/IP tests, so it
+    # compiles + interprets under miri in seconds (unlike `graph`, whose ~1k-dep
+    # tree pulls in all of nickel and blows the timeout). Non-blocking.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    env:
+      # rust-toolchain.toml pins 1.97.0, which has no miri component; override it
+      # for this job so `cargo miri` resolves the nightly installed below (same
+      # mechanism the beta/nightly-rustc canaries use).
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Nightly toolchain + miri
+        uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+        with:
+          toolchain: nightly
+          components: miri
+      - name: Setup Rust (protoc + cache; primes the miri cache on main)
+        uses: ./.github/actions/setup-rust
+        with:
+          shared-key: miri
+      - name: cargo miri setup
+        run: cargo miri setup
+      - name: cargo miri test (switch)
+        # Mirrors `just miri`; RUSTUP_TOOLCHAIN=nightly is set at job level.
+        run: cargo miri test -p switch
+
+  nightly-rustc-canary:
+    # The beta canary's forward twin: run the workspace suite on nightly rustc
+    # to catch upcoming-toolchain breakage ahead of the pin. Non-blocking;
+    # RUSTUP_TOOLCHAIN overrides rust-toolchain.toml for this job only.
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    continue-on-error: true
+    env:
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Nightly toolchain
+        uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly
+        with:
+          toolchain: nightly
+      - name: Core workspace tests (nightly)
+        uses: ./.github/actions/core-tests
+        with:
+          # Own cache class, and never write (a nightly build must not consume
+          # the shared pool the real lanes restore from).
+          shared-key: nightly-canary
+          save-if: "false"
+
+  macos-e2e:
+    # macOS/HVF VM smoke nightly — closes the docs/ci-strategy.md §9 "both
+    # platforms" row (the Linux/KVM soak above is the other half). Reuses the
+    # macOS lane via workflow_call; on this scheduled (non-PR) call the lane's
+    # internal path filter is bypassed so the full hypervisor e2e runs on the
+    # self-hosted Apple Silicon runner (still honoring the RUN_MACOS_CI
+    # kill-switch). BLOCKING — feeds `notify`.
+    permissions:
+      contents: read
+      # ci-macos.yml declares pull-requests: read (dorny/paths-filter on its PR
+      # runs); a called reusable workflow cannot request a permission the caller
+      # withheld, so grant it here too. Unused on this non-PR call.
+      pull-requests: read
+    uses: ./.github/workflows/ci-macos.yml
+
   notify:
     # File (or update) a tracking issue when a BLOCKING nightly job fails, so
     # a regression doesn't rot in the Actions tab. Canaries are
     # continue-on-error and deliberately do NOT trip this — read them in the
     # run itself.
-    needs: [advisories, session-e2e-soak, installer]
+    needs: [advisories, session-e2e-soak, installer, msrv, macos-e2e]
     # Fire on failure OR cancellation of a blocking job (a timeout reports
-    # 'failure', so hangs are covered; this also catches an infra cancel).
+    # 'failure', so hangs are covered; this also catches an infra cancel). The
+    # canaries (beta/nightly rustc, updated-deps) and miri are continue-on-error
+    # and deliberately absent here.
     if: >-
       always() &&
       (needs.advisories.result == 'failure' || needs.advisories.result == 'cancelled'
        || needs.session-e2e-soak.result == 'failure' || needs.session-e2e-soak.result == 'cancelled'
-       || needs.installer.result == 'failure' || needs.installer.result == 'cancelled')
+       || needs.installer.result == 'failure' || needs.installer.result == 'cancelled'
+       || needs.msrv.result == 'failure' || needs.msrv.result == 'cancelled'
+       || needs.macos-e2e.result == 'failure' || needs.macos-e2e.result == 'cancelled')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -270,6 +408,8 @@ jobs:
           ADV: ${{ needs.advisories.result }}
           SOAK: ${{ needs.session-e2e-soak.result }}
           INSTALLER: ${{ needs.installer.result }}
+          MSRV: ${{ needs.msrv.result }}
+          MACOS: ${{ needs.macos-e2e.result }}
         run: |
           set -euo pipefail
           title="Nightly test tier failing"
@@ -281,8 +421,8 @@ jobs:
           # The trigger condition fires on both failure and cancellation (a
           # timeout reports 'failure'); the per-job lines below carry the exact
           # result, so keep the lead line accurate for either outcome.
-          body="$(printf 'A nightly-tests run failed or was cancelled.\n\n- advisories: %s\n- session-e2e-soak: %s\n- installer: %s\n\nRun: %s' \
-            "$ADV" "$SOAK" "$INSTALLER" "$RUN_URL")"
+          body="$(printf 'A nightly-tests run failed or was cancelled.\n\n- advisories: %s\n- session-e2e-soak: %s\n- installer: %s\n- msrv: %s\n- macos-e2e: %s\n\nRun: %s' \
+            "$ADV" "$SOAK" "$INSTALLER" "$MSRV" "$MACOS" "$RUN_URL")"
           existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --label ci-nightly --json number --jq '.[0].number // empty')"
           if [ -n "$existing" ]; then

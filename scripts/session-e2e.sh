@@ -199,6 +199,21 @@ fail() {
     echo "--- guest boot console (tail) ---"
     tail -80 "${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-minvmd0/boot.log}" 2>/dev/null || echo "(no boot log — VM never started)"
   fi
+  # Diagnostic bundle (`min bug`): the daemon's own logs/state/config, which the
+  # tail-dumps above can't reach (it runs detached, often in-guest). The daemon
+  # may be wedged or already gone, so bound the guest wait and fall back to a
+  # host-only bundle. Written next to the boot log — under a VM soak that dir is
+  # the job's uploaded soak-logs — so a failing nightly ships a real bundle, not
+  # just scraped tails. now_ms keeps per-iteration bundles from colliding.
+  echo "--- min bug (diagnostic bundle) ---"
+  bug_dir="${MINVMD_BOOT_LOG:+$(dirname "$MINVMD_BOOT_LOG")}"
+  bug_out="${bug_dir:-$WORK}/minimal-diag-session-$(now_ms).tar.zst"
+  if mnl bug --guest-timeout-secs 30 --output "$bug_out" >/dev/null 2>&1 \
+    || mnl bug --no-guest --output "$bug_out" >/dev/null 2>&1; then
+    echo "wrote diagnostic bundle: $bug_out ($(wc -c <"$bug_out" 2>/dev/null || echo '?') bytes)"
+  else
+    echo "(min bug produced no bundle)"
+  fi
   echo "::endgroup::"
   teardown
   exit 1

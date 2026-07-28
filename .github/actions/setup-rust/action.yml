@@ -24,7 +24,7 @@ runs:
   using: composite
   steps:
     - name: Free Disk Space
-      uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+      uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 # v3
       with:
         remove_android: true
         remove_dotnet: true
@@ -42,7 +42,7 @@ runs:
       shell: bash
       run: echo "CARGO_PROFILE_DEV_DEBUG=line-tables-only" >> "$GITHUB_ENV"
     - name: Cache cargo registry and build artifacts
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
         shared-key: ${{ inputs.shared-key }}
         save-if: ${{ inputs.save-if }}

@@ -168,6 +168,21 @@ diagnostics() {
     tail -80 "${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-minvmd0/boot.log}" 2>/dev/null \
       || echo "(no boot log — VM never started)"
   fi
+  # Diagnostic bundle (`min bug`): the daemon's own logs/state/config that the
+  # tail-dumps can't reach. Collected here while the state dir still exists (the
+  # EXIT teardown wipes $WORK). The daemon may be wedged or gone, so bound the
+  # guest wait and fall back to a host-only bundle. Under a VM soak the boot-log
+  # dir is the job's uploaded soak-logs, so the bundle ships with the run; the
+  # /tmp fallback survives the $WORK teardown for a local no-VM run.
+  echo "--- min bug (diagnostic bundle) ---"
+  bug_dir="${MINVMD_BOOT_LOG:+$(dirname "$MINVMD_BOOT_LOG")}"
+  bug_out="${bug_dir:-/tmp}/minimal-diag-bulk-$(date +%s).tar.zst"
+  if mnl bug --guest-timeout-secs 30 --output "$bug_out" >/dev/null 2>&1 \
+    || mnl bug --no-guest --output "$bug_out" >/dev/null 2>&1; then
+    echo "wrote diagnostic bundle: $bug_out ($(wc -c <"$bug_out" 2>/dev/null || echo '?') bytes)"
+  else
+    echo "(min bug produced no bundle)"
+  fi
   echo "::endgroup::"
 }
 

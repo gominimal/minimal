@@ -1,0 +1,8 @@
+# actionlint configuration for the nightly `hygiene` job (actionlint over
+# .github/workflows/). Declares hosted runner labels that are newer than the
+# actionlint release's built-in label list so they are not flagged as unknown.
+self-hosted-runner:
+  labels:
+    # GitHub-hosted arm64 image used by the release lane; newer than
+    # actionlint 1.7.12's bundled label set.
+    - ubuntu-26.04-arm

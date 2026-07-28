@@ -179,6 +179,21 @@ clippy:
 deny: (_need "cargo-deny" "cargo install cargo-deny --locked")
     cargo deny --all-features check
 
+# The declared MSRV floor (`package.rust-version` in the root Cargo.toml, inherited
+# by every crate) still type-checks. cargo-hack drives the check against the
+# declared version; the toolchain the check runs under is fetched by rustup.
+# CI: nightly-tests.yml `msrv` (blocking).
+msrv: (_need "cargo-hack" "cargo install cargo-hack --locked")
+    cargo hack check --rust-version --workspace --all-targets --locked
+
+# miri on `switch` — the vsock/subnet/MAC primitives (docs/ci-strategy.md §6
+# "vsock framing"). Zero deps + pure integer/IP tests, so it compiles and
+# interprets under miri in seconds. Needs the nightly toolchain + miri component:
+#   rustup toolchain install nightly && rustup +nightly component add miri
+# CI: nightly-tests.yml `miri` (non-blocking). Widen the set as more crates prove clean.
+miri:
+    cargo +nightly miri test -p switch
+
 # Unit + in-process integration tests. CI: every lane's core-tests suite.
 test: _nextest
     cargo nextest run {{scope}} {{ci-profile}} --locked --no-tests=fail
@@ -336,6 +351,13 @@ soak n="10": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
 # Bulk host→guest upload proof (#869): N `min activate`s of a large, compressible project.
 bulk-upload n="5": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/bulk-upload-e2e.sh {{n}}
+
+# Mints N sessions CONCURRENTLY against one daemon (vs. the soak's N-serial reps),
+# then bulk-tears-down — the supervision-under-load surface of ci-strategy §6.
+#
+# Concurrency stress proof. CI: a non-fatal step in nightly-tests.yml `session-e2e-soak`.
+stress n="5": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
+    {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/stress-session-e2e.sh {{n}}
 
 # ── stack bring-up ───────────────────────────────────────────────────────────
 #

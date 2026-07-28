@@ -14,6 +14,12 @@ on:
     pull_request:
         branches: ["main"]
     workflow_dispatch:
+    # Reusable so the nightly test tier can run the macOS/HVF e2e on a schedule
+    # (nightly-tests.yml `macos-e2e`). On a scheduled call `github.event_name`
+    # is the caller's event (not `pull_request`), so the lane's internal path
+    # filter is bypassed and the full hypervisor e2e runs. No secrets are used
+    # by this workflow, so the call needs none.
+    workflow_call:
 
 env:
     CARGO_TERM_COLOR: always
@@ -36,7 +42,7 @@ jobs:
         outputs:
             macos: ${{ steps.filter.outputs.macos }}
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
             - name: Detect macOS-relevant changes
@@ -92,17 +98,19 @@ jobs:
               # GitHub-hosted Ubuntu runner. `remove_tool_cache: true`
               # reclaims /opt/hostedtoolcache (~14 GB); the dtolnay Toolchain
               # step below reinstalls the Rust toolchain we actually need.
-              uses: endersonmenezes/free-disk-space@v3 # Use @main for latest, @v3 for stable
+              uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 # v3
               with:
                   remove_android: true
                   remove_dotnet: true
                   remove_haskell: true
                   remove_tool_cache: true
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
             - name: Toolchain
-              uses: dtolnay/rust-toolchain@stable
+              uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+              with:
+                  toolchain: stable
             - name: Install protoc
               run: sudo sh -c 'apt-get update && apt-get install -y protobuf-compiler'
             - name: Cache cargo + build artifacts (incl. the aarch64 cross target)
@@ -111,7 +119,7 @@ jobs:
               # is incremental after the first run. Restore-only here; the save
               # half (main only) runs at the end of the job.
               id: stage2-cache
-              uses: actions/cache/restore@v6
+              uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
               with:
                   path: |
                       ~/.cargo/bin/
@@ -136,7 +144,7 @@ jobs:
                   arch: aarch64
                   channel: unstable
             - name: Install cross
-              uses: taiki-e/install-action@v2
+              uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2
               with:
                   tool: cross
             - name: Build guest initramfs (minimald as /init)
@@ -145,19 +153,19 @@ jobs:
               # not baked into the rootfs.
               run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs.cpio"
             - name: Upload kernel artifact
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: virtio-kernel-aarch64
                   path: ${{ runner.temp }}/vmlinuz
                   if-no-files-found: error
             - name: Upload rootfs artifact
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: minvmd-rootfs-aarch64
                   path: ${{ runner.temp }}/rootfs.img
                   if-no-files-found: error
             - name: Upload initramfs artifact
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: minimald-initramfs-aarch64
                   path: ${{ runner.temp }}/initramfs.cpio
@@ -166,7 +174,7 @@ jobs:
               # PR branches restore but never write: multi-GB caches written by
               # every branch LRU-evict the main entries all PRs restore from.
               if: github.ref == 'refs/heads/main' && steps.stage2-cache.outputs.cache-hit != 'true'
-              uses: actions/cache/save@v6
+              uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
               with:
                   path: |
                       ~/.cargo/bin/
@@ -207,31 +215,31 @@ jobs:
         runs-on: [self-hosted, macOS, ARM64]
         timeout-minutes: 30
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
             - name: Download virtio-linux kernel
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: virtio-kernel-aarch64
                   path: ${{ runner.temp }}/kernel
             - name: Download minvmd-rootfs image
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: minvmd-rootfs-aarch64
                   path: ${{ runner.temp }}/rootfs
             - name: Download guest initramfs
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: minimald-initramfs-aarch64
                   path: ${{ runner.temp }}/initramfs
             - name: Download darwin testbed
-              uses: actions/download-artifact@v8
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
               with:
                   name: mac-testbed
                   path: ${{ runner.temp }}/testbed
             - name: Install nextest
-              uses: taiki-e/install-action@v2
+              uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2
               with:
                   tool: nextest
             - name: Unpack testbed + resolve paths
@@ -378,7 +386,7 @@ jobs:
               # Capture hvc0 output for diagnosing a stuck/failed boot (e.g. a missing
               # virtio driver in the kernel). Always runs so a red boot is debuggable.
               if: always()
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: minvmd-boot-logs
                   path: |
@@ -413,15 +421,16 @@ jobs:
             # sets this on the Linux lanes.
             CARGO_PROFILE_DEV_DEBUG: line-tables-only
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
             - name: Toolchain
-              uses: dtolnay/rust-toolchain@stable
+              uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
               with:
+                  toolchain: stable
                   components: clippy
             - name: Cache cargo registry and build artifacts
-              uses: Swatinem/rust-cache@v2
+              uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
               with:
                   shared-key: mac-unit
                   # PR branches restore but never save, so PR churn cannot
@@ -431,7 +440,7 @@ jobs:
             - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Install nextest
-              uses: taiki-e/install-action@v2
+              uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2
               with:
                   tool: nextest
             - name: Clippy (minvmd)
@@ -502,7 +511,7 @@ jobs:
                   cp "$LIBKRUN_PREFIX/libkrun.1.dylib" testbed/lib/libkrun.1.dylib
                   scripts/rewrite-macos-linkage.sh testbed/bin/minvmd
             - name: Upload darwin testbed
-              uses: actions/upload-artifact@v7
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: mac-testbed
                   path: testbed/

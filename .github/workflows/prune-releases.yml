@@ -48,7 +48,7 @@ jobs:
         # still allowed (it'll act on that fork's own releases).
         if: github.event_name != 'schedule' || github.repository == 'gominimal/minimal'
         steps:
-            - uses: actions/checkout@v7
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   # The script authenticates via GH_TOKEN and deletes tags through the
                   # API, so no git credentials need to persist on the runner.
