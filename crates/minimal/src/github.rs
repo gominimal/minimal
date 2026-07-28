@@ -396,9 +396,9 @@ mod tests {
     #[test]
     fn login_parses_with_no_flags() {
         let cli = parse(&["github", "login"]);
-        let Command::Github(GithubArgs {
+        let Some(Command::Github(GithubArgs {
             command: GithubCommand::Login(args),
-        }) = cli.command
+        })) = cli.command
         else {
             panic!("expected Command::Github(Login)");
         };
@@ -415,9 +415,9 @@ mod tests {
             "--scope",
             "issues:rw",
         ]);
-        let Command::Github(GithubArgs {
+        let Some(Command::Github(GithubArgs {
             command: GithubCommand::Login(args),
-        }) = cli.command
+        })) = cli.command
         else {
             panic!("expected Command::Github(Login)");
         };
@@ -436,9 +436,9 @@ mod tests {
             "--repo",
             "octocat/world",
         ]);
-        let Command::Github(GithubArgs {
+        let Some(Command::Github(GithubArgs {
             command: GithubCommand::Status(args),
-        }) = cli.command
+        })) = cli.command
         else {
             panic!("expected Command::Github(Status)");
         };
@@ -449,9 +449,9 @@ mod tests {
     #[test]
     fn status_parses_with_no_flags() {
         let cli = parse(&["github", "status"]);
-        let Command::Github(GithubArgs {
+        let Some(Command::Github(GithubArgs {
             command: GithubCommand::Status(args),
-        }) = cli.command
+        })) = cli.command
         else {
             panic!("expected Command::Github(Status)");
         };
@@ -462,9 +462,9 @@ mod tests {
     #[test]
     fn logout_parses_grant_id_and_force() {
         let cli = parse(&["github", "logout", "grant-123", "--force"]);
-        let Command::Github(GithubArgs {
+        let Some(Command::Github(GithubArgs {
             command: GithubCommand::Logout(args),
-        }) = cli.command
+        })) = cli.command
         else {
             panic!("expected Command::Github(Logout)");
         };
@@ -475,9 +475,9 @@ mod tests {
     #[test]
     fn logout_parses_without_grant_id() {
         let cli = parse(&["github", "logout"]);
-        let Command::Github(GithubArgs {
+        let Some(Command::Github(GithubArgs {
             command: GithubCommand::Logout(args),
-        }) = cli.command
+        })) = cli.command
         else {
             panic!("expected Command::Github(Logout)");
         };

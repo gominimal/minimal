@@ -694,7 +694,7 @@ mod tests {
         ) -> std::io::Result<()> {
             let mut buf = Vec::new();
             let mut chunk = [0u8; 4096];
-            let (header_len, mut want_body) = loop {
+            let (header_len, want_body) = loop {
                 let n = stream.read(&mut chunk).await?;
                 if n == 0 {
                     return Ok(());
@@ -708,7 +708,6 @@ mod tests {
             while buf.len() < header_len + 4 + want_body {
                 let n = stream.read(&mut chunk).await?;
                 if n == 0 {
-                    want_body = buf.len().saturating_sub(header_len + 4);
                     break;
                 }
                 buf.extend_from_slice(&chunk[..n]);
