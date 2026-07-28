@@ -41,7 +41,7 @@ The outputs section is unchanged.
 
 ### [tasks]
 
-Going forward, interactive tasks (bash, shell, interactive agent sessions) are supported by `session` definitions. Non-interactive tasks (test, build) are currently not supported by v0.5.0.
+Interactive tasks (bash, shell, interactive agent sessions) are supported by `session` definitions. Non-interactive tasks (test, build) are currently not supported by v0.5.0.
 
 ### [session] (NEW)
 
