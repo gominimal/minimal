@@ -1,32 +1,29 @@
 #!/usr/bin/env bash
-# Rewrite a Linux minvmd binary + its libkrun pair for the SHIPPED layout, then
+# Rewrite a Linux minvmd binary's libkrun linkage for the SHIPPED layout, then
 # verify the result. The Linux twin of scripts/rewrite-macos-linkage.sh.
 #
-# The installer drops bin/minvmd beside lib/libkrun.so.1 and lib/libkrunfw.so.5
-# (stage-release.sh's `lib/` rows), so two RUNPATHs have to be right:
+# The installer drops bin/minvmd beside lib/libkrun.so.1 (stage-release.sh's
+# `lib/` row), so one RUNPATH has to be right:
 #
-#   minvmd       -> $ORIGIN/../lib    finds lib/libkrun.so.1 from bin/
-#   libkrun.so.1 -> $ORIGIN           finds its libkrunfw.so.5 SIBLING
-#
-# The second is not optional and not covered by the first: libkrun dlopen()s
-# libkrunfw by soname, and glibc resolves a dlopen from a library against the
-# RUNPATH of the *calling object*, never the executable's. Without it a shipped
-# libkrun finds no libkrunfw and every VM boot fails on a host that has no
-# system copy.
+#   minvmd -> $ORIGIN/../lib    finds lib/libkrun.so.1 from bin/
 #
 # build.rs already bakes `$ORIGIN` first plus the system lib dirs, and drops the
 # ephemeral $LIBKRUN_PREFIX on a Linux --release build; this inserts the
 # `../lib` entry after `$ORIGIN` and leaves the rest alone (so the system-libkrun
 # fallback keeps working, and the list is not duplicated here).
 #
+# NOT libkrunfw: its purpose is to carry a bundled GPL-2 guest kernel, and
+# minvmd supplies its own (`ctx.set_kernel`, from the shipped data/vmlinuz), so
+# it is neither linked nor needed at runtime. macOS has shipped libkrun without
+# it all along. Nothing here touches it.
+#
 # Verifies afterwards that:
 #   - minvmd really links libkrun (not the stub) and its RUNPATH has $ORIGIN/../lib
-#   - no ephemeral build path (a $HOME/.krun prefix) leaked into any RUNPATH
-#   - the two sonames are exactly what stage-release.sh's `lib/` dests assume
-#   - libkrun's RUNPATH has $ORIGIN
+#   - no ephemeral build path (a $HOME/.krun prefix) leaked into the RUNPATH
+#   - libkrun's soname is exactly what stage-release.sh's `lib/` dest assumes
 #
 # A soname mismatch is a HARD failure: it means a libkrun major bump landed and
-# the dest basenames in stage-release.sh must change with it. Failing here beats
+# the dest basename in stage-release.sh must change with it. Failing here beats
 # shipping an install whose minvmd cannot resolve its library.
 #
 # Usage: scripts/rewrite-linux-linkage.sh <minvmd-binary> <libkrun-dir>
@@ -40,9 +37,8 @@ set -euo pipefail
 BIN="${1:?usage: rewrite-linux-linkage.sh <minvmd-binary> <libkrun-dir>}"
 LIBDIR="${2:?usage: rewrite-linux-linkage.sh <minvmd-binary> <libkrun-dir>}"
 
-# Kept in lockstep with the `lib/` dest basenames in scripts/stage-release.sh.
+# Kept in lockstep with the `lib/` dest basename in scripts/stage-release.sh.
 WANT_KRUN_SONAME="libkrun.so.1"
-WANT_KRUNFW_SONAME="libkrunfw.so.5"
 
 command -v patchelf >/dev/null 2>&1 || {
     echo "::error::patchelf not found (apt-get install patchelf)" >&2
@@ -108,52 +104,24 @@ case "$rpath" in
     *.krun*) die "$BIN RUNPATH leaks an ephemeral build prefix: $rpath" ;;
 esac
 
-# --- libkrun + libkrunfw --------------------------------------------------
+# --- libkrun ---------------------------------------------------------------
 
 krun="$(resolve_real "$LIBDIR/$WANT_KRUN_SONAME")"
 [ -f "$krun" ] || die "no $WANT_KRUN_SONAME under $LIBDIR (is the soname chain there?)"
-krunfw="$(resolve_real "$LIBDIR/$WANT_KRUNFW_SONAME")"
-[ -f "$krunfw" ] || die "no $WANT_KRUNFW_SONAME under $LIBDIR"
 
-# Checked by explicit (file, expected-soname) pairs rather than by pattern-
-# matching the path: `case "$lib" in *krunfw*` tested the WHOLE resolved path,
-# so a lib dir whose own path contained "krunfw" picked the wrong expectation
-# and hard-failed a release citing a soname bump that never happened.
-check_soname() {
-    got="$(patchelf --print-soname "$1" || true)"
-    [ "$got" = "$2" ] \
-        || die "$1 has soname '$got', expected '$2' (a major bump: update the lib/ dests in stage-release.sh)"
-}
-check_soname "$krun" "$WANT_KRUN_SONAME"
-check_soname "$krunfw" "$WANT_KRUNFW_SONAME"
+got="$(patchelf --print-soname "$krun" || true)"
+[ "$got" = "$WANT_KRUN_SONAME" ] \
+    || die "$krun has soname '$got', expected '$WANT_KRUN_SONAME' (a major bump: update the lib/ dest in stage-release.sh)"
 
-# libkrun dlopen()s libkrunfw by soname; glibc searches the CALLING object's
-# RUNPATH, so this entry is what makes the shipped sibling resolvable.
+# The upstream .so carries whatever RUNPATH its own build host baked in, and it
+# ships verbatim, so an absolute build path would reach users in a file nothing
+# else in the pipeline inspects. Same check minvmd gets above.
 libkrun_rpath="$(patchelf --print-rpath "$krun" || true)"
-case ":$libkrun_rpath:" in
-    *':$ORIGIN:'*) ;;
-    *)
-        if [ -z "$libkrun_rpath" ]; then
-            patchelf --set-rpath '$ORIGIN' "$krun"
-        else
-            patchelf --set-rpath "\$ORIGIN:$libkrun_rpath" "$krun"
-        fi
-        ;;
-esac
-libkrun_rpath="$(patchelf --print-rpath "$krun")"
-case ":$libkrun_rpath:" in
-    *':$ORIGIN:'*) ;;
-    *) die "$krun is missing the \$ORIGIN RUNPATH; its dlopen of $WANT_KRUNFW_SONAME will not find the shipped sibling" ;;
-esac
-# Same leak check minvmd gets above. The upstream .so carries whatever RUNPATH
-# its own build host baked in, and we prepend to it rather than replacing it —
-# so without this an absolute build path ships to users in a file nothing else
-# in the pipeline inspects.
 case "$libkrun_rpath" in
     *.krun*) die "$krun RUNPATH leaks an ephemeral build prefix: $libkrun_rpath" ;;
 esac
 
 echo "minvmd  RUNPATH: $rpath"
-echo "libkrun RUNPATH: $libkrun_rpath"
-echo "sonames: $WANT_KRUN_SONAME, $WANT_KRUNFW_SONAME"
+echo "libkrun RUNPATH: ${libkrun_rpath:-(none)}"
+echo "soname: $WANT_KRUN_SONAME"
 echo "linkage rewrite OK: $BIN"

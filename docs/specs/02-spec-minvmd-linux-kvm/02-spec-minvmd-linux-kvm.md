@@ -316,7 +316,10 @@ runners provisioned via the infrastructure team use the configured path.
 **An installed host resolves nothing from the system.** The release ships
 libkrun alongside `minvmd` and the installer places it in the `lib` prefix, a
 sibling of `bin` (`scripts/stage-release.sh`): `lib/libkrun.so.1` on Linux,
-`lib/libkrun.1.dylib` on macOS. The shipped binary finds it through a
+`lib/libkrun.1.dylib` on macOS. **`libkrunfw` is not shipped on either
+platform** — it exists to carry a bundled GPL-2 guest kernel, and minvmd
+supplies its own via `ctx.set_kernel` from the shipped `data/vmlinuz`, so it is
+neither linked nor loaded. The shipped binary finds it through a
 **binary-relative rpath** — `$ORIGIN/../lib` on Linux, `@loader_path/../lib` on
 macOS — rewritten from the build-time absolute prefix after the build, by
 `scripts/rewrite-linux-linkage.sh` and `scripts/rewrite-macos-linkage.sh`

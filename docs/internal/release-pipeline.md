@@ -35,15 +35,14 @@ override for green-but-unreported commits.
 - `build-release-linux-{amd64,arm64}`: static musl builds of `mip`, `min`
   (package `minimal`), and `minimald`, one cargo invocation per package so the
   fat-LTO links serialize. Each job then builds a native-glibc `minvmd` against
-  a materialized libkrun prefix and uploads that prefix's `libkrun` +
-  `libkrunfw` pair, so a Linux install ships the VM backend rather than
-  depending on a system libkrun.
+  a materialized libkrun prefix and uploads that prefix's `libkrun`, so a Linux
+  install ships the VM backend rather than depending on a system libkrun.
+  `libkrunfw` is deliberately not shipped on either platform: it carries a
+  bundled GPL-2 guest kernel, and minvmd supplies its own (`data/vmlinuz`).
   [`scripts/rewrite-linux-linkage.sh`](../../scripts/rewrite-linux-linkage.sh)
-  sets the two RUNPATHs the shipped layout needs (`minvmd` →
-  `$ORIGIN/../lib`, `libkrun` → `$ORIGIN`, the latter because its `dlopen` of
-  `libkrunfw` resolves against the *calling* object's RUNPATH) and hard-fails
-  on a soname bump, which would otherwise silently invalidate the `lib/` dests
-  in stage-release.sh.
+  sets the RUNPATH the shipped layout needs (`minvmd` → `$ORIGIN/../lib`) and
+  hard-fails on a soname bump, which would otherwise silently invalidate the
+  `lib/` dest in stage-release.sh.
 - `build-release-macos-arm64` (self-hosted Apple Silicon, gated on the
   `RUN_MACOS_CI` kill-switch): builds `minvmd` (libkrun /
   Hypervisor.framework) and `min`, rewrites minvmd's libkrun linkage to
@@ -152,8 +151,8 @@ skip oracle, so reruns only touch changed components, and a running daemon is
 stopped before an executable is swapped. Per-platform sets (from
 stage-release.sh's `COMPONENTS` table): every platform gets the session stack —
 `bin/min`, `bin/minvmd`, `bin/gvproxy-min`, a `git-remote-min` symlink, the
-libkrun the VM backend links (`lib/libkrun.so.1` + `lib/libkrunfw.so.5` on
-Linux, `lib/libkrun.1.dylib` on macOS), and the guest payload
+libkrun the VM backend links (`lib/libkrun.so.1` on Linux,
+`lib/libkrun.1.dylib` on macOS), and the guest payload
 (`data/{vmlinuz,rootfs.img,initramfs.cpio}`) for its own arch. Linux
 additionally gets `bin/mip`, `bin/minimald`, and the AppArmor
 profile/tunable/loader under `data/`.

@@ -195,7 +195,7 @@ jobs:
                   mip: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/mip-linux-amd64
             - name: Build native minvmd binary
               # Native host target (x86_64-unknown-linux-gnu), NOT musl: the binary
-              # links libkrun.so (and libkrunfw.so.5 is dlopen'd at runtime), so unlike
+              # links libkrun.so, so unlike
               # the three above it is not self-contained — running it still needs those
               # .so's reachable via rpath/LD_LIBRARY_PATH. LIBKRUN_PREFIX — published
               # by the setup-libkrun-linux composite above — drives the build.rs link
@@ -205,22 +205,20 @@ jobs:
                   mv target/release/minvmd target/release/minvmd-linux-amd64
             - name: Rewrite + verify minvmd/libkrun linkage (RUNPATH)
               # The Linux twin of the macOS @rpath rewrite: point minvmd at
-              # $ORIGIN/../lib (bin/minvmd -> lib/libkrun.so.1) and libkrun at
-              # $ORIGIN (its dlopen of libkrunfw.so.5 resolves against its OWN
-              # RUNPATH, not the executable's). Also hard-fails on a soname
-              # bump, which would silently break the lib/ dests in
+              # $ORIGIN/../lib (bin/minvmd -> lib/libkrun.so.1). Also hard-fails
+              # on a soname bump, which would silently break the lib/ dest in
               # stage-release.sh.
               run: ./scripts/rewrite-linux-linkage.sh target/release/minvmd-linux-amd64 "$LIBKRUN_PREFIX"
-            - name: Stage libkrun pair for upload
-              # Resolve the soname symlink chain to the real (now patched) files
-              # and copy them under platform-suffixed names, so merge-multiple's
-              # basename flatten does not collide with the arm64 build. The
-              # SONAME inside each file is unchanged; the installer stages them
-              # back under their soname (lib/libkrun.so.1, lib/libkrunfw.so.5).
+            - name: Stage libkrun for upload
+              # Resolve the soname symlink chain to the real file and copy it
+              # under a platform-suffixed name, so merge-multiple's basename
+              # flatten does not collide with the arm64 build. The SONAME inside
+              # is unchanged; the installer stages it back under that soname
+              # (lib/libkrun.so.1). libkrunfw is deliberately not shipped: it
+              # carries a bundled GPL-2 kernel and minvmd supplies its own.
               run: |
                   mkdir -p "$RUNNER_TEMP/libs"
                   cp "$(readlink -f "$LIBKRUN_PREFIX/libkrun.so.1")"   "$RUNNER_TEMP/libs/libkrun-linux-amd64.so"
-                  cp "$(readlink -f "$LIBKRUN_PREFIX/libkrunfw.so.5")" "$RUNNER_TEMP/libs/libkrunfw-linux-amd64.so"
             - name: Upload binary (minvmd)
               uses: actions/upload-artifact@v7
               with:
@@ -232,12 +230,6 @@ jobs:
               with:
                   name: libkrun-linux-amd64
                   path: ${{ runner.temp }}/libs/libkrun-linux-amd64.so
-                  retention-days: 7
-            - name: Upload libkrunfw (linux-amd64)
-              uses: actions/upload-artifact@v7
-              with:
-                  name: libkrunfw-linux-amd64
-                  path: ${{ runner.temp }}/libs/libkrunfw-linux-amd64.so
                   retention-days: 7
 
     build-release-linux-arm64:
@@ -330,19 +322,18 @@ jobs:
                   mip: ${{ github.workspace }}/target/aarch64-unknown-linux-musl/release/mip-linux-arm64
             - name: Build native minvmd binary
               # Native host target (aarch64-unknown-linux-gnu), NOT musl: links
-              # libkrun.so.1 with libkrunfw.so.5 dlopen'd at runtime, so unlike
-              # the three above it is not self-contained — the installer ships
-              # both under lib/ and the RUNPATH rewrite below points at them.
+              # libkrun.so.1, so unlike the three above it is not
+              # self-contained — the installer ships it under lib/ and the
+              # RUNPATH rewrite below points at it.
               run: |
                   cargo build --release --locked -p minvmd --bin minvmd
                   mv target/release/minvmd target/release/minvmd-linux-arm64
             - name: Rewrite + verify minvmd/libkrun linkage (RUNPATH)
               run: ./scripts/rewrite-linux-linkage.sh target/release/minvmd-linux-arm64 "$LIBKRUN_PREFIX"
-            - name: Stage libkrun pair for upload
+            - name: Stage libkrun for upload
               run: |
                   mkdir -p "$RUNNER_TEMP/libs"
                   cp "$(readlink -f "$LIBKRUN_PREFIX/libkrun.so.1")"   "$RUNNER_TEMP/libs/libkrun-linux-arm64.so"
-                  cp "$(readlink -f "$LIBKRUN_PREFIX/libkrunfw.so.5")" "$RUNNER_TEMP/libs/libkrunfw-linux-arm64.so"
             - name: Upload binary (minvmd)
               uses: actions/upload-artifact@v7
               with:
@@ -354,12 +345,6 @@ jobs:
               with:
                   name: libkrun-linux-arm64
                   path: ${{ runner.temp }}/libs/libkrun-linux-arm64.so
-                  retention-days: 7
-            - name: Upload libkrunfw (linux-arm64)
-              uses: actions/upload-artifact@v7
-              with:
-                  name: libkrunfw-linux-arm64
-                  path: ${{ runner.temp }}/libs/libkrunfw-linux-arm64.so
                   retention-days: 7
 
     build-release-macos-arm64:

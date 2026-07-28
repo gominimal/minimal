@@ -54,12 +54,10 @@ scenario() {
     s="$root/$1"; rm -rf "$s"; mkdir -p "$s/state" "$s/lib"
     : >"$s/minvmd"
     : >"$s/lib/libkrun.so.1"
-    : >"$s/lib/libkrunfw.so.5"
     printf 'libkrun.so.1\nlibc.so.6\n' >"$s/state/minvmd.needed"
     printf '$ORIGIN:/usr/local/lib:/usr/lib\n' >"$s/state/minvmd.rpath"
     printf 'libkrun.so.1\n' >"$s/state/libkrun.so.1.soname"
     printf '\n' >"$s/state/libkrun.so.1.rpath"
-    printf 'libkrunfw.so.5\n' >"$s/state/libkrunfw.so.5.soname"
 }
 
 run() {
@@ -81,8 +79,6 @@ run happy
 check 0 "$rc" "happy path exits 0"
 check '$ORIGIN:$ORIGIN/../lib:/usr/local/lib:/usr/lib' "$(rpath_of happy minvmd)" \
     "minvmd gains \$ORIGIN/../lib, system dirs preserved in order"
-check '$ORIGIN' "$(rpath_of happy libkrun.so.1)" \
-    "libkrun gains \$ORIGIN so its dlopen finds libkrunfw"
 
 # Re-running over already-rewritten state must be a no-op, not a second insert:
 # the release job and a manual re-run both hit this.
@@ -90,7 +86,6 @@ run happy
 check 0 "$rc" "re-run exits 0"
 check '$ORIGIN:$ORIGIN/../lib:/usr/local/lib:/usr/lib' "$(rpath_of happy minvmd)" \
     "re-run leaves minvmd RUNPATH unchanged (idempotent)"
-check '$ORIGIN' "$(rpath_of happy libkrun.so.1)" "re-run leaves libkrun RUNPATH unchanged"
 
 # --- the stub-backend trap -------------------------------------------------
 
@@ -113,11 +108,6 @@ run sonamebump
 check 1 "$rc" "a libkrun soname bump fails"
 if grep -q "stage-release" "$OUT"; then ok "soname failure points at stage-release.sh"; else bad "soname failure points at stage-release.sh"; fi
 
-scenario fwbump
-printf 'libkrunfw.so.6\n' >"$root/fwbump/state/libkrunfw.so.5.soname"
-run fwbump
-check 1 "$rc" "a libkrunfw soname mismatch fails"
-
 # --- ephemeral prefix leak -------------------------------------------------
 
 # build.rs drops the materialized prefix on a Linux release build; if one ever
@@ -135,23 +125,6 @@ rm -f "$root/nolib/lib/libkrun.so.1"
 run nolib
 check 1 "$rc" "a missing libkrun under the lib dir fails"
 
-scenario nofw
-rm -f "$root/nofw/lib/libkrunfw.so.5"
-run nofw
-check 1 "$rc" "a missing libkrunfw under the lib dir fails"
-
-# --- soname dispatch keys on the file, not the path ------------------------
-
-# A lib dir whose own path contains "krunfw" must not make libkrun be checked
-# against libkrunfw's soname. The old `case "$lib" in *krunfw*` matched the
-# whole resolved path and aborted the release citing a bump that never happened.
-scenario krunfwpath
-mv "$root/krunfwpath/lib" "$root/krunfwpath/libkrunfw-1.5"
-sed_dir="$root/krunfwpath/libkrunfw-1.5"
-PATH="$root/bin:$PATH" STUB_STATE="$root/krunfwpath/state" \
-    bash "$script" "$root/krunfwpath/minvmd" "$sed_dir" >"$root/out.krunfwpath" 2>&1
-check 0 "$?" "a lib dir path containing 'krunfw' still checks libkrun's own soname"
-
 # --- leaked build prefix in the SHIPPED libkrun ----------------------------
 
 # The upstream .so carries its own build host's RUNPATH and we prepend to it,
@@ -165,14 +138,15 @@ if grep -q "ephemeral" "$OUT"; then ok "libkrun leak failure names the ephemeral
 
 # --- libkrun with a pre-existing RUNPATH -----------------------------------
 
-# The upstream .so may already carry one; $ORIGIN is prepended, not substituted,
-# so whatever it resolved before still resolves.
+# The shipped .so is not rewritten at all — libkrunfw is not shipped, so libkrun
+# has no sibling to find and needs no $ORIGIN. A benign vendor RUNPATH is left
+# exactly as upstream built it.
 scenario prerpath
 printf '/opt/vendor/lib\n' >"$root/prerpath/state/libkrun.so.1.rpath"
 run prerpath
-check 0 "$rc" "a libkrun with an existing RUNPATH exits 0"
-check '$ORIGIN:/opt/vendor/lib' "$(rpath_of prerpath libkrun.so.1)" \
-    "\$ORIGIN is prepended, existing entries kept"
+check 0 "$rc" "a libkrun with a benign existing RUNPATH exits 0"
+check '/opt/vendor/lib' "$(rpath_of prerpath libkrun.so.1)" \
+    "libkrun's RUNPATH is left verbatim"
 
 # --- minvmd with no RUNPATH at all -----------------------------------------
 

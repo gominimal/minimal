@@ -141,10 +141,11 @@ jobs:
         # same proof ci-linux-kvm's `test-kvm` runs. Every moving part is a
         # downloaded release artifact: the native-glibc `minvmd`, the guest kernel
         # + ext4 rootfs + initramfs, the pinned `gvproxy-min` switch, and the
-        # shipped libkrun pair — laid out as a `lib/` sibling of `bin/` exactly as
-        # scripts/install.sh drops it, so minvmd resolves libkrun through its
-        # $ORIGIN/../lib RUNPATH and libkrun finds libkrunfw through its own
-        # $ORIGIN (mirrors what smoke-macos proves for the dylib). Deliberately
+        # shipped libkrun — laid out as a `lib/` sibling of `bin/` exactly as
+        # scripts/install.sh drops it, so minvmd resolves it through its
+        # $ORIGIN/../lib RUNPATH (mirrors what smoke-macos proves for the dylib;
+        # like macOS, no libkrunfw is shipped — minvmd brings its own kernel, so
+        # libkrun's bundled-GPL-kernel library is never loaded). Deliberately
         # NO LD_LIBRARY_PATH and no materialize step: this lane is what catches a
         # shipped libkrun whose RUNPATH is wrong, and either would mask exactly
         # that failure.
@@ -173,8 +174,7 @@ jobs:
                   sudo udevadm trigger --name-match=kvm
                   ls -l /dev/kvm
             - name: Download shipped linux-amd64 artifacts
-              # Pulls min, minvmd, mip, gvproxy and the libkrun/libkrunfw pair
-              # (plus minimald, unused on the host — it ships inside the
+              # Pulls min, minvmd, mip, gvproxy and libkrun (plus minimald, unused on the host — it ships inside the
               # initramfs). `*-linux-amd64` is a clean glob here: only darwin
               # artifacts carry the `temp-` prefix.
               uses: actions/download-artifact@v8
@@ -204,8 +204,8 @@ jobs:
               # or /usr/lib/minimal/bin (see resolve_gvproxy_path) — so the e2e
               # step below points MINVMD_GVPROXY_BIN at it.
               #
-              # The two .so's move to a lib/ SIBLING of bin/ under their sonames,
-              # which is where the shipped RUNPATHs look. Verified explicitly:
+              # The .so moves to a lib/ SIBLING of bin/ under its soname, which is
+              # where the shipped RUNPATH looks. Verified explicitly:
               # `ldd` must resolve libkrun out of that lib/ and leave nothing
               # "not found", so a bad RUNPATH fails here with a readable error
               # instead of an opaque VM boot timeout later.
@@ -219,7 +219,6 @@ jobs:
                   mv "$BIN/mip-linux-amd64" "$BIN/mip"
                   mv "$BIN/gvproxy-linux-amd64" "$BIN/gvproxy-min"
                   mv "$BIN/libkrun-linux-amd64.so" "$LIB/libkrun.so.1"
-                  mv "$BIN/libkrunfw-linux-amd64.so" "$LIB/libkrunfw.so.5"
                   chmod +x "$BIN/min" "$BIN/minvmd" "$BIN/mip" "$BIN/gvproxy-min"
                   echo "$BIN" >> "$GITHUB_PATH"
                   # Capture once, then match on the string. Piping into `grep -q`
