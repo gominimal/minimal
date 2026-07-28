@@ -138,6 +138,32 @@ impl IndexFile {
         }
         Ok(())
     }
+
+    /// Absorbs `other`'s entries into `self` (other wins on overlap).
+    /// Returns the number of entries whose value *changed* — overlapping
+    /// records should be byte-identical across per-link closures, so a
+    /// non-zero count is a divergence signal the caller should surface.
+    pub fn merge(&mut self, other: IndexFile) -> usize {
+        let mut conflicts = 0;
+        for (k, v) in other.idx {
+            if let Some(prev) = self.idx.insert(k, v.clone())
+                && prev != v
+            {
+                conflicts += 1;
+            }
+        }
+        conflicts
+    }
+
+    /// The number of entries in the index.
+    pub fn len(&self) -> usize {
+        self.idx.len()
+    }
+
+    /// Whether the index has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.idx.is_empty()
+    }
 }
 
 impl Extend<(SpecHash, [u8; 32])> for IndexFile {
@@ -206,5 +232,22 @@ mod tests {
                 &IndexEntry { sha256: [1u8; 32] },
             ))
         );
+    }
+
+    #[test]
+    fn merge_unions_and_counts_only_value_changes() {
+        let h = |b: u8| common::SpecHash::from_bytes([b; 32]);
+        let mut a = IndexFile::default();
+        a.extend([(h(1), [0x11; 32]), (h(2), [0x22; 32])]);
+        let mut b = IndexFile::default();
+        // h(2) identical (no conflict), h(3) new, h(1) DIFFERENT (conflict).
+        b.extend([(h(2), [0x22; 32]), (h(3), [0x33; 32]), (h(1), [0xFF; 32])]);
+
+        let conflicts = a.merge(b);
+        assert_eq!(conflicts, 1);
+        assert_eq!(a.len(), 3);
+        // Other wins on overlap.
+        assert_eq!(a.sha256(&h(1)), Some([0xFF; 32]));
+        assert_eq!(a.sha256(&h(3)), Some([0x33; 32]));
     }
 }

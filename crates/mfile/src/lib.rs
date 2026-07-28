@@ -607,6 +607,9 @@ pub enum IndexSourceMode {
     Pinned,
     /// The global root index only.
     Root,
+    /// The union of the per-commit *closure* snapshots of every pinned chain
+    /// link (upstream + sideloads); a missing closure is an error.
+    Closure,
 }
 
 impl std::str::FromStr for IndexSourceMode {
@@ -616,8 +619,9 @@ impl std::str::FromStr for IndexSourceMode {
             "auto" => Ok(Self::Auto),
             "pinned" => Ok(Self::Pinned),
             "root" => Ok(Self::Root),
+            "closure" => Ok(Self::Closure),
             other => Err(format!(
-                "unknown index source {other:?} (expected \"auto\", \"pinned\" or \"root\")"
+                "unknown index source {other:?} (expected \"auto\", \"pinned\", \"root\" or \"closure\")"
             )),
         }
     }
@@ -636,12 +640,21 @@ pub enum CacheConfig {
     /// Read the immutable per-commit snapshot `object`; if it doesn't exist,
     /// fail rather than fall back.
     CommitIndexOnly { object: String },
+    /// Read and union the immutable per-commit closure snapshots, one per
+    /// pinned chain link; any missing object fails rather than falls back.
+    CommitClosures { objects: Vec<String> },
 }
 
 /// Object key of the per-commit index snapshot for a repo + commit:
 /// `<host>/<owner>/<repo>/<commit>.shisha`, matching the publisher's keying.
 pub fn commit_index_object(repo_url: &str, commit_sha: &str) -> String {
     format!("{}/{commit_sha}.shisha", repo_slug(repo_url))
+}
+
+/// Object key of the per-commit *closure* snapshot (the bounded catalog at a
+/// commit): `<host>/<owner>/<repo>/<commit>.closure.shisha`.
+pub fn commit_closure_object(repo_url: &str, commit_sha: &str) -> String {
+    format!("{}/{commit_sha}.closure.shisha", repo_slug(repo_url))
 }
 
 /// Stable `host/owner/repo` slug for a repo URL: query/fragment, scheme,
@@ -1099,7 +1112,38 @@ impl File {
             (IndexSourceMode::Pinned, None) => Err(
                 "index_source \"pinned\" requires a git upstream with a locked_commit".to_string(),
             ),
+            (IndexSourceMode::Closure, _) => {
+                let objects = self.closure_objects();
+                if objects.is_empty() {
+                    Err("index_source \"closure\" requires at least one git link \
+                         (upstream or sideload) with a locked_commit"
+                        .to_string())
+                } else {
+                    Ok(CacheConfig::CommitClosures { objects })
+                }
+            }
         }
+    }
+
+    /// The per-commit closure object of every pinned git chain link: the
+    /// upstream first, then each sideload, in declaration order. Links
+    /// without a locked commit (or backed by a directory) have no remote
+    /// presence and contribute nothing.
+    fn closure_objects(&self) -> Vec<String> {
+        let Some(upstream) = self.upstream.as_ref() else {
+            return Vec::new();
+        };
+        std::iter::once(&upstream.link)
+            .chain(upstream.sideloads().iter().map(|s| s.link()))
+            .filter_map(|link| match link {
+                LinkConfig::Git {
+                    repo,
+                    locked_commit: Some(commit),
+                    ..
+                } => Some(commit_closure_object(repo, commit)),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -1732,6 +1776,56 @@ mod tests {
             CacheConfig::CommitIndexOnly {
                 object: format!("github.com/gominimal/pkgs/{SHA}.shisha")
             }
+        );
+    }
+
+    #[test]
+    fn cache_config_closure_unions_pinned_links_and_skips_the_rest() {
+        const UP: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const SIDE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mf: File = toml::from_str(&format!(
+            r#"
+            [upstream]
+            repo = "https://github.com/gominimal/pkgs"
+            locked_commit = "{UP}"
+
+            [[upstream.sideload]]
+            repo = "https://github.com/acme/extra"
+            locked_commit = "{SIDE}"
+
+            [[upstream.sideload]]
+            dir = "/tmp/local-overlay"
+
+            [[upstream.sideload]]
+            repo = "https://github.com/acme/unpinned"
+            "#
+        ))
+        .unwrap();
+        // Upstream first, then pinned sideloads in declaration order; the
+        // dir and unpinned links have no remote presence.
+        assert_eq!(
+            mf.cache_config(Some(IndexSourceMode::Closure)).unwrap(),
+            CacheConfig::CommitClosures {
+                objects: vec![
+                    format!("github.com/gominimal/pkgs/{UP}.closure.shisha"),
+                    format!("github.com/acme/extra/{SIDE}.closure.shisha"),
+                ]
+            }
+        );
+
+        // No pinned links at all: closure mode is a loud error.
+        let unpinned: File =
+            toml::from_str("[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n").unwrap();
+        assert!(
+            unpinned
+                .cache_config(Some(IndexSourceMode::Closure))
+                .is_err()
+        );
+
+        // The env-override spelling parses.
+        assert_eq!(
+            "closure".parse::<IndexSourceMode>().unwrap(),
+            IndexSourceMode::Closure
         );
     }
 }

@@ -260,6 +260,9 @@ impl RemoteCache<AnyBackend> {
                 },
                 false,
             ),
+            mfile::CacheConfig::CommitClosures { objects } => {
+                return Self::new_any_closure_union(url, gcs_storage, index_dir, ot, objects).await;
+            }
         };
         if let IndexSource::Snapshot { object } = &source {
             tracing::debug!("cache index: per-commit snapshot {object}");
@@ -278,6 +281,63 @@ impl RemoteCache<AnyBackend> {
                 Self::new_any(url, gcs_storage, index_dir, ot, IndexSource::Root).await
             }
             other => other,
+        }
+    }
+
+    /// Reads and unions the per-commit *closure* snapshots of every pinned
+    /// chain link into one index. Strict by design (the `closure` rollout
+    /// mode): any missing object surfaces as [`Error::SnapshotMissing`]
+    /// naming that link's object — never a silent fallback. Each closure is
+    /// fetched through the same immutable-snapshot path as the byte-copy
+    /// (whole-record check, local cache forever).
+    async fn new_any_closure_union(
+        url: AnyUrl,
+        gcs_storage: Option<Storage>,
+        index_dir: Option<PathBuf>,
+        ot: Option<OpTracker>,
+        objects: &[String],
+    ) -> Result<Self, Error<AnyRespError>> {
+        let mut merged: Option<Self> = None;
+        for object in objects {
+            tracing::debug!("cache index: per-commit closure {object}");
+            let rc = Self::new_any(
+                url.clone(),
+                gcs_storage.clone(),
+                index_dir.clone(),
+                ot.clone(),
+                IndexSource::Snapshot {
+                    object: object.clone(),
+                },
+            )
+            .await?;
+            merged = Some(match merged {
+                None => rc,
+                Some(mut acc) => {
+                    let conflicts = acc.index.merge(rc.index);
+                    if conflicts > 0 {
+                        // Overlapping spec hashes must agree across links;
+                        // divergence means two closures claim different bytes
+                        // for one spec — surface it, last link wins.
+                        tracing::warn!(
+                            "closure union: {conflicts} conflicting entries merging {object}"
+                        );
+                    }
+                    acc
+                }
+            });
+        }
+        match merged {
+            Some(rc) => {
+                tracing::debug!(
+                    "cache index: closure union of {} link(s), {} entries",
+                    objects.len(),
+                    rc.index.len()
+                );
+                Ok(rc)
+            }
+            None => Err(Error::Config(
+                "closure mode resolved no snapshot objects".to_string(),
+            )),
         }
     }
 }
@@ -922,6 +982,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rc.sha256(&spec_hash), Some(sha256));
+    }
+
+    #[tokio::test]
+    async fn configured_closure_union_merges_per_link_closures() {
+        const OBJ_A: &str = "github.com/gominimal/pkgs/aaaa.closure.shisha";
+        const OBJ_B: &str = "github.com/acme/extra/bbbb.closure.shisha";
+        let spec_a = SpecHash::from_bytes([0x0A; 32]);
+        let spec_b = SpecHash::from_bytes([0x0B; 32]);
+        let base = serve_objects(vec![
+            (OBJ_A.to_string(), index_bytes_for(&spec_a, [0xA1; 32])),
+            (OBJ_B.to_string(), index_bytes_for(&spec_b, [0xB1; 32])),
+        ]);
+
+        let config = mfile::CacheConfig::CommitClosures {
+            objects: vec![OBJ_A.to_string(), OBJ_B.to_string()],
+        };
+        let rc = RemoteCache::new_any_configured(https_url(&base), None, None, None, &config)
+            .await
+            .unwrap();
+        // Entries from BOTH links resolve through the one merged index.
+        assert_eq!(rc.sha256(&spec_a), Some([0xA1; 32]));
+        assert_eq!(rc.sha256(&spec_b), Some([0xB1; 32]));
+        assert_eq!(rc.sha256(&SpecHash::from_bytes([0x0C; 32])), None);
+    }
+
+    #[tokio::test]
+    async fn configured_closure_missing_link_is_a_loud_error() {
+        const OBJ_A: &str = "github.com/gominimal/pkgs/aaaa.closure.shisha";
+        const OBJ_B: &str = "github.com/acme/extra/bbbb.closure.shisha";
+        // Only the first link's closure exists; the root index also exists
+        // and must NOT be silently used.
+        let spec_a = SpecHash::from_bytes([0x0A; 32]);
+        let base = serve_objects(vec![
+            (OBJ_A.to_string(), index_bytes_for(&spec_a, [0xA1; 32])),
+            (
+                INDEX_FILENAME.to_string(),
+                index_bytes_for(&spec_a, [0xA1; 32]),
+            ),
+        ]);
+
+        let config = mfile::CacheConfig::CommitClosures {
+            objects: vec![OBJ_A.to_string(), OBJ_B.to_string()],
+        };
+        let err = RemoteCache::new_any_configured(https_url(&base), None, None, None, &config)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::SnapshotMissing { object } if object == OBJ_B),
+            "expected SnapshotMissing for {OBJ_B}, got {err:?}"
+        );
     }
 
     #[tokio::test]
