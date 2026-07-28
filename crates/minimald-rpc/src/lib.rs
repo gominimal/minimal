@@ -904,42 +904,6 @@ impl RepoInstallationStatus {
             repo,
             installed,
             install_url,
-// Diagnostic bundle (`min bug`).
-// ---------------------------------------------------------------------------
-
-/// Streaming RPC subsystem: the daemon's contribution to a `min bug`
-/// diagnostic bundle.
-///
-/// Not an [`OneshotSshRpc`]: the client writes one JSON-encoded
-/// [`DiagBundleRequest`] and half-closes, then the daemon streams back a
-/// zstd-compressed tar archive of its diagnostic bundle and closes. Errors hit
-/// before streaming starts are relayed over extended-data stream 1, so a client
-/// that reads zero payload bytes should surface the extended data as the
-/// failure reason.
-///
-/// Served identically by the native Linux minimald and the in-VM minimald
-/// behind the minvmd bridge — the archive's `meta.json` says which one
-/// answered.
-pub const DIAG_BUNDLE_SUBSYSTEM: &str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "DiagBundleTarZst");
-
-/// Request body for [`DIAG_BUNDLE_SUBSYSTEM`].
-#[non_exhaustive]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DiagBundleRequest {
-    /// Per-log-file tail cap in bytes; `0` means the daemon's default. The
-    /// daemon clamps this to its own ceiling — the value is caller-controlled.
-    #[serde(default)]
-    pub log_tail_bytes: u64,
-    /// Include the recursive state-dir listing (names/sizes only).
-    #[serde(default = "default_true")]
-    pub include_state_listing: bool,
-}
-
-impl Default for DiagBundleRequest {
-    fn default() -> Self {
-        Self {
-            log_tail_bytes: 0,
-            include_state_listing: true,
         }
     }
 }
@@ -1487,6 +1451,49 @@ impl OneshotSshRpc for GetSessionGitState {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionGitState");
     type Request<'a> = GetSessionGitStateRequest;
     type Response = Errorable<GetSessionGitStateResponse>;
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic bundle (`min bug`).
+// ---------------------------------------------------------------------------
+
+/// Streaming RPC subsystem: the daemon's contribution to a `min bug`
+/// diagnostic bundle.
+///
+/// Not an [`OneshotSshRpc`]: the client writes one JSON-encoded
+/// [`DiagBundleRequest`] and half-closes, then the daemon streams back a
+/// zstd-compressed tar archive of its diagnostic bundle and closes. Errors hit
+/// before streaming starts are relayed over extended-data stream 1, so a client
+/// that reads zero payload bytes should surface the extended data as the
+/// failure reason.
+///
+/// Served identically by the native Linux minimald and the in-VM minimald
+/// behind the minvmd bridge — the archive's `meta.json` says which one
+/// answered.
+pub const DIAG_BUNDLE_SUBSYSTEM: &str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "DiagBundleTarZst");
+
+/// Request body for [`DIAG_BUNDLE_SUBSYSTEM`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagBundleRequest {
+    /// Per-log-file tail cap in bytes; `0` means the daemon's default. The
+    /// daemon clamps this to its own ceiling — the value is caller-controlled.
+    #[serde(default)]
+    pub log_tail_bytes: u64,
+    /// Include the recursive state-dir listing (names/sizes only).
+    #[serde(default = "default_true")]
+    pub include_state_listing: bool,
+}
+
+impl Default for DiagBundleRequest {
+    fn default() -> Self {
+        Self {
+            log_tail_bytes: 0,
+            include_state_listing: true,
+        }
+    }
+}
+
 /// The type is `#[non_exhaustive]`, so other crates cannot write a struct
 /// literal for it; these are how a client departs from the defaults.
 impl DiagBundleRequest {
@@ -1713,10 +1720,8 @@ mod tests {
         // accepted property the unit-struct/optional responses in this file
         // already have. We therefore assert the error's construction and
         // serialized shape, not a round-trip.
-        let err: Errorable<GithubBeginLoginResponse> = Err::<GithubBeginLoginResponse, _>(
-            "GitHub App client id is not configured",
-        )
-        .into();
+        let err: Errorable<GithubBeginLoginResponse> =
+            Err::<GithubBeginLoginResponse, _>("GitHub App client id is not configured").into();
         assert!(err.err().is_some());
         let json = serde_json::to_string(&err).unwrap();
         assert!(json.contains("client id is not configured"), "got: {json}");
@@ -1759,8 +1764,7 @@ mod tests {
             assert_eq!(round_trip(&wrapped), wrapped);
         }
 
-        let json =
-            serde_json::to_string(&GithubPollLoginResponse::Pending).unwrap();
+        let json = serde_json::to_string(&GithubPollLoginResponse::Pending).unwrap();
         assert!(json.contains(r#""kind":"pending""#), "got: {json}");
     }
 
@@ -1856,8 +1860,7 @@ mod tests {
     fn github_logout_round_trips() {
         let req = GithubLogoutRequest::new("grant-1".into());
         assert_eq!(round_trip(&req), req);
-        let resp: Errorable<GithubLogoutResponse> =
-            Errorable::Ok(GithubLogoutResponse::new(true));
+        let resp: Errorable<GithubLogoutResponse> = Errorable::Ok(GithubLogoutResponse::new(true));
         assert_eq!(round_trip(&resp), resp);
     }
 
@@ -1865,7 +1868,10 @@ mod tests {
     fn github_prime_repos_round_trips() {
         let req = GithubPrimeReposRequest::new(
             sid(),
-            vec!["octocat/api@feat/x:main".into(), "octocat/web@feat/x".into()],
+            vec![
+                "octocat/api@feat/x:main".into(),
+                "octocat/web@feat/x".into(),
+            ],
             "grant-1".into(),
         );
         assert_eq!(round_trip(&req), req);
