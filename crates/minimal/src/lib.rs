@@ -299,11 +299,24 @@ pub struct ActivateArgs {
     #[arg(long, value_enum, default_value_t = SyncMode::Tarball)]
     pub sync: SyncMode,
     /// Network mode: no-net, host-net (default), or own-ip.
+    ///
+    /// Hidden from `--help` while `own-ip` is not usable on an installed host:
+    /// the daemon resolves a switch binary that no install ships yet
+    /// (gominimal/minimal#980), so advertising the flag offers a mode that
+    /// cannot work outside a dev checkout. Still accepted, and `host-net`
+    /// remains the default, so nothing that passes it today breaks. Unhide,
+    /// and restore the row in docs/reference/cli-min.md, once own-ip works
+    /// from an install.
     #[arg(long, value_enum, default_value_t = CliNetworkMode::HostNet)]
+    #[clap(hide = true)]
     pub network: CliNetworkMode,
     /// Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp|udp, default
     /// tcp). Repeatable. Requires `--network own-ip`.
+    ///
+    /// Hidden for the same reason as `--network`: it is only meaningful with
+    /// `--network own-ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
+    #[clap(hide = true)]
     pub ingress: Vec<String>,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
     /// Repeatable. If any `--loadout` is specified, defaults from
