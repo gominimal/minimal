@@ -1,5 +1,5 @@
 use crate::channel_progress::ChannelProgress;
-use crate::session_sop::{BuildUpdate, SideOp};
+use crate::session_sop::{BuildUpdate, CheckOpts, CheckUpdate, SideOp};
 use crate::sessions::{SessionControl, WeakManagerHandle, composables};
 use crate::store::SessionRecordHandle;
 use crate::{
@@ -306,6 +306,12 @@ enum SessionMessage {
         rebuild: bool,
         pkgs: Vec<String>,
         reply: oneshot::Sender<Result<mpsc::Receiver<BuildUpdate>, std::io::Error>>,
+    },
+    /// Kick off a background check run as a session side-op. Replies with the
+    /// receiver end of the run's result stream.
+    StartCheck {
+        opts: CheckOpts,
+        reply: oneshot::Sender<Result<mpsc::Receiver<CheckUpdate>, std::io::Error>>,
     },
     /// Test-only inspection: an `Arc` clone of the held [`Composition`]
     /// (`None` in `Draft`, or `Active` without one post-restart). Lets tests
@@ -670,6 +676,9 @@ impl Session {
             } => {
                 let _ = reply.send(self.start_build(rebuild, pkgs).await);
             }
+            SessionMessage::StartCheck { opts, reply } => {
+                let _ = reply.send(self.start_check(opts).await);
+            }
             SessionMessage::GetRecord(r) => {
                 let _ = r.send(self.record.record().await.unwrap());
             }
@@ -986,6 +995,29 @@ impl Session {
     ) -> Result<mpsc::Receiver<BuildUpdate>, std::io::Error> {
         let ctx = self.context(false).await.map_err(std::io::Error::other)?;
         let (sop, rx) = SideOp::spawn_build(self.weak_self.clone(), rebuild, pkgs, ctx, 64).await?;
+        match &mut self.inner {
+            SessionInner::Active { sops, .. } => sops.push(sop),
+            SessionInner::Draft { .. } => {
+                sop.shutdown().await;
+                unreachable!("`context()` already rejected a `Draft`");
+            }
+        }
+        Ok(rx)
+    }
+
+    /// Kicks off a background check run as a side-op and registers it on this
+    /// session, returning the receiver end of its result stream. Like
+    /// [`start_build`](Self::start_build) it runs against a fresh
+    /// workspace-rooted context, so it sees `minimal.toml` edits made since the
+    /// session came up.
+    ///
+    /// The returned receiver closes when the run ends.
+    async fn start_check(
+        &mut self,
+        opts: CheckOpts,
+    ) -> Result<mpsc::Receiver<CheckUpdate>, std::io::Error> {
+        let ctx = self.context(false).await.map_err(std::io::Error::other)?;
+        let (sop, rx) = SideOp::spawn_check(self.weak_self.clone(), opts, ctx, 64).await?;
         match &mut self.inner {
             SessionInner::Active { sops, .. } => sops.push(sop),
             SessionInner::Draft { .. } => {
@@ -1416,6 +1448,26 @@ impl SessionHandle {
                 pkgs,
                 reply,
             })
+            .await;
+        recv.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
+        })?
+    }
+
+    /// Kicks off a background check run as a session side-op, returning the
+    /// receiver end of the run's result stream. Results flow until the run
+    /// finishes (completion, failure, or cancellation), at which point the
+    /// channel closes. A `Draft` session is refused with `InvalidInput`; a dead
+    /// actor maps to `NotConnected`.
+    pub(crate) async fn start_check(
+        &self,
+        opts: CheckOpts,
+    ) -> Result<mpsc::Receiver<CheckUpdate>, std::io::Error> {
+        let (reply, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .0
+            .send(SessionMessage::StartCheck { opts, reply })
             .await;
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")

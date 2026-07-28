@@ -23,6 +23,9 @@ pub struct StandaloneTest<'a> {
     pub stdout_writer: Option<Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync>>,
     /// Optional async writer that receives a copy of the sandbox's stderr stream.
     pub stderr_writer: Option<Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync>>,
+
+    /// Cancellation token to stop the test.
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 impl<'a> StandaloneTest<'a> {
@@ -137,10 +140,11 @@ impl<'a> StandaloneTest<'a> {
     ) -> Result<Vec<StandaloneTestError>, Error> {
         let invocations = self.invocations(test)?;
         match sandbox
-            .run(
+            .run_with_cancel(
                 invocations.clone(),
                 self.stdout_writer.take(),
                 self.stderr_writer.take(),
+                self.cancel.clone(),
             )
             .await
         {

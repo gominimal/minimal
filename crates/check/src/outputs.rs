@@ -160,9 +160,11 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
 
         // Clone the graph and release the read lock so other checkers can proceed.
         let graph = std::ops::Deref::deref(&graph).clone();
+        let cancel = ctx.cancel.clone();
 
         tokio::task::spawn_blocking(move || {
             (move || -> Result<CheckResult, Error> {
+            crate::bail_if_cancelled(&cancel)?;
             let build = graph.get(&bsr).unwrap();
             let spec_hash = graph.spec_hash(&bsr);
             let cached_build = if let Ok(cached_build) = cache.read_dir(&spec_hash) {
@@ -201,6 +203,9 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
             for (name, output) in &build.outputs {
                 let glob = output.glob();
                 for path in check_cache.match_files_for_glob(cached_build.path(), glob)?.iter() {
+                    // Every output file gets read and ELF-parsed below, so this
+                    // is where a large package spends its time.
+                    crate::bail_if_cancelled(&cancel)?;
                     let data = std::fs::read(path)
                         .map_err(|e| Error::IO("reading output file", path.to_path_buf(), e))?;
                     if let (Ok(elf), BuildOutput::Binary { .. } | BuildOutput::Library { .. }) =
@@ -270,6 +275,8 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
                 }
             }
             for (needed_lib, outputs) in &all_imports {
+                // Resolving a lib reads and parses it for its symbol table.
+                crate::bail_if_cancelled(&cancel)?;
                 match find_lib_in_deps(&check_cache, needed_lib, &deps)? {
                     Some((idx, lib_path)) => {
                         // There was a library, check that all the symbols we need are present.

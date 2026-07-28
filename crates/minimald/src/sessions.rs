@@ -1597,4 +1597,52 @@ mod tests {
             other => panic!("expected Ready, got {other:?}"),
         }
     }
+
+    /// `min check` runs as a session side-op, so the stream contract the
+    /// renderer in `env::run_check` depends on has to hold: the actor accepts
+    /// a `StartCheck`, results flow, and the channel closes after exactly one
+    /// terminal outcome. This workspace holds no `packages/`, `profiles/`, or
+    /// `stacks/` dirs, so there is nothing to check and the run completes
+    /// clean — the terminal update is the whole point here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_check_closes_with_exactly_one_terminal_outcome() {
+        use crate::session_sop::{CheckOpts, CheckOutcome, CheckUpdate};
+
+        let (_state, _cache, mngr) = manager().await;
+        let id = create_active_session(&mngr).await;
+        // `start_check` builds a fresh workspace-rooted context per call, so
+        // the workspace needs an mfile for it to resolve at all.
+        seed_workspace_mfile(&mngr, id, "").await;
+
+        let mut updates = session(&mngr, id)
+            .await
+            .start_check(CheckOpts {
+                packages: true,
+                profiles: true,
+                stacks: true,
+                fix: false,
+                filter_names: vec![],
+                skip_checkers: vec![],
+            })
+            .await
+            .expect("starting a check on an Active session should succeed");
+
+        let mut outcomes = Vec::new();
+        while let Some(update) = updates.recv().await {
+            match update {
+                CheckUpdate::Checked { object, .. } => {
+                    panic!("nothing to check in an empty workspace, got {object}")
+                }
+                CheckUpdate::Finished(o) => outcomes.push(o),
+            }
+        }
+
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [CheckOutcome::Completed { failed: false }]
+            ),
+            "expected exactly one clean terminal outcome, got {outcomes:?}",
+        );
+    }
 }
