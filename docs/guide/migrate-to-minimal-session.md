@@ -30,7 +30,7 @@ The harness section is renamed to `stack`. The functionalities of `stack` remain
 
 ### [defaults]
 
-The defaults section is unchanged.
+`profiles` that was formerly defined in the defaults section has been deprecated.
 
 ### [outputs]
 
@@ -60,3 +60,5 @@ To create and then enter the new session immediately
 ```shell
 min activate --attach
 ```
+## Profiles
+Profiles have been deprecated. `profile.env_vars` should be migrated to `session.vars`, and `profile.packages` should be migrated to `session.packages`. For how to define a session, please refer to [the session configuration in minimal.toml](../reference/minimal-dot-toml.md#session---what-every-contributors-session-gets-session). 
