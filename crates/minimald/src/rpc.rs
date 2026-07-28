@@ -614,58 +614,55 @@ async fn serve_get_mesh_status(
 // other RPC in this file.
 // ---------------------------------------------------------------------------
 
-async fn serve_github_begin_login(s: ServerStateHandle, c: RuChannel<Msg>) {
-    let res = GithubBeginLogin
+async fn serve_github_begin_login(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    GithubBeginLogin
         .handle_channel(c, async |req| {
             Ok(crate::github::rpcs::begin_login(s.github().await, req).await)
         })
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", GithubBeginLogin::NAME, e);
-    }
+        .await
 }
 
-async fn serve_github_poll_login(c: RuChannel<Msg>) {
-    let res = GithubPollLogin
+async fn serve_github_poll_login(c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    GithubPollLogin
         .handle_channel(
             c,
             async |req| Ok(crate::github::rpcs::poll_login(req).await),
         )
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", GithubPollLogin::NAME, e);
-    }
+        .await
 }
 
-async fn serve_github_status(s: ServerStateHandle, c: RuChannel<Msg>) {
-    let res = GithubStatus
+async fn serve_github_status(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    GithubStatus
         .handle_channel(c, async |req| crate::github::rpcs::status(s, req).await)
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", GithubStatus::NAME, e);
-    }
+        .await
 }
 
-async fn serve_github_list_auths(s: ServerStateHandle, c: RuChannel<Msg>) {
-    let res = GithubListAuths
+async fn serve_github_list_auths(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    GithubListAuths
         .handle_channel(c, async |req| {
             Ok(crate::github::rpcs::list_auths(s.github().await, req).await)
         })
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", GithubListAuths::NAME, e);
-    }
+        .await
 }
 
-async fn serve_github_logout(s: ServerStateHandle, c: RuChannel<Msg>) {
-    let res = GithubLogout
+async fn serve_github_logout(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    GithubLogout
         .handle_channel(c, async |req| {
             Ok(crate::github::rpcs::logout(s.github().await, req).await)
         })
-        .await;
-    if let Err(e) = res {
-        tracing::warn!("RPC handler for {} failed: {}", GithubLogout::NAME, e);
-    }
+        .await
 }
 
 pub(crate) const STREAM_WORKSPACE_FILES: &str =
