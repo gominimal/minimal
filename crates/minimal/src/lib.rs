@@ -654,7 +654,8 @@ async fn cmd_default(global: &GlobalArgs) -> Result<(), anyhow::Error> {
             // Drop the listing connection before shelling out; the ssh child
             // holds its own proxy connection to the daemon.
             drop(client);
-            attach_to_session(&sock, entry.id, None).await
+            let status = attach_to_session(&sock, entry.id, None).await?;
+            std::process::exit(attach_exit_code(status));
         }
         None => {
             // No sessions exist: activate a new one for the current directory
