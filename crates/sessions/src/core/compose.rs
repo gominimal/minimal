@@ -486,6 +486,32 @@ impl Contribution {
         Ok(())
     }
 
+    /// Drop the items a *package* supplied that we refuse to compose:
+    /// every patch tagged [`Source::Package`], and every
+    /// [`Source::Package`] var that carries user data (an env-inherited
+    /// value — [`ResolvedVar::carries_user_data`]).
+    ///
+    /// A package var with a static (non-user) value, a package's request
+    /// for a package (the `packages` list), and every item from a
+    /// non-package source are all left untouched. Because vars and
+    /// patches are never deduped across sources (each contributor keeps
+    /// its own entry — see [`Self::merge`]), dropping the package's own
+    /// entry here still leaves any project- or loadout-supplied entry for
+    /// the same var name / patch destination intact: an item requested by
+    /// a package *and* something else still composes in, via that other
+    /// source.
+    ///
+    /// [`Source::Package`]: crate::core::source::Source::Package
+    /// [`ResolvedVar::carries_user_data`]: crate::core::primitives::ResolvedVar::carries_user_data
+    pub(crate) fn drop_package_supplied_patches_and_user_data_vars(&mut self) {
+        use crate::core::source::{Provenanced, Source};
+        self.patches
+            .retain(|p| !matches!(p.source(), Source::Package { .. }));
+        self.vars.retain(|v| {
+            !(matches!(v.source(), Source::Package { .. }) && v.var().carries_user_data())
+        });
+    }
+
     /// True when no items have been contributed across any domain.
     /// Used by daemon-side composers to take the empty-contribution
     /// fast path (no pending items to ship back to the client).
@@ -3336,6 +3362,80 @@ mod tests {
                 contribution_with(vec![], vec![], vec![], vec![hook("echo hi", user_source())]);
             left.merge(right).unwrap();
             assert_eq!(left.lifecycle_hooks.len(), 2);
+        }
+
+        // ---------------- package-supplied fs / user-data filter ----------------
+
+        /// A package may not supply patches, nor vars that carry user
+        /// data (env-inherited values). Both are dropped; a package's
+        /// static var and every non-package item survive.
+        #[test]
+        fn package_supplied_patches_and_user_data_vars_are_dropped() {
+            let pkg_src = || Source::Package { name: "go".into() };
+            let mut c = Contribution::new();
+            // Patches: one from a package (dropped), one from the project (kept).
+            c.push_patch(pp("pkg/src", "etc/pkg.conf", pkg_src()));
+            c.push_patch(pp("proj/src", "etc/proj.conf", project_source()));
+            // Vars: package env-inherited (dropped), package static (kept),
+            // project env-inherited (kept).
+            c.push_var(ProvenancedVar::new(
+                ResolvedVar::from_env_value("SECRET".into(), "s".into()),
+                pkg_src(),
+            ));
+            c.push_var(ProvenancedVar::new(
+                ResolvedVar::from_literal("GOFLAGS".into(), "-mod=mod".into()),
+                pkg_src(),
+            ));
+            c.push_var(pv_value("EDITOR", "hx", project_source()));
+
+            c.drop_package_supplied_patches_and_user_data_vars();
+
+            // Only the project patch survives.
+            assert_eq!(c.patches().len(), 1);
+            assert!(matches!(c.patches()[0].source(), Source::Project { .. }));
+
+            // The package's env-inherited var is gone; its static var and
+            // the project var remain.
+            let names: Vec<&str> = c.vars().iter().map(|v| v.var().name()).collect();
+            assert_eq!(names.len(), 2);
+            assert!(
+                names.contains(&"GOFLAGS"),
+                "package static var kept: {names:?}"
+            );
+            assert!(names.contains(&"EDITOR"), "project var kept: {names:?}");
+            assert!(
+                !names.contains(&"SECRET"),
+                "package user-data var dropped: {names:?}"
+            );
+        }
+
+        /// An item requested by a package *and* another source still
+        /// composes in: dropping the package's own entry leaves the
+        /// project/loadout entry (same patch dest / var name) intact,
+        /// because vars and patches are never deduped across sources.
+        #[test]
+        fn item_from_package_and_another_source_survives_via_the_other_source() {
+            let pkg_src = || Source::Package { name: "go".into() };
+            let mut c = Contribution::new();
+            // Same patch destination from a package and the project.
+            c.push_patch(pp("pkg/src", "etc/shared.conf", pkg_src()));
+            c.push_patch(pp("proj/src", "etc/shared.conf", project_source()));
+            // Same env-inherited var name from a package and a loadout.
+            c.push_var(ProvenancedVar::new(
+                ResolvedVar::from_env_value("TOKEN".into(), "t".into()),
+                pkg_src(),
+            ));
+            c.push_var(pv_value("TOKEN", "t", user_source()));
+
+            c.drop_package_supplied_patches_and_user_data_vars();
+
+            // The shared patch destination still composes — via the project.
+            assert_eq!(c.patches().len(), 1);
+            assert!(matches!(c.patches()[0].source(), Source::Project { .. }));
+            // The shared var still composes — via the loadout.
+            assert_eq!(c.vars().len(), 1);
+            assert!(matches!(c.vars()[0].source(), Source::UserLoadout { .. }));
+            assert_eq!(c.vars()[0].var().name(), "TOKEN");
         }
 
         // ---------------- pure aggregation (no conflict check) ----------------
