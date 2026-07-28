@@ -4,6 +4,7 @@ use minimald_rpc::{
     AbortSession, AbortSessionResponse, CreateSession, DestroySession, DestroySessionResponse,
     Errorable, GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
     GetSessionRecordRequest, GetSessionRecordResponse, GetVersion, GetVersionResponse,
+    GithubBeginLogin, GithubListAuths, GithubLogout, GithubPollLogin, GithubStatus,
     IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse,
     OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool,
     Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
@@ -502,6 +503,70 @@ async fn serve_get_mesh_status(s: ServerStateHandle, c: RuChannel<Msg>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GitHub (spec 10): a contiguous block for every `github`-prefixed RPC.
+// Later tasks (prime/push/PR/facade) append sibling `serve_github_*`
+// wrappers + allowlist/dispatch arms here rather than scattering them
+// through the file. The decision logic for each handler lives in
+// `crate::github::rpcs` (see that module's docs); these wrappers only own
+// the SSH-channel framing (`ServeOneshot::handle_channel`), matching every
+// other RPC in this file.
+// ---------------------------------------------------------------------------
+
+async fn serve_github_begin_login(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = GithubBeginLogin
+        .handle_channel(c, async |req| {
+            Ok(crate::github::rpcs::begin_login(s.github().await, req).await)
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", GithubBeginLogin::NAME, e);
+    }
+}
+
+async fn serve_github_poll_login(c: RuChannel<Msg>) {
+    let res = GithubPollLogin
+        .handle_channel(
+            c,
+            async |req| Ok(crate::github::rpcs::poll_login(req).await),
+        )
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", GithubPollLogin::NAME, e);
+    }
+}
+
+async fn serve_github_status(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = GithubStatus
+        .handle_channel(c, async |req| crate::github::rpcs::status(s, req).await)
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", GithubStatus::NAME, e);
+    }
+}
+
+async fn serve_github_list_auths(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = GithubListAuths
+        .handle_channel(c, async |req| {
+            Ok(crate::github::rpcs::list_auths(s.github().await, req).await)
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", GithubListAuths::NAME, e);
+    }
+}
+
+async fn serve_github_logout(s: ServerStateHandle, c: RuChannel<Msg>) {
+    let res = GithubLogout
+        .handle_channel(c, async |req| {
+            Ok(crate::github::rpcs::logout(s.github().await, req).await)
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::warn!("RPC handler for {} failed: {}", GithubLogout::NAME, e);
+    }
+}
+
 pub(crate) const STREAM_WORKSPACE_FILES: &str =
     constcat::concat!(RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
 
@@ -589,7 +654,12 @@ pub async fn handle_ssh_rpc(
         | GetSessionPolicy::NAME
         | GetMeshStatus::NAME
         | STREAM_WORKSPACE_FILES
-        | IssueClientCert::NAME => {
+        | IssueClientCert::NAME
+        | GithubBeginLogin::NAME
+        | GithubPollLogin::NAME
+        | GithubStatus::NAME
+        | GithubListAuths::NAME
+        | GithubLogout::NAME => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
                 None => {
@@ -628,6 +698,11 @@ pub async fn handle_ssh_rpc(
         GetSessionPolicy::NAME => drop(spawn(serve_get_session_policy(s, channel))),
         GetMeshStatus::NAME => drop(spawn(serve_get_mesh_status(s, channel))),
         STREAM_WORKSPACE_FILES => drop(spawn(serve_stream_workspace_files(s, config, channel))),
+        GithubBeginLogin::NAME => drop(spawn(serve_github_begin_login(s, channel))),
+        GithubPollLogin::NAME => drop(spawn(serve_github_poll_login(channel))),
+        GithubStatus::NAME => drop(spawn(serve_github_status(s, channel))),
+        GithubListAuths::NAME => drop(spawn(serve_github_list_auths(s, channel))),
+        GithubLogout::NAME => drop(spawn(serve_github_logout(s, channel))),
         IssueClientCert::NAME => {
             #[cfg(feature = "networking-proxy")]
             drop(spawn(serve_issue_client_cert(s, channel)));
