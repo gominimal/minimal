@@ -13,6 +13,9 @@ WARNING: `tasks` are not supported by v0.5.0. If you rely on `tasks` for non-int
 Going forward, the Minimal command will become `min`, and will not conflict with the existing `minimal` command. 
 
 If you no longer need the legacy `minimal` command, you can uninstall it with:
+```shell
+./.minimal/shim/uninstall.sh
+```
 
 To install `min`, see [install](./install.md).
 
