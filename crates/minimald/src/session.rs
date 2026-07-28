@@ -108,6 +108,21 @@ pub(crate) fn registry_name(record: &Record) -> String {
     }
 }
 
+/// The server-side `AcceptEnv` allowlist: locale and timezone vars a client is
+/// permitted to forward from its shell into the session (OpenSSH's default
+/// `AcceptEnv LANG LC_*`, plus `TZ`). Everything else the client set on the
+/// channel — e.g. `MINIMAL_SESSION_ID`, `TRACEPARENT` — is control plumbing and
+/// must not leak into the shell environment, so it is filtered out here.
+fn inherited_session_env(
+    channel_env: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    channel_env
+        .iter()
+        .filter(|(k, _)| k.as_str() == "LANG" || k.as_str() == "TZ" || k.starts_with("LC_"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// An error that occurred when attaching to a running session/its-shell.
 #[derive(Debug)]
 pub enum AttachError {
@@ -1093,6 +1108,31 @@ impl Session {
             None => return Err(AttachError::NoPty),
         });
 
+        // Capture the environment this attach contributes to the shell it may
+        // mint: the locale/timezone vars the client forwarded (folded as
+        // defaults below the composition) and the per-connection facts folded
+        // above it. Currently the only connection fact is `TERM`, from the
+        // client's PTY request.
+        //
+        // `SSH_TTY` and `SSH_CONNECTION`/`SSH_CLIENT` are intentionally omitted:
+        // the session sandbox has no host `/dev/pts` and the transport is a
+        // local Unix socket (no peer IP/port), so any value would name something
+        // that doesn't exist in-session and would only mislead audit logs,
+        // source-IP checks, or `$SSH_TTY` consumers.
+        let attach_env = {
+            let inherited = inherited_session_env(&config.env_vars);
+            let mut connection = Vec::new();
+            if let Some(pty) = config.pty.as_ref()
+                && !pty.term.is_empty()
+            {
+                connection.push(("TERM".to_string(), pty.term.clone()));
+            }
+            session_host::AttachEnv {
+                inherited,
+                connection,
+            }
+        };
+
         // A session that was created but never had its loadout configured has
         // nothing in flight, so attaching to it shouldn't be an error: set it
         // up now, with an empty contribution, and carry on into the attach.
@@ -1175,7 +1215,7 @@ impl Session {
         };
         match host {
             None => {
-                self.mint_session_host(session_hnd, conn_username, channel, sz)
+                self.mint_session_host(session_hnd, conn_username, channel, sz, attach_env)
                     .await
             }
             Some((h, _)) => {
@@ -1183,7 +1223,7 @@ impl Session {
                     Ok(()) => Ok(()),
                     Err((channel, sz)) => {
                         // session host is dead
-                        self.mint_session_host(session_hnd, conn_username, channel, sz)
+                        self.mint_session_host(session_hnd, conn_username, channel, sz, attach_env)
                             .await
                     }
                 }
@@ -1197,6 +1237,7 @@ impl Session {
         conn_username: String,
         channel: Channel<Msg>,
         sz: WinSize,
+        attach_env: session_host::AttachEnv,
     ) -> Result<(), AttachError> {
         let record = self.record.record().await.unwrap();
         let paths = self.paths().await;
@@ -1206,7 +1247,9 @@ impl Session {
         let control = SessionControl::new(self.manager.clone(), record.id);
 
         // Spawn/setup the session in a closure that reports progress down the terminal.
-        let launcher = self.session_launcher(session_hnd, &record).await?;
+        let launcher = self
+            .session_launcher(session_hnd, &record, attach_env)
+            .await?;
         let progress = ChannelProgress::new(channel, self.tracker.clone(), (sz.cols, sz.rows));
         let (channel, spawned) = progress
             .run(Box::pin(session_host::Host::spawn(
@@ -1253,6 +1296,7 @@ impl Session {
         &mut self,
         session: SessionHandle,
         record: &Record,
+        attach_env: session_host::AttachEnv,
     ) -> Result<session_host::SandboxLauncher, AttachError> {
         // R2.1: reject a policy that is incompatible with the network mode
         // (e.g. egress on a non-`OwnIp` PTask) before launching the host.
@@ -1269,6 +1313,7 @@ impl Session {
                 .context(true)
                 .await
                 .map_err(AttachError::ContextCreationFailed)?,
+            attach_env,
             network_mode,
             net_switch: Arc::clone(&self.net_switch),
             ingress,
@@ -1287,6 +1332,7 @@ impl Session {
         &mut self,
         _session: SessionHandle,
         record: &Record,
+        _attach_env: session_host::AttachEnv,
     ) -> Result<session_host::MockLauncher, AttachError> {
         // Mirror the production R2.1 gate so test launches reject a
         // policy/network-mode mismatch the same way production does.
@@ -1721,6 +1767,66 @@ mod tests {
     use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
 
     use crate::test_harness::{TestClient, TestServer, create_configured_session};
+
+    /// The `AcceptEnv` allowlist keeps locale + timezone vars and drops
+    /// everything else — critically the control-plane vars, which must never
+    /// reach the shell environment.
+    #[test]
+    fn inherited_session_env_keeps_only_locale_and_tz() {
+        let env: std::collections::BTreeMap<String, String> = [
+            ("LANG", "en_US.UTF-8"),
+            ("LC_CTYPE", "en_US.UTF-8"),
+            ("LC_ALL", "C"),
+            ("TZ", "America/New_York"),
+            ("MINIMAL_SESSION_ID", "00000000-0000-0000-0000-000000000000"),
+            ("TRACEPARENT", "00-abc-def-01"),
+            ("PATH", "/evil/bin"),
+            ("PS1", "# "),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let kept: std::collections::BTreeMap<String, String> =
+            super::inherited_session_env(&env).into_iter().collect();
+
+        assert_eq!(kept.get("LANG").map(String::as_str), Some("en_US.UTF-8"));
+        assert_eq!(
+            kept.get("LC_CTYPE").map(String::as_str),
+            Some("en_US.UTF-8")
+        );
+        assert_eq!(kept.get("LC_ALL").map(String::as_str), Some("C"));
+        assert_eq!(kept.get("TZ").map(String::as_str), Some("America/New_York"));
+        // Control-plane routing/tracing vars and everything else must be dropped.
+        assert!(!kept.contains_key("MINIMAL_SESSION_ID"));
+        assert!(!kept.contains_key("TRACEPARENT"));
+        assert!(!kept.contains_key("PATH"));
+        assert!(!kept.contains_key("PS1"));
+        assert_eq!(kept.len(), 4, "only LANG, LC_*, and TZ should survive");
+    }
+
+    /// A `LC_`-*prefixed* var is accepted, but a bare `LC` (or one that merely
+    /// contains `LC_`) is not — the filter is a prefix match, not a substring.
+    #[test]
+    fn inherited_session_env_prefix_not_substring() {
+        let env: std::collections::BTreeMap<String, String> = [
+            ("LC_MESSAGES", "C"),
+            ("LC", "nope"),
+            ("MYLC_VAR", "nope"),
+            ("XLANG", "nope"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let kept: std::collections::BTreeMap<String, String> =
+            super::inherited_session_env(&env).into_iter().collect();
+
+        assert_eq!(
+            kept.keys().cloned().collect::<Vec<_>>(),
+            vec!["LC_MESSAGES"]
+        );
+    }
 
     /// Reads the session record for `id`, or `None` once it has been deleted.
     async fn record_exists(client: &mut TestClient, id: SessionId) -> bool {

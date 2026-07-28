@@ -208,18 +208,40 @@ pub fn hardlink_dir_contents(src: &Path, dst: &Path) -> Result<(), HardlinkError
         } else if metadata.is_file() {
             match fs::hard_link(&path, &dst_path) {
                 Ok(()) => Ok(()),
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    warn!(
+                        "Not linking {} => {}, already exists",
+                        path.display(),
+                        dst_path.display()
+                    );
+                    Ok(())
+                }
+                // The cache and destination can live on different filesystems
+                // (e.g. a per-VM `/state` volume vs. the rootfs holding
+                // `/home`), where hardlinks are impossible (`EXDEV`). Fall back
+                // to a copy so materialization still succeeds — slower and no
+                // longer deduplicated, but correct.
+                Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+                    // Every file in a cross-device tree hits EXDEV, so warn only
+                    // on the first — a per-file log would flood with thousands
+                    // of identical lines. Once-per-process is enough: the cause
+                    // is a fixed filesystem-layout fact, not a per-file
+                    // condition.
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static WARNED: AtomicBool = AtomicBool::new(false);
+                    if !WARNED.swap(true, Ordering::Relaxed) {
                         warn!(
-                            "Not linking {} => {}, already exists",
+                            "Copying instead of hardlinking: cache and \
+                             destination are on different filesystems; further \
+                             cross-device copies this run are silent (first: {} \
+                             => {})",
                             path.display(),
                             dst_path.display()
                         );
-                        Ok(())
-                    } else {
-                        Err(e)
                     }
+                    fs::copy(&path, &dst_path).map(|_| ())
                 }
+                Err(e) => Err(e),
             }
             .map_err(|e| HardlinkError::HardlinkFailed(path.to_path_buf(), dst_path, e))?;
         } else if metadata.is_symlink() {

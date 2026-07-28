@@ -24,7 +24,7 @@ use crate::core::source::{
 use crate::wire::policy::{WirePatchVerdict, WireVarVerdict};
 use crate::wire::primitives::{
     PendingId, WirePendingPatch, WirePendingVar, WireProvenancedHook, WireSessionPatch,
-    WireSessionVar, WireVarSpec,
+    WireSessionVar,
 };
 
 /// Errors produced while a [`Composable`] materializes its
@@ -562,6 +562,19 @@ pub fn default_env() -> StoredEnv {
     Box::new(|name| std::env::var(name))
 }
 
+/// Env lookup for the *daemon-side* composer, which must never resolve
+/// an inherited var against the daemon's own process environment — the
+/// daemon's launch shell is not the user's shell. Every lookup reports
+/// the name as present-but-empty: an `Inherit` var resolves without
+/// erroring, its placeholder value is discarded, and
+/// [`contribution_to_pending`] ships the preserved spec so the client
+/// re-resolves against the *user's* env. (`Specified` vars never call
+/// the lookup, so their literals are untouched.)
+#[must_use]
+pub fn deferring_env() -> StoredEnv {
+    Box::new(|_name| Ok(String::new()))
+}
+
 /// Anything that can contribute primitives (vars, patches, packages,
 /// lifecycle hooks) to a composer during session construction.
 ///
@@ -933,15 +946,14 @@ impl PendingVar {
         wire: WirePendingVar,
         env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
     ) -> Result<Self, ComposeError> {
-        // Preserve the `carries_user_data` bit the daemon computed.
-        // The daemon always ships pending vars as `Specified` (with
-        // the already-resolved value), so `ResolvedVar::resolve_with`
-        // alone would always return `carries_user_data = false` and
-        // the policy gate would silently skip every daemon-derived
-        // var. We OR the daemon's bit on top: if the daemon resolved
-        // an Inherit against its own env, that value crossed a trust
-        // boundary and the client should still gate it.
-        let daemon_says_carries_user_data = wire.carries_user_data;
+        // Resolve the daemon-shipped spec against the *user's* env
+        // (`env` is the client's `std::env::var`). For an inherited
+        // var the daemon shipped `Inherit`/`InheritWithDefault` — never
+        // its own value — so this is the single, authoritative
+        // resolution, and `resolved.carries_user_data()` correctly
+        // reflects whether the value came from the user's environment.
+        // `Specified` specs (hardcoded project literals) resolve
+        // verbatim with `carries_user_data = false`, as before.
         let resolved = ResolvedVar::resolve_with(wire.name, wire.spec.into(), env).map_err(
             |err| match err {
                 VarError::ResolutionFailure { name, source } => {
@@ -957,16 +969,6 @@ impl PendingVar {
                 },
             },
         )?;
-        // OR the two bits: user data flowed in if EITHER the daemon
-        // pulled from its env or the client's own `resolve_with`
-        // pulled from the client env. In the production path today
-        // the daemon always ships `Specified`, so the client's bit is
-        // always false and the daemon's is authoritative; the OR
-        // keeps `WirePendingVar` correct for direct-construction
-        // tests too.
-        let carries_user_data = daemon_says_carries_user_data || resolved.carries_user_data();
-        let (name, value) = resolved.into_parts();
-        let resolved = ResolvedVar::from_env_value_or_literal(name, value, carries_user_data);
         Ok(Self {
             id: wire.id,
             var: ProvenancedVar::new(resolved, wire.source.into()),
@@ -1758,22 +1760,20 @@ pub(crate) fn contribution_to_pending(
     let mut wire_vars: Vec<WirePendingVar> = Vec::with_capacity(vars.len());
     for (i, pv) in vars.into_iter().enumerate() {
         let id = PendingId::new(u32::try_from(i).expect("pending var index fits in u32"));
-        // Items reach this transform already resolved (the composer's
-        // input is `ResolvedVar`); ship as a `Specified` spec so the
-        // client treats the value verbatim instead of re-resolving
-        // against its env. Carry the `carries_user_data` bit
-        // separately so the client's policy gate knows whether the
-        // resolved value pulled from an environment (daemon-side
-        // env, but still a host env — the client policy applies
-        // uniformly to any env-derived value) or was a hardcoded
-        // literal / fallback default.
+        // Ship the var's *original* spec, not the composer's resolved
+        // value: an inherited var (`Inherit`/`InheritWithDefault`) must
+        // be resolved by the client against the *user's* env, never the
+        // daemon's. Only `Specified` (a hardcoded literal) carries a
+        // real value here; the daemon composer resolves inherited vars
+        // against a deferring env (no host lookup), so its `value` for
+        // them is a discardable placeholder. `carries_user_data` is
+        // recomputed by the client after it resolves, so the bit shipped
+        // here is advisory only.
         let carries_user_data = pv.var().carries_user_data();
         wire_vars.push(WirePendingVar {
             id,
             name: pv.var().name().to_string(),
-            spec: WireVarSpec::Specified {
-                value: pv.var().value().to_string(),
-            },
+            spec: pv.var().spec().clone().into(),
             source: pv.source().clone().into(),
             carries_user_data,
         });
@@ -1862,6 +1862,80 @@ mod tests {
             Patch::new(source_pattern, PatchDest::try_new(dest).unwrap()),
             prov,
         )
+    }
+
+    /// The core of the daemon-resolves-inherited-vars fix: a project
+    /// `Inherit` var composed daemon-side must be shipped to the client
+    /// as an `Inherit` *spec*, never as a `Specified` carrying whatever
+    /// value the daemon's own environment held — and the client then
+    /// resolves it against the *user's* env.
+    #[test]
+    fn daemon_ships_inherit_spec_and_client_resolves_from_user_env() {
+        // Daemon-side resolution uses `deferring_env`, so no host lookup
+        // happens and the placeholder value is a discardable "".
+        let env = deferring_env();
+        let daemon = ResolvedVar::resolve_with("LANG".into(), VarValue::Inherit, &env).unwrap();
+        let transform = contribution_to_pending(
+            vec![ProvenancedVar::new(daemon, project_source())],
+            vec![],
+            vec![],
+        );
+        let wire = &transform.wire.vars[0];
+        // Shipped as the spec, not the daemon's baked-in value.
+        assert_eq!(wire.spec, crate::wire::primitives::WireVarSpec::Inherit);
+
+        // The client resolves against the USER's env — not the daemon's.
+        let user_env = |name: &str| {
+            if name == "LANG" {
+                Ok("en_US.UTF-8".to_string())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        };
+        let pending = PendingVar::from_wire(wire.clone(), &user_env).unwrap();
+        assert_eq!(pending.provenanced().var().value(), "en_US.UTF-8");
+        assert!(pending.provenanced().var().carries_user_data());
+    }
+
+    /// `InheritWithDefault` ships its default in the spec so the client
+    /// falls back correctly when the user's env is unset (and marks it
+    /// not-user-data), yet uses the user's value when present.
+    #[test]
+    fn daemon_ships_inherit_with_default_and_client_resolves_both_ways() {
+        let env = deferring_env();
+        let daemon =
+            ResolvedVar::resolve_with("TZ".into(), VarValue::inherit_with_default("UTC"), &env)
+                .unwrap();
+        let transform = contribution_to_pending(
+            vec![ProvenancedVar::new(daemon, project_source())],
+            vec![],
+            vec![],
+        );
+        let wire = &transform.wire.vars[0];
+        assert_eq!(
+            wire.spec,
+            crate::wire::primitives::WireVarSpec::InheritWithDefault {
+                default: "UTC".into()
+            }
+        );
+
+        // User env unset → default, not user data.
+        let miss = |_: &str| Err(std::env::VarError::NotPresent);
+        let pending = PendingVar::from_wire(wire.clone(), &miss).unwrap();
+        assert_eq!(pending.provenanced().var().value(), "UTC");
+        assert!(!pending.provenanced().var().carries_user_data());
+
+        // User env set → the user's value, marked as user data.
+        let hit = |name: &str| {
+            if name == "TZ" {
+                Ok("America/New_York".to_string())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        };
+        let pending = PendingVar::from_wire(wire.clone(), &hit).unwrap();
+        assert_eq!(pending.provenanced().var().value(), "America/New_York");
+        assert!(pending.provenanced().var().carries_user_data());
     }
 
     type VarsPolicyMutator = Box<dyn Fn(&mut VarsPolicy)>;

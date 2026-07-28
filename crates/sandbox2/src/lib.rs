@@ -379,6 +379,23 @@ impl Container {
             command.env("XDG_CONFIG_HOME", "/home/.config");
             command.env("XDG_DATA_HOME", "/home/.local/share");
             command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin"); // adds /home/.local/bin
+            // A styled default shell prompt for interactive sessions. Set as a
+            // plain default here (not forced) so a user's composition var can
+            // override it: the composed `env_vars` are applied further down and
+            // win on key collision.
+            command.env(
+                "PS1",
+                r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ ",
+            );
+            // Login-shell identity, mirroring what sshd/pam would set from
+            // `/etc/passwd`. `USER`/`LOGNAME` track the configured username;
+            // `SHELL` points at the session shell (the `bash` package installs
+            // to `/usr/bin/bash`). All plain defaults, so composition vars win.
+            if let Some(user) = &sandbox.config.username {
+                command.env("USER", user);
+                command.env("LOGNAME", user);
+            }
+            command.env("SHELL", "/usr/bin/bash");
         } else {
             // Both build and BoundWd layouts
             command.env("XDG_STATE_HOME", "/state/state");
@@ -413,8 +430,19 @@ impl Container {
             command.env("PYTHONHASHSEED", "0");
         }
 
-        command.env("LANG", "en_US.utf8");
-        command.env("LC_ALL", "en_US.utf8");
+        // Locale. Sessions get a safe, always-present `C.UTF-8` floor: it's
+        // built into glibc so it never triggers "cannot set locale" warnings
+        // the way `en_US.utf8` does when that locale isn't generated in the
+        // rootfs, and setting only `LANG` (the lowest-precedence locale knob,
+        // no `LC_ALL`) lets a session's composed `env_vars` or a client's
+        // forwarded `LANG`/`LC_*` override it. Build/task sandboxes keep the
+        // fixed `en_US.utf8` + `LC_ALL` they always had, for output stability.
+        if let WdSetup::Session { .. } = &sandbox.config.wd {
+            command.env("LANG", "C.UTF-8");
+        } else {
+            command.env("LANG", "en_US.utf8");
+            command.env("LC_ALL", "en_US.utf8");
+        }
         command.env("IS_SANDBOX", "1");
         if let WdSetup::BoundDir { .. } = sandbox.config.wd {
             //  Quality-of-life wiring for task sandboxes
@@ -1313,9 +1341,9 @@ fn userns_restriction_from(
     euid_is_root: bool,
     apparmor_label: Option<&str>,
 ) -> Option<UsernsRestriction> {
-    if !max_user_namespaces
+    if max_user_namespaces
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .is_some_and(|n| n > 0)
+        .is_none_or(|n| n == 0)
     {
         return Some(UsernsRestriction::Disabled);
     }
