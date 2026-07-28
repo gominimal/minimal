@@ -19,28 +19,9 @@ You can use the following to uninstall `minimal`.
 
 To install `min`, see [install](./install.md).
 
-
 ## minimal.toml
 
-Prior to v0.5.0, `minimal.toml` had the following sections: upstream, harness, defaults, and tasks. 
-
-```toml
-[upstream]
-repo = "https://github.com/gominimal/pkgs"
-branch = "main"
-locked_commit = "11a8cf050340e3946171476b22ff4b3a8e08e66b"
-
-[harness]
-use = "shell"
-
-[defaults]
-state_key = "dev"
-
-[tasks.shell]
-interactive = true
-packages = ["base"]
-exec = "bash --noprofile -l"
-```
+Prior to v0.5.0, `minimal.toml` had the following sections: upstream, harness, defaults, outputs, and tasks. 
 
 ### [upstream]
 
