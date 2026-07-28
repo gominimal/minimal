@@ -944,6 +944,75 @@ check 0 "$rc" "data-only uninstall exits 0"
 want_ok "dump kept when no zsh completions were installed (R9.4)" \
     grep -q '# untouched user cache' "$H5/.zcompdump"
 
+# --- gvproxy -> gvproxy-min rename migration --------------------------------
+
+# The switch binary moved from bin/gvproxy to bin/gvproxy-min (the bin prefix is
+# on PATH and podman/crc ship their own gvproxy). The old dest is in no
+# manifest any more, so nothing would ever revisit it — the install has to undo
+# it explicitly, on the same bytes-still-ours terms as uninstall.
+H15="$root/h15"; mkdir -p "$H15"
+run gvren_seed "$H15"
+check 0 "$rc" "rename-migration seed install exits 0"
+
+# Seed what a pre-rename install left behind: the binary plus its record row.
+gvren_rec="$H15/xdg-state/minimal/installed"
+printf 'old-gvproxy-body\n' >"$H15/bin/gvproxy"
+gvren_h="$(hash_file "$H15/bin/gvproxy")"
+printf 'gvproxy\t%s\t%s\t%s\n' "$H15/bin/gvproxy" "$gvren_h" "$gvren_h" >>"$gvren_rec"
+
+run gvren "$H15"
+check 0 "$rc" "rename-migration install exits 0"
+want_err "stale bin/gvproxy removed on upgrade" test -e "$H15/bin/gvproxy"
+want_ok "removal announced" grep -q "renamed to gvproxy-min" "$OUT"
+
+run gvren_rerun "$H15"
+check 0 "$rc" "rerun after migration exits 0"
+want_err "rerun says nothing about gvproxy" grep -q "renamed to gvproxy-min" "$OUT"
+
+# A manifest that STILL ships a `gvproxy` component is not a rename: the file
+# on disk is the one this very run installed, so the migration must not touch
+# it. Channels advance independently, so a post-rename installer WILL be
+# pointed at a pre-rename manifest — deleting there would leave the host with
+# no switch binary at all, on every single run.
+H17="$root/h17"; mkdir -p "$H17"
+run gvship_seed "$H17"
+check 0 "$rc" "still-ships-gvproxy seed install exits 0"
+gvship_rec="$H17/xdg-state/minimal/installed"
+printf 'shipped-gvproxy-body\n' >"$H17/bin/gvproxy"
+gvship_h="$(hash_file "$H17/bin/gvproxy")"
+printf 'gvproxy\t%s\t%s\t%s\n' "$H17/bin/gvproxy" "$gvship_h" "$gvship_h" >>"$gvship_rec"
+# Make THIS run install a gvproxy component too, as a pre-rename manifest does.
+printf 'shipped-gvproxy-body\n' >"$mock/versions/v1/gvproxy-linux-amd64"
+h_gv="$(hash_file "$mock/versions/v1/gvproxy-linux-amd64")"
+{
+    cat "$mock/versions/v1/components"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+        gvproxy linux amd64 v1 "$h_gv" file bin/gvproxy versions/v1/gvproxy-linux-amd64
+} >"$mock/versions/v1/components.new"
+mv "$mock/versions/v1/components.new" "$mock/versions/v1/components"
+run gvship "$H17"
+check 0 "$rc" "install against a manifest that still ships gvproxy exits 0"
+want_ok "the just-installed bin/gvproxy survives" test -f "$H17/bin/gvproxy"
+want_err "no removal is announced" grep -q "renamed to gvproxy-min" "$OUT"
+write_manifest 1
+
+# A gvproxy the user replaced (podman's, say) is NOT ours to delete: the hash
+# no longer matches what we recorded writing, so it is kept and reported.
+H16="$root/h16"; mkdir -p "$H16"
+run gvkeep_seed "$H16"
+check 0 "$rc" "rename-keep seed install exits 0"
+gvkeep_rec="$H16/xdg-state/minimal/installed"
+printf 'ours-when-installed\n' >"$H16/bin/gvproxy"
+gvkeep_h="$(hash_file "$H16/bin/gvproxy")"
+printf 'gvproxy\t%s\t%s\t%s\n' "$H16/bin/gvproxy" "$gvkeep_h" "$gvkeep_h" >>"$gvkeep_rec"
+printf 'the-users-own-gvproxy\n' >"$H16/bin/gvproxy"
+
+run gvkeep "$H16"
+check 0 "$rc" "rename-keep install exits 0"
+want_ok "a user-replaced gvproxy is kept" test -f "$H16/bin/gvproxy"
+want_ok "kept content is untouched" grep -q 'the-users-own-gvproxy' "$H16/bin/gvproxy"
+want_ok "keeping it is announced" grep -q "modified since install" "$OUT"
+
 # ===========================================================================
 echo "# ---"
 printf '# %d passed, %d failed\n' "$pass" "$fail"
