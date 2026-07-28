@@ -1859,6 +1859,154 @@ mod tests {
             );
         }
 
+        /// Writes an executable sink script at `path` that touches `sink` when
+        /// run, so a test can detect whether any daemon git executed a hostile
+        /// worktree config directive (the daemon-RCE the rework closes).
+        fn write_sink_script(path: &Path, sink: &Path) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(
+                path,
+                format!("#!/bin/sh\necho fired > {}\n", sink.display()),
+            )
+            .expect("write sink script");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod sink script");
+        }
+
+        /// Drives an authorized `git%push` with a hostile directive planted in
+        /// the worktree config by `plant`, and asserts the facade neither
+        /// executed the directive (the sink never appears) nor leaked the
+        /// token: the push still reaches only the canonical remote and no token
+        /// bytes touch the sandbox or disk. This is the daemon-RCE / token-exfil
+        /// regression — the fixed facade never lets a daemon git read the
+        /// sandbox-writable worktree config, where `core.fsmonitor`,
+        /// `core.sshCommand`, `filter.*.process`, hooks, and `[include]`d files
+        /// would otherwise run arbitrary code as the daemon.
+        async fn assert_hostile_worktree_config_is_inert(plant: impl FnOnce(&Path, &Path)) {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            let work = worktree_dir(fixtures.path());
+            let sink = fixtures.path().join("daemon-rce-fired");
+            plant(&work, &sink);
+
+            let lines = drive(&mut chan, "git%push").await;
+
+            assert_no_error(&lines);
+            assert_no_token(&lines);
+            assert!(
+                remote_has_branch(fixtures.path(), "feat/x"),
+                "the push must still reach the canonical remote: {lines:?}"
+            );
+            assert!(
+                !sink.exists(),
+                "a daemon git executed sandbox-writable worktree config (RCE): {lines:?}"
+            );
+            assert_no_token_on_disk(fixtures.path());
+        }
+
+        /// A `core.fsmonitor` hook (which git runs to service any index refresh)
+        /// planted in the worktree config is never executed by the daemon: no
+        /// daemon git reads the worktree config or touches its index.
+        #[tokio::test]
+        async fn worktree_core_fsmonitor_never_runs_as_the_daemon() {
+            assert_hostile_worktree_config_is_inert(|work, sink| {
+                let script = work.parent().unwrap().join("fsmon.sh");
+                write_sink_script(&script, sink);
+                git_run(
+                    &["config", "core.fsmonitor", script.to_str().unwrap()],
+                    work,
+                );
+            })
+            .await;
+        }
+
+        /// A `core.sshCommand` planted in the worktree config (git would run it
+        /// as the ssh transport) never fires: the credentialed leg runs only in
+        /// the daemon-authored mirror and never reads the worktree config.
+        #[tokio::test]
+        async fn worktree_core_sshcommand_never_runs_as_the_daemon() {
+            assert_hostile_worktree_config_is_inert(|work, sink| {
+                let script = work.parent().unwrap().join("ssh.sh");
+                write_sink_script(&script, sink);
+                git_run(
+                    &["config", "core.sshCommand", script.to_str().unwrap()],
+                    work,
+                );
+            })
+            .await;
+        }
+
+        /// A `filter.<n>.process`/`smudge` driver assigned via `.gitattributes`
+        /// (git runs it on checkout) planted in the worktree config never fires:
+        /// the daemon never checks out in the sandbox-writable tree.
+        #[tokio::test]
+        async fn worktree_filter_process_never_runs_as_the_daemon() {
+            assert_hostile_worktree_config_is_inert(|work, sink| {
+                let script = work.parent().unwrap().join("filter.sh");
+                write_sink_script(&script, sink);
+                git_run(
+                    &["config", "filter.evil.process", script.to_str().unwrap()],
+                    work,
+                );
+                git_run(
+                    &["config", "filter.evil.smudge", script.to_str().unwrap()],
+                    work,
+                );
+                std::fs::write(work.join(".gitattributes"), "* filter=evil\n").unwrap();
+            })
+            .await;
+        }
+
+        /// An `[include]` directive that pulls in an attacker-authored file
+        /// setting `core.fsmonitor` — the include is resolved only at git
+        /// runtime, defeating any config-text scanner — is equally powerless:
+        /// no daemon git reads the worktree config at all, so the include is
+        /// never followed and the hook never runs.
+        #[tokio::test]
+        async fn worktree_include_setting_fsmonitor_never_runs_as_the_daemon() {
+            assert_hostile_worktree_config_is_inert(|work, sink| {
+                let script = work.parent().unwrap().join("inc-fsmon.sh");
+                write_sink_script(&script, sink);
+                let evil_cfg = work.parent().unwrap().join("evil-exec.gitconfig");
+                std::fs::write(
+                    &evil_cfg,
+                    format!("[core]\n\tfsmonitor = {}\n", script.display()),
+                )
+                .unwrap();
+                git_run(
+                    &["config", "include.path", evil_cfg.to_str().unwrap()],
+                    work,
+                );
+            })
+            .await;
+        }
+
+        /// No verb — push, fetch, or status — lets a planted `core.fsmonitor`
+        /// run as the daemon, because the daemon runs git only in the mirror and
+        /// moves objects/refs by alternate + plain files.
+        #[tokio::test]
+        async fn no_verb_lets_worktree_fsmonitor_run_as_the_daemon() {
+            let attrs = bound_attrs(&["octo/hello@feat/x:main"]);
+            let (_state, _rootfs, _cwd, fixtures, mut chan) = github_channel(Some(&attrs)).await;
+            let work = worktree_dir(fixtures.path());
+            let sink = fixtures.path().join("fsmon-any-verb-fired");
+            let script = fixtures.path().join("fsmon-any.sh");
+            write_sink_script(&script, &sink);
+            git_run(
+                &["config", "core.fsmonitor", script.to_str().unwrap()],
+                &work,
+            );
+
+            for verb in ["git%push", "git%fetch", "git%status"] {
+                let lines = drive(&mut chan, verb).await;
+                assert_no_token(&lines);
+                assert!(
+                    !sink.exists(),
+                    "{verb} executed the worktree fsmonitor as the daemon (RCE): {lines:?}"
+                );
+            }
+        }
+
         /// A dash-leading current branch (planted via low-level ref surgery,
         /// which git's porcelain resists) is refused before `git push` could
         /// parse it as an option — the argv-injection hardening.

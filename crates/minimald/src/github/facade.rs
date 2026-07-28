@@ -49,58 +49,86 @@
 //! `github::gitops`, which injects it env-only and scrubs it from all output;
 //! it never appears in this module's errors, spans, or `msg:` lines.
 //!
-//! # Isolating the credentialed leg (the security core)
+//! # The isolation invariant (the security core)
 //!
-//! The session workspace is sandbox-visible: in-sandbox code can rewrite a
-//! primed repo's `.git/config` at will, and `git` honours a large, open-ended
-//! set of config directives that redirect where a connection goes or splice
-//! material into it — `[include]`/`[includeIf]` (which pull in arbitrary
-//! attacker-authored config from any path), `credential.helper`,
-//! `http.<url>.extraHeader`, `url.<base>.insteadOf`/`pushInsteadOf`, and
-//! `remote.origin.url`/`pushurl`. Any one of these can point a token-bearing
-//! `git` at an attacker host or splice the token into a header. There is **no**
-//! way to make this safe by inspecting the config text first: an `[includeIf]`
-//! alone (path resolved and read only at git runtime) defeats any parser, and
-//! a check-then-use scan races the sandbox rewriting the file underneath it.
+//! **No privileged (daemon-run) `git` process may read sandbox-writable git
+//! config.** The session workspace is sandbox-visible: in-sandbox code can
+//! rewrite a primed repo's `.git/config` at will, and `git` executes a large,
+//! open-ended set of config directives *as the process that reads them* —
+//! `core.fsmonitor`, `core.sshCommand`, `core.pager`, `filter.<n>.process`,
+//! `diff.external`, hooks, and `[include]`/`[includeIf]` (which splice in
+//! arbitrary attacker-authored files, resolved only at git runtime). If the
+//! daemon ran `git` in the worktree — or made a daemon git open
+//! `upload-pack`/`receive-pack` *against* the worktree — any one of those would
+//! run attacker code **as the daemon**, which then reads the token from the
+//! mirror. This is the residual the earlier "token-free local leg" design
+//! still had: even without a token in the working tree, a daemon
+//! `git fetch <worktree-path>` spawns `upload-pack` there and executes its
+//! config. A `.git/config` text scanner cannot close it (git honours includes
+//! at file precedence, and a check-then-use scan races the sandbox rewriting
+//! the file).
 //!
-//! So the token-bearing operation never runs in — and never reads the config
-//! of — the sandbox working tree. Every push/pull/fetch is split into a
-//! token-free **local** leg and a credentialed **network** leg run against a
-//! **daemon-authored clean mirror** the sandbox cannot reach:
+//! So the daemon runs `git` in exactly one place: the daemon-private, bare,
+//! daemon-authored **mirror** ([`mirror_root`] →
+//! `<workspace-parent>/.gh-mirror/<owner>__<repo>.git`), a sibling of the
+//! sandbox-mounted workspace that is mounted nowhere into the sandbox, with
+//! `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, its
+//! `remote.origin.url` set to the canonical URL [`remote_url`] derives
+//! daemon-side (never the string `"origin"`, never anything the sandbox
+//! authored), and the token injected env-only by [`github::gitops`]. Object and
+//! ref movement between the worktree and the mirror never exposes worktree
+//! config to a daemon git:
 //!
-//! * The mirror is a bare repo under the session's daemon-side state
-//!   ([`mirror_root`] → `<workspace-parent>/.gh-mirror/<owner>__<repo>.git`), a
-//!   sibling of the sandbox-mounted workspace/home/state dirs that is itself
-//!   mounted nowhere into the sandbox. Its config is written only by the daemon
-//!   ([`ensure_mirror`] sets `remote.origin.url` to the canonical URL derived
-//!   daemon-side by [`remote_url`], never from sandbox input) — no `[include]`,
-//!   no `insteadOf`, no on-disk credential helper.
-//! * **Push:** the requested branch is transferred worktree → mirror over the
-//!   local, network-incapable leg ([`run_local_git`]: protocol pinned to
-//!   `file`, global/system config disabled, no token), then pushed mirror →
-//!   canonical URL by [`github::gitops`], which injects the token env-only and,
-//!   running in the mirror, reads only the daemon-authored mirror config.
-//! * **Fetch/pull:** [`github::gitops`] fetches canonical → mirror with the
-//!   token (again reading only the mirror config), then the worktree is
-//!   updated from the mirror over the local, token-free leg.
-//! * **Clone:** the same discipline — *not* an exemption. The credentialed
-//!   leg fetches canonical → mirror (and resolves the remote default branch
-//!   with an `ls-remote` run *in the mirror*); the worktree is then built from
-//!   the mirror over local, token-free legs inside a temp directory under the
-//!   daemon-private mirror root and renamed into the workspace only once it is
-//!   complete. This matters because a fresh clone's `.git/config` becomes
-//!   sandbox-writable the instant the directory lands in the workspace:
-//!   running a token-bearing `ls-remote`/`fetch` in it *afterwards* (as an
-//!   earlier revision did for the branch checkout) reopens the exact TOCTOU
-//!   this design closes — a racing sandbox process rewrites `origin` between
-//!   the rename and the checkout's first network op. So nothing token-bearing
-//!   ever runs in the finished tree, full stop.
+//! * **Objects are inert.** Git objects are content-addressed blobs; reading
+//!   them executes nothing. Worktree → mirror transfer uses
+//!   `objects/info/alternates` ([`link_worktree_objects`]): the mirror is given
+//!   read-only object access to `<worktree>/.git/objects`. No `git upload-pack`
+//!   ever runs in the worktree (that would read its config), and an alternate
+//!   is an object *source* only — git never reads the alternate parent's config.
+//! * **Refs are read and written as plain files.** The daemon parses the
+//!   worktree's `HEAD`/`refs/*`/`packed-refs` itself ([`read_head_branch`],
+//!   [`read_ref_oid`]) and writes tracking / branch tips back with
+//!   [`write_loose_ref`] — never `git -C <worktree> …`. Every OID is validated
+//!   as a hex sha ([`valid_oid`]) and every branch name is
+//!   [`check_safe_branch`]-validated before it is used as a path component or a
+//!   git argument, so a planted `refs/heads/x` holding `--evil` cannot become
+//!   option-injection.
+//! * **Mirror → worktree** object transfer builds a self-contained pack *in the
+//!   mirror* ([`import_objects_into_worktree`], daemon-authored config) and
+//!   drops the resulting `.pack`/`.idx` into the worktree object store as plain
+//!   files.
 //!
-//! Net invariant: **no `git` process that holds the token ever runs in — or
-//! resolves a remote name from — a directory the sandbox can write.** The
-//! canonical URL is always the daemon's own derivation; a rewritten worktree
-//! `origin`/`pushurl`/`insteadOf`/`include` is simply never consulted on the
-//! token leg, so it cannot redirect it or leak the token.
+//! Per operation:
+//!
+//! * **Push:** read the worktree branch tip (plain file) → give the mirror
+//!   object access to the worktree (alternate) and write the tip as a mirror
+//!   ref (plain file) → [`github::gitops`] pushes mirror → canonical (token,
+//!   mirror config only). The worktree's `origin`/`pushurl`/`insteadOf`/
+//!   `include`/hooks are never read.
+//! * **Fetch:** [`github::gitops`] fetches canonical → mirror (token, mirror
+//!   config) → the objects are packed *in the mirror* and copied into the
+//!   worktree, and each `refs/remotes/origin/*` is written as a plain file.
+//! * **Pull:** fetch as above, verify a fast-forward *in the mirror*
+//!   (`merge-base --is-ancestor`, the worktree tip resolved via the alternate),
+//!   then advance the checked-out branch and its tracking ref as plain files.
+//!   The daemon never runs a checkout in the sandbox-writable tree, so the
+//!   working-tree files re-materialize on the sandbox's own next checkout.
+//! * **Status:** branch from `HEAD`; ahead/behind from a mirror-side
+//!   `rev-list` over the alternate — again no git in the worktree.
+//! * **Clone:** the worktree does not exist yet, so the whole clone is built in
+//!   a daemon-private temp under the mirror root (credentialed fetch → mirror,
+//!   worktree assembled from the mirror over local legs) and renamed into the
+//!   workspace only once complete — nothing token-bearing or config-reading
+//!   ever runs in the sandbox-reachable destination, and a pre-existing
+//!   destination is refused outright rather than adopted.
+//!
+//! Net invariant: **no `git` process the daemon runs ever reads — or resolves a
+//! remote name from — a directory the sandbox can write.** The canonical URL is
+//! always the daemon's own derivation; a rewritten worktree
+//! `origin`/`pushurl`/`insteadOf`/`include`, and any `core.fsmonitor`/
+//! `core.sshCommand`/`filter.*.process`/hook planted in the worktree config, is
+//! simply never consulted by a daemon git, so it can neither redirect the token
+//! leg nor execute code as the daemon.
 //!
 //! The mirror-location half of the invariant — `<workspace-parent>/.gh-mirror`
 //! is writable by the daemon only — is owed by the launcher: the activation
@@ -228,14 +256,33 @@ pub(crate) enum FacadeError {
     #[error("no repos are declared for this session")]
     NoDeclaredRepos,
 
-    /// A branch name that would be handed to git as a bare argument begins
-    /// with `-`, so git would parse it as an option rather than a branch
-    /// (argv injection). Covers the worktree's current branch on push and the
-    /// declared/derived branch on clone. Refuse rather than run any git on it
-    /// (defense-in-depth; the branch name is not secret).
-    #[error("branch `{branch}` has an unsafe name (leading `-`); rename it")]
+    /// A branch name is unsafe to use as a git argument or a ref-file path
+    /// component: it begins with `-` (git would parse it as an option), or
+    /// contains a `..`/empty path component or a git-special character (a
+    /// planted `HEAD`/ref could try to escape the refs tree). Covers the
+    /// worktree's current branch on push/pull/status and the declared/derived
+    /// branch on clone. Refuse rather than run any git or touch any path on it
+    /// (the branch name is not secret).
+    #[error("branch `{branch}` has an unsafe name; rename it")]
     UnsafeBranchName {
         /// The offending branch name.
+        branch: String,
+    },
+
+    /// A `pull` targeted a branch that has no counterpart on the remote (there
+    /// is nothing to fast-forward onto).
+    #[error("branch `{branch}` does not exist on the remote")]
+    NoRemoteBranch {
+        /// The branch that was not found on the remote.
+        branch: String,
+    },
+
+    /// A `pull` would not be a fast-forward: the checked-out branch has
+    /// diverged from the remote. The facade never merges or rebases in the
+    /// sandbox-writable tree, so it refuses (mirrors `git pull --ff-only`).
+    #[error("`{branch}` has diverged from the remote; `min git pull` is fast-forward only")]
+    NotFastForward {
+        /// The branch that could not be fast-forwarded.
         branch: String,
     },
 
@@ -795,6 +842,367 @@ fn run_local_git(
     })
 }
 
+/// The maximum symbolic-ref chase depth when resolving a worktree ref by hand.
+const MAX_SYMREF_DEPTH: usize = 8;
+
+/// Whether `s` is a git object id: 40 (SHA-1) or 64 (SHA-256) hex digits.
+/// Everything read out of a sandbox-writable ref file is validated with this
+/// before it is used as a git argument, so a planted `refs/heads/x` holding
+/// `--upload-pack=evil` can never become option-injection on the mirror side.
+fn valid_oid(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Validates a branch name that will become both a ref-file **path component**
+/// and a **git argument**. A conservative subset of `git check-ref-format`:
+/// non-empty, no leading `-`, no trailing `/`, no `.lock` suffix, no `..`/`//`,
+/// no `.`/`..`/empty path component, and none of git's special characters or
+/// control characters. Fail-closed — an unlisted shape is rejected — so a
+/// hostile `HEAD`/ref cannot escape the refs tree or smuggle an option.
+fn check_safe_branch(branch: &str) -> Result<(), FacadeError> {
+    let unsafe_name = branch.is_empty()
+        || branch.starts_with('-')
+        || branch.ends_with('/')
+        || branch.ends_with(".lock")
+        || branch.contains("..")
+        || branch.contains("//")
+        || branch.contains(|c: char| c.is_ascii_control() || " \t\\~^:?*[".contains(c))
+        || branch
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..");
+    if unsafe_name {
+        return Err(FacadeError::UnsafeBranchName {
+            branch: branch.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The `.git` directory of a primed worktree. Only a real directory is
+/// accepted (never a `.git` *file*: a gitfile could redirect the git dir
+/// elsewhere), failing closed otherwise.
+fn worktree_git_dir(work: &Path) -> Result<PathBuf, FacadeError> {
+    let git_dir = work.join(".git");
+    if git_dir.is_dir() {
+        Ok(git_dir)
+    } else {
+        Err(FacadeError::LocalGit {
+            operation: "open worktree".to_string(),
+            detail: format!("{} has no .git directory", work.display()),
+        })
+    }
+}
+
+/// A short, non-secret local-git error for a ref read/write step.
+fn ref_step_error(operation: impl Into<String>, detail: impl Into<String>) -> FacadeError {
+    FacadeError::LocalGit {
+        operation: operation.into(),
+        detail: detail.into(),
+    }
+}
+
+/// Validates a ref-file value as an OID, erroring with a non-secret message.
+fn validated_oid(refname: &str, value: &str) -> Result<String, FacadeError> {
+    if valid_oid(value) {
+        Ok(value.to_string())
+    } else {
+        Err(ref_step_error(
+            format!("read ref {refname}"),
+            "ref does not contain a valid object id",
+        ))
+    }
+}
+
+/// Resolves a ref's target OID by parsing the loose ref file then `packed-refs`
+/// as plain files — never by running git in the (sandbox-writable) tree. Chases
+/// symbolic refs up to [`MAX_SYMREF_DEPTH`]. `Ok(None)` when the ref is absent.
+/// Works on any git dir, worktree or bare mirror.
+fn read_ref_oid(git_dir: &Path, refname: &str) -> Result<Option<String>, FacadeError> {
+    read_ref_oid_depth(git_dir, refname, 0)
+}
+
+fn read_ref_oid_depth(
+    git_dir: &Path,
+    refname: &str,
+    depth: usize,
+) -> Result<Option<String>, FacadeError> {
+    if depth > MAX_SYMREF_DEPTH {
+        return Err(ref_step_error(
+            format!("read ref {refname}"),
+            "symbolic ref chain too deep",
+        ));
+    }
+    // A loose ref file takes precedence over any packed-refs entry.
+    let loose = git_dir.join(refname);
+    if let Ok(contents) = fs::read_to_string(&loose) {
+        let line = contents.trim();
+        if let Some(target) = line.strip_prefix("ref:") {
+            return read_ref_oid_depth(git_dir, target.trim(), depth + 1);
+        }
+        return validated_oid(refname, line).map(Some);
+    }
+    let packed = git_dir.join("packed-refs");
+    if let Ok(contents) = fs::read_to_string(&packed) {
+        for entry in contents.lines() {
+            if entry.starts_with('#') || entry.starts_with('^') {
+                continue;
+            }
+            if let Some((oid, name)) = entry.split_once(' ')
+                && name.trim() == refname
+            {
+                return validated_oid(refname, oid.trim()).map(Some);
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Reads the branch a worktree's `HEAD` points at, as a plain file. Errors on a
+/// detached HEAD (nothing to push/pull) and validates the branch name.
+fn read_head_branch(git_dir: &Path) -> Result<String, FacadeError> {
+    let head = fs::read_to_string(git_dir.join("HEAD"))
+        .map_err(|source| ref_step_error("read HEAD", format!("{source}")))?;
+    let branch = head
+        .trim()
+        .strip_prefix("ref: refs/heads/")
+        .ok_or_else(|| ref_step_error("read HEAD", "HEAD is detached; check out a branch first"))?;
+    check_safe_branch(branch)?;
+    Ok(branch.to_string())
+}
+
+/// Writes a ref as a loose plain file (creating the ref subdirectory),
+/// atomically via a temp file + rename. The daemon moves a worktree ref this
+/// way — never with `git -C <worktree> …` — so no worktree config is read. The
+/// caller has [`check_safe_branch`]-validated the branch component of
+/// `refname`, so this join cannot escape the refs tree.
+fn write_loose_ref(git_dir: &Path, refname: &str, oid: &str) -> Result<(), FacadeError> {
+    let path = git_dir.join(refname);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| {
+            ref_step_error(format!("write ref {refname}"), format!("{source}"))
+        })?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("ref")
+        .to_string();
+    let tmp = path.with_file_name(format!(".{file_name}.min-{}.tmp", std::process::id()));
+    fs::write(&tmp, format!("{oid}\n"))
+        .map_err(|source| ref_step_error(format!("write ref {refname}"), format!("{source}")))?;
+    fs::rename(&tmp, &path).map_err(|source| {
+        let _ = fs::remove_file(&tmp);
+        ref_step_error(format!("write ref {refname}"), format!("{source}"))
+    })
+}
+
+/// Grants the daemon-private mirror read-only access to the worktree's object
+/// store via `objects/info/alternates`. Objects are content-addressed and
+/// inert, so this exposes **no** worktree config to the mirror's git — the
+/// mechanism that lets the daemon pack/read worktree commits without ever
+/// running `git upload-pack` (which would read worktree config) in the tree.
+fn link_worktree_objects(mirror: &Path, worktree_git_dir: &Path) -> Result<(), FacadeError> {
+    let objects = worktree_git_dir.join("objects");
+    let objects = path_arg(&objects)?;
+    let info = mirror.join("objects").join("info");
+    fs::create_dir_all(&info)
+        .map_err(|source| ref_step_error("link worktree objects", format!("{source}")))?;
+    fs::write(info.join("alternates"), format!("{objects}\n"))
+        .map_err(|source| ref_step_error("link worktree objects", format!("{source}")))
+}
+
+/// Runs one hardened, token-free git command in a **daemon-private** directory
+/// (the mirror — never the sandbox worktree), capturing stdout. Shares
+/// [`local_git_command`]'s hardening (global/system config denied, hooks off,
+/// no credential prompt). `stdin` is fed when present (for `pack-objects
+/// --revs`). The `detail` on failure is the last non-secret stderr line.
+fn mirror_git_capture(
+    cwd: &Path,
+    operation: &str,
+    subargs: &[&str],
+    stdin: Option<&str>,
+) -> Result<String, FacadeError> {
+    let mut command = local_git_command(cwd, subargs);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|source| ref_step_error(operation, format!("could not run git: {source}")))?;
+    if let Some(input) = stdin
+        && let Some(mut sink) = child.stdin.take()
+    {
+        let _ = sink.write_all(input.as_bytes());
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|source| ref_step_error(operation, format!("{source}")))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr
+        .trim()
+        .lines()
+        .next_back()
+        .unwrap_or("git failed")
+        .to_string();
+    Err(ref_step_error(operation, detail))
+}
+
+/// The `(branch, oid)` heads of the daemon-private mirror. Read with a
+/// mirror-side `for-each-ref` (daemon-authored config), never from the
+/// worktree. Unsafe branch names / invalid OIDs are skipped defensively.
+fn mirror_heads(mirror: &Path) -> Result<Vec<(String, String)>, FacadeError> {
+    let out = mirror_git_capture(
+        mirror,
+        "list mirror heads",
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/heads",
+        ],
+        None,
+    )?;
+    Ok(out
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter_map(|(oid, refname)| {
+            let branch = refname.strip_prefix("refs/heads/")?;
+            (valid_oid(oid) && check_safe_branch(branch).is_ok())
+                .then(|| (branch.to_string(), oid.to_string()))
+        })
+        .collect())
+}
+
+/// Copies the objects reachable from `tips` out of the mirror and into the
+/// worktree's object store **without running git in the worktree**.
+/// `pack-objects` runs *in the mirror* (daemon-authored config) and writes a
+/// self-contained pack to a daemon-private temp; the resulting `.pack`/`.idx`
+/// are copied into `<worktree>/.git/objects/pack` as plain, inert files. A
+/// no-op when there are no valid tips.
+fn import_objects_into_worktree(
+    mirror: &Path,
+    worktree_git_dir: &Path,
+    tips: &[String],
+) -> Result<(), FacadeError> {
+    let stdin: String = tips
+        .iter()
+        .filter(|t| valid_oid(t))
+        .map(|t| format!("{t}\n"))
+        .collect();
+    if stdin.is_empty() {
+        return Ok(());
+    }
+    let staging = mirror.join(format!(".pack-import-{}.tmp", std::process::id()));
+    fs::create_dir_all(&staging)
+        .map_err(|source| ref_step_error("import objects", format!("{source}")))?;
+    let result = import_objects_inner(mirror, worktree_git_dir, &staging, &stdin);
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
+fn import_objects_inner(
+    mirror: &Path,
+    worktree_git_dir: &Path,
+    staging: &Path,
+    stdin: &str,
+) -> Result<(), FacadeError> {
+    let base = staging.join("pack");
+    let base_arg = path_arg(&base)?;
+    // A full pack reachable from the tips: self-contained (no `--thin`), so the
+    // `.pack`/`.idx` are valid in the worktree object store on their own.
+    mirror_git_capture(
+        mirror,
+        "pack objects",
+        &["pack-objects", "--revs", "--delta-base-offset", base_arg],
+        Some(stdin),
+    )?;
+    let dest = worktree_git_dir.join("objects").join("pack");
+    fs::create_dir_all(&dest)
+        .map_err(|source| ref_step_error("import objects", format!("{source}")))?;
+    // Copy the `.pack` before the `.idx`: a reader that sees an `.idx` treats
+    // the pack as usable, so the data file must already be in place.
+    for extension in ["pack", "idx"] {
+        for entry in fs::read_dir(staging)
+            .map_err(|source| ref_step_error("import objects", format!("{source}")))?
+        {
+            let path = entry
+                .map_err(|source| ref_step_error("import objects", format!("{source}")))?
+                .path();
+            let matches = path.extension().and_then(|e| e.to_str()) == Some(extension);
+            if let (true, Some(name)) = (matches, path.file_name()) {
+                fs::copy(&path, dest.join(name))
+                    .map_err(|source| ref_step_error("import objects", format!("{source}")))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `new` is a descendant of (or equal to) `old`, decided in the mirror
+/// with `merge-base --is-ancestor` (worktree-only commits resolved via the
+/// object alternate). A non-zero exit — not-an-ancestor or a bad object — is a
+/// non-fast-forward.
+fn is_fast_forward(mirror: &Path, old: &str, new: &str) -> Result<bool, FacadeError> {
+    if old == new {
+        return Ok(true);
+    }
+    let status = local_git_command(mirror, &["merge-base", "--is-ancestor", old, new])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|source| {
+            ref_step_error("check fast-forward", format!("could not run git: {source}"))
+        })?;
+    Ok(status.success())
+}
+
+/// `(ahead, behind)` of `local` relative to `upstream`, computed in the mirror
+/// over the worktree object alternate (`rev-list --left-right --count
+/// upstream...local` prints `<behind>\t<ahead>`).
+fn count_ahead_behind(
+    mirror: &Path,
+    upstream: &str,
+    local: &str,
+) -> Result<(usize, usize), FacadeError> {
+    let range = format!("{upstream}...{local}");
+    let out = mirror_git_capture(
+        mirror,
+        "count ahead/behind",
+        &["rev-list", "--left-right", "--count", range.as_str()],
+        None,
+    )?;
+    let mut counts = out.split_whitespace();
+    let behind = counts.next().and_then(|n| n.parse().ok());
+    let ahead = counts.next().and_then(|n| n.parse().ok());
+    match (behind, ahead) {
+        (Some(behind), Some(ahead)) => Ok((ahead, behind)),
+        _ => Err(ref_step_error(
+            "count ahead/behind",
+            "could not parse ahead/behind counts",
+        )),
+    }
+}
+
+/// Ahead/behind of the checked-out branch versus its `origin/<branch>` tracking
+/// ref, computed in a mirror over the worktree objects (alternate). Extracted
+/// from [`execute`]'s `status` arm so it has no immediately-invoked closure.
+fn worktree_ahead_behind(
+    mirror_root: &Path,
+    repo: &RepoSpec,
+    remote: &Url,
+    git_dir: &Path,
+    upstream: &str,
+    local: &str,
+    out: &mut UnixStream,
+) -> Result<(usize, usize), FacadeError> {
+    let mirror = ensure_mirror(mirror_root, repo, remote, out)?;
+    link_worktree_objects(&mirror, git_dir)?;
+    count_ahead_behind(&mirror, upstream, local)
+}
+
 /// Ensures a clean, daemon-authored bare mirror exists for `repo` under
 /// `root`, and returns its path. The mirror's `origin` is (re-)pointed at the
 /// `canonical` URL on every call so the config the token leg later reads is
@@ -1082,133 +1490,149 @@ fn execute(
     match cmd {
         GitVerbCmd::Push { .. } => {
             let work = primed_dir(working, declared_repos, repo)?;
-            let branch = Repo::open(&work, remote.as_str()).current_branch()?;
-            // A leading-dash branch name would be parsed as a git option once
-            // it reaches `git push … <branch>`; refuse before any token-bearing
-            // process runs.
-            if branch.starts_with('-') {
-                return Err(FacadeError::UnsafeBranchName { branch });
-            }
+            let git_dir = worktree_git_dir(&work)?;
+            // Branch + tip read as plain files: no git runs in the worktree, so
+            // no worktree config is executed. `read_head_branch` validates the
+            // name (rejects a leading-dash / escaping branch) and rejects a
+            // detached HEAD.
+            let branch = read_head_branch(&git_dir)?;
+            let branch_ref = format!("refs/heads/{branch}");
+            let tip = read_ref_oid(&git_dir, &branch_ref)?.ok_or_else(|| {
+                ref_step_error(
+                    "read branch tip",
+                    format!("branch `{branch}` has no commits"),
+                )
+            })?;
 
             let mirror = ensure_mirror(&mirror_root(working)?, repo, remote, &mut out)?;
-            let work_arg = path_arg(&work)?;
-            let refspec = format!("+refs/heads/{branch}:refs/heads/{branch}");
-            // Local, token-free leg: copy the branch worktree → mirror. Runs in
-            // the mirror (clean config); the worktree is only a fetch *source*.
-            run_local_git(
-                &mirror,
-                "stage push",
-                &["fetch", "--no-tags", work_arg, refspec.as_str()],
-                &mut out,
-            )?;
+            // The only bridge from the sandbox tree to the credentialed leg:
+            // read-only object access (inert) + the tip written as a mirror ref
+            // (plain file). No `git upload-pack` ever runs in the worktree.
+            link_worktree_objects(&mirror, &git_dir)?;
+            write_loose_ref(&mirror, &branch_ref, &tip)?;
 
             // Credentialed leg: push mirror → canonical. `gitops` runs in the
-            // mirror and reads only the daemon-authored mirror config.
+            // mirror and reads only the daemon-authored mirror config; the tip's
+            // objects are reachable via the alternate.
             Repo::open(mirror.clone(), remote.as_str()).push(token, &branch, |_, line| {
                 let _ = writeln!(out, "msg:{line}");
             })?;
 
-            // Best-effort: reflect the push in the worktree's remote-tracking
-            // so the sandbox's own `git status` is sane. Purely local and
-            // token-free; failure here does not undo the successful push.
-            if let Ok(mirror_arg) = path_arg(&mirror) {
-                let track = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
-                let _ = run_local_git(
-                    &work,
-                    "update tracking",
-                    &["fetch", mirror_arg, track.as_str()],
-                    &mut out,
-                );
-                let upstream = format!("origin/{branch}");
-                let _ = run_local_git(
-                    &work,
-                    "set upstream",
-                    &[
-                        "branch",
-                        "--set-upstream-to",
-                        upstream.as_str(),
-                        branch.as_str(),
-                    ],
-                    &mut out,
-                );
-            }
+            // Reflect the push in the worktree's remote-tracking ref (plain
+            // file; the pushed objects already live in the worktree). Purely
+            // local; failure here does not undo the successful push.
+            let _ = write_loose_ref(&git_dir, &format!("refs/remotes/origin/{branch}"), &tip);
             let _ = writeln!(out, "msg:pushed `{branch}` to origin ({owner_repo})");
         }
         GitVerbCmd::Fetch { .. } => {
             let work = primed_dir(working, declared_repos, repo)?;
+            let git_dir = worktree_git_dir(&work)?;
             let mirror = ensure_mirror(&mirror_root(working)?, repo, remote, &mut out)?;
-            // Credentialed leg: canonical → mirror (mirror config only).
+            // Credentialed leg: canonical → mirror (mirror config only). Objects
+            // accumulate in the mirror across fetches, so this stays incremental
+            // without ever touching the worktree.
             Repo::open(mirror.clone(), remote.as_str()).fetch(token, |_, line| {
                 let _ = writeln!(out, "msg:{line}");
             })?;
-            // Local, token-free leg: mirror → worktree remote-tracking refs.
-            let mirror_arg = path_arg(&mirror)?;
-            run_local_git(
-                &work,
-                "fetch",
-                &[
-                    "fetch",
-                    "--prune",
-                    mirror_arg,
-                    "+refs/heads/*:refs/remotes/origin/*",
-                ],
-                &mut out,
-            )?;
+            // Reflect every canonical head into the worktree with plain-file
+            // ops: import the objects (packed in the mirror) then write
+            // `refs/remotes/origin/*`. No git runs in the worktree.
+            let heads = mirror_heads(&mirror)?;
+            let tips: Vec<String> = heads.iter().map(|(_, oid)| oid.clone()).collect();
+            import_objects_into_worktree(&mirror, &git_dir, &tips)?;
+            for (branch, oid) in &heads {
+                write_loose_ref(&git_dir, &format!("refs/remotes/origin/{branch}"), oid)?;
+            }
             let _ = writeln!(out, "msg:fetched origin ({owner_repo})");
         }
         GitVerbCmd::Pull { .. } => {
             let work = primed_dir(working, declared_repos, repo)?;
-            let branch = Repo::open(&work, remote.as_str()).current_branch()?;
+            let git_dir = worktree_git_dir(&work)?;
+            let branch = read_head_branch(&git_dir)?;
+            let branch_ref = format!("refs/heads/{branch}");
+            let local_tip = read_ref_oid(&git_dir, &branch_ref)?.ok_or_else(|| {
+                ref_step_error(
+                    "read branch tip",
+                    format!("branch `{branch}` has no commits"),
+                )
+            })?;
+
             let mirror = ensure_mirror(&mirror_root(working)?, repo, remote, &mut out)?;
             // Credentialed leg: canonical → mirror (mirror config only).
             Repo::open(mirror.clone(), remote.as_str()).fetch(token, |_, line| {
                 let _ = writeln!(out, "msg:{line}");
             })?;
-            // Local, token-free legs: update the worktree's tracking ref from
-            // the mirror, then fast-forward the current branch onto it.
-            let mirror_arg = path_arg(&mirror)?;
-            let track = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
-            run_local_git(
-                &work,
-                "pull (fetch)",
-                &["fetch", mirror_arg, track.as_str()],
-                &mut out,
-            )?;
-            let upstream = format!("refs/remotes/origin/{branch}");
-            run_local_git(
-                &work,
-                "pull (fast-forward)",
-                &["merge", "--ff-only", upstream.as_str()],
-                &mut out,
-            )?;
-            let _ = writeln!(
-                out,
-                "msg:pulled origin into the current branch ({owner_repo})"
-            );
+            let new_tip =
+                read_ref_oid(&mirror, &branch_ref)?.ok_or_else(|| FacadeError::NoRemoteBranch {
+                    branch: branch.clone(),
+                })?;
+
+            if new_tip == local_tip {
+                let _ = writeln!(out, "msg:already up to date ({owner_repo})");
+            } else {
+                // Fast-forward only, decided in the mirror over the worktree
+                // objects (alternate) — the facade never merges/rebases in the
+                // sandbox-writable tree.
+                link_worktree_objects(&mirror, &git_dir)?;
+                if !is_fast_forward(&mirror, &local_tip, &new_tip)? {
+                    return Err(FacadeError::NotFastForward { branch });
+                }
+                import_objects_into_worktree(&mirror, &git_dir, std::slice::from_ref(&new_tip))?;
+                // Advance the checked-out branch and its tracking ref as plain
+                // files. The working-tree files re-materialize on the sandbox's
+                // own next checkout; no daemon git touches the tree.
+                write_loose_ref(&git_dir, &branch_ref, &new_tip)?;
+                write_loose_ref(&git_dir, &format!("refs/remotes/origin/{branch}"), &new_tip)?;
+                let _ = writeln!(
+                    out,
+                    "msg:fast-forwarded `{branch}` to origin ({owner_repo})"
+                );
+            }
         }
         GitVerbCmd::Status { .. } => {
-            // Local-only probes: no token, no remote contact.
+            // Local-only, no token, no remote contact — and no git in the
+            // worktree: branch from `HEAD`, tips from the ref files.
             let dir = primed_dir(working, declared_repos, repo)?;
-            let tree = Repo::open(dir, remote.as_str());
-            let branch = tree.current_branch()?;
+            let git_dir = worktree_git_dir(&dir)?;
+            let Ok(branch) = read_head_branch(&git_dir) else {
+                let _ = writeln!(out, "msg:{owner_repo}: HEAD is detached");
+                return Ok(());
+            };
             let _ = writeln!(out, "msg:{owner_repo}: on branch `{branch}`");
-            match tree.ahead_of_upstream()? {
-                github::gitops::Ahead::NoUpstream => {
+            let local_tip = read_ref_oid(&git_dir, &format!("refs/heads/{branch}"))?;
+            let upstream = read_ref_oid(&git_dir, &format!("refs/remotes/origin/{branch}"))?;
+            match (local_tip, upstream) {
+                (Some(local), Some(up)) => {
+                    // Ahead/behind computed in the mirror over the worktree
+                    // objects (alternate). Degrade gracefully rather than fail
+                    // the whole status if the comparison cannot be made.
+                    let counts = worktree_ahead_behind(
+                        &mirror_root(working)?,
+                        repo,
+                        remote,
+                        &git_dir,
+                        &up,
+                        &local,
+                        &mut out,
+                    );
+                    match counts {
+                        Ok((ahead, behind)) => {
+                            let _ = writeln!(
+                                out,
+                                "msg:ahead of origin/{branch} by {ahead} commit(s), behind by {behind}"
+                            );
+                        }
+                        Err(_) => {
+                            let _ = writeln!(out, "msg:upstream relationship not recognized");
+                        }
+                    }
+                }
+                _ => {
                     let _ = writeln!(
                         out,
                         "msg:no upstream: the branch has never been pushed \
                          (`min git push` publishes it)"
                     );
-                }
-                github::gitops::Ahead::Tracking { ahead, behind } => {
-                    let _ = writeln!(
-                        out,
-                        "msg:ahead of origin/{branch} by {ahead} commit(s), behind by {behind}"
-                    );
-                }
-                // `Ahead` is non-exhaustive; report rather than guess.
-                _ => {
-                    let _ = writeln!(out, "msg:upstream relationship not recognized");
                 }
             }
         }
@@ -1503,6 +1927,14 @@ mod tests {
                 branch: "-oProxyCommand=evil".into(),
             }
             .to_string(),
+            FacadeError::NoRemoteBranch {
+                branch: "feat/x".into(),
+            }
+            .to_string(),
+            FacadeError::NotFastForward {
+                branch: "feat/x".into(),
+            }
+            .to_string(),
         ];
         for message in messages {
             assert!(!message.is_empty());
@@ -1513,5 +1945,147 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- plain-file ref reading/writing & OID/branch validation ----
+
+    #[test]
+    fn valid_oid_accepts_shas_and_rejects_everything_else() {
+        assert!(valid_oid(&"a".repeat(40)));
+        assert!(valid_oid(&"0".repeat(64)));
+        assert!(valid_oid("9dbd6e01f4657f834203ed1b4da152d704ddeaec"));
+        assert!(!valid_oid(&"a".repeat(39)));
+        assert!(!valid_oid(&"a".repeat(41)));
+        // An option-shaped or path-shaped ref-file value is never an OID, so it
+        // can never reach a git argument via `read_ref_oid`.
+        assert!(!valid_oid("--upload-pack=/tmp/evil"));
+        assert!(!valid_oid("ref: refs/heads/main"));
+        assert!(!valid_oid(&format!("{}z", "a".repeat(39))));
+    }
+
+    #[test]
+    fn check_safe_branch_accepts_normal_and_rejects_dangerous() {
+        for ok in ["main", "feat/x", "release/1.2.x", "user.name/topic"] {
+            check_safe_branch(ok).unwrap_or_else(|_| panic!("{ok} must be accepted"));
+        }
+        for bad in [
+            "",
+            "-oProxyCommand=evil",
+            "..",
+            "a/../b",
+            "a//b",
+            "feat/",
+            "has space",
+            "ctrl\tchar",
+            "weird~ref",
+            "x.lock",
+            "back\\slash",
+        ] {
+            assert!(
+                matches!(
+                    check_safe_branch(bad),
+                    Err(FacadeError::UnsafeBranchName { .. })
+                ),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_head_and_refs_as_plain_files() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let git_dir = dir.path();
+        let oid = "9dbd6e01f4657f834203ed1b4da152d704ddeaec";
+
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/feat/x\n").unwrap();
+        fs::create_dir_all(git_dir.join("refs").join("heads").join("feat")).unwrap();
+        fs::write(git_dir.join("refs/heads/feat/x"), format!("{oid}\n")).unwrap();
+
+        assert_eq!(read_head_branch(git_dir).unwrap(), "feat/x");
+        assert_eq!(
+            read_ref_oid(git_dir, "refs/heads/feat/x")
+                .unwrap()
+                .as_deref(),
+            Some(oid)
+        );
+        // A missing ref is `None`, not an error.
+        assert!(
+            read_ref_oid(git_dir, "refs/remotes/origin/feat/x")
+                .unwrap()
+                .is_none()
+        );
+
+        // packed-refs fallback for a ref with no loose file.
+        let packed_oid = "0000000000000000000000000000000000000abc";
+        fs::write(
+            git_dir.join("packed-refs"),
+            format!("# pack-refs with: peeled\n{packed_oid} refs/heads/main\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            read_ref_oid(git_dir, "refs/heads/main").unwrap().as_deref(),
+            Some(packed_oid)
+        );
+    }
+
+    #[test]
+    fn detached_and_unsafe_head_are_refused() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let git_dir = dir.path();
+
+        fs::write(
+            git_dir.join("HEAD"),
+            "9dbd6e01f4657f834203ed1b4da152d704ddeaec\n",
+        )
+        .unwrap();
+        assert!(
+            read_head_branch(git_dir).is_err(),
+            "detached HEAD must fail"
+        );
+
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/-oEvil\n").unwrap();
+        assert!(
+            matches!(
+                read_head_branch(git_dir),
+                Err(FacadeError::UnsafeBranchName { .. })
+            ),
+            "a dash-leading HEAD branch must be refused"
+        );
+    }
+
+    #[test]
+    fn write_loose_ref_roundtrips_and_creates_subdirs() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let git_dir = dir.path();
+        let oid = "9dbd6e01f4657f834203ed1b4da152d704ddeaec";
+
+        write_loose_ref(git_dir, "refs/remotes/origin/feat/x", oid).unwrap();
+        assert_eq!(
+            read_ref_oid(git_dir, "refs/remotes/origin/feat/x")
+                .unwrap()
+                .as_deref(),
+            Some(oid)
+        );
+        // No stray temp file is left behind next to the ref.
+        let leftovers: Vec<_> = fs::read_dir(git_dir.join("refs/remotes/origin/feat"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp ref file not cleaned up");
+    }
+
+    #[test]
+    fn read_ref_oid_rejects_a_planted_option_shaped_value() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let git_dir = dir.path();
+        fs::create_dir_all(git_dir.join("refs").join("heads")).unwrap();
+        // A hostile worktree plants an option string where an OID belongs; the
+        // reader refuses it rather than let it flow into a git argument.
+        fs::write(git_dir.join("refs/heads/main"), "--upload-pack=/tmp/evil\n").unwrap();
+        assert!(
+            read_ref_oid(git_dir, "refs/heads/main").is_err(),
+            "a non-OID ref value must be rejected"
+        );
     }
 }
