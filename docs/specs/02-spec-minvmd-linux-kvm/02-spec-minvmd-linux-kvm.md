@@ -300,8 +300,11 @@ code-signing target are macOS-only and require no change.
 
 ### libkrun installation on Linux
 
-On macOS, libkrun is installed via the Homebrew tap (`slp/krun/libkrun`) at
-`/opt/homebrew/lib`. On Linux the typical install paths are:
+Two distinct situations, and they resolve libkrun differently.
+
+**A development or CI build** finds libkrun on the build host. On macOS that is
+the Homebrew tap (`slp/krun/libkrun`) at `/opt/homebrew/lib`. On Linux the
+typical paths are:
 - Fedora/RHEL: `dnf install libkrun-devel` → `/usr/lib`
 - Ubuntu/Debian: source build → `/usr/local/lib` (no distro package as of
   this writing)
@@ -309,6 +312,30 @@ On macOS, libkrun is installed via the Homebrew tap (`slp/krun/libkrun`) at
 
 The `build.rs` default of `/usr` covers the Fedora path; GCP nested-virt
 runners provisioned via the infrastructure team use the configured path.
+
+**An installed host resolves nothing from the system.** The release ships
+libkrun alongside `minvmd` and the installer places it in the `lib` prefix, a
+sibling of `bin` (`scripts/stage-release.sh`): `lib/libkrun.so.1` on Linux,
+`lib/libkrun.1.dylib` on macOS. The shipped binary finds it through a
+**binary-relative rpath** — `$ORIGIN/../lib` on Linux, `@loader_path/../lib` on
+macOS — rewritten from the build-time absolute prefix after the build, by
+`scripts/rewrite-linux-linkage.sh` and `scripts/rewrite-macos-linkage.sh`
+respectively. Those scripts also hard-fail on a soname/install-name change,
+because the `lib/` destination names in `stage-release.sh` encode it.
+
+Consequences worth stating, because they are easy to get wrong:
+
+- The absolute build-time prefix must **not** survive into a shipped binary; it
+  names a directory that exists only on the release runner. The Linux release
+  build drops it (`crates/minvmd/build.rs`) and the rewrite script verifies it.
+- Because the rpath is binary-relative, the `lib` prefix has to stay a sibling
+  of `bin`. See [spec 07 R4.1a](../07-spec-installer/07-spec-installer.md),
+  which specifies the installer's warning when a host's prefixes diverge.
+- Shipping libkrun sets a **glibc floor** on Linux: unlike `min`, `mip` and
+  `minimald` — static musl, self-contained — `minvmd` is a native-glibc build,
+  so an installed host older than the release runner cannot load it. Removing
+  that floor needs a musl libkrun; tracked in
+  [gominimal/pkgs#533](https://github.com/gominimal/pkgs/issues/533).
 
 ### Relation to the session domain model
 

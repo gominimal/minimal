@@ -190,6 +190,7 @@ fixed `case`, **never** shell-expanded or `eval`ed from the manifest string:
 | token   | resolves to                                             |
 |---------|---------------------------------------------------------|
 | `bin`   | `${MINIMAL_BIN:-$HOME/.local/bin}`                      |
+| `lib`   | `${XDG_LIB_HOME:-$HOME/.local/lib}`                     |
 | `data`  | `${XDG_DATA_HOME:-$HOME/.local/share}/minimal`          |
 | `state` | `${XDG_STATE_HOME:-$HOME/.local/state}/minimal`         |
 | `cache` | `${XDG_CACHE_HOME:-$HOME/.cache}/minimal`               |
@@ -197,6 +198,21 @@ fixed `case`, **never** shell-expanded or `eval`ed from the manifest string:
 An unknown token exits with an error. (Note the correct XDG variable names,
 `XDG_DATA_HOME`/`XDG_STATE_HOME`/`XDG_CACHE_HOME`, and that `~/.local/bin` has
 no XDG variable, hence the `MINIMAL_BIN` override.)
+
+**R4.1a**, The `lib` prefix must resolve to a **sibling of the `bin` prefix**
+(`<bin>/../lib`). `minvmd` locates the libkrun it links through a
+binary-relative rpath — `$ORIGIN/../lib` on Linux, `@loader_path/../lib` on
+macOS — so a `lib` prefix anywhere else is unreachable at load time no matter
+what the manifest placed there. The two tokens resolve from unrelated variables
+(`MINIMAL_BIN` and `XDG_LIB_HOME`), so a host may set one and not the other.
+
+The installer therefore compares them once, before the component loop, and
+**warns** when they diverge, naming both resolved paths. It is a warning and not
+a hard error because the divergence only breaks VM-backed sessions: every other
+component still installs and works, and a host that never boots a microVM is
+unaffected. Diagnosing it here — where the cause is visible — is the point;
+left to runtime it surfaces as `libkrun.so.1: cannot open shared object file`
+from an autospawned daemon.
 
 **R4.2**, The `dest` subpath is rejected before use if it is absolute (`/…`) or
 contains a `..` component, preventing a manifest from writing outside the
@@ -261,8 +277,20 @@ mv -f "$target.tmp.$$" "$target"
 **R5.5**, Installing a new version over a **running daemon** wedges it: the
 daemon goes on serving from the old image while the newly-installed `min` speaks
 to it. Before the first component file is replaced, the installer therefore runs
-`<bin>/min stop --force`, the `min` **already on disk**, which is the build that
-matches the daemon it started and is the one about to be overwritten. `--force`
+the `min` **already on disk**, which is the build that matches the daemon it
+started and is the one about to be overwritten, **once per backend**:
+
+```
+<bin>/min stop --force
+<bin>/min --provider local-minvmd stop --force
+```
+
+Both, because bare `min stop` resolves the *default* provider — `local-minimald`
+on Linux — and since Linux began shipping `minvmd` and its libkrun, a single
+invocation would leave a live `minvmd` holding its socket while exactly those
+files are swapped underneath it. Stopping a backend that is not running is a
+failed connect and nothing more, so the second call is free on hosts that never
+use it. `--force`
 because an upgrade must not be blocked by live sessions, and because a prompt is
 not available in a `curl … | sh` pipeline.
 
@@ -303,8 +331,9 @@ both hash columns in place of digests.
   it, the recorded installed hash does not mask a new release.
 - **Test** (R5.5): a fresh install stops nothing (no `min` on disk yet) and an
   up-to-date rerun stops nothing (nothing replaced); an upgrade whose components
-  are stale runs the on-disk `min` with exactly `stop --force`, once, however
-  many components it replaces.
+  are stale runs the on-disk `min` with `stop --force` once per backend — the
+  default provider and `--provider local-minvmd` — however many components it
+  replaces.
 - **Test** (R5.5): an installed `min` whose `stop` exits non-zero and writes to
   both stdout and stderr still yields exit 0, leaks neither stream into the
   installer's output, and completes the upgrade.
@@ -327,6 +356,34 @@ cannot collide with a hex digest and is what the uninstaller keys on (R7.3).
 The record also enables uninstall (Units 7–8) and surfaces prefix drift if
 `XDG_*` variables change between runs.
 
+**R6.1a**, **Renamed-component migration.** When a component is renamed, its old
+`dest` stops appearing in every subsequent manifest, so the record walk of Units
+7–8 never revisits it and the file is stranded on disk forever. For a `bin`
+component that is a live PATH collision, not just clutter. The installer
+therefore reverses a known rename from the *prior* record, on the same
+bytes-still-ours terms uninstall uses (R7.3): the old `dest` is removed only
+when its SHA-256 still equals the `installed-hash` recorded for it, so a file
+the user replaced is kept and reported.
+
+The concrete case is the switch binary, installed as `gvproxy` before this
+release and as `gvproxy-min` after it — the `bin` prefix is on `PATH` and
+podman/crc ship their own `gvproxy` there, so the two cannot share a name.
+
+Three rules make the migration safe:
+
+- **Skip when the manifest still ships the old component.** Channels advance
+  independently, so a post-rename installer *will* be pointed at a pre-rename
+  manifest. There the file on disk is the one this very run installed, and
+  deleting it would leave the host with no switch binary at all, on every run.
+  The migration therefore runs only when this run's records contain no row for
+  the old component name.
+- **Report a refusal.** A hash mismatch means the user replaced the file; it is
+  kept and named.
+- **Retry a failure.** If removal fails (a read-only or root-owned `bin`), the
+  row is carried into this run's record so the next run tries again — without
+  it the migration gets exactly one attempt, because the record it reads is
+  replaced immediately afterwards.
+
 **R6.2**, If the resolved `bin` directory is not on `$PATH` **in the
 installing session**, the installer prints an advisory: the Unit 9 rc hook only
 takes effect in new shells, so the advisory tells the user to restart their
@@ -339,6 +396,14 @@ the only rc edit it makes is Unit 9's announced, marker-fenced block (R9.2).
   exists and lists the installed components with their destinations and hashes.
 - **Test**: With the `bin` prefix absent from `PATH`, the advisory is printed;
   with it present, it is not.
+- **Test** (R6.1a): a record naming the old component at a path whose bytes
+  still match the recorded hash has that file removed on the next install, the
+  removal is announced, and a further rerun says nothing (the row is gone).
+- **Test** (R6.1a): a record naming the old component whose file the user has
+  since replaced keeps the file, byte-for-byte, and reports that it was kept.
+- **Test** (R6.1a): when the manifest for *this* run still ships the old
+  component, the file it just installed survives and no removal is announced —
+  the case that would otherwise leave the host with no switch binary.
 
 ### Unit 9 - Shell integration: PATH, shell-init files, completions
 
@@ -752,10 +817,10 @@ already-absent. Teardown happens after the walk (not before) for the same reason
 an interrupted run leaves the inventory intact for the retry. Then each
 `minimal`-owned directory that the installer may have created is removed **only
 if empty**, via `rmdir` (never `rm -rf`): the `data`, `state`, and `cache`
-prefixes resolve to `.../minimal` subdirectories the installer owns, and the
-`bin` prefix (`~/.local/bin`) is shared with other tools so it is `rmdir`ed only
-when empty and otherwise left untouched. Pruning failures (a non-empty dir) are
-ignored, not fatal.
+prefixes resolve to `.../minimal` subdirectories the installer owns, while the
+`bin` (`~/.local/bin`) and `lib` (`~/.local/lib`) prefixes are shared with other
+tools, so those two are `rmdir`ed only when empty and otherwise left untouched.
+Pruning failures (a non-empty dir) are ignored, not fatal.
 
 **R8.2**, `--purge` additionally removes the `minimal`-owned trees in full,
 the resolved `data`, `state`, and `cache` directories and everything under them

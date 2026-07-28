@@ -429,7 +429,11 @@ hold under this model.
 - **libkrun linking**: pinned to a known-good version (v1.18.0).
   `build.rs` emits `cargo:rustc-link-search` and
   `cargo:rustc-link-arg=-Wl,-rpath` pointing at `/opt/homebrew/lib`
-  with a `LIBKRUN_PREFIX` env override.
+  with a `LIBKRUN_PREFIX` env override. That absolute rpath is the
+  **development** story only: a *shipped* binary resolves libkrun through a
+  binary-relative rpath into a `lib/` sibling of `bin/`, rewritten after the
+  build on both platforms. See
+  [spec 02, "libkrun installation on Linux"](../02-spec-minvmd-linux-kvm/02-spec-minvmd-linux-kvm.md).
 - **Hidden `__krun-vmm` subcommand**, not in `--help`;
   verified-via-auth-token; the only entry point that calls
   `krun_start_enter`.

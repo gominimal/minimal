@@ -253,7 +253,7 @@ place; atomicity semantics and the non-empty check are new.
 as an empty directory (bind-mount point) and `e2fsprogs` (`mkfs.ext4`,
 `e2fsck`) to the rootfs closure. The rootfs format stays raw ext4 (`rootfs.img`); no change to
 the release artifact shape (informed by `.minimal/minimal.toml:52-56` and
-`scripts/stage-release.sh:118`).
+`scripts/stage-release.sh` (its `rootfs` COMPONENTS rows)).
 
 ## Alternatives considered
 

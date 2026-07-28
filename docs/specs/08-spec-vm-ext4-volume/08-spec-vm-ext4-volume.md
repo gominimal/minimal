@@ -226,7 +226,7 @@ trees on a shared writable ext4 volume. Introduces the host provisioner, the
   directory (a bind-mount point for the writable volume) and include `e2fsprogs`
   (`mkfs.ext4`) in the rootfs closure. The rootfs image format stays raw ext4
   (`rootfs.img`); no packaging change to the release artifact shape (informed by
-  `.minimal/minimal.toml:52-56` and `scripts/stage-release.sh:118`).
+  `.minimal/minimal.toml:52-56` and `scripts/stage-release.sh` (its `rootfs` COMPONENTS rows)).
 
 - **R1.9**: The `sync_mode` and `direct_io` flags passed to `add_disk_with_sync`
   (R1.4) shall not be hardcoded. `crates/minvmd/src/vm.rs` shall read them from
