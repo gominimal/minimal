@@ -640,9 +640,14 @@ pub enum CacheConfig {
     /// Read the immutable per-commit snapshot `object`; if it doesn't exist,
     /// fail rather than fall back.
     CommitIndexOnly { object: String },
-    /// Read and union the immutable per-commit closure snapshots, one per
-    /// pinned chain link; any missing object fails rather than falls back.
-    CommitClosures { objects: Vec<String> },
+    /// Read and union the immutable per-commit closure snapshots. The
+    /// upstream's closure is required (it is the signed catalog); sideload
+    /// closures are best-effort — a sideload repo not covered by build
+    /// infrastructure publishes no index, and its specs resolve locally.
+    CommitClosures {
+        upstream: String,
+        sideloads: Vec<String>,
+    },
 }
 
 /// Object key of the per-commit index snapshot for a repo + commit:
@@ -1113,37 +1118,44 @@ impl File {
                 "index_source \"pinned\" requires a git upstream with a locked_commit".to_string(),
             ),
             (IndexSourceMode::Closure, _) => {
-                let objects = self.closure_objects();
-                if objects.is_empty() {
-                    Err("index_source \"closure\" requires at least one git link \
-                         (upstream or sideload) with a locked_commit"
-                        .to_string())
-                } else {
-                    Ok(CacheConfig::CommitClosures { objects })
-                }
-            }
-        }
-    }
-
-    /// The per-commit closure object of every pinned git chain link: the
-    /// upstream first, then each sideload, in declaration order. Links
-    /// without a locked commit (or backed by a directory) have no remote
-    /// presence and contribute nothing.
-    fn closure_objects(&self) -> Vec<String> {
-        let Some(upstream) = self.upstream.as_ref() else {
-            return Vec::new();
-        };
-        std::iter::once(&upstream.link)
-            .chain(upstream.sideloads().iter().map(|s| s.link()))
-            .filter_map(|link| match link {
-                LinkConfig::Git {
+                let Some(u) = self.upstream.as_ref() else {
+                    return Err(
+                        "index_source \"closure\" requires a git upstream with a locked_commit"
+                            .to_string(),
+                    );
+                };
+                let LinkConfig::Git {
                     repo,
                     locked_commit: Some(commit),
                     ..
-                } => Some(commit_closure_object(repo, commit)),
-                _ => None,
-            })
-            .collect()
+                } = &u.link
+                else {
+                    return Err(
+                        "index_source \"closure\" requires a git upstream with a locked_commit"
+                            .to_string(),
+                    );
+                };
+                // Sideloads in declaration order; links without a locked
+                // commit (or backed by a directory) have no remote presence
+                // and contribute nothing.
+                let sideloads = u
+                    .sideloads()
+                    .iter()
+                    .filter_map(|s| match s.link() {
+                        LinkConfig::Git {
+                            repo,
+                            locked_commit: Some(commit),
+                            ..
+                        } => Some(commit_closure_object(repo, commit)),
+                        _ => None,
+                    })
+                    .collect();
+                Ok(CacheConfig::CommitClosures {
+                    upstream: commit_closure_object(repo, commit),
+                    sideloads,
+                })
+            }
+        }
     }
 }
 
@@ -1801,21 +1813,29 @@ mod tests {
             "#
         ))
         .unwrap();
-        // Upstream first, then pinned sideloads in declaration order; the
+        // Required upstream, then pinned sideloads in declaration order; the
         // dir and unpinned links have no remote presence.
         assert_eq!(
             mf.cache_config(Some(IndexSourceMode::Closure)).unwrap(),
             CacheConfig::CommitClosures {
-                objects: vec![
-                    format!("github.com/gominimal/pkgs/{UP}.closure.shisha"),
-                    format!("github.com/acme/extra/{SIDE}.closure.shisha"),
-                ]
+                upstream: format!("github.com/gominimal/pkgs/{UP}.closure.shisha"),
+                sideloads: vec![format!("github.com/acme/extra/{SIDE}.closure.shisha")],
             }
         );
 
-        // No pinned links at all: closure mode is a loud error.
-        let unpinned: File =
-            toml::from_str("[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n").unwrap();
+        // An unpinned upstream is a loud error — even with a pinned sideload:
+        // the upstream closure is the required (signed) catalog.
+        let unpinned: File = toml::from_str(&format!(
+            r#"
+            [upstream]
+            repo = "https://github.com/gominimal/pkgs"
+
+            [[upstream.sideload]]
+            repo = "https://github.com/acme/extra"
+            locked_commit = "{SIDE}"
+            "#
+        ))
+        .unwrap();
         assert!(
             unpinned
                 .cache_config(Some(IndexSourceMode::Closure))
