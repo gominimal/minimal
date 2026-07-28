@@ -8,14 +8,11 @@ If you are using a release of Minimal **older than v0.5.0**, you will need to up
 
 ## Upgrade from v0.4.1 or older
 
-WARNING: `tasks` are not supported by v0.5.0. If you rely on `tasks` for non-interactive, job-like workflows, it is recommended to keep using `minimal` (<=v0.4.1) for tasks, and `min` (v0.5.0) for sessions.
+WARNING: `tasks` are not supported by v0.5.0. If you rely on `tasks` for non-interactive, job-like workflows, keep `minimal` (<=v0.4.1) installed for tasks and install `min` (v0.5.0) for sessions.
 
 Going forward, the Minimal command will become `min`, and will not conflict with the existing `minimal` command. 
 
-You can use the following to uninstall `minimal`.
-```bash
-./.minimal/shim/uninstall.sh
-```
+If you no longer need the legacy `minimal` command, you can uninstall it with:
 
 To install `min`, see [install](./install.md).
 
