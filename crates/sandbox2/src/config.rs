@@ -386,6 +386,12 @@ impl Config {
         // At this layer its plausible that there might be two packages of the same name
         // built at the same time, so we do an atomic directory creation dance /w an attempt
         // counter to make sure each sandbox gets its own folder.
+        //
+        // The pid here is for *uniqueness only*. Ownership — whose death makes
+        // this directory reclaimable — is recorded separately in
+        // [`common::sandbox_owner`], because the creating process is not the
+        // process whose lifetime the sandbox tracks. A reaper that reads this
+        // name instead sees the daemon (pid 1 in the guest), which never dies.
         use std::time::{SystemTime, UNIX_EPOCH};
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -426,6 +432,13 @@ impl Config {
                 }
             }
         };
+
+        // Claim ownership for *this* process until a leader exists. Setup below
+        // (fs mappings, synth dir) runs before anything is spawned, and a
+        // concurrent reaper must not mistake a sandbox that is mid-construction
+        // for an abandoned one. `Sandbox::run` overwrites this with the leader's
+        // pid once there is one.
+        common::sandbox_owner::set_owning_pid(&build_base_dir, std::process::id());
 
         // Validate FS mappings, creating any non-existent files as we go.
         if let WdSetup::BoundDir { fs_mappings, .. } = &self.wd {

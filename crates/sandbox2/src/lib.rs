@@ -875,6 +875,15 @@ impl<C: Channel> Sandbox<C> {
                 .spawn()
                 .map_err(|e| Error::Execution(ExecutionError::SpawnFailed(e)))?;
 
+            // Hand ownership of the directory to the process that now occupies
+            // it. Until this point the marker named whoever built the sandbox,
+            // which for the daemon is itself — a process that outlives every
+            // sandbox it creates, and inside the microVM is pid 1 and so alive
+            // by definition. The leader is the process whose death actually
+            // means this directory is finished with. Rewritten per invocation,
+            // so a sandbox running several execs always names the current one.
+            common::sandbox_owner::set_owning_pid(&self.base_dir, child.id());
+
             // Apply the configured per-sandbox network to this invocation's
             // freshly-unshared netns (own-IP switch attach). No-op for
             // HostNet/NoNet and when no custom `Network` is set, so existing

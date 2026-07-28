@@ -102,14 +102,23 @@ pub async fn cmd_cache(args: CacheArgs, ctx: &mut Context) -> Result<(), Error> 
     Ok(())
 }
 
+/// Remove a sandbox/task/temp directory whose owning process is gone.
+///
+/// Ownership comes from the marker the sandbox writes
+/// ([`common::sandbox_owner`]), not from the trailing `-<pid>` in the directory
+/// name. That suffix is the pid of whatever *created* the sandbox, which is the
+/// right answer only when the creator is also the thing whose lifetime the
+/// sandbox tracks — true for this CLI, false for a long-lived daemon. Reading
+/// the marker means one rule works for both.
+///
+/// A directory with no marker is left alone: it predates the marker, or was
+/// abandoned before its leader spawned, and neither is distinguishable here
+/// from a sandbox mid-construction.
 fn cleanup_stale(kind: &str, entry: std::fs::DirEntry) -> Result<(), Error> {
     let name = entry.file_name();
     let s = name.to_str().unwrap();
-    if s.contains("-")
-        && let Some(pid_str) = s.rsplit('-').next()
-        && let Ok(false) = std::fs::exists(format!("/proc/{}", pid_str))
-    {
-        // No such proc entry, therefore PID dead. Clean up directory.
+    if common::sandbox_owner::owner_is_gone(&entry.path()) {
+        // No such proc entry, therefore the owner is dead. Clean up directory.
         println!("Cleaning up stale {} {}", kind, s);
         common::remove_dir_all(entry.path())
             .map_err(|e| Error::IO("rm stale sandbox", entry.path(), e))?;
