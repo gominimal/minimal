@@ -86,16 +86,29 @@ fn installer_bin_dir() -> Option<PathBuf> {
 /// concrete path.
 #[must_use]
 pub fn installed_gvproxy_bin() -> PathBuf {
-    if let Some(local) = installer_bin_dir().map(|dir| dir.join(GVPROXY_FILE))
+    resolve_installed(
+        installer_bin_dir(),
+        Path::new(DEFAULT_GVPROXY_BIN),
+        Path::new(LEGACY_SYSTEM_GVPROXY_BIN),
+    )
+}
+
+/// The resolution itself, with every probed location passed in.
+///
+/// Split out so the tests can drive both system-path branches against temp
+/// dirs. Probing the real `/usr/lib/minimal/bin` instead would make them depend
+/// on host install state — and fail on exactly the pre-rename hosts the legacy
+/// branch exists to serve.
+fn resolve_installed(bin_dir: Option<PathBuf>, system: &Path, legacy: &Path) -> PathBuf {
+    if let Some(local) = bin_dir.map(|dir| dir.join(GVPROXY_FILE))
         && local.exists()
     {
         return local;
     }
-    let system = PathBuf::from(DEFAULT_GVPROXY_BIN);
-    if !system.exists() && Path::new(LEGACY_SYSTEM_GVPROXY_BIN).exists() {
-        return PathBuf::from(LEGACY_SYSTEM_GVPROXY_BIN);
+    if !system.exists() && legacy.exists() {
+        return legacy.to_path_buf();
     }
-    system
+    system.to_path_buf()
 }
 
 /// A subnet was constructed with a prefix outside the supported `8..=29` range —
@@ -364,24 +377,67 @@ mod tests {
     }
 
     #[test]
-    fn installed_gvproxy_ignores_an_upstream_named_binary() {
-        let _g = ENV_LOCK.lock().unwrap();
-        // A foreign `gvproxy` sitting in the same bin dir must not be picked
-        // up — only our own filename counts.
+    fn ignores_an_upstream_named_binary_in_the_bin_dir() {
+        // A foreign `gvproxy` (podman's, crc's) sitting in the bin dir must not
+        // be picked up — only our own filename counts. Driven through
+        // `resolve_installed` so the assertion does not depend on what the host
+        // has under /usr/lib/minimal/bin.
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("gvproxy"), b"podman's").unwrap();
-        unsafe { std::env::set_var("MINIMAL_BIN", tmp.path()) };
-        assert_eq!(installed_gvproxy_bin(), PathBuf::from(DEFAULT_GVPROXY_BIN));
-        unsafe { std::env::remove_var("MINIMAL_BIN") };
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("gvproxy"), b"podman's").unwrap();
+        let system = tmp.path().join("gvproxy-min");
+        let legacy = tmp.path().join("gvproxy");
+        assert_eq!(resolve_installed(Some(bin), &system, &legacy), system);
+    }
+
+    // The system-path branches go through `resolve_installed` with temp paths.
+    // Calling the public resolver would probe the real /usr/lib/minimal/bin and
+    // flip on a host that has either binary installed — failing on precisely
+    // the pre-rename hosts the legacy branch exists to serve.
+
+    #[test]
+    fn falls_back_to_the_current_system_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let system = tmp.path().join("gvproxy-min");
+        let legacy = tmp.path().join("gvproxy");
+        std::fs::write(&system, b"current").unwrap();
+        std::fs::write(&legacy, b"legacy").unwrap();
+        // Both present: the current name wins.
+        assert_eq!(resolve_installed(None, &system, &legacy), system);
     }
 
     #[test]
-    fn installed_gvproxy_falls_back_to_system_path() {
-        let _g = ENV_LOCK.lock().unwrap();
-        // MINIMAL_BIN points at an empty dir: no user-local install present.
+    fn falls_back_to_the_legacy_system_path_when_only_it_exists() {
         let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("MINIMAL_BIN", tmp.path()) };
-        assert_eq!(installed_gvproxy_bin(), PathBuf::from(DEFAULT_GVPROXY_BIN));
-        unsafe { std::env::remove_var("MINIMAL_BIN") };
+        let system = tmp.path().join("gvproxy-min");
+        let legacy = tmp.path().join("gvproxy");
+        std::fs::write(&legacy, b"legacy").unwrap();
+        // An operator who provisioned the pre-rename path keeps working.
+        assert_eq!(resolve_installed(None, &system, &legacy), legacy);
+    }
+
+    #[test]
+    fn reports_the_current_system_path_when_neither_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let system = tmp.path().join("gvproxy-min");
+        let legacy = tmp.path().join("gvproxy");
+        // Nothing installed anywhere: name the current path, so the caller's
+        // spawn failure cites the location an install should have used.
+        assert_eq!(resolve_installed(None, &system, &legacy), system);
+    }
+
+    #[test]
+    fn user_local_install_beats_both_system_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let want = bin.join(GVPROXY_FILE);
+        std::fs::write(&want, b"user-local").unwrap();
+        let system = tmp.path().join("gvproxy-min");
+        let legacy = tmp.path().join("gvproxy");
+        std::fs::write(&system, b"current").unwrap();
+        std::fs::write(&legacy, b"legacy").unwrap();
+        assert_eq!(resolve_installed(Some(bin), &system, &legacy), want);
     }
 }

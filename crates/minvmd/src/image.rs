@@ -115,8 +115,9 @@ pub fn resolve_initramfs_path() -> Result<PathBuf, VmError> {
 
 /// Resolve the host gvproxy binary path: the `MINVMD_GVPROXY_BIN` override,
 /// then the installed location — the user-local `bin/gvproxy-min` the curl|sh
-/// installer stamps, else the system-wide `switch::DEFAULT_GVPROXY_BIN`
-/// ([`switch::installed_gvproxy_bin`], the definition shared with minimald).
+/// installer stamps, else a system-wide path ([`switch::installed_gvproxy_bin`],
+/// the definition shared with minimald, which also honours the pre-rename
+/// `/usr/lib/minimal/bin/gvproxy` when only that exists).
 ///
 /// Unlike the kernel/rootfs/initramfs resolvers this never errors: gvproxy is
 /// only spawned for an own-IP VM, so an absent override is the common case, and
@@ -258,9 +259,15 @@ mod tests {
         // MINIMAL_BIN points at an empty dir: no user-local gvproxy present.
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("MINIMAL_BIN", tmp.path()) };
-        assert_eq!(
-            resolve_gvproxy_path(),
-            PathBuf::from(switch::DEFAULT_GVPROXY_BIN)
+        // One of the two system paths — the shared resolver prefers the legacy
+        // one on a host that still has it, so asserting a single path here
+        // would fail on exactly the pre-rename hosts that branch serves.
+        // `switch`'s own tests pin which branch wins; this one only proves the
+        // tier-2 miss falls through to a system path.
+        let got = resolve_gvproxy_path();
+        assert!(
+            got.starts_with("/usr/lib/minimal/bin"),
+            "expected a system-wide switch path, got {got:?}"
         );
         clear_gvproxy_env();
     }
