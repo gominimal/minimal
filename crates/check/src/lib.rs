@@ -23,6 +23,7 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::{RwLock, RwLockReadGuard, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 /// A shared buffer that implements [`tokio::io::AsyncWrite`], allowing captured
 /// output to be retrieved after the writer is consumed.
@@ -81,6 +82,9 @@ use outputs::{MissingRuntimeDeps, OutputTypesValid};
 pub enum Error {
     IO(&'static str, PathBuf, std::io::Error),
     Graph(Box<graph::Error>),
+    /// The caller cancelled the run via [`CheckCtx`]'s token; the check stopped
+    /// at its last cancellation point and its results are incomplete.
+    Cancelled,
     Other(anyhow::Error),
 }
 
@@ -91,6 +95,7 @@ impl fmt::Display for Error {
                 write!(f, "{} I/O error at path {}: {}", ctx, path.display(), e)
             }
             Error::Graph(e) => write!(f, "graph: {:?}", e),
+            Error::Cancelled => write!(f, "cancelled"),
             Error::Other(e) => write!(f, "{}", e),
         }
     }
@@ -101,6 +106,7 @@ impl std::error::Error for Error {
         match self {
             Error::IO(_, _, e) => Some(e),
             Error::Graph(_e) => None,
+            Error::Cancelled => None,
             Error::Other(_e) => None,
         }
     }
@@ -339,6 +345,16 @@ pub struct CheckCtx {
     pub cache: Cache<LocalDir>,
     pub ot: Option<OpTracker>,
 
+    /// Fires when the caller wants the run to stop.
+    ///
+    /// Checkers observe this at coarse-grained points - between checkers, per
+    /// output file, per test - and give up with [`Error::Cancelled`] rather
+    /// than running to completion. It also reaches the sandbox running
+    /// standalone tests, so a cancelled run doesn't leave test processes
+    /// behind. Individual blocking steps (a Nickel typecheck, an ELF parse)
+    /// are not interruptible, so cancellation is prompt, not instant.
+    pub cancel: CancellationToken,
+
     /// Limits the number of concurrent package/harness/profile checks.
     semaphore: Arc<Semaphore>,
     pub check_cache: Arc<CheckCache>,
@@ -362,9 +378,33 @@ impl CheckCtx {
             stdlib_dir,
             cache,
             ot,
+            cancel: CancellationToken::new(),
             semaphore: Arc::new(Semaphore::new(20)),
             check_cache: Arc::new(CheckCache::new()),
         }
+    }
+
+    /// Returns this context with `cancel` as its cancellation token, replacing
+    /// the never-cancelled one [`CheckCtx::new`] installs.
+    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// `Err(Error::Cancelled)` once the caller has cancelled the run.
+    fn bail_if_cancelled(&self) -> Result<(), Error> {
+        bail_if_cancelled(&self.cancel)
+    }
+}
+
+/// `Err(Error::Cancelled)` once `cancel` has fired.
+///
+/// For the checkers that hand their token to a blocking closure rather than
+/// carrying the whole [`CheckCtx`] in.
+pub(crate) fn bail_if_cancelled(cancel: &CancellationToken) -> Result<(), Error> {
+    match cancel.is_cancelled() {
+        true => Err(Error::Cancelled),
+        false => Ok(()),
     }
 }
 
@@ -429,9 +469,17 @@ fn package_check_futures(packages_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<Che
         .map::<CheckFuture, _>(move |(pkg, dir)| {
             let ctx = ctx.clone();
             Box::pin(async move {
-                let _permit = ctx.semaphore.clone().acquire_owned().await.unwrap();
-                let result = check_package(pkg.clone(), dir, ctx);
-                (CheckObj::Package(pkg), result.await)
+                let _permit = tokio::select! {
+                    biased;
+                    // Checks still queued behind the semaphore give up without
+                    // waiting their turn.
+                    _ = ctx.cancel.cancelled() => {
+                        return (CheckObj::Package(pkg), Err(Error::Cancelled));
+                    }
+                    permit = ctx.semaphore.clone().acquire_owned() => permit.unwrap(),
+                };
+                let result = check_package(pkg.clone(), dir, ctx).await;
+                (CheckObj::Package(pkg), result)
             })
         })
         .collect::<Vec<_>>())
@@ -475,11 +523,17 @@ fn profile_check_futures(profiles_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<Che
             let profiles_dir = profiles_dir.clone();
 
             Box::pin(async move {
-                let _permit = ctx.semaphore.acquire().await.unwrap();
+                let name = pd.to_str().unwrap().to_string();
+                let _permit = tokio::select! {
+                    biased;
+                    _ = ctx.cancel.cancelled() => {
+                        return (CheckObj::Profile(name), Err(Error::Cancelled));
+                    }
+                    permit = ctx.semaphore.acquire() => permit.unwrap(),
+                };
                 (
-                    CheckObj::Profile(pd.to_str().unwrap().to_string()),
-                    profile::check_profile(pd.to_str().unwrap().to_string(), &ctx, profiles_dir)
-                        .await,
+                    CheckObj::Profile(name.clone()),
+                    profile::check_profile(name, &ctx, profiles_dir).await,
                 )
             })
         })
@@ -524,10 +578,17 @@ fn stack_check_futures(stacks_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<CheckFu
             let stacks_dir = stacks_dir.clone();
 
             Box::pin(async move {
-                let _permit = ctx.semaphore.acquire().await.unwrap();
+                let name = pd.to_str().unwrap().to_string();
+                let _permit = tokio::select! {
+                    biased;
+                    _ = ctx.cancel.cancelled() => {
+                        return (CheckObj::Stack(name), Err(Error::Cancelled));
+                    }
+                    permit = ctx.semaphore.acquire() => permit.unwrap(),
+                };
                 (
-                    CheckObj::Stack(pd.to_str().unwrap().to_string()),
-                    stack::check_stack(pd.to_str().unwrap().to_string(), &ctx, stacks_dir).await,
+                    CheckObj::Stack(name.clone()),
+                    stack::check_stack(name, &ctx, stacks_dir).await,
                 )
             })
         })
@@ -582,6 +643,10 @@ async fn check_package(
             run_checker!(sources::SourceUrlsValid),
         );
         for r in [r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11] {
+            // Checked first: a checker that was interrupted mid-flight reports
+            // whatever it tripped over on the way out, which isn't the useful
+            // error to hand back.
+            ctx.bail_if_cancelled()?;
             out.push(r.map_err(|e| Error::Other(anyhow!(e)))?);
         }
     }
@@ -604,6 +669,13 @@ async fn check_package(
 
             let mut results = Vec::new();
             for mut c in file_based.into_iter() {
+                // Only observable between checkers: the blocking pool can't
+                // interrupt one mid-run, and `ParseCheck`'s typecheck is the
+                // slowest thing here. The partial results are dropped by the
+                // `bail_if_cancelled` below.
+                if ctx.cancel.is_cancelled() {
+                    break;
+                }
                 let check_result = c
                     .as_mut()
                     .check(&ctx, &pkg, &package_dir, Some(check_op.clone()))
@@ -617,6 +689,7 @@ async fn check_package(
         .map_err(|e| Error::Other(anyhow!(e)))?
     };
 
+    ctx.bail_if_cancelled()?;
     out.extend(file_based_results);
 
     check_op.set_done();
@@ -980,12 +1053,19 @@ impl GraphBasedChecker for StandaloneTestCheck {
         result.verdict = CheckVerdict::Pass;
         if let Some(tests) = build.tests {
             let graph2 = graph.deref().clone();
+            let cancel = ctx.cancel.clone();
             drop(graph);
             result = tokio::task::spawn(async move {
                 let mut result = result;
                 for (name, test) in tests {
                     if test.build_test {
                         continue; // We only do standalone tests here
+                    }
+                    // This task is detached, so it outlives a dropped check
+                    // stream: without this it would keep running tests (and
+                    // their sandboxes) after the caller has given up.
+                    if cancel.is_cancelled() {
+                        break;
                     }
                     let temp_dir = cache.temp_dir().map_err(anyhow::Error::from)?;
 
@@ -996,6 +1076,7 @@ impl GraphBasedChecker for StandaloneTestCheck {
                         test_name: name.as_str(),
                         stdout_writer: Some(Box::new(stdout_buf.clone())),
                         stderr_writer: Some(Box::new(stderr_buf.clone())),
+                        cancel: cancel.clone(),
                     };
                     let opts = Options {
                         cache: cache.clone(),
@@ -1321,5 +1402,75 @@ impl GraphBasedChecker for BuildScriptIsExecutable {
         }
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    /// Lays out a project tree with one package, one profile, and one stack,
+    /// so `run_checks` produces a future of every kind.
+    fn make_project(suffix: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("check_cancel_test_{}_{suffix}", std::process::id()));
+        std::fs::create_dir_all(dir.join("packages").join("pkg")).expect("create packages dir");
+        std::fs::write(dir.join("packages").join("pkg").join("build.ncl"), "{}")
+            .expect("write build.ncl");
+        std::fs::create_dir_all(dir.join("profiles").join("prof")).expect("create profiles dir");
+        std::fs::create_dir_all(dir.join("stacks").join("stk")).expect("create stacks dir");
+        dir
+    }
+
+    fn make_ctx(dir: &Path) -> CheckCtx {
+        CheckCtx::new(
+            vec![],
+            vec![],
+            false,
+            None,
+            dir.to_path_buf(),
+            Cache::at_dir(dir).expect("Cache::at_dir"),
+            None,
+        )
+    }
+
+    /// The token `CheckCtx::new` installs must never fire on its own, otherwise
+    /// every caller that doesn't opt in to cancellation gets a run that bails.
+    #[test]
+    fn new_ctx_is_not_cancelled() {
+        let dir = make_project("default_token");
+        assert!(!make_ctx(&dir).cancel.is_cancelled());
+        std::fs::remove_dir_all(&dir).expect("cleanup test tmp dir");
+    }
+
+    /// A token that is already cancelled when `run_checks` is called must make
+    /// every check give up rather than run: none of them reach a checker.
+    #[tokio::test]
+    async fn run_checks_bails_on_cancelled_token() {
+        let dir = make_project("upfront");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let mut stream = run_checks(
+            Some(dir.join("packages")),
+            Some(dir.join("profiles")),
+            Some(dir.join("stacks")),
+            make_ctx(&dir).with_cancel(cancel),
+        )
+        .expect("run_checks should still enumerate the tree");
+
+        let mut seen = Vec::new();
+        while let Some((obj, result)) = stream.next().await {
+            assert!(
+                matches!(result, Err(Error::Cancelled)),
+                "expected {obj} to be cancelled, got {:?}",
+                result.map(|r| r.len()),
+            );
+            seen.push(obj);
+        }
+
+        assert_eq!(seen.len(), 3, "expected one check per object, got {seen:?}");
+        std::fs::remove_dir_all(&dir).expect("cleanup test tmp dir");
     }
 }

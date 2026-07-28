@@ -751,6 +751,8 @@ where
 ///    that must be set on the channel by the client
 ///  * `min package build <args>` - builds package(s), routed via a
 ///    `MINIMAL_SESSION_ID` env var that must be set on the channel by the client
+///  * `min check <args>` - lints the session's `minimal.toml`, packages,
+///    profiles, and stacks, routed the same way as `min package build`
 pub(crate) async fn handle_exec(
     argv: &[u8],
     serv: ServerStateHandle,
@@ -877,6 +879,13 @@ pub(crate) async fn handle_exec(
                 run_build_exec(session_handle, id, channel, build_args).await;
             });
         }
+        Some("check") => {
+            session.channel_success(id)?;
+            let check_args = rem.strip_prefix("check").unwrap_or("").trim().to_string();
+            spawn(async move {
+                run_check_exec(session_handle, id, channel, check_args).await;
+            });
+        }
         Some(other) => {
             tracing::warn!(%session_id, "execution request rejected: unexpected min sub-command `{other}`");
             session.channel_failure(id)?;
@@ -967,6 +976,77 @@ async fn run_build_exec(
         Err(err) => {
             let _ = e
                 .write_all(format!("minimald: failed to start build: {err}\n").as_bytes())
+                .await;
+            1
+        }
+    };
+
+    let _ = w.flush().await;
+    let _ = e.flush().await;
+    let _ = ws.eof().await;
+    let _ = ws.exit_status(exit_status).await; // otherwise considered -1
+    let _ = ws.close().await; // needed to release the remote
+}
+
+/// Streams a `min check [--packages] [--profiles] [--stacks] [--fix] [names...]`
+/// exec over the SSH channel. Kicks off a session side-op check run based on an
+/// existing session.
+async fn run_check_exec(
+    session: SessionHandle,
+    channel_id: ChannelId,
+    channel: Channel<Msg>,
+    args: String,
+) {
+    use crate::session_sop::{CheckOpts, CheckOutcome, CheckUpdate};
+
+    let (_rs, ws) = channel.split();
+    let mut w = ws.make_writer();
+    let mut e = ws.make_writer_ext(Some(1));
+
+    // A bad flag is reported here rather than refused at the request layer:
+    // a `channel_failure` would only tell the client "rejected", where this
+    // path gets the message across and still exits non-zero.
+    let opts = match CheckOpts::from_args(&args) {
+        Ok(opts) => opts,
+        Err(msg) => {
+            let _ = e.write_all(format!("minimald: {msg}\n").as_bytes()).await;
+            let _ = e.flush().await;
+            let _ = ws.eof().await;
+            let _ = ws.exit_status(1).await;
+            let _ = ws.close().await;
+            return;
+        }
+    };
+
+    let exit_status = match session.start_check(opts).await {
+        Ok(mut updates) => {
+            let mut outcome = None;
+            'drain: while let Some(update) = updates.recv().await {
+                if let CheckUpdate::Finished(o) = &update {
+                    outcome = Some(o.clone());
+                }
+                for line in update.render() {
+                    if let Err(err) = w.write_all(format!("{line}\n").as_bytes()).await {
+                        // No reader on the channel — the client went away. Stop
+                        // streaming; the side-op keeps running independently.
+                        tracing::warn!(%channel_id, error = %err, "min check: channel write failed");
+                        break 'drain;
+                    }
+                }
+            }
+
+            // Only a clean run exits 0; everything else reports on stderr.
+            let (status, message) = CheckOutcome::summarize(outcome.as_ref());
+            let out: &mut (dyn AsyncWrite + Unpin + Send) = match status {
+                0 => &mut w,
+                _ => &mut e,
+            };
+            let _ = out.write_all(format!("{message}\n").as_bytes()).await;
+            status
+        }
+        Err(err) => {
+            let _ = e
+                .write_all(format!("minimald: failed to start check: {err}\n").as_bytes())
                 .await;
             1
         }
@@ -1663,6 +1743,104 @@ mod tests {
                 out.stderr.is_empty(),
                 "echo task should produce no stderr: {:?}",
                 out.stderr,
+            );
+        }
+
+        /// End-to-end happy path for `min check`: the exec is accepted,
+        /// routed to a check side-op, and the run reports a terminal outcome
+        /// with an exit status. This workspace holds no `packages/`,
+        /// `profiles/`, or `stacks/` dirs, so there is nothing to lint and
+        /// the run completes clean — what's under test is the routing and the
+        /// exit-status contract a scripted `min check` depends on.
+        #[tokio::test]
+        async fn exec_runs_check_and_exits_zero_when_nothing_fails() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let session_id = fresh_session(&mut client).await;
+            let session_str = session_id.to_string();
+            // `start_check` builds a fresh workspace-rooted context per call,
+            // so the workspace needs an mfile for it to resolve at all.
+            server.seed_workspace_mfile(session_id, "").await;
+
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    "min check",
+                    &[],
+                )
+                .await
+                .expect("min check should be accepted");
+
+            assert_eq!(out.exit_status, Some(0));
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                "check finished",
+            );
+            assert!(
+                out.stderr.is_empty(),
+                "a clean check should produce no stderr: {:?}",
+                out.stderr,
+            );
+        }
+
+        /// A mistyped flag must exit non-zero. Parsed as a name filter it
+        /// would match nothing, so the run would check zero objects and report
+        /// success — and the exit status is the whole contract for a scripted
+        /// `min check` over SSH.
+        #[tokio::test]
+        async fn exec_check_rejects_a_typod_flag_rather_than_passing() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let session_id = fresh_session(&mut client).await;
+            let session_str = session_id.to_string();
+            server.seed_workspace_mfile(session_id, "").await;
+
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    "min check --packags",
+                    &[],
+                )
+                .await
+                .expect("the exec itself is accepted; the flag fails the run");
+
+            assert_eq!(
+                out.exit_status,
+                Some(1),
+                "a typo'd flag must not exit 0; stdout was {:?}",
+                String::from_utf8_lossy(&out.stdout),
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("unknown flag `--packags`"),
+                "the bad flag should be named on stderr, got {:?}",
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+
+        /// `min check` takes its flags after the sub-command, so a form the
+        /// parser accepts must still route — a prefix-matched `min checkx`
+        /// must not.
+        #[tokio::test]
+        async fn exec_rejects_a_check_lookalike_subcommand() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let session_id = fresh_session(&mut client).await;
+            let session_str = session_id.to_string();
+
+            let result = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    "min checkx",
+                    &[],
+                )
+                .await;
+
+            assert!(
+                result.is_err(),
+                "`min checkx` is not `min check` and must be refused, got {result:?}",
             );
         }
     }

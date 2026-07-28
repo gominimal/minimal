@@ -256,6 +256,9 @@ impl From<check::Error> for Error {
             check::Error::IO(s, p, e) => Self::IO(s, p, e),
             check::Error::Other(e) => Self::Other(e),
             check::Error::Graph(e) => Self::Graph(e),
+            // Unreachable through this crate: mctx never hands `check` a token
+            // it later fires.
+            check::Error::Cancelled => Self::Other(anyhow::anyhow!("checks were cancelled")),
         }
     }
 }
