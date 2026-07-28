@@ -148,6 +148,32 @@ pub enum GitError {
         /// The offending path, rendered lossily.
         path: String,
     },
+
+    /// A branch/ref name that would be handed to git as a bare argument begins
+    /// with `-`, so git would parse it as an option rather than a ref
+    /// (option-injection). Refused before any git runs.
+    #[error("unsafe {kind} name `{name}`: names beginning with `-` are refused")]
+    UnsafeRefName {
+        /// What the name is (`branch`, `base`).
+        kind: String,
+        /// The offending name (not secret).
+        name: String,
+    },
+}
+
+/// Refuses a ref/branch name git would parse as an option (leading `-`). The
+/// credentialed argv builders never place such a name where git could read it
+/// as a flag (push additionally separates it with `--`); this boundary guard
+/// makes that guarantee explicit and covers callers that pass a name derived
+/// from `rev-parse`/remote output.
+fn reject_option_like(kind: &str, name: &str) -> Result<(), GitError> {
+    if name.starts_with('-') {
+        return Err(GitError::UnsafeRefName {
+            kind: kind.to_string(),
+            name: name.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// The result of [`Repo::checkout_or_create`] (spec R2.2).
@@ -269,9 +295,13 @@ fn build_git(scheme: &str, subargs: &[&str], token: Option<&str>) -> GitCommand 
         // Deny the operator's global/system config: the child reads only the
         // repo-local config of the daemon-controlled directory it runs in
         // (see the module docs — this makes the isolation hold by
-        // construction).
+        // construction). `GIT_CONFIG_NOSYSTEM=1` belts-and-braces the
+        // `GIT_CONFIG_SYSTEM=/dev/null` redirect: either alone denies the
+        // system config, and NOSYSTEM also covers builds that ignore the path
+        // override.
         ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
         ("GIT_CONFIG_SYSTEM".to_string(), "/dev/null".to_string()),
+        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
     ];
 
     if let Some(secret) = token {
@@ -578,10 +608,14 @@ impl Repo {
         branch: &str,
         on_line: impl FnMut(OutputStream, &str),
     ) -> Result<(), GitError> {
+        // Option-injection guard: `branch` comes from `rev-parse`/the caller,
+        // so refuse a leading-dash name and additionally separate it from the
+        // options with `--` so git parses it as a refspec, never a flag.
+        reject_option_like("branch", branch)?;
         require(
             self.git(
                 "push",
-                &["push", "--set-upstream", "origin", branch],
+                &["push", "--set-upstream", "origin", "--", branch],
                 token,
                 on_line,
             )?,
@@ -604,6 +638,9 @@ impl Repo {
         base: Option<&str>,
         mut on_line: impl FnMut(OutputStream, &str),
     ) -> Result<CheckoutOutcome, GitError> {
+        // The branch/base become bare `checkout -B/-b <name>` arguments; refuse
+        // a leading-dash name up front (option-injection guard).
+        reject_option_like("branch", branch)?;
         if self.remote_has_branch(token, branch)? {
             let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
             require(
@@ -632,6 +669,7 @@ impl Repo {
             Some(base) => base.to_string(),
             None => self.default_branch(token)?,
         };
+        reject_option_like("base", &base)?;
         if !self.remote_has_branch(token, &base)? {
             return Err(GitError::BaseBranchNotFound { branch: base });
         }
@@ -736,10 +774,11 @@ impl Repo {
         token: Option<&SecretString>,
         branch: &str,
     ) -> Result<bool, GitError> {
+        reject_option_like("branch", branch)?;
         let out = require(
             self.git_quiet(
                 "ls-remote",
-                &["ls-remote", "--heads", "origin", branch],
+                &["ls-remote", "--heads", "origin", "--", branch],
                 token,
             )?,
             "ls-remote",
@@ -850,6 +889,26 @@ mod tests {
     }
 
     #[test]
+    fn option_like_ref_names_are_refused_before_any_git_runs() {
+        // A leading-dash branch/base would be parsed by git as an option once
+        // it reached `git push … <branch>` / `git checkout -B <branch>`; the
+        // boundary guard refuses it up front (no working tree needed: it fails
+        // before spawning git).
+        let repo = Repo::open("/nonexistent", "file:///unused");
+        let err = repo
+            .push(None, "-oProxyCommand=evil", |_, _| {})
+            .expect_err("dash-leading branch must be refused");
+        assert!(
+            matches!(err, GitError::UnsafeRefName { ref kind, .. } if kind == "branch"),
+            "unexpected error: {err:?}"
+        );
+        let err = repo
+            .checkout_or_create(None, "--upload-pack=x", Some("main"), |_, _| {})
+            .expect_err("dash-leading branch must be refused");
+        assert!(matches!(err, GitError::UnsafeRefName { .. }), "{err:?}");
+    }
+
+    #[test]
     fn scrub_masks_only_the_current_token() {
         assert_eq!(
             scrub("password=ghs_secret trailing", Some("ghs_secret")).as_ref(),
@@ -948,6 +1007,11 @@ mod tests {
                 "{var} must be pinned to /dev/null"
             );
         }
+        assert_eq!(
+            value_of("GIT_CONFIG_NOSYSTEM").as_deref(),
+            Some("1"),
+            "GIT_CONFIG_NOSYSTEM must deny the system config outright"
+        );
 
         // Debug is redaction-safe.
         let dbg = format!("{cmd:?}");
