@@ -71,7 +71,7 @@ Prints the effective per-VM configuration and each value's source.
 
 ```
 minvmd config set [--vcpus <N>] [--ram-mib <N>]
-                  [--maintenance-interval-secs <N>]
+                  [--maintenance-at <HH:MM>]
                   [--maintenance-older-than-secs <N>]
 ```
 
@@ -81,51 +81,59 @@ Validates and persists configuration, applied on the next boot.
 |------|-------------|---------|
 | `--vcpus <N>` | Number of virtual CPUs | 2 |
 | `--ram-mib <N>` | Guest RAM in MiB | 2048 (x86_64) / 4096 |
-| `--maintenance-interval-secs <N>` | Seconds between guest maintenance cycles; `0` disables the timer | 21600 (6 h) |
+| `--maintenance-at <HH:MM>` | Time of day, UTC, the guest runs maintenance | `03:00` |
 | `--maintenance-older-than-secs <N>` | Seconds a cache entry may go unused before a sweep may delete it | 1209600 (14 d) |
 
 Each value resolves as `env override ?? persisted config ?? default`; the
 environment variables are `MINVMD_VM_VCPUS`, `MINVMD_VM_RAM_MIB`,
-`MINVMD_MAINTENANCE_INTERVAL_SECS`, and
-`MINVMD_MAINTENANCE_OLDER_THAN_SECS`.
+`MINVMD_MAINTENANCE_AT`, and `MINVMD_MAINTENANCE_OLDER_THAN_SECS`.
 
-`config set` refuses a retention shorter than the interval: it would make
-every artifact built between two cycles eligible at the next one, sweeping
-away exactly what is being actively rebuilt.
+`--maintenance-at` must be a fixed-width 24-hour `HH:MM`. It is passed to the
+guest on the kernel command line, which the kernel splits on whitespace, so a
+malformed value is rejected here rather than silently dropped at the next boot.
 
 ## Guest maintenance
 
-While a VM is up, the supervisor drives the in-VM `minimald` through a
-maintenance cycle every `maintenance-interval-secs`:
+The **guest** owns the maintenance schedule. `minvmd` only configures it: the
+time of day and the retention are handed over on the kernel command line at
+boot, and the in-VM `minimald` runs its own daily timer from them.
+
+Each run is two ordered steps:
 
 1. **Sweep** — delete cache entries unused for longer than
    `maintenance-older-than-secs`.
 2. **Trim** — `fstrim` the state volume, so the blocks the sweep freed are
    returned to the host's backing raw image.
 
-Both steps are needed. The state volume is mounted without `discard`, so
-deleting files inside the guest frees ext4 blocks but leaves the host image
-at its high-water mark; the trim is what shrinks it. Each cycle logs what it
-reclaimed (`guest maintenance reclaimed state`), so a run that reclaimed
-nothing is distinguishable from one that never happened.
+Both are needed. The state volume is mounted without `discard`, so deleting
+files inside the guest frees ext4 blocks but leaves the host image at its
+high-water mark; the trim is what shrinks it. Each run logs what it reclaimed
+(`guest maintenance reclaimed state`), so a run that reclaimed nothing is
+distinguishable from one that never happened.
 
-A cycle is skipped, and retried on the next tick, when the host is running on
-battery. Otherwise it always runs: `FITRIM` is the online-discard ioctl and is
-safe on a live filesystem, so a concurrent build costs the cycle latency
-rather than correctness.
+The schedule is UTC, because a microVM rootfs carries no timezone database for
+the guest to resolve local time against.
+
+Scheduling in the guest is only sound because the guest clock is kept correct:
+it advances only while the VM is scheduled, so a sleeping host would otherwise
+leave it hours behind, and `minvmd`'s timekeep bridge pushes the host wall clock
+in every minute and immediately after a suspend. The guest waits in short slices
+against the wall clock rather than one long sleep, so a suspend moves the target
+instead of slipping the schedule. A clock that jumps forward over several missed
+occurrences runs once and resumes the daily cadence, rather than firing a
+backlog.
 
 A sweep never deletes a cache entry that any session depends on: the protected
-set is the union of the packages every session's project references. If that
-set cannot be computed for even one session, the sweep deletes nothing — but
-the trim still runs, since discarding already-free blocks cannot evict
-anything. The skip is reported in the cycle's log line.
+set is the union of the packages every session's project references. If that set
+cannot be computed for even one session, the sweep deletes nothing — but the
+trim still runs, since discarding already-free blocks cannot evict anything. The
+skip is reported in the run's log line.
 
 Leaked build sandboxes are **not** reclaimed. A build keeps its sandbox
-directory until it succeeds, so a failed or interrupted one leaves the
-directory behind; reclaiming those needs a dependable "is the owning process
-still alive" signal, which the current `-<pid>` directory suffix does not
-provide inside the VM (it records the creating process, which there is the
-daemon itself, pid 1).
+directory until it succeeds, so a failed or interrupted one leaves the directory
+behind; reclaiming those needs a dependable "is the owning process still alive"
+signal, which the current `-<pid>` directory suffix does not provide inside the
+VM (it records the creating process, which there is the daemon itself, pid 1).
 
 ### `stop`
 

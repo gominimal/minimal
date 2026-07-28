@@ -34,11 +34,11 @@ pub struct ResourceConfig {
     /// Persisted guest RAM in MiB, if set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ram_mib: Option<u32>,
-    /// Seconds between guest maintenance cycles, if set. `0` disables the
-    /// timer outright, which is why this is not folded into the
-    /// positive-only env parsing the resource knobs use.
+    /// Time of day, `HH:MM` UTC, at which the guest runs its maintenance
+    /// cycle. Unset means no schedule, which is how maintenance is switched
+    /// off — the guest owns the timer, so there is no interval to zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maintenance_interval_secs: Option<u64>,
+    pub maintenance_at: Option<String>,
     /// Retention for the maintenance sweep in seconds, if set: a cache entry
     /// unused for longer than this is eligible for deletion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,7 +91,7 @@ mod tests {
         let cfg = ResourceConfig {
             vcpus: Some(4),
             ram_mib: Some(6144),
-            maintenance_interval_secs: Some(3600),
+            maintenance_at: Some("03:00".to_string()),
             maintenance_older_than_secs: Some(86400),
         };
         cfg.write(tmp.path()).expect("write");
@@ -125,25 +125,25 @@ mod tests {
         let cfg = ResourceConfig::read(tmp.path()).expect("read");
         assert_eq!(cfg.vcpus, Some(4));
         assert_eq!(cfg.ram_mib, Some(6144));
-        assert!(cfg.maintenance_interval_secs.is_none());
+        assert!(cfg.maintenance_at.is_none());
         assert!(cfg.maintenance_older_than_secs.is_none());
     }
 
-    /// A zero interval is a real setting — "no maintenance timer" — so it must
-    /// survive the round-trip rather than being skipped as if unset.
+    /// The schedule is a string on the wire; round-tripping it is what proves
+    /// a `config set` survives to the next boot's kernel command line.
     #[test]
-    fn a_disabled_maintenance_timer_round_trips() {
+    fn a_maintenance_schedule_round_trips() {
         let tmp = temp_dir();
         let cfg = ResourceConfig {
-            maintenance_interval_secs: Some(0),
+            maintenance_at: Some("04:30".to_string()),
             ..ResourceConfig::default()
         };
         cfg.write(tmp.path()).expect("write");
         assert_eq!(
             ResourceConfig::read(tmp.path())
                 .expect("read")
-                .maintenance_interval_secs,
-            Some(0)
+                .maintenance_at,
+            Some("04:30".to_string())
         );
     }
 

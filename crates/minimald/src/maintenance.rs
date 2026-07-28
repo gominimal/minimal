@@ -7,10 +7,22 @@
 //! [`crate::guest::trim_state_volume`] returns those blocks to the host image.
 //! Neither alone changes what the user sees on disk.
 //!
-//! **Policy lives on the caller.** The host `minvmd` decides *when* a cycle
-//! runs and how long an entry may go unused; this module only executes and
-//! reports. That mirrors the `Shutdown` RPC, and it keeps the schedule on the
-//! side of the system with a trustworthy clock and a view of the power state.
+//! **The schedule lives here, in the guest.** `minvmd` configures it — a
+//! wall-clock time of day and a retention, handed over on the kernel command
+//! line at boot — but the daemon owns the timer and fires its own cycles.
+//!
+//! That is only sound because the guest clock is now trustworthy. It sets from
+//! the RTC at boot and then advances only while the VM is scheduled, so a host
+//! that sleeps used to leave it hours behind; `minvmd`'s timekeep bridge fixes
+//! that by pushing the host's wall clock in every minute and immediately after
+//! a suspend. Without it, a "run at 03:00" schedule would fire at whatever the
+//! guest believed 03:00 to be, which on a laptop is anyone's guess.
+//!
+//! The waiting is done in short slices against the wall clock rather than one
+//! long sleep, because a single `sleep_until` is measured monotonically and
+//! would not advance across a host suspend — the schedule would slip by exactly
+//! the time the machine spent asleep, which is the failure the timekeep bridge
+//! exists to prevent.
 //!
 //! **The sweep is fail-closed.** `mip cache clean` protects the packages of
 //! *the current project*; a daemon has no such thing and must instead protect
@@ -42,10 +54,169 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use common::SpecHash;
-use minimald_rpc::{MaintenanceReport, MaintenanceRequest};
 
 use crate::server::ServerStateHandle;
 use crate::sessions::MaintenanceInputs;
+
+/// Environment variable naming the daily maintenance time as `HH:MM`, UTC.
+/// Set by `minvmd` on the kernel command line; absent means no schedule.
+pub(crate) const MAINTENANCE_AT_ENV: &str = "MINIMAL_MAINTENANCE_AT";
+
+/// Environment variable carrying the sweep retention in seconds. Absent falls
+/// back to [`DEFAULT_OLDER_THAN_SECS`].
+pub(crate) const MAINTENANCE_OLDER_THAN_ENV: &str = "MINIMAL_MAINTENANCE_OLDER_THAN_SECS";
+
+/// Retention applied when the host did not name one: 14 days, matching
+/// `mip cache clean --older-than`'s default so the manual and scheduled sweeps
+/// age entries out on the same terms.
+pub(crate) const DEFAULT_OLDER_THAN_SECS: u64 = 14 * 24 * 60 * 60;
+
+/// How long to wait between wall-clock checks. Bounds how late a cycle can be
+/// after the host wakes from suspend, and is short enough that a clock step
+/// lands the run near its scheduled minute rather than a tick later.
+const TICK: Duration = Duration::from_secs(30);
+
+/// What one maintenance cycle reclaimed.
+///
+/// Both halves are recorded because either can be a silent no-op: a sweep that
+/// deleted nothing and a trim that returned nothing look identical in a log
+/// that only says "maintenance ran".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MaintenanceReport {
+    /// Cache entries deleted by the sweep.
+    pub cache_entries_deleted: u64,
+    /// Bytes those entries occupied, as measured before deletion.
+    pub cache_bytes_deleted: u64,
+    /// Cache entries held back because a session references them.
+    pub cache_entries_protected: u64,
+    /// Why the sweep was skipped, if it was. The trim still runs regardless.
+    pub cache_sweep_skipped: Option<String>,
+    /// Bytes `FITRIM` reported discarding. `None` when the trim did not run.
+    pub bytes_trimmed: Option<u64>,
+    /// Wall-clock duration of the cycle.
+    pub duration_ms: u64,
+}
+
+/// Start the daily maintenance scheduler, if one is configured.
+///
+/// Reads its schedule from the environment the kernel command line supplied at
+/// boot. No [`MAINTENANCE_AT_ENV`] means no schedule and no task — that is how
+/// maintenance is switched off, and how a daemon that is not running under
+/// `minvmd` behaves by default.
+///
+/// The task runs for the life of the daemon; the returned handle is safe to
+/// drop.
+pub(crate) fn spawn_scheduler(state: ServerStateHandle) -> Option<tokio::task::JoinHandle<()>> {
+    let raw = std::env::var(MAINTENANCE_AT_ENV).ok()?;
+    let Some(at) = TimeOfDay::parse(&raw) else {
+        tracing::warn!(
+            env = MAINTENANCE_AT_ENV,
+            value = raw,
+            "ignoring an unparseable maintenance time; expected HH:MM",
+        );
+        return None;
+    };
+    let older_than_secs = std::env::var(MAINTENANCE_OLDER_THAN_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .unwrap_or(DEFAULT_OLDER_THAN_SECS);
+
+    tracing::info!(
+        at = %raw,
+        older_than_secs,
+        "guest maintenance scheduled daily (UTC)"
+    );
+    Some(tokio::spawn(async move {
+        run_scheduler(&state, at, older_than_secs).await;
+    }))
+}
+
+/// Fire one cycle each time the wall clock passes `at`.
+///
+/// Never returns. Every failure is logged and swallowed: maintenance is
+/// best-effort housekeeping and must not be able to take the daemon down.
+async fn run_scheduler(state: &ServerStateHandle, at: TimeOfDay, older_than_secs: u64) {
+    // Anchored to the wall clock rather than a monotonic deadline, and
+    // re-evaluated every tick, so a host suspend or a timekeep correction moves
+    // the target instead of silently slipping the schedule by the sleep's
+    // duration.
+    let mut next = at.next_after(SystemTime::now());
+    loop {
+        tokio::time::sleep(TICK).await;
+        let now = SystemTime::now();
+        if now < next {
+            continue;
+        }
+        // Recomputed from `now`, not by adding a day to `next`: if the clock
+        // jumped forward past several occurrences (a laptop closed for a
+        // weekend), this runs once and resumes the daily cadence rather than
+        // firing a burst to "catch up" on housekeeping nobody missed.
+        next = at.next_after(now);
+        match run_cycle(state, older_than_secs).await {
+            Ok(report) => tracing::info!(
+                cache_entries_deleted = report.cache_entries_deleted,
+                cache_bytes_deleted = report.cache_bytes_deleted,
+                cache_entries_protected = report.cache_entries_protected,
+                cache_sweep_skipped = report.cache_sweep_skipped,
+                bytes_trimmed = report.bytes_trimmed,
+                duration_ms = report.duration_ms,
+                "guest maintenance reclaimed state"
+            ),
+            Err(error) => tracing::warn!(%error, "maintenance cycle could not run"),
+        }
+    }
+}
+
+/// A time of day, UTC, as `minvmd` configures it.
+///
+/// UTC rather than local time because the guest has no timezone configuration
+/// to read — a microVM rootfs carries no `/etc/localtime` — so "03:00" means
+/// the same instant regardless of where the host happens to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TimeOfDay {
+    hour: u32,
+    minute: u32,
+}
+
+impl TimeOfDay {
+    /// Seconds in a day.
+    const DAY: u64 = 24 * 60 * 60;
+
+    /// Parse `HH:MM`. `None` for anything else, including out-of-range values —
+    /// an unparseable schedule must switch maintenance off loudly rather than
+    /// silently pick a time nobody asked for.
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        let (h, m) = s.trim().split_once(':')?;
+        let hour: u32 = h.parse().ok()?;
+        let minute: u32 = m.parse().ok()?;
+        (hour < 24 && minute < 60).then_some(Self { hour, minute })
+    }
+
+    /// Seconds past midnight UTC.
+    const fn seconds_into_day(self) -> u64 {
+        (self.hour as u64) * 3600 + (self.minute as u64) * 60
+    }
+
+    /// The next instant strictly after `now` at which this time of day falls.
+    ///
+    /// Strictly after, so a cycle that finishes within the same minute it
+    /// started cannot immediately re-trigger.
+    pub(crate) fn next_after(self, now: SystemTime) -> SystemTime {
+        let since_epoch = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let midnight = since_epoch - (since_epoch % Self::DAY);
+        let today = midnight + self.seconds_into_day();
+        let next = if today > since_epoch {
+            today
+        } else {
+            today + Self::DAY
+        };
+        SystemTime::UNIX_EPOCH + Duration::from_secs(next)
+    }
+}
 
 /// Run one maintenance cycle against `s`.
 ///
@@ -60,7 +231,7 @@ use crate::sessions::MaintenanceInputs;
 /// signal costs the reclaim entirely. See the module note on scope.
 pub(crate) async fn run_cycle(
     s: &ServerStateHandle,
-    req: MaintenanceRequest,
+    older_than_secs: u64,
 ) -> Result<MaintenanceReport, String> {
     let started = Instant::now();
     let inputs = s
@@ -71,12 +242,9 @@ pub(crate) async fn run_cycle(
         .map_err(|e| format!("reading maintenance inputs: {e}"))?;
 
     let cutoff = SystemTime::now()
-        .checked_sub(Duration::from_secs(req.older_than_secs))
+        .checked_sub(Duration::from_secs(older_than_secs))
         .ok_or_else(|| {
-            format!(
-                "retention of {}s predates the epoch on this clock",
-                req.older_than_secs
-            )
+            format!("retention of {older_than_secs}s predates the epoch on this clock")
         })?;
     let protected = match protected_spec_hashes(&inputs).await {
         Ok(protected) => Some(protected),
@@ -95,9 +263,7 @@ pub(crate) async fn run_cycle(
         .map_err(|e| format!("sweep task panicked: {e}"))?;
     report.cache_entries_protected = protected_count;
 
-    if req.trim {
-        report.bytes_trimmed = trim(s).await;
-    }
+    report.bytes_trimmed = trim(s).await;
     report.duration_ms = started.elapsed().as_millis() as u64;
 
     tracing::info!(
@@ -303,6 +469,80 @@ async fn trim(_s: &ServerStateHandle) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Epoch seconds → `SystemTime`, for readable schedule assertions.
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn a_time_of_day_parses_from_hh_mm() {
+        assert_eq!(
+            TimeOfDay::parse("03:00"),
+            Some(TimeOfDay { hour: 3, minute: 0 })
+        );
+        assert_eq!(
+            TimeOfDay::parse("23:59"),
+            Some(TimeOfDay {
+                hour: 23,
+                minute: 59
+            })
+        );
+    }
+
+    /// An unparseable schedule switches maintenance off rather than defaulting
+    /// to a time nobody asked for — including the out-of-range values that
+    /// would otherwise silently wrap.
+    #[test]
+    fn an_invalid_time_of_day_is_rejected() {
+        for bad in [
+            "", "3", "03", "03:60", "24:00", "-1:00", "aa:bb", "03:00:00",
+        ] {
+            assert_eq!(TimeOfDay::parse(bad), None, "should reject {bad:?}");
+        }
+    }
+
+    /// Later the same day, the run is today; once the time has passed, it rolls
+    /// to tomorrow.
+    #[test]
+    fn the_next_run_rolls_to_tomorrow_once_today_has_passed() {
+        let three_am = TimeOfDay::parse("03:00").unwrap();
+        // 1970-01-01T00:00:00Z — 03:00 is still ahead.
+        assert_eq!(three_am.next_after(at(0)), at(3 * 3600));
+        // 1970-01-01T04:00:00Z — 03:00 has gone, so tomorrow.
+        assert_eq!(three_am.next_after(at(4 * 3600)), at(24 * 3600 + 3 * 3600));
+    }
+
+    /// Exactly on the scheduled second counts as passed, so a cycle finishing
+    /// within its own minute cannot immediately re-trigger.
+    #[test]
+    fn the_next_run_is_strictly_after_now() {
+        let three_am = TimeOfDay::parse("03:00").unwrap();
+        let today = 3 * 3600;
+        assert_eq!(three_am.next_after(at(today)), at(today + 24 * 3600));
+    }
+
+    /// A clock that jumps forward over several occurrences resumes the daily
+    /// cadence rather than queueing a run for each one missed — housekeeping
+    /// skipped while the host slept is not owed retrospectively.
+    #[test]
+    fn a_forward_clock_jump_does_not_queue_missed_runs() {
+        let three_am = TimeOfDay::parse("03:00").unwrap();
+        let after_a_long_weekend = at(3 * 24 * 3600 + 10 * 3600);
+        assert_eq!(
+            three_am.next_after(after_a_long_weekend),
+            at(4 * 24 * 3600 + 3 * 3600),
+            "the next run is the following 03:00, not a backlog"
+        );
+    }
+
+    /// Midnight is a legitimate schedule and must not degenerate into "now".
+    #[test]
+    fn midnight_schedules_the_following_day_when_it_is_already_midnight() {
+        let midnight = TimeOfDay::parse("00:00").unwrap();
+        assert_eq!(midnight.next_after(at(0)), at(24 * 3600));
+        assert_eq!(midnight.next_after(at(1)), at(24 * 3600));
+    }
 
     /// A distinct spec hash per `nibble`. Only distinctness matters here — the
     /// predicate under test never looks at the bytes.

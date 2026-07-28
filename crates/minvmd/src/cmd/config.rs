@@ -102,29 +102,20 @@ fn validate_resources(
     Ok(warnings)
 }
 
-/// Reject a maintenance schedule that would be self-defeating. Pure, so the
-/// bounds are testable without touching the provider dir.
+/// Reject a maintenance schedule the guest could not act on.
 ///
-/// A retention shorter than the interval is the trap worth catching: it makes
-/// every entry built since the last cycle eligible at the next one, so the
-/// cache would be swept clean of exactly the artifacts the user is actively
-/// rebuilding. Zero retention is the same failure at its limit. Zero *interval*
-/// is fine — that is how the timer is switched off.
-fn validate_maintenance(interval_secs: Option<u64>, older_than_secs: Option<u64>) -> Result<()> {
+/// `HH:MM` is fixed-width and whitespace-free because it rides the kernel
+/// command line, which the kernel splits on whitespace — a malformed value
+/// would either be dropped silently or corrupt the boot line, and the user
+/// would find out a reboot later by noticing maintenance never ran.
+fn validate_maintenance(at: Option<&str>, older_than_secs: Option<u64>) -> Result<()> {
+    if let Some(at) = at
+        && !crate::cmd::is_valid_maintenance_at(at)
+    {
+        bail!("--maintenance-at must be HH:MM in 24-hour UTC, e.g. 03:00 (got `{at}`)");
+    }
     if let Some(0) = older_than_secs {
         bail!("--maintenance-older-than-secs must be at least 1 (0 would sweep the whole cache)");
-    }
-    let effective_interval = interval_secs
-        .unwrap_or_else(|| crate::cmd::effective_maintenance_interval().map_or(0, |d| d.as_secs()));
-    let effective_retention =
-        older_than_secs.unwrap_or_else(crate::cmd::effective_maintenance_older_than_secs);
-    // A disabled timer never sweeps, so the relationship cannot bite.
-    if effective_interval > 0 && effective_retention < effective_interval {
-        bail!(
-            "--maintenance-older-than-secs ({effective_retention}) is shorter than the \
-             maintenance interval ({effective_interval}); every entry built between two \
-             cycles would be swept"
-        );
     }
     Ok(())
 }
@@ -133,22 +124,22 @@ fn validate_maintenance(interval_secs: Option<u64>, older_than_secs: Option<u64>
 pub fn run_set(
     vcpus: Option<u8>,
     ram_mib: Option<u32>,
-    maintenance_interval_secs: Option<u64>,
+    maintenance_at: Option<String>,
     maintenance_older_than_secs: Option<u64>,
 ) -> Result<()> {
     if vcpus.is_none()
         && ram_mib.is_none()
-        && maintenance_interval_secs.is_none()
+        && maintenance_at.is_none()
         && maintenance_older_than_secs.is_none()
     {
         bail!(
-            "nothing to set: pass --vcpus, --ram-mib, --maintenance-interval-secs, \
+            "nothing to set: pass --vcpus, --ram-mib, --maintenance-at, \
              and/or --maintenance-older-than-secs"
         );
     }
 
     let warnings = validate_resources(vcpus, ram_mib, HostCapacity::probe())?;
-    validate_maintenance(maintenance_interval_secs, maintenance_older_than_secs)?;
+    validate_maintenance(maintenance_at.as_deref(), maintenance_older_than_secs)?;
 
     let dir = provider_dir();
     // `StateDir::new` creates the provider dir (a `config set` can precede any
@@ -168,8 +159,8 @@ pub fn run_set(
     if let Some(m) = ram_mib {
         cfg.ram_mib = Some(m);
     }
-    if let Some(secs) = maintenance_interval_secs {
-        cfg.maintenance_interval_secs = Some(secs);
+    if let Some(at) = maintenance_at {
+        cfg.maintenance_at = Some(at);
     }
     if let Some(secs) = maintenance_older_than_secs {
         cfg.maintenance_older_than_secs = Some(secs);
@@ -180,13 +171,13 @@ pub fn run_set(
         eprintln!("warning: {w}");
     }
     println!(
-        "saved: vcpus={}, ram_mib={}, maintenance_interval_secs={}, \
+        "saved: vcpus={}, ram_mib={}, maintenance_at={}, \
          maintenance_older_than_secs={} (takes effect on next boot)",
         describe(cfg.vcpus, DEFAULT_VM_VCPUS),
         describe(cfg.ram_mib, DEFAULT_VM_RAM_MIB),
         describe(
-            cfg.maintenance_interval_secs,
-            crate::cmd::DEFAULT_MAINTENANCE_INTERVAL_SECS
+            cfg.maintenance_at.as_deref(),
+            crate::cmd::DEFAULT_MAINTENANCE_AT
         ),
         describe(
             cfg.maintenance_older_than_secs,
@@ -206,11 +197,11 @@ pub fn run_show(json: bool) -> Result<()> {
     let ram_source = source(env_ram_mib().is_some(), cfg.ram_mib.is_some());
     // Reported as seconds, `0` meaning "no timer", so the shown value matches
     // exactly what `config set` accepts back.
-    let interval = crate::cmd::effective_maintenance_interval().map_or(0, |d| d.as_secs());
+    let at = crate::cmd::effective_maintenance_at();
     let older_than = crate::cmd::effective_maintenance_older_than_secs();
-    let interval_source = source(
-        std::env::var(crate::cmd::MAINTENANCE_INTERVAL_ENV).is_ok(),
-        cfg.maintenance_interval_secs.is_some(),
+    let at_source = source(
+        std::env::var(crate::cmd::MAINTENANCE_AT_ENV).is_ok(),
+        cfg.maintenance_at.is_some(),
     );
     let older_than_source = source(
         std::env::var(crate::cmd::MAINTENANCE_OLDER_THAN_ENV).is_ok(),
@@ -221,18 +212,21 @@ pub fn run_show(json: bool) -> Result<()> {
         let out = serde_json::json!({
             "vcpus": vcpus,
             "ram_mib": ram_mib,
-            "maintenance_interval_secs": interval,
+            "maintenance_at": at,
             "maintenance_older_than_secs": older_than,
             "vcpus_source": vcpus_source,
             "ram_mib_source": ram_source,
-            "maintenance_interval_secs_source": interval_source,
+            "maintenance_at_source": at_source,
             "maintenance_older_than_secs_source": older_than_source,
         });
         println!("{out}");
     } else {
         println!("vcpus                       = {vcpus} ({vcpus_source})");
         println!("ram_mib                     = {ram_mib} ({ram_source})");
-        println!("maintenance_interval_secs   = {interval} ({interval_source})");
+        println!(
+            "maintenance_at              = {} ({at_source})",
+            at.as_deref().unwrap_or("unscheduled")
+        );
         println!("maintenance_older_than_secs = {older_than} ({older_than_source})");
     }
     Ok(())
@@ -323,34 +317,36 @@ mod tests {
         );
     }
 
-    /// Both values supplied, so the check is decided entirely by its
-    /// arguments — no env or provider-dir read, and no ordering hazard against
-    /// other tests.
     #[test]
-    fn retention_longer_than_the_interval_is_accepted() {
-        validate_maintenance(Some(6 * 60 * 60), Some(14 * 24 * 60 * 60)).expect("valid");
+    fn a_well_formed_schedule_is_accepted() {
+        validate_maintenance(Some("03:00"), Some(14 * 24 * 60 * 60)).expect("valid");
+        validate_maintenance(Some("00:00"), None).expect("midnight is valid");
+        validate_maintenance(Some("23:59"), None).expect("last minute is valid");
     }
 
-    /// The trap this check exists for: a retention shorter than the cycle
-    /// means every artifact built since the last cycle is stale at the next
-    /// one, so the sweep clears exactly what is being actively rebuilt.
+    /// The value rides the kernel command line, which the kernel splits on
+    /// whitespace — so a malformed schedule has to be refused here, not
+    /// discovered a reboot later by noticing maintenance never ran.
     #[test]
-    fn retention_shorter_than_the_interval_is_rejected() {
-        let err = validate_maintenance(Some(3600), Some(600)).unwrap_err();
-        assert!(err.to_string().contains("shorter than"), "got: {err}");
+    fn a_malformed_schedule_is_rejected() {
+        for bad in ["3:00", "03:0", "24:00", "03:60", "0300", "03 00", "", "3am"] {
+            let err =
+                validate_maintenance(Some(bad), None).expect_err(&format!("should reject {bad:?}"));
+            assert!(err.to_string().contains("HH:MM"), "got: {err}");
+        }
     }
 
     #[test]
     fn zero_retention_is_rejected() {
-        let err = validate_maintenance(Some(3600), Some(0)).unwrap_err();
+        let err = validate_maintenance(None, Some(0)).unwrap_err();
         assert!(err.to_string().contains("at least 1"), "got: {err}");
     }
 
-    /// A zero interval switches the timer off, so no sweep can happen and the
-    /// retention relationship cannot bite — it must not be rejected.
     #[test]
-    fn zero_interval_disables_the_timer_and_bypasses_the_relation() {
-        validate_maintenance(Some(0), Some(1)).expect("a disabled timer never sweeps");
+    fn is_valid_maintenance_at_requires_fixed_width_fields() {
+        assert!(crate::cmd::is_valid_maintenance_at("03:00"));
+        assert!(!crate::cmd::is_valid_maintenance_at("3:00"));
+        assert!(!crate::cmd::is_valid_maintenance_at("03:0"));
     }
 
     #[test]

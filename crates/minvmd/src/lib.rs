@@ -15,7 +15,6 @@ pub mod config;
 pub mod error;
 pub mod image;
 pub mod lifecycle;
-pub mod maintenance;
 pub mod metrics;
 pub mod net;
 pub(crate) mod rpc_client;

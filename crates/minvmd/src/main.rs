@@ -78,10 +78,10 @@ enum ConfigAction {
         /// Guest RAM in MiB.
         #[arg(long)]
         ram_mib: Option<u32>,
-        /// Seconds between guest maintenance cycles (cache sweep + fstrim).
-        /// `0` disables the timer. Takes effect on the next boot.
+        /// Time of day (`HH:MM`, UTC) at which the guest runs its maintenance
+        /// cycle (cache sweep + fstrim). Takes effect on the next boot.
         #[arg(long)]
-        maintenance_interval_secs: Option<u64>,
+        maintenance_at: Option<String>,
         /// Seconds a cache entry may go unused before a maintenance sweep may
         /// delete it. Takes effect on the next boot.
         #[arg(long)]
@@ -127,12 +127,12 @@ fn main() -> Result<()> {
             ConfigAction::Set {
                 vcpus,
                 ram_mib,
-                maintenance_interval_secs,
+                maintenance_at,
                 maintenance_older_than_secs,
             } => minvmd::cmd::config::run_set(
                 vcpus,
                 ram_mib,
-                maintenance_interval_secs,
+                maintenance_at,
                 maintenance_older_than_secs,
             ),
         },
