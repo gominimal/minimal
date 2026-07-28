@@ -50,3 +50,16 @@ Session is a new concept in v0.5.0. `[session]` will define interactive environm
 interactive = true
 ```
 should be migrated to a session definition. For how to define a session, please refer to [the session configuration in minimal.toml](../reference/minimal-dot-toml.md#session---what-every-contributors-session-gets-session). 
+
+Unlike `tasks`, which can have multiple definitions and each can be invoked with `minimal run <task>`, `session` has only 1 definition, and is created with 
+```shell
+min activate #produces session ID as output
+```
+You can enter a session with
+```shell
+min attach <session ID>
+```
+To create and then enter the new session immediately
+```shell
+min activate --attach
+```
