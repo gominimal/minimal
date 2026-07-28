@@ -108,8 +108,14 @@ fn run(
     stopped: &Receiver<()>,
 ) {
     while should_continue(stopped.recv_timeout(interval)) {
+        // Every arm below logs at INFO, including the ones that did nothing.
+        // A skipped or deferred cycle is the case this feature is least able
+        // to afford being silent about: at DEBUG it is indistinguishable from
+        // a timer that never fired, which is exactly the failure a reader
+        // would be trying to diagnose. At the real interval this is a handful
+        // of lines a day.
         if on_battery() == Some(true) {
-            tracing::debug!("host is on battery; skipping this maintenance cycle");
+            tracing::info!("host is on battery; skipping this maintenance cycle");
             continue;
         }
 
@@ -119,21 +125,16 @@ fn run(
             CONNECT_TIMEOUT,
             RPC_TIMEOUT,
         ) {
-            Ok(minimald_rpc::MaintenanceResponse::Completed(report)) => {
+            Ok(report) => {
                 tracing::info!(
                     cache_entries_deleted = report.cache_entries_deleted,
                     cache_bytes_deleted = report.cache_bytes_deleted,
                     cache_entries_protected = report.cache_entries_protected,
                     cache_sweep_skipped = report.cache_sweep_skipped,
-                    stale_dirs_removed = report.stale_dirs_removed,
-                    stale_dir_bytes_deleted = report.stale_dir_bytes_deleted,
                     bytes_trimmed = report.bytes_trimmed,
                     duration_ms = report.duration_ms,
                     "guest maintenance reclaimed state"
                 );
-            }
-            Ok(minimald_rpc::MaintenanceResponse::Deferred { reason }) => {
-                tracing::debug!(reason, "guest deferred maintenance");
             }
             Err(error) => {
                 tracing::warn!(error = %error, "guest maintenance cycle failed");

@@ -80,8 +80,8 @@ pub(crate) fn shutdown_guest(
 }
 
 /// Ask the in-VM minimald to run one maintenance cycle: sweep stale cache
-/// entries and dead sandbox/task/temp dirs, then `fstrim` the state volume so
-/// the freed blocks come back out of the host's raw image.
+/// entries, then `fstrim` the state volume so the freed blocks come back out of
+/// the host's raw image.
 ///
 /// The whole cycle runs before the daemon answers, so `rpc_timeout` bounds the
 /// sweep itself rather than a round-trip; size it for a cache with tens of
@@ -91,7 +91,7 @@ pub(crate) fn run_guest_maintenance(
     older_than_secs: u64,
     connect_timeout: Duration,
     rpc_timeout: Duration,
-) -> anyhow::Result<minimald_rpc::MaintenanceResponse> {
+) -> anyhow::Result<minimald_rpc::MaintenanceReport> {
     let response = call_oneshot_blocking::<minimald_rpc::Maintenance>(
         uds_path,
         minimald_rpc::MaintenanceRequest::new(older_than_secs),

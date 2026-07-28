@@ -99,8 +99,7 @@ While a VM is up, the supervisor drives the in-VM `minimald` through a
 maintenance cycle every `maintenance-interval-secs`:
 
 1. **Sweep** — delete cache entries unused for longer than
-   `maintenance-older-than-secs`, plus sandbox, task, and temp directories
-   whose owning process is gone.
+   `maintenance-older-than-secs`.
 2. **Trim** — `fstrim` the state volume, so the blocks the sweep freed are
    returned to the host's backing raw image.
 
@@ -110,16 +109,23 @@ at its high-water mark; the trim is what shrinks it. Each cycle logs what it
 reclaimed (`guest maintenance reclaimed state`), so a run that reclaimed
 nothing is distinguishable from one that never happened.
 
-The cycle is skipped, and retried on the next tick, when:
+A cycle is skipped, and retried on the next tick, when the host is running on
+battery. Otherwise it always runs: `FITRIM` is the online-discard ioctl and is
+safe on a live filesystem, so a concurrent build costs the cycle latency
+rather than correctness.
 
-- a build or task is in flight in the guest — `FITRIM` takes ext4
-  block-group locks, and maintenance has no deadline while a build does;
-- the host is running on battery.
+A sweep never deletes a cache entry that any session depends on: the protected
+set is the union of the packages every session's project references. If that
+set cannot be computed for even one session, the sweep deletes nothing — but
+the trim still runs, since discarding already-free blocks cannot evict
+anything. The skip is reported in the cycle's log line.
 
-A sweep never deletes a cache entry that any live session depends on: the
-protected set is the union of the packages every live session's project
-references. If that set cannot be computed for even one session, the cycle
-deletes nothing at all.
+Leaked build sandboxes are **not** reclaimed. A build keeps its sandbox
+directory until it succeeds, so a failed or interrupted one leaves the
+directory behind; reclaiming those needs a dependable "is the owning process
+still alive" signal, which the current `-<pid>` directory suffix does not
+provide inside the VM (it records the creating process, which there is the
+daemon itself, pid 1).
 
 ### `stop`
 

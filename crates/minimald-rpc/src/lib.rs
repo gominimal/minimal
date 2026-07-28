@@ -433,8 +433,8 @@ impl OneshotSshRpc for Shutdown {
 }
 
 /// An RPC asking the daemon to run one steady-state maintenance cycle over its
-/// state dir: sweep stale cache entries and dead sandbox/task/temp dirs, then
-/// `fstrim` so the freed blocks are returned to the host's backing image.
+/// state dir: sweep stale cache entries, then `fstrim` so the freed blocks are
+/// returned to the host's backing image.
 ///
 /// Policy lives on the caller (the host `minvmd`, which owns a trustworthy
 /// clock and the power state), the way [`Shutdown`] does; the daemon only
@@ -475,7 +475,7 @@ impl MaintenanceRequest {
     }
 }
 
-/// What one completed maintenance cycle reclaimed.
+/// What one maintenance cycle reclaimed.
 ///
 /// Both halves are reported because either can be a silent no-op: a sweep that
 /// deleted nothing and a trim that returned nothing look identical in a log
@@ -489,19 +489,14 @@ pub struct MaintenanceReport {
     pub cache_bytes_deleted: u64,
     /// Cache entries held back because a live session references them.
     pub cache_entries_protected: u64,
-    /// Why the cache half of the sweep was skipped, if it was.
+    /// Why the sweep was skipped, if it was.
     ///
     /// The sweep may only delete an entry it has proven no session needs, so a
     /// daemon that cannot enumerate some session's packages must not touch the
-    /// cache. The rest of the cycle still runs: reaping a directory whose
-    /// owning pid is gone, and trimming already-free blocks, cannot evict
+    /// cache. The trim still runs — discarding already-free blocks cannot evict
     /// anything. Reported rather than raised so one unresolvable session
     /// degrades a cycle instead of disabling maintenance outright.
     pub cache_sweep_skipped: Option<String>,
-    /// Sandbox/task/temp directories removed because their owning pid is gone.
-    pub stale_dirs_removed: u64,
-    /// Bytes those directories occupied, as measured before deletion.
-    pub stale_dir_bytes_deleted: u64,
     /// Bytes `FITRIM` reported discarding. `None` when the trim was not run —
     /// either the caller asked for none, or the state dir is not a filesystem
     /// this daemon can trim.
@@ -510,25 +505,10 @@ pub struct MaintenanceReport {
     pub duration_ms: u64,
 }
 
-/// The response for a [`Maintenance`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum MaintenanceResponse {
-    /// The cycle ran to completion.
-    Completed(MaintenanceReport),
-    /// The daemon declined this cycle and changed nothing. `FITRIM` holds
-    /// ext4 block-group locks, so maintenance defers to in-flight work rather
-    /// than contending with it; the caller simply tries again next tick.
-    Deferred {
-        /// Why the cycle was skipped, for the caller's log.
-        reason: String,
-    },
-}
-
 impl OneshotSshRpc for Maintenance {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "Maintenance");
     type Request<'a> = MaintenanceRequest;
-    type Response = Errorable<MaintenanceResponse>;
+    type Response = Errorable<MaintenanceReport>;
 }
 
 /// Resume a `Pending` session with the client's per-item
@@ -880,25 +860,28 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_response_round_trips_both_variants() {
-        let completed = MaintenanceResponse::Completed(MaintenanceReport {
+    fn maintenance_report_round_trips() {
+        let report = MaintenanceReport {
             cache_entries_deleted: 12,
             cache_bytes_deleted: 4096,
             cache_entries_protected: 3,
             cache_sweep_skipped: None,
-            stale_dirs_removed: 1,
-            stale_dir_bytes_deleted: 512,
             bytes_trimmed: Some(1_048_576),
             duration_ms: 250,
-        });
-        assert_eq!(round_trip(&completed), completed);
-
-        let deferred = MaintenanceResponse::Deferred {
-            reason: "a build is in flight".to_string(),
         };
-        assert_eq!(round_trip(&deferred), deferred);
-        let json = serde_json::to_string(&deferred).unwrap();
-        assert!(json.contains(r#""kind":"deferred""#), "got: {json}");
+        assert_eq!(round_trip(&report), report);
+    }
+
+    /// A skipped sweep still reports a trim: the two halves fail independently,
+    /// and the trim is the half that reaches the host image.
+    #[test]
+    fn a_skipped_sweep_still_carries_its_trim() {
+        let report = MaintenanceReport {
+            cache_sweep_skipped: Some("packages unresolvable".to_string()),
+            bytes_trimmed: Some(4096),
+            ..MaintenanceReport::default()
+        };
+        assert_eq!(round_trip(&report), report);
     }
 
     /// A trim that did not run is `None`, not `0` — "we skipped it" and "we

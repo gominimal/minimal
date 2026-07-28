@@ -1313,8 +1313,8 @@ pub async fn handle_ssh_rpc(
 mod tests {
     use minimald_rpc::{
         CreateSession, CreateSessionRequest, DestroySessionRequest, EgressPolicy, GetSessionPolicy,
-        GetSessionPolicyRequest, MaintenanceResponse, RenameSessionRequest, SessionPolicy,
-        Shutdown, ShutdownRequest, ShutdownResponse,
+        GetSessionPolicyRequest, RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest,
+        ShutdownResponse,
     };
     use paths::HostAbsPath;
     use sessions::{NetworkMode, SessionId};
@@ -1914,11 +1914,8 @@ mod tests {
             .call::<Maintenance>(&MaintenanceRequest::new(14 * 24 * 60 * 60))
             .await
             .unwrap();
-        let MaintenanceResponse::Completed(report) = resp else {
-            panic!("an idle daemon has no in-flight work to defer to: {resp:?}");
-        };
+        let report = resp;
         assert_eq!(report.cache_entries_deleted, 0);
-        assert_eq!(report.stale_dirs_removed, 0);
         assert_eq!(
             report.cache_entries_protected, 0,
             "no sessions, nothing to protect"
@@ -1928,8 +1925,8 @@ mod tests {
         assert_eq!(report.bytes_trimmed, None);
     }
 
-    /// A session present in the store must not make the cycle fail or defer,
-    /// even at a retention of zero where every cache entry is eligible.
+    /// A session present in the store must not make the cycle fail, even at a
+    /// retention of zero where every cache entry is eligible.
     ///
     /// This asserts reachability, not the size of the protected set: the
     /// harness composes sessions whose workspace holds no `minimal.toml` (see
@@ -1957,9 +1954,7 @@ mod tests {
             .call::<Maintenance>(&MaintenanceRequest::new(0).without_trim())
             .await
             .unwrap();
-        let MaintenanceResponse::Completed(report) = resp else {
-            panic!("nothing is building in this test: {resp:?}");
-        };
+        let report = resp;
         assert_eq!(
             report.cache_sweep_skipped, None,
             "a workspace without a minimal.toml is a session with nothing to \

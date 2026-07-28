@@ -1,10 +1,9 @@
 //! Steady-state guest maintenance: a cache sweep followed by an `fstrim`.
 //!
-//! Nothing else reclaims guest state. `cache/built` grows monotonically and
-//! every build leaves sandbox/task/temp directories behind, while the state
-//! volume is mounted without `discard`, so the host's backing raw image is a
-//! high-water mark of every block ever written to it. The two halves here are
-//! ordered and both required: the sweep frees blocks inside ext4, and
+//! Nothing else reclaims guest state. `cache/built` grows monotonically, while
+//! the state volume is mounted without `discard`, so the host's backing raw
+//! image is a high-water mark of every block ever written to it. The two halves
+//! here are ordered and both required: the sweep frees blocks inside ext4, and
 //! [`crate::guest::trim_state_volume`] returns those blocks to the host image.
 //! Neither alone changes what the user sees on disk.
 //!
@@ -13,23 +12,29 @@
 //! reports. That mirrors the `Shutdown` RPC, and it keeps the schedule on the
 //! side of the system with a trustworthy clock and a view of the power state.
 //!
-//! **The cache sweep is fail-closed.** `mip cache clean` protects the packages
-//! of *the current project*; a daemon has no such thing and must instead
-//! protect the union over every session. If that union cannot be computed, the
-//! cache is left entirely alone rather than risk evicting an entry out from
-//! under a running build.
-//!
-//! It degrades rather than aborting, though. Reaping a directory whose owning
-//! pid is gone, and trimming blocks that are already free, cannot evict
-//! anything a session needs — so both still run, and the skip is reported
-//! instead of raised. One session whose packages will not resolve should cost
-//! a cycle its cache sweep, not disable maintenance for the life of the VM.
+//! **The sweep is fail-closed.** `mip cache clean` protects the packages of
+//! *the current project*; a daemon has no such thing and must instead protect
+//! the union over every session. If that union cannot be computed, the cache is
+//! left entirely alone rather than risk evicting an entry out from under a
+//! running build. The trim still runs — discarding blocks that are already free
+//! cannot evict anything — and the skip is reported rather than raised, so one
+//! session whose packages will not resolve costs a cycle its sweep instead of
+//! disabling maintenance for the life of the VM.
 //!
 //! That protected set — not the recorded last-use times — is what makes the
 //! sweep safe. `ReadSnapshot` reads the tracker files off disk, where the
 //! owning process's records lag its in-memory state by up to a flush interval,
 //! so an entry a live session just used can still look untouched here. Ageing
 //! decides only *which of the unneeded entries* to drop.
+//!
+//! **Scope.** Leaked build sandboxes are deliberately not swept here. A build
+//! sets `keep_dir(true)` until it succeeds, so a failed or interrupted one
+//! leaves its directory behind, and reclaiming those needs a reliable "is the
+//! owning process still alive" signal. The `-<pid>` suffix `sandbox2` stamps
+//! into the directory name is the *creating* process's pid, which in the guest
+//! is this daemon — pid 1, and so alive by definition, including across
+//! restarts. Making the sandbox's leader process own its namespace is the fix;
+//! until then no sound signal exists and this module does not guess.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -37,21 +42,26 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use common::SpecHash;
-use minimald_rpc::{MaintenanceReport, MaintenanceRequest, MaintenanceResponse};
+use minimald_rpc::{MaintenanceReport, MaintenanceRequest};
 
 use crate::server::ServerStateHandle;
 use crate::sessions::MaintenanceInputs;
 
 /// Run one maintenance cycle against `s`.
 ///
-/// Returns [`MaintenanceResponse::Deferred`] without touching anything when a
-/// build or task is in flight. `Err` is reserved for a cycle that could not
-/// start at all; a cycle that merely could not establish the protected set
-/// completes with `cache_sweep_skipped` set and the cache untouched.
+/// `Err` is reserved for a cycle that could not start at all; a cycle that
+/// merely could not establish the protected set completes with
+/// `cache_sweep_skipped` set and the cache untouched.
+///
+/// The cycle does not defer to in-flight builds. `FITRIM` is the online-discard
+/// ioctl and is safe on a live filesystem, and the sweep only deletes entries
+/// no session references, so contention here costs latency rather than
+/// correctness — whereas a deferral built on an unreliable "is a build running"
+/// signal costs the reclaim entirely. See the module note on scope.
 pub(crate) async fn run_cycle(
     s: &ServerStateHandle,
     req: MaintenanceRequest,
-) -> Result<MaintenanceResponse, String> {
+) -> Result<MaintenanceReport, String> {
     let started = Instant::now();
     let inputs = s
         .sessions_manager()
@@ -59,12 +69,6 @@ pub(crate) async fn run_cycle(
         .maintenance_inputs()
         .await
         .map_err(|e| format!("reading maintenance inputs: {e}"))?;
-
-    // Deferral first: it is the cheapest check, and a cycle that is going to
-    // decline should not pay for a Nickel evaluation per session to find out.
-    if let Some(reason) = work_in_flight(&inputs.daemon_ctx) {
-        return Ok(MaintenanceResponse::Deferred { reason });
-    }
 
     let cutoff = SystemTime::now()
         .checked_sub(Duration::from_secs(req.older_than_secs))
@@ -101,13 +105,11 @@ pub(crate) async fn run_cycle(
         cache_bytes_deleted = report.cache_bytes_deleted,
         cache_entries_protected = report.cache_entries_protected,
         cache_sweep_skipped = report.cache_sweep_skipped,
-        stale_dirs_removed = report.stale_dirs_removed,
-        stale_dir_bytes_deleted = report.stale_dir_bytes_deleted,
         bytes_trimmed = report.bytes_trimmed,
         duration_ms = report.duration_ms,
         "maintenance cycle complete"
     );
-    Ok(MaintenanceResponse::Completed(report))
+    Ok(report)
 }
 
 /// The union of spec hashes every known session depends on — the set the sweep
@@ -160,11 +162,11 @@ async fn protected_spec_hashes(inputs: &MaintenanceInputs) -> Result<HashSet<Spe
     Ok(protected)
 }
 
-/// Delete aged-out cache entries and dead build/task/temp directories.
+/// Delete aged-out cache entries.
 ///
 /// `protected` is `None` when the set of entries live sessions depend on could
-/// not be established; the cache is then left alone and only the dead-directory
-/// reap runs. Blocking; call from [`tokio::task::spawn_blocking`].
+/// not be established; the cache is then left entirely alone. Blocking; call
+/// from [`tokio::task::spawn_blocking`].
 fn sweep(
     daemon_ctx: &mctx::DaemonContext,
     protected: Option<HashSet<SpecHash>>,
@@ -177,15 +179,13 @@ fn sweep(
         report.cache_sweep_skipped = Some(
             "the set of packages live sessions depend on could not be established".to_string(),
         );
-        reap_all_dead_dirs(daemon_ctx, &mut report);
         return report;
     };
 
     // An unreadable read tracker means "no entry has a recorded use", under
     // which every unprotected entry would look stale and the sweep would empty
-    // the cache. Skip the cache half instead — a wrongly-emptied cache is a
-    // rebuild of everything — but still reap dead directories below, which
-    // does not depend on access times at all.
+    // the cache. Skip it instead — a wrongly-emptied cache is a rebuild of
+    // everything, and the caller still gets its trim.
     match cache.atimes() {
         Ok(atimes) => {
             // Collected before deleting: `iter_entries` walks the same bucket
@@ -220,21 +220,7 @@ fn sweep(
         }
     }
 
-    reap_all_dead_dirs(daemon_ctx, &mut report);
     report
-}
-
-/// Reap dead-pid directories under every base dir a build or task leaves work
-/// in. Independent of the cache half, so it runs even when the cache must be
-/// left alone.
-fn reap_all_dead_dirs(daemon_ctx: &mctx::DaemonContext, report: &mut MaintenanceReport) {
-    for (kind, base) in [
-        ("sandbox", daemon_ctx.builds_base_dir()),
-        ("task", daemon_ctx.tasks_base_dir()),
-        ("tempdir", daemon_ctx.cache_base_dir().join("temp")),
-    ] {
-        reap_dead_dirs(kind, &base, report);
-    }
 }
 
 /// Whether a cache entry may be deleted: no session depends on it, and it has
@@ -252,85 +238,6 @@ fn is_sweepable(
     cutoff: SystemTime,
 ) -> bool {
     !protected.contains(hash) && last_read.is_none_or(|last| last < cutoff)
-}
-
-/// Remove every directory under `base` whose owning pid is gone, tallying into
-/// `report`.
-///
-/// The naming contract is `<something>-<pid>`, the same one `mip cache clean`
-/// reads; a directory that does not carry a pid suffix is left alone.
-fn reap_dead_dirs(kind: &str, base: &Path, report: &mut MaintenanceReport) {
-    let entries = match std::fs::read_dir(base) {
-        Ok(entries) => entries,
-        // A base dir that was never created is not an error: nothing has run
-        // of that kind yet.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            tracing::warn!(kind, path = %base.display(), error = %e, "could not read dir for sweep");
-            return;
-        }
-    };
-
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if owning_pid(name).is_none_or(pid_is_live) {
-            continue;
-        }
-        let bytes = dir_size(&entry.path());
-        match common::remove_dir_all(entry.path()) {
-            Ok(()) => {
-                tracing::debug!(kind, name, bytes, "reaped stale dir");
-                report.stale_dirs_removed += 1;
-                report.stale_dir_bytes_deleted += bytes;
-            }
-            Err(e) => {
-                tracing::warn!(kind, name, error = %e, "could not reap stale dir");
-            }
-        }
-    }
-}
-
-/// Whether a build or task sandbox is currently live, and so what to say about
-/// it in the deferral.
-///
-/// `FITRIM` walks ext4 taking block-group locks, and the sweep competes for the
-/// same directories a build is writing into, so a cycle that lands mid-build
-/// declines and waits for the next tick rather than contending. Steady-state
-/// maintenance has no deadline; a build does.
-fn work_in_flight(daemon_ctx: &mctx::DaemonContext) -> Option<String> {
-    for (kind, base) in [
-        ("build", daemon_ctx.builds_base_dir()),
-        ("task", daemon_ctx.tasks_base_dir()),
-    ] {
-        let Ok(entries) = std::fs::read_dir(&base) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if owning_pid(name).is_some_and(pid_is_live) {
-                return Some(format!("a {kind} is in flight ({name})"));
-            }
-        }
-    }
-    None
-}
-
-/// The pid a sandbox/task/temp directory name ends in, per the
-/// `<something>-<pid>` convention. `None` for a name that carries no pid
-/// suffix, which is what keeps the sweep off directories it does not own.
-fn owning_pid(name: &str) -> Option<u32> {
-    name.rsplit_once('-')?.1.parse().ok()
-}
-
-/// Whether `pid` still names a live process.
-///
-/// A `/proc` lookup, so this is meaningful only in the guest — which is
-/// precisely where maintenance runs. An unreadable `/proc` reads as "live",
-/// keeping the sweep off directories whose owner it cannot rule out.
-fn pid_is_live(pid: u32) -> bool {
-    std::fs::exists(format!("/proc/{pid}")).unwrap_or(true)
 }
 
 /// Total bytes occupied by `path`, following no symlinks.
@@ -396,32 +303,6 @@ async fn trim(_s: &ServerStateHandle) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn owning_pid_reads_the_trailing_pid() {
-        assert_eq!(owning_pid("sandbox-abc123-4242"), Some(4242));
-        assert_eq!(owning_pid("task-1"), Some(1));
-    }
-
-    /// A directory without the `-<pid>` suffix is not ours to reap. `mip cache
-    /// clean`'s own guard is the same one; without it the sweep would delete
-    /// anything that happened to sit in the base dir.
-    #[test]
-    fn owning_pid_rejects_names_without_a_pid_suffix() {
-        assert_eq!(owning_pid("no-pid-here"), None);
-        assert_eq!(owning_pid("nodashes"), None);
-        assert_eq!(owning_pid("trailing-"), None);
-        assert_eq!(owning_pid("sandbox-1a2b"), None);
-    }
-
-    /// The `-` is the separator, so it can never be consumed as a sign: a name
-    /// ending `--1` yields pid 1, not -1. Worth pinning because the parse being
-    /// `u32` is what keeps a negative out of the `/proc/<pid>` probe.
-    #[test]
-    fn owning_pid_never_yields_a_negative() {
-        assert_eq!(owning_pid("negative--1"), Some(1));
-        assert_eq!(owning_pid("sandbox--12"), Some(12));
-    }
 
     /// A distinct spec hash per `nibble`. Only distinctness matters here — the
     /// predicate under test never looks at the bytes.
@@ -489,39 +370,5 @@ mod tests {
             "an 8 KiB file must be accounted for"
         );
         assert_eq!(dir_size(&tmp.path().join("absent")), 0);
-    }
-
-    /// `reap_dead_dirs` must leave live-pid and un-suffixed directories alone,
-    /// and take only the ones whose owner is gone.
-    #[test]
-    fn reap_dead_dirs_removes_only_dead_pid_dirs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path();
-        let live = format!("sandbox-{}", std::process::id());
-        // pid 0 is never a live process, so `/proc/0` never exists.
-        for name in [live.as_str(), "sandbox-0", "not-a-sandbox"] {
-            std::fs::create_dir_all(base.join(name)).unwrap();
-        }
-
-        let mut report = MaintenanceReport::default();
-        reap_dead_dirs("sandbox", base, &mut report);
-
-        assert_eq!(report.stale_dirs_removed, 1, "only the dead-pid dir goes");
-        assert!(base.join(&live).exists(), "a live pid's dir must survive");
-        assert!(
-            base.join("not-a-sandbox").exists(),
-            "a dir with no pid suffix is not ours to reap"
-        );
-        assert!(!base.join("sandbox-0").exists());
-    }
-
-    /// A base dir that was never created is not a failure — it just means
-    /// nothing of that kind has run yet.
-    #[test]
-    fn reap_dead_dirs_tolerates_a_missing_base_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut report = MaintenanceReport::default();
-        reap_dead_dirs("task", &tmp.path().join("never-created"), &mut report);
-        assert_eq!(report.stale_dirs_removed, 0);
     }
 }
