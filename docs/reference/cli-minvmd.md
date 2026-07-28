@@ -64,21 +64,62 @@ lock contention. `--json` prints status as a JSON object.
 minvmd config show [--json]
 ```
 
-Prints the effective per-VM resource configuration and each value's
-source. `--json` prints it as a JSON object.
+Prints the effective per-VM configuration and each value's source.
+`--json` prints it as a JSON object.
 
 ### `config set`
 
 ```
 minvmd config set [--vcpus <N>] [--ram-mib <N>]
+                  [--maintenance-interval-secs <N>]
+                  [--maintenance-older-than-secs <N>]
 ```
 
-Validates and persists resource parameters, applied on the next boot.
+Validates and persists configuration, applied on the next boot.
 
-| Flag | Description |
-|------|-------------|
-| `--vcpus <N>` | Number of virtual CPUs |
-| `--ram-mib <N>` | Guest RAM in MiB |
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--vcpus <N>` | Number of virtual CPUs | 2 |
+| `--ram-mib <N>` | Guest RAM in MiB | 2048 (x86_64) / 4096 |
+| `--maintenance-interval-secs <N>` | Seconds between guest maintenance cycles; `0` disables the timer | 21600 (6 h) |
+| `--maintenance-older-than-secs <N>` | Seconds a cache entry may go unused before a sweep may delete it | 1209600 (14 d) |
+
+Each value resolves as `env override ?? persisted config ?? default`; the
+environment variables are `MINVMD_VM_VCPUS`, `MINVMD_VM_RAM_MIB`,
+`MINVMD_MAINTENANCE_INTERVAL_SECS`, and
+`MINVMD_MAINTENANCE_OLDER_THAN_SECS`.
+
+`config set` refuses a retention shorter than the interval: it would make
+every artifact built between two cycles eligible at the next one, sweeping
+away exactly what is being actively rebuilt.
+
+## Guest maintenance
+
+While a VM is up, the supervisor drives the in-VM `minimald` through a
+maintenance cycle every `maintenance-interval-secs`:
+
+1. **Sweep** — delete cache entries unused for longer than
+   `maintenance-older-than-secs`, plus sandbox, task, and temp directories
+   whose owning process is gone.
+2. **Trim** — `fstrim` the state volume, so the blocks the sweep freed are
+   returned to the host's backing raw image.
+
+Both steps are needed. The state volume is mounted without `discard`, so
+deleting files inside the guest frees ext4 blocks but leaves the host image
+at its high-water mark; the trim is what shrinks it. Each cycle logs what it
+reclaimed (`guest maintenance reclaimed state`), so a run that reclaimed
+nothing is distinguishable from one that never happened.
+
+The cycle is skipped, and retried on the next tick, when:
+
+- a build or task is in flight in the guest — `FITRIM` takes ext4
+  block-group locks, and maintenance has no deadline while a build does;
+- the host is running on battery.
+
+A sweep never deletes a cache entry that any live session depends on: the
+protected set is the union of the packages every live session's project
+references. If that set cannot be computed for even one session, the cycle
+deletes nothing at all.
 
 ### `stop`
 

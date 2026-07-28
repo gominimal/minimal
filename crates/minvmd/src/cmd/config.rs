@@ -102,13 +102,53 @@ fn validate_resources(
     Ok(warnings)
 }
 
+/// Reject a maintenance schedule that would be self-defeating. Pure, so the
+/// bounds are testable without touching the provider dir.
+///
+/// A retention shorter than the interval is the trap worth catching: it makes
+/// every entry built since the last cycle eligible at the next one, so the
+/// cache would be swept clean of exactly the artifacts the user is actively
+/// rebuilding. Zero retention is the same failure at its limit. Zero *interval*
+/// is fine — that is how the timer is switched off.
+fn validate_maintenance(interval_secs: Option<u64>, older_than_secs: Option<u64>) -> Result<()> {
+    if let Some(0) = older_than_secs {
+        bail!("--maintenance-older-than-secs must be at least 1 (0 would sweep the whole cache)");
+    }
+    let effective_interval = interval_secs
+        .unwrap_or_else(|| crate::cmd::effective_maintenance_interval().map_or(0, |d| d.as_secs()));
+    let effective_retention =
+        older_than_secs.unwrap_or_else(crate::cmd::effective_maintenance_older_than_secs);
+    // A disabled timer never sweeps, so the relationship cannot bite.
+    if effective_interval > 0 && effective_retention < effective_interval {
+        bail!(
+            "--maintenance-older-than-secs ({effective_retention}) is shorter than the \
+             maintenance interval ({effective_interval}); every entry built between two \
+             cycles would be swept"
+        );
+    }
+    Ok(())
+}
+
 /// Run `minvmd config set`: validate, merge into the persisted config, and save.
-pub fn run_set(vcpus: Option<u8>, ram_mib: Option<u32>) -> Result<()> {
-    if vcpus.is_none() && ram_mib.is_none() {
-        bail!("nothing to set: pass --vcpus and/or --ram-mib");
+pub fn run_set(
+    vcpus: Option<u8>,
+    ram_mib: Option<u32>,
+    maintenance_interval_secs: Option<u64>,
+    maintenance_older_than_secs: Option<u64>,
+) -> Result<()> {
+    if vcpus.is_none()
+        && ram_mib.is_none()
+        && maintenance_interval_secs.is_none()
+        && maintenance_older_than_secs.is_none()
+    {
+        bail!(
+            "nothing to set: pass --vcpus, --ram-mib, --maintenance-interval-secs, \
+             and/or --maintenance-older-than-secs"
+        );
     }
 
     let warnings = validate_resources(vcpus, ram_mib, HostCapacity::probe())?;
+    validate_maintenance(maintenance_interval_secs, maintenance_older_than_secs)?;
 
     let dir = provider_dir();
     // `StateDir::new` creates the provider dir (a `config set` can precede any
@@ -128,15 +168,30 @@ pub fn run_set(vcpus: Option<u8>, ram_mib: Option<u32>) -> Result<()> {
     if let Some(m) = ram_mib {
         cfg.ram_mib = Some(m);
     }
+    if let Some(secs) = maintenance_interval_secs {
+        cfg.maintenance_interval_secs = Some(secs);
+    }
+    if let Some(secs) = maintenance_older_than_secs {
+        cfg.maintenance_older_than_secs = Some(secs);
+    }
     cfg.write(&dir).context("persisting resource config")?;
 
     for w in &warnings {
         eprintln!("warning: {w}");
     }
     println!(
-        "saved: vcpus={}, ram_mib={} (takes effect on next boot)",
+        "saved: vcpus={}, ram_mib={}, maintenance_interval_secs={}, \
+         maintenance_older_than_secs={} (takes effect on next boot)",
         describe(cfg.vcpus, DEFAULT_VM_VCPUS),
         describe(cfg.ram_mib, DEFAULT_VM_RAM_MIB),
+        describe(
+            cfg.maintenance_interval_secs,
+            crate::cmd::DEFAULT_MAINTENANCE_INTERVAL_SECS
+        ),
+        describe(
+            cfg.maintenance_older_than_secs,
+            crate::cmd::DEFAULT_MAINTENANCE_OLDER_THAN_SECS
+        ),
     );
     Ok(())
 }
@@ -149,18 +204,36 @@ pub fn run_show(json: bool) -> Result<()> {
     let ram_mib = crate::cmd::effective_ram_mib();
     let vcpus_source = source(env_vcpus().is_some(), cfg.vcpus.is_some());
     let ram_source = source(env_ram_mib().is_some(), cfg.ram_mib.is_some());
+    // Reported as seconds, `0` meaning "no timer", so the shown value matches
+    // exactly what `config set` accepts back.
+    let interval = crate::cmd::effective_maintenance_interval().map_or(0, |d| d.as_secs());
+    let older_than = crate::cmd::effective_maintenance_older_than_secs();
+    let interval_source = source(
+        std::env::var(crate::cmd::MAINTENANCE_INTERVAL_ENV).is_ok(),
+        cfg.maintenance_interval_secs.is_some(),
+    );
+    let older_than_source = source(
+        std::env::var(crate::cmd::MAINTENANCE_OLDER_THAN_ENV).is_ok(),
+        cfg.maintenance_older_than_secs.is_some(),
+    );
 
     if json {
         let out = serde_json::json!({
             "vcpus": vcpus,
             "ram_mib": ram_mib,
+            "maintenance_interval_secs": interval,
+            "maintenance_older_than_secs": older_than,
             "vcpus_source": vcpus_source,
             "ram_mib_source": ram_source,
+            "maintenance_interval_secs_source": interval_source,
+            "maintenance_older_than_secs_source": older_than_source,
         });
         println!("{out}");
     } else {
-        println!("vcpus   = {vcpus} ({vcpus_source})");
-        println!("ram_mib = {ram_mib} ({ram_source})");
+        println!("vcpus                       = {vcpus} ({vcpus_source})");
+        println!("ram_mib                     = {ram_mib} ({ram_source})");
+        println!("maintenance_interval_secs   = {interval} ({interval_source})");
+        println!("maintenance_older_than_secs = {older_than} ({older_than_source})");
     }
     Ok(())
 }
@@ -248,6 +321,36 @@ mod tests {
             warns.iter().any(|w| w.contains("MMIO hole")),
             "expected an MMIO-hole warning: {warns:?}"
         );
+    }
+
+    /// Both values supplied, so the check is decided entirely by its
+    /// arguments — no env or provider-dir read, and no ordering hazard against
+    /// other tests.
+    #[test]
+    fn retention_longer_than_the_interval_is_accepted() {
+        validate_maintenance(Some(6 * 60 * 60), Some(14 * 24 * 60 * 60)).expect("valid");
+    }
+
+    /// The trap this check exists for: a retention shorter than the cycle
+    /// means every artifact built since the last cycle is stale at the next
+    /// one, so the sweep clears exactly what is being actively rebuilt.
+    #[test]
+    fn retention_shorter_than_the_interval_is_rejected() {
+        let err = validate_maintenance(Some(3600), Some(600)).unwrap_err();
+        assert!(err.to_string().contains("shorter than"), "got: {err}");
+    }
+
+    #[test]
+    fn zero_retention_is_rejected() {
+        let err = validate_maintenance(Some(3600), Some(0)).unwrap_err();
+        assert!(err.to_string().contains("at least 1"), "got: {err}");
+    }
+
+    /// A zero interval switches the timer off, so no sweep can happen and the
+    /// retention relationship cannot bite — it must not be rejected.
+    #[test]
+    fn zero_interval_disables_the_timer_and_bypasses_the_relation() {
+        validate_maintenance(Some(0), Some(1)).expect("a disabled timer never sweeps");
     }
 
     #[test]

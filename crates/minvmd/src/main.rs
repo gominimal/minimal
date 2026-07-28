@@ -64,13 +64,13 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ConfigAction {
-    /// Print the effective resource configuration and each value's source.
+    /// Print the effective configuration and each value's source.
     Show {
         /// Print as a JSON object.
         #[arg(long)]
         json: bool,
     },
-    /// Validate and persist resource parameters for the next boot.
+    /// Validate and persist configuration for the next boot.
     Set {
         /// Number of virtual CPUs.
         #[arg(long)]
@@ -78,6 +78,14 @@ enum ConfigAction {
         /// Guest RAM in MiB.
         #[arg(long)]
         ram_mib: Option<u32>,
+        /// Seconds between guest maintenance cycles (cache sweep + fstrim).
+        /// `0` disables the timer. Takes effect on the next boot.
+        #[arg(long)]
+        maintenance_interval_secs: Option<u64>,
+        /// Seconds a cache entry may go unused before a maintenance sweep may
+        /// delete it. Takes effect on the next boot.
+        #[arg(long)]
+        maintenance_older_than_secs: Option<u64>,
     },
 }
 
@@ -116,7 +124,17 @@ fn main() -> Result<()> {
         }
         Command::Config { action } => match action {
             ConfigAction::Show { json } => minvmd::cmd::config::run_show(json),
-            ConfigAction::Set { vcpus, ram_mib } => minvmd::cmd::config::run_set(vcpus, ram_mib),
+            ConfigAction::Set {
+                vcpus,
+                ram_mib,
+                maintenance_interval_secs,
+                maintenance_older_than_secs,
+            } => minvmd::cmd::config::run_set(
+                vcpus,
+                ram_mib,
+                maintenance_interval_secs,
+                maintenance_older_than_secs,
+            ),
         },
         Command::Stop => minvmd::cmd::stop::run(),
         Command::KrunVmm => minvmd::cmd::vmm_child::run(),

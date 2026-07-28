@@ -265,6 +265,29 @@ impl DaemonContext {
         self.cache.release_read_tracker();
     }
 
+    /// Returns the base directory for build sandboxes.
+    ///
+    /// The [`Context`] methods of the same name resolve against this same
+    /// daemon-scoped config, so the three are duplicated here rather than
+    /// reached through a session: daemon-wide work (a maintenance sweep) has
+    /// no project to build a `Context` from and must not need one.
+    pub fn builds_base_dir(&self) -> PathBuf {
+        self.config.builds_base_dir()
+    }
+
+    /// Returns the base directory for task sandboxes.
+    pub fn tasks_base_dir(&self) -> PathBuf {
+        self.config.task_base_dir()
+    }
+
+    /// Returns the base directory for the artifact/binary cache.
+    ///
+    /// DO NOT USE unless you really know what you are doing — prefer
+    /// [`DaemonContext::local_cache`] instead.
+    pub fn cache_base_dir(&self) -> PathBuf {
+        self.config.built_cache_dir()
+    }
+
     /// Initializes a bunch of internals and returns them. Use
     /// [`DaemonContext::init`] instead unless you are `minimal init`,
     /// which needs to use these before a full context can be built.

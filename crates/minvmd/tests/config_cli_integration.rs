@@ -24,6 +24,8 @@ fn run(state_home: &std::path::Path, args: &[&str]) -> (bool, String, String) {
         // Ensure no ambient override leaks into the effective-value resolution.
         .env_remove("MINVMD_VM_RAM_MIB")
         .env_remove("MINVMD_VM_VCPUS")
+        .env_remove("MINVMD_MAINTENANCE_INTERVAL_SECS")
+        .env_remove("MINVMD_MAINTENANCE_OLDER_THAN_SECS")
         .output()
         .expect("spawn minvmd");
     (
@@ -50,6 +52,87 @@ fn set_then_show_reports_persisted_value_and_source() {
     );
     // vcpus was not set, so it falls back to the default.
     assert_eq!(v["vcpus_source"], "default");
+}
+
+/// The maintenance schedule persists and reports through the same
+/// env/config/default precedence as the resource knobs. A one-hour interval
+/// with 30-day retention differs from both defaults, so each assertion
+/// distinguishes a persisted value from a fallback.
+#[test]
+fn maintenance_schedule_persists_and_reports_its_source() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let (ok, _out, err) = run(
+        tmp.path(),
+        &[
+            "config",
+            "set",
+            "--maintenance-interval-secs",
+            "3600",
+            "--maintenance-older-than-secs",
+            "2592000",
+        ],
+    );
+    assert!(ok, "config set must succeed; stderr: {err}");
+
+    let (ok, out, err) = run(tmp.path(), &["config", "show", "--json"]);
+    assert!(ok, "config show must succeed; stderr: {err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    assert_eq!(v["maintenance_interval_secs"], 3600);
+    assert_eq!(v["maintenance_older_than_secs"], 2_592_000);
+    assert_eq!(v["maintenance_interval_secs_source"], "config");
+    assert_eq!(v["maintenance_older_than_secs_source"], "config");
+    // Untouched by this set, so the resource knobs still report defaults.
+    assert_eq!(v["ram_mib_source"], "default");
+}
+
+/// `0` disables the timer and must be reported back as `0` — the value
+/// `config set` accepts — not silently re-defaulted, which would leave a user
+/// who switched maintenance off unable to tell that it stayed on.
+#[test]
+fn a_zero_maintenance_interval_is_persisted_and_shown_as_disabled() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let (ok, _out, err) = run(
+        tmp.path(),
+        &["config", "set", "--maintenance-interval-secs", "0"],
+    );
+    assert!(ok, "disabling the timer must succeed; stderr: {err}");
+
+    let (ok, out, _err) = run(tmp.path(), &["config", "show", "--json"]);
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    assert_eq!(v["maintenance_interval_secs"], 0);
+    assert_eq!(v["maintenance_interval_secs_source"], "config");
+}
+
+/// A retention shorter than the interval would sweep away everything built
+/// between two cycles, so `config set` rejects it rather than persisting a
+/// schedule that empties the cache on a timer.
+#[test]
+fn a_retention_shorter_than_the_interval_is_rejected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let (ok, _out, err) = run(
+        tmp.path(),
+        &[
+            "config",
+            "set",
+            "--maintenance-interval-secs",
+            "3600",
+            "--maintenance-older-than-secs",
+            "600",
+        ],
+    );
+    assert!(!ok, "the schedule must be rejected");
+    assert!(err.contains("shorter than"), "stderr: {err}");
+
+    // Nothing persisted: a rejected set must leave the defaults in place.
+    let (ok, out, _err) = run(tmp.path(), &["config", "show", "--json"]);
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    assert_eq!(v["maintenance_interval_secs_source"], "default");
+    assert_eq!(v["maintenance_older_than_secs_source"], "default");
 }
 
 #[test]

@@ -286,16 +286,25 @@ impl Cache<LocalDir> {
         })
     }
 
-    /// Invalidates (deletes) a directory cache entry with the given spec hash.
-    pub fn invalidate_dir(&self, hash: &SpecHash) -> Result<(), CacheErr> {
+    /// The on-disk directory of the entry for `hash`, whether or not it exists.
+    ///
+    /// Exposed for callers that need to inspect an entry immediately before
+    /// [`Self::invalidate_dir`] removes it (e.g. measuring how much a sweep
+    /// reclaimed). [`Self::read_dir`] cannot serve that purpose: it records an
+    /// access, which would reset the very last-use time such a sweep selects on.
+    pub fn entry_path(&self, hash: &SpecHash) -> PathBuf {
         let hash_hex = hash.0.to_hex();
         // Entries on disk are at <root>/<first byte as hex>/<remaining bytes as hex>
         let subpath: PathBuf = [&hash_hex.as_str()[0..2], &hash_hex.as_str()[2..]]
             .iter()
             .collect();
 
-        let p = self.inner().fs.path().join(subpath);
-        std::fs::remove_dir_all(p).map_err(CacheErr::from)
+        self.inner().fs.path().join(subpath)
+    }
+
+    /// Invalidates (deletes) a directory cache entry with the given spec hash.
+    pub fn invalidate_dir(&self, hash: &SpecHash) -> Result<(), CacheErr> {
+        std::fs::remove_dir_all(self.entry_path(hash)).map_err(CacheErr::from)
     }
 
     /// Allocates a temporary directory in the same filesystem as the rest of the cache.

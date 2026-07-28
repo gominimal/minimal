@@ -6,7 +6,9 @@ use crate::{
     store::{RecordPredicate, SessionRecordHandle, Store, StoreHandle},
 };
 use paths::DaemonAbsPath;
-use sessions::SessionId;
+// `SessionObject` for its `workspace_path` on the store's session objects,
+// which the maintenance inputs read.
+use sessions::{SessionId, store::SessionObject as _};
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::RwLock;
@@ -125,6 +127,29 @@ enum ManagerMessage {
     /// A no-op for an id already removed; ids are never reused, so a stale
     /// evict can't remove a fresh actor.
     Evict(SessionId),
+    /// Hand back everything a maintenance sweep needs, gathered without
+    /// resolving a single session actor.
+    MaintenanceInputs(Responder<MaintenanceInputs>),
+}
+
+/// What the maintenance sweep reads out of the manager in one round-trip.
+///
+/// Deliberately *not* assembled from [`SessionHandle`]s: resolving a session
+/// spawns its actor if it is not already running, so a sweep built that way
+/// would wake every dormant session on every cycle. Everything here comes from
+/// the store and the manager's own daemon-scoped state, neither of which has
+/// that side effect.
+#[derive(Debug)]
+pub(crate) struct MaintenanceInputs {
+    /// Daemon-scoped mctx state (config, stdlib dir, vcs, cache) shared by
+    /// every session — and the only route to the cache when no session exists.
+    pub daemon_ctx: Arc<mctx::DaemonContext>,
+    /// The daemon-side workspace of every session the store knows about. The
+    /// workspace, not the client's `project_path`: it is where the uploaded
+    /// `minimal.toml` naming the session's packages actually lives.
+    pub workspaces: Vec<(SessionId, DaemonAbsPath)>,
+    pub minimal_state_dir: DaemonAbsPath,
+    pub minimal_cache_dir: DaemonAbsPath,
 }
 
 /// Routes session operations to per-session [`Session`] actors, spawning
@@ -427,6 +452,37 @@ impl Manager {
                 })
                 .await;
             }
+            // Gathers the maintenance sweep's inputs. Walks the store rather
+            // than `resolve_session`, so no dormant session's actor is woken
+            // by a housekeeping cycle.
+            ManagerMessage::MaintenanceInputs(r) => {
+                r.handle(async {
+                    let mut workspaces = Vec::new();
+                    for handle in self.store.handles().await? {
+                        let id = *handle.id();
+                        // A session whose on-disk object cannot be read is
+                        // skipped, not fatal: the caller's fail-closed rule is
+                        // about sessions whose *packages* are unknown, and one
+                        // unreadable record must not be able to wedge every
+                        // future cycle.
+                        match handle.object().await {
+                            Ok(obj) => workspaces.push((id, obj.workspace_path())),
+                            Err(e) => tracing::warn!(
+                                session_id = %id,
+                                error = %e,
+                                "maintenance: could not read session object; skipping",
+                            ),
+                        }
+                    }
+                    Ok(MaintenanceInputs {
+                        daemon_ctx: Arc::clone(&self.daemon_ctx),
+                        workspaces,
+                        minimal_state_dir: self.minimal_state_dir.clone(),
+                        minimal_cache_dir: self.minimal_cache_dir.clone(),
+                    })
+                })
+                .await;
+            }
             // Gets the record for a specific session.
             ManagerMessage::GetRecord(pred, r) => {
                 r.handle(async {
@@ -632,6 +688,19 @@ impl ManagerHandle {
     #[must_use]
     pub fn hostnames(&self) -> Arc<RwLock<crate::net::dns::HostnameRegistry>> {
         Arc::clone(&self.hostnames)
+    }
+
+    /// Returns the inputs for a maintenance sweep — see [`MaintenanceInputs`]
+    /// for why they are gathered here rather than assembled from session
+    /// handles.
+    pub(crate) async fn maintenance_inputs(&self) -> Result<MaintenanceInputs, SessionsError> {
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .sender
+            .send(ManagerMessage::MaintenanceInputs(send))
+            .await;
+        recv.await.expect("corresponding sessions manager is dead")
     }
 
     /// Lists the sessions known to this (minimald) instance.

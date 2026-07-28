@@ -73,6 +73,25 @@ fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
     run_foreground()
 }
 
+/// Start the guest-maintenance timer for the VM behind `uds_path`, or return
+/// `None` when it is switched off or could not be spawned.
+///
+/// Failing to start the timer is not fatal: an un-maintained VM still works,
+/// it just grows, and taking a booted VM down over housekeeping would be a
+/// worse trade than logging and carrying on.
+#[cfg(minvmd_libkrun)]
+fn start_maintenance(uds_path: std::path::PathBuf) -> Option<crate::maintenance::MaintenanceTimer> {
+    let interval = crate::cmd::effective_maintenance_interval()?;
+    let older_than_secs = crate::cmd::effective_maintenance_older_than_secs();
+    match crate::maintenance::spawn(uds_path, interval, older_than_secs) {
+        Ok(timer) => Some(timer),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not start the guest maintenance timer");
+            None
+        }
+    }
+}
+
 /// Spawn `minvmd run` as a detached background supervisor, then poll until
 /// the VM is serving (up to `timeout_secs`).
 #[cfg(minvmd_libkrun)]
@@ -447,7 +466,7 @@ fn run_foreground() -> Result<()> {
 
     // Tighten + verify the bridge socket permissions (R3.2): libkrun creates
     // it with default perms, and the shared provider dir is not 0700.
-    match crate::sock::resolve_uds_path() {
+    let uds_path = match crate::sock::resolve_uds_path() {
         Ok(uds_path) => {
             if let Err(e) = crate::sock::enforce_socket_permissions(&uds_path)
                 .and_then(|()| crate::sock::verify_socket_permissions(&uds_path))
@@ -458,14 +477,24 @@ fn run_foreground() -> Result<()> {
                     "could not secure minimald bridge socket to 0600",
                 );
             }
+            Some(uds_path)
         }
         Err(e) => {
             tracing::warn!(error = %e, "minimald bridge socket path resolution failed");
+            None
         }
-    }
+    };
 
     // ── Phase 3: Supervise until VMM child exits ─────────────────────────────
+    // Nothing inside a long-lived guest reclaims its own state, and deleting
+    // files there does not shrink the host image on its own, so the supervisor
+    // drives both halves on a timer for as long as the VM is up.
+    let maintenance = uds_path.and_then(start_maintenance);
+
     let status = child.wait().context("waiting for VMM child")?;
+    // The guest is gone; stop the timer before teardown rather than let a
+    // cycle dispatch into a socket nobody is serving.
+    drop(maintenance);
     tracing::info!(success = status.success(), "VMM child exited");
 
     // ── Phase 4: Running → Stopped (under lock) ─────────────────────────────

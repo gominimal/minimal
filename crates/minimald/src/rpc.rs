@@ -5,9 +5,9 @@ use minimald_rpc::{
     Errorable, FinalizeSession, FinalizeSessionResponse, GetMeshStatus, GetSessionPolicy,
     GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse,
     GetVersion, GetVersionResponse, IssueClientCert, IssueClientCertRequest, ListSessions,
-    ListSessionsEntry, ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
-    RenameSessionResponse, ResourcePool, Shutdown, ShutdownRequest, ShutdownResponse,
-    SubmitVerdict,
+    ListSessionsEntry, ListSessionsResponse, Maintenance, MaintenanceRequest, OneshotSshRpc,
+    RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool, Shutdown,
+    ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -450,6 +450,27 @@ async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), C
                     ShutdownResponse::ShuttingDown
                 }
                 Err(()) => ShutdownResponse::SessionsLive,
+            })
+        })
+        .await
+}
+
+/// `Maintenance`: one steady-state sweep-then-trim cycle over the state dir.
+///
+/// The whole cycle runs inside the handler, so the reply carries what it
+/// reclaimed — this RPC's `rpc_timeout` on the caller therefore has to cover a
+/// full sweep, not just a round-trip. A failure is an `Errorable::Err` rather
+/// than a transport error: the caller is a timer that will simply try again,
+/// and it should be able to log why the last attempt did nothing.
+async fn serve_maintenance(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    Maintenance
+        .handle_channel(c, async |req: MaintenanceRequest| {
+            Ok(match crate::maintenance::run_cycle(&s, req).await {
+                Ok(response) => Errorable::Ok(response),
+                Err(error) => {
+                    tracing::warn!(%error, "maintenance cycle could not run");
+                    Errorable::Err { error }
+                }
             })
         })
         .await
@@ -1180,6 +1201,7 @@ pub async fn handle_ssh_rpc(
         | RenameSession::NAME
         | DestroySession::NAME
         | Shutdown::NAME
+        | Maintenance::NAME
         | AbortSession::NAME
         | GetSessionPolicy::NAME
         | GetMeshStatus::NAME
@@ -1259,6 +1281,7 @@ pub async fn handle_ssh_rpc(
         RenameSession::NAME => serve!(serve_rename_session(s, channel)),
         DestroySession::NAME => serve!(serve_destroy_session(s, channel)),
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
+        Maintenance::NAME => serve!(serve_maintenance(s, channel)),
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
         GetMeshStatus::NAME => serve!(serve_get_mesh_status(s, channel)),
@@ -1290,8 +1313,8 @@ pub async fn handle_ssh_rpc(
 mod tests {
     use minimald_rpc::{
         CreateSession, CreateSessionRequest, DestroySessionRequest, EgressPolicy, GetSessionPolicy,
-        GetSessionPolicyRequest, RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest,
-        ShutdownResponse,
+        GetSessionPolicyRequest, MaintenanceResponse, RenameSessionRequest, SessionPolicy,
+        Shutdown, ShutdownRequest, ShutdownResponse,
     };
     use paths::HostAbsPath;
     use sessions::{NetworkMode, SessionId};
@@ -1876,6 +1899,71 @@ mod tests {
         assert!(
             matches!(resp, Errorable::Err { error } if error.contains("no session with ID")),
             "expected an unknown-id error",
+        );
+    }
+
+    /// A cycle against an empty daemon completes rather than erroring, and
+    /// reports nothing reclaimed. The zero report is the point: a sweep that
+    /// found nothing must be distinguishable from one that never ran.
+    #[tokio::test]
+    async fn maintenance_completes_with_an_empty_report_on_an_idle_daemon() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let resp = client
+            .call::<Maintenance>(&MaintenanceRequest::new(14 * 24 * 60 * 60))
+            .await
+            .unwrap();
+        let MaintenanceResponse::Completed(report) = resp else {
+            panic!("an idle daemon has no in-flight work to defer to: {resp:?}");
+        };
+        assert_eq!(report.cache_entries_deleted, 0);
+        assert_eq!(report.stale_dirs_removed, 0);
+        assert_eq!(
+            report.cache_entries_protected, 0,
+            "no sessions, nothing to protect"
+        );
+        // The test daemon's state dir is a host directory, not a mounted data
+        // volume, so there is nothing this daemon may trim.
+        assert_eq!(report.bytes_trimmed, None);
+    }
+
+    /// A session present in the store must not make the cycle fail or defer,
+    /// even at a retention of zero where every cache entry is eligible.
+    ///
+    /// This asserts reachability, not the size of the protected set: the
+    /// harness composes sessions whose workspace holds no `minimal.toml` (see
+    /// `configure_loadout_with_missing_mfile_still_succeeds`), which references
+    /// no packages, so a correct sweep protects nothing here. The protected set
+    /// being *computed* from a real project is proven by the session e2e, and
+    /// the rule it applies is unit-tested in `maintenance::tests`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn maintenance_completes_with_a_session_in_the_store() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        // Drop the actor too: the sweep reads the store, so it must handle a
+        // session that is known but has nothing live behind it. Resolving
+        // sessions instead would spawn this actor back up as a side effect.
+        server
+            .state
+            .sessions_manager()
+            .await
+            .evict(session_id)
+            .await;
+
+        let resp = client
+            .call::<Maintenance>(&MaintenanceRequest::new(0).without_trim())
+            .await
+            .unwrap();
+        let MaintenanceResponse::Completed(report) = resp else {
+            panic!("nothing is building in this test: {resp:?}");
+        };
+        assert_eq!(
+            report.cache_sweep_skipped, None,
+            "a workspace without a minimal.toml is a session with nothing to \
+             protect, not one that suppresses the sweep: {report:?}"
         );
     }
 

@@ -432,6 +432,105 @@ impl OneshotSshRpc for Shutdown {
     type Response = ShutdownResponse;
 }
 
+/// An RPC asking the daemon to run one steady-state maintenance cycle over its
+/// state dir: sweep stale cache entries and dead sandbox/task/temp dirs, then
+/// `fstrim` so the freed blocks are returned to the host's backing image.
+///
+/// Policy lives on the caller (the host `minvmd`, which owns a trustworthy
+/// clock and the power state), the way [`Shutdown`] does; the daemon only
+/// executes and reports. Distinct from `Shutdown`'s quiesce: this is
+/// steady-state work against a live daemon, and it never unmounts anything.
+pub struct Maintenance;
+
+/// The request for a [`Maintenance`] RPC.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MaintenanceRequest {
+    /// Cache entries whose last recorded read is older than this — and entries
+    /// with no recorded read at all — are eligible for deletion. Seconds, so
+    /// the wire form carries no host clock: the daemon applies it against its
+    /// own `now`.
+    pub older_than_secs: u64,
+    /// Run the `fstrim` pass after the sweep. `false` sweeps only, which is
+    /// what a caller wants when it knows the state dir is not a discard-capable
+    /// block device (a native daemon's host directory).
+    #[serde(default = "default_true")]
+    pub trim: bool,
+}
+
+impl MaintenanceRequest {
+    /// A full cycle — sweep with the given retention, then trim.
+    #[must_use]
+    pub fn new(older_than_secs: u64) -> Self {
+        Self {
+            older_than_secs,
+            trim: true,
+        }
+    }
+
+    /// Sweep only; skip the trim pass.
+    #[must_use]
+    pub fn without_trim(mut self) -> Self {
+        self.trim = false;
+        self
+    }
+}
+
+/// What one completed maintenance cycle reclaimed.
+///
+/// Both halves are reported because either can be a silent no-op: a sweep that
+/// deleted nothing and a trim that returned nothing look identical in a log
+/// that only says "maintenance ran".
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MaintenanceReport {
+    /// Cache entries deleted by the sweep.
+    pub cache_entries_deleted: u64,
+    /// Bytes those entries occupied, as measured before deletion.
+    pub cache_bytes_deleted: u64,
+    /// Cache entries held back because a live session references them.
+    pub cache_entries_protected: u64,
+    /// Why the cache half of the sweep was skipped, if it was.
+    ///
+    /// The sweep may only delete an entry it has proven no session needs, so a
+    /// daemon that cannot enumerate some session's packages must not touch the
+    /// cache. The rest of the cycle still runs: reaping a directory whose
+    /// owning pid is gone, and trimming already-free blocks, cannot evict
+    /// anything. Reported rather than raised so one unresolvable session
+    /// degrades a cycle instead of disabling maintenance outright.
+    pub cache_sweep_skipped: Option<String>,
+    /// Sandbox/task/temp directories removed because their owning pid is gone.
+    pub stale_dirs_removed: u64,
+    /// Bytes those directories occupied, as measured before deletion.
+    pub stale_dir_bytes_deleted: u64,
+    /// Bytes `FITRIM` reported discarding. `None` when the trim was not run —
+    /// either the caller asked for none, or the state dir is not a filesystem
+    /// this daemon can trim.
+    pub bytes_trimmed: Option<u64>,
+    /// Wall-clock duration of the cycle.
+    pub duration_ms: u64,
+}
+
+/// The response for a [`Maintenance`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MaintenanceResponse {
+    /// The cycle ran to completion.
+    Completed(MaintenanceReport),
+    /// The daemon declined this cycle and changed nothing. `FITRIM` holds
+    /// ext4 block-group locks, so maintenance defers to in-flight work rather
+    /// than contending with it; the caller simply tries again next tick.
+    Deferred {
+        /// Why the cycle was skipped, for the caller's log.
+        reason: String,
+    },
+}
+
+impl OneshotSshRpc for Maintenance {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "Maintenance");
+    type Request<'a> = MaintenanceRequest;
+    type Response = Errorable<MaintenanceResponse>;
+}
+
 /// Resume a `Pending` session with the client's per-item
 /// [`ContributionVerdict`]. The daemon promotes the record
 /// `Pending → Materializing` and replies with
@@ -767,6 +866,53 @@ mod tests {
             DIAG_BUNDLE_SUBSYSTEM, "minimald-v1-DiagBundleTarZst",
             "subsystem name is wire contract; changing it breaks old clients"
         );
+    }
+
+    /// `trim` defaults on, so a caller that only names a retention gets the
+    /// full sweep-then-trim cycle — the ordering the reclaim depends on.
+    #[test]
+    fn maintenance_request_trims_by_default() {
+        let req: MaintenanceRequest =
+            serde_json::from_str(r#"{"older_than_secs":1209600}"#).expect("deserialize");
+        assert_eq!(req, MaintenanceRequest::new(1_209_600));
+        assert!(req.trim);
+        assert!(!MaintenanceRequest::new(60).without_trim().trim);
+    }
+
+    #[test]
+    fn maintenance_response_round_trips_both_variants() {
+        let completed = MaintenanceResponse::Completed(MaintenanceReport {
+            cache_entries_deleted: 12,
+            cache_bytes_deleted: 4096,
+            cache_entries_protected: 3,
+            cache_sweep_skipped: None,
+            stale_dirs_removed: 1,
+            stale_dir_bytes_deleted: 512,
+            bytes_trimmed: Some(1_048_576),
+            duration_ms: 250,
+        });
+        assert_eq!(round_trip(&completed), completed);
+
+        let deferred = MaintenanceResponse::Deferred {
+            reason: "a build is in flight".to_string(),
+        };
+        assert_eq!(round_trip(&deferred), deferred);
+        let json = serde_json::to_string(&deferred).unwrap();
+        assert!(json.contains(r#""kind":"deferred""#), "got: {json}");
+    }
+
+    /// A trim that did not run is `None`, not `0` — "we skipped it" and "we
+    /// trimmed nothing" are different findings, and the report exists so the
+    /// caller's log can tell them apart.
+    #[test]
+    fn maintenance_report_distinguishes_untrimmed_from_zero_trimmed() {
+        let skipped = MaintenanceReport::default();
+        assert_eq!(skipped.bytes_trimmed, None);
+        let ran = MaintenanceReport {
+            bytes_trimmed: Some(0),
+            ..MaintenanceReport::default()
+        };
+        assert_ne!(round_trip(&ran), skipped);
     }
 
     #[test]

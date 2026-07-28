@@ -208,6 +208,63 @@ pub fn effective_vcpus() -> u8 {
     )
 }
 
+/// Environment variable overriding [`DEFAULT_MAINTENANCE_INTERVAL_SECS`]. `0`
+/// disables the maintenance timer for this boot.
+pub const MAINTENANCE_INTERVAL_ENV: &str = "MINVMD_MAINTENANCE_INTERVAL_SECS";
+
+/// Environment variable overriding [`DEFAULT_MAINTENANCE_OLDER_THAN_SECS`].
+pub const MAINTENANCE_OLDER_THAN_ENV: &str = "MINVMD_MAINTENANCE_OLDER_THAN_SECS";
+
+/// Default seconds between guest maintenance cycles: six hours.
+///
+/// The work it drives is unbounded *growth*, not a leak, so the cadence only
+/// has to beat the rate a developer fills a cache — a handful of cycles a day
+/// does. Each cycle costs a package resolution per live session plus an ext4
+/// `FITRIM` walk, so a much tighter interval would spend real CPU to reclaim
+/// almost nothing.
+pub const DEFAULT_MAINTENANCE_INTERVAL_SECS: u64 = 6 * 60 * 60;
+
+/// Default retention for the maintenance sweep: 14 days, matching
+/// `mip cache clean --older-than`'s default so the manual and scheduled sweeps
+/// age entries out on the same terms.
+pub const DEFAULT_MAINTENANCE_OLDER_THAN_SECS: u64 = 14 * 24 * 60 * 60;
+
+/// Parse a non-negative integer from environment variable `var`. Unlike
+/// [`positive_env`], zero is a meaningful value here — it is how the
+/// maintenance timer is switched off — so only a missing, empty, or
+/// non-numeric value counts as unset.
+fn non_negative_env(var: &str) -> Option<u64> {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// The effective maintenance interval, resolved as
+/// `env override ?? persisted config ?? default` (R9.7). `None` when the
+/// resolved value is `0`, which switches the timer off entirely.
+#[must_use]
+pub fn effective_maintenance_interval() -> Option<std::time::Duration> {
+    let secs = non_negative_env(MAINTENANCE_INTERVAL_ENV)
+        .or_else(|| persisted_resource_config().maintenance_interval_secs)
+        .unwrap_or(DEFAULT_MAINTENANCE_INTERVAL_SECS);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// The effective sweep retention in seconds, resolved as
+/// `env override ?? persisted config ?? default` (R9.7).
+///
+/// A zero retention would make every cache entry eligible on the next tick, so
+/// it is rejected in favour of the default rather than honoured — the timer is
+/// unattended, and "delete the whole cache every six hours" is never what a
+/// stray `0` in the environment meant.
+#[must_use]
+pub fn effective_maintenance_older_than_secs() -> u64 {
+    non_negative_env(MAINTENANCE_OLDER_THAN_ENV)
+        .or_else(|| persisted_resource_config().maintenance_older_than_secs)
+        .filter(|&secs| secs > 0)
+        .unwrap_or(DEFAULT_MAINTENANCE_OLDER_THAN_SECS)
+}
+
 /// Resolve `(vcpus, ram_mib)` from a **single** read of the persisted config, so
 /// the pair cannot tear when `config.toml` changes between two separate
 /// `effective_*` calls (e.g. the two `booted_*` fields recorded at the Running
