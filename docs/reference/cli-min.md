@@ -11,12 +11,13 @@ development sessions. Most commands start the daemon automatically when it
 isn't running, with `bug`, `stop`, and `version` being the exceptions. The 
 daemon starts natively on Linux (and under `--provider local-minvmd`) or 
 inside the [`minvmd`](./cli-minvmd.md) microVM host daemon on macOS. 
-Running bare `min` with no subcommand resolves a session for the current 
-directory (activating one if needed) and attaches to it.
+Running bare `min` with no subcommand prints this help and exits; use
+`min session attach` to get into a session for the current directory, or
+`min session activate` to create one.
 
 Commands are spelled `min <noun> <verb>`, and every noun accepts its singular
-and plural form (`session`/`sessions`, `loadout`/`loadouts`). Bare `min` and a
-handful of bare verbs (`ls`, `stop`,
+and plural form (`session`/`sessions`, `loadout`/`loadouts`). A handful of
+bare verbs (`ls`, `stop`,
 `init`, `add`, `update`) survive at the top level as deliberate ergonomic
 exceptions, called out as such below; see
 [the CLI convention](./cli.md#command-naming-convention) for the rule and the
