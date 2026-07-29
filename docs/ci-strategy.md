@@ -62,7 +62,7 @@ cannot nest virtualization); it is gated to trusted refs. Everything expensive,
 matrix-expanding, or advisory-flavored moves to a nightly cron that doubles as a
 cache-primer for main.
 
-Target: **≤ ~10 min PR wall-clock** on the common path (quick gates ~2 min, build ~4–6 min
+Target: **≤ ~10 min PR wall-clock** on the common path (quick gates ~2 min, build ~4-6 min
 warm, tests and VM smoke overlapping in parallel).
 
 ```mermaid
@@ -141,10 +141,10 @@ Order tests by cost; push each test into the cheapest tier that can catch its fa
 
 | Tier | What | Where | Cost |
 |---|---|---|---|
-| 1 | `cargo fmt --check`, `cargo clippy --all-targets`, `cargo-deny` | any runner, no VM | seconds–2 min |
+| 1 | `cargo fmt --check`, `cargo clippy --all-targets`, `cargo-deny` | any runner, no VM | seconds-2 min |
 | 2 | unit + integration tests (`cargo nextest run`), `cargo test --doc` | Linux + macOS runners | minutes, warm-cached |
 | 3 | **process-mode e2e**, guest daemon as a plain process, direct client connection | Linux runners, no KVM needed | minutes |
-| 4 | **VM smoke e2e**, boot real libkrun VM, client → vsock proxy → guest daemon round-trip, handful of scenarios | `ubuntu-latest` (KVM) + self-hosted Mac | ~5–10 min |
+| 4 | **VM smoke e2e**, boot real libkrun VM, client → vsock proxy → guest daemon round-trip, handful of scenarios | `ubuntu-latest` (KVM) + self-hosted Mac | ~5-10 min |
 | 5 | extended e2e, long scenarios, supervision/restart paths, stress, larger matrix | nightly | tens of minutes |
 
 **Tier 3 is this project's structural advantage.** The Linux no-KVM fallback (guest daemon
@@ -230,7 +230,7 @@ artifacts:
    Test jobs need a same-revision checkout for fixtures, nothing else.
 2. **Guest musl binaries** built once per arch → artifact → consumed by VM-smoke jobs
    and the host-daemon packaging step.
-3. Doctests are the one thing nextest can't run, keep a cheap `cargo test --doc` step
+3. Doctests are the one thing nextest cannot run, keep a cheap `cargo test --doc` step
    in the build job (compiles against the already-built lib).
 
 Avoid the classic redundancy traps:
@@ -282,15 +282,15 @@ concurrency:
 | Job | Runner | Does | Est. (warm) |
 |---|---|---|---|
 | `fmt` | ubuntu-latest | `cargo fmt --check`, no cache, no deps | <1 min |
-| `clippy` | ubuntu-latest | `cargo clippy --workspace --all-targets --locked` (own cache key; clippy shares artifacts with `check`, not `build`) | 2–4 min |
+| `clippy` | ubuntu-latest | `cargo clippy --workspace --all-targets --locked` (own cache key; clippy shares artifacts with `check`, not `build`) | 2-4 min |
 | `deny` | ubuntu-latest | `cargo-deny check`, **licenses/bans blocking; advisories `continue-on-error`** (Embark's own recommendation: a newly published advisory must not break unrelated PRs) | 1 min |
 | `preflight` | ubuntu-latest | classify changed paths (cloud-hypervisor pattern); docs-only changes skip everything below | seconds |
-| `build-linux` | ubuntu-latest | workspace build, `nextest archive`, `cargo test --doc`, x86_64-musl guest → upload artifacts | 4–6 min |
-| `build-guest-arm64` | ubuntu-24.04-arm | aarch64-musl guest → artifact | 2–3 min |
-| `test-linux` | ubuntu-latest | nextest from archive (tier 2) + **process-mode e2e** (tier 3) | 2–4 min |
-| `vm-smoke-linux` | ubuntu-latest | KVM perms step → boot libkrun VM with real guest daemon → client→vsock→guest round-trip smoke; console logs uploaded `if: always()` | 3–6 min |
-| `build-test-macos` | macos-15 (arm64) | build + unit tests, **no VM** | 4–6 min |
-| `vm-smoke-macos` | self-hosted Mac | download client/host-daemon (from macOS build) + aarch64 guest artifacts → libkrun/HVF smoke. **Gated** (§7): same-repo PRs via label, always on main/merge-queue | 3–6 min |
+| `build-linux` | ubuntu-latest | workspace build, `nextest archive`, `cargo test --doc`, x86_64-musl guest → upload artifacts | 4-6 min |
+| `build-guest-arm64` | ubuntu-24.04-arm | aarch64-musl guest → artifact | 2-3 min |
+| `test-linux` | ubuntu-latest | nextest from archive (tier 2) + **process-mode e2e** (tier 3) | 2-4 min |
+| `vm-smoke-linux` | ubuntu-latest | KVM perms step → boot libkrun VM with real guest daemon → client→vsock→guest round-trip smoke; console logs uploaded `if: always()` | 3-6 min |
+| `build-test-macos` | macos-15 (arm64) | build + unit tests, **no VM** | 4-6 min |
+| `vm-smoke-macos` | self-hosted Mac | download client/host-daemon (from macOS build) + aarch64 guest artifacts → libkrun/HVF smoke. **Gated** (§7): same-repo PRs via label, always on main/merge-queue | 3-6 min |
 | `ci-ok` | ubuntu-latest | join job, `needs:` everything, `if: always()` + fail-on-any-failure | seconds |
 
 The KVM permissions step (used by GitHub's own changelog, android-emulator-runner, and
@@ -446,13 +446,13 @@ and make every test **discovered by convention, never registered**.
 
 ### 10.1 Freeze the workflow layer mechanically
 
-Instructions alone ("don't touch GitHub Actions") are policy; enforce them structurally:
+Instructions alone ("do not touch GitHub Actions") are policy; enforce them structurally:
 
 - **CODEOWNERS**: the repo-wide `* @gominimal/minimalists` rule (so the minimalists team
   owns `.github/` along with everything else) plus branch protection "require code owner
   review", any PR touching workflows is un-mergeable without human sign-off, no matter
   who or what authored it. This is the standard control; GitHub already treats workflow
-  edits as privileged (fork PRs modifying workflows don't run with secrets).
+  edits as privileged (fork PRs modifying workflows do not run with secrets).
 - **Preflight guard**: the existing `preflight` job fails fast if a PR from an
   agent-labeled branch modifies `.github/**`, cheap belt-and-suspenders, and it gives
   agents an immediate, legible error instead of a review-time rejection.
@@ -519,7 +519,7 @@ first two honest: new capabilities go through reviewed code, never through YAML.
 
 ### 10.4 Proofs
 
-"Provide proofs" becomes cheap when local and CI runs are identical (§8):
+"Getting proofs" becomes cheap when local and CI runs are identical (§8):
 
 - The local commands produce the same artifacts CI does: `cargo nextest run` writes the
   JUnit XML, and `just up` / `scripts/session-e2e.sh` produce the VM console logs and
@@ -527,7 +527,7 @@ first two honest: new capabilities go through reviewed code, never through YAML.
   reviewer re-derives it by reading the CI run, not by trusting the claim.
 - CI publishes the JUnit summary to `$GITHUB_STEP_SUMMARY` (libkrun's `--github-summary`
   flag is precedent), so per-PR test evidence is visible without downloading artifacts.
-- Optional soft gate: `preflight` warns (labels, doesn't fail) when a PR touches `src/`
+- Optional soft gate: `preflight` warns (labels, does not fail) when a PR touches `src/`
   without touching any test path, a nudge, with the real enforcement left to review.
 
 Document this contract in `CONTRIBUTING.md` / the agents' instruction file as a short

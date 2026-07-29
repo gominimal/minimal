@@ -6,7 +6,7 @@ description: Packages are reproducible, dependency-aware units of software in Mi
 
 Packages are the core of software production in Minimal. Packages are reproducible, maintainable, and dependency-aware building blocks designed for environment parity across the software development lifecycle (SDLC).
 
-Structurally, a package is the union of its declarative build specification and the resulting binary artifacts. A metaphor for Minimal's packages would be a recipe (the build specification) and the meal that's cooked from it (the resulting artifacts). This relationship is cemented by a [layer of metadata](#definition) that defines the package's dependencies, architecture, and provenance. In our metaphor, these would be the optional modifications made to tailor the dish so it's more to your liking. By binding the "recipe" to the "result," Minimal ensures that you have complete control over every dish you make, verifying that every component of your environment is transparent, verifiable, and maintainable at scale.
+Structurally, a package is the union of its declarative build specification and the resulting binary artifacts. A metaphor for Minimal's packages would be a recipe (the build specification) and the meal that's cooked from it (the resulting artifacts). This relationship is cemented by a [layer of metadata](#definition) that defines the package's dependencies, architecture, and provenance. In our metaphor, these would be the optional modifications made to tailor the dish so it's more to your liking. By binding the "recipe" to the "result," Minimal makes sure that you have complete control over every dish you make, verifying that every component of your environment is transparent, verifiable, and maintainable at scale.
 
 ## Using packages {#using}
 
@@ -34,7 +34,7 @@ The package definition captures a variety of useful information:
 ## Caching {#caching}
 
 Built packages are cached against their _spec hash_: a cryptographic hash of the metadata of the package, including the recipe for
-building the package (and the recipes for building all its transitive dependencies). Using these hashes as the storage key ensures
+building the package (and the recipes for building all its transitive dependencies). Using these hashes as the storage key makes sure
 that the exact package described in your repository or [software supply chain](./software-supply-chain.md) is used anywhere it is
 requested, as well as providing a reliable key for fetching packages remotely.
 

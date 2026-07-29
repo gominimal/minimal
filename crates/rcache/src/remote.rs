@@ -260,6 +260,20 @@ impl RemoteCache<AnyBackend> {
                 },
                 false,
             ),
+            mfile::CacheConfig::CommitClosures {
+                upstream,
+                sideloads,
+            } => {
+                return Self::new_any_closure_union(
+                    url,
+                    gcs_storage,
+                    index_dir,
+                    ot,
+                    upstream,
+                    sideloads,
+                )
+                .await;
+            }
         };
         if let IndexSource::Snapshot { object } = &source {
             tracing::debug!("cache index: per-commit snapshot {object}");
@@ -279,6 +293,73 @@ impl RemoteCache<AnyBackend> {
             }
             other => other,
         }
+    }
+
+    /// Reads and unions per-commit *closure* snapshots into one index. The
+    /// upstream's closure is required — it is the signed catalog, and its
+    /// absence surfaces as [`Error::SnapshotMissing`] naming the object,
+    /// never a silent fallback. Sideload closures are best-effort: a sideload
+    /// repo not covered by build infrastructure publishes no index, so a
+    /// missing one is logged and skipped (its specs resolve locally as they
+    /// always have). Every closure is fetched through the same
+    /// immutable-snapshot path as the byte-copy (whole-record check, local
+    /// cache forever).
+    async fn new_any_closure_union(
+        url: AnyUrl,
+        gcs_storage: Option<Storage>,
+        index_dir: Option<PathBuf>,
+        ot: Option<OpTracker>,
+        upstream: &str,
+        sideloads: &[String],
+    ) -> Result<Self, Error<AnyRespError>> {
+        tracing::debug!("cache index: per-commit closure {upstream}");
+        let mut rc = Self::new_any(
+            url.clone(),
+            gcs_storage.clone(),
+            index_dir.clone(),
+            ot.clone(),
+            IndexSource::Snapshot {
+                object: upstream.to_string(),
+            },
+        )
+        .await?;
+
+        for object in sideloads {
+            let side = Self::new_any(
+                url.clone(),
+                gcs_storage.clone(),
+                index_dir.clone(),
+                ot.clone(),
+                IndexSource::Snapshot {
+                    object: object.clone(),
+                },
+            )
+            .await;
+            match side {
+                Ok(s) => {
+                    let conflicts = rc.index.merge(s.index);
+                    if conflicts > 0 {
+                        // Overlapping spec hashes must agree across links;
+                        // divergence means two closures claim different bytes
+                        // for one spec — surface it, last link wins.
+                        tracing::warn!(
+                            "closure union: {conflicts} conflicting entries merging {object}"
+                        );
+                    }
+                }
+                Err(Error::SnapshotMissing { object }) => {
+                    tracing::info!(
+                        "sideload closure {object} not published; its specs resolve locally"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        tracing::debug!(
+            "cache index: closure union ready, {} entries",
+            rc.index.len()
+        );
+        Ok(rc)
     }
 }
 
@@ -922,6 +1003,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rc.sha256(&spec_hash), Some(sha256));
+    }
+
+    #[tokio::test]
+    async fn configured_closure_union_merges_per_link_closures() {
+        const OBJ_A: &str = "github.com/gominimal/pkgs/aaaa.closure.shisha";
+        const OBJ_B: &str = "github.com/acme/extra/bbbb.closure.shisha";
+        let spec_a = SpecHash::from_bytes([0x0A; 32]);
+        let spec_b = SpecHash::from_bytes([0x0B; 32]);
+        let base = serve_objects(vec![
+            (OBJ_A.to_string(), index_bytes_for(&spec_a, [0xA1; 32])),
+            (OBJ_B.to_string(), index_bytes_for(&spec_b, [0xB1; 32])),
+        ]);
+
+        let config = mfile::CacheConfig::CommitClosures {
+            upstream: OBJ_A.to_string(),
+            sideloads: vec![OBJ_B.to_string()],
+        };
+        let rc = RemoteCache::new_any_configured(https_url(&base), None, None, None, &config)
+            .await
+            .unwrap();
+        // Entries from BOTH links resolve through the one merged index.
+        assert_eq!(rc.sha256(&spec_a), Some([0xA1; 32]));
+        assert_eq!(rc.sha256(&spec_b), Some([0xB1; 32]));
+        assert_eq!(rc.sha256(&SpecHash::from_bytes([0x0C; 32])), None);
+    }
+
+    #[tokio::test]
+    async fn configured_closure_missing_upstream_is_a_loud_error() {
+        const OBJ_UP: &str = "github.com/gominimal/pkgs/aaaa.closure.shisha";
+        // The root index exists and must NOT be silently used: the upstream
+        // closure is the required (signed) catalog.
+        let spec_a = SpecHash::from_bytes([0x0A; 32]);
+        let base = serve_index(Some(index_bytes_for(&spec_a, [0xA1; 32])));
+
+        let config = mfile::CacheConfig::CommitClosures {
+            upstream: OBJ_UP.to_string(),
+            sideloads: vec![],
+        };
+        let err = RemoteCache::new_any_configured(https_url(&base), None, None, None, &config)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::SnapshotMissing { object } if object == OBJ_UP),
+            "expected SnapshotMissing for {OBJ_UP}, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_closure_missing_sideload_is_skipped_not_fatal() {
+        const OBJ_UP: &str = "github.com/gominimal/pkgs/aaaa.closure.shisha";
+        const OBJ_SIDE: &str = "github.com/acme/extra/bbbb.closure.shisha";
+        // Only the upstream closure exists — the sideload repo publishes no
+        // index (the common case: not covered by build infrastructure).
+        let spec_a = SpecHash::from_bytes([0x0A; 32]);
+        let base = serve_objects(vec![(
+            OBJ_UP.to_string(),
+            index_bytes_for(&spec_a, [0xA1; 32]),
+        )]);
+
+        let config = mfile::CacheConfig::CommitClosures {
+            upstream: OBJ_UP.to_string(),
+            sideloads: vec![OBJ_SIDE.to_string()],
+        };
+        let rc = RemoteCache::new_any_configured(https_url(&base), None, None, None, &config)
+            .await
+            .unwrap();
+        // Upstream entries resolve; the sideload's specs simply miss (and
+        // would build locally), exactly as they do today.
+        assert_eq!(rc.sha256(&spec_a), Some([0xA1; 32]));
+        assert_eq!(rc.sha256(&SpecHash::from_bytes([0x0B; 32])), None);
     }
 
     #[tokio::test]
