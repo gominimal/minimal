@@ -254,6 +254,13 @@ test-installer:
 lint-shell:
     bash scripts/lint-shell.sh
 
+# Replay the release job's shipped-binary CLI invocations against the debug
+# binaries (builds any that are missing). The frozen release.yml only runs them
+# on a dispatched release, so this is their pre-merge gate; CI runs the same
+# check through crates/common/tests/release_cli_smoke.rs (part of `just test`).
+test-release-cli:
+    bash scripts/release-cli-smoke.sh --build
+
 # Run the promotion provenance gate's test harness (stubbed `gh`, no network,
 # no auth); shellcheck runs when present.
 test-promote-gate:
