@@ -1,7 +1,7 @@
 //! The minimal CLI which pairs/talks-with minimald.
 
 use anyhow::{Context as _, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use clap_complete::Shell;
 use std::io::IsTerminal as _;
 use std::io::Write as _;
@@ -458,13 +458,10 @@ pub struct LsArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(ArgGroup::new("target").args(["session", "all"]).required(true).multiple(false)))]
 pub struct DestroyArgs {
     /// Session identifier (UUID or session name)
-    #[arg(
-        required_unless_present = "all",
-        conflicts_with = "all",
-        add = completion::session_completer()
-    )]
+    #[arg(add = completion::session_completer())]
     pub session: Option<String>,
     /// Destroy all sessions
     #[arg(long)]
@@ -2787,6 +2784,31 @@ mod tests {
         use clap::Parser as _;
         let cli = Cli::try_parse_from(["min", "ls"]).unwrap();
         assert!(!cli.global_args.use_minvmd());
+    }
+
+    /// `session destroy` must present `[SESSION]` and `--all` as mutually
+    /// exclusive alternatives, one required. Regression for #1038: the error
+    /// path used to hide `--all` and demand a session outright, yielding a
+    /// usage line that could never parse.
+    #[test]
+    fn destroy_models_session_and_all_as_required_alternatives() {
+        use clap::Parser as _;
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+
+        // Exactly one of a session or --all is required; both together conflict.
+        assert!(parse(&["min", "session", "destroy", "web"]).is_ok());
+        assert!(parse(&["min", "session", "destroy", "--all"]).is_ok());
+        assert!(parse(&["min", "session", "destroy"]).is_err());
+        assert!(parse(&["min", "session", "destroy", "--all", "web"]).is_err());
+
+        // --force only makes sense with --all, and its error no longer hides
+        // that --all is the alternative the bare error omitted.
+        assert!(parse(&["min", "session", "destroy", "--all", "--force"]).is_ok());
+        let bare = parse(&["min", "session", "destroy", "-f"])
+            .err()
+            .expect("-f without --all must fail to parse")
+            .to_string();
+        assert!(bare.contains("--all"), "usage must surface --all: {bare}");
     }
 
     #[test]
