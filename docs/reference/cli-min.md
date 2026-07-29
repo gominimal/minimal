@@ -185,14 +185,42 @@ min version
 
 Prints CLI and daemon version information.
 
-### `completions`
+### `completions` (alias: `completion`)
 
 ```
-min completions <SHELL>
+min completions print <SHELL>
+min completions install [<SHELL>...]
 ```
 
-Generates a shell tab-completion script. Supported shells include `bash`, `zsh`,
-`elvish`, `fish`. Usage: `source <(min completions bash)`.
+`print` writes a shell tab-completion script to stdout. Supported shells
+include `bash`, `zsh`, `elvish`, `fish`. Usage:
+`source <(min completions print bash)`.
+
+`install` writes that script into the shell's completion directory instead,
+for the three shells with a conventional per-user completion path. With no
+`SHELL` argument it installs for all three.
+
+| Shell | Path |
+|-------|------|
+| `bash` | `$XDG_DATA_HOME/bash-completion/completions/min` (default `~/.local/share/...`) |
+| `zsh` | `$XDG_DATA_HOME/zsh/completions/_min` (default `~/.local/share/...`) |
+| `fish` | `$XDG_CONFIG_HOME/fish/completions/min.fish` (default `~/.config/...`) |
+
+Each file is written atomically — a temporary sibling, then a rename — so a
+half-written completion file never reaches a shell.
+
+`install` prints every path it wrote to stdout, one per line. That is a
+contract rather than a convenience: `scripts/install.sh` feeds exactly those
+paths into its install record so `uninstall` can remove them, and derives no
+paths of its own. The bookkeeping therefore has one implementation, reachable
+by everyone rather than only by users who installed via `curl | sh`.
+
+A completion directory that exists but is not writable — these are shared,
+user-owned locations that can pre-exist root-owned — produces a warning on
+stderr, not a failure: the other shells still install and the exit status is
+still 0. For `zsh`, a stale `compinit` dump is dropped after a (re)install,
+since it can otherwise keep trusting its cached contents after the completion
+file underneath has changed.
 
 What it emits is a short *registration* shim, not a completion table: it teaches
 the shell to ask `min` itself what to offer. That indirection is what makes
