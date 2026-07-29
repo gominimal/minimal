@@ -145,6 +145,20 @@ pub(crate) fn enumerate_patch_files(
                 }
             };
             if !entry.file_type().is_file() {
+                // A *literal* patch source that is itself a symlink is
+                // the walk root (depth 0). With follow_symlinks off the
+                // walker won't traverse it, so it's dropped here with no
+                // other signal — warn, mirroring the missing-source case,
+                // rather than failing open silently. Deeper symlinks come
+                // from glob enumeration, whose no-follow behavior is
+                // documented, so they stay quiet.
+                if !follow_symlinks && entry.depth() == 0 && entry.file_type().is_symlink() {
+                    tracing::warn!(
+                        source_pattern = %pp.source.pattern(),
+                        walk_root = %walk_root_path,
+                        "patch source is a symlink and follow_symlinks is off; dropping (set follow_symlinks = true to include it)"
+                    );
+                }
                 continue;
             }
             let link_path = match Utf8PathBuf::from_path_buf(entry.into_path()) {
@@ -332,6 +346,49 @@ mod tests {
             ),
             "got: {:?}",
             errors[0],
+        );
+    }
+
+    /// A *literal* (non-glob) patch source that resolves to a symlink
+    /// is the walk root itself, so with `follow_symlinks` off the walker
+    /// skips it and the patch is dropped (now with a warn — see the
+    /// `is_file()` skip branch). Turning `follow_symlinks` on recovers
+    /// it, which pins the cause to the follow decision rather than
+    /// anything else about the patch. Mirrors the issue's own control.
+    #[test]
+    fn literal_symlink_source_drops_off_and_lands_on() {
+        use crate::core::primitives::{FileSet, PatchDest};
+        use crate::core::source::Source;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(std::fs::canonicalize(tmp.path()).unwrap()).unwrap();
+        std::fs::write(root.join("real.txt").as_std_path(), "x").unwrap();
+        std::os::unix::fs::symlink(
+            root.join("real.txt").as_std_path(),
+            root.join("link.txt").as_std_path(),
+        )
+        .unwrap();
+
+        let make_item = |follow_symlinks| ExpandedProvenancedPatch {
+            source: FileSet::try_new(root.join("link.txt").as_str()).unwrap(),
+            dest: PatchDest::try_new("FROMLINK.txt").unwrap(),
+            provenance: Source::UserLoadout {
+                name: "symsrc".to_string(),
+            },
+            follow_symlinks,
+        };
+
+        let dropped = enumerate_patch_files(vec![make_item(false)]).unwrap();
+        assert!(
+            dropped.is_empty(),
+            "literal symlink source must drop when follow_symlinks is off",
+        );
+
+        let landed = enumerate_patch_files(vec![make_item(true)]).unwrap();
+        assert_eq!(
+            landed.len(),
+            1,
+            "literal symlink source must land when follow_symlinks is on",
         );
     }
 
