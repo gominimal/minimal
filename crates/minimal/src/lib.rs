@@ -443,7 +443,7 @@ pub struct AttachArgs {
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
     /// Command to exec in the session context (non-interactive)
-    #[arg(long, short)]
+    #[arg(long, short, hide = true)]
     pub command: Option<String>,
 }
 
@@ -1865,8 +1865,9 @@ fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), anyhow::Error
     } else {
         bail!(
             "`min session attach` needs an interactive terminal, but stdin is not a TTY. \
-             Run it from a terminal, or use `min session attach --command <cmd>` to run a \
-             single command non-interactively."
+             Run it from a terminal, or use the non-interactive escape hatch \
+             `min session attach --command <cmd>` (a hidden flag, kept for scripted \
+             callers) to run a single command."
         )
     }
 }

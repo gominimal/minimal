@@ -67,8 +67,8 @@ ergonomic choices, not leftovers — do not "fix" them:
 - **macOS**: installs ship `min` and `minvmd` only. `minimald` always runs
   inside the microVM, and the package/build plane runs there with it;
   there is no native macOS `mip`.
-- `mip run` (and its `shell`/`build`/`test` shorthands) executes tasks in
-  Linux sandboxes and is available on Linux only.
+- `mip run` executes tasks in Linux sandboxes and is available on Linux
+  only.
 
 ## In-sandbox helper commands
 

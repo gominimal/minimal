@@ -3798,7 +3798,6 @@ dependencies = [
  "constcat",
  "decode",
  "diagnostics",
- "either",
  "fd-lock",
  "futures",
  "graph",
