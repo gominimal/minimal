@@ -104,21 +104,31 @@ fi
 #     (the installer's completion generation runs `<bin>/min`, spec R9.3), while
 #     the component and artifact names keep the crate name.
 #
-# Linux hosts install just the three self-contained musl binaries. macOS hosts
-# additionally need minvmd + gvproxy and the guest microVM payload (kernel,
-# rootfs, initramfs) to boot Linux workloads under libkrun; macOS is arm64-only
-# here, and its guest is arm64, so it consumes the arm64 guest artifacts.
+# Linux hosts install the three self-contained musl binaries plus the switch
+# binary, which `minimald` spawns for native (DM2) own-IP sessions. macOS hosts
+# additionally need minvmd and the guest microVM payload (kernel, rootfs,
+# initramfs) to boot Linux workloads under libkrun; macOS is arm64-only here,
+# and its guest is arm64, so it consumes the arm64 guest artifacts. minvmd is
+# not staged for Linux yet — see gominimal/minimal#980.
+#
+# The switch installs as `bin/gvproxy-min`, NOT `bin/gvproxy`: the bin prefix is
+# `~/.local/bin`, which is on PATH, and podman/crc ship their own `gvproxy`
+# there. The bytes are stock gvproxy (pinned and SHA-256-verified by
+# scripts/fetch-gvproxy.sh); only the installed name is ours, and
+# `switch::GVPROXY_FILE` is the resolver's matching definition.
 COMPONENTS=(
     # Linux amd64
     "minimald|linux|amd64|file|bin/minimald|minimald-linux-amd64"
     "mip|linux|amd64|file|bin/mip|mip-linux-amd64"
     "minimal|linux|amd64|file|bin/min|minimal-linux-amd64"
     "git-remote-min|linux|amd64|symlink|bin/git-remote-min|min"
+    "gvproxy-min|linux|amd64|file|bin/gvproxy-min|gvproxy-linux-amd64"
     # Linux arm64
     "minimald|linux|arm64|file|bin/minimald|minimald-linux-arm64"
     "mip|linux|arm64|file|bin/mip|mip-linux-arm64"
     "minimal|linux|arm64|file|bin/min|minimal-linux-arm64"
     "git-remote-min|linux|arm64|symlink|bin/git-remote-min|min"
+    "gvproxy-min|linux|arm64|file|bin/gvproxy-min|gvproxy-linux-arm64"
     # macOS arm64 (darwin)
     "minimal|darwin|arm64|file|bin/min|minimal-macos-arm64"
     "git-remote-min|darwin|arm64|symlink|bin/git-remote-min|min"
@@ -128,12 +138,6 @@ COMPONENTS=(
     # Basename MUST be libkrun.1.dylib: minvmd's load command is @rpath/libkrun.1.dylib
     # and the release job adds a @loader_path/../lib rpath.
     "libkrun|darwin|arm64|file|lib/libkrun.1.dylib|libkrun-macos-arm64.dylib"
-    # Installed as `gvproxy-min`, NOT `gvproxy`: the bin prefix is
-    # `~/.local/bin`, which is on PATH, and podman/crc ship their own `gvproxy`
-    # there — under the upstream name whichever landed last would win a PATH
-    # lookup, in either direction. The bytes are stock gvproxy (still pinned and
-    # SHA-256-verified by scripts/fetch-gvproxy.sh); only the installed name is
-    # ours, and `switch::GVPROXY_FILE` is the resolver's matching definition.
     "gvproxy-min|darwin|arm64|file|bin/gvproxy-min|gvproxy-darwin-arm64"
     "initramfs|darwin|arm64|file|data/initramfs.cpio|initramfs-arm64.cpio"
     "rootfs|darwin|arm64|file|data/rootfs.img|rootfs-arm64.img"
