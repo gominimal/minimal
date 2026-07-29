@@ -34,7 +34,6 @@ chrono.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 constcat.workspace = true
-either.workspace = true
 fd-lock.workspace = true
 futures.workspace = true
 size.workspace = true
