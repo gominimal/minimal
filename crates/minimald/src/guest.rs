@@ -650,6 +650,61 @@ pub fn mount_dev() {
     mount_if_absent("/dev", "devtmpfs", "devtmpfs");
 }
 
+/// Soft and hard `RLIMIT_NOFILE` the microVM's init installs, and so every
+/// session, task, and build forked from it inherits.
+///
+/// pid-1 starts at the kernel's 1024/4096 default with no service manager
+/// underneath to widen it. 64 Ki covers the fd-hungry cases (many SSH channels,
+/// a build fanning out to hundreds of processes) while staying well under the
+/// `fs.nr_open` ceiling, where the soft limit itself becomes a cost to code that
+/// closes fds by looping up to it.
+pub const DEFAULT_MICROVM_NOFILE_LIMIT: u64 = 65536;
+
+/// Raises `RLIMIT_NOFILE`, soft and hard, to `limit`; returns the soft limit in
+/// force afterwards, which can be below `limit` (see the fallback).
+pub fn raise_nofile_limit(limit: u64) -> std::io::Result<u64> {
+    let current = get_nofile_limit()?;
+    let target = limit as libc::rlim_t;
+    if current.rlim_cur >= target {
+        return Ok(current.rlim_cur);
+    }
+
+    // The kernel rejects a hard limit above `fs.nr_open` outright rather than
+    // clamping, so an overshooting request fails wholesale. Fall back to the
+    // hard limit we already have — no privilege needed — instead of leaving the
+    // 1024-fd default in place.
+    if set_nofile_limit(target, target).is_err() {
+        set_nofile_limit(current.rlim_max, current.rlim_max)?;
+    }
+
+    Ok(get_nofile_limit()?.rlim_cur)
+}
+
+fn get_nofile_limit() -> std::io::Result<libc::rlimit> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a live `rlimit`, which is exactly what the kernel
+    // writes through the pointer.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) };
+    (rc == 0)
+        .then_some(limit)
+        .ok_or_else(std::io::Error::last_os_error)
+}
+
+fn set_nofile_limit(soft: libc::rlim_t, hard: libc::rlim_t) -> std::io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: soft,
+        rlim_max: hard,
+    };
+    // SAFETY: `limit` is a live `rlimit` the kernel only reads from.
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) };
+    (rc == 0)
+        .then_some(())
+        .ok_or_else(std::io::Error::last_os_error)
+}
+
 const NANOS_IN_SECOND: u64 = 1_000_000_000;
 
 /// How far the guest's `CLOCK_REALTIME` may sit from the host's before we step
@@ -1283,5 +1338,26 @@ mod tests {
             .unwrap();
         assert!(reason.len() <= MOUNT_FAILED_REASON_MAX_BYTES);
         assert!(reason.chars().all(|c| c == 'é'));
+    }
+
+    /// One test, not two: it mutates process-global state, so a sibling could
+    /// race it. Unprivileged, so it covers the no-op and the fallback; raising
+    /// the hard limit as pid-1 is proved by the VM boot itself.
+    #[test]
+    fn the_open_file_limit_only_ever_goes_up() {
+        let before = get_nofile_limit().unwrap();
+        assert_eq!(
+            raise_nofile_limit(before.rlim_cur).unwrap(),
+            before.rlim_cur,
+            "asking for the limit we already have must not change it",
+        );
+
+        // Above any possible `fs.nr_open`, so the hard-limit raise is refused
+        // (EPERM) regardless of privilege and we take the fallback.
+        assert_eq!(
+            raise_nofile_limit(1 << 40).unwrap(),
+            before.rlim_max,
+            "an unreachable request must still leave us at the hard limit",
+        );
     }
 }
