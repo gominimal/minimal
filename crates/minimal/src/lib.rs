@@ -92,7 +92,7 @@ pub enum Command {
     /// Obtain an mTLS client certificate for the HTTPS reverse proxy
     ///
     /// Connects to minimald, generates a fresh client certificate signed by
-    /// the daemon's internal CA (R4.4, R4.5), and saves the certificate and
+    /// the daemon's internal CA, and saves the certificate and
     /// private key to `~/.config/minimal/client.pem` /
     /// `~/.config/minimal/client.key`. Also saves the CA certificate to
     /// `~/.config/minimal/ca.pem` so tools like `curl` can trust the HTTPS
@@ -266,7 +266,7 @@ pub struct GlobalArgs {
     pub config_dir: Option<PathBuf>,
     /// Select the daemon backend that hosts sessions. On Linux, `local-minimald`
     /// (the default) runs minimald on the host; `local-minvmd` runs it inside
-    /// the minvmd microVM (DM1). No effect on macOS, where minvmd is the only
+    /// the minvmd microVM. No effect on macOS, where minvmd is the only
     /// backend.
     #[arg(long, global = true, value_name = "PROVIDER")]
     pub provider: Option<Provider>,
