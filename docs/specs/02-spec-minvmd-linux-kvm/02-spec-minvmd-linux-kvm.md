@@ -147,9 +147,9 @@ the guards are removed.
 **Proof Artifacts:**
 
 1. **CLI:** `cargo build -p minvmd` on a Linux host with libkrun installed
-   exits 0, demonstrates the crate links cleanly against libkrun on Linux.
+   exits 0, shows the crate links cleanly against libkrun on Linux.
 2. **Test:** `cargo test -p minvmd` (excluding e2e tests) on Linux exits 0,
-   demonstrates existing unit tests pass on Linux.
+   shows existing unit tests pass on Linux.
 
 ---
 
@@ -199,10 +199,10 @@ instead of Hypervisor.framework availability.
 **Proof Artifacts:**
 
 1. **CLI:** `MINVMD_KERNEL_PATH=<k> MINVMD_ROOTFS_PATH=<r> MINVMD_INITRAMFS=<i> minvmd boot --foreground`
-   on a Linux host with `/dev/kvm` prints `vm-up` within 10 s, demonstrates
+   on a Linux host with `/dev/kvm` prints `vm-up` within 10 s, shows
    KVM boot + READY marker round-trip on Linux.
 2. **Test:** `MINVMD_E2E=1 cargo test -p minvmd --test boot_integration -- --include-ignored`
-   on a Linux host with `/dev/kvm` exits 0, demonstrates the automated boot
+   on a Linux host with `/dev/kvm` exits 0, shows the automated boot
    e2e passes (test is un-gated from macOS in Unit 3).
 
 ---
@@ -258,7 +258,7 @@ establish the Linux/KVM baseline.
    session e2e passes on Linux over the host UDS→vsock bridge.
 2. **File:** The pull request description contains a latency table (min /
    median / max boot-to-READY) from the Linux/KVM benchmark run, cited
-   against the ~75 ms macOS baseline, demonstrates R3.5 was executed.
+   against the ~75 ms macOS baseline, shows R3.5 was executed.
 
 ---
 

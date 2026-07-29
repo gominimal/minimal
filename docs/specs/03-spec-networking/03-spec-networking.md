@@ -160,10 +160,10 @@ extended network-mode types in `crates/minimald-rpc/`
 
 1. **Test:** Integration test (`crates/minimald/tests/` or `crates/minvmd/tests/`)
    starts two `OwnIp` PTasks and asserts a TCP connect from PTask A to PTask B's
-   switch IP succeeds, demonstrates UC6 same-host PTask-to-PTask.
+   switch IP succeeds, shows UC6 same-host PTask-to-PTask.
 2. **Test:** Integration test starts a `NoNet` PTask and asserts that a TCP
    connect attempt from within it to `8.8.8.8:80` fails with connection
-   refused or ENETUNREACH, demonstrates UC1 no-net isolation.
+   refused or ENETUNREACH, shows UC1 no-net isolation.
 
 ---
 
@@ -217,14 +217,14 @@ types, gvproxy filter/portfwd API integration
 
 1. **Test:** Integration test starts an `OwnIp` PTask with an egress allowlist
    permitting only `tcp` to a specific test IP. Asserts that a TCP connect to the
-   allowed IP succeeds and a connect to a different IP fails, demonstrates UC3
+   allowed IP succeeds and a connect to a different IP fails, shows UC3
    egress enforcement.
 2. **Test:** Integration test configures a static ingress mapping on an `OwnIp`
    PTask, starts a listener inside it, and asserts that `connect("127.0.0.1",
-   external_port)` from the host reaches the in-PTask listener, demonstrates
+   external_port)` from the host reaches the in-PTask listener, shows
    UC4 ingress port mapping.
 3. **CLI:** `minimal session policy <id>` returns the effective egress/ingress
-   policy JSON for a running session, demonstrates the R2.6 read-only RPC.
+   policy JSON for a running session, shows the R2.6 read-only RPC.
 
 ---
 
@@ -296,10 +296,10 @@ DNS integration), new hostname manager module, host-side DNS configuration path
 2. **CLI:** with an own-IP PTask that publishes a port (ingress `<external>:<internal>`,
    R2.3), `curl -x http://127.0.0.1:7654 http://<session-name>.<host-id>.min.internal:<external>/`
    from the local host returns HTTP 200 from a webserver running inside the PTask,
-   demonstrates UC2a local browser access (hostname → published loopback port).
+   shows UC2a local browser access (hostname → published loopback port).
 3. **CLI:** `curl http://<session-name>.<host-id>.min.internal:<port>/` from the
    local host returns HTTP 200 from a webserver running inside a `HostNet` PTask
-   (hostname resolves to `127.0.0.1`), demonstrates UC2 hostname-driven access
+   (hostname resolves to `127.0.0.1`), shows UC2 hostname-driven access
    for host-net PTask services (R3.6).
 
 ---
@@ -368,13 +368,13 @@ management)
 1. **Test:** Integration test with two `minimald` instances in separate test
    network namespaces, WireGuard mesh configured, asserts that a TCP connect from
    a PTask on instance A to a PTask on instance B (via their switch IPs across the
-   mesh tunnel) succeeds, demonstrates UC7 remote PTask-to-PTask.
+   mesh tunnel) succeeds, shows UC7 remote PTask-to-PTask.
 2. **CLI:** From a laptop in the mesh, `curl http://<session-name>.<host-id>.min.internal/`
    returns HTTP 200 from a webserver in an own-IP PTask on a remote host, routed
-   over the WireGuard tunnel, demonstrates UC2b option A remote mesh access.
+   over the WireGuard tunnel, shows UC2b option A remote mesh access.
 3. **CLI:** `minimal ssh-forward <session> 8080:127.0.0.1:80` with the WireGuard
    feature flag disabled establishes a TCP tunnel; `curl http://localhost:8080/`
-   returns HTTP 200 from a webserver inside the PTask, demonstrates the SSH
+   returns HTTP 200 from a webserver inside the PTask, shows the SSH
    fallback for restricted networks (R4.9).
 
 ---
@@ -440,7 +440,7 @@ macOS root-write fallback, not the default.
 ### WireGuard implementation: wireguard-go vs boringtun
 
 R4.1 leaves the choice open. `boringtun` (Rust) avoids a Go toolchain dependency
-and produces a smaller binary. wireguard-go is more battle-tested and is the
+and produces a smaller binary. wireguard-go is more mature and is the
 reference implementation used in Tailscale's production stack. The decision is
 made during Unit 4 design, informed by build-chain and maintenance considerations.
 

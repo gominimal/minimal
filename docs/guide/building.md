@@ -58,7 +58,7 @@ Similarly to `mip build`, you can run your test suite with:
 $ mip test
 ```
 
-This is shorthand for `mip run test`, and runs the `test` task from your `minimal.toml`; define one with `[tasks.test]`. Stacks provide a default `build` task only.
+This is shorthand for `mip run test`, and runs the `test` task from your `minimal.toml`; define one with `[tasks.test]`. Stacks only ship a default `build` task.
 
 ## Persisting build state
 
@@ -69,4 +69,4 @@ By default, each task invocation starts from a clean state. To cache build artif
 state_key = "dev"
 ```
 
-Tasks sharing the same `state_key` share cached state, so your builds don't start from scratch every time.
+Tasks sharing the same `state_key` share cached state, so your builds do not start from scratch every time.

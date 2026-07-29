@@ -229,7 +229,7 @@ unified subprocess capture helper.
   `bundle.rs:92-133` uses `symlink_metadata` before open; this unit upgrades
   it). The read is bounded with `Read::take(cap)` so a file growing mid-read
   cannot exceed the recorded cap.
-- **R1.5**: `redact.rs` shall provide the key-based policy engine:
+- **R1.5**: `redact.rs` shall define the key-based policy engine:
   `is_sensitive_key` (substring parts list, with compound-key handling such
   that `public_key` only exempts when no sensitive part remains after
   stripping it — `public_key_token` masks), `is_env_table_name`,
@@ -244,7 +244,7 @@ unified subprocess capture helper.
   manifest error), per-entry read failures are recorded inline, and hitting
   the cap appends an explicit trailing truncation marker
   (`… truncated at N entries`).
-- **R1.7**: `capture.rs` (new) shall provide the single subprocess helper
+- **R1.7**: `capture.rs` (new) shall define the single subprocess helper
   ```rust
   pub async fn command_capture(cmd: &str, args: &[&str], timeout: Duration) -> Result<Capture>
   ```
@@ -261,16 +261,16 @@ unified subprocess capture helper.
 1. **Test:** unit tests for redaction (compound public-key regressions:
    `public_key_token`, `public_key_password`, `private_public_key`), tail-cap
    bounding, symlink rejection, listing caps and truncation marker —
-   demonstrates R1.4–R1.6.
+   shows R1.4–R1.6.
 2. **Test:** the same entry set written through `create` and through `stream`
    round-trips to identical archives modulo the root prefix, each carrying
    the manifest as its final entry at the exact mode-specific path
    (`{root}/manifest.json` file-backed; top-level `manifest.json` streamed)
-   — demonstrates R1.2, R1.3.
-3. **Test:** archive created with mode `0600` — demonstrates R1.2.
+   — shows R1.2, R1.3.
+3. **Test:** archive created with mode `0600` — shows R1.2.
 4. **Test:** a subprocess exceeding its timeout is terminated
    (`kill_on_drop`), with captured stdout/stderr/status retained alongside a
-   typed timeout error — demonstrates R1.7.
+   typed timeout error — shows R1.7.
 
 ---
 
@@ -369,7 +369,7 @@ paths, and the archive layout.
   (`minimald.log*`, `minvmd.log*`) and per known name (`run.log`,
   `boot.log`), the newest **5** files per prefix by rotation order,
   tail-capped, rejecting non-regular files (no-follow discipline per R1.4).
-  Absent files are manifest skips, not errors (the files only begin to exist
+  Absent files are manifest skips, not errors (the files only start to exist
   after Unit 3 — best-effort by design).
 - **R2.8**: `host/dirs.txt` shall capture the `min dirs` report; `dirs.rs`
   refactors to return `String` with `cmd_dirs` printing it (behavior of
@@ -381,12 +381,12 @@ paths, and the archive layout.
 
 1. **Test:** `bug_without_daemon_still_produces_a_bundle` — valid tar.zst,
    manifest accounts for system.json/env.json/state listing, provider absence
-   recorded as a skip — demonstrates R2.1, R2.2, R2.6.
+   recorded as a skip — shows R2.1, R2.2, R2.6.
 2. **Test:** a planted secret in a fake config dir appears as
    `<redacted:len=N>` in the bundled config and never verbatim anywhere in the
-   archive — demonstrates R2.4, R2.5.
+   archive — shows R2.4, R2.5.
 3. **CLI:** `min bug` on a dev box; inspect manifest counts and `host/`
-   entries — demonstrates R2.3, R2.7–R2.9.
+   entries — shows R2.3, R2.7–R2.9.
 
 ---
 
@@ -477,17 +477,17 @@ records carry correlation ids on spans.
 1. **CLI (gate):** boot a VM, hold an idle attach, `minvmd stop`; the volume
    unmounts cleanly (no journal replay on next mount), `boot.log` is present
    in the host-side provider directory, and rotated `minimald.log*` appear on
-   the data volume at next boot — demonstrates R3.2–R3.4. The
+   the data volume at next boot — shows R3.2–R3.4. The
    release-before-quiesce path is compile/unit-verified only on the reference
    branch; this live check gates the unit.
 2. **Test:** log-release runs exactly once and before quiesce returns;
-   harness passes `None` release unaffected — demonstrates R3.4.
+   harness passes `None` release unaffected — shows R3.4.
 3. **Test:** the daily appender writes to its date-suffixed file; retention
    and rotation are `tracing_appender`'s own tested behavior, and the live
    gate (artifact 1) confirms rotated `minimald.log*` on the volume —
-   demonstrates R3.6.
+   shows R3.6.
 4. **CLI:** grep a session's records by span-carried channel id across
-   accept/attach/close lines — demonstrates R3.5.
+   accept/attach/close lines — shows R3.5.
 
 ---
 
@@ -559,13 +559,13 @@ the daemon across the SSH boundary.
 
 1. **Test:** a file-log line parses as JSON and carries level, target,
    timestamp, flattened span fields, and top-level resource fields —
-   demonstrates R4.1, R4.2.
+   shows R4.1, R4.2.
 2. **CLI (gate):** run one attach with `min`; a single `trace_id` greps
    across the host CLI log and the guest daemon's on-volume log —
-   demonstrates R4.3, R4.4.
+   shows R4.3, R4.4.
 3. **Test:** malformed `TRACEPARENT` values are ignored (fresh mint, no
    error), and client and daemon reference the same env-name constant —
-   demonstrates R4.4.
+   shows R4.4.
 
 ---
 
@@ -597,7 +597,7 @@ established for its disk/log/env/system helpers.
   `netstat` with raw `/proc/net` fallback — verbatim output, no typed
   re-serialization), interfaces with MACs masked to their vendor OUI, and
   routes.
-- **R5.2**: `diagnostics::procs` shall provide the process tree and hang
+- **R5.2**: `diagnostics::procs` shall produce the process tree and hang
   triage for up to 8 pids matched by **argv0 basename** against a
   caller-supplied `markers: &[&str]`. The Linux path shall be **pure `/proc`
   reads** — wchan/syscall/kernel-stack/fd readlinks, plus an
@@ -623,12 +623,12 @@ established for its disk/log/env/system helpers.
 **Proof Artifacts:**
 
 1. **Test:** interfaces output masks full MACs to OUI; routes/listening
-   captures present in the bundle — demonstrates R5.1.
+   captures present in the bundle — shows R5.1.
 2. **CLI:** `min bug` while a `min attach` runs: `host/proc/<pid>.sample.txt`
    (macOS) or `.stack.txt` (Linux) plus `host/proc/lsof.txt` appear for the
-   process family — demonstrates R5.2, R5.4.
+   process family — shows R5.2, R5.4.
 3. **Test:** crate-level tests for markers matching (argv0 basename, not
-   substring) and power event caps — demonstrates R5.2, R5.3.
+   substring) and power event caps — shows R5.2, R5.3.
 
 ---
 
@@ -685,7 +685,7 @@ same `manifest.json` schema as the host bundle.
   — scrubbed per the R5.2 argv rule — only for marker-matched processes,
   `comm` otherwise), raw `/proc/net` tables, and `disk.json` — finishing
   with `manifest.json`.
-- **R6.6**: The bundle shall additionally capture the guest-side incident
+- **R6.6**: The bundle shall also capture the guest-side incident
   trio via the Unit 5 mechanics (all pure `/proc`, R5.2 — the microVM rootfs
   has no `lsof`/`ss`/`ip`):
   - `net/routes.txt` — `/proc/net/route` + `/proc/net/fib_trie` (routing
@@ -714,16 +714,16 @@ same `manifest.json` schema as the host bundle.
 
 1. **Test:** in-crate tests fetch a bundle over the test harness and assert
    `meta.json` + `manifest.json` presence, session redaction, and the
-   pre-stream error path (extended data, zero payload) — demonstrates R6.1,
+   pre-stream error path (extended data, zero payload) — shows R6.1,
    R6.2, R6.4.
 2. **CLI:** raw `ssh -s` subsystem invocation against a dev daemon returns a
-   decompressible rootless tar.zst — demonstrates R6.2.
+   decompressible rootless tar.zst — shows R6.2.
 3. **Test:** oversized request body and oversized `log_tail_bytes` are
-   clamped/rejected — demonstrates R6.3.
+   clamped/rejected — shows R6.3.
 4. **Test:** the harness bundle contains `net/routes.txt`, per-pid
    `proc/<pid>.stack.txt` for the daemon's own family, `proc/sockets.txt`
    with fd→inode-resolved sockets, and `env.json` with a planted
-   `MINIMALD_TOKEN`-style variable masked — demonstrates R6.6.
+   `MINIMALD_TOKEN`-style variable masked — shows R6.6.
 
 ---
 
@@ -786,15 +786,15 @@ and logs harvested read-only from the volume image.
 
 1. **Test:** full-stack — `min bug` against the harness daemon nests a guest
    bundle whose manifest parses; loadout redaction and client-key skip hold
-   across layers — demonstrates R7.1–R7.3.
+   across layers — shows R7.1–R7.3.
 2. **Test:** stale socket file → probe records the failed connect stage and
    `error.txt` explains the skip; volume fallback artifacts appear —
-   demonstrates R7.1, R7.5.
+   shows R7.1, R7.5.
 3. **Test:** `--no-guest` against a live harness daemon performs zero daemon
-   contact — demonstrates R7.4.
+   contact — shows R7.4.
 4. **CLI (gate):** kill a real VM's daemon mid-session, run `min bug`: probe
    stages + `volume-meta.json` + harvested `volume-logs/` present —
-   demonstrates R7.5 end to end.
+   shows R7.5 end to end.
 
 ---
 
@@ -829,7 +829,7 @@ read both pre-convergence (`errors.json`) and post-convergence
 
 1. **CLI:** `summary`/`check`/`errors` against one pre-convergence bundle
    (a field-captured sample retained by the team) and one post-Unit-6 bundle
-   — both pass — demonstrates R8.1–R8.3.
+   — both pass — shows R8.1–R8.3.
 
 ## Non-Goals
 
@@ -881,7 +881,7 @@ the move).
 
 No maintained crate does data-driven recursive key-based scrubbing of
 arbitrary JSON/TOML: `secrecy`/`veil`/`redact` are type-level (annotate your
-own structs — the opposite shape from walking config you didn't define), and
+own structs — the opposite shape from walking config you did not define), and
 `redactable` explicitly treats dynamic `serde_json::Value`s as opaque
 wholesale-redact leaves. Vector's VRL `redact()` is the only real prior art
 and is an entire language runtime. The ~200-line fail-closed key-walk stays,

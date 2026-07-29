@@ -178,7 +178,7 @@ trees on a shared writable ext4 volume. Introduces the host provisioner, the
   `sync_mode: SyncMode` and delegates to `raw::krun_add_disk3` via the same
   `CString` construction and `check_backend` error translation as `add_disk`.
 
-- **R1.3**: `crates/minvmd/src/volume.rs` (new file) shall provide a single
+- **R1.3**: `crates/minvmd/src/volume.rs` (new file) shall define a single
   idempotent provisioning function
   ```rust
   pub fn ensure_sparse_raw(path: &Path, size_bytes: u64) -> Result<(), VolumeError>;
@@ -247,7 +247,7 @@ trees on a shared writable ext4 volume. Introduces the host provisioner, the
 
 1. **Test:** An integration test (`crates/minvmd/tests/` or `crates/minimald/tests/`)
    boots the VM, runs a build that hardlinks from the cache into a sandbox staging
-   tree, and asserts the build succeeds with no `EXDEV` error, demonstrates the
+   tree, and asserts the build succeeds with no `EXDEV` error, shows the
    same-FS constraint is satisfied.
 2. **CLI:** `minvmd boot --foreground` on macOS/HVF starts the VM, the guest
    mounts `/dev/vdb`, and the READY marker arrives, confirms the second disk is
@@ -354,16 +354,16 @@ loud rather than silently degraded.
   `minvmd run` shall surface this condition as a user-visible error; the host
   decides whether the failure is fatal (e.g. fatal when a prior volume image for
   this VM already exists, recoverable when provisioning a fresh blank volume).
-  This ensures that a corrupt or unmountable volume does not produce a ghost
+  This makes sure that a corrupt or unmountable volume does not produce a ghost
   READY that appears to the host as a healthy VM.
 
 **Proof Artifacts:**
 
 1. **Test:** A test sends `minvmd stop` to a running VM, then confirms the volume
-   image is mountable (ext4 journal clean) on the host after teardown, demonstrates
+   image is mountable (ext4 journal clean) on the host after teardown, shows
    the quiesce path flushed the journal.
 2. **Test:** A test boots a VM with a missing or incorrectly-sized `/dev/vdb` and
-   asserts that no `READY` marker arrives within the boot timeout, demonstrates
+   asserts that no `READY` marker arrives within the boot timeout, shows
    R2.4 and R2.5 (loud failure, no silent fallback).
 
 ---
@@ -408,7 +408,7 @@ the host-side mapping from session id to volume image.
   file-open), but never on a corrupt JSON file alone.
 
 - **R3.2**: The guest boot path (`crates/minimald/src/guest.rs` or the volume
-  mount step) shall ensure `providers/` is reset on each boot while `sessions/`
+  mount step) shall make sure `providers/` is reset on each boot while `sessions/`
   is preserved. A `providers/` reset already occurs on the PR #573 branch via
   commit `ee5299cc` scoping the boot reset to `providers/`; this requirement
   makes that behaviour explicit and tested. The implementation shall log a
@@ -454,11 +454,11 @@ the host-side mapping from session id to volume image.
 
 1. **Test:** A test writes a deliberately corrupt `sessions/index.json` to the
    volume, boots the VM, and asserts `minimald` reaches READY without error and
-   the session count recovered from `record.json` matches expectation, demonstrates
+   the session count recovered from `record.json` matches expectation, shows
    R3.1.
 2. **Test:** A test uploads a workspace to a non-empty worktree without `force=true`
    and asserts the RPC returns an error; uploads with `force=true` succeed and the
-   prior worktree content is atomically replaced, demonstrates R3.3.
+   prior worktree content is atomically replaced, shows R3.3.
 
 ---
 
@@ -658,7 +658,7 @@ staging directory is adjacent to the live worktree on the same volume, making
   does not support `fallocate`, so `ftruncate` (which also creates a sparse/thin
   file on APFS and HFS+) is the portable fallback.
 - **Session UUIDv7**: globally unique, monotonically ordered by creation time.
-  The `ProviderIndex` key is the session UUIDs, ensuring no collision across VMs
+  The `ProviderIndex` key is the session UUIDs, so there is no collision across VMs
   or host reboots.
 - **krun_add_disk3 is in libkrun ≥ 1.19.0.** The installed version is confirmed
   at 1.19.0 (`libkrun.h:278-284`); no library upgrade is required.

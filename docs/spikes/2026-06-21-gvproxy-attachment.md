@@ -119,7 +119,7 @@ Notes:
   `forwards`, `vpnKitUUIDMacAddresses`, and `dnsSearchDomains` are **not**
   applied; they must be explicit in the YAML if needed.
 - `-ssh-port -1` disables the default `127.0.0.1:2222 → 192.168.127.2:22`
-  forward (that forward targets an IP that doesn't exist on our custom subnet).
+  forward (that forward targets an IP that does not exist on our custom subnet).
 - The warning `"CLI argument -ssh-port is unavailable with config file"` is
   emitted when `-config` is present; pass `-ssh-port -1` anyway to suppress
   the default forward that would be added without the flag.
@@ -193,7 +193,7 @@ assign IP via DHCP or static config
 connect(unix, /run/minimald/gvproxy-api.sock) ───►
 write("POST /connect HTTP/1.0\r\nHost: …\r\n\r\n") ─►
                                             hijack conn, register switch port
-        ◄─── [no response; raw frame exchange begins] ───►
+        ◄─── [no response; raw frame exchange starts] ───►
 
 async task rx: read(tap_fd) → LE_u16(len) + frame → write(sock)
 async task tx: read(sock) → LE_u16(len) → read(frame) → write(tap_fd)
@@ -538,7 +538,7 @@ was correct with one material correction.
 
 The following findings are source-confirmed but not yet live-tested. A live
 trial against an actual gvproxy process is recommended before U1-T2
-implementation begins:
+implementation starts:
 
 - **`dhcpStaticLeases` YAML assignment**: source reading confirms the
   `{ip: mac}` key format, but live behavior of gvproxy's DHCP server

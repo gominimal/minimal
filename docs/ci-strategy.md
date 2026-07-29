@@ -230,7 +230,7 @@ artifacts:
    Test jobs need a same-revision checkout for fixtures, nothing else.
 2. **Guest musl binaries** built once per arch → artifact → consumed by VM-smoke jobs
    and the host-daemon packaging step.
-3. Doctests are the one thing nextest can't run, keep a cheap `cargo test --doc` step
+3. Doctests are the one thing nextest cannot run, keep a cheap `cargo test --doc` step
    in the build job (compiles against the already-built lib).
 
 Avoid the classic redundancy traps:
@@ -446,13 +446,13 @@ and make every test **discovered by convention, never registered**.
 
 ### 10.1 Freeze the workflow layer mechanically
 
-Instructions alone ("don't touch GitHub Actions") are policy; enforce them structurally:
+Instructions alone ("do not touch GitHub Actions") are policy; enforce them structurally:
 
 - **CODEOWNERS**: the repo-wide `* @gominimal/minimalists` rule (so the minimalists team
   owns `.github/` along with everything else) plus branch protection "require code owner
   review", any PR touching workflows is un-mergeable without human sign-off, no matter
   who or what authored it. This is the standard control; GitHub already treats workflow
-  edits as privileged (fork PRs modifying workflows don't run with secrets).
+  edits as privileged (fork PRs modifying workflows do not run with secrets).
 - **Preflight guard**: the existing `preflight` job fails fast if a PR from an
   agent-labeled branch modifies `.github/**`, cheap belt-and-suspenders, and it gives
   agents an immediate, legible error instead of a review-time rejection.
@@ -519,7 +519,7 @@ first two honest: new capabilities go through reviewed code, never through YAML.
 
 ### 10.4 Proofs
 
-"Provide proofs" becomes cheap when local and CI runs are identical (§8):
+"Getting proofs" becomes cheap when local and CI runs are identical (§8):
 
 - The local commands produce the same artifacts CI does: `cargo nextest run` writes the
   JUnit XML, and `just up` / `scripts/session-e2e.sh` produce the VM console logs and
@@ -527,7 +527,7 @@ first two honest: new capabilities go through reviewed code, never through YAML.
   reviewer re-derives it by reading the CI run, not by trusting the claim.
 - CI publishes the JUnit summary to `$GITHUB_STEP_SUMMARY` (libkrun's `--github-summary`
   flag is precedent), so per-PR test evidence is visible without downloading artifacts.
-- Optional soft gate: `preflight` warns (labels, doesn't fail) when a PR touches `src/`
+- Optional soft gate: `preflight` warns (labels, does not fail) when a PR touches `src/`
   without touching any test path, a nudge, with the real enforcement left to review.
 
 Document this contract in `CONTRIBUTING.md` / the agents' instruction file as a short

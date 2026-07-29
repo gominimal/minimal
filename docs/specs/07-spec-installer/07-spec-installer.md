@@ -119,7 +119,7 @@ mode's one option, `--force-stop` (R5.5), is recognized wherever it appears in
 the arguments and removed from them before the target is read, so the target
 stays the sole positional on either side of the flag.
 
-**R2.2**, The script fetches `<BUCKET>/<target>` to obtain a version string.
+**R2.2**, The script fetches `<BUCKET>/<target>` to get a version string.
 The result is validated against `^[A-Za-z0-9._-]+$` (command substitution having
 already stripped the trailing newline); a malformed value exits with an error.
 `<BUCKET>` is hardcoded into the script, but can be overridden with an environment
@@ -445,7 +445,7 @@ downloads) one init file per shell family under `<data>/shell-init/`:
   `fish_add_path --prepend` for fish), so sourcing is idempotent and becomes a
   no-op once the user manages `PATH` themselves.
 
-`zsh.sh` additionally adds the zsh completions dir (R9.3) to `fpath` and runs
+`zsh.sh` also adds the zsh completions dir (R9.3) to `fpath` and runs
 `compinit`, and then **self-heals a lying dump**: `compinit` trusts its cached
 `.zcompdump` whenever the dump's (zsh version, completion-file count) header
 matches, a check that misses real changes (one completions dir replacing
@@ -623,7 +623,7 @@ installer. The manifest is strictly *data*; prefix tokens are mapped through a
 `case`, never expanded.
 
 **On-disk hash as the skip oracle.** Comparing the manifest hash against the
-actual destination file (R5.1) is more robust than trusting a recorded state
+actual destination file (R5.1) is more reliable than trusting a recorded state
 file, which drifts when a user deletes a binary or a prior run dies mid-install.
 A local SHA-256 is far cheaper than the download it avoids.
 
@@ -844,7 +844,7 @@ prefixes resolve to `.../minimal` subdirectories the installer owns, and the
 when empty and otherwise left untouched. Pruning failures (a non-empty dir) are
 ignored, not fatal.
 
-**R8.2**, `--purge` additionally removes the `minimal`-owned trees in full,
+**R8.2**, `--purge` also removes the `minimal`-owned trees in full,
 the resolved `data`, `state`, and `cache` directories and everything under them
 (build cache included), because those live at fixed `.../minimal` paths the tool
 owns exclusively. `--purge` never touches the shared `bin` directory beyond the
