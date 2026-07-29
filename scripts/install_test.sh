@@ -40,6 +40,12 @@ check(){ if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (want [$1] got [$2])"; f
 want_ok()  { _m="$1"; shift; if "$@"; then ok "$_m"; else bad "$_m"; fi; }
 want_err() { _m="$1"; shift; if "$@"; then bad "$_m"; else ok "$_m"; fi; }
 
+# record_has <component> <path> <record> — true when the install record holds a
+# row pairing that component with that exact path (columns 1 and 2).
+record_has() {
+    awk -v c="$1" -v p="$2" '$1==c && $2==p {hit=1} END{exit !hit}' "$3"
+}
+
 # The harness computes expected hashes with whatever SHA-256 tool the host has.
 # macOS ships `shasum`, not `sha256sum`, so pick portably (same order the
 # installer under test uses) — otherwise the macOS lane fails in the harness
@@ -60,28 +66,70 @@ BUCKET_HOST="https://mock.invalid/minimal-one"
 mock="$root/bucket"
 mkdir -p "$mock/versions/v1"
 
+# write_min_stub <path> [label] — the stand-in for the real binary at every
+# point install.sh runs it: `completions install <shell>` (R9.3), `ls` and
+# `stop` for the live-session prompt (R5.5). The completions arm implements the
+# same contract the real command does — write the shell's file under its
+# XDG-derived path, print that path on stdout, warn on stderr and still exit 0
+# when the directory is not writable, drop a stale compinit dump for zsh —
+# because the installer now delegates all of it and only reads the printed
+# paths.
+write_min_stub() {
+    printf '#!/bin/sh\n# mock min (%s)\n' "${2:-previous release}" >"$1"
+    cat >>"$1" <<'MOCKEOF'
+comp_target() {
+    case "$1" in
+        bash) printf '%s/bash-completion/completions/min\n' "${XDG_DATA_HOME:-$HOME/.local/share}" ;;
+        zsh)  printf '%s/zsh/completions/_min\n'            "${XDG_DATA_HOME:-$HOME/.local/share}" ;;
+        fish) printf '%s/fish/completions/min.fish\n'       "${XDG_CONFIG_HOME:-$HOME/.config}" ;;
+    esac
+}
+comp_install() {
+    _t="$(comp_target "$1")"
+    _d="${_t%/*}"
+    if ! ( mkdir -p "$_d" && : >"$_t.tmp.$$" ) 2>/dev/null; then
+        echo "warning: failed to install $1 completions ($_d is not writable)" >&2
+        return 0
+    fi
+    printf '# mock min completions for %s\n' "$1" >"$_t.tmp.$$"
+    mv -f "$_t.tmp.$$" "$_t"
+    printf '%s\n' "$_t"
+    if [ "$1" = zsh ]; then
+        _dump="${ZDOTDIR:-$HOME}/.zcompdump"
+        if [ -f "$_dump" ] && rm -f "$_dump" 2>/dev/null; then
+            echo "cleared compinit dump cache $_dump" >&2
+        fi
+    fi
+}
+case "${1:-}" in
+    completions)
+        shift
+        [ "${1:-}" = install ] || { echo "mock min: no such completions verb: ${1:-}" >&2; exit 2; }
+        shift
+        [ $# -gt 0 ] || set -- bash zsh fish
+        for _s in "$@"; do comp_install "$_s"; done
+        ;;
+    ls)          printf 'session-alpha  running\n' ;;
+    stop)
+        printf '%s\n' "$*" >>"$HOME/stop.calls"
+        if [ -f "$HOME/sessions.live" ] && [ "${2:-}" != "--force" ]; then
+            echo "daemon has active sessions; pass --force to shut down anyway" >&2
+            exit 1
+        fi
+        ;;
+esac
+MOCKEOF
+    chmod +x "$1"
+}
+
 # Platform-diverse artifacts with padded columns and comment/blank lines, to
 # prove awk field-splitting survives padding (R3.1/R3.3). The `minimal` CLI
-# artifacts are runnable sh scripts that answer `completions <shell>`, because
-# the installer generates completions by executing the installed bin/min
+# artifacts are runnable sh scripts that answer `completions install <shell>`,
+# because the installer installs completions by executing the installed bin/min
 # (R9.3); the other artifacts stay opaque bodies.
 printf 'linux-amd64-minimald-body\n'  >"$mock/versions/v1/minimald-linux-amd64"
-cat >"$mock/versions/v1/minimal-linux-amd64" <<'EOF'
-#!/bin/sh
-# mock min (linux-amd64)
-case "${1:-}" in
-    completions) printf '# mock min completions for %s\n' "$2" ;;
-    stop)        printf '%s\n' "$*" >>"$HOME/stop.calls" ;;
-esac
-EOF
-cat >"$mock/versions/v1/minimal-darwin-arm64" <<'EOF'
-#!/bin/sh
-# mock min (darwin-arm64)
-case "${1:-}" in
-    completions) printf '# mock min completions for %s\n' "$2" ;;
-    stop)        printf '%s\n' "$*" >>"$HOME/stop.calls" ;;
-esac
-EOF
+write_min_stub "$mock/versions/v1/minimal-linux-amd64"  linux-amd64
+write_min_stub "$mock/versions/v1/minimal-darwin-arm64" darwin-arm64
 printf 'darwin-arm64-rootfs-body\n'   >"$mock/versions/v1/rootfs-arm64.img"
 
 # AppArmor components: noarch text (the loader is a runnable stub here), shipped
@@ -498,29 +546,6 @@ want_err "PATH advisory suppressed when bin present (R6.2)" grep -q "is not on y
 # run once, only on a run that actually replaces a file, and only when it was
 # already on disk beforehand.
 
-# The `min` an upgrade finds already on disk. It records every `stop` call,
-# answers `ls`, and — when the scenario drops a `sessions.live` marker in the
-# home — refuses a graceful stop with the real daemon's wording, exactly as
-# `min stop` does when sessions are running.
-write_min_stub() {
-    cat >"$1" <<'STUB'
-#!/bin/sh
-# mock min, previous release
-case "${1:-}" in
-    completions) printf '# mock min completions for %s\n' "$2" ;;
-    ls)          printf 'session-alpha  running\n' ;;
-    stop)
-        printf '%s\n' "$*" >>"$HOME/stop.calls"
-        if [ -f "$HOME/sessions.live" ] && [ "${2:-}" != "--force" ]; then
-            echo "daemon has active sessions; pass --force to shut down anyway" >&2
-            exit 1
-        fi
-        ;;
-esac
-STUB
-    chmod +x "$1"
-}
-
 # Seed <home> with a completed install, then stage the next run as an upgrade
 # (one stale component) whose on-disk `min` reports live sessions.
 stage_live_upgrade() {
@@ -547,7 +572,7 @@ want_err "up-to-date rerun stops no daemon (R5.5)" test -e "$H8/stop.calls"
 # still runnable, still able to reach the daemon it started. With no sessions
 # running the graceful stop succeeds, so nothing is forced and nothing is asked.
 printf 'stale\n' >"$H8/bin/minimald"
-write_min_stub "$H8/bin/min"
+write_min_stub "$H8/bin/min" "previous release"
 run daemonupgrade "$H8"
 check 0 "$rc" "upgrade exits 0"
 want_ok "upgrade runs min stop (R5.5)" test -f "$H8/stop.calls"
@@ -707,7 +732,7 @@ run shellinit2 "$H7"
 check 0 "$rc" "shell-init rerun exits 0"
 check 1 "$(grep -c '>>> minimal >>>' "$H7/.bashrc")" "rerun adds no second rc block (R9.2)"
 
-# Completions, generated by executing the installed mock min (R9.3).
+# Completions, installed by executing the installed mock min (R9.3).
 want_ok "bash completions written for min (R9.3)" \
     grep -q "mock min completions for bash" "$H7/xdg-data/bash-completion/completions/min"
 want_ok "zsh completions written as _min (R9.3)" \
@@ -716,6 +741,37 @@ want_ok "fish completions written (R9.3)" \
     grep -q "mock min completions for fish" "$H7/xdg-config/fish/completions/min.fish"
 want_ok "record lists the generated completions (R9.3/R6.1)" \
     grep -q "completions-zsh" "$H7/xdg-state/minimal/installed"
+# The record's path column is the path the binary printed, per shell — the
+# whole contract of the delegation (R9.3).
+want_ok "record row carries the installed zsh path (R9.3)" \
+    record_has completions-zsh "$H7/xdg-data/zsh/completions/_min" \
+        "$H7/xdg-state/minimal/installed"
+
+# The record is fed by what the binary PRINTS on stdout, not by a path table
+# the installer keeps: a min that installs somewhere the installer never
+# derives is still recorded (and so still uninstallable). That is the contract
+# between the two halves of R9.3.
+cat >"$mock/versions/v1/minimal-odd" <<'EOF'
+#!/bin/sh
+# mock min that installs completions where it likes, and says so on stdout
+[ "${1:-}" = completions ] || exit 0
+mkdir -p "$HOME/odd"
+printf '# odd completions for %s\n' "$3" >"$HOME/odd/$3-odd"
+printf '%s\n' "$HOME/odd/$3-odd"
+EOF
+chmod +x "$mock/versions/v1/minimal-odd"
+h_odd="$(hash_file "$mock/versions/v1/minimal-odd")"
+awk -v h="$h_odd" \
+    '$1=="minimal" && $2=="linux" {$5=h; $8="versions/v1/minimal-odd"} {print}' \
+    "$root/good-components" >"$mock/versions/v1/components"
+H16="$root/h16"; mkdir -p "$H16"
+run oddpaths "$H16"
+check 0 "$rc" "install exits 0 when min installs completions elsewhere (R9.3)"
+want_ok "the path the binary printed is what gets recorded (R9.3)" \
+    record_has completions-zsh "$H16/odd/zsh-odd" "$H16/xdg-state/minimal/installed"
+want_err "the installer records no path of its own devising (R9.3)" \
+    grep -q "bash-completion/completions/min" "$H16/xdg-state/minimal/installed"
+cp "$root/good-components" "$mock/versions/v1/components"   # restore
 
 # Both existing bash rc files are hooked, and user content is preserved.
 H8="$root/h8"; mkdir -p "$H8"
@@ -850,8 +906,9 @@ if [ "$(id -u)" -ne 0 ]; then
     run compreadonly "$H13"
     chmod 755 "$H13/xdg-config/fish/completions"   # restore for later cleanup
     check 0 "$rc" "unwritable completion dir is non-fatal (R9.3)"
+    # The binary warns on stderr; the installer relays it in its own voice.
     want_ok "warning names the unwritable completion dir (R9.3)" \
-        grep -q "failed to install fish completions" "$OUT"
+        grep -q "completions: warning: failed to install fish completions" "$OUT"
     want_err "no raw shell error leaks on completion failure (R9.3)" \
         grep -qi "permission denied" "$OUT"
     want_ok "other shells' completions still installed (R9.3)" \

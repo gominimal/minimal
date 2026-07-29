@@ -45,7 +45,13 @@ async fn run() -> ExitCode {
     let cli = minimal::Cli::parse();
 
     let registry = tracing_subscriber::registry().with(filter);
-    if matches!(cli.command, Some(minimal::Command::CompleteSessionStr(_))) {
+    // `completions` joins the completion handler on stderr: its stdout is a
+    // contract — the shim to `source`, or the installed paths the installer
+    // records — and a log line landing in it would be read as content.
+    if matches!(
+        cli.command,
+        Some(minimal::Command::CompleteSessionStr(_) | minimal::Command::Completions(_))
+    ) {
         registry
             .with(fmt::layer().with_writer(std::io::stderr))
             .init();

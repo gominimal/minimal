@@ -13,6 +13,7 @@ mod attach;
 pub mod autospawn;
 pub mod client;
 pub mod completion;
+pub mod completions;
 pub mod config;
 pub mod diag;
 pub mod dirs;
@@ -137,9 +138,10 @@ pub enum Command {
     /// Never starts a daemon and never fails: no daemon means no output.
     #[command(name = completion::COMPLETE_SESSION_STR, hide = true)]
     CompleteSessionStr(CompleteSessionStrArgs),
-    /// Generate shell completion script
+    /// Print or install the shell tab-completion integration
     #[command(
-        long_about = "Generate a shell tab-completion script for the min CLI.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(min completions bash)"
+        alias = "completion",
+        long_about = "Print or install the shell tab-completion integration for the min CLI.\n\n   source <(min completions print bash)\n   min completions install"
     )]
     Completions(CompletionsArgs),
 }
@@ -557,9 +559,35 @@ pub struct CompleteSessionStrArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct CompletionsArgs {
-    /// The shell type for a CLI completion script should be printed
+    #[command(subcommand)]
+    pub command: CompletionsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CompletionsCommand {
+    /// Print the shell integration on stdout
+    #[command(
+        long_about = "Print the shell integration for a shell on stdout.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(min completions print bash)"
+    )]
+    Print(CompletionsPrintArgs),
+    /// Write the shell integration into each shell's completion directory
+    #[command(
+        long_about = "Write the shell integration into each shell's user-level completion directory,\nand print every path written on stdout, one per line.\n\n   bash  ${XDG_DATA_HOME:-~/.local/share}/bash-completion/completions/min\n   zsh   ${XDG_DATA_HOME:-~/.local/share}/zsh/completions/_min\n   fish  ${XDG_CONFIG_HOME:-~/.config}/fish/completions/min.fish\n\nA shell that cannot be installed for (an unwritable shared directory, say) is\na warning on stderr, not a failure."
+    )]
+    Install(CompletionsInstallArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CompletionsPrintArgs {
+    /// The shell to print the integration for
     #[arg(value_parser)]
     pub shell: Shell,
+}
+
+#[derive(Debug, Args)]
+pub struct CompletionsInstallArgs {
+    /// Shells to install for (default: every supported shell)
+    pub shells: Vec<completions::InstallShell>,
 }
 
 /// The process-wide trace context, minted once at command dispatch. The
@@ -629,7 +657,10 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::CompleteSessionStr(args)) => {
             completion::cmd_complete_session_str(&cli.global_args, args).await
         }
-        Some(Command::Completions(CompletionsArgs { shell })) => cmd_completions(shell),
+        Some(Command::Completions(CompletionsArgs { command })) => match command {
+            CompletionsCommand::Print(args) => completions::cmd_print(args.shell),
+            CompletionsCommand::Install(args) => completions::cmd_install(&args.shells),
+        },
     }
 }
 
@@ -821,45 +852,11 @@ fn confirm(question: &str, default: bool) -> Result<bool, anyhow::Error> {
     })
 }
 
-/// Print the shell integration for `shell` on stdout.
-///
-/// This is a *registration* shim, not a completion table: a dozen lines that
-/// teach the shell to ask `min` itself what to complete, rather than the
-/// thousand-line static script this used to emit. That indirection is the
-/// whole point — session names and IDs only exist at runtime, so a table
-/// baked at install time cannot contain them (see `completion.rs`).
-///
-/// The installed file paths are unchanged, and so is
-/// `scripts/install.sh` (R9.3): zsh's shim still opens with `#compdef min`,
-/// so it autoloads from an fpath dir as `_min`, and bash's and fish's are
-/// still plain source-able files.
-///
-/// The shim calls `min` by bare name so it resolves through `PATH` — an
-/// upgrade that moves the binary keeps working, and the installer puts its
-/// bindir on `PATH` in the same breath as writing this file.
-fn cmd_completions(shell: Shell) -> Result<(), anyhow::Error> {
-    let name = shell.to_string();
-    let shells = clap_complete::env::Shells::builtins();
-    let completer = shells
-        .completer(&name)
-        .with_context(|| format!("no shell integration for `{name}`"))?;
-
-    let mut out = Vec::new();
-    completer
-        .write_registration(COMPLETE_VAR, "min", "min", "min", &mut out)
-        .context("render shell integration")?;
-
-    std::io::stdout()
-        .write_all(&out)
-        .context("write shell integration to stdout")?;
-    Ok(())
-}
-
 /// The environment variable a shell sets to ask `min` for completions.
 ///
 /// clap_complete's default, named here because both ends have to agree: the
-/// shim emitted by [`cmd_completions`] sets it, and the `CompleteEnv` call in
-/// `main.rs` reads it.
+/// shim rendered by [`completions::cmd_print`] sets it, and the `CompleteEnv`
+/// call in `main.rs` reads it.
 pub const COMPLETE_VAR: &str = "COMPLETE";
 
 /// List sessions via the `ListSessions` RPC.
