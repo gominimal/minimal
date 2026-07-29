@@ -140,7 +140,7 @@ pub enum Command {
     CompleteSessionStr(CompleteSessionStrArgs),
     /// Print or install the shell tab-completion integration
     #[command(
-        alias = "completion",
+        visible_alias = "completion",
         long_about = "Print or install the shell tab-completion integration for the min CLI.\n\n   source <(min completions print bash)\n   min completions install"
     )]
     Completions(CompletionsArgs),
