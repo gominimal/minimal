@@ -58,7 +58,10 @@ installed component against the current release and re-downloads only the ones
 that changed, swapping them into place atomically.
 
 Note: upgrading restarts the Minimal daemon, which interrupts any sessions that
-are currently active. Detach first, or expect to reattach after the upgrade.
+are currently active. When sessions are running, the installer lists them and
+asks on your terminal before ending them; declining leaves everything as it was.
+For a scripted upgrade that must not stop to ask, pass `--force-stop` (or set
+`MINIMAL_INSTALL_FORCE_STOP=1`).
 
 ## Uninstall
 
