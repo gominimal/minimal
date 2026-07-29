@@ -47,7 +47,7 @@ After the files are placed, the installer wires up shell integration (Unit 9):
 it generates per-shell init files that put the bin dir on `PATH`, installs tab
 completions for `min` by running the freshly-installed binary, and hooks the
 user's login-shell rc file with an idempotent, marker-fenced block. Uninstall
-(Units 7–8) undoes all of it.
+(Units 7-8) undoes all of it.
 
 The whole script targets POSIX `sh` (not bash) so it runs identically under
 `dash`, macOS's frozen bash 3.2, busybox, and zsh-invoked-`sh`. It depends only
@@ -375,12 +375,12 @@ lets the R5.1 signed-file skip stay correct across releases (skip only while the
 manifest still wants that artifact). A `symlink` row (R5.6) records
 `link:<target>` in both hash columns instead of digests, the `link:` prefix
 cannot collide with a hex digest and is what the uninstaller keys on (R7.3).
-The record also enables uninstall (Units 7–8) and surfaces prefix drift if
+The record also enables uninstall (Units 7-8) and surfaces prefix drift if
 `XDG_*` variables change between runs.
 
 **R6.1a**, **Renamed-component migration.** When a component is renamed, its old
 `dest` stops appearing in every subsequent manifest, so the record walk of Units
-7–8 never revisits it and the file is stranded on disk forever. For a `bin`
+7-8 never revisits it and the file is stranded on disk forever. For a `bin`
 component that is a live PATH collision, not just clutter. The installer
 therefore reverses a known rename from the *prior* record, on the same
 bytes-still-ours terms uninstall uses (R7.3): the old `dest` is removed only
@@ -431,7 +431,7 @@ the only rc edit it makes is Unit 9's announced, marker-fenced block (R9.2).
 
 The goal: after one install and one new shell, `min` is on `PATH` and
 tab-completes, in bash, zsh, and fish. Everything this unit writes is either an
-install-record row (so Units 7–8 remove it for free) or a marker-fenced rc
+install-record row (so Units 7-8 remove it for free) or a marker-fenced rc
 block (so uninstall can strip it precisely).
 
 **R9.1**, After the component loop, the installer **generates** (never
@@ -528,7 +528,7 @@ dead in every new shell until an unrelated `fpath` change. Dropping the cache
 forces a real rescan on the next zsh startup (the `zsh.sh` self-heal in R9.1
 is the belt-and-braces for dumps that go stale later).
 
-**R9.4**, Uninstall (Units 7–8) undoes shell integration completely:
+**R9.4**, Uninstall (Units 7-8) undoes shell integration completely:
 
 - the generated init and completion files are ordinary record rows, removed by
   the hash-verified walk (R7.3);
@@ -691,7 +691,7 @@ architecture record; design rationale is captured above.
 1. **Static**: `shellcheck --shell=sh` passes on the installer with no warnings.
 2. **Dash conformance**: the installer's test harness runs the script under
    `dash` (and, where available, macOS `/bin/sh`), not just `bash`, in CI.
-3. **Unit tests** (Units 1–6, 9) pass against fixture pointer files, manifests,
+3. **Unit tests** (Units 1-6, 9) pass against fixture pointer files, manifests,
    and a stubbed bucket/downloader, asserting: downloader/hasher/platform
    selection; target and version validation; field extraction; prefix resolution
    and traversal rejection; skip-on-rerun and checksum-mismatch handling; install
@@ -930,7 +930,7 @@ behind explicit `--purge` and confined to the `.../minimal` roots the tool owns.
 
 1. **Static/conformance**: the same `shellcheck --shell=sh` and `dash` CI gates
    cover the added uninstall path.
-2. **Unit tests** (Units 7–8): dispatch and record-absent no-op; hash-verified
+2. **Unit tests** (Units 7-8): dispatch and record-absent no-op; hash-verified
    removal; modified-file keep vs `--force`; already-absent idempotency;
    non-regular-file refusal; record teardown and empty-dir pruning; `--dry-run`
    removing nothing; `--purge` clearing the owned trees; rc-block stripping and

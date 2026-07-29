@@ -258,7 +258,7 @@ establish the Linux/KVM baseline.
    session e2e passes on Linux over the host UDS→vsock bridge.
 2. **File:** The pull request description contains a latency table (min /
    median / max boot-to-READY) from the Linux/KVM benchmark run, cited
-   against the ~75 ms macOS baseline, shows R3.5 was executed.
+   against the ~75 ms macOS baseline, covers R3.5 was executed.
 
 ---
 

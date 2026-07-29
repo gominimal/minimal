@@ -17,7 +17,7 @@ The host (`minvmd boot` and `minvmd run`) receives this marker and signals boot
 completion to its caller.
 
 The native (non-VM) `minimald` path already writes the SSH host key to a
-per-instance `known_hosts` file on startup (`minimald/src/main.rs:377–382`,
+per-instance `known_hosts` file on startup (`minimald/src/main.rs:377-382`,
 via `russh::keys::known_hosts::learn_known_hosts_path`). In the VM path the
 equivalent write happens inside the VM into `/run/minimal/…` (a tmpfs the host
 SSH client never sees), so the first SSH connection to a fresh VM triggers a
@@ -152,7 +152,7 @@ implementation plan is in the tracking issue comment (ADR 0024).
 ## Open Questions
 
 None. The prior art (`learn_known_hosts_path` call at
-`minimald/src/main.rs:377–382`) settles the API, hostname, and port. The beacon
+`minimald/src/main.rs:377-382`) settles the API, hostname, and port. The beacon
 extension is additive and backward-compatible.
 
 ## Technical Considerations
@@ -180,7 +180,7 @@ extension is additive and backward-compatible.
 ## Verification
 
 1. `cargo test -p minimald`, the `emit_ready_marker` unit test (R1.1) passes.
-2. `cargo test -p minvmd`, the READY-marker integration test (R2.1–R2.4)
+2. `cargo test -p minvmd`, the READY-marker integration test (R2.1-R2.4)
    passes; the expected key entry is present in the temp `known_hosts`.
 3. End-to-end: `minvmd run` followed by a fresh SSH connect with
    `ssh -o UserKnownHostsFile=<path> local-minvmd0` succeeds with no host-key prompt.

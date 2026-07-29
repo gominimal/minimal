@@ -183,7 +183,7 @@ boringtun's integration advantages for a Rust project:
 | Cross-compilation | High, C cross-compiler | Medium, separate binary | Low, Rust toolchain |
 | Process count | Same (in-proc) | +1 (alongside gvproxy) | Same (in-proc) |
 | Production subnet-router | Tailscale-scale | Tailscale-scale | Cloudflare/Mullvad-scale |
-| Maintenance risk | Low | Low | Low–Medium (gap resolved in 2026) |
+| Maintenance risk | Low | Low | Low-Medium (gap resolved in 2026) |
 
 If boringtun's maintenance pace declines materially or the v1 manual-key-exchange
 model is replaced with Tailscale-style coordination, revisiting wireguard-go via
@@ -239,7 +239,7 @@ approach's in-process integration benefit.
    - `networking-with-diagrams.md` deployment-model diagram, `LapWG` node
      (line 503): "wireguard-go peer (bundled in minimal CLI)" → "boringtun peer
      (bundled in minimal CLI)"
-   - `networking-with-diagrams.md` Option A prose (lines 585–588): "Each
+   - `networking-with-diagrams.md` Option A prose (lines 585-588): "Each
      minimald is a wireguard-go peer" → "Each minimald is a boringtun peer";
      "wireguard-go is bundled" → "boringtun is bundled"
 3. **Workspace dependency pin:** When Unit 4 implementation starts, pin

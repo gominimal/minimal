@@ -280,7 +280,7 @@ trees on a shared writable ext4 volume. Introduces the host provisioner, the
    the default posture is chosen from data. Does not gate merge.
 
    - **macOS/HVF/APFS, DONE (2026-07-07).** Sync-heavy (`O_DSYNC`/block):
-     `none` 4.7 GB/s, `relaxed` 3.1 GB/s, `full` 254 MB/s (~12–18× slower);
+     `none` 4.7 GB/s, `relaxed` 3.1 GB/s, `full` 254 MB/s (~12-18× slower);
      `direct_io=true` halves `relaxed` to 1.2 GB/s. → default `relaxed` +
      `direct_io=false`.
    - **Linux/KVM, REQUIRED, runs in CI.** On Linux, libkrun documents
@@ -363,7 +363,7 @@ loud rather than silently degraded.
    image is mountable (ext4 journal clean) on the host after teardown, shows
    the quiesce path flushed the journal.
 2. **Test:** A test boots a VM with a missing or incorrectly-sized `/dev/vdb` and
-   asserts that no `READY` marker arrives within the boot timeout, shows
+   asserts that no `READY` marker arrives within the boot timeout, covers
    R2.4 and R2.5 (loud failure, no silent fallback).
 
 ---
@@ -454,11 +454,11 @@ the host-side mapping from session id to volume image.
 
 1. **Test:** A test writes a deliberately corrupt `sessions/index.json` to the
    volume, boots the VM, and asserts `minimald` reaches READY without error and
-   the session count recovered from `record.json` matches expectation, shows
+   the session count recovered from `record.json` matches expectation, covers
    R3.1.
 2. **Test:** A test uploads a workspace to a non-empty worktree without `force=true`
    and asserts the RPC returns an error; uploads with `force=true` succeed and the
-   prior worktree content is atomically replaced, shows R3.3.
+   prior worktree content is atomically replaced, covers R3.3.
 
 ---
 
@@ -650,7 +650,7 @@ staging directory is adjacent to the live worktree on the same volume, making
 
 ## Technical Considerations
 
-- **ext4 superblock magic (`0x53EF`)** is at bytes 56–57 of the superblock, which
+- **ext4 superblock magic (`0x53EF`)** is at bytes 56-57 of the superblock, which
   starts at byte offset 1024 from the device start (total offset 1080 for the
   magic). This is stable across all ext4 versions and requires reading only 2
   bytes for the probe.
