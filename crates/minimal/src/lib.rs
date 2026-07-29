@@ -274,25 +274,28 @@ pub struct GlobalArgs {
     /// Override the base directory used for operations (default: ~/.cache/minimal)
     #[arg(long, global = true)]
     pub minimal_dir: Option<PathBuf>,
-    /// Override the user config directory. Everything under
-    /// `<config_dir>/minimal/` (config.toml, loadouts/, ...) is
-    /// resolved relative to this. Defaults to the platform's config
+    /// Override the user config directory (default: platform config dir).
+    ///
+    /// Everything under `<config_dir>/minimal/` (config.toml, loadouts/,
+    /// ...) is resolved relative to this. Defaults to the platform's config
     /// dir — `$XDG_CONFIG_HOME` on Linux (or `$HOME/.config` when
     /// that's unset). macOS uses `$HOME/.config` for consistency with
     /// state and cache dirs, not `~/Library/Application Support`.
     #[arg(long, global = true)]
     pub config_dir: Option<PathBuf>,
-    /// Select the daemon backend that hosts sessions. On Linux, `local-minimald`
-    /// (the default) runs minimald on the host; `local-minvmd` runs it inside
-    /// the minvmd microVM. No effect on macOS, where minvmd is the only
-    /// backend.
+    /// Select the daemon backend that hosts sessions.
+    ///
+    /// On Linux, `local-minimald` (the default) runs minimald on the host;
+    /// `local-minvmd` runs it inside the minvmd microVM. No effect on macOS,
+    /// where minvmd is the only backend.
     #[arg(long, global = true, value_name = "PROVIDER")]
     pub provider: Option<Provider>,
-    /// Skip interactive prompts that need a terminal (e.g. the session
-    /// picker shown by bare `min` or `min session attach` with no session argument).
-    /// When a choice is ambiguous, the command errors with a list of
-    /// candidates instead of opening a picker. Implied when stdin/stdout is
-    /// not a terminal.
+    /// Skip interactive prompts that need a terminal.
+    ///
+    /// Affects e.g. the session picker shown by bare `min` or `min session
+    /// attach` with no session argument. When a choice is ambiguous, the
+    /// command errors with a list of candidates instead of opening a picker.
+    /// Implied when stdin/stdout is not a terminal.
     #[arg(long, global = true, default_value_t = false)]
     pub no_input: bool,
 }
@@ -443,7 +446,7 @@ pub struct AttachArgs {
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
     /// Command to exec in the session context (non-interactive)
-    #[arg(long, short, hide = true)]
+    #[arg(long, short)]
     pub command: Option<String>,
 }
 
@@ -1865,9 +1868,8 @@ fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), anyhow::Error
     } else {
         bail!(
             "`min session attach` needs an interactive terminal, but stdin is not a TTY. \
-             Run it from a terminal, or use the non-interactive escape hatch \
-             `min session attach --command <cmd>` (a hidden flag, kept for scripted \
-             callers) to run a single command."
+             Run it from a terminal, or use `min session attach --command <cmd>` to run a \
+             single command non-interactively."
         )
     }
 }
