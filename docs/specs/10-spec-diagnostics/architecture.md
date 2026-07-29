@@ -417,7 +417,7 @@ already enabled) are named follow-ups under #801, not foundations.
 
 **Redaction crates (`secrecy`, `veil`, `redact`, `redactable`, VRL).**
 Rejected: all type-level (annotate your own structs) — the opposite shape
-from walking user config you didn't define; `redactable` explicitly
+from walking user config you did not define; `redactable` explicitly
 wholesale-redacts dynamic values ("could contain anything") — i.e. the one
 crate that considered the problem punted on it; VRL is a language runtime.
 Nothing is fail-closed. The bespoke key-walk is ~200 lines no crate deletes.

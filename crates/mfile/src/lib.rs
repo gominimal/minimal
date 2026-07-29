@@ -607,6 +607,16 @@ pub enum IndexSourceMode {
     Pinned,
     /// The global root index only.
     Root,
+    /// The union of the per-commit *closure* snapshots of the pinned chain.
+    /// Asymmetric by design: the upstream's closure is required (it is the
+    /// signed catalog — missing is an error), while each sideload's closure
+    /// is unioned best-effort — a sideload not covered by build
+    /// infrastructure publishes no closure, is skipped with a log line, and
+    /// its specs resolve locally. Distinct from [`Self::Pinned`] in both the
+    /// object read (`<commit>.closure.shisha`, the bounded signed catalog,
+    /// vs `<commit>.shisha`, a byte copy of the whole root index) and in
+    /// covering sideload closures at their own pins.
+    Closure,
 }
 
 impl std::str::FromStr for IndexSourceMode {
@@ -616,8 +626,9 @@ impl std::str::FromStr for IndexSourceMode {
             "auto" => Ok(Self::Auto),
             "pinned" => Ok(Self::Pinned),
             "root" => Ok(Self::Root),
+            "closure" => Ok(Self::Closure),
             other => Err(format!(
-                "unknown index source {other:?} (expected \"auto\", \"pinned\" or \"root\")"
+                "unknown index source {other:?} (expected \"auto\", \"pinned\", \"root\" or \"closure\")"
             )),
         }
     }
@@ -636,12 +647,26 @@ pub enum CacheConfig {
     /// Read the immutable per-commit snapshot `object`; if it doesn't exist,
     /// fail rather than fall back.
     CommitIndexOnly { object: String },
+    /// Read and union the immutable per-commit closure snapshots. The
+    /// upstream's closure is required (it is the signed catalog); sideload
+    /// closures are best-effort — a sideload repo not covered by build
+    /// infrastructure publishes no index, and its specs resolve locally.
+    CommitClosures {
+        upstream: String,
+        sideloads: Vec<String>,
+    },
 }
 
 /// Object key of the per-commit index snapshot for a repo + commit:
 /// `<host>/<owner>/<repo>/<commit>.shisha`, matching the publisher's keying.
 pub fn commit_index_object(repo_url: &str, commit_sha: &str) -> String {
     format!("{}/{commit_sha}.shisha", repo_slug(repo_url))
+}
+
+/// Object key of the per-commit *closure* snapshot (the bounded catalog at a
+/// commit): `<host>/<owner>/<repo>/<commit>.closure.shisha`.
+pub fn commit_closure_object(repo_url: &str, commit_sha: &str) -> String {
+    format!("{}/{commit_sha}.closure.shisha", repo_slug(repo_url))
 }
 
 /// Stable `host/owner/repo` slug for a repo URL: query/fragment, scheme,
@@ -1099,6 +1124,44 @@ impl File {
             (IndexSourceMode::Pinned, None) => Err(
                 "index_source \"pinned\" requires a git upstream with a locked_commit".to_string(),
             ),
+            (IndexSourceMode::Closure, _) => {
+                let Some(u) = self.upstream.as_ref() else {
+                    return Err(
+                        "index_source \"closure\" requires a git upstream with a locked_commit"
+                            .to_string(),
+                    );
+                };
+                let LinkConfig::Git {
+                    repo,
+                    locked_commit: Some(commit),
+                    ..
+                } = &u.link
+                else {
+                    return Err(
+                        "index_source \"closure\" requires a git upstream with a locked_commit"
+                            .to_string(),
+                    );
+                };
+                // Sideloads in declaration order; links without a locked
+                // commit (or backed by a directory) have no remote presence
+                // and contribute nothing.
+                let sideloads = u
+                    .sideloads()
+                    .iter()
+                    .filter_map(|s| match s.link() {
+                        LinkConfig::Git {
+                            repo,
+                            locked_commit: Some(commit),
+                            ..
+                        } => Some(commit_closure_object(repo, commit)),
+                        _ => None,
+                    })
+                    .collect();
+                Ok(CacheConfig::CommitClosures {
+                    upstream: commit_closure_object(repo, commit),
+                    sideloads,
+                })
+            }
         }
     }
 }
@@ -1732,6 +1795,64 @@ mod tests {
             CacheConfig::CommitIndexOnly {
                 object: format!("github.com/gominimal/pkgs/{SHA}.shisha")
             }
+        );
+    }
+
+    #[test]
+    fn cache_config_closure_unions_pinned_links_and_skips_the_rest() {
+        const UP: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const SIDE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mf: File = toml::from_str(&format!(
+            r#"
+            [upstream]
+            repo = "https://github.com/gominimal/pkgs"
+            locked_commit = "{UP}"
+
+            [[upstream.sideload]]
+            repo = "https://github.com/acme/extra"
+            locked_commit = "{SIDE}"
+
+            [[upstream.sideload]]
+            dir = "/tmp/local-overlay"
+
+            [[upstream.sideload]]
+            repo = "https://github.com/acme/unpinned"
+            "#
+        ))
+        .unwrap();
+        // Required upstream, then pinned sideloads in declaration order; the
+        // dir and unpinned links have no remote presence.
+        assert_eq!(
+            mf.cache_config(Some(IndexSourceMode::Closure)).unwrap(),
+            CacheConfig::CommitClosures {
+                upstream: format!("github.com/gominimal/pkgs/{UP}.closure.shisha"),
+                sideloads: vec![format!("github.com/acme/extra/{SIDE}.closure.shisha")],
+            }
+        );
+
+        // An unpinned upstream is a loud error — even with a pinned sideload:
+        // the upstream closure is the required (signed) catalog.
+        let unpinned: File = toml::from_str(&format!(
+            r#"
+            [upstream]
+            repo = "https://github.com/gominimal/pkgs"
+
+            [[upstream.sideload]]
+            repo = "https://github.com/acme/extra"
+            locked_commit = "{SIDE}"
+            "#
+        ))
+        .unwrap();
+        assert!(
+            unpinned
+                .cache_config(Some(IndexSourceMode::Closure))
+                .is_err()
+        );
+
+        // The env-override spelling parses.
+        assert_eq!(
+            "closure".parse::<IndexSourceMode>().unwrap(),
+            IndexSourceMode::Closure
         );
     }
 }

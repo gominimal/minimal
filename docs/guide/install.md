@@ -25,7 +25,7 @@ curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh
 min --version
 ```
 
-If installed correctly, it will provide you with the version.
+If installed correctly, it prints the version.
 
 ## macOS
 
@@ -49,7 +49,7 @@ curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh
 min --version
 ```
 
-If installed correctly, it will provide you with the version.
+If installed correctly, it prints the version.
 
 ## Upgrade
 

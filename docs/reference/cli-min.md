@@ -15,8 +15,8 @@ subcommand resolves a session for the current directory (activating one if
 needed) and attaches to it.
 
 Commands are spelled `min <noun> <verb>`, and every noun accepts its singular
-and plural form (`session`/`sessions`, `provider`/`providers`,
-`loadout`/`loadouts`). Bare `min` and a handful of bare verbs (`ls`, `stop`,
+and plural form (`session`/`sessions`, `loadout`/`loadouts`). Bare `min` and a
+handful of bare verbs (`ls`, `stop`,
 `init`, `add`, `update`) survive at the top level as deliberate ergonomic
 exceptions, called out as such below; see
 [the CLI convention](./cli.md#command-naming-convention) for the rule and the
@@ -228,7 +228,7 @@ session arguments completable — `min session attach <TAB>` lists live session
 names, and `min session attach 019<TAB>` lists session IDs, neither of which
 exists at the time a static script would be written. Every argument documented
 as "UUID or session name" completes this way: `session attach`,
-`session destroy`, `session rename`, `session policy`, and `ssh-forward`.
+`session destroy`, `session rename`, and `session policy`.
 
 Session completion is best-effort by design. It never starts a daemon — with
 none running there is nothing to list, and booting a VM on a keystroke would be

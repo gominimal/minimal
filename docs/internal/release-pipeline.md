@@ -34,7 +34,7 @@ override for green-but-unreported commits.
 
 - `build-release-linux-{amd64,arm64}`: static musl builds of `mip`, `min`
   (package `minimal`), and `minimald`, one cargo invocation per package so the
-  fat-LTO links serialize. The amd64 job additionally builds a native-glibc
+  fat-LTO links serialize. The amd64 job also builds a native-glibc
   `minvmd` against a materialized libkrun prefix (there is currently no
   `minvmd-linux-arm64` release artifact).
 - `build-release-macos-arm64` (self-hosted Apple Silicon, gated on the
