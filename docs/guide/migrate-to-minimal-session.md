@@ -20,7 +20,7 @@ If you no longer need the legacy `minimal` command, you can uninstall it with:
 To install `min`, see [install](./install.md).
 
 ### Linux
-To maintain backward compatibility for ephemeral systems on Linux, the installer for `min` will also install a version of Minimal that's functionally identical to `minimal`, and renamed to `mip` (Minimal-In-Place). All commands available to `minimal` are available in `mip`. Any commands using `minimal` should be upgraded to use `mip`.
+To maintain backward compatibility for ephemeral build systems on Linux, the installer for `min` will also install a version of Minimal that's functionally identical to `minimal`, and renamed to `mip` (Minimal-In-Process). All commands available to `minimal` are available in `mip`. Any commands using `minimal` should be upgraded to use `mip`. For the complete documentation on `mip`, see [cli-mip](../reference/cli-mip.md).
 ```
 minimal run --> mip run
 minimal update --> mip update
