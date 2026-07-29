@@ -88,10 +88,21 @@ if [ -d "$PATCHES" ]; then
 fi
 
 echo "building trimmed libkrun (blk,net; no gpu, no init-blob)"
+# `cd "$WORK"` rather than --manifest-path: cargo resolves .cargo/config.toml
+# from the CURRENT DIRECTORY, not from the manifest's directory, so building
+# from the minimal repo root read OUR config and ignored libkrun's. Harmless in
+# what it drops here (a macOS test runner), but the same file carries
+#     [target.'cfg(target_env = "musl")']
+#     rustflags = ["--cfg", "musl_v1_2_3"]
+# which IS load-bearing for the musl build in build-libkrun-linux.sh. Fixed in
+# both places so the two scripts cannot disagree about what they compiled.
+#
 # --locked: build exactly upstream's committed Cargo.lock — a silent
 # re-resolve would undermine the pinned, reproducible-build guarantee.
-cargo build --release --locked -p libkrun --no-default-features --features blk,net \
-  --manifest-path "$WORK/Cargo.toml"
+(
+  cd "$WORK"
+  cargo build --release --locked -p libkrun --no-default-features --features blk,net
+)
 DYLIB="$WORK/target/release/libkrun.dylib"
 test -f "$DYLIB" || { echo "::error::build produced no $DYLIB" >&2; exit 1; }
 

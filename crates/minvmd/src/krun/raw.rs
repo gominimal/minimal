@@ -111,7 +111,11 @@ pub enum SyncMode {
 //   context cannot be reused after this call.
 // - Return values are i32: zero or positive on success, negative errno on
 //   failure. [`crate::error::VmError::check_backend`] translates these.
-#[link(name = "krun")]
+// Link kind is chosen by build.rs. `minvmd_libkrun_static` is emitted when the
+// resolved prefix holds a `libkrun.a` (Linux/musl, the self-contained shipping
+// build); otherwise libkrun is a shared object resolved via rpath at load time.
+#[cfg_attr(minvmd_libkrun_static, link(name = "krun", kind = "static"))]
+#[cfg_attr(not(minvmd_libkrun_static), link(name = "krun"))]
 unsafe extern "C" {
     // ----- smoke-test bring-up surface -----
 

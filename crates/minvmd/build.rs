@@ -29,6 +29,21 @@
 //!   Linux-only workflow stays green; a Linux host *with* libkrun builds the
 //!   real implementation with a plain `cargo build -p minvmd`.
 //! - **Other targets**: stub only; never links libkrun.
+//!
+//! ## Static libkrun (musl)
+//!
+//! A prefix holding `libkrun.a` (built by `scripts/build-libkrun-linux.sh`)
+//! selects a static link instead: this emits `minvmd_libkrun_static`, which
+//! flips the `#[link]` in `src/krun/raw.rs` to `kind = "static"`, and no rpath
+//! is recorded — a statically linked binary has nothing to resolve at load
+//! time. That is what lets minvmd ship to Linux as a single self-contained
+//! musl binary rather than a glibc build trailing `libkrun.so` and
+//! `libkrunfw.so.5` (gominimal/minimal#1065).
+//!
+//! The archive wins when both it and a shared object are present: a prefix
+//! containing both is a dev host that has materialized the upstream package
+//! and then built the static one, and the static link is the shipping
+//! configuration.
 
 use std::path::Path;
 
@@ -46,11 +61,16 @@ const LINUX_LIB_DIRS: &[&str] = &[
     "/usr/lib/aarch64-linux-gnu",
 ];
 
+/// The static libkrun archive, as staged by `scripts/build-libkrun-linux.sh`.
+/// Its presence in the prefix is what selects a static link over a dynamic one.
+const STATIC_LIB: &str = "libkrun.a";
+
 fn main() {
     println!("cargo:rerun-if-env-changed=LIBKRUN_PREFIX");
     // Declared so `#[cfg(minvmd_libkrun)]` does not trip the unexpected-cfgs
     // lint under `-D warnings`.
     println!("cargo::rustc-check-cfg=cfg(minvmd_libkrun)");
+    println!("cargo::rustc-check-cfg=cfg(minvmd_libkrun_static)");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
@@ -73,7 +93,20 @@ fn main() {
 
     if let Some(prefix) = prefix {
         println!("cargo:rustc-link-search=native={prefix}");
-        emit_rpaths(&target_os, &prefix);
+
+        // A `libkrun.a` in the prefix selects the static link. Linux only: the
+        // macOS pipeline builds and ships a dylib, and quietly switching that
+        // proven path because some other libkrun install happened to drop an
+        // archive in /opt/homebrew/lib would be a surprise, not a feature.
+        if target_os == "linux" && Path::new(&prefix).join(STATIC_LIB).exists() {
+            // No rpath: a static link resolves at build time, so there is
+            // nothing for the loader to search for. The `#[link]` kind is
+            // flipped in src/krun/raw.rs by this cfg.
+            println!("cargo::rustc-cfg=minvmd_libkrun_static");
+        } else {
+            emit_rpaths(&target_os, &prefix);
+        }
+
         println!("cargo::rustc-cfg=minvmd_libkrun");
     }
 }
@@ -134,8 +167,10 @@ fn find_libkrun_prefix() -> Option<String> {
         .map(|dir| (*dir).to_string())
 }
 
-/// True when `dir` contains a `libkrun.so*` file (the bare `.so` link or a
-/// versioned soname such as `libkrun.so.1`).
+/// True when `dir` contains a linkable libkrun: a `libkrun.so*` (the bare `.so`
+/// link or a versioned soname such as `libkrun.so.1`) or the static
+/// [`STATIC_LIB`] archive. Either form makes the directory a usable prefix;
+/// which link model it selects is decided in [`main`].
 fn dir_has_libkrun(dir: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(Path::new(dir)) else {
         return false;
@@ -144,6 +179,6 @@ fn dir_has_libkrun(dir: &str) -> bool {
         entry
             .file_name()
             .to_str()
-            .is_some_and(|name| name.starts_with("libkrun.so"))
+            .is_some_and(|name| name.starts_with("libkrun.so") || name == STATIC_LIB)
     })
 }
