@@ -719,14 +719,19 @@ jobs:
             - name: Make binaries executable
               run: chmod +x artifacts/*-*-*
             - name: Generate completions
+              # `min` splits printing from installing (`completions print
+              # <shell>`); `mip` and `minimald` keep the flat verb. The `min`
+              # files are named for the `min` binary, not the crate — the shim
+              # it prints registers the command `min`, so a shell only autoloads
+              # it from a file of that name.
               run: |
                   mkdir -p artifacts/completions/{bash,zsh,fish}
                   artifacts/mip-linux-amd64 completions bash > artifacts/completions/bash/mip
                   artifacts/mip-linux-amd64 completions zsh  > artifacts/completions/zsh/_mip
                   artifacts/mip-linux-amd64 completions fish > artifacts/completions/fish/mip.fish
-                  artifacts/minimal-linux-amd64 completions bash > artifacts/completions/bash/minimal
-                  artifacts/minimal-linux-amd64 completions zsh  > artifacts/completions/zsh/_minimal
-                  artifacts/minimal-linux-amd64 completions fish > artifacts/completions/fish/minimal.fish
+                  artifacts/minimal-linux-amd64 completions print bash > artifacts/completions/bash/min
+                  artifacts/minimal-linux-amd64 completions print zsh  > artifacts/completions/zsh/_min
+                  artifacts/minimal-linux-amd64 completions print fish > artifacts/completions/fish/min.fish
                   artifacts/minimald-linux-amd64 completions bash > artifacts/completions/bash/minimald
                   artifacts/minimald-linux-amd64 completions zsh  > artifacts/completions/zsh/_minimald
                   artifacts/minimald-linux-amd64 completions fish > artifacts/completions/fish/minimald.fish
