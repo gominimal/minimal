@@ -66,8 +66,6 @@ patches = [
 [vars]
 EDITOR    = "hx"
 VISUAL    = "hx"
-TERM      = { inherit = true, default = "xterm-256color" }
-COLORTERM = { inherit = true }
 
 # Declared to warm helix's tree-sitter grammar cache when the session
 # comes up. Best-effort; failures don't tank activation.
@@ -128,8 +126,8 @@ Variables set in the session environment. Names must be POSIX-shaped
 ```toml
 [vars]
 EDITOR = "hx"                                # literal value
-TERM   = { inherit = true, default = "xterm-256color" }  # inherit, with fallback
-COLORTERM = { inherit = true }               # inherit from the host env
+PAGER   = { inherit = true, default = "less" }  # inherit, with fallback
+MUXER = { inherit = true }               # inherit from the host env
 ```
 
 - A **literal** string sets the variable to that value.

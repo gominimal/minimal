@@ -72,7 +72,7 @@ baseline packages. This is how you land your editor and tools in the sandbox
 without asking the project to depend on them:
 
 ```toml
-packages = ["helix", "zellij", "ripgrep"]
+packages = ["helix", "zellij"]
 ```
 
 Packages compose as a set across all contributors, so listing something the
@@ -88,7 +88,6 @@ fallback:
 [vars]
 EDITOR = "hx"
 VISUAL = "hx"
-TERM   = { inherit = true, default = "xterm-256color" }
 ```
 
 Vars are the main lever for interactive setup, because the shell you get from
@@ -118,7 +117,7 @@ that may not be present on every machine.
 
 > **Coming soon.** Lifecycle hooks are not yet live: a hook declared in a
 > loadout is accepted, but the current release excludes it from composition
-> and nothing executes it. The declaration format below is what will ship.
+> and nothing executes it. The declaration format below is what we expect to ship.
 
 Hooks are scripts declared to run at session transition points: `on_activate`
 when the session comes up, `on_destroy` when it is torn down, and `on_failure`
@@ -127,7 +126,6 @@ up after a failed start:
 
 ```toml
 [[lifecycle_hooks]]
-description = "warm the grammar cache"
 on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || true" }
 ```
 
@@ -150,7 +148,6 @@ patches = [
 
 [vars]
 EDITOR = "hx"
-TERM   = { inherit = true, default = "xterm-256color" }
 
 [[lifecycle_hooks]]
 on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || true" }
