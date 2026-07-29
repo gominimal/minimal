@@ -269,10 +269,10 @@ pub struct MeshJoinArgs {
 pub struct GlobalArgs {
     /// Use the given directory as the repository root, instead of the current
     /// working directory.
-    #[arg(long, short = 'C')]
+    #[arg(long, short = 'C', global = true)]
     pub repo_dir: Option<PathBuf>,
     /// Override the base directory used for operations (default: ~/.cache/minimal)
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub minimal_dir: Option<PathBuf>,
     /// Override the user config directory. Everything under
     /// `<config_dir>/minimal/` (config.toml, loadouts/, ...) is
@@ -2787,6 +2787,18 @@ mod tests {
         use clap::Parser as _;
         let cli = Cli::try_parse_from(["min", "ls"]).unwrap();
         assert!(!cli.global_args.use_minvmd());
+    }
+
+    /// `repo_dir` and `minimal_dir` are global, so they must be accepted after
+    /// the subcommand — not just before it (#1039).
+    #[test]
+    fn repo_and_minimal_dir_are_accepted_after_the_subcommand() {
+        use clap::Parser as _;
+        let cli =
+            Cli::try_parse_from(["min", "ls", "-C", "/tmp/x", "--minimal-dir", "/tmp/y"]).unwrap();
+        let p = std::path::Path::new;
+        assert_eq!(cli.global_args.repo_dir.as_deref(), Some(p("/tmp/x")));
+        assert_eq!(cli.global_args.minimal_dir.as_deref(), Some(p("/tmp/y")));
     }
 
     #[test]
