@@ -560,6 +560,10 @@ installed=0 skipped=0
 # rather than on exit status: a bare non-zero also means no daemon, a failed
 # connect, or a transport drop on an otherwise successful stop, and none of
 # those may turn every upgrade into a prompt.
+#
+# Every `min` below reads from /dev/null: this runs inside the component loop,
+# whose stdin is the applicable-manifest file, and a child that ever read stdin
+# would eat the rows still to be installed.
 sessions_live_msg='daemon has active sessions'
 
 # Ask, on the CONTROLLING TERMINAL, whether to end the live sessions. Under
@@ -573,7 +577,7 @@ confirm_force_stop() {
     _tty="${MINIMAL_OVERRIDE_TTY:-/dev/tty}"
     say ""
     say "warning: the running daemon has active sessions:"
-    "$bindir/min" ls >&2 || true
+    "$bindir/min" ls >&2 </dev/null || true
     say ""
     if ! (exec <"$_tty") 2>/dev/null; then
         say "there is no terminal to confirm on; rerun with --force-stop"
@@ -597,7 +601,7 @@ stop_running_daemon() {
 
     if [ "$force_stop" -eq 0 ]; then
         # Stopped gracefully (or there was nothing to stop): done, no --force.
-        if _stop_out="$("$bindir/min" stop 2>&1)"; then
+        if _stop_out="$("$bindir/min" stop 2>&1 </dev/null)"; then
             return 0
         fi
         case "$_stop_out" in
@@ -605,7 +609,7 @@ stop_running_daemon() {
         esac
         # Any other failure falls through to the force stop, silent as before.
     fi
-    "$bindir/min" stop --force >/dev/null 2>&1 || true
+    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null || true
 }
 
 # The prior run's install record (R6.1) maps each component to the hash of the
@@ -721,12 +725,15 @@ while read -r comp _ _ _ want kind dest src; do
     # re-shipped apparmor text) must not kill live sessions.
     # A declined (or unconfirmable) stop aborts here, still before the first
     # rename: the downloaded temp file is dropped, no record is written, and
-    # the daemon and its sessions are left exactly as they were.
+    # the daemon and its sessions are left exactly as they were. The message
+    # claims only what the abort point guarantees — the stop runs before the
+    # FIRST bin/lib swap, so no executable has been replaced, but a `data` row
+    # earlier in the manifest may already have been.
     case "$prefix" in
         bin|lib)
             stop_running_daemon || {
                 rm -f "$tmp"
-                die "aborted: nothing was installed, the daemon is still running"
+                die "aborted: no executables were replaced, the daemon is still running"
             }
             ;;
     esac

@@ -60,8 +60,12 @@ that changed, swapping them into place atomically.
 Note: upgrading restarts the Minimal daemon, which interrupts any sessions that
 are currently active. When sessions are running, the installer lists them and
 asks on your terminal before ending them; declining leaves everything as it was.
-For a scripted upgrade that must not stop to ask, pass `--force-stop` (or set
-`MINIMAL_INSTALL_FORCE_STOP=1`).
+For a scripted upgrade that must not stop to ask, set
+`MINIMAL_INSTALL_FORCE_STOP=1`, or pass the flag through the shell:
+
+```shell
+curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh -s -- --force-stop
+```
 
 ## Uninstall
 

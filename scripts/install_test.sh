@@ -574,6 +574,7 @@ run daemonprep "$H9"
 check 0 "$rc" "prep install exits 0"
 cat >"$H9/bin/min" <<'EOF'
 #!/bin/sh
+printf '%s\n' "$*" >>"$HOME/stop.calls"
 echo "old min: unrecognized subcommand 'stop'" >&2
 echo "noise on stdout" >&1
 exit 2
@@ -586,9 +587,12 @@ want_err "min stop stderr is hidden (R5.5)" grep -q "unrecognized subcommand" "$
 want_err "min stop stdout is hidden (R5.5)" grep -q "noise on stdout" "$OUT"
 check "$h_minimald" "$(hash_file "$H9/bin/minimald")" "the upgrade still completed (R5.5)"
 # Only the active-sessions refusal may prompt: every other non-zero stop (no
-# daemon, a failed connect, a min too old) stays silent and best-effort.
+# daemon, a failed connect, a min too old) stays silent and best-effort, and
+# still falls through to the force stop — the arm that covers a wedged daemon.
 want_err "a non-sessions stop failure asks nothing (R5.5)" grep -q "Continue?" "$OUT"
 want_err "a non-sessions stop failure lists nothing (R5.5)" grep -q "active sessions" "$OUT"
+want_ok "a non-sessions stop failure still force-stops (R5.5)" \
+    grep -qx "stop --force" "$H9/stop.calls"
 
 # Live sessions turn the stop into a decision: the installer lists what is
 # running and asks. The answer is read from the controlling terminal, never
@@ -616,7 +620,8 @@ TTY_FILE="$root/tty-no"
 run liveno "$H17"
 TTY_FILE=
 check 1 "$rc" "declining aborts the install (R5.5)"
-want_ok "the abort says nothing was installed (R5.5)" grep -q "nothing was installed" "$OUT"
+want_ok "the abort reports no executable was replaced (R5.5)" \
+    grep -q "no executables were replaced" "$OUT"
 want_err "declining never force-stops (R5.5)" grep -qx "stop --force" "$H17/stop.calls"
 check "stale" "$(cat "$H17/bin/minimald")" "the stale component is left in place (R5.5)"
 want_err "no temp file survives the abort (R5.5)" ls "$H17/bin/"*.tmp.* 2>/dev/null
@@ -654,12 +659,15 @@ want_err "the env hatch asks nothing (R5.5)" grep -q "Continue?" "$OUT"
 want_ok "the env hatch force-stops (R5.5)" grep -qx "stop --force" "$H20/stop.calls"
 
 # The flag is filtered out of the arguments wherever it sits, so the target
-# positional still resolves (R2.1).
+# positional still resolves (R2.1). Deliberately a NON-default target: with
+# `stable` a filter that dropped every positional would land on the default and
+# still look right.
+printf 'v1\n' >"$mock/unstable"
 H21="$root/h21"; mkdir -p "$H21"
 stage_live_upgrade "$H21" liveforcepos
-run liveforcepos "$H21" stable --force-stop
+run liveforcepos "$H21" unstable --force-stop
 check 0 "$rc" "target plus --force-stop exits 0 (R5.5/R2.1)"
-want_ok "the target survives the option filter (R2.1)" grep -q "target 'stable'" "$OUT"
+want_ok "the target survives the option filter (R2.1)" grep -q "target 'unstable'" "$OUT"
 want_ok "the trailing flag still force-stops (R5.5)" grep -qx "stop --force" "$H21/stop.calls"
 
 # --- Unit 9: shell-init files, rc hook, completions (R9.1-R9.3) -------------

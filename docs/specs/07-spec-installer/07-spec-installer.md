@@ -278,8 +278,11 @@ outcome an upgrade must not decide on the user's behalf: it means live work is
 about to be destroyed. The installer then lists the running sessions
 (`<bin>/min ls`), asks whether to end them, and only on an explicit yes runs
 `<bin>/min stop --force` and carries on. A declined upgrade exits non-zero
-before the first replacement, dropping the temp download and leaving the daemon,
-its sessions, the installed files, and the install record exactly as they were.
+before the first **executable** replacement, dropping the temp download and
+leaving the daemon, its sessions, every installed executable, and the install
+record exactly as they were. It claims no more than that: the stop is attempted
+at the first `bin`/`lib` component, so a `data` component ordered ahead of it in
+the manifest may already have been replaced.
 
 The question is asked on the **controlling terminal**, never on stdin: in a
 `curl … | sh` pipeline stdin is the script itself, so reading the answer there
@@ -342,8 +345,14 @@ both hash columns in place of digests.
   on the terminal (a stand-in for `/dev/tty`, since stdin is the script pipe);
   answering yes escalates to `stop --force` and completes the upgrade.
 - **Test** (R5.5): answering no exits non-zero, never runs `stop --force`,
-  leaves the stale component and no temp file behind, and says nothing was
-  installed.
+  leaves the stale component and no temp file behind, and reports that no
+  executable was replaced.
+- **Test** (R5.5): the refusal message the installer matches on is asserted, by
+  the workspace test suite, to still be present in the CLI source that prints
+  it. The signal crosses a language boundary with nothing else holding the two
+  ends together, and a reword on the CLI side would otherwise return every
+  upgrade to an unconditional force-stop with the installer's own tests — which
+  supply their own copy of the message — still green.
 - **Test** (R5.5): with the same refusal and no openable terminal, the run exits
   non-zero naming the escape hatch, without prompting, force-stopping, or
   installing anything.
