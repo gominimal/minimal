@@ -65,10 +65,10 @@ it.
 You create a session by **activating** a project. From the project directory:
 
 ```console
-$ min activate --attach
+$ min session activate --attach
 ```
 
-`min activate` takes a project path that defaults to the current directory.
+`min session activate` takes a project path that defaults to the current directory.
 `--attach` drops you straight into a shell in the new session once it is ready.
 Without `--attach`, activation prints the new session's id and returns, leaving
 the session ready in the background for you to attach to later.
@@ -104,13 +104,13 @@ Useful activation options:
 To enter a session that already exists, **attach** to it by id or name:
 
 ```console
-$ min attach my-session
+$ min session attach my-session
 ```
 
 Attach opens an interactive shell inside the session, with your tools on `PATH`
 and the session's workspace (your project files, uploaded at activation) as your
 working directory. Exiting the shell detaches: the session keeps running in the
-background, and `min attach` rejoins it later. Changes you make inside stay in
+background, and `min session attach` rejoins it later. Changes you make inside stay in
 the session's workspace; bring them back to the host by pushing them out with
 `git push min://<session>`.
 
@@ -119,7 +119,7 @@ To run a declared task non-interactively instead of opening a shell, pass
 invocations; arbitrary commands need an interactive shell:
 
 ```console
-$ min attach my-session -c 'min run test'
+$ min session attach my-session -c 'min run test'
 ```
 
 ## How a session is composed
@@ -185,17 +185,18 @@ scripting, and `--json` prints the full list as JSON.
 Rename a session:
 
 ```console
-$ min rename my-session backend-work
+$ min session rename my-session backend-work
 ```
 
 Destroy a session when you are finished with it:
 
 ```console
-$ min destroy my-session
+$ min session destroy my-session
 ```
 
-`min destroy` terminates a single session by id or name. `min destroy --all`
-tears down every session at once (add `--force` to skip the confirmation).
+`min session destroy` terminates a single session by id or name.
+`min session destroy --all` tears down every session at once (add `--force` to
+skip the confirmation).
 
 Stop the provider itself:
 
@@ -203,12 +204,13 @@ Stop the provider itself:
 $ min stop
 ```
 
-`min stop` shuts down the active provider. Stopping the provider ends
+`min stop` shuts down the active provider.
+Stopping the provider ends
 every running shell, but the sessions themselves survive: their records and
 workspaces persist, and a provider that comes back up re-hosts them (the extras
 composed from loadouts are rebuilt when you re-activate). The provider refuses
 to shut down while any session is busy (a live shell, or an activation in
-flight) unless you pass `--force`. Contrast this with `min destroy`, which
+flight) unless you pass `--force`. Contrast this with `min session destroy`, which
 removes one session entirely and leaves the provider running to host the rest.
 Because `min` auto-spawns a provider on demand, the next `min` command after a
 stop simply brings one back up.
@@ -244,7 +246,7 @@ test run, a linter) that executes in a freshly composed sandbox built from the
 packages that task needs. If a needed package is not present, Minimal builds it
 or fetches it from a remote cache first. Loadouts contribute to the session's
 interactive shell only, never to tasks, so your personal tooling cannot
-influence a task's deterministic execution. Running `min attach -c 'min run
+influence a task's deterministic execution. Running `min session attach -c 'min run
 <task>'` is the non-interactive way to trigger a declared task against a
 session; arbitrary commands need an interactive shell.
 

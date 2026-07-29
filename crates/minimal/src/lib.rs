@@ -41,18 +41,23 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// List sessions
+    //
+    // Deliberate exception to the `<noun> <verb>` convention (documented in
+    // docs/reference/cli.md): `min ls` is the highest-traffic command in the
+    // CLI and keeps its bare top-level form. Not an oversight — do not move it
+    // under `session`.
     Ls(LsArgs),
-    /// Activate (create) a new session
-    Activate(ActivateArgs),
-    /// Attach to an existing session
-    Attach(AttachArgs),
-    /// Destroy (terminate) a session
-    Destroy(DestroyArgs),
     /// Shut down the minimald daemon
+    //
+    // Stays top-level: it acts on the daemon backend, not on any session, and
+    // it is the daemon-lifecycle command people reach for. Documented as a
+    // deliberate exception in docs/reference/cli.md.
     Stop(StopArgs),
-    /// Session inspection subcommands
+    /// Session management subcommands
+    #[command(visible_alias = "sessions")]
     Session(SessionArgs),
     /// Loadout management subcommands
+    #[command(visible_alias = "loadouts")]
     Loadout(LoadoutArgs),
     /// Print important directories and file paths for debugging
     Dirs,
@@ -107,8 +112,11 @@ pub enum Command {
     ///        https://localhost:7655/
     #[command(verbatim_doc_comment)]
     Login(LoginArgs),
-    /// Rename an existing session
-    Rename(RenameArgs),
+    // `init`, `add`, and `update` are deliberate exceptions to the
+    // `<noun> <verb>` convention (documented in docs/reference/cli.md): they
+    // are passthroughs to the project-configuration commands of the same name
+    // in `mip`, and keeping the spelling identical across the two CLIs is
+    // worth more than the hierarchy. Do not move them under a noun.
     /// Automatically initialize minimal configuration based on your source tree
     Init(InitArgs),
     /// Add a new tool or dependency
@@ -120,7 +128,7 @@ pub enum Command {
     /// Demo the client's activity spinner (development aid).
     ///
     /// Draws the same build-hold-fade spinner used by the file-upload
-    /// phases of `min activate` so you can eyeball timing and layout
+    /// phases of `min session activate` so you can eyeball timing and layout
     /// without triggering a real upload. Stops after `--seconds` or
     /// on Ctrl-C, whichever comes first.
     #[command(hide = true)]
@@ -151,6 +159,14 @@ pub struct SessionArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
+    /// Activate (create) a new session
+    Activate(ActivateArgs),
+    /// Attach to an existing session
+    Attach(AttachArgs),
+    /// Destroy (terminate) a session
+    Destroy(DestroyArgs),
+    /// Rename an existing session
+    Rename(RenameArgs),
     /// Print the effective networking policy for a session as JSON
     Policy(PolicyArgs),
 }
@@ -270,7 +286,7 @@ pub struct GlobalArgs {
     #[arg(long, global = true, value_name = "PROVIDER")]
     pub provider: Option<Provider>,
     /// Skip interactive prompts that need a terminal (e.g. the session
-    /// picker shown by bare `min` or `min attach` with no session argument).
+    /// picker shown by bare `min` or `min session attach` with no session argument).
     /// When a choice is ambiguous, the command errors with a list of
     /// candidates instead of opening a picker. Implied when stdin/stdout is
     /// not a terminal.
@@ -417,7 +433,7 @@ fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyhow::Error> 
 
 #[derive(Debug, Args)]
 pub struct AttachArgs {
-    /// Session identifier (UUID or session name). When omitted, `min attach`
+    /// Session identifier (UUID or session name). When omitted, `min session attach`
     /// resolves a session from the current working directory (or the only
     /// existing session), and opens an interactive picker if the choice is
     /// ambiguous. See `--no-input` to skip the picker in scripts.
@@ -589,15 +605,19 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     client::migrate_legacy_provider_dirs(cli.global_args.minimal_dir.as_deref());
 
     match cli.command {
+        // A bare `min` (no subcommand) resolves-or-activates and attaches. A
+        // deliberate exception to the `<noun> <verb>` convention, documented
+        // in docs/reference/cli.md — see `cmd_default`.
         None => cmd_default(&cli.global_args).await,
         Some(Command::Ls(args)) => cmd_ls(&cli.global_args, args).await,
-        Some(Command::Activate(args)) => cmd_activate(&cli.global_args, args).await,
-        Some(Command::Attach(args)) => cmd_attach(&cli.global_args, args).await,
-        Some(Command::Destroy(args)) => cmd_destroy(&cli.global_args, args).await,
         Some(Command::Stop(args)) => cmd_stop(&cli.global_args, args).await,
-        Some(Command::Session(SessionArgs {
-            command: SessionCommand::Policy(args),
-        })) => cmd_session_policy(&cli.global_args, args).await,
+        Some(Command::Session(SessionArgs { command })) => match command {
+            SessionCommand::Activate(args) => cmd_activate(&cli.global_args, args).await,
+            SessionCommand::Attach(args) => cmd_attach(&cli.global_args, args).await,
+            SessionCommand::Destroy(args) => cmd_destroy(&cli.global_args, args).await,
+            SessionCommand::Rename(args) => cmd_rename(&cli.global_args, args).await,
+            SessionCommand::Policy(args) => cmd_session_policy(&cli.global_args, args).await,
+        },
         Some(Command::Loadout(LoadoutArgs {
             command: LoadoutCommand::List(args),
         })) => loadouts::cmd_loadout_list(args, &cli.global_args),
@@ -615,7 +635,6 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Login(args)) => cmd_login(&cli.global_args, args).await,
         Some(Command::Version) => cmd_version(&cli.global_args).await,
         Some(Command::Spin(args)) => cmd_spin(&cli.global_args, args).await,
-        Some(Command::Rename(args)) => cmd_rename(&cli.global_args, args).await,
         Some(Command::Init(args)) => cmd_init(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
@@ -641,7 +660,7 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
 ///   (auto-resolve, or picker if ambiguous).
 /// - Otherwise → attach to the only session, or open a picker over all.
 ///
-/// Shares smart resolution with `min attach` (no session arg) via
+/// Shares smart resolution with `min session attach` (no session arg) via
 /// [`resolve_smart_attach`]; the only difference is the `NoSessions` case,
 /// which activates here instead of erroring.
 async fn cmd_default(global: &GlobalArgs) -> Result<(), anyhow::Error> {
@@ -669,7 +688,7 @@ async fn cmd_default(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         None => {
             // No sessions exist: activate a new one for the current directory
             // (or -C/--repo-dir if set) and chain into attach, mirroring
-            // `min activate --attach`. `cmd_activate` resolves the path from
+            // `min session activate --attach`. `cmd_activate` resolves the path from
             // `global.repo_dir` when no positional is given, matching the
             // attach side's `cwd_host_path(global)`.
             drop(client);
@@ -1169,7 +1188,7 @@ async fn best_effort_destroy(client: &mut client::Client, session_id: sessions::
             eprintln!(
                 "DestroySession timed out after {DESTROY_TIMEOUT:?} while cleaning up \
                  session {session_id}; the session may still be present on the daemon \
-                 (run `min destroy {session_id}` to clean up manually)",
+                 (run `min session destroy {session_id}` to clean up manually)",
             );
         }
     }
@@ -1722,7 +1741,7 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
         }
         None => match resolve_smart_attach(&mut client, global).await? {
             Some(entry) => (entry.id, entry.name),
-            None => bail!("no sessions exist; use 'min activate' to create one"),
+            None => bail!("no sessions exist; use 'min session activate' to create one"),
         },
     };
 
@@ -1741,7 +1760,7 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
 /// (ambiguous), or errors (ambiguous but non-interactive).
 ///
 /// Returns `Ok(None)` when no sessions exist at all — the caller decides
-/// whether that is an error (`min attach`) or a cue to activate a new session
+/// whether that is an error (`min session attach`) or a cue to activate a new session
 /// (bare `min`).
 async fn resolve_smart_attach(
     client: &mut client::Client,
@@ -1782,8 +1801,8 @@ fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), anyhow::Error
         Ok(())
     } else {
         bail!(
-            "`min attach` needs an interactive terminal, but stdin is not a TTY. \
-             Run it from a terminal, or use `min attach --command <cmd>` to run a \
+            "`min session attach` needs an interactive terminal, but stdin is not a TTY. \
+             Run it from a terminal, or use `min session attach --command <cmd>` to run a \
              single command non-interactively."
         )
     }

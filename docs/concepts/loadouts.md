@@ -38,7 +38,7 @@ conflict. (For the exact merge and conflict rules, see the
 [loadout reference](../reference/loadouts.md).)
 
 One boundary worth stating up front: loadouts apply to **sessions**
-(`min activate`). They do not apply to task sandboxes, which carry their own
+(`min session activate`). They do not apply to task sandboxes, which carry their own
 packages and environment through the task schema.
 
 ## Where loadouts live
@@ -92,7 +92,7 @@ TERM   = { inherit = true, default = "xterm-256color" }
 ```
 
 Vars are the main lever for interactive setup, because the shell you get from
-`min attach` sources no rc files. Your prompt (`PS1`), a one-time banner, and
+`min session attach` sources no rc files. Your prompt (`PS1`), a one-time banner, and
 similar touches all travel through `[vars]` rather than through a `.bashrc`
 patch. The [reference](../reference/loadouts.md) walks through the prompt and
 banner patterns in detail.
@@ -164,8 +164,8 @@ Name a loadout when you activate a session with `--loadout`, which is
 repeatable to stack several at once:
 
 ```console
-$ min activate --loadout dev
-$ min activate --loadout dev --loadout scratch
+$ min session activate --loadout dev
+$ min session activate --loadout dev --loadout scratch
 ```
 
 Loadouts are read and composed on the client, before the CLI contacts the
@@ -183,7 +183,7 @@ To activate with no loadouts at all, including skipping the defaults described
 below, pass `--no-loadouts` (which conflicts with `--loadout`):
 
 ```console
-$ min activate --no-loadouts
+$ min session activate --no-loadouts
 ```
 
 ## Auto-applying with `default_loadouts`
@@ -197,7 +197,7 @@ under a `[loadouts]` section:
 default_loadouts = ["dev", "fish"]
 ```
 
-With this in place, a plain `min activate` applies `dev` and `fish`
+With this in place, a plain `min session activate` applies `dev` and `fish`
 automatically. The defaults are a convenience layer, and the activation flags
 take precedence over them:
 
@@ -230,7 +230,7 @@ per-kind summary of what it contributes:
 ```
 
 Loadouts named in `default_loadouts` are marked with a leading `*`, so the
-listing doubles as a quick check of what a plain `min activate` will pull in.
+listing doubles as a quick check of what a plain `min session activate` will pull in.
 A malformed file is listed with its parse error so you can fix it in place
 rather than hunting for which file is broken. Pass `--dir <DIR>` to list a
 loadouts directory other than the default.

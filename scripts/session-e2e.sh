@@ -9,7 +9,7 @@
 #
 # Two proofs, in order, on EVERY lane:
 #
-#  1. Lifecycle: from a guaranteed-clean state, `min activate` must auto-spawn
+#  1. Lifecycle: from a guaranteed-clean state, `min session activate` must auto-spawn
 #     the target's daemon and create a session; then list, warm-call, destroy
 #     (verified delisted), and a clean `min stop` that the next command
 #     auto-respawns from.
@@ -33,7 +33,7 @@
 #     tears the session down, so it must be delisted afterwards. The same daemon
 #     prompt runs whether local or in-guest, so the pty driver covers every lane.
 #
-# Host-side project seed: `min activate` runs client-side and, since #758,
+# Host-side project seed: `min session activate` runs client-side and, since #758,
 # BAILS (rather than scaffolding over an existing config) when the target dir
 # has no `minimal.toml` and stdin is non-interactive; and since #748 it UPLOADS
 # the project dir into the session. So we activate a small, self-seeded dir
@@ -53,7 +53,7 @@
 #   E2E_MINIMAL_ARGS    global args for every `min` call (e.g. --provider local-minvmd)
 #   E2E_PROJECT_DIR     project to activate (default: a self-seeded throwaway
 #                       dir; VM lanes pass /tmp)
-#   E2E_ACTIVATE_ARGS   extra args for `min activate` (e.g. a future
+#   E2E_ACTIVATE_ARGS   extra args for `min session activate` (e.g. a future
 #                       `--loadout dev` once the loadouts CLI lands, #686)
 #   E2E_VM              set to 1 for VM-backed targets (extra teardown +
 #                       diagnostics: minvmd stop, guest boot log)
@@ -75,7 +75,7 @@ E2E_VM="${E2E_VM:-}"
 ADD_TOOL="jq"
 ADD_TOOL_MARKER="jq-1"
 
-# Resolve + seed the project to activate. Since #748, `min activate` UPLOADS the
+# Resolve + seed the project to activate. Since #748, `min session activate` UPLOADS the
 # project dir into the session, so the target must (a) carry a `minimal.toml`
 # (also what the #758 client pre-flight requires) and (b) stay SMALL, as the
 # whole dir is uploaded. SEED_DIR is a throwaway we created and remove wholesale
@@ -115,7 +115,7 @@ if [ -n "$SEED_DIR" ] || { [ ! -e "$PROJECT_DIR/minimal.toml" ] && [ ! -e "$PROJ
     ' "$ROOT/.minimal/minimal.toml"
     printf '\n[stack]\nuse = "shell"\n'
   } > "$PROJECT_DIR/minimal.toml"
-  # The upstream MUST be pinned — `min activate` uploads this and the graph
+  # The upstream MUST be pinned — `min session activate` uploads this and the graph
   # loader rejects an unpinned upstream.
   if ! grep -q '^\[upstream\]' "$PROJECT_DIR/minimal.toml" \
      || ! grep -q '^locked_commit' "$PROJECT_DIR/minimal.toml"; then
@@ -240,14 +240,14 @@ if [ -z "$E2E_VM" ] && [ "$(uname -s)" = Linux ] \
   fi
 fi
 
-# Cold: `min activate` must auto-spawn the target's daemon and print the
+# Cold: `min session activate` must auto-spawn the target's daemon and print the
 # new session id on stdout. The id is the LAST stdout line (any log lines
 # that slip through the RUST_LOG filter precede it), validated as a UUID.
 echo "::group::cold activate (auto-spawns the daemon)"
 t0=$(now_ms)
 # shellcheck disable=SC2086
-activate_out="$(cd "$PROJECT_DIR" && mnl activate . ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/activate.err")" \
-  || { echo "::error::cold 'min activate' failed to auto-spawn the daemon / create a session"; fail; }
+activate_out="$(cd "$PROJECT_DIR" && mnl session activate . ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/activate.err")" \
+  || { echo "::error::cold 'min session activate' failed to auto-spawn the daemon / create a session"; fail; }
 t1=$(now_ms)
 sid="$(printf '%s\n' "$activate_out" | tail -n1 | tr -d '\r')"
 echo "session: $sid (cold activate: $((t1 - t0))ms)"
@@ -286,11 +286,11 @@ echo "::group::sandbox proof (interactive attach via pty: min add $ADD_TOOL + ru
 t0=$(now_ms)
 # shellcheck disable=SC2086
 attach_out="$(python3 "$ROOT/scripts/e2e-attach-pty.py" "$ADD_TOOL" \
-  min ${E2E_MINIMAL_ARGS:-} attach "$sid" 2>"$WORK/exec.err")"
+  min ${E2E_MINIMAL_ARGS:-} session attach "$sid" 2>"$WORK/exec.err")"
 rc=$?
 t1=$(now_ms)
 if [ "$rc" -ne 0 ]; then
-  echo "::error::interactive 'min attach $sid' (pty) exited $rc (expected 0)"
+  echo "::error::interactive 'min session attach $sid' (pty) exited $rc (expected 0)"
   echo "--- attach output ---"; printf '%s\n' "$attach_out"
   echo "--- driver stderr ---"; cat "$WORK/exec.err" 2>/dev/null || true
   fail

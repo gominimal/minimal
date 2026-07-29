@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Bulk host→guest upload proof: `min activate` a project carrying a large,
+# Bulk host→guest upload proof: `min session activate` a project carrying a large,
 # COMPRESSIBLE fixture, N times, and fail if ANY attempt errors or hangs.
 #
 # Regression cover for the vsock transport reset in
 # https://github.com/gominimal/minimal/issues/869. A guest kernel bump
 # (6.12.43 → 6.12.94, https://github.com/gominimal/pkgs/pull/311) crossed Linux
 # 6.12.92, where a new queued-skb-overhead check turned a previously silent
-# vsock protocol violation into a fatal connection reset. Every `min activate`
+# vsock protocol violation into a fatal connection reset. Every `min session activate`
 # carrying a real project failed from that day on, and NOTHING went red for
 # three weeks — no test we had moves enough data through the guest vsock to
 # trip it. Client side the signature is:
@@ -138,7 +138,7 @@ mnl() {
 # worse than no canary. Sessions first — `min stop` refuses while any is live
 # unless forced, and the fixture dir goes whether or not the daemon cooperates.
 teardown() {
-  mnl destroy --all --force >/dev/null 2>&1 || true
+  mnl session destroy --all --force >/dev/null 2>&1 || true
   mnl stop --force >/dev/null 2>&1 || true
   if [ -n "$E2E_VM" ]; then
     minvmd stop >/dev/null 2>&1 || true
@@ -191,7 +191,7 @@ diagnostics() {
 # because `timeout` is not on a stock macOS, and because running the VM stack
 # under it wedges the boot: libkrun tcsetattr()s from timeout's background
 # process group and SIGTTOU stops the group. </dev/null is load-bearing for the
-# same reason — and it is also what puts `min activate` in its non-interactive
+# same reason — and it is also what puts `min session activate` in its non-interactive
 # mode, where it neither prompts for the non-VCS upload confirmation (#770) nor
 # expects a keypress for policy gating.
 run_deadline() {
@@ -287,7 +287,7 @@ else
 fi
 echo "::endgroup::"
 
-# `min activate` uploads the CURRENT directory, not the path argument (#873),
+# `min session activate` uploads the CURRENT directory, not the path argument (#873),
 # so the project dir has to be the cwd. Everything else here is absolute.
 cd "$PROJECT_DIR" || { echo "::error::cannot cd into $PROJECT_DIR"; exit 1; }
 
@@ -309,7 +309,7 @@ for i in $(seq 1 "$ITER"); do
   echo "::group::bulk upload $i/$ITER (${FIXTURE_MIB} MiB project)"
   # shellcheck disable=SC2086
   run_deadline "$DEADLINE_SECS" \
-    min ${E2E_MINIMAL_ARGS:-} activate . >"$WORK/activate.out" 2>"$WORK/activate.err"
+    min ${E2E_MINIMAL_ARGS:-} session activate . >"$WORK/activate.out" 2>"$WORK/activate.err"
   rc=$?
 
   sid="$(tail -n1 "$WORK/activate.out" 2>/dev/null | tr -d '\r')"
@@ -319,7 +319,7 @@ for i in $(seq 1 "$ITER"); do
     echo "iteration $i: OK (session $sid)"
     # Destroy as we go: one live session at a time, and nothing to leak if the
     # run is cancelled mid-loop.
-    mnl destroy "$sid" >/dev/null 2>&1 \
+    mnl session destroy "$sid" >/dev/null 2>&1 \
       || echo "::warning::could not destroy session $sid (the teardown sweep will retry)"
   else
     fail=$((fail + 1))
@@ -327,15 +327,15 @@ for i in $(seq 1 "$ITER"); do
     # the run, and folding them into a collapsed group buries them.
     echo "::endgroup::"
     if [ "$rc" -eq 124 ]; then
-      echo "::error::iteration $i: 'min activate' still running after ${DEADLINE_SECS}s — the #869 hang"
+      echo "::error::iteration $i: 'min session activate' still running after ${DEADLINE_SECS}s — the #869 hang"
     elif [ "$rc" -eq 0 ]; then
       echo "::error::iteration $i: activate's last stdout line is not a session UUID: '$sid'"
     else
-      echo "::error::iteration $i: 'min activate' exited $rc — check for 'Failed to upload project files: copying tar stream to channel: channel closed' (https://github.com/gominimal/minimal/issues/869)"
+      echo "::error::iteration $i: 'min session activate' exited $rc — check for 'Failed to upload project files: copying tar stream to channel: channel closed' (https://github.com/gominimal/minimal/issues/869)"
     fi
     diagnostics
     # Sweep whatever a failed activate left half-created before the next pass.
-    mnl destroy --all --force >/dev/null 2>&1 || true
+    mnl session destroy --all --force >/dev/null 2>&1 || true
     # A hang costs a full deadline; five of them would burn the nightly's whole
     # budget, and one is already conclusive. Errors are cheap, so keep going —
     # the pass/fail tally is what identifies the ~89% signature.

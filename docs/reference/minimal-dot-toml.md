@@ -124,7 +124,7 @@ When set, `defaults.state_key` will set a state key on all tasks which do not se
 ### `[session]` - What every contributor's session gets {#session}
 
 Contributes to [sessions](https://docs.minimal.dev/concepts/sessions) activated
-on this project (`min activate`). It carries the same primitives as a
+on this project (`min session activate`). It carries the same primitives as a
 [loadout](./loadouts.md) (packages, vars, patches, lifecycle hooks), scoped to
 the project rather than the developer: where a loadout says "what this
 developer wants everywhere", the session block says "what every session

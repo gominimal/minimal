@@ -204,7 +204,7 @@ Verified against the current tree; sources in parentheses.
   typically the distribution shim (`~/.minimal/shim/bin/minimal`), distinct
   from anything this repo builds (justfile comments,
   `crates/minvmd/README.md`).
-- **`min attach -c` is not a general remote shell.** The daemon's exec
+- **`min session attach -c` is not a general remote shell.** The daemon's exec
   handler accepts only `min run <task>`, `min package build [args...]`, and
   `min check [args...]` (plus the internal `git-receive-pack min://` path);
   anything else fails the channel. Task

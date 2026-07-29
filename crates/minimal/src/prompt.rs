@@ -1,4 +1,4 @@
-//! Interactive policy prompts for `min activate`.
+//! Interactive policy prompts for `min session activate`.
 //!
 //! When the daemon returns a pending item (a Project or Package
 //! contribution the user's [`UserPolicy`] can't auto-decide), the
@@ -1241,7 +1241,7 @@ allow = [\"/etc/foo\"]
         // and a rule the caller isn't modifying.
         let original = "\
 # User policy for minimal
-# Edit by hand or via `min activate`.
+# Edit by hand or via `min session activate`.
 
 [vars]
 # Approved env vars from projects.

@@ -677,7 +677,10 @@ mod tests {
     fn argv0_matches_executable_basename_not_substring() {
         assert!(argv0_matches("/usr/bin/minimald run --detach", MARKERS));
         assert!(argv0_matches("minvmd __krun-vmm --token x", MARKERS));
-        assert!(argv0_matches("/home/u/.local/bin/min activate .", MARKERS));
+        assert!(argv0_matches(
+            "/home/u/.local/bin/min session activate .",
+            MARKERS
+        ));
         assert!(argv0_matches("gvproxy -mtu 1500", MARKERS));
 
         assert!(!argv0_matches("vim minutes.txt", MARKERS));
