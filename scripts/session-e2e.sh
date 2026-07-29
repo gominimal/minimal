@@ -182,6 +182,21 @@ teardown() {
   fi
   [ -n "$SEED_DIR" ] && rm -rf "$SEED_DIR"
   [ -n "$SEEDED_MFILE" ] && rm -f "$SEEDED_MFILE"
+  # And the state dir — which is NOT just metadata. On a VM lane it holds the
+  # provider's per-VM writable data volume
+  # (`minimal/providers/local-minvmd0/data-vol.raw`), a sparse image whose HOST
+  # allocation is everything the guest wrote into it: its package cache, the
+  # session rootfs, the workspace. WORK is fresh per run, so nothing is shared
+  # and every run pays that allocation again. Leaving one behind is survivable;
+  # scripts/soak-session-e2e.sh runs this script TEN times back-to-back, so ten
+  # accumulate on one runner — and the nightly soak now dies inside that step
+  # with the runner agent gone (job `failure`, step still `in_progress`, no
+  # retrievable log lines and no uploaded artifacts), which is the shape a
+  # runner ENOSPC takes. The sibling harnesses (bulk-upload-e2e.sh,
+  # stress-session-e2e.sh) already remove theirs; this one was the outlier.
+  # `fail` collects every diagnostic — including the `min bug` bundle, which it
+  # writes OUTSIDE $WORK — before calling this.
+  rm -rf "$WORK"
 }
 trap teardown EXIT
 
@@ -204,10 +219,12 @@ fail() {
   # may be wedged or already gone, so bound the guest wait and fall back to a
   # host-only bundle. Written next to the boot log — under a VM soak that dir is
   # the job's uploaded soak-logs — so a failing nightly ships a real bundle, not
-  # just scraped tails. now_ms keeps per-iteration bundles from colliding.
+  # just scraped tails. now_ms keeps per-iteration bundles from colliding. The
+  # fallback is /tmp, NOT $WORK: teardown removes the state dir, so a bundle
+  # written there would die with it (same reasoning as bulk-upload-e2e.sh).
   echo "--- min bug (diagnostic bundle) ---"
   bug_dir="${MINVMD_BOOT_LOG:+$(dirname "$MINVMD_BOOT_LOG")}"
-  bug_out="${bug_dir:-$WORK}/minimal-diag-session-$(now_ms).tar.zst"
+  bug_out="${bug_dir:-/tmp}/minimal-diag-session-$(now_ms).tar.zst"
   if mnl bug --guest-timeout-secs 30 --output "$bug_out" >/dev/null 2>&1 \
     || mnl bug --no-guest --output "$bug_out" >/dev/null 2>&1; then
     echo "wrote diagnostic bundle: $bug_out ($(wc -c <"$bug_out" 2>/dev/null || echo '?') bytes)"
