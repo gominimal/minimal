@@ -58,9 +58,9 @@ Prior to v0.5.0, `minimal.toml` had five sections: `upstream`, `harness`, `defau
 Unlike `tasks`, which supported multiple definitions each invoked with `minimal run <task>`, a project has only one `session`:
 
 ```shell
-min activate          # creates a session, prints its ID
-min attach <session ID>  # enters an existing session
-min activate --attach    # creates and enters a session in one step
+min session activate             # creates a session, prints its ID
+min session attach <session ID>  # enters an existing session
+min session activate --attach    # creates and enters a session in one step
 ```
 
 ## Profiles
