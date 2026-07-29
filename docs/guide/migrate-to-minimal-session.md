@@ -21,10 +21,10 @@ To install `min`, see [install](./install.md).
 
 ### Linux
 To maintain backward compatibility for ephemeral systems on Linux, the installer for `min` will also install a version of Minimal that's functionally identical to `minimal`, and renamed to `mip` (Minimal-In-Place). All commands available to `minimal` are available in `mip`. Any commands using `minimal` should be upgraded to use `mip`.
-```shell
+```
 minimal run --> mip run
 minimal update --> mip update
-minimal add --> mip update
+minimal add --> mip add
 minimal status --> mip status
 minimal build --> mip build
 minimal test --> mip test
