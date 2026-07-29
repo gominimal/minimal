@@ -44,7 +44,9 @@ mod specs;
 pub use specs::{SpecBuild, SpecBuildResult};
 
 mod oci_image;
-pub use oci_image::OciImageCreate;
+
+mod materialize;
+pub use materialize::{Materialize, MaterializeEvent, OutputSpec, Report, Sink};
 
 mod patched;
 pub use patched::{PatchedBuild, PatchedBuildResult};

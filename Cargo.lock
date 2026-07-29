@@ -3834,6 +3834,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sessions",
+ "size",
  "stdlib",
  "switch",
  "sysinfo",

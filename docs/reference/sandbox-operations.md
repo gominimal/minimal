@@ -73,3 +73,14 @@ Builds the named package in a clean room using potentially-stale dependencies
 (the already-cached builds of its dependencies, without rebuilding them first),
 and commits the result to the local cache. Useful for quickly iterating on a
 single package's build.
+
+### `materialize [--arch <arch>] -o <out-file> <output-name>`
+
+Materializes an output specified in an
+[`[outputs.<name>]`](./minimal-dot-toml.md#outputs) section of
+`minimal.toml`.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--output <PATH>` | `-o` | **(required)** The output file to write |
+| `--arch <ARCH>` | | Override the architecture used when building the output (e.g. `amd64`, `arm64`); takes precedence over the `arch` field in `minimal.toml` and the host default |

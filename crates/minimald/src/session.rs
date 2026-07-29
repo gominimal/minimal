@@ -1,5 +1,8 @@
 use crate::channel_progress::ChannelProgress;
-use crate::session_sop::{BuildUpdate, CheckOpts, CheckUpdate, SideOp};
+use crate::session_sop::{
+    BuildUpdate, CheckOpts, CheckUpdate, MaterializeOpts, MaterializeUpdate, SideOp,
+};
+
 use crate::sessions::{SessionControl, WeakManagerHandle, composables};
 use crate::store::SessionRecordHandle;
 use crate::{
@@ -312,6 +315,12 @@ enum SessionMessage {
     StartCheck {
         opts: CheckOpts,
         reply: oneshot::Sender<Result<mpsc::Receiver<CheckUpdate>, std::io::Error>>,
+    },
+    /// Kick off a background materialize run as a session side-op. Replies with
+    /// the receiver end of the run's stream.
+    StartMaterialize {
+        opts: MaterializeOpts,
+        reply: oneshot::Sender<Result<mpsc::Receiver<MaterializeUpdate>, std::io::Error>>,
     },
     /// Test-only inspection: an `Arc` clone of the held [`Composition`]
     /// (`None` in `Draft`, or `Active` without one post-restart). Lets tests
@@ -679,6 +688,9 @@ impl Session {
             SessionMessage::StartCheck { opts, reply } => {
                 let _ = reply.send(self.start_check(opts).await);
             }
+            SessionMessage::StartMaterialize { opts, reply } => {
+                let _ = reply.send(self.start_materialize(opts).await);
+            }
             SessionMessage::GetRecord(r) => {
                 let _ = r.send(self.record.record().await.unwrap());
             }
@@ -1018,6 +1030,27 @@ impl Session {
     ) -> Result<mpsc::Receiver<CheckUpdate>, std::io::Error> {
         let ctx = self.context(false).await.map_err(std::io::Error::other)?;
         let (sop, rx) = SideOp::spawn_check(self.weak_self.clone(), opts, ctx, 64).await?;
+        match &mut self.inner {
+            SessionInner::Active { sops, .. } => sops.push(sop),
+            SessionInner::Draft { .. } => {
+                sop.shutdown().await;
+                unreachable!("`context()` already rejected a `Draft`");
+            }
+        }
+        Ok(rx)
+    }
+
+    /// Kicks off a background materialize run as a side-op and registers it on
+    /// this session, returning the receiver end of its stream. Like
+    /// [`start_build`](Self::start_build) it runs against a fresh
+    /// workspace-rooted context, so it sees outputs declared since the session
+    /// came up. The receiver closes when the run ends.
+    async fn start_materialize(
+        &mut self,
+        opts: MaterializeOpts,
+    ) -> Result<mpsc::Receiver<MaterializeUpdate>, std::io::Error> {
+        let ctx = self.context(false).await.map_err(std::io::Error::other)?;
+        let (sop, rx) = SideOp::spawn_materialize(self.weak_self.clone(), opts, ctx, 64).await?;
         match &mut self.inner {
             SessionInner::Active { sops, .. } => sops.push(sop),
             SessionInner::Draft { .. } => {
@@ -1468,6 +1501,25 @@ impl SessionHandle {
         let _ = self
             .0
             .send(SessionMessage::StartCheck { opts, reply })
+            .await;
+        recv.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
+        })?
+    }
+
+    /// Kicks off a background materialize run as a session side-op, returning
+    /// the receiver end of the run's stream. An unknown output name is refused
+    /// with `NotFound`; a `Draft` session with `InvalidInput`; a dead actor
+    /// maps to `NotConnected`.
+    pub async fn start_materialize(
+        &self,
+        opts: MaterializeOpts,
+    ) -> Result<mpsc::Receiver<MaterializeUpdate>, std::io::Error> {
+        let (reply, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .0
+            .send(SessionMessage::StartMaterialize { opts, reply })
             .await;
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
