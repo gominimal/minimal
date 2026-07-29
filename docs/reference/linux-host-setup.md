@@ -97,8 +97,8 @@ the profile exists to avoid. It is what CI does, for a throwaway runner.
 
 ## Other deployment models
 
-Only the host-native daemon (**DM2**) is affected. When minimald runs inside a
-minimal-managed microVM (**DM1** on macOS, **DM3** on Linux/KVM) the sandbox's
+Only the daemon running natively on the host is affected. When minimald runs
+inside a minimal-managed microVM (on macOS, or on Linux under KVM) the sandbox's
 user namespace is created in the guest, whose kernel carries no such
 restriction; the host's setting is irrelevant.
 

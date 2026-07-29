@@ -106,7 +106,7 @@ mac-buildable (see the comments in `.github/workflows/ci-macos.yml`).
 
 ## justfile recipes
 
-33 recipes on Linux (`just --summary`; OS-specific recipes carry
+40 recipes on Linux (`just --summary`; OS-specific recipes carry
 `[linux]`/`[macos]` attributes, so macOS shows a smaller set plus
 `test-cross`). The justfile is the local twin of the frozen CI workflows:
 the CI YAML schedules, the logic lives here and in `scripts/`
@@ -218,7 +218,7 @@ Verified against the current tree; sources in parentheses.
 Canonical docs: [docs/ci-strategy.md](docs/ci-strategy.md) (design and
 rationale) and
 [docs/internal/release-pipeline.md](docs/internal/release-pipeline.md)
-(release/promotion mechanics). The 11 workflows on `main`:
+(release/promotion mechanics). The 12 workflows on `main`:
 
 | Workflow | One line |
 |---|---|
@@ -232,6 +232,7 @@ rationale) and
 | `nightly` | 10:00 UTC **channel cut**: reuses `release.yml` to build/stage, then blesses the `nightly` channel after smoke tests. |
 | `release` | Manual build/sign/stage of all shipped artifacts; its verify-ci gate requires the five lane aggregators green on the commit. |
 | `promote` | Manual, gated pointer flip of the `stable`/`unstable` channels to a staged version. |
+| `docs-hotfix` | Manual: repoint the public docs on `gominimal/webapp` to a chosen `main` sha between releases, without cutting or promoting a binary release. |
 | `prune-releases` | Scheduled housekeeping: deletes aged auto-cut `release-<sha>` GitHub Releases (never tagged `vX.Y.Z` releases). |
 
 The required-check vocabulary is the **five aggregators**: `ci-success`,
