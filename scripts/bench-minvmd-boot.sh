@@ -33,6 +33,9 @@ for v in MINVMD_KERNEL_PATH MINVMD_ROOTFS_PATH MINVMD_INITRAMFS; do
   [ -f "${!v}" ] || { echo "$v points at a missing file: ${!v}" >&2; exit 1; }
 done
 [ -x "$BIN" ] || { echo "minvmd binary not found/executable: $BIN" >&2; exit 1; }
+# Absolute path for the teardown pattern (see `teardown` below): the running
+# processes carry it, and it is what keeps a sibling checkout's VM out of range.
+BIN_ABS="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 command -v perl >/dev/null || { echo "perl required for sub-ms timing" >&2; exit 1; }
 # GNU coreutils ships `timeout`, but Homebrew installs it as `gtimeout` unless
 # the gnubin dir is on PATH — accept either so the macOS path works out of box.
@@ -53,23 +56,38 @@ fi
 # SIGTTOU then stops the whole group and the boot dies silently at the timeout.
 BOOT_TIMEOUT=12
 OUT="$(mktemp -t bench-minvmd.XXXXXX)"
+# Private state dir. minvmd refuses to boot when the default one already has a
+# VM registered ("minvmd is already running"), which a parallel checkout's dev
+# stack is enough to trigger — the state dir is shared across checkouts even
+# though the binaries are not. Isolating it also keeps the bench from touching
+# that stack's socket, pidfile, or logs.
+STATE_DIR="$(mktemp -d -t bench-minvmd-state.XXXXXX)"
 
 now_ms() { perl -MTime::HiRes=time -e 'printf "%d", time()*1000'; }
 # SIGKILL, not TERM: a VM in krun_start_enter ignores SIGTERM, so a leaked
 # __krun-vmm (e.g. from a Ctrl-C'd foreground boot) would otherwise hold the
 # bridge socket and make every subsequent boot fail.
-teardown() { pkill -9 -f "__krun-vmm" 2>/dev/null; pkill -9 -f "$BIN boot" 2>/dev/null; sleep 0.3; }
+#
+# Matching is scoped to THIS checkout, the same discipline scripts/reap-vms.sh
+# documents: a bare `-f "__krun-vmm"` matches EVERY checkout's VM, so running
+# this bench beside a parallel working copy would SIGKILL that copy's live dev
+# stack — sessions and all — between every run. Both the supervisor and the
+# __krun-vmm grandchild re-exec via current_exe(), so both carry the binary's
+# absolute path in their cmdline. Resolved to an absolute path because $BIN is
+# conventionally passed relative (`./target/debug/minvmd`), which would match
+# nothing here.
+teardown() { pkill -9 -f "$BIN_ABS" 2>/dev/null; sleep 0.3; }
 
 # Tear down on normal exit AND on Ctrl-C / kill, so an interrupt never leaves a
 # detached VM running (and the run stops promptly instead of deferring).
-trap 'teardown; rm -f "$OUT"' EXIT
+trap 'teardown; rm -f "$OUT"; rm -rf "$STATE_DIR"' EXIT
 trap 'echo; echo "interrupted — tearing down" >&2; teardown; exit 130' INT TERM
 
 # Warmup (page-cache the kernel/rootfs; the first boot is cold). Fail loudly here
 # if the artifacts/codesign are wrong, rather than silently N times below.
 echo "warming up (cold boot, discarded)…" >&2
 teardown
-if ! "$TIMEOUT" "$BOOT_TIMEOUT" "$BIN" boot </dev/null >"$OUT" 2>&1 || ! grep -qx vm-up "$OUT"; then
+if ! "$TIMEOUT" "$BOOT_TIMEOUT" "$BIN" --minimal-state-dir "$STATE_DIR" boot </dev/null >"$OUT" 2>&1 || ! grep -qx vm-up "$OUT"; then
   echo "warmup boot did not reach vm-up — check artifacts, codesign, and libkrun:" >&2
   tail -6 "$OUT" >&2
   exit 1
@@ -79,7 +97,7 @@ teardown
 samples=()
 for i in $(seq 1 "$N"); do
   t0="$(now_ms)"
-  if "$TIMEOUT" "$BOOT_TIMEOUT" "$BIN" boot </dev/null >"$OUT" 2>/dev/null && grep -qx vm-up "$OUT"; then
+  if "$TIMEOUT" "$BOOT_TIMEOUT" "$BIN" --minimal-state-dir "$STATE_DIR" boot </dev/null >"$OUT" 2>/dev/null && grep -qx vm-up "$OUT"; then
     t1="$(now_ms)"; ms="$(( t1 - t0 ))"; samples+=( "$ms" )
     printf 'run %2d/%d: %4d ms\n' "$i" "$N" "$ms" >&2
   else
