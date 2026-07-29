@@ -735,6 +735,7 @@ dependencies = [
  "path-absolutize",
  "regex",
  "tokio",
+ "tokio-util",
  "tracing",
  "url",
 ]
@@ -6508,6 +6509,9 @@ checksum = "b7401a30af6cb5818bb64852270bb722533397edcfc7344954a38f420819ece2"
 [[package]]
 name = "switch"
 version = "0.0.1"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "symlink"
