@@ -120,7 +120,7 @@ target-OS behaviour (see assumption `dns-hostname-mechanism`, needs-spike
 below). Both candidate paths are architecturally uniform from `minimald`'s
 perspective: `minimald` writes hostnames to either a local resolver
 configuration or the system resolver stub at launch, and removes them on exit.
-Unit 3 begins after the spike resolves this question.
+Unit 3 starts after the spike resolves this question.
 
 `HostNet` PTask hostnames (R3.6) use the same format; the resolved IP is
 `127.0.0.1` for local-only instances or the host's configured network
@@ -218,7 +218,7 @@ PTask".)
 ### pasta for the per-PTask Linux path
 
 Rejected. Pasta does TCP splicing rather than a full TCP/IP stack; it cannot
-run on macOS; it cannot provide UC6 without bridging. A shared gvproxy gives
+run on macOS; it cannot support UC6 without bridging. A shared gvproxy gives
 platform uniformity and direct PTask-to-PTask routing at no extra cost.
 (Informed by spec § rootless implementation analysis.)
 
@@ -268,7 +268,7 @@ proposed here is the typed replacement for that placeholder.
 | `dm2-uc5-collapse` | VM-wide egress (UC5) is a configuration error on DM2 (native Linux, no VM boundary); UC5 collapses to UC3 on DM2 | settled | spec R2.5 explicitly states this; DM2 has no VM boundary, `vm_egress` applies only when minvmd owns the VM |
 | `gvproxy-source-build` | gvproxy ships as a pinned **pre-built** release binary (gvisor-tap-vsock v0.8.9), fetched and verified against checked-in SHA-256 digests in `vendor/gvproxy/gvproxy.lock` via `scripts/fetch-gvproxy.sh`, not built from source | settled (maintainer decision; supersedes the spec's source-build preference) | spec § "Technical Considerations" lists a SHA-256-verified pre-built binary as the accepted alternative; chosen to avoid a Go toolchain + module-proxy egress in the build sandbox; supply-chain risk mitigated by pinned upstream digests (#495) |
 | `https-proxy-hyper-rustls` | The Unit 4 HTTPS reverse proxy uses hyper/axum for HTTP and rustls for TLS, matching the workspace's existing ecosystem | settled | spec § "Technical Considerations"; `rustls` is listed as a no-OpenSSL-dependency choice; `hyper`/`axum` are named as consistent with workspace deps |
-| `dns-hostname-mechanism` | The system resolver supports PTask hostname registration without root privilege per-invocation via either `*.localhost` wildcard (rootless on macOS; requires systemd-resolved or NetworkManager on Linux) or a one-time `/etc/resolver`-equivalent setup | needs-spike | spec Open Questions item 1: "Decision needed before Unit 3 implementation begins"; whether `*.localhost` wildcard resolution is reliably available on common Linux distributions (Ubuntu, Fedora, Arch, Debian) is not settleable from the repo working tree; R3.4 requires rootless per-invocation operation |
+| `dns-hostname-mechanism` | The system resolver supports PTask hostname registration without root privilege per-invocation via either `*.localhost` wildcard (rootless on macOS; requires systemd-resolved or NetworkManager on Linux) or a one-time `/etc/resolver`-equivalent setup | needs-spike | spec Open Questions item 1: "Decision needed before Unit 3 implementation starts"; whether `*.localhost` wildcard resolution is reliably available on common Linux distributions (Ubuntu, Fedora, Arch, Debian) is not settleable from the repo working tree; R3.4 requires rootless per-invocation operation |
 | `wireguard-implementation` | Unit 4 WireGuard implementation is **boringtun** (pure Rust); wireguard-go subprocess is the v2 escalation path if peer coordination is needed or boringtun stalls | settled | spike #486 concluded boringtun for v1: clean Cargo feature-flag support for R4.7, zero additional build-chain dependencies, sufficient production maturity (Cloudflare WARP, Mullvad VPN) for the AllowedIPs-based subnet-router model; cgo path substantially more complex than hypothesised; maintainer confirmed on #478 (informed by #486) |
 
 ALREADY EXISTS: `sandbox2::Config::disable_networking: bool`, covers R1.2 (NoNet) and R1.3 (HostNet) in boolean form. The trimodal enum refactor replaces this field, preserving its semantics for the two existing modes.
