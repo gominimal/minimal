@@ -91,17 +91,6 @@ pub enum Command {
     SshForward(SshForwardArgs),
     /// Obtain an mTLS client certificate for the HTTPS reverse proxy
     ///
-    /// Hidden from `--help` while the proxy is not usable on an installed
-    /// host: issuance rides minimald's `IssueClientCert` RPC, which exists
-    /// only under its off-by-default `networking-proxy` feature, and the
-    /// release builds compile minimald with no `--features` at all. Against
-    /// a shipped daemon the RPC answers "minimald was built without the
-    /// networking-proxy feature" and the :7655 listener never binds, so the
-    /// command is usable only from a dev checkout, whose guest initramfs the
-    /// justfile does build with the feature. Still accepted, and unchanged in
-    /// behaviour. Unhide, and document it in docs/reference/cli-min.md, once
-    /// shipped minimald builds the proxy in.
-    ///
     /// Connects to minimald, generates a fresh client certificate signed by
     /// the daemon's internal CA (R4.4, R4.5), and saves the certificate and
     /// private key to `~/.config/minimal/client.pem` /
