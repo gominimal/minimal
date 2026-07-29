@@ -254,6 +254,14 @@ test-installer:
 lint-shell:
     bash scripts/lint-shell.sh
 
+# release.yml's "Generate completions" step calls the same
+# scripts/gen-completions.sh this test does, so a breaking CLI change fails a PR
+# instead of a dispatched release (#1035). Part of `just test` on Linux.
+#
+# Generate the release's completions from the dev binaries and check each one.
+test-completions:
+    cargo test -p common --test release_completions --locked
+
 # Run the promotion provenance gate's test harness (stubbed `gh`, no network,
 # no auth); shellcheck runs when present.
 test-promote-gate:
