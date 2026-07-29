@@ -4,83 +4,70 @@ description: Migration to the new architecture after v0.5.0 release for Linux an
 
 # Minimal Sessions Migration Guide
 
-If you are using a release of Minimal **older than v0.5.0**, you will need to update your configuration before using the Sessions architecture. You can check the version with `minimal --version` or `min --version`.
+If you're on a release **older than v0.5.0**, you'll need to update your configuration to use the new Sessions architecture. Check your version with `minimal --version` or `min --version`.
 
-## Upgrade from v0.4.1 or older
+## Upgrading from v0.4.1 or earlier
 
-WARNING: `tasks` are not supported by v0.5.0. If you rely on `tasks` for non-interactive, job-like workflows, keep `minimal` (<=v0.4.1) installed for tasks and install `min` (v0.5.0) for sessions.
+> **Note:** `tasks` are not supported by v0.5.0. If you rely on `tasks` for non-interactive, job-like workflows, keep `minimal` (<=v0.4.1) installed for tasks, and install `min` (v0.5.0) alongside it for sessions.
 
-Going forward, the Minimal command will become `min`, and will not conflict with the legacy `minimal` command. The installer for legacy `minimal` will no longer be available after v0.5.0 is released. However, `minimal` will remain operational for the foreseeable future.
+The Minimal command is becoming `min`, which won't conflict with the legacy `minimal` command. `minimal` will keep working for the foreseeable future, but its installer will no longer be available after v0.5.0 ships.
 
-If you no longer need the legacy `minimal` command, you can uninstall it with:
+To install `min`, see [install](./install.md). If you no longer need `minimal`, uninstall it with:
 ```shell
 ./.minimal/shim/uninstall.sh
 ```
 
-To install `min`, see [install](./install.md).
+### Linux: use `mip` in place of `minimal`
 
-### Linux
-To maintain backward compatibility for ephemeral build systems on Linux, the installer for `min` will also install a version of Minimal that's functionally identical to `minimal`, and renamed to `mip` (Minimal-In-Process). All commands available to `minimal` are available in `mip`. Any commands using `minimal` should be upgraded to use `mip`. For the complete documentation on `mip`, see [cli-mip](../reference/cli-mip.md).
-```
-minimal run --> mip run
-minimal update --> mip update
-minimal add --> mip add
-minimal status --> mip status
-minimal build --> mip build
-minimal test --> mip test
-minimal materialize --> mip materialize
-minimal package --> mip package
-minimal cache --> mip cache
-minimal check --> mip check
-minimal dep --> mip dep
-minimal completions --> mip completions
-minimal help --> mip help
-```
-The in-VM command `min add` remains unchanged.
+To keep ephemeral build systems on Linux working, the `min` installer also installs `mip` (Minimal-In-Process), which is functionally identical to `minimal`. Update any scripts using `minimal` to use `mip` instead — see [cli-mip](../reference/cli-mip.md) for full docs.
 
-## minimal.toml
+| Old | New |
+|---|---|
+| `minimal run` | `mip run` |
+| `minimal update` | `mip update` |
+| `minimal add` | `mip add` |
+| `minimal status` | `mip status` |
+| `minimal build` | `mip build` |
+| `minimal test` | `mip test` |
+| `minimal materialize` | `mip materialize` |
+| `minimal package` | `mip package` |
+| `minimal cache` | `mip cache` |
+| `minimal check` | `mip check` |
+| `minimal dep` | `mip dep` |
+| `minimal completions` | `mip completions` |
+| `minimal help` | `mip help` |
 
-Prior to v0.5.0, `minimal.toml` had the following sections: upstream, harness, defaults, outputs, and tasks. 
+The in-VM command `min add` is unchanged.
 
-### [upstream]
+## Changes to `minimal.toml`
 
-The upstream section is unchanged.
+Prior to v0.5.0, `minimal.toml` had five sections: `upstream`, `harness`, `defaults`, `outputs`, and `tasks`.
 
-### [harness]
+| Section | Status |
+|---|---|
+| `[upstream]` | Unchanged |
+| `[harness]` | Renamed to [`[stack]`](../concepts/stacks.md); functionality unchanged |
+| `[defaults]` | `profiles` deprecated — see [Profiles](#profiles) |
+| `[outputs]` | Unchanged |
+| `[tasks]` | Interactive tasks (bash, shell, interactive agent sessions) moved to [`[session]`](#session-new); non-interactive tasks (test, build) aren't supported in v0.5.0 |
 
-The harness section is renamed to `stack`. The functionalities of `stack` remain unchanged. For more information on stack, see [stack](../concepts/stacks.md).
+### `[session]` (new)
 
-### [defaults]
+`session` is a new concept in v0.5.0 for interactive environments — shell, bash, and interactive agent entry points. Migrate any task using `shell`, `bash`, or an interactive agent entry point to a session definition; see [the session configuration reference](../reference/minimal-dot-toml.md#session---what-every-contributors-session-gets-session) for how.
 
-`profiles` that was formerly defined in the defaults section has been deprecated.
+Unlike `tasks`, which supported multiple definitions each invoked with `minimal run <task>`, a project has only one `session`:
 
-### [outputs]
-
-The outputs section is unchanged.
-
-### [tasks]
-
-Interactive tasks (bash, shell, interactive agent sessions) are supported by `session` definitions. Non-interactive tasks (test, build) are currently not supported by v0.5.0.
-
-### [session] (NEW)
-
-Session is a new concept in v0.5.0. `[session]` will define interactive environments where shell, bash, and interactive agent tasks. Task defined with 
-```toml
-interactive = true
-```
-should be migrated to a session definition. For how to define a session, please refer to [the session configuration in minimal.toml](../reference/minimal-dot-toml.md#session---what-every-contributors-session-gets-session). 
-
-Unlike `tasks`, which can have multiple definitions and each can be invoked with `minimal run <task>`, `session` has only 1 definition, and is created with 
 ```shell
-min activate #produces session ID as output
+min activate          # creates a session, prints its ID
+min attach <session ID>  # enters an existing session
+min activate --attach    # creates and enters a session in one step
 ```
-You can enter a session with
-```shell
-min attach <session ID>
-```
-To create and then enter the new session immediately
-```shell
-min activate --attach
-```
+
 ## Profiles
-Profiles have been deprecated. `profile.env_vars` should be migrated to `session.vars`, and `profile.packages` should be migrated to `session.packages`. For how to define a session, please refer to [the session configuration in minimal.toml](../reference/minimal-dot-toml.md#session---what-every-contributors-session-gets-session). 
+
+Profiles have been deprecated:
+
+- `profile.env_vars` → `session.vars`
+- `profile.packages` → `session.packages`
+
+See [the session configuration reference](../reference/minimal-dot-toml.md#session---what-every-contributors-session-gets-session) for how to define a session.
