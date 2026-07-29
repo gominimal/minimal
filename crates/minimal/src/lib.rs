@@ -2134,23 +2134,37 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
             .context("The wait for the daemon to stop panicked")?
             .context("Failed while waiting for the daemon to stop")
         },
-        async move || {
-            tokio::task::spawn_blocking(move || {
-                // That same wait, then the liveness probe this command opened
-                // with. On a VM backend the wait IS the observation — it polls
-                // the lifecycle state — but a native minimald has no lifecycle
-                // file and its wait returns at once, saying nothing, so only
-                // the probe can answer for that backend. Anything we cannot
-                // read is not a confirmed stop.
-                autospawn::wait_for_daemon_stopped(use_minvmd, probe_dir.as_deref()).is_ok()
-                    && !autospawn::is_daemon_running(use_minvmd, probe_dir.as_deref())
-                        .unwrap_or(true)
-            })
-            .await
-            .unwrap_or(false)
-        },
+        async move || daemon_confirmed_stopped(use_minvmd, probe_dir).await,
     )
     .await
+}
+
+/// Whether the daemon can be *observed* to have stopped — the question the
+/// failed-RPC arm of [`stop_outcome`] turns on.
+///
+/// The shutdown wait, then the liveness probe this command opened with. On a VM
+/// backend the wait IS the observation — it polls the lifecycle state — but a
+/// native minimald has no lifecycle file and its wait returns at once, saying
+/// nothing, so only the probe can answer for that backend. Anything we cannot
+/// read is not a confirmed stop.
+///
+/// Which makes the recovery a VM-backend one in practice: the native probe fires
+/// once, immediately, and minimald keeps its listener bound through the 5s drain
+/// grace it takes after its accept loop exits (minimald's `SHUTDOWN_GRACE`), so
+/// a connect in that window still succeeds and reports "running". Native
+/// therefore keeps today's fail-on-RPC-error behaviour — which is right for it:
+/// a native daemon is not pid-1 and does not take the transport down with it, so
+/// the lost reply this recovers from is not a failure mode it has.
+async fn daemon_confirmed_stopped(use_minvmd: bool, minimal_dir: Option<PathBuf>) -> bool {
+    // Both calls can sleep-poll, so they go on the blocking pool rather than
+    // stalling an async worker (rust-coding-standards: no blocking in an async
+    // context). A panicked probe observed nothing, which is not a confirmation.
+    tokio::task::spawn_blocking(move || {
+        autospawn::wait_for_daemon_stopped(use_minvmd, minimal_dir.as_deref()).is_ok()
+            && !autospawn::is_daemon_running(use_minvmd, minimal_dir.as_deref()).unwrap_or(true)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Decide what `min stop` reports, given how the `Shutdown` RPC ended, the wait
@@ -2192,6 +2206,12 @@ where
         }
         Err(rpc_err) => {
             if confirm_stopped().await {
+                // Say what was suppressed. Exiting 0 over a failed RPC is only
+                // sound because the daemon is observably down, and a silent
+                // recovery would leave nothing — in a terminal or in a soak
+                // log — to check that reading against. stderr, so it survives
+                // the `>/dev/null` every scripted caller wraps `stop` in.
+                eprintln!("warning: the shutdown RPC failed, but the daemon stopped: {rpc_err:#}");
                 println!("Daemon is shutting down.");
                 Ok(())
             } else {
@@ -2904,6 +2924,20 @@ mod tests {
         assert!(
             !probed.get(),
             "an accepted shutdown is judged by its wait alone"
+        );
+    }
+
+    /// The recovery's actual observation, not a stand-in for it: the real
+    /// probe `cmd_stop` hands `stop_outcome`, run against a state dir no daemon
+    /// ever ran in. Nothing is listening and no lifecycle is active, which is
+    /// exactly the post-shutdown reading a lost reply has to be judged on, so
+    /// it must confirm the stop.
+    #[tokio::test]
+    async fn the_real_probe_confirms_a_daemon_that_is_not_there() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            daemon_confirmed_stopped(true, Some(dir.path().to_path_buf())).await,
+            "a state dir with no live daemon is a confirmed stop"
         );
     }
 
