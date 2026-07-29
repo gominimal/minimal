@@ -129,7 +129,11 @@ macro_rules! annotate_record {
                     $id += 1;
                     NickelValue::term_posless(Term::RecRecord(rec_data))
                 }
-                _ => unreachable!("record type was {:?}", $val),
+                // A build-spec annotation can sit on a non-record term (e.g. an
+                // unresolved `Term::Var` when the upstream pkgs checkout is
+                // absent). Leave such terms unannotated rather than aborting;
+                // evaluation then surfaces a real error instead of a panic.
+                _ => return Ok($orig_val),
             }
         }
     };
@@ -547,6 +551,34 @@ mod tests {
 
         let sr = sr.unwrap();
         assert_eq!(sr.last_id, 2); // two build specs
+    }
+
+    #[test]
+    fn loader_annotates_buildspec_via_var() {
+        // A build spec whose annotated term is a variable reference (Term::Var)
+        // rather than an inline record must not abort the annotate pass. This is
+        // the shape decode meets when the upstream pkgs checkout is absent.
+        let sr = Loader::new(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+                let spec = { name = \"via var\" } in
+                {
+                    toplevel = spec | BuildSpec
+                }"
+            }
+            .to_string(),
+            None,
+            &LoadOptions::for_test(),
+        );
+
+        // So we can see the actual error when the test fails
+        if let Some(e) = sr.as_ref().err().iter().next() {
+            e.report_to_stderr();
+            panic!();
+        }
+
+        sr.unwrap();
     }
 
     #[test]
