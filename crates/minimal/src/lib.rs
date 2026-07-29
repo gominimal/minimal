@@ -443,7 +443,7 @@ pub struct AttachArgs {
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
     /// Command to exec in the session context (non-interactive)
-    #[arg(long, short)]
+    #[arg(long, short, hide = true)]
     pub command: Option<String>,
 }
 
@@ -492,10 +492,6 @@ pub struct InitArgs {
     /// Skip confirmation, writing configuration based on auto-detection
     #[arg(long, short, default_value_t = false)]
     pub yes: bool,
-    /// Overwrite an existing minimal.toml; without it, init refuses when one
-    /// already exists.
-    #[arg(long, default_value_t = false)]
-    pub force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1362,7 +1358,7 @@ fn offer_mfile_scaffold(
             .build()
             .map_err(|e| anyhow::anyhow!("{e}"))?
     };
-    run_init_flow(config, false, false)
+    run_init_flow(config, false)
 }
 
 /// Resolves the directory whose tree should be uploaded as the session
@@ -1865,8 +1861,9 @@ fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), anyhow::Error
     } else {
         bail!(
             "`min session attach` needs an interactive terminal, but stdin is not a TTY. \
-             Run it from a terminal, or use `min session attach --command <cmd>` to run a \
-             single command non-interactively."
+             Run it from a terminal, or use the non-interactive escape hatch \
+             `min session attach --command <cmd>` (a hidden flag, kept for scripted \
+             callers) to run a single command."
         )
     }
 }
@@ -1896,27 +1893,9 @@ async fn attach_to_session(
     let [strict, known_hosts_file] = host_key_opts(&sock.with_file_name(paths::KNOWN_HOSTS_FILE));
 
     let mut ssh = std::process::Command::new("ssh");
-    // Pin the shell ssh uses to run the ProxyCommand. ssh launches a
-    // ProxyCommand via `$SHELL -c` and execs `$SHELL` with no PATH lookup, so a
-    // caller whose `$SHELL` is a bare name (`fish`) or points at a shell absent
-    // from this context fails with "<shell>: No such file or directory" and the
-    // transport dies at "banner exchange … Broken pipe". Our ProxyCommand is a
-    // full-path `min proxy …` that needs nothing but a POSIX `sh`, so force the
-    // always-present `/bin/sh` rather than inherit the user's interactive shell.
-    ssh.env("SHELL", "/bin/sh");
     ssh.env("MINIMAL_SESSION_ID", id.to_string()).args([
         "-o",
         "SendEnv=MINIMAL_SESSION_ID",
-        // Forward the user's locale and timezone into the session, mirroring a
-        // conventional `SendEnv LANG LC_* TZ`. The daemon accepts only these
-        // (its `AcceptEnv` allowlist) and folds them in below any loadout.
-        // `TERM` needs no `SendEnv`: ssh always carries it in the PTY request.
-        "-o",
-        "SendEnv=LANG",
-        "-o",
-        "SendEnv=LC_*",
-        "-o",
-        "SendEnv=TZ",
         "-o",
         &format!("ProxyCommand={proxy_cmd}"),
         "-o",
@@ -2552,32 +2531,15 @@ pub fn build_config(global: &GlobalArgs) -> Result<mctx::Config, mctx::Error> {
 /// generate a `minimal.toml`, show the plan, prompt for confirmation,
 /// and write the file. Shared by `cmd_init` and the `cmd_activate`
 /// missing-mfile prompt.
-fn run_init_flow(
-    config: mctx::Config,
-    skip_confirm: bool,
-    force: bool,
-) -> Result<(), anyhow::Error> {
+fn run_init_flow(config: mctx::Config, skip_confirm: bool) -> Result<(), anyhow::Error> {
     use op::ProjectOp as _;
     let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| anyhow::anyhow!("{e}"))?;
     let plan = op::InitProject
         .run(&mut env)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Overwriting an existing minimal.toml is destructive — no backup is
-    // written — so require an explicit --force rather than let confirm() read
-    // a non-TTY EOF as a silent "yes". Mirrors `min session destroy --all`,
-    // which likewise refuses non-interactively and names the flag to proceed.
-    let exists = plan.toml_path.exists();
-    if exists && !force {
-        bail!(
-            "refusing to overwrite existing {} without confirmation; pass --force",
-            plan.toml_path.display()
-        );
-    }
-
     if !skip_confirm {
-        let verb = if exists { "overwrite" } else { "create" };
-        eprintln!("\nWill {verb} {}:\n", plan.toml_path.display());
+        eprintln!("\nWill create {}:\n", plan.toml_path.display());
         eprintln!("---");
         eprint!("{}", plan.content);
         eprintln!("---");
@@ -2591,11 +2553,7 @@ fn run_init_flow(
     std::fs::write(&plan.toml_path, &plan.content)
         .with_context(|| format!("writing {}", plan.toml_path.display()))?;
 
-    eprintln!(
-        "{} {}",
-        if exists { "Updated" } else { "Created" },
-        plan.toml_path.display()
-    );
+    eprintln!("Created {}", plan.toml_path.display());
 
     Ok(())
 }
@@ -2603,7 +2561,7 @@ fn run_init_flow(
 /// Initialize a `minimal.toml` based on the source tree.
 pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::Error> {
     let config = build_config(global)?;
-    run_init_flow(config, args.yes, args.force).map_err(mctx::Error::Other)
+    run_init_flow(config, args.yes).map_err(mctx::Error::Other)
 }
 
 /// Add packages as dependencies to the project's `minimal.toml`.
