@@ -501,7 +501,7 @@ impl Binding {
             match async_dialog::Select::new()
                 .with_prompt(SHELL_EXIT_PROMPT)
                 .items([
-                    "Detach, leaving the session running",
+                    "Exit, leaving the session filesystem in place and recoverable",
                     "Delete, all in-session files permanently deleted",
                 ])
                 .interact(rs.make_reader(), &mut w)
