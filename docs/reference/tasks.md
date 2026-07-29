@@ -16,7 +16,7 @@ Tasks are defined in a `[tasks.<task-name>]` block in your minimal file.
 
 _Optional_
 
-`packages` lists additional [packages](https://docs.minimal.dev/concepts/packages) which will be installed in the tasks'
+`packages` lists additional [packages](../concepts/packages.md) which will be installed in the tasks'
 runtime environment. Packages listed here are in addition to any installed due to the profile or stack.
 
 ```toml
