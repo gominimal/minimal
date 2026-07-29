@@ -221,7 +221,7 @@ pub fn hardlink_dir_contents(src: &Path, dst: &Path) -> Result<(), HardlinkError
                 // `/home`), where hardlinks are impossible (`EXDEV`). Fall back
                 // to a copy so materialization still succeeds — slower and no
                 // longer deduplicated, but correct.
-                Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+                Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
                     // Every file in a cross-device tree hits EXDEV, so warn only
                     // on the first — a per-file log would flood with thousands
                     // of identical lines. Once-per-process is enough: the cause

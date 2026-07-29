@@ -62,6 +62,18 @@ pub async fn listening_sockets<W: BundleSink>(
 /// The `/proc/net` socket tables, in the order a reader wants them.
 pub const PROC_NET_SOCKET_TABLES: &[&str] = &["tcp", "tcp6", "udp", "udp6", "unix"];
 
+/// The `/proc/net` table that stands in for `ip addr`/`ifconfig` when a host
+/// ships no net tools: the interface list (`/proc/net/dev`). It carries names
+/// and stats but no addresses or MACs — the picture a process has with nothing
+/// installed, and the same table the in-microVM guest collector captures.
+pub const PROC_NET_INTERFACE_TABLES: &[&str] = &["dev"];
+
+/// The `/proc/net` tables that stand in for `ip route`/`netstat -rn` on a
+/// stripped host: the IPv4 routing table plus the fib trie, which also carries
+/// the local address picture `ip addr` gives where tools exist. Hex-encoded;
+/// the dev team decodes.
+pub const PROC_NET_ROUTE_TABLES: &[&str] = &["route", "fib_trie"];
+
 /// `<dest>/net/<name>.txt`: the named raw `/proc/net` tables, concatenated
 /// verbatim behind a `=== /proc/net/<table> ===` banner each.
 ///
@@ -99,8 +111,20 @@ pub async fn interfaces<W: BundleSink>(
     } else {
         &[("ifconfig", &["-a"])]
     };
-    let (banner, out) = first_available(attempts).await?;
-    let text = format!("{banner}\n{}", mask_macs(&out));
+    let text = match first_available(attempts).await {
+        Ok((banner, out)) => format!("{banner}\n{}", mask_macs(&out)),
+        // A stripped host (no `ip`/`ifconfig`) still gets the interface picture
+        // `/proc/net` carries, mirroring `listening_sockets`. No MACs live in
+        // `/proc/net/dev`, so the mask pass is a no-op — kept to honor the
+        // `Redaction::Keys` label uniformly across both paths.
+        #[cfg(target_os = "linux")]
+        Err(cmd_err) => format!(
+            "(commands unavailable: {cmd_err})\n{}",
+            mask_macs(&proc_net_text(PROC_NET_INTERFACE_TABLES).await)
+        ),
+        #[cfg(not(target_os = "linux"))]
+        Err(cmd_err) => return Err(cmd_err.into()),
+    };
     w.add_bytes(
         &format!("{dest}/net/interfaces.txt"),
         text.as_bytes(),
@@ -121,10 +145,21 @@ pub async fn routes<W: BundleSink>(
     } else {
         &[("netstat", &["-rn"])]
     };
-    let (banner, out) = first_available(attempts).await?;
+    let text = match first_available(attempts).await {
+        Ok((banner, out)) => format!("{banner}\n{out}"),
+        // On a stripped host fall back to the raw routing tables, mirroring
+        // `listening_sockets`; `fib_trie` also carries the local address picture.
+        #[cfg(target_os = "linux")]
+        Err(cmd_err) => format!(
+            "(commands unavailable: {cmd_err})\n{}",
+            proc_net_text(PROC_NET_ROUTE_TABLES).await
+        ),
+        #[cfg(not(target_os = "linux"))]
+        Err(cmd_err) => return Err(cmd_err.into()),
+    };
     w.add_bytes(
         &format!("{dest}/net/routes.txt"),
-        format!("{banner}\n{out}").as_bytes(),
+        text.as_bytes(),
         Redaction::None,
     )
     .await
