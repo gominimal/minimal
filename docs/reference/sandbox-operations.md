@@ -63,11 +63,12 @@ Runs the specified task in a new Minimal sandbox. Interactive tasks are not supp
 
 `min run` is the in-sandbox equivalent of the [`mip run`](./cli-mip.md#run) command.
 
-### `build`, `test`
+### `package build <PACKAGES...>`
 
-Shorthands for `min run build` and `min run test` respectively.
+Builds the named packages in a clean room, making them available in the local
+cache.
 
-### `patched-pkg <PACKAGE>`
+### `package patched-build <PACKAGE>`
 
 Builds the named package in a clean room using potentially-stale dependencies
 (the already-cached builds of its dependencies, without rebuilding them first),
