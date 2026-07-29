@@ -365,6 +365,10 @@ mod tests {
         assert!(DEFAULT_GVPROXY_BIN.ends_with(GVPROXY_FILE));
     }
 
+    // The resolver tests below create real temp dirs; Miri's default isolation
+    // has no `mkdir`, so exclude them there. The miri lane still covers the pure
+    // subnet/MAC/vsock primitives above, which is what it was added to check.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn installed_gvproxy_prefers_existing_user_local_install() {
         let _g = ENV_LOCK.lock().unwrap();
@@ -376,6 +380,7 @@ mod tests {
         unsafe { std::env::remove_var("MINIMAL_BIN") };
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn ignores_an_upstream_named_binary_in_the_bin_dir() {
         // A foreign `gvproxy` (podman's, crc's) sitting in the bin dir must not
@@ -396,6 +401,7 @@ mod tests {
     // flip on a host that has either binary installed — failing on precisely
     // the pre-rename hosts the legacy branch exists to serve.
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn falls_back_to_the_current_system_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -407,6 +413,7 @@ mod tests {
         assert_eq!(resolve_installed(None, &system, &legacy), system);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn falls_back_to_the_legacy_system_path_when_only_it_exists() {
         let tmp = tempfile::tempdir().unwrap();
@@ -417,6 +424,7 @@ mod tests {
         assert_eq!(resolve_installed(None, &system, &legacy), legacy);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn reports_the_current_system_path_when_neither_exists() {
         let tmp = tempfile::tempdir().unwrap();
@@ -427,6 +435,7 @@ mod tests {
         assert_eq!(resolve_installed(None, &system, &legacy), system);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn user_local_install_beats_both_system_paths() {
         let tmp = tempfile::tempdir().unwrap();
