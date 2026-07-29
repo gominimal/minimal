@@ -741,7 +741,10 @@ async fn cmd_default(global: &GlobalArgs) -> Result<(), anyhow::Error> {
             // (or -C/--repo-dir if set) and chain into attach, mirroring
             // `min session activate --attach`. `cmd_activate` resolves the path from
             // `global.repo_dir` when no positional is given, matching the
-            // attach side's `cwd_host_path(global)`.
+            // attach side's `cwd_host_path(global)`. But refuse first when that
+            // chained attach could never run: creating then failing orphans the
+            // session (#1031).
+            ensure_activate_on_empty_allowed(global.no_input, std::io::stdin().is_terminal())?;
             drop(client);
             let activate_args = ActivateArgs {
                 name: None,
@@ -1825,6 +1828,25 @@ async fn resolve_smart_attach(
     }
 }
 
+/// Guard for bare `min` on an empty daemon: activating there chains straight
+/// into an interactive attach, which needs a TTY on stdin. Under `--no-input`,
+/// or when stdin is not a terminal, that attach can never succeed — so refuse
+/// before creating anything, emitting the same message the explicit
+/// `min session attach` produces, instead of creating a session and then
+/// failing the attach guard, which leaves the session orphaned (#1031).
+///
+/// Pure in its inputs so both branches are unit-testable without a controlled
+/// terminal.
+fn ensure_activate_on_empty_allowed(
+    no_input: bool,
+    stdin_is_tty: bool,
+) -> Result<(), anyhow::Error> {
+    if no_input || !stdin_is_tty {
+        bail!("no sessions exist; use 'min session activate' to create one");
+    }
+    Ok(())
+}
+
 /// Guard for the interactive attach path: the PTY-backed session shell must be
 /// driven from a real terminal. When stdin is not a TTY there is nothing to
 /// drive the remote shell and no EOF ever reaches it through the forced `-tt`
@@ -2702,6 +2724,25 @@ mod tests {
             "expected an actionable non-TTY error, got: {err}"
         );
         ensure_interactive_attach_tty(true).expect("a real terminal must pass the guard");
+    }
+
+    /// Bare `min` on an empty daemon must refuse before creating a session when
+    /// it could not follow through with the interactive attach — under
+    /// `--no-input` or over a non-TTY stdin — so it never orphans a session
+    /// (#1031). Only a plain interactive invocation proceeds to activate.
+    #[test]
+    fn bare_min_refuses_to_activate_on_empty_daemon_non_interactively() {
+        let err = ensure_activate_on_empty_allowed(true, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no sessions exist") && err.contains("min session activate"),
+            "expected the explicit-verb refusal, got: {err}"
+        );
+        ensure_activate_on_empty_allowed(false, false)
+            .expect_err("a non-TTY stdin must be refused even without --no-input");
+        ensure_activate_on_empty_allowed(false, true)
+            .expect("an interactive terminal without --no-input must be allowed to activate");
     }
 
     /// The attach/create confirmation prefers the session name and appends a
