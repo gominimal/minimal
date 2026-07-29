@@ -99,8 +99,8 @@ pub enum Command {
     /// networking-proxy feature" and the :7655 listener never binds, so the
     /// command is usable only from a dev checkout, whose guest initramfs the
     /// justfile does build with the feature. Still accepted, and unchanged in
-    /// behaviour. Unhide, and restore the section in
-    /// docs/reference/cli-min.md, once shipped minimald builds the proxy in.
+    /// behaviour. Unhide, and document it in docs/reference/cli-min.md, once
+    /// shipped minimald builds the proxy in.
     ///
     /// Connects to minimald, generates a fresh client certificate signed by
     /// the daemon's internal CA (R4.4, R4.5), and saves the certificate and
@@ -117,7 +117,7 @@ pub enum Command {
     ///        --key  ~/.config/minimal/client.key \
     ///        https://localhost:7655/
     #[command(verbatim_doc_comment)]
-    #[clap(hide = true)]
+    #[command(hide = true)]
     Login(LoginArgs),
     /// Rename an existing session
     Rename(RenameArgs),
