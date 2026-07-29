@@ -701,8 +701,8 @@ pub struct BuildDecl {
     /// `None` means the build-decl did not explicitly declare a target and should
     /// be hydrated with the target of whatever graph is being constructed from it.
     /// This happens at the decode→graph seam in `graph::BuildSpec::from_decoded`,
-    /// which consults `Loader::for_target`. See gominimal/infra#18 for the arm64
-    /// res-server dispatch bug that motivated moving this from eager to deferred.
+    /// which consults `Loader::for_target`. Moved from eager to deferred to fix
+    /// an arm64 dispatch bug where the target was resolved before it was known.
     pub target: Option<Target>,
     /// Any attributes explicitly set on this build-decl.
     pub attrs: Option<IndexMap<String, AttrValue>>,

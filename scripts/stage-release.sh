@@ -128,7 +128,13 @@ COMPONENTS=(
     # Basename MUST be libkrun.1.dylib: minvmd's load command is @rpath/libkrun.1.dylib
     # and the release job adds a @loader_path/../lib rpath.
     "libkrun|darwin|arm64|file|lib/libkrun.1.dylib|libkrun-macos-arm64.dylib"
-    "gvproxy|darwin|arm64|file|bin/gvproxy|gvproxy-darwin-arm64"
+    # Installed as `gvproxy-min`, NOT `gvproxy`: the bin prefix is
+    # `~/.local/bin`, which is on PATH, and podman/crc ship their own `gvproxy`
+    # there — under the upstream name whichever landed last would win a PATH
+    # lookup, in either direction. The bytes are stock gvproxy (still pinned and
+    # SHA-256-verified by scripts/fetch-gvproxy.sh); only the installed name is
+    # ours, and `switch::GVPROXY_FILE` is the resolver's matching definition.
+    "gvproxy-min|darwin|arm64|file|bin/gvproxy-min|gvproxy-darwin-arm64"
     "initramfs|darwin|arm64|file|data/initramfs.cpio|initramfs-arm64.cpio"
     "rootfs|darwin|arm64|file|data/rootfs.img|rootfs-arm64.img"
     "vmlinuz|darwin|arm64|file|data/vmlinuz|vmlinuz-arm64"

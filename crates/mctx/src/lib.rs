@@ -1265,6 +1265,7 @@ mod tests {
                 test_name: "smoke",
                 stdout_writer: None,
                 stderr_writer: None,
+                cancel: tokio_util::sync::CancellationToken::new(),
             };
             let opts = op::Options {
                 cache: ctx.local_cache(),
