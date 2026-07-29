@@ -716,18 +716,46 @@ impl DiskLoader {
     }
 }
 
+/// Reject a session name that would break a downstream output contract.
+///
+/// `complete-session-str` emits one `value<TAB>description` line per session
+/// and the `min ls` table renders the name verbatim; a control character —
+/// tab or newline in particular — splits one row into several, and an empty
+/// or whitespace-padded name is useless as an addressable handle. Enforced
+/// here beside the name-collision check so both name writers (`create` for
+/// `activate --name`, `save` for `rename`) share one gate.
+fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
+    let invalid = |msg: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid session name: {msg}"),
+        )
+    };
+    if name.trim().is_empty() {
+        return Err(invalid("must not be empty or whitespace"));
+    }
+    if name.trim() != name {
+        return Err(invalid("must not have leading or trailing whitespace"));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(invalid("must not contain control characters"));
+    }
+    Ok(())
+}
+
 impl Loader for DiskLoader {
     type Key = DiskSessionKey;
     type Object = DiskSession;
 
     fn create(&mut self, mut record: Record) -> Result<Self::Key, std::io::Error> {
-        if let Some(name) = &record.name
-            && self.index.name_to_id.contains_key(name)
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!("a session with name `{name}` already exists"),
-            ));
+        if let Some(name) = &record.name {
+            validate_session_name(name)?;
+            if self.index.name_to_id.contains_key(name) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("a session with name `{name}` already exists"),
+                ));
+            }
         }
 
         let uuid = Uuid::now_v7();
@@ -818,6 +846,15 @@ impl Loader for DiskLoader {
 
         let old_name = self.index.name_by_id(&id).cloned();
         let new_name = record.name.clone();
+
+        // Validate a newly-assigned name at the character level before the
+        // uniqueness check. Gate on an actual change so re-saving an unchanged
+        // record (e.g. a status promotion) never re-validates a name.
+        if old_name != new_name
+            && let Some(name) = &new_name
+        {
+            validate_session_name(name)?;
+        }
 
         // Collision check: if the new name belongs to a *different*
         // session, refuse. Same-id same-name is a no-op, not a collision.
@@ -1060,6 +1097,58 @@ mod tests {
         assert_eq!(
             loader.create(sample_record()).err().map(|e| e.kind()),
             Some(ErrorKind::AlreadyExists)
+        );
+    }
+
+    #[test]
+    fn validate_session_name_accepts_ordinary_names() {
+        assert!(validate_session_name("debug-qa").is_ok());
+        assert!(validate_session_name("my session").is_ok());
+    }
+
+    #[test]
+    fn validate_session_name_rejects_empty_whitespace_and_control_chars() {
+        for bad in ["", "   ", " leading", "trailing ", "a\tb", "x\ny"] {
+            assert_eq!(
+                validate_session_name(bad).err().map(|e| e.kind()),
+                Some(ErrorKind::InvalidInput),
+                "expected `{bad:?}` to be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn create_rejects_a_control_character_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let mut record = sample_record();
+        record.name = Some("a\tb".to_string());
+        assert_eq!(
+            loader.create(record).err().map(|e| e.kind()),
+            Some(ErrorKind::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn rename_rejects_a_control_character_name_and_keeps_the_old_one() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        // The production rename path flows through `save`, so this exercises
+        // the same gate the daemon's rename does.
+        let key = loader.create(sample_record()).unwrap();
+        assert_eq!(
+            loader
+                .rename(&key, "x\ny".to_string())
+                .err()
+                .map(|e| e.kind()),
+            Some(ErrorKind::InvalidInput)
+        );
+        assert_eq!(
+            loader.get(&key).unwrap().record().name.as_deref(),
+            Some("my-session"),
+            "a rejected rename must leave the original name intact"
         );
     }
 
