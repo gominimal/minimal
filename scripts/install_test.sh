@@ -598,77 +598,84 @@ want_ok "a non-sessions stop failure still force-stops (R5.5)" \
 # running and asks. The answer is read from the controlling terminal, never
 # from stdin — under `curl … | sh` stdin is the script itself — so the harness
 # points MINIMAL_OVERRIDE_TTY at a file standing in for /dev/tty.
-H16="$root/h16"; mkdir -p "$H16"
-stage_live_upgrade "$H16" liveyes
+#
+# These homes carry their own HL prefix rather than extending the plain H<n>
+# run, following the HAA_/HD/HU families above. Every scenario here deliberately
+# leaves a home a later run must not inherit — a `sessions.live` marker and a
+# `min` that refuses to stop while it exists — so a home reused by number
+# further down would not be the fresh install it reads as, and would abort on
+# the prompt instead.
+HL1="$root/hl1"; mkdir -p "$HL1"
+stage_live_upgrade "$HL1" liveyes
 printf 'y\n' >"$root/tty-yes"
 TTY_FILE="$root/tty-yes"
-run liveyes "$H16"
+run liveyes "$HL1"
 TTY_FILE=
 check 0 "$rc" "confirmed upgrade exits 0 (R5.5)"
 want_ok "the running sessions are listed (R5.5)" grep -q "session-alpha" "$OUT"
 want_ok "the user is asked before sessions die (R5.5)" grep -q "Continue?" "$OUT"
-want_ok "the graceful stop is tried first (R5.5)" grep -qx "stop" "$H16/stop.calls"
-want_ok "confirmation escalates to --force (R5.5)" grep -qx "stop --force" "$H16/stop.calls"
-check "$h_minimald" "$(hash_file "$H16/bin/minimald")" "a confirmed upgrade completes (R5.5)"
+want_ok "the graceful stop is tried first (R5.5)" grep -qx "stop" "$HL1/stop.calls"
+want_ok "confirmation escalates to --force (R5.5)" grep -qx "stop --force" "$HL1/stop.calls"
+check "$h_minimald" "$(hash_file "$HL1/bin/minimald")" "a confirmed upgrade completes (R5.5)"
 
 # Declining aborts before the first swap: non-zero, nothing installed, no
 # temp file left behind, and the daemon never force-stopped.
-H17="$root/h17"; mkdir -p "$H17"
-stage_live_upgrade "$H17" liveno
+HL2="$root/hl2"; mkdir -p "$HL2"
+stage_live_upgrade "$HL2" liveno
 printf 'n\n' >"$root/tty-no"
 TTY_FILE="$root/tty-no"
-run liveno "$H17"
+run liveno "$HL2"
 TTY_FILE=
 check 1 "$rc" "declining aborts the install (R5.5)"
 want_ok "the abort reports no executable was replaced (R5.5)" \
     grep -q "no executables were replaced" "$OUT"
-want_err "declining never force-stops (R5.5)" grep -qx "stop --force" "$H17/stop.calls"
-check "stale" "$(cat "$H17/bin/minimald")" "the stale component is left in place (R5.5)"
-want_err "no temp file survives the abort (R5.5)" ls "$H17/bin/"*.tmp.* 2>/dev/null
+want_err "declining never force-stops (R5.5)" grep -qx "stop --force" "$HL2/stop.calls"
+check "stale" "$(cat "$HL2/bin/minimald")" "the stale component is left in place (R5.5)"
+want_err "no temp file survives the abort (R5.5)" ls "$HL2/bin/"*.tmp.* 2>/dev/null
 
 # No terminal to ask on (CI, a non-interactive shell): abort promptly naming the
 # escape hatch rather than hang on a read or destroy sessions unasked.
-H18="$root/h18"; mkdir -p "$H18"
-stage_live_upgrade "$H18" livenotty
-run livenotty "$H18"
+HL3="$root/hl3"; mkdir -p "$HL3"
+stage_live_upgrade "$HL3" livenotty
+run livenotty "$HL3"
 check 1 "$rc" "an unconfirmable upgrade aborts (R5.5)"
 want_ok "the abort names the escape hatch (R5.5)" grep -q -- "--force-stop" "$OUT"
 want_err "nothing is asked without a terminal (R5.5)" grep -q "Continue?" "$OUT"
 want_err "an unconfirmable upgrade never force-stops (R5.5)" \
-    grep -qx "stop --force" "$H18/stop.calls"
-check "stale" "$(cat "$H18/bin/minimald")" "nothing is installed without confirmation (R5.5)"
+    grep -qx "stop --force" "$HL3/stop.calls"
+check "stale" "$(cat "$HL3/bin/minimald")" "nothing is installed without confirmation (R5.5)"
 
 # The escape hatch as a flag: force-stop straight away, no question, no hang.
-H19="$root/h19"; mkdir -p "$H19"
-stage_live_upgrade "$H19" liveforce
-run liveforce "$H19" --force-stop
+HL4="$root/hl4"; mkdir -p "$HL4"
+stage_live_upgrade "$HL4" liveforce
+run liveforce "$HL4" --force-stop
 check 0 "$rc" "--force-stop upgrade exits 0 (R5.5)"
 want_err "--force-stop asks nothing (R5.5)" grep -q "Continue?" "$OUT"
-want_err "--force-stop skips the graceful stop (R5.5)" grep -qx "stop" "$H19/stop.calls"
-want_ok "--force-stop force-stops (R5.5)" grep -qx "stop --force" "$H19/stop.calls"
-check "$h_minimald" "$(hash_file "$H19/bin/minimald")" "a forced upgrade completes (R5.5)"
+want_err "--force-stop skips the graceful stop (R5.5)" grep -qx "stop" "$HL4/stop.calls"
+want_ok "--force-stop force-stops (R5.5)" grep -qx "stop --force" "$HL4/stop.calls"
+check "$h_minimald" "$(hash_file "$HL4/bin/minimald")" "a forced upgrade completes (R5.5)"
 
 # The same hatch through the environment, for a pipeline with no argv at all.
-H20="$root/h20"; mkdir -p "$H20"
-stage_live_upgrade "$H20" liveforceenv
+HL5="$root/hl5"; mkdir -p "$HL5"
+stage_live_upgrade "$HL5" liveforceenv
 FORCE_STOP=1
-run liveforceenv "$H20"
+run liveforceenv "$HL5"
 FORCE_STOP=
 check 0 "$rc" "MINIMAL_INSTALL_FORCE_STOP upgrade exits 0 (R5.5)"
 want_err "the env hatch asks nothing (R5.5)" grep -q "Continue?" "$OUT"
-want_ok "the env hatch force-stops (R5.5)" grep -qx "stop --force" "$H20/stop.calls"
+want_ok "the env hatch force-stops (R5.5)" grep -qx "stop --force" "$HL5/stop.calls"
 
 # The flag is filtered out of the arguments wherever it sits, so the target
 # positional still resolves (R2.1). Deliberately a NON-default target: with
 # `stable` a filter that dropped every positional would land on the default and
 # still look right.
 printf 'v1\n' >"$mock/unstable"
-H21="$root/h21"; mkdir -p "$H21"
-stage_live_upgrade "$H21" liveforcepos
-run liveforcepos "$H21" unstable --force-stop
+HL6="$root/hl6"; mkdir -p "$HL6"
+stage_live_upgrade "$HL6" liveforcepos
+run liveforcepos "$HL6" unstable --force-stop
 check 0 "$rc" "target plus --force-stop exits 0 (R5.5/R2.1)"
 want_ok "the target survives the option filter (R2.1)" grep -q "target 'unstable'" "$OUT"
-want_ok "the trailing flag still force-stops (R5.5)" grep -qx "stop --force" "$H21/stop.calls"
+want_ok "the trailing flag still force-stops (R5.5)" grep -qx "stop --force" "$HL6/stop.calls"
 
 # --- Unit 9: shell-init files, rc hook, completions (R9.1-R9.3) -------------
 # A bash-login-shell install generates the three init files, hooks .bashrc
