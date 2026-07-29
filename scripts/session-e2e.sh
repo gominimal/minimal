@@ -326,7 +326,10 @@ if mnl ls --raw 2>/dev/null | grep -Fqx "$sid"; then
 fi
 
 # Shut the daemon down; it must not survive.
-mnl stop >/dev/null 2>&1 || { echo "::error::'min stop' failed"; fail; }
+# Keep stderr: discarding it leaves a failing stop indistinguishable from every
+# other one, and this assertion's error text is the whole diagnosis.
+mnl stop >/dev/null 2>"$WORK/stop.err" \
+  || { echo "::error::'min stop' failed"; cat "$WORK/stop.err" 2>/dev/null; fail; }
 
 # On VM targets the daemon IS the guest's pid-1, so stopping it must take the
 # VM down with it: the guest resets, the supervisor reaps the VMM child and
