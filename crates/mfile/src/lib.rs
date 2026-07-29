@@ -607,8 +607,15 @@ pub enum IndexSourceMode {
     Pinned,
     /// The global root index only.
     Root,
-    /// The union of the per-commit *closure* snapshots of every pinned chain
-    /// link (upstream + sideloads); a missing closure is an error.
+    /// The union of the per-commit *closure* snapshots of the pinned chain.
+    /// Asymmetric by design: the upstream's closure is required (it is the
+    /// signed catalog — missing is an error), while each sideload's closure
+    /// is unioned best-effort — a sideload not covered by build
+    /// infrastructure publishes no closure, is skipped with a log line, and
+    /// its specs resolve locally. Distinct from [`Self::Pinned`] in both the
+    /// object read (`<commit>.closure.shisha`, the bounded signed catalog,
+    /// vs `<commit>.shisha`, a byte copy of the whole root index) and in
+    /// covering sideload closures at their own pins.
     Closure,
 }
 
