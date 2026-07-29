@@ -523,6 +523,30 @@ pub struct Output {
     extra: HashMap<String, toml::Value>,
 }
 
+impl Output {
+    /// The target to build this output for. Arch precedence: `arch_override` >
+    /// the `arch` field > the host. The OS is always Linux.
+    pub fn target(
+        &self,
+        arch_override: Option<&str>,
+    ) -> Result<common::Target, common::target::ArchParseError> {
+        let arch = match arch_override.or(self.arch.as_deref()) {
+            Some(s) => s.parse()?,
+            None => common::Target::host().arch().clone(),
+        };
+        Ok(common::Target::new(arch, common::target::OS::Linux))
+    }
+
+    /// The graph top levels for this output; `base` when it names no packages.
+    pub fn top_levels(&self) -> Vec<String> {
+        if self.packages.is_empty() {
+            vec!["base".to_string()]
+        } else {
+            self.packages.clone()
+        }
+    }
+}
+
 impl TryFrom<OutputRaw> for Output {
     type Error = String;
 
@@ -1422,6 +1446,59 @@ mod tests {
         })
         .unwrap();
         assert_eq!(mf.outputs["image"].arch, Some("amd64".to_string()));
+    }
+
+    #[test]
+    fn output_target_arch_precedence() {
+        let pinned = Output {
+            arch: Some("arm64".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            pinned.target(Some("amd64")).unwrap().arch(),
+            &common::target::Arch::Amd64,
+            "the override must beat the output's own arch"
+        );
+        assert_eq!(
+            pinned.target(None).unwrap().arch(),
+            &common::target::Arch::Arm64,
+            "without an override the output's arch is used"
+        );
+        assert_eq!(
+            Output::default().target(None).unwrap().arch(),
+            common::Target::host().arch(),
+            "with neither set, the host's arch is used"
+        );
+    }
+
+    #[test]
+    fn output_target_os_is_always_linux() {
+        assert_eq!(
+            Output::default().target(None).unwrap().os(),
+            &common::target::OS::Linux
+        );
+    }
+
+    #[test]
+    fn output_target_rejects_an_unknown_arch() {
+        let err = Output::default()
+            .target(Some("s390x"))
+            .expect_err("s390x is not a supported architecture");
+        assert!(
+            err.to_string().contains("s390x"),
+            "the error should name the offending input, got {err}"
+        );
+    }
+
+    #[test]
+    fn output_top_levels_default_to_base() {
+        assert_eq!(Output::default().top_levels(), vec!["base".to_string()]);
+
+        let explicit = Output {
+            packages: vec!["openssl".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(explicit.top_levels(), vec!["openssl".to_string()]);
     }
 
     #[test]

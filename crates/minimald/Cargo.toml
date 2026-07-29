@@ -37,6 +37,7 @@ constcat.workspace = true
 either.workspace = true
 fd-lock.workspace = true
 futures.workspace = true
+size.workspace = true
 hakoniwa.workspace = true
 libc.workspace = true
 nix.workspace = true

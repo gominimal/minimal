@@ -44,7 +44,24 @@ impl Channel for () {
     }
 }
 
-const SESSION_DEFAULT_WD: &str = "workbench";
+/// The name of the working directory inside a session sandbox: the host
+/// directory given to [`Config::with_session_dirs`] is bind-mounted at
+/// `/{SESSION_DEFAULT_WD}` unless the config overrides the name.
+///
+/// Exported so callers that have to translate between a path typed inside the
+/// sandbox and the host directory backing it agree with the mount on where it
+/// lives.
+///
+/// [`Config::with_session_dirs`]: config::Config::with_session_dirs
+pub const SESSION_DEFAULT_WD: &str = "workbench";
+
+/// The name of the home directory inside a session sandbox: the host directory
+/// given to [`Config::with_session_dirs`] is bind-mounted at `/{SESSION_HOME}`.
+///
+/// Exported for the same reason as [`SESSION_DEFAULT_WD`].
+///
+/// [`Config::with_session_dirs`]: config::Config::with_session_dirs
+pub const SESSION_HOME: &str = "home";
 
 /// An initialized sandbox.
 ///
@@ -241,7 +258,7 @@ impl<C: Channel> Sandbox<C> {
                 );
                 fs::create_dir_all(&rootfs_cwd)
                     .map_err(|e| Error::IO("create cwd", rootfs_cwd, e))?;
-                let rootfs_home = rootfs.join("home");
+                let rootfs_home = rootfs.join(SESSION_HOME);
                 fs::create_dir_all(&rootfs_home)
                     .map_err(|e| Error::IO("create home", rootfs_home.clone(), e))?;
             }
@@ -668,10 +685,10 @@ impl<C: Channel> Sandbox<C> {
                 working,
                 working_name_override,
             } => {
-                // mount the given home path to /home
+                // mount the given home path to /{SESSION_HOME}
                 Self::bind_mount(
                     home,
-                    "/home",
+                    &format!("/{SESSION_HOME}"),
                     BindOpts {
                         recursive: true,
                         read_only: false,
