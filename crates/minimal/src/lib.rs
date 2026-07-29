@@ -106,6 +106,7 @@ pub enum Command {
     ///        --key  ~/.config/minimal/client.key \
     ///        https://localhost:7655/
     #[command(verbatim_doc_comment)]
+    #[command(hide = true)]
     Login(LoginArgs),
     /// Rename an existing session
     Rename(RenameArgs),
