@@ -495,6 +495,10 @@ pub struct InitArgs {
     /// Skip confirmation, writing configuration based on auto-detection
     #[arg(long, short, default_value_t = false)]
     pub yes: bool,
+    /// Overwrite an existing minimal.toml; without it, init refuses when one
+    /// already exists.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1358,7 +1362,7 @@ fn offer_mfile_scaffold(
             .build()
             .map_err(|e| anyhow::anyhow!("{e}"))?
     };
-    run_init_flow(config, false)
+    run_init_flow(config, false, false)
 }
 
 /// Resolves the directory whose tree should be uploaded as the session
@@ -2511,15 +2515,32 @@ pub fn build_config(global: &GlobalArgs) -> Result<mctx::Config, mctx::Error> {
 /// generate a `minimal.toml`, show the plan, prompt for confirmation,
 /// and write the file. Shared by `cmd_init` and the `cmd_activate`
 /// missing-mfile prompt.
-fn run_init_flow(config: mctx::Config, skip_confirm: bool) -> Result<(), anyhow::Error> {
+fn run_init_flow(
+    config: mctx::Config,
+    skip_confirm: bool,
+    force: bool,
+) -> Result<(), anyhow::Error> {
     use op::ProjectOp as _;
     let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| anyhow::anyhow!("{e}"))?;
     let plan = op::InitProject
         .run(&mut env)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // Overwriting an existing minimal.toml is destructive — no backup is
+    // written — so require an explicit --force rather than let confirm() read
+    // a non-TTY EOF as a silent "yes". Mirrors `min session destroy --all`,
+    // which likewise refuses non-interactively and names the flag to proceed.
+    let exists = plan.toml_path.exists();
+    if exists && !force {
+        bail!(
+            "refusing to overwrite existing {} without confirmation; pass --force",
+            plan.toml_path.display()
+        );
+    }
+
     if !skip_confirm {
-        eprintln!("\nWill create {}:\n", plan.toml_path.display());
+        let verb = if exists { "overwrite" } else { "create" };
+        eprintln!("\nWill {verb} {}:\n", plan.toml_path.display());
         eprintln!("---");
         eprint!("{}", plan.content);
         eprintln!("---");
@@ -2533,7 +2554,11 @@ fn run_init_flow(config: mctx::Config, skip_confirm: bool) -> Result<(), anyhow:
     std::fs::write(&plan.toml_path, &plan.content)
         .with_context(|| format!("writing {}", plan.toml_path.display()))?;
 
-    eprintln!("Created {}", plan.toml_path.display());
+    eprintln!(
+        "{} {}",
+        if exists { "Updated" } else { "Created" },
+        plan.toml_path.display()
+    );
 
     Ok(())
 }
@@ -2541,7 +2566,7 @@ fn run_init_flow(config: mctx::Config, skip_confirm: bool) -> Result<(), anyhow:
 /// Initialize a `minimal.toml` based on the source tree.
 pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::Error> {
     let config = build_config(global)?;
-    run_init_flow(config, args.yes).map_err(mctx::Error::Other)
+    run_init_flow(config, args.yes, args.force).map_err(mctx::Error::Other)
 }
 
 /// Add packages as dependencies to the project's `minimal.toml`.
