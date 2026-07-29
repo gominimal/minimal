@@ -8,11 +8,11 @@ description: "Reference for the min session CLI: create, attach to, and manage s
 `min` is the Minimal session CLI. It talks to the `minimald` daemon (see
 [minimald](./cli-minimald.md)) to create, attach to, and manage sandboxed
 development sessions. Most commands start the daemon automatically when it
-isn't running (`bug`, `stop`, and `version` are the exceptions): natively on
-Linux, or inside the [`minvmd`](./cli-minvmd.md) microVM host daemon on macOS
-(and on Linux under `--provider local-minvmd`). Running bare `min` with no
-subcommand resolves a session for the current directory (activating one if
-needed) and attaches to it.
+isn't running, with `bug`, `stop`, and `version` being the exceptions. The 
+daemon starts natively on Linux (and under `--provider local-minvmd`) or 
+inside the [`minvmd`](./cli-minvmd.md) microVM host daemon on macOS. 
+Running bare `min` with no subcommand resolves a session for the current 
+directory (activating one if needed) and attaches to it.
 
 Commands are spelled `min <noun> <verb>`, and every noun accepts its singular
 and plural form (`session`/`sessions`, `loadout`/`loadouts`). Bare `min` and a
@@ -21,8 +21,6 @@ handful of bare verbs (`ls`, `stop`,
 exceptions, called out as such below; see
 [the CLI convention](./cli.md#command-naming-convention) for the rule and the
 full list of exceptions.
-
-Generated from `--help` at `cb29f065`.
 
 ## Global flags
 
@@ -150,12 +148,12 @@ broken install still yields a valid archive that explains what is
 missing.
 
 Diagnosing a wedged system must not change it: `bug` mutates no state and
-never starts a daemon; it works even when none is running.
+never starts a daemon; it works even when none are running.
 
 Secret-shaped values (env vars, tokens) are redacted before they enter
 the archive: only a small allowlist of env names (`RUST_LOG`, `HOME`,
 `SHELL`, `TERM`, `PATH`, and the `XDG_*` / `MINIMAL_*` / `MINVMD_*` /
-`MINIMALD_*` prefixes) has values captured verbatim (a sensitive-shaped
+`MINIMALD_*` prefixes) have values captured verbatim (a sensitive-shaped
 name always loses to the allowlist), and every other env var is reported
 by name only. Session and project file contents are never included, only
 name/size listings. Review the archive before sharing.
