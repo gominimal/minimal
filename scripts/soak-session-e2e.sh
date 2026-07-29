@@ -19,6 +19,11 @@
 # same as the lane invocation. Each iteration runs session-e2e.sh, which
 # creates its own fresh XDG state, so every pass is a clean cold start.
 #
+# Environment:
+#   SOAK_MIN_FREE_MIB   free-space floor, in MiB, for the filesystem holding the
+#                       per-iteration state dirs (default 4096). See the
+#                       headroom check below for why this harness needs one.
+#
 # Usage: scripts/soak-session-e2e.sh [iterations] [boot-log-dir]
 set -uo pipefail
 
@@ -49,11 +54,66 @@ trap 'reap' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# ── Disk headroom ────────────────────────────────────────────────────────────
+# Repeating a VM-backed e2e is the one thing this repo does that can genuinely
+# exhaust a CI runner's disk: each iteration's state dir carries the provider's
+# per-VM data volume, whose host allocation is everything the guest wrote (its
+# package cache, the session rootfs, the workspace). session-e2e.sh reclaims
+# its own state dir, so this should now stay flat — but "should" is what the
+# nightly already believed. The failure mode is what makes a check worth having:
+# a real ENOSPC kills the runner AGENT, and the job then reports `failure` with
+# this step still `in_progress` and NO retrievable log lines, no uploaded
+# artifacts, nothing to read. So measure the headroom, print it every iteration
+# (the per-check delta is exactly the number that says whether reclamation is
+# working), and stop with a real error while a runner is still alive to report.
+case "$(uname -s)" in
+  Darwin) STATE_FS=/tmp ;;    # where session-e2e.sh puts its state dir,
+  *) STATE_FS="$HOME" ;;      # per platform (its sun_path / hardlink split)
+esac
+MIN_FREE_MIB="${SOAK_MIN_FREE_MIB:-4096}"
+case "$MIN_FREE_MIB" in
+  '' | *[!0-9]*) echo "SOAK_MIN_FREE_MIB must be a non-negative integer, got: '$MIN_FREE_MIB'" >&2; exit 2 ;;
+esac
+
+# Free MiB on the filesystem holding "$1". `df -Pk` is the portable spelling:
+# -P pins one line per filesystem (GNU df wraps a long device name onto two
+# otherwise, which would shift the columns) and -k pins 1024-byte blocks
+# (macOS df reports 512-byte ones by default).
+free_mib() { df -Pk "$1" 2>/dev/null | awk 'NR == 2 { print int($4 / 1024) }'; }
+
+LAST_FREE=""
+# Report headroom, and fail the step if it has fallen below the floor. "$1"
+# names what is about to run, for the error text.
+check_free() {
+  local now delta
+  now="$(free_mib "$STATE_FS")"
+  case "$now" in
+    '' | *[!0-9]*)
+      echo "::warning::could not read free space on $STATE_FS — headroom check skipped"
+      return 0
+      ;;
+  esac
+  if [ -n "$LAST_FREE" ]; then
+    delta=$((now - LAST_FREE))
+    echo "disk: ${now} MiB free on $STATE_FS (${delta} MiB since the last check)"
+  else
+    echo "disk: ${now} MiB free on $STATE_FS (floor ${MIN_FREE_MIB} MiB)"
+  fi
+  LAST_FREE="$now"
+  [ "$now" -ge "$MIN_FREE_MIB" ] && return 0
+  echo "::error::only ${now} MiB free on $STATE_FS before $1 (floor ${MIN_FREE_MIB} MiB; override with SOAK_MIN_FREE_MIB). Stopping here so this reports as a failed step: an actual ENOSPC kills the runner agent, and the job then reports 'failure' with no log lines at all."
+  return 1
+}
+
 pass=0
 fail=0
 for i in $(seq 1 "$ITER"); do
   echo "::group::soak iteration $i/$ITER"
   reap
+  if ! check_free "soak iteration $i/$ITER"; then
+    echo "::endgroup::"
+    exit 1
+  fi
   if MINVMD_BOOT_LOG="$LOGDIR/boot-$i.log" "$ROOT/scripts/session-e2e.sh"; then
     pass=$((pass + 1))
     echo "iteration $i: OK"
@@ -67,6 +127,10 @@ done
 
 echo "::group::bulk host→guest upload proof"
 reap
+if ! check_free "the bulk upload proof"; then
+  echo "::endgroup::"
+  exit 1
+fi
 if MINVMD_BOOT_LOG="$LOGDIR/boot-bulk.log" "$ROOT/scripts/bulk-upload-e2e.sh"; then
   bulk=OK
 else
@@ -75,6 +139,9 @@ else
 fi
 echo "::endgroup::"
 
+# Closing headroom, reported not enforced: everything is already done, and a
+# `::error::` here would paint a run that passed red.
+echo "disk: $(free_mib "$STATE_FS") MiB free on $STATE_FS at the end of the run"
 echo "soak complete: $pass passed, $fail failed (of $ITER); bulk upload proof: $bulk"
 # Require every iteration to have run AND passed — a short-circuited loop that
 # ran zero iterations must not report success.
