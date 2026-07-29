@@ -53,7 +53,7 @@ exec = "bash -l"
 ### `[upstream]` - Where software comes from {#upstream}
 
 The `[upstream]` section defines the precise source of packages, stacks, and profiles. This represents the
-preceding link in the [software supply chain](https://docs.minimal.dev/concepts/software-supply-chain).
+preceding link in the [software supply chain](../concepts/software-supply-chain.md).
 
 ```toml
 [upstream]
@@ -93,7 +93,7 @@ build_packages = ["<additional build package>"]     # optional
 runtime_packages = ["<additional runtime package>"] # optional
 ```
 
-The `[stack]` section configures the [stack](https://docs.minimal.dev/concepts/stacks) to use for building code, if any.
+The `[stack]` section configures the [stack](../concepts/stacks.md) to use for building code, if any.
 See [stack specs](./stack-specs.md) for how stacks themselves are defined.
 
 `use` is an accepted alias for the canonical `name` key; both parse. `[harness]`
@@ -115,7 +115,7 @@ profile = "<profile name>" # optional
 state_key = "<state key>"  # optional
 ```
 
-When set, `defaults.profile` will set a [profile](https://docs.minimal.dev/concepts/profiles) on all tasks which do not set a profile.
+When set, `defaults.profile` will set a [profile](../concepts/profiles.md) on all tasks which do not set a profile.
 
 When set, `defaults.state_key` will set a state key on all tasks which do not set `state_key`.
 
@@ -123,7 +123,7 @@ When set, `defaults.state_key` will set a state key on all tasks which do not se
 
 ### `[session]` - What every contributor's session gets {#session}
 
-Contributes to [sessions](https://docs.minimal.dev/concepts/sessions) activated
+Contributes to [sessions](../concepts/sessions.md) activated
 on this project (`min session activate`). It carries the same primitives as a
 [loadout](./loadouts.md) (packages, vars, patches, lifecycle hooks), scoped to
 the project rather than the developer: where a loadout says "what this
