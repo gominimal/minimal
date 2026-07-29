@@ -2122,33 +2122,115 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
     // so a connect failure is still a real error, not something to swallow.
     let mut client = connect_daemon(global).await?;
 
-    use minimald_rpc::{Shutdown, ShutdownRequest, ShutdownResponse};
+    use minimald_rpc::{Shutdown, ShutdownRequest};
     let resp = client
         .oneshot_rpc::<Shutdown>(ShutdownRequest { force: args.force })
         .await
-        .context("Shutdown RPC failed")?;
+        .context("Shutdown RPC failed");
 
-    match resp {
-        ShutdownResponse::ShuttingDown => {
-            // Drop our connection before waiting: the daemon holds the shutdown
-            // open for its drain grace period while a client is still attached,
-            // and we are that client.
-            drop(client);
-            println!("Daemon is shutting down.");
+    // Drop our connection before waiting: the daemon holds the shutdown open
+    // for its drain grace period while a client is still attached, and we are
+    // that client.
+    drop(client);
+
+    let (use_minvmd, minimal_dir) = (global.use_minvmd(), global.minimal_dir.clone());
+    let probe_dir = minimal_dir.clone();
+    stop_outcome(
+        resp,
+        async move || {
             // The wait polls the lifecycle file on a sleep loop, so it goes on
             // the blocking pool rather than stalling an async worker for up to
             // 20s (rust-coding-standards: no blocking in an async context).
-            let (use_minvmd, minimal_dir) = (global.use_minvmd(), global.minimal_dir.clone());
             tokio::task::spawn_blocking(move || {
                 autospawn::wait_for_daemon_stopped(use_minvmd, minimal_dir.as_deref())
             })
             .await
             .context("The wait for the daemon to stop panicked")?
-            .context("Failed while waiting for the daemon to stop")?;
-            Ok(())
+            .context("Failed while waiting for the daemon to stop")
+        },
+        async move || daemon_confirmed_stopped(use_minvmd, probe_dir).await,
+    )
+    .await
+}
+
+/// Whether the daemon can be *observed* to have stopped — the question the
+/// failed-RPC arm of [`stop_outcome`] turns on.
+///
+/// The shutdown wait, then the liveness probe this command opened with. On a VM
+/// backend the wait IS the observation — it polls the lifecycle state — but a
+/// native minimald has no lifecycle file and its wait returns at once, saying
+/// nothing, so only the probe can answer for that backend. Anything we cannot
+/// read is not a confirmed stop.
+///
+/// Which makes the recovery a VM-backend one in practice: the native probe fires
+/// once, immediately, and minimald keeps its listener bound through the 5s drain
+/// grace it takes after its accept loop exits (minimald's `SHUTDOWN_GRACE`), so
+/// a connect in that window still succeeds and reports "running". Native
+/// therefore keeps today's fail-on-RPC-error behaviour — which is right for it:
+/// a native daemon is not pid-1 and does not take the transport down with it, so
+/// the lost reply this recovers from is not a failure mode it has.
+async fn daemon_confirmed_stopped(use_minvmd: bool, minimal_dir: Option<PathBuf>) -> bool {
+    // Both calls can sleep-poll, so they go on the blocking pool rather than
+    // stalling an async worker (rust-coding-standards: no blocking in an async
+    // context). A panicked probe observed nothing, which is not a confirmation.
+    tokio::task::spawn_blocking(move || {
+        autospawn::wait_for_daemon_stopped(use_minvmd, minimal_dir.as_deref()).is_ok()
+            && !autospawn::is_daemon_running(use_minvmd, minimal_dir.as_deref()).unwrap_or(true)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Decide what `min stop` reports, given how the `Shutdown` RPC ended, the wait
+/// an accepted shutdown runs out, and — only when the RPC itself failed —
+/// whether the daemon can nevertheless be confirmed down.
+///
+/// What `stop` promises is observable: the daemon is down. On a VM target the
+/// daemon IS the guest's pid-1, so an accepted shutdown takes the SSH transport
+/// down with it — as a *consequence of succeeding* — and the reply can be lost
+/// before the client decodes it. Gating on the transport would report failure
+/// for a stop that did exactly what was asked, so a failed RPC over a daemon
+/// that did stop is a success. A daemon still there afterwards is a real
+/// failure, and the RPC error — the one that explains what went wrong — is what
+/// the user sees.
+///
+/// Only that failure arm probes. An accepted shutdown is judged by its wait
+/// alone: the daemon acknowledges before it has finished going down, so asking
+/// again there would race its own teardown and fail stops that worked.
+///
+/// `SessionsLive` is not a lost reply but an answer: the daemon refused, and is
+/// going nowhere, so there is nothing to observe.
+async fn stop_outcome<W, C>(
+    resp: Result<minimald_rpc::ShutdownResponse, anyhow::Error>,
+    wait_for_stopped: W,
+    confirm_stopped: C,
+) -> Result<(), anyhow::Error>
+where
+    W: AsyncFnOnce() -> Result<(), anyhow::Error>,
+    C: AsyncFnOnce() -> bool,
+{
+    use minimald_rpc::ShutdownResponse;
+    match resp {
+        Ok(ShutdownResponse::ShuttingDown) => {
+            println!("Daemon is shutting down.");
+            wait_for_stopped().await
         }
-        ShutdownResponse::SessionsLive => {
+        Ok(ShutdownResponse::SessionsLive) => {
             bail!("daemon has active sessions; pass --force to shut down anyway")
+        }
+        Err(rpc_err) => {
+            if confirm_stopped().await {
+                // Say what was suppressed. Exiting 0 over a failed RPC is only
+                // sound because the daemon is observably down, and a silent
+                // recovery would leave nothing — in a terminal or in a soak
+                // log — to check that reading against. stderr, so it survives
+                // the `>/dev/null` every scripted caller wraps `stop` in.
+                eprintln!("warning: the shutdown RPC failed, but the daemon stopped: {rpc_err:#}");
+                println!("Daemon is shutting down.");
+                Ok(())
+            } else {
+                Err(rpc_err)
+            }
         }
     }
 }
@@ -2755,5 +2837,140 @@ mod tests {
         std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
         let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
         assert!(resolve_upload_root(path).is_err());
+    }
+
+    /// On a VM target the daemon is the guest's pid-1, so an accepted shutdown
+    /// takes the SSH transport down with it and the reply can be lost on the
+    /// way out. `stop` gates on the observable goal, not on the transport: a
+    /// daemon that reached the stopped state is a stop that worked.
+    #[tokio::test]
+    async fn stop_succeeds_when_a_lost_reply_still_stopped_the_daemon() {
+        stop_outcome(
+            Err(anyhow::anyhow!("EOF while parsing a value")
+                .context("decode response for shutdown")
+                .context("Shutdown RPC failed")),
+            async || Ok(()),
+            async || true,
+        )
+        .await
+        .expect("a daemon that reached the stopped state is a successful stop");
+    }
+
+    /// The other half of that judgement: a failed RPC over a daemon that is
+    /// still there is a real failure, and the RPC's own error — context and all
+    /// — is what the user needs.
+    #[tokio::test]
+    async fn stop_reports_the_rpc_error_when_the_daemon_is_still_running() {
+        let err = stop_outcome(
+            Err(anyhow::anyhow!("connection reset").context("Shutdown RPC failed")),
+            async || Ok(()),
+            async || false,
+        )
+        .await
+        .unwrap_err();
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("Shutdown RPC failed") && chain.contains("connection reset"),
+            "expected the original RPC error chain, got: {chain}"
+        );
+    }
+
+    /// A refusal is an answer, not a lost reply: it keeps its own message and
+    /// its non-zero exit, and observes nothing — the daemon it names is staying
+    /// up on purpose.
+    #[tokio::test]
+    async fn stop_with_live_sessions_bails_without_waiting() {
+        let observed = std::cell::Cell::new(false);
+        let err = stop_outcome(
+            Ok(minimald_rpc::ShutdownResponse::SessionsLive),
+            async || {
+                observed.set(true);
+                Ok(())
+            },
+            async || {
+                observed.set(true);
+                true
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "daemon has active sessions; pass --force to shut down anyway"
+        );
+        assert!(
+            !observed.get(),
+            "a refused shutdown has nothing to wait for"
+        );
+    }
+
+    /// An acknowledged shutdown still has to finish, and its wait is the whole
+    /// judgement: a daemon that never reaches a stopped state fails with the
+    /// wait's own error, and the extra liveness probe — which exists only to
+    /// judge a *failed* RPC — never races a teardown the daemon acknowledged.
+    #[tokio::test]
+    async fn stop_fails_when_an_accepted_shutdown_never_completes() {
+        stop_outcome(
+            Ok(minimald_rpc::ShutdownResponse::ShuttingDown),
+            async || Ok(()),
+            async || false,
+        )
+        .await
+        .expect("an acknowledged shutdown that completes is a successful stop");
+
+        let probed = std::cell::Cell::new(false);
+        let err = stop_outcome(
+            Ok(minimald_rpc::ShutdownResponse::ShuttingDown),
+            async || Err(anyhow::anyhow!("the VM is still shutting down after 20s")),
+            async || {
+                probed.set(true);
+                true
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("still shutting down"),
+            "expected the wait's error, got: {err}"
+        );
+        assert!(
+            !probed.get(),
+            "an accepted shutdown is judged by its wait alone"
+        );
+    }
+
+    /// The recovery's actual observation, not a stand-in for it: the real
+    /// probe `cmd_stop` hands `stop_outcome`, run against a state dir no daemon
+    /// ever ran in. Nothing is listening and no lifecycle is active, which is
+    /// exactly the post-shutdown reading a lost reply has to be judged on, so
+    /// it must confirm the stop.
+    #[tokio::test]
+    async fn the_real_probe_confirms_a_daemon_that_is_not_there() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            daemon_confirmed_stopped(true, Some(dir.path().to_path_buf())).await,
+            "a state dir with no live daemon is a confirmed stop"
+        );
+    }
+
+    /// The already-down fast path: against a state dir no daemon ever ran in,
+    /// `stop` reports the goal state and exits 0 without connecting or
+    /// spawning anything.
+    #[tokio::test]
+    async fn stop_is_a_no_op_when_the_daemon_is_already_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = GlobalArgs {
+            repo_dir: None,
+            minimal_dir: Some(dir.path().to_path_buf()),
+            config_dir: None,
+            provider: None,
+            no_input: true,
+        };
+
+        cmd_stop(&global, StopArgs { force: false })
+            .await
+            .expect("an already-stopped daemon is the goal state, not an error");
     }
 }

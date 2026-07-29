@@ -80,6 +80,9 @@ on tools present by default on every target: a downloader (`curl` **or**
   components that actually changed are downloaded.
 - **As a minimal employee**, I pass `unstable` as an argument and get the
   bleeding-edge version through the identical mechanism.
+- **As a user with long-running sessions**, an upgrade tells me what is running
+  and asks before it ends any of it, so I decide whether the upgrade is worth
+  the work it costs; scripted upgrades pass a flag and never stop to ask.
 
 ## Demoable Units of Work
 
@@ -111,7 +114,10 @@ exits with a clear error.
 
 **R2.1**, The script takes an optional first argument, the **target**,
 defaulting to `stable`. The target is validated against `^[A-Za-z0-9._-]+$`
-before use; a value containing any other character exits with an error.
+before use; a value containing any other character exits with an error. Install
+mode's one option, `--force-stop` (R5.5), is recognized wherever it appears in
+the arguments and removed from them before the target is read, so the target
+stays the sole positional on either side of the flag.
 
 **R2.2**, The script fetches `<BUCKET>/<target>` to obtain a version string.
 The result is validated against `^[A-Za-z0-9._-]+$` (command substitution having
@@ -260,19 +266,44 @@ mv -f "$target.tmp.$$" "$target"
 
 **R5.5**, Installing a new version over a **running daemon** wedges it: the
 daemon goes on serving from the old image while the newly-installed `min` speaks
-to it. Before the first component file is replaced, the installer therefore runs
-`<bin>/min stop --force`, the `min` **already on disk**, which is the build that
-matches the daemon it started and is the one about to be overwritten. `--force`
-because an upgrade must not be blocked by live sessions, and because a prompt is
-not available in a `curl … | sh` pipeline.
+to it. Before the first component file is replaced, the installer therefore stops
+it with the `min` **already on disk**, which is the build that matches the daemon
+it started and is the one about to be overwritten. Only `<bin>/min` is ever run,
+never a `min` found on `$PATH`, which is not this installer's footprint.
 
-The step is **best-effort and silent**, output discarded and exit status ignored:
-"no `min` installed yet" (a fresh install), "no daemon running" (`min stop`
-merely connects; it never autospawns, so this is a failed connect and nothing
-more), and "the installed `min` is too old to know `stop --force`" are all just
-*nothing to stop*, and none may fail an install whose binaries are otherwise
-fine. Only `<bin>/min` is ever run, never a `min` found on `$PATH`, which is not
-this installer's footprint.
+The stop is **graceful first**: `<bin>/min stop`, which succeeds when nothing is
+running and refuses while sessions are live. That refusal, recognized by the
+message the CLI prints for it rather than by a bare non-zero exit, is the one
+outcome an upgrade must not decide on the user's behalf: it means live work is
+about to be destroyed. The installer then lists the running sessions
+(`<bin>/min ls`), asks whether to end them, and only on an explicit yes runs
+`<bin>/min stop --force` and carries on. A declined upgrade exits non-zero
+before the first **executable** replacement, dropping the temp download and
+leaving the daemon, its sessions, every installed executable, and the install
+record exactly as they were. It claims no more than that: the stop is attempted
+at the first `bin`/`lib` component, so a `data` component ordered ahead of it in
+the manifest may already have been replaced.
+
+The question is asked on the **controlling terminal**, never on stdin: in a
+`curl … | sh` pipeline stdin is the script itself, so reading the answer there
+would consume it. Where no controlling terminal can be opened (CI, any
+non-interactive invocation) there is nobody to consent, so the installer exits
+non-zero naming the escape hatch instead of hanging on a read or ending sessions
+unasked. That escape hatch — a `--force-stop` argument, or a non-empty
+`MINIMAL_INSTALL_FORCE_STOP` in the environment for a pipeline with no argv —
+skips both the graceful stop and the question and force-stops outright, so
+scripted upgrades never block. It is deliberately not spelled `--force`, which
+already means "remove modified files too" in uninstall mode.
+
+Every other outcome stays **best-effort and silent**, output discarded and exit
+status ignored: "no `min` installed yet" (a fresh install), "no daemon running"
+(`min stop` merely connects; it never autospawns, so this is a failed connect
+and nothing more), "the installed `min` is too old to know `stop`", and a
+transport drop on an otherwise successful stop are all just *nothing to stop*.
+None of them may fail an install whose binaries are otherwise fine, and none of
+them may raise the question — treating a bare failure as "sessions are live"
+would make every upgrade ask one. They fall through to the force stop, which
+remains unconditional for them.
 
 It is attempted **at most once per run**, and only from the path that actually
 replaces a file: a rerun where every component is already up to date, or a run
@@ -303,11 +334,31 @@ both hash columns in place of digests.
   it, the recorded installed hash does not mask a new release.
 - **Test** (R5.5): a fresh install stops nothing (no `min` on disk yet) and an
   up-to-date rerun stops nothing (nothing replaced); an upgrade whose components
-  are stale runs the on-disk `min` with exactly `stop --force`, once, however
-  many components it replaces.
+  are stale runs the on-disk `min` with exactly `stop`, once, however many
+  components it replaces, never escalating to `--force` and never asking
+  anything when the graceful stop succeeds.
 - **Test** (R5.5): an installed `min` whose `stop` exits non-zero and writes to
   both stdout and stderr still yields exit 0, leaks neither stream into the
-  installer's output, and completes the upgrade.
+  installer's output, asks nothing, and completes the upgrade.
+- **Test** (R5.5): an on-disk `min` whose graceful `stop` refuses with the
+  active-sessions message makes the installer list the running sessions and ask
+  on the terminal (a stand-in for `/dev/tty`, since stdin is the script pipe);
+  answering yes escalates to `stop --force` and completes the upgrade.
+- **Test** (R5.5): answering no exits non-zero, never runs `stop --force`,
+  leaves the stale component and no temp file behind, and reports that no
+  executable was replaced.
+- **Test** (R5.5): the refusal message the installer matches on is asserted, by
+  the workspace test suite, to still be present in the CLI source that prints
+  it. The signal crosses a language boundary with nothing else holding the two
+  ends together, and a reword on the CLI side would otherwise return every
+  upgrade to an unconditional force-stop with the installer's own tests — which
+  supply their own copy of the message — still green.
+- **Test** (R5.5): with the same refusal and no openable terminal, the run exits
+  non-zero naming the escape hatch, without prompting, force-stopping, or
+  installing anything.
+- **Test** (R5.5): the escape hatch, given as an argument or through the
+  environment, force-stops without a graceful attempt and without asking, and
+  completes the upgrade; given after the target, the target still resolves.
 - **Test** (R5.6): a `symlink` component lands as a symlink at its `dest`
   pointing at the manifest target, with no download; a rerun skips it, and a
   retargeted link is repaired on the next run, still with no download.
