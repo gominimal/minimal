@@ -8,7 +8,7 @@ description: "Reference for the min session CLI: create, attach to, and manage s
 `min` is the Minimal session CLI. It talks to the `minimald` daemon (see
 [minimald](./cli-minimald.md)) to create, attach to, and manage sandboxed
 development sessions. Most commands start the daemon automatically when it
-is not running (`bug`, `stop`, and `version` are the exceptions): natively on
+isn't running (`bug`, `stop`, and `version` are the exceptions): natively on
 Linux, or inside the [`minvmd`](./cli-minvmd.md) microVM host daemon on macOS
 (and on Linux under `--provider local-minvmd`). Running bare `min` with no
 subcommand resolves a session for the current directory (activating one if
@@ -68,7 +68,7 @@ the current directory).
 | `--sync <MODE>` | | How to load project files into the session: `tarball` (default: stream a tarball of your project and unpack it) or `none` (do not populate the worktree) |
 | `--loadout <NAME>` | | Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`. Repeatable; if given, config-file `default_loadouts` are ignored |
 | `--no-loadouts` | | Apply no loadouts at all (also skips the config's `default_loadouts`). Conflicts with `--loadout` |
-| `--no-prompt` | | Fail instead of prompting when the daemon surfaces items user policy cannot auto-decide; implied when stdin/stderr is not a TTY |
+| `--no-prompt` | | Fail instead of prompting when the daemon surfaces items user policy can't auto-decide; implied when stdin/stderr isn't a TTY |
 | `--attach` | | Automatically attach after creation |
 
 ### `session attach`
@@ -228,7 +228,7 @@ session arguments completable — `min session attach <TAB>` lists live session
 names, and `min session attach 019<TAB>` lists session IDs, neither of which
 exists at the time a static script would be written. Every argument documented
 as "UUID or session name" completes this way: `session attach`,
-`session destroy`, `session rename`, `session policy`, and `ssh-forward`.
+`session destroy`, `session rename`, and `session policy`.
 
 Session completion is best-effort by design. It never starts a daemon — with
 none running there is nothing to list, and booting a VM on a keystroke would be
