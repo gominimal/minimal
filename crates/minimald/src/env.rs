@@ -34,7 +34,6 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use camino::Utf8PathBuf;
-use futures::StreamExt;
 use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives};
 use mctx::{AddDepMode, Context, Error};
 use mfile::{EnvPatches, EnvVarValue};
@@ -731,72 +730,49 @@ impl SessionChannel {
         }
     }
 
-    /// Implements `min check`.
+    /// Implements `min check [--packages] [--stacks] [--profiles] [--fix] [names...]`:
+    /// kicks off a session side-op check run and streams each object's results
+    /// back to the client until the run completes.
     async fn run_check(&mut self, stream: &mut UnixStream, args: &str) {
-        let mut flag_packages = false;
-        let mut flag_stacks = false;
-        let mut flag_profiles = false;
-        let mut fix = false;
-        let mut filter_names: Vec<String> = Vec::new();
+        use crate::session_sop::{CheckOpts, CheckOutcome, CheckUpdate};
 
-        for token in args.split_whitespace() {
-            match token {
-                "--packages" => flag_packages = true,
-                "--stacks" => flag_stacks = true,
-                "--profiles" => flag_profiles = true,
-                "--fix" => fix = true,
-                _ => filter_names.push(token.to_string()),
+        let Some(session) = self.session.upgrade() else {
+            let _ = writeln!(stream, "error: session is gone");
+            return;
+        };
+
+        let opts = match CheckOpts::from_args(args) {
+            Ok(opts) => opts,
+            Err(msg) => {
+                let _ = writeln!(stream, "error: {msg}");
+                return;
+            }
+        };
+
+        let mut updates = match session.start_check(opts).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                let _ = writeln!(stream, "error: {e}");
+                return;
+            }
+        };
+
+        let mut outcome = None;
+        while let Some(update) = updates.recv().await {
+            if let CheckUpdate::Finished(o) = &update {
+                outcome = Some(o.clone());
+            }
+            for line in update.render() {
+                let _ = writeln!(stream, "msg:{line}");
             }
         }
 
-        // If no kind flags specified, check everything.
-        let check_all = !flag_packages && !flag_stacks && !flag_profiles;
-
-        let mut check_ctx = match self.ctx.cloned_reinit() {
-            Err(e) => return Self::write_error(&e, stream),
-            Ok(ctx) => ctx,
-        };
-        let graph = match check_ctx.graph_from_all_packages() {
-            Err(e) => return Self::write_error(&e, stream),
-            Ok(g) => g,
-        };
-
-        let upstream_dir = check_ctx.minimal_file().dir_path().unwrap().to_path_buf();
-
-        let mut checks_stream = match check::run_checks(
-            (check_all || flag_packages).then(|| upstream_dir.join("packages")),
-            (check_all || flag_profiles).then(|| upstream_dir.join("profiles")),
-            (check_all || flag_stacks).then(|| upstream_dir.join("stacks")),
-            check::CheckCtx::new(
-                filter_names,
-                vec![],
-                fix,
-                Some(Arc::new(tokio::sync::RwLock::new(graph))),
-                check_ctx.stdlib_dir().to_path_buf(),
-                check_ctx.local_cache(),
-                self.ot.clone(),
-            ),
-        ) {
-            Err(e) => return Self::write_error(&Error::from(e), stream),
-            Ok(res_stream) => res_stream,
-        };
-
-        while let Some((heading, result)) = checks_stream.next().await {
-            let checks = match result {
-                Ok(checks) => checks,
-                Err(e) => {
-                    let _ = writeln!(stream, "error: {e}");
-                    return;
-                }
-            };
-            let _ = writeln!(stream, "msg:");
-            let _ = writeln!(stream, "msg:{heading}");
-            for check in checks {
-                let _ = writeln!(stream, "msg:{}...{}", check.check, check.verdict);
-                for err in check.err {
-                    let _ = writeln!(stream, "msg:\t{err}");
-                }
-            }
+        // Report the propagated outcome; only a clean run claims success.
+        let (status, message) = CheckOutcome::summarize(outcome.as_ref());
+        if status == 0 {
+            let _ = writeln!(stream, "msg:{message}");
+        } else {
+            let _ = writeln!(stream, "error: {message}");
         }
     }
 

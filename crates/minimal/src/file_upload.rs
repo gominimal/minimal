@@ -562,9 +562,28 @@ fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
                     .metadata()
                     .await
                     .with_context(|| format!("statting {}", entry_path.display()))?;
+                // Preserve the source's permission bits (masked to the
+                // standard nine + suid/sgid/sticky), same as
+                // `TarZstArchive::add_file`'s default. Hardcoding 0o644
+                // here silently strips the exec bit off scripts and
+                // binaries in every workspace upload.
+                let mode = {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    metadata.permissions().mode() & 0o7777
+                };
+                // Preserve the mtime too: leaving the header's zero
+                // stamp unpacks every file at the epoch, which breaks
+                // mtime-keyed (make-style) builds inside the session.
+                // Pre-epoch mtimes (nonsensical but legal) clamp to 0.
+                let mtime = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs());
                 let mut header = async_tar::Header::new_gnu();
                 header.set_size(metadata.len());
-                header.set_mode(0o644);
+                header.set_mode(mode);
+                header.set_mtime(mtime);
                 header.set_entry_type(async_tar::EntryType::Regular);
                 header.set_cksum();
                 tar.append_data(&mut header, &archive_path, &mut file)
@@ -836,6 +855,64 @@ mod tests {
             "escape should be a symlink, not a copied file"
         );
         assert!(out.path().join("safe.txt").is_file());
+    }
+
+    /// The dir-walk uploader must preserve file permission bits: a
+    /// workspace upload that flattens everything to 0o644 strips the
+    /// exec bit off scripts (e.g. `scripts/setup-dev.sh`), so they
+    /// arrive in the session un-runnable.
+    #[tokio::test]
+    async fn stream_preserves_file_modes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("setup-dev.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plain = dir.path().join("notes.txt");
+        std::fs::write(&plain, "notes").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let mut buf = Vec::new();
+        stream_tar_zstd(dir.path(), &mut buf).await.unwrap();
+
+        let decoder = async_compression::tokio::bufread::ZstdDecoder::new(&buf[..]);
+        let out = tempfile::TempDir::new().unwrap();
+        async_tar::Archive::new(decoder)
+            .unpack(out.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let mode_of = |name: &str| {
+            std::fs::metadata(out.path().join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(
+            mode_of("setup-dev.sh"),
+            0o755,
+            "executable bit must survive the upload round-trip"
+        );
+        assert_eq!(
+            mode_of("notes.txt"),
+            0o640,
+            "non-default permission bits must survive the upload round-trip"
+        );
+
+        let src_mtime_secs = |p: &std::path::Path| {
+            std::fs::metadata(p)
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        assert_eq!(
+            src_mtime_secs(&out.path().join("setup-dev.sh")),
+            src_mtime_secs(&script),
+            "mtime must survive the upload round-trip, not unpack at the epoch"
+        );
     }
 
     #[tokio::test]

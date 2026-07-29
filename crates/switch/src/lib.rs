@@ -8,6 +8,7 @@
 
 use std::fmt;
 use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
 
 /// MTU advertised to the switch and the tap devices. gvproxy's own default.
 pub const DEFAULT_MTU: u16 = 1500;
@@ -33,6 +34,82 @@ pub const DEFAULT_SUBNET: SwitchSubnet = SwitchSubnet {
     base: Ipv4Addr::new(100, 64, 0, 0),
     prefix: 16,
 };
+
+/// Filename the switch binary is installed under, in both the user-local `bin/`
+/// prefix and the system-wide path below.
+///
+/// Deliberately **not** plain `gvproxy`: the installer's `bin` prefix is
+/// `~/.local/bin`, which is on `PATH`, and podman/crc/Docker Desktop all ship
+/// their own `gvproxy` there. Installing under the upstream name would let
+/// whichever came last win a `PATH` lookup — in either direction — so the
+/// binary carries a minimal-specific name even though the bytes are stock
+/// gvproxy (`scripts/fetch-gvproxy.sh` pins and SHA-256-verifies them).
+pub const GVPROXY_FILE: &str = "gvproxy-min";
+
+/// System-wide install path for the switch binary: the final fallback when no
+/// user-local install exists.
+pub const DEFAULT_GVPROXY_BIN: &str = "/usr/lib/minimal/bin/gvproxy-min";
+
+/// The pre-rename system-wide path, still honoured when it exists and the
+/// current one does not.
+///
+/// This directory is not on `PATH`, so the collision that motivates
+/// [`GVPROXY_FILE`] never applied here — but an operator who provisioned the
+/// old path has no install record for us to migrate (`install.sh` only walks
+/// user-local rows), so renaming without this fallback would silently break
+/// own-IP on their hosts.
+const LEGACY_SYSTEM_GVPROXY_BIN: &str = "/usr/lib/minimal/bin/gvproxy";
+
+/// The user-local bin directory the installer stamps into: `$MINIMAL_BIN`, else
+/// `$HOME/.local/bin`. Mirrors the installer's `bin` prefix resolution in
+/// `scripts/install.sh`. `None` when neither is set.
+fn installer_bin_dir() -> Option<PathBuf> {
+    if let Some(bin) = std::env::var("MINIMAL_BIN").ok().filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(bin));
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|home| PathBuf::from(home).join(".local/bin"))
+}
+
+/// Resolve the switch binary an install placed on this host: an existing
+/// user-local install (`<bin-dir>/gvproxy-min`, where the curl|sh installer
+/// stamps it), else the system-wide [`DEFAULT_GVPROXY_BIN`].
+///
+/// One definition shared by `minimald` (which spawns the switch for native
+/// own-IP sessions) and `minvmd` (the host switch supervisor), so the two
+/// daemons and the installer cannot drift on where the binary lives;
+/// daemon-specific overrides (config field, env var) layer on top in the
+/// callers. Never errors: the system path is returned as a last resort even if
+/// nothing exists there, so the caller surfaces a spawn failure naming a
+/// concrete path.
+#[must_use]
+pub fn installed_gvproxy_bin() -> PathBuf {
+    resolve_installed(
+        installer_bin_dir(),
+        Path::new(DEFAULT_GVPROXY_BIN),
+        Path::new(LEGACY_SYSTEM_GVPROXY_BIN),
+    )
+}
+
+/// The resolution itself, with every probed location passed in.
+///
+/// Split out so the tests can drive both system-path branches against temp
+/// dirs. Probing the real `/usr/lib/minimal/bin` instead would make them depend
+/// on host install state — and fail on exactly the pre-rename hosts the legacy
+/// branch exists to serve.
+fn resolve_installed(bin_dir: Option<PathBuf>, system: &Path, legacy: &Path) -> PathBuf {
+    if let Some(local) = bin_dir.map(|dir| dir.join(GVPROXY_FILE))
+        && local.exists()
+    {
+        return local;
+    }
+    if !system.exists() && legacy.exists() {
+        return legacy.to_path_buf();
+    }
+    system.to_path_buf()
+}
 
 /// A subnet was constructed with a prefix outside the supported `8..=29` range —
 /// a configuration error, distinct from runtime address exhaustion.
@@ -274,5 +351,93 @@ mod tests {
         let yaml = render_gvproxy_config(SwitchSubnet::default(), &[]);
         assert!(yaml.contains("dhcpStaticLeases:\n    {}\n"));
         assert!(yaml.contains("subnet: \"100.64.0.0/16\""));
+    }
+
+    // Resolver tests mutate process-global env (MINIMAL_BIN), so serialise
+    // them to avoid races when `cargo test` runs them in parallel.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn installed_name_is_not_the_upstream_one() {
+        // The whole point of the rename: a stock `gvproxy` on PATH (podman,
+        // crc) must not be mistaken for ours, nor ours for it.
+        assert_ne!(GVPROXY_FILE, "gvproxy");
+        assert!(DEFAULT_GVPROXY_BIN.ends_with(GVPROXY_FILE));
+    }
+
+    #[test]
+    fn installed_gvproxy_prefers_existing_user_local_install() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let want = tmp.path().join(GVPROXY_FILE);
+        std::fs::write(&want, b"gvproxy").unwrap();
+        unsafe { std::env::set_var("MINIMAL_BIN", tmp.path()) };
+        assert_eq!(installed_gvproxy_bin(), want);
+        unsafe { std::env::remove_var("MINIMAL_BIN") };
+    }
+
+    #[test]
+    fn ignores_an_upstream_named_binary_in_the_bin_dir() {
+        // A foreign `gvproxy` (podman's, crc's) sitting in the bin dir must not
+        // be picked up — only our own filename counts. Driven through
+        // `resolve_installed` so the assertion does not depend on what the host
+        // has under /usr/lib/minimal/bin.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("gvproxy"), b"podman's").unwrap();
+        let system = tmp.path().join("gvproxy-min");
+        let legacy = tmp.path().join("gvproxy");
+        assert_eq!(resolve_installed(Some(bin), &system, &legacy), system);
+    }
+
+    // The system-path branches go through `resolve_installed` with temp paths.
+    // Calling the public resolver would probe the real /usr/lib/minimal/bin and
+    // flip on a host that has either binary installed — failing on precisely
+    // the pre-rename hosts the legacy branch exists to serve.
+
+    #[test]
+    fn falls_back_to_the_current_system_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let system = tmp.path().join("gvproxy-min");
+        let legacy = tmp.path().join("gvproxy");
+        std::fs::write(&system, b"current").unwrap();
+        std::fs::write(&legacy, b"legacy").unwrap();
+        // Both present: the current name wins.
+        assert_eq!(resolve_installed(None, &system, &legacy), system);
+    }
+
+    #[test]
+    fn falls_back_to_the_legacy_system_path_when_only_it_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let system = tmp.path().join("gvproxy-min");
+        let legacy = tmp.path().join("gvproxy");
+        std::fs::write(&legacy, b"legacy").unwrap();
+        // An operator who provisioned the pre-rename path keeps working.
+        assert_eq!(resolve_installed(None, &system, &legacy), legacy);
+    }
+
+    #[test]
+    fn reports_the_current_system_path_when_neither_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let system = tmp.path().join("gvproxy-min");
+        let legacy = tmp.path().join("gvproxy");
+        // Nothing installed anywhere: name the current path, so the caller's
+        // spawn failure cites the location an install should have used.
+        assert_eq!(resolve_installed(None, &system, &legacy), system);
+    }
+
+    #[test]
+    fn user_local_install_beats_both_system_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let want = bin.join(GVPROXY_FILE);
+        std::fs::write(&want, b"user-local").unwrap();
+        let system = tmp.path().join("gvproxy-min");
+        let legacy = tmp.path().join("gvproxy");
+        std::fs::write(&system, b"current").unwrap();
+        std::fs::write(&legacy, b"legacy").unwrap();
+        assert_eq!(resolve_installed(Some(bin), &system, &legacy), want);
     }
 }

@@ -378,6 +378,34 @@ cannot collide with a hex digest and is what the uninstaller keys on (R7.3).
 The record also enables uninstall (Units 7–8) and surfaces prefix drift if
 `XDG_*` variables change between runs.
 
+**R6.1a**, **Renamed-component migration.** When a component is renamed, its old
+`dest` stops appearing in every subsequent manifest, so the record walk of Units
+7–8 never revisits it and the file is stranded on disk forever. For a `bin`
+component that is a live PATH collision, not just clutter. The installer
+therefore reverses a known rename from the *prior* record, on the same
+bytes-still-ours terms uninstall uses (R7.3): the old `dest` is removed only
+when its SHA-256 still equals the `installed-hash` recorded for it, so a file
+the user replaced is kept and reported.
+
+The concrete case is the switch binary, installed as `gvproxy` before this
+release and as `gvproxy-min` after it — the `bin` prefix is on `PATH` and
+podman/crc ship their own `gvproxy` there, so the two cannot share a name.
+
+Three rules make the migration safe:
+
+- **Skip when the manifest still ships the old component.** Channels advance
+  independently, so a post-rename installer *will* be pointed at a pre-rename
+  manifest. There the file on disk is the one this very run installed, and
+  deleting it would leave the host with no switch binary at all, on every run.
+  The migration therefore runs only when this run's records contain no row for
+  the old component name.
+- **Report a refusal.** A hash mismatch means the user replaced the file; it is
+  kept and named.
+- **Retry a failure.** If removal fails (a read-only or root-owned `bin`), the
+  row is carried into this run's record so the next run tries again — without
+  it the migration gets exactly one attempt, because the record it reads is
+  replaced immediately afterwards.
+
 **R6.2**, If the resolved `bin` directory is not on `$PATH` **in the
 installing session**, the installer prints an advisory: the Unit 9 rc hook only
 takes effect in new shells, so the advisory tells the user to restart their
@@ -390,6 +418,14 @@ the only rc edit it makes is Unit 9's announced, marker-fenced block (R9.2).
   exists and lists the installed components with their destinations and hashes.
 - **Test**: With the `bin` prefix absent from `PATH`, the advisory is printed;
   with it present, it is not.
+- **Test** (R6.1a): a record naming the old component at a path whose bytes
+  still match the recorded hash has that file removed on the next install, the
+  removal is announced, and a further rerun says nothing (the row is gone).
+- **Test** (R6.1a): a record naming the old component whose file the user has
+  since replaced keeps the file, byte-for-byte, and reports that it was kept.
+- **Test** (R6.1a): when the manifest for *this* run still ships the old
+  component, the file it just installed survives and no removal is announced —
+  the case that would otherwise leave the host with no switch binary.
 
 ### Unit 9 - Shell integration: PATH, shell-init files, completions
 

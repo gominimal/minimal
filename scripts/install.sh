@@ -869,6 +869,50 @@ fi
 
 # --- Unit 6: install record and PATH advisory ------------------------------
 
+# Migration: the switch binary used to install as `bin/gvproxy` and now installs
+# as `bin/gvproxy-min` (the bin prefix is on PATH, and podman/crc ship their own
+# `gvproxy` there). The renamed component is a *new* row, so the old file is no
+# longer referenced by any manifest and the record walk would never revisit it —
+# it would sit on PATH forever, which is the collision the rename exists to
+# remove. Undo it here on the same terms as uninstall: remove it only when its
+# bytes are still exactly what we recorded writing, so a user who replaced that
+# path with their own gvproxy keeps it.
+remove_renamed_gvproxy() {
+    [ -f "$prev_record" ] || return 0
+    _tab="$(printf '\t')"
+    # Only a RENAME justifies deleting the old path. If the manifest this run
+    # installed still ships a `gvproxy` component, the file on disk is the one
+    # we just placed — deleting it would leave the host with no switch binary
+    # at all, on every run. Channels advance independently, so a post-rename
+    # installer WILL be pointed at a pre-rename manifest.
+    if cut -f1 "$records" | grep -qx gvproxy; then
+        return 0
+    fi
+    while IFS="$_tab" read -r _comp _dest _ _want; do
+        [ "$_comp" = gvproxy ] || continue
+        [ -n "$_dest" ] || continue
+        [ -f "$_dest" ] || continue
+        # A symlink row, or one we did not write, is not ours to remove.
+        [ -L "$_dest" ] && continue
+        case "$_want" in link:*) continue ;; esac
+        # No dry-run branch: --dry-run is an uninstall-only option, and
+        # uninstall is dispatched long before this runs.
+        if [ "$(sha256 "$_dest")" != "$_want" ]; then
+            say "  gvproxy: kept $_dest (modified since install; now shipped as gvproxy-min)"
+        elif rm -f "$_dest"; then
+            say "  gvproxy: removed $_dest (renamed to gvproxy-min)"
+        else
+            # Carry the row into this run's record so the next run retries.
+            # Without it the migration gets exactly one attempt — the record is
+            # replaced below — and a stale gvproxy would sit on PATH forever,
+            # which is the collision the rename exists to remove.
+            say "  gvproxy: could not remove $_dest; will retry on the next install"
+            printf '%s\t%s\t%s\t%s\n' "$_comp" "$_dest" "$_want" "$_want" >>"$records"
+        fi
+    done <"$prev_record"
+}
+remove_renamed_gvproxy
+
 # R6.1 — persist the resolved (component, dest, installed-hash) rows for this
 # platform, replacing the prior record read during the loop. Enables a future
 # uninstall and surfaces prefix drift across XDG changes.
