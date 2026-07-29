@@ -633,6 +633,28 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     }
 }
 
+/// Whether to announce the resolved or freshly created session on stderr
+/// before handing off to the interactive shell. Suppressed under `--no-input`
+/// and when stderr is not a terminal, so scripted and CI callers — which read
+/// the session id from stdout — see nothing extra.
+fn should_announce_session(global: &GlobalArgs) -> bool {
+    !global.no_input && std::io::stderr().is_terminal()
+}
+
+/// A one-line identity for a session in an attach/create confirmation: the
+/// session name plus a short id in parentheses, or just the short id when the
+/// session is unnamed. The short id is the leading block of the UUID — enough
+/// to tell two same-named sessions built from the same directory apart without
+/// the full 36-character id.
+fn session_announce_label(id: &sessions::SessionId, name: Option<&str>) -> String {
+    let id = id.to_string();
+    let short = id.split('-').next().unwrap_or(&id);
+    match name {
+        Some(name) => format!("{name} ({short})"),
+        None => short.to_string(),
+    }
+}
+
 /// The default action for a bare `min` (no subcommand): get the operator into
 /// a session for the current directory with the least ceremony.
 ///
@@ -1646,7 +1668,16 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     println!("{id}");
 
     if args.attach {
-        // Chain into attach.
+        // Chain into attach. Announce the freshly created session first: the
+        // bare id printed to stdout above is the scripting contract, while this
+        // stderr line tells an interactive operator which session they just
+        // created and are entering.
+        if should_announce_session(global) {
+            eprintln!(
+                "Created session {}",
+                session_announce_label(&id, args.name.as_deref())
+            );
+        }
         let attach_args = AttachArgs {
             session: Some(id.to_string()),
             command: None,
@@ -1757,7 +1788,18 @@ async fn resolve_smart_attach(
     let cwd = attach::cwd_host_path(global)?;
     match attach::resolve_for_attach(&resp.sessions, &cwd) {
         attach::SmartResolve::NoSessions => Ok(None),
-        attach::SmartResolve::Attach(entry) => Ok(Some(entry)),
+        attach::SmartResolve::Attach(entry) => {
+            // Unambiguous auto-resolve: the operator never chose this session,
+            // so tell them which one they're landing in. The picker path below
+            // needs no such line — the selection is its own confirmation.
+            if should_announce_session(global) {
+                eprintln!(
+                    "Attaching to session {}",
+                    session_announce_label(&entry.id, entry.name.as_deref())
+                );
+            }
+            Ok(Some(entry))
+        }
         attach::SmartResolve::Pick(cands) => {
             if global.no_input || !attach::can_pick_interactively() {
                 bail!(attach::ambiguous_no_input_message(&cands, &cwd));
@@ -2565,6 +2607,17 @@ mod tests {
             "expected an actionable non-TTY error, got: {err}"
         );
         ensure_interactive_attach_tty(true).expect("a real terminal must pass the guard");
+    }
+
+    /// The attach/create confirmation prefers the session name and appends a
+    /// short id so two same-named sessions built from the same directory are
+    /// still distinguishable; an unnamed session falls back to the short id
+    /// alone rather than the full 36-character UUID.
+    #[test]
+    fn session_announce_label_prefers_name_with_short_id() {
+        let id = sessions::SessionId::parse_str("a1b2c3d4-0000-0000-0000-000000000000").unwrap();
+        assert_eq!(session_announce_label(&id, Some("api")), "api (a1b2c3d4)");
+        assert_eq!(session_announce_label(&id, None), "a1b2c3d4");
     }
 
     /// A VM-backed provider dir carries the guest's recorded host key, so
