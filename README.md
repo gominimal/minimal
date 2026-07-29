@@ -85,7 +85,7 @@ min init
 min add --session git gh claude-code
 
 # start and enter a sandbox, which copies up the CWD file tree into the sandbox
-min activate --attach .
+min session activate --attach .
 
 git init
 
@@ -112,7 +112,7 @@ min add --session git gh claude-code mermaid-cli kittyview less emacs
 security find-generic-password -w -s "PAT-foo-repo" -a "my-mac-user-name" | pbcopy
 
 # start and enter a sandbox, which copies up the CWD file tree into the sandbox
-min activate --attach .
+min session activate --attach .
 
 git init
 
@@ -145,7 +145,7 @@ cd ~/projects/foo
 git pull
 
 # don't copy any files up; we'll git pull inside the sandbox
-min activate --attach --sync none .
+min session activate --attach --sync none .
 
 # tell claude to pull https://github.com/<your-owner>/<your-repo>.git
 # then add new features, fix bugs, etc.
@@ -173,7 +173,7 @@ EDITOR = "hx"
 TERM   = { inherit = true, default = "xterm-256color" }
 ```
 
-Apply one with `min activate --loadout dev --attach .`, or list it in
+Apply one with `min session activate --loadout dev --attach .`, or list it in
 `default_loadouts` under `[loadouts]` in `~/.config/minimal/config.toml` to have it join every
 session automatically. `min loadout list` shows what's available. The full
 schema (file patches, lifecycle hooks, environment-variable inheritance,

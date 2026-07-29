@@ -1262,7 +1262,7 @@ impl Composition {
 /// [`WireComposition`](crate::wire::request::WireComposition)
 /// snapshot. The daemon writes the snapshot at composition-assembly
 /// time and reads it back at spawn-from-disk so a restart re-applies
-/// the exact composition that was approved at `min activate` time.
+/// the exact composition that was approved at `min session activate` time.
 ///
 /// Fallible only on lifecycle hooks (a wire hook with no callbacks
 /// is rejected); vars, patches, and packages convert infallibly via

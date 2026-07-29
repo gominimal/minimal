@@ -1131,11 +1131,11 @@ impl Session {
                 // requires. `finalize`'s per-op guard will refuse
                 // any later attempt against this Materializing
                 // record, so the operator has to destroy it and
-                // re-activate through `min activate`, which drives
+                // re-activate through `min session activate`, which drives
                 // the full flow.
                 return Err(AttachError::LoadoutFailed(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "composition has patches that can only be uploaded via `min activate` \
+                    "composition has patches that can only be uploaded via `min session activate` \
                      (ConfigureLoadout → WorkspacePatchesTarZst → FinalizeSession); \
                      the attach shortcut can't drive that sequence — destroy this session \
                      and re-activate through the CLI",
@@ -1739,7 +1739,7 @@ mod tests {
     /// Attaching to a session whose loadout was never configured must not
     /// blow up: nothing is in flight on a bare `Draft`, so the attach
     /// configures it with an empty contribution on the way in and mints the
-    /// shell as usual. Guards the `min activate` → `min attach` path against
+    /// shell as usual. Guards the `min session activate` → `min session attach` path against
     /// a caller that never reached the compose step (a compose failure
     /// leaves the actor `Draft` — attach has to still land it live), and
     /// any internal caller that only ever wanted a session to run something

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive an interactive `min attach` over a REAL pty, like a user at a terminal.
+"""Drive an interactive `min session attach` over a REAL pty, like a user at a terminal.
 
 The session-exit path shows a Detach/Delete prompt (`async_dialog::Select`) and
 reads the answer as keystrokes from the channel. A piped stdin cannot answer it
@@ -10,7 +10,7 @@ interactive teardown a user performs.
 
 Usage: e2e-attach-pty.py <add_tool> <argv...>
   <add_tool>  package to `min add` (also its binary + `--version` subject)
-  <argv...>   the command to spawn under the pty, e.g. `min --provider local-minvmd attach <sid>`
+  <argv...>   the command to spawn under the pty, e.g. `min --provider local-minvmd session attach <sid>`
 
 Prints the full captured terminal output on stdout. Exits 0 iff the attach
 process exited 0.

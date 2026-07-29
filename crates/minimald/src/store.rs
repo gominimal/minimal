@@ -285,7 +285,7 @@ impl SessionRecordHandle {
     /// Atomically persists the composition snapshot for this session
     /// (tmp + rename). Called at composition-assembly time so a
     /// restart can re-apply the exact composition that was approved at
-    /// `min activate` time.
+    /// `min session activate` time.
     pub async fn store_composition(
         &self,
         composition: &sessions::core::compose::Composition,

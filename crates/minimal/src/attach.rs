@@ -1,6 +1,6 @@
 //! Smart session resolution and the interactive attach picker.
 //!
-//! When `min attach` is invoked without a session reference (or `min` is
+//! When `min session attach` is invoked without a session reference (or `min` is
 //! invoked bare), the client has to decide which session to attach to. The
 //! rules (issue #837) prefer a session built from the current working
 //! directory, fall back to the only session in the store when exactly one
@@ -46,7 +46,7 @@ pub(crate) enum SmartResolve {
     /// directly to this session.
     Attach(ListSessionsEntry),
     /// No sessions exist at all. The caller decides whether to error
-    /// (`min attach`) or activate a new session (bare `min`).
+    /// (`min session attach`) or activate a new session (bare `min`).
     NoSessions,
     /// More than one candidate; the caller must pick. The candidates are
     /// already limited to cwd-matches when any matched, else the full list.
@@ -233,7 +233,7 @@ pub(crate) fn ambiguous_no_input_message(
             .unwrap_or_else(|| "(unknown)".to_string());
         out.push_str(&format!("  {id}  {name}  {path}{cwd_marker}\n", id = c.id));
     }
-    out.push_str("Pass a session id or name explicitly: `min attach <id>`.");
+    out.push_str("Pass a session id or name explicitly: `min session attach <id>`.");
     out
 }
 
@@ -431,7 +431,7 @@ mod tests {
         assert!(msg.contains("019f5d0f-0a99-78b1-9165-0809440f0052"));
         assert!(msg.contains("019f5d0f-0a99-78b1-9165-0809440f0066"));
         assert!(msg.contains("(cwd)"));
-        assert!(msg.contains("min attach <id>"));
+        assert!(msg.contains("min session attach <id>"));
     }
 
     /// An entry from an older daemon that predates `project_path` (the field

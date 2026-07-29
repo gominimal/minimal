@@ -23,7 +23,7 @@ verdicts that come back.
 The daemon-side compose runs off the project files in the session's
 *daemon-side workspace*, and the composition's approved patches
 must land on the daemon's disk before the session is attachable —
-so `min activate` splits into four sequential RPCs bracketed by
+so `min session activate` splits into four sequential RPCs bracketed by
 two file-tree uploads:
 
 ```mermaid

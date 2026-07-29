@@ -348,7 +348,7 @@ soak n="10": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
 
 # Each pass uploads a 49 MiB project (~13 MB on the wire) and destroys its session.
 #
-# Bulk host→guest upload proof (#869): N `min activate`s of a large, compressible project.
+# Bulk host→guest upload proof (#869): N `min session activate`s of a large, compressible project.
 bulk-upload n="5": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/bulk-upload-e2e.sh {{n}}
 
@@ -409,7 +409,7 @@ up: minimald-build minimal-cli gvproxy && (_smoke "--minimal-dir" native-dir)
     # `activate` sandbox dies at uid_map EPERM until it's installed.
     just _userns-check || true
     echo "up: host-native minimald at $sock (pid $(cat "$pidf"))"
-    echo "  own-IP demo: min --minimal-dir {{native-dir}} activate -n net1 --network own-ip . && min --minimal-dir {{native-dir}} attach net1"
+    echo "  own-IP demo: min --minimal-dir {{native-dir}} session activate -n net1 --network own-ip . && min --minimal-dir {{native-dir}} session attach net1"
 
 # Bring the stack up: native Linux + one Linux VM over KVM (stop with `just stop`).
 [linux]

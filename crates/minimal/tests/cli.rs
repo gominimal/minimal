@@ -322,7 +322,7 @@ async fn upload_workspace_files_surfaces_daemon_unpack_error() {
 
 // --- attach (smart resolution) ---
 
-/// `min activate` with no positional path but `-C/--repo-dir` set uploads
+/// `min session activate` with no positional path but `-C/--repo-dir` set uploads
 /// from the repo-dir directory, not the process cwd (#873).
 #[tokio::test]
 async fn activate_uses_repo_dir_when_no_positional_path() {
@@ -371,7 +371,7 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
     assert_eq!(hello, b"hello world");
 }
 
-/// `min attach` with no session argument and `--no-input` errors cleanly when
+/// `min session attach` with no session argument and `--no-input` errors cleanly when
 /// no sessions exist, rather than hanging or shelling out to ssh. The error
 /// surfaces before any ssh exec, so it is deterministic in a test environment.
 #[tokio::test]
@@ -395,7 +395,7 @@ async fn attach_with_no_session_errors_when_no_sessions_exist() {
     );
 }
 
-/// `min attach` with no session argument and `--no-input` errors with a list
+/// `min session attach` with no session argument and `--no-input` errors with a list
 /// of candidates when more than one session shares the current directory,
 /// rather than opening a picker. Both sessions are built from the same
 /// canonicalized tempdir so the cwd match is deterministic across platforms.
@@ -433,7 +433,7 @@ async fn attach_with_no_session_errors_when_ambiguous_and_no_input() {
     assert!(err.contains("amb-1"), "candidates list names: {err}");
     assert!(err.contains("amb-2"), "candidates list names: {err}");
     assert!(
-        err.contains("min attach <id>"),
+        err.contains("min session attach <id>"),
         "should suggest explicit attach, got: {err}"
     );
 }

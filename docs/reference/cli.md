@@ -26,6 +26,37 @@ drive it directly with the **`mip`** CLI.
 | `minimald` | Host daemon: serves sessions to `min` over SSH-on-UDS | [minimald](./cli-minimald.md) |
 | `minvmd` | VM daemon: boots the Linux microVM that hosts `minimald` | [minvmd](./cli-minvmd.md) |
 
+## Command naming convention {#command-naming-convention}
+
+Commands are spelled **`<noun> <verb>`**: `min session activate`,
+`min session policy`, `min loadout list`, `mip package build`. The noun names
+the thing being acted on; the verb names the action.
+
+Three rules follow from that:
+
+1. **Every noun accepts its singular and plural form.** `session`/`sessions`,
+   `loadout`/`loadouts`, `package`/`packages` (which also keeps `pkg`). Both
+   spellings are visible in `--help`, so neither is a hidden alias you have to
+   know about.
+2. **Verbs are shared across nouns, not owned by one.** `list`, `stop`,
+   `build`, and friends mean the same thing wherever they appear, so
+   `<noun> list` is guessable for any noun that has a list.
+3. **New surface gets a noun.** Reach for an existing noun before inventing
+   one; a genuinely new kind of thing gets a new noun rather than a new bare
+   verb at the top level.
+
+### Documented exceptions
+
+A few high-traffic forms stay bare at the top level. These are deliberate
+ergonomic choices, not leftovers — do not "fix" them:
+
+| Form | Why it stays |
+|------|--------------|
+| `min` (no subcommand) | Resolve-or-activate-and-attach for the current directory: the single most common thing anyone does with `min`. |
+| `min ls` | The highest-traffic command in the CLI; the break is not worth the consistency. |
+| `min stop` | Acts on the daemon backend rather than any session, and is the daemon-lifecycle command people reach for. |
+| `min init`, `min add`, `min update` | Passthroughs to the `mip` commands of the same name; keeping the spelling identical across the two CLIs beats the hierarchy. |
+
 ## Platform availability
 
 - **Linux**: installs ship `min`, `mip`, and `minimald`. `minimald` runs

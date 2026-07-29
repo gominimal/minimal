@@ -5,7 +5,7 @@
 #
 # Try it:
 #   cargo build -p minimal -p minimald
-#   ./target/debug/min activate crates/sessions/example_project --attach
+#   ./target/debug/min session activate crates/sessions/example_project --attach
 #
 # Then inside the session:
 #

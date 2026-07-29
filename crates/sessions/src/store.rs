@@ -161,7 +161,7 @@ pub trait Loader {
     /// Atomically persists the composition snapshot for the session
     /// at `key` (tmp + rename, same crash-safety as [`Self::save`]).
     /// Called at composition-assembly time so a restart can re-apply
-    /// the exact composition that was approved at `min activate` time.
+    /// the exact composition that was approved at `min session activate` time.
     ///
     /// # Errors
     ///
