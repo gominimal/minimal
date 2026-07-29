@@ -68,7 +68,7 @@ is silenced identically to the existing `signal_child` behaviour; unexpected
 errors (`EPERM`, `EINVAL`) are logged via `tracing::warn!`.
 
 **R1.3** `stop()` and `GvproxySwitch::Drop` signal via `signal_pidfd`. The
-`stopping` atomic and its acquire/release ordering are unchanged, they continue
+`stopping` atomic and its get/release ordering are unchanged, they continue
 to classify exits as intentional vs. unexpected in `supervise_switch`.
 
 **R1.4** A new test `pidfd_signal_to_reaped_child_returns_esrch` spawns a

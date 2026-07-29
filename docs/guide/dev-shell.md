@@ -84,7 +84,7 @@ on_activate = { type = "inline", value = "cargo fetch >/dev/null 2>&1 || true" }
 
 ## Session lifecycle
 
-Exit the shell to detach; the session keeps running in the background. To reattach, list, or tear down sessions:
+Exit the shell to detach; the session keeps running in the background. To reattach, list, or remove sessions:
 
 ```shell
 $ min session attach            # reattach to a session (resolves from the current directory)

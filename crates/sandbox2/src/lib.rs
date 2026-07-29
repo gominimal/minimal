@@ -44,7 +44,24 @@ impl Channel for () {
     }
 }
 
-const SESSION_DEFAULT_WD: &str = "workbench";
+/// The name of the working directory inside a session sandbox: the host
+/// directory given to [`Config::with_session_dirs`] is bind-mounted at
+/// `/{SESSION_DEFAULT_WD}` unless the config overrides the name.
+///
+/// Exported so callers that have to translate between a path typed inside the
+/// sandbox and the host directory backing it agree with the mount on where it
+/// lives.
+///
+/// [`Config::with_session_dirs`]: config::Config::with_session_dirs
+pub const SESSION_DEFAULT_WD: &str = "workbench";
+
+/// The name of the home directory inside a session sandbox: the host directory
+/// given to [`Config::with_session_dirs`] is bind-mounted at `/{SESSION_HOME}`.
+///
+/// Exported for the same reason as [`SESSION_DEFAULT_WD`].
+///
+/// [`Config::with_session_dirs`]: config::Config::with_session_dirs
+pub const SESSION_HOME: &str = "home";
 
 /// An initialized sandbox.
 ///
@@ -241,7 +258,7 @@ impl<C: Channel> Sandbox<C> {
                 );
                 fs::create_dir_all(&rootfs_cwd)
                     .map_err(|e| Error::IO("create cwd", rootfs_cwd, e))?;
-                let rootfs_home = rootfs.join("home");
+                let rootfs_home = rootfs.join(SESSION_HOME);
                 fs::create_dir_all(&rootfs_home)
                     .map_err(|e| Error::IO("create home", rootfs_home.clone(), e))?;
             }
@@ -379,6 +396,23 @@ impl Container {
             command.env("XDG_CONFIG_HOME", "/home/.config");
             command.env("XDG_DATA_HOME", "/home/.local/share");
             command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin"); // adds /home/.local/bin
+            // A styled default shell prompt for interactive sessions. Set as a
+            // plain default here (not forced) so a user's composition var can
+            // override it: the composed `env_vars` are applied further down and
+            // win on key collision.
+            command.env(
+                "PS1",
+                r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ ",
+            );
+            // Login-shell identity, mirroring what sshd/pam would set from
+            // `/etc/passwd`. `USER`/`LOGNAME` track the configured username;
+            // `SHELL` points at the session shell (the `bash` package installs
+            // to `/usr/bin/bash`). All plain defaults, so composition vars win.
+            if let Some(user) = &sandbox.config.username {
+                command.env("USER", user);
+                command.env("LOGNAME", user);
+            }
+            command.env("SHELL", "/usr/bin/bash");
         } else {
             // Both build and BoundWd layouts
             command.env("XDG_STATE_HOME", "/state/state");
@@ -413,8 +447,19 @@ impl Container {
             command.env("PYTHONHASHSEED", "0");
         }
 
-        command.env("LANG", "en_US.utf8");
-        command.env("LC_ALL", "en_US.utf8");
+        // Locale. Sessions get a safe, always-present `C.UTF-8` floor: it's
+        // built into glibc so it never triggers "cannot set locale" warnings
+        // the way `en_US.utf8` does when that locale isn't generated in the
+        // rootfs, and setting only `LANG` (the lowest-precedence locale knob,
+        // no `LC_ALL`) lets a session's composed `env_vars` or a client's
+        // forwarded `LANG`/`LC_*` override it. Build/task sandboxes keep the
+        // fixed `en_US.utf8` + `LC_ALL` they always had, for output stability.
+        if let WdSetup::Session { .. } = &sandbox.config.wd {
+            command.env("LANG", "C.UTF-8");
+        } else {
+            command.env("LANG", "en_US.utf8");
+            command.env("LC_ALL", "en_US.utf8");
+        }
         command.env("IS_SANDBOX", "1");
         if let WdSetup::BoundDir { .. } = sandbox.config.wd {
             //  Quality-of-life wiring for task sandboxes
@@ -668,10 +713,10 @@ impl<C: Channel> Sandbox<C> {
                 working,
                 working_name_override,
             } => {
-                // mount the given home path to /home
+                // mount the given home path to /{SESSION_HOME}
                 Self::bind_mount(
                     home,
-                    "/home",
+                    &format!("/{SESSION_HOME}"),
                     BindOpts {
                         recursive: true,
                         read_only: false,
@@ -1313,9 +1358,9 @@ fn userns_restriction_from(
     euid_is_root: bool,
     apparmor_label: Option<&str>,
 ) -> Option<UsernsRestriction> {
-    if !max_user_namespaces
+    if max_user_namespaces
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .is_some_and(|n| n > 0)
+        .is_none_or(|n| n == 0)
     {
         return Some(UsernsRestriction::Disabled);
     }

@@ -97,7 +97,7 @@ production adoption at the subnet-router level.
   an implementation-specific feature. Both wireguard-go and boringtun support it
   identically: set `AllowedIPs = 100.64.0.0/16` (the gvproxy switch subnet) on
   remote peers. The implementation-level difference between the two is nil for
-  this use case. Tailscale's "battle-tested subnet-router" advantage lies in
+  this use case. Tailscale's "mature subnet-router" advantage lies in
   their coordination and ACL layer, not in wireguard-go itself, which minimald
   does not need in v1 (manual key exchange per R4.1).
 - **Rust integration:** `cargo add boringtun` in the workspace `Cargo.toml`.
@@ -158,7 +158,7 @@ with no impact on binary size or startup time when unconfigured.
 
 **boringtun is the recommended choice for minimald v1.**
 
-The hypothesis is partially supported, wireguard-go is more battle-tested at
+The hypothesis is partially supported, wireguard-go is more mature at
 Tailscale's scale, and Go toolchain presence does reduce the raw toolchain
 footprint for cgo. However, the hypothesis underestimates two factors:
 
@@ -183,7 +183,7 @@ boringtun's integration advantages for a Rust project:
 | Cross-compilation | High, C cross-compiler | Medium, separate binary | Low, Rust toolchain |
 | Process count | Same (in-proc) | +1 (alongside gvproxy) | Same (in-proc) |
 | Production subnet-router | Tailscale-scale | Tailscale-scale | Cloudflare/Mullvad-scale |
-| Maintenance risk | Low | Low | Low–Medium (gap resolved in 2026) |
+| Maintenance risk | Low | Low | Low-Medium (gap resolved in 2026) |
 
 If boringtun's maintenance pace declines materially or the v1 manual-key-exchange
 model is replaced with Tailscale-style coordination, revisiting wireguard-go via
@@ -194,7 +194,7 @@ subprocess (not via cgo) is the recommended escalation path.
 **Status: partial.**
 
 The hypothesis holds for the production maturity claim: wireguard-go, via
-Tailscale's derivative, is more extensively battle-tested for the subnet-router
+Tailscale's derivative, is more extensively tested for the subnet-router
 model than boringtun. This is confirmed.
 
 The "reduced marginal CI cost" claim is partially confirmed (Go toolchain is
@@ -239,10 +239,10 @@ approach's in-process integration benefit.
    - `networking-with-diagrams.md` deployment-model diagram, `LapWG` node
      (line 503): "wireguard-go peer (bundled in minimal CLI)" → "boringtun peer
      (bundled in minimal CLI)"
-   - `networking-with-diagrams.md` Option A prose (lines 585–588): "Each
+   - `networking-with-diagrams.md` Option A prose (lines 585-588): "Each
      minimald is a wireguard-go peer" → "Each minimald is a boringtun peer";
      "wireguard-go is bundled" → "boringtun is bundled"
-3. **Workspace dependency pin:** When Unit 4 implementation begins, pin
+3. **Workspace dependency pin:** When Unit 4 implementation starts, pin
    `boringtun` in `[workspace.dependencies]` with `features = []` and add it to
    `minimald/Cargo.toml` behind the `wg` feature flag.
 4. **Risk register entry:** Note that boringtun exhibited an ~30-month release

@@ -554,6 +554,15 @@ pub struct ResolvedVar {
     /// - [`VarValue::InheritWithDefault`] with env-hit → `true`
     /// - [`VarValue::InheritWithDefault`] falling back to default → `false`
     carries_user_data: bool,
+    /// The original, pre-resolution spec. Preserved so a daemon-side
+    /// composer can ship an inherited var to the client *as an
+    /// `Inherit`/`InheritWithDefault` spec* (see
+    /// `contribution_to_pending`) rather than baking in its own
+    /// resolved value — the client must always resolve inherited vars
+    /// against the *user's* env. Terminal constructors (already-
+    /// resolved values that never get re-shipped) record it as a
+    /// [`VarValue::Specified`] of the resolved value.
+    spec: VarValue,
 }
 
 impl ResolvedVar {
@@ -578,6 +587,14 @@ impl ResolvedVar {
         self.carries_user_data
     }
 
+    /// The original, pre-resolution spec. `contribution_to_pending`
+    /// uses this to hand an inherited var back to the client for
+    /// user-env resolution instead of shipping the daemon's value.
+    #[must_use]
+    pub fn spec(&self) -> &VarValue {
+        &self.spec
+    }
+
     /// Construct a [`ResolvedVar`] whose value came directly from a
     /// host env lookup, so `carries_user_data` is true. Used by
     /// callers that already ran their own env lookup and need to
@@ -588,6 +605,7 @@ impl ResolvedVar {
     pub fn from_env_value(name: String, value: String) -> Self {
         Self {
             name,
+            spec: VarValue::specified(value.clone()),
             value,
             carries_user_data: true,
         }
@@ -600,6 +618,7 @@ impl ResolvedVar {
     pub fn from_literal(name: String, value: String) -> Self {
         Self {
             name,
+            spec: VarValue::specified(value.clone()),
             value,
             carries_user_data: false,
         }
@@ -614,6 +633,7 @@ impl ResolvedVar {
     pub fn from_env_value_or_literal(name: String, value: String, carries_user_data: bool) -> Self {
         Self {
             name,
+            spec: VarValue::specified(value.clone()),
             value,
             carries_user_data,
         }
@@ -650,6 +670,10 @@ impl ResolvedVar {
     where
         F: FnOnce(&str) -> Result<String, std::env::VarError>,
     {
+        // Retain the pre-resolution spec so a daemon-side composer can
+        // forward it verbatim for the client to resolve against the
+        // user's env (see `contribution_to_pending`).
+        let spec = value.clone();
         let (resolved_value, carries_user_data) = match value {
             VarValue::Specified { value } => (value, false),
             VarValue::Inherit => {
@@ -674,6 +698,7 @@ impl ResolvedVar {
             name,
             value: resolved_value,
             carries_user_data,
+            spec,
         })
     }
 
@@ -708,6 +733,7 @@ impl From<crate::wire::primitives::WireResolvedVar> for ResolvedVar {
     fn from(v: crate::wire::primitives::WireResolvedVar) -> Self {
         Self {
             name: v.name,
+            spec: VarValue::specified(v.value.clone()),
             value: v.value,
             carries_user_data: v.carries_user_data,
         }
@@ -722,6 +748,16 @@ impl From<crate::wire::primitives::WireVarSpec> for VarValue {
             crate::wire::primitives::WireVarSpec::InheritWithDefault { default } => {
                 Self::InheritWithDefault { default }
             }
+        }
+    }
+}
+
+impl From<VarValue> for crate::wire::primitives::WireVarSpec {
+    fn from(spec: VarValue) -> Self {
+        match spec {
+            VarValue::Specified { value } => Self::Specified { value },
+            VarValue::Inherit => Self::Inherit,
+            VarValue::InheritWithDefault { default } => Self::InheritWithDefault { default },
         }
     }
 }

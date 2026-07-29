@@ -1,5 +1,6 @@
 //! The minimal CLI which pairs/talks-with minimald.
 
+use std::io::IsTerminal as _;
 use std::process::ExitCode;
 
 use clap::{CommandFactory as _, Parser};
@@ -45,19 +46,24 @@ async fn run() -> ExitCode {
     let cli = minimal::Cli::parse();
 
     let registry = tracing_subscriber::registry().with(filter);
-    // `completions` joins the completion handler on stderr: its stdout is a
-    // contract — the shim to `source`, or the installed paths the installer
-    // records — and a log line landing in it would be read as content.
-    if matches!(
-        cli.command,
-        Some(minimal::Command::CompleteSessionStr(_) | minimal::Command::Completions(_))
-    ) {
+    // Commands whose stdout is a data contract route tracing to stderr, so a log
+    // line never lands in captured output. ANSI is gated on the destination
+    // being a real terminal, so a redirected stream carries no escape codes.
+    if stdout_is_data_contract(&cli.command) {
         registry
-            .with(fmt::layer().with_writer(std::io::stderr))
+            .with(
+                fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_ansi(std::io::stderr().is_terminal()),
+            )
             .init();
     } else {
         registry
-            .with(fmt::layer().with_writer(ot::StdoutWriter::new))
+            .with(
+                fmt::layer()
+                    .with_writer(ot::StdoutWriter::new)
+                    .with_ansi(std::io::stdout().is_terminal()),
+            )
             .init();
     }
 
@@ -66,4 +72,49 @@ async fn run() -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// Whether the command's stdout is a data contract that tracing must not
+/// pollute, so its logs go to stderr instead. The `completions` handlers emit a
+/// shell shim on stdout, and `session attach -c` carries only the exec'd
+/// command's output — a log line in either would be read as content.
+fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
+    matches!(
+        command,
+        Some(
+            minimal::Command::CompleteSessionStr(_)
+                | minimal::Command::Completions(_)
+                | minimal::Command::Session(minimal::SessionArgs {
+                    command: minimal::SessionCommand::Attach(minimal::AttachArgs {
+                        command: Some(_),
+                        ..
+                    }),
+                })
+        )
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minimal::{AttachArgs, Command, SessionArgs, SessionCommand};
+
+    fn attach(command: Option<&str>) -> Option<Command> {
+        Some(Command::Session(SessionArgs {
+            command: SessionCommand::Attach(AttachArgs {
+                session: None,
+                command: command.map(str::to_owned),
+            }),
+        }))
+    }
+
+    #[test]
+    fn attach_with_command_is_a_stdout_contract() {
+        assert!(stdout_is_data_contract(&attach(Some("min check"))));
+    }
+
+    #[test]
+    fn interactive_attach_is_not_a_stdout_contract() {
+        assert!(!stdout_is_data_contract(&attach(None)));
+    }
 }

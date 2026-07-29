@@ -130,6 +130,12 @@ min_check() {
     __min_rpc "check" "$@"
 }
 
+min_materialize() {
+    # The working directory leads the arguments so a relative --output
+    # can be resolved.
+    __min_rpc "materialize" "${PWD}%$*"
+}
+
 # If invoked directly as a script (not sourced), handle invocation
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     subcmd="$1"
@@ -150,12 +156,16 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         check)
             min_check "$@"
             ;;
+        materialize)
+            min_materialize "$@"
+            ;;
         *)
             echo "Usage: min <subcommand>" >&2
             echo "" >&2
             echo "Add packages: min add [--session|--build|--runtime] <packages>" >&2
             echo "Search for packages: min search <query>" >&2
             echo "Check minimal configuration: min check" >&2
+            echo "Materialize an output into the workspace: min materialize --output <path> [--arch <arch>] <output name>" >&2
             echo "Run a task: min run <task name>" >&2
             echo "Build packages: min package build <packages>" >&2
             echo "Try building a package (with potentially-stale dependencies): min package patched-build <package name>" >&2

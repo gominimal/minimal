@@ -236,7 +236,7 @@ paint.
   a per-request `UnixStream` rather than a `Channel<Msg>`, plus plumbing the real
   PTY `WinSize` down to supply `size`, is a separate follow-up.
 
-- **`StridesDriver`** (future), additive, Layers 1–2 untouched.
+- **`StridesDriver`** (future), additive, Layers 1-2 untouched.
 
 ## Migration plan
 

@@ -1,7 +1,7 @@
 //! The minimal CLI which pairs/talks-with minimald.
 
 use anyhow::{Context as _, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use clap_complete::Shell;
 use std::io::IsTerminal as _;
 use std::io::Write as _;
@@ -458,13 +458,10 @@ pub struct LsArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(ArgGroup::new("target").args(["session", "all"]).required(true).multiple(false)))]
 pub struct DestroyArgs {
     /// Session identifier (UUID or session name)
-    #[arg(
-        required_unless_present = "all",
-        conflicts_with = "all",
-        add = completion::session_completer()
-    )]
+    #[arg(add = completion::session_completer())]
     pub session: Option<String>,
     /// Destroy all sessions
     #[arg(long)]
@@ -744,7 +741,10 @@ async fn cmd_default(global: &GlobalArgs) -> Result<(), anyhow::Error> {
             // (or -C/--repo-dir if set) and chain into attach, mirroring
             // `min session activate --attach`. `cmd_activate` resolves the path from
             // `global.repo_dir` when no positional is given, matching the
-            // attach side's `cwd_host_path(global)`.
+            // attach side's `cwd_host_path(global)`. But refuse first when that
+            // chained attach could never run: creating then failing orphans the
+            // session (#1031).
+            ensure_activate_on_empty_allowed(global.no_input, std::io::stdin().is_terminal())?;
             drop(client);
             let activate_args = ActivateArgs {
                 name: None,
@@ -1828,6 +1828,25 @@ async fn resolve_smart_attach(
     }
 }
 
+/// Guard for bare `min` on an empty daemon: activating there chains straight
+/// into an interactive attach, which needs a TTY on stdin. Under `--no-input`,
+/// or when stdin is not a terminal, that attach can never succeed — so refuse
+/// before creating anything, emitting the same message the explicit
+/// `min session attach` produces, instead of creating a session and then
+/// failing the attach guard, which leaves the session orphaned (#1031).
+///
+/// Pure in its inputs so both branches are unit-testable without a controlled
+/// terminal.
+fn ensure_activate_on_empty_allowed(
+    no_input: bool,
+    stdin_is_tty: bool,
+) -> Result<(), anyhow::Error> {
+    if no_input || !stdin_is_tty {
+        bail!("no sessions exist; use 'min session activate' to create one");
+    }
+    Ok(())
+}
+
 /// Guard for the interactive attach path: the PTY-backed session shell must be
 /// driven from a real terminal. When stdin is not a TTY there is nothing to
 /// drive the remote shell and no EOF ever reaches it through the forced `-tt`
@@ -1873,9 +1892,27 @@ async fn attach_to_session(
     let [strict, known_hosts_file] = host_key_opts(&sock.with_file_name(paths::KNOWN_HOSTS_FILE));
 
     let mut ssh = std::process::Command::new("ssh");
+    // Pin the shell ssh uses to run the ProxyCommand. ssh launches a
+    // ProxyCommand via `$SHELL -c` and execs `$SHELL` with no PATH lookup, so a
+    // caller whose `$SHELL` is a bare name (`fish`) or points at a shell absent
+    // from this context fails with "<shell>: No such file or directory" and the
+    // transport dies at "banner exchange … Broken pipe". Our ProxyCommand is a
+    // full-path `min proxy …` that needs nothing but a POSIX `sh`, so force the
+    // always-present `/bin/sh` rather than inherit the user's interactive shell.
+    ssh.env("SHELL", "/bin/sh");
     ssh.env("MINIMAL_SESSION_ID", id.to_string()).args([
         "-o",
         "SendEnv=MINIMAL_SESSION_ID",
+        // Forward the user's locale and timezone into the session, mirroring a
+        // conventional `SendEnv LANG LC_* TZ`. The daemon accepts only these
+        // (its `AcceptEnv` allowlist) and folds them in below any loadout.
+        // `TERM` needs no `SendEnv`: ssh always carries it in the PTY request.
+        "-o",
+        "SendEnv=LANG",
+        "-o",
+        "SendEnv=LC_*",
+        "-o",
+        "SendEnv=TZ",
         "-o",
         &format!("ProxyCommand={proxy_cmd}"),
         "-o",
@@ -2707,6 +2744,25 @@ mod tests {
         ensure_interactive_attach_tty(true).expect("a real terminal must pass the guard");
     }
 
+    /// Bare `min` on an empty daemon must refuse before creating a session when
+    /// it could not follow through with the interactive attach — under
+    /// `--no-input` or over a non-TTY stdin — so it never orphans a session
+    /// (#1031). Only a plain interactive invocation proceeds to activate.
+    #[test]
+    fn bare_min_refuses_to_activate_on_empty_daemon_non_interactively() {
+        let err = ensure_activate_on_empty_allowed(true, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no sessions exist") && err.contains("min session activate"),
+            "expected the explicit-verb refusal, got: {err}"
+        );
+        ensure_activate_on_empty_allowed(false, false)
+            .expect_err("a non-TTY stdin must be refused even without --no-input");
+        ensure_activate_on_empty_allowed(false, true)
+            .expect("an interactive terminal without --no-input must be allowed to activate");
+    }
+
     /// The attach/create confirmation prefers the session name and appends a
     /// short id so two same-named sessions built from the same directory are
     /// still distinguishable; an unnamed session falls back to the short id
@@ -2799,6 +2855,31 @@ mod tests {
         let p = std::path::Path::new;
         assert_eq!(cli.global_args.repo_dir.as_deref(), Some(p("/tmp/x")));
         assert_eq!(cli.global_args.minimal_dir.as_deref(), Some(p("/tmp/y")));
+    }
+
+    /// `session destroy` must present `[SESSION]` and `--all` as mutually
+    /// exclusive alternatives, one required. Regression for #1038: the error
+    /// path used to hide `--all` and demand a session outright, yielding a
+    /// usage line that could never parse.
+    #[test]
+    fn destroy_models_session_and_all_as_required_alternatives() {
+        use clap::Parser as _;
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+
+        // Exactly one of a session or --all is required; both together conflict.
+        assert!(parse(&["min", "session", "destroy", "web"]).is_ok());
+        assert!(parse(&["min", "session", "destroy", "--all"]).is_ok());
+        assert!(parse(&["min", "session", "destroy"]).is_err());
+        assert!(parse(&["min", "session", "destroy", "--all", "web"]).is_err());
+
+        // --force only makes sense with --all, and its error no longer hides
+        // that --all is the alternative the bare error omitted.
+        assert!(parse(&["min", "session", "destroy", "--all", "--force"]).is_ok());
+        let bare = parse(&["min", "session", "destroy", "-f"])
+            .err()
+            .expect("-f without --all must fail to parse")
+            .to_string();
+        assert!(bare.contains("--all"), "usage must surface --all: {bare}");
     }
 
     #[test]

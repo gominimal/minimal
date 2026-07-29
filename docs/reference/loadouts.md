@@ -134,11 +134,11 @@ COLORTERM = { inherit = true }               # inherit from the host env
 
 - A **literal** string sets the variable to that value.
 - `{ inherit = true }` passes the variable through from the environment of
-  the `min` process on the host. If the host doesn't have it set, the
+  the `min` process on the host. If the host does not have it set, the
   variable is dropped from the session (with a warning) rather than failing
   activation, so opportunistically inheriting things like `TERM` is safe.
 - `{ inherit = true, default = "..." }` inherits, falling back to `default`
-  when the host doesn't have the variable set.
+  when the host does not have the variable set.
 
 `inherit = false` is rejected; omit the variable instead.
 

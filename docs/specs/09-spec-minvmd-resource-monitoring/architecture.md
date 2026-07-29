@@ -25,7 +25,7 @@ the next launch).
    persists to `config.toml` in the provider-instance dir, **separate from the
    runtime `State`** so a stop/crash reset cannot wipe it. `effective_vcpus()` /
    `effective_ram_mib()` resolve `env ?? config ?? default`; `vmm_child` boots
-   from them and `config show` reports them. The `Running` state additionally
+   from them and `config show` reports them. The `Running` state also
    records the resolved boot-time values (`State.booted_*`), and `status` reports
    *those* for a live VM.
 
