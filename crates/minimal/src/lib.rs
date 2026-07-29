@@ -1892,9 +1892,27 @@ async fn attach_to_session(
     let [strict, known_hosts_file] = host_key_opts(&sock.with_file_name(paths::KNOWN_HOSTS_FILE));
 
     let mut ssh = std::process::Command::new("ssh");
+    // Pin the shell ssh uses to run the ProxyCommand. ssh launches a
+    // ProxyCommand via `$SHELL -c` and execs `$SHELL` with no PATH lookup, so a
+    // caller whose `$SHELL` is a bare name (`fish`) or points at a shell absent
+    // from this context fails with "<shell>: No such file or directory" and the
+    // transport dies at "banner exchange … Broken pipe". Our ProxyCommand is a
+    // full-path `min proxy …` that needs nothing but a POSIX `sh`, so force the
+    // always-present `/bin/sh` rather than inherit the user's interactive shell.
+    ssh.env("SHELL", "/bin/sh");
     ssh.env("MINIMAL_SESSION_ID", id.to_string()).args([
         "-o",
         "SendEnv=MINIMAL_SESSION_ID",
+        // Forward the user's locale and timezone into the session, mirroring a
+        // conventional `SendEnv LANG LC_* TZ`. The daemon accepts only these
+        // (its `AcceptEnv` allowlist) and folds them in below any loadout.
+        // `TERM` needs no `SendEnv`: ssh always carries it in the PTY request.
+        "-o",
+        "SendEnv=LANG",
+        "-o",
+        "SendEnv=LC_*",
+        "-o",
+        "SendEnv=TZ",
         "-o",
         &format!("ProxyCommand={proxy_cmd}"),
         "-o",

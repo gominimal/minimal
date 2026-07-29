@@ -601,7 +601,7 @@ fn blocked_syn(frame: &[u8], allowed: &HashSet<u16>) -> Option<(u16, SocketAddrV
         return None;
     }
     let (syn, ack) = (pkt.tcp_flags & 0x02 != 0, pkt.tcp_flags & 0x10 != 0);
-    if !(syn && !ack) || allowed.contains(&pkt.dst.port()) {
+    if !syn || ack || allowed.contains(&pkt.dst.port()) {
         return None;
     }
     Some((pkt.dst.port(), pkt.src))
