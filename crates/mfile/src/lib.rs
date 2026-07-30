@@ -789,6 +789,12 @@ pub struct File {
 }
 
 impl File {
+    /// Parses a `minimal.toml` from raw bytes — the pure, filesystem-free core
+    /// of [`File::from_dir`], exposed for fuzzing (crates/mfile/fuzz) and tests.
+    pub fn from_toml_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        toml::from_slice(bytes).map_err(Error::Format)
+    }
+
     /// Searches from the given directory backwards to load the `minimal.toml` file.
     pub fn from_dir_recursive<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
         match Self::from_dir(&dir) {

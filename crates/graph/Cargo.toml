@@ -26,3 +26,11 @@ common.workspace = true
 checkouts.workspace = true
 decode.workspace = true
 mfile.workspace = true
+
+# Optional, enabled by the `fuzzing` feature for the in-crate round-trip fuzz
+# entry point (crates/graph/fuzz). Off in normal builds.
+arbitrary = { workspace = true, optional = true }
+
+[features]
+# Exposes `Graph::fuzz_roundtrip` for crates/graph/fuzz. Not for production use.
+fuzzing = ["dep:arbitrary"]
