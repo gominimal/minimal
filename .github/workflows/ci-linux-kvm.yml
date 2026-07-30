@@ -70,10 +70,14 @@ jobs:
               - "rust-toolchain.toml"
               - ".minimal/minimal.toml"
               - ".github/workflows/ci-linux-kvm.yml"
+              # The libkrun this lane builds from source and links statically:
+              # the pin and the carried patches are build inputs, so a bump to
+              # either must re-run the boot test.
+              - "vendor/libkrun/**"
               # Composite actions this lane's setup runs through — without
               # these, a composite-only edit would skip this lane and break
               # it post-merge.
-              - ".github/actions/setup-libkrun-linux/**"
+              - ".github/actions/build-libkrun-static-linux/**"
               - ".github/actions/materialize/**"
 
   build-linux:
@@ -117,10 +121,20 @@ jobs:
         # explicitly since we use --no-install-recommends. cpio: packs the
         # guest initramfs (scripts/build-initramfs.sh). git: source fetches
         # during the CLI build.
+        #
+        # musl-tools: musl-gcc, the linker for the static-musl minvmd this lane
+        # now builds and boots (scripts/build-libkrun-linux.sh and the cargo
+        # build below both need it).
         run: |
           sudo sh -c \
             'apt-get update && apt-get install -y --no-install-recommends \
-               protobuf-compiler libprotobuf-dev cpio git'
+               protobuf-compiler libprotobuf-dev cpio git musl-tools'
+
+      - name: Add musl target
+        # Installs into the rust-toolchain.toml-pinned toolchain, which is what
+        # build-libkrun-linux.sh resolves and carries across its cd into the
+        # fetched libkrun tree.
+        run: rustup target add x86_64-unknown-linux-musl
 
       - name: Install cross + nextest
         uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2
@@ -141,21 +155,32 @@ jobs:
           key: ${{ runner.os }}-x86_64-minvmd-kvm-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-x86_64-minvmd-kvm-
 
-      - name: Materialize libkrun prefix (upstream package)
-        # Needed at BUILD time: minvmd links libkrun.so (build.rs link search
-        # + the minvmd_libkrun cfg for the real, non-stub impl). The prefix is
-        # shipped in the testbed so the test job runs against the exact
-        # libraries this job linked. Runs after the cargo cache restore so the
-        # CLI build the cache fetch drives is incremental.
-        uses: ./.github/actions/setup-libkrun-linux
+      - name: Build static libkrun (musl)
+        # Needed at BUILD time: minvmd links libkrun (build.rs link search +
+        # the minvmd_libkrun cfg for the real, non-stub impl).
+        #
+        # STATIC, matching what Linux users receive. This lane is the only
+        # pre-merge proof that boots a real microVM, so it has to boot the
+        # linkage we distribute: a dynamic build here would leave the shipped
+        # static one first exercised by nightly, after merge. The merge and
+        # objcopy-localize pass that produces libkrun.a is exactly the kind of
+        # change that links clean and misbehaves at runtime, so it needs a boot
+        # test, not a symbol check.
+        uses: ./.github/actions/build-libkrun-static-linux
         with:
-          arch: x86_64
+          target: x86_64-unknown-linux-musl
 
       - name: Build guest initramfs (minimald as /init)
         run: ./scripts/build-initramfs.sh "$RUNNER_TEMP/initramfs.cpio" x86_64-unknown-linux-musl
 
-      - name: Build minvmd
-        run: cargo build -p minvmd --bin minvmd --locked
+      - name: Build minvmd (static musl)
+        # Same target and same linkage as the release build, so what boots
+        # below is what ships. MINVMD_REQUIRE_LIBKRUN=static makes a build.rs
+        # that failed to find libkrun.a a hard error instead of a silent stub
+        # that would "pass" every test by bailing at VM boot.
+        env:
+          MINVMD_REQUIRE_LIBKRUN: static
+        run: cargo build -p minvmd --bin minvmd --locked --target x86_64-unknown-linux-musl
 
       - name: Build the minimal CLI
         # SEPARATE invocation from the minvmd build: a combined `cargo build
@@ -169,19 +194,29 @@ jobs:
         # `cargo nextest archive` replaces the hand-rolled testbins.json
         # manifest: the archive carries every minvmd test binary with exec
         # bits intact, and the test job selects harnesses with filtersets.
-        # The sidecar files stay explicit — libkrun lives outside target/ (an
-        # archive cannot carry it), and the harnesses/CLI locate minvmd via
+        # The sidecar files stay explicit — the harnesses/CLI locate minvmd via
         # MINVMD_BIN / PATH (their compile-time CARGO_BIN_EXE path does not
         # exist on the test runner).
+        #
+        # The harnesses link libkrun too, so they are archived for the SAME
+        # musl target with the same requirement; a native-gnu archive would
+        # test a different binary than the one shipped. No libkrun sidecar
+        # travels with the testbed any more: it is inside these binaries.
+        env:
+          MINVMD_REQUIRE_LIBKRUN: static
         run: |
           set -euo pipefail
           mkdir -p testbed
-          cargo nextest archive -p minvmd --locked --archive-file testbed/nextest-archive.tar.zst
-          cp target/debug/minvmd testbed/minvmd
+          cargo nextest archive -p minvmd --locked \
+            --target x86_64-unknown-linux-musl \
+            --archive-file testbed/nextest-archive.tar.zst
+          cp target/x86_64-unknown-linux-musl/debug/minvmd testbed/minvmd
           cp target/debug/min testbed/min
           cp "$RUNNER_TEMP/initramfs.cpio" testbed/initramfs.cpio
-          # Ship the exact libkrun prefix the binaries were linked against.
-          tar czf testbed/libkrun-prefix.tgz -C "$LIBKRUN_PREFIX" .
+          # Prove it before it leaves this job: a dynamically-linked minvmd
+          # here means the lane silently stopped testing what we distribute.
+          file testbed/minvmd | grep -q 'statically linked' \
+            || { echo "::error::built minvmd is not statically linked"; file testbed/minvmd; exit 1; }
 
       - name: Upload testbed
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -251,23 +286,22 @@ jobs:
         # harnesses at the shipped minvmd (their baked CARGO_BIN_EXE path only
         # exists on the build runner); the testbed joins PATH so the CLI's
         # autospawn and the lifecycle script resolve minvmd/minimal by name.
-        # The libkrun prefix is unpacked to the same $HOME/.krun path the
-        # build linked (rpath) and exported for the dynamic loader; its
-        # krun_add_disk3 export was verified at build time by the
-        # setup-libkrun-linux composite — minvmd loading it here is the
-        # runtime backstop.
+        #
+        # No libkrun prefix, no LD_LIBRARY_PATH: minvmd links libkrun
+        # statically and dlopens nothing, so there is nothing for the loader to
+        # find. Asserted rather than assumed — if this binary ever goes back to
+        # a dynamic link, the VM boots below would start depending on host
+        # state that the shipped binary does not have.
         run: |
           set -euo pipefail
           TESTBED="$RUNNER_TEMP/testbed"
           chmod +x "$TESTBED/minvmd" "$TESTBED/min"
-          mkdir -p "$HOME/.krun"
-          tar xzf "$TESTBED/libkrun-prefix.tgz" -C "$HOME/.krun"
+          file "$TESTBED/minvmd" | grep -q 'statically linked' \
+            || { echo "::error::testbed minvmd is not statically linked"; file "$TESTBED/minvmd"; exit 1; }
           echo "$TESTBED" >> "$GITHUB_PATH"
           {
             echo "TESTBED=$TESTBED"
             echo "MINVMD_BIN=$TESTBED/minvmd"
-            echo "LIBKRUN_PREFIX=$HOME/.krun"
-            echo "LD_LIBRARY_PATH=$HOME/.krun${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             echo "MINVMD_E2E=1"
             echo "MINVMD_KERNEL_PATH=$RUNNER_TEMP/vmlinuz"
             echo "MINVMD_ROOTFS_PATH=$RUNNER_TEMP/rootfs.img"
