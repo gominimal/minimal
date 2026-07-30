@@ -1,0 +1,39 @@
+# Standalone fuzz workspace for the `common` crate. Its own `[workspace]` keeps
+# the nightly/sanitizer build off the main workspace.
+[package]
+name = "common-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.common]
+path = ".."
+
+[[bin]]
+name = "spec_hash_from_hex"
+path = "fuzz_targets/spec_hash_from_hex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "target_from_str"
+path = "fuzz_targets/target_from_str.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jq_parse_json"
+path = "fuzz_targets/jq_parse_json.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

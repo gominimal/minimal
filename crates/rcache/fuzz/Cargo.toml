@@ -1,0 +1,25 @@
+# Standalone fuzz workspace for the `rcache` crate. Its own `[workspace]` keeps
+# the nightly/sanitizer build off the main workspace; excluded from root members.
+[package]
+name = "rcache-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.rcache]
+path = ".."
+
+[[bin]]
+name = "remote_index_from_reader"
+path = "fuzz_targets/remote_index_from_reader.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

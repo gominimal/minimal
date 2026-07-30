@@ -25,6 +25,9 @@ native-dir   := scratch / "native-state"
 # Linux-only): scope to the darwin-capable crates there; `just test-cross`
 # covers the rest. The Linux lanes run nextest's ci profile; macOS has none.
 scope      := if os() == "macos" { "-p minvmd -p sessions" } else { "--workspace" }
+# Crates carrying a `fuzz/` workspace. `rcache` is Linux-only: it pulls in
+# `lcache`, which uses the Linux-only `common::renameat2`.
+fuzz-crates := if os() == "macos" { "args common graph mfile" } else { "args common graph mfile rcache" }
 ci-profile := if os() == "macos" { "" } else { "--profile ci" }
 e2e-env    := "E2E_VM=1 E2E_PROJECT_DIR=/tmp" + if os() == "linux" { " E2E_MINIMAL_ARGS='--provider local-minvmd'" } else { "" }
 
@@ -193,6 +196,30 @@ msrv: (_need "cargo-hack" "cargo install cargo-hack --locked")
 # CI: nightly-tests.yml `miri` (non-blocking). Widen the set as more crates prove clean.
 miri:
     cargo +nightly miri test -p switch
+
+# Each `fuzz/` dir is its OWN workspace (so the nightly/sanitizer build can't
+# perturb the main one), which means no workspace-wide build ever compiles
+# them — they bitrot silently as the crates they target evolve. Plain `cargo
+# check` on stable is enough to catch it: no nightly, no sanitizer.
+#
+# Type-check every cargo-fuzz target (bitrot guard). See docs/fuzzing.md.
+fuzz-check:
+    #!/usr/bin/env sh
+    set -eu
+    for c in {{fuzz-crates}}; do
+        echo "== crates/$c/fuzz =="
+        # No --locked: fuzz Cargo.lock files are gitignored (see fuzz/.gitignore).
+        cargo check --manifest-path "crates/$c/fuzz/Cargo.toml" --all-targets
+    done
+
+# Needs nightly (libFuzzer + sanitizers). The RSS cap is load-bearing: these
+# decoders can allocate from an untrusted length field, and the cap turns an
+# unbounded-allocation bug into a catchable crash rather than an ambient OOM.
+# Seed the corpus first for the structured targets (docs/fuzzing.md).
+#
+# Run one fuzz target: `just fuzz graph graph_from_bytes -max_total_time=60`.
+fuzz crate target *args: (_need "cargo-fuzz" "cargo install cargo-fuzz --locked")
+    cd crates/{{crate}} && cargo +nightly fuzz run {{target}} -- -rss_limit_mb=2048 {{args}}
 
 # Unit + in-process integration tests. CI: every lane's core-tests suite.
 test: _nextest
