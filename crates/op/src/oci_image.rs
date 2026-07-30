@@ -62,7 +62,7 @@ impl OciImage<'_> {
         let results =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(all_deps.len())));
         rayon::scope(|s| {
-            for (bsr, dep) in &all_deps {
+            for (dep_idx, (bsr, dep)) in all_deps.iter().enumerate() {
                 let tokio_runtime = tokio_runtime.clone();
                 let results = results.clone();
                 let cache = opts.cache.clone();
@@ -91,16 +91,21 @@ impl OciImage<'_> {
                         &match_globs,
                         &events,
                     ));
-                    results.lock().unwrap().push(result);
+                    results.lock().unwrap().push((dep_idx, result));
                 });
             }
         });
+        // Threads finish in scheduler order; layer order is part of the
+        // manifest and therefore the image digest. Restore dep order.
+        let mut results = std::sync::Arc::into_inner(results)
+            .unwrap()
+            .into_inner()
+            .unwrap();
+        results.sort_by_key(|(dep_idx, _)| *dep_idx);
         layers.extend(
-            std::sync::Arc::into_inner(results)
-                .unwrap()
-                .into_inner()
-                .unwrap()
+            results
                 .into_iter()
+                .map(|(_, result)| result)
                 .collect::<Result<Vec<_>, _>>()?,
         );
 
@@ -145,9 +150,13 @@ impl OciImage<'_> {
                         cb = cb.cmd(cmd.to_vec());
                     };
                     if !self.vars.is_empty() {
+                        // HashMap iteration order is random per process; env
+                        // order is part of the config blob and therefore the
+                        // image digest. Sort by key.
+                        let mut vars: Vec<_> = self.vars.iter().collect();
+                        vars.sort_by_key(|(k, _)| k.as_str());
                         cb = cb.env(
-                            self.vars
-                                .iter()
+                            vars.into_iter()
                                 .map(|(k, v)| String::from_iter([k, "=", v]))
                                 .collect::<Vec<_>>(),
                         );

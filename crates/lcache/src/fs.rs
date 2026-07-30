@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 pub enum FileType {
     File,
     Dir,
+    /// Anything else found in a cache directory (symlink, socket, fifo,
+    /// device). The cache never creates these, but a walk must classify
+    /// them rather than panic.
+    Other,
 }
 
 /// An error returned from the filesystem.
@@ -53,7 +57,7 @@ impl DirEntry for std::fs::DirEntry {
             } else if ft.is_dir() {
                 FileType::Dir
             } else {
-                unreachable!();
+                FileType::Other
             }),
         }
     }
