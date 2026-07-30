@@ -98,7 +98,7 @@ fn filtered() {
 }
 
 #[test]
-fn preview_tab_with_screen_snapshot() {
+fn preview_section_with_screen_snapshot() {
     let mut model = fixed_model(vec![provider(
         "host",
         vec![entry(1, Some("api-staging"), "/src/api")],

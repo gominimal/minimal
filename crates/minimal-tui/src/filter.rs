@@ -5,11 +5,12 @@ use common::fuzzy_search::{SearchMatch, fuzzy_match};
 use minimald_rpc::ListSessionsEntry;
 
 /// The best fuzzy match of `filter` against a session's name, id, and
-/// project path (last path segment). An empty filter matches everything
-/// at the lowest rank so callers can treat "no filter" uniformly.
+/// project path (last path segment). `None` means no match; an empty
+/// filter is not special-cased here, the caller (`Model::visible_rows`)
+/// treats it as "show everything".
 pub fn session_match(filter: &str, entry: &ListSessionsEntry) -> Option<SearchMatch> {
     if filter.is_empty() {
-        return Some(SearchMatch::Fuzzy { score: 0 });
+        return None;
     }
     let id = entry.id.to_string();
     let project_segment = entry
@@ -42,9 +43,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_filter_matches_everything() {
-        assert!(session_match("", &entry(Some("api"), "/src/api")).is_some());
-        assert!(session_match("", &entry(None, "/src/api")).is_some());
+    fn empty_filter_matches_nothing_here() {
+        // "No filter" is the caller's concern, not a match.
+        assert!(session_match("", &entry(Some("api"), "/src/api")).is_none());
+        assert!(session_match("", &entry(None, "/src/api")).is_none());
     }
 
     #[test]

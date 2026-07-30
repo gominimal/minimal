@@ -2,6 +2,12 @@
 //! a [`Msg`] enum of everything that can happen, and a pure [`update`]
 //! producing follow-up [`Effect`]s that the tokio driver executes against
 //! the daemon connections.
+//!
+//! Deliberately hand-rolled rather than built on a TEA framework: the
+//! reusable machinery is ~200 lines of boring Rust, and our pure
+//! `update -> Vec<Effect>` doesn't fit component-centric frameworks. If
+//! `min dash` grows beyond a single screen (multiple views, reusable
+//! widgets), reevaluate adopting `tui-realm` instead of extending this.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -70,11 +76,23 @@ pub enum CreateField {
     Network,
 }
 
+impl CreateForm {
+    /// The focused text field's buffer, if it is one (`Network` cycles
+    /// modes instead of taking text).
+    fn input_mut(&mut self) -> Option<&mut String> {
+        match self.field {
+            CreateField::Name => Some(&mut self.name),
+            CreateField::Path => Some(&mut self.path),
+            CreateField::Network => None,
+        }
+    }
+}
+
 /// The network modes the create form cycles through, in cycle order.
 pub const NETWORK_MODES: &[NetworkMode] =
     &[NetworkMode::HostNet, NetworkMode::OwnIp, NetworkMode::NoNet];
 
-/// The Preview tab's state for a session: the screen snapshot, a soft
+/// The Preview section's state for a session: the screen snapshot, a soft
 /// "not active", or the fetch error (e.g. a daemon too old to serve
 /// `GetSessionScreen`) — rendered legibly rather than loading forever.
 pub type ScreenFetch = Result<Option<minimald_rpc::ScreenSnapshot>, String>;
@@ -88,7 +106,7 @@ pub enum Msg {
     Refreshed(Vec<ProviderData>),
     /// Detail-pane data for a session.
     DetailLoaded(SessionKey, Box<Detail>),
-    /// A screen fetch for the Preview tab.
+    /// A screen fetch for the Preview section.
     ScreenLoaded(SessionKey, ScreenFetch),
     /// A destroy/rename completed.
     ActionDone(Result<String, String>),
@@ -200,7 +218,13 @@ impl Model {
                 .sessions
                 .iter()
                 .filter_map(|entry| {
-                    filter::session_match(&self.filter.input, entry).map(|rank| (rank, entry.id))
+                    match filter::session_match(&self.filter.input, entry) {
+                        Some(rank) => Some((Some(rank), entry.id)),
+                        // An empty filter means "no filter": keep everything
+                        // in daemon order rather than ranking.
+                        None if self.filter.input.is_empty() => Some((None, entry.id)),
+                        None => None,
+                    }
                 })
                 .collect();
             // Best match first within the group when filtering; list order
@@ -581,22 +605,11 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                 model.action = None;
                 Vec::new()
             }
-            KeyCode::Backspace => {
-                input.pop();
+            _ => {
+                line_edit(&mut input, &key);
                 model.action = Some(Action::Rename { key: target, input });
                 Vec::new()
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                input.clear();
-                model.action = Some(Action::Rename { key: target, input });
-                Vec::new()
-            }
-            KeyCode::Char(c) => {
-                input.push(c);
-                model.action = Some(Action::Rename { key: target, input });
-                Vec::new()
-            }
-            _ => Vec::new(),
         },
         Action::Create(mut form) => {
             match (key.code, form.field) {
@@ -650,44 +663,28 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                         network: NETWORK_MODES[form.net_idx],
                     }];
                 }
-                (KeyCode::Backspace, field) => {
-                    match field {
-                        CreateField::Name => {
-                            form.name.pop();
-                        }
-                        CreateField::Path => {
-                            form.path.pop();
-                        }
-                        CreateField::Network => {}
-                    }
-                    model.action = Some(Action::Create(form));
-                }
-                // Ctrl-U clears the focused text field.
-                (KeyCode::Char('u'), field)
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && field != CreateField::Network =>
-                {
-                    match field {
-                        CreateField::Name => form.name.clear(),
-                        CreateField::Path => form.path.clear(),
-                        CreateField::Network => {}
-                    }
-                    model.action = Some(Action::Create(form));
-                }
-                (KeyCode::Char(c), field) => {
-                    match field {
-                        CreateField::Name => form.name.push(c),
-                        CreateField::Path => form.path.push(c),
-                        CreateField::Network => {}
-                    }
-                    model.action = Some(Action::Create(form));
-                }
                 _ => {
+                    if let Some(input) = form.input_mut() {
+                        line_edit(input, &key);
+                    }
                     model.action = Some(Action::Create(form));
                 }
             }
             Vec::new()
         }
+    }
+}
+
+/// Apply one line-editing key to an input buffer: backspace deletes,
+/// ctrl-u clears, a printable char appends; anything else is a no-op.
+fn line_edit(input: &mut String, key: &KeyEvent) {
+    match key.code {
+        KeyCode::Backspace => {
+            input.pop();
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => input.clear(),
+        KeyCode::Char(c) => input.push(c),
+        _ => {}
     }
 }
 
@@ -722,18 +719,16 @@ fn on_focus_change(model: &mut Model) -> Vec<Effect> {
     fetch_focused(model)
 }
 
-/// Fetch detail/screen data for the focused session when it isn't cached.
-fn fetch_focused(model: &mut Model) -> Vec<Effect> {
+/// Fetch detail data for the focused session when it isn't cached. The
+/// screen preview is covered by the 2s tick, not per-keystroke fetches.
+fn fetch_focused(model: &Model) -> Vec<Effect> {
     let Some(key) = model.focused() else {
         return Vec::new();
     };
-    let mut effects = Vec::new();
-    if !model.details.contains_key(&key) {
-        effects.push(Effect::FetchDetail(key));
+    if model.details.contains_key(&key) {
+        return Vec::new();
     }
-    // Preview is always visible in the stacked detail pane.
-    effects.push(Effect::FetchScreen(key));
-    effects
+    vec![Effect::FetchDetail(key)]
 }
 
 /// Options for [`run`].

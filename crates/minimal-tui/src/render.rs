@@ -7,6 +7,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
     Action, CreateField, Model, Row, SessionKey, display_name_of, network_mode_label,
@@ -25,16 +26,27 @@ pub fn view(model: &Model, frame: &mut Frame) {
     render_footer(model, frame, footer);
 }
 
-/// Truncate `s` to at most `w` columns (appending `…` when cut), or pad it
-/// with trailing spaces to exactly `w`.
+/// Truncate `s` to at most `w` display columns (appending `…` when cut), or
+/// pad it with trailing spaces to exactly `w`. Widths are terminal display
+/// widths, so CJK/emoji session names don't misalign the sidebar.
 fn pad_truncate(s: &str, w: usize) -> String {
-    let len = s.chars().count();
-    if len > w {
-        let cut: String = s.chars().take(w.saturating_sub(1)).collect();
-        format!("{cut}…")
-    } else {
-        format!("{s:<width$}", width = w.saturating_sub(len) + len)
+    let width = UnicodeWidthStr::width(s);
+    if width <= w {
+        return format!("{s}{}", " ".repeat(w - width));
     }
+    let budget = w.saturating_sub(1);
+    let mut used = 0;
+    let cut: String = s
+        .chars()
+        .map_while(|ch| {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            (used + cw <= budget).then(|| {
+                used += cw;
+                ch
+            })
+        })
+        .collect();
+    format!("{cut}…")
 }
 
 fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
@@ -84,7 +96,7 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
                 // the group's health mark.
                 let version = pad_truncate(
                     &format!("v{}", provider.version),
-                    inner_width.saturating_sub(provider.label.chars().count() + 7),
+                    inner_width.saturating_sub(UnicodeWidthStr::width(provider.label.as_str()) + 7),
                 );
                 Line::from(vec![
                     Span::styled(
@@ -116,13 +128,13 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
                 // edge (this was the "no activity indicator" bug).
                 let marker = if selected { "▸ " } else { "  " };
                 let right = format!("{net} {indicator:>2}");
-                let right_w = right.chars().count();
+                let right_w = UnicodeWidthStr::width(right.as_str());
                 let left = pad_truncate(
                     &format!("  {marker}{name}"),
                     inner_width.saturating_sub(right_w),
                 );
                 let gap = inner_width
-                    .saturating_sub(left.chars().count())
+                    .saturating_sub(UnicodeWidthStr::width(left.as_str()))
                     .saturating_sub(right_w);
                 Line::from(vec![
                     Span::styled(
@@ -199,7 +211,7 @@ fn render_detail(model: &Model, frame: &mut Frame, area: Rect) {
 
     // Fixed-size sections first; Preview takes the remainder.
     const INFO_HEIGHT: u16 = 4;
-    let policy_height = policy_height(model, key);
+    let policy_height = policy_lines(model, key).len() as u16;
     let [
         info_area,
         policy_div,
@@ -222,34 +234,6 @@ fn render_detail(model: &Model, frame: &mut Frame, area: Rect) {
         preview_div,
     );
     render_preview_body(model, key, frame, preview_area);
-}
-
-/// The Policy section's rendered height in rows, so the stacked layout can
-/// size it exactly.
-fn policy_height(model: &Model, key: SessionKey) -> u16 {
-    let detail = model.details.get(&key);
-    let record = detail.and_then(|d| d.record.as_ref());
-    if record.is_some() && record.map(|r| r.network) != Some(sessions::NetworkMode::OwnIp) {
-        return 1;
-    }
-    match detail.and_then(|d| d.policy.as_ref()) {
-        None => 1,
-        Some(policy) => {
-            let egress_rows = match &policy.egress {
-                None => 2,
-                Some(_) => 4,
-            };
-            let ingress_rows = match &policy.ingress {
-                None => 2,
-                Some(ingress) => {
-                    1 + (ingress.port_mappings.len() as u16
-                        + u16::from(ingress.dynamic_allowed_range.is_some()))
-                    .max(1)
-                }
-            };
-            egress_rows + ingress_rows
-        }
-    }
 }
 
 /// Shorten the user's home directory prefix to `~`, the way the spec's
@@ -366,12 +350,20 @@ fn format_duration(d: chrono::Duration) -> String {
 }
 
 fn render_policy(model: &Model, key: SessionKey, frame: &mut Frame, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(policy_lines(model, key)).wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// The Policy section's lines. The stacked layout sizes the section by
+/// `policy_lines(...).len()`, so height and content can never drift.
+fn policy_lines(model: &Model, key: SessionKey) -> Vec<Line<'static>> {
     let detail = model.details.get(&key);
     let record = detail.and_then(|d| d.record.as_ref());
     let mut lines: Vec<Line> = Vec::new();
 
-    let network_known = record.is_some();
-    if network_known && record.map(|r| r.network) != Some(sessions::NetworkMode::OwnIp) {
+    if record.is_some() && record.map(|r| r.network) != Some(sessions::NetworkMode::OwnIp) {
         lines.push(Line::styled(
             "No network policy (HostNet/NoNet)",
             Style::default().fg(Color::Gray),
@@ -432,7 +424,7 @@ fn render_policy(model: &Model, key: SessionKey, frame: &mut Frame, area: Rect) 
         }
     }
 
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    lines
 }
 
 fn policy_list(lines: &mut Vec<Line>, label: &str, values: &Option<Vec<String>>) {

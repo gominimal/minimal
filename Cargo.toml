@@ -166,6 +166,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 thiserror = "2"
+unicode-width = "0.2"
 url = "2" # keep in sync with reqwest
 uuid = { version = "1.24", features = ["v4", "v7", "serde"] }
 vt100-ctt = { version = "0.17", default-features = false }
