@@ -91,8 +91,12 @@ impl Task {
         match &self.action {
             TaskAction::Exec(StrOrList::Single(s)) => Some({
                 let mut cmd = shlex::Shlex::new(s.trim());
-                let exec = cmd.next().unwrap();
-                (maybe_make_abs(&exec), cmd.collect())
+                match cmd.next() {
+                    Some(exec) => (maybe_make_abs(&exec), cmd.collect()),
+                    // No tokens (empty, whitespace, or comment-only exec
+                    // string): same shape as the empty Multiple arm below.
+                    None => ("".to_string(), vec![]),
+                }
             }),
             TaskAction::Exec(StrOrList::Multiple(v)) => Some(match v.len() {
                 0 => ("".to_string(), vec![]),
@@ -156,6 +160,16 @@ impl TaskAction {
 mod tests {
     use super::*;
     use indoc::indoc;
+
+    /// An exec string with no tokens (empty or whitespace-only) must resolve
+    /// like the empty Multiple form, not panic.
+    #[test]
+    fn exec_str_empty_does_not_panic() {
+        for raw in ["exec = \"\"", "exec = \"   \""] {
+            let t: Task = toml::from_str(raw).unwrap();
+            assert_eq!(t.exec_and_args(), Some(("".to_string(), vec![])));
+        }
+    }
 
     #[test]
     fn exec_str() {
