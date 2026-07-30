@@ -221,7 +221,7 @@ async fn activate_creates_session() {
     let activate_args = ActivateArgs {
         name: Some("test-session".to_string()),
         path: Some(project.path().to_string_lossy().to_string()),
-        sync: SyncMode::Tarball,
+        sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
         loadout: vec![],
@@ -263,7 +263,7 @@ async fn activate_uploads_project_files() {
     let activate_args = ActivateArgs {
         name: Some("upload-test".to_string()),
         path: Some(project.path().to_string_lossy().to_string()),
-        sync: SyncMode::Tarball,
+        sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
         loadout: vec![],
@@ -342,7 +342,7 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
     let activate_args = ActivateArgs {
         name: Some("repo-dir-test".to_string()),
         path: None,
-        sync: SyncMode::Tarball,
+        sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
         loadout: vec![],
