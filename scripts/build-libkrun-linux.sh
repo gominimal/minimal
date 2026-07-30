@@ -114,6 +114,20 @@ grep -q '^crate-type = \["cdylib", "lib"\]$' "$LIBTOML" || {
 }
 sed -i 's/^crate-type = \["cdylib", "lib"\]$/crate-type = ["cdylib", "staticlib", "lib"]/' "$LIBTOML"
 
+# Cross-linking to musl needs musl-gcc as the linker. A musl-native host (Alpine)
+# builds its own triple and needs nothing; a glibc host with musl-tools does.
+# Default it here — cargo's documented env form of `[target.<triple>] linker`,
+# triple uppercased with dashes as underscores — so a standalone run works
+# without the caller knowing. An explicit value always wins.
+LINKER_VAR="CARGO_TARGET_$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER"
+if [ -z "${!LINKER_VAR:-}" ] && [ "$TARGET" != "$(rustc -vV | sed -n 's/^host: //p')" ]; then
+  command -v musl-gcc >/dev/null || {
+    echo "::error::$TARGET is not the host triple and musl-gcc is not installed (apt install musl-tools)" >&2
+    exit 1
+  }
+  export "$LINKER_VAR=musl-gcc"
+fi
+
 echo "building static libkrun for $TARGET (blk,net; no gpu, no init-blob, no libkrunfw)"
 # `cd "$WORK"` rather than --manifest-path: cargo resolves .cargo/config.toml
 # from the CURRENT DIRECTORY, not from the manifest's directory. libkrun ships
