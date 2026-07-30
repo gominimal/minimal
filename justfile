@@ -138,7 +138,7 @@ min *args:
 # Print `export` lines for running the stack by hand: eval "$(just env)".
 env:
     @printf 'export %s="%s"\n' \
-      PATH "$PATH" LD_LIBRARY_PATH "$LD_LIBRARY_PATH" \
+      PATH "$PATH" \
       MINVMD_KERNEL_PATH "$MINVMD_KERNEL_PATH" MINVMD_ROOTFS_PATH "$MINVMD_ROOTFS_PATH" \
       MINVMD_INITRAMFS "$MINVMD_INITRAMFS" \
       MINVMD_GVPROXY_BIN "{{gvproxy}}" \
