@@ -32,7 +32,7 @@ nightly/sanitizer build doesn't perturb the main workspace).
 | Target | Crate | Decodes | Trust | Platform |
 |---|---|---|---|---|
 | `graph_from_bytes` | `crates/graph/fuzz` | `Graph::from_bytes` — the build-graph wire format shipped over the remote-execution channel | NET | any |
-| `remote_index_from_reader` | `crates/rcache/fuzz` | `RemoteIndex::from_reader` — the remote-cache binary index fetched over GCS/HTTPS | NET | **Linux only** |
+| `remote_index_from_reader` | `crates/rcache/fuzz` | `IndexFile::from_reader` — `index.shisha`, the remote-cache index fetched over GCS/HTTPS | NET | **Linux only** |
 | `spec_hash_from_hex` | `crates/common/fuzz` | `SpecHash::from_hex` — blake3 hex from cache keys / wire payloads | NET | any |
 | `target_from_str` | `crates/common/fuzz` | `Target::from_str` — hand-written `<arch>/<os>` parser | OWN | any |
 | `mfile_from_toml` | `crates/mfile/fuzz` | `File::from_toml_bytes` — `minimal.toml` through the custom serde visitors | OWN | any |
@@ -47,7 +47,16 @@ else.
 
 ## Running
 
-From the crate that owns the `fuzz/` dir:
+```sh
+just fuzz-check                                   # type-check every target (stable, no nightly)
+just fuzz graph graph_from_bytes -max_total_time=600
+```
+
+`just fuzz-check` is the **bitrot guard** — see [Keeping the targets
+alive](#keeping-the-targets-alive). `just fuzz <crate> <target> [libfuzzer
+args]` wraps the raw invocation below and applies the RSS cap for you.
+
+Equivalently, from the crate that owns the `fuzz/` dir:
 
 ```sh
 cd crates/graph
@@ -96,6 +105,31 @@ std::fs::write("fuzz/corpus/graph_from_bytes/seed_myshape", &bytes).unwrap();
 Good next seeds for `graph_from_bytes` (paths current seeds don't reach):
 profiles, stacks, supply-chain records, and cross-referenced specs (the
 arena-remap / dangling-ref logic).
+
+## Keeping the targets alive
+
+Every `fuzz/` dir declares its own `[workspace]`, so the nightly + sanitizer
+build can't perturb the main workspace. The cost of that isolation: **no
+workspace-wide build ever compiles these targets**, so they rot silently as the
+crates they fuzz evolve. This is not hypothetical — the first version of this
+suite went 253 commits before anyone rebuilt it, by which point one target
+referenced a type that had been renamed.
+
+`just fuzz-check` is the guard. It runs a plain `cargo check` over every fuzz
+workspace: no nightly, no sanitizer, no libFuzzer runtime — just "does this
+still compile against today's API." Run it after changing any fuzzed decoder,
+and treat a red `fuzz-check` exactly like a red build.
+
+Rules of thumb when a target stops compiling:
+
+- **The fuzzed API moved** — update the harness; that is the whole point of
+  the guard firing.
+- **The harness needs a new hook into the crate** — prefer a `#[doc(hidden)]`
+  export or a `fuzzing`-gated entry point (as `graph` does for
+  `Graph::fuzz_roundtrip`) over widening real public API.
+- **A target is genuinely obsolete** — delete it, don't `#[allow]` it into
+  silence. A target that doesn't build is worse than no target: it looks like
+  coverage that isn't there.
 
 ## Track record
 
