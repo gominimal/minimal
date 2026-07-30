@@ -54,6 +54,28 @@ exception to the `min <noun> <verb>` convention, since it is the
 highest-traffic command in the CLI; `min session ls` is the noun-level alias.
 All three spellings take the same flags and produce identical output.
 
+### `dash`
+
+```
+min dash
+```
+
+Opens a full-screen TUI for browsing, inspecting, and managing sessions
+across every running provider on the host (native minimald and the minvmd
+microVM). The left pane lists sessions grouped by provider; the right pane
+shows the focused session's Info, networking Policy, and a read-only live
+Preview of its terminal screen (no attach, no PTY resize). Requires a
+terminal.
+
+Keys: `↑`/`↓` (or `k`/`j`) move, `/` fuzzy-filters by name, ID, and
+project path, `tab`/`shift-tab` cycles the detail tabs, `enter` attaches
+to the focused session (suspend TUI → ssh → resume on `ctrl-w` detach) or
+collapses a provider group, `d` destroys (with confirmation — also cancels
+an in-flight create/upload), `r` renames, `n` creates a session through
+the full activate flow (project upload, loadout compose, finalize),
+`q` quits. The cursor's last position is restored on the next launch from
+`<state>/dash-state.json`; TUI diagnostics go to `<state>/dash.log`.
+
 ### `session activate`
 
 ```

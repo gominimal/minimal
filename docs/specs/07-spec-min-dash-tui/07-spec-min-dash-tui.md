@@ -2,7 +2,7 @@
 id: spec-min-dash-tui
 title: "min dash — session manager TUI for minimal2"
 kind: spec
-status: planned
+status: shipped
 tracking-issue:
 supersedes:
 ---

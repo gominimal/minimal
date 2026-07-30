@@ -26,7 +26,7 @@ The CLI reference overview is [docs/reference/cli.md](docs/reference/cli.md).
 
 ## Crate map
 
-29 crates. One line each; the long-form map with plane assignments is in
+31 crates. One line each; the long-form map with plane assignments is in
 [docs/architecture.md](docs/architecture.md) §3.
 
 | Crate | Role |
@@ -43,6 +43,8 @@ The CLI reference overview is [docs/reference/cli.md](docs/reference/cli.md).
 | `mctx` | Top-level 'minimal context' API tying configuration, decoding, graph, and cache together. |
 | `mfile` | Finding and reading the `minimal.toml` file. |
 | `minimal` | The `min` session CLI, which pairs with and talks to `minimald`. |
+| `minimal-client` | SSH client transport to `minimald` over the UDS bridge, shared by `min` and the TUI. |
+| `minimal-tui` | `min dash`: the session-manager TUI (ratatui/crossterm, Elm-style loop). |
 | `minimald` | The session daemon: an SSH server hosting sessions and task/sandbox executions. |
 | `minimald-rpc` | Wire contract for `minimald`'s oneshot SSH RPCs. |
 | `minvmd` | Host daemon that boots Linux microVMs via libkrun and bridges host UDS to in-VM vsock. |

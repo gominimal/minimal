@@ -47,10 +47,32 @@ async fn run() -> ExitCode {
     minimal::theme::install();
 
     let registry = tracing_subscriber::registry().with(filter);
-    // Commands whose stdout is a data contract route tracing to stderr, so a log
-    // line never lands in captured output. ANSI is gated on the destination
-    // being a real terminal, so a redirected stream carries no escape codes.
-    if stdout_is_data_contract(&cli.command) {
+    // `min dash` owns the terminal (alternate screen); a log line landing on
+    // stdout/stderr would corrupt the frame. Log to <state>/dash.log
+    // instead, discarding if the state dir can't be written.
+    if matches!(cli.command, Some(minimal::Command::Dash)) {
+        // Honor `--minimal-dir` so an isolated daemon's logs stay isolated.
+        let base = cli
+            .global_args
+            .minimal_dir
+            .clone()
+            .unwrap_or_else(|| paths::minimal_state_dir().as_utf8_path().into());
+        let log = move || -> Box<dyn std::io::Write + Send> {
+            let path = base.join("dash.log");
+            let _ = std::fs::create_dir_all(&base);
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                Ok(f) => Box::new(f),
+                Err(_) => Box::new(std::io::sink()),
+            }
+        };
+        registry
+            .with(fmt::layer().with_writer(log).with_ansi(false))
+            .init();
+    } else if stdout_is_data_contract(&cli.command) {
         registry
             .with(
                 fmt::layer()
