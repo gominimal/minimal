@@ -57,16 +57,22 @@ async fn run() -> ExitCode {
             .minimal_dir
             .clone()
             .unwrap_or_else(|| paths::minimal_state_dir().as_utf8_path().into());
-        let log = move || -> Box<dyn std::io::Write + Send> {
+        // Open the log file once; MakeWriter is per-write, so the closure
+        // must not re-open it per log event.
+        let file = {
             let path = base.join("dash.log");
             let _ = std::fs::create_dir_all(&base);
-            match std::fs::OpenOptions::new()
+            std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
-            {
-                Ok(f) => Box::new(f),
-                Err(_) => Box::new(std::io::sink()),
+                .map(std::sync::Arc::new)
+                .ok()
+        };
+        let log = move || -> Box<dyn std::io::Write + Send> {
+            match &file {
+                Some(f) => Box::new(DashLog(f.clone())),
+                None => Box::new(std::io::sink()),
             }
         };
         registry
@@ -101,6 +107,20 @@ async fn run() -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// A cheaply clonable writer over the dash log file: every clone writes
+/// through the same opened file (append mode) instead of re-opening it.
+struct DashLog(std::sync::Arc<std::fs::File>);
+
+impl std::io::Write for DashLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&*self.0).write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&*self.0).flush()
+    }
 }
 
 /// Whether the command's stdout is a data contract that tracing must not
