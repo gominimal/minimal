@@ -2,7 +2,7 @@
 source: crates/minimal-tui/tests/snapshots.rs
 expression: render(&model)
 ---
-"┌ sessions ────────────────────┐┌────────────────────────────────────────────[Info] Policy Preview ┐"
+"┌ sessions ────────────────────┐┌──────────────────────────────────────────────────────────────────┐"
 "│ /                            ││ no session selected                                              │"
 "│ ──────────────────────────── ││                                                                  │"
 "│ ▼ host  v0.1              ●  ││                                                                  │"
@@ -31,4 +31,4 @@ expression: render(&model)
 "│                              ││                                                                  │"
 "│                              ││                                                                  │"
 "└──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘"
-" ↑↓ move · / filter · tab switch · enter attach · d destroy · r rename · n new · q quit             "
+" ↑↓ move · / filter · enter attach · d destroy · r rename · n new · q quit                          "

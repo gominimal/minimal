@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{
-    Action, CreateField, DetailTab, Model, Row, SessionKey, display_name_of, network_mode_label,
+    Action, CreateField, Model, Row, SessionKey, display_name_of, network_mode_label,
 };
 
 /// Render the whole frame: sidebar left, detail pane right, footer line at
@@ -142,32 +142,26 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_detail(model: &Model, frame: &mut Frame, area: Rect) {
-    // The focused session's identity on the left of the top border, the
-    // tabs on the right — the active tab bracketed, per the spec's mock.
-    let tabs = [
-        ("Info", DetailTab::Info),
-        ("Policy", DetailTab::Policy),
-        ("Preview", DetailTab::Preview),
-    ];
-    let mut tab_spans = Vec::new();
-    for (label, tab) in tabs {
-        if tab == model.tab {
-            tab_spans.push(Span::styled(
-                format!("[{label}]"),
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-        } else {
-            tab_spans.push(Span::styled(label, Style::default().fg(Color::Gray)));
-        }
-        tab_spans.push(Span::raw(" "));
-    }
+/// A dim section divider with a centered-left label, e.g.
+/// `─ Policy ─────────────`.
+fn divider(label: &str, width: u16) -> Line<'static> {
+    let head = format!("─ {label} ");
+    Line::styled(
+        format!(
+            "{head}{}",
+            "─".repeat((width as usize).saturating_sub(head.chars().count()))
+        ),
+        Style::default().fg(Color::Gray),
+    )
+}
 
+fn render_detail(model: &Model, frame: &mut Frame, area: Rect) {
+    // The detail pane is one vertical stack: Info fields, a Policy section,
+    // then the live Preview filling the rest. No tabs.
     let focused = model.focused();
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .padding(ratatui::widgets::Padding::horizontal(1))
-        .title(Line::from(tab_spans).right_aligned());
+        .padding(ratatui::widgets::Padding::horizontal(1));
     if let Some(key) = focused {
         let name = model.display_name(key);
         let id = key.id.to_string();
@@ -192,10 +186,59 @@ fn render_detail(model: &Model, frame: &mut Frame, area: Rect) {
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    match model.tab {
-        DetailTab::Info => render_info(model, key, frame, inner),
-        DetailTab::Policy => render_policy(model, key, frame, inner),
-        DetailTab::Preview => render_preview(model, key, frame, inner),
+
+    // Fixed-size sections first; Preview takes the remainder.
+    const INFO_HEIGHT: u16 = 4;
+    let policy_height = policy_height(model, key);
+    let [
+        info_area,
+        policy_div,
+        policy_area,
+        preview_div,
+        preview_area,
+    ] = Layout::vertical([
+        Constraint::Length(INFO_HEIGHT),
+        Constraint::Length(1),
+        Constraint::Length(policy_height),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .areas(inner);
+    render_info(model, key, frame, info_area);
+    frame.render_widget(Paragraph::new(divider("Policy", inner.width)), policy_div);
+    render_policy(model, key, frame, policy_area);
+    frame.render_widget(
+        Paragraph::new(divider("Preview (live screen snapshot)", inner.width)),
+        preview_div,
+    );
+    render_preview_body(model, key, frame, preview_area);
+}
+
+/// The Policy section's rendered height in rows, so the stacked layout can
+/// size it exactly.
+fn policy_height(model: &Model, key: SessionKey) -> u16 {
+    let detail = model.details.get(&key);
+    let record = detail.and_then(|d| d.record.as_ref());
+    if record.is_some() && record.map(|r| r.network) != Some(sessions::NetworkMode::OwnIp) {
+        return 1;
+    }
+    match detail.and_then(|d| d.policy.as_ref()) {
+        None => 1,
+        Some(policy) => {
+            let egress_rows = match &policy.egress {
+                None => 2,
+                Some(_) => 4,
+            };
+            let ingress_rows = match &policy.ingress {
+                None => 2,
+                Some(ingress) => {
+                    1 + (ingress.port_mappings.len() as u16
+                        + u16::from(ingress.dynamic_allowed_range.is_some()))
+                    .max(1)
+                }
+            };
+            egress_rows + ingress_rows
+        }
     }
 }
 
@@ -389,23 +432,12 @@ fn policy_list(lines: &mut Vec<Line>, label: &str, values: &Option<Vec<String>>)
     }
 }
 
-fn render_preview(model: &Model, key: SessionKey, frame: &mut Frame, area: Rect) {
-    // Divider header per the spec mock, then the snapshot below it.
-    let [header, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
-    let label = "─ Preview (live screen snapshot) ";
-    let rule = format!(
-        "{label}{}",
-        "─".repeat((body.width as usize).saturating_sub(label.chars().count()))
-    );
-    frame.render_widget(
-        Paragraph::new(Line::styled(rule, Style::default().fg(Color::Gray))),
-        header,
-    );
-
+/// The Preview section's body (its divider is drawn by [`render_detail`]).
+fn render_preview_body(model: &Model, key: SessionKey, frame: &mut Frame, area: Rect) {
     let Some(fetch) = model.screens.get(&key) else {
         frame.render_widget(
             Paragraph::new("loading preview…").style(Style::default().fg(Color::Gray)),
-            body,
+            area,
         );
         return;
     };
@@ -423,21 +455,21 @@ fn render_preview(model: &Model, key: SessionKey, frame: &mut Frame, area: Rect)
                 Paragraph::new(text)
                     .style(Style::default().fg(Color::Red))
                     .wrap(Wrap { trim: false }),
-                body,
+                area,
             );
         }
         Ok(None) => {
             frame.render_widget(
-                Paragraph::new("Session not active — enter to attach")
+                Paragraph::new("session not active — enter to attach")
                     .style(Style::default().fg(Color::Gray)),
-                body,
+                area,
             );
         }
         Ok(Some(snapshot)) => {
             let text = snapshot_to_text(snapshot);
             // If the session's terminal is taller than the pane, scroll so
             // the session's cursor row stays visible.
-            let visible_height = body.height as usize;
+            let visible_height = area.height as usize;
             let offset = match snapshot.cursor_row {
                 Some(cursor) if snapshot.rows as usize > visible_height => {
                     let cursor = cursor as usize;
@@ -447,7 +479,7 @@ fn render_preview(model: &Model, key: SessionKey, frame: &mut Frame, area: Rect)
                 }
                 _ => 0,
             };
-            frame.render_widget(Paragraph::new(text).scroll((offset, 0)), body);
+            frame.render_widget(Paragraph::new(text).scroll((offset, 0)), area);
         }
     }
 }
@@ -593,7 +625,7 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
             // Key hints flush left; the transient status line flush right.
             frame.render_widget(
                 Paragraph::new(Line::styled(
-                    " ↑↓ move · / filter · tab switch · enter attach · d destroy · r rename · n new · q quit ",
+                    " ↑↓ move · / filter · enter attach · d destroy · r rename · n new · q quit ",
                     Style::default().fg(Color::Gray),
                 )),
                 area,

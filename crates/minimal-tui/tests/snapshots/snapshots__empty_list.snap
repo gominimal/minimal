@@ -2,7 +2,7 @@
 source: crates/minimal-tui/tests/snapshots.rs
 expression: "render(&fixed_model(vec![]))"
 ---
-"┌ sessions ────────────────────┐┌────────────────────────────────────────────[Info] Policy Preview ┐"
+"┌ sessions ────────────────────┐┌──────────────────────────────────────────────────────────────────┐"
 "│ /                            ││ no session selected                                              │"
 "│ ──────────────────────────── ││                                                                  │"
 "│ no sessions (n to create)    ││                                                                  │"
@@ -31,4 +31,4 @@ expression: "render(&fixed_model(vec![]))"
 "│                              ││                                                                  │"
 "│                              ││                                                                  │"
 "└──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘"
-" ↑↓ move · / filter · tab switch · enter attach · d destroy · r rename · n new · q quit             "
+" ↑↓ move · / filter · enter attach · d destroy · r rename · n new · q quit                          "

@@ -144,7 +144,6 @@ fn preview_tab_with_screen_snapshot() {
         })),
     );
     model.cursor = 1;
-    model.tab = app::DetailTab::Preview;
     insta::assert_snapshot!(render(&model));
 }
 
@@ -179,8 +178,7 @@ fn detail_pane_with_policy() {
             )),
         },
     );
-    // Focus the session and switch to the Policy tab.
+    // Focus the session.
     model.cursor = 1;
-    model.tab = app::DetailTab::Policy;
     insta::assert_snapshot!(render(&model));
 }

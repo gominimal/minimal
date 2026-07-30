@@ -43,19 +43,24 @@ existing `minimal2` SSH client transport (`client.rs`) for all RPCs.
 ### Layout
 
 ```
-┌─ sessions ──────────────────────┐ ┌─ api-staging · a1b2… ─── [Info] Policy Preview ┐
+┌─ sessions ──────────────────────┐ ┌─ api-staging · a1b2… ──────────────────────────┐
 │ / st_                           │ │ project  ~/src/api        net   OwnIp          │
 │ ────                            │ │ user     chroma           idle  12s            │
 │ ▼ host  minimald v0.1  ●        │ │ title    vim: src/api/main.rs                  │
 │   ▸ api-staging    OwnIp    ●   │ │ bells    ●2 (last 3m)                          │
-│     (unnamed)      Host         │ ├─ Preview (live screen snapshot) ───────────────┤
-│ ▼ vm    minvmd kvm     ●        │ │ $ cargo run                                    │
-│     bench          NoNet        │ │    Compiling minimal v0.1 (1457 deps)…         │
+│     (unnamed)      Host         │ │ ─ Policy ────────────────────────────────      │
+│ ▼ vm    minvmd kvm     ●        │ │ egress   allow all                             │
+│     bench          NoNet        │ │ ─ Preview (live screen snapshot) ────────      │
+│                                 │ │ $ cargo run                                    │
 │                                 │ │    Finished `dev` profile in 3m 04s            │
 │                                 │ │ $ ▏                                            │
 └─────────────────────────────────┘ └────────────────────────────────────────────────┘
- ↑↓ move · / filter · tab switch · d destroy · r rename · n new · q quit
+ ↑↓ move · / filter · enter attach · d destroy · r rename · n new · q quit
 ```
+
+(Implemented revision: the detail pane stacks Info, Policy, and Preview
+vertically instead of tabbing between them, and `enter` attaches in place
+— suspend TUI, ssh, resume on detach.)
 
 ## Goals
 

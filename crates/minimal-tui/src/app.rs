@@ -42,32 +42,6 @@ pub struct Detail {
     pub policy: Option<sessions::SessionPolicy>,
 }
 
-/// Which tab the detail pane shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DetailTab {
-    #[default]
-    Info,
-    Policy,
-    Preview,
-}
-
-impl DetailTab {
-    pub fn next(self) -> Self {
-        match self {
-            Self::Info => Self::Policy,
-            Self::Policy => Self::Preview,
-            Self::Preview => Self::Info,
-        }
-    }
-    pub fn prev(self) -> Self {
-        match self {
-            Self::Info => Self::Preview,
-            Self::Policy => Self::Info,
-            Self::Preview => Self::Policy,
-        }
-    }
-}
-
 /// A modal prompt capturing footer input, if one is open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -162,7 +136,6 @@ pub struct Model {
     /// Index into [`Model::visible_rows`].
     pub cursor: usize,
     pub filter: FilterState,
-    pub tab: DetailTab,
     pub details: HashMap<SessionKey, Detail>,
     pub screens: HashMap<SessionKey, ScreenFetch>,
     /// The most recent bell timestamp acknowledged for a session; a bell
@@ -200,7 +173,6 @@ impl Model {
             providers: Vec::new(),
             cursor: 0,
             filter: FilterState::default(),
-            tab: DetailTab::default(),
             details: HashMap::new(),
             screens: HashMap::new(),
             bells_seen: HashMap::new(),
@@ -376,10 +348,10 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
         Msg::Tick => {
             model.spinner_frame += 1;
             model.now = Utc::now();
+            // The detail pane stacks Info, Policy, and Preview vertically,
+            // so the focused session's screen refreshes on every tick.
             let mut effects = vec![Effect::Refresh];
-            if model.tab == DetailTab::Preview
-                && let Some(key) = model.focused()
-            {
+            if let Some(key) = model.focused() {
                 effects.push(Effect::FetchScreen(key));
             }
             effects
@@ -500,14 +472,6 @@ fn update_key(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                 model.cursor += 1;
             }
             on_focus_change(model)
-        }
-        (KeyCode::Tab, _) => {
-            model.tab = model.tab.next();
-            on_tab_change(model)
-        }
-        (KeyCode::BackTab, _) => {
-            model.tab = model.tab.prev();
-            on_tab_change(model)
         }
         (KeyCode::Enter, _) => match model.cursor_row() {
             Some(Row::ProviderHeader(p)) => {
@@ -767,21 +731,9 @@ fn fetch_focused(model: &mut Model) -> Vec<Effect> {
     if !model.details.contains_key(&key) {
         effects.push(Effect::FetchDetail(key));
     }
-    if model.tab == DetailTab::Preview {
-        effects.push(Effect::FetchScreen(key));
-    }
+    // Preview is always visible in the stacked detail pane.
+    effects.push(Effect::FetchScreen(key));
     effects
-}
-
-/// Switching onto the Preview tab fetches the focused session's screen.
-fn on_tab_change(model: &mut Model) -> Vec<Effect> {
-    match model.tab {
-        DetailTab::Preview => match model.focused() {
-            Some(key) => vec![Effect::FetchScreen(key)],
-            None => Vec::new(),
-        },
-        _ => Vec::new(),
-    }
 }
 
 /// Options for [`run`].
@@ -1150,18 +1102,6 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_the_detail_tab() {
-        let mut model = two_providers();
-        assert_eq!(model.tab, DetailTab::Info);
-        update(&mut model, key(KeyCode::Tab));
-        assert_eq!(model.tab, DetailTab::Policy);
-        update(&mut model, key(KeyCode::Tab));
-        assert_eq!(model.tab, DetailTab::Preview);
-        update(&mut model, key(KeyCode::BackTab));
-        assert_eq!(model.tab, DetailTab::Policy);
-    }
-
-    #[test]
     fn enter_on_a_header_toggles_collapse() {
         let mut model = two_providers();
         update(&mut model, key(KeyCode::Enter));
@@ -1395,12 +1335,9 @@ mod tests {
     }
 
     #[test]
-    fn preview_tab_fetches_the_screen_on_tick() {
+    fn tick_fetches_the_focused_sessions_screen() {
         let mut model = two_providers();
         update(&mut model, key(KeyCode::Down));
-        update(&mut model, key(KeyCode::Tab));
-        update(&mut model, key(KeyCode::Tab));
-        assert_eq!(model.tab, DetailTab::Preview);
         let effects = update(&mut model, Msg::Tick);
         assert!(effects.iter().any(|e| matches!(e, Effect::Refresh)));
         assert!(
