@@ -14,8 +14,6 @@ content-addressed local cache.
 > the package/build plane directly. Most workflows are better served by the
 > [`min` session CLI](./cli-min.md).
 
-Generated from `--help` at `d9f20165`.
-
 ## Global flags
 
 These apply to every subcommand.

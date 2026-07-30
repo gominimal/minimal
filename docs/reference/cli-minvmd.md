@@ -11,8 +11,6 @@ description: "Ops reference for the minvmd VM daemon: boots and supervises the L
 the only session backend; on Linux it is selected with `min --provider local-minvmd`
 (see [min](./cli-min.md)).
 
-Generated from `--help` at `3a05252c`.
-
 ## Global flags
 
 | Flag | Description |

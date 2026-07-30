@@ -12,8 +12,6 @@ microVM). End users normally never run it by hand: `min` auto-starts a
 native daemon on Linux, and [minvmd](./cli-minvmd.md) supervises it
 inside the microVM.
 
-Generated from `--help` at `3a05252c`.
-
 ## Global flags
 
 | Flag | Short | Description |
