@@ -6,7 +6,7 @@ expression: render(&model)
 "│ /                            ││ project /src/api                  net   OwnIp                    │"
 "│ ──────────────────────────── ││ user    chroma                    idle  -                        │"
 "│ ▼ host  v0.1              ●  ││ title   -                                                        │"
-"│   ▸ api-staging      OwnIp   ││ bells   -                                                        │"
+"│   ▸ api-staging     OwnIp    ││ bells   -                                                        │"
 "│                              ││ ─ Policy ─────────────────────────────────────────────────────── │"
 "│                              ││ egress                                                           │"
 "│                              ││   subnets  10.0.0.0/8                                            │"

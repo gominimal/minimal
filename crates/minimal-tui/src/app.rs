@@ -1335,6 +1335,60 @@ mod tests {
     }
 
     #[test]
+    fn indicator_shows_spinner_for_recent_stdout() {
+        let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let mut hot = entry(1, Some("hot"));
+        hot.attrs = Some(minimald_rpc::RunningSessionAttrs {
+            last_stdout: Some(now - chrono::Duration::seconds(2)),
+            last_stdin: None,
+            title: None,
+            audible_bell: None,
+            visual_bell: None,
+        });
+        // Refreshed overwrites `now` with the wall clock; pin it back.
+        let mut model = model_with(vec![provider("host", vec![hot])]);
+        model.now = now;
+        let key = SessionKey {
+            provider: 0,
+            id: id(1),
+        };
+        assert_eq!(model.indicator(key), "◐");
+    }
+
+    #[test]
+    fn indicator_shows_waiting_for_stdin_without_stdout() {
+        let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let mut waiting = entry(1, Some("wait"));
+        waiting.attrs = Some(minimald_rpc::RunningSessionAttrs {
+            last_stdout: Some(now - chrono::Duration::seconds(60)),
+            last_stdin: Some(now - chrono::Duration::seconds(2)),
+            title: None,
+            audible_bell: None,
+            visual_bell: None,
+        });
+        let mut model = model_with(vec![provider("host", vec![waiting])]);
+        model.now = now;
+        let key = SessionKey {
+            provider: 0,
+            id: id(1),
+        };
+        assert_eq!(model.indicator(key), "○");
+    }
+
+    #[test]
+    fn indicator_blank_when_idle() {
+        let model = two_providers();
+        let key = SessionKey {
+            provider: 0,
+            id: id(1),
+        };
+        assert_eq!(model.indicator(key), "");
+    }
+    #[test]
     fn tick_fetches_the_focused_sessions_screen() {
         let mut model = two_providers();
         update(&mut model, key(KeyCode::Down));

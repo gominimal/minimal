@@ -6,7 +6,7 @@ expression: render(&model)
 "│ /                            ││ project /src/api                  net   ?                        │"
 "│ ──────────────────────────── ││ user    ?                         idle  -                        │"
 "│ ▼ host  v0.1              ●  ││ title   -                                                        │"
-"│   ▸ api-staging          -   ││ bells   -                                                        │"
+"│   ▸ api-staging         -    ││ bells   -                                                        │"
 "│                              ││ ─ Policy ─────────────────────────────────────────────────────── │"
 "│                              ││ loading policy…                                                  │"
 "│                              ││ ─ Preview (live screen snapshot) ─────────────────────────────── │"

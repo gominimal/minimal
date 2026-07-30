@@ -111,21 +111,31 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
                     .unwrap_or("-");
                 // Selected rows get a `▸` marker and bold text; unselected
                 // rows indent past the marker. Indicator stays flush right.
+                // The row must total exactly `inner_width` columns: one over
+                // and the terminal swallows the indicator cell at the right
+                // edge (this was the "no activity indicator" bug).
                 let marker = if selected { "▸ " } else { "  " };
-                let name_w =
-                    inner_width.saturating_sub(marker.chars().count() + net.chars().count() + 4);
+                let right = format!("{net} {indicator:>2}");
+                let right_w = right.chars().count();
+                let left = pad_truncate(
+                    &format!("  {marker}{name}"),
+                    inner_width.saturating_sub(right_w),
+                );
+                let gap = inner_width
+                    .saturating_sub(left.chars().count())
+                    .saturating_sub(right_w);
                 Line::from(vec![
                     Span::styled(
-                        format!("  {marker}{}", pad_truncate(&name, name_w)),
+                        format!("{left}{}", " ".repeat(gap)),
                         if selected {
                             Style::default().add_modifier(Modifier::BOLD)
                         } else {
                             Style::default()
                         },
                     ),
-                    Span::styled(net, Style::default().fg(Color::Gray)),
+                    Span::styled(net.to_string(), Style::default().fg(Color::Gray)),
                     Span::styled(
-                        format!("{:>3}", indicator),
+                        format!(" {indicator:>2}"),
                         Style::default().fg(Color::Yellow),
                     ),
                 ])

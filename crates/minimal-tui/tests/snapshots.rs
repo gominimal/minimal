@@ -182,3 +182,64 @@ fn detail_pane_with_policy() {
     model.cursor = 1;
     insta::assert_snapshot!(render(&model));
 }
+
+/// A session with fresh stdout renders its activity spinner in the sidebar
+/// (TestBackend text, not a stored snapshot — the glyph is what matters).
+#[test]
+fn sidebar_shows_activity_indicator_for_recent_stdout() {
+    let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+        .unwrap()
+        .to_utc();
+    let mut hot = entry(1, Some("busy"), "/src/busy");
+    hot.attrs = Some(minimald_rpc::RunningSessionAttrs {
+        last_stdout: Some(now - chrono::Duration::seconds(2)),
+        last_stdin: None,
+        title: None,
+        audible_bell: None,
+        visual_bell: None,
+    });
+    let mut model = fixed_model(vec![provider("host", vec![hot])]);
+    model.now = now;
+    assert!(render(&model).contains('◐'));
+}
+
+/// An unacknowledged bell renders `●`; focusing the session acknowledges
+/// it (covered at the model level), so the glyph disappears on the next
+/// render.
+#[test]
+fn sidebar_shows_bell_indicator() {
+    let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+        .unwrap()
+        .to_utc();
+    let mut ringing = entry(1, Some("loud"), "/src/loud");
+    ringing.attrs = Some(minimald_rpc::RunningSessionAttrs {
+        last_stdout: None,
+        last_stdin: None,
+        title: None,
+        audible_bell: Some(minimald_rpc::Bell {
+            count: 1,
+            last: now,
+        }),
+        visual_bell: None,
+    });
+    let mut model = fixed_model(vec![provider("host", vec![ringing])]);
+    model.now = now;
+    assert!(render(&model).contains('●'));
+    // Provider headers also render ● (health); the bell assert above counts
+    // on both. After focusing the session, its bell is acknowledged and only
+    // the header dot remains — check the session row specifically.
+    model.cursor = 1;
+    minimal_tui::app::update(
+        &mut model,
+        Msg::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )),
+    );
+    let rendered = render(&model);
+    let row = rendered
+        .lines()
+        .find(|l| l.contains("loud"))
+        .expect("session row");
+    assert!(!row.contains('●'), "bell must clear on focus: {row}");
+}
