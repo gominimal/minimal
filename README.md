@@ -18,13 +18,11 @@
 </p>
 
 <p align="center">
-
-[![CI](https://github.com/gominimal/minimal/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gominimal/minimal/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Docs](https://img.shields.io/badge/docs-online-blue)](https://docs.minimal.dev/)
-[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.com/invite/qgX8sm6X7G)
-[![Built with Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](https://www.rust-lang.org/)
-
+  <a href="https://github.com/gominimal/minimal/actions/workflows/ci.yml"><img src="https://github.com/gominimal/minimal/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
+  <a href="https://docs.minimal.dev/"><img src="https://img.shields.io/badge/docs-online-blue" alt="Docs"></a>
+  <a href="https://discord.com/invite/qgX8sm6X7G"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built_with-Rust-dea584.svg" alt="Built with Rust"></a>
 </p>
 
 ---
@@ -54,18 +52,18 @@ Not on one of these platforms yet? Tell us what you'd like to see supported in [
 
 ## Installation
 
-To get started, install Minimal with the following shell command (a stable channel is coming soon):
+To get started, install Minimal with the following shell command:
 
 ```shell
-curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/unstable' | sh
+curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/' | sh
 ```
 
-This installs Minimal on your system, adds `min` to your PATH, and sets up shell completions for bash, fish, and zsh.
+This installs the stable channel of Minimal, adds `min` to your PATH, and sets up shell completions for bash, fish, and zsh.
 
 Minimal can be uninstalled with:
 
 ```shell
-curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/unstable' | sh -s -- --uninstall
+curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/' | sh -s -- --uninstall
 ```
 
 ## Getting Started
@@ -84,21 +82,23 @@ cd ~/projects/foo
 min init
 min add --session git gh claude-code
 
-# start and enter a sandbox, which copies up the CWD file tree into the sandbox
+# start and enter a sandbox; the current directory's file tree is copied in
 min session activate --attach .
 
 git init
 
-# develop specs, generate & test code, push to git, etc.
+# develop specs, generate & test code, push to GitHub, etc.
 # agents can add build/runtime dependencies from the Minimal Public Registry with "min add"
 claude
 
 exit
 ```
 
-Prefer not to install the Claude GitHub App? The next example uses a fine-grained GitHub personal access token (PAT) stored in the macOS keychain instead. To create a fine-grained PAT (e.g. scoped to a specific repo), go to <https://github.com/settings/personal-access-tokens>.
+Prefer not to grant Claude Code access to your GitHub repos via the Claude GitHub App? This variant keeps the agent credential-free: it uses a fine-grained GitHub personal access token (PAT) stored in the macOS keychain, revealed to the sandbox only after the agent has exited.
 
-Once you have created the PAT, copied it into your keychain (e.g. `security add-generic-password -s "PAT-foo-repo" -a "my-mac-user-name" -w`), and created the new, empty GitHub repo, the following shows how to populate that repo from within a sandbox:
+First create the new, empty GitHub repo, then create a fine-grained PAT scoped to it at <https://github.com/settings/personal-access-tokens>. Store the PAT in your keychain with `security add-generic-password -s "PAT-foo-repo" -a "my-mac-user-name" -w`.
+
+The following shows how to populate that repo from within a sandbox:
 
 ```shell
 mkdir -p ~/projects/foo
@@ -111,20 +111,21 @@ min add --session git gh claude-code mermaid-cli kittyview less emacs
 # copy the GitHub PAT to your clipboard from your macOS keychain
 security find-generic-password -w -s "PAT-foo-repo" -a "my-mac-user-name" | pbcopy
 
-# start and enter a sandbox, which copies up the CWD file tree into the sandbox
+# start and enter a sandbox; the current directory's file tree is copied in
 min session activate --attach .
 
 git init
 
-# develop specs, generate code, etc.
+# develop specs, generate code, etc. — skipping permission prompts is
+# reasonable here: the agent is sealed in the sandbox with no credentials
 claude --dangerously-skip-permissions
 
-# review the generated code first
+# review the generated code before committing
 git add -A
-git commit -m "initial checkin"
+git commit -m "initial commit"
 
-# add GH credential after AI Agents are terminated
-read -sp "paste GH PAT now:" GH_TOKEN && export GH_TOKEN
+# add the GitHub credential now that the AI agent has exited
+read -sp "paste GitHub PAT now: " GH_TOKEN && export GH_TOKEN
 
 # push to github
 git remote add origin https://github.com/<your-owner>/<your-repo>.git
@@ -136,16 +137,22 @@ exit
 
 ### Work on an existing project in a Minimal sandbox
 
-In this example we'll work on an existing git repo that already has a `minimal.toml`, where Claude Code has been granted access to our GitHub repos.
+In this example we'll work on an existing git repo that already has a `minimal.toml`, reusing the keychain-stored GitHub PAT from the previous example so Claude can pull the repo and open a PR.
 
 ```shell
 cd ~/projects/foo
 
-# get the latest files on the current branch - we need the minimal.toml
+# get the latest files on the current branch; we need the minimal.toml
 git pull
+
+# copy the GitHub PAT to your clipboard from your macOS keychain
+security find-generic-password -w -s "PAT-foo-repo" -a "my-mac-user-name" | pbcopy
 
 # don't copy any files up; we'll git pull inside the sandbox
 min session activate --attach --sync none .
+
+# note: the exported GH_TOKEN is visible to Claude in this session
+read -sp "paste GitHub PAT now: " GH_TOKEN && export GH_TOKEN
 
 # tell claude to pull https://github.com/<your-owner>/<your-repo>.git
 # then add new features, fix bugs, etc.
@@ -168,9 +175,25 @@ name        = "dev"
 description = "helix + zellij with my dotfiles"
 packages    = ["helix", "zellij"]
 
+patches = [
+    # Helix: single config files plus a themes directory.
+    { dest = ".config/helix/config.toml", source = "~/dotfiles/helix/config.toml" },
+    { dest = ".config/helix/languages.toml", source = "~/dotfiles/helix/languages.toml" },
+    { dest = ".config/helix/themes/", source = "~/dotfiles/helix/themes/**/*.toml" },
+
+    # Zellij: single config file plus a layouts directory.
+    { dest = ".config/zellij/config.kdl", source = "~/dotfiles/zellij/config.kdl" },
+    { dest = ".config/zellij/layouts/", source = "~/dotfiles/zellij/layouts/**/*.kdl" },
+]
+
 [vars]
-EDITOR = "hx"
-TERM   = { inherit = true, default = "xterm-256color" }
+EDITOR    = "hx"
+VISUAL    = "hx"
+
+# Declared to warm helix's tree-sitter grammar cache when the session
+# comes up. Best-effort; failures don't tank activation.
+[[lifecycle_hooks]]
+on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || true" }
 ```
 
 Apply one with `min session activate --loadout dev --attach .`, or list it in

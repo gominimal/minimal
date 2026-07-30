@@ -163,7 +163,7 @@ name/size listings. Review the archive before sharing.
 
 ```
 min init [-y|--yes]
-min add <--runtime|--build|--task <TASK>> <PACKAGES>...
+min add <--session|--runtime|--build|--task <TASK>> <PACKAGES>...
 min update
 ```
 
