@@ -1797,9 +1797,7 @@ fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), anyhow::Error
     } else {
         bail!(
             "`min session attach` needs an interactive terminal, but stdin is not a TTY. \
-             Run it from a terminal, or use the non-interactive escape hatch \
-             `min session attach --command <cmd>` (a hidden flag, kept for scripted \
-             callers) to run a single command."
+             Run it from a terminal."
         )
     }
 }
@@ -2696,7 +2694,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("not a TTY") && err.contains("--command"),
+            err.contains("not a TTY"),
             "expected an actionable non-TTY error, got: {err}"
         );
         ensure_interactive_attach_tty(true).expect("a real terminal must pass the guard");

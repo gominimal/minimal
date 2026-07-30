@@ -204,12 +204,6 @@ Verified against the current tree; sources in parentheses.
   typically the distribution shim (`~/.minimal/shim/bin/minimal`), distinct
   from anything this repo builds (justfile comments,
   `crates/minvmd/README.md`).
-- **`min session attach -c` is not a general remote shell.** It is a hidden,
-  legacy escape hatch for scripted callers, gated behind a small internal
-  allowlist (`crates/minimald/src/exec.rs`) that rejects anything outside it.
-  Task execs inherit the session's no-net/host-net mode, but an own-IP
-  session's task exec currently falls back to host networking; use an
-  interactive attach when the session's network identity matters.
 
 ## CI lane map
 
