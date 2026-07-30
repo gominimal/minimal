@@ -72,29 +72,7 @@ The examples below walk through the two most common workflows: starting a brand-
 
 ### Create a new project with Minimal
 
-In this example we'll create a new git repo from within a Minimal sandbox, using tools from the [Minimal Public Registry](https://github.com/gominimal/pkgs/). It assumes Claude Code has been granted access to your GitHub repos (via the Claude GitHub App) so it can push changes on your behalf.
-
-```shell
-mkdir -p ~/projects/foo
-cd ~/projects/foo
-
-# create and update a minimal.toml file
-min init
-min add --session git gh claude-code
-
-# start and enter a sandbox; the current directory's file tree is copied in
-min session activate --attach .
-
-git init
-
-# develop specs, generate & test code, push to GitHub, etc.
-# agents can add build/runtime dependencies from the Minimal Public Registry with "min add"
-claude
-
-exit
-```
-
-Prefer not to grant Claude Code access to your GitHub repos via the Claude GitHub App? This variant keeps the agent credential-free: it uses a fine-grained GitHub personal access token (PAT) stored in the macOS keychain, revealed to the sandbox only after the agent has exited.
+In this example we'll create a new git repo from within a Minimal sandbox, using tools from the [Minimal Public Registry](https://github.com/gominimal/pkgs/). The workflow keeps the agent credential-free: it uses a fine-grained GitHub personal access token (PAT) stored in the macOS keychain, revealed to the sandbox only after the agent has exited.
 
 First create the new, empty GitHub repo, then create a fine-grained PAT scoped to it at <https://github.com/settings/personal-access-tokens>. Store the PAT in your keychain with `security add-generic-password -s "PAT-foo-repo" -a "my-mac-user-name" -w`.
 
@@ -117,7 +95,8 @@ min session activate --attach .
 git init
 
 # develop specs, generate code, etc. — skipping permission prompts is
-# reasonable here: the agent is sealed in the sandbox with no credentials
+# reasonable here: the agent is sealed in the sandbox with no credentials;
+# agents can add build/runtime dependencies from the registry with "min add"
 claude --dangerously-skip-permissions
 
 # review the generated code before committing
