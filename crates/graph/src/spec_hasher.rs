@@ -10,6 +10,79 @@ use std::io::Write;
 
 type Edges = SmallVec<[Edge; 12]>;
 
+/// The byte-encoding primitives the spec-hash serializer emits through.
+///
+/// This trait is the seam between two concerns that used to be interleaved:
+/// - **traversal** — [`SpecHasher::process`] discovers every referenced spec
+///   and assigns it a stable discovery index (unchanged by this split);
+/// - **encoding** — turning each spec's fields and edges into the bytes fed to
+///   Blake3, which now happens exclusively through this trait.
+///
+/// Isolating encoding behind one trait means a future hash format (the injective
+/// redesign — length-prefixed framing, deps-as-sets) is a *new impl of this
+/// trait*, selected at the call site, rather than edits threaded through the
+/// walk. It also localizes the layer where the known non-injectivity lives
+/// (unframed concatenation, in-band markers).
+///
+/// The method names carry semantic intent that today's [`LegacyEncoder`]
+/// deliberately collapses — a structural `tag` and variable `bytes` are both raw
+/// `write_all` in the legacy scheme — but a framed successor distinguishes (a
+/// tag is fixed; content gets a length prefix). This split is **byte-for-byte
+/// preserving**: the golden hash tests below pin concrete digests and are
+/// unchanged.
+trait SpecEncoder {
+    /// A fixed structural marker (e.g. `b"src"`, `b"i"`, `b"-outputs"`).
+    fn tag(&mut self, tag: &[u8]);
+    /// Variable content (a name, glob, url, sha, ...).
+    fn bytes(&mut self, bytes: &[u8]);
+    /// A discovery/traversal index.
+    fn index(&mut self, idx: usize);
+    /// A hashed number (`AttrValue::Number`).
+    fn number(&mut self, n: f64);
+    /// The build target.
+    fn target(&mut self, target: &Target);
+    /// Consume the encoder and produce the digest.
+    fn finish(self) -> SpecHash;
+}
+
+/// Epoch-0 encoder: byte-for-byte the historical scheme — raw concatenation,
+/// in-band markers, platform-width little-endian indices.
+///
+/// **Do not change its output.** These bytes are the live cache keyspace
+/// (~46k entries, sealed per-commit closures, signed catalogs). A new hash
+/// format is a *sibling* `SpecEncoder` impl chosen at the call site, never an
+/// edit to this one.
+struct LegacyEncoder {
+    h: Hasher,
+}
+
+impl LegacyEncoder {
+    fn new() -> Self {
+        Self { h: Hasher::new() }
+    }
+}
+
+impl SpecEncoder for LegacyEncoder {
+    fn tag(&mut self, tag: &[u8]) {
+        self.h.write_all(tag).unwrap();
+    }
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.h.write_all(bytes).unwrap();
+    }
+    fn index(&mut self, idx: usize) {
+        self.h.write_all(&idx.to_le_bytes()).unwrap();
+    }
+    fn number(&mut self, n: f64) {
+        self.h.write_all(&n.to_le_bytes()).unwrap();
+    }
+    fn target(&mut self, target: &Target) {
+        target.hash_to(&mut self.h);
+    }
+    fn finish(self) -> SpecHash {
+        SpecHash(self.h.finalize())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SpecIndex(usize);
 
@@ -38,54 +111,44 @@ impl<'a> SpecHasher<'a> {
             spec_idx: HashMap::with_capacity(2048),
         };
         sh.process(bsr);
+        sh.encode(LegacyEncoder::new())
+    }
 
-        let mut h = Hasher::new();
+    /// The encoding pass: walk the specs discovered by [`Self::process`] in
+    /// discovery order, emitting each spec's fields then its edges through
+    /// `enc`. Pure over `self.specs` — contains no traversal. The hash *format*
+    /// is entirely the choice of `enc`; swapping in a different [`SpecEncoder`]
+    /// is the whole surface a future hash epoch touches here.
+    fn encode<E: SpecEncoder>(self, mut enc: E) -> SpecHash {
+        let SpecHasher { graph, specs, .. } = self;
+        for (i, (bsr, edges)) in specs.into_iter().enumerate() {
+            let build = graph.get(&bsr).unwrap();
 
-        // compute the hash by walking all seen build-specs in the order they were seen,
-        // first writing base (non-edge) attributes into the hash before describing edges
-        // by index.
-        for (i, (bsr, edges)) in sh.specs.into_iter().enumerate() {
-            let build = sh.graph.get(&bsr).unwrap();
-
-            h.write_all(&i.to_le_bytes()).unwrap();
-            build_attrs_hash(build, &mut h);
+            enc.index(i);
+            build_attrs_hash(build, &mut enc);
 
             for edge in edges.unwrap().into_iter() {
                 use Edge::*;
                 match edge {
                     BuildInput(input_idx, subset_info) => {
-                        h.write_all(b"i").unwrap();
-                        h.write_all(&input_idx.0.to_le_bytes()).unwrap();
-                        if let Some(SubsetInfo(outputs)) = subset_info {
-                            h.write_all(b"ss").unwrap();
-                            for output in &outputs {
-                                h.write_all(output.as_bytes()).unwrap();
-                                h.write_all(b",").unwrap();
-                            }
-                            h.write_all(b"l").unwrap(); // TODO: Remove the next time we break spec-hash values
-                        }
+                        enc.tag(b"i");
+                        enc.index(input_idx.0);
+                        encode_subset_info(subset_info.as_ref(), &mut enc);
                     }
                     RuntimeDep(dep_idx, subset_info) => {
-                        h.write_all(b"r").unwrap();
-                        h.write_all(&dep_idx.0.to_le_bytes()).unwrap();
-                        if let Some(SubsetInfo(outputs)) = subset_info {
-                            h.write_all(b"ss").unwrap();
-                            for output in &outputs {
-                                h.write_all(output.as_bytes()).unwrap();
-                                h.write_all(b",").unwrap();
-                            }
-                            h.write_all(b"l").unwrap(); // TODO: Remove the next time we break spec-hash values
-                        }
+                        enc.tag(b"r");
+                        enc.index(dep_idx.0);
+                        encode_subset_info(subset_info.as_ref(), &mut enc);
                     }
                     ReplaceOnCycle(r_idx) => {
-                        h.write_all(b"c").unwrap();
-                        h.write_all(&r_idx.0.to_le_bytes()).unwrap();
+                        enc.tag(b"c");
+                        enc.index(r_idx.0);
                     }
                 }
             }
         }
 
-        SpecHash(h.finalize())
+        enc.finish()
     }
 
     fn process(&mut self, bsr: &BuildSpecRef) -> SpecIndex {
@@ -128,47 +191,60 @@ impl<'a> SpecHasher<'a> {
     }
 }
 
-fn build_output_hash(output: &BuildOutput, h: &mut Hasher) {
+/// Emit a build/runtime edge's optional subset-output list. Factored from the
+/// two byte-identical inline copies the edge encoding used to carry.
+fn encode_subset_info<E: SpecEncoder>(subset_info: Option<&SubsetInfo>, enc: &mut E) {
+    if let Some(SubsetInfo(outputs)) = subset_info {
+        enc.tag(b"ss");
+        for output in outputs {
+            enc.bytes(output.as_bytes());
+            enc.tag(b",");
+        }
+        enc.tag(b"l"); // TODO: Remove the next time we break spec-hash values
+    }
+}
+
+fn build_output_hash<E: SpecEncoder>(output: &BuildOutput, enc: &mut E) {
     use BuildOutput::*;
     match output {
         Library { glob, allow_data } => {
-            h.write_all(b"lib").unwrap();
-            h.write_all(glob.as_bytes()).unwrap();
+            enc.tag(b"lib");
+            enc.bytes(glob.as_bytes());
             if *allow_data {
-                h.write_all(b"-allow_data").unwrap();
+                enc.tag(b"-allow_data");
             }
         }
         Data {
             glob,
             allow_executable,
         } => {
-            h.write_all(b"data").unwrap();
-            h.write_all(glob.as_bytes()).unwrap();
+            enc.tag(b"data");
+            enc.bytes(glob.as_bytes());
             if *allow_executable {
-                h.write_all(b"-allow_exec").unwrap();
+                enc.tag(b"-allow_exec");
             }
         }
         Binary {
             glob,
             allow_missing_interpreter,
         } => {
-            h.write_all(b"bin").unwrap();
-            h.write_all(glob.as_bytes()).unwrap();
+            enc.tag(b"bin");
+            enc.bytes(glob.as_bytes());
             if *allow_missing_interpreter {
-                h.write_all(b"-allow_missing_interp").unwrap();
+                enc.tag(b"-allow_missing_interp");
             }
         }
     }
 }
 
-fn build_input_hash(input: &BuildDep, h: &mut Hasher) {
+fn build_input_hash<E: SpecEncoder>(input: &BuildDep, enc: &mut E) {
     use BuildDep::*;
     match input {
         Build(_) | Subset(_) => {
             unreachable!();
         }
         Source(s) => {
-            h.write_all(b"src").unwrap();
+            enc.tag(b"src");
             match &s.from {
                 SourceFetch::Web {
                     url,
@@ -176,26 +252,26 @@ fn build_input_hash(input: &BuildDep, h: &mut Hasher) {
                     url_pos: _,
                     sha256_pos: _,
                 } => {
-                    h.write_all(b"url").unwrap();
-                    h.write_all(url.as_bytes()).unwrap();
-                    h.write_all(sha256.as_bytes()).unwrap();
+                    enc.tag(b"url");
+                    enc.bytes(url.as_bytes());
+                    enc.bytes(sha256.as_bytes());
                 }
                 SourceFetch::Local {
                     filename,
                     file_hash,
                     full_path: _,
                 } => {
-                    h.write_all(b"local source").unwrap();
-                    h.write_all(filename.as_bytes()).unwrap();
-                    h.write_all(file_hash.as_bytes()).unwrap();
+                    enc.tag(b"local source");
+                    enc.bytes(filename.as_bytes());
+                    enc.bytes(file_hash.as_bytes());
                 }
             };
             if s.extract {
-                h.write_all(b"ext").unwrap();
+                enc.tag(b"ext");
             }
             if let Some(prefix) = &s.strip_prefix {
-                h.write_all(b"strip_prefix").unwrap();
-                h.write_all(prefix.as_bytes()).unwrap();
+                enc.tag(b"strip_prefix");
+                enc.bytes(prefix.as_bytes());
             }
         }
         Local {
@@ -203,100 +279,100 @@ fn build_input_hash(input: &BuildDep, h: &mut Hasher) {
             filename,
             file_hash,
         } => {
-            h.write_all(b"local").unwrap();
-            h.write_all(filename.as_bytes()).unwrap();
-            h.write_all(file_hash.as_bytes()).unwrap();
+            enc.tag(b"local");
+            enc.bytes(filename.as_bytes());
+            enc.bytes(file_hash.as_bytes());
         }
     }
 }
 
 // NB: 'attrs' in this context means the fields of the build, not
 // literally attributes defined on the build (those are not part of the hash).
-fn build_attrs_hash(spec: &BuildSpec, h: &mut Hasher) {
-    h.write_all(b"build spec").unwrap();
-    h.write_all(spec.name.as_bytes()).unwrap();
+fn build_attrs_hash<E: SpecEncoder>(spec: &BuildSpec, enc: &mut E) {
+    enc.tag(b"build spec");
+    enc.bytes(spec.name.as_bytes());
     if spec.prebuilt {
-        h.write_all(b"-prebuilt").unwrap();
+        enc.tag(b"-prebuilt");
     }
     for cmd in &spec.cmds {
-        cmd.iter().for_each(|e| h.write_all(e.as_bytes()).unwrap());
+        cmd.iter().for_each(|e| enc.bytes(e.as_bytes()));
     }
     if let Some(build_args) = &spec.build_args
         && !build_args.is_empty()
     {
-        h.write_all(b"-build args").unwrap();
+        enc.tag(b"-build args");
         for (name, value) in build_args.iter() {
-            h.write_all(b"k").unwrap();
-            h.write_all(name.as_bytes()).unwrap();
-            h.write_all(b"v").unwrap();
-            h.write_all(value.as_bytes()).unwrap();
+            enc.tag(b"k");
+            enc.bytes(name.as_bytes());
+            enc.tag(b"v");
+            enc.bytes(value.as_bytes());
         }
     }
 
-    h.write_all(b"-inputs").unwrap();
-    // Build and Subset deps are hashed as edges (by index) in SpecHasher::hash,
+    enc.tag(b"-inputs");
+    // Build and Subset deps are hashed as edges (by index) in SpecHasher::encode,
     // not as inline inputs — build_input_hash treats both as `unreachable!()`.
     spec.build_deps
         .iter()
         .filter(|i| !matches!(i, BuildDep::Build(_) | BuildDep::Subset(_)))
-        .for_each(|i| build_input_hash(i, h));
+        .for_each(|i| build_input_hash(i, enc));
 
-    h.write_all(b"-outputs").unwrap();
+    enc.tag(b"-outputs");
     for (name, output) in spec.outputs.iter() {
-        h.write_all(name.as_bytes()).unwrap();
-        build_output_hash(output, h);
+        enc.bytes(name.as_bytes());
+        build_output_hash(output, enc);
     }
 
     if spec.target != Target::new(target::Arch::Amd64, target::OS::Linux) {
-        h.write_all(b"-target").unwrap();
-        spec.target.hash_to(h);
+        enc.tag(b"-target");
+        enc.target(&spec.target);
     }
 
     if !spec.abstract_deps.is_empty() {
-        h.write_all(b"-needs").unwrap();
+        enc.tag(b"-needs");
         for (name, v) in spec.abstract_deps.iter() {
-            h.write_all(b"k").unwrap();
-            h.write_all(name.as_bytes()).unwrap();
-            h.write_all(b"v").unwrap();
-            build_attrvalue_hash(v, h);
+            enc.tag(b"k");
+            enc.bytes(name.as_bytes());
+            enc.tag(b"v");
+            build_attrvalue_hash(v, enc);
         }
     }
 }
 
-fn build_attrvalue_hash(v: &AttrValue, h: &mut Hasher) {
+fn build_attrvalue_hash<E: SpecEncoder>(v: &AttrValue, enc: &mut E) {
     match v {
         AttrValue::Bool(b) => {
-            h.write_all(b"b").unwrap();
-            h.write_all(if *b { b"1" } else { b"0" }).unwrap();
+            enc.tag(b"b");
+            enc.tag(if *b { b"1" } else { b"0" });
         }
         AttrValue::String(s, _str_pos) => {
-            h.write_all(b"s").unwrap();
-            h.write_all(s.as_bytes()).unwrap();
+            enc.tag(b"s");
+            enc.bytes(s.as_bytes());
         }
         AttrValue::Number(n) => {
-            h.write_all(b"n").unwrap();
-            h.write_all(&n.to_le_bytes()).unwrap();
+            enc.tag(b"n");
+            enc.number(*n);
         }
 
         AttrValue::List(v) => {
-            h.write_all(b"v").unwrap();
+            enc.tag(b"v");
             if !v.is_empty() {
-                v.iter().for_each(|av| build_attrvalue_hash(av, h));
+                v.iter().for_each(|av| build_attrvalue_hash(av, enc));
             }
         }
         AttrValue::Map(m) => {
-            h.write_all(b"m").unwrap();
+            enc.tag(b"m");
             if !m.is_empty() {
                 m.iter().for_each(|(k, av)| {
-                    h.write_all(k.as_bytes()).unwrap();
-                    build_attrvalue_hash(av, h);
+                    enc.bytes(k.as_bytes());
+                    build_attrvalue_hash(av, enc);
                 });
             }
         }
         AttrValue::EnumVariant(name, v) => {
-            h.write_all(b"ev").unwrap();
-            h.write_all(name.as_bytes()).unwrap();
-            build_attrvalue_hash(v, h);
+            enc.tag(b"ev");
+            enc.bytes(name.as_bytes());
+            build_attrvalue_hash(v, enc);
         }
     }
 }
@@ -328,17 +404,17 @@ impl SubsetHasher {
 
     /// Computs the [SpecHash] of the given [SubsetSpec].
     pub fn hash(subset_spec: &SubsetSpec) -> SpecHash {
-        let mut h = Hasher::new();
-        h.write_all(b"subset").unwrap();
+        let mut enc = LegacyEncoder::new();
+        enc.tag(b"subset");
         for (spec, sorted_outputs) in subset_spec.iter_components() {
-            h.write_all(spec.as_bytes()).unwrap();
+            enc.bytes(spec.as_bytes());
             for output in sorted_outputs {
-                h.write_all(b"-output").unwrap();
-                h.write_all(output.as_bytes()).unwrap();
+                enc.tag(b"-output");
+                enc.bytes(output.as_bytes());
             }
         }
 
-        SpecHash(h.finalize())
+        enc.finish()
     }
 }
 
