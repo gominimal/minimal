@@ -97,6 +97,14 @@ echo "building trimmed libkrun (blk,net; no gpu, no init-blob)"
 # which IS load-bearing for the musl build in build-libkrun-linux.sh. Fixed in
 # both places so the two scripts cannot disagree about what they compiled.
 #
+# rustup resolves rust-toolchain.toml from the CWD too, so leaving the repo
+# falls back to the DEFAULT toolchain instead of the pin. Resolve it here, where
+# rust-toolchain.toml still applies, and carry it across the cd.
+if command -v rustup >/dev/null 2>&1; then
+  RUSTUP_TOOLCHAIN="$(cd "$ROOT" && rustup show active-toolchain 2>/dev/null | cut -d' ' -f1)"
+  [ -n "$RUSTUP_TOOLCHAIN" ] && export RUSTUP_TOOLCHAIN
+fi
+
 # --locked: build exactly upstream's committed Cargo.lock — a silent
 # re-resolve would undermine the pinned, reproducible-build guarantee.
 (

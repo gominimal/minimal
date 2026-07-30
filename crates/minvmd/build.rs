@@ -67,6 +67,7 @@ const STATIC_LIB: &str = "libkrun.a";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=LIBKRUN_PREFIX");
+    println!("cargo:rerun-if-env-changed=MINVMD_REQUIRE_LIBKRUN");
     // Declared so `#[cfg(minvmd_libkrun)]` does not trip the unexpected-cfgs
     // lint under `-D warnings`.
     println!("cargo::rustc-check-cfg=cfg(minvmd_libkrun)");
@@ -91,6 +92,11 @@ fn main() {
         })
         .flatten();
 
+    let has_static = prefix
+        .as_deref()
+        .is_some_and(|p| target_os == "linux" && Path::new(p).join(STATIC_LIB).exists());
+    enforce_requirement(prefix.as_deref(), has_static);
+
     if let Some(prefix) = prefix {
         println!("cargo:rustc-link-search=native={prefix}");
 
@@ -98,7 +104,7 @@ fn main() {
         // macOS pipeline builds and ships a dylib, and quietly switching that
         // proven path because some other libkrun install happened to drop an
         // archive in /opt/homebrew/lib would be a surprise, not a feature.
-        if target_os == "linux" && Path::new(&prefix).join(STATIC_LIB).exists() {
+        if has_static {
             // No rpath: a static link resolves at build time, so there is
             // nothing for the loader to search for. The `#[link]` kind is
             // flipped in src/krun/raw.rs by this cfg.
@@ -108,6 +114,47 @@ fn main() {
         }
 
         println!("cargo::rustc-cfg=minvmd_libkrun");
+    }
+}
+
+/// Turn the silent stub fallback into a hard build error, when asked.
+///
+/// The default is deliberately permissive: a Linux host with no libkrun builds
+/// the stub, which is what keeps stock Linux CI green. The cost is that a build
+/// which SHOULD have linked libkrun and didn't — a release job whose libkrun
+/// step regressed, say — still succeeds, and ships a binary that compiles,
+/// links, and then bails at VM boot. Nothing in the build catches it.
+///
+/// `MINVMD_REQUIRE_LIBKRUN` is the opt-in that closes that gap; the release
+/// lanes set it. Values:
+///
+/// - `static` — a `libkrun.a` must have been found and the link must be static.
+///   This is what a shipped Linux `minvmd` requires.
+/// - anything else non-empty and not `0` — some libkrun must have been found;
+///   dynamic is acceptable.
+///
+/// Unset (or `0`) preserves the stub-on-miss behaviour.
+fn enforce_requirement(prefix: Option<&str>, has_static: bool) {
+    let requirement = std::env::var("MINVMD_REQUIRE_LIBKRUN").unwrap_or_default();
+    if requirement.is_empty() || requirement == "0" {
+        return;
+    }
+
+    let Some(prefix) = prefix else {
+        panic!(
+            "MINVMD_REQUIRE_LIBKRUN={requirement} but no libkrun was found, so this build would \
+             silently produce a STUB minvmd that bails at VM boot. Set LIBKRUN_PREFIX to a \
+             directory holding libkrun.a (static, see scripts/build-libkrun-linux.sh) or \
+             libkrun.so, or unset MINVMD_REQUIRE_LIBKRUN to allow the stub."
+        );
+    };
+
+    if requirement == "static" && !has_static {
+        panic!(
+            "MINVMD_REQUIRE_LIBKRUN=static but no {STATIC_LIB} in {prefix}; the build would link \
+             libkrun DYNAMICALLY and produce a binary that needs libkrun.so at runtime. Build the \
+             archive with scripts/build-libkrun-linux.sh, or drop the `static` requirement."
+        );
     }
 }
 

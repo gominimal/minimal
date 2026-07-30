@@ -135,8 +135,24 @@ echo "building static libkrun for $TARGET (blk,net; no gpu, no init-blob, no lib
 #     [target.'cfg(target_env = "musl")']
 #     rustflags = ["--cfg", "musl_v1_2_3"]
 # which is load-bearing for a musl build. Running from the minimal repo root
-# with --manifest-path (as build-libkrun-macos.sh does) silently drops it.
+# with --manifest-path (as build-libkrun-macos.sh used to) silently drops it.
 #
+# But rustup resolves rust-toolchain.toml from the CWD too, and leaving the repo
+# would silently fall back to the DEFAULT toolchain — which is not the pinned
+# one and, in CI, is not the toolchain `rustup target add` installed the musl
+# target into (the build then dies with "can't find crate for `core`"). So
+# resolve the pin HERE, where rust-toolchain.toml still applies, and carry it
+# across the cd.
+#
+# This is a correctness requirement, not just convenience: libkrun.a is a Rust
+# staticlib linked into a Rust binary, and Rust has no stable ABI. libkrun and
+# minvmd must come out of the same rustc.
+if command -v rustup >/dev/null 2>&1; then
+  RUSTUP_TOOLCHAIN="$(cd "$ROOT" && rustup show active-toolchain 2>/dev/null | cut -d' ' -f1)"
+  [ -n "$RUSTUP_TOOLCHAIN" ] && export RUSTUP_TOOLCHAIN
+  echo "building with toolchain ${RUSTUP_TOOLCHAIN:-<rustup default>}"
+fi
+
 # --locked: build exactly upstream's committed Cargo.lock — a silent re-resolve
 # would undermine the pinned, reproducible-build guarantee.
 (
