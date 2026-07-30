@@ -120,7 +120,11 @@ sed -i 's/^crate-type = \["cdylib", "lib"\]$/crate-type = ["cdylib", "staticlib"
 # triple uppercased with dashes as underscores — so a standalone run works
 # without the caller knowing. An explicit value always wins.
 LINKER_VAR="CARGO_TARGET_$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER"
-if [ -z "${!LINKER_VAR:-}" ] && [ "$TARGET" != "$(rustc -vV | sed -n 's/^host: //p')" ]; then
+# `eval`, not bash's ${!VAR} indirection: this script is otherwise POSIX, and a
+# lone bashism made `sh scripts/build-libkrun-linux.sh` die with "bad
+# substitution" on any ash/dash host (Alpine, the natural musl build box).
+eval "linker_set=\${$LINKER_VAR:-}"
+if [ -z "$linker_set" ] && [ "$TARGET" != "$(rustc -vV | sed -n 's/^host: //p')" ]; then
   command -v musl-gcc >/dev/null || {
     echo "::error::$TARGET is not the host triple and musl-gcc is not installed (apt install musl-tools)" >&2
     exit 1
