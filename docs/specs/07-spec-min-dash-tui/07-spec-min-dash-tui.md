@@ -32,9 +32,10 @@ available providers on the host.
 
 `min dash` is a new subcommand on `minimal2` backed by a new `minimal-tui`
 sub-crate. It renders a master-detail split: a filterable session list on the
-left (grouped by provider), and a tabbed detail pane on the right (Info /
-Policy / Preview). The Preview tab shows a read-only snapshot of the session's
-live terminal output via a new `GetSessionScreen` RPC.
+left (grouped by provider), and a detail pane on the right that stacks the
+Info, Policy, and Preview sections vertically. The Preview section shows a
+read-only snapshot of the session's live terminal output via a new
+`GetSessionScreen` RPC.
 
 The TUI follows an Elm-style architecture (model/update/view) with a tokio
 event loop driving crossterm input and a periodic refresh tick. It reuses the
@@ -58,9 +59,8 @@ existing `minimal2` SSH client transport (`client.rs`) for all RPCs.
  ↑↓ move · / filter · enter attach · d destroy · r rename · n new · q quit
 ```
 
-(Implemented revision: the detail pane stacks Info, Policy, and Preview
-vertically instead of tabbing between them, and `enter` attaches in place
-— suspend TUI, ssh, resume on detach.)
+(Implemented revision: `enter` attaches in place — suspend TUI, ssh, resume
+on detach.)
 
 ## Goals
 
@@ -139,7 +139,7 @@ check [blessed.rs](https://blessed.rs) first):
 The TUI is a standard Elm architecture:
 
 ```
-Model          → App state: sessions, filter, cursor, focus, detail tab, ...
+Model          → App state: sessions, filter, cursor, focus, detail, ...
 Msg            → enum of events: KeyPressed, Tick, RpcResult(...), ...
 update(Model, Msg) -> Model + Effect
 view(Model)    -> ratatui::Frame (pure; no side effects)
@@ -217,7 +217,7 @@ it writes `self.parser.screen().state_formatted()` to the new SSH channel
 attaching — and attaching opens a live I/O relay and triggers a PTY resize
 (`set_size` → `SIGWINCH`).
 
-The Preview tab needs read-only access to the screen without these side
+The Preview section needs read-only access to the screen without these side
 effects. A new oneshot RPC provides it.
 
 ### Wire contract
@@ -320,8 +320,8 @@ and `resolve_socket_path(true)`). For each reachable socket, connect and call
 session rows beneath. Each row shows name (or generated short name), network
 mode, and an activity indicator (● if `last_stdout`/`last_stdin` within 60s).
 
-**R2.3** `↑`/`↓` moves the cursor within the filtered set. `Tab`/`Shift+Tab`
-cycles the right-pane tab. `Enter` on a group header toggles collapse/expand.
+**R2.3** `↑`/`↓` moves the cursor within the filtered set. `Enter` on a
+group header toggles collapse/expand.
 
 **R2.4** Refresh tick: re-call `ListSessions` on every reachable provider and
 update the model. The cursor stays on the same session if it still exists.
@@ -339,21 +339,21 @@ filtered view.
 **R3.3** When the filter is active and the list narrows, the cursor clamps to
 the first visible row if the previously focused row was filtered out.
 
-### Unit 4 — Detail pane: Info and Policy tabs
+### Unit 4 — Detail pane: Info and Policy sections
 
 **R4.1** When a session is focused, call `GetSessionRecord` and
 `GetSessionPolicy` (debounced: one RPC per focus change, not per tick). Cache
 in the model.
 
-**R4.2** Info tab: project path, username, network mode, session ID. Live
+**R4.2** Info section: project path, username, network mode, session ID. Live
 attrs from `ListSessions` (title, last stdin/stdout, bell counts) are merged
 from the list-refresh data — no separate RPC.
 
-**R4.3** Policy tab: egress (allowed subnets, DNS hosts, protocols) and
+**R4.3** Policy section: egress (allowed subnets, DNS hosts, protocols) and
 ingress (port mappings, dynamic range) rendered as a readable list. If the
 session is not `OwnIp`, show "No network policy (HostNet/NoNet)".
 
-### Unit 5 — Preview tab: GetSessionScreen RPC
+### Unit 5 — Preview section: GetSessionScreen RPC
 
 **R5.1** Add `GetSessionScreen` RPC types to `minimald-rpc`.
 
@@ -366,7 +366,7 @@ loop gains the arm. The snapshot is read-only — no PTY resize, no I/O relay.
 ID/name (reusing the `GetSessionRecord` path), send `Message::GetScreen` to
 the `Host` actor, serialize the `ScreenSnapshot` as the response.
 
-**R5.4** TUI Preview tab: on focus change and on each refresh tick, call
+**R5.4** TUI Preview section: on each refresh tick, call
 `GetSessionScreen` for the focused session. Render the `ScreenSnapshot` as a
 read-only ratatui `Paragraph` or custom widget. If the session's terminal is
 larger than the pane, scroll (cursor follows the session's cursor position).
@@ -476,7 +476,7 @@ eliminate polling latency, enable immediate sidebar indicator updates
 (spinner → `○` transitions visible in real time), and reduce wasted
 RPCs. The current `OneshotSshRpc` contract would need a `StreamingSshRpc`
 counterpart. This also subsumes a per-session `WatchSessionScreen` for
-the Preview tab — the same stream carries screen-change events.
+the Preview section — the same stream carries screen-change events.
 
 ### F5: Customizable keybindings
 
@@ -521,5 +521,5 @@ defined.
 
 **Proof artifact 3 (Manual):**
 `min dash` opens the TUI, shows sessions from all running providers, and the
-Preview tab shows live terminal output for a focused session without
+Preview section shows live terminal output for a focused session without
 attaching.
