@@ -446,7 +446,7 @@ pub struct AttachArgs {
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
     /// Command to exec in the session context (non-interactive)
-    #[arg(long, short)]
+    #[arg(long, short, hide = true)]
     pub command: Option<String>,
 }
 
@@ -1797,8 +1797,7 @@ fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), anyhow::Error
     } else {
         bail!(
             "`min session attach` needs an interactive terminal, but stdin is not a TTY. \
-             Run it from a terminal, or use `min session attach --command <cmd>` to run a \
-             single command non-interactively."
+             Run it from a terminal."
         )
     }
 }
@@ -2695,7 +2694,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("not a TTY") && err.contains("--command"),
+            err.contains("not a TTY"),
             "expected an actionable non-TTY error, got: {err}"
         );
         ensure_interactive_attach_tty(true).expect("a real terminal must pass the guard");

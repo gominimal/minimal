@@ -73,16 +73,13 @@ the current directory).
 ### `session attach`
 
 ```
-min session attach [-c <COMMAND>] [SESSION]
+min session attach [SESSION]
 ```
 
 Attaches to an existing session, identified by UUID or session name. When
 `SESSION` is omitted, `min session attach` resolves a session from the current
 working directory (or the only existing session) and opens an interactive
 picker if the choice is ambiguous (`--no-input` errors instead).
-`-c/--command` execs a command in the session context non-interactively
-instead of opening an interactive shell; the daemon accepts only
-`min run <task name>` invocations on this channel, not arbitrary commands.
 
 ### `session destroy`
 

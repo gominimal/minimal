@@ -204,14 +204,6 @@ Verified against the current tree; sources in parentheses.
   typically the distribution shim (`~/.minimal/shim/bin/minimal`), distinct
   from anything this repo builds (justfile comments,
   `crates/minvmd/README.md`).
-- **`min session attach -c` is not a general remote shell.** The daemon's exec
-  handler accepts only `min run <task>`, `min package build [args...]`, and
-  `min check [args...]` (plus the internal `git-receive-pack min://` path);
-  anything else fails the channel. Task
-  execs inherit the session's no-net/host-net mode, but an own-IP session's
-  task exec currently falls back to host networking; use an interactive
-  attach when the session's network identity matters
-  (`crates/minimald/src/exec.rs`).
 
 ## CI lane map
 
