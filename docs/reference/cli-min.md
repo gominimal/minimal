@@ -82,7 +82,8 @@ working directory (or the only existing session) and opens an interactive
 picker if the choice is ambiguous (`--no-input` errors instead).
 `-c/--command` execs a command in the session context non-interactively
 instead of opening an interactive shell; the daemon accepts only
-`min run <task name>` invocations on this channel, not arbitrary commands.
+`min run <task name>`, `min package build [args...]`, and `min check [args...]`
+invocations on this channel, not arbitrary commands.
 
 ### `session destroy`
 
