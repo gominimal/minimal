@@ -828,14 +828,28 @@ enum Message {
         reply: oneshot::Sender<Result<std::process::Command, crate::nsenter::NsenterError>>,
     },
 
+    /// Snapshot the terminal screen for a read-only preview (`min dash`).
+    /// Answered straight off the parser — no PTY resize, no I/O relay.
+    GetScreen(oneshot::Sender<minimald_rpc::ScreenSnapshot>),
+
     SetTitleCallback(String),
     VisualBellCallback,
     AudibleBellCallback,
 }
 
+/// Renders a vt100 cell color into the string form the
+/// [`minimald_rpc::ScreenCell`] wire type uses: `"idx:<n>"` for an ANSI-256
+/// palette index, `"#rrggbb"` for truecolor, `None` for the terminal default.
+fn wire_color(color: vt100_ctt::Color) -> Option<String> {
+    match color {
+        vt100_ctt::Color::Default => None,
+        vt100_ctt::Color::Idx(n) => Some(format!("idx:{n}")),
+        vt100_ctt::Color::Rgb(r, g, b) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
+    }
+}
+
 /// Handles callback events from the terminal parser, transmitting them to the host.
 struct ParserEventHandler(WeakHostHandle);
-
 impl vt100_ctt::Callbacks for ParserEventHandler {
     fn set_window_title(&mut self, _: &mut vt100_ctt::Screen, title: &[u8]) {
         self.0.set_title_cb(title);
@@ -973,6 +987,18 @@ impl HostHandle {
         match self.sender.send(Message::GetAttrs(send)).await {
             Ok(()) => Ok(recv.await.expect("host died")),
             Err(SendError(Message::GetAttrs(_))) => Err(()),
+            Err(e) => unreachable!("{:?}", e),
+        }
+    }
+
+    /// Returns a snapshot of the terminal screen. A dead host reads as
+    /// `Err(())` rather than a panic, matching [`Self::get_attrs`].
+    pub async fn get_screen(&self) -> Result<minimald_rpc::ScreenSnapshot, ()> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        match self.sender.send(Message::GetScreen(send)).await {
+            Ok(()) => recv.await.map_err(|_| ()),
+            Err(SendError(Message::GetScreen(_))) => Err(()),
             Err(e) => unreachable!("{:?}", e),
         }
     }
@@ -1969,6 +1995,60 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         }
     }
 
+    /// Snapshots the visible terminal screen into the structured
+    /// [`minimald_rpc::ScreenSnapshot`] wire type: dimensions, the cursor
+    /// position (omitted when the session hid its cursor), and every cell
+    /// of the grid. Read-only — no PTY resize and no I/O relay, unlike
+    /// `attach`.
+    fn screen_snapshot(&self) -> minimald_rpc::ScreenSnapshot {
+        use minimald_rpc::{ScreenCell, ScreenRow, ScreenSnapshot};
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        let lines = (0..rows)
+            .map(|row| ScreenRow {
+                cells: (0..cols)
+                    .map(|col| match screen.cell(row, col) {
+                        Some(cell) => ScreenCell {
+                            // A cell's contents can be wider than one char
+                            // (wide glyphs); the wire type is a single char,
+                            // so keep the first.
+                            ch: cell.contents().chars().next().unwrap_or(' '),
+                            fg: wire_color(cell.fgcolor()),
+                            bg: wire_color(cell.bgcolor()),
+                            bold: cell.bold(),
+                            italic: cell.italic(),
+                            underline: cell.underline(),
+                            reverse: cell.inverse(),
+                        },
+                        None => ScreenCell {
+                            ch: ' ',
+                            fg: None,
+                            bg: None,
+                            bold: false,
+                            italic: false,
+                            underline: false,
+                            reverse: false,
+                        },
+                    })
+                    .collect(),
+            })
+            .collect();
+        let (cursor_row, cursor_col) = match screen.hide_cursor() {
+            true => (None, None),
+            false => {
+                let (row, col) = screen.cursor_position();
+                (Some(row), Some(col))
+            }
+        };
+        ScreenSnapshot {
+            rows,
+            cols,
+            cursor_row,
+            cursor_col,
+            lines,
+        }
+    }
+
     pub async fn step(&mut self) -> Result<(), ()> {
         tokio::select! {
             // Read actor messages.
@@ -2014,6 +2094,9 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     }
                     Message::GetAttrs(s) => {
                         let _ = s.send(self.attrs.clone());
+                    }
+                    Message::GetScreen(s) => {
+                        let _ = s.send(self.screen_snapshot());
                     }
                     Message::CommandInSession {
                         program,

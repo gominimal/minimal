@@ -300,6 +300,9 @@ enum SessionMessage {
     /// to the `SessionDelta` RPC for the destroy confirm. `Unavailable`
     /// without a running host, or when the host cannot compute it.
     GetWorkspaceDelta(oneshot::Sender<minimald_rpc::SessionDeltaResponse>),
+    /// Snapshot the running host's terminal screen for a read-only preview
+    /// (`min dash`'s `GetSessionScreen`). `None` when no host is running.
+    GetHostScreen(oneshot::Sender<Option<minimald_rpc::ScreenSnapshot>>),
     /// Compose a `Draft` session's loadout from the project config and the
     /// client's wire contribution. `None` finalizes the session (`Active`);
     /// `Some(response)` parks it in `Draft` awaiting a verdict. Refused with
@@ -675,6 +678,14 @@ impl Session {
                     let _ = r.send(minimald_rpc::SessionDeltaResponse::Unavailable);
                 }
             },
+            SessionMessage::GetHostScreen(r) => {
+                let _ = r.send(match &self.inner {
+                    SessionInner::Active {
+                        host: Some((h, _)), ..
+                    } => h.get_screen().await.ok(),
+                    _ => None,
+                });
+            }
             SessionMessage::ConfigureLoadout(contribution, r) => {
                 let _ = r.send(self.configure_loadout(contribution).await);
             }
@@ -1740,6 +1751,14 @@ impl SessionHandle {
         let _ = self.0.send(SessionMessage::GetWorkspaceDelta(send)).await;
         recv.await
             .unwrap_or(minimald_rpc::SessionDeltaResponse::Unavailable)
+    }
+    /// Returns a snapshot of the running session's terminal screen, if any.
+    /// Same dead-actor semantics as [`Self::get_attrs`].
+    pub async fn get_screen(&self) -> Option<minimald_rpc::ScreenSnapshot> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.0.send(SessionMessage::GetHostScreen(send)).await;
+        recv.await.ok().flatten()
     }
 
     /// Returns a minimal context initialized on this sessions' worktree.
