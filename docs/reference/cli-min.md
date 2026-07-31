@@ -100,21 +100,16 @@ min session rename <SESSION> <NEW_NAME>
 
 Renames an existing session.
 
-### `daemon stop` (alias: `min stop`)
+### `session policy`
 
 ```
-min daemon stop [-f|--force]
+min session policy <SESSION>
 ```
 
-Shuts down the `minimald` daemon. `--force` shuts down even if active
-sessions exist. This stops the daemon backend that hosts sessions, and the
-sessions themselves survive it (contrast
-[`session destroy`](#session-destroy), which removes one session and leaves the
-daemon running).
+Prints the effective networking policy for `SESSION` (a UUID or session
+name) as JSON — an object with `egress` and `ingress` fields, each null
+when unset. Resolved from the daemon.
 
-`min stop` is the same command kept bare at the top level — a deliberate
-exception to the `min <noun> <verb>` convention: it acts on the daemon, not
-on any session. Both spellings take the same flags and behave identically.
 
 ### `loadout list` (alias: `ls`)
 
@@ -192,7 +187,7 @@ min completions install [<SHELL>...]
 ```
 
 `print` writes a shell tab-completion script to stdout. Supported shells
-include `bash`, `zsh`, `elvish`, `fish`. Usage:
+include `bash`, `zsh`, `elvish`, `fish`, `powershell`. Usage:
 `source <(min completions print bash)`.
 
 `install` writes that script into the shell's completion directory instead,
