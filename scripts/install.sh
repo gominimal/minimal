@@ -1222,7 +1222,7 @@ case ":${PATH:-}:" in
        say "" ;;
 esac
 say "  $mark ${b}min init$rst                          ${dim}declare this project's environment$rst"
-say "  $mark ${b}min session activate --attach .$rst   ${dim}build the sandbox and step inside$rst"
+say "  $mark ${b}min$rst                               ${dim}build the sandbox and step inside$rst"
 say ""
 say "  ${dim}docs.minimal.dev   $sep   discord.com/invite/qgX8sm6X7G$rst"
 say ""
