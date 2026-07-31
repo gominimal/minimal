@@ -662,6 +662,10 @@ enum Message {
     Kill(bool),
     Attach(Channel<Msg>, WinSize),
     GetAttrs(oneshot::Sender<HostAttrs>),
+    /// Compute the workspace delta (files changed since activation) and
+    /// reply with its rendered rows; `None` when no baseline was armed or
+    /// the re-walk fails.
+    GetChangedFiles(oneshot::Sender<Option<Vec<String>>>),
 
     SetTitleCallback(String),
     VisualBellCallback,
@@ -762,6 +766,25 @@ impl HostHandle {
             Err(SendError(Message::GetAttrs(_))) => Err(()),
             Err(e) => unreachable!("{:?}", e),
         }
+    }
+
+    /// Returns the files changed in the session's workspace since activation
+    /// — the shell-exit prompt's rows — or `None` when the delta is
+    /// unavailable: no baseline was armed, the bounded re-walk failed, or
+    /// the host is gone (a dead host reads as `None`, not a panic, because
+    /// callers race teardown). The walk itself runs off the host's runtime
+    /// loop and is bounded by [`DeltaSource`]'s internal timeout.
+    pub async fn changed_files(&self) -> Option<Vec<String>> {
+        let (send, recv) = oneshot::channel();
+        if self
+            .sender
+            .send(Message::GetChangedFiles(send))
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        recv.await.unwrap_or(None)
     }
 }
 
@@ -1608,6 +1631,20 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                     Message::GetAttrs(s) => {
                         let _ = s.send(self.attrs.clone());
                     }
+                    Message::GetChangedFiles(s) => match &self.delta {
+                        // Computed on a spawned task: the re-walk can take
+                        // up to the delta's walk timeout, and this loop must
+                        // keep pumping the pty while it runs.
+                        Some(delta) => {
+                            let delta = Arc::clone(delta);
+                            tokio::spawn(async move {
+                                let _ = s.send(delta.changed_files().await);
+                            });
+                        }
+                        None => {
+                            let _ = s.send(None);
+                        }
+                    },
                 }
             },
             // Read from master - stdout of session process => ssh channel (if any)

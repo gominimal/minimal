@@ -536,8 +536,8 @@ pub struct DestroyArgs {
     /// Destroy all sessions
     #[arg(long)]
     pub all: bool,
-    /// Skip confirmation when destroying all sessions
-    #[arg(long, short, requires = "all")]
+    /// Skip the destroy confirmation
+    #[arg(long, short)]
     pub force: bool,
 }
 
@@ -2316,7 +2316,98 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
         .context("a session or --all is required")?;
     let record = resolve_session(&mut client, session).await?;
 
+    match destroy_gate(args.force, global.no_input, std::io::stdin().is_terminal())? {
+        DestroyGate::Proceed => {}
+        DestroyGate::Confirm => {
+            // Lead with what the destroy would lose. Best-effort by
+            // design: an unavailable delta (stopped session, RPC error,
+            // timeout, a daemon predating the RPC) renders the plain
+            // confirm — destroy never blocks on the listing.
+            print_destroy_delta(&session_delta(&mut client, record.id).await);
+            let label = record.name.as_deref().unwrap_or(session);
+            if !confirm(
+                &format!("Destroy session {label}? This permanently deletes all in-session files."),
+                false,
+            )? {
+                println!("Aborted.");
+                return Ok(());
+            }
+        }
+    }
+
     destroy_session(&mut client, record.id, record.name.as_deref()).await
+}
+
+/// How a single-session destroy proceeds past its confirmation gate.
+#[derive(Debug, PartialEq, Eq)]
+enum DestroyGate {
+    /// `--force`: destroy without prompting.
+    Proceed,
+    /// Prompt interactively (default No) before destroying.
+    Confirm,
+}
+
+/// Decides whether a single-session destroy skips the confirm (`--force`),
+/// may prompt, or must refuse. Mirrors the `--all` headless precedent:
+/// without a terminal on stdin (or under `--no-input`) the command errors
+/// rather than letting EOF read as consent.
+fn destroy_gate(
+    force: bool,
+    no_input: bool,
+    stdin_is_terminal: bool,
+) -> Result<DestroyGate, anyhow::Error> {
+    if force {
+        return Ok(DestroyGate::Proceed);
+    }
+    if no_input || !stdin_is_terminal {
+        bail!("refusing to destroy the session without confirmation; pass --force")
+    }
+    Ok(DestroyGate::Confirm)
+}
+
+/// Best-effort fetch of the files changed since activation, for the destroy
+/// confirm. Any failure — RPC error, timeout, a daemon predating the RPC —
+/// reads as `None`, and the confirm renders without the listing.
+async fn session_delta(
+    client: &mut client::Client,
+    id: sessions::SessionId,
+) -> Option<Vec<String>> {
+    /// Client-side ceiling on the delta fetch. The daemon bounds its
+    /// workspace walk at 5 s; this sits just above so a slow-but-healthy
+    /// walk still answers while a wedged daemon cannot stall the confirm.
+    const SESSION_DELTA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+    use minimald_rpc::{SessionDelta, SessionDeltaRequest};
+    tokio::time::timeout(
+        SESSION_DELTA_TIMEOUT,
+        client.oneshot_rpc::<SessionDelta>(SessionDeltaRequest::Id(id)),
+    )
+    .await
+    .ok()?
+    .ok()?
+    .changed
+}
+
+/// Renders the destroy-confirm listing above the prompt: the changed-file
+/// rows as the shell-exit prompt renders them, the no-changes line, or —
+/// when the delta is unavailable — nothing at all.
+fn print_destroy_delta(changed: &Option<Vec<String>>) {
+    /// Cap on rows printed, matching the shell-exit prompt's.
+    const ROWS_SHOWN: usize = 10;
+    match changed {
+        Some(rows) if rows.is_empty() => println!("No files changed since activation."),
+        Some(rows) => {
+            let n = rows.len();
+            let plural = if n == 1 { "" } else { "s" };
+            println!("{n} file{plural} changed since activation:");
+            for row in rows.iter().take(ROWS_SHOWN) {
+                println!("  {row}");
+            }
+            if n > ROWS_SHOWN {
+                println!("  ... and {} more", n - ROWS_SHOWN);
+            }
+        }
+        None => {}
+    }
 }
 
 async fn destroy_all_sessions(
@@ -3195,14 +3286,41 @@ mod tests {
         assert!(parse(&["min", "session", "destroy"]).is_err());
         assert!(parse(&["min", "session", "destroy", "--all", "web"]).is_err());
 
-        // --force only makes sense with --all, and its error no longer hides
-        // that --all is the alternative the bare error omitted.
+        // --force skips the confirm on either target: --all, or — since the
+        // single-session confirm landed — a bare session too.
         assert!(parse(&["min", "session", "destroy", "--all", "--force"]).is_ok());
-        let bare = parse(&["min", "session", "destroy", "-f"])
-            .err()
-            .expect("-f without --all must fail to parse")
-            .to_string();
-        assert!(bare.contains("--all"), "usage must surface --all: {bare}");
+        assert!(parse(&["min", "session", "destroy", "web", "--force"]).is_ok());
+        assert!(parse(&["min", "session", "destroy", "web", "-f"]).is_ok());
+        // ... but never stands in for the required target.
+        assert!(parse(&["min", "session", "destroy", "-f"]).is_err());
+    }
+
+    /// The single-session destroy gate: `--force` proceeds promptless in
+    /// every mode; an interactive run without it prompts; a headless run
+    /// (no terminal on stdin, or `--no-input`) refuses, naming `--force` —
+    /// EOF must never read as consent.
+    #[test]
+    fn destroy_gate_headless_refuses_and_force_skips_the_prompt() {
+        assert_eq!(
+            destroy_gate(true, false, true).unwrap(),
+            DestroyGate::Proceed
+        );
+        assert_eq!(
+            destroy_gate(true, true, false).unwrap(),
+            DestroyGate::Proceed
+        );
+
+        assert_eq!(
+            destroy_gate(false, false, true).unwrap(),
+            DestroyGate::Confirm
+        );
+
+        for (no_input, tty) in [(true, true), (false, false), (true, false)] {
+            let err = destroy_gate(false, no_input, tty)
+                .expect_err("headless without --force must refuse")
+                .to_string();
+            assert!(err.contains("--force"), "error must name --force: {err}");
+        }
     }
 
     /// `min task run <task>` parses with `--keep` off by default; the flag

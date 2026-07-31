@@ -272,6 +272,11 @@ enum SessionMessage {
         ChannelConfig,
     ),
     GetHostAttrs(oneshot::Sender<Option<HostAttrs>>),
+    /// The files changed in the session's workspace since activation (the
+    /// shell-exit prompt's rows), served to the `SessionDelta` RPC for the
+    /// destroy confirm. `None` without a running host, or when the host's
+    /// delta is unavailable.
+    GetWorkspaceDelta(oneshot::Sender<Option<Vec<String>>>),
     /// Compose a `Draft` session's loadout from the project config and the
     /// client's wire contribution. `None` finalizes the session (`Active`);
     /// `Some(response)` parks it in `Draft` awaiting a verdict. Refused with
@@ -628,6 +633,22 @@ impl Session {
                     _ => None,
                 });
             }
+            SessionMessage::GetWorkspaceDelta(r) => match &self.inner {
+                SessionInner::Active {
+                    host: Some((h, _)), ..
+                } => {
+                    // Forwarded off-actor: the host answers via a bounded
+                    // workspace re-walk that can take seconds, and this
+                    // actor must stay responsive while it runs.
+                    let h = h.clone();
+                    tokio::spawn(async move {
+                        let _ = r.send(h.changed_files().await);
+                    });
+                }
+                _ => {
+                    let _ = r.send(None);
+                }
+            },
             SessionMessage::ConfigureLoadout(contribution, r) => {
                 let _ = r.send(self.configure_loadout(contribution).await);
             }
@@ -1594,6 +1615,18 @@ impl SessionHandle {
         recv.await.ok().flatten()
     }
 
+    /// Returns the files changed in the session's workspace since activation
+    /// (the shell-exit prompt's rows), or `None` when the delta is
+    /// unavailable — no running host, no baseline, a failed bounded re-walk,
+    /// or a dead actor. Never an error: the destroy confirm renders with or
+    /// without the listing.
+    pub async fn workspace_delta(&self) -> Option<Vec<String>> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.0.send(SessionMessage::GetWorkspaceDelta(send)).await;
+        recv.await.ok().flatten()
+    }
+
     /// Returns a minimal context initialized on this sessions' worktree.
     pub async fn context(&self) -> Result<mctx::Context, String> {
         let (send, recv) = oneshot::channel();
@@ -2124,6 +2157,100 @@ mod tests {
             record_exists(&mut client, session_id).await,
             "keep must not delete the session record"
         );
+    }
+
+    /// The `SessionDelta` RPC serves the destroy-confirm listing from the
+    /// running host's baseline: a file seeded before activation and edited
+    /// during the session comes back as an `M` row, a file created during
+    /// the session as an `A` row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_delta_rpc_reports_changed_files_for_a_running_session() {
+        use minimald_rpc::{SessionDelta, SessionDeltaRequest};
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        // Seed a file before the host launches, so the baseline snapshot
+        // includes it and the in-session edit below reads as `M`.
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("session should resolve");
+        let paths = handle.paths().await.expect("paths should resolve");
+        let seeded = paths
+            .working
+            .join(&paths::DaemonRelPath::try_new("seeded.txt").unwrap());
+        tokio::fs::write(seeded.as_utf8_path(), b"v1")
+            .await
+            .unwrap();
+
+        let mut channel = client.open_shell(session_id).await;
+
+        // Prove the shell is live (mock echoes `got:<line>`): the baseline
+        // is taken before the process launches, so changes from here on
+        // are "since activation".
+        channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+        let mut stdout = Vec::new();
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    stdout.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&stdout).contains("got:hello") {
+                        break;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("channel closed before the echo arrived"),
+            }
+        }
+
+        // Change the workspace daemon-side, as an in-session shell would.
+        tokio::fs::write(seeded.as_utf8_path(), b"v2 longer")
+            .await
+            .unwrap();
+        let added = paths
+            .working
+            .join(&paths::DaemonRelPath::try_new("scratch.txt").unwrap());
+        tokio::fs::write(added.as_utf8_path(), b"made in session")
+            .await
+            .unwrap();
+
+        let resp = client
+            .call::<SessionDelta>(&SessionDeltaRequest::Id(session_id))
+            .await;
+        let rows = resp
+            .changed
+            .expect("delta should be available for a running session");
+        assert!(
+            rows.contains(&"A scratch.txt".to_string()),
+            "expected the added file; got: {rows:?}"
+        );
+        assert!(
+            rows.contains(&"M seeded.txt".to_string()),
+            "expected the modified file; got: {rows:?}"
+        );
+    }
+
+    /// A session without a running host has no delta baseline: the RPC
+    /// answers `changed: None` (never an error), so the destroy confirm
+    /// degrades to its plain form.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_delta_rpc_is_none_without_a_running_host() {
+        use minimald_rpc::{SessionDelta, SessionDeltaRequest};
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        // Configured but never attached: no host was minted, as for a
+        // stopped session or one recovered after a daemon restart.
+        let session_id = create_session(&mut client).await;
+
+        let resp = client
+            .call::<SessionDelta>(&SessionDeltaRequest::Id(session_id))
+            .await;
+        assert_eq!(resp.changed, None);
     }
 
     /// Selecting "delete" on the shell-exit prompt must tear the connection down

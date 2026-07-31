@@ -400,6 +400,42 @@ impl OneshotSshRpc for DestroySession {
     type Response = Errorable<DestroySessionResponse>;
 }
 
+/// An RPC to read the files changed in a session's workspace since
+/// activation — the same rows the shell-exit prompt leads with. Serves
+/// the destroy-confirm listing in `min session destroy`.
+pub struct SessionDelta;
+
+/// The request for a [`SessionDelta`] RPC.
+///
+/// Serialized examples:
+///
+///  * `{"name": "my-session"}`
+///  * `{"id": "<some-uuid>"}`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionDeltaRequest {
+    Name(String),
+    Id(SessionId),
+}
+
+/// The response for a [`SessionDelta`] RPC.
+///
+/// `changed` rows render as `A <path>` / `M <path>` / `D <path>`, sorted by
+/// path; an empty vec means nothing changed. `None` means the delta is
+/// unavailable — no such session, no running host, no baseline, or the
+/// daemon-side bounded re-walk failed — and the caller should not claim
+/// anything about the workspace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionDeltaResponse {
+    pub changed: Option<Vec<String>>,
+}
+
+impl OneshotSshRpc for SessionDelta {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "SessionDelta");
+    type Request<'a> = SessionDeltaRequest;
+    type Response = SessionDeltaResponse;
+}
+
 /// An RPC asking the daemon to shut down its session manager so the process
 /// can terminate gracefully.
 pub struct Shutdown;
@@ -844,6 +880,19 @@ mod tests {
                 ingress: None
             })
         );
+    }
+
+    /// `SessionDelta` distinguishes "nothing changed" (`Some([])`) from
+    /// "delta unavailable" (`None`); both shapes must survive the wire.
+    #[test]
+    fn session_delta_response_round_trips() {
+        let resp = SessionDeltaResponse {
+            changed: Some(vec!["A notes.md".to_string(), "M src/main.rs".to_string()]),
+        };
+        assert_eq!(round_trip(&resp), resp);
+
+        let unavailable = SessionDeltaResponse { changed: None };
+        assert_eq!(round_trip(&unavailable), unavailable);
     }
 
     #[test]

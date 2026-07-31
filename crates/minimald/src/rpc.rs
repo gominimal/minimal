@@ -6,8 +6,8 @@ use minimald_rpc::{
     GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse,
     GetVersion, GetVersionResponse, IssueClientCert, IssueClientCertRequest, ListSessions,
     ListSessionsEntry, ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
-    RenameSessionResponse, ResourcePool, Shutdown, ShutdownRequest, ShutdownResponse,
-    SubmitVerdict,
+    RenameSessionResponse, ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse,
+    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -548,6 +548,30 @@ async fn serve_get_session_policy(
                 // session record, not a hardcoded default.
                 Some(record) => Ok(Errorable::Ok(record.policy)),
             }
+        })
+        .await
+}
+
+/// `SessionDelta`: the files changed in the session's workspace since
+/// activation, as the shell-exit prompt renders them. Best-effort by
+/// contract: an unknown session, a session without a running host, and an
+/// unavailable delta all answer `changed: None` rather than an error — the
+/// client's destroy confirm renders with or without the listing.
+async fn serve_session_delta(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    SessionDelta
+        .handle_channel(c, async |req| {
+            let predicate = match req {
+                SessionDeltaRequest::Id(id) => SessionKeyPredicate::Id(id),
+                SessionDeltaRequest::Name(name) => SessionKeyPredicate::Name(name),
+            };
+            let changed = match s.sessions_manager().await.get_session(predicate).await {
+                Ok(Some(h)) => h.workspace_delta().await,
+                Ok(None) | Err(_) => None,
+            };
+            Ok(SessionDeltaResponse { changed })
         })
         .await
 }
@@ -1182,6 +1206,7 @@ pub async fn handle_ssh_rpc(
         | Shutdown::NAME
         | AbortSession::NAME
         | GetSessionPolicy::NAME
+        | SessionDelta::NAME
         | GetMeshStatus::NAME
         | STREAM_WORKSPACE_FILES
         | STREAM_WORKSPACE_PATCHES
@@ -1261,6 +1286,7 @@ pub async fn handle_ssh_rpc(
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
+        SessionDelta::NAME => serve!(serve_session_delta(s, channel)),
         GetMeshStatus::NAME => serve!(serve_get_mesh_status(s, channel)),
         STREAM_WORKSPACE_FILES => serve!(serve_stream_workspace_files(s, config, channel)),
         STREAM_WORKSPACE_PATCHES => serve!(serve_stream_workspace_patches(s, config, channel)),
