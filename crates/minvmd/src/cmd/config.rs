@@ -102,13 +102,44 @@ fn validate_resources(
     Ok(warnings)
 }
 
+/// Reject a maintenance schedule the guest could not act on.
+///
+/// `HH:MM` is fixed-width and whitespace-free because it rides the kernel
+/// command line, which the kernel splits on whitespace — a malformed value
+/// would either be dropped silently or corrupt the boot line, and the user
+/// would find out a reboot later by noticing maintenance never ran.
+fn validate_maintenance(at: Option<&str>, older_than_secs: Option<u64>) -> Result<()> {
+    if let Some(at) = at
+        && !crate::cmd::is_valid_maintenance_at(at)
+    {
+        bail!("--maintenance-at must be HH:MM in 24-hour UTC, e.g. 03:00 (got `{at}`)");
+    }
+    if let Some(0) = older_than_secs {
+        bail!("--maintenance-older-than-secs must be at least 1 (0 would sweep the whole cache)");
+    }
+    Ok(())
+}
+
 /// Run `minvmd config set`: validate, merge into the persisted config, and save.
-pub fn run_set(vcpus: Option<u8>, ram_mib: Option<u32>) -> Result<()> {
-    if vcpus.is_none() && ram_mib.is_none() {
-        bail!("nothing to set: pass --vcpus and/or --ram-mib");
+pub fn run_set(
+    vcpus: Option<u8>,
+    ram_mib: Option<u32>,
+    maintenance_at: Option<String>,
+    maintenance_older_than_secs: Option<u64>,
+) -> Result<()> {
+    if vcpus.is_none()
+        && ram_mib.is_none()
+        && maintenance_at.is_none()
+        && maintenance_older_than_secs.is_none()
+    {
+        bail!(
+            "nothing to set: pass --vcpus, --ram-mib, --maintenance-at, \
+             and/or --maintenance-older-than-secs"
+        );
     }
 
     let warnings = validate_resources(vcpus, ram_mib, HostCapacity::probe())?;
+    validate_maintenance(maintenance_at.as_deref(), maintenance_older_than_secs)?;
 
     let dir = provider_dir();
     // `StateDir::new` creates the provider dir (a `config set` can precede any
@@ -128,15 +159,30 @@ pub fn run_set(vcpus: Option<u8>, ram_mib: Option<u32>) -> Result<()> {
     if let Some(m) = ram_mib {
         cfg.ram_mib = Some(m);
     }
+    if let Some(at) = maintenance_at {
+        cfg.maintenance_at = Some(at);
+    }
+    if let Some(secs) = maintenance_older_than_secs {
+        cfg.maintenance_older_than_secs = Some(secs);
+    }
     cfg.write(&dir).context("persisting resource config")?;
 
     for w in &warnings {
         eprintln!("warning: {w}");
     }
     println!(
-        "saved: vcpus={}, ram_mib={} (takes effect on next boot)",
+        "saved: vcpus={}, ram_mib={}, maintenance_at={}, \
+         maintenance_older_than_secs={} (takes effect on next boot)",
         describe(cfg.vcpus, DEFAULT_VM_VCPUS),
         describe(cfg.ram_mib, DEFAULT_VM_RAM_MIB),
+        describe(
+            cfg.maintenance_at.as_deref(),
+            crate::cmd::DEFAULT_MAINTENANCE_AT
+        ),
+        describe(
+            cfg.maintenance_older_than_secs,
+            crate::cmd::DEFAULT_MAINTENANCE_OLDER_THAN_SECS
+        ),
     );
     Ok(())
 }
@@ -149,18 +195,39 @@ pub fn run_show(json: bool) -> Result<()> {
     let ram_mib = crate::cmd::effective_ram_mib();
     let vcpus_source = source(env_vcpus().is_some(), cfg.vcpus.is_some());
     let ram_source = source(env_ram_mib().is_some(), cfg.ram_mib.is_some());
+    // Reported as seconds, `0` meaning "no timer", so the shown value matches
+    // exactly what `config set` accepts back.
+    let at = crate::cmd::effective_maintenance_at();
+    let older_than = crate::cmd::effective_maintenance_older_than_secs();
+    let at_source = source(
+        std::env::var(crate::cmd::MAINTENANCE_AT_ENV).is_ok(),
+        cfg.maintenance_at.is_some(),
+    );
+    let older_than_source = source(
+        std::env::var(crate::cmd::MAINTENANCE_OLDER_THAN_ENV).is_ok(),
+        cfg.maintenance_older_than_secs.is_some(),
+    );
 
     if json {
         let out = serde_json::json!({
             "vcpus": vcpus,
             "ram_mib": ram_mib,
+            "maintenance_at": at,
+            "maintenance_older_than_secs": older_than,
             "vcpus_source": vcpus_source,
             "ram_mib_source": ram_source,
+            "maintenance_at_source": at_source,
+            "maintenance_older_than_secs_source": older_than_source,
         });
         println!("{out}");
     } else {
-        println!("vcpus   = {vcpus} ({vcpus_source})");
-        println!("ram_mib = {ram_mib} ({ram_source})");
+        println!("vcpus                       = {vcpus} ({vcpus_source})");
+        println!("ram_mib                     = {ram_mib} ({ram_source})");
+        println!(
+            "maintenance_at              = {} ({at_source})",
+            at.as_deref().unwrap_or("unscheduled")
+        );
+        println!("maintenance_older_than_secs = {older_than} ({older_than_source})");
     }
     Ok(())
 }
@@ -248,6 +315,38 @@ mod tests {
             warns.iter().any(|w| w.contains("MMIO hole")),
             "expected an MMIO-hole warning: {warns:?}"
         );
+    }
+
+    #[test]
+    fn a_well_formed_schedule_is_accepted() {
+        validate_maintenance(Some("03:00"), Some(14 * 24 * 60 * 60)).expect("valid");
+        validate_maintenance(Some("00:00"), None).expect("midnight is valid");
+        validate_maintenance(Some("23:59"), None).expect("last minute is valid");
+    }
+
+    /// The value rides the kernel command line, which the kernel splits on
+    /// whitespace — so a malformed schedule has to be refused here, not
+    /// discovered a reboot later by noticing maintenance never ran.
+    #[test]
+    fn a_malformed_schedule_is_rejected() {
+        for bad in ["3:00", "03:0", "24:00", "03:60", "0300", "03 00", "", "3am"] {
+            let err =
+                validate_maintenance(Some(bad), None).expect_err(&format!("should reject {bad:?}"));
+            assert!(err.to_string().contains("HH:MM"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn zero_retention_is_rejected() {
+        let err = validate_maintenance(None, Some(0)).unwrap_err();
+        assert!(err.to_string().contains("at least 1"), "got: {err}");
+    }
+
+    #[test]
+    fn is_valid_maintenance_at_requires_fixed_width_fields() {
+        assert!(crate::cmd::is_valid_maintenance_at("03:00"));
+        assert!(!crate::cmd::is_valid_maintenance_at("3:00"));
+        assert!(!crate::cmd::is_valid_maintenance_at("03:0"));
     }
 
     #[test]

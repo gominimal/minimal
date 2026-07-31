@@ -26,6 +26,19 @@ pub const DISK_SYNC_ENV: &str = "MINVMD_DISK_SYNC";
 /// see `kernel_cmdline` for both.
 pub const GUEST_LOG_ENV: &str = "RUST_LOG";
 
+/// Guest environment variable naming the daily maintenance time (`HH:MM`, UTC),
+/// forwarded on the kernel command line.
+///
+/// Mirrors `minimald`'s `maintenance::MAINTENANCE_AT_ENV` — minvmd does not
+/// depend on the minimald crate, so the name is duplicated here exactly as
+/// [`crate::timekeep::VSOCK_TIMEKEEP_PORT`] duplicates the guest's vsock port.
+/// Keep the two in step.
+pub const GUEST_MAINTENANCE_AT_ENV: &str = "MINIMAL_MAINTENANCE_AT";
+
+/// Guest environment variable carrying the maintenance sweep's retention in
+/// seconds. Mirrors `minimald`'s `maintenance::MAINTENANCE_OLDER_THAN_ENV`.
+pub const GUEST_MAINTENANCE_OLDER_THAN_ENV: &str = "MINIMAL_MAINTENANCE_OLDER_THAN_SECS";
+
 /// Kernel command line every microVM boots with: the console the guest's
 /// stdout/stderr reaches the host boot log through. `kernel_cmdline` extends it;
 /// nothing else in the boot line is optional.
@@ -227,13 +240,30 @@ impl VmConfig {
         // runs its `/init` (no `root=`/`init=` cmdline). minimald-as-/init mounts
         // devtmpfs itself, then mounts the rootfs disk below and chroots into it.
         //
-        // The boot line also carries the host's RUST_LOG to the guest daemon as
-        // an environment variable: the kernel command line is the only vector,
+        // The boot line also carries settings to the guest daemon as
+        // environment variables: the kernel command line is the only vector,
         // since the guest `/init` is minimald itself and the kernel starts it
-        // with an empty environment (see `kernel_cmdline`). Bound to a local so
-        // the &str handed to `set_kernel` outlives the call.
+        // with an empty environment (see `kernel_cmdline`). That is why the
+        // maintenance schedule is a whitespace-free `HH:MM` — the kernel would
+        // split anything else into separate boot tokens. Bound to locals so the
+        // &strs handed to `set_kernel` outlive the call.
         let rust_log = std::env::var(GUEST_LOG_ENV).ok();
-        let cmdline = kernel_cmdline(rust_log.as_deref());
+        let maintenance_at = crate::cmd::effective_maintenance_at();
+        let older_than = maintenance_at
+            .is_some()
+            .then(|| crate::cmd::effective_maintenance_older_than_secs().to_string());
+
+        let mut envs: Vec<(&str, &str)> = Vec::new();
+        if let Some(v) = rust_log.as_deref() {
+            envs.push((GUEST_LOG_ENV, v));
+        }
+        // Both or neither: a retention without a schedule configures nothing,
+        // and the guest would have no run to apply it to.
+        if let (Some(at), Some(secs)) = (maintenance_at.as_deref(), older_than.as_deref()) {
+            envs.push((GUEST_MAINTENANCE_AT_ENV, at));
+            envs.push((GUEST_MAINTENANCE_OLDER_THAN_ENV, secs));
+        }
+        let cmdline = kernel_cmdline(&envs);
         ctx.set_kernel(
             &self.kernel_path,
             crate::image::kernel_format(),
@@ -351,36 +381,48 @@ impl VmConfig {
 // Only `apply` calls this, and `apply` needs libkrun; without it the crate is a
 // runtime-bailing stub, but the tests below still cover this on every target.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn kernel_cmdline(rust_log: Option<&str>) -> Cow<'static, str> {
-    let Some(value) = rust_log else {
-        return Cow::Borrowed(BASE_KERNEL_CMDLINE);
-    };
+fn kernel_cmdline(envs: &[(&str, &str)]) -> Cow<'static, str> {
+    let mut line = String::from(BASE_KERNEL_CMDLINE);
 
-    // `<base> RUST_LOG=<value>`: the three extra bytes are the separating space,
-    // the `=`, and the NUL the kernel's buffer must also hold.
-    let total_len = BASE_KERNEL_CMDLINE.len() + GUEST_LOG_ENV.len() + value.len() + 3;
-    let rejection = if value.is_empty() {
-        Some("value is empty")
-    } else if value.contains(char::is_whitespace) {
-        Some("value contains whitespace, which the kernel would split into separate boot tokens")
-    } else if total_len > COMMAND_LINE_SIZE {
-        Some("value would push the boot line past the kernel's COMMAND_LINE_SIZE")
-    } else {
-        None
-    };
+    for (name, value) in envs {
+        // `<line> NAME=<value>`: the three extra bytes are the separating
+        // space, the `=`, and the NUL the kernel's buffer must also hold.
+        let total_len = line.len() + name.len() + value.len() + 3;
+        let rejection = if value.is_empty() {
+            Some("value is empty")
+        } else if value.contains(char::is_whitespace) {
+            Some(
+                "value contains whitespace, which the kernel would split into separate boot tokens",
+            )
+        } else if total_len > COMMAND_LINE_SIZE {
+            Some("value would push the boot line past the kernel's COMMAND_LINE_SIZE")
+        } else {
+            None
+        };
 
-    match rejection {
-        Some(reason) => {
-            tracing::warn!(
-                env = GUEST_LOG_ENV,
+        match rejection {
+            // Skipping one token leaves the rest of the line intact: a log
+            // filter that cannot travel must not also cost the guest its
+            // maintenance schedule, or vice versa.
+            Some(reason) => tracing::warn!(
+                env = name,
                 value_len = value.len(),
                 reason,
-                "not forwarding the host log filter to the guest; the guest keeps minimald's \
-                 default filter",
-            );
-            Cow::Borrowed(BASE_KERNEL_CMDLINE)
+                "not forwarding this setting to the guest; the guest keeps its own default",
+            ),
+            None => {
+                line.push(' ');
+                line.push_str(name);
+                line.push('=');
+                line.push_str(value);
+            }
         }
-        None => Cow::Owned(format!("{BASE_KERNEL_CMDLINE} {GUEST_LOG_ENV}={value}")),
+    }
+
+    if line == BASE_KERNEL_CMDLINE {
+        Cow::Borrowed(BASE_KERNEL_CMDLINE)
+    } else {
+        Cow::Owned(line)
     }
 }
 
@@ -431,23 +473,28 @@ fn resolve_disk_flags() -> (bool, crate::krun::SyncMode) {
 mod tests {
     use super::*;
 
+    /// A log filter alone, in the shape the caller builds it.
+    fn log(value: &str) -> Vec<(&str, &str)> {
+        vec![(GUEST_LOG_ENV, value)]
+    }
+
     #[test]
-    fn kernel_cmdline_without_a_host_filter_is_the_bare_console_line() {
+    fn kernel_cmdline_without_any_settings_is_the_bare_console_line() {
         // Byte-identical to the pre-forwarding boot line: no empty token, no
         // trailing space.
-        assert_eq!(kernel_cmdline(None), "console=hvc0");
+        assert_eq!(kernel_cmdline(&[]), "console=hvc0");
     }
 
     #[test]
     fn kernel_cmdline_forwards_a_simple_filter() {
-        assert_eq!(kernel_cmdline(Some("debug")), "console=hvc0 RUST_LOG=debug");
+        assert_eq!(kernel_cmdline(&log("debug")), "console=hvc0 RUST_LOG=debug");
     }
 
     #[test]
     fn kernel_cmdline_preserves_comma_separated_directives() {
         // The normal form of a real filter; commas are legal in a boot token.
         assert_eq!(
-            kernel_cmdline(Some("info,russh=debug,minimald=debug")),
+            kernel_cmdline(&log("info,russh=debug,minimald=debug")),
             "console=hvc0 RUST_LOG=info,russh=debug,minimald=debug"
         );
     }
@@ -456,20 +503,20 @@ mod tests {
     fn kernel_cmdline_skips_a_filter_containing_whitespace() {
         // The kernel would split these into separate boot tokens, silently
         // corrupting the line, so the whole value is dropped.
-        assert_eq!(kernel_cmdline(Some("info, russh=debug")), "console=hvc0");
-        assert_eq!(kernel_cmdline(Some("info\trussh=debug")), "console=hvc0");
+        assert_eq!(kernel_cmdline(&log("info, russh=debug")), "console=hvc0");
+        assert_eq!(kernel_cmdline(&log("info\trussh=debug")), "console=hvc0");
     }
 
     #[test]
     fn kernel_cmdline_skips_an_empty_filter() {
-        assert_eq!(kernel_cmdline(Some("")), "console=hvc0");
+        assert_eq!(kernel_cmdline(&log("")), "console=hvc0");
     }
 
     #[test]
     fn kernel_cmdline_skips_an_oversized_filter() {
         let huge = "minimald=trace,".repeat(500);
         assert!(huge.len() > COMMAND_LINE_SIZE);
-        assert_eq!(kernel_cmdline(Some(&huge)), "console=hvc0");
+        assert_eq!(kernel_cmdline(&log(&huge)), "console=hvc0");
     }
 
     #[test]
@@ -477,12 +524,55 @@ mod tests {
         // `console=hvc0 RUST_LOG=` is 22 bytes, so a 2025-byte value yields a
         // 2047-byte line that fills COMMAND_LINE_SIZE exactly once NUL-terminated.
         let longest = "d".repeat(2025);
-        let line = kernel_cmdline(Some(&longest));
+        let line = kernel_cmdline(&log(&longest));
         assert_eq!(line.len(), COMMAND_LINE_SIZE - 1);
         assert!(line.ends_with(&longest));
 
         // One byte more must be skipped, not truncated.
-        assert_eq!(kernel_cmdline(Some(&"d".repeat(2026))), "console=hvc0");
+        assert_eq!(kernel_cmdline(&log(&"d".repeat(2026))), "console=hvc0");
+    }
+
+    /// The maintenance schedule reaches the guest as two boot tokens. `HH:MM`
+    /// is whitespace-free precisely so it can travel this way.
+    #[test]
+    fn kernel_cmdline_forwards_the_maintenance_schedule() {
+        let line = kernel_cmdline(&[
+            (GUEST_MAINTENANCE_AT_ENV, "03:00"),
+            (GUEST_MAINTENANCE_OLDER_THAN_ENV, "1209600"),
+        ]);
+        assert_eq!(
+            line,
+            "console=hvc0 MINIMAL_MAINTENANCE_AT=03:00 \
+             MINIMAL_MAINTENANCE_OLDER_THAN_SECS=1209600"
+                .replace("             ", "")
+        );
+    }
+
+    #[test]
+    fn kernel_cmdline_forwards_a_filter_and_a_schedule_together() {
+        let line = kernel_cmdline(&[
+            (GUEST_LOG_ENV, "debug"),
+            (GUEST_MAINTENANCE_AT_ENV, "03:00"),
+            (GUEST_MAINTENANCE_OLDER_THAN_ENV, "60"),
+        ]);
+        assert!(line.contains("RUST_LOG=debug"), "{line}");
+        assert!(line.contains("MINIMAL_MAINTENANCE_AT=03:00"), "{line}");
+        assert!(
+            line.contains("MINIMAL_MAINTENANCE_OLDER_THAN_SECS=60"),
+            "{line}"
+        );
+    }
+
+    /// One unusable token must not cost the others their place on the boot
+    /// line — a log filter that cannot travel should not also disable the
+    /// guest's maintenance schedule.
+    #[test]
+    fn one_rejected_setting_does_not_drop_the_rest() {
+        let line = kernel_cmdline(&[
+            (GUEST_LOG_ENV, "has a space"),
+            (GUEST_MAINTENANCE_AT_ENV, "03:00"),
+        ]);
+        assert_eq!(line, "console=hvc0 MINIMAL_MAINTENANCE_AT=03:00");
     }
 
     #[test]

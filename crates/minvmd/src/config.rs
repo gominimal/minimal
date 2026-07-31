@@ -1,7 +1,8 @@
-//! Persisted per-VM resource configuration (#747, R9.4).
+//! Persisted per-VM user configuration (#747, R9.4).
 //!
-//! User-set resource parameters (vcpu count, RAM MiB) live in `config.toml` in
-//! the provider-instance dir, **separate** from the runtime [`State`](crate::state::State):
+//! User-set parameters — the VM's resources (vcpu count, RAM MiB) and its
+//! guest-maintenance schedule — live in `config.toml` in the
+//! provider-instance dir, **separate** from the runtime [`State`](crate::state::State):
 //! `State::stopped()` and `StartingGuard` reset runtime state on every stop or
 //! crash, so config kept there would be silently wiped. This file is written
 //! only by `minvmd config set` and read at boot and by `minvmd status` /
@@ -16,10 +17,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Persisted resource parameters. A `None` field means "unset — use the
+/// Persisted user configuration. A `None` field means "unset — use the
 /// built-in default"; an explicit value overrides the default (but is itself
 /// overridden by the matching environment variable at resolution time, see
 /// [`crate::cmd::effective_ram_mib`]).
+///
+/// Named for the resource parameters it originally carried; the maintenance
+/// schedule joined it rather than opening a second file, so that one atomic
+/// write under one lock still covers every user-set knob.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ResourceConfig {
@@ -29,6 +34,15 @@ pub struct ResourceConfig {
     /// Persisted guest RAM in MiB, if set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ram_mib: Option<u32>,
+    /// Time of day, `HH:MM` UTC, at which the guest runs its maintenance
+    /// cycle. Unset means no schedule, which is how maintenance is switched
+    /// off — the guest owns the timer, so there is no interval to zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_at: Option<String>,
+    /// Retention for the maintenance sweep in seconds, if set: a cache entry
+    /// unused for longer than this is eligible for deletion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_older_than_secs: Option<u64>,
 }
 
 impl ResourceConfig {
@@ -77,6 +91,8 @@ mod tests {
         let cfg = ResourceConfig {
             vcpus: Some(4),
             ram_mib: Some(6144),
+            maintenance_at: Some("03:00".to_string()),
+            maintenance_older_than_secs: Some(86400),
         };
         cfg.write(tmp.path()).expect("write");
         let read_back = ResourceConfig::read(tmp.path()).expect("read");
@@ -90,9 +106,45 @@ mod tests {
         let cfg = ResourceConfig {
             vcpus: None,
             ram_mib: Some(3072),
+            ..ResourceConfig::default()
         };
         cfg.write(tmp.path()).expect("write");
         assert_eq!(ResourceConfig::read(tmp.path()).expect("read"), cfg);
+    }
+
+    /// A `config.toml` written before the maintenance knobs existed must still
+    /// read — its absent fields are "unset", exactly as if never configured.
+    #[test]
+    fn config_predating_the_maintenance_knobs_still_reads() {
+        let tmp = temp_dir();
+        std::fs::write(
+            ResourceConfig::path(tmp.path()),
+            "vcpus = 4\nram_mib = 6144\n",
+        )
+        .expect("write legacy config");
+        let cfg = ResourceConfig::read(tmp.path()).expect("read");
+        assert_eq!(cfg.vcpus, Some(4));
+        assert_eq!(cfg.ram_mib, Some(6144));
+        assert!(cfg.maintenance_at.is_none());
+        assert!(cfg.maintenance_older_than_secs.is_none());
+    }
+
+    /// The schedule is a string on the wire; round-tripping it is what proves
+    /// a `config set` survives to the next boot's kernel command line.
+    #[test]
+    fn a_maintenance_schedule_round_trips() {
+        let tmp = temp_dir();
+        let cfg = ResourceConfig {
+            maintenance_at: Some("04:30".to_string()),
+            ..ResourceConfig::default()
+        };
+        cfg.write(tmp.path()).expect("write");
+        assert_eq!(
+            ResourceConfig::read(tmp.path())
+                .expect("read")
+                .maintenance_at,
+            Some("04:30".to_string())
+        );
     }
 
     #[test]
@@ -101,6 +153,7 @@ mod tests {
         let cfg = ResourceConfig {
             vcpus: Some(2),
             ram_mib: None,
+            ..ResourceConfig::default()
         };
         cfg.write(tmp.path()).expect("write");
         let target = ResourceConfig::path(tmp.path());

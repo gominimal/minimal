@@ -436,6 +436,12 @@ impl Server {
         #[cfg(target_os = "linux")]
         start_host_proxies(&state, in_microvm).await;
 
+        // Guest maintenance, when `minvmd` configured a schedule. Started here
+        // rather than in `main` because it needs the server state, and for the
+        // server's lifetime like the proxies above. A no-op when unscheduled,
+        // which is every daemon not running under `minvmd`.
+        let _maintenance = crate::maintenance::spawn_scheduler(state.clone());
+
         let russh_config = build_russh_config(&state)
             .await
             .map_err(std::io::Error::other)?;

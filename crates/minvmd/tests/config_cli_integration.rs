@@ -24,6 +24,8 @@ fn run(state_home: &std::path::Path, args: &[&str]) -> (bool, String, String) {
         // Ensure no ambient override leaks into the effective-value resolution.
         .env_remove("MINVMD_VM_RAM_MIB")
         .env_remove("MINVMD_VM_VCPUS")
+        .env_remove("MINVMD_MAINTENANCE_AT")
+        .env_remove("MINVMD_MAINTENANCE_OLDER_THAN_SECS")
         .output()
         .expect("spawn minvmd");
     (
@@ -50,6 +52,69 @@ fn set_then_show_reports_persisted_value_and_source() {
     );
     // vcpus was not set, so it falls back to the default.
     assert_eq!(v["vcpus_source"], "default");
+}
+
+/// The maintenance schedule persists and reports through the same
+/// env/config/default precedence as the resource knobs. 04:30 differs from the
+/// 03:00 default, so the assertion distinguishes a persisted value from a
+/// fallback.
+#[test]
+fn maintenance_schedule_persists_and_reports_its_source() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let (ok, _out, err) = run(
+        tmp.path(),
+        &[
+            "config",
+            "set",
+            "--maintenance-at",
+            "04:30",
+            "--maintenance-older-than-secs",
+            "2592000",
+        ],
+    );
+    assert!(ok, "config set must succeed; stderr: {err}");
+
+    let (ok, out, err) = run(tmp.path(), &["config", "show", "--json"]);
+    assert!(ok, "config show must succeed; stderr: {err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    assert_eq!(v["maintenance_at"], "04:30");
+    assert_eq!(v["maintenance_older_than_secs"], 2_592_000);
+    assert_eq!(v["maintenance_at_source"], "config");
+    assert_eq!(v["maintenance_older_than_secs_source"], "config");
+    // Untouched by this set, so the resource knobs still report defaults.
+    assert_eq!(v["ram_mib_source"], "default");
+}
+
+/// Unset, the schedule reports the built-in default rather than nothing —
+/// maintenance is on out of the box, because the growth it reclaims is
+/// unbounded and a knob nobody sets would leave it that way.
+#[test]
+fn an_unset_schedule_reports_the_default() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (ok, out, _err) = run(tmp.path(), &["config", "show", "--json"]);
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    assert_eq!(v["maintenance_at"], "03:00");
+    assert_eq!(v["maintenance_at_source"], "default");
+}
+
+/// The value rides the kernel command line, which splits on whitespace, so a
+/// malformed schedule is refused at `config set` rather than silently dropped
+/// at the next boot.
+#[test]
+fn a_malformed_schedule_is_rejected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let (ok, _out, err) = run(tmp.path(), &["config", "set", "--maintenance-at", "3am"]);
+    assert!(!ok, "the schedule must be rejected");
+    assert!(err.contains("HH:MM"), "stderr: {err}");
+
+    // Nothing persisted: a rejected set must leave the default in place.
+    let (ok, out, _err) = run(tmp.path(), &["config", "show", "--json"]);
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    assert_eq!(v["maintenance_at_source"], "default");
 }
 
 #[test]

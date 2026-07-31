@@ -208,6 +208,71 @@ pub fn effective_vcpus() -> u8 {
     )
 }
 
+/// Environment variable overriding the persisted maintenance time (`HH:MM`,
+/// UTC). An empty value switches the schedule off for this boot.
+pub const MAINTENANCE_AT_ENV: &str = "MINVMD_MAINTENANCE_AT";
+
+/// Environment variable overriding [`DEFAULT_MAINTENANCE_OLDER_THAN_SECS`].
+pub const MAINTENANCE_OLDER_THAN_ENV: &str = "MINVMD_MAINTENANCE_OLDER_THAN_SECS";
+
+/// Default time of day the guest runs maintenance: 03:00 UTC.
+///
+/// Overnight for most of the world, so a cycle lands when the machine is most
+/// likely idle and on mains — which is why the guest needs no power-state
+/// probe of its own. A default rather than "off" because the growth this
+/// reclaims is unbounded, and a knob nobody sets would leave it unbounded.
+pub const DEFAULT_MAINTENANCE_AT: &str = "03:00";
+
+/// Default retention for the maintenance sweep: 14 days, matching
+/// `mip cache clean --older-than`'s default so the manual and scheduled sweeps
+/// age entries out on the same terms.
+pub const DEFAULT_MAINTENANCE_OLDER_THAN_SECS: u64 = 14 * 24 * 60 * 60;
+
+/// Whether `s` is a well-formed `HH:MM` in range. Pure, and deliberately
+/// stricter than the guest's own parse so a bad value is rejected at
+/// `config set` rather than silently disabling maintenance a boot later.
+#[must_use]
+pub fn is_valid_maintenance_at(s: &str) -> bool {
+    let Some((h, m)) = s.trim().split_once(':') else {
+        return false;
+    };
+    // Fixed-width, so `3:0` is rejected: it would ride the kernel command line
+    // and reach the guest, and a schedule is not the place for two spellings.
+    if h.len() != 2 || m.len() != 2 {
+        return false;
+    }
+    matches!((h.parse::<u32>(), m.parse::<u32>()), (Ok(h), Ok(m)) if h < 24 && m < 60)
+}
+
+/// The effective maintenance time, resolved as
+/// `env override ?? persisted config ?? default` (R9.7). `None` when the
+/// resolved value is empty or malformed, which leaves the guest unscheduled.
+#[must_use]
+pub fn effective_maintenance_at() -> Option<String> {
+    let value = std::env::var(MAINTENANCE_AT_ENV)
+        .ok()
+        .or_else(|| persisted_resource_config().maintenance_at)
+        .unwrap_or_else(|| DEFAULT_MAINTENANCE_AT.to_string());
+    is_valid_maintenance_at(&value).then_some(value)
+}
+
+/// The effective sweep retention in seconds, resolved as
+/// `env override ?? persisted config ?? default` (R9.7).
+///
+/// A zero retention would make every cache entry eligible on the next run, so
+/// it is rejected in favour of the default rather than honoured — the schedule
+/// is unattended, and "delete the whole cache every night" is never what a
+/// stray `0` in the environment meant.
+#[must_use]
+pub fn effective_maintenance_older_than_secs() -> u64 {
+    std::env::var(MAINTENANCE_OLDER_THAN_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .or_else(|| persisted_resource_config().maintenance_older_than_secs)
+        .filter(|&secs| secs > 0)
+        .unwrap_or(DEFAULT_MAINTENANCE_OLDER_THAN_SECS)
+}
+
 /// Resolve `(vcpus, ram_mib)` from a **single** read of the persisted config, so
 /// the pair cannot tear when `config.toml` changes between two separate
 /// `effective_*` calls (e.g. the two `booted_*` fields recorded at the Running
