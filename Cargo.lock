@@ -3824,6 +3824,7 @@ dependencies = [
  "stdlib",
  "switch",
  "sysinfo",
+ "tar",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -3837,6 +3838,7 @@ dependencies = [
  "version",
  "vt100-ctt",
  "walkdir",
+ "zstd",
 ]
 
 [[package]]

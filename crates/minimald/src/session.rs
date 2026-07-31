@@ -1295,6 +1295,14 @@ impl Session {
         let record = self.record.record().await.unwrap();
         let paths = self.paths().await;
         let name = registry_name(&record);
+        // Where the shell-exit prompt's save-then-delete lane archives the
+        // changed files. Daemon-side and session-independent; created on
+        // demand at save time.
+        let archives_dir = self
+            .minimal_state_dir
+            .as_utf8_path()
+            .as_std_path()
+            .join("archives");
 
         // Mint a handle to this session ID in the sessions actor/manager.
         let control = SessionControl::new(self.manager.clone(), record.id);
@@ -1313,6 +1321,7 @@ impl Session {
                 sz,
                 None,
                 Some(control),
+                archives_dir,
             )))
             .await;
         let h = spawned.map_err(AttachError::SpawnFailed)?;
@@ -2430,6 +2439,147 @@ mod tests {
         assert!(
             !record_exists(&mut client, session_id).await,
             "delete must remove the session record"
+        );
+    }
+
+    /// When files changed since activation, the shell-exit prompt gains a
+    /// middle save-then-delete lane: selecting it (a down-arrow then Enter,
+    /// the same keystrokes that pick delete when nothing changed) writes an
+    /// archive of the changed files under the daemon's archives dir and only
+    /// then destroys the session, exactly like the delete lane.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn save_option_archives_changed_files_then_deletes_session() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        let mut channel = client.open_shell(session_id).await;
+
+        // Prove the shell is live first (mock echoes `got:<line>`); the
+        // baseline snapshot is taken before the process launches, so a write
+        // from here on is a change.
+        channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+        let mut stdout = Vec::new();
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    stdout.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&stdout).contains("got:hello") {
+                        break;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("channel closed before the echo arrived"),
+            }
+        }
+
+        // Change the workspace daemon-side, as an in-session shell would.
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("session should resolve");
+        let paths = handle.paths().await.expect("paths should resolve");
+        let scratch = paths
+            .working
+            .join(&paths::DaemonRelPath::try_new("scratch.txt").unwrap());
+        tokio::fs::write(scratch.as_utf8_path(), b"made in session")
+            .await
+            .unwrap();
+
+        // Exit the shell, then pick the middle option (save-then-delete).
+        channel
+            .data_bytes(format!("{}\n", crate::session_host::MOCK_EXIT_LINE).into_bytes())
+            .await
+            .unwrap();
+        let mut closed = false;
+        let mut answered_prompt = false;
+        let mut prompt_out = Vec::new();
+        while let Ok(msg) = tokio::time::timeout(Duration::from_secs(10), channel.wait()).await {
+            match msg {
+                Some(ChannelMsg::Data { data }) => {
+                    prompt_out.extend_from_slice(&data);
+                    if !answered_prompt
+                        && String::from_utf8_lossy(&prompt_out)
+                            .contains(crate::session_host::SHELL_EXIT_PROMPT)
+                    {
+                        channel.data_bytes(b"\x1b[B\r".to_vec()).await.unwrap();
+                        answered_prompt = true;
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        let prompt_text = String::from_utf8_lossy(&prompt_out);
+        assert!(
+            answered_prompt,
+            "expected the session-exit prompt to render; got: {prompt_text:?}"
+        );
+        assert!(
+            prompt_text.contains("Save changes to "),
+            "a non-empty delta should render the save lane; got: {prompt_text:?}"
+        );
+        assert!(
+            closed,
+            "channel should close after the save + delete completes"
+        );
+
+        // The session is gone, like the plain delete lane.
+        assert!(
+            !record_exists(&mut client, session_id).await,
+            "save-then-delete must remove the session record"
+        );
+
+        // ...and the archive is on disk, named for the session, holding
+        // exactly the changed file under its workspace-relative path.
+        let archives = server
+            .state
+            .minimal_state_dir()
+            .await
+            .as_utf8_path()
+            .as_std_path()
+            .join("archives");
+        let mut entries: Vec<_> = std::fs::read_dir(&archives)
+            .expect("the archives dir should have been created")
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected exactly one archive: {entries:?}"
+        );
+        let archive_path = entries.pop().unwrap();
+        let file_name = archive_path.file_name().unwrap().to_string_lossy();
+        assert!(
+            file_name.starts_with("shell-test-") && file_name.ends_with(".tar.zst"),
+            "archive should be named <session>-<timestamp>.tar.zst; got {file_name:?}"
+        );
+
+        use std::io::Read as _;
+        let mut archive = tar::Archive::new(
+            zstd::Decoder::new(std::fs::File::open(&archive_path).unwrap()).unwrap(),
+        );
+        let mut files = std::collections::BTreeMap::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().into_owned();
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).unwrap();
+            files.insert(path, contents);
+        }
+        assert_eq!(
+            files,
+            [(
+                std::path::PathBuf::from("scratch.txt"),
+                "made in session".to_string(),
+            )]
+            .into_iter()
+            .collect(),
         );
     }
 
