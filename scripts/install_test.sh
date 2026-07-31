@@ -40,6 +40,19 @@ check(){ if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (want [$1] got [$2])"; f
 want_ok()  { _m="$1"; shift; if "$@"; then ok "$_m"; else bad "$_m"; fi; }
 want_err() { _m="$1"; shift; if "$@"; then bad "$_m"; else ok "$_m"; fi; }
 
+# want_card_last <message> — true when the run's parting block is the closing
+# card (R10.4). Keyed on the card's last content line rather than on `tail -n 1`,
+# because the card ends on a blank line for the shell prompt that follows.
+want_card_last() {
+    case "$(awk 'NF {l=$0} END {print l}' "$OUT")" in
+        *docs.minimal.dev*) ok "$1" ;;
+        *)                  bad "$1 (last line: $(awk 'NF {l=$0} END {print l}' "$OUT"))" ;;
+    esac
+}
+
+# A literal ESC, for asserting that redirected output carries no SGR sequences.
+esc="$(printf '\033')"
+
 # record_has <component> <path> <record> — true when the install record holds a
 # row pairing that component with that exact path (columns 1 and 2).
 record_has() {
@@ -318,20 +331,24 @@ n1="$(downloads)"; want_ok "first run downloaded ($n1)" test "$n1" -gt 0
 want_ok "symlink component placed as a symlink (R5.6)" test -L "$H1/bin/git-remote-min"
 check "min" "$(readlink "$H1/bin/git-remote-min")" "symlink points at its manifest target (R5.6)"
 
-# A successful run closes on the getting-started hint, after every bookkeeping
-# note (here the PATH advisory fires), and it is the very last line so it is
-# what the user is left looking at.
-want_ok "fresh install emits the getting-started hint" \
-    grep -q "To get started: open a new terminal" "$OUT"
-check "    min session activate --attach ." "$(tail -n 1 "$OUT")" \
-    "getting-started command is the last line of a fresh install"
+# A successful run closes on the card, after every bookkeeping note (here the
+# PATH advisory fires), so the parting block is what the user is left looking
+# at (R10.4).
+want_ok "fresh install emits the closing card (R10.4)" \
+    grep -qE "Minimal .+ is ready" "$OUT"
+want_ok "the card names the first command (R10.4)" \
+    grep -q "min session activate --attach ." "$OUT"
+want_card_last "the card closes a fresh install (R10.4)"
+# Nothing on a redirected stream may carry terminal escapes (R10.1): this
+# output is a file, so a stray SGR here would land in every CI log.
+want_err "no terminal escapes when stderr is not a terminal (R10.1)" \
+    grep -q "$esc" "$OUT"
 
 reset_dl
 run second "$H1"
 check 0 "$rc" "rerun exits 0"
 check 0 "$(downloads)" "rerun performs zero downloads (R5.1/R2 reruns cheap)"
-check "    min session activate --attach ." "$(tail -n 1 "$OUT")" \
-    "getting-started command is the last line of an up-to-date rerun"
+want_card_last "the card closes an up-to-date rerun (R10.4)"
 
 # --- AppArmor components + Ubuntu 24.04+ advisory --------------------------
 # The three noarch apparmor components install under the data prefix on Linux.
@@ -357,9 +374,8 @@ want_ok "advisory points at the shipped loader with sudo bash" \
 # attachment set, so the advised command must attach it explicitly.
 want_ok "advisory carries --path for a custom MINIMAL_BIN" \
     grep -q -- "--path \"$H1/bin/minimald\"" "$OUT"
-# The hint is the parting line even when the AppArmor advisory is the last note.
-check "    min session activate --attach ." "$(tail -n 1 "$OUT")" \
-    "getting-started hint follows the AppArmor advisory"
+# The card is the parting block even when the AppArmor advisory is the last note.
+want_card_last "the card follows the AppArmor advisory (R10.4)"
 
 USERNS_SYSCTL="$root/sysctl-off"
 run aa_unrestricted "$H1"
@@ -446,8 +462,8 @@ reset_dl
 run mismatch "$H2"
 check 1 "$rc" "checksum mismatch exits non-zero (R5.3)"
 want_ok "mismatch names the failure" grep -q "checksum mismatch" "$OUT"
-want_err "no getting-started hint on a failed install" \
-    grep -q "To get started" "$OUT"
+want_err "no closing card on a failed install (R10.4)" \
+    grep -qE "Minimal .+ is ready" "$OUT"
 want_err "no file installed on mismatch" test -e "$H2/bin/min"
 if ls "$H2/bin/"min.tmp.* >/dev/null 2>&1
 then bad "temp file left behind"; else ok "no .tmp file left (R5.3)"; fi
@@ -843,7 +859,7 @@ run oldblock "$H14"
 check 0 "$rc" "upgrade over old rc block exits 0"
 want_err "stale compinit dump dropped on upgrade (R9.3)" test -e "$H14/.zcompdump"
 want_ok "dump drop announced (R9.3)" grep -q "cleared compinit dump cache" "$OUT"
-want_ok "stale block replacement announced (R9.2)" grep -q "replaced stale block" "$OUT"
+want_ok "stale block replacement announced (R9.2)" grep -qE "shell-init +replaced" "$OUT"
 check 1 "$(grep -c '>>> minimal >>>' "$H14/.zshrc")" "exactly one marker block after upgrade (R9.2)"
 want_ok "block now sources the current zsh init (R9.2)" grep -q "shell-init/zsh.sh" "$H14/.zshrc"
 want_err "no reference to the old shim path remains (R9.2)" grep -q '\.minimal/shim' "$H14/.zshrc"
@@ -852,7 +868,7 @@ want_ok "user content after the old block preserved (R9.2)" \
     grep -q '# added after the old install' "$H14/.zshrc"
 run oldblock2 "$H14"
 check 0 "$rc" "rerun after replacement exits 0"
-want_err "rerun rewrites nothing (R9.2)" grep -qE "shell-init: (added|replaced)" "$OUT"
+want_err "rerun rewrites nothing (R9.2)" grep -qE "shell-init +(added|replaced)" "$OUT"
 check 1 "$(grep -c '>>> minimal >>>' "$H14/.zshrc")" "rerun keeps a single marker block (R9.2)"
 want_err "no dump means no drop announcement on rerun (R9.3)" \
     grep -q "cleared compinit dump cache" "$OUT"
@@ -888,7 +904,7 @@ TEST_SHELL=
 
 # A manifest without the min CLI (data-only) skips completions, non-fatally.
 want_ok "completions skipped when min absent (R9.3)" \
-    grep -q "completions: skipped" "$root/out.datadest"
+    grep -qE "completions +skipped" "$root/out.datadest"
 
 # A read-only rc file degrades to a warning: the install itself already
 # succeeded and must still exit 0, with the PATH advisory still printed.
@@ -1032,7 +1048,7 @@ printf 'my own build\n' >"$HU2/bin/minimald"      # user replaced a binary
 run u2_keep "$HU2" --uninstall
 check 0 "$rc" "uninstall with a modified file exits 0 (R8.4)"
 want_ok "modified file kept (R7.3)" test -f "$HU2/bin/minimald"
-want_ok "keep is reported (R7.3)" grep -q "kept (modified" "$OUT"
+want_ok "keep is reported (R7.3)" grep -qE "kept +modified since install" "$OUT"
 want_err "unmodified sibling still removed (R7.3)" test -e "$HU2/bin/min"
 want_ok "record retained while entries remain (R8.1)" test -f "$urec2"
 # --force then removes the modified file and, footprint clear, drops the record.

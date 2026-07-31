@@ -17,7 +17,7 @@
 #   curl … | sh -s -- --force-stop      # stop live sessions without asking
 #   curl … | sh -s -- --uninstall       # remove what a prior run installed
 #
-# An upgrade must stop the running daemon before it swaps its binaries (R5.5).
+# An upgrade must stop the running daemon before it swaps its binaries.
 # When that daemon has active sessions the installer asks on the terminal before
 # ending them; --force-stop (or a non-empty MINIMAL_INSTALL_FORCE_STOP) skips the
 # question, for scripted upgrades that must not block.
@@ -25,9 +25,9 @@
 # Uninstall walks the local install record (no network) and removes each file
 # whose on-disk bytes still match what the installer recorded writing; it accepts
 # --force (remove modified files too), --purge (also delete the minimal data/
-# state/cache trees), and --dry-run. See Units 7–8 of the spec.
+# state/cache trees), and --dry-run.
 #
-# After the files are placed, the installer wires up shell integration (Unit 9):
+# After the files are placed, the installer wires up shell integration:
 # it generates per-shell init files that prepend the bin dir to PATH, installs
 # tab completions for `min` by running the freshly-installed binary, and adds a
 # marker-fenced source line to the current shell's rc file. Uninstall undoes all
@@ -48,27 +48,145 @@ set -eu
 BUCKET="${MINIMAL_OVERRIDE_INSTALLER_BUCKET:-https://storage.googleapis.com/minimal-one}"
 
 # Manifest column layout this installer understands. The manifest carries a
-# `# format:` header (spec R2.4); a mismatch is a hard error, not a misparse.
+# `# format:` header; a mismatch is a hard error, not a misparse.
 SUPPORTED_FORMAT=1
 
 # --- Output helpers --------------------------------------------------------
 
 # All diagnostics go to stderr so a future machine-readable stdout stays clean.
-say() { printf '%s\n' "$*" >&2; }
-die() { printf 'install: %s\n' "$*" >&2; exit 1; }
+#
+# A component row is written in two halves on a terminal (the verb first, the
+# finished row rewritten over it), so anything that prints in between has to
+# close the open row first or its message lands mid-line. Every path out of
+# this script prints through say/die, so closing there covers all of them.
+row_open=0
+end_row() { [ "$row_open" -eq 0 ] || { row_open=0; printf '\n' >&2; }; }
+say() { end_row; printf '%s\n' "$*" >&2; }
+die() { end_row; printf 'install: %s\n' "$*" >&2; exit 1; }
 
-# --- Mode dispatch: install (default) vs uninstall (R7.1) ------------------
+# --- Presentation ----------------------------------------------------------
+
+# `curl … | sh` lands on everything from a modern terminal to a CI log with no
+# terminal at all, so presentation degrades along two independent axes:
+#
+#   attr  — bold/dim SGR attributes. Needs stderr to be a terminal, NO_COLOR
+#           unset, and a TERM that is not `dumb`. Also gates the two effects
+#           that only make sense live: the in-place row rewrite and the mark.
+#   glyph — the ▸ marker and → arrow (the marker matches `min`'s prompt theme
+#           and the `min dash` cursor). Needs a UTF-8 locale; ASCII otherwise.
+#           Independent of attr: UTF-8 in a redirected log is still fine.
+#
+# Deliberately monochrome — no color accents anywhere — because that is what
+# the product and the website are (crates/minimal/src/theme.rs).
+# MINIMAL_INSTALL_PLAIN=1 forces both axes off.
+attr=0
+glyph=0
+if [ -z "${MINIMAL_INSTALL_PLAIN:-}" ]; then
+    if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
+        attr=1
+    fi
+    case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+        *UTF-8*|*utf-8*|*UTF8*|*utf8*) glyph=1 ;;
+    esac
+fi
+
+if [ "$attr" -eq 1 ]; then
+    b="$(printf '\033[1m')"
+    dim="$(printf '\033[2m')"
+    rst="$(printf '\033[0m')"
+else
+    b='' dim='' rst=''
+fi
+
+if [ "$glyph" -eq 1 ]; then
+    mark='▸' arrow='→' sep='·'
+else
+    mark='>' arrow='->' sep='-'
+fi
+
+# One table row: the component in a fixed dim column, its verb, and an
+# optional dim detail (a size, a path). `row_wait` writes the in-progress half
+# and `row` finishes it — on a terminal by rewriting the same line, so a slow
+# download narrates itself and still leaves exactly one clean line behind;
+# everywhere else the two halves are ordinary consecutive lines, which is what
+# a CI log wants anyway.
+row_wait() {
+    printf '  %s%-18s%s %s' "$dim" "$1" "$rst" "$2" >&2
+    if [ "$attr" -eq 1 ]; then
+        row_open=1
+    else
+        printf '\n' >&2
+    fi
+}
+row() {
+    if [ "$row_open" -eq 1 ]; then
+        row_open=0
+        printf '\r\033[K' >&2
+    fi
+    if [ -n "${3:-}" ]; then
+        printf '  %s%-18s%s %-12s %s%s%s\n' "$dim" "$1" "$rst" "$2" "$dim" "$3" "$rst" >&2
+    else
+        printf '  %s%-18s%s %s\n' "$dim" "$1" "$rst" "$2" >&2
+    fi
+}
+
+# Byte count -> one short human string. Integer arithmetic only (POSIX sh has
+# no floats), so the MB tenth is computed by scaling before dividing.
+human_size() {
+    _hs="$1"
+    if [ "$_hs" -ge 1048576 ]; then
+        printf '%s.%s MB\n' "$((_hs / 1048576))" "$(((_hs % 1048576) * 10 / 1048576))"
+    elif [ "$_hs" -ge 1024 ]; then
+        printf '%s KB\n' "$((_hs / 1024))"
+    else
+        printf '%s B\n' "$_hs"
+    fi
+}
+
+# $HOME-relative display path: the card and the table are meant to be read, and
+# an absolute /Users/... prefix on every line is noise.
+tilde() {
+    case "$1" in
+        "$HOME"/*) printf '~%s\n' "${1#"$HOME"}" ;;
+        *)         printf '%s\n' "$1" ;;
+    esac
+}
+
+# The mark, character-for-character the one in the README's session demo
+# (docs/public/loadout-demo.cast): the three strokes of
+# docs/public/minimal-mark-dark.svg in block glyphs, over the `minimal ·` line
+# the same demo prints. One rendering of the mark in the terminal, not two.
+#
+# Terminal-only (attr), because a mark in a log file is litter, and only on a
+# first install (see first_run below). The cast paints it 256-color 215; here
+# it is bold and otherwise unpainted, like everything else the installer and
+# the CLI print (crates/minimal/src/theme.rs). Without UTF-8 the blocks would
+# render as mojibake, so that host gets the wordmark line alone.
+wordmark() {
+    [ "$attr" -eq 1 ] || return 0
+    printf '\n' >&2
+    if [ "$glyph" -eq 1 ]; then
+        printf '%s%s\n%s\n%s%s\n\n' "$b" \
+            '     ████  ████▄' \
+            '  ▄▄▄ ▀███▄ ▀███▄' \
+            '  ▀███  ▀███  ▀███' "$rst" >&2
+    fi
+    printf '  %sminimal%s %s%s Build Software You Can Trust%s\n' \
+        "$b" "$rst" "$dim" "$sep" "$rst" >&2
+}
+
+# --- Mode dispatch: install (default) vs uninstall -------------------------
 
 # `--uninstall` as the FIRST argument switches to uninstall mode; it is parsed
-# here, before the target charset check (R2.1), because `--uninstall` otherwise
+# here, before the target charset check, because `--uninstall` otherwise
 # validates as a target and would be fetched as one. Uninstall is offline and
 # takes its own flags; install mode's sole positional is the target, left in `$@`
-# for Unit 2. The two modes are mutually exclusive.
+# for target resolution below. The two modes are mutually exclusive.
 MODE=install
 uninstall_force=0
 uninstall_purge=0
 dry_run=0
-# Install mode's escape hatch for the active-sessions prompt (R5.5), settable by
+# Install mode's escape hatch for the active-sessions prompt, settable by
 # flag or environment because `curl … | sh` makes argv awkward. Deliberately NOT
 # named --force: that flag already means "remove modified files" in uninstall.
 force_stop=0
@@ -90,7 +208,8 @@ if [ "${1-}" = "--uninstall" ]; then
 else
     # Install mode's only option. Filter it out of "$@" wherever it appears (by
     # rotating the kept arguments to the end) so the sole positional — the
-    # target — is still $1 for Unit 2, whichever side of the flag it was on.
+    # target — is still $1 for target resolution, whichever side of the
+    # flag it was on.
     argn=$#
     while [ "$argn" -gt 0 ]; do
         case "$1" in
@@ -102,10 +221,10 @@ else
     done
 fi
 
-# --- Unit 1: environment probing (downloader, hasher, platform) ------------
+# --- Environment probing (downloader, hasher, platform) --------------------
 
-# R1.1 — prefer curl, else wget. Both enforce HTTPS + TLS 1.2 and refuse a
-# redirect that would downgrade the scheme. Uninstall never fetches (R7.1), so a
+# Prefer curl, else wget. Both enforce HTTPS + TLS 1.2 and refuse a
+# redirect that would downgrade the scheme. Uninstall never fetches, so a
 # missing downloader is fatal only in install mode.
 DL_TOOL=
 if command -v curl >/dev/null 2>&1; then
@@ -124,7 +243,7 @@ fetch() {
     esac
 }
 
-# R1.2 — prefer sha256sum, else `shasum -a 256`, else `openssl dgst -sha256`.
+# Prefer sha256sum, else `shasum -a 256`, else `openssl dgst -sha256`.
 # Each wrapper prints the bare lowercase hex digest, nothing else.
 SHA_TOOL=
 if command -v sha256sum >/dev/null 2>&1; then
@@ -146,8 +265,8 @@ sha256() {
     esac
 }
 
-# R1.3 — normalize OS/arch so one CPU has one name across platforms. R1.4 — tool
-# discovery uses `command -v`, never `which` (see above).
+# Normalize OS/arch so one CPU has one name across platforms. Tool discovery
+# uses `command -v`, never `which` (see above).
 os=
 case "$(uname -s)" in
     Linux)  os=linux ;;
@@ -164,9 +283,9 @@ esac
 
 [ -n "${HOME:-}" ] || die "HOME is not set; cannot resolve install prefixes"
 
-# --- Unit 4: destination prefix resolution ---------------------------------
+# --- Destination prefix resolution -----------------------------------------
 
-# R4.1 — map a prefix token to an absolute directory through a fixed case.
+# Map a prefix token to an absolute directory through a fixed case.
 # The manifest string is NEVER shell-expanded or eval'ed; an unknown token is a
 # hard error. Note the XDG variable names and that ~/.local/bin has no XDG var
 # (hence MINIMAL_BIN).
@@ -182,17 +301,32 @@ resolve_prefix() {
 }
 
 # The bin prefix, resolved once. Needed early: the pre-upgrade daemon stop
-# (R5.5) runs the `min` already installed there, before the component loop
+# runs the `min` already installed there, before the component loop
 # replaces it.
 bindir="$(resolve_prefix bin)"
 
-# --- Unit 9: shared shell-integration paths and markers ---------------------
+# The prior run's install record maps each component to the hash of the
+# file it placed on disk. Its path is needed early too: its absence is what
+# makes this a first install rather than an upgrade, which is the one run that
+# gets the mark. The on-disk files — not this record — remain the skip oracle
+#: a deleted or tampered file matches nothing and is reinstalled.
+state_dir="$(resolve_prefix state)"
+prev_record="$state_dir/installed"
+first_run=0
+[ -f "$prev_record" ] || first_run=1
+
+# Whole-second wall clock for the closing card. `date +%s` is not in POSIX but
+# is in every shipped date (GNU, BSD, busybox); a host without it just loses
+# the elapsed line.
+t0="$(date +%s 2>/dev/null || echo 0)"
+
+# --- Shared shell-integration paths and markers ----------------------------
 
 # Where the generated (not downloaded) shell-integration files live. Init
 # scripts sit under the minimal-owned data prefix; completions go to each
 # shell's standard user-level lookup dir. Shared by install (write/record) and
 # uninstall (strip/prune). The rc files themselves are the user's; the
-# installer only ever appends/removes one marker-fenced block (R9.2).
+# installer only ever appends/removes one marker-fenced block.
 init_dir="$(resolve_prefix data)/shell-init"
 bash_comp_dir="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"
 zsh_comp_dir="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/completions"
@@ -209,7 +343,7 @@ zcompdump="${ZDOTDIR:-$HOME}/.zcompdump"
 marker_start='# >>> minimal >>>'
 marker_end='# <<< minimal <<<'
 
-# Remove the marker-fenced block (R9.2) from rc file $1. Rewrites via a temp
+# Remove the marker-fenced block from rc file $1. Rewrites via a temp
 # sibling + atomic mv — `sed -i` is not portable across BSD/GNU. A file without
 # the start marker is never rewritten (or even opened for write).
 strip_rc_block() {
@@ -227,7 +361,7 @@ strip_rc_block() {
         return 2
     fi
     if [ "$dry_run" -eq 1 ]; then
-        say "  would remove shell-init block from $1"
+        say "  would remove shell-init block from $(tilde "$1")"
         return 0
     fi
     _tmp="$1.tmp.$$"
@@ -235,7 +369,7 @@ strip_rc_block() {
         '$0==s {skip=1; next} $0==e {skip=0; next} !skip' "$1" >"$_tmp" \
         || { rm -f "$_tmp"; die "failed to rewrite $1"; }
     mv -f "$_tmp" "$1"
-    say "  removed shell-init block from $1"
+    say "  removed shell-init block from $(tilde "$1")"
 }
 
 # Offer to also remove the *system* AppArmor profile on uninstall. That profile
@@ -287,34 +421,35 @@ maybe_remove_apparmor_profile() {
     say "      sudo apparmor_parser -R \"$_aa_profile\" && sudo rm -f \"$_aa_profile\" \"$_aa_tunable\""
 }
 
-# --- Units 7+8: uninstall (walk the install record and undo it) ------------
+# --- Uninstall (walk the install record and undo it) -----------------------
 
-# Offline teardown driven solely by the local install record (R6.1). The record
+# Offline teardown driven solely by the local install record. The record
 # is a tab-delimited table of `component<TAB>dest<TAB>manifest-hash<TAB>installed-hash`
 # rows, where `dest` is absolute and `installed-hash` is the SHA-256 of the bytes
 # actually written. Uninstall keys off `installed-hash`; the manifest-hash column
 # is unused here (it equals installed-hash for records written by this installer,
 # but may differ in records written by older signing installers). A file is removed
-# only if it is still byte-for-byte what we recorded writing (R7.3/R7.4), so a
+# only if it is still byte-for-byte what we recorded writing, so a
 # user's edited or replaced file is kept unless --force. Runs entirely on local
 # state: no network, manifest, or bucket.
 do_uninstall() {
     state_dir="$(resolve_prefix state)"
     record="$state_dir/installed"
 
-    # R7.2 — no record means nothing to undo (or it is already gone). Absence is
+    # No record means nothing to undo (or it is already gone). Absence is
     # success, so a second --uninstall is a clean no-op.
     if [ ! -f "$record" ]; then
-        say "uninstall: nothing to uninstall (no install record at $record)"
+        say "uninstall: nothing to uninstall (no install record at $(tilde "$record"))"
         return 0
     fi
+    say ""
     [ "$dry_run" -eq 1 ] && say "uninstall: dry run — nothing will be removed"
 
     # Before the walk (which deletes the shipped loader), offer to tear down the
     # separately-installed system AppArmor profile too.
     maybe_remove_apparmor_profile
 
-    # Tab, computed once, so rows are split on tab alone (R7.3): a dest under a
+    # Tab, computed once, so rows are split on tab alone: a dest under a
     # $HOME containing spaces must still parse as one field.
     tab="$(printf '\t')"
     removed=0 absent=0 kept_modified=0 kept_foreign=0 had_zsh_completions=0
@@ -331,14 +466,14 @@ do_uninstall() {
         [ "$comp" = completions-zsh ] && had_zsh_completions=1
 
         # Already gone (not even a dangling symlink) — count and continue, which
-        # is what makes an interrupted run re-runnable (R7.3).
+        # is what makes an interrupted run re-runnable.
         if [ ! -e "$dest" ] && [ ! -L "$dest" ]; then
-            say "  $comp: already removed"
+            row "$comp" "already gone"
             absent=$((absent + 1))
             continue
         fi
 
-        # A `link:<target>` row is a symlink the installer created (R5.6); the
+        # A `link:<target>` row is a symlink the installer created; the
         # regular-file rules below don't apply. It is still ours while the
         # path is a symlink pointing at the recorded target — `rm` removes the
         # link itself, never what it points at. A retargeted link is the
@@ -347,17 +482,17 @@ do_uninstall() {
         case "$want" in
             link:*)
                 if [ ! -L "$dest" ]; then
-                    say "  $comp: kept ($dest is not a symlink the installer wrote)"
+                    row "$comp" kept "$(tilde "$dest") is not a symlink the installer wrote"
                     kept_foreign=$((kept_foreign + 1))
                 elif [ "$(readlink "$dest")" != "${want#link:}" ] && [ "$uninstall_force" -eq 0 ]; then
-                    say "  $comp: kept (retargeted since install; pass --force to remove)"
+                    row "$comp" kept "retargeted since install; pass --force to remove"
                     kept_modified=$((kept_modified + 1))
                 elif [ "$dry_run" -eq 1 ]; then
-                    say "  $comp: would remove $dest"
+                    row "$comp" "would remove" "$(tilde "$dest")"
                     removed=$((removed + 1))
                 else
                     rm -f "$dest" || die "failed to remove $dest"
-                    say "  $comp: removed $dest"
+                    row "$comp" removed "$(tilde "$dest")"
                     removed=$((removed + 1))
                 fi
                 continue
@@ -367,41 +502,41 @@ do_uninstall() {
         # A `file` row only ever wrote a regular file. A symlink or directory
         # now at this path is something else — never follow it into a delete.
         if [ -L "$dest" ] || [ ! -f "$dest" ]; then
-            say "  $comp: kept ($dest is not a regular file the installer wrote)"
+            row "$comp" kept "$(tilde "$dest") is not a regular file the installer wrote"
             kept_foreign=$((kept_foreign + 1))
             continue
         fi
 
-        # R7.3/R7.4 — remove only if the on-disk bytes still equal the recorded
+        # Remove only if the on-disk bytes still equal the recorded
         # installed-hash, unless --force.
         if [ "$(sha256 "$dest")" != "$want" ] && [ "$uninstall_force" -eq 0 ]; then
-            say "  $comp: kept (modified since install; pass --force to remove)"
+            row "$comp" kept "modified since install; pass --force to remove"
             kept_modified=$((kept_modified + 1))
             continue
         fi
 
         if [ "$dry_run" -eq 1 ]; then
-            say "  $comp: would remove $dest"
+            row "$comp" "would remove" "$(tilde "$dest")"
         else
             rm -f "$dest" || die "failed to remove $dest"
-            say "  $comp: removed $dest"
+            row "$comp" removed "$(tilde "$dest")"
         fi
         removed=$((removed + 1))
     done <"$record"
 
-    # R8.1 — teardown AFTER the walk. Remove the record only once the footprint is
+    # Teardown AFTER the walk. Remove the record only once the footprint is
     # fully gone; if anything was kept (modified or foreign), retain it so a later
     # `--force`/manual cleanup still has the inventory to work from. Re-running is
     # idempotent: already-removed rows re-classify as already-gone.
     if [ "$kept_modified" -ne 0 ] || [ "$kept_foreign" -ne 0 ]; then
-        say "  kept install record $record (unremoved entries remain)"
+        say "  kept install record $(tilde "$record") (unremoved entries remain)"
     elif [ "$dry_run" -eq 1 ]; then
-        say "  would remove install record $record"
+        say "  would remove install record $(tilde "$record")"
     else
         rm -f "$record"
     fi
 
-    # R9.4 — strip the marker-fenced shell-init block from every rc file the
+    # Strip the marker-fenced shell-init block from every rc file the
     # installer may have edited (which shell's rc got it depends on $SHELL at
     # install time, so try them all — a file without markers is untouched).
     # The generated init/completion files themselves are ordinary record rows,
@@ -412,7 +547,7 @@ do_uninstall() {
         strip_rc_block "$_rc" || true
     done
 
-    # R9.4 — the `min` registration also lives on inside zsh's compinit dump
+    # The `min` registration also lives on inside zsh's compinit dump
     # (see zcompdump above); left behind, the first `min <tab>` in every new
     # zsh fails with "function definition file not found". Dropped only when
     # the record shows zsh completions were installed: the dump belongs to
@@ -420,15 +555,15 @@ do_uninstall() {
     # business clearing their cache.
     if [ "$had_zsh_completions" -eq 1 ] && [ -f "$zcompdump" ]; then
         if [ "$dry_run" -eq 1 ]; then
-            say "  would remove compinit dump cache $zcompdump"
+            say "  would remove compinit dump cache $(tilde "$zcompdump")"
         elif rm -f "$zcompdump" 2>/dev/null; then
-            say "  removed compinit dump cache $zcompdump"
+            say "  removed compinit dump cache $(tilde "$zcompdump")"
         else
-            say "  warning: could not remove compinit dump cache $zcompdump"
+            say "  warning: could not remove compinit dump cache $(tilde "$zcompdump")"
         fi
     fi
 
-    # R8.2 — --purge additionally deletes the minimal-owned trees wholesale (build
+    # --purge additionally deletes the minimal-owned trees wholesale (build
     # cache included); they live at fixed .../minimal paths the tool owns. It
     # never removes files outside those roots.
     if [ "$uninstall_purge" -eq 1 ]; then
@@ -443,13 +578,13 @@ do_uninstall() {
         done
     fi
 
-    # R8.1 — prune now-empty minimal-owned dirs with rmdir only (never rm -rf):
+    # Prune now-empty minimal-owned dirs with rmdir only (never rm -rf):
     # the shared bin/lib dirs are removed only if empty, and a non-empty dir fails
     # rmdir harmlessly. --purge (above) already cleared the data/state/cache trees.
     # lib (~/.local/lib) is shared like bin, so it is only ever rmdir'd-if-empty,
     # never purged.
     if [ "$dry_run" -eq 0 ]; then
-        # Shell-integration dirs first (R9.4): the init dir must empty out
+        # Shell-integration dirs first: the init dir must empty out
         # before the data prefix can, and the completion dirs (plus their
         # parents, which the installer may have created) are shared with other
         # tools so, like bin, they are only ever rmdir'd-if-empty.
@@ -471,23 +606,24 @@ do_uninstall() {
         done
     fi
 
-    # R8.4 — a run that merely kept modified files still did what was asked; only
+    # A run that merely kept modified files still did what was asked; only
     # an unexpected internal failure (via set -e / die) is non-zero.
+    say ""
     say "uninstall: $removed removed, $absent already gone, $kept_modified kept (modified), $kept_foreign kept (foreign)"
     [ "$dry_run" -eq 1 ] && say "uninstall: dry run — nothing was actually removed"
     return 0
 }
 
-# R7.1 — dispatch uninstall before any target/manifest work. resolve_prefix and
-# the SHA/platform probes above are all it needs; it never reaches Unit 2.
+# Dispatch uninstall before any target/manifest work. resolve_prefix and
+# the SHA/platform probes above are all it needs; it never resolves a target.
 if [ "$MODE" = uninstall ]; then
     do_uninstall
     exit 0
 fi
 
-# --- Unit 2: target -> version -> manifest resolution ----------------------
+# --- Target -> version -> manifest resolution ------------------------------
 
-# R2.1 — the target. A non-empty MINIMAL_INSTALL_TARGET_OVERRIDE (injected by
+# The target. A non-empty MINIMAL_INSTALL_TARGET_OVERRIDE (injected by
 # the download endpoint for a pinned target) wins outright; otherwise it is the
 # optional first argument, defaulting to `stable`. The default applies only when
 # no argument is given (`${1-…}`, not `${1:-…}`): an explicitly-passed empty
@@ -506,7 +642,7 @@ esac
 tmpdir="$(mktemp -d 2>/dev/null || mktemp -d -t minimal)" || die "mktemp failed"
 trap 'rm -rf "$tmpdir"' EXIT
 
-# R2.2 — resolve the target to a version via the pointer file. Command
+# Resolve the target to a version via the pointer file. Command
 # substitution strips the trailing newline; the charset check catches any
 # internal whitespace or smuggled path segment.
 fetch "$BUCKET/$target" "$tmpdir/pointer" \
@@ -517,22 +653,29 @@ VERSION="$(cat "$tmpdir/pointer")"
 case "$VERSION" in
     ''|.|..|*[!A-Za-z0-9._-]*) die "target '$target' resolved to a malformed version" ;;
 esac
-say "install: target '$target' -> version $VERSION"
+# The mark waits for a resolved version: a run that cannot even reach the
+# bucket should print an error, not a logo.
+if [ "$first_run" -eq 1 ]; then
+    wordmark
+fi
+say ""
+say "$mark target '$target' $arrow $b$VERSION$rst"
+say ""
 
-# R2.3 — fetch that version's immutable components manifest.
+# Fetch that version's immutable components manifest.
 manifest="$tmpdir/components"
 fetch "$BUCKET/versions/$VERSION/components" "$manifest" \
     || die "could not fetch components manifest for version $VERSION"
 
-# R2.4 — refuse a manifest whose format this installer does not understand.
+# Refuse a manifest whose format this installer does not understand.
 fmt="$(awk '/^#[ \t]*format:/ {print $3; exit}' "$manifest")"
 [ -n "$fmt" ] || die "manifest has no '# format:' header"
 [ "$fmt" = "$SUPPORTED_FORMAT" ] \
     || die "unsupported manifest format '$fmt' (this installer supports $SUPPORTED_FORMAT); upgrade the installer"
 
-# --- Units 3+5: field extraction, skip/download/verify/install -------------
+# --- Field extraction, skip/download/verify/install ------------------------
 
-# R3.1/R3.2/R3.3 — select every data row that applies to this host by EXACT
+# Select every data row that applies to this host by EXACT
 # field equality on awk-split columns. Comment and blank lines are dropped.
 # The rows are written to a file and consumed by a `while read` fed via redirection
 # so the loop body runs in this shell: its `die` exits the whole script and its counters persist.
@@ -545,7 +688,7 @@ records="$tmpdir/installed"
 : >"$records"
 installed=0 skipped=0
 
-# R5.5 — swapping binaries under a running daemon wedges it: the daemon keeps
+# Swapping binaries under a running daemon wedges it: the daemon keeps
 # serving from the old image while the new `min` talks to it. Stop it first,
 # using the `min` ALREADY on disk — that one matches the daemon it started, and
 # it is about to be overwritten. Deliberately best-effort and silent: nothing
@@ -612,15 +755,7 @@ stop_running_daemon() {
     "$bindir/min" stop --force >/dev/null 2>&1 </dev/null || true
 }
 
-# The prior run's install record (R6.1) maps each component to the hash of the
-# file it placed on disk. Written into place at the end of this run; here we only
-# need its path so a completed run can replace it. The on-disk file — not this
-# record — is the skip oracle (R5.1): a deleted or tampered file matches nothing
-# and is reinstalled.
-state_dir="$(resolve_prefix state)"
-prev_record="$state_dir/installed"
-
-# No field ever contains whitespace (R3.2), so default IFS splitting is exact.
+# No field ever contains whitespace, so default IFS splitting is exact.
 # The os/arch/version columns are consumed into `_` (already matched in awk, or
 # informational); comp/want/kind/dest/src are what drive the install.
 while read -r comp _ _ _ want kind dest src; do
@@ -640,7 +775,7 @@ while read -r comp _ _ _ want kind dest src; do
     prefix="${dest%%/*}"
     subpath="${dest#*/}"
 
-    # R4.2 — reject an absolute subpath or any `..` component before it is used
+    # Reject an absolute subpath or any `..` component before it is used
     # to build a path, closing the traversal vector.
     case "$subpath" in
         ''|/*|..|../*|*/..|*/../*) die "component $comp has unsafe dest subpath '$subpath'" ;;
@@ -649,7 +784,7 @@ while read -r comp _ _ _ want kind dest src; do
     dir="$(resolve_prefix "$prefix")"
     target_file="$dir/$subpath"
 
-    # R5.6 — a symlink component: `src` is the LINK TARGET rather than a bucket
+    # A symlink component: `src` is the LINK TARGET rather than a bucket
     # path, resolved by the OS relative to the link's own directory. It gets
     # the same traversal discipline as the dest subpath, so a manifest can only
     # point a link within its own prefix. Nothing is downloaded either way.
@@ -658,55 +793,56 @@ while read -r comp _ _ _ want kind dest src; do
             ''|/*|..|../*|*/..|*/../*) die "component $comp has unsafe symlink target '$src'" ;;
         esac
         if [ -L "$target_file" ] && [ "$(readlink "$target_file")" = "$src" ]; then
-            say "  $comp: up to date"
+            row "$comp" current
             skipped=$((skipped + 1))
         else
-            # Atomic like R5.4: create the link as a temp sibling and rename it
+            # Atomic like a file component: create the link as a temp sibling
+            # and rename it
             # over whatever holds the path now — notably a stale regular file
             # from a release that shipped this component as a copy.
             mkdir -p "$dir"
             tmp="$target_file.tmp.$$"
             ln -s "$src" "$tmp" || { rm -f "$tmp"; die "failed to create symlink for $comp"; }
             mv -f "$tmp" "$target_file"
-            say "  $comp: linked -> $src"
+            row "$comp" linked "$arrow $src"
             installed=$((installed + 1))
         fi
         # No artifact hashes exist for a link; both hash columns carry the
         # link target instead (`link:` cannot collide with a hex digest), so
-        # --uninstall can verify the link is still ours (R6.1/R7.3).
+        # --uninstall can verify the link is still ours.
         printf '%s\t%s\t%s\t%s\n' "$comp" "$target_file" "link:$src" "link:$src" >>"$records"
         continue
     fi
 
-    # R5.1 — the on-disk file is the skip oracle: it is up to date when its hash
+    # The on-disk file is the skip oracle: it is up to date when its hash
     # equals the manifest `sha256`. A changed manifest hash (a new release) fails
     # this check and is re-downloaded.
     if [ -f "$target_file" ]; then
         on_disk="$(sha256 "$target_file")"
         if [ "$on_disk" = "$want" ]; then
-            say "  $comp: up to date"
+            row "$comp" current
             skipped=$((skipped + 1))
             printf '%s\t%s\t%s\t%s\n' "$comp" "$target_file" "$want" "$on_disk" >>"$records"
             continue
         fi
     fi
 
-    # R4.3/R5.2 — create the destination dir, then download to a temp sibling
+    # Create the destination dir, then download to a temp sibling
     # IN that dir so the final rename is a same-filesystem atomic swap. Create
     # the target file's PARENT (not just the prefix root): a component whose
     # subpath nests dirs (e.g. apparmor/tunables/minimald) needs them made first.
     mkdir -p "${target_file%/*}"
     tmp="$target_file.tmp.$$"
-    say "  $comp: downloading"
+    row_wait "$comp" downloading
     fetch "$BUCKET/$src" "$tmp" || { rm -f "$tmp"; die "download failed: $comp ($src)"; }
 
-    # R5.3 — verify the DOWNLOAD against the manifest before any local
+    # Verify the DOWNLOAD against the manifest before any local
     # post-processing modifies it; a mismatch removes the temp file and aborts,
     # so a truncated/corrupt artifact is never placed.
     got="$(sha256 "$tmp")"
     [ "$got" = "$want" ] || { rm -f "$tmp"; die "checksum mismatch for $comp (want $want, got $got)"; }
 
-    # R5.4 — bin components appear executable at their final path atomically:
+    # Bin components appear executable at their final path atomically:
     # chmod the temp file, then rename.
     [ "$prefix" = bin ] && chmod +x "$tmp"
 
@@ -717,7 +853,7 @@ while read -r comp _ _ _ want kind dest src; do
         xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true
     fi
 
-    # R5.5 — last moment before the first live file is swapped, so a run where
+    # Last moment before the first live file is swapped, so a run where
     # every component is up to date (or one that dies fetching/verifying) never
     # touches a healthy daemon. The guard inside makes this a no-op after the
     # first replaced component. Only executable images wedge a running daemon
@@ -739,19 +875,20 @@ while read -r comp _ _ _ want kind dest src; do
     esac
 
     mv -f "$tmp" "$target_file"
+    row "$comp" installed "$(human_size "$(wc -c <"$target_file" | tr -d ' ')")"
     installed=$((installed + 1))
     # Record the manifest hash paired with the on-disk hash, so a later
-    # run and `--uninstall` know what this run placed (R5.1/R6.1). The
+    # run and `--uninstall` know what this run placed. The
     #
     # paired-column format is retained for compatibility with records
     # written by earlier installer versions.
     printf '%s\t%s\t%s\t%s\n' "$comp" "$target_file" "$want" "$(sha256 "$target_file")" >>"$records"
 done <"$applicable"
 
-# --- Unit 9a: generated shell-init files and completions -------------------
+# --- Generated shell-init files and completions ----------------------------
 
 # Append a generated file to this run's install record so a later run and
-# `--uninstall` treat it exactly like a downloaded component (R9.1/R9.3). No
+# `--uninstall` treat it exactly like a downloaded component. No
 # manifest hash exists for generated content, so both hash columns carry the
 # on-disk digest.
 record_generated() {
@@ -759,7 +896,7 @@ record_generated() {
     printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$_h" "$_h" >>"$records"
 }
 
-# R9.1 — per-shell init files, regenerated on every run. Each embeds the bin
+# Per-shell init files, regenerated on every run. Each embeds the bin
 # dir as resolved NOW and guards at shell startup (dir exists, not already on
 # PATH), so sourcing is idempotent and a no-op once the user manages PATH
 # themselves. Only shell-runtime variables are escaped in the heredocs; the
@@ -820,7 +957,7 @@ end
 EOF
 record_generated shell-init-fish "$init_dir/fish.fish"
 
-# R9.3 — tab completions, installed by the just-installed binary itself
+# Tab completions, installed by the just-installed binary itself
 # (`min completions install <shell>`), so they always match the installed
 # version and the bookkeeping — target dir per shell, atomic write,
 # unwritable-dir tolerance, zsh zcompdump invalidation — has exactly one
@@ -854,15 +991,19 @@ gen_completions() {
 }
 
 if [ -x "$bindir/min" ]; then
-    say "  completions: generating for bash, zsh, fish"
+    # One open row across all three shells: each shell's own warnings (an
+    # unwritable dir) close it and print above, so the finished row still
+    # lands last and still reads as one line.
+    row_wait completions generating
     gen_completions bash
     gen_completions zsh
     gen_completions fish
+    row completions installed "bash zsh fish"
 else
-    say "  completions: skipped ($bindir/min not present)"
+    row completions skipped "$(tilde "$bindir")/min not present"
 fi
 
-# --- Unit 6: install record and PATH advisory ------------------------------
+# --- Install record and PATH advisory --------------------------------------
 
 # Migration: the switch binary used to install as `bin/gvproxy` and now installs
 # as `bin/gvproxy-min` (the bin prefix is on PATH, and podman/crc ship their own
@@ -908,17 +1049,15 @@ remove_renamed_gvproxy() {
 }
 remove_renamed_gvproxy
 
-# R6.1 — persist the resolved (component, dest, installed-hash) rows for this
+# Persist the resolved (component, dest, installed-hash) rows for this
 # platform, replacing the prior record read during the loop. Enables a future
 # uninstall and surfaces prefix drift across XDG changes.
 mkdir -p "$state_dir"
 mv -f "$records" "$prev_record"
 
-say "install: $installed installed, $skipped up to date -> record at $prev_record"
+# --- Hook the current shell's rc file --------------------------------------
 
-# --- Unit 9b: hook the current shell's rc file ------------------------------
-
-# R9.2 — append one marker-fenced block sourcing the matching init file to the
+# Append one marker-fenced block sourcing the matching init file to the
 # rc of the user's login shell ($SHELL). The markers are ours to own: a block
 # already sourcing the current init file is left alone (reruns add nothing),
 # but a marker block with any other content is stale — e.g. the pre-rewrite
@@ -926,7 +1065,7 @@ say "install: $installed installed, $skipped up to date -> record at $prev_recor
 # and completions silently break on upgraded machines. The markers are also
 # what --uninstall strips (strip_rc_block).
 add_rc_block() {
-    _verb="added block to"
+    _verb=added
     _hook_ok=1
     if grep -q '>>> minimal >>>' "$1" 2>/dev/null; then
         if grep -qxF "$2" "$1" 2>/dev/null; then
@@ -946,11 +1085,11 @@ add_rc_block() {
             return 0
         fi
         [ "$_strip_rc" -eq 0 ] || _hook_ok=0
-        _verb="replaced stale block in"
+        _verb=replaced
     fi
     # Non-fatal: by this point the binaries are correctly installed, so an
     # unwritable rc file must not turn a successful install into a failure.
-    # Warn, tell the user what to add by hand, and keep going (the R6.2 PATH
+    # Warn, tell the user what to add by hand, and keep going (the PATH
     # advisory below still fires).
     # The subshell wrapper (not just 2>/dev/null on the command) is what keeps
     # a redirection failure quiet: that error is printed by the shell itself,
@@ -966,7 +1105,7 @@ add_rc_block() {
         say "      $2"
         return 0
     fi
-    say "  shell-init: $_verb $1"
+    row shell-init "$_verb" "$(tilde "$1")"
 }
 
 posix_line="[ -f \"$init_dir/bash.sh\" ] && . \"$init_dir/bash.sh\""
@@ -999,16 +1138,21 @@ case "$shell_name" in
         ;;
 esac
 
-# R6.2 — if the bin prefix is not on PATH in THIS session, say so: the rc hook
-# above only takes effect in new shells.
-case ":${PATH:-}:" in
-    *":$bindir:"*) ;;
-    *) say ""
-       say "note: $bindir is not on your PATH yet."
-       say "  restart your shell, or add it now:  export PATH=\"$bindir:\$PATH\"" ;;
-esac
+# The run's own receipt, closing the component table: what changed, what did
+# not, and how long it took. The record path stays on it — dim, but present:
+# it is the first thing a support answer asks for.
+elapsed=
+if [ "$t0" -gt 0 ]; then
+    t1="$(date +%s 2>/dev/null || echo 0)"
+    if [ "$t1" -gt "$t0" ]; then
+        elapsed=" $sep $((t1 - t0))s"
+    fi
+fi
+say ""
+say "  $b$installed installed$rst $sep $skipped current$elapsed"
+say "  ${dim}record: $(tilde "$prev_record")$rst"
 
-# --- Linux host advisory: unprivileged user namespaces ----------------------
+# --- Linux host advisory: unprivileged user namespaces ---------------------
 
 # Ubuntu 24.04+ defaults kernel.apparmor_restrict_unprivileged_userns=1, under
 # which minimald cannot create the user namespace every session sandbox needs —
@@ -1051,13 +1195,25 @@ if [ "$os" = linux ] && [ -r "$userns_sysctl" ] \
     fi
 fi
 
-# --- Getting started -------------------------------------------------------
+# --- The closing card ------------------------------------------------------
 
-# The parting line, after every bookkeeping note above (install record, PATH,
-# AppArmor): a finished installer otherwise leaves the user with no next step.
-# Emitted last on every successful exit so it is what they are left looking at;
-# if the CLI gains a shorter entry command, only the literal below changes.
+# The last thing a `curl … | sh` user sees. It ends on what to run rather than
+# on a filesystem path, and it carries the PATH advisory when it applies:
+# the rc hook above only takes effect in NEW shells, so in this one the two
+# commands below would not resolve, and saying so is part of the next step
+# rather than a footnote after it.
 say ""
-say "To get started: open a new terminal, cd into a project, and run:"
+say "  ${b}Minimal $VERSION is ready.$rst"
 say ""
-say "    min session activate --attach ."
+case ":${PATH:-}:" in
+    *":$bindir:"*) ;;
+    *) say "  $(tilde "$bindir") is not on your PATH in this shell yet."
+       say "  Start a new shell, or run:"
+       say "      export PATH=\"$bindir:\$PATH\""
+       say "" ;;
+esac
+say "  $mark ${b}min init$rst                          ${dim}declare this project's environment$rst"
+say "  $mark ${b}min session activate --attach .$rst   ${dim}build the sandbox and step inside$rst"
+say ""
+say "  ${dim}docs.minimal.dev   $sep   discord.com/invite/qgX8sm6X7G$rst"
+say ""
