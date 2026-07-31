@@ -134,6 +134,105 @@ impl DeltaSource {
     }
 }
 
+/// Assesses what a destroy of the workspace at `root` would permanently
+/// lose, for the `SessionDelta` RPC.
+///
+/// Precision ladder: when the workspace has a root `.git` and git answers,
+/// the report is VCS-exact — uncommitted files and unpushed commits, so a
+/// fully committed-and-pushed tree is proven clean even though it differs
+/// from the activation baseline. Otherwise it falls back to the
+/// activation-delta walk (which may include committed work), and when that
+/// too is unavailable it says so. Best-effort throughout: every arm is
+/// bounded by [`WALK_TIMEOUT`] and failures degrade down the ladder, never
+/// error.
+pub(crate) async fn assess(
+    root: PathBuf,
+    delta: Option<Arc<DeltaSource>>,
+) -> minimald_rpc::SessionDeltaResponse {
+    if let Some(vcs) = vcs_at_risk(&root).await {
+        return vcs;
+    }
+    match delta {
+        Some(delta) => match delta.changed_files().await {
+            Some(rows) => minimald_rpc::SessionDeltaResponse::ChangedSinceActivation { rows },
+            None => minimald_rpc::SessionDeltaResponse::Unavailable,
+        },
+        None => minimald_rpc::SessionDeltaResponse::Unavailable,
+    }
+}
+
+/// VCS-mode assessment: `Some` only when `root` has a `.git` entry and both
+/// git commands succeed in time; any failure (no git binary, a `.git` that
+/// isn't a real repository, a timeout) yields `None` and the caller falls
+/// back to the activation delta.
+async fn vcs_at_risk(root: &Path) -> Option<minimald_rpc::SessionDeltaResponse> {
+    if !root.join(".git").exists() {
+        return None;
+    }
+    let status = run_git(root, &["status", "--porcelain=v1", "-unormal"]).await?;
+    let count = run_git(
+        root,
+        &["rev-list", "--branches", "--not", "--remotes", "--count"],
+    )
+    .await?;
+    Some(minimald_rpc::SessionDeltaResponse::Vcs {
+        uncommitted: parse_porcelain(&status),
+        unpushed_commits: count.trim().parse::<u64>().ok()?,
+    })
+}
+
+/// Runs one git command against `root`'s tree, mirroring the `checkouts`
+/// crate's shell-out precedent, on the blocking pool with the walk timeout.
+/// `None` on spawn failure (no git binary), non-zero exit, non-UTF-8
+/// output, or timeout — the abandoned process keeps running detached until
+/// it finishes; nothing awaits it.
+async fn run_git(root: &Path, args: &[&str]) -> Option<String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(root).args(args);
+    let task = tokio::task::spawn_blocking(move || cmd.output());
+    let out = tokio::time::timeout(WALK_TIMEOUT, task)
+        .await
+        .ok()?
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+/// Renders `git status --porcelain=v1` output as the delta's `A/M/D <path>`
+/// rows, sorted by path: untracked (`??`) and added entries render as `A`,
+/// deletions in either column as `D`, everything else as `M`. Rename/copy
+/// entries render their new path.
+fn parse_porcelain(status: &str) -> Vec<String> {
+    let mut rows = Vec::new();
+    for line in status.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        // Format: `XY <path>` — X the index column, Y the worktree column,
+        // both ASCII, so the byte split is a char split.
+        let (code, path) = line.split_at(3);
+        let path = match path.split_once(" -> ") {
+            Some((_, new)) => new,
+            None => path,
+        };
+        let marker = if code.starts_with("??") {
+            'A'
+        } else if code[..2].contains('D') {
+            'D'
+        } else if code[..2].contains('A') {
+            'A'
+        } else {
+            'M'
+        };
+        rows.push(format!("{marker} {path}"));
+    }
+    rows.sort_by(|a, b| a[2..].cmp(&b[2..]));
+    rows
+}
+
 /// Walks `root` without following symlinks (walkdir's default), recording
 /// every non-directory entry keyed by its root-relative path. A symlink is
 /// recorded via its own metadata — never traversed, even when it points at a
@@ -435,6 +534,118 @@ mod tests {
                 "A vendor/dep/.git/config".to_string(),
             ],
         );
+    }
+
+    /// Porcelain-v1 status codes map onto the delta's `A/M/D` marker style,
+    /// sorted by path: untracked and added are `A`, deletions in either
+    /// column are `D`, edits (staged or not) are `M`, and renames render
+    /// their new path.
+    #[test]
+    fn parse_porcelain_maps_status_codes_to_delta_markers() {
+        let status = "?? new.txt\n M edited.txt\nM  staged.txt\nD  gone.txt\n\
+                      A  staged-add.txt\nR  old.txt -> renamed.txt\n";
+        assert_eq!(
+            parse_porcelain(status),
+            vec![
+                "M edited.txt".to_string(),
+                "D gone.txt".to_string(),
+                "A new.txt".to_string(),
+                "M renamed.txt".to_string(),
+                "A staged-add.txt".to_string(),
+                "M staged.txt".to_string(),
+            ],
+        );
+        assert!(parse_porcelain("").is_empty());
+    }
+
+    /// The VCS assessment ladder against a real repository: committed but
+    /// unpushed work is at risk via the commit count, pushing makes the
+    /// tree proven-clean, new work lists as uncommitted — and a `.git`
+    /// that is not a repository (the e2e seed's marker dir) declines VCS
+    /// mode so the caller falls back to the activation delta.
+    #[tokio::test]
+    async fn vcs_at_risk_distinguishes_clean_uncommitted_and_unpushed() {
+        use minimald_rpc::SessionDeltaResponse as R;
+
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: no git binary in this environment");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "tracked.txt", "v1");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "initial"]);
+
+        // Committed but nowhere pushed: the commit itself is at risk.
+        assert_eq!(
+            vcs_at_risk(root).await,
+            Some(R::Vcs {
+                uncommitted: vec![],
+                unpushed_commits: 1
+            }),
+        );
+
+        // Push to a bare remote: proven clean.
+        let bare = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(bare.path())
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "git init --bare failed");
+        git(&["remote", "add", "origin", bare.path().to_str().unwrap()]);
+        git(&["push", "origin", "main"]);
+        assert_eq!(
+            vcs_at_risk(root).await,
+            Some(R::Vcs {
+                uncommitted: vec![],
+                unpushed_commits: 0
+            }),
+        );
+
+        // New work since: an edit and an untracked file list as at risk.
+        write(root, "tracked.txt", "v2");
+        write(root, "wip.txt", "unsaved");
+        assert_eq!(
+            vcs_at_risk(root).await,
+            Some(R::Vcs {
+                uncommitted: vec!["M tracked.txt".to_string(), "A wip.txt".to_string()],
+                unpushed_commits: 0
+            }),
+        );
+
+        // An empty `.git` marker dir is not a repository: VCS mode declines.
+        let fake = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fake.path().join(".git")).unwrap();
+        assert_eq!(vcs_at_risk(fake.path()).await, None);
     }
 
     /// Symlinks are entries, never traversal: a link out of the root must not

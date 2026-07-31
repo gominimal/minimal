@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use crate::GlobalArgs;
 use crate::config::resolve_minimal_config_dir;
+#[cfg(feature = "remote-access")]
 use crate::mesh_enrolment_path;
 
 /// Print the important directories and files a user might want to
@@ -21,11 +22,13 @@ pub fn cmd_dirs(global: &GlobalArgs) -> Result<(), anyhow::Error> {
 pub(crate) fn report(global: &GlobalArgs) -> String {
     let dirs = DirsLookup {
         config: resolve_minimal_config_dir(global),
+        #[cfg(feature = "remote-access")]
         mesh_enrolment: mesh_enrolment_path(global),
         // `mesh_enrolment_path` follows `--minimal-dir` when set,
         // so the row groups with State in that case rather than
         // Config — otherwise a user reading `minimal dirs` would
         // find the mesh file under the wrong header.
+        #[cfg(feature = "remote-access")]
         mesh_group: if global.minimal_dir.is_some() {
             MeshGroup::State
         } else {
@@ -57,10 +60,12 @@ struct DirsLookup {
     /// The specific path `min mesh join` writes to. Kept separate
     /// so a `--minimal-dir` override that redirects the mesh file
     /// (but not the loadouts subsystem) still shows up correctly.
+    #[cfg(feature = "remote-access")]
     mesh_enrolment: PathBuf,
     /// Which group heading the mesh row prints under —
     /// `Config` in the common case, `State` when
     /// `--minimal-dir` redirected the mesh file to the state tree.
+    #[cfg(feature = "remote-access")]
     mesh_group: MeshGroup,
     /// `<state>/minimal` (or the `--minimal-dir` override).
     state: PathBuf,
@@ -73,12 +78,14 @@ struct DirsLookup {
 
 /// Which top-level group the mesh-enrolment row prints under. Values
 /// match the row group labels one-to-one via [`Self::as_row_group`].
+#[cfg(feature = "remote-access")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MeshGroup {
     Config,
     State,
 }
 
+#[cfg(feature = "remote-access")]
 impl MeshGroup {
     /// Group label used in [`DirRow::group`] and printed as the
     /// column header. Kept as a method (not `Display`) so the mapping
@@ -97,6 +104,7 @@ impl MeshGroup {
 /// calls beyond what [`DirRow::existence_marker`] does at print
 /// time.
 fn build_dir_rows(dirs: &DirsLookup) -> Vec<DirRow> {
+    #[cfg(feature = "remote-access")]
     let mesh_row = || {
         (
             dirs.mesh_group.as_row_group(),
@@ -124,6 +132,7 @@ fn build_dir_rows(dirs: &DirsLookup) -> Vec<DirRow> {
         )
             .into_row(),
     ];
+    #[cfg(feature = "remote-access")]
     if dirs.mesh_group == MeshGroup::Config {
         rows.push(mesh_row());
     }
@@ -169,6 +178,7 @@ fn build_dir_rows(dirs: &DirsLookup) -> Vec<DirRow> {
         )
             .into_row(),
     ]);
+    #[cfg(feature = "remote-access")]
     if dirs.mesh_group == MeshGroup::State {
         // After the SSH-socket row so the mesh file lands at the
         // tail of the State group — visually adjacent to the state
@@ -281,16 +291,19 @@ impl IntoDirRow for (&'static str, &'static str, Option<PathBuf>, Option<String>
 mod tests {
     use super::*;
 
-    /// `build_dir_rows` produces exactly 13 rows in the fixed order
-    /// [Config × 7, State × 4, Cache × 2] when the mesh row is
-    /// under Config (the common case), each with the right group
-    /// tag, name, and derived path. Guards against a future edit
-    /// that drops a row or shuffles groups without noticing.
+    /// `build_dir_rows` produces the fixed layout [Config, State × 4,
+    /// Cache × 2] — plus a "Mesh enrolment" row under Config (the
+    /// common case) only when the `remote-access` feature is compiled
+    /// in — each with the right group tag, name, and derived path.
+    /// Guards against a future edit that drops a row or shuffles
+    /// groups without noticing.
     #[test]
     fn build_dir_rows_layout_is_stable() {
         let dirs = DirsLookup {
             config: PathBuf::from("/home/u/.config/minimal"),
+            #[cfg(feature = "remote-access")]
             mesh_enrolment: PathBuf::from("/home/u/.config/minimal/mesh-enrolment"),
+            #[cfg(feature = "remote-access")]
             mesh_group: MeshGroup::Config,
             state: PathBuf::from("/home/u/.local/state/minimal"),
             cache: PathBuf::from("/home/u/.cache/minimal"),
@@ -301,72 +314,77 @@ mod tests {
             .iter()
             .map(|r| (r.group, r.name, r.path_display()))
             .collect();
-        assert_eq!(
-            shape,
-            vec![
-                (
-                    "Config",
-                    "Config dir",
-                    "/home/u/.config/minimal".to_string()
-                ),
-                (
-                    "Config",
-                    "config.toml",
-                    "/home/u/.config/minimal/config.toml".to_string()
-                ),
-                (
-                    "Config",
-                    "Loadouts dir",
-                    "/home/u/.config/minimal/loadouts".to_string()
-                ),
-                (
-                    "Config",
-                    "Mesh enrolment",
-                    "/home/u/.config/minimal/mesh-enrolment".to_string()
-                ),
-                (
-                    "Config",
-                    "mTLS client cert",
-                    "/home/u/.config/minimal/client.pem".to_string()
-                ),
-                (
-                    "Config",
-                    "mTLS client key",
-                    "/home/u/.config/minimal/client.key".to_string()
-                ),
-                (
-                    "Config",
-                    "mTLS CA cert",
-                    "/home/u/.config/minimal/ca.pem".to_string()
-                ),
-                (
-                    "State",
-                    "State dir",
-                    "/home/u/.local/state/minimal".to_string()
-                ),
-                (
-                    "State",
-                    "Sessions",
-                    "/home/u/.local/state/minimal/sessions".to_string()
-                ),
-                (
-                    "State",
-                    "Daemon logs",
-                    "/home/u/.local/state/minimal/logs".to_string()
-                ),
-                (
-                    "State",
-                    "SSH socket",
-                    "/home/u/.local/state/minimal/providers/local-minimald0/ssh.sock".to_string()
-                ),
-                ("Cache", "Cache dir", "/home/u/.cache/minimal".to_string()),
-                (
-                    "Cache",
-                    "Built artifacts",
-                    "/home/u/.cache/minimal/built".to_string()
-                ),
-            ],
+        #[allow(unused_mut)]
+        let mut expected = vec![
+            (
+                "Config",
+                "Config dir",
+                "/home/u/.config/minimal".to_string(),
+            ),
+            (
+                "Config",
+                "config.toml",
+                "/home/u/.config/minimal/config.toml".to_string(),
+            ),
+            (
+                "Config",
+                "Loadouts dir",
+                "/home/u/.config/minimal/loadouts".to_string(),
+            ),
+            (
+                "Config",
+                "mTLS client cert",
+                "/home/u/.config/minimal/client.pem".to_string(),
+            ),
+            (
+                "Config",
+                "mTLS client key",
+                "/home/u/.config/minimal/client.key".to_string(),
+            ),
+            (
+                "Config",
+                "mTLS CA cert",
+                "/home/u/.config/minimal/ca.pem".to_string(),
+            ),
+            (
+                "State",
+                "State dir",
+                "/home/u/.local/state/minimal".to_string(),
+            ),
+            (
+                "State",
+                "Sessions",
+                "/home/u/.local/state/minimal/sessions".to_string(),
+            ),
+            (
+                "State",
+                "Daemon logs",
+                "/home/u/.local/state/minimal/logs".to_string(),
+            ),
+            (
+                "State",
+                "SSH socket",
+                "/home/u/.local/state/minimal/providers/local-minimald0/ssh.sock".to_string(),
+            ),
+            ("Cache", "Cache dir", "/home/u/.cache/minimal".to_string()),
+            (
+                "Cache",
+                "Built artifacts",
+                "/home/u/.cache/minimal/built".to_string(),
+            ),
+        ];
+        // Mesh enrolment prints under Config, right after "Loadouts
+        // dir", only in `remote-access` builds where `min mesh` exists.
+        #[cfg(feature = "remote-access")]
+        expected.insert(
+            3,
+            (
+                "Config",
+                "Mesh enrolment",
+                "/home/u/.config/minimal/mesh-enrolment".to_string(),
+            ),
         );
+        assert_eq!(shape, expected);
     }
 
     /// The "Daemon logs" row's note names both daemons' rotated files so
@@ -375,7 +393,9 @@ mod tests {
     fn build_dir_rows_daemon_logs_note_names_both_daemons() {
         let dirs = DirsLookup {
             config: PathBuf::from("/c"),
+            #[cfg(feature = "remote-access")]
             mesh_enrolment: PathBuf::from("/c/mesh-enrolment"),
+            #[cfg(feature = "remote-access")]
             mesh_group: MeshGroup::Config,
             state: PathBuf::from("/s"),
             cache: PathBuf::from("/x"),
@@ -411,6 +431,7 @@ mod tests {
     /// tree, the Mesh row must render under the State group so the
     /// output stays semantically honest. Guards the `mesh_group`
     /// branching added to `build_dir_rows`.
+    #[cfg(feature = "remote-access")]
     #[test]
     fn build_dir_rows_places_mesh_under_state_when_minimal_dir_overrides() {
         let dirs = DirsLookup {
