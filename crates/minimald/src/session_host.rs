@@ -1053,16 +1053,33 @@ pub(crate) struct AttachEnv {
 /// attach shell") documents.
 const BASELINE_PROMPT_COMMAND: &str = r#"eval "$MINIMAL_MOTD"; unset PROMPT_COMMAND MINIMAL_MOTD"#;
 
+/// Absolute workspace root inside a session sandbox, `/workbench` by
+/// convention. Derived from the same [`sandbox2::SESSION_DEFAULT_WD`] the
+/// sandbox uses as the shell's initial cwd (sessions never set a
+/// `working_name_override`), so [`BASELINE_MOTD`]'s blueprint test cannot
+/// drift from where the workspace actually lives.
+const SESSION_WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_DEFAULT_WD);
+
 /// Payload half of the launcher-baseline orientation banner: a STATIC
-/// template. The daemon knows the session name but not the loadout list or
-/// whether the project carries a blueprint, so the template interpolates
-/// `$MINIMAL_SESSION_NAME` (seeded by [`session_baseline_env`]) plus
-/// `$MINIMAL_LOADOUTS` and `$MINIMAL_BLUEPRINT` (contributed by the client
-/// through the composition's var lane) in-shell at print time, where all
-/// three exist. Every interpolation carries a `${VAR:-fallback}` so a
-/// missing var still renders sanely. TTY-gated, plain text — `NO_COLOR`-safe,
-/// no box drawing.
-const BASELINE_MOTD: &str = r#"[ -t 1 ] && { printf 'minimal · session %s · loadout %s\ndetach: ctrl-w' "${MINIMAL_SESSION_NAME:-unnamed}" "${MINIMAL_LOADOUTS:-none}"; [ "${MINIMAL_BLUEPRINT:-none}" = present ] || printf ' · no minimal.toml here — min init to add one'; printf '\n'; }"#;
+/// template. The daemon knows the session name but not the loadout list,
+/// so the template interpolates `$MINIMAL_SESSION_NAME` (seeded by
+/// [`session_baseline_env`]) and `$MINIMAL_LOADOUTS` (contributed by the
+/// client through the composition's var lane) in-shell at print time,
+/// where both exist; each carries a `${VAR:-fallback}` so a missing var
+/// still renders sanely. Whether the workspace holds a blueprint is a
+/// SESSION-filesystem fact, so it is not interpolated from anywhere — the
+/// template tests [`SESSION_WORKSPACE_ROOT`] directly (both mfile
+/// layouts, `minimal.toml` and `.minimal/minimal.toml`) when it prints,
+/// which stays correct across skipped uploads, an in-session `min init`,
+/// and attaches from unrelated host directories. TTY-gated, plain text —
+/// `NO_COLOR`-safe, no box drawing.
+const BASELINE_MOTD: &str = constcat::concat!(
+    r#"[ -t 1 ] && { printf 'minimal · session %s · loadout %s\ndetach: ctrl-w' "${MINIMAL_SESSION_NAME:-unnamed}" "${MINIMAL_LOADOUTS:-none}"; [ -f "#,
+    SESSION_WORKSPACE_ROOT,
+    r#"/minimal.toml ] || [ -f "#,
+    SESSION_WORKSPACE_ROOT,
+    r#"/.minimal/minimal.toml ] || printf ' · no minimal.toml here — min init to add one'; printf '\n'; }"#,
+);
 
 /// The launcher-baseline environment seeded beneath every other layer of
 /// [`layer_session_env`]: the session's name as `MINIMAL_SESSION_NAME`,
@@ -2049,8 +2066,11 @@ mod tests {
     /// once-only orientation banner pair: the session name verbatim in
     /// `MINIMAL_SESSION_NAME`, the self-unsetting `PROMPT_COMMAND`
     /// trigger, and a STATIC `MINIMAL_MOTD` template that defers the
-    /// dynamic parts to in-shell interpolation of the `$MINIMAL_*` vars
-    /// (with `${VAR:-fallback}` unset-safety).
+    /// dynamic parts to print time — env interpolation for the name and
+    /// loadout list (with `${VAR:-fallback}` unset-safety), a direct
+    /// in-shell filesystem test of the session workspace for the
+    /// blueprint clause (never a var: the client can't know the
+    /// workspace's state).
     #[test]
     fn layer_session_env_seeds_baseline_banner() {
         let env = layer_session_env(
@@ -2073,7 +2093,15 @@ mod tests {
         // Static template, dynamic vars: interpolated in-shell, unset-safe.
         assert!(motd.contains("${MINIMAL_SESSION_NAME:-"));
         assert!(motd.contains("${MINIMAL_LOADOUTS:-"));
-        assert!(motd.contains("${MINIMAL_BLUEPRINT:-"));
+        // The blueprint clause tests the session workspace itself at
+        // print time — both mfile layouts — pinned to the same constant
+        // that is the shell's initial cwd.
+        assert!(motd.contains("[ -f /workbench/minimal.toml ]"));
+        assert!(motd.contains("[ -f /workbench/.minimal/minimal.toml ]"));
+        assert!(
+            !motd.contains("MINIMAL_BLUEPRINT"),
+            "blueprint is a session-filesystem fact, not an env var"
+        );
         assert!(motd.contains("detach: ctrl-w"));
         assert!(motd.contains("min init"));
     }

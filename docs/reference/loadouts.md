@@ -393,19 +393,23 @@ minimal · session api-server-4f2a · loadout default (built-in)
 detach: ctrl-w · no minimal.toml here — min init to add one
 ```
 
-The second line drops the `min init` pointer when the project carries a
-`minimal.toml`. The banner is TTY-gated, prints exactly once, and is
-plain text (`NO_COLOR`-safe).
+The second line drops the `min init` pointer when the session workspace
+carries a `minimal.toml` (either layout, `minimal.toml` or
+`.minimal/minimal.toml`) — the template tests the workspace root
+(`/workbench`) in-shell at the moment it prints, so the clause reflects
+the session's actual filesystem: it stays correct when an activation
+skipped the file upload, and disappears after an in-session `min init`
+once a fresh shell launches. The banner is TTY-gated, prints exactly
+once, and is plain text (`NO_COLOR`-safe).
 
 It ships as a *static template* in the launcher baseline (the MOTD
-recipe above), interpolated by the shell at print time from three env
+recipe above), interpolated by the shell at print time from two env
 vars every session carries:
 
 | Var | Value |
 |-----|-------|
 | `MINIMAL_SESSION_NAME` | The session's name, seeded by the daemon's launcher baseline |
 | `MINIMAL_LOADOUTS` | Display list of the active loadouts, contributed by the client: comma-joined names, `default (built-in)` for the zero-config fallback, `none` with `--no-loadouts` |
-| `MINIMAL_BLUEPRINT` | `present` when the activated project carries a `minimal.toml`, else `none` |
 
 Because the trigger lives in the baseline layer, a loadout that sets its
 own `PROMPT_COMMAND` replaces the banner cleanly — and can interpolate

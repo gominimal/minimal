@@ -126,6 +126,13 @@ if [ -n "$SEED_DIR" ] || { [ ! -e "$PROJECT_DIR/minimal.toml" ] && [ ! -e "$PROJ
   # A dir we own is cleaned wholesale; otherwise track the lone file we dropped.
   [ -n "$SEED_DIR" ] || SEEDED_MFILE="$PROJECT_DIR/minimal.toml"
 fi
+# A dir we own also becomes a VCS root (a bare `.git` marker, exactly like
+# the task seed below): the headless upload gate then ships the seed into
+# the session workspace. The sandbox proof's banner assertion depends on
+# it — the orientation banner tests /workbench/minimal.toml in-shell at
+# print time, so the blueprint must actually be IN the workspace for the
+# `min init` pointer to stay suppressed.
+[ -z "$SEED_DIR" ] || mkdir "$SEED_DIR/.git"
 
 # Fresh state dir — a clean (no-daemon) cold-start on persistent runners:
 # post-#690, all daemon state (minvmd.toml, locks, the bridge socket) lives
@@ -302,10 +309,10 @@ echo "warm 'min ls': $((t1 - t0))ms"
 # `min task run` proof: a declared task runs in an ephemeral session — output
 # streamed through, the task's exit code relayed, the session destroyed
 # afterwards (or kept with --keep). Runs against its own tiny seeded project:
-# the shared PROJECT_DIR seed deliberately declares no tasks (and, not being a
-# VCS root, a headless activate skips its upload), so this seed carries the
-# same pinned [upstream] + shell stack PLUS the tasks and a `.git` marker so
-# the headless upload gate ships the config into the session. Skipped when the
+# the shared PROJECT_DIR seed deliberately declares no tasks, so this seed
+# carries the same pinned [upstream] + shell stack PLUS the tasks (and the
+# same `.git` marker, so the headless upload gate ships the config into the
+# session). Skipped when the
 # caller supplied a project we didn't seed — its minimal.toml declares none of
 # these tasks. Short mktemp template on purpose (mirrors the PROJECT_DIR
 # seed): the basename lands in the state root's task-dir paths, inside the
@@ -463,10 +470,13 @@ if [[ "$attach_out" != *"detach: ctrl-w"* ]]; then
   echo "--- attach output ---"; printf '%s\n' "$attach_out"
   fail
 fi
-# The seeded project DOES carry a minimal.toml, so the banner's `min init`
-# pointer (the MINIMAL_BLUEPRINT=none branch) must not have printed.
-if [[ "$attach_out" == *"no minimal.toml here"* ]]; then
-  echo "::error::banner shows the 'min init' pointer despite the seeded minimal.toml"
+# The banner tests /workbench/minimal.toml IN-SHELL at print time, so this
+# asserts the workspace's real state: our owned seed is a VCS root whose
+# upload shipped the blueprint, so the `min init` pointer must not have
+# printed. Only asserted for a seed we own — a caller-provided
+# E2E_PROJECT_DIR controls its own upload-gate outcome.
+if [ -n "$SEED_DIR" ] && [[ "$attach_out" == *"no minimal.toml here"* ]]; then
+  echo "::error::banner shows the 'min init' pointer despite the uploaded minimal.toml"
   echo "--- attach output ---"; printf '%s\n' "$attach_out"
   fail
 fi

@@ -57,12 +57,19 @@ const BUILTIN_DEFAULT_NAME: &str = "default";
 /// The MOTD is a STATIC template: after the mark it prints the same
 /// orientation lines the launcher-baseline banner prints — the session
 /// name, the active loadout list, the detach chord, and a `min init`
-/// pointer when the project has no blueprint — by interpolating
-/// `$MINIMAL_SESSION_NAME` (seeded by the daemon's launcher baseline)
-/// and `$MINIMAL_LOADOUTS` / `$MINIMAL_BLUEPRINT` (contributed by the
-/// client alongside this loadout) in-shell at print time. Every
-/// interpolation carries a `${VAR:-fallback}` so a missing var still
-/// renders sanely.
+/// pointer when the session workspace has no blueprint — by
+/// interpolating `$MINIMAL_SESSION_NAME` (seeded by the daemon's
+/// launcher baseline) and `$MINIMAL_LOADOUTS` (contributed by the
+/// client alongside this loadout) in-shell at print time; both carry a
+/// `${VAR:-fallback}` so a missing var still renders sanely. The
+/// blueprint clause is a SESSION-filesystem fact, so it is tested
+/// in-shell against the workspace root when the banner prints — both
+/// mfile layouts, `minimal.toml` and `.minimal/minimal.toml` — which
+/// stays correct across skipped uploads, an in-session `min init`, and
+/// attaches from unrelated host directories. `/workbench` mirrors
+/// `sandbox2::SESSION_DEFAULT_WD`, the attach shell's initial cwd (a
+/// literal here because this client crate doesn't depend on the sandbox
+/// crate; the daemon-side template derives it from the constant).
 const BUILTIN_DEFAULT_TOML: &str = r#"
 name = "default"
 description = "orientation banner and shaped prompt"
@@ -71,7 +78,7 @@ description = "orientation banner and shaped prompt"
 PROMPT_COMMAND = 'eval "$MINIMAL_MOTD"; unset PROMPT_COMMAND MINIMAL_MOTD'
 PS1 = 'minimal:\w\$ '
 MINIMAL_MOTD = '''
-[ -t 1 ] && { printf '\n     ████  ████▄\n  ▄▄▄ ▀███▄ ▀███▄\n  ▀███  ▀███  ▀███\n\n'; printf '  minimal · session %s · loadout %s\n  detach: ctrl-w' "${MINIMAL_SESSION_NAME:-unnamed}" "${MINIMAL_LOADOUTS:-default (built-in)}"; [ "${MINIMAL_BLUEPRINT:-none}" = present ] || printf ' · no minimal.toml here — min init to add one'; printf '\n\n  Add tools to this box:   min add --session <pkg>\n  Search the registry:     min search <query>\n\n'; }
+[ -t 1 ] && { printf '\n     ████  ████▄\n  ▄▄▄ ▀███▄ ▀███▄\n  ▀███  ▀███  ▀███\n\n'; printf '  minimal · session %s · loadout %s\n  detach: ctrl-w' "${MINIMAL_SESSION_NAME:-unnamed}" "${MINIMAL_LOADOUTS:-default (built-in)}"; [ -f /workbench/minimal.toml ] || [ -f /workbench/.minimal/minimal.toml ] || printf ' · no minimal.toml here — min init to add one'; printf '\n\n  Add tools to this box:   min add --session <pkg>\n  Search the registry:     min search <query>\n\n'; }
 '''
 "#;
 
@@ -174,41 +181,35 @@ pub(crate) fn loadout_display_list(active: &ActiveLoadouts) -> String {
         .join(", ")
 }
 
-/// Source tag for the client's synthetic orientation vars; shows up in
+/// Source tag for the client's synthetic orientation var; shows up in
 /// provenance-labelled surfaces (daemon logs, conflict errors).
 const ORIENTATION_SOURCE: &str = "session-orientation";
 
-/// Append the two synthetic orientation vars to the composed
-/// contribution: `MINIMAL_LOADOUTS` (the display list the banner
-/// interpolates) and `MINIMAL_BLUEPRINT` (`present`/`none`, gating the
-/// banner's `min init` pointer). They ride the existing composition var
-/// lane — no new wire surface — and are appended *after* the user-policy
-/// gate on purpose: like the daemon's launcher baseline they are
-/// client infrastructure, not user-declared loadout content, so a
+/// Append the synthetic orientation var to the composed contribution:
+/// `MINIMAL_LOADOUTS`, the display list the banner interpolates. It is
+/// static composition truth the client alone knows, riding the existing
+/// composition var lane — no new wire surface — and appended *after* the
+/// user-policy gate on purpose: like the daemon's launcher baseline it
+/// is client infrastructure, not user-declared loadout content, so a
 /// user's `deny`/`ignore` patterns don't silently blind the banner.
-pub(crate) fn push_orientation_vars(
+/// (Whether the workspace holds a blueprint is deliberately NOT a var:
+/// it is a session-filesystem fact the banner templates test in-shell
+/// at print time.)
+pub(crate) fn push_orientation_var(
     contribution: &mut sessions::wire::request::WireContribution,
     loadout_display: &str,
-    blueprint_present: bool,
 ) {
     use sessions::wire::primitives::{WireResolvedVar, WireSessionVar, WireSource};
-    let mut push = |name: &str, value: &str| {
-        contribution.vars.push(WireSessionVar {
-            var: WireResolvedVar {
-                name: name.to_string(),
-                value: value.to_string(),
-                carries_user_data: false,
-            },
-            source: WireSource::UserLoadout {
-                name: ORIENTATION_SOURCE.to_string(),
-            },
-        });
-    };
-    push("MINIMAL_LOADOUTS", loadout_display);
-    push(
-        "MINIMAL_BLUEPRINT",
-        if blueprint_present { "present" } else { "none" },
-    );
+    contribution.vars.push(WireSessionVar {
+        var: WireResolvedVar {
+            name: "MINIMAL_LOADOUTS".to_string(),
+            value: loadout_display.to_string(),
+            carries_user_data: false,
+        },
+        source: WireSource::UserLoadout {
+            name: ORIENTATION_SOURCE.to_string(),
+        },
+    });
 }
 
 /// Build the [`ComposeOptions`] the client passes to
@@ -577,7 +578,14 @@ on_activate = { type = "inline", value = "echo activated" }
         assert!(motd.contains("min add --session"), "the pointers stay");
         assert!(motd.contains("${MINIMAL_SESSION_NAME:-"));
         assert!(motd.contains("${MINIMAL_LOADOUTS:-"));
-        assert!(motd.contains("${MINIMAL_BLUEPRINT:-"));
+        // The blueprint clause tests the session workspace itself at
+        // print time — both mfile layouts — never a client-probed var.
+        assert!(motd.contains("[ -f /workbench/minimal.toml ]"));
+        assert!(motd.contains("[ -f /workbench/.minimal/minimal.toml ]"));
+        assert!(
+            !motd.contains("MINIMAL_BLUEPRINT"),
+            "blueprint is a session-filesystem fact, not an env var"
+        );
         assert!(motd.contains("detach: ctrl-w"));
         assert!(motd.contains("min init"));
     }
@@ -597,37 +605,21 @@ on_activate = { type = "inline", value = "echo activated" }
         assert_eq!(loadout_display_list(&active), "helix, fish");
     }
 
-    /// `push_orientation_vars` appends exactly the two synthetic vars to
-    /// the composed contribution, riding the existing var lane.
+    /// `push_orientation_var` appends exactly the loadout display list —
+    /// the one composition fact the banner needs from the client — to
+    /// the composed contribution, riding the existing var lane. No
+    /// blueprint var: that is a session-filesystem fact the banner
+    /// templates test in-shell at print time.
     #[test]
-    fn push_orientation_vars_appends_display_and_blueprint() {
+    fn push_orientation_var_appends_display_list() {
         let mut contribution = sessions::wire::request::WireContribution::default();
-        push_orientation_vars(&mut contribution, "default (built-in)", false);
+        push_orientation_var(&mut contribution, "default (built-in)");
 
-        assert_eq!(contribution.vars.len(), 2);
-        let get = |name: &str| {
-            contribution
-                .vars
-                .iter()
-                .find(|v| v.var.name == name)
-                .unwrap_or_else(|| panic!("{name} present"))
-        };
-        assert_eq!(get("MINIMAL_LOADOUTS").var.value, "default (built-in)");
-        assert_eq!(get("MINIMAL_BLUEPRINT").var.value, "none");
-        assert!(!get("MINIMAL_LOADOUTS").var.carries_user_data);
-
-        let mut contribution = sessions::wire::request::WireContribution::default();
-        push_orientation_vars(&mut contribution, "helix, fish", true);
-        assert_eq!(
-            contribution
-                .vars
-                .iter()
-                .find(|v| v.var.name == "MINIMAL_BLUEPRINT")
-                .expect("MINIMAL_BLUEPRINT present")
-                .var
-                .value,
-            "present"
-        );
+        assert_eq!(contribution.vars.len(), 1);
+        let var = &contribution.vars[0];
+        assert_eq!(var.var.name, "MINIMAL_LOADOUTS");
+        assert_eq!(var.var.value, "default (built-in)");
+        assert!(!var.var.carries_user_data);
     }
 
     /// Zero-config resolution — no flags, empty `default_loadouts`, no

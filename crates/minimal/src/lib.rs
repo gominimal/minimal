@@ -1497,19 +1497,6 @@ fn resolve_upload_root(dir: &camino::Utf8Path) -> Result<camino::Utf8PathBuf, an
     }
 }
 
-/// Whether the project carries a blueprint (`minimal.toml`), probed with
-/// the same walk [`resolve_upload_root`] uses. Feeds the orientation
-/// banner's `MINIMAL_BLUEPRINT` var, which gates its `min init` pointer —
-/// so only a definite not-found counts as absent; a present-but-broken
-/// mfile is "present" (pointing its owner at `min init` would be wrong,
-/// and the upload path already fails loudly on it).
-fn blueprint_present(dir: &camino::Utf8Path) -> bool {
-    !matches!(
-        mfile::File::from_dir_recursive(dir.as_std_path()),
-        Err(mfile::Error::NotFound)
-    )
-}
-
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
@@ -1579,17 +1566,15 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
         let names: Vec<&str> = active.loadouts.iter().map(|l| l.name().as_ref()).collect();
         eprintln!("Applying loadouts: {}", names.join(", "));
     }
-    // The orientation banner's dynamic halves, contributed as synthetic
-    // composed vars the daemon-seeded banner template (or a loadout's
-    // own MOTD) interpolates in-shell at print time.
+    // The orientation banner's loadout list, contributed as a synthetic
+    // composed var the daemon-seeded banner template (or a loadout's
+    // own MOTD) interpolates in-shell at print time. The banner's other
+    // dynamic clause — blueprint presence — is a session-filesystem
+    // fact, tested by the templates in-shell when they print.
     let loadout_display = loadouts::loadout_display_list(&active);
     let (mut contribution, user_policy) =
         loadouts::compose_user_contribution(active.loadouts, user_policy, compose_options)?;
-    loadouts::push_orientation_vars(
-        &mut contribution,
-        &loadout_display,
-        blueprint_present(&utf8_path),
-    );
+    loadouts::push_orientation_var(&mut contribution, &loadout_display);
 
     // `--sync` defaults to tarball; `sync_explicit` records whether the
     // user actually typed the flag, which distinguishes a deliberate
