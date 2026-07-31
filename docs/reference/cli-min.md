@@ -100,6 +100,16 @@ min session rename <SESSION> <NEW_NAME>
 
 Renames an existing session.
 
+### `session policy`
+
+```
+min session policy <SESSION>
+```
+
+Prints the effective networking policy for `SESSION` (a UUID or session
+name) as JSON — an object with `egress` and `ingress` fields, each null
+when unset. Resolved from the daemon.
+
 ### `stop`
 
 ```
@@ -191,7 +201,7 @@ min completions install [<SHELL>...]
 ```
 
 `print` writes a shell tab-completion script to stdout. Supported shells
-include `bash`, `zsh`, `elvish`, `fish`. Usage:
+include `bash`, `zsh`, `elvish`, `fish`, `powershell`. Usage:
 `source <(min completions print bash)`.
 
 `install` writes that script into the shell's completion directory instead,

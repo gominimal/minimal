@@ -190,7 +190,7 @@ mip completions <SHELL>
 ```
 
 Generates a shell tab-completion script for `mip`. Supported shells:
-`bash`, `zsh`, `elvish`, `fish`. Usage: `source <(mip completions bash)`.
+`bash`, `zsh`, `elvish`, `fish`, `powershell`. Usage: `source <(mip completions bash)`.
 
 ## Environment variables
 
