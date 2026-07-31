@@ -979,6 +979,14 @@ impl Context {
         graph: &Graph,
         pkgs: I,
     ) -> Result<(), Error> {
+        // The two arms are NOT interchangeable, though they look it.
+        // `rcache::Error`'s Display is `write!(f, "{:?}", self)` — it
+        // Debug-formats itself — so the fallback arm renders a Config as
+        // `Config("MINIMAL_INDEX_SOURCE: unknown index source \"banana\" ...")`,
+        // variant name and escaped quotes included. Destructuring Config and
+        // formatting the inner `msg` is what yields the clean, user-facing
+        // message. Collapsing this to one arm reintroduces the panic-era
+        // output this replaced.
         let rc = self.remote_cache(false, true).await.map_err(|e| match e {
             RemoteError::Config(msg) => Error::Other(anyhow::anyhow!("{msg}")),
             other => Error::Other(anyhow::anyhow!("{other}")),
