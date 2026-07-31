@@ -21,6 +21,7 @@ mod file_upload;
 pub mod git_remote;
 pub mod loadouts;
 pub mod prompt;
+pub mod theme;
 
 #[derive(Parser)]
 #[command(name = "min", version = version::VERSION, long_version = version::LONG_VERSION)]
@@ -50,13 +51,17 @@ pub enum Command {
     Ls(LsArgs),
     /// Shut down the minimald daemon
     //
-    // Stays top-level: it acts on the daemon backend, not on any session, and
-    // it is the daemon-lifecycle command people reach for. Documented as a
-    // deliberate exception in docs/reference/cli.md.
+    // Deliberate exception to the `<noun> <verb>` convention (documented in
+    // docs/reference/cli.md): `min daemon stop` is the canonical spelling,
+    // and `min stop` — acting on the daemon backend, not on any session —
+    // keeps this bare top-level form as its visible alias. Not an oversight —
+    // do not remove it.
     Stop(StopArgs),
     /// Session management subcommands
     #[command(visible_alias = "sessions")]
     Session(SessionArgs),
+    /// Daemon management subcommands
+    Daemon(DaemonArgs),
     /// Loadout management subcommands
     #[command(visible_alias = "loadouts")]
     Loadout(LoadoutArgs),
@@ -182,6 +187,18 @@ pub struct PolicyArgs {
     /// Session identifier (UUID or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
+}
+
+#[derive(Debug, Args)]
+pub struct DaemonArgs {
+    #[command(subcommand)]
+    pub command: DaemonCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DaemonCommand {
+    /// Shut down the minimald daemon
+    Stop(StopArgs),
 }
 
 #[derive(Debug, Args)]
@@ -658,6 +675,9 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             SessionCommand::Rename(args) => cmd_rename(&cli.global_args, args).await,
             SessionCommand::Policy(args) => cmd_session_policy(&cli.global_args, args).await,
         },
+        Some(Command::Daemon(DaemonArgs { command })) => match command {
+            DaemonCommand::Stop(args) => cmd_stop(&cli.global_args, args).await,
+        },
         Some(Command::Loadout(LoadoutArgs {
             command: LoadoutCommand::List(args),
         })) => loadouts::cmd_loadout_list(args, &cli.global_args),
@@ -988,11 +1008,11 @@ fn format_memory(bytes: u64) -> String {
 /// renders on stderr (so stderr must be a terminal) and reads
 /// keypresses from stdin (so stdin must be a terminal too). If
 /// either side is redirected we take the `--no-prompt` path — going
-/// interactive when stdin is a pipe just hangs `dialoguer` and then
+/// interactive when stdin is a pipe just hangs the prompt and then
 /// aborts with a much less helpful error than the `--no-prompt`
 /// snippet the operator actually wants to paste.
 fn can_prompt_interactively() -> bool {
-    dialoguer::console::user_attended() && dialoguer::console::user_attended_stderr()
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
 /// Phase 3 gate: run the user policy + hooks over the daemon's
@@ -1208,13 +1228,13 @@ async fn upload_and_finalize(
 /// Guard that tears down a half-built session if the user interrupts the
 /// activation with Ctrl-C.
 ///
-/// `dialoguer`/`console` re-raise SIGINT to this process on a Ctrl-C at
-/// the composition-gating prompt (console `unix_term.rs`). With no
-/// handler installed the default disposition kills `min` mid-prompt —
-/// before the abort-cleanup that [`drive_pending_to_active`] runs — so
-/// the daemon is left holding a `Pending` session that blocks its name.
-/// [`arm_activation_interrupt`] installs a SIGINT handler (keeping the
-/// process alive past console's re-raise) that best-effort
+/// inquire (crossterm raw mode) captures a Ctrl-C at the
+/// composition-gating prompt as an error return, so the abort-cleanup
+/// that [`drive_pending_to_active`] runs gets to execute. During the
+/// non-prompt phases (waiting on the daemon) a Ctrl-C is a plain
+/// SIGINT, which would kill `min` before that cleanup, leaving the
+/// daemon holding a `Pending` session that blocks its name.
+/// [`arm_activation_interrupt`] installs a SIGINT handler that best-effort
 /// `AbortSession`s the in-flight session over a fresh connection — the
 /// activation borrows the primary one — then exits. The daemon's
 /// connection-close reap is the backstop if the abort can't be
@@ -2857,6 +2877,38 @@ mod tests {
         assert!(canonical.raw && canonical.json);
         let bare = ls_args(&["min", "ls", "--json"]);
         assert!(bare.json && !bare.raw);
+    }
+
+    /// `min daemon stop` is the canonical `<noun> <verb>` spelling of the
+    /// daemon-shutdown command; `min stop` (top-level) is its visible alias.
+    /// Both parse to the same `StopArgs`, so `--force` reaches the one
+    /// `cmd_stop` implementation identically.
+    #[test]
+    fn daemon_stop_spellings_all_reach_stop() {
+        use clap::Parser as _;
+        let stop_args = |args: &[&str]| -> StopArgs {
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Command::Stop(a))
+                | Some(Command::Daemon(DaemonArgs {
+                    command: DaemonCommand::Stop(a),
+                })) => a,
+                _ => panic!("expected a stop command for {args:?}"),
+            }
+        };
+
+        for spelling in [
+            ["min", "daemon", "stop"].as_slice(),
+            ["min", "stop"].as_slice(),
+        ] {
+            let a = stop_args(spelling);
+            assert!(!a.force, "{spelling:?} must default --force off");
+        }
+
+        // `--force` is accepted on the canonical and the bare form alike.
+        let canonical = stop_args(&["min", "daemon", "stop", "--force"]);
+        assert!(canonical.force);
+        let bare = stop_args(&["min", "stop", "--force"]);
+        assert!(bare.force);
     }
 
     /// `repo_dir` and `minimal_dir` are global, so they must be accepted after

@@ -100,10 +100,10 @@ min session rename <SESSION> <NEW_NAME>
 
 Renames an existing session.
 
-### `stop`
+### `daemon stop` (alias: `min stop`)
 
 ```
-min stop [-f|--force]
+min daemon stop [-f|--force]
 ```
 
 Shuts down the `minimald` daemon. `--force` shuts down even if active
@@ -112,8 +112,9 @@ sessions themselves survive it (contrast
 [`session destroy`](#session-destroy), which removes one session and leaves the
 daemon running).
 
-`stop` stays bare at the top level — a deliberate exception to the
-`min <noun> <verb>` convention: it acts on the daemon, not on any session.
+`min stop` is the same command kept bare at the top level — a deliberate
+exception to the `min <noun> <verb>` convention: it acts on the daemon, not
+on any session. Both spellings take the same flags and behave identically.
 
 ### `loadout list` (alias: `ls`)
 
