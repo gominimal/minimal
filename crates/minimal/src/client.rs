@@ -302,12 +302,38 @@ impl Client {
         &mut self,
         command: &str,
     ) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
+        self.exec_channel(None, command).await
+    }
+
+    /// Like [`Self::open_exec_channel`], but sets `MINIMAL_SESSION_ID` on the
+    /// channel before the exec request, the routing contract the daemon's
+    /// `min`-prefixed exec forms (`min task run <task>`, `min package build`,
+    /// `min check`) are served under.
+    pub async fn open_session_exec_channel(
+        &mut self,
+        session_id: sessions::SessionId,
+        command: &str,
+    ) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
+        self.exec_channel(Some(session_id), command).await
+    }
+
+    async fn exec_channel(
+        &mut self,
+        session_id: Option<sessions::SessionId>,
+        command: &str,
+    ) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
         let mut channel = self
             .handle
             .channel_open_session()
             .await
             .context("open exec channel")?;
         send_traceparent(&channel).await;
+        if let Some(id) = session_id {
+            channel
+                .set_env(true, "MINIMAL_SESSION_ID", id.to_string())
+                .await
+                .context("set MINIMAL_SESSION_ID env")?;
+        }
         channel
             .exec(true, command)
             .await

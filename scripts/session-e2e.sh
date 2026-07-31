@@ -82,6 +82,7 @@ ADD_TOOL_MARKER="jq-1"
 # on teardown; SEEDED_MFILE is a lone minimal.toml dropped into a caller's dir.
 SEED_DIR=""
 SEEDED_MFILE=""
+TASK_SEED_DIR="" # seeded by the `min task run` proof below; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -182,6 +183,7 @@ teardown() {
   fi
   [ -n "$SEED_DIR" ] && rm -rf "$SEED_DIR"
   [ -n "$SEEDED_MFILE" ] && rm -f "$SEEDED_MFILE"
+  [ -n "$TASK_SEED_DIR" ] && rm -rf "$TASK_SEED_DIR"
   # And the state dir — which is NOT just metadata. On a VM lane it holds the
   # provider's per-VM writable data volume
   # (`minimal/providers/local-minvmd0/data-vol.raw`), a sparse image whose HOST
@@ -284,6 +286,106 @@ t0=$(now_ms)
 mnl ls >/dev/null 2>&1 || { echo "::error::warm 'min ls' failed"; fail; }
 t1=$(now_ms)
 echo "warm 'min ls': $((t1 - t0))ms"
+
+# ---------------------------------------------------------------------------
+# `min task run` proof: a declared task runs in an ephemeral session — output
+# streamed through, the task's exit code relayed, the session destroyed
+# afterwards (or kept with --keep). Runs against its own tiny seeded project:
+# the shared PROJECT_DIR seed deliberately declares no tasks (and, not being a
+# VCS root, a headless activate skips its upload), so this seed carries the
+# same pinned [upstream] + shell stack PLUS the tasks and a `.git` marker so
+# the headless upload gate ships the config into the session. Skipped when the
+# caller supplied a project we didn't seed — its minimal.toml declares none of
+# these tasks. Short mktemp template on purpose (mirrors the PROJECT_DIR
+# seed): the basename lands in the state root's task-dir paths, inside the
+# sun_path budget.
+if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
+  echo "::group::task run proof (min task run: ephemeral session loop)"
+  TASK_SEED_DIR="$(mktemp -d /tmp/mnlt.XXXXXX)"
+  {
+    awk '
+      /^\[upstream\]/            { grab = 1; print; next }
+      grab && (/^$/ || /^\[/)    { exit }
+      grab                       { print }
+    ' "$ROOT/.minimal/minimal.toml"
+    printf '\n[stack]\nuse = "shell"\n'
+    printf '\n[tasks.e2e-echo]\necho = "TASK_RUN_E2E_OK"\n'
+    printf '\n[tasks.e2e-fail]\nbash = "exit 7"\n'
+  } > "$TASK_SEED_DIR/minimal.toml"
+  mkdir "$TASK_SEED_DIR/.git"
+
+  # The loop: run → the task's output on stdout → exit 0 → session gone.
+  t0=$(now_ms)
+  task_out="$(cd "$TASK_SEED_DIR" && mnl task run e2e-echo 2>"$WORK/task-run.err")"
+  rc=$?
+  t1=$(now_ms)
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::'min task run e2e-echo' exited $rc (expected 0)"
+    echo "--- task stderr ---"; cat "$WORK/task-run.err" 2>/dev/null || true
+    fail
+  fi
+  # Glob, not grep — same SIGPIPE-under-pipefail reasoning as the attach
+  # proof's markers.
+  if [[ "$task_out" != *TASK_RUN_E2E_OK* ]]; then
+    echo "::error::'min task run e2e-echo' did not stream the task's output"
+    echo "--- task stdout ---"; printf '%s\n' "$task_out"
+    echo "--- task stderr ---"; cat "$WORK/task-run.err" 2>/dev/null || true
+    fail
+  fi
+  if mnl ls 2>/dev/null | grep -q 'task-e2e-echo-'; then
+    echo "::error::ephemeral session still listed after 'min task run e2e-echo'"
+    fail
+  fi
+  echo "task run loop: output + destroy OK ($((t1 - t0))ms)"
+
+  # The task's exit code must come back as ours — and the failing run's
+  # session must be torn down just the same.
+  (cd "$TASK_SEED_DIR" && mnl task run e2e-fail >/dev/null 2>"$WORK/task-fail.err")
+  rc=$?
+  if [ "$rc" -ne 7 ]; then
+    echo "::error::'min task run e2e-fail' exited $rc (expected the task's exit code 7)"
+    echo "--- task stderr ---"; cat "$WORK/task-fail.err" 2>/dev/null || true
+    fail
+  fi
+  if mnl ls 2>/dev/null | grep -q 'task-e2e-fail-'; then
+    echo "::error::ephemeral session still listed after a failing 'min task run'"
+    fail
+  fi
+  echo "task run exit-code relay: 7 → 7 OK"
+
+  # --keep retains the session, named task-<task>-<hex>, attachable later.
+  (cd "$TASK_SEED_DIR" && mnl task run e2e-echo --keep >/dev/null 2>"$WORK/task-keep.err") \
+    || { echo "::error::'min task run e2e-echo --keep' failed"; cat "$WORK/task-keep.err" 2>/dev/null || true; fail; }
+  kept="$(mnl ls 2>/dev/null | grep -o 'task-e2e-echo-[0-9a-f]\{4\}' | head -n1)"
+  if [ -z "$kept" ]; then
+    echo "::error::--keep did not leave a 'task-e2e-echo-*' session listed"
+    mnl ls 2>&1 || true
+    fail
+  fi
+  mnl session destroy "$kept" >/dev/null 2>&1 \
+    || { echo "::error::could not destroy kept session $kept"; fail; }
+  echo "task run --keep: session $kept retained OK"
+
+  # Unknown task: an instant client-side error listing what IS declared.
+  if (cd "$TASK_SEED_DIR" && mnl task run no-such-task >/dev/null 2>"$WORK/task-unknown.err"); then
+    echo "::error::'min task run no-such-task' unexpectedly succeeded"
+    fail
+  fi
+  grep -q 'e2e-echo' "$WORK/task-unknown.err" \
+    || { echo "::error::unknown-task error does not list the declared tasks"; cat "$WORK/task-unknown.err" 2>/dev/null || true; fail; }
+
+  # Muscle-memory catch: the hidden bare `min run <task>` errors naming the
+  # canonical spelling.
+  if mnl run e2e-echo >/dev/null 2>"$WORK/task-alias.err"; then
+    echo "::error::hidden 'min run' unexpectedly succeeded"
+    fail
+  fi
+  grep -q 'min task run' "$WORK/task-alias.err" \
+    || { echo "::error::hidden 'min run' error does not name 'min task run'"; cat "$WORK/task-alias.err" 2>/dev/null || true; fail; }
+
+  echo "task run proof OK"
+  echo "::endgroup::"
+fi
 
 # ---------------------------------------------------------------------------
 # Session-sandbox proof (every lane). Everything above proves the lifecycle;

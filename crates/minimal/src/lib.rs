@@ -21,6 +21,7 @@ mod file_upload;
 pub mod git_remote;
 pub mod loadouts;
 pub mod prompt;
+pub mod task;
 pub mod theme;
 
 #[derive(Parser)]
@@ -61,6 +62,14 @@ pub enum Command {
     /// Loadout management subcommands
     #[command(visible_alias = "loadouts")]
     Loadout(LoadoutArgs),
+    /// Task subcommands: run declared project tasks in ephemeral sessions
+    #[command(visible_alias = "tasks")]
+    Task(TaskArgs),
+    /// Muscle-memory catch for the in-box `min run <task>`: always errors,
+    /// naming the canonical `min task run <task>` (host) and
+    /// `min session attach --command 'min task run <task>'` (in-box) forms.
+    #[command(hide = true)]
+    Run(RunArgs),
     /// Print important directories and file paths for debugging
     Dirs,
     /// Collect a diagnostic bundle (logs, state, config) to send to the
@@ -204,6 +213,45 @@ pub struct LoadoutListArgs {
     /// `<config>/minimal/loadouts` per platform, e.g. `~/.config/minimal/loadouts` on Linux)
     #[arg(long)]
     pub dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct TaskArgs {
+    #[command(subcommand)]
+    pub command: TaskCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TaskCommand {
+    /// Run a declared task in an ephemeral session
+    ///
+    /// Creates a session for the project (named `task-<task>-<hex>`),
+    /// uploads the project like `min session activate`, runs the task
+    /// inside it with output streamed to the terminal, exits with the
+    /// task's exit code, and destroys the session afterwards. `--keep`
+    /// retains the session as an attachable box instead.
+    Run(TaskRunArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TaskRunArgs {
+    /// Name of a task declared in the project's minimal.toml
+    pub task: String,
+    /// Project path. Defaults to the directory set by `-C`/`--repo-dir`,
+    /// or the current working directory when neither is given.
+    pub path: Option<String>,
+    /// Keep the session after the task exits instead of destroying it
+    #[arg(long)]
+    pub keep: bool,
+}
+
+/// Arguments for the hidden top-level `run` catch. Everything after `run` is
+/// swallowed (flags included) so any in-box spelling reaches the redirect
+/// error in [`task::cmd_run`] instead of a clap parse error.
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+    pub rest: Vec<String>,
 }
 
 /// WireGuard mesh subcommands for authenticated remote PTask access (UC7 /
@@ -669,6 +717,10 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Loadout(LoadoutArgs {
             command: LoadoutCommand::List(args),
         })) => loadouts::cmd_loadout_list(args, &cli.global_args),
+        Some(Command::Task(TaskArgs { command })) => match command {
+            TaskCommand::Run(args) => task::cmd_task_run(&cli.global_args, args).await,
+        },
+        Some(Command::Run(args)) => task::cmd_run(&args),
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
         #[cfg(feature = "remote-access")]
@@ -3074,6 +3126,66 @@ mod tests {
             .expect("-f without --all must fail to parse")
             .to_string();
         assert!(bare.contains("--all"), "usage must surface --all: {bare}");
+    }
+
+    /// `min task run <task>` parses with `--keep` off by default; the flag
+    /// and the optional path positional are accepted in any order.
+    #[test]
+    fn task_run_parses_task_keep_and_path() {
+        use clap::Parser as _;
+        let run_args = |args: &[&str]| -> TaskRunArgs {
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Command::Task(TaskArgs {
+                    command: TaskCommand::Run(a),
+                })) => a,
+                _ => panic!("expected `task run` for {args:?}"),
+            }
+        };
+
+        let a = run_args(&["min", "task", "run", "build"]);
+        assert_eq!(a.task, "build");
+        assert!(!a.keep);
+        assert!(a.path.is_none());
+
+        let a = run_args(&["min", "task", "run", "build", "--keep"]);
+        assert!(a.keep);
+
+        let a = run_args(&["min", "task", "run", "--keep", "build", "sub/dir"]);
+        assert_eq!(a.task, "build");
+        assert_eq!(a.path.as_deref(), Some("sub/dir"));
+        assert!(a.keep);
+
+        // The task name is required.
+        assert!(Cli::try_parse_from(["min", "task", "run"]).is_err());
+        assert!(Cli::try_parse_from(["min", "task"]).is_err());
+    }
+
+    /// The hidden top-level `run` swallows any spelling — flags included —
+    /// so every muscle-memory invocation reaches the redirect error rather
+    /// than a clap parse error; and it stays hidden from help.
+    #[test]
+    fn hidden_run_swallows_any_spelling_and_stays_hidden() {
+        use clap::CommandFactory as _;
+        use clap::Parser as _;
+
+        match Cli::try_parse_from(["min", "run", "build", "--keep"])
+            .unwrap()
+            .command
+        {
+            Some(Command::Run(a)) => assert_eq!(a.rest, ["build", "--keep"]),
+            _ => panic!("expected the hidden run catch"),
+        }
+        // A bare `min run` parses too; the redirect copy handles it.
+        match Cli::try_parse_from(["min", "run"]).unwrap().command {
+            Some(Command::Run(a)) => assert!(a.rest.is_empty()),
+            _ => panic!("expected the hidden run catch"),
+        }
+
+        let cmd = Cli::command();
+        let run = cmd
+            .find_subcommand("run")
+            .expect("the run subcommand must exist");
+        assert!(run.is_hide_set(), "`min run` must stay hidden from help");
     }
 
     #[test]
