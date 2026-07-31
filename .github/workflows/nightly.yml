@@ -231,7 +231,9 @@ jobs:
               run: |
                   set -euo pipefail
                   bin="$RUNNER_TEMP/bin/minvmd"
-                  file "$bin" | grep -q 'statically linked' \
+                  # x86_64-musl emits a static PIE, which file(1) reports as
+                  # "static-pie linked"; aarch64-musl reports "statically linked".
+                  file "$bin" | grep -qE 'statically linked|static-pie linked' \
                     || { echo "::error::shipped minvmd is not statically linked"; file "$bin"; exit 1; }
                   echo "shipped minvmd is self-contained; no libkrun on the host"
             - name: Point the microVM env at the shipped guest artifacts

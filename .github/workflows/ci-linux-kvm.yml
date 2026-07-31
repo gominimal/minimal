@@ -215,7 +215,9 @@ jobs:
           cp "$RUNNER_TEMP/initramfs.cpio" testbed/initramfs.cpio
           # Prove it before it leaves this job: a dynamically-linked minvmd
           # here means the lane silently stopped testing what we distribute.
-          file testbed/minvmd | grep -q 'statically linked' \
+          # x86_64-musl emits a static PIE, which file(1) reports as
+          # "static-pie linked"; aarch64-musl reports "statically linked".
+          file testbed/minvmd | grep -qE 'statically linked|static-pie linked' \
             || { echo "::error::built minvmd is not statically linked"; file testbed/minvmd; exit 1; }
 
       - name: Upload testbed
@@ -296,7 +298,8 @@ jobs:
           set -euo pipefail
           TESTBED="$RUNNER_TEMP/testbed"
           chmod +x "$TESTBED/minvmd" "$TESTBED/min"
-          file "$TESTBED/minvmd" | grep -q 'statically linked' \
+          # See the build job for why both file(1) spellings are accepted.
+          file "$TESTBED/minvmd" | grep -qE 'statically linked|static-pie linked' \
             || { echo "::error::testbed minvmd is not statically linked"; file "$TESTBED/minvmd"; exit 1; }
           echo "$TESTBED" >> "$GITHUB_PATH"
           {

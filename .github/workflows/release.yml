@@ -215,7 +215,11 @@ jobs:
               run: |
                   set -euo pipefail
                   bin=target/x86_64-unknown-linux-musl/release/minvmd-linux-amd64
-                  file "$bin" | grep -q 'statically linked' \
+                  # Both spellings are static. x86_64-musl emits a static PIE,
+                  # which file(1) calls "static-pie linked"; aarch64-musl emits a
+                  # plain static executable, "statically linked". Neither has a
+                  # PT_INTERP or a DT_NEEDED, which is the property we want.
+                  file "$bin" | grep -qE 'statically linked|static-pie linked' \
                     || { echo "::error::$bin is not statically linked"; file "$bin"; exit 1; }
                   # The KVM backend's bindgen types are only present when libkrun
                   # is really linked in; the stub carries none of them.
@@ -326,7 +330,8 @@ jobs:
               run: |
                   set -euo pipefail
                   bin=target/aarch64-unknown-linux-musl/release/minvmd-linux-arm64
-                  file "$bin" | grep -q 'statically linked' \
+                  # See the amd64 job for why both file(1) spellings are accepted.
+                  file "$bin" | grep -qE 'statically linked|static-pie linked' \
                     || { echo "::error::$bin is not statically linked"; file "$bin"; exit 1; }
                   strings -a "$bin" | grep -q 'kvm_run' \
                     || { echo "::error::$bin does not contain libkrun's KVM backend (stub build?)"; exit 1; }
