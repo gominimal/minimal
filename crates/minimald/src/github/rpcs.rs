@@ -637,6 +637,7 @@ mod tests {
         GithubBeginLogin, GithubListAuths, GithubLogout, GithubPollLogin, GithubStatus,
     };
 
+    use crate::github::state::APP_SLUG;
     use crate::test_harness::TestServer;
 
     // -- a tiny hand-rolled mock GitHub -------------------------------------
@@ -913,9 +914,12 @@ mod tests {
         let install = &status_resp.installations[0];
         assert_eq!(install.repo, "octocat/hello");
         assert!(!install.installed);
+        // The install URL is built from the configured OAuth base (see
+        // `state::GithubService::install_url`), which `server_against` pointed
+        // at the mock — so assert against that base, not public GitHub's.
         assert_eq!(
             install.install_url.as_deref(),
-            Some("https://github.com/apps/minimal/installations/new")
+            Some(format!("{}apps/{APP_SLUG}/installations/new", mock.base_url()).as_str())
         );
 
         // Now mark it installed and confirm the flip.

@@ -76,7 +76,7 @@ pub type DaemonGrantManager = GrantManager<HttpRefreshBackend>;
 /// constant is only used to build the best-effort installation URL surfaced
 /// by [`github::Error::AppNotInstalled`] (spec R1.5); it is not read from
 /// [`GithubConfig`] because the config carries no App-identity field yet.
-const APP_SLUG: &str = "minimal";
+pub(super) const APP_SLUG: &str = "minimal";
 
 /// The daemon's single composition root for everything GitHub (spec 10).
 ///
