@@ -54,7 +54,7 @@ ergonomic choices, not leftovers — do not "fix" them:
 
 | Form | Why it stays |
 |------|--------------|
-| `min ls` | The highest-traffic command in the CLI; the break is not worth the consistency. |
+| `min ls` | Visible top-level alias of the canonical `min session list`; the highest-traffic command keeps its bare form. |
 | `min stop` | Acts on the daemon backend rather than any session, and is the daemon-lifecycle command people reach for. |
 | `min init`, `min add`, `min update` | Passthroughs to the `mip` commands of the same name; keeping the spelling identical across the two CLIs beats the hierarchy. |
 

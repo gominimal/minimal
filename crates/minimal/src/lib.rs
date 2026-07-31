@@ -21,7 +21,6 @@ mod file_upload;
 pub mod git_remote;
 pub mod loadouts;
 pub mod prompt;
-pub mod theme;
 
 #[derive(Parser)]
 #[command(name = "min", version = version::VERSION, long_version = version::LONG_VERSION)]
@@ -45,9 +44,9 @@ pub enum Command {
     /// List sessions
     //
     // Deliberate exception to the `<noun> <verb>` convention (documented in
-    // docs/reference/cli.md): `min ls` is the highest-traffic command in the
-    // CLI and keeps its bare top-level form. Not an oversight — do not move it
-    // under `session`.
+    // docs/reference/cli.md): `min session list` is the canonical spelling,
+    // and `min ls` — the highest-traffic command in the CLI — keeps this bare
+    // top-level form as its visible alias. Not an oversight — do not remove it.
     Ls(LsArgs),
     /// Shut down the minimald daemon
     //
@@ -163,6 +162,9 @@ pub struct SessionArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
+    /// List sessions
+    #[command(visible_alias = "ls")]
+    List(LsArgs),
     /// Activate (create) a new session
     Activate(ActivateArgs),
     /// Attach to an existing session
@@ -649,6 +651,7 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Ls(args)) => cmd_ls(&cli.global_args, args).await,
         Some(Command::Stop(args)) => cmd_stop(&cli.global_args, args).await,
         Some(Command::Session(SessionArgs { command })) => match command {
+            SessionCommand::List(args) => cmd_ls(&cli.global_args, args).await,
             SessionCommand::Activate(args) => cmd_activate(&cli.global_args, args).await,
             SessionCommand::Attach(args) => cmd_attach(&cli.global_args, args).await,
             SessionCommand::Destroy(args) => cmd_destroy(&cli.global_args, args).await,
@@ -985,11 +988,11 @@ fn format_memory(bytes: u64) -> String {
 /// renders on stderr (so stderr must be a terminal) and reads
 /// keypresses from stdin (so stdin must be a terminal too). If
 /// either side is redirected we take the `--no-prompt` path — going
-/// interactive when stdin is a pipe just hangs the prompt and then
+/// interactive when stdin is a pipe just hangs `dialoguer` and then
 /// aborts with a much less helpful error than the `--no-prompt`
 /// snippet the operator actually wants to paste.
 fn can_prompt_interactively() -> bool {
-    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+    dialoguer::console::user_attended() && dialoguer::console::user_attended_stderr()
 }
 
 /// Phase 3 gate: run the user policy + hooks over the daemon's
@@ -1205,13 +1208,13 @@ async fn upload_and_finalize(
 /// Guard that tears down a half-built session if the user interrupts the
 /// activation with Ctrl-C.
 ///
-/// inquire (crossterm raw mode) captures a Ctrl-C at the
-/// composition-gating prompt as an error return, so the abort-cleanup
-/// that [`drive_pending_to_active`] runs gets to execute. During the
-/// non-prompt phases (waiting on the daemon) a Ctrl-C is a plain
-/// SIGINT, which would kill `min` before that cleanup, leaving the
-/// daemon holding a `Pending` session that blocks its name.
-/// [`arm_activation_interrupt`] installs a SIGINT handler that best-effort
+/// `dialoguer`/`console` re-raise SIGINT to this process on a Ctrl-C at
+/// the composition-gating prompt (console `unix_term.rs`). With no
+/// handler installed the default disposition kills `min` mid-prompt —
+/// before the abort-cleanup that [`drive_pending_to_active`] runs — so
+/// the daemon is left holding a `Pending` session that blocks its name.
+/// [`arm_activation_interrupt`] installs a SIGINT handler (keeping the
+/// process alive past console's re-raise) that best-effort
 /// `AbortSession`s the in-flight session over a fresh connection — the
 /// activation borrows the primary one — then exits. The daemon's
 /// connection-close reap is the backstop if the abort can't be
@@ -2818,6 +2821,42 @@ mod tests {
         use clap::Parser as _;
         let cli = Cli::try_parse_from(["min", "ls"]).unwrap();
         assert!(!cli.global_args.use_minvmd());
+    }
+
+    /// `min session list` is the canonical `<noun> list` spelling of the
+    /// flagship list command; `min ls` (top-level) and `min session ls`
+    /// (noun-level) are visible aliases. All three parse to the same `LsArgs`,
+    /// so `--raw`/`--json` reach the one `cmd_ls` implementation identically.
+    #[test]
+    fn session_list_spellings_all_reach_ls() {
+        use clap::Parser as _;
+        let ls_args = |args: &[&str]| -> LsArgs {
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Command::Ls(a))
+                | Some(Command::Session(SessionArgs {
+                    command: SessionCommand::List(a),
+                })) => a,
+                _ => panic!("expected an ls command for {args:?}"),
+            }
+        };
+
+        for spelling in [
+            ["min", "session", "list"].as_slice(),
+            ["min", "session", "ls"].as_slice(),
+            ["min", "ls"].as_slice(),
+        ] {
+            let a = ls_args(spelling);
+            assert!(
+                !a.raw && !a.json,
+                "{spelling:?} must default both flags off"
+            );
+        }
+
+        // `--raw`/`--json` are accepted on the canonical and the bare form alike.
+        let canonical = ls_args(&["min", "session", "list", "--raw", "--json"]);
+        assert!(canonical.raw && canonical.json);
+        let bare = ls_args(&["min", "ls", "--json"]);
+        assert!(bare.json && !bare.raw);
     }
 
     /// `repo_dir` and `minimal_dir` are global, so they must be accepted after
