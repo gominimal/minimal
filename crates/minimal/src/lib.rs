@@ -319,8 +319,12 @@ pub struct ActivateArgs {
     /// is given.
     pub path: Option<String>,
     /// How to load project files into the session.
-    #[arg(long, value_enum, default_value_t = SyncMode::Tarball)]
-    pub sync: SyncMode,
+    ///
+    /// Defaults to `tarball`. Passing `--sync tarball` explicitly is also
+    /// the escape hatch that uploads an empty directory or `$HOME`, which
+    /// are otherwise skipped without a prompt.
+    #[arg(long, value_enum)]
+    pub sync: Option<SyncMode>,
     /// Network mode: no-net, host-net (default), or own-ip.
     ///
     /// Hidden from `--help` while `own-ip` is not usable on an installed host:
@@ -1401,15 +1405,30 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     let (contribution, user_policy) =
         loadouts::compose_user_contribution(active, user_policy, compose_options)?;
 
+    // `--sync` defaults to tarball; `sync_explicit` records whether the
+    // user actually typed the flag, which distinguishes a deliberate
+    // `--sync tarball` (the escape hatch that force-uploads an empty dir
+    // or `$HOME`) from the implicit default.
+    let sync_explicit = args.sync.is_some();
+    let sync_mode = args.sync.unwrap_or(SyncMode::Tarball);
+
     // Resolve the upload root before opening the daemon connection:
     // a malformed mfile in an ancestor should fail loudly before
     // we create a session on the daemon, so we don't leak a draft
     // session. Only needed for tarball sync — `--sync none` skips
     // the upload entirely (#770).
-    let upload_root = match args.sync {
+    let upload_root = match sync_mode {
         SyncMode::None => None,
         SyncMode::Tarball => Some(resolve_upload_root(&utf8_path)?),
     };
+
+    // Skip the upload without prompting when the resolved root is an
+    // empty directory or `$HOME` — unless the user asked for it with an
+    // explicit `--sync tarball`, the escape hatch.
+    let skip_empty_or_home = !sync_explicit
+        && upload_root.as_ref().is_some_and(|root| {
+            file_upload::is_empty_or_home(root.as_std_path(), std::env::home_dir().as_deref())
+        });
 
     let mut client = connect_daemon(global).await?;
 
@@ -1445,8 +1464,17 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     // has to run before `ConfigureLoadout`. `--sync none` opts out;
     // the daemon then composes against an empty workspace and the
     // caller is on their own for getting files there.
-    match args.sync {
+    match sync_mode {
         SyncMode::None => {}
+        SyncMode::Tarball if skip_empty_or_home => {
+            // An empty directory has nothing to sync, and `$HOME` is far
+            // too much to ship on a stray confirmation keypress — and if
+            // `$HOME` is itself a VCS root the old gate uploaded it with
+            // no prompt at all. Skip both silently by default; a
+            // deliberate `--sync tarball` (via `sync_explicit`) is the
+            // escape hatch that still uploads them.
+            eprintln!("Starting with an empty box (nothing here to sync)");
+        }
         SyncMode::Tarball => {
             // Upload from the project root — the directory the mfile
             // lives in — rather than wherever the user invoked us. This
