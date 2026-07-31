@@ -344,6 +344,7 @@ pub struct CheckCtx {
     pub stdlib_dir: PathBuf,
     pub cache: Cache<LocalDir>,
     pub ot: Option<OpTracker>,
+    pub daemon_id: Option<String>,
 
     /// Fires when the caller wants the run to stop.
     ///
@@ -361,6 +362,7 @@ pub struct CheckCtx {
 }
 
 impl CheckCtx {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         filter_names: Vec<String>,
         skip_checkers: Vec<String>,
@@ -369,6 +371,7 @@ impl CheckCtx {
         stdlib_dir: PathBuf,
         cache: Cache<LocalDir>,
         ot: Option<OpTracker>,
+        daemon_id: Option<String>,
     ) -> Self {
         Self {
             filter_names,
@@ -378,6 +381,7 @@ impl CheckCtx {
             stdlib_dir,
             cache,
             ot,
+            daemon_id,
             cancel: CancellationToken::new(),
             semaphore: Arc::new(Semaphore::new(20)),
             check_cache: Arc::new(CheckCache::new()),
@@ -1054,6 +1058,7 @@ impl GraphBasedChecker for StandaloneTestCheck {
         if let Some(tests) = build.tests {
             let graph2 = graph.deref().clone();
             let cancel = ctx.cancel.clone();
+            let daemon_id = ctx.daemon_id.clone();
             drop(graph);
             result = tokio::task::spawn(async move {
                 let mut result = result;
@@ -1083,6 +1088,7 @@ impl GraphBasedChecker for StandaloneTestCheck {
                         exec_base: temp_dir.path().to_path_buf(),
                         graph: &graph2,
                         ot: ot.clone(),
+                        daemon_id: daemon_id.clone(),
                     };
 
                     match t.run(&opts).await {
@@ -1431,6 +1437,7 @@ mod tests {
             None,
             dir.to_path_buf(),
             Cache::at_dir(dir).expect("Cache::at_dir"),
+            None,
             None,
         )
     }

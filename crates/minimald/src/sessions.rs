@@ -911,6 +911,7 @@ mod tests {
         let mctx_config = mctx::ConfigBuilder::new()
             .with_cache_dir(cache.path())
             .with_state_dir(state.path())
+            .with_daemon_id("test".to_string())
             .build()
             .unwrap();
         let mngr = Manager::init(daemon_dir(&state), daemon_dir(&cache), mctx_config, switch)
@@ -1555,6 +1556,7 @@ mod tests {
         let mctx_config = mctx::ConfigBuilder::new()
             .with_cache_dir(cache.path())
             .with_state_dir(state.path())
+            .with_daemon_id("test".to_string())
             .build()
             .unwrap();
         let daemon = std::sync::Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());

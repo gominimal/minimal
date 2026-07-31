@@ -258,6 +258,11 @@ impl DaemonContext {
         self.cache.clone()
     }
 
+    /// Returns the daemon ID.
+    pub fn daemon_id(&self) -> Option<String> {
+        self.config().daemon_id()
+    }
+
     /// Releases the local cache's read tracker (its held-open append-log fd).
     /// Called on daemon shutdown before unmounting the filesystem that holds
     /// the cache; harmless otherwise (read tracking is best-effort).
@@ -420,6 +425,10 @@ impl Context {
     /// Returns the vcs manager.
     pub fn vcs_manager(&self) -> VcsManagerHandle {
         self.daemon.vcs.clone()
+    }
+    /// Returns the daemon ID, if one was configured.
+    pub fn daemon_id(&self) -> Option<String> {
+        self.daemon.config.daemon_id()
     }
 
     /// Returns true if the context is configured to use the local cache.
@@ -705,6 +714,7 @@ impl Context {
             self.daemon.config.num_parallel_builds(),
             graph.clone(),
             cache.clone(),
+            self.daemon_id(),
             log_sink,
             self.daemon.config.ot.clone(),
             cancel,
@@ -969,7 +979,10 @@ impl Context {
         graph: &Graph,
         pkgs: I,
     ) -> Result<(), Error> {
-        let rc = self.remote_cache(false, true).await.unwrap();
+        let rc = self.remote_cache(false, true).await.map_err(|e| match e {
+            RemoteError::Config(msg) => Error::Other(anyhow::anyhow!("{msg}")),
+            other => Error::Other(anyhow::anyhow!("{other}")),
+        })?;
         let mut task_set = tokio::task::JoinSet::new();
         let fetch_start = SystemTime::now();
         let semaphore = Arc::new(Semaphore::new(8));
@@ -1272,6 +1285,7 @@ mod tests {
                 exec_base: temp_dir.path().to_path_buf(),
                 graph: &graph,
                 ot: ctx.daemon.config.ot.clone(),
+                daemon_id: ctx.daemon.config.daemon_id(),
             };
 
             assert_eq!(t.run(&opts).await.unwrap(), vec![]);

@@ -108,6 +108,21 @@ min_run() {
     __min_rpc "run" "$@"
 }
 
+min_task() {
+    local subcmd="$1"
+    shift
+
+    case "$subcmd" in
+        run)
+            min_run "$@"
+            ;;
+        *)
+            echo "error: unknown subcommand '$subcmd'. Expected 'run'" >&2
+            return 1
+            ;;
+    esac
+}
+
 min_package() {
     local subcmd="$1"
     shift
@@ -119,8 +134,14 @@ min_package() {
         build)
             __min_rpc "build" "$@"
             ;;
+        search)
+            min_search "$@"
+            ;;
+        add)
+            min_add "$@"
+            ;;
         *)
-            echo "error: unknown subcommand '$subcmd'. Expected 'build' or 'patched-build'" >&2
+            echo "error: unknown subcommand '$subcmd'. Expected 'add', 'build', 'search', or 'patched-build'" >&2
             return 1
             ;;
     esac
@@ -150,6 +171,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         run)
             min_run "$@"
             ;;
+        task)
+            min_task "$@"
+            ;;
         package|pkg)
             min_package "$@"
             ;;
@@ -163,12 +187,12 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             echo "Usage: min <subcommand>" >&2
             echo "" >&2
             echo "Add packages: min add [--session|--build|--runtime] <packages>" >&2
-            echo "Search for packages: min search <query>" >&2
-            echo "Check minimal configuration: min check" >&2
-            echo "Materialize an output into the workspace: min materialize --output <path> [--arch <arch>] <output name>" >&2
-            echo "Run a task: min run <task name>" >&2
+            echo "Run a task: min task run <task name>" >&2
+            echo "Search for packages: min package search <query>" >&2
             echo "Build packages: min package build <packages>" >&2
             echo "Try building a package (with potentially-stale dependencies): min package patched-build <package name>" >&2
+            echo "Check minimal configuration (bare, by exception): min check" >&2
+            echo "Materialize an output into the workspace (bare, by exception): min materialize --output <path> [--arch <arch>] <output name>" >&2
             exit 1
             ;;
     esac

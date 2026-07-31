@@ -413,6 +413,7 @@ mod tests {
             graph,
             exec_base: "/not-exists".into(),
             ot: None,
+            daemon_id: None,
         };
         futures::executor::block_on(
             Materialize {

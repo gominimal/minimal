@@ -15,6 +15,7 @@ pub struct Options<'a> {
     pub graph: &'a Graph,
     pub exec_base: PathBuf,
     pub ot: Option<OpTracker>,
+    pub daemon_id: Option<String>,
 }
 
 /// Describes an operation which is configured and ready to be executed.

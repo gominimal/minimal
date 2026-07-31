@@ -85,6 +85,18 @@ pub(crate) fn resolve_for_attach(
     }
 }
 
+/// The ` — created from <path>` suffix for the attach announcement. On the
+/// no-cwd-match/single-session branch the operator is by definition somewhere
+/// other than the session's project directory, so naming the origin is a
+/// tripwire against working in the wrong box. Empty when the cwd matched (the
+/// match is its own confirmation) or the record predates `project_path`.
+pub(crate) fn created_from_suffix(entry: &ListSessionsEntry, cwd: &paths::HostAbsPath) -> String {
+    match entry.project_path.as_ref() {
+        Some(path) if path != cwd => format!(" — created from {path}"),
+        _ => String::new(),
+    }
+}
+
 /// Whether the picker can actually run: it draws to stdout and reads
 /// keystrokes from stdin, so both must be a real terminal. A redirected
 /// stdin (a script, a pipe) would hang waiting for a keypress that never
@@ -171,9 +183,53 @@ fn format_candidate(entry: &ListSessionsEntry, cwd: &paths::HostAbsPath) -> Stri
     format!("{glyph} {head} · {path}{cwd_marker}")
 }
 
+/// A row in the attach picker: an existing session to attach to, or the
+/// trailing affordance that creates a fresh session for the cwd. `Display`
+/// renders the row the user sees and fuzzy-searches against.
+#[derive(Clone)]
+enum PickerRow {
+    Session(SessionCandidate),
+    CreateNew(String),
+}
+
+impl fmt::Display for PickerRow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PickerRow::Session(c) => c.fmt(f),
+            PickerRow::CreateNew(label) => f.write_str(label),
+        }
+    }
+}
+
+/// The user's choice from the attach picker.
+pub(crate) enum Picked {
+    /// Attach to this existing session.
+    Session(ListSessionsEntry),
+    /// The create row was chosen: activate a fresh session for the cwd and
+    /// attach, exactly as `min session activate --attach .` would.
+    CreateNew,
+}
+
+/// The trailing `+ Create a new session for <cwd>` picker row. Rendered without
+/// a state glyph so it reads as an action rather than a session, and always
+/// placed last so it never displaces an existing session.
+fn create_row_label(cwd: &paths::HostAbsPath) -> String {
+    format!("+ Create a new session for {cwd}")
+}
+
+/// Maps a chosen picker row to the attach outcome. Split out so the selection
+/// arm is unit-testable without a live terminal.
+fn resolve_pick(row: PickerRow) -> Picked {
+    match row {
+        PickerRow::Session(c) => Picked::Session(c.entry),
+        PickerRow::CreateNew(_) => Picked::CreateNew,
+    }
+}
+
 /// Runs the interactive session picker over `candidates`, ordered with the
-/// most recently active session first. Returns the chosen entry, or `None`
-/// if the user dismissed the prompt (Esc / Ctrl-C / Ctrl-D / EOF).
+/// most recently active session first and a trailing create-new row. Returns
+/// the user's choice — an existing session or the create affordance — or
+/// `None` if the user dismissed the prompt (Esc / Ctrl-C / Ctrl-D / EOF).
 ///
 /// # Errors
 ///
@@ -183,19 +239,23 @@ fn format_candidate(entry: &ListSessionsEntry, cwd: &paths::HostAbsPath) -> Stri
 pub(crate) fn pick_session(
     candidates: &[ListSessionsEntry],
     cwd: &paths::HostAbsPath,
-) -> Result<Option<ListSessionsEntry>, anyhow::Error> {
+) -> Result<Option<Picked>, anyhow::Error> {
     // Most recently active first; sessions without activity sort last in a
     // stable order so the picker doesn't reshuffle between invocations.
     let mut ordered: Vec<&ListSessionsEntry> = candidates.iter().collect();
     ordered.sort_by_key(|e| std::cmp::Reverse(last_activity(e)));
 
-    let items: Vec<SessionCandidate> = ordered
+    let mut items: Vec<PickerRow> = ordered
         .iter()
-        .map(|e| SessionCandidate {
-            entry: (*e).clone(),
-            label: format_candidate(e, cwd),
+        .map(|e| {
+            PickerRow::Session(SessionCandidate {
+                entry: (*e).clone(),
+                label: format_candidate(e, cwd),
+            })
         })
         .collect();
+    // Always last, so it never displaces an existing session.
+    items.push(PickerRow::CreateNew(create_row_label(cwd)));
 
     let choice = match inquire::Select::new("Select a session to attach:", items).prompt_skippable()
     {
@@ -210,7 +270,7 @@ pub(crate) fn pick_session(
         Err(inquire::InquireError::OperationInterrupted) => return Ok(None),
         Err(e) => return Err(e).context("session picker"),
     };
-    Ok(choice.map(|c| c.entry))
+    Ok(choice.map(resolve_pick))
 }
 
 /// The error message shown when smart resolution is ambiguous but the picker
@@ -500,5 +560,68 @@ mod tests {
             !label.contains("0a99-78b1"),
             "full uuid must not appear: {label}"
         );
+    }
+
+    #[test]
+    fn created_from_suffix_names_origin_on_no_cwd_match() {
+        let e = entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            "/elsewhere",
+            SessionStatus::Active,
+        );
+        assert_eq!(
+            created_from_suffix(&e, &cwd("/a")),
+            " — created from /elsewhere"
+        );
+    }
+
+    #[test]
+    fn created_from_suffix_empty_when_cwd_matches() {
+        let e = entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            "/a",
+            SessionStatus::Active,
+        );
+        assert_eq!(created_from_suffix(&e, &cwd("/a")), "");
+    }
+
+    #[test]
+    fn created_from_suffix_empty_when_project_path_absent() {
+        let e = entry_no_path(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            SessionStatus::Active,
+        );
+        assert_eq!(created_from_suffix(&e, &cwd("/a")), "");
+    }
+
+    #[test]
+    fn create_row_label_prefixes_plus_and_names_cwd() {
+        assert_eq!(
+            create_row_label(&cwd("/code/api-server")),
+            "+ Create a new session for /code/api-server"
+        );
+    }
+
+    #[test]
+    fn selecting_create_row_yields_create_new() {
+        let row = PickerRow::CreateNew(create_row_label(&cwd("/a")));
+        assert!(matches!(resolve_pick(row), Picked::CreateNew));
+    }
+
+    #[test]
+    fn selecting_session_row_yields_its_entry() {
+        let e = entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            "/a",
+            SessionStatus::Active,
+        );
+        let row = PickerRow::Session(SessionCandidate {
+            entry: e.clone(),
+            label: format_candidate(&e, &cwd("/a")),
+        });
+        match resolve_pick(row) {
+            Picked::Session(got) => assert_eq!(got.id, e.id),
+            Picked::CreateNew => panic!("expected the existing session, got create"),
+        }
     }
 }

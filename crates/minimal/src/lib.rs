@@ -21,6 +21,7 @@ mod file_upload;
 pub mod git_remote;
 pub mod loadouts;
 pub mod prompt;
+pub mod task;
 pub mod theme;
 
 #[derive(Parser)]
@@ -61,6 +62,14 @@ pub enum Command {
     /// Loadout management subcommands
     #[command(visible_alias = "loadouts")]
     Loadout(LoadoutArgs),
+    /// Task subcommands: run declared project tasks in ephemeral sessions
+    #[command(visible_alias = "tasks")]
+    Task(TaskArgs),
+    /// Muscle-memory catch for the in-box `min run <task>`: always errors,
+    /// naming the canonical `min task run <task>` (host) and
+    /// `min session attach --command 'min task run <task>'` (in-box) forms.
+    #[command(hide = true)]
+    Run(RunArgs),
     /// Print important directories and file paths for debugging
     Dirs,
     /// Collect a diagnostic bundle (logs, state, config) to send to the
@@ -206,6 +215,49 @@ pub struct LoadoutListArgs {
     pub dir: Option<PathBuf>,
 }
 
+#[derive(Debug, Args)]
+pub struct TaskArgs {
+    #[command(subcommand)]
+    pub command: TaskCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TaskCommand {
+    /// Run a declared task in an ephemeral session
+    ///
+    /// Creates a session for the project (named `task-<task>-<hex>`),
+    /// uploads the project like `min session activate`, runs the task
+    /// inside it with output streamed to the terminal, exits with the
+    /// task's exit code, and destroys the session afterwards. `--keep`
+    /// retains the session as an attachable box instead. Ctrl-C tears the
+    /// session down (or keeps it with `--keep`) and exits 130 without
+    /// relaying the interrupt to the task itself. Tasks run
+    /// non-interactively: pipe stdin to feed input; use `min session
+    /// attach` for interactive work.
+    Run(TaskRunArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TaskRunArgs {
+    /// Name of a task declared in the project's minimal.toml
+    pub task: String,
+    /// Project path. Defaults to the directory set by `-C`/`--repo-dir`,
+    /// or the current working directory when neither is given.
+    pub path: Option<String>,
+    /// Keep the session after the task exits instead of destroying it
+    #[arg(long)]
+    pub keep: bool,
+}
+
+/// Arguments for the hidden top-level `run` catch. Everything after `run` is
+/// swallowed (flags included) so any in-box spelling reaches the redirect
+/// error in [`task::cmd_run`] instead of a clap parse error.
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+    pub rest: Vec<String>,
+}
+
 /// WireGuard mesh subcommands for authenticated remote PTask access (UC7 /
 /// UC2b). The mesh lets a laptop, or another host's PTasks, reach this host's
 /// PTasks over an encrypted tunnel.
@@ -275,7 +327,13 @@ pub struct GlobalArgs {
     /// working directory.
     #[arg(long, short = 'C', global = true)]
     pub repo_dir: Option<PathBuf>,
-    /// Override the base directory used for operations (default: ~/.cache/minimal)
+    /// Override the base directory for minimal's state (default: platform
+    /// state dir).
+    ///
+    /// The session store, provider instances, and other on-disk state live
+    /// under `<minimal_dir>/`. Defaults to `$XDG_STATE_HOME/minimal` on Linux
+    /// (or `$HOME/.local/state/minimal` when that's unset); macOS also uses
+    /// `$HOME/.local/state/minimal`.
     #[arg(long, global = true)]
     pub minimal_dir: Option<PathBuf>,
     /// Override the user config directory (default: platform config dir).
@@ -463,8 +521,9 @@ pub struct LsArgs {
     /// Output raw session IDs (one per line) for piping into scripts
     #[arg(long)]
     pub raw: bool,
-    /// Output the full session list as JSON (pretty-printed)
-    #[arg(long)]
+    /// Output the full session list as JSON (pretty-printed). Conflicts
+    /// with `--raw`.
+    #[arg(long, conflicts_with = "raw")]
     pub json: bool,
 }
 
@@ -600,7 +659,7 @@ pub enum CompletionsCommand {
     Print(CompletionsPrintArgs),
     /// Write the shell integration into each shell's completion directory
     #[command(
-        long_about = "Write the shell integration into each shell's user-level completion directory,\nand print every path written on stdout, one per line.\n\n   bash  ${XDG_DATA_HOME:-~/.local/share}/bash-completion/completions/min\n   zsh   ${XDG_DATA_HOME:-~/.local/share}/zsh/completions/_min\n   fish  ${XDG_CONFIG_HOME:-~/.config}/fish/completions/min.fish\n\nA shell that cannot be installed for (an unwritable shared directory, say) is\na warning on stderr, not a failure."
+        long_about = "Write the shell integration into each shell's user-level completion directory,\nand print every path written on stdout, one per line.\n\n   bash  ${XDG_DATA_HOME:-~/.local/share}/bash-completion/completions/min\n   zsh   ${XDG_DATA_HOME:-~/.local/share}/zsh/completions/_min\n   fish  ${XDG_CONFIG_HOME:-~/.config}/fish/completions/min.fish\n\nInstalling zsh completions also clears the compinit dump cache\n(${ZDOTDIR:-$HOME}/.zcompdump), when present, so compinit rebuilds it and picks\nup the new _min; the cleared path is reported on stderr.\n\nA shell that cannot be installed for (an unwritable shared directory, say) is\na warning on stderr, not a failure."
     )]
     Install(CompletionsInstallArgs),
 }
@@ -662,6 +721,10 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Loadout(LoadoutArgs {
             command: LoadoutCommand::List(args),
         })) => loadouts::cmd_loadout_list(args, &cli.global_args),
+        Some(Command::Task(TaskArgs { command })) => match command {
+            TaskCommand::Run(args) => task::cmd_task_run(&cli.global_args, args).await,
+        },
+        Some(Command::Run(args)) => task::cmd_run(&args),
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
         #[cfg(feature = "remote-access")]
@@ -715,6 +778,69 @@ fn session_announce_label(id: &sessions::SessionId, name: Option<&str>) -> Strin
         Some(name) => format!("{name} ({short})"),
         None => short.to_string(),
     }
+}
+
+/// Bounded retries when a freshly minted autogen name collides with an
+/// existing session built from the same directory.
+const AUTOGEN_NAME_RETRIES: u32 = 8;
+
+/// Reduce a directory basename to the characters a session name should carry —
+/// ASCII alphanumerics plus `-`, `_`, `.`, lowercased — dropping everything
+/// else (spaces, unicode) so the minted handle is typable and clears
+/// `validate_session_name`. Falls back to `session` when nothing survives.
+fn sanitize_name_component(basename: &str) -> String {
+    let filtered: String = basename
+        .chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() {
+                Some(c.to_ascii_lowercase())
+            } else if matches!(c, '-' | '_' | '.') {
+                Some(c)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let trimmed = filtered.trim_matches(|c| matches!(c, '-' | '_' | '.'));
+    if trimmed.is_empty() {
+        "session".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Mint a typable session name `<dir-basename>-<hex>` from the project
+/// directory. The caller supplies the hex so the format is unit-testable and
+/// so a collision retry can re-mint with fresh entropy.
+fn autogen_session_name(project_dir: &camino::Utf8Path, hex: &str) -> String {
+    let base = sanitize_name_component(project_dir.file_name().unwrap_or("session"));
+    format!("{base}-{hex}")
+}
+
+/// Four lowercase hex digits of per-call entropy, drawn from the stdlib
+/// hasher's randomized seed — enough to disambiguate sessions from one
+/// directory without pulling in an RNG dependency. Each call reseeds, so a
+/// retry gets a fresh suffix.
+fn random_hex4() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    let seed = RandomState::new().hash_one("minimal-session-name");
+    format!("{:04x}", seed & 0xffff)
+}
+
+/// The daemon collapses the session-store `AlreadyExists` into a plain message
+/// (see `serve_create_session` in `crates/minimald/src/rpc.rs`); match it so an
+/// autogen name clash can be told apart from any other `CreateSession` failure.
+fn is_name_collision(error: &str) -> bool {
+    error.contains("already exists")
+}
+
+/// Whether a failed `CreateSession` should retry under a freshly minted name:
+/// only autogen names (`autogen`), only on a name collision, and only within
+/// the bounded budget. A user-supplied name never retries, so its collision
+/// surfaces verbatim.
+fn should_retry_autogen(autogen: bool, attempts: u32, error: &str) -> bool {
+    autogen && attempts < AUTOGEN_NAME_RETRIES && is_name_collision(error)
 }
 
 /// The default action for a bare `min` (no subcommand): print the top-level
@@ -1381,10 +1507,21 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
         }),
     };
 
+    // A session with no `--name` still deserves a typable handle, so mint
+    // `<dir-basename>-<4 hex>` client-side; without it `min ls`, the attach
+    // picker, and the create announcement fall back to a bare short id. A
+    // user-supplied name is passed through untouched — including a collision,
+    // which must surface as an error rather than be silently suffixed.
+    let autogen = args.name.is_none();
+    let session_name = args
+        .name
+        .clone()
+        .unwrap_or_else(|| autogen_session_name(&utf8_path, &random_hex4()));
+
     // The daemon sources `username` from the authenticated SSH
     // connection context; the client doesn't send it.
     let config = minimald_rpc::SessionConfig {
-        name: args.name.clone(),
+        name: Some(session_name),
         project_path: abs_path,
         network: args.network.into(),
         policy,
@@ -1439,18 +1576,30 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
     };
-    let resp = client
-        .oneshot_rpc::<CreateSession>(CreateSessionRequest { config })
-        .await
-        .context("CreateSession RPC failed")?;
-
-    // Surface the daemon's typed policy/network-mode validation error (e.g.
-    // ingress on a non-own-ip session, privileged host port) rather than a
-    // generic failure line.
-    let created = match resp {
-        minimald_rpc::Errorable::Ok(r) => r,
-        minimald_rpc::Errorable::Err { error } => {
-            bail!("CreateSession failed: {error}");
+    // An autogen name can (rarely) collide with an existing session built
+    // from the same directory; on the daemon's already-exists rejection,
+    // re-mint the hex suffix and retry a bounded number of times. A
+    // user-supplied name never retries — its collision, and any other failure
+    // (e.g. a policy/network-mode validation error), surfaces unchanged.
+    let mut config = config;
+    let mut attempts = 0u32;
+    let created = loop {
+        let resp = client
+            .oneshot_rpc::<CreateSession>(CreateSessionRequest {
+                config: config.clone(),
+            })
+            .await
+            .context("CreateSession RPC failed")?;
+        match resp {
+            minimald_rpc::Errorable::Ok(r) => break r,
+            minimald_rpc::Errorable::Err { error } => {
+                if should_retry_autogen(autogen, attempts, &error) {
+                    attempts += 1;
+                    config.name = Some(autogen_session_name(&utf8_path, &random_hex4()));
+                    continue;
+                }
+                bail!("CreateSession failed: {error}");
+            }
         }
     };
     let id = created.id;
@@ -1693,7 +1842,7 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
         if should_announce_session(global) {
             eprintln!(
                 "Created session {}",
-                session_announce_label(&id, args.name.as_deref())
+                session_announce_label(&id, config.name.as_deref())
             );
         }
         let attach_args = AttachArgs {
@@ -1771,8 +1920,11 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
             (r.id, r.name)
         }
         None => match resolve_smart_attach(&mut client, global).await? {
-            Some(entry) => (entry.id, entry.name),
-            None => bail!("no sessions exist; use 'min session activate' to create one"),
+            SmartAttach::Attach(entry) => (entry.id, entry.name),
+            SmartAttach::CreateForCwd => return activate_new_for_attach(global).await,
+            SmartAttach::NoSessions => {
+                bail!("no sessions exist; use 'min session activate' to create one")
+            }
         },
     };
 
@@ -1790,12 +1942,12 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
 /// and either attaches directly (unambiguous), opens the interactive picker
 /// (ambiguous), or errors (ambiguous but non-interactive).
 ///
-/// Returns `Ok(None)` when no sessions exist at all, which `min session attach`
-/// reports as an error pointing at `min session activate`.
+/// Returns [`SmartAttach::NoSessions`] when no sessions exist at all, which
+/// `min session attach` reports as an error pointing at `min session activate`.
 async fn resolve_smart_attach(
     client: &mut client::Client,
     global: &GlobalArgs,
-) -> Result<Option<minimald_rpc::ListSessionsEntry>, anyhow::Error> {
+) -> Result<SmartAttach, anyhow::Error> {
     use minimald_rpc::ListSessions;
 
     let resp = client
@@ -1804,29 +1956,67 @@ async fn resolve_smart_attach(
         .context("ListSessions RPC failed")?;
     let cwd = attach::cwd_host_path(global)?;
     match attach::resolve_for_attach(&resp.sessions, &cwd) {
-        attach::SmartResolve::NoSessions => Ok(None),
+        attach::SmartResolve::NoSessions => Ok(SmartAttach::NoSessions),
         attach::SmartResolve::Attach(entry) => {
             // Unambiguous auto-resolve: the operator never chose this session,
             // so tell them which one they're landing in. The picker path below
             // needs no such line — the selection is its own confirmation.
             if should_announce_session(global) {
                 eprintln!(
-                    "Attaching to session {}",
-                    session_announce_label(&entry.id, entry.name.as_deref())
+                    "Attaching to session {}{}",
+                    session_announce_label(&entry.id, entry.name.as_deref()),
+                    attach::created_from_suffix(&entry, &cwd)
                 );
             }
-            Ok(Some(entry))
+            Ok(SmartAttach::Attach(entry))
         }
         attach::SmartResolve::Pick(cands) => {
             if global.no_input || !attach::can_pick_interactively() {
                 bail!(attach::ambiguous_no_input_message(&cands, &cwd));
             }
             match attach::pick_session(&cands, &cwd)? {
-                Some(entry) => Ok(Some(entry)),
+                Some(attach::Picked::Session(entry)) => Ok(SmartAttach::Attach(entry)),
+                Some(attach::Picked::CreateNew) => Ok(SmartAttach::CreateForCwd),
                 None => bail!("session selection cancelled"),
             }
         }
     }
+}
+
+/// Outcome of smart attach resolution when the user gave no explicit session.
+enum SmartAttach {
+    /// Attach to this resolved or picked session.
+    Attach(minimald_rpc::ListSessionsEntry),
+    /// The picker's create row was chosen: activate a fresh session for the
+    /// cwd and attach, exactly as `min session activate --attach .` would.
+    CreateForCwd,
+    /// No sessions exist at all.
+    NoSessions,
+}
+
+/// The picker's `+ Create a new session` arm: activate a fresh session for the
+/// cwd and attach. A thin wrapper over [`cmd_activate`] with an autogen name
+/// and default sync, so the create-then-attach path stays the one that
+/// `min session activate --attach .` runs.
+async fn activate_new_for_attach(global: &GlobalArgs) -> Result<(), anyhow::Error> {
+    // `Box::pin` breaks the async recursion cycle: `cmd_activate` chains into
+    // `cmd_attach` (on `--attach`), which reaches back here — an unboxed cycle
+    // is an infinitely sized future (E0733).
+    Box::pin(cmd_activate(
+        global,
+        ActivateArgs {
+            name: None,
+            path: None,
+            sync: None,
+            network: CliNetworkMode::HostNet,
+            ingress: Vec::new(),
+            loadout: Vec::new(),
+            no_loadouts: false,
+            no_prompt: false,
+            attach: true,
+        },
+    ))
+    .await
 }
 
 /// Guard for the interactive attach path: the PTY-backed session shell must be
@@ -2626,7 +2816,17 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
 pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mctx::Error> {
     use op::ProjectOp as _;
     let config = build_config(global)?;
-    let mut ctx = mctx::Context::new(config)?;
+    let mut ctx = match mctx::Context::new(config) {
+        Ok(ctx) => ctx,
+        // Point a user with no `minimal.toml` at `min init`, matching the hint
+        // `min session activate` gives in the same situation.
+        Err(e @ mctx::Error::MFile(mfile::Error::NotFound)) => {
+            return Err(mctx::Error::Other(anyhow::anyhow!(
+                "{e}\nRun 'min init' to give the project its own config."
+            )));
+        }
+        Err(e) => return Err(e),
+    };
 
     let mut env = ctx.project_setup();
     let report = op::UpdateProject.run(&mut env)?;
@@ -2766,6 +2966,70 @@ mod tests {
         assert_eq!(session_announce_label(&id, None), "a1b2c3d4");
     }
 
+    /// A session created without `--name` gets a typable `<dir>-<hex>` handle:
+    /// the basename is lowercased and stripped to the name alphabet, and the
+    /// caller-supplied hex tails it.
+    #[test]
+    fn autogen_session_name_slugs_the_basename() {
+        assert_eq!(
+            autogen_session_name(camino::Utf8Path::new("/home/u/code/foo"), "9c1e"),
+            "foo-9c1e"
+        );
+        // Disallowed characters are dropped and the rest lowercased.
+        assert_eq!(
+            autogen_session_name(camino::Utf8Path::new("/tmp/My Project!"), "4f2a"),
+            "myproject-4f2a"
+        );
+        // A basename that sanitizes to nothing falls back to `session`.
+        assert_eq!(
+            autogen_session_name(camino::Utf8Path::new("/"), "0001"),
+            "session-0001"
+        );
+    }
+
+    /// Sanitization drops out-of-alphabet characters, trims leading/trailing
+    /// separators, and falls back to `session` for an all-symbol basename, so
+    /// the minted name always clears `validate_session_name`.
+    #[test]
+    fn sanitize_name_component_trims_and_falls_back() {
+        assert_eq!(sanitize_name_component("--foo--"), "foo");
+        assert_eq!(sanitize_name_component("café"), "caf");
+        assert_eq!(sanitize_name_component("...."), "session");
+        assert_eq!(sanitize_name_component("a\tb"), "ab");
+    }
+
+    /// The minted suffix is exactly four lowercase hex digits.
+    #[test]
+    fn random_hex4_is_four_lowercase_hex_digits() {
+        let h = random_hex4();
+        assert_eq!(h.len(), 4);
+        assert!(
+            h.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "expected four lowercase hex digits, got {h:?}"
+        );
+    }
+
+    /// Only an autogen name retries on collision, and only within the bounded
+    /// budget; a user-supplied name never retries, so its collision passes
+    /// through, and a non-collision failure is never retried.
+    #[test]
+    fn autogen_collision_retry_is_bounded_and_skips_user_names() {
+        let collision = "A session with that name already exists";
+        assert!(should_retry_autogen(true, 0, collision));
+        assert!(should_retry_autogen(
+            true,
+            AUTOGEN_NAME_RETRIES - 1,
+            collision
+        ));
+        // Budget spent: stop retrying.
+        assert!(!should_retry_autogen(true, AUTOGEN_NAME_RETRIES, collision));
+        // A user-supplied name never retries — its collision surfaces verbatim.
+        assert!(!should_retry_autogen(false, 0, collision));
+        // A non-collision failure is never retried.
+        assert!(!should_retry_autogen(true, 0, "CreateSession failed: boom"));
+    }
+
     /// A VM-backed provider dir carries the guest's recorded host key, so
     /// attach must verify against it rather than waive the check.
     #[test]
@@ -2867,10 +3131,18 @@ mod tests {
         }
 
         // `--raw`/`--json` are accepted on the canonical and the bare form alike.
-        let canonical = ls_args(&["min", "session", "list", "--raw", "--json"]);
-        assert!(canonical.raw && canonical.json);
+        let canonical = ls_args(&["min", "session", "list", "--raw"]);
+        assert!(canonical.raw && !canonical.json);
         let bare = ls_args(&["min", "ls", "--json"]);
         assert!(bare.json && !bare.raw);
+    }
+
+    /// `--raw` and `--json` select mutually exclusive output formats, so
+    /// passing both must be rejected rather than silently letting one win.
+    #[test]
+    fn ls_raw_and_json_conflict() {
+        use clap::Parser as _;
+        assert!(Cli::try_parse_from(["min", "ls", "--raw", "--json"]).is_err());
     }
 
     /// `repo_dir` and `minimal_dir` are global, so they must be accepted after
@@ -2908,6 +3180,66 @@ mod tests {
             .expect("-f without --all must fail to parse")
             .to_string();
         assert!(bare.contains("--all"), "usage must surface --all: {bare}");
+    }
+
+    /// `min task run <task>` parses with `--keep` off by default; the flag
+    /// and the optional path positional are accepted in any order.
+    #[test]
+    fn task_run_parses_task_keep_and_path() {
+        use clap::Parser as _;
+        let run_args = |args: &[&str]| -> TaskRunArgs {
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Command::Task(TaskArgs {
+                    command: TaskCommand::Run(a),
+                })) => a,
+                _ => panic!("expected `task run` for {args:?}"),
+            }
+        };
+
+        let a = run_args(&["min", "task", "run", "build"]);
+        assert_eq!(a.task, "build");
+        assert!(!a.keep);
+        assert!(a.path.is_none());
+
+        let a = run_args(&["min", "task", "run", "build", "--keep"]);
+        assert!(a.keep);
+
+        let a = run_args(&["min", "task", "run", "--keep", "build", "sub/dir"]);
+        assert_eq!(a.task, "build");
+        assert_eq!(a.path.as_deref(), Some("sub/dir"));
+        assert!(a.keep);
+
+        // The task name is required.
+        assert!(Cli::try_parse_from(["min", "task", "run"]).is_err());
+        assert!(Cli::try_parse_from(["min", "task"]).is_err());
+    }
+
+    /// The hidden top-level `run` swallows any spelling — flags included —
+    /// so every muscle-memory invocation reaches the redirect error rather
+    /// than a clap parse error; and it stays hidden from help.
+    #[test]
+    fn hidden_run_swallows_any_spelling_and_stays_hidden() {
+        use clap::CommandFactory as _;
+        use clap::Parser as _;
+
+        match Cli::try_parse_from(["min", "run", "build", "--keep"])
+            .unwrap()
+            .command
+        {
+            Some(Command::Run(a)) => assert_eq!(a.rest, ["build", "--keep"]),
+            _ => panic!("expected the hidden run catch"),
+        }
+        // A bare `min run` parses too; the redirect copy handles it.
+        match Cli::try_parse_from(["min", "run"]).unwrap().command {
+            Some(Command::Run(a)) => assert!(a.rest.is_empty()),
+            _ => panic!("expected the hidden run catch"),
+        }
+
+        let cmd = Cli::command();
+        let run = cmd
+            .find_subcommand("run")
+            .expect("the run subcommand must exist");
+        assert!(run.is_hide_set(), "`min run` must stay hidden from help");
     }
 
     #[test]
