@@ -38,23 +38,78 @@ impl LoadoutSelection {
     }
 }
 
+/// Filename stem and `name` of the built-in `default` loadout.
+const BUILTIN_DEFAULT_NAME: &str = "default";
+
+/// The built-in `default` loadout, as inline TOML: a once-only
+/// orientation banner and a shaped prompt, and nothing else — no
+/// packages. It backs a zero-config box so a fresh install comes up
+/// with the minimal mark and a pointer to `min add`, instead of a
+/// bare prompt.
+///
+/// The banner ships through the attach shell's environment via the
+/// documented MOTD recipe (see `docs/reference/loadouts.md`, "Vars in
+/// the attach shell"): `PROMPT_COMMAND` evaluates the `MINIMAL_MOTD`
+/// payload once and then unsets both vars, so it prints exactly once
+/// and never for non-interactive commands; the `[ -t 1 ]` guard keeps
+/// redirected output clean and the plain text renders under `NO_COLOR`.
+const BUILTIN_DEFAULT_TOML: &str = r#"
+name = "default"
+description = "orientation banner and shaped prompt"
+
+[vars]
+PROMPT_COMMAND = 'eval "$MINIMAL_MOTD"; unset PROMPT_COMMAND MINIMAL_MOTD'
+PS1 = 'minimal:\w\$ '
+MINIMAL_MOTD = '''
+[ -t 1 ] && printf '\n     ████  ████▄\n  ▄▄▄ ▀███▄ ▀███▄\n  ▀███  ▀███  ▀███\n\n  minimal · default loadout\n\n  Add tools to this box:   min add --session <pkg>\n  Search the registry:     min search <query>\n\n'
+'''
+"#;
+
+/// Parse [`BUILTIN_DEFAULT_TOML`] into a [`Loadout`]. The TOML is a
+/// compile-time constant exercised by a unit test, so a parse failure
+/// is a bug in this file rather than a runtime condition.
+///
+/// [`Loadout`]: sessions::core::loadout::Loadout
+fn builtin_default_loadout() -> sessions::core::loadout::Loadout {
+    toml::from_str(BUILTIN_DEFAULT_TOML).expect("built-in default loadout TOML must parse")
+}
+
 /// Resolve the loadout names to apply for a session activation
 /// and load each from disk.
 ///
 /// Errors out on any missing or malformed loadout so the user
 /// doesn't get a silently-empty session when their config is
 /// broken.
+///
+/// With no flags and an empty `default_loadouts`, falls back to the
+/// built-in [`builtin_default_loadout`] so a zero-config box is
+/// oriented rather than bare; a user `default.toml` on disk shadows
+/// the built-in.
 pub(crate) fn resolve_active_loadouts(
     selection: LoadoutSelection,
     cfg: &sessions::client::config::Config,
     global: &GlobalArgs,
 ) -> Result<Vec<sessions::core::loadout::Loadout>, anyhow::Error> {
+    let loadouts_dir = resolve_minimal_config_dir(global).join("loadouts");
     let (names, source): (Vec<String>, &str) = match selection {
         LoadoutSelection::None => return Ok(Vec::new()),
         LoadoutSelection::Cli(names) => (names, "--loadout"),
-        LoadoutSelection::Defaults => (cfg.loadouts.default_loadouts.clone(), "default_loadouts"),
+        LoadoutSelection::Defaults => {
+            let configured = cfg.loadouts.default_loadouts.clone();
+            if configured.is_empty() {
+                // Zero-config: no flags and no configured defaults.
+                // Fall back to the built-in `default` loadout unless
+                // the user shadows it with their own `default.toml`,
+                // in which case that file is loaded instead.
+                if !loadouts_dir.join("default.toml").exists() {
+                    return Ok(vec![builtin_default_loadout()]);
+                }
+                (vec![BUILTIN_DEFAULT_NAME.to_string()], "default_loadouts")
+            } else {
+                (configured, "default_loadouts")
+            }
+        }
     };
-    let loadouts_dir = resolve_minimal_config_dir(global).join("loadouts");
     names
         .iter()
         .map(|name| {
@@ -141,10 +196,15 @@ pub fn cmd_loadout_list(args: LoadoutListArgs, global: &GlobalArgs) -> Result<()
     let dir = resolve_loadouts_dir(&args, global);
     let entries = match sessions::client::disk::list_loadouts(&dir) {
         Ok(entries) => entries,
+        // A missing directory is the fresh-install case: there are no
+        // user loadouts yet, but the built-in `default` row below still
+        // orients the user. Note where to add their own and continue.
         Err(sessions::client::disk::ListError::NotFound { path }) => {
-            eprintln!("No loadouts directory at {}.", path.display());
-            eprintln!("Create it and drop `<name>.toml` files there to get started.");
-            return Ok(());
+            eprintln!(
+                "No loadouts directory at {} yet — drop `<name>.toml` files there to add your own.",
+                path.display()
+            );
+            Vec::new()
         }
         Err(e) => bail!("{e}"),
     };
@@ -159,11 +219,6 @@ pub fn cmd_loadout_list(args: LoadoutListArgs, global: &GlobalArgs) -> Result<()
         .default_loadouts
         .into_iter()
         .collect();
-
-    if entries.is_empty() {
-        println!("No loadouts in {}.", dir.display());
-        return Ok(());
-    }
 
     // Warn about defaults that don't have a matching file — a
     // silent typo in `default_loadouts` would otherwise be
@@ -181,10 +236,17 @@ pub fn cmd_loadout_list(args: LoadoutListArgs, global: &GlobalArgs) -> Result<()
             );
         });
 
-    let rows: Vec<LoadoutRow> = entries
+    // The built-in `default` loadout is always available, so it gets a
+    // row unless the user has shadowed it with their own `default.toml`.
+    let show_builtin = !present.contains(BUILTIN_DEFAULT_NAME);
+
+    let mut rows: Vec<LoadoutRow> = entries
         .iter()
         .map(|entry| LoadoutRow::from_entry(entry, &defaults))
         .collect();
+    if show_builtin {
+        rows.push(LoadoutRow::builtin_default());
+    }
 
     let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(4).max(4);
     let desc_w = rows
@@ -205,6 +267,10 @@ pub fn cmd_loadout_list(args: LoadoutListArgs, global: &GlobalArgs) -> Result<()
              counts,
          }| { println!("{marker} {name:<name_w$}  {desc:<desc_w$}  {counts}") },
     );
+    if show_builtin {
+        println!();
+        println!("  default (built-in) applied when no loadouts are configured");
+    }
     if !defaults.is_empty() {
         println!();
         println!("* default (from `[loadouts].default_loadouts`)");
@@ -258,6 +324,24 @@ impl LoadoutRow {
                 // broken even if two entries share a `file_stem`.
                 counts: format!("(error at {}: {e})", entry.path.display()),
             },
+        }
+    }
+
+    /// Row for the built-in `default` loadout. Its name column carries
+    /// the `(built-in)` tag so the listing distinguishes it from a
+    /// user file of the same stem.
+    fn builtin_default() -> Self {
+        let l = builtin_default_loadout();
+        Self {
+            marker: " ",
+            name: format!("{BUILTIN_DEFAULT_NAME} (built-in)"),
+            desc: l.description().unwrap_or("").to_string(),
+            counts: format!(
+                "{} pkg / {} var / {} patch",
+                l.packages().len(),
+                l.vars().len() + l.vars_lenient().len(),
+                l.patches().iter().count(),
+            ),
         }
     }
 }
@@ -361,5 +445,85 @@ on_activate = { type = "inline", value = "echo activated" }
         // ...while the loadout's other items compose normally.
         assert_eq!(wire.requested_packages.len(), 1);
         assert_eq!(wire.vars.len(), 1);
+    }
+
+    /// The built-in `default` loadout parses (guarding the `expect` in
+    /// [`builtin_default_loadout`]) and has the shape the banner
+    /// feature promises: no packages, no lifecycle hooks, and the three
+    /// MOTD/prompt vars — no task or run-target lines.
+    #[test]
+    fn builtin_default_loadout_has_banner_shape() {
+        let l = builtin_default_loadout();
+        assert_eq!(l.name().as_ref(), BUILTIN_DEFAULT_NAME);
+        assert!(
+            l.packages().is_empty(),
+            "built-in default contributes no packages"
+        );
+        assert!(l.lifecycle_hooks().is_empty());
+        assert!(l.patches().is_empty());
+
+        let vars: Vec<String> = l.all_vars().map(|(n, _)| n.as_str().to_owned()).collect();
+        assert_eq!(vars.len(), 3);
+        assert!(vars.iter().any(|n| n == "PROMPT_COMMAND"));
+        assert!(vars.iter().any(|n| n == "MINIMAL_MOTD"));
+        assert!(vars.iter().any(|n| n == "PS1"));
+    }
+
+    /// Zero-config resolution — no flags, empty `default_loadouts`, no
+    /// user `default.toml` — falls back to the built-in `default`
+    /// loadout instead of returning an empty vec.
+    #[test]
+    fn resolve_active_loadouts_defaults_falls_back_to_builtin() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("minimal/loadouts")).unwrap();
+        let cfg = sessions::client::config::Config::default();
+        let global = GlobalArgs {
+            repo_dir: None,
+            minimal_dir: None,
+            config_dir: Some(tmp.path().to_path_buf()),
+            provider: None,
+            no_input: false,
+        };
+        let out = resolve_active_loadouts(LoadoutSelection::Defaults, &cfg, &global)
+            .expect("built-in fallback resolves");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name().as_ref(), BUILTIN_DEFAULT_NAME);
+        assert!(out[0].packages().is_empty());
+    }
+
+    /// A user `default.toml` on disk shadows the built-in: zero-config
+    /// resolution loads the user's file instead of the built-in.
+    #[test]
+    fn resolve_active_loadouts_user_default_shadows_builtin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loadouts = tmp.path().join("minimal/loadouts");
+        std::fs::create_dir_all(&loadouts).unwrap();
+        std::fs::write(
+            loadouts.join("default.toml"),
+            "name = \"default\"\ndescription = \"user override\"\n",
+        )
+        .unwrap();
+        let cfg = sessions::client::config::Config::default();
+        let global = GlobalArgs {
+            repo_dir: None,
+            minimal_dir: None,
+            config_dir: Some(tmp.path().to_path_buf()),
+            provider: None,
+            no_input: false,
+        };
+        let out = resolve_active_loadouts(LoadoutSelection::Defaults, &cfg, &global)
+            .expect("user default resolves");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].description(), Some("user override"));
+    }
+
+    /// The built-in listing row carries the `(built-in)` tag and a
+    /// zero-package contributes cell.
+    #[test]
+    fn builtin_default_row_is_tagged_and_packageless() {
+        let row = LoadoutRow::builtin_default();
+        assert_eq!(row.name, format!("{BUILTIN_DEFAULT_NAME} (built-in)"));
+        assert_eq!(row.marker, " ");
+        assert!(row.counts.starts_with("0 pkg"), "got: {}", row.counts);
     }
 }
