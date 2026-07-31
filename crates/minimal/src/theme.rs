@@ -20,8 +20,8 @@ pub fn theme() -> RenderConfig<'static> {
                 .with_fg(Color::White)
                 .with_attr(Attributes::BOLD),
         )
-        .with_help_message(StyleSheet::new().with_fg(Color::DarkGrey));
-    config.placeholder = StyleSheet::new().with_fg(Color::DarkGrey);
+        .with_help_message(StyleSheet::new().with_fg(Color::Grey));
+    config.placeholder = StyleSheet::new().with_fg(Color::Grey);
     config
 }
 
