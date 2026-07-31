@@ -5,6 +5,7 @@ pub mod connection;
 mod diag;
 pub mod env;
 mod exec;
+mod github;
 #[cfg(target_os = "linux")]
 pub mod guest;
 #[cfg(target_os = "linux")]
