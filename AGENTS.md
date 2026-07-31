@@ -127,10 +127,6 @@ the CI YAML schedules, the logic lives here and in `scripts/`
 only their own artifacts there (which is why `clean` is scoped, never
 `rm -rf .scratch` wholesale).
 
-One warning `just --list` does not surface, because it renders only the last
-comment line above a recipe: `just soak` reaps between iterations, which WILL
-kill this checkout's live dev stack each pass.
-
 ## Footguns
 
 Verified against the current tree; sources in parentheses.
