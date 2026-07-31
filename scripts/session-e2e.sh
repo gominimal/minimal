@@ -366,9 +366,17 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     mnl ls 2>&1 || true
     fail
   fi
-  mnl session destroy "$kept" >/dev/null 2>&1 \
+  # The destroy dirty gate: headless (no TTY) without --force must refuse,
+  # and the refusal must name the escape hatch.
+  if mnl session destroy "$kept" >/dev/null 2>"$WORK/destroy-refuse.err"; then
+    echo "::error::headless 'min session destroy' without --force should refuse"
+    fail
+  fi
+  grep -q -- "--force" "$WORK/destroy-refuse.err" \
+    || { echo "::error::headless destroy refusal does not name --force"; cat "$WORK/destroy-refuse.err" 2>/dev/null || true; fail; }
+  mnl session destroy --force "$kept" >/dev/null 2>&1 \
     || { echo "::error::could not destroy kept session $kept"; fail; }
-  echo "task run --keep: session $kept retained OK"
+  echo "task run --keep: session $kept retained; dirty gate refused headless destroy OK"
 
   # Unknown task: an instant client-side error listing what IS declared.
   if (cd "$TASK_SEED_DIR" && mnl task run no-such-task >/dev/null 2>"$WORK/task-unknown.err"); then
