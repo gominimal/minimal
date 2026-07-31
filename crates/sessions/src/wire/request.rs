@@ -12,8 +12,8 @@
 use super::errors::WireError;
 use super::policy::{WirePatchVerdict, WireVarVerdict};
 use super::primitives::{
-    WirePackageRef, WirePendingPatch, WirePendingVar, WireProvenancedHook, WireSessionPatch,
-    WireSessionVar,
+    WireOrientation, WirePackageRef, WirePendingPatch, WirePendingVar, WireProvenancedHook,
+    WireSessionPatch, WireSessionVar,
 };
 use crate::SessionId;
 
@@ -34,6 +34,11 @@ pub struct WireContribution {
     pub lifecycle_hooks: Vec<WireProvenancedHook>,
     /// Packages the client requested be brought in.
     pub requested_packages: Vec<WirePackageRef>,
+    /// First-prompt orientation facts (no policy applies — control
+    /// plane, not user vars). Serde-defaulted so payloads from clients
+    /// that predate the field deserialize cleanly.
+    #[serde(default)]
+    pub orientation: WireOrientation,
 }
 
 /// Persisted composition snapshot, written by the daemon as a sidecar
@@ -63,6 +68,11 @@ pub struct WireComposition {
     /// Lifecycle hooks contributed to the session (pass-through; no
     /// gate).
     pub lifecycle_hooks: Vec<WireProvenancedHook>,
+    /// First-prompt orientation facts (pass-through; no gate).
+    /// Serde-defaulted so sidecars written before the field existed
+    /// deserialize cleanly.
+    #[serde(default)]
+    pub orientation: WireOrientation,
 }
 
 fn default_composition_version() -> u32 {
@@ -82,6 +92,7 @@ impl From<&crate::core::compose::Composition> for WireComposition {
                 .cloned()
                 .map(Into::into)
                 .collect(),
+            orientation: c.orientation().clone().into(),
         }
     }
 }
@@ -250,6 +261,9 @@ mod tests {
                 source: WireSource::UserLoadout { name: "dev".into() },
             }],
             lifecycle_hooks: vec![],
+            orientation: WireOrientation {
+                loadouts_display: "dev".into(),
+            },
         };
         assert_eq!(round_trip(&c), c);
     }
@@ -262,5 +276,36 @@ mod tests {
         let json = r#"{"vars":[],"patches":[],"packages":[],"lifecycle_hooks":[]}"#;
         let c: WireComposition = serde_json::from_str(json).unwrap();
         assert_eq!(c.version, COMPOSITION_SNAPSHOT_VERSION);
+    }
+
+    /// Payloads written before the `orientation` field existed
+    /// deserialize cleanly to the default (empty display list, meaning
+    /// "unknown") — the interop contract for old clients (contribution)
+    /// and old sidecars (composition snapshot) alike.
+    #[test]
+    fn orientation_field_defaults_when_absent() {
+        let json = r#"{"vars":[],"patches":[],"lifecycle_hooks":[],"requested_packages":[]}"#;
+        let c: WireContribution = serde_json::from_str(json).unwrap();
+        assert_eq!(c.orientation, WireOrientation::default());
+        assert!(c.orientation.loadouts_display.is_empty());
+
+        let json = r#"{"vars":[],"patches":[],"packages":[],"lifecycle_hooks":[]}"#;
+        let c: WireComposition = serde_json::from_str(json).unwrap();
+        assert_eq!(c.orientation, WireOrientation::default());
+    }
+
+    /// The contribution round-trips its orientation field.
+    #[test]
+    fn contribution_orientation_round_trips() {
+        let c = WireContribution {
+            vars: vec![],
+            patches: vec![],
+            lifecycle_hooks: vec![],
+            requested_packages: vec![],
+            orientation: WireOrientation {
+                loadouts_display: "default (built-in)".into(),
+            },
+        };
+        assert_eq!(round_trip(&c), c);
     }
 }

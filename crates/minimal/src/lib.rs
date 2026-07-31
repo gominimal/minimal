@@ -1562,10 +1562,15 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     let compose_options = loadouts::compose_options_from_config(&cfg);
     let selection = loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts);
     let active = loadouts::resolve_active_loadouts(selection, &cfg, global)?;
-    if !active.is_empty() {
-        let names: Vec<&str> = active.iter().map(|l| l.name().as_ref()).collect();
+    if !active.loadouts.is_empty() {
+        let names: Vec<&str> = active.loadouts.iter().map(|l| l.name().as_ref()).collect();
         eprintln!("Applying loadouts: {}", names.join(", "));
     }
+    // The contribution carries the banner's loadout display list as a
+    // first-class orientation field (the daemon seeds MINIMAL_LOADOUTS
+    // from it in the launcher baseline). The banner's other dynamic
+    // clause — blueprint presence — is a session-filesystem fact,
+    // tested by the templates in-shell when they print.
     let (contribution, user_policy) =
         loadouts::compose_user_contribution(active, user_policy, compose_options)?;
 

@@ -53,6 +53,23 @@ const BUILTIN_DEFAULT_NAME: &str = "default";
 /// payload once and then unsets both vars, so it prints exactly once
 /// and never for non-interactive commands; the `[ -t 1 ]` guard keeps
 /// redirected output clean and the plain text renders under `NO_COLOR`.
+///
+/// The MOTD is a STATIC template: after the mark it prints the same
+/// orientation lines the launcher-baseline banner prints — the session
+/// name, the active loadout list, the detach chord, and a `min init`
+/// pointer when the session workspace has no blueprint — by
+/// interpolating `$MINIMAL_SESSION_NAME` (seeded by the daemon's
+/// launcher baseline) and `$MINIMAL_LOADOUTS` (contributed by the
+/// client alongside this loadout) in-shell at print time; both carry a
+/// `${VAR:-fallback}` so a missing var still renders sanely. The
+/// blueprint clause is a SESSION-filesystem fact, so it is tested
+/// in-shell against the workspace root when the banner prints — both
+/// mfile layouts, `minimal.toml` and `.minimal/minimal.toml` — which
+/// stays correct across skipped uploads, an in-session `min init`, and
+/// attaches from unrelated host directories. `/workbench` mirrors
+/// `sandbox2::SESSION_DEFAULT_WD`, the attach shell's initial cwd (a
+/// literal here because this client crate doesn't depend on the sandbox
+/// crate; the daemon-side template derives it from the constant).
 const BUILTIN_DEFAULT_TOML: &str = r#"
 name = "default"
 description = "orientation banner and shaped prompt"
@@ -61,7 +78,7 @@ description = "orientation banner and shaped prompt"
 PROMPT_COMMAND = 'eval "$MINIMAL_MOTD"; unset PROMPT_COMMAND MINIMAL_MOTD'
 PS1 = 'minimal:\w\$ '
 MINIMAL_MOTD = '''
-[ -t 1 ] && printf '\n     ████  ████▄\n  ▄▄▄ ▀███▄ ▀███▄\n  ▀███  ▀███  ▀███\n\n  minimal · default loadout\n\n  Add tools to this box:   min add --session <pkg>\n  Search the registry:     min search <query>\n\n'
+[ -t 1 ] && { printf '\n     ████  ████▄\n  ▄▄▄ ▀███▄ ▀███▄\n  ▀███  ▀███  ▀███\n\n'; printf '  minimal · session %s · loadout %s\n  detach: ctrl-w' "${MINIMAL_SESSION_NAME:-unnamed}" "${MINIMAL_LOADOUTS:-default (built-in)}"; [ -f /workbench/minimal.toml ] || [ -f /workbench/.minimal/minimal.toml ] || printf ' · no minimal.toml here — min init to add one'; printf '\n\n  Add tools to this box:   min add --session <pkg>\n  Search the registry:     min search <query>\n\n'; }
 '''
 "#;
 
@@ -72,6 +89,19 @@ MINIMAL_MOTD = '''
 /// [`Loadout`]: sessions::core::loadout::Loadout
 fn builtin_default_loadout() -> sessions::core::loadout::Loadout {
     toml::from_str(BUILTIN_DEFAULT_TOML).expect("built-in default loadout TOML must parse")
+}
+
+/// The loadouts resolved for a session activation, plus how the
+/// zero-config fallback resolved — the display list interpolated into
+/// the orientation banner tags the built-in `default` distinctly.
+#[derive(Debug)]
+pub(crate) struct ActiveLoadouts {
+    /// The loadouts to compose, in application order.
+    pub(crate) loadouts: Vec<sessions::core::loadout::Loadout>,
+    /// True when the zero-config fallback used the built-in `default`
+    /// loadout (as opposed to user files, including a shadowing user
+    /// `default.toml`).
+    pub(crate) builtin_default: bool,
 }
 
 /// Resolve the loadout names to apply for a session activation
@@ -89,10 +119,15 @@ pub(crate) fn resolve_active_loadouts(
     selection: LoadoutSelection,
     cfg: &sessions::client::config::Config,
     global: &GlobalArgs,
-) -> Result<Vec<sessions::core::loadout::Loadout>, anyhow::Error> {
+) -> Result<ActiveLoadouts, anyhow::Error> {
     let loadouts_dir = resolve_minimal_config_dir(global).join("loadouts");
     let (names, source): (Vec<String>, &str) = match selection {
-        LoadoutSelection::None => return Ok(Vec::new()),
+        LoadoutSelection::None => {
+            return Ok(ActiveLoadouts {
+                loadouts: Vec::new(),
+                builtin_default: false,
+            });
+        }
         LoadoutSelection::Cli(names) => (names, "--loadout"),
         LoadoutSelection::Defaults => {
             let configured = cfg.loadouts.default_loadouts.clone();
@@ -102,7 +137,10 @@ pub(crate) fn resolve_active_loadouts(
                 // the user shadows it with their own `default.toml`,
                 // in which case that file is loaded instead.
                 if !loadouts_dir.join("default.toml").exists() {
-                    return Ok(vec![builtin_default_loadout()]);
+                    return Ok(ActiveLoadouts {
+                        loadouts: vec![builtin_default_loadout()],
+                        builtin_default: true,
+                    });
                 }
                 (vec![BUILTIN_DEFAULT_NAME.to_string()], "default_loadouts")
             } else {
@@ -110,14 +148,37 @@ pub(crate) fn resolve_active_loadouts(
             }
         }
     };
-    names
+    let loadouts = names
         .iter()
         .map(|name| {
             let path = loadouts_dir.join(format!("{name}.toml"));
             sessions::client::disk::read_loadout_file(&path)
                 .with_context(|| format!("{source} `{name}`"))
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ActiveLoadouts {
+        loadouts,
+        builtin_default: false,
+    })
+}
+
+/// Human-readable list of the active loadouts, as interpolated into the
+/// orientation banner via `$MINIMAL_LOADOUTS`: comma-joined names,
+/// `default (built-in)` for the zero-config fallback, `none` when no
+/// loadout applies.
+pub(crate) fn loadout_display_list(active: &ActiveLoadouts) -> String {
+    if active.builtin_default {
+        return format!("{BUILTIN_DEFAULT_NAME} (built-in)");
+    }
+    if active.loadouts.is_empty() {
+        return "none".to_string();
+    }
+    active
+        .loadouts
+        .iter()
+        .map(|l| l.name().as_ref())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Build the [`ComposeOptions`] the client passes to
@@ -131,12 +192,17 @@ pub(crate) fn compose_options_from_config(
         .with_follow_symlinks(cfg.loadouts.follow_symlinks)
 }
 
-/// Compose the given loadouts into a
+/// Compose the resolved [`ActiveLoadouts`] into a
 /// [`sessions::wire::request::WireContribution`] under the user's
 /// [`UserPolicy`] loaded from `user_policy.toml`. User-origin items
 /// auto-pass the allow step but the policy's `deny` / `ignore` rules
 /// still apply, so a loadout patch matching a deny rule fails the
 /// composition here rather than at the daemon.
+///
+/// The contribution also carries the first-prompt orientation as a
+/// first-class field (never a var): the loadout display list computed
+/// via [`loadout_display_list`], which the daemon seeds into the banner
+/// env (`MINIMAL_LOADOUTS`) in the launcher baseline.
 ///
 /// Returns the possibly-mutated policy alongside the wire
 /// contribution — a hook (interactive prompt) may have appended
@@ -144,7 +210,7 @@ pub(crate) fn compose_options_from_config(
 ///
 /// [`UserPolicy`]: sessions::core::policy::UserPolicy
 pub(crate) fn compose_user_contribution(
-    loadouts: Vec<sessions::core::loadout::Loadout>,
+    active: ActiveLoadouts,
     policy: sessions::core::policy::UserPolicy,
     options: sessions::core::compose::ComposeOptions,
 ) -> Result<
@@ -154,17 +220,20 @@ pub(crate) fn compose_user_contribution(
     ),
     anyhow::Error,
 > {
+    let loadouts_display = loadout_display_list(&active);
     // Session transition scripts declared in a loadout are not available
     // in this release, so they are silently excluded here — before the
     // loadouts reach the composer — rather than after composition. This
     // keeps a declared hook from participating in composition at all.
     // Drop the `without_lifecycle_hooks` map when the feature ships.
-    let loadouts: Vec<_> = loadouts
+    let loadouts: Vec<_> = active
+        .loadouts
         .into_iter()
         .map(sessions::core::loadout::Loadout::without_lifecycle_hooks)
         .collect();
 
-    let mut composer = sessions::client::composer::UserComposer::new();
+    let mut composer = sessions::client::composer::UserComposer::new()
+        .with_orientation(sessions::core::compose::Orientation { loadouts_display });
     composer
         .add_all(loadouts)
         .map_err(|e| anyhow::anyhow!("composing loadouts: {e}"))?;
@@ -394,7 +463,9 @@ mod tests {
         };
         let out = resolve_active_loadouts(LoadoutSelection::None, &cfg, &global)
             .expect("None → Ok(empty), no I/O");
-        assert!(out.is_empty());
+        assert!(out.loadouts.is_empty());
+        assert!(!out.builtin_default);
+        assert_eq!(loadout_display_list(&out), "none");
     }
 
     /// `resolve_active_loadouts` errors when a `--loadout NAME`
@@ -441,7 +512,10 @@ on_activate = { type = "inline", value = "echo activated" }
         assert_eq!(loadout.lifecycle_hooks().len(), 1);
 
         let (wire, _policy) = compose_user_contribution(
-            vec![loadout],
+            ActiveLoadouts {
+                loadouts: vec![loadout],
+                builtin_default: false,
+            },
             sessions::core::policy::UserPolicy::empty(),
             sessions::core::compose::ComposeOptions::default(),
         )
@@ -455,6 +529,8 @@ on_activate = { type = "inline", value = "echo activated" }
         // ...while the loadout's other items compose normally.
         assert_eq!(wire.requested_packages.len(), 1);
         assert_eq!(wire.vars.len(), 1);
+        // The orientation rides as a first-class field, never a var.
+        assert_eq!(wire.orientation.loadouts_display, "dev");
     }
 
     /// The built-in `default` loadout parses (guarding the `expect` in
@@ -477,6 +553,71 @@ on_activate = { type = "inline", value = "echo activated" }
         assert!(vars.iter().any(|n| n == "PROMPT_COMMAND"));
         assert!(vars.iter().any(|n| n == "MINIMAL_MOTD"));
         assert!(vars.iter().any(|n| n == "PS1"));
+
+        // The MOTD carries the orientation lines as a static template:
+        // the dynamic parts are `${MINIMAL_*:-fallback}` interpolations
+        // the shell resolves at print time (the mark and the `min add`
+        // pointers stay verbatim).
+        let motd = l
+            .all_vars()
+            .find(|(n, _)| n.as_str() == "MINIMAL_MOTD")
+            .map(|(_, v)| match v {
+                sessions::core::primitives::VarValue::Specified { value } => value.clone(),
+                other => panic!("MINIMAL_MOTD must be a literal value, got {other:?}"),
+            })
+            .expect("MINIMAL_MOTD present");
+        assert!(motd.contains("████"), "the mark stays");
+        assert!(motd.contains("min add --session"), "the pointers stay");
+        assert!(motd.contains("${MINIMAL_SESSION_NAME:-"));
+        assert!(motd.contains("${MINIMAL_LOADOUTS:-"));
+        // The blueprint clause tests the session workspace itself at
+        // print time — both mfile layouts — never a client-probed var.
+        assert!(motd.contains("[ -f /workbench/minimal.toml ]"));
+        assert!(motd.contains("[ -f /workbench/.minimal/minimal.toml ]"));
+        assert!(
+            !motd.contains("MINIMAL_BLUEPRINT"),
+            "blueprint is a session-filesystem fact, not an env var"
+        );
+        assert!(motd.contains("detach: ctrl-w"));
+        assert!(motd.contains("min init"));
+    }
+
+    /// The display list interpolated into the banner: comma-joined names
+    /// for user loadouts, `none` for an empty set (the built-in and
+    /// shadow cases are asserted in the resolution tests above).
+    #[test]
+    fn loadout_display_list_joins_names() {
+        let mk = |name: &str| -> sessions::core::loadout::Loadout {
+            toml::from_str(&format!("name = \"{name}\"\n")).expect("loadout parses")
+        };
+        let active = ActiveLoadouts {
+            loadouts: vec![mk("helix"), mk("fish")],
+            builtin_default: false,
+        };
+        assert_eq!(loadout_display_list(&active), "helix, fish");
+    }
+
+    /// The composed contribution carries the loadout display list as a
+    /// first-class orientation field — never a var, so user vars and
+    /// user policy cannot collide with it. (No blueprint field either:
+    /// that is a session-filesystem fact the banner templates test
+    /// in-shell at print time.)
+    #[test]
+    fn compose_carries_orientation_as_field_not_var() {
+        let (wire, _policy) = compose_user_contribution(
+            ActiveLoadouts {
+                loadouts: Vec::new(),
+                builtin_default: true,
+            },
+            sessions::core::policy::UserPolicy::empty(),
+            sessions::core::compose::ComposeOptions::default(),
+        )
+        .expect("empty composition succeeds");
+        assert_eq!(wire.orientation.loadouts_display, "default (built-in)");
+        assert!(
+            wire.vars.iter().all(|v| v.var.name != "MINIMAL_LOADOUTS"),
+            "orientation must not ride the var lane"
+        );
     }
 
     /// Zero-config resolution — no flags, empty `default_loadouts`, no
@@ -496,9 +637,11 @@ on_activate = { type = "inline", value = "echo activated" }
         };
         let out = resolve_active_loadouts(LoadoutSelection::Defaults, &cfg, &global)
             .expect("built-in fallback resolves");
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].name().as_ref(), BUILTIN_DEFAULT_NAME);
-        assert!(out[0].packages().is_empty());
+        assert_eq!(out.loadouts.len(), 1);
+        assert_eq!(out.loadouts[0].name().as_ref(), BUILTIN_DEFAULT_NAME);
+        assert!(out.loadouts[0].packages().is_empty());
+        assert!(out.builtin_default);
+        assert_eq!(loadout_display_list(&out), "default (built-in)");
     }
 
     /// A user `default.toml` on disk shadows the built-in: zero-config
@@ -523,8 +666,12 @@ on_activate = { type = "inline", value = "echo activated" }
         };
         let out = resolve_active_loadouts(LoadoutSelection::Defaults, &cfg, &global)
             .expect("user default resolves");
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].description(), Some("user override"));
+        assert_eq!(out.loadouts.len(), 1);
+        assert_eq!(out.loadouts[0].description(), Some("user override"));
+        // A user shadow is NOT the built-in — the banner's loadout list
+        // must not tag it `(built-in)`.
+        assert!(!out.builtin_default);
+        assert_eq!(loadout_display_list(&out), "default");
     }
 
     /// The built-in listing row carries the `(built-in)` tag and a

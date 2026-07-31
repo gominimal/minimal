@@ -1079,6 +1079,23 @@ impl PendingPatchFile {
     }
 }
 
+/// Orientation facts for the attached shell's first-prompt banner,
+/// carried on the composition as first-class control-plane data — never
+/// through the user var lane, so user vars and user policy cannot
+/// collide with it. Collected by the client's
+/// [`UserComposer`](crate::client::composer::UserComposer) (the only
+/// party that knows which loadouts were selected) and read by the
+/// session launcher, which seeds the banner env (`MINIMAL_LOADOUTS`)
+/// from it in the baseline layer.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Orientation {
+    /// Human-readable display list of the active loadouts (comma-joined
+    /// names, `default (built-in)` for the zero-config fallback, `none`
+    /// with `--no-loadouts`). Empty means "unknown" — a peer that
+    /// predates the field — and seeds nothing.
+    pub loadouts_display: String,
+}
+
 /// Everything that survived the policy gate.
 ///
 /// Vars and patches are policy-gated. Packages and lifecycle hooks
@@ -1091,9 +1108,19 @@ pub struct Composition {
     patches: Vec<SessionPatch>,
     packages: Vec<ProvenancedPackage>,
     lifecycle_hooks: Vec<ProvenancedHook>,
+    /// First-prompt orientation facts; see [`Orientation`]. Client-set:
+    /// the daemon-side passthrough never populates it, and
+    /// [`Self::extend_from_wire`] installs the client's value.
+    orientation: Orientation,
 }
 
 impl Composition {
+    /// The first-prompt orientation facts the client contributed.
+    #[must_use]
+    pub fn orientation(&self) -> &Orientation {
+        &self.orientation
+    }
+
     /// The vars that survived the policy gate, each paired with its
     /// source.
     #[must_use]
@@ -1190,12 +1217,15 @@ impl Composition {
         // `ComposeError::Conflict` via the `#[from]` impl.
         self.check_incoming_conflicts(&incoming_vars, &incoming_patches)?;
 
-        // Checks passed — commit.
+        // Checks passed — commit. The client is the sole source of
+        // orientation (the daemon passthrough never populates it), so
+        // its value is installed rather than merged.
         self.vars.extend(incoming_vars);
         self.patches.extend(incoming_patches);
         self.packages.extend(incoming_packages);
         dedupe_by_name(&mut self.packages, ProvenancedPackage::package);
         self.lifecycle_hooks.extend(incoming_hooks);
+        self.orientation = wire.orientation.into();
         Ok(())
     }
 
@@ -1212,6 +1242,7 @@ impl Composition {
             patches: Vec::new(),
             packages,
             lifecycle_hooks,
+            orientation: Orientation::default(),
         }
     }
 
@@ -1288,6 +1319,7 @@ impl TryFrom<crate::wire::request::WireComposition> for Composition {
             patches: wire.patches.into_iter().map(Into::into).collect(),
             packages: wire.packages.into_iter().map(Into::into).collect(),
             lifecycle_hooks: hooks,
+            orientation: wire.orientation.into(),
         })
     }
 }
@@ -1715,6 +1747,10 @@ pub(crate) fn compose_contribution(
         patches: gated_patches,
         packages,
         lifecycle_hooks,
+        // Orientation never passes through the gate: it is control-plane
+        // data the caller attaches outside the composition pipeline (see
+        // `UserComposer::with_orientation`).
+        orientation: Orientation::default(),
     };
     Ok((composition, final_policy))
 }
@@ -3656,8 +3692,8 @@ mod tests {
     mod extend_from_wire {
         use super::*;
         use crate::wire::primitives::{
-            WireLifecycleHook, WirePackageRef, WireProvenancedHook, WireResolvedPatch,
-            WireResolvedVar, WireSessionPatch, WireSessionVar, WireSource,
+            WireLifecycleHook, WireOrientation, WirePackageRef, WireProvenancedHook,
+            WireResolvedPatch, WireResolvedVar, WireSessionPatch, WireSessionVar, WireSource,
         };
         use crate::wire::request::WireContribution;
 
@@ -3714,6 +3750,7 @@ mod tests {
                 patches,
                 packages: Vec::new(),
                 lifecycle_hooks: Vec::new(),
+                orientation: Orientation::default(),
             }
         }
 
@@ -3726,6 +3763,7 @@ mod tests {
                 patches,
                 requested_packages: vec![],
                 lifecycle_hooks: vec![],
+                orientation: WireOrientation::default(),
             }
         }
 
@@ -3756,6 +3794,7 @@ mod tests {
                     hook: WireLifecycleHook::default(),
                     source: WireSource::UserLoadout { name: "dev".into() },
                 }],
+                orientation: WireOrientation::default(),
             };
 
             let before = Composition::default();
@@ -3862,6 +3901,7 @@ mod tests {
                     source: dev_loadout(),
                 }],
                 lifecycle_hooks: vec![],
+                orientation: WireOrientation::default(),
             };
             let err = composition.extend_from_wire(wire).unwrap_err();
             assert!(
@@ -3933,6 +3973,7 @@ mod tests {
                     },
                 )],
                 lifecycle_hooks: vec![],
+                orientation: Orientation::default(),
             };
             let wire = WireContribution {
                 vars: vec![],
@@ -3948,6 +3989,7 @@ mod tests {
                     },
                 ],
                 lifecycle_hooks: vec![],
+                orientation: WireOrientation::default(),
             };
             composition.extend_from_wire(wire).unwrap();
             let names: Vec<&str> = composition

@@ -26,6 +26,41 @@ pub enum WireSource {
     },
 }
 
+/// Orientation facts for the attached shell's first-prompt banner.
+/// Mirrors [`crate::core::compose::Orientation`].
+///
+/// Control-plane data, deliberately NOT a session var: it rides the
+/// composition as a first-class field so user vars and user policy can
+/// never collide with it. The daemon seeds the banner env
+/// (`MINIMAL_LOADOUTS`) from it in the launcher baseline. Serde-defaulted
+/// end to end so peers that predate the field interop cleanly.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WireOrientation {
+    /// Human-readable display list of the active loadouts (comma-joined
+    /// names, `default (built-in)` for the zero-config fallback, `none`
+    /// with `--no-loadouts`). Empty means "unknown" — a peer that
+    /// predates the field — and seeds nothing, leaving the banner
+    /// template's own `${MINIMAL_LOADOUTS:-…}` fallback to render.
+    #[serde(default)]
+    pub loadouts_display: String,
+}
+
+impl From<crate::core::compose::Orientation> for WireOrientation {
+    fn from(o: crate::core::compose::Orientation) -> Self {
+        Self {
+            loadouts_display: o.loadouts_display,
+        }
+    }
+}
+
+impl From<WireOrientation> for crate::core::compose::Orientation {
+    fn from(o: WireOrientation) -> Self {
+        Self {
+            loadouts_display: o.loadouts_display,
+        }
+    }
+}
+
 /// A fully-resolved variable: name and value as plain strings.
 ///
 /// Mirrors [`crate::core::primitives::ResolvedVar`] in a form
