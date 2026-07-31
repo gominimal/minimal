@@ -1864,8 +1864,11 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
             (r.id, r.name)
         }
         None => match resolve_smart_attach(&mut client, global).await? {
-            Some(entry) => (entry.id, entry.name),
-            None => bail!("no sessions exist; use 'min session activate' to create one"),
+            SmartAttach::Attach(entry) => (entry.id, entry.name),
+            SmartAttach::CreateForCwd => return activate_new_for_attach(global).await,
+            SmartAttach::NoSessions => {
+                bail!("no sessions exist; use 'min session activate' to create one")
+            }
         },
     };
 
@@ -1883,12 +1886,12 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
 /// and either attaches directly (unambiguous), opens the interactive picker
 /// (ambiguous), or errors (ambiguous but non-interactive).
 ///
-/// Returns `Ok(None)` when no sessions exist at all, which `min session attach`
-/// reports as an error pointing at `min session activate`.
+/// Returns [`SmartAttach::NoSessions`] when no sessions exist at all, which
+/// `min session attach` reports as an error pointing at `min session activate`.
 async fn resolve_smart_attach(
     client: &mut client::Client,
     global: &GlobalArgs,
-) -> Result<Option<minimald_rpc::ListSessionsEntry>, anyhow::Error> {
+) -> Result<SmartAttach, anyhow::Error> {
     use minimald_rpc::ListSessions;
 
     let resp = client
@@ -1897,7 +1900,7 @@ async fn resolve_smart_attach(
         .context("ListSessions RPC failed")?;
     let cwd = attach::cwd_host_path(global)?;
     match attach::resolve_for_attach(&resp.sessions, &cwd) {
-        attach::SmartResolve::NoSessions => Ok(None),
+        attach::SmartResolve::NoSessions => Ok(SmartAttach::NoSessions),
         attach::SmartResolve::Attach(entry) => {
             // Unambiguous auto-resolve: the operator never chose this session,
             // so tell them which one they're landing in. The picker path below
@@ -1909,18 +1912,55 @@ async fn resolve_smart_attach(
                     attach::created_from_suffix(&entry, &cwd)
                 );
             }
-            Ok(Some(entry))
+            Ok(SmartAttach::Attach(entry))
         }
         attach::SmartResolve::Pick(cands) => {
             if global.no_input || !attach::can_pick_interactively() {
                 bail!(attach::ambiguous_no_input_message(&cands, &cwd));
             }
             match attach::pick_session(&cands, &cwd)? {
-                Some(entry) => Ok(Some(entry)),
+                Some(attach::Picked::Session(entry)) => Ok(SmartAttach::Attach(entry)),
+                Some(attach::Picked::CreateNew) => Ok(SmartAttach::CreateForCwd),
                 None => bail!("session selection cancelled"),
             }
         }
     }
+}
+
+/// Outcome of smart attach resolution when the user gave no explicit session.
+enum SmartAttach {
+    /// Attach to this resolved or picked session.
+    Attach(minimald_rpc::ListSessionsEntry),
+    /// The picker's create row was chosen: activate a fresh session for the
+    /// cwd and attach, exactly as `min session activate --attach .` would.
+    CreateForCwd,
+    /// No sessions exist at all.
+    NoSessions,
+}
+
+/// The picker's `+ Create a new session` arm: activate a fresh session for the
+/// cwd and attach. A thin wrapper over [`cmd_activate`] with an autogen name
+/// and default sync, so the create-then-attach path stays the one that
+/// `min session activate --attach .` runs.
+async fn activate_new_for_attach(global: &GlobalArgs) -> Result<(), anyhow::Error> {
+    // `Box::pin` breaks the async recursion cycle: `cmd_activate` chains into
+    // `cmd_attach` (on `--attach`), which reaches back here — an unboxed cycle
+    // is an infinitely sized future (E0733).
+    Box::pin(cmd_activate(
+        global,
+        ActivateArgs {
+            name: None,
+            path: None,
+            sync: None,
+            network: CliNetworkMode::HostNet,
+            ingress: Vec::new(),
+            loadout: Vec::new(),
+            no_loadouts: false,
+            no_prompt: false,
+            attach: true,
+        },
+    ))
+    .await
 }
 
 /// Guard for the interactive attach path: the PTY-backed session shell must be
