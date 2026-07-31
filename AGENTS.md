@@ -26,7 +26,7 @@ The CLI reference overview is [docs/reference/cli.md](docs/reference/cli.md).
 
 ## Crate map
 
-29 crates. One line each; the long-form map with plane assignments is in
+30 crates. One line each; the long-form map with plane assignments is in
 [docs/architecture.md](docs/architecture.md) §3.
 
 | Crate | Role |
@@ -38,6 +38,7 @@ The CLI reference overview is [docs/reference/cli.md](docs/reference/cli.md).
 | `common` | Common types and utilities (e.g. `SpecHash`) used across the codebase. |
 | `decode` | Evaluates a Nickel config layer into in-memory packages/profiles/stacks. |
 | `diagnostics` | App-agnostic machinery for diagnostic support bundles. |
+| `github` | Daemon-held GitHub auth (device flow, grants, refresh) and leak-proof git/REST ops. |
 | `graph` | In-memory dependency graph; its `planner` module orders builds. |
 | `lcache` | Local cache of built artifacts, keyed by `SpecHash`. |
 | `mctx` | Top-level 'minimal context' API tying configuration, decoding, graph, and cache together. |
