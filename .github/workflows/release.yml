@@ -30,6 +30,23 @@ on:
 
 env:
     CARGO_TERM_COLOR: always
+    # The GitHub App client id baked into every binary that links the `github`
+    # crate (crates/github/build.rs registers the rebuild trigger;
+    # crates/github/src/config.rs reads it via `option_env!`). Set at workflow
+    # level so it reaches every build job — including the minimald-linux-*
+    # binaries that build-release-initramfs repacks as the guest daemon, which
+    # boots with an empty environment and so could not be configured any other
+    # way.
+    #
+    # A repo VARIABLE, not a secret: a GitHub App client id is public (the
+    # device flow is a public-client flow with no client secret) and shipping it
+    # inside the binary discloses nothing. Never move this to `secrets` — a
+    # masked value would be unreadable in build logs for no benefit.
+    #
+    # Unset resolves to the empty string, which the crate treats as "no App
+    # configured": those builds fail closed with `Error::NotConfigured` exactly
+    # as they did before this seam existed.
+    MINIMAL_GITHUB_CLIENT_ID: ${{ vars.MINIMAL_GITHUB_CLIENT_ID }}
 
 # Serialize release runs so two manual dispatches can't race to cut a release
 # from different commits at the same time.
