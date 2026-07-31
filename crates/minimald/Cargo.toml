@@ -28,6 +28,7 @@ test-support = []
 anyhow.workspace = true
 async-compression.workspace = true
 async-tar.workspace = true
+blake3.workspace = true
 bytes.workspace = true
 camino.workspace = true
 chrono.workspace = true
@@ -50,6 +51,7 @@ tempfile.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 vt100-ctt.workspace = true
+walkdir.workspace = true
 
 tokio.workspace = true
 tokio-util.workspace = true
