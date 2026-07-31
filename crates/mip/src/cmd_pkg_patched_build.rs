@@ -33,6 +33,7 @@ pub async fn cmd_pkg_patched_build(
         graph: &graph,
         exec_base: output_base,
         ot: ctx.op_tracker(),
+        daemon_id: ctx.daemon_id(),
     })
     .await
     .map_err(|e| Error::Other(anyhow!("build failed: {}", e)))?;

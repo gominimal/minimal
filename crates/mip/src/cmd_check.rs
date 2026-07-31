@@ -107,6 +107,7 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
         ctx.stdlib_dir().to_path_buf(),
         ctx.local_cache(),
         None,
+        ctx.daemon_id(),
     );
 
     let mut checks_stream = check::run_checks(
