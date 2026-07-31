@@ -59,6 +59,37 @@ impl DeltaSource {
         .ok()
         .flatten()
     }
+
+    /// Re-walks the workspace and returns the workspace-relative paths of the
+    /// added and modified files, sorted by path — the files a save archive
+    /// must carry (deleted files have no content to save). `None` means the
+    /// delta could not be computed.
+    pub(crate) async fn changed_paths(self: &Arc<Self>) -> Option<Vec<PathBuf>> {
+        let src = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let now = snapshot(&src.root).ok()?;
+            Some(changed_rel_paths(&src.baseline, &now))
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Packs `files` (workspace-relative, as [`Self::changed_paths`] returns
+    /// them) into a zstd-compressed tar at `dest` on the blocking pool,
+    /// creating `dest`'s directory on demand. Entry paths inside the archive
+    /// stay workspace-relative, so the archive unpacks as the same tree shape
+    /// the workspace had.
+    pub(crate) async fn archive_changed(
+        self: &Arc<Self>,
+        files: Vec<PathBuf>,
+        dest: PathBuf,
+    ) -> std::io::Result<()> {
+        let src = Arc::clone(self);
+        tokio::task::spawn_blocking(move || write_archive(&src.root, &files, &dest))
+            .await
+            .map_err(std::io::Error::other)?
+    }
 }
 
 /// Walks `root` without following symlinks, recording every non-directory
@@ -85,6 +116,34 @@ fn snapshot(root: &Path) -> std::io::Result<Snapshot> {
         }
     }
     Ok(out)
+}
+
+/// The added + modified half of [`diff`], as relative paths instead of
+/// rendered rows: what an archive of "the changes" should contain. Sorted by
+/// path via the snapshot's `BTreeMap` order.
+fn changed_rel_paths(before: &Snapshot, after: &Snapshot) -> Vec<PathBuf> {
+    after
+        .iter()
+        .filter(|(path, sig)| before.get(*path) != Some(*sig))
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// Writes a zstd-compressed tar of `files` (paths relative to `root`) at
+/// `dest`, creating the destination directory on demand. Fails eagerly on the
+/// first unreadable file rather than shipping a partial archive — the caller
+/// treats any error as "nothing was saved".
+fn write_archive(root: &Path, files: &[PathBuf], dest: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let out = std::fs::File::create(dest)?;
+    let encoder = zstd::stream::Encoder::new(out, zstd::DEFAULT_COMPRESSION_LEVEL)?;
+    let mut tar = tar::Builder::new(encoder);
+    for rel in files {
+        tar.append_path_with_name(root.join(rel), rel)?;
+    }
+    tar.into_inner()?.finish()?.sync_all()
 }
 
 fn diff(before: &Snapshot, after: &Snapshot) -> Vec<String> {
@@ -154,5 +213,99 @@ mod tests {
         let before = snapshot(dir.path()).unwrap();
         std::fs::create_dir(dir.path().join("newdir")).unwrap();
         assert!(diff(&before, &snapshot(dir.path()).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn changed_rel_paths_reports_added_and_modified_but_not_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "kept.txt", "same");
+        write(root, "sub/edited.txt", "v1");
+        write(root, "removed.txt", "bye");
+
+        let before = snapshot(root).unwrap();
+        write(root, "sub/edited.txt", "v2 longer");
+        write(root, "added.txt", "new");
+        std::fs::remove_file(root.join("removed.txt")).unwrap();
+        let after = snapshot(root).unwrap();
+
+        assert_eq!(
+            changed_rel_paths(&before, &after),
+            vec![PathBuf::from("added.txt"), PathBuf::from("sub/edited.txt")],
+        );
+    }
+
+    /// The archive writer creates the destination directory on demand and
+    /// packs exactly the given files, keyed inside the tar by their
+    /// workspace-relative paths.
+    #[test]
+    fn write_archive_packs_exactly_the_changed_files() {
+        use std::io::Read as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        write(&root, "unchanged.txt", "not archived");
+        write(&root, "added.txt", "new");
+        write(&root, "sub/edited.txt", "v2");
+
+        let files = vec![PathBuf::from("added.txt"), PathBuf::from("sub/edited.txt")];
+        // `archives/` does not exist yet — the writer must create it.
+        let dest = dir
+            .path()
+            .join("archives")
+            .join("s-20260101T000000Z.tar.zst");
+        write_archive(&root, &files, &dest).unwrap();
+
+        let mut archive =
+            tar::Archive::new(zstd::Decoder::new(std::fs::File::open(&dest).unwrap()).unwrap());
+        let mut entries = std::collections::BTreeMap::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().into_owned();
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).unwrap();
+            entries.insert(path, contents);
+        }
+        assert_eq!(
+            entries,
+            [
+                (PathBuf::from("added.txt"), "new".to_string()),
+                (PathBuf::from("sub/edited.txt"), "v2".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+    }
+
+    /// An unwritable destination surfaces as an error (here: the would-be
+    /// archives directory is blocked by a regular file), and a missing source
+    /// file does too — the caller must be able to tell nothing was saved.
+    #[test]
+    fn write_archive_surfaces_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        write(&root, "a.txt", "x");
+
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        assert!(
+            write_archive(
+                &root,
+                &[PathBuf::from("a.txt")],
+                &blocker.join("nested.tar.zst"),
+            )
+            .is_err(),
+            "a file where the destination directory should be must error",
+        );
+
+        assert!(
+            write_archive(
+                &root,
+                &[PathBuf::from("does-not-exist.txt")],
+                &dir.path().join("out.tar.zst"),
+            )
+            .is_err(),
+            "an unreadable source file must error",
+        );
     }
 }
