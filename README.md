@@ -7,7 +7,7 @@
 <p align="center"><strong>Dev Environments, Contained</strong><br>Isolated, reproducible development sandboxes and a secure package manager that give your whole team identical environments, while keeping AI agents off the laptop.</p>
 
 <p align="center">
-  <a href="https://docs.minimal.dev/">Documentation</a> ·
+  <a href="https://minimal.dev/docs">Documentation</a> ·
   <a href="#getting-started">Getting Started</a> ·
   <a href="docs/reference/loadouts.md">Loadouts</a> ·
   <a href="docs/architecture.md">Architecture</a> ·
@@ -17,7 +17,7 @@
 <p align="center">
   <a href="https://github.com/gominimal/minimal/actions/workflows/ci.yml"><img src="https://github.com/gominimal/minimal/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
-  <a href="https://docs.minimal.dev/"><img src="https://img.shields.io/badge/docs-online-blue" alt="Docs"></a>
+  <a href="https://minimal.dev/docs"><img src="https://img.shields.io/badge/docs-online-blue" alt="Docs"></a>
   <a href="https://discord.com/invite/qgX8sm6X7G"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built_with-Rust-dea584.svg" alt="Built with Rust"></a>
 </p>
@@ -32,7 +32,7 @@ The executables inside a sandbox (git, claude-code, compilers, shells, and more)
 
 Per-developer Loadouts then layer each person's own editors, terminal multiplexers, and configs on top of that shared toolchain, so the environment stays identical for everyone while you keep the muscle memory you have earned.
 
-> Full documentation lives at [docs.minimal.dev](https://docs.minimal.dev/).
+> Full documentation lives at [minimal.dev/docs](https://minimal.dev/docs).
 
 <p align="center">
   <img src="docs/public/loadout-demo.gif" alt="Activating the minimal dev loadout: packages, EDITOR=vim, a themed prompt, and a once-only MOTD banner" width="720">
