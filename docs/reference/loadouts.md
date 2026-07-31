@@ -245,7 +245,10 @@ Resolution order:
 1. `--no-loadouts`: nothing is applied, regardless of configuration.
 2. One or more `--loadout NAME`: exactly the named loadouts are applied.
 3. Neither flag: the `[loadouts].default_loadouts` list from the
-   [client config](#client-config) is applied (which may be empty).
+   [client config](#client-config) is applied.
+4. Neither flag and an empty `default_loadouts`: the
+   [built-in `default` loadout](#built-in-default-loadout) is applied,
+   unless a user `default.toml` shadows it.
 
 Loadouts are resolved and composed **before** the CLI contacts the daemon:
 a missing or malformed loadout file fails the activation loudly on the
@@ -257,6 +260,22 @@ once, inherited vars are resolved against the host environment, and the
 composed result is what the session runs with. Editing a loadout file
 does not change sessions that already exist; destroy and re-activate to
 pick up the edit.
+
+## Built-in default loadout {#built-in-default-loadout}
+
+When a session is activated with no loadout flags and an empty
+`default_loadouts`, a built-in `default` loadout applies so a fresh box
+comes up oriented rather than in a bare shell. It contributes **no
+packages** — only a shaped `PS1` and a once-only banner (the minimal
+mark plus a pointer to `min add`), shipped through the
+[MOTD recipe](#vars-in-the-attach-shell). The banner is TTY-gated, prints
+exactly once per session, and renders without color.
+
+It is the lowest-precedence source: `--no-loadouts`, `--loadout`, and a
+non-empty `default_loadouts` all take priority, and a user
+`default.toml` in the loadouts directory shadows it entirely (the file
+is applied in its place). `min loadout list` shows it as a
+`default (built-in)` row unless that user file is present.
 
 ## Client config {#client-config}
 
@@ -284,14 +303,18 @@ a typo (`[loadout]` for `[loadouts]`) fails loudly.
 directory, one row per file:
 
 ```
-  NAME   DESCRIPTION                     CONTRIBUTES
-* dev    helix + zellij with my dotfiles 2 pkg / 4 var / 5 patch
-  extra                                  1 pkg / 0 var / 0 patch
+  NAME               DESCRIPTION                       CONTRIBUTES
+* dev                helix + zellij with my dotfiles   2 pkg / 4 var / 5 patch
+  extra                                                1 pkg / 0 var / 0 patch
+  default (built-in) orientation banner and shaped prompt  0 pkg / 3 var / 0 patch
 
+  default (built-in) applied when no loadouts are configured
 * default (from `[loadouts].default_loadouts`)
 ```
 
 - Loadouts named in `default_loadouts` are marked with a leading `*`.
+- The [built-in `default` loadout](#built-in-default-loadout) is listed as a
+  `default (built-in)` row unless a user `default.toml` shadows it.
 - Malformed entries are listed with their parse error so they can be fixed
   in place; a `default_loadouts` entry with no matching file produces a
   warning.
