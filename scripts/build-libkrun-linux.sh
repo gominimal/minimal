@@ -31,7 +31,9 @@
 #
 # Usage: scripts/build-libkrun-linux.sh <prefix-dir> [target-triple]
 # Requires: git, a Rust toolchain with the musl target, musl-gcc, GNU binutils
-# (ld, nm, objcopy, ar).
+# (ld, nm, objcopy, ar). Cross-building additionally needs target-prefixed
+# binutils (<arch>-linux-musl-* or <arch>-linux-gnu-*); the archive rewrite
+# below refuses to run the host's on foreign objects.
 set -euo pipefail
 
 PREFIX="${1:?usage: build-libkrun-linux.sh <prefix-dir> [target-triple]}"
@@ -41,8 +43,10 @@ case "$(uname -s)" in
   *) echo "build-libkrun-linux.sh is Linux-only (got $(uname -s))" >&2; exit 1 ;;
 esac
 
-# Default to this host's musl triple; CI passes the target explicitly so one
-# runner can produce either arch.
+# Default to this host's musl triple. CI passes the target explicitly, but
+# still builds each arch on its own runner (amd64 on ubuntu-latest, arm64 on
+# ubuntu-*-arm), so those runs are native. A genuine cross-build works only
+# with target binutils installed — see the archive-rewrite section.
 case "${2:-}" in
   "") case "$(uname -m)" in
         x86_64)  TARGET=x86_64-unknown-linux-musl ;;
@@ -120,10 +124,13 @@ sed -i 's/^crate-type = \["cdylib", "lib"\]$/crate-type = ["cdylib", "staticlib"
 # triple uppercased with dashes as underscores — so a standalone run works
 # without the caller knowing. An explicit value always wins.
 LINKER_VAR="CARGO_TARGET_$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER"
-# `eval`, not bash's ${!VAR} indirection: this script is otherwise POSIX, and a
-# lone bashism made `sh scripts/build-libkrun-linux.sh` die with "bad
-# substitution" on any ash/dash host (Alpine, the natural musl build box).
-eval "linker_set=\${$LINKER_VAR:-}"
+# `printenv`, not `eval` and not bash's ${!VAR}: the name is derived from
+# $TARGET, which is only suffix-validated, so `eval` would re-parse
+# caller-controlled text as shell syntax. `printenv` reads the variable without
+# a second round of expansion, and unlike ${!VAR} it is not a bashism (a lone
+# one here once made `sh scripts/build-libkrun-linux.sh` die with "bad
+# substitution" on ash/dash). Absent variable => empty, hence the `|| true`.
+linker_set="$(printenv "$LINKER_VAR" 2>/dev/null || true)"
 if [ -z "$linker_set" ] && [ "$TARGET" != "$(rustc -vV | sed -n 's/^host: //p')" ]; then
   command -v musl-gcc >/dev/null || {
     echo "::error::$TARGET is not the host triple and musl-gcc is not installed (apt install musl-tools)" >&2
@@ -180,29 +187,53 @@ test -f "$RAW" || { echo "::error::build produced no $RAW" >&2; exit 1; }
 # gets localized in the definition and becomes unresolvable from the reference.
 # Merging first with `ld -r` makes every such reference intra-object, after
 # which localization is safe.
+# Binutils must match the TARGET's architecture, not the host's. Building
+# natively (what CI does: an x86_64 runner for amd64, an arm64 runner for arm64)
+# the plain names are correct. Cross-building, they are not: the host `ld -r`
+# cannot merge objects of a foreign architecture, and the failure surfaces deep
+# in the merge as "file format not recognized" rather than as the unsupported
+# configuration it is. Prefer a target-prefixed toolchain when the arches
+# differ, and say so plainly when none is installed.
+TARGET_ARCH_BU="${TARGET%%-*}"
+HOST_ARCH_BU="$(uname -m)"
+BU_PREFIX=""
+if [ "$TARGET_ARCH_BU" != "$HOST_ARCH_BU" ]; then
+  for candidate in "${TARGET_ARCH_BU}-linux-musl-" "${TARGET_ARCH_BU}-linux-gnu-"; do
+    if command -v "${candidate}ld" >/dev/null 2>&1; then
+      BU_PREFIX="$candidate"
+      break
+    fi
+  done
+  [ -n "$BU_PREFIX" ] || {
+    echo "::error::cross-building $TARGET on $HOST_ARCH_BU needs target binutils, but neither ${TARGET_ARCH_BU}-linux-musl-ld nor ${TARGET_ARCH_BU}-linux-gnu-ld is installed. Build $TARGET on a $TARGET_ARCH_BU host, or install the cross binutils." >&2
+    exit 1
+  }
+  echo "cross-build: using ${BU_PREFIX}* binutils"
+fi
+
 echo "merging archive members into one relocatable object"
-ld -r --whole-archive "$RAW" -o "$WORK/libkrun-merged.o"
+"${BU_PREFIX}ld" -r --whole-archive "$RAW" -o "$WORK/libkrun-merged.o"
 
 # Keep exactly the public C API global; localize everything else. Derived from
 # the object rather than hardcoded, so a pin that adds or removes an entry
 # point needs no edit here.
-nm -g --defined-only "$WORK/libkrun-merged.o" \
+"${BU_PREFIX}nm" -g --defined-only "$WORK/libkrun-merged.o" \
   | awk '{print $NF}' | grep '^krun_' | sort -u > "$WORK/keep.syms"
 count="$(wc -l < "$WORK/keep.syms" | tr -d ' ')"
 [ "$count" -gt 0 ] || { echo "::error::no krun_* symbols found in the merged object" >&2; exit 1; }
 echo "keeping $count krun_* symbols global, localizing the rest"
 
-objcopy --keep-global-symbols="$WORK/keep.syms" \
+"${BU_PREFIX}objcopy" --keep-global-symbols="$WORK/keep.syms" \
   "$WORK/libkrun-merged.o" "$WORK/libkrun-local.o"
 
 rm -f "$WORK/libkrun.a"
-ar crs "$WORK/libkrun.a" "$WORK/libkrun-local.o"
+"${BU_PREFIX}ar" crs "$WORK/libkrun.a" "$WORK/libkrun-local.o"
 
 # Dump the final symbol table ONCE and assert against the file, never against a
 # live pipe: under `set -o pipefail` a `grep -q` that exits on its first match
 # SIGPIPEs `nm` mid-write, and the non-zero producer fails the whole pipeline —
 # so a passing assertion reads as a failing one.
-nm -g --defined-only "$WORK/libkrun.a" > "$WORK/final.syms"
+"${BU_PREFIX}nm" -g --defined-only "$WORK/libkrun.a" > "$WORK/final.syms"
 
 # krun_add_disk3 (the /dev/vdb attach) needs libkrun >= 1.19.0 — assert the pin
 # never silently regresses below the API surface minvmd uses. Mirrors the same

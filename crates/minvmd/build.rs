@@ -74,6 +74,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(minvmd_libkrun_static)");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
 
     // Real backend is opt-in via the `libkrun` feature (default on; the `minimal`
     // CLI opts out). Off => stub, and no dependent binary inherits libkrun's
@@ -92,10 +93,18 @@ fn main() {
         })
         .flatten();
 
-    let has_static = prefix
-        .as_deref()
-        .is_some_and(|p| target_os == "linux" && Path::new(p).join(STATIC_LIB).exists());
-    enforce_requirement(prefix.as_deref(), has_static);
+    // `scripts/build-libkrun-linux.sh` only ever produces a MUSL archive (it
+    // rejects a non-musl triple outright), so the target env must match too.
+    // Gating on `target_os` alone let a default `*-linux-gnu` build pointed at
+    // a staged prefix select `kind = "static"` and try to link a musl
+    // staticlib into a glibc binary — and, worse, let it satisfy
+    // `MINVMD_REQUIRE_LIBKRUN=static`, whose whole job is to prove the shipped
+    // link model. A gnu build now falls back to the dynamic path, or fails the
+    // requirement honestly.
+    let has_static = prefix.as_deref().is_some_and(|p| {
+        target_os == "linux" && target_env == "musl" && Path::new(p).join(STATIC_LIB).exists()
+    });
+    enforce_requirement(prefix.as_deref(), has_static, &target_env);
 
     if let Some(prefix) = prefix {
         println!("cargo:rustc-link-search=native={prefix}");
@@ -134,7 +143,7 @@ fn main() {
 ///   dynamic is acceptable.
 ///
 /// Unset (or `0`) preserves the stub-on-miss behaviour.
-fn enforce_requirement(prefix: Option<&str>, has_static: bool) {
+fn enforce_requirement(prefix: Option<&str>, has_static: bool, target_env: &str) {
     let requirement = std::env::var("MINVMD_REQUIRE_LIBKRUN").unwrap_or_default();
     if requirement.is_empty() || requirement == "0" {
         return;
@@ -150,6 +159,18 @@ fn enforce_requirement(prefix: Option<&str>, has_static: bool) {
     };
 
     if requirement == "static" && !has_static {
+        // Distinguish the two ways `static` can go unmet: no archive at all,
+        // versus a non-musl target that must not consume the musl archive even
+        // when one is staged. Reporting "no libkrun.a" for a gnu build whose
+        // prefix visibly contains one sends the reader hunting the wrong thing.
+        if !target_env.is_empty() && target_env != "musl" {
+            panic!(
+                "MINVMD_REQUIRE_LIBKRUN=static but the target env is `{target_env}`, not `musl`. \
+                 {STATIC_LIB} is built for musl only (scripts/build-libkrun-linux.sh rejects any \
+                 other triple), so it cannot be linked into this build. Build for a \
+                 *-unknown-linux-musl target, or drop the `static` requirement."
+            );
+        }
         panic!(
             "MINVMD_REQUIRE_LIBKRUN=static but no {STATIC_LIB} in {prefix}; the build would link \
              libkrun DYNAMICALLY and produce a binary that needs libkrun.so at runtime. Build the \
