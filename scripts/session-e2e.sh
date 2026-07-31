@@ -9,7 +9,7 @@
 #
 # Two proofs, in order, on EVERY lane:
 #
-#  1. Lifecycle: from a guaranteed-clean state, `min activate` must auto-spawn
+#  1. Lifecycle: from a guaranteed-clean state, `min session activate` must auto-spawn
 #     the target's daemon and create a session; then list, warm-call, destroy
 #     (verified delisted), and a clean `min stop` that the next command
 #     auto-respawns from.
@@ -33,7 +33,7 @@
 #     tears the session down, so it must be delisted afterwards. The same daemon
 #     prompt runs whether local or in-guest, so the pty driver covers every lane.
 #
-# Host-side project seed: `min activate` runs client-side and, since #758,
+# Host-side project seed: `min session activate` runs client-side and, since #758,
 # BAILS (rather than scaffolding over an existing config) when the target dir
 # has no `minimal.toml` and stdin is non-interactive; and since #748 it UPLOADS
 # the project dir into the session. So we activate a small, self-seeded dir
@@ -53,7 +53,7 @@
 #   E2E_MINIMAL_ARGS    global args for every `min` call (e.g. --provider local-minvmd)
 #   E2E_PROJECT_DIR     project to activate (default: a self-seeded throwaway
 #                       dir; VM lanes pass /tmp)
-#   E2E_ACTIVATE_ARGS   extra args for `min activate` (e.g. a future
+#   E2E_ACTIVATE_ARGS   extra args for `min session activate` (e.g. a future
 #                       `--loadout dev` once the loadouts CLI lands, #686)
 #   E2E_VM              set to 1 for VM-backed targets (extra teardown +
 #                       diagnostics: minvmd stop, guest boot log)
@@ -75,7 +75,7 @@ E2E_VM="${E2E_VM:-}"
 ADD_TOOL="jq"
 ADD_TOOL_MARKER="jq-1"
 
-# Resolve + seed the project to activate. Since #748, `min activate` UPLOADS the
+# Resolve + seed the project to activate. Since #748, `min session activate` UPLOADS the
 # project dir into the session, so the target must (a) carry a `minimal.toml`
 # (also what the #758 client pre-flight requires) and (b) stay SMALL, as the
 # whole dir is uploaded. SEED_DIR is a throwaway we created and remove wholesale
@@ -115,7 +115,7 @@ if [ -n "$SEED_DIR" ] || { [ ! -e "$PROJECT_DIR/minimal.toml" ] && [ ! -e "$PROJ
     ' "$ROOT/.minimal/minimal.toml"
     printf '\n[stack]\nuse = "shell"\n'
   } > "$PROJECT_DIR/minimal.toml"
-  # The upstream MUST be pinned — `min activate` uploads this and the graph
+  # The upstream MUST be pinned — `min session activate` uploads this and the graph
   # loader rejects an unpinned upstream.
   if ! grep -q '^\[upstream\]' "$PROJECT_DIR/minimal.toml" \
      || ! grep -q '^locked_commit' "$PROJECT_DIR/minimal.toml"; then
@@ -182,6 +182,21 @@ teardown() {
   fi
   [ -n "$SEED_DIR" ] && rm -rf "$SEED_DIR"
   [ -n "$SEEDED_MFILE" ] && rm -f "$SEEDED_MFILE"
+  # And the state dir — which is NOT just metadata. On a VM lane it holds the
+  # provider's per-VM writable data volume
+  # (`minimal/providers/local-minvmd0/data-vol.raw`), a sparse image whose HOST
+  # allocation is everything the guest wrote into it: its package cache, the
+  # session rootfs, the workspace. WORK is fresh per run, so nothing is shared
+  # and every run pays that allocation again. Leaving one behind is survivable;
+  # scripts/soak-session-e2e.sh runs this script TEN times back-to-back, so ten
+  # accumulate on one runner — and the nightly soak now dies inside that step
+  # with the runner agent gone (job `failure`, step still `in_progress`, no
+  # retrievable log lines and no uploaded artifacts), which is the shape a
+  # runner ENOSPC takes. The sibling harnesses (bulk-upload-e2e.sh,
+  # stress-session-e2e.sh) already remove theirs; this one was the outlier.
+  # `fail` collects every diagnostic — including the `min bug` bundle, which it
+  # writes OUTSIDE $WORK — before calling this.
+  rm -rf "$WORK"
 }
 trap teardown EXIT
 
@@ -204,10 +219,12 @@ fail() {
   # may be wedged or already gone, so bound the guest wait and fall back to a
   # host-only bundle. Written next to the boot log — under a VM soak that dir is
   # the job's uploaded soak-logs — so a failing nightly ships a real bundle, not
-  # just scraped tails. now_ms keeps per-iteration bundles from colliding.
+  # just scraped tails. now_ms keeps per-iteration bundles from colliding. The
+  # fallback is /tmp, NOT $WORK: teardown removes the state dir, so a bundle
+  # written there would die with it (same reasoning as bulk-upload-e2e.sh).
   echo "--- min bug (diagnostic bundle) ---"
   bug_dir="${MINVMD_BOOT_LOG:+$(dirname "$MINVMD_BOOT_LOG")}"
-  bug_out="${bug_dir:-$WORK}/minimal-diag-session-$(now_ms).tar.zst"
+  bug_out="${bug_dir:-/tmp}/minimal-diag-session-$(now_ms).tar.zst"
   if mnl bug --guest-timeout-secs 30 --output "$bug_out" >/dev/null 2>&1 \
     || mnl bug --no-guest --output "$bug_out" >/dev/null 2>&1; then
     echo "wrote diagnostic bundle: $bug_out ($(wc -c <"$bug_out" 2>/dev/null || echo '?') bytes)"
@@ -240,14 +257,14 @@ if [ -z "$E2E_VM" ] && [ "$(uname -s)" = Linux ] \
   fi
 fi
 
-# Cold: `min activate` must auto-spawn the target's daemon and print the
+# Cold: `min session activate` must auto-spawn the target's daemon and print the
 # new session id on stdout. The id is the LAST stdout line (any log lines
 # that slip through the RUST_LOG filter precede it), validated as a UUID.
 echo "::group::cold activate (auto-spawns the daemon)"
 t0=$(now_ms)
 # shellcheck disable=SC2086
-activate_out="$(cd "$PROJECT_DIR" && mnl activate . ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/activate.err")" \
-  || { echo "::error::cold 'min activate' failed to auto-spawn the daemon / create a session"; fail; }
+activate_out="$(cd "$PROJECT_DIR" && mnl session activate . ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/activate.err")" \
+  || { echo "::error::cold 'min session activate' failed to auto-spawn the daemon / create a session"; fail; }
 t1=$(now_ms)
 sid="$(printf '%s\n' "$activate_out" | tail -n1 | tr -d '\r')"
 echo "session: $sid (cold activate: $((t1 - t0))ms)"
@@ -286,11 +303,11 @@ echo "::group::sandbox proof (interactive attach via pty: min add $ADD_TOOL + ru
 t0=$(now_ms)
 # shellcheck disable=SC2086
 attach_out="$(python3 "$ROOT/scripts/e2e-attach-pty.py" "$ADD_TOOL" \
-  min ${E2E_MINIMAL_ARGS:-} attach "$sid" 2>"$WORK/exec.err")"
+  min ${E2E_MINIMAL_ARGS:-} session attach "$sid" 2>"$WORK/exec.err")"
 rc=$?
 t1=$(now_ms)
 if [ "$rc" -ne 0 ]; then
-  echo "::error::interactive 'min attach $sid' (pty) exited $rc (expected 0)"
+  echo "::error::interactive 'min session attach $sid' (pty) exited $rc (expected 0)"
   echo "--- attach output ---"; printf '%s\n' "$attach_out"
   echo "--- driver stderr ---"; cat "$WORK/exec.err" 2>/dev/null || true
   fail
@@ -326,7 +343,10 @@ if mnl ls --raw 2>/dev/null | grep -Fqx "$sid"; then
 fi
 
 # Shut the daemon down; it must not survive.
-mnl stop >/dev/null 2>&1 || { echo "::error::'min stop' failed"; fail; }
+# Keep stderr: discarding it leaves a failing stop indistinguishable from every
+# other one, and this assertion's error text is the whole diagnosis.
+mnl stop >/dev/null 2>"$WORK/stop.err" \
+  || { echo "::error::'min stop' failed"; cat "$WORK/stop.err" 2>/dev/null; fail; }
 
 # On VM targets the daemon IS the guest's pid-1, so stopping it must take the
 # VM down with it: the guest resets, the supervisor reaps the VMM child and

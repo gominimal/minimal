@@ -182,31 +182,64 @@ jobs:
                   name: minimald-linux-amd64
                   path: target/x86_64-unknown-linux-musl/release/minimald-linux-amd64
                   retention-days: 7
-            - name: Materialize libkrun prefix (upstream package)
-              # minvmd links libkrun's KVM backend dynamically, so unlike the three
-              # binaries above it can't join the static-musl cross build — it needs a
-              # native glibc build against a real libkrun. Reuse the static mip built
-              # above (mip:) instead of letting the fetch compile a second, debug mip
-              # just to drive the cache fetch.
-              uses: ./.github/actions/setup-libkrun-linux
+            - name: Build static libkrun (musl)
+              # Static libkrun.a from the vendored pin, so minvmd JOINS the
+              # static-musl build instead of being the one binary that can't.
+              # Publishes LIBKRUN_PREFIX; build.rs reads the .a there, selects a
+              # static link and records no rpath. libkrunfw is not involved —
+              # minvmd supplies its own kernel, and a static musl binary cannot
+              # dlopen one anyway. See gominimal/minimal#1065.
+              uses: ./.github/actions/build-libkrun-static-linux
               with:
-                  arch: x86_64
-                  mip: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/mip-linux-amd64
-            - name: Build native minvmd binary
-              # Native host target (x86_64-unknown-linux-gnu), NOT musl: the binary
-              # links libkrun.so (and libkrunfw.so.5 is dlopen'd at runtime), so unlike
-              # the three above it is not self-contained — running it still needs those
-              # .so's reachable via rpath/LD_LIBRARY_PATH. LIBKRUN_PREFIX — published
-              # by the setup-libkrun-linux composite above — drives the build.rs link
-              # search and the `minvmd_libkrun` cfg (real, non-stub impl).
+                  target: x86_64-unknown-linux-musl
+            - name: Build static minvmd binary
+              # Same musl target as the three above, and self-contained for the
+              # same reason: nothing to resolve at load time, no lib/ sibling, no
+              # glibc floor. Its own cargo invocation so the fat-LTO link does
+              # not overlap theirs (see the build step above).
+              #
+              # MINVMD_REQUIRE_LIBKRUN=static: without it, a build.rs that fails
+              # to find libkrun quietly emits a runtime-bailing STUB that
+              # compiles and links perfectly well. That default keeps stock
+              # Linux CI green, but here it would ship. Demanding the static
+              # link turns the regression into a build error naming the prefix.
+              env:
+                  MINVMD_REQUIRE_LIBKRUN: static
               run: |
-                  cargo build --release --locked -p minvmd --bin minvmd
-                  mv target/release/minvmd target/release/minvmd-linux-amd64
+                  cargo build --release --locked --target x86_64-unknown-linux-musl -p minvmd --bin minvmd
+                  mv target/x86_64-unknown-linux-musl/release/minvmd target/x86_64-unknown-linux-musl/release/minvmd-linux-amd64
+            - name: Verify minvmd is static and links libkrun
+              # Both halves matter and neither is implied by a successful build:
+              # a stub minvmd (build.rs found no libkrun) also compiles and
+              # links, and would ship as a binary that bails at VM boot.
+              run: |
+                  set -euo pipefail
+                  bin=target/x86_64-unknown-linux-musl/release/minvmd-linux-amd64
+                  syms="$RUNNER_TEMP/minvmd-amd64.strings"
+                  # Both spellings are static. x86_64-musl emits a static PIE,
+                  # which file(1) calls "static-pie linked"; aarch64-musl emits a
+                  # plain static executable, "statically linked". Neither has a
+                  # PT_INTERP or a DT_NEEDED, which is the property we want.
+                  file "$bin" | grep -qE 'statically linked|static-pie linked' \
+                    || { echo "::error::$bin is not statically linked"; file "$bin"; exit 1; }
+                  # The KVM backend's bindgen types are only present when libkrun
+                  # is really linked in; the stub carries none of them.
+                  #
+                  # Dump once, then assert against the FILE, never against a live
+                  # pipe: `grep -q` exits at its first match and SIGPIPEs the
+                  # `strings -a` walking a ~10 MB binary, and under `pipefail`
+                  # that producer's death fails the step — so a PASSING check
+                  # reads as a stub build and kills a good release. Same reason
+                  # scripts/build-libkrun-linux.sh materializes its nm output.
+                  strings -a "$bin" > "$syms"
+                  grep -q 'kvm_run' "$syms" \
+                    || { echo "::error::$bin does not contain libkrun's KVM backend (stub build?)"; exit 1; }
+                  echo "minvmd OK: static, libkrun linked ($(stat -c%s "$bin") bytes)"
             - name: Upload binary (minvmd)
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: minvmd-linux-amd64
-                  path: target/release/minvmd-linux-amd64
+                  path: target/x86_64-unknown-linux-musl/release/minvmd-linux-amd64
                   retention-days: 7
 
     build-release-linux-arm64:
@@ -284,6 +317,43 @@ jobs:
               with:
                   name: minimald-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/minimald-linux-arm64
+                  retention-days: 7
+            - name: Build static libkrun (musl)
+              # See the amd64 job. arm64 had no minvmd artifact at all before
+              # this — the dynamic build needed a native glibc host per arch, and
+              # only amd64 got one. A static musl build has no such constraint,
+              # so the two Linux arches finally ship the same set of binaries.
+              uses: ./.github/actions/build-libkrun-static-linux
+              with:
+                  target: aarch64-unknown-linux-musl
+            - name: Build static minvmd binary
+              # See the amd64 job for MINVMD_REQUIRE_LIBKRUN.
+              env:
+                  MINVMD_REQUIRE_LIBKRUN: static
+              run: |
+                  cargo build --release --locked --target aarch64-unknown-linux-musl -p minvmd --bin minvmd
+                  mv target/aarch64-unknown-linux-musl/release/minvmd target/aarch64-unknown-linux-musl/release/minvmd-linux-arm64
+            - name: Verify minvmd is static and links libkrun
+              # See the amd64 job: a stub minvmd builds and links cleanly too, so
+              # neither half of this is implied by the build succeeding.
+              run: |
+                  set -euo pipefail
+                  bin=target/aarch64-unknown-linux-musl/release/minvmd-linux-arm64
+                  syms="$RUNNER_TEMP/minvmd-arm64.strings"
+                  # See the amd64 job for why both file(1) spellings are accepted,
+                  # and why the symbol check runs against a dumped file rather
+                  # than a live `strings | grep -q` pipe under pipefail.
+                  file "$bin" | grep -qE 'statically linked|static-pie linked' \
+                    || { echo "::error::$bin is not statically linked"; file "$bin"; exit 1; }
+                  strings -a "$bin" > "$syms"
+                  grep -q 'kvm_run' "$syms" \
+                    || { echo "::error::$bin does not contain libkrun's KVM backend (stub build?)"; exit 1; }
+                  echo "minvmd OK: static, libkrun linked ($(stat -c%s "$bin") bytes)"
+            - name: Upload binary (minvmd)
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: minvmd-linux-arm64
+                  path: target/aarch64-unknown-linux-musl/release/minvmd-linux-arm64
                   retention-days: 7
 
     build-release-macos-arm64:
@@ -719,14 +789,19 @@ jobs:
             - name: Make binaries executable
               run: chmod +x artifacts/*-*-*
             - name: Generate completions
+              # `min` splits printing from installing (`completions print
+              # <shell>`); `mip` and `minimald` keep the flat verb. The `min`
+              # files are named for the `min` binary, not the crate — the shim
+              # it prints registers the command `min`, so a shell only autoloads
+              # it from a file of that name.
               run: |
                   mkdir -p artifacts/completions/{bash,zsh,fish}
                   artifacts/mip-linux-amd64 completions bash > artifacts/completions/bash/mip
                   artifacts/mip-linux-amd64 completions zsh  > artifacts/completions/zsh/_mip
                   artifacts/mip-linux-amd64 completions fish > artifacts/completions/fish/mip.fish
-                  artifacts/minimal-linux-amd64 completions bash > artifacts/completions/bash/minimal
-                  artifacts/minimal-linux-amd64 completions zsh  > artifacts/completions/zsh/_minimal
-                  artifacts/minimal-linux-amd64 completions fish > artifacts/completions/fish/minimal.fish
+                  artifacts/minimal-linux-amd64 completions print bash > artifacts/completions/bash/min
+                  artifacts/minimal-linux-amd64 completions print zsh  > artifacts/completions/zsh/_min
+                  artifacts/minimal-linux-amd64 completions print fish > artifacts/completions/fish/min.fish
                   artifacts/minimald-linux-amd64 completions bash > artifacts/completions/bash/minimald
                   artifacts/minimald-linux-amd64 completions zsh  > artifacts/completions/zsh/_minimald
                   artifacts/minimald-linux-amd64 completions fish > artifacts/completions/fish/minimald.fish

@@ -1,0 +1,99 @@
+name: Build static libkrun (Linux/musl)
+description: >
+  Provision the STATIC libkrun.a that minvmd links into a self-contained musl
+  binary — built from source at the commit pinned in vendor/libkrun/libkrun.lock
+  via scripts/build-libkrun-linux.sh — into a commit-keyed prefix, and publish
+  LIBKRUN_PREFIX to GITHUB_ENV. minvmd's build.rs treats a libkrun.a in the
+  prefix as the selector for a static link and records no rpath, so the
+  resulting binary has no runtime library dependency at all. The Linux twin of
+  setup-libkrun-macos, and the alternative to setup-libkrun-linux (which
+  materializes the DYNAMIC upstream package for dev/native builds).
+  Build-on-miss, riding actions/cache keyed by every build input. Requires a
+  Rust toolchain with the musl target, musl-tools, and the repository checked
+  out.
+
+inputs:
+  target:
+    description: musl target triple (e.g. x86_64-unknown-linux-musl)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve libkrun pin
+      id: pin
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+      run: |
+        set -euo pipefail
+        case "$TARGET" in
+          *-linux-musl) ;;
+          *) echo "::error::target '$TARGET' is not a musl triple" >&2; exit 1 ;;
+        esac
+        commit="$(sed -n 's/^commit=//p' vendor/libkrun/libkrun.lock)"
+        if [ -z "$commit" ]; then
+          echo "::error::no commit= line in vendor/libkrun/libkrun.lock" >&2
+          exit 1
+        fi
+        script_hash="$(sha256sum scripts/build-libkrun-linux.sh | cut -d' ' -f1)"
+        # Hash the carried patches (name + content, in apply order) so editing,
+        # adding, or removing a patch invalidates the build. Mirrors the macOS
+        # composite, including the `-d` guard: git drops the directory once the
+        # last patch is removed, and a non-zero `find` would become a step
+        # failure under pipefail.
+        patches_hash="$( { [ -d vendor/libkrun/patches ] && find vendor/libkrun/patches -name '*.patch' -type f -exec sha256sum {} + || true; } | sort | sha256sum | cut -d' ' -f1)"
+        {
+          echo "commit=$commit"
+          # The prefix embeds every build input, and the TARGET besides: one
+          # runner arch builds one triple, but keying on it keeps an amd64 and
+          # an arm64 prefix from ever colliding in a shared cache.
+          echo "prefix=$HOME/.cache/minimal-ci/libkrun-static/$TARGET/$commit-${script_hash:0:12}-${patches_hash:0:12}"
+          echo "script_hash=$script_hash"
+          echo "patches_hash=$patches_hash"
+        } >> "$GITHUB_OUTPUT"
+    - name: Cache built libkrun.a
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      with:
+        path: ~/.cache/minimal-ci/libkrun-static
+        key: libkrun-static-${{ inputs.target }}-${{ steps.pin.outputs.commit }}-${{ steps.pin.outputs.script_hash }}-${{ steps.pin.outputs.patches_hash }}
+    - name: Build static libkrun from source (on miss)
+      shell: bash
+      env:
+        PREFIX: ${{ steps.pin.outputs.prefix }}
+        TARGET: ${{ inputs.target }}
+      run: |
+        set -euo pipefail
+        if [ ! -f "$PREFIX/libkrun.a" ]; then
+          ./scripts/build-libkrun-linux.sh "$PREFIX" "$TARGET"
+        else
+          echo "libkrun.a already staged at $PREFIX (cache hit)"
+        fi
+    - name: Verify staged libkrun.a + export LIBKRUN_PREFIX
+      # Re-assert the API floor and the symbol surface on the staged (possibly
+      # cache-restored) archive, so a corrupt or hand-tampered prefix fails here
+      # with an actionable message instead of a link error — or worse, a
+      # duplicate-symbol collision — much later.
+      shell: bash
+      env:
+        PREFIX: ${{ steps.pin.outputs.prefix }}
+      run: |
+        set -euo pipefail
+        if [ ! -f "$PREFIX/libkrun.a" ]; then
+          echo "::error::libkrun.a missing from $PREFIX after build/restore" >&2
+          exit 1
+        fi
+        # Dump once and assert against the file: under pipefail a `grep -q` that
+        # exits early SIGPIPEs nm, and the non-zero producer fails the pipeline.
+        nm -g --defined-only "$PREFIX/libkrun.a" > /tmp/libkrun-staged.syms
+        if ! grep -q ' T krun_add_disk3$' /tmp/libkrun-staged.syms; then
+          echo "::error::staged libkrun lacks krun_add_disk3 (need >= 1.19.0); delete $PREFIX and re-run to rebuild" >&2
+          exit 1
+        fi
+        leaked="$(awk '$2 ~ /^[A-TV-Z]$/ {print $NF}' /tmp/libkrun-staged.syms | grep -v '^krun_' | head -5 || true)"
+        if [ -n "$leaked" ]; then
+          echo "::error::staged libkrun.a exports symbols outside the krun_* API; it would collide with minvmd's own libstd:" >&2
+          echo "$leaked" >&2
+          exit 1
+        fi
+        echo "LIBKRUN_PREFIX=$PREFIX" >> "$GITHUB_ENV"

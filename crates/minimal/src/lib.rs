@@ -1,7 +1,7 @@
 //! The minimal CLI which pairs/talks-with minimald.
 
 use anyhow::{Context as _, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use clap_complete::Shell;
 use std::io::IsTerminal as _;
 use std::io::Write as _;
@@ -12,6 +12,7 @@ mod attach;
 pub mod autospawn;
 pub mod client;
 pub mod completion;
+pub mod completions;
 pub mod config;
 pub mod diag;
 pub mod dirs;
@@ -20,6 +21,7 @@ pub mod git_remote;
 pub mod github;
 pub mod loadouts;
 pub mod prompt;
+pub mod theme;
 
 #[derive(Parser)]
 #[command(name = "min", version = version::VERSION, long_version = version::LONG_VERSION)]
@@ -28,9 +30,9 @@ pub mod prompt;
 )]
 #[command(subcommand_required = false)]
 pub struct Cli {
-    // Optional: a bare `min` (no subcommand) resolves or activates a session
-    // for the current directory — see `cmd_default`. Keeps every named
-    // subcommand reachable unchanged when one is supplied.
+    // Optional: a bare `min` (no subcommand) prints the top-level help — see
+    // `cmd_default`. Keeps every named subcommand reachable unchanged when one
+    // is supplied.
     #[command(subcommand)]
     pub command: Option<Command>,
 
@@ -41,20 +43,25 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// List sessions
+    //
+    // Deliberate exception to the `<noun> <verb>` convention (documented in
+    // docs/reference/cli.md): `min session list` is the canonical spelling,
+    // and `min ls` — the highest-traffic command in the CLI — keeps this bare
+    // top-level form as its visible alias. Not an oversight — do not remove it.
     Ls(LsArgs),
-    /// Activate (create) a new session
-    Activate(ActivateArgs),
-    /// Attach to an existing session
-    Attach(AttachArgs),
-    /// Destroy (terminate) a session
-    Destroy(DestroyArgs),
     /// Shut down the minimald daemon
+    //
+    // Stays top-level: it acts on the daemon backend, not on any session, and
+    // it is the daemon-lifecycle command people reach for. Documented as a
+    // deliberate exception in docs/reference/cli.md.
     Stop(StopArgs),
-    /// Session inspection subcommands
+    /// Session management subcommands
+    #[command(visible_alias = "sessions")]
     Session(SessionArgs),
     /// GitHub authentication: sign in, inspect status, and sign out (R1.4/R7.2)
     Github(github::GithubArgs),
     /// Loadout management subcommands
+    #[command(visible_alias = "loadouts")]
     Loadout(LoadoutArgs),
     /// Print important directories and file paths for debugging
     Dirs,
@@ -94,7 +101,7 @@ pub enum Command {
     /// Obtain an mTLS client certificate for the HTTPS reverse proxy
     ///
     /// Connects to minimald, generates a fresh client certificate signed by
-    /// the daemon's internal CA (R4.4, R4.5), and saves the certificate and
+    /// the daemon's internal CA, and saves the certificate and
     /// private key to `~/.config/minimal/client.pem` /
     /// `~/.config/minimal/client.key`. Also saves the CA certificate to
     /// `~/.config/minimal/ca.pem` so tools like `curl` can trust the HTTPS
@@ -108,9 +115,13 @@ pub enum Command {
     ///        --key  ~/.config/minimal/client.key \
     ///        https://localhost:7655/
     #[command(verbatim_doc_comment)]
+    #[command(hide = true)]
     Login(LoginArgs),
-    /// Rename an existing session
-    Rename(RenameArgs),
+    // `init`, `add`, and `update` are deliberate exceptions to the
+    // `<noun> <verb>` convention (documented in docs/reference/cli.md): they
+    // are passthroughs to the project-configuration commands of the same name
+    // in `mip`, and keeping the spelling identical across the two CLIs is
+    // worth more than the hierarchy. Do not move them under a noun.
     /// Automatically initialize minimal configuration based on your source tree
     Init(InitArgs),
     /// Add a new tool or dependency
@@ -122,7 +133,7 @@ pub enum Command {
     /// Demo the client's activity spinner (development aid).
     ///
     /// Draws the same build-hold-fade spinner used by the file-upload
-    /// phases of `min activate` so you can eyeball timing and layout
+    /// phases of `min session activate` so you can eyeball timing and layout
     /// without triggering a real upload. Stops after `--seconds` or
     /// on Ctrl-C, whichever comes first.
     #[command(hide = true)]
@@ -138,9 +149,10 @@ pub enum Command {
     /// Never starts a daemon and never fails: no daemon means no output.
     #[command(name = completion::COMPLETE_SESSION_STR, hide = true)]
     CompleteSessionStr(CompleteSessionStrArgs),
-    /// Generate shell completion script
+    /// Print or install the shell tab-completion integration
     #[command(
-        long_about = "Generate a shell tab-completion script for the min CLI.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(min completions bash)"
+        visible_alias = "completion",
+        long_about = "Print or install the shell tab-completion integration for the min CLI.\n\n   source <(min completions print bash)\n   min completions install"
     )]
     Completions(CompletionsArgs),
 }
@@ -153,6 +165,17 @@ pub struct SessionArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
+    /// List sessions
+    #[command(visible_alias = "ls")]
+    List(LsArgs),
+    /// Activate (create) a new session
+    Activate(ActivateArgs),
+    /// Attach to an existing session
+    Attach(AttachArgs),
+    /// Destroy (terminate) a session
+    Destroy(DestroyArgs),
+    /// Rename an existing session
+    Rename(RenameArgs),
     /// Print the effective networking policy for a session as JSON
     Policy(PolicyArgs),
 }
@@ -252,30 +275,33 @@ pub struct MeshJoinArgs {
 pub struct GlobalArgs {
     /// Use the given directory as the repository root, instead of the current
     /// working directory.
-    #[arg(long, short = 'C')]
+    #[arg(long, short = 'C', global = true)]
     pub repo_dir: Option<PathBuf>,
     /// Override the base directory used for operations (default: ~/.cache/minimal)
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub minimal_dir: Option<PathBuf>,
-    /// Override the user config directory. Everything under
-    /// `<config_dir>/minimal/` (config.toml, loadouts/, ...) is
-    /// resolved relative to this. Defaults to the platform's config
+    /// Override the user config directory (default: platform config dir).
+    ///
+    /// Everything under `<config_dir>/minimal/` (config.toml, loadouts/,
+    /// ...) is resolved relative to this. Defaults to the platform's config
     /// dir — `$XDG_CONFIG_HOME` on Linux (or `$HOME/.config` when
     /// that's unset). macOS uses `$HOME/.config` for consistency with
     /// state and cache dirs, not `~/Library/Application Support`.
     #[arg(long, global = true)]
     pub config_dir: Option<PathBuf>,
-    /// Select the daemon backend that hosts sessions. On Linux, `local-minimald`
-    /// (the default) runs minimald on the host; `local-minvmd` runs it inside
-    /// the minvmd microVM (DM1). No effect on macOS, where minvmd is the only
-    /// backend.
+    /// Select the daemon backend that hosts sessions.
+    ///
+    /// On Linux, `local-minimald` (the default) runs minimald on the host;
+    /// `local-minvmd` runs it inside the minvmd microVM. No effect on macOS,
+    /// where minvmd is the only backend.
     #[arg(long, global = true, value_name = "PROVIDER")]
     pub provider: Option<Provider>,
-    /// Skip interactive prompts that need a terminal (e.g. the session
-    /// picker shown by bare `min` or `min attach` with no session argument).
-    /// When a choice is ambiguous, the command errors with a list of
-    /// candidates instead of opening a picker. Implied when stdin/stdout is
-    /// not a terminal.
+    /// Skip interactive prompts that need a terminal.
+    ///
+    /// Affects e.g. the session picker shown by `min session attach` with no
+    /// session argument. When a choice is ambiguous, the command errors with a
+    /// list of candidates instead of opening a picker. Implied when
+    /// stdin/stdout is not a terminal.
     #[arg(long, global = true, default_value_t = false)]
     pub no_input: bool,
 }
@@ -298,8 +324,12 @@ pub struct ActivateArgs {
     /// is given.
     pub path: Option<String>,
     /// How to load project files into the session.
-    #[arg(long, value_enum, default_value_t = SyncMode::Tarball)]
-    pub sync: SyncMode,
+    ///
+    /// Defaults to `tarball`. Passing `--sync tarball` explicitly is also
+    /// the escape hatch that uploads an empty directory or `$HOME`, which
+    /// are otherwise skipped without a prompt.
+    #[arg(long, value_enum)]
+    pub sync: Option<SyncMode>,
     /// Network mode: no-net, host-net (default), or own-ip.
     ///
     /// Hidden from `--help` while `own-ip` is not usable on an installed host:
@@ -419,14 +449,14 @@ fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyhow::Error> 
 
 #[derive(Debug, Args)]
 pub struct AttachArgs {
-    /// Session identifier (UUID or session name). When omitted, `min attach`
+    /// Session identifier (UUID or session name). When omitted, `min session attach`
     /// resolves a session from the current working directory (or the only
     /// existing session), and opens an interactive picker if the choice is
     /// ambiguous. See `--no-input` to skip the picker in scripts.
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
     /// Command to exec in the session context (non-interactive)
-    #[arg(long, short)]
+    #[arg(long, short, hide = true)]
     pub command: Option<String>,
 }
 
@@ -441,13 +471,10 @@ pub struct LsArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(ArgGroup::new("target").args(["session", "all"]).required(true).multiple(false)))]
 pub struct DestroyArgs {
     /// Session identifier (UUID or session name)
-    #[arg(
-        required_unless_present = "all",
-        conflicts_with = "all",
-        add = completion::session_completer()
-    )]
+    #[arg(add = completion::session_completer())]
     pub session: Option<String>,
     /// Destroy all sessions
     #[arg(long)]
@@ -478,6 +505,10 @@ pub struct InitArgs {
     /// Skip confirmation, writing configuration based on auto-detection
     #[arg(long, short, default_value_t = false)]
     pub yes: bool,
+    /// Overwrite an existing minimal.toml; without it, init refuses when one
+    /// already exists.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -558,9 +589,35 @@ pub struct CompleteSessionStrArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct CompletionsArgs {
-    /// The shell type for a CLI completion script should be printed
+    #[command(subcommand)]
+    pub command: CompletionsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CompletionsCommand {
+    /// Print the shell integration on stdout
+    #[command(
+        long_about = "Print the shell integration for a shell on stdout.\nSupported shells include bash, zsh, elvish and fish.\n\n   source <(min completions print bash)"
+    )]
+    Print(CompletionsPrintArgs),
+    /// Write the shell integration into each shell's completion directory
+    #[command(
+        long_about = "Write the shell integration into each shell's user-level completion directory,\nand print every path written on stdout, one per line.\n\n   bash  ${XDG_DATA_HOME:-~/.local/share}/bash-completion/completions/min\n   zsh   ${XDG_DATA_HOME:-~/.local/share}/zsh/completions/_min\n   fish  ${XDG_CONFIG_HOME:-~/.config}/fish/completions/min.fish\n\nA shell that cannot be installed for (an unwritable shared directory, say) is\na warning on stderr, not a failure."
+    )]
+    Install(CompletionsInstallArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CompletionsPrintArgs {
+    /// The shell to print the integration for
     #[arg(value_parser)]
     pub shell: Shell,
+}
+
+#[derive(Debug, Args)]
+pub struct CompletionsInstallArgs {
+    /// Shells to install for (default: every supported shell)
+    pub shells: Vec<completions::InstallShell>,
 }
 
 /// The process-wide trace context, minted once at command dispatch. The
@@ -591,15 +648,19 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     client::migrate_legacy_provider_dirs(cli.global_args.minimal_dir.as_deref());
 
     match cli.command {
-        None => cmd_default(&cli.global_args).await,
+        // A bare `min` (no subcommand) prints the top-level help — see
+        // `cmd_default`.
+        None => cmd_default(),
         Some(Command::Ls(args)) => cmd_ls(&cli.global_args, args).await,
-        Some(Command::Activate(args)) => cmd_activate(&cli.global_args, args).await,
-        Some(Command::Attach(args)) => cmd_attach(&cli.global_args, args).await,
-        Some(Command::Destroy(args)) => cmd_destroy(&cli.global_args, args).await,
         Some(Command::Stop(args)) => cmd_stop(&cli.global_args, args).await,
-        Some(Command::Session(SessionArgs {
-            command: SessionCommand::Policy(args),
-        })) => cmd_session_policy(&cli.global_args, args).await,
+        Some(Command::Session(SessionArgs { command })) => match command {
+            SessionCommand::List(args) => cmd_ls(&cli.global_args, args).await,
+            SessionCommand::Activate(args) => cmd_activate(&cli.global_args, args).await,
+            SessionCommand::Attach(args) => cmd_attach(&cli.global_args, args).await,
+            SessionCommand::Destroy(args) => cmd_destroy(&cli.global_args, args).await,
+            SessionCommand::Rename(args) => cmd_rename(&cli.global_args, args).await,
+            SessionCommand::Policy(args) => cmd_session_policy(&cli.global_args, args).await,
+        },
         Some(Command::Github(args)) => github::cmd_github(&cli.global_args, args).await,
         Some(Command::Loadout(LoadoutArgs {
             command: LoadoutCommand::List(args),
@@ -618,7 +679,6 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Login(args)) => cmd_login(&cli.global_args, args).await,
         Some(Command::Version) => cmd_version(&cli.global_args).await,
         Some(Command::Spin(args)) => cmd_spin(&cli.global_args, args).await,
-        Some(Command::Rename(args)) => cmd_rename(&cli.global_args, args).await,
         Some(Command::Init(args)) => cmd_init(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
@@ -631,70 +691,47 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::CompleteSessionStr(args)) => {
             completion::cmd_complete_session_str(&cli.global_args, args).await
         }
-        Some(Command::Completions(CompletionsArgs { shell })) => cmd_completions(shell),
+        Some(Command::Completions(CompletionsArgs { command })) => match command {
+            CompletionsCommand::Print(args) => completions::cmd_print(args.shell),
+            CompletionsCommand::Install(args) => completions::cmd_install(&args.shells),
+        },
     }
 }
 
-/// The default action for a bare `min` (no subcommand): get the operator into
-/// a session for the current directory with the least ceremony.
-///
-/// - No sessions exist → [`cmd_activate`] a new one with `--attach`, so a
-///   fresh `min` lands the user in a shell.
-/// - A session built from the current directory exists → attach to it
-///   (auto-resolve, or picker if ambiguous).
-/// - Otherwise → attach to the only session, or open a picker over all.
-///
-/// Shares smart resolution with `min attach` (no session arg) via
-/// [`resolve_smart_attach`]; the only difference is the `NoSessions` case,
-/// which activates here instead of erroring.
-async fn cmd_default(global: &GlobalArgs) -> Result<(), anyhow::Error> {
-    ensure_daemon(global)?;
+/// Whether to announce the resolved or freshly created session on stderr
+/// before handing off to the interactive shell. Suppressed under `--no-input`
+/// and when stderr is not a terminal, so scripted and CI callers — which read
+/// the session id from stdout — see nothing extra.
+fn should_announce_session(global: &GlobalArgs) -> bool {
+    !global.no_input && std::io::stderr().is_terminal()
+}
 
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
-        .context("Failed to resolve daemon socket path")?;
-
-    let mut client = client::Client::connect(&sock)
-        .await
-        .context("Failed to connect to minimald")?;
-
-    match resolve_smart_attach(&mut client, global).await? {
-        Some(entry) => {
-            tracing::info!(
-                session_id = %entry.id,
-                session_name = ?entry.name,
-                "bare `min`: attaching to resolved session"
-            );
-            // Drop the listing connection before shelling out; the ssh child
-            // holds its own proxy connection to the daemon.
-            drop(client);
-            let status = attach_to_session(&sock, entry.id, None).await?;
-            std::process::exit(attach_exit_code(status));
-        }
-        None => {
-            // No sessions exist: activate a new one for the current directory
-            // (or -C/--repo-dir if set) and chain into attach, mirroring
-            // `min activate --attach`. `cmd_activate` resolves the path from
-            // `global.repo_dir` when no positional is given, matching the
-            // attach side's `cwd_host_path(global)`.
-            drop(client);
-            let activate_args = ActivateArgs {
-                name: None,
-                path: None,
-                sync: SyncMode::Tarball,
-                network: CliNetworkMode::HostNet,
-                ingress: Vec::new(),
-                loadout: Vec::new(),
-                no_loadouts: false,
-                // A non-interactive caller (--no-input, CI, a script) can't
-                // answer the activation policy prompt; `cmd_activate` already
-                // falls back to the `--no-prompt` path when stderr isn't a
-                // terminal, so mirror that here rather than forcing a hang.
-                no_prompt: global.no_input || !can_prompt_interactively(),
-                attach: true,
-            };
-            cmd_activate(global, activate_args).await
-        }
+/// A one-line identity for a session in an attach/create confirmation: the
+/// session name plus a short id in parentheses, or just the short id when the
+/// session is unnamed. The short id is the leading block of the UUID — enough
+/// to tell two same-named sessions built from the same directory apart without
+/// the full 36-character id.
+fn session_announce_label(id: &sessions::SessionId, name: Option<&str>) -> String {
+    let id = id.to_string();
+    let short = id.split('-').next().unwrap_or(&id);
+    match name {
+        Some(name) => format!("{name} ({short})"),
+        None => short.to_string(),
     }
+}
+
+/// The default action for a bare `min` (no subcommand): print the top-level
+/// help and exit successfully, the same text `min --help` produces.
+///
+/// Deliberately inert — it starts no daemon, creates no session, and attaches
+/// to nothing. Getting into a session is spelled explicitly:
+/// `min session attach` (which still auto-resolves from the current directory)
+/// or `min session activate`.
+pub fn cmd_default() -> Result<(), anyhow::Error> {
+    use clap::CommandFactory as _;
+    Cli::command()
+        .print_help()
+        .context("Failed to write help output")
 }
 
 /// Connect to the daemon, resolving the socket path from global args.
@@ -824,45 +861,11 @@ fn confirm(question: &str, default: bool) -> Result<bool, anyhow::Error> {
     })
 }
 
-/// Print the shell integration for `shell` on stdout.
-///
-/// This is a *registration* shim, not a completion table: a dozen lines that
-/// teach the shell to ask `min` itself what to complete, rather than the
-/// thousand-line static script this used to emit. That indirection is the
-/// whole point — session names and IDs only exist at runtime, so a table
-/// baked at install time cannot contain them (see `completion.rs`).
-///
-/// The installed file paths are unchanged, and so is
-/// `scripts/install.sh` (R9.3): zsh's shim still opens with `#compdef min`,
-/// so it autoloads from an fpath dir as `_min`, and bash's and fish's are
-/// still plain source-able files.
-///
-/// The shim calls `min` by bare name so it resolves through `PATH` — an
-/// upgrade that moves the binary keeps working, and the installer puts its
-/// bindir on `PATH` in the same breath as writing this file.
-fn cmd_completions(shell: Shell) -> Result<(), anyhow::Error> {
-    let name = shell.to_string();
-    let shells = clap_complete::env::Shells::builtins();
-    let completer = shells
-        .completer(&name)
-        .with_context(|| format!("no shell integration for `{name}`"))?;
-
-    let mut out = Vec::new();
-    completer
-        .write_registration(COMPLETE_VAR, "min", "min", "min", &mut out)
-        .context("render shell integration")?;
-
-    std::io::stdout()
-        .write_all(&out)
-        .context("write shell integration to stdout")?;
-    Ok(())
-}
-
 /// The environment variable a shell sets to ask `min` for completions.
 ///
 /// clap_complete's default, named here because both ends have to agree: the
-/// shim emitted by [`cmd_completions`] sets it, and the `CompleteEnv` call in
-/// `main.rs` reads it.
+/// shim rendered by [`completions::cmd_print`] sets it, and the `CompleteEnv`
+/// call in `main.rs` reads it.
 pub const COMPLETE_VAR: &str = "COMPLETE";
 
 /// List sessions via the `ListSessions` RPC.
@@ -989,11 +992,11 @@ fn format_memory(bytes: u64) -> String {
 /// renders on stderr (so stderr must be a terminal) and reads
 /// keypresses from stdin (so stdin must be a terminal too). If
 /// either side is redirected we take the `--no-prompt` path — going
-/// interactive when stdin is a pipe just hangs `dialoguer` and then
+/// interactive when stdin is a pipe just hangs the prompt and then
 /// aborts with a much less helpful error than the `--no-prompt`
 /// snippet the operator actually wants to paste.
 fn can_prompt_interactively() -> bool {
-    dialoguer::console::user_attended() && dialoguer::console::user_attended_stderr()
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
 /// Phase 3 gate: run the user policy + hooks over the daemon's
@@ -1173,7 +1176,7 @@ async fn best_effort_destroy(client: &mut client::Client, session_id: sessions::
             eprintln!(
                 "DestroySession timed out after {DESTROY_TIMEOUT:?} while cleaning up \
                  session {session_id}; the session may still be present on the daemon \
-                 (run `min destroy {session_id}` to clean up manually)",
+                 (run `min session destroy {session_id}` to clean up manually)",
             );
         }
     }
@@ -1209,13 +1212,13 @@ async fn upload_and_finalize(
 /// Guard that tears down a half-built session if the user interrupts the
 /// activation with Ctrl-C.
 ///
-/// `dialoguer`/`console` re-raise SIGINT to this process on a Ctrl-C at
-/// the composition-gating prompt (console `unix_term.rs`). With no
-/// handler installed the default disposition kills `min` mid-prompt —
-/// before the abort-cleanup that [`drive_pending_to_active`] runs — so
-/// the daemon is left holding a `Pending` session that blocks its name.
-/// [`arm_activation_interrupt`] installs a SIGINT handler (keeping the
-/// process alive past console's re-raise) that best-effort
+/// inquire (crossterm raw mode) captures a Ctrl-C at the
+/// composition-gating prompt as an error return, so the abort-cleanup
+/// that [`drive_pending_to_active`] runs gets to execute. During the
+/// non-prompt phases (waiting on the daemon) a Ctrl-C is a plain
+/// SIGINT, which would kill `min` before that cleanup, leaving the
+/// daemon holding a `Pending` session that blocks its name.
+/// [`arm_activation_interrupt`] installs a SIGINT handler that best-effort
 /// `AbortSession`s the in-flight session over a fresh connection — the
 /// activation borrows the primary one — then exits. The daemon's
 /// connection-close reap is the backstop if the abort can't be
@@ -1323,7 +1326,7 @@ fn offer_mfile_scaffold(
             .build()
             .map_err(|e| anyhow::anyhow!("{e}"))?
     };
-    run_init_flow(config, false)
+    run_init_flow(config, false, false)
 }
 
 /// Resolves the directory whose tree should be uploaded as the session
@@ -1409,15 +1412,30 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     let (contribution, user_policy) =
         loadouts::compose_user_contribution(active, user_policy, compose_options)?;
 
+    // `--sync` defaults to tarball; `sync_explicit` records whether the
+    // user actually typed the flag, which distinguishes a deliberate
+    // `--sync tarball` (the escape hatch that force-uploads an empty dir
+    // or `$HOME`) from the implicit default.
+    let sync_explicit = args.sync.is_some();
+    let sync_mode = args.sync.unwrap_or(SyncMode::Tarball);
+
     // Resolve the upload root before opening the daemon connection:
     // a malformed mfile in an ancestor should fail loudly before
     // we create a session on the daemon, so we don't leak a draft
     // session. Only needed for tarball sync — `--sync none` skips
     // the upload entirely (#770).
-    let upload_root = match args.sync {
+    let upload_root = match sync_mode {
         SyncMode::None => None,
         SyncMode::Tarball => Some(resolve_upload_root(&utf8_path)?),
     };
+
+    // Skip the upload without prompting when the resolved root is an
+    // empty directory or `$HOME` — unless the user asked for it with an
+    // explicit `--sync tarball`, the escape hatch.
+    let skip_empty_or_home = !sync_explicit
+        && upload_root.as_ref().is_some_and(|root| {
+            file_upload::is_empty_or_home(root.as_std_path(), std::env::home_dir().as_deref())
+        });
 
     let mut client = connect_daemon(global).await?;
 
@@ -1453,8 +1471,17 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     // has to run before `ConfigureLoadout`. `--sync none` opts out;
     // the daemon then composes against an empty workspace and the
     // caller is on their own for getting files there.
-    match args.sync {
+    match sync_mode {
         SyncMode::None => {}
+        SyncMode::Tarball if skip_empty_or_home => {
+            // An empty directory has nothing to sync, and `$HOME` is far
+            // too much to ship on a stray confirmation keypress — and if
+            // `$HOME` is itself a VCS root the old gate uploaded it with
+            // no prompt at all. Skip both silently by default; a
+            // deliberate `--sync tarball` (via `sync_explicit`) is the
+            // escape hatch that still uploads them.
+            eprintln!("Starting with an empty box (nothing here to sync)");
+        }
         SyncMode::Tarball => {
             // Upload from the project root — the directory the mfile
             // lives in — rather than wherever the user invoked us. This
@@ -1467,28 +1494,41 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
                 eprintln!("Uploading from project root {upload_root} (resolved from {utf8_path})");
             }
             // Guard against accidentally uploading a non-VCS directory
-            // (e.g. `~`): if the resolved project root is not a recognized
-            // VCS root, warn and ask for confirmation before the recursive
-            // upload. On non-interactive stdin (CI, pipes, agents) and under
-            // `--no-prompt` we proceed without prompting — `--sync none`
-            // remains available for explicit opt-out (#770).
-            let should_upload = file_upload::is_vcs_root(upload_root.as_std_path())
-                || args.no_prompt
-                || global.no_input
-                || !can_prompt_interactively()
-                || confirm(
+            // (e.g. `~`). A VCS root uploads unconditionally. For a non-VCS
+            // root an interactive caller gets the confirm (default No); a
+            // headless caller (CI, pipes, agents, `--no-prompt`,
+            // `--no-input`) can't be asked, so it skips the upload with a
+            // warning rather than silently shipping a directory nobody
+            // confirmed — `--sync tarball` (via `sync_explicit`) is the
+            // escape hatch that force-uploads it anyway (#770).
+            let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
+            let should_upload = match file_upload::upload_gate(
+                file_upload::is_vcs_root(upload_root.as_std_path()),
+                sync_explicit,
+                headless,
+            ) {
+                file_upload::UploadGate::Upload => true,
+                file_upload::UploadGate::SkipHeadless => {
+                    eprintln!(
+                        "warning: {upload_root} is not a version control repository root; \
+                         skipping file upload (pass --sync tarball to upload anyway)"
+                    );
+                    false
+                }
+                file_upload::UploadGate::Prompt => confirm(
                     &format!(
                         "{upload_root} is not a version control repository root. \
                          Upload all files from this directory?"
                     ),
                     false,
-                )?;
+                )?,
+            };
             if should_upload {
                 client
                     .upload_workspace_files(id, upload_root.as_std_path())
                     .await
                     .context("Failed to upload project files")?;
-            } else {
+            } else if !headless {
                 eprintln!(
                     "Skipping file upload; the session will start with an \
                      empty workspace."
@@ -1649,7 +1689,16 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     println!("{id}");
 
     if args.attach {
-        // Chain into attach.
+        // Chain into attach. Announce the freshly created session first: the
+        // bare id printed to stdout above is the scripting contract, while this
+        // stderr line tells an interactive operator which session they just
+        // created and are entering.
+        if should_announce_session(global) {
+            eprintln!(
+                "Created session {}",
+                session_announce_label(&id, args.name.as_deref())
+            );
+        }
         let attach_args = AttachArgs {
             session: Some(id.to_string()),
             command: None,
@@ -1730,7 +1779,7 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
         }
         None => match resolve_smart_attach(&mut client, global).await? {
             Some(entry) => (entry.id, entry.name),
-            None => bail!("no sessions exist; use 'min activate' to create one"),
+            None => bail!("no sessions exist; use 'min session activate' to create one"),
         },
     };
 
@@ -1755,9 +1804,8 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
 /// and either attaches directly (unambiguous), opens the interactive picker
 /// (ambiguous), or errors (ambiguous but non-interactive).
 ///
-/// Returns `Ok(None)` when no sessions exist at all — the caller decides
-/// whether that is an error (`min attach`) or a cue to activate a new session
-/// (bare `min`).
+/// Returns `Ok(None)` when no sessions exist at all, which `min session attach`
+/// reports as an error pointing at `min session activate`.
 async fn resolve_smart_attach(
     client: &mut client::Client,
     global: &GlobalArgs,
@@ -1771,7 +1819,18 @@ async fn resolve_smart_attach(
     let cwd = attach::cwd_host_path(global)?;
     match attach::resolve_for_attach(&resp.sessions, &cwd) {
         attach::SmartResolve::NoSessions => Ok(None),
-        attach::SmartResolve::Attach(entry) => Ok(Some(entry)),
+        attach::SmartResolve::Attach(entry) => {
+            // Unambiguous auto-resolve: the operator never chose this session,
+            // so tell them which one they're landing in. The picker path below
+            // needs no such line — the selection is its own confirmation.
+            if should_announce_session(global) {
+                eprintln!(
+                    "Attaching to session {}",
+                    session_announce_label(&entry.id, entry.name.as_deref())
+                );
+            }
+            Ok(Some(entry))
+        }
         attach::SmartResolve::Pick(cands) => {
             if global.no_input || !attach::can_pick_interactively() {
                 bail!(attach::ambiguous_no_input_message(&cands, &cwd));
@@ -1797,9 +1856,8 @@ fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), anyhow::Error
         Ok(())
     } else {
         bail!(
-            "`min attach` needs an interactive terminal, but stdin is not a TTY. \
-             Run it from a terminal, or use `min attach --command <cmd>` to run a \
-             single command non-interactively."
+            "`min session attach` needs an interactive terminal, but stdin is not a TTY. \
+             Run it from a terminal."
         )
     }
 }
@@ -1818,9 +1876,9 @@ fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), anyhow::Error
 /// killing the waiting client; callers propagate the returned status via
 /// [`attach_exit_code`] so the observable outcome matches the old `exec()`.
 ///
-/// Split from [`cmd_attach`] so the bare-`min` default dispatch
-/// ([`cmd_default`]) and the smart-resolution picker can attach without
-/// re-resolving an entry they already hold.
+/// Split from [`cmd_attach`] so the activate-then-attach chain and the
+/// smart-resolution picker can attach without re-resolving an entry they
+/// already hold.
 async fn attach_to_session(
     sock: &std::path::Path,
     id: sessions::SessionId,
@@ -1838,9 +1896,27 @@ async fn attach_to_session(
     let [strict, known_hosts_file] = host_key_opts(&sock.with_file_name(paths::KNOWN_HOSTS_FILE));
 
     let mut ssh = std::process::Command::new("ssh");
+    // Pin the shell ssh uses to run the ProxyCommand. ssh launches a
+    // ProxyCommand via `$SHELL -c` and execs `$SHELL` with no PATH lookup, so a
+    // caller whose `$SHELL` is a bare name (`fish`) or points at a shell absent
+    // from this context fails with "<shell>: No such file or directory" and the
+    // transport dies at "banner exchange … Broken pipe". Our ProxyCommand is a
+    // full-path `min proxy …` that needs nothing but a POSIX `sh`, so force the
+    // always-present `/bin/sh` rather than inherit the user's interactive shell.
+    ssh.env("SHELL", "/bin/sh");
     ssh.env("MINIMAL_SESSION_ID", id.to_string()).args([
         "-o",
         "SendEnv=MINIMAL_SESSION_ID",
+        // Forward the user's locale and timezone into the session, mirroring a
+        // conventional `SendEnv LANG LC_* TZ`. The daemon accepts only these
+        // (its `AcceptEnv` allowlist) and folds them in below any loadout.
+        // `TERM` needs no `SendEnv`: ssh always carries it in the PTY request.
+        "-o",
+        "SendEnv=LANG",
+        "-o",
+        "SendEnv=LC_*",
+        "-o",
+        "SendEnv=TZ",
         "-o",
         &format!("ProxyCommand={proxy_cmd}"),
         "-o",
@@ -2260,33 +2336,115 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
     // so a connect failure is still a real error, not something to swallow.
     let mut client = connect_daemon(global).await?;
 
-    use minimald_rpc::{Shutdown, ShutdownRequest, ShutdownResponse};
+    use minimald_rpc::{Shutdown, ShutdownRequest};
     let resp = client
         .oneshot_rpc::<Shutdown>(ShutdownRequest { force: args.force })
         .await
-        .context("Shutdown RPC failed")?;
+        .context("Shutdown RPC failed");
 
-    match resp {
-        ShutdownResponse::ShuttingDown => {
-            // Drop our connection before waiting: the daemon holds the shutdown
-            // open for its drain grace period while a client is still attached,
-            // and we are that client.
-            drop(client);
-            println!("Daemon is shutting down.");
+    // Drop our connection before waiting: the daemon holds the shutdown open
+    // for its drain grace period while a client is still attached, and we are
+    // that client.
+    drop(client);
+
+    let (use_minvmd, minimal_dir) = (global.use_minvmd(), global.minimal_dir.clone());
+    let probe_dir = minimal_dir.clone();
+    stop_outcome(
+        resp,
+        async move || {
             // The wait polls the lifecycle file on a sleep loop, so it goes on
             // the blocking pool rather than stalling an async worker for up to
             // 20s (rust-coding-standards: no blocking in an async context).
-            let (use_minvmd, minimal_dir) = (global.use_minvmd(), global.minimal_dir.clone());
             tokio::task::spawn_blocking(move || {
                 autospawn::wait_for_daemon_stopped(use_minvmd, minimal_dir.as_deref())
             })
             .await
             .context("The wait for the daemon to stop panicked")?
-            .context("Failed while waiting for the daemon to stop")?;
-            Ok(())
+            .context("Failed while waiting for the daemon to stop")
+        },
+        async move || daemon_confirmed_stopped(use_minvmd, probe_dir).await,
+    )
+    .await
+}
+
+/// Whether the daemon can be *observed* to have stopped — the question the
+/// failed-RPC arm of [`stop_outcome`] turns on.
+///
+/// The shutdown wait, then the liveness probe this command opened with. On a VM
+/// backend the wait IS the observation — it polls the lifecycle state — but a
+/// native minimald has no lifecycle file and its wait returns at once, saying
+/// nothing, so only the probe can answer for that backend. Anything we cannot
+/// read is not a confirmed stop.
+///
+/// Which makes the recovery a VM-backend one in practice: the native probe fires
+/// once, immediately, and minimald keeps its listener bound through the 5s drain
+/// grace it takes after its accept loop exits (minimald's `SHUTDOWN_GRACE`), so
+/// a connect in that window still succeeds and reports "running". Native
+/// therefore keeps today's fail-on-RPC-error behaviour — which is right for it:
+/// a native daemon is not pid-1 and does not take the transport down with it, so
+/// the lost reply this recovers from is not a failure mode it has.
+async fn daemon_confirmed_stopped(use_minvmd: bool, minimal_dir: Option<PathBuf>) -> bool {
+    // Both calls can sleep-poll, so they go on the blocking pool rather than
+    // stalling an async worker (rust-coding-standards: no blocking in an async
+    // context). A panicked probe observed nothing, which is not a confirmation.
+    tokio::task::spawn_blocking(move || {
+        autospawn::wait_for_daemon_stopped(use_minvmd, minimal_dir.as_deref()).is_ok()
+            && !autospawn::is_daemon_running(use_minvmd, minimal_dir.as_deref()).unwrap_or(true)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Decide what `min stop` reports, given how the `Shutdown` RPC ended, the wait
+/// an accepted shutdown runs out, and — only when the RPC itself failed —
+/// whether the daemon can nevertheless be confirmed down.
+///
+/// What `stop` promises is observable: the daemon is down. On a VM target the
+/// daemon IS the guest's pid-1, so an accepted shutdown takes the SSH transport
+/// down with it — as a *consequence of succeeding* — and the reply can be lost
+/// before the client decodes it. Gating on the transport would report failure
+/// for a stop that did exactly what was asked, so a failed RPC over a daemon
+/// that did stop is a success. A daemon still there afterwards is a real
+/// failure, and the RPC error — the one that explains what went wrong — is what
+/// the user sees.
+///
+/// Only that failure arm probes. An accepted shutdown is judged by its wait
+/// alone: the daemon acknowledges before it has finished going down, so asking
+/// again there would race its own teardown and fail stops that worked.
+///
+/// `SessionsLive` is not a lost reply but an answer: the daemon refused, and is
+/// going nowhere, so there is nothing to observe.
+async fn stop_outcome<W, C>(
+    resp: Result<minimald_rpc::ShutdownResponse, anyhow::Error>,
+    wait_for_stopped: W,
+    confirm_stopped: C,
+) -> Result<(), anyhow::Error>
+where
+    W: AsyncFnOnce() -> Result<(), anyhow::Error>,
+    C: AsyncFnOnce() -> bool,
+{
+    use minimald_rpc::ShutdownResponse;
+    match resp {
+        Ok(ShutdownResponse::ShuttingDown) => {
+            println!("Daemon is shutting down.");
+            wait_for_stopped().await
         }
-        ShutdownResponse::SessionsLive => {
+        Ok(ShutdownResponse::SessionsLive) => {
             bail!("daemon has active sessions; pass --force to shut down anyway")
+        }
+        Err(rpc_err) => {
+            if confirm_stopped().await {
+                // Say what was suppressed. Exiting 0 over a failed RPC is only
+                // sound because the daemon is observably down, and a silent
+                // recovery would leave nothing — in a terminal or in a soak
+                // log — to check that reading against. stderr, so it survives
+                // the `>/dev/null` every scripted caller wraps `stop` in.
+                eprintln!("warning: the shutdown RPC failed, but the daemon stopped: {rpc_err:#}");
+                println!("Daemon is shutting down.");
+                Ok(())
+            } else {
+                Err(rpc_err)
+            }
         }
     }
 }
@@ -2509,15 +2667,32 @@ pub fn build_config(global: &GlobalArgs) -> Result<mctx::Config, mctx::Error> {
 /// generate a `minimal.toml`, show the plan, prompt for confirmation,
 /// and write the file. Shared by `cmd_init` and the `cmd_activate`
 /// missing-mfile prompt.
-fn run_init_flow(config: mctx::Config, skip_confirm: bool) -> Result<(), anyhow::Error> {
+fn run_init_flow(
+    config: mctx::Config,
+    skip_confirm: bool,
+    force: bool,
+) -> Result<(), anyhow::Error> {
     use op::ProjectOp as _;
     let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| anyhow::anyhow!("{e}"))?;
     let plan = op::InitProject
         .run(&mut env)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // Overwriting an existing minimal.toml is destructive — no backup is
+    // written — so require an explicit --force rather than let confirm() read
+    // a non-TTY EOF as a silent "yes". Mirrors `min session destroy --all`,
+    // which likewise refuses non-interactively and names the flag to proceed.
+    let exists = plan.toml_path.exists();
+    if exists && !force {
+        bail!(
+            "refusing to overwrite existing {} without confirmation; pass --force",
+            plan.toml_path.display()
+        );
+    }
+
     if !skip_confirm {
-        eprintln!("\nWill create {}:\n", plan.toml_path.display());
+        let verb = if exists { "overwrite" } else { "create" };
+        eprintln!("\nWill {verb} {}:\n", plan.toml_path.display());
         eprintln!("---");
         eprint!("{}", plan.content);
         eprintln!("---");
@@ -2531,7 +2706,11 @@ fn run_init_flow(config: mctx::Config, skip_confirm: bool) -> Result<(), anyhow:
     std::fs::write(&plan.toml_path, &plan.content)
         .with_context(|| format!("writing {}", plan.toml_path.display()))?;
 
-    eprintln!("Created {}", plan.toml_path.display());
+    eprintln!(
+        "{} {}",
+        if exists { "Updated" } else { "Created" },
+        plan.toml_path.display()
+    );
 
     Ok(())
 }
@@ -2539,7 +2718,7 @@ fn run_init_flow(config: mctx::Config, skip_confirm: bool) -> Result<(), anyhow:
 /// Initialize a `minimal.toml` based on the source tree.
 pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::Error> {
     let config = build_config(global)?;
-    run_init_flow(config, args.yes).map_err(mctx::Error::Other)
+    run_init_flow(config, args.yes, args.force).map_err(mctx::Error::Other)
 }
 
 /// Add packages as dependencies to the project's `minimal.toml`.
@@ -2699,7 +2878,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("not a TTY") && err.contains("--command"),
+            err.contains("not a TTY"),
             "expected an actionable non-TTY error, got: {err}"
         );
         ensure_interactive_attach_tty(true).expect("a real terminal must pass the guard");
@@ -2746,6 +2925,26 @@ mod tests {
         drop(guard);
         assert!(!keyboard_signals::is_ignored(keyboard_signals::SIGINT));
         assert!(!keyboard_signals::is_ignored(keyboard_signals::SIGQUIT));
+    }
+
+    /// A bare `min` must be inert: it prints the top-level help and succeeds,
+    /// touching no daemon and creating no session. The `Cli` command tree has
+    /// to stay renderable for that (a malformed clap definition panics in
+    /// `print_help`, not at parse time).
+    #[test]
+    fn bare_min_prints_help() {
+        cmd_default().expect("bare `min` must print help and succeed");
+    }
+
+    /// The attach/create confirmation prefers the session name and appends a
+    /// short id so two same-named sessions built from the same directory are
+    /// still distinguishable; an unnamed session falls back to the short id
+    /// alone rather than the full 36-character UUID.
+    #[test]
+    fn session_announce_label_prefers_name_with_short_id() {
+        let id = sessions::SessionId::parse_str("a1b2c3d4-0000-0000-0000-000000000000").unwrap();
+        assert_eq!(session_announce_label(&id, Some("api")), "api (a1b2c3d4)");
+        assert_eq!(session_announce_label(&id, None), "a1b2c3d4");
     }
 
     /// A VM-backed provider dir carries the guest's recorded host key, so
@@ -2817,6 +3016,79 @@ mod tests {
         use clap::Parser as _;
         let cli = Cli::try_parse_from(["min", "ls"]).unwrap();
         assert!(!cli.global_args.use_minvmd());
+    }
+
+    /// `min session list` is the canonical `<noun> list` spelling of the
+    /// flagship list command; `min ls` (top-level) and `min session ls`
+    /// (noun-level) are visible aliases. All three parse to the same `LsArgs`,
+    /// so `--raw`/`--json` reach the one `cmd_ls` implementation identically.
+    #[test]
+    fn session_list_spellings_all_reach_ls() {
+        use clap::Parser as _;
+        let ls_args = |args: &[&str]| -> LsArgs {
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Command::Ls(a))
+                | Some(Command::Session(SessionArgs {
+                    command: SessionCommand::List(a),
+                })) => a,
+                _ => panic!("expected an ls command for {args:?}"),
+            }
+        };
+
+        for spelling in [
+            ["min", "session", "list"].as_slice(),
+            ["min", "session", "ls"].as_slice(),
+            ["min", "ls"].as_slice(),
+        ] {
+            let a = ls_args(spelling);
+            assert!(
+                !a.raw && !a.json,
+                "{spelling:?} must default both flags off"
+            );
+        }
+
+        // `--raw`/`--json` are accepted on the canonical and the bare form alike.
+        let canonical = ls_args(&["min", "session", "list", "--raw", "--json"]);
+        assert!(canonical.raw && canonical.json);
+        let bare = ls_args(&["min", "ls", "--json"]);
+        assert!(bare.json && !bare.raw);
+    }
+
+    /// `repo_dir` and `minimal_dir` are global, so they must be accepted after
+    /// the subcommand — not just before it (#1039).
+    #[test]
+    fn repo_and_minimal_dir_are_accepted_after_the_subcommand() {
+        use clap::Parser as _;
+        let cli =
+            Cli::try_parse_from(["min", "ls", "-C", "/tmp/x", "--minimal-dir", "/tmp/y"]).unwrap();
+        let p = std::path::Path::new;
+        assert_eq!(cli.global_args.repo_dir.as_deref(), Some(p("/tmp/x")));
+        assert_eq!(cli.global_args.minimal_dir.as_deref(), Some(p("/tmp/y")));
+    }
+
+    /// `session destroy` must present `[SESSION]` and `--all` as mutually
+    /// exclusive alternatives, one required. Regression for #1038: the error
+    /// path used to hide `--all` and demand a session outright, yielding a
+    /// usage line that could never parse.
+    #[test]
+    fn destroy_models_session_and_all_as_required_alternatives() {
+        use clap::Parser as _;
+        let parse = |args: &[&str]| Cli::try_parse_from(args);
+
+        // Exactly one of a session or --all is required; both together conflict.
+        assert!(parse(&["min", "session", "destroy", "web"]).is_ok());
+        assert!(parse(&["min", "session", "destroy", "--all"]).is_ok());
+        assert!(parse(&["min", "session", "destroy"]).is_err());
+        assert!(parse(&["min", "session", "destroy", "--all", "web"]).is_err());
+
+        // --force only makes sense with --all, and its error no longer hides
+        // that --all is the alternative the bare error omitted.
+        assert!(parse(&["min", "session", "destroy", "--all", "--force"]).is_ok());
+        let bare = parse(&["min", "session", "destroy", "-f"])
+            .err()
+            .expect("-f without --all must fail to parse")
+            .to_string();
+        assert!(bare.contains("--all"), "usage must surface --all: {bare}");
     }
 
     #[test]
@@ -2936,5 +3208,140 @@ mod tests {
         std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
         let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
         assert!(resolve_upload_root(path).is_err());
+    }
+
+    /// On a VM target the daemon is the guest's pid-1, so an accepted shutdown
+    /// takes the SSH transport down with it and the reply can be lost on the
+    /// way out. `stop` gates on the observable goal, not on the transport: a
+    /// daemon that reached the stopped state is a stop that worked.
+    #[tokio::test]
+    async fn stop_succeeds_when_a_lost_reply_still_stopped_the_daemon() {
+        stop_outcome(
+            Err(anyhow::anyhow!("EOF while parsing a value")
+                .context("decode response for shutdown")
+                .context("Shutdown RPC failed")),
+            async || Ok(()),
+            async || true,
+        )
+        .await
+        .expect("a daemon that reached the stopped state is a successful stop");
+    }
+
+    /// The other half of that judgement: a failed RPC over a daemon that is
+    /// still there is a real failure, and the RPC's own error — context and all
+    /// — is what the user needs.
+    #[tokio::test]
+    async fn stop_reports_the_rpc_error_when_the_daemon_is_still_running() {
+        let err = stop_outcome(
+            Err(anyhow::anyhow!("connection reset").context("Shutdown RPC failed")),
+            async || Ok(()),
+            async || false,
+        )
+        .await
+        .unwrap_err();
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("Shutdown RPC failed") && chain.contains("connection reset"),
+            "expected the original RPC error chain, got: {chain}"
+        );
+    }
+
+    /// A refusal is an answer, not a lost reply: it keeps its own message and
+    /// its non-zero exit, and observes nothing — the daemon it names is staying
+    /// up on purpose.
+    #[tokio::test]
+    async fn stop_with_live_sessions_bails_without_waiting() {
+        let observed = std::cell::Cell::new(false);
+        let err = stop_outcome(
+            Ok(minimald_rpc::ShutdownResponse::SessionsLive),
+            async || {
+                observed.set(true);
+                Ok(())
+            },
+            async || {
+                observed.set(true);
+                true
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "daemon has active sessions; pass --force to shut down anyway"
+        );
+        assert!(
+            !observed.get(),
+            "a refused shutdown has nothing to wait for"
+        );
+    }
+
+    /// An acknowledged shutdown still has to finish, and its wait is the whole
+    /// judgement: a daemon that never reaches a stopped state fails with the
+    /// wait's own error, and the extra liveness probe — which exists only to
+    /// judge a *failed* RPC — never races a teardown the daemon acknowledged.
+    #[tokio::test]
+    async fn stop_fails_when_an_accepted_shutdown_never_completes() {
+        stop_outcome(
+            Ok(minimald_rpc::ShutdownResponse::ShuttingDown),
+            async || Ok(()),
+            async || false,
+        )
+        .await
+        .expect("an acknowledged shutdown that completes is a successful stop");
+
+        let probed = std::cell::Cell::new(false);
+        let err = stop_outcome(
+            Ok(minimald_rpc::ShutdownResponse::ShuttingDown),
+            async || Err(anyhow::anyhow!("the VM is still shutting down after 20s")),
+            async || {
+                probed.set(true);
+                true
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("still shutting down"),
+            "expected the wait's error, got: {err}"
+        );
+        assert!(
+            !probed.get(),
+            "an accepted shutdown is judged by its wait alone"
+        );
+    }
+
+    /// The recovery's actual observation, not a stand-in for it: the real
+    /// probe `cmd_stop` hands `stop_outcome`, run against a state dir no daemon
+    /// ever ran in. Nothing is listening and no lifecycle is active, which is
+    /// exactly the post-shutdown reading a lost reply has to be judged on, so
+    /// it must confirm the stop.
+    #[tokio::test]
+    async fn the_real_probe_confirms_a_daemon_that_is_not_there() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            daemon_confirmed_stopped(true, Some(dir.path().to_path_buf())).await,
+            "a state dir with no live daemon is a confirmed stop"
+        );
+    }
+
+    /// The already-down fast path: against a state dir no daemon ever ran in,
+    /// `stop` reports the goal state and exits 0 without connecting or
+    /// spawning anything.
+    #[tokio::test]
+    async fn stop_is_a_no_op_when_the_daemon_is_already_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = GlobalArgs {
+            repo_dir: None,
+            minimal_dir: Some(dir.path().to_path_buf()),
+            config_dir: None,
+            provider: None,
+            no_input: true,
+        };
+
+        cmd_stop(&global, StopArgs { force: false })
+            .await
+            .expect("an already-stopped daemon is the goal state, not an error");
     }
 }

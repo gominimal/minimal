@@ -58,7 +58,7 @@ that macOS imposes. The daemon:
    cold; warm reattach is sub-second.
 4. `minvmd` auto-spawns on first CLI call and survives client exit.
 5. `minvmd status` / `minvmd stop` work; PID and socket discovery follow
-   XDG conventions; concurrent CLI invocations don't race lifecycle.
+   XDG conventions; concurrent CLI invocations do not race lifecycle.
 
 ## User Stories
 
@@ -122,9 +122,9 @@ with no rootfs work.
 1. **File:** `crates/minvmd/src/krun/raw.rs` contains FFI declarations
    for `krun_create_ctx`, `krun_set_vm_config`, `krun_set_exec`,
    `krun_start_enter`, `krun_free_ctx` with `// SAFETY:` comments,
-   demonstrates the FFI scaffold and safety discipline.
+   shows the FFI scaffold and safety discipline.
 2. **CLI:** `MINVMD_E2E=1 cargo test -p minvmd --test krun_smoke_integration -- --include-ignored`
-   exits 0 on a Mac with libkrun installed, demonstrates end-to-end
+   exits 0 on a Mac with libkrun installed, shows end-to-end
    FFI bring-up.
 
 ---
@@ -189,10 +189,10 @@ mounts `/proc`, `/sys`, `/dev`, and execs the workload set via
 
 1. **CLI:** `MINVMD_KERNEL_PATH=<path> MINVMD_ROOTFS_PATH=<path> minvmd boot --foreground`
    boots and prints `vm-up` to stdout within 5 s, and a host-side reader
-   on the vsock marker socket reads `READY`, demonstrates kernel+rootfs
+   on the vsock marker socket reads `READY`, shows kernel+rootfs
    come up.
 2. **Test:** `tests/boot_integration.rs` (gated `MINVMD_E2E=1`, `#[ignore]`)
-   asserts the marker round-trip end-to-end, demonstrates automated
+   asserts the marker round-trip end-to-end, shows automated
    boot verification.
 
 ---
@@ -246,14 +246,14 @@ permissions), guest-side vsock stub
 1. **Test:** `tests/bridge_e2e.rs` (gated `MINVMD_E2E=1`, `#[ignore]`)
    boots a VM whose guest listens on vsock `VSOCK_PORT`, opens 5
    concurrent host UDS connections, each writes a distinct payload and
-   reads it back. All 5 succeed, demonstrates libkrun-multiplexed
+   reads it back. All 5 succeed, shows libkrun-multiplexed
    bidirectional bridging. (Removed in the auto-discovery migration: it
    bridged the Stage-1 socat-echo stub that minimald-as-pid1 replaced
    with a direct SSH session server; session coverage of the bridge is
    now `tests/minimald_session_integration.rs`.)
 2. **CLI:** With a stub `minimald` reachable on vsock `VSOCK_PORT`,
    running `nc -U $XDG_RUNTIME_DIR/minimal/minimald.sock` from the host
-   yields the empty `list-sessions` response end-to-end, demonstrates
+   yields the empty `list-sessions` response end-to-end, shows
    the host→guest path.
 
 ---
@@ -310,14 +310,14 @@ auto-spawns it; subsequent calls reuse; `minvmd status` introspects;
 
 1. **Test:** `crates/minvmd/src/lifecycle.rs` includes table-driven
    `#[test]`s for every legal and illegal transition;
-   `cargo test -p minvmd lifecycle::` passes, demonstrates the pure
+   `cargo test -p minvmd lifecycle::` passes, shows the pure
    state machine.
 2. **CLI:** `minvmd stop && minvmd status --json` prints
-   `{"state":"stopped",...}` and exits 1, demonstrates stop + status
+   `{"state":"stopped",...}` and exits 1, shows stop + status
    semantics.
 3. **CLI:** From a clean state (no minvmd running), `minimal ls` on a
    Mac succeeds within 8 s and a subsequent `minvmd status` reports
-   `running`; a second `minimal ls` completes in < 500 ms, demonstrates
+   `running`; a second `minimal ls` completes in < 500 ms, shows
    auto-spawn + warm reuse.
 
 ## Non-Goals

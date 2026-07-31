@@ -13,7 +13,7 @@ session needs; a loadout carries what *you* want on top (your editor,
 terminal multiplexer, shell config, and dotfiles) so each development
 environment comes up matching your muscle memory.
 
-Loadouts apply to sessions (`min activate`); they are not used by task
+Loadouts apply to sessions (`min session activate`); they are not used by task
 sandboxes, which have their own `packages`/`env_vars`/`patches` schema
 described in [Tasks](./tasks.md).
 
@@ -66,8 +66,6 @@ patches = [
 [vars]
 EDITOR    = "hx"
 VISUAL    = "hx"
-TERM      = { inherit = true, default = "xterm-256color" }
-COLORTERM = { inherit = true }
 
 # Declared to warm helix's tree-sitter grammar cache when the session
 # comes up. Best-effort; failures don't tank activation.
@@ -76,7 +74,7 @@ on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || 
 ```
 
 Saved as `<config>/minimal/loadouts/dev.toml`, this is applied with
-`min activate --loadout dev`, or automatically via
+`min session activate --loadout dev`, or automatically via
 [`default_loadouts`](#client-config).
 
 ## Loadout schema
@@ -128,17 +126,17 @@ Variables set in the session environment. Names must be POSIX-shaped
 ```toml
 [vars]
 EDITOR = "hx"                                # literal value
-TERM   = { inherit = true, default = "xterm-256color" }  # inherit, with fallback
-COLORTERM = { inherit = true }               # inherit from the host env
+PAGER   = { inherit = true, default = "less" }  # inherit, with fallback
+MUXER = { inherit = true }               # inherit from the host env
 ```
 
 - A **literal** string sets the variable to that value.
 - `{ inherit = true }` passes the variable through from the environment of
-  the `min` process on the host. If the host doesn't have it set, the
+  the `min` process on the host. If the host does not have it set, the
   variable is dropped from the session (with a warning) rather than failing
   activation, so opportunistically inheriting things like `TERM` is safe.
 - `{ inherit = true, default = "..." }` inherits, falling back to `default`
-  when the host doesn't have the variable set.
+  when the host does not have the variable set.
 
 `inherit = false` is rejected; omit the variable instead.
 
@@ -234,7 +232,7 @@ follow_symlinks = true
 
 ## Selecting loadouts at activation
 
-[`min activate`](./cli-min.md#activate) decides which loadouts to apply
+[`min session activate`](./cli-min.md#session-activate) decides which loadouts to apply
 from two flags:
 
 | Flag | Description |
@@ -287,8 +285,8 @@ directory, one row per file:
 
 ```
   NAME   DESCRIPTION                     CONTRIBUTES
-* dev    helix + zellij with my dotfiles 2 pkg / 4 var / 5 patch / 1 hook
-  extra                                  1 pkg / 0 var / 0 patch / 0 hook
+* dev    helix + zellij with my dotfiles 2 pkg / 4 var / 5 patch
+  extra                                  1 pkg / 0 var / 0 patch
 
 * default (from `[loadouts].default_loadouts`)
 ```
@@ -330,7 +328,7 @@ file means an empty policy; a fresh install activates fine without it.
 
 ## Vars in the attach shell
 
-The interactive shell minted by [`min attach`](./cli-min.md#attach) is
+The interactive shell minted by [`min session attach`](./cli-min.md#session-attach) is
 `bash --noprofile -l`, a login shell that sources **no** startup files
 (not `/etc/profile`, `~/.bash_profile`, or `~/.bashrc`), so rc-file
 patches cannot influence it. Interactive setup travels through the

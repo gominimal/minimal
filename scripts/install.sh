@@ -14,7 +14,13 @@
 # Usage:
 #   curl --proto '=https' --tlsv1.2 -fsSL <URL>/install.sh | sh
 #   curl … | sh -s -- unstable          # pick a non-default target
+#   curl … | sh -s -- --force-stop      # stop live sessions without asking
 #   curl … | sh -s -- --uninstall       # remove what a prior run installed
+#
+# An upgrade must stop the running daemon before it swaps its binaries (R5.5).
+# When that daemon has active sessions the installer asks on the terminal before
+# ending them; --force-stop (or a non-empty MINIMAL_INSTALL_FORCE_STOP) skips the
+# question, for scripted upgrades that must not block.
 #
 # Uninstall walks the local install record (no network) and removes each file
 # whose on-disk bytes still match what the installer recorded writing; it accepts
@@ -62,6 +68,13 @@ MODE=install
 uninstall_force=0
 uninstall_purge=0
 dry_run=0
+# Install mode's escape hatch for the active-sessions prompt (R5.5), settable by
+# flag or environment because `curl … | sh` makes argv awkward. Deliberately NOT
+# named --force: that flag already means "remove modified files" in uninstall.
+force_stop=0
+if [ -n "${MINIMAL_INSTALL_FORCE_STOP:-}" ]; then
+    force_stop=1
+fi
 if [ "${1-}" = "--uninstall" ]; then
     MODE=uninstall
     shift
@@ -73,6 +86,19 @@ if [ "${1-}" = "--uninstall" ]; then
             *)            die "unknown uninstall option '$1' (allowed: --force, --purge, --dry-run)" ;;
         esac
         shift
+    done
+else
+    # Install mode's only option. Filter it out of "$@" wherever it appears (by
+    # rotating the kept arguments to the end) so the sole positional — the
+    # target — is still $1 for Unit 2, whichever side of the flag it was on.
+    argn=$#
+    while [ "$argn" -gt 0 ]; do
+        case "$1" in
+            --force-stop) force_stop=1 ;;
+            *)            set -- "$@" "$1" ;;
+        esac
+        shift
+        argn=$((argn - 1))
     done
 fi
 
@@ -523,16 +549,67 @@ installed=0 skipped=0
 # serving from the old image while the new `min` talks to it. Stop it first,
 # using the `min` ALREADY on disk — that one matches the daemon it started, and
 # it is about to be overwritten. Deliberately best-effort and silent: nothing
-# installed yet, no daemon running, or a `min` too old to have `stop --force`
-# all mean "nothing to stop", and none of them should fail an install whose
-# binaries are otherwise fine. `min stop` only connects (it never autospawns),
-# so with no daemon up this is a failed connect and nothing more.
+# installed yet, no daemon running, or a `min` too old to have `stop` all mean
+# "nothing to stop", and none of them should fail an install whose binaries are
+# otherwise fine. `min stop` only connects (it never autospawns), so with no
+# daemon up this is a failed connect and nothing more.
+#
+# The graceful `min stop` goes first because it already refuses while sessions
+# are live, printing exactly this message — the one signal that an upgrade is
+# about to destroy someone's work, and worth a question. Matched literally
+# rather than on exit status: a bare non-zero also means no daemon, a failed
+# connect, or a transport drop on an otherwise successful stop, and none of
+# those may turn every upgrade into a prompt.
+#
+# Every `min` below reads from /dev/null: this runs inside the component loop,
+# whose stdin is the applicable-manifest file, and a child that ever read stdin
+# would eat the rows still to be installed.
+sessions_live_msg='daemon has active sessions'
+
+# Ask, on the CONTROLLING TERMINAL, whether to end the live sessions. Under
+# `curl … | sh` stdin is the script pipe, so reading the answer from it would
+# consume the script; /dev/tty is the only sound source (overridable so the
+# test harness can drive both answers). No terminal to ask on — CI, a
+# non-interactive shell — means nobody can consent: say so and let the caller
+# abort, rather than hang or silently destroy work. Returns non-zero when the
+# upgrade must not proceed.
+confirm_force_stop() {
+    _tty="${MINIMAL_OVERRIDE_TTY:-/dev/tty}"
+    say ""
+    say "warning: the running daemon has active sessions:"
+    "$bindir/min" ls >&2 </dev/null || true
+    say ""
+    if ! (exec <"$_tty") 2>/dev/null; then
+        say "there is no terminal to confirm on; rerun with --force-stop"
+        say "(or MINIMAL_INSTALL_FORCE_STOP=1) to stop those sessions anyway."
+        return 1
+    fi
+    printf 'Stopping the daemon ends them. Continue? [y/N] ' >&2
+    _ans=
+    read -r _ans <"$_tty" || _ans=
+    case "$_ans" in
+        [Yy]*) return 0 ;;
+        *)     return 1 ;;
+    esac
+}
+
 daemon_stop_tried=0
 stop_running_daemon() {
     [ "$daemon_stop_tried" -eq 0 ] || return 0
     daemon_stop_tried=1
     [ -x "$bindir/min" ] || return 0
-    "$bindir/min" stop --force >/dev/null 2>&1 || true
+
+    if [ "$force_stop" -eq 0 ]; then
+        # Stopped gracefully (or there was nothing to stop): done, no --force.
+        if _stop_out="$("$bindir/min" stop 2>&1 </dev/null)"; then
+            return 0
+        fi
+        case "$_stop_out" in
+            *"$sessions_live_msg"*) confirm_force_stop || return 1 ;;
+        esac
+        # Any other failure falls through to the force stop, silent as before.
+    fi
+    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null || true
 }
 
 # The prior run's install record (R6.1) maps each component to the hash of the
@@ -646,8 +723,19 @@ while read -r comp _ _ _ want kind dest src; do
     # first replaced component. Only executable images wedge a running daemon
     # (bin, and lib — minvmd's @rpath dylib); replacing a data file (e.g. a
     # re-shipped apparmor text) must not kill live sessions.
+    # A declined (or unconfirmable) stop aborts here, still before the first
+    # rename: the downloaded temp file is dropped, no record is written, and
+    # the daemon and its sessions are left exactly as they were. The message
+    # claims only what the abort point guarantees — the stop runs before the
+    # FIRST bin/lib swap, so no executable has been replaced, but a `data` row
+    # earlier in the manifest may already have been.
     case "$prefix" in
-        bin|lib) stop_running_daemon ;;
+        bin|lib)
+            stop_running_daemon || {
+                rm -f "$tmp"
+                die "aborted: no executables were replaced, the daemon is still running"
+            }
+            ;;
     esac
 
     mv -f "$tmp" "$target_file"
@@ -732,49 +820,44 @@ end
 EOF
 record_generated shell-init-fish "$init_dir/fish.fish"
 
-# R9.3 — tab completions, generated by the just-installed binary itself so
-# they always match the installed version, written atomically like any other
-# install. A failure here is a warning, not an error: the binaries are already
-# correctly installed, and completions regenerate on the next run.
+# R9.3 — tab completions, installed by the just-installed binary itself
+# (`min completions install <shell>`), so they always match the installed
+# version and the bookkeeping — target dir per shell, atomic write,
+# unwritable-dir tolerance, zsh zcompdump invalidation — has exactly one
+# implementation, reachable by everyone rather than only by `curl | sh` users.
+# The binary prints every path it wrote on stdout, one per line; that is the
+# contract, and those paths are what this records. A failure here is a warning,
+# not an error: the binaries are already correctly installed, and completions
+# regenerate on the next run.
 gen_completions() {
-    _dir="${2%/*}"
-    _tmp="$2.tmp.$$"
-    # Probe that the dir exists and is writable BEFORE generating, inside a
-    # subshell with stderr nulled: the completion dirs are shared, user-owned
-    # locations that can pre-exist unwritable (e.g. a root-owned
-    # ~/.config/fish/completions), and a redirection error is reported by the
-    # shell itself — a plain `2>/dev/null` on the command cannot silence it,
-    # only the subshell wrapper can. Non-fatal either way: the binaries are
-    # already correctly installed.
-    if ! ( mkdir -p "$_dir" && : >"$_tmp" ) 2>/dev/null; then
-        say "  completions: warning: failed to install $1 completions ($_dir is not writable)"
+    _out="$tmpdir/completions.out"
+    _err="$tmpdir/completions.err"
+    # One shell per call, so each record row still names the shell it belongs
+    # to (uninstall walks those rows). The binary exits 0 even when it skipped
+    # a shell with a warning, so a non-zero status means the binary itself is
+    # unusable — the one case where its stderr is dropped rather than relayed,
+    # since an unrunnable `min` produces the shell's noise, not a warning.
+    if ! "$bindir/min" completions install "$1" >"$_out" 2>"$_err"; then
+        say "  completions: warning: could not generate $1 completions (non-fatal)"
         return 0
     fi
-    if ( "$bindir/min" completions "$1" >"$_tmp" ) 2>/dev/null \
-        && [ -s "$_tmp" ] \
-        && mv -f "$_tmp" "$2" 2>/dev/null; then
-        record_generated "completions-$1" "$2"
-        # A pre-existing compinit dump can keep trusting its stale contents
-        # after the zsh completion file changes (see zcompdump above) — the
-        # upgrade path from the pre-rewrite installer hits exactly that, and
-        # "restart your shell" cannot fix it. Cheap rm, so unconditional on
-        # every (re)generation; failure is as non-fatal as the rest of R9.3.
-        if [ "$1" = zsh ] && [ -f "$zcompdump" ]; then
-            if rm -f "$zcompdump" 2>/dev/null; then
-                say "  completions: cleared compinit dump cache $zcompdump"
-            fi
-        fi
-    else
-        rm -f "$_tmp" 2>/dev/null || true
-        say "  completions: warning: could not generate $1 completions (non-fatal)"
-    fi
+    # Its warnings (an unwritable dir) and notices (a dropped compinit dump)
+    # arrive on stderr, re-emitted here so they read like the rest of the
+    # installer's output.
+    while IFS= read -r _line; do
+        say "  completions: $_line"
+    done <"$_err"
+    while IFS= read -r _path; do
+        [ -f "$_path" ] || continue
+        record_generated "completions-$1" "$_path"
+    done <"$_out"
 }
 
 if [ -x "$bindir/min" ]; then
     say "  completions: generating for bash, zsh, fish"
-    gen_completions bash "$bash_comp_dir/min"
-    gen_completions zsh  "$zsh_comp_dir/_min"
-    gen_completions fish "$fish_comp_dir/min.fish"
+    gen_completions bash
+    gen_completions zsh
+    gen_completions fish
 else
     say "  completions: skipped ($bindir/min not present)"
 fi

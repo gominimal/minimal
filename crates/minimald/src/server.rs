@@ -908,7 +908,7 @@ mod tests {
     }
 
     /// A session left unfinalized when its creating connection closes —
-    /// the state an interrupted `min activate` (Ctrl-C at the gating
+    /// the state an interrupted `min session activate` (Ctrl-C at the gating
     /// prompt) leaves on the daemon — is reaped, while a finalized
     /// (`Active`) session created over that same connection survives.
     #[tokio::test]

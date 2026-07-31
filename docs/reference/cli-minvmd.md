@@ -95,5 +95,5 @@ minvmd completions <SHELL>
 ```
 
 Generates a shell tab-completion script. Supported shells include `bash`, `zsh`,
-`elvish`, `fish`.
+`elvish`, `fish`, `powershell`.
 

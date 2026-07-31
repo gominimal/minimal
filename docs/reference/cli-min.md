@@ -8,13 +8,20 @@ description: "Reference for the min session CLI: create, attach to, and manage s
 `min` is the Minimal session CLI. It talks to the `minimald` daemon (see
 [minimald](./cli-minimald.md)) to create, attach to, and manage sandboxed
 development sessions. Most commands start the daemon automatically when it
-isn't running (`bug`, `stop`, and `version` are the exceptions): natively on
-Linux, or inside the [`minvmd`](./cli-minvmd.md) microVM host daemon on macOS
-(and on Linux under `--provider local-minvmd`). Running bare `min` with no
-subcommand resolves a session for the current directory (activating one if
-needed) and attaches to it.
+isn't running, with `bug`, `stop`, and `version` being the exceptions. The 
+daemon starts natively on Linux (and under `--provider local-minvmd`) or 
+inside the [`minvmd`](./cli-minvmd.md) microVM host daemon on macOS. 
+Running bare `min` with no subcommand prints this help and exits; use
+`min session attach` to get into a session for the current directory, or
+`min session activate` to create one.
 
-Generated from `--help` at `3a05252c`.
+Commands are spelled `min <noun> <verb>`, and every noun accepts its singular
+and plural form (`session`/`sessions`, `loadout`/`loadouts`). A handful of
+bare verbs (`ls`, `stop`,
+`init`, `add`, `update`) survive at the top level as deliberate ergonomic
+exceptions, called out as such below; see
+[the CLI convention](./cli.md#command-naming-convention) for the rule and the
+full list of exceptions.
 
 ## Global flags
 
@@ -30,10 +37,10 @@ These apply to every subcommand.
 
 ## Commands
 
-### `ls`
+### `session list` (aliases: `min ls`, `min session ls`)
 
 ```
-min ls [--raw] [--json]
+min session list [--raw] [--json]
 ```
 
 Lists sessions. `--raw` prints raw session IDs one per line for piping
@@ -42,10 +49,15 @@ JSON. When the daemon reports a shared resource pool, the table is headed
 by a `RESOURCE POOL:` line (CPU cores, memory, and the number of sessions
 sharing them); `--raw` omits it.
 
-### `activate`
+`min ls` is the same command kept bare at the top level — a deliberate
+exception to the `min <noun> <verb>` convention, since it is the
+highest-traffic command in the CLI; `min session ls` is the noun-level alias.
+All three spellings take the same flags and produce identical output.
+
+### `session activate`
 
 ```
-min activate [OPTIONS] [PATH]
+min session activate [OPTIONS] [PATH]
 ```
 
 Activates (creates) a new session for the project at `PATH` (defaults to
@@ -60,28 +72,43 @@ the current directory).
 | `--no-prompt` | | Fail instead of prompting when the daemon surfaces items user policy can't auto-decide; implied when stdin/stderr isn't a TTY |
 | `--attach` | | Automatically attach after creation |
 
-### `attach`
+### `session attach`
 
 ```
-min attach [-c <COMMAND>] [SESSION]
+min session attach [SESSION]
 ```
 
 Attaches to an existing session, identified by UUID or session name. When
-`SESSION` is omitted, `min attach` resolves a session from the current
+`SESSION` is omitted, `min session attach` resolves a session from the current
 working directory (or the only existing session) and opens an interactive
 picker if the choice is ambiguous (`--no-input` errors instead).
-`-c/--command` execs a command in the session context non-interactively
-instead of opening an interactive shell; the daemon accepts only
-`min run <task name>` invocations on this channel, not arbitrary commands.
 
-### `destroy`
+### `session destroy`
 
 ```
-min destroy [--all] [-f|--force] [SESSION]
+min session destroy [--all] [-f|--force] [SESSION]
 ```
 
 Destroys (terminates) a session. `--all` destroys all sessions;
 `-f/--force` skips the confirmation when destroying all sessions.
+
+### `session rename`
+
+```
+min session rename <SESSION> <NEW_NAME>
+```
+
+Renames an existing session.
+
+### `session policy`
+
+```
+min session policy <SESSION>
+```
+
+Prints the effective networking policy for `SESSION` (a UUID or session
+name) as JSON — an object with `egress` and `ingress` fields, each null
+when unset. Resolved from the daemon.
 
 ### `stop`
 
@@ -90,7 +117,13 @@ min stop [-f|--force]
 ```
 
 Shuts down the `minimald` daemon. `--force` shuts down even if active
-sessions exist.
+sessions exist. This stops the daemon backend that hosts sessions, and the
+sessions themselves survive it (contrast
+[`session destroy`](#session-destroy), which removes one session and leaves the
+daemon running).
+
+`stop` stays bare at the top level — a deliberate exception to the
+`min <noun> <verb>` convention: it acts on the daemon, not on any session.
 
 ### `loadout list` (alias: `ls`)
 
@@ -125,29 +158,21 @@ broken install still yields a valid archive that explains what is
 missing.
 
 Diagnosing a wedged system must not change it: `bug` mutates no state and
-never starts a daemon; it works even when none is running.
+never starts a daemon; it works even when none are running.
 
 Secret-shaped values (env vars, tokens) are redacted before they enter
 the archive: only a small allowlist of env names (`RUST_LOG`, `HOME`,
 `SHELL`, `TERM`, `PATH`, and the `XDG_*` / `MINIMAL_*` / `MINVMD_*` /
-`MINIMALD_*` prefixes) has values captured verbatim (a sensitive-shaped
+`MINIMALD_*` prefixes) have values captured verbatim (a sensitive-shaped
 name always loses to the allowlist), and every other env var is reported
 by name only. Session and project file contents are never included, only
 name/size listings. Review the archive before sharing.
-
-### `rename`
-
-```
-min rename <SESSION> <NEW_NAME>
-```
-
-Renames an existing session.
 
 ### `init`, `add`, `update`
 
 ```
 min init [-y|--yes]
-min add <--runtime|--build|--task <TASK>> <PACKAGES>...
+min add <--session|--runtime|--build|--task <TASK>> <PACKAGES>...
 min update
 ```
 
@@ -155,6 +180,10 @@ Project-configuration conveniences mirroring the corresponding `mip`
 commands: initialize minimal configuration from your source tree, add a
 tool or dependency, and refresh local checkouts of upstream packages and
 the standard library. See the [mip reference](./cli-mip.md) for details.
+
+These three are deliberate exceptions to the `min <noun> <verb>` convention:
+they are passthroughs to the `mip` commands of the same name, and keeping the
+spelling identical across the two CLIs is worth more than the hierarchy.
 
 ### `version`
 
@@ -164,22 +193,50 @@ min version
 
 Prints CLI and daemon version information.
 
-### `completions`
+### `completions` (alias: `completion`)
 
 ```
-min completions <SHELL>
+min completions print <SHELL>
+min completions install [<SHELL>...]
 ```
 
-Generates a shell tab-completion script. Supported shells include `bash`, `zsh`,
-`elvish`, `fish`. Usage: `source <(min completions bash)`.
+`print` writes a shell tab-completion script to stdout. Supported shells
+include `bash`, `zsh`, `elvish`, `fish`, `powershell`. Usage:
+`source <(min completions print bash)`.
+
+`install` writes that script into the shell's completion directory instead,
+for the three shells with a conventional per-user completion path. With no
+`SHELL` argument it installs for all three.
+
+| Shell | Path |
+|-------|------|
+| `bash` | `$XDG_DATA_HOME/bash-completion/completions/min` (default `~/.local/share/...`) |
+| `zsh` | `$XDG_DATA_HOME/zsh/completions/_min` (default `~/.local/share/...`) |
+| `fish` | `$XDG_CONFIG_HOME/fish/completions/min.fish` (default `~/.config/...`) |
+
+Each file is written atomically — a temporary sibling, then a rename — so a
+half-written completion file never reaches a shell.
+
+`install` prints every path it wrote to stdout, one per line. That is a
+contract rather than a convenience: `scripts/install.sh` feeds exactly those
+paths into its install record so `uninstall` can remove them, and derives no
+paths of its own. The bookkeeping therefore has one implementation, reachable
+by everyone rather than only by users who installed via `curl | sh`.
+
+A completion directory that exists but is not writable — these are shared,
+user-owned locations that can pre-exist root-owned — produces a warning on
+stderr, not a failure: the other shells still install and the exit status is
+still 0. For `zsh`, a stale `compinit` dump is dropped after a (re)install,
+since it can otherwise keep trusting its cached contents after the completion
+file underneath has changed.
 
 What it emits is a short *registration* shim, not a completion table: it teaches
 the shell to ask `min` itself what to offer. That indirection is what makes
-session arguments completable — `min attach <TAB>` lists live session names, and
-`min attach 019<TAB>` lists session IDs, neither of which exists at the time a
-static script would be written. Every argument documented as "UUID or session
-name" completes this way: `attach`, `destroy`, `rename`, `session policy`, and
-`ssh-forward`.
+session arguments completable — `min session attach <TAB>` lists live session
+names, and `min session attach 019<TAB>` lists session IDs, neither of which
+exists at the time a static script would be written. Every argument documented
+as "UUID or session name" completes this way: `session attach`,
+`session destroy`, `session rename`, and `session policy`.
 
 Session completion is best-effort by design. It never starts a daemon — with
 none running there is nothing to list, and booting a VM on a keystroke would be

@@ -25,7 +25,7 @@ esac
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 E2E_VM="${E2E_VM:-}"
 # Resolve + seed a SMALL pinned project to activate, exactly as session-e2e.sh
-# does: `min activate` uploads the dir, so it must carry a pinned [upstream] +
+# does: `min session activate` uploads the dir, so it must carry a pinned [upstream] +
 # a light `shell` stack and stay small. All N activates share this one dir (each
 # still mints a distinct session); a dir we create is removed wholesale on exit.
 SEED_DIR=""
@@ -107,7 +107,7 @@ echo "::group::mint $N sessions concurrently (cold start)"
 pids=""
 for i in $(seq 1 "$N"); do
   (
-    out="$(cd "$PROJECT_DIR" && mnl activate . 2>"$WORK/activate.$i.err")"
+    out="$(cd "$PROJECT_DIR" && mnl session activate . 2>"$WORK/activate.$i.err")"
     printf '%s\n' "$out" | tail -n1 | tr -d '\r' > "$WORK/activate.$i.out"
   ) &
   pids="$pids $!"

@@ -40,6 +40,12 @@ check(){ if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (want [$1] got [$2])"; f
 want_ok()  { _m="$1"; shift; if "$@"; then ok "$_m"; else bad "$_m"; fi; }
 want_err() { _m="$1"; shift; if "$@"; then bad "$_m"; else ok "$_m"; fi; }
 
+# record_has <component> <path> <record> — true when the install record holds a
+# row pairing that component with that exact path (columns 1 and 2).
+record_has() {
+    awk -v c="$1" -v p="$2" '$1==c && $2==p {hit=1} END{exit !hit}' "$3"
+}
+
 # The harness computes expected hashes with whatever SHA-256 tool the host has.
 # macOS ships `shasum`, not `sha256sum`, so pick portably (same order the
 # installer under test uses) — otherwise the macOS lane fails in the harness
@@ -60,28 +66,70 @@ BUCKET_HOST="https://mock.invalid/minimal-one"
 mock="$root/bucket"
 mkdir -p "$mock/versions/v1"
 
+# write_min_stub <path> [label] — the stand-in for the real binary at every
+# point install.sh runs it: `completions install <shell>` (R9.3), `ls` and
+# `stop` for the live-session prompt (R5.5). The completions arm implements the
+# same contract the real command does — write the shell's file under its
+# XDG-derived path, print that path on stdout, warn on stderr and still exit 0
+# when the directory is not writable, drop a stale compinit dump for zsh —
+# because the installer now delegates all of it and only reads the printed
+# paths.
+write_min_stub() {
+    printf '#!/bin/sh\n# mock min (%s)\n' "${2:-previous release}" >"$1"
+    cat >>"$1" <<'MOCKEOF'
+comp_target() {
+    case "$1" in
+        bash) printf '%s/bash-completion/completions/min\n' "${XDG_DATA_HOME:-$HOME/.local/share}" ;;
+        zsh)  printf '%s/zsh/completions/_min\n'            "${XDG_DATA_HOME:-$HOME/.local/share}" ;;
+        fish) printf '%s/fish/completions/min.fish\n'       "${XDG_CONFIG_HOME:-$HOME/.config}" ;;
+    esac
+}
+comp_install() {
+    _t="$(comp_target "$1")"
+    _d="${_t%/*}"
+    if ! ( mkdir -p "$_d" && : >"$_t.tmp.$$" ) 2>/dev/null; then
+        echo "warning: failed to install $1 completions ($_d is not writable)" >&2
+        return 0
+    fi
+    printf '# mock min completions for %s\n' "$1" >"$_t.tmp.$$"
+    mv -f "$_t.tmp.$$" "$_t"
+    printf '%s\n' "$_t"
+    if [ "$1" = zsh ]; then
+        _dump="${ZDOTDIR:-$HOME}/.zcompdump"
+        if [ -f "$_dump" ] && rm -f "$_dump" 2>/dev/null; then
+            echo "cleared compinit dump cache $_dump" >&2
+        fi
+    fi
+}
+case "${1:-}" in
+    completions)
+        shift
+        [ "${1:-}" = install ] || { echo "mock min: no such completions verb: ${1:-}" >&2; exit 2; }
+        shift
+        [ $# -gt 0 ] || set -- bash zsh fish
+        for _s in "$@"; do comp_install "$_s"; done
+        ;;
+    ls)          printf 'session-alpha  running\n' ;;
+    stop)
+        printf '%s\n' "$*" >>"$HOME/stop.calls"
+        if [ -f "$HOME/sessions.live" ] && [ "${2:-}" != "--force" ]; then
+            echo "daemon has active sessions; pass --force to shut down anyway" >&2
+            exit 1
+        fi
+        ;;
+esac
+MOCKEOF
+    chmod +x "$1"
+}
+
 # Platform-diverse artifacts with padded columns and comment/blank lines, to
 # prove awk field-splitting survives padding (R3.1/R3.3). The `minimal` CLI
-# artifacts are runnable sh scripts that answer `completions <shell>`, because
-# the installer generates completions by executing the installed bin/min
+# artifacts are runnable sh scripts that answer `completions install <shell>`,
+# because the installer installs completions by executing the installed bin/min
 # (R9.3); the other artifacts stay opaque bodies.
 printf 'linux-amd64-minimald-body\n'  >"$mock/versions/v1/minimald-linux-amd64"
-cat >"$mock/versions/v1/minimal-linux-amd64" <<'EOF'
-#!/bin/sh
-# mock min (linux-amd64)
-case "${1:-}" in
-    completions) printf '# mock min completions for %s\n' "$2" ;;
-    stop)        printf '%s\n' "$*" >>"$HOME/stop.calls" ;;
-esac
-EOF
-cat >"$mock/versions/v1/minimal-darwin-arm64" <<'EOF'
-#!/bin/sh
-# mock min (darwin-arm64)
-case "${1:-}" in
-    completions) printf '# mock min completions for %s\n' "$2" ;;
-    stop)        printf '%s\n' "$*" >>"$HOME/stop.calls" ;;
-esac
-EOF
+write_min_stub "$mock/versions/v1/minimal-linux-amd64"  linux-amd64
+write_min_stub "$mock/versions/v1/minimal-darwin-arm64" darwin-arm64
 printf 'darwin-arm64-rootfs-body\n'   >"$mock/versions/v1/rootfs-arm64.img"
 
 # AppArmor components: noarch text (the loader is a runnable stub here), shipped
@@ -218,6 +266,14 @@ APPARMOR_DIR=
 # branch of the userns advisory.
 BIN_OVERRIDE=
 
+# Stand-in for /dev/tty, where the active-sessions prompt reads its answer
+# (R5.5). Empty points the installer at a path that cannot be opened — the
+# harness's own terminal must never be read, and every scenario that does not
+# stage an answer must behave like a non-interactive run. Scenarios point it at
+# a file holding the keystroke. FORCE_STOP fills MINIMAL_INSTALL_FORCE_STOP.
+TTY_FILE=
+FORCE_STOP=
+
 # run <label> <homeprefix> [args...] ; sets rc, captures combined output in $OUT.
 OUT=
 run() {
@@ -238,6 +294,8 @@ run() {
         STUB_UNAME_M="$PLAT_M" \
         MINIMAL_OVERRIDE_USERNS_SYSCTL="${USERNS_SYSCTL:-$root/no-such-sysctl}" \
         MINIMAL_OVERRIDE_APPARMOR_DIR="${APPARMOR_DIR:-$root/no-such-apparmor.d}" \
+        MINIMAL_OVERRIDE_TTY="${TTY_FILE:-$root/no-such-tty}" \
+        MINIMAL_INSTALL_FORCE_STOP="${FORCE_STOP:-}" \
         "$SH" "$installer" "$@" </dev/null >"$OUT" 2>&1
     rc=$?
     set -e
@@ -487,6 +545,18 @@ want_err "PATH advisory suppressed when bin present (R6.2)" grep -q "is not on y
 # The installed `min` (the mock records its `stop` calls to $HOME/stop.calls) is
 # run once, only on a run that actually replaces a file, and only when it was
 # already on disk beforehand.
+
+# Seed <home> with a completed install, then stage the next run as an upgrade
+# (one stale component) whose on-disk `min` reports live sessions.
+stage_live_upgrade() {
+    run "$2_seed" "$1"
+    check 0 "$rc" "$2: seed install exits 0"
+    printf 'stale\n' >"$1/bin/minimald"
+    write_min_stub "$1/bin/min"
+    : >"$1/sessions.live"
+    rm -f "$1/stop.calls"
+}
+
 H8="$root/h8"; mkdir -p "$H8"
 run daemonfresh "$H8"
 check 0 "$rc" "fresh install exits 0"
@@ -499,21 +569,17 @@ want_err "up-to-date rerun stops no daemon (R5.5)" test -e "$H8/stop.calls"
 
 # An upgrade (two components stale) stops the daemon exactly once, before the
 # swap, via the min that is on disk now — an older build than the manifest's,
-# still runnable, still able to reach the daemon it started.
+# still runnable, still able to reach the daemon it started. With no sessions
+# running the graceful stop succeeds, so nothing is forced and nothing is asked.
 printf 'stale\n' >"$H8/bin/minimald"
-cat >"$H8/bin/min" <<'EOF'
-#!/bin/sh
-# mock min, previous release
-case "${1:-}" in
-    completions) printf '# mock min completions for %s\n' "$2" ;;
-    stop)        printf '%s\n' "$*" >>"$HOME/stop.calls" ;;
-esac
-EOF
-chmod +x "$H8/bin/min"
+write_min_stub "$H8/bin/min" "previous release"
 run daemonupgrade "$H8"
 check 0 "$rc" "upgrade exits 0"
-want_ok "upgrade runs min stop --force (R5.5)" test -f "$H8/stop.calls"
-check "stop --force" "$(cat "$H8/stop.calls")" "stop is called once, with --force (R5.5)"
+want_ok "upgrade runs min stop (R5.5)" test -f "$H8/stop.calls"
+check "stop" "$(cat "$H8/stop.calls")" "stop is called once, gracefully (R5.5)"
+want_err "a graceful stop is never escalated to --force (R5.5)" \
+    grep -qx "stop --force" "$H8/stop.calls"
+want_err "no sessions means no question (R5.5)" grep -q "Continue?" "$OUT"
 
 # Replacing only a data component must NOT stop the daemon: data files (the
 # apparmor profile/tunable/loader) are not executable images, and the running
@@ -533,6 +599,7 @@ run daemonprep "$H9"
 check 0 "$rc" "prep install exits 0"
 cat >"$H9/bin/min" <<'EOF'
 #!/bin/sh
+printf '%s\n' "$*" >>"$HOME/stop.calls"
 echo "old min: unrecognized subcommand 'stop'" >&2
 echo "noise on stdout" >&1
 exit 2
@@ -544,6 +611,96 @@ check 0 "$rc" "a failing min stop does not fail the install (R5.5)"
 want_err "min stop stderr is hidden (R5.5)" grep -q "unrecognized subcommand" "$OUT"
 want_err "min stop stdout is hidden (R5.5)" grep -q "noise on stdout" "$OUT"
 check "$h_minimald" "$(hash_file "$H9/bin/minimald")" "the upgrade still completed (R5.5)"
+# Only the active-sessions refusal may prompt: every other non-zero stop (no
+# daemon, a failed connect, a min too old) stays silent and best-effort, and
+# still falls through to the force stop — the arm that covers a wedged daemon.
+want_err "a non-sessions stop failure asks nothing (R5.5)" grep -q "Continue?" "$OUT"
+want_err "a non-sessions stop failure lists nothing (R5.5)" grep -q "active sessions" "$OUT"
+want_ok "a non-sessions stop failure still force-stops (R5.5)" \
+    grep -qx "stop --force" "$H9/stop.calls"
+
+# Live sessions turn the stop into a decision: the installer lists what is
+# running and asks. The answer is read from the controlling terminal, never
+# from stdin — under `curl … | sh` stdin is the script itself — so the harness
+# points MINIMAL_OVERRIDE_TTY at a file standing in for /dev/tty.
+#
+# These homes carry their own HL prefix rather than extending the plain H<n>
+# run, following the HAA_/HD/HU families above. Every scenario here deliberately
+# leaves a home a later run must not inherit — a `sessions.live` marker and a
+# `min` that refuses to stop while it exists — so a home reused by number
+# further down would not be the fresh install it reads as, and would abort on
+# the prompt instead.
+HL1="$root/hl1"; mkdir -p "$HL1"
+stage_live_upgrade "$HL1" liveyes
+printf 'y\n' >"$root/tty-yes"
+TTY_FILE="$root/tty-yes"
+run liveyes "$HL1"
+TTY_FILE=
+check 0 "$rc" "confirmed upgrade exits 0 (R5.5)"
+want_ok "the running sessions are listed (R5.5)" grep -q "session-alpha" "$OUT"
+want_ok "the user is asked before sessions die (R5.5)" grep -q "Continue?" "$OUT"
+want_ok "the graceful stop is tried first (R5.5)" grep -qx "stop" "$HL1/stop.calls"
+want_ok "confirmation escalates to --force (R5.5)" grep -qx "stop --force" "$HL1/stop.calls"
+check "$h_minimald" "$(hash_file "$HL1/bin/minimald")" "a confirmed upgrade completes (R5.5)"
+
+# Declining aborts before the first swap: non-zero, nothing installed, no
+# temp file left behind, and the daemon never force-stopped.
+HL2="$root/hl2"; mkdir -p "$HL2"
+stage_live_upgrade "$HL2" liveno
+printf 'n\n' >"$root/tty-no"
+TTY_FILE="$root/tty-no"
+run liveno "$HL2"
+TTY_FILE=
+check 1 "$rc" "declining aborts the install (R5.5)"
+want_ok "the abort reports no executable was replaced (R5.5)" \
+    grep -q "no executables were replaced" "$OUT"
+want_err "declining never force-stops (R5.5)" grep -qx "stop --force" "$HL2/stop.calls"
+check "stale" "$(cat "$HL2/bin/minimald")" "the stale component is left in place (R5.5)"
+want_err "no temp file survives the abort (R5.5)" ls "$HL2/bin/"*.tmp.* 2>/dev/null
+
+# No terminal to ask on (CI, a non-interactive shell): abort promptly naming the
+# escape hatch rather than hang on a read or destroy sessions unasked.
+HL3="$root/hl3"; mkdir -p "$HL3"
+stage_live_upgrade "$HL3" livenotty
+run livenotty "$HL3"
+check 1 "$rc" "an unconfirmable upgrade aborts (R5.5)"
+want_ok "the abort names the escape hatch (R5.5)" grep -q -- "--force-stop" "$OUT"
+want_err "nothing is asked without a terminal (R5.5)" grep -q "Continue?" "$OUT"
+want_err "an unconfirmable upgrade never force-stops (R5.5)" \
+    grep -qx "stop --force" "$HL3/stop.calls"
+check "stale" "$(cat "$HL3/bin/minimald")" "nothing is installed without confirmation (R5.5)"
+
+# The escape hatch as a flag: force-stop straight away, no question, no hang.
+HL4="$root/hl4"; mkdir -p "$HL4"
+stage_live_upgrade "$HL4" liveforce
+run liveforce "$HL4" --force-stop
+check 0 "$rc" "--force-stop upgrade exits 0 (R5.5)"
+want_err "--force-stop asks nothing (R5.5)" grep -q "Continue?" "$OUT"
+want_err "--force-stop skips the graceful stop (R5.5)" grep -qx "stop" "$HL4/stop.calls"
+want_ok "--force-stop force-stops (R5.5)" grep -qx "stop --force" "$HL4/stop.calls"
+check "$h_minimald" "$(hash_file "$HL4/bin/minimald")" "a forced upgrade completes (R5.5)"
+
+# The same hatch through the environment, for a pipeline with no argv at all.
+HL5="$root/hl5"; mkdir -p "$HL5"
+stage_live_upgrade "$HL5" liveforceenv
+FORCE_STOP=1
+run liveforceenv "$HL5"
+FORCE_STOP=
+check 0 "$rc" "MINIMAL_INSTALL_FORCE_STOP upgrade exits 0 (R5.5)"
+want_err "the env hatch asks nothing (R5.5)" grep -q "Continue?" "$OUT"
+want_ok "the env hatch force-stops (R5.5)" grep -qx "stop --force" "$HL5/stop.calls"
+
+# The flag is filtered out of the arguments wherever it sits, so the target
+# positional still resolves (R2.1). Deliberately a NON-default target: with
+# `stable` a filter that dropped every positional would land on the default and
+# still look right.
+printf 'v1\n' >"$mock/unstable"
+HL6="$root/hl6"; mkdir -p "$HL6"
+stage_live_upgrade "$HL6" liveforcepos
+run liveforcepos "$HL6" unstable --force-stop
+check 0 "$rc" "target plus --force-stop exits 0 (R5.5/R2.1)"
+want_ok "the target survives the option filter (R2.1)" grep -q "target 'unstable'" "$OUT"
+want_ok "the trailing flag still force-stops (R5.5)" grep -qx "stop --force" "$HL6/stop.calls"
 
 # --- Unit 9: shell-init files, rc hook, completions (R9.1-R9.3) -------------
 # A bash-login-shell install generates the three init files, hooks .bashrc
@@ -575,7 +732,7 @@ run shellinit2 "$H7"
 check 0 "$rc" "shell-init rerun exits 0"
 check 1 "$(grep -c '>>> minimal >>>' "$H7/.bashrc")" "rerun adds no second rc block (R9.2)"
 
-# Completions, generated by executing the installed mock min (R9.3).
+# Completions, installed by executing the installed mock min (R9.3).
 want_ok "bash completions written for min (R9.3)" \
     grep -q "mock min completions for bash" "$H7/xdg-data/bash-completion/completions/min"
 want_ok "zsh completions written as _min (R9.3)" \
@@ -584,6 +741,37 @@ want_ok "fish completions written (R9.3)" \
     grep -q "mock min completions for fish" "$H7/xdg-config/fish/completions/min.fish"
 want_ok "record lists the generated completions (R9.3/R6.1)" \
     grep -q "completions-zsh" "$H7/xdg-state/minimal/installed"
+# The record's path column is the path the binary printed, per shell — the
+# whole contract of the delegation (R9.3).
+want_ok "record row carries the installed zsh path (R9.3)" \
+    record_has completions-zsh "$H7/xdg-data/zsh/completions/_min" \
+        "$H7/xdg-state/minimal/installed"
+
+# The record is fed by what the binary PRINTS on stdout, not by a path table
+# the installer keeps: a min that installs somewhere the installer never
+# derives is still recorded (and so still uninstallable). That is the contract
+# between the two halves of R9.3.
+cat >"$mock/versions/v1/minimal-odd" <<'EOF'
+#!/bin/sh
+# mock min that installs completions where it likes, and says so on stdout
+[ "${1:-}" = completions ] || exit 0
+mkdir -p "$HOME/odd"
+printf '# odd completions for %s\n' "$3" >"$HOME/odd/$3-odd"
+printf '%s\n' "$HOME/odd/$3-odd"
+EOF
+chmod +x "$mock/versions/v1/minimal-odd"
+h_odd="$(hash_file "$mock/versions/v1/minimal-odd")"
+awk -v h="$h_odd" \
+    '$1=="minimal" && $2=="linux" {$5=h; $8="versions/v1/minimal-odd"} {print}' \
+    "$root/good-components" >"$mock/versions/v1/components"
+H16="$root/h16"; mkdir -p "$H16"
+run oddpaths "$H16"
+check 0 "$rc" "install exits 0 when min installs completions elsewhere (R9.3)"
+want_ok "the path the binary printed is what gets recorded (R9.3)" \
+    record_has completions-zsh "$H16/odd/zsh-odd" "$H16/xdg-state/minimal/installed"
+want_err "the installer records no path of its own devising (R9.3)" \
+    grep -q "bash-completion/completions/min" "$H16/xdg-state/minimal/installed"
+cp "$root/good-components" "$mock/versions/v1/components"   # restore
 
 # Both existing bash rc files are hooked, and user content is preserved.
 H8="$root/h8"; mkdir -p "$H8"
@@ -718,8 +906,9 @@ if [ "$(id -u)" -ne 0 ]; then
     run compreadonly "$H13"
     chmod 755 "$H13/xdg-config/fish/completions"   # restore for later cleanup
     check 0 "$rc" "unwritable completion dir is non-fatal (R9.3)"
+    # The binary warns on stderr; the installer relays it in its own voice.
     want_ok "warning names the unwritable completion dir (R9.3)" \
-        grep -q "failed to install fish completions" "$OUT"
+        grep -q "completions: warning: failed to install fish completions" "$OUT"
     want_err "no raw shell error leaks on completion failure (R9.3)" \
         grep -qi "permission denied" "$OUT"
     want_ok "other shells' completions still installed (R9.3)" \

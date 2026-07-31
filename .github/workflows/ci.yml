@@ -96,8 +96,19 @@ jobs:
     dogfood:
         needs: [changes]
         if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
+        # `actions: read` is for the cache-save verification step below; the
+        # job-level block replaces the workflow-level grant, so `contents` has
+        # to be restated for actions/checkout.
+        permissions:
+            contents: read
+            actions: read
         runs-on: ubuntu-latest
-        timeout-minutes: 20
+        # 30, not 20: a cold build (no usable cache entry) is ~13 min of cargo
+        # on top of ~1 min of disk reclaim and up to ~4 min of cache restore,
+        # which left a slow runner no margin. Run #30482500938 was cancelled
+        # mid-`Compiling mip` at exactly 20:00 and took `ci-success` red with
+        # it -- the aggregator counts `cancelled` as failure.
+        timeout-minutes: 30
         steps:
             - name: Free Disk Space
               uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 # v3
@@ -105,6 +116,16 @@ jobs:
                   remove_android: true
                   remove_dotnet: true
                   remove_haskell: true
+                  # The tool cache (~8 GB) and the cloud CLIs go too, to keep
+                  # the save step below off the ENOSPC wall. Nothing in this job
+                  # reads either: the two JS actions run on the runner's bundled
+                  # node, `run-task` is a shell composite, and the build itself
+                  # fetches over plain HTTPS. `remove_packages` takes a
+                  # space-separated list, NOT a boolean -- the action's `main.sh`
+                  # validates for an embedded space and `exit 0`s on `true`,
+                  # which would silently skip every reclaim above as well.
+                  remove_tool_cache: true
+                  remove_packages: azure-cli google-cloud-cli
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
@@ -140,6 +161,16 @@ jobs:
               with:
                   path: ~/.local/state/minimal/state
                   key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+            - name: Verify the cache actually saved (main only)
+              # A save that runs out of disk is downgraded to `##[warning]Failed
+              # to save` and leaves the job green, so the entry can freeze for
+              # days while every run silently pays a cold build. Turn that into
+              # a red main. Rationale and the incident in the script header.
+              if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  CACHE_KEY: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+              run: scripts/ci-verify-cache-saved.sh "$CACHE_KEY"
 
     cargo-deny:
         needs: [changes]

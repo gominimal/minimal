@@ -4,12 +4,12 @@
 //! from minimal packages. It generates multi-layer images where each runtime dependency
 //! becomes a separate layer.
 
-use crate::{Error, Options, Runnable};
+use crate::materialize::{Emitter, MaterializeEvent};
+use crate::{Error, Options};
 use common::SpecHash;
 use flate2::{Compression, write::GzEncoder};
 use globset::{Glob, GlobSet};
 use graph::{BuildSpecRef, Transitives, TransitivesDep};
-use mfile::StrOrList;
 use oci_spec::image::{
     ANNOTATION_REF_NAME, ConfigBuilder, Descriptor, DescriptorBuilder, ImageConfigurationBuilder,
     ImageIndexBuilder, ImageManifestBuilder, MediaType, PlatformBuilder, RootFsBuilder,
@@ -18,40 +18,39 @@ use oci_spec::image::{
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Seek;
-use std::path::PathBuf;
 use std::str::FromStr;
-use tracing::info;
 
-/// Creates an OCI image from a set of packages.
-pub struct OciImageCreate {
-    /// The packages to include in the image (used for logging)
-    pub packages: Vec<String>,
-    /// The output file path to write the OCI image tarball
-    pub output_file: PathBuf,
-
-    pub name: Option<String>,
-    pub entrypoint: Option<mfile::StrOrList>,
-    pub cmd: Option<mfile::StrOrList>,
-    pub vars: HashMap<String, String>,
+/// An OCI image assembled from the built top levels of [`Options::graph`] and
+/// their transitive runtime dependencies, one layer per package. The target
+/// architecture comes from the graph.
+pub(crate) struct OciImage<'a> {
+    /// The image's `org.opencontainers.image.ref.name` annotation.
+    pub name: &'a str,
+    pub entrypoint: Option<&'a [String]>,
+    pub cmd: Option<&'a [String]>,
+    pub vars: &'a HashMap<String, String>,
 }
 
-impl Runnable for OciImageCreate {
-    type Result = ();
-
+impl OciImage<'_> {
+    /// Writes the image tarball to `w` and returns it, so a caller that
+    /// wrapped its sink can recover the wrapper.
     #[tracing::instrument(skip_all, err)]
-    async fn run<'b>(&mut self, opts: &Options<'b>) -> Result<Self::Result, Error> {
+    pub(crate) async fn write<W: std::io::Write>(
+        &self,
+        opts: &Options<'_>,
+        w: W,
+        events: &Emitter,
+    ) -> Result<W, Error> {
         let mut all_deps: Vec<(BuildSpecRef, TransitivesDep)> =
             Transitives::for_toplevels(opts.graph, opts.graph.top_levels.to_vec(), false)
                 .into_iter()
                 .collect();
         all_deps.sort_by_key(|(bsr, _)| opts.graph.get(bsr).unwrap().name.clone());
 
-        info!("Creating OCI image for packages: {:?}", self.packages);
-        info!(
-            "Will create {} layers: base layer + {} packages",
-            all_deps.len() + 1,
-            all_deps.len()
-        );
+        // Plus the base layer holding the /lib64 symlink.
+        events.send(MaterializeEvent::Layers {
+            total: all_deps.len() + 1,
+        });
 
         let mut layers = Vec::new();
 
@@ -63,10 +62,11 @@ impl Runnable for OciImageCreate {
         let results =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(all_deps.len())));
         rayon::scope(|s| {
-            for (bsr, dep) in &all_deps {
+            for (dep_idx, (bsr, dep)) in all_deps.iter().enumerate() {
                 let tokio_runtime = tokio_runtime.clone();
                 let results = results.clone();
                 let cache = opts.cache.clone();
+                let events = events.clone();
 
                 let dep_spec = opts.graph.get(bsr).unwrap();
                 let dep_hash = opts.graph.spec_hash(bsr);
@@ -77,14 +77,10 @@ impl Runnable for OciImageCreate {
                     .unwrap()
                 });
 
-                info!(
-                    "Creating layer for: {}",
-                    if match_globs.is_some() {
-                        format!("{} (subset)", dep_spec.name)
-                    } else {
-                        dep_spec.name.to_string()
-                    }
-                );
+                events.send(MaterializeEvent::LayerStarted {
+                    package: dep_spec.name.clone(),
+                    subset: match_globs.is_some(),
+                });
 
                 s.spawn(move |_| {
                     let _rt = tokio_runtime.enter();
@@ -93,17 +89,23 @@ impl Runnable for OciImageCreate {
                         &dep_hash,
                         &dep_spec.name,
                         &match_globs,
+                        &events,
                     ));
-                    results.lock().unwrap().push(result);
+                    results.lock().unwrap().push((dep_idx, result));
                 });
             }
         });
+        // Threads finish in scheduler order; layer order is part of the
+        // manifest and therefore the image digest. Restore dep order.
+        let mut results = std::sync::Arc::into_inner(results)
+            .unwrap()
+            .into_inner()
+            .unwrap();
+        results.sort_by_key(|(dep_idx, _)| *dep_idx);
         layers.extend(
-            std::sync::Arc::into_inner(results)
-                .unwrap()
-                .into_inner()
-                .unwrap()
+            results
                 .into_iter()
+                .map(|(_, result)| result)
                 .collect::<Result<Vec<_>, _>>()?,
         );
 
@@ -112,7 +114,6 @@ impl Runnable for OciImageCreate {
         // blobs/sha256/<manifest-digest> - image manifest, points to a image config and also all the layers in order
         // blobs/sha256/<image-config-digest> - image config, metadata about the image
         // blobs/sha256/<layer-gzip-digest> - the tar.gz of a filesystem layer
-        let w = std::fs::File::create(&self.output_file)?;
         let mut tb = tar::Builder::new(w);
 
         // ImageConfig - written as blob object by hash
@@ -121,7 +122,9 @@ impl Runnable for OciImageCreate {
             common::target::Arch::Arm64 => "arm64",
             common::target::Arch::Amd64 => "amd64",
         };
-        info!("OCI image architecture: {arch}");
+        events.send(MaterializeEvent::Architecture {
+            arch: arch.to_string(),
+        });
 
         let image_config_bytes = serde_json::to_vec(
             &ImageConfigurationBuilder::default()
@@ -140,22 +143,20 @@ impl Runnable for OciImageCreate {
                 )
                 .config({
                     let mut cb = ConfigBuilder::default();
-                    if let Some(entrypoint) = &self.entrypoint {
-                        cb = cb.entrypoint(match entrypoint {
-                            StrOrList::Single(s) => shlex::split(s).unwrap(),
-                            StrOrList::Multiple(v) => v.clone(),
-                        });
+                    if let Some(entrypoint) = self.entrypoint {
+                        cb = cb.entrypoint(entrypoint.to_vec());
                     };
-                    if let Some(cmd) = &self.cmd {
-                        cb = cb.cmd(match cmd {
-                            StrOrList::Single(s) => shlex::split(s).unwrap(),
-                            StrOrList::Multiple(v) => v.clone(),
-                        });
+                    if let Some(cmd) = self.cmd {
+                        cb = cb.cmd(cmd.to_vec());
                     };
                     if !self.vars.is_empty() {
+                        // HashMap iteration order is random per process; env
+                        // order is part of the config blob and therefore the
+                        // image digest. Sort by key.
+                        let mut vars: Vec<_> = self.vars.iter().collect();
+                        vars.sort_by_key(|(k, _)| k.as_str());
                         cb = cb.env(
-                            self.vars
-                                .iter()
+                            vars.into_iter()
                                 .map(|(k, v)| String::from_iter([k, "=", v]))
                                 .collect::<Vec<_>>(),
                         );
@@ -223,13 +224,10 @@ impl Runnable for OciImageCreate {
                             .build()
                             .unwrap(),
                     )
-                    .annotations({
-                        let mut annotations = HashMap::new();
-                        if let Some(name) = &self.name {
-                            annotations.insert(ANNOTATION_REF_NAME.to_string(), name.clone());
-                        }
-                        annotations
-                    })
+                    .annotations(HashMap::from([(
+                        ANNOTATION_REF_NAME.to_string(),
+                        self.name.to_string(),
+                    )]))
                     .build()?,
             ])
             .build()?;
@@ -264,8 +262,8 @@ impl Runnable for OciImageCreate {
             tb.append(&th, layer.targz)?;
         }
 
-        tb.finish()?;
-        Ok(())
+        // `into_inner` finishes the archive and hands the sink back.
+        Ok(tb.into_inner()?)
     }
 }
 
@@ -336,6 +334,7 @@ async fn create_layer_from_cache(
     spec_hash: &SpecHash,
     package_name: &str,
     match_globs: &Option<globset::GlobSet>,
+    events: &Emitter,
 ) -> anyhow::Result<BuiltLayer> {
     let cache_entry = cache
         .read_dir(spec_hash)
@@ -373,15 +372,11 @@ async fn create_layer_from_cache(
         .digest(Sha256Digest::from_str(&hex::encode(sha256))?)
         .build()?;
 
-    info!(
-        "Created layer for {}: {}",
-        if match_globs.is_some() {
-            format!("{} (subset)", package_name)
-        } else {
-            package_name.to_string()
-        },
-        size::Size::from_bytes(compressed_len)
-    );
+    events.send(MaterializeEvent::LayerFinished {
+        package: package_name.to_string(),
+        subset: match_globs.is_some(),
+        bytes: compressed_len,
+    });
 
     tar_file.seek(std::io::SeekFrom::Start(0))?;
     Ok(BuiltLayer {

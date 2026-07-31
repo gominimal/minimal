@@ -39,7 +39,7 @@ pub struct WireContribution {
 /// Persisted composition snapshot, written by the daemon as a sidecar
 /// to [`record.json`](crate::store) at composition-assembly time so a
 /// restart can re-apply the exact [`Composition`] that was approved at
-/// `min activate` time.
+/// `min session activate` time.
 ///
 /// Mirrors [`Composition`](crate::core::compose::Composition) via the
 /// same wire primitives used for the live RPC flow

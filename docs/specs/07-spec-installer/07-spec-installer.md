@@ -47,7 +47,7 @@ After the files are placed, the installer wires up shell integration (Unit 9):
 it generates per-shell init files that put the bin dir on `PATH`, installs tab
 completions for `min` by running the freshly-installed binary, and hooks the
 user's login-shell rc file with an idempotent, marker-fenced block. Uninstall
-(Units 7–8) undoes all of it.
+(Units 7-8) undoes all of it.
 
 The whole script targets POSIX `sh` (not bash) so it runs identically under
 `dash`, macOS's frozen bash 3.2, busybox, and zsh-invoked-`sh`. It depends only
@@ -80,6 +80,9 @@ on tools present by default on every target: a downloader (`curl` **or**
   components that actually changed are downloaded.
 - **As a minimal employee**, I pass `unstable` as an argument and get the
   bleeding-edge version through the identical mechanism.
+- **As a user with long-running sessions**, an upgrade tells me what is running
+  and asks before it ends any of it, so I decide whether the upgrade is worth
+  the work it costs; scripted upgrades pass a flag and never stop to ask.
 
 ## Demoable Units of Work
 
@@ -111,9 +114,12 @@ exits with a clear error.
 
 **R2.1**, The script takes an optional first argument, the **target**,
 defaulting to `stable`. The target is validated against `^[A-Za-z0-9._-]+$`
-before use; a value containing any other character exits with an error.
+before use; a value containing any other character exits with an error. Install
+mode's one option, `--force-stop` (R5.5), is recognized wherever it appears in
+the arguments and removed from them before the target is read, so the target
+stays the sole positional on either side of the flag.
 
-**R2.2**, The script fetches `<BUCKET>/<target>` to obtain a version string.
+**R2.2**, The script fetches `<BUCKET>/<target>` to get a version string.
 The result is validated against `^[A-Za-z0-9._-]+$` (command substitution having
 already stripped the trailing newline); a malformed value exits with an error.
 `<BUCKET>` is hardcoded into the script, but can be overridden with an environment
@@ -260,19 +266,44 @@ mv -f "$target.tmp.$$" "$target"
 
 **R5.5**, Installing a new version over a **running daemon** wedges it: the
 daemon goes on serving from the old image while the newly-installed `min` speaks
-to it. Before the first component file is replaced, the installer therefore runs
-`<bin>/min stop --force`, the `min` **already on disk**, which is the build that
-matches the daemon it started and is the one about to be overwritten. `--force`
-because an upgrade must not be blocked by live sessions, and because a prompt is
-not available in a `curl … | sh` pipeline.
+to it. Before the first component file is replaced, the installer therefore stops
+it with the `min` **already on disk**, which is the build that matches the daemon
+it started and is the one about to be overwritten. Only `<bin>/min` is ever run,
+never a `min` found on `$PATH`, which is not this installer's footprint.
 
-The step is **best-effort and silent**, output discarded and exit status ignored:
-"no `min` installed yet" (a fresh install), "no daemon running" (`min stop`
-merely connects; it never autospawns, so this is a failed connect and nothing
-more), and "the installed `min` is too old to know `stop --force`" are all just
-*nothing to stop*, and none may fail an install whose binaries are otherwise
-fine. Only `<bin>/min` is ever run, never a `min` found on `$PATH`, which is not
-this installer's footprint.
+The stop is **graceful first**: `<bin>/min stop`, which succeeds when nothing is
+running and refuses while sessions are live. That refusal, recognized by the
+message the CLI prints for it rather than by a bare non-zero exit, is the one
+outcome an upgrade must not decide on the user's behalf: it means live work is
+about to be destroyed. The installer then lists the running sessions
+(`<bin>/min ls`), asks whether to end them, and only on an explicit yes runs
+`<bin>/min stop --force` and carries on. A declined upgrade exits non-zero
+before the first **executable** replacement, dropping the temp download and
+leaving the daemon, its sessions, every installed executable, and the install
+record exactly as they were. It claims no more than that: the stop is attempted
+at the first `bin`/`lib` component, so a `data` component ordered ahead of it in
+the manifest may already have been replaced.
+
+The question is asked on the **controlling terminal**, never on stdin: in a
+`curl … | sh` pipeline stdin is the script itself, so reading the answer there
+would consume it. Where no controlling terminal can be opened (CI, any
+non-interactive invocation) there is nobody to consent, so the installer exits
+non-zero naming the escape hatch instead of hanging on a read or ending sessions
+unasked. That escape hatch — a `--force-stop` argument, or a non-empty
+`MINIMAL_INSTALL_FORCE_STOP` in the environment for a pipeline with no argv —
+skips both the graceful stop and the question and force-stops outright, so
+scripted upgrades never block. It is deliberately not spelled `--force`, which
+already means "remove modified files too" in uninstall mode.
+
+Every other outcome stays **best-effort and silent**, output discarded and exit
+status ignored: "no `min` installed yet" (a fresh install), "no daemon running"
+(`min stop` merely connects; it never autospawns, so this is a failed connect
+and nothing more), "the installed `min` is too old to know `stop`", and a
+transport drop on an otherwise successful stop are all just *nothing to stop*.
+None of them may fail an install whose binaries are otherwise fine, and none of
+them may raise the question — treating a bare failure as "sessions are live"
+would make every upgrade ask one. They fall through to the force stop, which
+remains unconditional for them.
 
 It is attempted **at most once per run**, and only from the path that actually
 replaces a file: a rerun where every component is already up to date, or a run
@@ -303,11 +334,31 @@ both hash columns in place of digests.
   it, the recorded installed hash does not mask a new release.
 - **Test** (R5.5): a fresh install stops nothing (no `min` on disk yet) and an
   up-to-date rerun stops nothing (nothing replaced); an upgrade whose components
-  are stale runs the on-disk `min` with exactly `stop --force`, once, however
-  many components it replaces.
+  are stale runs the on-disk `min` with exactly `stop`, once, however many
+  components it replaces, never escalating to `--force` and never asking
+  anything when the graceful stop succeeds.
 - **Test** (R5.5): an installed `min` whose `stop` exits non-zero and writes to
   both stdout and stderr still yields exit 0, leaks neither stream into the
-  installer's output, and completes the upgrade.
+  installer's output, asks nothing, and completes the upgrade.
+- **Test** (R5.5): an on-disk `min` whose graceful `stop` refuses with the
+  active-sessions message makes the installer list the running sessions and ask
+  on the terminal (a stand-in for `/dev/tty`, since stdin is the script pipe);
+  answering yes escalates to `stop --force` and completes the upgrade.
+- **Test** (R5.5): answering no exits non-zero, never runs `stop --force`,
+  leaves the stale component and no temp file behind, and reports that no
+  executable was replaced.
+- **Test** (R5.5): the refusal message the installer matches on is asserted, by
+  the workspace test suite, to still be present in the CLI source that prints
+  it. The signal crosses a language boundary with nothing else holding the two
+  ends together, and a reword on the CLI side would otherwise return every
+  upgrade to an unconditional force-stop with the installer's own tests — which
+  supply their own copy of the message — still green.
+- **Test** (R5.5): with the same refusal and no openable terminal, the run exits
+  non-zero naming the escape hatch, without prompting, force-stopping, or
+  installing anything.
+- **Test** (R5.5): the escape hatch, given as an argument or through the
+  environment, force-stops without a graceful attempt and without asking, and
+  completes the upgrade; given after the target, the target still resolves.
 - **Test** (R5.6): a `symlink` component lands as a symlink at its `dest`
   pointing at the manifest target, with no download; a rerun skips it, and a
   retargeted link is repaired on the next run, still with no download.
@@ -324,12 +375,12 @@ lets the R5.1 signed-file skip stay correct across releases (skip only while the
 manifest still wants that artifact). A `symlink` row (R5.6) records
 `link:<target>` in both hash columns instead of digests, the `link:` prefix
 cannot collide with a hex digest and is what the uninstaller keys on (R7.3).
-The record also enables uninstall (Units 7–8) and surfaces prefix drift if
+The record also enables uninstall (Units 7-8) and surfaces prefix drift if
 `XDG_*` variables change between runs.
 
 **R6.1a**, **Renamed-component migration.** When a component is renamed, its old
 `dest` stops appearing in every subsequent manifest, so the record walk of Units
-7–8 never revisits it and the file is stranded on disk forever. For a `bin`
+7-8 never revisits it and the file is stranded on disk forever. For a `bin`
 component that is a live PATH collision, not just clutter. The installer
 therefore reverses a known rename from the *prior* record, on the same
 bytes-still-ours terms uninstall uses (R7.3): the old `dest` is removed only
@@ -380,7 +431,7 @@ the only rc edit it makes is Unit 9's announced, marker-fenced block (R9.2).
 
 The goal: after one install and one new shell, `min` is on `PATH` and
 tab-completes, in bash, zsh, and fish. Everything this unit writes is either an
-install-record row (so Units 7–8 remove it for free) or a marker-fenced rc
+install-record row (so Units 7-8 remove it for free) or a marker-fenced rc
 block (so uninstall can strip it precisely).
 
 **R9.1**, After the component loop, the installer **generates** (never
@@ -394,7 +445,7 @@ downloads) one init file per shell family under `<data>/shell-init/`:
   `fish_add_path --prepend` for fish), so sourcing is idempotent and becomes a
   no-op once the user manages `PATH` themselves.
 
-`zsh.sh` additionally adds the zsh completions dir (R9.3) to `fpath` and runs
+`zsh.sh` also adds the zsh completions dir (R9.3) to `fpath` and runs
 `compinit`, and then **self-heals a lying dump**: `compinit` trusts its cached
 `.zcompdump` whenever the dump's (zsh version, completion-file count) header
 matches, a check that misses real changes (one completions dir replacing
@@ -477,7 +528,7 @@ dead in every new shell until an unrelated `fpath` change. Dropping the cache
 forces a real rescan on the next zsh startup (the `zsh.sh` self-heal in R9.1
 is the belt-and-braces for dumps that go stale later).
 
-**R9.4**, Uninstall (Units 7–8) undoes shell integration completely:
+**R9.4**, Uninstall (Units 7-8) undoes shell integration completely:
 
 - the generated init and completion files are ordinary record rows, removed by
   the hash-verified walk (R7.3);
@@ -572,7 +623,7 @@ installer. The manifest is strictly *data*; prefix tokens are mapped through a
 `case`, never expanded.
 
 **On-disk hash as the skip oracle.** Comparing the manifest hash against the
-actual destination file (R5.1) is more robust than trusting a recorded state
+actual destination file (R5.1) is more reliable than trusting a recorded state
 file, which drifts when a user deletes a binary or a prior run dies mid-install.
 A local SHA-256 is far cheaper than the download it avoids.
 
@@ -640,7 +691,7 @@ architecture record; design rationale is captured above.
 1. **Static**: `shellcheck --shell=sh` passes on the installer with no warnings.
 2. **Dash conformance**: the installer's test harness runs the script under
    `dash` (and, where available, macOS `/bin/sh`), not just `bash`, in CI.
-3. **Unit tests** (Units 1–6, 9) pass against fixture pointer files, manifests,
+3. **Unit tests** (Units 1-6, 9) pass against fixture pointer files, manifests,
    and a stubbed bucket/downloader, asserting: downloader/hasher/platform
    selection; target and version validation; field extraction; prefix resolution
    and traversal rejection; skip-on-rerun and checksum-mismatch handling; install
@@ -793,7 +844,7 @@ prefixes resolve to `.../minimal` subdirectories the installer owns, and the
 when empty and otherwise left untouched. Pruning failures (a non-empty dir) are
 ignored, not fatal.
 
-**R8.2**, `--purge` additionally removes the `minimal`-owned trees in full,
+**R8.2**, `--purge` also removes the `minimal`-owned trees in full,
 the resolved `data`, `state`, and `cache` directories and everything under them
 (build cache included), because those live at fixed `.../minimal` paths the tool
 owns exclusively. `--purge` never touches the shared `bin` directory beyond the
@@ -879,7 +930,7 @@ behind explicit `--purge` and confined to the `.../minimal` roots the tool owns.
 
 1. **Static/conformance**: the same `shellcheck --shell=sh` and `dash` CI gates
    cover the added uninstall path.
-2. **Unit tests** (Units 7–8): dispatch and record-absent no-op; hash-verified
+2. **Unit tests** (Units 7-8): dispatch and record-absent no-op; hash-verified
    removal; modified-file keep vs `--force`; already-absent idempotency;
    non-regular-file refusal; record teardown and empty-dir pruning; `--dry-run`
    removing nothing; `--purge` clearing the owned trees; rc-block stripping and

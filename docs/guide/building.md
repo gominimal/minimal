@@ -11,10 +11,10 @@ A build is a **one-shot** command that runs in its own fresh sandbox and exits, 
 ## Running a build
 
 ```shell
-$ mip build
+$ mip run build
 ```
 
-This is shorthand for `mip run build`. The stack configured in your `minimal.toml` determines what happens. For example, a Rust stack runs `cargo build --release`, while a pnpm stack runs roughly `pnpm install && pnpm build`.
+The stack configured in your `minimal.toml` determines what happens. For example, a Rust stack runs `cargo build --release`, while a pnpm stack runs roughly `pnpm install && pnpm build`.
 
 ## How stacks work
 
@@ -22,7 +22,7 @@ When you declare a stack, it provides:
 
 - **Build packages**: compilers, build tools, and other dependencies needed during compilation
 - **Runtime packages**: libraries needed wherever the built software runs
-- **Build commands**: the default commands executed by `mip build`
+- **Build commands**: the default commands executed by `mip run build`
 - **Environment variables**: compiler flags, paths, and other configuration
 
 ```toml
@@ -30,7 +30,7 @@ When you declare a stack, it provides:
 use = "go"
 ```
 
-With just this configuration, `mip build` will run `go build` with the Go compiler and all necessary toolchain packages available in the sandbox.
+With just this configuration, `mip run build` will run `go build` with the Go compiler and all necessary toolchain packages available in the sandbox.
 
 ## Adding extra dependencies
 
@@ -52,13 +52,13 @@ $ min add --runtime openssl
 
 ## Running tests
 
-Similarly to `mip build`, you can run your test suite with:
+Similarly to `mip run build`, you can run your test suite with:
 
 ```shell
-$ mip test
+$ mip run test
 ```
 
-This is shorthand for `mip run test`, and runs the `test` task from your `minimal.toml`; define one with `[tasks.test]`. Stacks provide a default `build` task only.
+This runs the `test` task from your `minimal.toml`; define one with `[tasks.test]`. Stacks only ship a default `build` task.
 
 ## Persisting build state
 
@@ -69,4 +69,4 @@ By default, each task invocation starts from a clean state. To cache build artif
 state_key = "dev"
 ```
 
-Tasks sharing the same `state_key` share cached state, so your builds don't start from scratch every time.
+Tasks sharing the same `state_key` share cached state, so your builds do not start from scratch every time.

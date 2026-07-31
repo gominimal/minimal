@@ -18,13 +18,13 @@ packages = ["claude-code", "base"]
 Then activate the session and run the agent inside it:
 
 ```shell
-$ min activate --attach .
+$ min session activate --attach .
 $ claude
 ```
 
 Claude Code launches inside the session with your project's source code and a read-only system containing the `claude-code` binary and core utilities from `base`. The session has no additional access to anything on your host system unless you explicitly declare it.
 
-Note that sessions are driven interactively: attaching needs a terminal, and the non-interactive `min attach -c` channel accepts only `min run <task>` invocations. Launch the agent from inside an attached shell as shown above, rather than scripting it from the host.
+Note that sessions are driven interactively: attaching needs a terminal. Launch the agent from inside an attached shell as shown above, rather than scripting it from the host.
 
 ## Adding more tools
 

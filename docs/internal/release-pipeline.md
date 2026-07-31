@@ -33,10 +33,16 @@ override for green-but-unreported commits.
 **Build jobs.**
 
 - `build-release-linux-{amd64,arm64}`: static musl builds of `mip`, `min`
-  (package `minimal`), and `minimald`, one cargo invocation per package so the
-  fat-LTO links serialize. The amd64 job additionally builds a native-glibc
-  `minvmd` against a materialized libkrun prefix (there is currently no
-  `minvmd-linux-arm64` release artifact).
+  (package `minimal`), `minimald`, and `minvmd`, one cargo invocation per
+  package so the fat-LTO links serialize. `minvmd` links a static `libkrun.a`
+  built from the vendored pin by the `build-libkrun-static-linux` composite
+  ([`scripts/build-libkrun-linux.sh`](../../scripts/build-libkrun-linux.sh)),
+  so it ships as a single self-contained binary with no `lib/` sibling, no
+  RUNPATH, and no glibc floor — and both arches ship it, where only amd64 had
+  a (dynamic) `minvmd` before. Each job asserts the result is `statically
+  linked` or `static-pie linked` (amd64 musl emits a static PIE, which
+  `file(1)` names differently) and really contains the KVM backend, since a
+  stub `minvmd` builds and links just as cleanly.
 - `build-release-macos-arm64` (self-hosted Apple Silicon, gated on the
   `RUN_MACOS_CI` kill-switch): builds `minvmd` (libkrun /
   Hypervisor.framework) and `min`, rewrites minvmd's libkrun linkage to
@@ -144,10 +150,12 @@ SHA-256-verifies, and atomically installs the file. The on-disk hash is the
 skip oracle, so reruns only touch changed components, and a running daemon is
 stopped before an executable is swapped. Per-platform sets (from
 stage-release.sh's `COMPONENTS` table): Linux amd64/arm64 get `bin/min`,
-`bin/mip`, `bin/minimald`, a `git-remote-min` symlink, and the AppArmor
-profile/tunable/loader under `data/`; macOS arm64 gets `bin/min`,
-`bin/minvmd`, `bin/gvproxy`, `lib/libkrun.1.dylib`, the `git-remote-min`
-symlink, and the guest payload (`data/{vmlinuz,rootfs.img,initramfs.cpio}`).
+`bin/mip`, `bin/minimald`, `bin/minvmd`, `bin/gvproxy-min`, a `git-remote-min`
+symlink, the guest payload (`data/{vmlinuz,rootfs.img,initramfs.cpio}`), and the
+AppArmor profile/tunable/loader under `data/`; macOS arm64 gets `bin/min`,
+`bin/minvmd`, `bin/gvproxy-min`, `lib/libkrun.1.dylib`, the `git-remote-min`
+symlink, and the same guest payload. Only macOS carries a `lib/` component:
+the Linux `minvmd` links libkrun statically.
 It also wires shell integration (PATH init files, `min` completions, one
 marker-fenced rc block). `--uninstall` reverses all of it offline from the
 local install record, keeping user-modified files unless `--force`;

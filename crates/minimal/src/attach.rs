@@ -1,6 +1,6 @@
 //! Smart session resolution and the interactive attach picker.
 //!
-//! When `min attach` is invoked without a session reference (or `min` is
+//! When `min session attach` is invoked without a session reference (or `min` is
 //! invoked bare), the client has to decide which session to attach to. The
 //! rules (issue #837) prefer a session built from the current working
 //! directory, fall back to the only session in the store when exactly one
@@ -46,7 +46,7 @@ pub(crate) enum SmartResolve {
     /// directly to this session.
     Attach(ListSessionsEntry),
     /// No sessions exist at all. The caller decides whether to error
-    /// (`min attach`) or activate a new session (bare `min`).
+    /// (`min session attach`) or activate a new session (bare `min`).
     NoSessions,
     /// More than one candidate; the caller must pick. The candidates are
     /// already limited to cwd-matches when any matched, else the full list.
@@ -137,10 +137,16 @@ fn last_activity(entry: &ListSessionsEntry) -> Option<chrono::DateTime<chrono::U
 /// Formats a single session as a picker row: `glyph  name | title · path`,
 /// eliding the title segment when the session has none, and tagging rows
 /// built from the current working directory so the cwd match is visible at
-/// a glance even in the "pick over all sessions" case.
+/// a glance even in the "pick over all sessions" case. Unnamed sessions
+/// render as `(unnamed) · <id-prefix>` — the first id segment is enough to
+/// tell same-path rows apart without a full UUID.
 fn format_candidate(entry: &ListSessionsEntry, cwd: &paths::HostAbsPath) -> String {
     let glyph = state_glyph(entry.status);
-    let name = entry.name.clone().unwrap_or_else(|| entry.id.to_string());
+    let name = entry.name.clone().unwrap_or_else(|| {
+        let id = entry.id.to_string();
+        let short = id.split('-').next().unwrap_or(&id);
+        format!("(unnamed) · {short}")
+    });
     let title = entry
         .attrs
         .as_ref()
@@ -233,7 +239,7 @@ pub(crate) fn ambiguous_no_input_message(
             .unwrap_or_else(|| "(unknown)".to_string());
         out.push_str(&format!("  {id}  {name}  {path}{cwd_marker}\n", id = c.id));
     }
-    out.push_str("Pass a session id or name explicitly: `min attach <id>`.");
+    out.push_str("Pass a session id or name explicitly: `min session attach <id>`.");
     out
 }
 
@@ -431,7 +437,7 @@ mod tests {
         assert!(msg.contains("019f5d0f-0a99-78b1-9165-0809440f0052"));
         assert!(msg.contains("019f5d0f-0a99-78b1-9165-0809440f0066"));
         assert!(msg.contains("(cwd)"));
-        assert!(msg.contains("min attach <id>"));
+        assert!(msg.contains("min session attach <id>"));
     }
 
     /// An entry from an older daemon that predates `project_path` (the field
@@ -476,5 +482,23 @@ mod tests {
         let label = format_candidate(&entries[0], &cwd("/a"));
         assert!(label.contains("(unknown)"), "unknown path label: {label}");
         assert!(!label.contains("(cwd)"), "no cwd marker: {label}");
+    }
+
+    #[test]
+    fn unnamed_session_shows_short_id_not_full_uuid() {
+        let e = entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            "/a",
+            SessionStatus::Active,
+        );
+        let label = format_candidate(&e, &cwd("/a"));
+        assert!(
+            label.contains("(unnamed) · 019f5d0f"),
+            "short id form: {label}"
+        );
+        assert!(
+            !label.contains("0a99-78b1"),
+            "full uuid must not appear: {label}"
+        );
     }
 }

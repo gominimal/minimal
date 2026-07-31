@@ -1645,4 +1645,36 @@ mod tests {
             "expected exactly one clean terminal outcome, got {outcomes:?}",
         );
     }
+
+    /// The output is resolved before the side-op spawns, so an unknown name is
+    /// a plain error rather than a terminal update on a channel the caller
+    /// would first have to be handed and drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_materialize_rejects_an_unknown_output_by_name() {
+        use crate::session_sop::MaterializeOpts;
+
+        let (_state, _cache, mngr) = manager().await;
+        let id = create_active_session(&mngr).await;
+        // Builds a fresh workspace-rooted context, so an mfile must exist.
+        seed_workspace_mfile(&mngr, id, "").await;
+
+        let err = session(&mngr, id)
+            .await
+            .start_materialize(MaterializeOpts {
+                output_name: "no-such-output".to_string(),
+                arch: None,
+            })
+            .await
+            .expect_err("an output the minimal file does not declare must be refused");
+
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "an undeclared output is a NotFound, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("no-such-output"),
+            "the error must name the output that was asked for, got {err}"
+        );
+    }
 }

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use crate::SessionId;
 use crate::core::compose::{
     Composable, ComposeError, ComposeOptions, Composition, Contribution, Error, SessionPatch,
-    SessionVar, StoredEnv, contribution_to_pending, default_env,
+    SessionVar, StoredEnv, contribution_to_pending, deferring_env,
 };
 use crate::core::primitives::ResolvedPatch;
 use crate::core::source::{
@@ -80,14 +80,15 @@ const _: fn() = || {
 
 impl SessionComposer {
     /// Construct a composer seeded with the client's wire
-    /// contribution and the default env lookup
-    /// ([`std::env::var`]).
+    /// contribution and the daemon-side [`deferring_env`] lookup —
+    /// inherited vars are never resolved against the daemon's own
+    /// environment; the client resolves them against the user's env.
     #[must_use]
     pub fn new(client: WireContribution) -> Self {
         Self {
             client,
             contribution: Contribution::new(),
-            env: default_env(),
+            env: deferring_env(),
         }
     }
 

@@ -43,6 +43,50 @@ pub fn is_vcs_root(dir: &Path) -> bool {
     VCS_MARKERS.iter().any(|marker| dir.join(marker).exists())
 }
 
+/// Returns `true` when activating from `dir` should skip the workspace
+/// upload without prompting: either `dir` is empty (nothing to sync) or
+/// it is the user's home directory (`home`). An empty box has nothing
+/// worth a confirmation, and `$HOME` — even when non-empty or itself a
+/// VCS root — is far too much to bulk-upload on a stray keystroke, so
+/// the home check ignores contents entirely. `home` is `None` when the
+/// caller can't resolve one, leaving only the emptiness check. The
+/// escape hatch for a genuinely wanted upload (`--sync tarball` passed
+/// explicitly) is decided at the call site, not here.
+pub fn is_empty_or_home(dir: &Path, home: Option<&Path>) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if home.is_some_and(|home| canon(dir) == canon(home)) {
+        return true;
+    }
+    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none())
+}
+
+/// The non-VCS-root upload gate's decision from inputs that need no TTY.
+/// Split out so the three-way choice is unit-testable; the interactive
+/// `Prompt` case is resolved by the caller (#441).
+#[derive(Debug, PartialEq, Eq)]
+pub enum UploadGate {
+    /// Upload without asking: a VCS root, or an explicit `--sync tarball`.
+    Upload,
+    /// Headless caller, non-VCS root, implicit sync: skip and warn.
+    SkipHeadless,
+    /// Interactive caller, non-VCS root: confirm before uploading.
+    Prompt,
+}
+
+/// Decide the non-VCS-root upload gate. `headless` means no interactive
+/// confirm is possible (`--no-prompt`, `--no-input`, or a non-TTY); an
+/// explicit `--sync tarball` (`sync_explicit`) forces the upload, else a
+/// headless caller skips rather than upload a directory nobody confirmed.
+pub fn upload_gate(is_vcs_root: bool, sync_explicit: bool, headless: bool) -> UploadGate {
+    if is_vcs_root || sync_explicit {
+        UploadGate::Upload
+    } else if headless {
+        UploadGate::SkipHeadless
+    } else {
+        UploadGate::Prompt
+    }
+}
+
 fn is_default_excluded(name: &str) -> bool {
     DEFAULT_EXCLUDED_DIRS.contains(&name)
 }
@@ -562,9 +606,28 @@ fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
                     .metadata()
                     .await
                     .with_context(|| format!("statting {}", entry_path.display()))?;
+                // Preserve the source's permission bits (masked to the
+                // standard nine + suid/sgid/sticky), same as
+                // `TarZstArchive::add_file`'s default. Hardcoding 0o644
+                // here silently strips the exec bit off scripts and
+                // binaries in every workspace upload.
+                let mode = {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    metadata.permissions().mode() & 0o7777
+                };
+                // Preserve the mtime too: leaving the header's zero
+                // stamp unpacks every file at the epoch, which breaks
+                // mtime-keyed (make-style) builds inside the session.
+                // Pre-epoch mtimes (nonsensical but legal) clamp to 0.
+                let mtime = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs());
                 let mut header = async_tar::Header::new_gnu();
                 header.set_size(metadata.len());
-                header.set_mode(0o644);
+                header.set_mode(mode);
+                header.set_mtime(mtime);
                 header.set_entry_type(async_tar::EntryType::Regular);
                 header.set_cksum();
                 tar.append_data(&mut header, &archive_path, &mut file)
@@ -838,6 +901,64 @@ mod tests {
         assert!(out.path().join("safe.txt").is_file());
     }
 
+    /// The dir-walk uploader must preserve file permission bits: a
+    /// workspace upload that flattens everything to 0o644 strips the
+    /// exec bit off scripts (e.g. `scripts/setup-dev.sh`), so they
+    /// arrive in the session un-runnable.
+    #[tokio::test]
+    async fn stream_preserves_file_modes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("setup-dev.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plain = dir.path().join("notes.txt");
+        std::fs::write(&plain, "notes").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let mut buf = Vec::new();
+        stream_tar_zstd(dir.path(), &mut buf).await.unwrap();
+
+        let decoder = async_compression::tokio::bufread::ZstdDecoder::new(&buf[..]);
+        let out = tempfile::TempDir::new().unwrap();
+        async_tar::Archive::new(decoder)
+            .unpack(out.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let mode_of = |name: &str| {
+            std::fs::metadata(out.path().join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(
+            mode_of("setup-dev.sh"),
+            0o755,
+            "executable bit must survive the upload round-trip"
+        );
+        assert_eq!(
+            mode_of("notes.txt"),
+            0o640,
+            "non-default permission bits must survive the upload round-trip"
+        );
+
+        let src_mtime_secs = |p: &std::path::Path| {
+            std::fs::metadata(p)
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        assert_eq!(
+            src_mtime_secs(&out.path().join("setup-dev.sh")),
+            src_mtime_secs(&script),
+            "mtime must survive the upload round-trip, not unpack at the epoch"
+        );
+    }
+
     #[tokio::test]
     async fn stream_excludes_default_dirs() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1023,6 +1144,46 @@ mod tests {
     fn is_vcs_root_rejects_plain_dir() {
         let dir = tempfile::TempDir::new().unwrap();
         assert!(!is_vcs_root(dir.path()));
+    }
+
+    #[test]
+    fn is_empty_or_home_skips_empty_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(is_empty_or_home(dir.path(), None));
+    }
+
+    #[test]
+    fn is_empty_or_home_skips_home_even_with_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "x").unwrap();
+        assert!(is_empty_or_home(dir.path(), Some(dir.path())));
+    }
+
+    #[test]
+    fn is_empty_or_home_skips_home_that_is_a_vcs_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        assert!(is_empty_or_home(dir.path(), Some(dir.path())));
+    }
+
+    #[test]
+    fn is_empty_or_home_keeps_ordinary_non_empty_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "x").unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        assert!(!is_empty_or_home(dir.path(), Some(home.path())));
+    }
+
+    #[test]
+    fn upload_gate_covers_three_lanes() {
+        // A VCS root, or an explicit `--sync tarball`, always uploads —
+        // headless or not.
+        assert_eq!(upload_gate(true, false, true), UploadGate::Upload);
+        assert_eq!(upload_gate(false, true, true), UploadGate::Upload);
+        // Headless + non-VCS root + implicit sync: skip and warn.
+        assert_eq!(upload_gate(false, false, true), UploadGate::SkipHeadless);
+        // Interactive + non-VCS root + implicit sync: confirm first.
+        assert_eq!(upload_gate(false, false, false), UploadGate::Prompt);
     }
 
     // ---- TarZstArchive per-entry API ----

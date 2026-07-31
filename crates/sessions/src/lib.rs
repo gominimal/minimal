@@ -141,6 +141,13 @@ impl IngressPolicy {
 /// deny-all-external ingress default). Stored on [`Record`] as the policy
 /// configured at launch and returned verbatim by the `GetSessionPolicy` RPC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+// Every field is an `Option`, so without this an unrelated JSON object would
+// decode as an all-`None` policy. That matters because `GetSessionPolicy`'s
+// response is an `#[serde(untagged)]` `Errorable<SessionPolicy>`: the daemon's
+// `{"error":"no session found"}` reply must fall through to the `Err` arm, not
+// masquerade as a valid empty policy (a silent false negative on a
+// security-introspection command).
+#[serde(deny_unknown_fields)]
 pub struct SessionPolicy {
     /// Egress policy; `None` when no explicit egress config is present.
     pub egress: Option<EgressPolicy>,

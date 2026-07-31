@@ -25,7 +25,7 @@ curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh
 min --version
 ```
 
-If installed correctly, it will provide you with the version.
+If installed correctly, it prints the version.
 
 ## macOS
 
@@ -49,7 +49,7 @@ curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh
 min --version
 ```
 
-If installed correctly, it will provide you with the version.
+If installed correctly, it prints the version.
 
 ## Upgrade
 
@@ -58,7 +58,14 @@ installed component against the current release and re-downloads only the ones
 that changed, swapping them into place atomically.
 
 Note: upgrading restarts the Minimal daemon, which interrupts any sessions that
-are currently active. Detach first, or expect to reattach after the upgrade.
+are currently active. When sessions are running, the installer lists them and
+asks on your terminal before ending them; declining leaves everything as it was.
+For a scripted upgrade that must not stop to ask, set
+`MINIMAL_INSTALL_FORCE_STOP=1`, or pass the flag through the shell:
+
+```shell
+curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh -s -- --force-stop
+```
 
 ## Uninstall
 

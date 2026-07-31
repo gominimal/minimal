@@ -5,7 +5,7 @@
 #
 # Try it:
 #   cargo build -p minimal -p minimald
-#   ./target/debug/min activate crates/sessions/example_project --attach
+#   ./target/debug/min session activate crates/sessions/example_project --attach
 #
 # Then inside the session:
 #
@@ -56,8 +56,10 @@
 repo = "https://github.com/gominimal/pkgs"
 branch = "unstable"
 # Reused from the workspace's own `minimal.toml` — guaranteed to
-# resolve as long as that pin does.
-locked_commit = "75884ceb9d227e7c97642ccdfff01fecbb8380a1"
+# resolve as long as that pin does. Keep this in sync with
+# `.minimal/minimal.toml`; a drifted pin that upstream has since
+# rebased away fails at checkout with "invalid reference".
+locked_commit = "c854d6b1e0fdc67efd84fc664251079c0719987d"
 
 [stack]
 use = "shell"
@@ -73,7 +75,7 @@ use = "shell"
 # the package's build attrs and routes them through the same
 # `PatchPolicy`/`VarsPolicy` gate every other contribution goes
 # through.
-packages = ["mermaid-ascii", "go", "claude-code"]
+packages = ["mermaid-ascii", "go"]
 
 [session.vars]
 # Hardcoded literal — auto-approves at the gate because

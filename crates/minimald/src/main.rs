@@ -210,6 +210,14 @@ pub struct ListenArgs {
     #[clap(hide = true)]
     mk_mount_state_volume: Option<String>,
 
+    /// Raise `RLIMIT_NOFILE`, soft and hard, to this many descriptors, which
+    /// everything the daemon forks inherits. Only useful as a VM init process,
+    /// where nothing else widens the kernel's 1024-fd default; `None` keeps the
+    /// limits we were started with.
+    #[arg(long)]
+    #[clap(hide = true)]
+    rlimit_nofile: Option<u64>,
+
     /// Vsock port to listen on for host time updates: 8-byte little-endian
     /// nanoseconds-since-epoch stamps, dialed in by the host half in `minvmd`
     /// (see `guest::run_timekeep_listener`). Only useful as a VM init process;
@@ -409,6 +417,8 @@ async fn async_main() -> Result<(), MainError> {
                 mount_rootfs: Some("/dev/vda".to_string()),
                 mk_mount_state_volume: Some("/dev/vdb".to_string()),
                 detach: false,
+                // No service manager above pid-1 to widen the kernel default.
+                rlimit_nofile: Some(guest::DEFAULT_MICROVM_NOFILE_LIMIT),
                 // Host time updates arrive on a vsock stream we listen on, from
                 // minvmd. Always listen: the guest cannot see what the
                 // host runs.
@@ -471,6 +481,26 @@ async fn async_main() -> Result<(), MainError> {
 
     // Handle setup specific to operating in a micro-vm.
     use minimald::guest;
+    // Before anything forks from us and inherits the limits. Best effort: the
+    // kernel default is the prior behaviour, not a reason to refuse to boot.
+    if let Some(limit) = listen_args.rlimit_nofile {
+        match guest::raise_nofile_limit(limit) {
+            Ok(effective) if effective >= limit => {
+                tracing::debug!(nofile = effective, "raised the open-file limit");
+            }
+            Ok(effective) => tracing::warn!(
+                requested = limit,
+                effective,
+                "the open-file limit could not be raised as far as requested; fd-hungry builds \
+                 may fail with EMFILE"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                requested = limit,
+                "could not raise the open-file limit; fd-hungry builds may fail with EMFILE"
+            ),
+        }
+    }
     if listen_args.mount_dev {
         guest::mount_dev();
     }

@@ -577,7 +577,7 @@ access, no memorized ports). The two paths below preserve the hostname UX.
 
 Note that there are interesting options like embedded an egress webproxy in the
 gvproxy and using PAC file with MacOS's webproxy configuration to make it
-work seamlessly with the DNS hosts minimal creates for PTasks and VMs.
+work with the DNS hosts minimal creates for PTasks and VMs.
 
 ## Option A — Laptop joins the WireGuard mesh
 
@@ -637,6 +637,6 @@ service becomes a separately-managed `ssh -L` tunnel mapped to a `localhost:N`
 the user has to remember (or that a helper has to manage). Layered on top of a
 local resolver / proxy you could rebuild the hostname UX, but at that point you
 are re-implementing option A's UX with more moving parts and a transport that
-can't carry UDP. SSH-forward is best kept as a fallback for restricted
+cannot carry UDP. SSH-forward is best kept as a fallback for restricted
 networks where WireGuard cannot get out.
 

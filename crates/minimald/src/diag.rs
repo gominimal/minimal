@@ -322,14 +322,25 @@ async fn build_bundle(
     collect_step!(
         w,
         "net.interfaces",
-        diagnostics::net::proc_net_tables(&mut w, "", "interfaces", &["dev"])
+        diagnostics::net::proc_net_tables(
+            &mut w,
+            "",
+            "interfaces",
+            diagnostics::net::PROC_NET_INTERFACE_TABLES
+        )
     );
     // Routing *and* addresses: `fib_trie` carries the local address picture the
-    // host's `ip addr` gives on the other side of the switch.
+    // host's `ip addr` gives on the other side of the switch. Same tables the
+    // host collector falls back to, so the two captures stay comparable.
     collect_step!(
         w,
         "net.routes",
-        diagnostics::net::proc_net_tables(&mut w, "", "routes", &["route", "fib_trie"])
+        diagnostics::net::proc_net_tables(
+            &mut w,
+            "",
+            "routes",
+            diagnostics::net::PROC_NET_ROUTE_TABLES
+        )
     );
     if s.in_microvm().await {
         collect_step!(w, "net.gvproxy", gvproxy_probe(&mut w));

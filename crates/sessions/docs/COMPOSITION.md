@@ -23,7 +23,7 @@ verdicts that come back.
 The daemon-side compose runs off the project files in the session's
 *daemon-side workspace*, and the composition's approved patches
 must land on the daemon's disk before the session is attachable —
-so `min activate` splits into four sequential RPCs bracketed by
+so `min session activate` splits into four sequential RPCs bracketed by
 two file-tree uploads:
 
 ```mermaid
@@ -194,7 +194,7 @@ declared.
 
 **Two hook implementations ship in `crates/minimal/src/prompt.rs`:**
 
-- `InteractivePrompt` — a `dialoguer::Select`-driven prompter that
+- `InteractivePrompt` — an `inquire::Select`-driven prompter that
   offers `AllowOnce` / `AllowPermanent` / `IgnoreOnce` /
   `IgnorePermanent` / `DenyPermanent` / `Abort`. Permanent choices
   mutate a `RefCell`-held policy that `save_user_policy` writes to
@@ -214,7 +214,7 @@ declared.
   `submit_verdict_and_wait` normally.
 
 The TTY probe (`can_prompt_interactively`) requires both stdin
-(where `dialoguer` reads keypresses) and stderr (where prompts
+(where `inquire` reads keypresses) and stderr (where prompts
 render) to be terminals; either being redirected takes the
 `NoPromptHook` path.
 

@@ -49,16 +49,25 @@ To add a tool to a running session without editing config, run `min add <package
 
 ## Task-specific packages
 
-Packages can also be scoped to individual [tasks](../reference/tasks.md), where they are only available when that task runs. Add them with `min add --task <name>`:
+Packages can also be scoped to individual [tasks](../reference/tasks.md), where they are only available when that task runs. The task must already be declared in `minimal.toml` — `min add --task <name>` updates an existing task's `packages` list, it does not create the task:
+
+```toml
+[tasks.lint]
+exec = "ruff check ."
+```
+
+Add a package to the declared task with `min add --task <name>`:
 
 ```shell
 $ min add --task lint ruff
 ```
 
+The task's `packages` list is updated in place:
+
 ```toml
 [tasks.lint]
-packages = ["python", "ruff"]
 exec = "ruff check ."
+packages = ["ruff"]
 ```
 
 ## Available packages

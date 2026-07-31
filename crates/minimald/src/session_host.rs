@@ -10,8 +10,6 @@ use russh::Channel;
 use russh::server::Msg;
 #[cfg(not(test))]
 use sandbox2::Network;
-#[cfg(not(test))]
-use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::io::{Read, Write};
@@ -167,7 +165,7 @@ impl Pty {
 /// from?" back to the loadout / project / package that contributed
 /// it.
 ///
-/// Baseline items (the launcher-defaults `PS1`, `base`, `coreutils`,
+/// Baseline packages (the launcher-defaults `base`, `coreutils`,
 /// `socat`) log with `source = "launcher-baseline"` so they can be
 /// distinguished from composition contributions. Patches and hooks
 /// still log even though the launcher can't act on them yet — an
@@ -181,7 +179,6 @@ impl Pty {
 fn log_session_contents(
     session_name: &str,
     baseline_packages: &[&str],
-    baseline_var_names: &[&str],
     composition: Option<&sessions::core::compose::Composition>,
 ) {
     for p in baseline_packages {
@@ -189,15 +186,6 @@ fn log_session_contents(
             session = session_name,
             domain = "package",
             name = p,
-            source = "launcher-baseline",
-            "session content",
-        );
-    }
-    for k in baseline_var_names {
-        tracing::info!(
-            session = session_name,
-            domain = "var",
-            name = k,
             source = "launcher-baseline",
             "session content",
         );
@@ -501,7 +489,7 @@ impl Binding {
             match async_dialog::Select::new()
                 .with_prompt(SHELL_EXIT_PROMPT)
                 .items([
-                    "Detach, leaving the session running",
+                    "Exit, leaving the session filesystem in place and recoverable",
                     "Delete, all in-session files permanently deleted",
                 ])
                 .interact(rs.make_reader(), &mut w)
@@ -831,20 +819,57 @@ impl SessionProcess for SandboxProcess {
 #[cfg(not(test))]
 const BASELINE_PACKAGES: &[&str] = &["base", "coreutils", "socat"];
 
-/// Env vars every session sandbox gets unconditionally, regardless of
-/// the client's contribution. `PS1` is here so the shell prompt is
-/// styled the same whether a composition sets it or not.
-#[cfg(not(test))]
-const BASELINE_VARS: &[(&str, &str)] = &[(
-    "PS1",
-    r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ ",
-)];
+/// Environment folded into a session shell at the launching attach, over and
+/// above the composition. Both halves are captured from the SSH channel that
+/// mints the shell (see [`crate::session::Session::attach`]); a re-attach to an
+/// already-running shell does not revisit them.
+///
+/// The two halves sit on opposite sides of the composition in precedence:
+/// `inherited` are defaults the composition may override, `connection` are
+/// authoritative facts that override the composition.
+///
+/// The fields are read only by the real [`SandboxLauncher`] (`cfg(not(test))`);
+/// the mock launcher ignores them, so tolerate them being unread under `test`.
+#[derive(Debug, Default, Clone)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) struct AttachEnv {
+    /// Locale/timezone vars the client forwarded from its shell (`LANG`,
+    /// `LC_*`, `TZ`) — OpenSSH's `AcceptEnv` set. Applied as defaults *below*
+    /// the composition, so a loadout's explicit locale still wins.
+    pub(crate) inherited: Vec<(String, String)>,
+    /// Per-connection facts — currently just `TERM` from the PTY request.
+    /// Applied *above* the composition, the way sshd sets `TERM`
+    /// authoritatively regardless of shell dotfiles. (`SSH_TTY` and
+    /// `SSH_CONNECTION`/`SSH_CLIENT` are deliberately not set: the session
+    /// sandbox has no host `/dev/pts` and the Unix-socket transport has no peer
+    /// address, so any value would name something that doesn't exist in-session.)
+    pub(crate) connection: Vec<(String, String)>,
+}
+
+/// Layers a session shell's environment by precedence, lowest first: the
+/// client-forwarded `inherited` locale/timezone, then the `composition` vars
+/// (which may override the inherited defaults), then the `connection` facts
+/// (which override everything — sshd-style). Later inserts win on a shared key.
+fn layer_session_env(
+    inherited: Vec<(String, String)>,
+    composition: Vec<(String, String)>,
+    connection: Vec<(String, String)>,
+) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    for (k, v) in inherited.into_iter().chain(composition).chain(connection) {
+        env.insert(k, v);
+    }
+    env
+}
 
 /// The real [`SessionLauncher`]: evaluates a minimal context into a graph,
 /// builds a sandboxed `/bin/bash`, and wires it to a freshly opened PTY.
 #[cfg(not(test))]
 pub(crate) struct SandboxLauncher {
     pub(crate) ctx: mctx::Context,
+    /// Env captured from the SSH channel that mints this shell; see
+    /// [`AttachEnv`].
+    pub(crate) attach_env: AttachEnv,
     pub(crate) network_mode: NetworkMode,
     /// Shared per-host gvproxy switch. Used only for
     /// [`NetworkMode::OwnIp`] launches.
@@ -931,6 +956,7 @@ impl SessionLauncher for SandboxLauncher {
         // the sandbox env below.
         let session_name = name.clone();
         let composition = self.composition;
+        let attach_env = self.attach_env;
         let session = self.session;
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
@@ -996,8 +1022,11 @@ impl SessionLauncher for SandboxLauncher {
         // contribution the composer collected. Packages: baseline set
         // (required for a usable interactive shell) unioned with
         // everything the composition asks for, dedup-preserving-order
-        // so the base packages install first. Env vars: baseline
-        // `PS1` first, composition vars overwrite on the same key.
+        // so the base packages install first. Env vars: purely the
+        // composition's, since the launcher no longer forces any
+        // baseline var — sandbox2 sets the session defaults (`PS1`,
+        // `PATH`, `HOME`, `LANG`, …) which these composed vars then
+        // override on a shared key.
         //
         // Baseline is intentionally minimal: `base` for the shell,
         // `coreutils` for `ls`/`cat`/etc, and `socat` for the
@@ -1025,10 +1054,6 @@ impl SessionLauncher for SandboxLauncher {
             BASELINE_PACKAGES.iter().map(|s| (*s).to_string()).collect();
         let mut package_set: std::collections::HashSet<String> =
             BASELINE_PACKAGES.iter().map(|s| (*s).to_string()).collect();
-        let mut env_vars: HashMap<String, String> = BASELINE_VARS
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-            .collect();
         if let Some(comp) = &composition {
             for p in comp.packages() {
                 let name = p.package();
@@ -1036,22 +1061,29 @@ impl SessionLauncher for SandboxLauncher {
                     packages.push(name.to_string());
                 }
             }
-            for v in comp.vars() {
-                let var = v.var();
-                env_vars.insert(var.name().to_string(), var.value().to_string());
-            }
         }
+        // Env vars, layered by precedence (see [`layer_session_env`]): the
+        // client-forwarded locale/timezone sit below the composition, and the
+        // per-connection facts (`TERM`) sit above it.
+        let composition_vars: Vec<(String, String)> = composition
+            .as_ref()
+            .map(|c| {
+                c.vars()
+                    .iter()
+                    .map(|v| (v.var().name().to_string(), v.var().value().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let env_vars = layer_session_env(
+            attach_env.inherited,
+            composition_vars,
+            attach_env.connection,
+        );
         // Log every item that will (or would) end up in the session,
         // tagged with its provenance. Patches and lifecycle hooks are
         // included even though the launcher can't act on them yet —
         // an operator inspecting logs should see the intent.
-        let baseline_var_names: Vec<&str> = BASELINE_VARS.iter().map(|(k, _)| *k).collect();
-        log_session_contents(
-            &name,
-            BASELINE_PACKAGES,
-            &baseline_var_names,
-            composition.as_deref(),
-        );
+        log_session_contents(&name, BASELINE_PACKAGES, composition.as_deref());
 
         // Build the env + container and spawn the process. Any failure here (env
         // build, container build, spawn) leaves no process to reap; the phase-1
@@ -1703,6 +1735,33 @@ mod tests {
         xpixel: 0,
         ypixel: 0,
     };
+
+    /// Precedence: client-forwarded `inherited` sits below the composition,
+    /// which sits below the per-connection `connection` facts. Later layers win
+    /// on a shared key; non-colliding keys from every layer survive.
+    #[test]
+    fn layer_session_env_precedence() {
+        let sv = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let env = layer_session_env(
+            // inherited: LANG is overridden by composition; TZ survives.
+            vec![sv("LANG", "de_DE.UTF-8"), sv("TZ", "Europe/Berlin")],
+            // composition: beats inherited LANG; its TERM is overridden by the
+            // connection; EDITOR survives.
+            vec![
+                sv("LANG", "fr_FR.UTF-8"),
+                sv("TERM", "dumb"),
+                sv("EDITOR", "hx"),
+            ],
+            // connection: authoritative TERM.
+            vec![sv("TERM", "xterm-256color")],
+        );
+
+        assert_eq!(env.get("LANG").map(String::as_str), Some("fr_FR.UTF-8")); // composition > inherited
+        assert_eq!(env.get("TZ").map(String::as_str), Some("Europe/Berlin")); // inherited-only survives
+        assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color")); // connection > composition
+        assert_eq!(env.get("EDITOR").map(String::as_str), Some("hx")); // composition-only survives
+        assert_eq!(env.len(), 4);
+    }
 
     #[test]
     fn open_and_get_fds() {

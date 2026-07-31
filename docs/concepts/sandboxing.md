@@ -4,13 +4,13 @@ description: How Minimal isolates all builds and tasks from the host system usin
 
 # Sandboxing
 
-Sandboxing is essential to ensure all builds and tasks are insulated from the machine they run in. **In Minimal, all tasks and builds run in a sandbox**.
+Sandboxing is essential to make sure all builds and tasks are insulated from the machine they run in. **In Minimal, all tasks and builds run in a sandbox**.
 
 
 ## Package builds
 
-Minimal packages encapsulate all tooling and software, so it's essential they are compiled in a hermetically-sealed environment to provide a strong
-foundation to the rest of the ecosystem. As such, package builds take place in a cleanroom sandbox that shares nothing with the host machine, aside from network access when a dependency calls for it.
+Minimal packages encapsulate all tooling and software, so it's essential they are compiled in a hermetically-sealed environment that gives the rest of the ecosystem a strong
+foundation. As such, package builds take place in a cleanroom sandbox that shares nothing with the host machine, aside from network access when a dependency calls for it.
 
 Specifically, the cleanroom sandbox wires:
 

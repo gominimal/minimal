@@ -1,20 +1,31 @@
 # justfile — repo-wide task runner; the local twin of the frozen CI workflows
 # (docs/ci-strategy.md §8: CI YAML schedules, the logic lives here + scripts/).
 # OS-specific recipes carry [linux]/[macos] attributes — `just --list` shows
-# only this host's. The comment line directly above a recipe is its caption.
+# only this host's. `just --list` renders ONLY the last comment line above a
+# recipe, so that line must be a standalone summary (warnings included);
+# rationale, CI pointers and caveats go above it, separated by a bare `#`.
 
 scratch      := justfile_directory() / ".scratch"
 arch         := arch()
 musl-target  := arch + "-unknown-linux-musl"
-# Flat libkrun link/runtime prefix (Linux; macOS links the Homebrew install).
+# Flat libkrun link/runtime prefix for the DYNAMIC upstream package (Linux;
+# macOS links the Homebrew install). No longer on the dev stack's path — kept
+# for `just libkrun`, which still fetches it.
 krun-prefix  := env('HOME') / ".krun"
+# Prefix for the STATIC libkrun the dev stack links (Linux). Built from the
+# vendored pin, not fetched; `just clean` removes it.
+krun-static  := scratch / "libkrun-static" / musl-target
 # Guest networking features baked into the initramfs (networking-wg deferred).
 features     := "networking-proxy"
 kernel       := scratch / "vmlinuz"
 rootfs       := scratch / "rootfs.img"
 initramfs    := scratch / "initramfs.cpio"
 gvproxy      := scratch / "gvproxy"
-minvmd-bin   := justfile_directory() / "target/debug/minvmd"
+# On Linux minvmd builds for the musl target (static libkrun — the linkage
+# users receive), so it lands under target/<triple>/ rather than target/debug.
+# macOS keeps the native debug dir.
+minvmd-dir   := if os() == "linux" { justfile_directory() / "target" / musl-target / "debug" } else { justfile_directory() / "target/debug" }
+minvmd-bin   := minvmd-dir / "minvmd"
 minimald-bin := justfile_directory() / "target/debug/minimald"
 # The CLI crate is `minimal`; its [[bin]] target is `min`.
 min-bin      := justfile_directory() / "target/debug/min"
@@ -25,6 +36,9 @@ native-dir   := scratch / "native-state"
 # Linux-only): scope to the darwin-capable crates there; `just test-cross`
 # covers the rest. The Linux lanes run nextest's ci profile; macOS has none.
 scope      := if os() == "macos" { "-p minvmd -p sessions" } else { "--workspace" }
+# Crates carrying a `fuzz/` workspace. `rcache` is Linux-only: it pulls in
+# `lcache`, which uses the Linux-only `common::renameat2`.
+fuzz-crates := if os() == "macos" { "args common graph mfile" } else { "args common graph mfile rcache" }
 ci-profile := if os() == "macos" { "" } else { "--profile ci" }
 e2e-env    := "E2E_VM=1 E2E_PROJECT_DIR=/tmp" + if os() == "linux" { " E2E_MINIMAL_ARGS='--provider local-minvmd'" } else { "" }
 
@@ -32,8 +46,11 @@ e2e-env    := "E2E_VM=1 E2E_PROJECT_DIR=/tmp" + if os() == "linux" { " E2E_MINIM
 # binaries; MINVMD_* are inert outside the VM recipes. 150s timeouts: the
 # generic guest kernel can spend 40-70s probing hardware before pid-1 starts,
 # overrunning the 60s READY / 75s autospawn / 30s lifecycle defaults.
-export PATH := justfile_directory() / "target/debug:" + env('PATH')
-export LD_LIBRARY_PATH := krun-prefix + if env('LD_LIBRARY_PATH', '') == '' { '' } else { ':' + env('LD_LIBRARY_PATH') }
+#
+# minvmd-dir leads: on Linux it holds the musl build, and `min` autospawns
+# `minvmd` by bare name. No LD_LIBRARY_PATH — minvmd links libkrun statically
+# and dlopens nothing, so there is nothing for the loader to resolve.
+export PATH := minvmd-dir + ":" + justfile_directory() / "target/debug:" + env('PATH')
 export MINVMD_KERNEL_PATH := kernel
 export MINVMD_ROOTFS_PATH := rootfs
 export MINVMD_INITRAMFS := initramfs
@@ -61,10 +78,23 @@ artifacts:
     @[ -f {{kernel}} ] || scripts/fetch-prebuilt.sh kernel {{kernel}} {{arch}}
     @[ -f {{rootfs}} ] || scripts/fetch-prebuilt.sh rootfs {{rootfs}} {{arch}}
 
-# Fetch prebuilt libkrun + libkrunfw into the link/runtime prefix.
+# Not on the dev stack's path any more — see `libkrun-static`. Kept because
+# nightly-tests.yml still builds against the upstream package, and this is how
+# you reproduce that locally.
+#
+# Fetch the prebuilt DYNAMIC libkrun + libkrunfw into the link/runtime prefix.
 [linux]
 libkrun:
     scripts/fetch-prebuilt.sh krun {{krun-prefix}} {{arch}}
+
+# The linkage Linux users actually receive, and what `minvmd-build` and
+# `test-vm` link against. Built from the vendored pin rather than fetched.
+# Skips when already built; `just clean` forces a rebuild.
+#
+# Build the STATIC libkrun (libkrun.a) from the vendored pin.
+[linux]
+libkrun-static:
+    @[ -f {{krun-static}}/libkrun.a ] || scripts/build-libkrun-linux.sh {{krun-static}} {{musl-target}}
 
 # Fetch the pinned gvproxy switch (guest egress + own-IP; missing = switchless boot).
 gvproxy:
@@ -84,10 +114,15 @@ minvmd-build:
     cargo build -p minvmd --bin minvmd --locked
     codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - {{minvmd-bin}}
 
-# Build minvmd (debug); LIBKRUN_PREFIX links the real (non-stub) libkrun.
+# The same target and linkage the release ships, so the dev stack exercises
+# what users run. MINVMD_REQUIRE_LIBKRUN makes a missing libkrun.a an error
+# rather than a silent runtime-bailing stub.
+#
+# Build minvmd (debug, static musl against the vendored libkrun.a).
 [linux]
-minvmd-build: libkrun
-    LIBKRUN_PREFIX="{{krun-prefix}}" cargo build -p minvmd --bin minvmd --locked
+minvmd-build: libkrun-static
+    MINVMD_REQUIRE_LIBKRUN=static LIBKRUN_PREFIX="{{krun-static}}" \
+      cargo build -p minvmd --bin minvmd --locked --target {{musl-target}}
 
 # Build the `min` CLI.
 minimal-cli:
@@ -108,7 +143,7 @@ min *args:
 # Print `export` lines for running the stack by hand: eval "$(just env)".
 env:
     @printf 'export %s="%s"\n' \
-      PATH "$PATH" LD_LIBRARY_PATH "$LD_LIBRARY_PATH" \
+      PATH "$PATH" \
       MINVMD_KERNEL_PATH "$MINVMD_KERNEL_PATH" MINVMD_ROOTFS_PATH "$MINVMD_ROOTFS_PATH" \
       MINVMD_INITRAMFS "$MINVMD_INITRAMFS" \
       MINVMD_GVPROXY_BIN "{{gvproxy}}" \
@@ -128,9 +163,13 @@ status:
 stop:
     @"{{minvmd-bin}}" stop
 
+# The built libkrun.a goes too: it is keyed to the vendored pin, so a stale one
+# would silently outlive a pin bump.
+#
 # Remove the bring-up artifacts this justfile manages (never all of .scratch).
 clean:
     rm -f {{kernel}} {{rootfs}} {{initramfs}} {{gvproxy}}
+    rm -rf {{scratch}}/libkrun-static
 
 # Kill THIS checkout's stranded VM processes (they wedge the next VM's vsock bridge).
 reap:
@@ -156,26 +195,33 @@ _nextest: (_need "cargo-nextest" "cargo install cargo-nextest --locked")
 fmt:
     cargo fmt --all
 
-# Autofix pass: fmt, clippy --fix, fmt again. Clippy's `--fix` can shuffle
-# whitespace during its rewrites, so the trailing `cargo fmt` normalizes
-# whatever landed. `--allow-dirty` skips the clean-worktree check — the
-# usual case here is running mid-edit with staged/unstaged work.
+# Clippy's `--fix` can shuffle whitespace during its rewrites, so the trailing
+# `cargo fmt` normalizes whatever landed. `--allow-dirty` skips the
+# clean-worktree check — the usual case here is running mid-edit with
+# staged/unstaged work.
+#
+# Autofix pass: fmt, clippy --fix, fmt again (safe to run mid-edit).
 fix:
     cargo fmt --all
     cargo clippy {{scope}} --all-targets --fix --allow-dirty -- -D warnings
     cargo fmt --all
 
 # CI: ci.yml `fmt`.
+#
+# Check rustfmt across the workspace without writing (`just fmt` is the fixer).
 fmt-check:
     cargo fmt --all -- --check
 
 # CI: ci.yml `clippy` / the ci-macos.yml `unit` scope.
+#
+# Clippy over all targets at this host's scope, warnings denied.
 clippy:
     cargo clippy {{scope}} --all-targets --locked -- -D warnings
 
 # A local advisories failure may just mean newer RUSTSEC data than CI's last run.
-#
 # CI: ci.yml `cargo-deny` (advisories/bans/licenses/sources).
+#
+# cargo-deny's all-features check: advisories, bans, licenses, sources.
 deny: (_need "cargo-deny" "cargo install cargo-deny --locked")
     cargo deny --all-features check
 
@@ -183,6 +229,8 @@ deny: (_need "cargo-deny" "cargo install cargo-deny --locked")
 # by every crate) still type-checks. cargo-hack drives the check against the
 # declared version; the toolchain the check runs under is fetched by rustup.
 # CI: nightly-tests.yml `msrv` (blocking).
+#
+# The declared MSRV floor still type-checks (cargo-hack).
 msrv: (_need "cargo-hack" "cargo install cargo-hack --locked")
     cargo hack check --rust-version --workspace --all-targets --locked
 
@@ -191,8 +239,34 @@ msrv: (_need "cargo-hack" "cargo install cargo-hack --locked")
 # interprets under miri in seconds. Needs the nightly toolchain + miri component:
 #   rustup toolchain install nightly && rustup +nightly component add miri
 # CI: nightly-tests.yml `miri` (non-blocking). Widen the set as more crates prove clean.
+#
+# miri over `switch`'s vsock/subnet/MAC primitives (needs nightly + the miri component).
 miri:
     cargo +nightly miri test -p switch
+
+# Each `fuzz/` dir is its OWN workspace (so the nightly/sanitizer build can't
+# perturb the main one), which means no workspace-wide build ever compiles
+# them — they bitrot silently as the crates they target evolve. Plain `cargo
+# check` on stable is enough to catch it: no nightly, no sanitizer.
+#
+# Type-check every cargo-fuzz target (bitrot guard). See docs/fuzzing.md.
+fuzz-check:
+    #!/usr/bin/env sh
+    set -eu
+    for c in {{fuzz-crates}}; do
+        echo "== crates/$c/fuzz =="
+        # No --locked: fuzz Cargo.lock files are gitignored (see fuzz/.gitignore).
+        cargo check --manifest-path "crates/$c/fuzz/Cargo.toml" --all-targets
+    done
+
+# Needs nightly (libFuzzer + sanitizers). The RSS cap is load-bearing: these
+# decoders can allocate from an untrusted length field, and the cap turns an
+# unbounded-allocation bug into a catchable crash rather than an ambient OOM.
+# Seed the corpus first for the structured targets (docs/fuzzing.md).
+#
+# Run one fuzz target: `just fuzz graph graph_from_bytes -max_total_time=60`.
+fuzz crate target *args: (_need "cargo-fuzz" "cargo install cargo-fuzz --locked")
+    cd crates/{{crate}} && cargo +nightly fuzz run {{target}} -- -rss_limit_mb=2048 {{args}}
 
 # Unit + in-process integration tests. CI: every lane's core-tests suite.
 test: _nextest
@@ -248,14 +322,16 @@ test-installer:
         SH="$sh" "$sh" scripts/install_test.sh
     done
 
-# Shellcheck EVERY script under scripts/ (not just the installer's two files).
 # The reviewed harness the frozen ci-shell-installer.yml can't widen to; CI runs
 # the same check through crates/common/tests/shell_lint.rs (part of `just test`).
+#
+# Shellcheck EVERY script under scripts/ (not just the installer's two files).
 lint-shell:
     bash scripts/lint-shell.sh
 
-# Run the promotion provenance gate's test harness (stubbed `gh`, no network,
-# no auth); shellcheck runs when present.
+# Shellcheck runs too, when present.
+#
+# Run the promotion provenance gate's test harness (stubbed `gh`, no network or auth).
 test-promote-gate:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -307,14 +383,17 @@ test-vm: _nextest artifacts initramfs
 # minvmd's VM harnesses (tests/*_integration.rs). CI: ci-linux-kvm.yml `test-kvm`.
 [linux]
 test-vm: _nextest _kvm artifacts initramfs minvmd-build
-    MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state" LIBKRUN_PREFIX="{{krun-prefix}}" \
-      cargo nextest run -p minvmd --profile vm --run-ignored all --no-tests=fail \
+    MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state" \
+      MINVMD_REQUIRE_LIBKRUN=static LIBKRUN_PREFIX="{{krun-static}}" \
+      cargo nextest run -p minvmd --profile vm --target {{musl-target}} \
+      --run-ignored all --no-tests=fail \
       -E 'binary(/_integration$/) and not binary(/_root_integration$/)'
 
-# minimald's netns/tap proofs (the tests sudo their own netns commands).
 # CI: ci-linux-native.yml `minimald-root-integration`. The AppArmor policy
 # can't unlock this surface — its namespaces come from hashed-path test
 # binaries and /usr/bin/unshare, which a per-binary profile can't cover.
+#
+# minimald's netns/tap proofs (the tests sudo their own netns commands).
 [linux]
 test-root-integration: _nextest gvproxy
     @[ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "0" ] || { echo "this host restricts unprivileged user namespaces, which this surface needs from hashed-path test binaries (the AppArmor policy can't cover those); leave this lane to CI, or see docs/reference/linux-host-setup.md before relaxing the restriction host-wide" >&2; exit 1; }
@@ -326,8 +405,9 @@ test-root-integration: _nextest gvproxy
 e2e: _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/session-e2e.sh
 
-# The SAME session e2e against a host-native minimald (no VM).
 # CI: ci-linux-native.yml `native-daemon-e2e`.
+#
+# The SAME session e2e against a host-native minimald (no VM).
 [linux]
 e2e-native:
     cargo build -p minimald --bin minimald -p minimal --bin min --locked
@@ -340,15 +420,16 @@ e2e-native:
 test-lifecycle: (_need "jq" "brew install jq (or apt install jq)") _kvm artifacts initramfs minvmd-build
     XDG_STATE_HOME="{{scratch}}/test-state" ./scripts/minvmd-lifecycle.sh
 
-# Reaps between iterations — this WILL kill this checkout's live dev stack each pass.
+# nightly-tests.yml runs 10 reps, then `just bulk-upload`. The reap between
+# iterations kills THIS checkout's live dev stack — not just the soak's own VMs.
 #
-# Nightly soak parity: N session-e2e reps (nightly-tests.yml runs 10), then `just bulk-upload`.
+# Nightly soak parity: N session-e2e reps; reaps between them — WILL kill your dev stack.
 soak n="10": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/soak-session-e2e.sh {{n}} "{{scratch}}/soak-logs"
 
 # Each pass uploads a 49 MiB project (~13 MB on the wire) and destroys its session.
 #
-# Bulk host→guest upload proof (#869): N `min activate`s of a large, compressible project.
+# Bulk host→guest upload proof (#869): N `min session activate`s of a large, compressible project.
 bulk-upload n="5": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/bulk-upload-e2e.sh {{n}}
 
@@ -409,7 +490,7 @@ up: minimald-build minimal-cli gvproxy && (_smoke "--minimal-dir" native-dir)
     # `activate` sandbox dies at uid_map EPERM until it's installed.
     just _userns-check || true
     echo "up: host-native minimald at $sock (pid $(cat "$pidf"))"
-    echo "  own-IP demo: min --minimal-dir {{native-dir}} activate -n net1 --network own-ip . && min --minimal-dir {{native-dir}} attach net1"
+    echo "  own-IP demo: min --minimal-dir {{native-dir}} session activate -n net1 --network own-ip . && min --minimal-dir {{native-dir}} session attach net1"
 
 # Bring the stack up: native Linux + one Linux VM over KVM (stop with `just stop`).
 [linux]

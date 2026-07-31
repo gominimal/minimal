@@ -1589,6 +1589,35 @@ mod tests {
         serde_json::from_str(&json).expect("deserialize")
     }
 
+    /// Regression: the daemon reports "no such session" from `GetSessionPolicy`
+    /// as `Errorable::Err { error }` (`{"error":"..."}`). Because `Errorable`
+    /// is untagged and every `SessionPolicy` field is optional, that object
+    /// once decoded as `Ok(SessionPolicy { egress: None, ingress: None })` —
+    /// exit 0, "no restrictions" — for any nonexistent session. It must decode
+    /// as `Err` instead.
+    #[test]
+    fn errorable_session_policy_decodes_daemon_error_as_err() {
+        let decoded: Errorable<SessionPolicy> =
+            serde_json::from_str(r#"{"error":"no session found"}"#).expect("deserialize");
+        assert_eq!(
+            decoded,
+            Errorable::Err {
+                error: "no session found".to_string()
+            }
+        );
+
+        // A real policy response still decodes as the `Ok` arm.
+        let decoded: Errorable<SessionPolicy> =
+            serde_json::from_str(r#"{"egress":null,"ingress":null}"#).expect("deserialize");
+        assert_eq!(
+            decoded,
+            Errorable::Ok(SessionPolicy {
+                egress: None,
+                ingress: None
+            })
+        );
+    }
+
     #[test]
     fn create_session_request_round_trips() {
         let req = CreateSessionRequest {
@@ -1722,9 +1751,9 @@ mod tests {
         // serialized shape, not a round-trip.
         let err: Errorable<GithubBeginLoginResponse> =
             Err::<GithubBeginLoginResponse, _>("GitHub App client id is not configured").into();
-        assert!(err.err().is_some());
         let json = serde_json::to_string(&err).unwrap();
         assert!(json.contains("client id is not configured"), "got: {json}");
+        assert!(err.err().is_some());
     }
 
     /// A daemon that predates the `expires_in_secs` field still decodes.

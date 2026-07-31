@@ -199,7 +199,7 @@ fn generate_mfile(
     content.push_str("[defaults]\n");
     content.push_str("state_key = \"dev\"\n");
     content.push('\n');
-    content.push_str("[session] # min attach\n");
+    content.push_str("[session] # min session attach\n");
     content.push_str("packages = [\"base\", \"vim\"");
     if std::fs::exists(repo_dir.join(".git")).unwrap_or_default() {
         content.push_str(", \"git\"");
