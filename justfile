@@ -78,17 +78,20 @@ artifacts:
     @[ -f {{kernel}} ] || scripts/fetch-prebuilt.sh kernel {{kernel}} {{arch}}
     @[ -f {{rootfs}} ] || scripts/fetch-prebuilt.sh rootfs {{rootfs}} {{arch}}
 
-# Fetch prebuilt libkrun + libkrunfw into the link/runtime prefix (DYNAMIC).
-# Not used by the dev stack any more — see `libkrun-static`. Kept because
+# Not on the dev stack's path any more — see `libkrun-static`. Kept because
 # nightly-tests.yml still builds against the upstream package, and this is how
 # you reproduce that locally.
+#
+# Fetch the prebuilt DYNAMIC libkrun + libkrunfw into the link/runtime prefix.
 [linux]
 libkrun:
     scripts/fetch-prebuilt.sh krun {{krun-prefix}} {{arch}}
 
-# Build the STATIC libkrun (libkrun.a) from the vendored pin — the linkage
-# Linux users receive, and what the dev stack and `just test-vm` link.
+# The linkage Linux users actually receive, and what `minvmd-build` and
+# `test-vm` link against. Built from the vendored pin rather than fetched.
 # Skips when already built; `just clean` forces a rebuild.
+#
+# Build the STATIC libkrun (libkrun.a) from the vendored pin.
 [linux]
 libkrun-static:
     @[ -f {{krun-static}}/libkrun.a ] || scripts/build-libkrun-linux.sh {{krun-static}} {{musl-target}}
@@ -111,9 +114,11 @@ minvmd-build:
     cargo build -p minvmd --bin minvmd --locked
     codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - {{minvmd-bin}}
 
-# Build minvmd (debug, static musl) — the same target and linkage the release
-# ships, so the dev stack exercises what users run. MINVMD_REQUIRE_LIBKRUN
-# makes a missing libkrun.a an error rather than a silent runtime-bailing stub.
+# The same target and linkage the release ships, so the dev stack exercises
+# what users run. MINVMD_REQUIRE_LIBKRUN makes a missing libkrun.a an error
+# rather than a silent runtime-bailing stub.
+#
+# Build minvmd (debug, static musl against the vendored libkrun.a).
 [linux]
 minvmd-build: libkrun-static
     MINVMD_REQUIRE_LIBKRUN=static LIBKRUN_PREFIX="{{krun-static}}" \
@@ -158,9 +163,10 @@ status:
 stop:
     @"{{minvmd-bin}}" stop
 
-# Remove the bring-up artifacts this justfile manages (never all of .scratch).
 # The built libkrun.a goes too: it is keyed to the vendored pin, so a stale one
 # would silently outlive a pin bump.
+#
+# Remove the bring-up artifacts this justfile manages (never all of .scratch).
 clean:
     rm -f {{kernel}} {{rootfs}} {{initramfs}} {{gvproxy}}
     rm -rf {{scratch}}/libkrun-static
