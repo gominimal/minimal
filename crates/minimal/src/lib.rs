@@ -21,6 +21,7 @@ mod file_upload;
 pub mod git_remote;
 pub mod loadouts;
 pub mod prompt;
+pub mod theme;
 
 #[derive(Parser)]
 #[command(name = "min", version = version::VERSION, long_version = version::LONG_VERSION)]
@@ -29,9 +30,9 @@ pub mod prompt;
 )]
 #[command(subcommand_required = false)]
 pub struct Cli {
-    // Optional: a bare `min` (no subcommand) resolves or activates a session
-    // for the current directory — see `cmd_default`. Keeps every named
-    // subcommand reachable unchanged when one is supplied.
+    // Optional: a bare `min` (no subcommand) prints the top-level help — see
+    // `cmd_default`. Keeps every named subcommand reachable unchanged when one
+    // is supplied.
     #[command(subcommand)]
     pub command: Option<Command>,
 
@@ -274,25 +275,28 @@ pub struct GlobalArgs {
     /// Override the base directory used for operations (default: ~/.cache/minimal)
     #[arg(long, global = true)]
     pub minimal_dir: Option<PathBuf>,
-    /// Override the user config directory. Everything under
-    /// `<config_dir>/minimal/` (config.toml, loadouts/, ...) is
-    /// resolved relative to this. Defaults to the platform's config
+    /// Override the user config directory (default: platform config dir).
+    ///
+    /// Everything under `<config_dir>/minimal/` (config.toml, loadouts/,
+    /// ...) is resolved relative to this. Defaults to the platform's config
     /// dir — `$XDG_CONFIG_HOME` on Linux (or `$HOME/.config` when
     /// that's unset). macOS uses `$HOME/.config` for consistency with
     /// state and cache dirs, not `~/Library/Application Support`.
     #[arg(long, global = true)]
     pub config_dir: Option<PathBuf>,
-    /// Select the daemon backend that hosts sessions. On Linux, `local-minimald`
-    /// (the default) runs minimald on the host; `local-minvmd` runs it inside
-    /// the minvmd microVM. No effect on macOS, where minvmd is the only
-    /// backend.
+    /// Select the daemon backend that hosts sessions.
+    ///
+    /// On Linux, `local-minimald` (the default) runs minimald on the host;
+    /// `local-minvmd` runs it inside the minvmd microVM. No effect on macOS,
+    /// where minvmd is the only backend.
     #[arg(long, global = true, value_name = "PROVIDER")]
     pub provider: Option<Provider>,
-    /// Skip interactive prompts that need a terminal (e.g. the session
-    /// picker shown by bare `min` or `min session attach` with no session argument).
-    /// When a choice is ambiguous, the command errors with a list of
-    /// candidates instead of opening a picker. Implied when stdin/stdout is
-    /// not a terminal.
+    /// Skip interactive prompts that need a terminal.
+    ///
+    /// Affects e.g. the session picker shown by `min session attach` with no
+    /// session argument. When a choice is ambiguous, the command errors with a
+    /// list of candidates instead of opening a picker. Implied when
+    /// stdin/stdout is not a terminal.
     #[arg(long, global = true, default_value_t = false)]
     pub no_input: bool,
 }
@@ -315,8 +319,12 @@ pub struct ActivateArgs {
     /// is given.
     pub path: Option<String>,
     /// How to load project files into the session.
-    #[arg(long, value_enum, default_value_t = SyncMode::Tarball)]
-    pub sync: SyncMode,
+    ///
+    /// Defaults to `tarball`. Passing `--sync tarball` explicitly is also
+    /// the escape hatch that uploads an empty directory or `$HOME`, which
+    /// are otherwise skipped without a prompt.
+    #[arg(long, value_enum)]
+    pub sync: Option<SyncMode>,
     /// Network mode: no-net, host-net (default), or own-ip.
     ///
     /// Hidden from `--help` while `own-ip` is not usable on an installed host:
@@ -443,7 +451,7 @@ pub struct AttachArgs {
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
     /// Command to exec in the session context (non-interactive)
-    #[arg(long, short)]
+    #[arg(long, short, hide = true)]
     pub command: Option<String>,
 }
 
@@ -635,10 +643,9 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     client::migrate_legacy_provider_dirs(cli.global_args.minimal_dir.as_deref());
 
     match cli.command {
-        // A bare `min` (no subcommand) resolves-or-activates and attaches. A
-        // deliberate exception to the `<noun> <verb>` convention, documented
-        // in docs/reference/cli.md — see `cmd_default`.
-        None => cmd_default(&cli.global_args).await,
+        // A bare `min` (no subcommand) prints the top-level help — see
+        // `cmd_default`.
+        None => cmd_default(),
         Some(Command::Ls(args)) => cmd_ls(&cli.global_args, args).await,
         Some(Command::Stop(args)) => cmd_stop(&cli.global_args, args).await,
         Some(Command::Session(SessionArgs { command })) => match command {
@@ -706,68 +713,18 @@ fn session_announce_label(id: &sessions::SessionId, name: Option<&str>) -> Strin
     }
 }
 
-/// The default action for a bare `min` (no subcommand): get the operator into
-/// a session for the current directory with the least ceremony.
+/// The default action for a bare `min` (no subcommand): print the top-level
+/// help and exit successfully, the same text `min --help` produces.
 ///
-/// - No sessions exist → [`cmd_activate`] a new one with `--attach`, so a
-///   fresh `min` lands the user in a shell.
-/// - A session built from the current directory exists → attach to it
-///   (auto-resolve, or picker if ambiguous).
-/// - Otherwise → attach to the only session, or open a picker over all.
-///
-/// Shares smart resolution with `min session attach` (no session arg) via
-/// [`resolve_smart_attach`]; the only difference is the `NoSessions` case,
-/// which activates here instead of erroring.
-async fn cmd_default(global: &GlobalArgs) -> Result<(), anyhow::Error> {
-    ensure_daemon(global)?;
-
-    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
-        .context("Failed to resolve daemon socket path")?;
-
-    let mut client = client::Client::connect(&sock)
-        .await
-        .context("Failed to connect to minimald")?;
-
-    match resolve_smart_attach(&mut client, global).await? {
-        Some(entry) => {
-            tracing::info!(
-                session_id = %entry.id,
-                session_name = ?entry.name,
-                "bare `min`: attaching to resolved session"
-            );
-            // Drop the listing connection before shelling out; the ssh child
-            // holds its own proxy connection to the daemon.
-            drop(client);
-            attach_to_session(&sock, entry.id, None).await
-        }
-        None => {
-            // No sessions exist: activate a new one for the current directory
-            // (or -C/--repo-dir if set) and chain into attach, mirroring
-            // `min session activate --attach`. `cmd_activate` resolves the path from
-            // `global.repo_dir` when no positional is given, matching the
-            // attach side's `cwd_host_path(global)`. But refuse first when that
-            // chained attach could never run: creating then failing orphans the
-            // session (#1031).
-            ensure_activate_on_empty_allowed(global.no_input, std::io::stdin().is_terminal())?;
-            drop(client);
-            let activate_args = ActivateArgs {
-                name: None,
-                path: None,
-                sync: SyncMode::Tarball,
-                network: CliNetworkMode::HostNet,
-                ingress: Vec::new(),
-                loadout: Vec::new(),
-                no_loadouts: false,
-                // A non-interactive caller (--no-input, CI, a script) can't
-                // answer the activation policy prompt; `cmd_activate` already
-                // falls back to the `--no-prompt` path when stderr isn't a
-                // terminal, so mirror that here rather than forcing a hang.
-                no_prompt: global.no_input || !can_prompt_interactively(),
-                attach: true,
-            };
-            cmd_activate(global, activate_args).await
-        }
-    }
+/// Deliberately inert — it starts no daemon, creates no session, and attaches
+/// to nothing. Getting into a session is spelled explicitly:
+/// `min session attach` (which still auto-resolves from the current directory)
+/// or `min session activate`.
+pub fn cmd_default() -> Result<(), anyhow::Error> {
+    use clap::CommandFactory as _;
+    Cli::command()
+        .print_help()
+        .context("Failed to write help output")
 }
 
 /// Connect to the daemon, resolving the socket path from global args.
@@ -1028,11 +985,11 @@ fn format_memory(bytes: u64) -> String {
 /// renders on stderr (so stderr must be a terminal) and reads
 /// keypresses from stdin (so stdin must be a terminal too). If
 /// either side is redirected we take the `--no-prompt` path — going
-/// interactive when stdin is a pipe just hangs `dialoguer` and then
+/// interactive when stdin is a pipe just hangs the prompt and then
 /// aborts with a much less helpful error than the `--no-prompt`
 /// snippet the operator actually wants to paste.
 fn can_prompt_interactively() -> bool {
-    dialoguer::console::user_attended() && dialoguer::console::user_attended_stderr()
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
 /// Phase 3 gate: run the user policy + hooks over the daemon's
@@ -1248,13 +1205,13 @@ async fn upload_and_finalize(
 /// Guard that tears down a half-built session if the user interrupts the
 /// activation with Ctrl-C.
 ///
-/// `dialoguer`/`console` re-raise SIGINT to this process on a Ctrl-C at
-/// the composition-gating prompt (console `unix_term.rs`). With no
-/// handler installed the default disposition kills `min` mid-prompt —
-/// before the abort-cleanup that [`drive_pending_to_active`] runs — so
-/// the daemon is left holding a `Pending` session that blocks its name.
-/// [`arm_activation_interrupt`] installs a SIGINT handler (keeping the
-/// process alive past console's re-raise) that best-effort
+/// inquire (crossterm raw mode) captures a Ctrl-C at the
+/// composition-gating prompt as an error return, so the abort-cleanup
+/// that [`drive_pending_to_active`] runs gets to execute. During the
+/// non-prompt phases (waiting on the daemon) a Ctrl-C is a plain
+/// SIGINT, which would kill `min` before that cleanup, leaving the
+/// daemon holding a `Pending` session that blocks its name.
+/// [`arm_activation_interrupt`] installs a SIGINT handler that best-effort
 /// `AbortSession`s the in-flight session over a fresh connection — the
 /// activation borrows the primary one — then exits. The daemon's
 /// connection-close reap is the backstop if the abort can't be
@@ -1448,15 +1405,30 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     let (contribution, user_policy) =
         loadouts::compose_user_contribution(active, user_policy, compose_options)?;
 
+    // `--sync` defaults to tarball; `sync_explicit` records whether the
+    // user actually typed the flag, which distinguishes a deliberate
+    // `--sync tarball` (the escape hatch that force-uploads an empty dir
+    // or `$HOME`) from the implicit default.
+    let sync_explicit = args.sync.is_some();
+    let sync_mode = args.sync.unwrap_or(SyncMode::Tarball);
+
     // Resolve the upload root before opening the daemon connection:
     // a malformed mfile in an ancestor should fail loudly before
     // we create a session on the daemon, so we don't leak a draft
     // session. Only needed for tarball sync — `--sync none` skips
     // the upload entirely (#770).
-    let upload_root = match args.sync {
+    let upload_root = match sync_mode {
         SyncMode::None => None,
         SyncMode::Tarball => Some(resolve_upload_root(&utf8_path)?),
     };
+
+    // Skip the upload without prompting when the resolved root is an
+    // empty directory or `$HOME` — unless the user asked for it with an
+    // explicit `--sync tarball`, the escape hatch.
+    let skip_empty_or_home = !sync_explicit
+        && upload_root.as_ref().is_some_and(|root| {
+            file_upload::is_empty_or_home(root.as_std_path(), std::env::home_dir().as_deref())
+        });
 
     let mut client = connect_daemon(global).await?;
 
@@ -1492,8 +1464,17 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     // has to run before `ConfigureLoadout`. `--sync none` opts out;
     // the daemon then composes against an empty workspace and the
     // caller is on their own for getting files there.
-    match args.sync {
+    match sync_mode {
         SyncMode::None => {}
+        SyncMode::Tarball if skip_empty_or_home => {
+            // An empty directory has nothing to sync, and `$HOME` is far
+            // too much to ship on a stray confirmation keypress — and if
+            // `$HOME` is itself a VCS root the old gate uploaded it with
+            // no prompt at all. Skip both silently by default; a
+            // deliberate `--sync tarball` (via `sync_explicit`) is the
+            // escape hatch that still uploads them.
+            eprintln!("Starting with an empty box (nothing here to sync)");
+        }
         SyncMode::Tarball => {
             // Upload from the project root — the directory the mfile
             // lives in — rather than wherever the user invoked us. This
@@ -1792,9 +1773,8 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
 /// and either attaches directly (unambiguous), opens the interactive picker
 /// (ambiguous), or errors (ambiguous but non-interactive).
 ///
-/// Returns `Ok(None)` when no sessions exist at all — the caller decides
-/// whether that is an error (`min session attach`) or a cue to activate a new session
-/// (bare `min`).
+/// Returns `Ok(None)` when no sessions exist at all, which `min session attach`
+/// reports as an error pointing at `min session activate`.
 async fn resolve_smart_attach(
     client: &mut client::Client,
     global: &GlobalArgs,
@@ -1832,25 +1812,6 @@ async fn resolve_smart_attach(
     }
 }
 
-/// Guard for bare `min` on an empty daemon: activating there chains straight
-/// into an interactive attach, which needs a TTY on stdin. Under `--no-input`,
-/// or when stdin is not a terminal, that attach can never succeed — so refuse
-/// before creating anything, emitting the same message the explicit
-/// `min session attach` produces, instead of creating a session and then
-/// failing the attach guard, which leaves the session orphaned (#1031).
-///
-/// Pure in its inputs so both branches are unit-testable without a controlled
-/// terminal.
-fn ensure_activate_on_empty_allowed(
-    no_input: bool,
-    stdin_is_tty: bool,
-) -> Result<(), anyhow::Error> {
-    if no_input || !stdin_is_tty {
-        bail!("no sessions exist; use 'min session activate' to create one");
-    }
-    Ok(())
-}
-
 /// Guard for the interactive attach path: the PTY-backed session shell must be
 /// driven from a real terminal. When stdin is not a TTY there is nothing to
 /// drive the remote shell and no EOF ever reaches it through the forced `-tt`
@@ -1865,8 +1826,7 @@ fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), anyhow::Error
     } else {
         bail!(
             "`min session attach` needs an interactive terminal, but stdin is not a TTY. \
-             Run it from a terminal, or use `min session attach --command <cmd>` to run a \
-             single command non-interactively."
+             Run it from a terminal."
         )
     }
 }
@@ -1876,9 +1836,9 @@ fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), anyhow::Error
 /// daemon's shell_request handler mints a PTY-backed shell, and ssh handles
 /// termios/PTY management.
 ///
-/// Split from [`cmd_attach`] so the bare-`min` default dispatch
-/// ([`cmd_default`]) and the smart-resolution picker can attach without
-/// re-resolving an entry they already hold.
+/// Split from [`cmd_attach`] so the activate-then-attach chain and the
+/// smart-resolution picker can attach without re-resolving an entry they
+/// already hold.
 async fn attach_to_session(
     sock: &std::path::Path,
     id: sessions::SessionId,
@@ -2763,29 +2723,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("not a TTY") && err.contains("--command"),
+            err.contains("not a TTY"),
             "expected an actionable non-TTY error, got: {err}"
         );
         ensure_interactive_attach_tty(true).expect("a real terminal must pass the guard");
     }
 
-    /// Bare `min` on an empty daemon must refuse before creating a session when
-    /// it could not follow through with the interactive attach — under
-    /// `--no-input` or over a non-TTY stdin — so it never orphans a session
-    /// (#1031). Only a plain interactive invocation proceeds to activate.
+    /// A bare `min` must be inert: it prints the top-level help and succeeds,
+    /// touching no daemon and creating no session. The `Cli` command tree has
+    /// to stay renderable for that (a malformed clap definition panics in
+    /// `print_help`, not at parse time).
     #[test]
-    fn bare_min_refuses_to_activate_on_empty_daemon_non_interactively() {
-        let err = ensure_activate_on_empty_allowed(true, true)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("no sessions exist") && err.contains("min session activate"),
-            "expected the explicit-verb refusal, got: {err}"
-        );
-        ensure_activate_on_empty_allowed(false, false)
-            .expect_err("a non-TTY stdin must be refused even without --no-input");
-        ensure_activate_on_empty_allowed(false, true)
-            .expect("an interactive terminal without --no-input must be allowed to activate");
+    fn bare_min_prints_help() {
+        cmd_default().expect("bare `min` must print help and succeed");
     }
 
     /// The attach/create confirmation prefers the session name and appends a

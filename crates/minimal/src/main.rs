@@ -44,6 +44,7 @@ async fn run() -> ExitCode {
     // Parse before installing the subscriber, so the shell completion handler can
     // be configured to log to stderr instead of stdout.
     let cli = minimal::Cli::parse();
+    minimal::theme::install();
 
     let registry = tracing_subscriber::registry().with(filter);
     // Commands whose stdout is a data contract route tracing to stderr, so a log

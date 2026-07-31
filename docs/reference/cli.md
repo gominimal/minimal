@@ -47,12 +47,13 @@ Three rules follow from that:
 
 ### Documented exceptions
 
+`min` with no arguments prints the top-level help.
+
 A few high-traffic forms stay bare at the top level. These are deliberate
 ergonomic choices, not leftovers — do not "fix" them:
 
 | Form | Why it stays |
 |------|--------------|
-| `min` (no subcommand) | Resolve-or-activate-and-attach for the current directory: the single most common thing anyone does with `min`. |
 | `min ls` | The highest-traffic command in the CLI; the break is not worth the consistency. |
 | `min stop` | Acts on the daemon backend rather than any session, and is the daemon-lifecycle command people reach for. |
 | `min init`, `min add`, `min update` | Passthroughs to the `mip` commands of the same name; keeping the spelling identical across the two CLIs beats the hierarchy. |
@@ -67,8 +68,8 @@ ergonomic choices, not leftovers — do not "fix" them:
 - **macOS**: installs ship `min` and `minvmd` only. `minimald` always runs
   inside the microVM, and the package/build plane runs there with it;
   there is no native macOS `mip`.
-- `mip run` (and its `shell`/`build`/`test` shorthands) executes tasks in
-  Linux sandboxes and is available on Linux only.
+- `mip run` executes tasks in Linux sandboxes and is available on Linux
+  only.
 
 ## In-sandbox helper commands
 

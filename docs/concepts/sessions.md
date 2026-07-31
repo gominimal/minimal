@@ -114,14 +114,6 @@ background, and `min session attach` rejoins it later. Changes you make inside s
 the session's workspace; bring them back to the host by pushing them out with
 `git push min://<session>`.
 
-To run a declared task non-interactively instead of opening a shell, pass
-`--command` (short `-c`). The command channel accepts only `min run <task name>`
-invocations; arbitrary commands need an interactive shell:
-
-```console
-$ min session attach my-session -c 'min run test'
-```
-
 ## How a session is composed
 
 A session's contents are not hand-configured. They are **composed** from

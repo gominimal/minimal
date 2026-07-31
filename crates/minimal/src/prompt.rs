@@ -5,7 +5,7 @@
 //! composer asks a [`PolicyHooks`] implementation what to do. This
 //! module provides two:
 //!
-//! - [`InteractivePrompt`] — the default: shows a `dialoguer::Select`
+//! - [`InteractivePrompt`] — the default: shows an `inquire::Select`
 //!   for each item with six actions (Allow once, Allow permanent,
 //!   Ignore once, Ignore permanent, Abort, Deny permanent). The
 //!   permanent actions mutate the passed-in narrow policy so
@@ -52,7 +52,7 @@ pub(crate) enum UserChoice {
 }
 
 impl UserChoice {
-    /// Label rendered as the `dialoguer::Select` option.
+    /// Label rendered as the `inquire::Select` option.
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::AllowOnce => "Allow once",
@@ -85,8 +85,14 @@ impl UserChoice {
     }
 }
 
+impl std::fmt::Display for UserChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 /// Abstraction over "ask the user for one choice." Real code uses
-/// `dialoguer`; tests inject a scripted answer stream.
+/// `inquire`; tests inject a scripted answer stream.
 pub(crate) trait Prompter {
     /// Show `message` and let the user pick one of `options`.
     /// Returns the chosen [`UserChoice`] or an IO error if the
@@ -94,24 +100,22 @@ pub(crate) trait Prompter {
     fn ask(&self, message: &str, options: &[UserChoice]) -> io::Result<UserChoice>;
 }
 
-/// Real `dialoguer`-backed prompter. Only used by the default
+/// Real `inquire`-backed prompter. Only used by the default
 /// [`InteractivePrompt::new`] constructor.
-pub(crate) struct DialoguerPrompter;
+pub(crate) struct InquirePrompter;
 
-impl Prompter for DialoguerPrompter {
+impl Prompter for InquirePrompter {
     fn ask(&self, message: &str, options: &[UserChoice]) -> io::Result<UserChoice> {
-        let labels: Vec<&str> = options.iter().map(|c| c.label()).collect();
-        // `default(0)` puts the cursor on "Allow once" — the safest
-        // one-shot action. A habitual user gets fast Enter-through.
-        // `dialoguer::Error` predominantly wraps `io::Error`; map to
-        // that so our `Prompter` trait can stay `io::Result`-shaped.
-        let idx = dialoguer::Select::new()
-            .with_prompt(message)
-            .items(&labels)
-            .default(0)
-            .interact()
-            .map_err(io::Error::other)?;
-        Ok(options[idx])
+        // Six fixed choices: type-to-filter would be noise, so filtering
+        // stays off. The cursor starts on index 0 ("Allow once", the
+        // safest one-shot action), giving a habitual user fast
+        // Enter-through. Esc (OperationCanceled) and Ctrl-C
+        // (OperationInterrupted) surface as errors so a dismissed prompt
+        // fails the activation, which then runs its abort cleanup.
+        inquire::Select::new(message, options.to_vec())
+            .without_filtering()
+            .prompt()
+            .map_err(io::Error::other)
     }
 }
 
@@ -147,7 +151,7 @@ impl Prompter for ScriptedPrompter {
 /// A [`PolicyHooks`] implementation that walks the user through each
 /// unapproved item interactively.
 ///
-/// Construct via [`Self::new`] (uses `dialoguer` + resolves the
+/// Construct via [`Self::new`] (uses `inquire` + resolves the
 /// read-only bit from the on-disk `user_policy.toml`) or, in tests,
 /// via [`Self::with_prompter`].
 ///
@@ -174,7 +178,7 @@ pub struct InteractivePrompt {
 }
 
 impl InteractivePrompt {
-    /// Real constructor: `dialoguer` prompter + read-only detection
+    /// Real constructor: `inquire` prompter + read-only detection
     /// against `policy_path`. `initial` seeds the internal policy
     /// state so the first hook call sees the same view as the
     /// composer.
@@ -182,7 +186,7 @@ impl InteractivePrompt {
     pub fn new(policy_path: &Path, initial: sessions::core::policy::UserPolicy) -> Self {
         let (vars, patches) = initial.into_parts();
         Self {
-            prompter: Box::new(DialoguerPrompter),
+            prompter: Box::new(InquirePrompter),
             can_persist: is_writable(policy_path),
             vars_policy: RefCell::new(vars),
             patches_policy: RefCell::new(patches),

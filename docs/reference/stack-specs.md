@@ -8,7 +8,7 @@ description: "Stack spec schema for defining build system stacks in Nickel: pack
 Stacks specify a set of tools and how to use them in a codebase. They encapsulate a common pattern for building software.
 
 Stacks are defined in a [Nickel](https://nickel-lang.org/) file located at `stacks/<stack name>/stack.ncl`, either in your codebase
-or any layer in your [software supply chain](https://docs.minimal.dev/concepts/software-supply-chain). The `stacks/` directory in a layer is always adjacent to
+or any layer in your [software supply chain](../concepts/software-supply-chain.md). The `stacks/` directory in a layer is always adjacent to
 the [`minimal.toml`](./minimal-dot-toml.md) file at the base of the layer. The directory can be omitted if the layer does not define any stacks.
 
 ## Examples

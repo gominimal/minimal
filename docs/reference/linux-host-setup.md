@@ -1,16 +1,20 @@
 ---
 title: Linux host setup
-description: "Preparing a Linux host to run minimald: the unprivileged user namespace the session sandbox needs, and the AppArmor profile that grants it on Ubuntu 24.04+."
+description: "Preparing a Linux host to run minimald: the unprivileged user namespace the session sandbox needs, and the sysctls and AppArmor profile that grant it on Ubuntu 24.04+."
 ---
 
 # Linux host setup
 
-`minimald` runs every session and task inside a sandbox (hakoniwa), and every
-sandbox is an **unprivileged user namespace**: the daemon forks, the child calls
-`unshare(CLONE_NEWUSER)` and writes `/proc/self/uid_map`. No `setcap`, no root,
-no setuid helper, but the host has to permit unprivileged user namespaces.
+`minimald` runs every session and task inside its own sandbox
+composed of an unprivileged user namespace and other Linux
+namespaces, similar to how containers are sandboxed on
+Kubernetes. Root/sudo access is not needed to create these sandboxes;
+however, some Linux distributions require enabling unprivileged user
+namespace creation.
 
-Most distributions do. **Ubuntu 24.04 and later do not**, by default.
+Most distributions allow this by default. **Ubuntu 24.04
+and later require the small configuration change described
+below.**
 
 ## The symptom
 
@@ -23,11 +27,12 @@ DIAG hakoniwa container/process exited non-zero code=125 exit_code=None
   reason=write("/proc/self/uid_map", ..) => Operation not permitted (os error 1)
 ```
 
-`min session attach` shows this as a session that closes immediately. The daemon
-also preflights this at startup: on a host that will refuse the namespace it
-logs a `sessions will fail to start` warning naming the restriction and this
-fix, so check the daemon log first. Confirm the host is the cause; this needs
-no minimal code at all:
+`min session attach` shows this as a session that closes
+immediately. The `minimald` daemon also checks this at startup: on a
+host that will refuse the namespace it logs a `sessions will fail to
+start` warning naming the restriction and this fix, so check the
+daemon log first. Confirm the host is the cause using stock tools,
+no Minimal involved:
 
 ```console
 $ cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
@@ -36,76 +41,59 @@ $ unshare --user --map-root-user id
 unshare: write failed /proc/self/uid_map: Operation not permitted
 ```
 
-## The fix: install minimald's AppArmor profile
+## Option 1: enable unprivileged user namespace creation host-wide
 
-Ubuntu's intended accommodation is a profile that grants the binary the `userns`
-permission, the same thing the distro ships for `rootlesskit`, `runc`, and
-`podman`. minimal ships one in `packaging/apparmor/`:
+The following disables the restriction for every program on the host until the next reboot:
 
 ```console
-$ sudo scripts/install-apparmor-profile.sh
-loaded the minimald AppArmor profile (/etc/apparmor.d/minimald)
+$ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 ```
 
-That is all. Sessions work; nothing else on the host gains the ability to create
-user namespaces.
+To persist this change across reboots, create a file in `/etc/sysctl.d/`:
 
-If you installed minimal with the `curl … | sh` installer rather than from a
-checkout, the same loader ships alongside the binaries; run it with root:
+```console
+$ sudo sh -c "echo 'kernel.apparmor_restrict_unprivileged_userns=0' > /etc/sysctl.d/enable-user-ns.conf"
+```
+
+## Option 2: install minimald's AppArmor profile
+
+If you installed Minimal with the `curl … | sh` installer, you can
+grant user namespace creation to minimald alone instead of
+system-wide:
 
 ```console
 $ sudo bash ~/.local/share/minimal/apparmor/install-apparmor-profile.sh
 loaded the minimald AppArmor profile (/etc/apparmor.d/minimald)
 ```
 
-The installer prints this exact hint on its own when it detects the restriction
-on the host, so you do not have to know to look for it.
+The only change to your system is allowing minimald to create user
+namespaces. To remove the profile run:
 
-The profile **confines nothing**: it is declared `flags=(unconfined)`, so it
-does not restrict what minimald may do. It exists only to give minimald a named
-AppArmor label, because on Ubuntu only a *labelled* program can be granted
-`userns`. Installing it neither sandboxes minimald nor weakens the host.
+```console
+$ sudo bash ~/.local/share/minimal/apparmor/install-apparmor-profile.sh --uninstall
+```
 
-It attaches to minimald at the paths it is normally installed to: `/usr/bin`,
-`/usr/local/bin`, and `~/.local/bin` (where the installer puts
-it). A binary somewhere else (a dev build in `target/debug`, or a custom
-`MINIMAL_BIN`) needs that path named explicitly, because AppArmor matches
-profiles by executable path:
+If you built minimald from source on an Ubuntu system, run
+the following script in the source directory to allow it to create
+user namespaces:
 
 ```console
 $ sudo scripts/install-apparmor-profile.sh --path "$PWD/target/debug/minimald"
 ```
 
-Re-run the installer after moving or reinstalling the binary. To remove the
-profile: `sudo scripts/install-apparmor-profile.sh --uninstall` (from a
-checkout) or `sudo bash ~/.local/share/minimal/apparmor/install-apparmor-profile.sh --uninstall`
-(curl-installed). `minimal`'s own uninstaller
-(`curl … | sh -s -- --uninstall`) also offers to remove this system profile,
-prompting on a terminal, or printing the root command otherwise.
-
-## Alternative: lift the restriction host-wide
-
-If you cannot install a profile, turn the restriction off:
+To remove the AppArmor profile:
 
 ```console
-$ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0   # until reboot
+$ sudo scripts/install-apparmor-profile.sh --uninstall   # from a checkout
 ```
-
-Persist it in `/etc/sysctl.d/`. Note this re-enables unprivileged user
-namespaces for **every** program on the host, not just minimald, which is what
-the profile exists to avoid. It is what CI does, for a throwaway runner.
-
-## Other deployment models
-
-Only the daemon running natively on the host is affected. When minimald runs
-inside a minimal-managed microVM (on macOS, or on Linux under KVM) the sandbox's
-user namespace is created in the guest, whose kernel carries no such
-restriction; the host's setting is irrelevant.
 
 ## User namespaces disabled entirely
 
-Separately from the AppArmor restriction, a kernel built without
-`CONFIG_USER_NS`, or a host with `user.max_user_namespaces` set to `0`, cannot
-create user namespaces at all. The daemon's preflight reports this as its own
-error. The fix is distribution-specific: raise `user.max_user_namespaces` via
-sysctl, or use a kernel with user namespaces enabled.
+Separately from the AppArmor restriction, user namespaces cannot be
+created at all on a kernel built without `CONFIG_USER_NS`, on a host
+with `user.max_user_namespaces` set to `0`, or on Debian-derived
+kernels that ship `kernel.unprivileged_userns_clone` with it set to
+`0`. The daemon's startup logs report this as its own error. The fix
+matches the cause: use a kernel with user namespaces enabled, raise
+`user.max_user_namespaces` via sysctl, or set
+`kernel.unprivileged_userns_clone=1`.

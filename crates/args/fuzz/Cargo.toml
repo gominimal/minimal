@@ -1,0 +1,24 @@
+# Standalone fuzz workspace for the `args` crate.
+[package]
+name = "args-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.args]
+path = ".."
+
+[[bin]]
+name = "arg_schema_parse"
+path = "fuzz_targets/arg_schema_parse.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
