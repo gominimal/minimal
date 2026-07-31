@@ -295,6 +295,7 @@ run() {
     set +e
     env -i \
         PATH="$stubbin:/usr/bin:/bin" \
+        TERM=xterm-256color \
         HOME="$hp" \
         SHELL="${TEST_SHELL:-/bin/sh}" \
         MINIMAL_BIN="${BIN_OVERRIDE:-$hp/bin}" \
@@ -340,7 +341,9 @@ want_ok "the card names the first command (R10.4)" \
     grep -q "min session activate --attach ." "$OUT"
 want_card_last "the card closes a fresh install (R10.4)"
 # Nothing on a redirected stream may carry terminal escapes (R10.1): this
-# output is a file, so a stray SGR here would land in every CI log.
+# output is a file, so a stray SGR here would land in every CI log. `run` sets a
+# terminal-like TERM, so what this pins is the `[ -t 2 ]` half of the guard:
+# with TERM unset the assertion would still pass if that check were dropped.
 want_err "no terminal escapes when stderr is not a terminal (R10.1)" \
     grep -q "$esc" "$OUT"
 
@@ -900,6 +903,29 @@ check 0 "$rc" "uninstall over unterminated block exits 0 (R9.4)"
 want_ok "uninstall warns about the broken block (R9.4)" \
     grep -q "unterminated minimal block" "$OUT"
 want_ok "uninstall keeps the rc tail (R9.4)" grep -q "alias important=stuff" "$H15/.zshrc"
+# The block survived, so the record must survive with it. The record is the only
+# inventory a later run has and `--uninstall` reads a missing one as "nothing to
+# undo", so dropping it here would strand the stray block permanently.
+want_ok "record retained while a shell block remains (R9.4)" \
+    test -f "$H15/xdg-state/minimal/installed"
+want_ok "record retention is announced (R9.4)" grep -q "kept install record" "$OUT"
+# ...and the retention is worth something: repair the marker by hand and a second
+# uninstall finishes the job, block and record both.
+{
+    printf '# my zshrc\n'
+    printf '# >>> minimal >>>\n'
+    printf '# end marker restored by hand\n'
+    printf '# <<< minimal <<<\n'
+    printf 'alias important=stuff\n'
+} >"$H15/.zshrc"
+TEST_SHELL=/usr/bin/zsh
+run untermretry "$H15" --uninstall
+check 0 "$rc" "uninstall retry over a repaired block exits 0 (R9.4)"
+want_err "repaired block is stripped on the retry (R9.4)" \
+    grep -q '>>> minimal >>>' "$H15/.zshrc"
+want_ok "retry keeps the rc tail (R9.4)" grep -q "alias important=stuff" "$H15/.zshrc"
+want_err "record removed once the footprint is fully gone (R9.4)" \
+    test -f "$H15/xdg-state/minimal/installed"
 TEST_SHELL=
 
 # A manifest without the min CLI (data-only) skips completions, non-fatally.

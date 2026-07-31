@@ -603,7 +603,10 @@ rediscover it.
 each probed once at startup:
 
 - *attributes* (bold, dim, and the in-place row rewrite) are emitted **only**
-  when stderr is a terminal, `NO_COLOR` is unset, and `TERM` is not `dumb`;
+  when stderr is a terminal, `NO_COLOR` is unset **or empty**, and `TERM` is not
+  `dumb`. Empty counts as absent per the `NO_COLOR` convention
+  (<https://no-color.org>): the variable suppresses only when set to a
+  non-empty value;
 - *glyphs* (the `▸` marker, `→` arrow, `·` separator, and the mark) are emitted
   only under a UTF-8 locale (`LC_ALL`/`LC_CTYPE`/`LANG`), with ASCII
   stand-ins otherwise. This axis is independent of the first: UTF-8 in a
@@ -629,9 +632,13 @@ prints the same table.
 
 **R10.3**, **The mark.** A first install — no prior install record (R6.1) —
 opens with the Minimal mark, character-for-character the one in the README's
-session demo (`docs/public/loadout-demo.cast`). Terminal-only, UTF-8 only, and
-never on an upgrade: a mark in a log file, or on the fifth rerun of the week,
-is litter.
+session demo (`docs/public/loadout-demo.cast`). Terminal-only and never on an
+upgrade: a mark in a log file, or on the fifth rerun of the week, is litter.
+The two parts degrade separately along the R10.1 glyph axis: the block mark is
+UTF-8 only, because in an ASCII locale it would render as mojibake, while the
+wordmark line under it is ASCII-safe (its only glyph is the R10.1 separator,
+which has a stand-in) and still prints. So an ASCII-locale terminal opens on
+the wordmark line alone rather than on nothing.
 
 **R10.4**, **The closing card.** Every **successful install** ends on a card
 naming the first commands to run. It is the last output of the run, after every

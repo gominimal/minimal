@@ -70,8 +70,9 @@ die() { end_row; printf 'install: %s\n' "$*" >&2; exit 1; }
 # terminal at all, so presentation degrades along two independent axes:
 #
 #   attr  — bold/dim SGR attributes. Needs stderr to be a terminal, NO_COLOR
-#           unset, and a TERM that is not `dumb`. Also gates the two effects
-#           that only make sense live: the in-place row rewrite and the mark.
+#           unset or empty (no-color.org: only a non-empty value suppresses),
+#           and a TERM that is not `dumb`. Also gates the two effects that
+#           only make sense live: the in-place row rewrite and the mark.
 #   glyph — the ▸ marker and → arrow (the marker matches `min`'s prompt theme
 #           and the `min dash` cursor). Needs a UTF-8 locale; ASCII otherwise.
 #           Independent of attr: UTF-8 in a redirected log is still fine.
@@ -524,27 +525,17 @@ do_uninstall() {
         removed=$((removed + 1))
     done <"$record"
 
-    # Teardown AFTER the walk. Remove the record only once the footprint is
-    # fully gone; if anything was kept (modified or foreign), retain it so a later
-    # `--force`/manual cleanup still has the inventory to work from. Re-running is
-    # idempotent: already-removed rows re-classify as already-gone.
-    if [ "$kept_modified" -ne 0 ] || [ "$kept_foreign" -ne 0 ]; then
-        say "  kept install record $(tilde "$record") (unremoved entries remain)"
-    elif [ "$dry_run" -eq 1 ]; then
-        say "  would remove install record $(tilde "$record")"
-    else
-        rm -f "$record"
-    fi
-
     # Strip the marker-fenced shell-init block from every rc file the
     # installer may have edited (which shell's rc got it depends on $SHELL at
     # install time, so try them all — a file without markers is untouched).
     # The generated init/completion files themselves are ordinary record rows,
     # already handled by the walk above.
+    kept_rc=0
     for _rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$zshrc" "$fish_config" "$HOME/.profile"; do
         # An unterminated block returns non-zero (file kept, warning printed);
-        # that must not abort the walk over the remaining rc candidates.
-        strip_rc_block "$_rc" || true
+        # that must not abort the walk over the remaining rc candidates, but it
+        # does mean a block survives, which the record teardown below must see.
+        strip_rc_block "$_rc" || kept_rc=1
     done
 
     # The `min` registration also lives on inside zsh's compinit dump
@@ -561,6 +552,24 @@ do_uninstall() {
         else
             say "  warning: could not remove compinit dump cache $(tilde "$zcompdump")"
         fi
+    fi
+
+    # Teardown LAST, after the walk and the shell teardown above. The record is
+    # the only inventory a later run has, and `--uninstall` treats its absence as
+    # "nothing to undo", so dropping it early strands whatever the run failed to
+    # remove: an unremoved rc block (or a kept component) would become
+    # uninstallable. Remove it only once the footprint is fully gone; otherwise
+    # retain it so a later `--force`/manual cleanup still has something to work
+    # from. Re-running is idempotent: already-removed rows re-classify as
+    # already-gone.
+    if [ "$kept_modified" -ne 0 ] || [ "$kept_foreign" -ne 0 ]; then
+        say "  kept install record $(tilde "$record") (unremoved entries remain)"
+    elif [ "$kept_rc" -ne 0 ]; then
+        say "  kept install record $(tilde "$record") (shell-init block remains)"
+    elif [ "$dry_run" -eq 1 ]; then
+        say "  would remove install record $(tilde "$record")"
+    else
+        rm -f "$record"
     fi
 
     # --purge additionally deletes the minimal-owned trees wholesale (build
