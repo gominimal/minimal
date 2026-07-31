@@ -147,11 +147,10 @@ jobs:
         # DM3 (native Linux + a minvmd/libkrun microVM): boot a REAL microVM from
         # the SHIPPED minvmd and pass the session e2e over the vsock bridge, the
         # same proof ci-linux-kvm's `test-kvm` runs. Every moving part is a
-        # downloaded release artifact: the native-glibc `minvmd`, the guest kernel
-        # + ext4 rootfs + initramfs, and the pinned gvproxy switch. libkrun itself
-        # is NOT shipped on Linux (users resolve it from the system / the upstream
-        # package), so it is materialized here exactly as the release build linked
-        # it, reusing the shipped static `mip` to drive the cache fetch.
+        # downloaded release artifact: the static-musl `minvmd`, the guest kernel
+        # + ext4 rootfs + initramfs, and the pinned gvproxy switch. Nothing is
+        # materialized and no LD_LIBRARY_PATH is set — minvmd links libkrun
+        # statically and dlopens nothing, so the host needs no libkrun at all.
         needs: [release]
         runs-on: ubuntu-latest # x86_64; KVM-capable
         timeout-minutes: 30
@@ -177,9 +176,11 @@ jobs:
                   sudo udevadm trigger --name-match=kvm
                   ls -l /dev/kvm
             - name: Enable unprivileged user namespaces
-              # `mip materialize` (the libkrun cache fetch below) runs the build
-              # pipeline, which needs userns; Ubuntu 24.04 restricts it via
-              # AppArmor by default.
+              # Ubuntu 24.04 restricts unprivileged userns via AppArmor by
+              # default, and the sandboxed build the session e2e drives needs it.
+              # (This used to be justified by the libkrun `mip materialize` step,
+              # which a static minvmd made unnecessary; the e2e's own need for
+              # userns is unchanged, so the sysctl stays.)
               run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
             - name: Download shipped linux-amd64 binaries
               # Pulls min, minvmd, mip and gvproxy (plus minimald, unused on the
@@ -220,17 +221,21 @@ jobs:
                   mv "$BIN/gvproxy-linux-amd64" "$BIN/gvproxy"
                   chmod +x "$BIN/min" "$BIN/minvmd" "$BIN/mip" "$BIN/gvproxy"
                   echo "$BIN" >> "$GITHUB_PATH"
-            - name: Materialize libkrun prefix (upstream package)
-              # minvmd links libkrun.so + dlopens libkrunfw.so.5 at runtime; the
-              # Linux release ships neither (its rpath resolves them from the
-              # system / LD_LIBRARY_PATH). Reuse the shipped static mip to drive
-              # the cache fetch (no Rust toolchain) — the exact libkrun the release
-              # build linked against. Publishes LIBKRUN_PREFIX and
-              # LD_LIBRARY_PATH=$HOME/.krun to later steps.
-              uses: ./.github/actions/setup-libkrun-linux
-              with:
-                  arch: x86_64
-                  mip: ${{ runner.temp }}/bin/mip
+            - name: Verify the shipped minvmd needs no libkrun at runtime
+              # The shipped minvmd links libkrun statically and dlopens nothing,
+              # so this job no longer materializes a libkrun prefix or sets
+              # LD_LIBRARY_PATH. Assert that rather than assume it: a regression
+              # to a dynamic build would otherwise surface as a confusing
+              # loader error mid-boot, and the smoke's whole point is to run the
+              # artifact exactly as a user receives it.
+              run: |
+                  set -euo pipefail
+                  bin="$RUNNER_TEMP/bin/minvmd"
+                  # x86_64-musl emits a static PIE, which file(1) reports as
+                  # "static-pie linked"; aarch64-musl reports "statically linked".
+                  file "$bin" | grep -qE 'statically linked|static-pie linked' \
+                    || { echo "::error::shipped minvmd is not statically linked"; file "$bin"; exit 1; }
+                  echo "shipped minvmd is self-contained; no libkrun on the host"
             - name: Point the microVM env at the shipped guest artifacts
               run: |
                   {

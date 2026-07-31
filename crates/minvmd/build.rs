@@ -29,6 +29,21 @@
 //!   Linux-only workflow stays green; a Linux host *with* libkrun builds the
 //!   real implementation with a plain `cargo build -p minvmd`.
 //! - **Other targets**: stub only; never links libkrun.
+//!
+//! ## Static libkrun (musl)
+//!
+//! A prefix holding `libkrun.a` (built by `scripts/build-libkrun-linux.sh`)
+//! selects a static link instead: this emits `minvmd_libkrun_static`, which
+//! flips the `#[link]` in `src/krun/raw.rs` to `kind = "static"`, and no rpath
+//! is recorded — a statically linked binary has nothing to resolve at load
+//! time. That is what lets minvmd ship to Linux as a single self-contained
+//! musl binary rather than a glibc build trailing `libkrun.so` and
+//! `libkrunfw.so.5` (gominimal/minimal#1065).
+//!
+//! The archive wins when both it and a shared object are present: a prefix
+//! containing both is a dev host that has materialized the upstream package
+//! and then built the static one, and the static link is the shipping
+//! configuration.
 
 use std::path::Path;
 
@@ -46,13 +61,20 @@ const LINUX_LIB_DIRS: &[&str] = &[
     "/usr/lib/aarch64-linux-gnu",
 ];
 
+/// The static libkrun archive, as staged by `scripts/build-libkrun-linux.sh`.
+/// Its presence in the prefix is what selects a static link over a dynamic one.
+const STATIC_LIB: &str = "libkrun.a";
+
 fn main() {
     println!("cargo:rerun-if-env-changed=LIBKRUN_PREFIX");
+    println!("cargo:rerun-if-env-changed=MINVMD_REQUIRE_LIBKRUN");
     // Declared so `#[cfg(minvmd_libkrun)]` does not trip the unexpected-cfgs
     // lint under `-D warnings`.
     println!("cargo::rustc-check-cfg=cfg(minvmd_libkrun)");
+    println!("cargo::rustc-check-cfg=cfg(minvmd_libkrun_static)");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
 
     // Real backend is opt-in via the `libkrun` feature (default on; the `minimal`
     // CLI opts out). Off => stub, and no dependent binary inherits libkrun's
@@ -71,10 +93,89 @@ fn main() {
         })
         .flatten();
 
+    // `scripts/build-libkrun-linux.sh` only ever produces a MUSL archive (it
+    // rejects a non-musl triple outright), so the target env must match too.
+    // Gating on `target_os` alone let a default `*-linux-gnu` build pointed at
+    // a staged prefix select `kind = "static"` and try to link a musl
+    // staticlib into a glibc binary — and, worse, let it satisfy
+    // `MINVMD_REQUIRE_LIBKRUN=static`, whose whole job is to prove the shipped
+    // link model. A gnu build now falls back to the dynamic path, or fails the
+    // requirement honestly.
+    let has_static = prefix.as_deref().is_some_and(|p| {
+        target_os == "linux" && target_env == "musl" && Path::new(p).join(STATIC_LIB).exists()
+    });
+    enforce_requirement(prefix.as_deref(), has_static, &target_env);
+
     if let Some(prefix) = prefix {
         println!("cargo:rustc-link-search=native={prefix}");
-        emit_rpaths(&target_os, &prefix);
+
+        // A `libkrun.a` in the prefix selects the static link. Linux only: the
+        // macOS pipeline builds and ships a dylib, and quietly switching that
+        // proven path because some other libkrun install happened to drop an
+        // archive in /opt/homebrew/lib would be a surprise, not a feature.
+        if has_static {
+            // No rpath: a static link resolves at build time, so there is
+            // nothing for the loader to search for. The `#[link]` kind is
+            // flipped in src/krun/raw.rs by this cfg.
+            println!("cargo::rustc-cfg=minvmd_libkrun_static");
+        } else {
+            emit_rpaths(&target_os, &prefix);
+        }
+
         println!("cargo::rustc-cfg=minvmd_libkrun");
+    }
+}
+
+/// Turn the silent stub fallback into a hard build error, when asked.
+///
+/// The default is deliberately permissive: a Linux host with no libkrun builds
+/// the stub, which is what keeps stock Linux CI green. The cost is that a build
+/// which SHOULD have linked libkrun and didn't — a release job whose libkrun
+/// step regressed, say — still succeeds, and ships a binary that compiles,
+/// links, and then bails at VM boot. Nothing in the build catches it.
+///
+/// `MINVMD_REQUIRE_LIBKRUN` is the opt-in that closes that gap; the release
+/// lanes set it. Values:
+///
+/// - `static` — a `libkrun.a` must have been found and the link must be static.
+///   This is what a shipped Linux `minvmd` requires.
+/// - anything else non-empty and not `0` — some libkrun must have been found;
+///   dynamic is acceptable.
+///
+/// Unset (or `0`) preserves the stub-on-miss behaviour.
+fn enforce_requirement(prefix: Option<&str>, has_static: bool, target_env: &str) {
+    let requirement = std::env::var("MINVMD_REQUIRE_LIBKRUN").unwrap_or_default();
+    if requirement.is_empty() || requirement == "0" {
+        return;
+    }
+
+    let Some(prefix) = prefix else {
+        panic!(
+            "MINVMD_REQUIRE_LIBKRUN={requirement} but no libkrun was found, so this build would \
+             silently produce a STUB minvmd that bails at VM boot. Set LIBKRUN_PREFIX to a \
+             directory holding libkrun.a (static, see scripts/build-libkrun-linux.sh) or \
+             libkrun.so, or unset MINVMD_REQUIRE_LIBKRUN to allow the stub."
+        );
+    };
+
+    if requirement == "static" && !has_static {
+        // Distinguish the two ways `static` can go unmet: no archive at all,
+        // versus a non-musl target that must not consume the musl archive even
+        // when one is staged. Reporting "no libkrun.a" for a gnu build whose
+        // prefix visibly contains one sends the reader hunting the wrong thing.
+        if !target_env.is_empty() && target_env != "musl" {
+            panic!(
+                "MINVMD_REQUIRE_LIBKRUN=static but the target env is `{target_env}`, not `musl`. \
+                 {STATIC_LIB} is built for musl only (scripts/build-libkrun-linux.sh rejects any \
+                 other triple), so it cannot be linked into this build. Build for a \
+                 *-unknown-linux-musl target, or drop the `static` requirement."
+            );
+        }
+        panic!(
+            "MINVMD_REQUIRE_LIBKRUN=static but no {STATIC_LIB} in {prefix}; the build would link \
+             libkrun DYNAMICALLY and produce a binary that needs libkrun.so at runtime. Build the \
+             archive with scripts/build-libkrun-linux.sh, or drop the `static` requirement."
+        );
     }
 }
 
@@ -134,8 +235,10 @@ fn find_libkrun_prefix() -> Option<String> {
         .map(|dir| (*dir).to_string())
 }
 
-/// True when `dir` contains a `libkrun.so*` file (the bare `.so` link or a
-/// versioned soname such as `libkrun.so.1`).
+/// True when `dir` contains a linkable libkrun: a `libkrun.so*` (the bare `.so`
+/// link or a versioned soname such as `libkrun.so.1`) or the static
+/// [`STATIC_LIB`] archive. Either form makes the directory a usable prefix;
+/// which link model it selects is decided in [`main`].
 fn dir_has_libkrun(dir: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(Path::new(dir)) else {
         return false;
@@ -144,6 +247,6 @@ fn dir_has_libkrun(dir: &str) -> bool {
         entry
             .file_name()
             .to_str()
-            .is_some_and(|name| name.starts_with("libkrun.so"))
+            .is_some_and(|name| name.starts_with("libkrun.so") || name == STATIC_LIB)
     })
 }
