@@ -2187,8 +2187,9 @@ pub async fn cmd_session_policy(
 /// so `--config-dir` moves the mesh enrolment along with everything
 /// else.
 ///
-/// Not gated behind `remote-access`: it is a pure path helper the `dirs` debug
-/// command surfaces regardless of whether the mesh commands are compiled in.
+/// Not gated behind `remote-access`: it is a pure path helper the `min bug`
+/// diagnostic bundle captures regardless of whether the mesh commands are
+/// compiled in.
 pub fn mesh_enrolment_path(global: &GlobalArgs) -> PathBuf {
     let base = match &global.minimal_dir {
         Some(dir) => dir.clone(),
