@@ -322,3 +322,20 @@ impl From<mfile::Error> for Error {
         Self::MFile(value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A missing minimal file renders with a single `minimal.toml:` prefix.
+    /// The boundary supplies the filename here, so `mfile`'s `NotFound` must
+    /// not carry it too, or the message reads `minimal.toml: minimal.toml not
+    /// found`.
+    #[test]
+    fn mfile_not_found_display_is_not_doubled() {
+        assert_eq!(
+            Error::MFile(mfile::Error::NotFound).to_string(),
+            "minimal.toml: not found",
+        );
+    }
+}

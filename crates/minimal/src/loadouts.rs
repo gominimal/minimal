@@ -114,7 +114,11 @@ pub(crate) fn resolve_active_loadouts(
         .iter()
         .map(|name| {
             let path = loadouts_dir.join(format!("{name}.toml"));
+            // `LoadError`'s Display already embeds its I/O source, so flatten
+            // it to a leaf before adding context; otherwise anyhow re-renders
+            // the underlying error a second time from the chain.
             sessions::client::disk::read_loadout_file(&path)
+                .map_err(|e| anyhow::anyhow!("{e}"))
                 .with_context(|| format!("{source} `{name}`"))
         })
         .collect()
@@ -405,6 +409,39 @@ mod tests {
         };
         let selection = LoadoutSelection::Cli(vec!["missing".to_string()]);
         assert!(resolve_active_loadouts(selection, &cfg, &global).is_err());
+    }
+
+    /// The `--loadout NAME` missing-file error names the underlying OS failure
+    /// exactly once. `LoadError`'s Display already embeds its source, so the
+    /// context chain must not re-render it (see the flatten in
+    /// [`resolve_active_loadouts`]).
+    #[test]
+    fn resolve_active_loadouts_cli_missing_file_error_not_doubled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loadouts = tmp.path().join("minimal/loadouts");
+        std::fs::create_dir_all(&loadouts).unwrap();
+        let cfg = sessions::client::config::Config::default();
+        let global = GlobalArgs {
+            repo_dir: None,
+            minimal_dir: None,
+            config_dir: Some(tmp.path().to_path_buf()),
+            provider: None,
+            no_input: false,
+        };
+        let selection = LoadoutSelection::Cli(vec!["missing".to_string()]);
+        let err = resolve_active_loadouts(selection, &cfg, &global)
+            .expect_err("a missing --loadout file must error");
+        let rendered = format!("{err:#}");
+        // The concrete OS-error text is platform-dependent, so derive it from
+        // the same failing read and assert it appears once, not twice.
+        let needle = std::fs::read_to_string(loadouts.join("missing.toml"))
+            .expect_err("the loadout file must be absent")
+            .to_string();
+        assert_eq!(
+            rendered.matches(&needle).count(),
+            1,
+            "OS error should appear once in `{rendered}`",
+        );
     }
 
     /// A loadout that declares a session transition script still composes

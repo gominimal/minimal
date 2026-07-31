@@ -1,8 +1,6 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::MFILE_NAME;
-
 /// The errors possible when working with the minimal file.
 #[derive(Debug)]
 pub enum Error {
@@ -20,7 +18,7 @@ impl fmt::Display for Error {
                 write!(f, "{} I/O error at path {}: {}", ctx, path.display(), e)
             }
             Error::Format(e) => write!(f, "invalid TOML: {}", e),
-            Error::NotFound => write!(f, "{} not found", MFILE_NAME),
+            Error::NotFound => write!(f, "not found"),
             Error::ConflictingLayouts(paths) => write!(
                 f,
                 "multiple minimal configurations detected at [{}]. Remove the erroneous one.",
