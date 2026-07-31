@@ -37,10 +37,10 @@ These apply to every subcommand.
 
 ## Commands
 
-### `ls`
+### `session list` (aliases: `min ls`, `min session ls`)
 
 ```
-min ls [--raw] [--json]
+min session list [--raw] [--json]
 ```
 
 Lists sessions. `--raw` prints raw session IDs one per line for piping
@@ -49,8 +49,10 @@ JSON. When the daemon reports a shared resource pool, the table is headed
 by a `RESOURCE POOL:` line (CPU cores, memory, and the number of sessions
 sharing them); `--raw` omits it.
 
-A deliberate exception to the `min <noun> <verb>` convention: `ls` is the
-highest-traffic command in the CLI and keeps its bare top-level form.
+`min ls` is the same command kept bare at the top level — a deliberate
+exception to the `min <noun> <verb>` convention, since it is the
+highest-traffic command in the CLI; `min session ls` is the noun-level alias.
+All three spellings take the same flags and produce identical output.
 
 ### `session activate`
 
