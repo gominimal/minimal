@@ -47,8 +47,9 @@ fn spawn_timeout_secs() -> u64 {
 }
 
 /// How long the autospawn wait may run before the CLI narrates it with a
-/// spinner. A warm boot connects well under this and stays silent; only a cold
-/// VM boot (up to ~1 min) crosses the threshold and shows the narration line.
+/// spinner. Warm boots and session starts connect in well under this and stay
+/// silent; only a cold VM boot (observed ~22–28 s; up to ~1 min under host
+/// load) crosses the threshold and shows the narration line.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const BOOT_SPINNER_DELAY: Duration = Duration::from_secs(2);
 
