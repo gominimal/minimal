@@ -1002,18 +1002,28 @@ pub fn format_ls(
         return Ok(());
     }
 
-    // Format as a table: ID, Name, Title, Last Activity.
-    // Widths chosen to fit a standard 80-col terminal.
+    // Format as a table. The columns mirror the fields `--json` exposes so
+    // the two surfaces present the same session attributes.
     writeln!(
         out,
-        "{:<36}  {:<20}  {:<20}  LAST ACTIVITY",
-        "SESSION ID", "NAME", "TITLE"
+        "{:<36}  {:<20}  {:<13}  {:<20}  {:<19}  PROJECT PATH",
+        "SESSION ID", "NAME", "STATUS", "TITLE", "LAST ACTIVITY"
     )?;
-    writeln!(out, "{:-<36}  {:-<20}  {:-<20}  {:-<24}", "", "", "", "")?;
+    writeln!(
+        out,
+        "{:-<36}  {:-<20}  {:-<13}  {:-<20}  {:-<19}  {:-<24}",
+        "", "", "", "", "", ""
+    )?;
 
     for entry in &resp.sessions {
         let id = entry.id.to_string();
         let name = entry.name.as_deref().unwrap_or("-");
+        let status = status_label(entry.status);
+        let project_path = entry
+            .project_path
+            .as_ref()
+            .map(paths::HostAbsPath::to_string)
+            .unwrap_or_else(|| "-".to_string());
         let (title, last_activity) = match &entry.attrs {
             Some(attrs) => {
                 let title = attrs
@@ -1033,10 +1043,23 @@ pub fn format_ls(
             }
             None => ("-", "-".to_string()),
         };
-        writeln!(out, "{id:<36}  {name:<20}  {title:<20}  {last_activity}")?;
+        writeln!(
+            out,
+            "{id:<36}  {name:<20}  {status:<13}  {title:<20}  {last_activity:<19}  {project_path}"
+        )?;
     }
 
     Ok(())
+}
+
+/// Human-readable lifecycle status for the `ls` table, using the same
+/// snake_case tokens the `--json` surface emits so the two agree.
+fn status_label(status: sessions::SessionStatus) -> &'static str {
+    match status {
+        sessions::SessionStatus::Pending => "pending",
+        sessions::SessionStatus::Materializing => "materializing",
+        sessions::SessionStatus::Active => "active",
+    }
 }
 
 fn format_memory(bytes: u64) -> String {
@@ -2720,17 +2743,7 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
 pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mctx::Error> {
     use op::ProjectOp as _;
     let config = build_config(global)?;
-    let mut ctx = match mctx::Context::new(config) {
-        Ok(ctx) => ctx,
-        // Point a user with no `minimal.toml` at `min init`, matching the hint
-        // `min session activate` gives in the same situation.
-        Err(e @ mctx::Error::MFile(mfile::Error::NotFound)) => {
-            return Err(mctx::Error::Other(anyhow::anyhow!(
-                "{e}\nRun 'min init' to give the project its own config."
-            )));
-        }
-        Err(e) => return Err(e),
-    };
+    let mut ctx = mctx::Context::new(config)?;
 
     let mut env = ctx.project_setup();
     let report = op::UpdateProject.run(&mut env)?;

@@ -72,6 +72,43 @@ fn ls_shows_shared_resource_pool() {
     );
 }
 
+#[test]
+fn ls_table_exposes_project_path_and_status() {
+    let resp = ListSessionsResponse {
+        resource_pool: None,
+        sessions: vec![minimald_rpc::ListSessionsEntry {
+            id: SessionId::nil(),
+            name: Some("s1".to_string()),
+            project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
+            status: sessions::SessionStatus::Active,
+            attrs: None,
+        }],
+    };
+    let mut out = Vec::new();
+
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+    )
+    .unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("STATUS"), "header should list STATUS: {text}");
+    assert!(
+        text.contains("PROJECT PATH"),
+        "header should list PROJECT PATH: {text}"
+    );
+    assert!(text.contains("active"), "row should show status: {text}");
+    assert!(
+        text.contains("/work/proj"),
+        "row should show project path: {text}"
+    );
+}
+
 #[tokio::test]
 async fn ls_empty() {
     let (_daemon, args) = setup().await;
