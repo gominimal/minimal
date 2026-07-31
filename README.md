@@ -7,7 +7,7 @@
 
 <h1 align="center">Minimal</h1>
 
-<p align="center"><strong>Dev Environments, Contained</strong><br>Isolated, reproducible development sandboxes and a secure package manager that give your whole team identical environments, while keeping AI agents off the laptop.</p>
+<p align="center"><strong>Build Software You Can Trust</strong><br>Isolated, reproducible development sandboxes and a secure package manager that give your whole team identical environments, while keeping AI agents off the laptop.</p>
 
 <p align="center">
   <a href="https://docs.minimal.dev/">Documentation</a> ·
