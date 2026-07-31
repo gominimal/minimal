@@ -2037,6 +2037,95 @@ mod tests {
         );
     }
 
+    /// The shell-exit prompt leads with the files changed since activation:
+    /// write a file into the session's workspace while the shell is live, then
+    /// exit it and expect the delta header and the changed-file row above the
+    /// prompt. Answered with the default (keep), so the session survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shell_exit_prompt_lists_files_changed_since_activation() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        let mut channel = client.open_shell(session_id).await;
+
+        // Prove the shell is live first (mock echoes `got:<line>`); the
+        // baseline snapshot is taken before the process launches, so a write
+        // from here on is a change.
+        channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+        let mut stdout = Vec::new();
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    stdout.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&stdout).contains("got:hello") {
+                        break;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("channel closed before the echo arrived"),
+            }
+        }
+
+        // Change the workspace daemon-side, as an in-session shell would.
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("session should resolve");
+        let paths = handle.paths().await.expect("paths should resolve");
+        let scratch = paths
+            .working
+            .join(&paths::DaemonRelPath::try_new("scratch.txt").unwrap());
+        tokio::fs::write(scratch.as_utf8_path(), b"made in session")
+            .await
+            .unwrap();
+
+        // Exit the shell; the prompt must lead with the delta.
+        channel
+            .data_bytes(format!("{}\n", crate::session_host::MOCK_EXIT_LINE).into_bytes())
+            .await
+            .unwrap();
+        let mut answered_prompt = false;
+        let mut prompt_out = Vec::new();
+        while let Ok(msg) = tokio::time::timeout(Duration::from_secs(10), channel.wait()).await {
+            match msg {
+                Some(ChannelMsg::Data { data }) => {
+                    prompt_out.extend_from_slice(&data);
+                    if !answered_prompt
+                        && String::from_utf8_lossy(&prompt_out)
+                            .contains(crate::session_host::SHELL_EXIT_PROMPT)
+                    {
+                        channel.data_bytes(b"\r".to_vec()).await.unwrap();
+                        answered_prompt = true;
+                    }
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        let prompt_out = String::from_utf8_lossy(&prompt_out);
+        assert!(
+            answered_prompt,
+            "expected the session-exit prompt to render; got: {prompt_out:?}"
+        );
+        assert!(
+            prompt_out.contains("changed since activation:"),
+            "prompt should lead with the delta header; got: {prompt_out:?}"
+        );
+        assert!(
+            prompt_out.contains("A scratch.txt"),
+            "prompt should list the added file; got: {prompt_out:?}"
+        );
+
+        // Keep (the default) must leave the session intact.
+        assert!(
+            record_exists(&mut client, session_id).await,
+            "keep must not delete the session record"
+        );
+    }
+
     /// Selecting "delete" on the shell-exit prompt must tear the connection down
     /// *and* destroy the session (record removed), routed through the manager
     /// via the binding's weak handle.
