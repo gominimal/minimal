@@ -88,12 +88,6 @@ Useful activation options:
 
 - `--name <NAME>` gives the session a stable, human-friendly name you can use
   in place of its id.
-- `--network <MODE>` selects the network mode: `no-net`, `host-net` (the
-  default), or `own-ip` (a dedicated IP on Minimal's virtual subnet). With
-  `own-ip` you can also publish `--ingress EXT:INT[/PROTO]` port mappings.
-  Platform support is still uneven: `own-ip` does not currently work with the
-  native Linux provider, and on macOS `host-net` carries outbound traffic
-  only, because the session lives inside a VM.
 - `--loadout <NAME>` applies a named loadout (repeatable); `--no-loadouts`
   applies none.
 - `--no-prompt` fails instead of prompting when composition surfaces items your
