@@ -282,7 +282,9 @@ enum WaitState {
     /// `Child`. The `JoinHandle` is retained across calls so a dropped
     /// `wait` future can be re-polled (`&mut JoinHandle` is cancel-safe).
     Waiting(JoinHandle<Result<hakoniwa::ExitStatus, hakoniwa::Error>>),
-    /// Cached numeric exit (or `None` for signal termination).
+    /// Cached exit status, shell-convention (`128 + signo` for a signal
+    /// death). `Option` for the terminal-state machinery; the success
+    /// path always fills it.
     Exited(Option<i32>),
     /// Wait itself errored. The original `io::Error` isn't `Clone`, so
     /// repeat `wait()` calls get a generic "previously failed" error
@@ -332,7 +334,11 @@ impl Process for HakoniwaProcess {
         // `wait()` call resumes the same `JoinHandle`.
         if let WaitState::Waiting(handle) = &mut self.state {
             self.state = match handle.await {
-                Ok(Ok(status)) => WaitState::Exited(status.exit_code),
+                // `code` is the shell-convention status (`128 + signo` for a
+                // signal death), so a SIGKILL reports 137 rather than 1. The
+                // `exit_code` field is `None` for signals and would collapse
+                // to 1 downstream; `code` is what the session path reports too.
+                Ok(Ok(status)) => WaitState::Exited(Some(status.code)),
                 Ok(Err(_)) | Err(_) => WaitState::Failed,
             };
         }
