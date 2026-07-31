@@ -366,8 +366,12 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     mnl ls 2>&1 || true
     fail
   fi
-  # The destroy dirty gate: headless (no TTY) without --force must refuse,
-  # and the refusal must name the escape hatch.
+  # The destroy dirty gate: the kept session's task process has exited, so
+  # no host is running and its at-risk state is unknowable — the gate must
+  # refuse a headless (no TTY) destroy without --force, naming the escape
+  # hatch. (Were a host live, the seed's empty `.git` marker would make VCS
+  # mode decline into the activation-delta fallback instead; only a
+  # proven-clean tree may destroy headless without --force.)
   if mnl session destroy "$kept" >/dev/null 2>"$WORK/destroy-refuse.err"; then
     echo "::error::headless 'min session destroy' without --force should refuse"
     fail

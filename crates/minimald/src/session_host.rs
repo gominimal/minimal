@@ -662,10 +662,10 @@ enum Message {
     Kill(bool),
     Attach(Channel<Msg>, WinSize),
     GetAttrs(oneshot::Sender<HostAttrs>),
-    /// Compute the workspace delta (files changed since activation) and
-    /// reply with its rendered rows; `None` when no baseline was armed or
-    /// the re-walk fails.
-    GetChangedFiles(oneshot::Sender<Option<Vec<String>>>),
+    /// Compute the workspace's at-risk report (VCS-exact when the tree is a
+    /// git repository, the changed-since-activation delta otherwise) and
+    /// reply with it; `Unavailable` when neither can be computed.
+    GetAtRisk(oneshot::Sender<minimald_rpc::SessionDeltaResponse>),
 
     SetTitleCallback(String),
     VisualBellCallback,
@@ -768,23 +768,20 @@ impl HostHandle {
         }
     }
 
-    /// Returns the files changed in the session's workspace since activation
-    /// — the shell-exit prompt's rows — or `None` when the delta is
-    /// unavailable: no baseline was armed, the bounded re-walk failed, or
-    /// the host is gone (a dead host reads as `None`, not a panic, because
-    /// callers race teardown). The walk itself runs off the host's runtime
-    /// loop and is bounded by [`DeltaSource`]'s internal timeout.
-    pub async fn changed_files(&self) -> Option<Vec<String>> {
+    /// Returns what a destroy of the session's workspace would lose: the
+    /// VCS-exact at-risk report when the workspace is a git repository, the
+    /// changed-since-activation rows otherwise, and `Unavailable` when
+    /// neither can be computed or the host is gone (a dead host reads as
+    /// `Unavailable`, not a panic, because callers race teardown). The
+    /// computation runs off the host's runtime loop, bounded per
+    /// [`crate::session_delta::assess`].
+    pub async fn at_risk(&self) -> minimald_rpc::SessionDeltaResponse {
         let (send, recv) = oneshot::channel();
-        if self
-            .sender
-            .send(Message::GetChangedFiles(send))
-            .await
-            .is_err()
-        {
-            return None;
+        if self.sender.send(Message::GetAtRisk(send)).await.is_err() {
+            return minimald_rpc::SessionDeltaResponse::Unavailable;
         }
-        recv.await.unwrap_or(None)
+        recv.await
+            .unwrap_or(minimald_rpc::SessionDeltaResponse::Unavailable)
     }
 }
 
@@ -860,6 +857,11 @@ pub(crate) struct Host<P: SessionProcess, G: Send + 'static> {
     // session. `None` when the workspace could not be walked at build time;
     // the prompt then renders without a delta.
     delta: Option<Arc<DeltaSource>>,
+
+    // The session's workspace root, kept for the at-risk assessment
+    // (`Message::GetAtRisk`): the VCS mode needs the tree path even when
+    // the baseline snapshot could not be armed.
+    workspace_root: std::path::PathBuf,
 
     // Keeps launcher-owned resources (the session's `Env`, which owns the
     // sandbox files backing the running process's rootfs along with the context
@@ -1457,8 +1459,8 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     {
         // Baseline the workspace before the process launches, so nothing the
         // session writes can leak into the "since activation" reference point.
-        let delta =
-            DeltaSource::arm(paths.working.as_utf8_path().as_std_path().to_path_buf()).await;
+        let workspace_root = paths.working.as_utf8_path().as_std_path().to_path_buf();
+        let delta = DeltaSource::arm(workspace_root.clone()).await;
 
         let Launched {
             master,
@@ -1500,6 +1502,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             net_guard,
             control,
             delta,
+            workspace_root,
             _guard: guard,
         };
 
@@ -1631,20 +1634,17 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                     Message::GetAttrs(s) => {
                         let _ = s.send(self.attrs.clone());
                     }
-                    Message::GetChangedFiles(s) => match &self.delta {
-                        // Computed on a spawned task: the re-walk can take
-                        // up to the delta's walk timeout, and this loop must
-                        // keep pumping the pty while it runs.
-                        Some(delta) => {
-                            let delta = Arc::clone(delta);
-                            tokio::spawn(async move {
-                                let _ = s.send(delta.changed_files().await);
-                            });
-                        }
-                        None => {
-                            let _ = s.send(None);
-                        }
-                    },
+                    Message::GetAtRisk(s) => {
+                        // Computed on a spawned task: the git commands and
+                        // the re-walk are each bounded but can take seconds,
+                        // and this loop must keep pumping the pty while
+                        // they run.
+                        let root = self.workspace_root.clone();
+                        let delta = self.delta.clone();
+                        tokio::spawn(async move {
+                            let _ = s.send(crate::session_delta::assess(root, delta).await);
+                        });
+                    }
                 }
             },
             // Read from master - stdout of session process => ssh channel (if any)

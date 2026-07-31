@@ -400,34 +400,45 @@ impl OneshotSshRpc for DestroySession {
     type Response = Errorable<DestroySessionResponse>;
 }
 
-/// An RPC to read the files changed in a session's workspace since
-/// activation — the same rows the shell-exit prompt leads with. Serves
-/// the destroy-confirm listing in `min session destroy`.
+/// An RPC to read what work is at risk in a session's workspace — what a
+/// destroy would permanently lose. Serves the destroy-confirm listing in
+/// `min session destroy`.
 pub struct SessionDelta;
 
-/// The request for a [`SessionDelta`] RPC.
-///
-/// Serialized examples:
-///
-///  * `{"name": "my-session"}`
-///  * `{"id": "<some-uuid>"}`
+/// The request for a [`SessionDelta`] RPC. By id only: every caller has
+/// already resolved the session record (destroy must, to name what it
+/// deletes), so there is no name-lookup arm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionDeltaRequest {
-    Name(String),
-    Id(SessionId),
+pub struct SessionDeltaRequest {
+    pub id: SessionId,
 }
 
-/// The response for a [`SessionDelta`] RPC.
-///
-/// `changed` rows render as `A <path>` / `M <path>` / `D <path>`, sorted by
-/// path; an empty vec means nothing changed. `None` means the delta is
-/// unavailable — no such session, no running host, no baseline, or the
-/// daemon-side bounded re-walk failed — and the caller should not claim
-/// anything about the workspace.
+/// The response for a [`SessionDelta`] RPC: the session's at-risk state, in
+/// decreasing order of precision. Row strings render as `A <path>` /
+/// `M <path>` / `D <path>`, sorted by path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SessionDeltaResponse {
-    pub changed: Option<Vec<String>>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionDeltaResponse {
+    /// The workspace is a git repository and git answered: what is at risk
+    /// is precisely the uncommitted work and the unpushed commits. Both
+    /// empty/zero means the session is proven clean — everything is
+    /// committed and pushed, and a destroy loses nothing.
+    Vcs {
+        /// One row per file with uncommitted changes (untracked renders
+        /// as `A`).
+        uncommitted: Vec<String>,
+        /// Commits on any branch that no remote has.
+        unpushed_commits: u64,
+    },
+    /// No usable VCS state (no root `.git`, git missing or failing): the
+    /// rows are the files that differ from the activation-time baseline,
+    /// which may include work that was committed during the session. An
+    /// empty vec means nothing changed since activation.
+    ChangedSinceActivation { rows: Vec<String> },
+    /// Neither VCS state nor a baseline delta could be computed — no such
+    /// session, no running host, no baseline, or the bounded computation
+    /// failed. The caller cannot claim anything about the workspace.
+    Unavailable,
 }
 
 impl OneshotSshRpc for SessionDelta {
@@ -882,17 +893,33 @@ mod tests {
         );
     }
 
-    /// `SessionDelta` distinguishes "nothing changed" (`Some([])`) from
-    /// "delta unavailable" (`None`); both shapes must survive the wire.
+    /// `SessionDelta` distinguishes proven-clean VCS state, the
+    /// activation-delta fallback, and "unavailable"; all three shapes must
+    /// survive the wire, tagged by `kind`.
     #[test]
     fn session_delta_response_round_trips() {
-        let resp = SessionDeltaResponse {
-            changed: Some(vec!["A notes.md".to_string(), "M src/main.rs".to_string()]),
+        let vcs = SessionDeltaResponse::Vcs {
+            uncommitted: vec!["A notes.md".to_string(), "M src/main.rs".to_string()],
+            unpushed_commits: 3,
         };
-        assert_eq!(round_trip(&resp), resp);
+        assert_eq!(round_trip(&vcs), vcs);
+        let json = serde_json::to_string(&vcs).unwrap();
+        assert!(json.contains(r#""kind":"vcs""#), "got: {json}");
 
-        let unavailable = SessionDeltaResponse { changed: None };
+        let fallback = SessionDeltaResponse::ChangedSinceActivation {
+            rows: vec!["A scratch.txt".to_string()],
+        };
+        assert_eq!(round_trip(&fallback), fallback);
+        let json = serde_json::to_string(&fallback).unwrap();
+        assert!(
+            json.contains(r#""kind":"changed_since_activation""#),
+            "got: {json}"
+        );
+
+        let unavailable = SessionDeltaResponse::Unavailable;
         assert_eq!(round_trip(&unavailable), unavailable);
+        let json = serde_json::to_string(&unavailable).unwrap();
+        assert!(json.contains(r#""kind":"unavailable""#), "got: {json}");
     }
 
     #[test]

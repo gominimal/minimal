@@ -552,26 +552,25 @@ async fn serve_get_session_policy(
         .await
 }
 
-/// `SessionDelta`: the files changed in the session's workspace since
-/// activation, as the shell-exit prompt renders them. Best-effort by
-/// contract: an unknown session, a session without a running host, and an
-/// unavailable delta all answer `changed: None` rather than an error — the
-/// client's destroy confirm renders with or without the listing.
+/// `SessionDelta`: the session workspace's at-risk report — VCS-exact
+/// (uncommitted files, unpushed commits) when the tree is a git repository,
+/// the changed-since-activation rows otherwise. Best-effort by contract: an
+/// unknown session, a session without a running host, and a failed
+/// computation all answer `Unavailable` rather than an error — the client's
+/// destroy confirm renders with or without the listing.
 async fn serve_session_delta(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
 ) -> Result<(), ConnectionError> {
     SessionDelta
-        .handle_channel(c, async |req| {
-            let predicate = match req {
-                SessionDeltaRequest::Id(id) => SessionKeyPredicate::Id(id),
-                SessionDeltaRequest::Name(name) => SessionKeyPredicate::Name(name),
-            };
-            let changed = match s.sessions_manager().await.get_session(predicate).await {
-                Ok(Some(h)) => h.workspace_delta().await,
-                Ok(None) | Err(_) => None,
-            };
-            Ok(SessionDeltaResponse { changed })
+        .handle_channel(c, async |req: SessionDeltaRequest| {
+            let predicate = SessionKeyPredicate::Id(req.id);
+            Ok(
+                match s.sessions_manager().await.get_session(predicate).await {
+                    Ok(Some(h)) => h.workspace_at_risk().await,
+                    Ok(None) | Err(_) => SessionDeltaResponse::Unavailable,
+                },
+            )
         })
         .await
 }
