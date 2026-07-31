@@ -60,6 +60,33 @@ pub fn is_empty_or_home(dir: &Path, home: Option<&Path>) -> bool {
     std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none())
 }
 
+/// The non-VCS-root upload gate's decision from inputs that need no TTY.
+/// Split out so the three-way choice is unit-testable; the interactive
+/// `Prompt` case is resolved by the caller (#441).
+#[derive(Debug, PartialEq, Eq)]
+pub enum UploadGate {
+    /// Upload without asking: a VCS root, or an explicit `--sync tarball`.
+    Upload,
+    /// Headless caller, non-VCS root, implicit sync: skip and warn.
+    SkipHeadless,
+    /// Interactive caller, non-VCS root: confirm before uploading.
+    Prompt,
+}
+
+/// Decide the non-VCS-root upload gate. `headless` means no interactive
+/// confirm is possible (`--no-prompt`, `--no-input`, or a non-TTY); an
+/// explicit `--sync tarball` (`sync_explicit`) forces the upload, else a
+/// headless caller skips rather than upload a directory nobody confirmed.
+pub fn upload_gate(is_vcs_root: bool, sync_explicit: bool, headless: bool) -> UploadGate {
+    if is_vcs_root || sync_explicit {
+        UploadGate::Upload
+    } else if headless {
+        UploadGate::SkipHeadless
+    } else {
+        UploadGate::Prompt
+    }
+}
+
 fn is_default_excluded(name: &str) -> bool {
     DEFAULT_EXCLUDED_DIRS.contains(&name)
 }
@@ -1145,6 +1172,18 @@ mod tests {
         std::fs::write(dir.path().join("file.txt"), "x").unwrap();
         let home = tempfile::TempDir::new().unwrap();
         assert!(!is_empty_or_home(dir.path(), Some(home.path())));
+    }
+
+    #[test]
+    fn upload_gate_covers_three_lanes() {
+        // A VCS root, or an explicit `--sync tarball`, always uploads —
+        // headless or not.
+        assert_eq!(upload_gate(true, false, true), UploadGate::Upload);
+        assert_eq!(upload_gate(false, true, true), UploadGate::Upload);
+        // Headless + non-VCS root + implicit sync: skip and warn.
+        assert_eq!(upload_gate(false, false, true), UploadGate::SkipHeadless);
+        // Interactive + non-VCS root + implicit sync: confirm first.
+        assert_eq!(upload_gate(false, false, false), UploadGate::Prompt);
     }
 
     // ---- TarZstArchive per-entry API ----
