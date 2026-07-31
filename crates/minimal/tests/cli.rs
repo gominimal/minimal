@@ -484,8 +484,10 @@ async fn destroy_removes_session() {
     // Create a session via TestClient.
     let session_id = create_session(&daemon, "doomed").await;
 
-    // Destroy it via cmd_destroy.
-    cmd_destroy(
+    // The session has no running host, so its at-risk state is unknowable
+    // — and this test binary's stdin is not a terminal, so the destroy
+    // gate must refuse headless without --force, naming the escape hatch.
+    let err = cmd_destroy(
         &args,
         DestroyArgs {
             session: Some(session_id.to_string()),
@@ -494,11 +496,29 @@ async fn destroy_removes_session() {
         },
     )
     .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("--force"), "refusal must name --force: {err}");
+
+    // The refusal must leave the session untouched.
+    let mut client = daemon.server.connect().await;
+    use minimald_rpc::ListSessions;
+    let resp = client.call::<ListSessions>(&()).await;
+    assert_eq!(resp.sessions.len(), 1, "refusal must not destroy anything");
+
+    // --force skips the gate and destroys it.
+    cmd_destroy(
+        &args,
+        DestroyArgs {
+            session: Some(session_id.to_string()),
+            all: false,
+            force: true,
+        },
+    )
+    .await
     .unwrap();
 
     // Verify the session is gone.
-    let mut client = daemon.server.connect().await;
-    use minimald_rpc::ListSessions;
     let resp = client.call::<ListSessions>(&()).await;
     assert!(resp.sessions.is_empty());
 }
@@ -508,12 +528,28 @@ async fn destroy_by_name() {
     let (daemon, args) = setup().await;
     let _ = create_session(&daemon, "by-name").await;
 
-    cmd_destroy(
+    // Name resolution precedes the gate: the headless refusal (unknowable
+    // at-risk state, non-terminal stdin) proves the name resolved...
+    let err = cmd_destroy(
         &args,
         DestroyArgs {
             session: Some("by-name".to_string()),
             all: false,
             force: false,
+        },
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("--force"), "refusal must name --force: {err}");
+
+    // ...and --force destroys by name.
+    cmd_destroy(
+        &args,
+        DestroyArgs {
+            session: Some("by-name".to_string()),
+            all: false,
+            force: true,
         },
     )
     .await
