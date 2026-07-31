@@ -47,9 +47,11 @@ path-absolutize.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sysinfo.workspace = true
+tar.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+zstd.workspace = true
 vt100-ctt.workspace = true
 walkdir.workspace = true
 
