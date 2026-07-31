@@ -12,6 +12,13 @@
 //! their signatures carry a content digest, so a same-length edit that
 //! preserves the modification time is still reported. Above the cap the
 //! comparison falls back to (length, mtime).
+//!
+//! The workspace root's `.git` directory is excluded from both walks: the
+//! delta reports working-tree files, and git-internal churn (index, refs,
+//! objects) no longer appears in it — without the exclusion, any in-session
+//! git operation floods the capped row list with `.git` noise. Only the
+//! root-level `.git` is skipped; a nested one (a vendored subrepo) is
+//! ordinary workspace content.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -100,11 +107,16 @@ impl DeltaSource {
 /// every non-directory entry keyed by its root-relative path. A symlink is
 /// recorded via its own metadata — never traversed, even when it points at a
 /// directory — so links out of the root or link cycles cannot widen or wedge
-/// the walk. Unreadable entries fail the whole snapshot: a partial baseline
-/// would misreport their contents as added later.
+/// the walk. The root-level `.git` directory is skipped entirely (see the
+/// module docs for the tradeoff). Unreadable entries fail the whole
+/// snapshot: a partial baseline would misreport their contents as added
+/// later.
 fn snapshot(root: &Path) -> std::io::Result<Snapshot> {
     let mut out = Snapshot::new();
-    for entry in WalkDir::new(root) {
+    for entry in WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| !(e.depth() == 1 && e.file_name() == ".git"))
+    {
         let entry = entry?;
         if entry.file_type().is_dir() {
             continue;
@@ -239,6 +251,36 @@ mod tests {
         assert_eq!(
             diff(&before, &snapshot(root).unwrap()),
             vec!["M sneaky.txt".to_string()],
+        );
+    }
+
+    /// The root `.git` directory is invisible to the walk: git-internal churn
+    /// must not appear in the delta, while a working-tree change — and a
+    /// nested (vendored) `.git` — still must.
+    #[test]
+    fn root_git_dir_is_excluded_from_the_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, ".git/index", "v1");
+        write(root, "tracked.txt", "v1");
+        let before = snapshot(root).unwrap();
+        assert!(
+            !before.keys().any(|p| p.starts_with(".git")),
+            "the baseline must not contain root .git entries",
+        );
+
+        write(root, ".git/index", "v2 grown");
+        write(root, ".git/objects/aa/blob", "obj");
+        write(root, "tracked.txt", "v2 longer");
+        write(root, "vendor/dep/.git/config", "vendored");
+        let after = snapshot(root).unwrap();
+
+        assert_eq!(
+            diff(&before, &after),
+            vec![
+                "M tracked.txt".to_string(),
+                "A vendor/dep/.git/config".to_string(),
+            ],
         );
     }
 

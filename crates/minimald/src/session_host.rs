@@ -500,87 +500,110 @@ impl Binding {
         tracing::info!(reason = ?exit_reason, "binding leaving mainloop");
 
         if exit_reason == MainloopExitReason::ProcessExited {
-            // The shell process exited. For a bash shell, this usually meant someone pressed ctrl-d absent-mindedly.
-            // We presume they didnt want to completely destroy the session, perhaps just detach, but lets prompt
-            // to see where they wanted to go from here.
-            let _ = w.write_all(b"\r\n").await;
-
-            // Lead with what a "delete" would lose. An unavailable delta (no
-            // baseline, or the re-walk failed) renders the plain prompt — the
-            // exit path never blocks on change detection.
-            let changed = match &self.delta {
-                Some(delta) => delta.changed_files().await,
-                None => None,
-            };
-            let mut delete_item = "Delete, all in-session files permanently deleted".to_string();
-            match &changed {
-                Some(rows) if rows.is_empty() => {
-                    let _ = w
-                        .write_all(format!("{SHELL_EXIT_NO_CHANGES}\r\n\r\n").as_bytes())
-                        .await;
-                    delete_item.push_str(" — nothing will be lost");
-                }
-                Some(rows) => {
-                    let n = rows.len();
-                    let plural = if n == 1 { "" } else { "s" };
-                    let _ = w
-                        .write_all(
-                            format!("{n} file{plural} changed since activation:\r\n").as_bytes(),
-                        )
-                        .await;
-                    for row in rows.iter().take(DELTA_ROWS_SHOWN) {
-                        let _ = w.write_all(format!("  {row}\r\n").as_bytes()).await;
-                    }
-                    if n > DELTA_ROWS_SHOWN {
-                        let _ = w
-                            .write_all(
-                                format!("  ... and {} more\r\n", n - DELTA_ROWS_SHOWN).as_bytes(),
-                            )
-                            .await;
-                    }
-                    let _ = w.write_all(b"\r\n").await;
-                }
-                None => {}
-            }
-            match async_dialog::Select::new()
-                .with_prompt(SHELL_EXIT_PROMPT)
-                .items([
-                    "Exit, leaving the session filesystem in place and recoverable",
-                    delete_item.as_str(),
-                ])
-                .interact(rs.make_reader(), &mut w)
-                .await
-            {
-                // User selected detach, keep going to disconnect
-                Ok(Selection::At(0)) => {}
-                // User cancelled selection, safest option is to detach
-                Ok(Selection::Cancelled) => {}
-                // User selected delete: ask the manager to tear the whole
-                // session down (kill the host, remove the on-disk record) before
-                // we close the channel. Awaiting is deadlock-free here — the
-                // destroy cascade waits on the host runtime loop (already exiting
-                // now that the process has ended), never on this binding task.
-                Ok(Selection::At(1)) => match &self.control {
-                    Some(control) => {
-                        let _ = w.write_all(b"\r\nDeleting session...\r\n").await;
-                        if let Err(e) = control.destroy().await {
-                            tracing::warn!(error = %e, "session delete failed");
-                            let _ = w
-                                .write_all(format!("Failed to delete session: {e}\r\n").as_bytes())
-                                .await;
-                        }
-                    }
-                    // No manager wired (test harness): degrade to a detach.
-                    None => tracing::warn!("delete selected but no session control available"),
-                },
-                Ok(Selection::At(_)) => unreachable!(),
-                Err(e) => tracing::warn!(error = %e, "session-exit prompt failed"),
-            }
+            Self::shell_exit_prompt(
+                self.delta.as_ref(),
+                self.control.as_ref(),
+                rs.make_reader(),
+                &mut w,
+            )
+            .await;
         }
 
         let _ = ws.eof().await;
         let _ = ws.exit_status(0).await;
         let _ = ws.close().await; // needed to release the remote
+    }
+
+    /// The shell-exit prompt, run after the session process ends: leads with
+    /// the files changed since activation (when `delta` is available), then
+    /// offers exit-vs-delete and drives the chosen teardown through
+    /// `control`. Extracted from [`Binding::run`]'s mainloop epilogue purely
+    /// for readability; the bytes written to the channel are identical. An
+    /// associated fn taking the binding's capabilities piecewise because
+    /// `run` has already moved the channel out of `self` by this point.
+    async fn shell_exit_prompt<R, W>(
+        delta: Option<&Arc<DeltaSource>>,
+        control: Option<&SessionControl>,
+        r: R,
+        mut w: W,
+    ) where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        // The shell process exited. For a bash shell, this usually meant someone pressed ctrl-d absent-mindedly.
+        // We presume they didnt want to completely destroy the session, perhaps just detach, but lets prompt
+        // to see where they wanted to go from here.
+        let _ = w.write_all(b"\r\n").await;
+
+        // Lead with what a "delete" would lose. An unavailable delta (no
+        // baseline, or the re-walk failed) renders the plain prompt — the
+        // exit path never blocks on change detection.
+        let changed = match delta {
+            Some(delta) => delta.changed_files().await,
+            None => None,
+        };
+        let mut delete_item = "Delete, all in-session files permanently deleted".to_string();
+        match &changed {
+            Some(rows) if rows.is_empty() => {
+                let _ = w
+                    .write_all(format!("{SHELL_EXIT_NO_CHANGES}\r\n\r\n").as_bytes())
+                    .await;
+                delete_item.push_str(" — nothing will be lost");
+            }
+            Some(rows) => {
+                let n = rows.len();
+                let plural = if n == 1 { "" } else { "s" };
+                let _ = w
+                    .write_all(format!("{n} file{plural} changed since activation:\r\n").as_bytes())
+                    .await;
+                for row in rows.iter().take(DELTA_ROWS_SHOWN) {
+                    let _ = w.write_all(format!("  {row}\r\n").as_bytes()).await;
+                }
+                if n > DELTA_ROWS_SHOWN {
+                    let _ = w
+                        .write_all(
+                            format!("  ... and {} more\r\n", n - DELTA_ROWS_SHOWN).as_bytes(),
+                        )
+                        .await;
+                }
+                let _ = w.write_all(b"\r\n").await;
+            }
+            None => {}
+        }
+        match async_dialog::Select::new()
+            .with_prompt(SHELL_EXIT_PROMPT)
+            .items([
+                "Exit, leaving the session filesystem in place and recoverable",
+                delete_item.as_str(),
+            ])
+            .interact(r, &mut w)
+            .await
+        {
+            // User selected detach, keep going to disconnect
+            Ok(Selection::At(0)) => {}
+            // User cancelled selection, safest option is to detach
+            Ok(Selection::Cancelled) => {}
+            // User selected delete: ask the manager to tear the whole
+            // session down (kill the host, remove the on-disk record) before
+            // we close the channel. Awaiting is deadlock-free here — the
+            // destroy cascade waits on the host runtime loop (already exiting
+            // now that the process has ended), never on this binding task.
+            Ok(Selection::At(1)) => match control {
+                Some(control) => {
+                    let _ = w.write_all(b"\r\nDeleting session...\r\n").await;
+                    if let Err(e) = control.destroy().await {
+                        tracing::warn!(error = %e, "session delete failed");
+                        let _ = w
+                            .write_all(format!("Failed to delete session: {e}\r\n").as_bytes())
+                            .await;
+                    }
+                }
+                // No manager wired (test harness): degrade to a detach.
+                None => tracing::warn!("delete selected but no session control available"),
+            },
+            Ok(Selection::At(_)) => unreachable!(),
+            Err(e) => tracing::warn!(error = %e, "session-exit prompt failed"),
+        }
     }
 }
 
