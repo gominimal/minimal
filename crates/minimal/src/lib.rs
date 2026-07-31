@@ -1515,8 +1515,6 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     let abs_path =
         paths::HostAbsPath::try_new(utf8_path.clone()).context("Invalid project path")?;
 
-    offer_mfile_scaffold(&utf8_path, global)?;
-
     let mut port_mappings = Vec::with_capacity(args.ingress.len());
     for spec in &args.ingress {
         let mapping = parse_ingress_mapping(spec)?;
@@ -1562,6 +1560,12 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     let compose_options = loadouts::compose_options_from_config(&cfg);
     let selection = loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts);
     let active = loadouts::resolve_active_loadouts(selection, &cfg, global)?;
+
+    // Scaffold-offer a missing `minimal.toml` only after loadouts resolve:
+    // a bad `--loadout` must error before anything prints, so the user is
+    // never told the session is proceeding and then that it is not.
+    offer_mfile_scaffold(&utf8_path, global)?;
+
     if !active.is_empty() {
         let names: Vec<&str> = active.iter().map(|l| l.name().as_ref()).collect();
         eprintln!("Applying loadouts: {}", names.join(", "));
