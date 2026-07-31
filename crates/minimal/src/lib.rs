@@ -275,7 +275,13 @@ pub struct GlobalArgs {
     /// working directory.
     #[arg(long, short = 'C', global = true)]
     pub repo_dir: Option<PathBuf>,
-    /// Override the base directory used for operations (default: ~/.cache/minimal)
+    /// Override the base directory for minimal's state (default: platform
+    /// state dir).
+    ///
+    /// The session store, provider instances, and other on-disk state live
+    /// under `<minimal_dir>/`. Defaults to `$XDG_STATE_HOME/minimal` on Linux
+    /// (or `$HOME/.local/state/minimal` when that's unset); macOS also uses
+    /// `$HOME/.local/state/minimal`.
     #[arg(long, global = true)]
     pub minimal_dir: Option<PathBuf>,
     /// Override the user config directory (default: platform config dir).

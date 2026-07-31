@@ -30,7 +30,7 @@ These apply to every subcommand.
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--repo-dir <PATH>` | `-C` | Use the given directory as the repository root, instead of the current working directory |
-| `--minimal-dir <PATH>` | | Override the base directory used for operations (default: `~/.cache/minimal`) |
+| `--minimal-dir <PATH>` | | Override the base directory for minimal's state; the session store, provider instances, and other on-disk state live under `<minimal_dir>/`. Defaults to `$XDG_STATE_HOME/minimal` on Linux (or `$HOME/.local/state/minimal`); macOS also uses `$HOME/.local/state/minimal` |
 | `--config-dir <PATH>` | | Override the user config directory; everything under `<config_dir>/minimal/` (`config.toml`, `loadouts/`, ...) resolves relative to it. Defaults to `$XDG_CONFIG_HOME` on Linux (or `$HOME/.config`); macOS also uses `$HOME/.config` |
 | `--provider <PROVIDER>` | | Daemon backend that hosts sessions: `local-minimald` (Linux default, `minimald` natively on the host) or `local-minvmd` (`minimald` inside the `minvmd` microVM). No effect on macOS, where `minvmd` is the only backend |
 | `--no-input` | | Skip interactive prompts that need a terminal (such as the session picker); ambiguous choices error with a list of candidates instead. Implied when stdin/stdout is not a terminal |
