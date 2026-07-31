@@ -722,7 +722,7 @@ fn clock_step_target(host_ns: u64, guest_ns: u64) -> Option<nix::sys::time::Time
         return None;
     }
     Some(nix::sys::time::TimeSpec::new(
-        (host_ns / NANOS_IN_SECOND) as libc::time_t,
+        (host_ns / NANOS_IN_SECOND) as libc::c_long,
         (host_ns % NANOS_IN_SECOND) as libc::c_long,
     ))
 }
