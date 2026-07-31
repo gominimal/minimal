@@ -827,8 +827,15 @@ pub(crate) async fn handle_exec(
     let rem = match argv.strip_prefix("min ") {
         Some(c) => c,
         None => {
-            tracing::warn!(%session_id, "execution request rejected: expected `min ` prefix");
-            session.channel_failure(id)?;
+            tracing::warn!(%session_id, "execution request rejected: not an accepted command form");
+            // Accept the channel so the client gets a diagnostic on stderr: a
+            // bare `channel_failure` reaches it only as "exec request failed",
+            // naming neither the rejected command nor what would be accepted.
+            // Nothing is run — the request still fails with a non-zero exit.
+            session.channel_success(id)?;
+            spawn(async move {
+                reject_unsupported_exec(channel, argv).await;
+            });
             return Ok(());
         }
     }
@@ -925,12 +932,43 @@ pub(crate) async fn handle_exec(
         }
         Some(other) => {
             tracing::warn!(%session_id, "execution request rejected: unexpected min sub-command `{other}`");
-            session.channel_failure(id)?;
-            return Ok(());
+            // As with the missing-`min ` case above, report the rejection on
+            // stderr rather than failing the channel opaquely.
+            session.channel_success(id)?;
+            spawn(async move {
+                reject_unsupported_exec(channel, argv).await;
+            });
         }
     };
 
     Ok(())
+}
+
+/// Accepts the channel and reports an exec request that is not one of the
+/// accepted forms on the SSH stderr stream, then exits non-zero. A bare
+/// `channel_failure` would reach the client only as an opaque "exec request
+/// failed", so — mirroring the accept-then-report shape `run_check_exec` uses
+/// for a bad flag — this names the rejected command and lists what the daemon
+/// runs. The command is still refused; nothing is spawned.
+async fn reject_unsupported_exec(channel: Channel<Msg>, rejected: String) {
+    let (_rs, ws) = channel.split();
+    let mut e = ws.make_writer_ext(Some(1));
+    let _ = e
+        .write_all(unsupported_command_message(&rejected).as_bytes())
+        .await;
+    let _ = e.flush().await;
+    let _ = ws.eof().await;
+    let _ = ws.exit_status(1).await; // otherwise considered -1
+    let _ = ws.close().await; // needed to release the remote
+}
+
+/// The stderr copy for an exec request that is not an accepted form: names the
+/// rejected command and lists the forms the daemon services.
+fn unsupported_command_message(rejected: &str) -> String {
+    format!(
+        "minimald: unsupported command '{rejected}'; accepted: \
+         min run <task>, min package build [args...], min check [args...]\n"
+    )
 }
 
 /// Streams a `min package build [--verbose] [--rebuild] [pkgs...]` exec over the SSH
@@ -1674,9 +1712,11 @@ mod tests {
             create_configured_session(client, "exec-test", "/tmp").await
         }
 
-        /// An exec request that isn't `min run <task>` must be refused
-        /// before any process starts: the daemon only services specific
-        /// safe invocations, never arbitrary client-supplied commands.
+        /// An exec request that isn't an accepted form must never start a
+        /// process — the daemon services only specific safe invocations. The
+        /// refusal is reported on stderr (exit 1) rather than failing the
+        /// channel opaquely, so the client sees what was rejected and what it
+        /// could run instead.
         #[tokio::test]
         async fn exec_rejects_arbitrary_command() {
             let server = TestServer::new().await;
@@ -1684,18 +1724,32 @@ mod tests {
             let session_id = fresh_session(&mut client).await;
             let session_str = session_id.to_string();
 
-            let result = client
+            let out = client
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
                     "printf pwned",
                     &[],
                 )
-                .await;
+                .await
+                .expect("the rejection is reported over the channel, not a channel failure");
 
+            assert_eq!(
+                out.exit_status,
+                Some(1),
+                "an arbitrary command must not exit 0; stdout was {:?}",
+                String::from_utf8_lossy(&out.stdout),
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(
-                result.is_err(),
-                "arbitrary command should be rejected, got {result:?}",
+                stderr.contains("printf pwned"),
+                "the rejected command should be named on stderr, got {stderr:?}",
+            );
+            assert!(
+                stderr.contains("min run <task>")
+                    && stderr.contains("min package build [args...]")
+                    && stderr.contains("min check [args...]"),
+                "the accepted forms should be listed on stderr, got {stderr:?}",
             );
         }
 
@@ -1898,7 +1952,8 @@ mod tests {
 
         /// `min check` takes its flags after the sub-command, so a form the
         /// parser accepts must still route — a prefix-matched `min checkx`
-        /// must not.
+        /// must not run, and its refusal is reported on stderr with a non-zero
+        /// exit rather than an opaque channel failure.
         #[tokio::test]
         async fn exec_rejects_a_check_lookalike_subcommand() {
             let server = TestServer::new().await;
@@ -1906,18 +1961,26 @@ mod tests {
             let session_id = fresh_session(&mut client).await;
             let session_str = session_id.to_string();
 
-            let result = client
+            let out = client
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
                     "min checkx",
                     &[],
                 )
-                .await;
+                .await
+                .expect("the rejection is reported over the channel, not a channel failure");
 
+            assert_eq!(
+                out.exit_status,
+                Some(1),
+                "`min checkx` is not `min check` and must not exit 0; stdout was {:?}",
+                String::from_utf8_lossy(&out.stdout),
+            );
             assert!(
-                result.is_err(),
-                "`min checkx` is not `min check` and must be refused, got {result:?}",
+                String::from_utf8_lossy(&out.stderr).contains("min checkx"),
+                "the rejected command should be named on stderr, got {:?}",
+                String::from_utf8_lossy(&out.stderr),
             );
         }
     }
