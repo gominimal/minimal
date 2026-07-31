@@ -21,6 +21,7 @@ mod file_upload;
 pub mod git_remote;
 pub mod loadouts;
 pub mod prompt;
+pub mod theme;
 
 #[derive(Parser)]
 #[command(name = "min", version = version::VERSION, long_version = version::LONG_VERSION)]
@@ -984,11 +985,11 @@ fn format_memory(bytes: u64) -> String {
 /// renders on stderr (so stderr must be a terminal) and reads
 /// keypresses from stdin (so stdin must be a terminal too). If
 /// either side is redirected we take the `--no-prompt` path — going
-/// interactive when stdin is a pipe just hangs `dialoguer` and then
+/// interactive when stdin is a pipe just hangs the prompt and then
 /// aborts with a much less helpful error than the `--no-prompt`
 /// snippet the operator actually wants to paste.
 fn can_prompt_interactively() -> bool {
-    dialoguer::console::user_attended() && dialoguer::console::user_attended_stderr()
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
 /// Phase 3 gate: run the user policy + hooks over the daemon's
@@ -1204,13 +1205,13 @@ async fn upload_and_finalize(
 /// Guard that tears down a half-built session if the user interrupts the
 /// activation with Ctrl-C.
 ///
-/// `dialoguer`/`console` re-raise SIGINT to this process on a Ctrl-C at
-/// the composition-gating prompt (console `unix_term.rs`). With no
-/// handler installed the default disposition kills `min` mid-prompt —
-/// before the abort-cleanup that [`drive_pending_to_active`] runs — so
-/// the daemon is left holding a `Pending` session that blocks its name.
-/// [`arm_activation_interrupt`] installs a SIGINT handler (keeping the
-/// process alive past console's re-raise) that best-effort
+/// inquire (crossterm raw mode) captures a Ctrl-C at the
+/// composition-gating prompt as an error return, so the abort-cleanup
+/// that [`drive_pending_to_active`] runs gets to execute. During the
+/// non-prompt phases (waiting on the daemon) a Ctrl-C is a plain
+/// SIGINT, which would kill `min` before that cleanup, leaving the
+/// daemon holding a `Pending` session that blocks its name.
+/// [`arm_activation_interrupt`] installs a SIGINT handler that best-effort
 /// `AbortSession`s the in-flight session over a fresh connection — the
 /// activation borrows the primary one — then exits. The daemon's
 /// connection-close reap is the backstop if the abort can't be
