@@ -3783,6 +3783,7 @@ dependencies = [
  "async-dialog",
  "async-tar",
  "base64 0.23.0",
+ "blake3",
  "boringtun",
  "bytes",
  "camino",
@@ -3836,6 +3837,7 @@ dependencies = [
  "uuid",
  "version",
  "vt100-ctt",
+ "walkdir",
  "zstd",
 ]
 
