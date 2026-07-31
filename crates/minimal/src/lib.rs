@@ -469,8 +469,9 @@ pub struct LsArgs {
     /// Output raw session IDs (one per line) for piping into scripts
     #[arg(long)]
     pub raw: bool,
-    /// Output the full session list as JSON (pretty-printed)
-    #[arg(long)]
+    /// Output the full session list as JSON (pretty-printed). Conflicts
+    /// with `--raw`.
+    #[arg(long, conflicts_with = "raw")]
     pub json: bool,
 }
 
@@ -3024,10 +3025,18 @@ mod tests {
         }
 
         // `--raw`/`--json` are accepted on the canonical and the bare form alike.
-        let canonical = ls_args(&["min", "session", "list", "--raw", "--json"]);
-        assert!(canonical.raw && canonical.json);
+        let canonical = ls_args(&["min", "session", "list", "--raw"]);
+        assert!(canonical.raw && !canonical.json);
         let bare = ls_args(&["min", "ls", "--json"]);
         assert!(bare.json && !bare.raw);
+    }
+
+    /// `--raw` and `--json` select mutually exclusive output formats, so
+    /// passing both must be rejected rather than silently letting one win.
+    #[test]
+    fn ls_raw_and_json_conflict() {
+        use clap::Parser as _;
+        assert!(Cli::try_parse_from(["min", "ls", "--raw", "--json"]).is_err());
     }
 
     /// `repo_dir` and `minimal_dir` are global, so they must be accepted after
