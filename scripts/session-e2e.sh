@@ -156,6 +156,12 @@ export XDG_RUNTIME_DIR="$WORK/runtime"
 mkdir -p "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME"
 chmod 700 "$XDG_RUNTIME_DIR"
 
+# Hermetic user config: the CLI resolves loadouts and config.toml under
+# XDG_CONFIG_HOME, and the sandbox proof below asserts the zero-config
+# orientation banner (built-in `default` loadout). An operator's own
+# `default_loadouts`/`default.toml` must not leak into the canonical proof.
+export XDG_CONFIG_HOME="$WORK/config"
+
 # The CLI's tracing layer writes to STDOUT (ot::StdoutWriter, minimal/src/
 # main.rs), so at the default level the autospawn INFO lines interleave with
 # the session id `activate` prints for piping. Quiet the logs; the last-line
@@ -263,9 +269,14 @@ fi
 # new session id on stdout. The id is the LAST stdout line (any log lines
 # that slip through the RUST_LOG filter precede it), validated as a UUID.
 echo "::group::cold activate (auto-spawns the daemon)"
+# Explicit name: the sandbox proof asserts the orientation banner
+# interpolates the ACTUAL session name at the first prompt; an autogen
+# name would make that assertion a moving target. The state dir is fresh
+# per run, so a fixed name cannot collide.
+SESSION_NAME="e2e-banner"
 t0=$(now_ms)
 # shellcheck disable=SC2086
-activate_out="$(cd "$PROJECT_DIR" && mnl session activate . ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/activate.err")" \
+activate_out="$(cd "$PROJECT_DIR" && mnl session activate . --name "$SESSION_NAME" ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/activate.err")" \
   || { echo "::error::cold 'min session activate' failed to auto-spawn the daemon / create a session"; fail; }
 t1=$(now_ms)
 sid="$(printf '%s\n' "$activate_out" | tail -n1 | tr -d '\r')"
@@ -437,7 +448,29 @@ if [[ "$attach_out" != *"$ADD_TOOL_MARKER"* ]]; then
   echo "--- driver stderr ---"; cat "$WORK/exec.err" 2>/dev/null || true
   fail
 fi
-echo "sandbox proof: in-sandbox 'min add $ADD_TOOL' + run OK ($((t1 - t0))ms)"
+# Orientation banner: the first interactive prompt must have printed the
+# two orientation lines, with the ACTUAL session name and loadout list
+# interpolated in-shell from the $MINIMAL_* vars (daemon baseline +
+# client-composed). XDG_CONFIG_HOME is hermetic (see the export above),
+# so the composed loadout is deterministically the built-in `default`.
+if [[ "$attach_out" != *"minimal · session $SESSION_NAME · loadout default (built-in)"* ]]; then
+  echo "::error::attach output lacks the orientation banner line (session name + loadout list)"
+  echo "--- attach output ---"; printf '%s\n' "$attach_out"
+  fail
+fi
+if [[ "$attach_out" != *"detach: ctrl-w"* ]]; then
+  echo "::error::attach output lacks the orientation banner's detach line"
+  echo "--- attach output ---"; printf '%s\n' "$attach_out"
+  fail
+fi
+# The seeded project DOES carry a minimal.toml, so the banner's `min init`
+# pointer (the MINIMAL_BLUEPRINT=none branch) must not have printed.
+if [[ "$attach_out" == *"no minimal.toml here"* ]]; then
+  echo "::error::banner shows the 'min init' pointer despite the seeded minimal.toml"
+  echo "--- attach output ---"; printf '%s\n' "$attach_out"
+  fail
+fi
+echo "sandbox proof: in-sandbox 'min add $ADD_TOOL' + run OK, orientation banner rendered ($((t1 - t0))ms)"
 echo "::endgroup::"
 
 # We answered the exit prompt with "Delete", so the session was destroyed and

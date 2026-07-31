@@ -320,12 +320,20 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     let compose_options = crate::loadouts::compose_options_from_config(&cfg);
     let selection = crate::loadouts::LoadoutSelection::from_flags(&[], false);
     let active = crate::loadouts::resolve_active_loadouts(selection, &cfg, global)?;
-    if !active.is_empty() {
-        let names: Vec<&str> = active.iter().map(|l| l.name().as_ref()).collect();
+    if !active.loadouts.is_empty() {
+        let names: Vec<&str> = active.loadouts.iter().map(|l| l.name().as_ref()).collect();
         eprintln!("Applying loadouts: {}", names.join(", "));
     }
-    let (contribution, user_policy) =
-        crate::loadouts::compose_user_contribution(active, user_policy, compose_options)?;
+    // Same synthetic orientation vars as an activate: a `--keep` task
+    // session is attachable later, and its banner should orient too.
+    let loadout_display = crate::loadouts::loadout_display_list(&active);
+    let (mut contribution, user_policy) =
+        crate::loadouts::compose_user_contribution(active.loadouts, user_policy, compose_options)?;
+    crate::loadouts::push_orientation_vars(
+        &mut contribution,
+        &loadout_display,
+        crate::blueprint_present(&utf8_path),
+    );
 
     // Upload per the normal activate rules: tarball sync (the default), the
     // same empty/`$HOME` and non-VCS-root gates, no `--sync` escape hatch.
