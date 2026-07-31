@@ -18,7 +18,7 @@ fn main() -> ExitCode {
 #[tokio::main]
 async fn run() -> ExitCode {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("info")
+        EnvFilter::new("warn")
             .add_directive("topiary=off".parse().unwrap())
             .add_directive("libcgroups=off".parse().unwrap())
     });
