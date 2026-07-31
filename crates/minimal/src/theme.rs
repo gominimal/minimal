@@ -20,7 +20,9 @@ pub fn theme() -> RenderConfig<'static> {
                 .with_fg(Color::White)
                 .with_attr(Attributes::BOLD),
         )
-        .with_help_message(StyleSheet::new().with_fg(Color::Grey));
+        // Empty stylesheet: help text inherits the terminal default, the
+        // same color as the prompt message itself.
+        .with_help_message(StyleSheet::new());
     config.placeholder = StyleSheet::new().with_fg(Color::Grey);
     config
 }
