@@ -42,11 +42,18 @@ pub trait OneshotSshRpc {
 }
 
 /// A convinence wrapper to let a response type be able to carry an error.
+///
+/// `Err` is declared **first** on purpose: the enum is `#[serde(untagged)]`, so
+/// serde tries variants in declaration order, and most response types here
+/// default every field. With `Ok` first, an `{"error": ".."}` payload decodes
+/// into `Ok(Default::default())` and the client sees a blank success instead of
+/// the daemon's failure. No response type carries an `error` field, so trying
+/// `Err` first is unambiguous.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum Errorable<S: std::fmt::Debug + PartialEq> {
-    Ok(S),
     Err { error: String },
+    Ok(S),
 }
 
 impl<S: std::fmt::Debug + PartialEq> Errorable<S> {
@@ -682,6 +689,778 @@ impl OneshotSshRpc for GetMeshStatus {
 }
 
 // ---------------------------------------------------------------------------
+// GitHub-integrated sessions (spec 10): daemon-held auth, mediated repo access,
+// PR on exit.
+//
+// SECURITY (hard rule): no request or response type in this section may be
+// capable of carrying GitHub token material. Only the daemon ever holds the
+// user/refresh token; it never crosses this wire. Fields here carry logins,
+// grant *identifiers*, branch/base names, public URLs (PR links, install
+// links), scope labels, and human-readable *scrubbed* status/error lines — but
+// never a token, and no field that could be spliced into a credentialed URL.
+//
+// Repositories and scopes cross the wire as PLAIN STRINGS so this crate gains
+// no new dependency. The single grammars live in the `github` crate
+// (`github::RepoSpec` for `owner/repo[@branch[:base]]`, `github::Scope` for
+// permission labels such as `contents:write`); both sides parse at the edges.
+// Parsing is deliberately NOT duplicated here.
+//
+// Every type is `#[non_exhaustive]` and `#[serde(default)]` per field so new
+// fields can be added without breaking old peers, and old-shape payloads
+// (missing the new fields) still decode. Method responses are `Errorable`-
+// wrapped like the other RPCs, so transport/daemon errors surface as
+// `Errorable::Err { error }` distinct from the in-band domain states.
+// ---------------------------------------------------------------------------
+
+/// An RPC that begins the GitHub App **device flow** on the daemon (R1.1).
+///
+/// The daemon requests a device+user code from GitHub and returns the
+/// verification URL and `user_code` for the `min` CLI to display, plus a
+/// `login_id` handle the client polls with [`GithubPollLogin`]. When no GitHub
+/// App client id is configured on the daemon, this answers with
+/// `Errorable::Err` carrying an actionable, non-secret message.
+pub struct GithubBeginLogin;
+
+/// Request for the [`GithubBeginLogin`] RPC.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubBeginLoginRequest {
+    /// Requested permission scopes as plain labels (e.g. `contents:write`),
+    /// parsed at the edges via `github::Scope`. Empty applies the daemon's
+    /// least-privilege defaults (R5.1).
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+impl GithubBeginLoginRequest {
+    #[must_use]
+    pub fn new(scopes: Vec<String>) -> Self {
+        Self { scopes }
+    }
+}
+
+/// Response for the [`GithubBeginLogin`] RPC: the device-flow prompt data.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubBeginLoginResponse {
+    /// The URL the user opens in a browser to enter their `user_code`.
+    #[serde(default)]
+    pub verification_uri: String,
+    /// The short code the user types at `verification_uri`.
+    #[serde(default)]
+    pub user_code: String,
+    /// Opaque handle identifying this in-flight login; passed back to
+    /// [`GithubPollLogin`].
+    #[serde(default)]
+    pub login_id: String,
+    /// Minimum seconds the client must wait between [`GithubPollLogin`] calls,
+    /// per GitHub's device-flow `interval`.
+    #[serde(default)]
+    pub poll_interval_secs: u64,
+    /// Seconds until the device code expires and the login must be restarted.
+    #[serde(default)]
+    pub expires_in_secs: u64,
+}
+
+impl GithubBeginLoginResponse {
+    #[must_use]
+    pub fn new(
+        verification_uri: String,
+        user_code: String,
+        login_id: String,
+        poll_interval_secs: u64,
+        expires_in_secs: u64,
+    ) -> Self {
+        Self {
+            verification_uri,
+            user_code,
+            login_id,
+            poll_interval_secs,
+            expires_in_secs,
+        }
+    }
+}
+
+impl OneshotSshRpc for GithubBeginLogin {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GithubBeginLogin");
+    type Request<'a> = GithubBeginLoginRequest;
+    type Response = Errorable<GithubBeginLoginResponse>;
+}
+
+/// An RPC to poll an in-flight device-flow login for completion (R1.1).
+pub struct GithubPollLogin;
+
+/// Request for the [`GithubPollLogin`] RPC.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubPollLoginRequest {
+    /// The [`GithubBeginLoginResponse::login_id`] to poll.
+    #[serde(default)]
+    pub login_id: String,
+}
+
+impl GithubPollLoginRequest {
+    #[must_use]
+    pub fn new(login_id: String) -> Self {
+        Self { login_id }
+    }
+}
+
+/// In-band domain state of a polled device-flow login.
+///
+/// These are the flow's own states, distinct from transport errors (which the
+/// `Errorable` wrapper carries). `Pending` means keep polling; `Complete`
+/// means the daemon stored a grant; `Failed`/`Expired` are terminal.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GithubPollLoginResponse {
+    /// The user has not yet approved; poll again after the interval.
+    Pending,
+    /// The login completed and a grant was stored. Carries the authenticated
+    /// GitHub `login` and the daemon-assigned `grant_id` (never a token).
+    Complete {
+        #[serde(default)]
+        login: String,
+        #[serde(default)]
+        grant_id: String,
+    },
+    /// The login failed terminally (e.g. access denied). `message` is an
+    /// actionable, non-secret description.
+    Failed {
+        #[serde(default)]
+        message: String,
+    },
+    /// The device code expired before approval; the user must restart login.
+    Expired,
+}
+
+impl OneshotSshRpc for GithubPollLogin {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GithubPollLogin");
+    type Request<'a> = GithubPollLoginRequest;
+    type Response = Errorable<GithubPollLoginResponse>;
+}
+
+/// An RPC for `min github status` self-diagnosis (R1.4 / R8.2): identity,
+/// token validity/expiry, per-repo App-installation state, and the per-session
+/// repo/branch/scope table.
+pub struct GithubStatus;
+
+/// Request for the [`GithubStatus`] RPC.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubStatusRequest {
+    /// When set, include the per-session repo/branch/scope table for this
+    /// session in the response.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+    /// Additional `owner/repo` strings to report App-installation state for,
+    /// beyond any the session declares. Parsed at the edges via
+    /// `github::RepoSpec`.
+    #[serde(default)]
+    pub repos: Vec<String>,
+}
+
+impl GithubStatusRequest {
+    #[must_use]
+    pub fn new(session_id: Option<SessionId>, repos: Vec<String>) -> Self {
+        Self { session_id, repos }
+    }
+}
+
+/// The authenticated GitHub identity behind a grant (metadata only).
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubIdentity {
+    /// The authenticated GitHub login (username).
+    #[serde(default)]
+    pub login: String,
+    /// The daemon-assigned grant identifier (never a token).
+    #[serde(default)]
+    pub grant_id: String,
+}
+
+impl GithubIdentity {
+    #[must_use]
+    pub fn new(login: String, grant_id: String) -> Self {
+        Self { login, grant_id }
+    }
+}
+
+/// Per-repo GitHub App installation state (R1.5): whether the App is installed
+/// on the repo/org, and if not, where to install it.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepoInstallationStatus {
+    /// The `owner/repo` this entry describes.
+    #[serde(default)]
+    pub repo: String,
+    /// Whether the GitHub App is installed with access to this repo.
+    #[serde(default)]
+    pub installed: bool,
+    /// Where to install/configure the App when `installed` is false; a public
+    /// github.com URL, never credentialed.
+    #[serde(default)]
+    pub install_url: Option<String>,
+}
+
+impl RepoInstallationStatus {
+    #[must_use]
+    pub fn new(repo: String, installed: bool, install_url: Option<String>) -> Self {
+        Self {
+            repo,
+            installed,
+            install_url,
+        }
+    }
+}
+
+/// One row of the per-session repo/branch/scope table (R8.2).
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionRepoStatus {
+    /// The `owner/repo` this row describes.
+    #[serde(default)]
+    pub repo: String,
+    /// The working branch prepared for this repo in the session.
+    #[serde(default)]
+    pub branch: String,
+    /// The base branch the working branch was created from, if applicable.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// The resolved permission scopes for this repo, as plain labels.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+impl SessionRepoStatus {
+    #[must_use]
+    pub fn new(repo: String, branch: String, base: Option<String>, scopes: Vec<String>) -> Self {
+        Self {
+            repo,
+            branch,
+            base,
+            scopes,
+        }
+    }
+}
+
+/// Response for the [`GithubStatus`] RPC.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubStatusResponse {
+    /// The active identity, or `None` when the daemon holds no usable grant.
+    #[serde(default)]
+    pub identity: Option<GithubIdentity>,
+    /// Whether the current user token is valid (refreshable counts as valid).
+    #[serde(default)]
+    pub token_valid: bool,
+    /// When the current user token expires, if known.
+    #[serde(default)]
+    pub token_expires_at: Option<chrono::DateTime<Utc>>,
+    /// Per-repo App-installation state for the requested/known repos.
+    #[serde(default)]
+    pub installations: Vec<RepoInstallationStatus>,
+    /// The per-session repo/branch/scope table, when a session was requested.
+    #[serde(default)]
+    pub session_repos: Vec<SessionRepoStatus>,
+}
+
+impl GithubStatusResponse {
+    #[must_use]
+    pub fn new(
+        identity: Option<GithubIdentity>,
+        token_valid: bool,
+        token_expires_at: Option<chrono::DateTime<Utc>>,
+        installations: Vec<RepoInstallationStatus>,
+        session_repos: Vec<SessionRepoStatus>,
+    ) -> Self {
+        Self {
+            identity,
+            token_valid,
+            token_expires_at,
+            installations,
+            session_repos,
+        }
+    }
+}
+
+impl OneshotSshRpc for GithubStatus {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GithubStatus");
+    type Request<'a> = GithubStatusRequest;
+    type Response = Errorable<GithubStatusResponse>;
+}
+
+/// An RPC to list stored auth grants as METADATA only — the reuse-or-mint
+/// substrate (R1.3 / R6.4). No token material crosses the wire.
+pub struct GithubListAuths;
+
+/// Request for the [`GithubListAuths`] RPC.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubListAuthsRequest {}
+
+impl GithubListAuthsRequest {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+/// Metadata describing one stored auth grant (never a token).
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GrantMetadata {
+    /// The daemon-assigned grant identifier.
+    #[serde(default)]
+    pub grant_id: String,
+    /// The GitHub login this grant authenticates as.
+    #[serde(default)]
+    pub login: String,
+    /// When the grant was first stored, if known.
+    #[serde(default)]
+    pub created_at: Option<chrono::DateTime<Utc>>,
+    /// The permission scopes bound to this grant, as plain labels.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// The `owner/repo` strings this grant is scoped to.
+    #[serde(default)]
+    pub repos: Vec<String>,
+    /// Whether the grant's token is currently valid (refreshable counts).
+    #[serde(default)]
+    pub token_valid: bool,
+    /// When the grant's user token expires, if known.
+    #[serde(default)]
+    pub expires_at: Option<chrono::DateTime<Utc>>,
+}
+
+impl GrantMetadata {
+    #[must_use]
+    pub fn new(
+        grant_id: String,
+        login: String,
+        created_at: Option<chrono::DateTime<Utc>>,
+        scopes: Vec<String>,
+        repos: Vec<String>,
+        token_valid: bool,
+        expires_at: Option<chrono::DateTime<Utc>>,
+    ) -> Self {
+        Self {
+            grant_id,
+            login,
+            created_at,
+            scopes,
+            repos,
+            token_valid,
+            expires_at,
+        }
+    }
+}
+
+/// Response for the [`GithubListAuths`] RPC.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubListAuthsResponse {
+    /// The stored grants, metadata only.
+    #[serde(default)]
+    pub grants: Vec<GrantMetadata>,
+}
+
+impl GithubListAuthsResponse {
+    #[must_use]
+    pub fn new(grants: Vec<GrantMetadata>) -> Self {
+        Self { grants }
+    }
+}
+
+impl OneshotSshRpc for GithubListAuths {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GithubListAuths");
+    type Request<'a> = GithubListAuthsRequest;
+    type Response = Errorable<GithubListAuthsResponse>;
+}
+
+/// An RPC to forget a stored auth grant (`min github logout`).
+pub struct GithubLogout;
+
+/// Request for the [`GithubLogout`] RPC.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubLogoutRequest {
+    /// The grant to forget. The daemon rejects an empty id rather than
+    /// guessing (fail-closed).
+    #[serde(default)]
+    pub grant_id: String,
+}
+
+impl GithubLogoutRequest {
+    #[must_use]
+    pub fn new(grant_id: String) -> Self {
+        Self { grant_id }
+    }
+}
+
+/// Response for the [`GithubLogout`] RPC.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubLogoutResponse {
+    /// Whether a grant was found and removed (`false` = nothing matched).
+    #[serde(default)]
+    pub removed: bool,
+}
+
+impl GithubLogoutResponse {
+    #[must_use]
+    pub fn new(removed: bool) -> Self {
+        Self { removed }
+    }
+}
+
+impl OneshotSshRpc for GithubLogout {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GithubLogout");
+    type Request<'a> = GithubLogoutRequest;
+    type Response = Errorable<GithubLogoutResponse>;
+}
+
+/// An RPC to pre-prime one or more repos into a session's workspace (R2):
+/// clone + checkout-or-create each branch using the daemon-held token.
+pub struct GithubPrimeRepos;
+
+/// Request for the [`GithubPrimeRepos`] RPC.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubPrimeReposRequest {
+    /// The session whose workspace receives the primed repos.
+    #[serde(default = "SessionId::nil")]
+    pub session_id: SessionId,
+    /// The repos to prepare, as `owner/repo[@branch[:base]]` strings parsed at
+    /// the edges via `github::RepoSpec`.
+    #[serde(default)]
+    pub repos: Vec<String>,
+    /// The grant whose token authorizes the clone/fetch.
+    #[serde(default)]
+    pub grant_id: String,
+}
+
+impl GithubPrimeReposRequest {
+    #[must_use]
+    pub fn new(session_id: SessionId, repos: Vec<String>, grant_id: String) -> Self {
+        Self {
+            session_id,
+            repos,
+            grant_id,
+        }
+    }
+}
+
+/// How a single repo's branch was prepared (R2.2 checkout-or-create), or why
+/// it failed. `#[non_exhaustive]` so new outcomes can be added later.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RepoPrimeOutcome {
+    /// The requested branch existed on the remote and was checked out.
+    CheckedOut,
+    /// The requested branch did not exist and was created from the base.
+    Created,
+    /// Priming this repo failed; `message` is actionable and non-secret and
+    /// the repo's directory was rolled back (R2.6).
+    Failed {
+        #[serde(default)]
+        message: String,
+    },
+}
+
+/// The result of priming a single repo.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepoPrimeResult {
+    /// The `owner/repo` this result describes.
+    #[serde(default)]
+    pub repo: String,
+    /// The working branch that was prepared.
+    #[serde(default)]
+    pub branch: String,
+    /// The base branch used when the working branch had to be created.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// What happened for this repo.
+    pub outcome: RepoPrimeOutcome,
+}
+
+impl RepoPrimeResult {
+    #[must_use]
+    pub fn new(
+        repo: String,
+        branch: String,
+        base: Option<String>,
+        outcome: RepoPrimeOutcome,
+    ) -> Self {
+        Self {
+            repo,
+            branch,
+            base,
+            outcome,
+        }
+    }
+}
+
+/// Response for the [`GithubPrimeRepos`] RPC.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubPrimeReposResponse {
+    /// Per-repo results, in request order.
+    #[serde(default)]
+    pub results: Vec<RepoPrimeResult>,
+}
+
+impl GithubPrimeReposResponse {
+    #[must_use]
+    pub fn new(results: Vec<RepoPrimeResult>) -> Self {
+        Self { results }
+    }
+}
+
+impl OneshotSshRpc for GithubPrimeRepos {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GithubPrimeRepos");
+    type Request<'a> = GithubPrimeReposRequest;
+    type Response = Errorable<GithubPrimeReposResponse>;
+}
+
+/// An RPC for an explicit, never-automatic push through the daemon (R3.4).
+pub struct GithubPush;
+
+/// Request for the [`GithubPush`] RPC.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubPushRequest {
+    /// The session whose workspace holds the repo.
+    #[serde(default = "SessionId::nil")]
+    pub session_id: SessionId,
+    /// The `owner/repo` within the session to push.
+    #[serde(default)]
+    pub repo: String,
+    /// The branch to push; `None` pushes the repo's current branch.
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+impl GithubPushRequest {
+    #[must_use]
+    pub fn new(session_id: SessionId, repo: String, branch: Option<String>) -> Self {
+        Self {
+            session_id,
+            repo,
+            branch,
+        }
+    }
+}
+
+/// Response for the [`GithubPush`] RPC.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubPushResponse {
+    /// The `owner/repo` that was pushed.
+    #[serde(default)]
+    pub repo: String,
+    /// The branch that was pushed.
+    #[serde(default)]
+    pub branch: String,
+    /// Whether any refs were updated (`false` = already up to date).
+    #[serde(default)]
+    pub pushed: bool,
+    /// A human-readable, token-scrubbed summary of what git reported.
+    #[serde(default)]
+    pub summary: String,
+}
+
+impl GithubPushResponse {
+    #[must_use]
+    pub fn new(repo: String, branch: String, pushed: bool, summary: String) -> Self {
+        Self {
+            repo,
+            branch,
+            pushed,
+            summary,
+        }
+    }
+}
+
+impl OneshotSshRpc for GithubPush {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GithubPush");
+    type Request<'a> = GithubPushRequest;
+    type Response = Errorable<GithubPushResponse>;
+}
+
+/// An RPC to open (or surface an existing) pull request (R4): the daemon
+/// creates it with the user token so it is authored by the real user.
+pub struct GithubCreatePr;
+
+/// Request for the [`GithubCreatePr`] RPC.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubCreatePrRequest {
+    /// The session whose workspace holds the repo.
+    #[serde(default = "SessionId::nil")]
+    pub session_id: SessionId,
+    /// The `owner/repo` to open the PR against.
+    #[serde(default)]
+    pub repo: String,
+    /// The head branch; `None` uses the repo's current branch.
+    #[serde(default)]
+    pub head: Option<String>,
+    /// The base branch; `None` uses the branch's bound base / repo default.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// The PR title.
+    #[serde(default)]
+    pub title: String,
+    /// The PR body (may be pre-populated from a repo PR template client-side).
+    #[serde(default)]
+    pub body: String,
+    /// Whether to open the PR as a draft.
+    #[serde(default)]
+    pub draft: bool,
+}
+
+impl GithubCreatePrRequest {
+    #[must_use]
+    pub fn new(
+        session_id: SessionId,
+        repo: String,
+        head: Option<String>,
+        base: Option<String>,
+        title: String,
+        body: String,
+        draft: bool,
+    ) -> Self {
+        Self {
+            session_id,
+            repo,
+            head,
+            base,
+            title,
+            body,
+            draft,
+        }
+    }
+}
+
+/// Response for the [`GithubCreatePr`] RPC: the created-or-existing PR (R4.5).
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GithubCreatePrResponse {
+    /// The public PR URL (github.com), never credentialed.
+    #[serde(default)]
+    pub url: String,
+    /// The PR number.
+    #[serde(default)]
+    pub number: u64,
+    /// Whether an open PR already existed for this head (surfaced, not
+    /// duplicated).
+    #[serde(default)]
+    pub already_existed: bool,
+}
+
+impl GithubCreatePrResponse {
+    #[must_use]
+    pub fn new(url: String, number: u64, already_existed: bool) -> Self {
+        Self {
+            url,
+            number,
+            already_existed,
+        }
+    }
+}
+
+impl OneshotSshRpc for GithubCreatePr {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GithubCreatePr");
+    type Request<'a> = GithubCreatePrRequest;
+    type Response = Errorable<GithubCreatePrResponse>;
+}
+
+/// An RPC to read a session's per-repo git state for the exit-PR prompt (R4.6):
+/// each repo's branch/base, commits ahead of base, and any existing PR URL.
+pub struct GetSessionGitState;
+
+/// Request for the [`GetSessionGitState`] RPC.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetSessionGitStateRequest {
+    /// The session to inspect.
+    #[serde(default = "SessionId::nil")]
+    pub session_id: SessionId,
+}
+
+impl GetSessionGitStateRequest {
+    #[must_use]
+    pub fn new(session_id: SessionId) -> Self {
+        Self { session_id }
+    }
+}
+
+/// The git state of one repo in a session (R4.6).
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepoGitState {
+    /// The `owner/repo` this entry describes.
+    #[serde(default)]
+    pub repo: String,
+    /// The current working branch.
+    #[serde(default)]
+    pub branch: String,
+    /// The base branch the working branch tracks, if known.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Commits on `branch` ahead of `base` — i.e. PR-able work.
+    #[serde(default)]
+    pub ahead: u32,
+    /// The public URL of an already-open PR for this branch, if any (R4.5).
+    #[serde(default)]
+    pub existing_pr_url: Option<String>,
+}
+
+impl RepoGitState {
+    #[must_use]
+    pub fn new(
+        repo: String,
+        branch: String,
+        base: Option<String>,
+        ahead: u32,
+        existing_pr_url: Option<String>,
+    ) -> Self {
+        Self {
+            repo,
+            branch,
+            base,
+            ahead,
+            existing_pr_url,
+        }
+    }
+}
+
+/// Response for the [`GetSessionGitState`] RPC.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetSessionGitStateResponse {
+    /// Per-repo git state, one entry per primed repo.
+    #[serde(default)]
+    pub repos: Vec<RepoGitState>,
+}
+
+impl GetSessionGitStateResponse {
+    #[must_use]
+    pub fn new(repos: Vec<RepoGitState>) -> Self {
+        Self { repos }
+    }
+}
+
+impl OneshotSshRpc for GetSessionGitState {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionGitState");
+    type Request<'a> = GetSessionGitStateRequest;
+    type Response = Errorable<GetSessionGitStateResponse>;
+}
+
+// ---------------------------------------------------------------------------
 // Diagnostic bundle (`min bug`).
 // ---------------------------------------------------------------------------
 
@@ -945,5 +1724,344 @@ mod tests {
         assert_eq!(round_trip(&resp), resp);
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains(r#""kind":"pending""#), "got: {json}");
+    }
+
+    // -----------------------------------------------------------------------
+    // GitHub-integrated sessions (spec 10) RPC wire types.
+    // -----------------------------------------------------------------------
+
+    fn sid() -> SessionId {
+        SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
+    }
+
+    #[test]
+    fn github_begin_login_round_trips() {
+        let req = GithubBeginLoginRequest::new(vec!["contents:write".into()]);
+        assert_eq!(round_trip(&req), req);
+
+        let resp: Errorable<GithubBeginLoginResponse> =
+            Errorable::Ok(GithubBeginLoginResponse::new(
+                "https://github.com/login/device".into(),
+                "ABCD-1234".into(),
+                "login-abc".into(),
+                5,
+                900,
+            ));
+        assert_eq!(round_trip(&resp), resp);
+
+        // The client-id-unset failure surfaces via the `Errorable` wrapper, and
+        // must survive the wire: every field of `GithubBeginLoginResponse` is
+        // `#[serde(default)]`, so an `{"error":..}` payload would decode as a
+        // blank `Ok` if `Errorable` tried `Ok` first (see its declaration).
+        let err: Errorable<GithubBeginLoginResponse> =
+            Err::<GithubBeginLoginResponse, _>("GitHub App client id is not configured").into();
+        assert_eq!(round_trip(&err), err);
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("client id is not configured"), "got: {json}");
+        assert!(err.err().is_some());
+    }
+
+    /// A daemon-side failure must decode as `Err` even when the response type
+    /// defaults every field — otherwise `{"error":..}` lands as a blank `Ok`
+    /// and the client reports success for a refused RPC.
+    #[test]
+    fn errorable_decodes_an_error_payload_as_err_not_a_blank_ok() {
+        let raw = r#"{"error":"grant_id must not be empty"}"#;
+        let resp: Errorable<GithubLogoutResponse> = serde_json::from_str(raw).expect("deserialize");
+        assert_eq!(resp.err().as_deref(), Some("grant_id must not be empty"));
+
+        // The success shape still decodes as `Ok`.
+        let ok: Errorable<GithubLogoutResponse> =
+            serde_json::from_str(r#"{"removed":true}"#).expect("deserialize");
+        assert!(ok.ok().is_some_and(|r| r.removed));
+    }
+
+    /// A daemon that predates the `expires_in_secs` field still decodes.
+    #[test]
+    fn github_begin_login_response_accepts_old_shape() {
+        let raw = serde_json::json!({
+            "verification_uri": "https://github.com/login/device",
+            "user_code": "ABCD-1234",
+            "login_id": "login-abc",
+            "poll_interval_secs": 5,
+        });
+        let resp: GithubBeginLoginResponse = serde_json::from_value(raw).expect("deserialize");
+        assert_eq!(resp.expires_in_secs, 0);
+    }
+
+    /// Wholly empty payloads decode to defaults (missing everything).
+    #[test]
+    fn github_begin_login_request_accepts_empty() {
+        let req: GithubBeginLoginRequest = serde_json::from_str("{}").expect("deserialize");
+        assert!(req.scopes.is_empty());
+    }
+
+    #[test]
+    fn github_poll_login_states_round_trip() {
+        for resp in [
+            GithubPollLoginResponse::Pending,
+            GithubPollLoginResponse::Complete {
+                login: "octocat".into(),
+                grant_id: "grant-1".into(),
+            },
+            GithubPollLoginResponse::Failed {
+                message: "access denied".into(),
+            },
+            GithubPollLoginResponse::Expired,
+        ] {
+            let wrapped: Errorable<GithubPollLoginResponse> = Errorable::Ok(resp.clone());
+            assert_eq!(round_trip(&wrapped), wrapped);
+        }
+
+        let json = serde_json::to_string(&GithubPollLoginResponse::Pending).unwrap();
+        assert!(json.contains(r#""kind":"pending""#), "got: {json}");
+    }
+
+    /// A `complete` variant emitted before `grant_id` existed still decodes.
+    #[test]
+    fn github_poll_complete_accepts_old_shape() {
+        let raw = serde_json::json!({ "kind": "complete", "login": "octocat" });
+        let resp: GithubPollLoginResponse = serde_json::from_value(raw).expect("deserialize");
+        match resp {
+            GithubPollLoginResponse::Complete { login, grant_id } => {
+                assert_eq!(login, "octocat");
+                assert_eq!(grant_id, "");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn github_status_round_trips() {
+        let req = GithubStatusRequest::new(Some(sid()), vec!["octocat/api".into()]);
+        assert_eq!(round_trip(&req), req);
+
+        let resp: Errorable<GithubStatusResponse> = Errorable::Ok(GithubStatusResponse::new(
+            Some(GithubIdentity::new("octocat".into(), "grant-1".into())),
+            true,
+            Some(Utc::now()),
+            vec![RepoInstallationStatus::new(
+                "octocat/api".into(),
+                false,
+                Some("https://github.com/apps/minimal/installations/new".into()),
+            )],
+            vec![SessionRepoStatus::new(
+                "octocat/api".into(),
+                "feat/x".into(),
+                Some("main".into()),
+                vec!["contents:write".into(), "pull_requests:write".into()],
+            )],
+        ));
+        assert_eq!(round_trip(&resp), resp);
+    }
+
+    /// Old status payloads without the newer collections still parse.
+    #[test]
+    fn github_status_response_accepts_old_shape() {
+        let raw = serde_json::json!({ "token_valid": false });
+        let resp: GithubStatusResponse = serde_json::from_value(raw).expect("deserialize");
+        assert!(resp.identity.is_none());
+        assert!(!resp.token_valid);
+        assert!(resp.installations.is_empty());
+        assert!(resp.session_repos.is_empty());
+        assert!(resp.token_expires_at.is_none());
+    }
+
+    /// Requesting status without a session id defaults it to `None`.
+    #[test]
+    fn github_status_request_accepts_missing_session() {
+        let req: GithubStatusRequest = serde_json::from_str("{}").expect("deserialize");
+        assert!(req.session_id.is_none());
+        assert!(req.repos.is_empty());
+    }
+
+    #[test]
+    fn github_list_auths_round_trips() {
+        let req = GithubListAuthsRequest::new();
+        assert_eq!(round_trip(&req), req);
+
+        let resp: Errorable<GithubListAuthsResponse> =
+            Errorable::Ok(GithubListAuthsResponse::new(vec![GrantMetadata::new(
+                "grant-1".into(),
+                "octocat".into(),
+                Some(Utc::now()),
+                vec!["contents:write".into()],
+                vec!["octocat/api".into()],
+                true,
+                Some(Utc::now()),
+            )]));
+        assert_eq!(round_trip(&resp), resp);
+    }
+
+    /// Grant metadata must carry no token material; a legacy shape with only
+    /// the identifier and login still decodes.
+    #[test]
+    fn grant_metadata_accepts_old_shape() {
+        let raw = serde_json::json!({ "grant_id": "grant-1", "login": "octocat" });
+        let m: GrantMetadata = serde_json::from_value(raw).expect("deserialize");
+        assert_eq!(m.grant_id, "grant-1");
+        assert!(m.scopes.is_empty());
+        assert!(m.repos.is_empty());
+        assert!(!m.token_valid);
+    }
+
+    #[test]
+    fn github_logout_round_trips() {
+        let req = GithubLogoutRequest::new("grant-1".into());
+        assert_eq!(round_trip(&req), req);
+        let resp: Errorable<GithubLogoutResponse> = Errorable::Ok(GithubLogoutResponse::new(true));
+        assert_eq!(round_trip(&resp), resp);
+    }
+
+    #[test]
+    fn github_prime_repos_round_trips() {
+        let req = GithubPrimeReposRequest::new(
+            sid(),
+            vec![
+                "octocat/api@feat/x:main".into(),
+                "octocat/web@feat/x".into(),
+            ],
+            "grant-1".into(),
+        );
+        assert_eq!(round_trip(&req), req);
+
+        let resp: Errorable<GithubPrimeReposResponse> =
+            Errorable::Ok(GithubPrimeReposResponse::new(vec![
+                RepoPrimeResult::new(
+                    "octocat/api".into(),
+                    "feat/x".into(),
+                    Some("main".into()),
+                    RepoPrimeOutcome::Created,
+                ),
+                RepoPrimeResult::new(
+                    "octocat/web".into(),
+                    "feat/x".into(),
+                    None,
+                    RepoPrimeOutcome::CheckedOut,
+                ),
+                RepoPrimeResult::new(
+                    "octocat/broken".into(),
+                    "feat/x".into(),
+                    None,
+                    RepoPrimeOutcome::Failed {
+                        message: "App not installed on octocat/broken".into(),
+                    },
+                ),
+            ]));
+        assert_eq!(round_trip(&resp), resp);
+    }
+
+    /// A prime request that predates `grant_id` still decodes (empty grant).
+    #[test]
+    fn github_prime_repos_request_accepts_old_shape() {
+        let raw = serde_json::json!({
+            "session_id": "00000000-0000-0000-0000-000000000001",
+            "repos": ["octocat/api@feat/x"],
+        });
+        let req: GithubPrimeReposRequest = serde_json::from_value(raw).expect("deserialize");
+        assert_eq!(req.session_id, sid());
+        assert_eq!(req.grant_id, "");
+    }
+
+    #[test]
+    fn github_push_round_trips() {
+        let req = GithubPushRequest::new(sid(), "octocat/api".into(), Some("feat/x".into()));
+        assert_eq!(round_trip(&req), req);
+        let resp: Errorable<GithubPushResponse> = Errorable::Ok(GithubPushResponse::new(
+            "octocat/api".into(),
+            "feat/x".into(),
+            true,
+            "feat/x -> feat/x (fast-forward)".into(),
+        ));
+        assert_eq!(round_trip(&resp), resp);
+    }
+
+    #[test]
+    fn github_create_pr_round_trips() {
+        let req = GithubCreatePrRequest::new(
+            sid(),
+            "octocat/api".into(),
+            Some("feat/x".into()),
+            Some("main".into()),
+            "Add feature x".into(),
+            "Body from template".into(),
+            true,
+        );
+        assert_eq!(round_trip(&req), req);
+        let resp: Errorable<GithubCreatePrResponse> = Errorable::Ok(GithubCreatePrResponse::new(
+            "https://github.com/octocat/api/pull/42".into(),
+            42,
+            false,
+        ));
+        assert_eq!(round_trip(&resp), resp);
+    }
+
+    /// An older create-pr request without `draft`/`base` still decodes.
+    #[test]
+    fn github_create_pr_request_accepts_old_shape() {
+        let raw = serde_json::json!({
+            "session_id": "00000000-0000-0000-0000-000000000001",
+            "repo": "octocat/api",
+            "title": "t",
+            "body": "b",
+        });
+        let req: GithubCreatePrRequest = serde_json::from_value(raw).expect("deserialize");
+        assert!(!req.draft);
+        assert!(req.base.is_none());
+        assert!(req.head.is_none());
+    }
+
+    #[test]
+    fn get_session_git_state_round_trips() {
+        let req = GetSessionGitStateRequest::new(sid());
+        assert_eq!(round_trip(&req), req);
+        let resp: Errorable<GetSessionGitStateResponse> =
+            Errorable::Ok(GetSessionGitStateResponse::new(vec![RepoGitState::new(
+                "octocat/api".into(),
+                "feat/x".into(),
+                Some("main".into()),
+                3,
+                Some("https://github.com/octocat/api/pull/42".into()),
+            )]));
+        assert_eq!(round_trip(&resp), resp);
+    }
+
+    /// Unknown fields are tolerated (no `deny_unknown_fields`), so a newer peer
+    /// can add fields without breaking an older decoder.
+    #[test]
+    fn github_types_tolerate_unknown_fields() {
+        let raw = serde_json::json!({
+            "verification_uri": "https://github.com/login/device",
+            "user_code": "ABCD-1234",
+            "login_id": "login-abc",
+            "poll_interval_secs": 5,
+            "expires_in_secs": 900,
+            "some_future_field": {"nested": true},
+        });
+        let resp: GithubBeginLoginResponse = serde_json::from_value(raw).expect("deserialize");
+        assert_eq!(resp.user_code, "ABCD-1234");
+
+        let raw = serde_json::json!({
+            "session_id": "00000000-0000-0000-0000-000000000001",
+            "repo": "octocat/api",
+            "ahead_by": 99,
+        });
+        let req: GetSessionGitStateRequest = serde_json::from_value(raw).expect("deserialize");
+        assert_eq!(req.session_id, sid());
+    }
+
+    /// The RPC subsystem names are stable and carry the shared prefix. A drift
+    /// here is a wire-compat break.
+    #[test]
+    fn github_rpc_names_are_stable() {
+        assert_eq!(GithubBeginLogin::NAME, "minimald-v1-GithubBeginLogin");
+        assert_eq!(GithubPollLogin::NAME, "minimald-v1-GithubPollLogin");
+        assert_eq!(GithubStatus::NAME, "minimald-v1-GithubStatus");
+        assert_eq!(GithubListAuths::NAME, "minimald-v1-GithubListAuths");
+        assert_eq!(GithubLogout::NAME, "minimald-v1-GithubLogout");
+        assert_eq!(GithubPrimeRepos::NAME, "minimald-v1-GithubPrimeRepos");
+        assert_eq!(GithubPush::NAME, "minimald-v1-GithubPush");
+        assert_eq!(GithubCreatePr::NAME, "minimald-v1-GithubCreatePr");
+        assert_eq!(GetSessionGitState::NAME, "minimald-v1-GetSessionGitState");
     }
 }

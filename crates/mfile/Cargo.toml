@@ -13,6 +13,7 @@ tempfile.workspace = true
 [dependencies]
 args.workspace = true
 common.workspace = true
+github.workspace = true
 paths.workspace = true
 sessions.workspace = true
 

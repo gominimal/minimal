@@ -46,6 +46,7 @@ chrono.workspace = true
 constcat.workspace = true
 diagnostics.workspace = true
 dirs.workspace = true
+github.workspace = true
 indicatif.workspace = true
 nix.workspace = true
 mctx.workspace = true

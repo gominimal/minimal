@@ -4,7 +4,8 @@ use minimald_rpc::{
     AbortSession, AbortSessionResponse, CreateSession, DestroySession, DestroySessionResponse,
     Errorable, FinalizeSession, FinalizeSessionResponse, GetMeshStatus, GetSessionPolicy,
     GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse,
-    GetVersion, GetVersionResponse, IssueClientCert, IssueClientCertRequest, ListSessions,
+    GetVersion, GetVersionResponse, GithubBeginLogin, GithubListAuths, GithubLogout,
+    GithubPollLogin, GithubStatus, IssueClientCert, IssueClientCertRequest, ListSessions,
     ListSessionsEntry, ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
     RenameSessionResponse, ResourcePool, Shutdown, ShutdownRequest, ShutdownResponse,
     SubmitVerdict,
@@ -603,6 +604,67 @@ async fn serve_get_mesh_status(
         .await
 }
 
+// ---------------------------------------------------------------------------
+// GitHub (spec 10): a contiguous block for every `github`-prefixed RPC.
+// Later tasks (prime/push/PR/facade) append sibling `serve_github_*`
+// wrappers + allowlist/dispatch arms here rather than scattering them
+// through the file. The decision logic for each handler lives in
+// `crate::github::rpcs` (see that module's docs); these wrappers only own
+// the SSH-channel framing (`ServeOneshot::handle_channel`), matching every
+// other RPC in this file.
+// ---------------------------------------------------------------------------
+
+async fn serve_github_begin_login(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    GithubBeginLogin
+        .handle_channel(c, async |req| {
+            Ok(crate::github::rpcs::begin_login(s.github().await, req).await)
+        })
+        .await
+}
+
+async fn serve_github_poll_login(c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    GithubPollLogin
+        .handle_channel(
+            c,
+            async |req| Ok(crate::github::rpcs::poll_login(req).await),
+        )
+        .await
+}
+
+async fn serve_github_status(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    GithubStatus
+        .handle_channel(c, async |req| crate::github::rpcs::status(s, req).await)
+        .await
+}
+
+async fn serve_github_list_auths(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    GithubListAuths
+        .handle_channel(c, async |req| {
+            Ok(crate::github::rpcs::list_auths(s.github().await, req).await)
+        })
+        .await
+}
+
+async fn serve_github_logout(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    GithubLogout
+        .handle_channel(c, async |req| {
+            Ok(crate::github::rpcs::logout(s.github().await, req).await)
+        })
+        .await
+}
+
 pub(crate) const STREAM_WORKSPACE_FILES: &str =
     constcat::concat!(RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
 
@@ -1186,7 +1248,12 @@ pub async fn handle_ssh_rpc(
         | STREAM_WORKSPACE_FILES
         | STREAM_WORKSPACE_PATCHES
         | minimald_rpc::DIAG_BUNDLE_SUBSYSTEM
-        | IssueClientCert::NAME => {
+        | IssueClientCert::NAME
+        | GithubBeginLogin::NAME
+        | GithubPollLogin::NAME
+        | GithubStatus::NAME
+        | GithubListAuths::NAME
+        | GithubLogout::NAME => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
                 None => {
@@ -1267,6 +1334,11 @@ pub async fn handle_ssh_rpc(
         minimald_rpc::DIAG_BUNDLE_SUBSYSTEM => {
             serve!(crate::diag::serve_stream_diag_bundle(s, config, channel))
         }
+        GithubBeginLogin::NAME => serve!(serve_github_begin_login(s, channel)),
+        GithubPollLogin::NAME => serve!(serve_github_poll_login(channel)),
+        GithubStatus::NAME => serve!(serve_github_status(s, channel)),
+        GithubListAuths::NAME => serve!(serve_github_list_auths(s, channel)),
+        GithubLogout::NAME => serve!(serve_github_logout(s, channel)),
         IssueClientCert::NAME => {
             #[cfg(feature = "networking-proxy")]
             serve!(serve_issue_client_cert(s, channel));
