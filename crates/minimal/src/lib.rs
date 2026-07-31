@@ -717,6 +717,69 @@ fn session_announce_label(id: &sessions::SessionId, name: Option<&str>) -> Strin
     }
 }
 
+/// Bounded retries when a freshly minted autogen name collides with an
+/// existing session built from the same directory.
+const AUTOGEN_NAME_RETRIES: u32 = 8;
+
+/// Reduce a directory basename to the characters a session name should carry —
+/// ASCII alphanumerics plus `-`, `_`, `.`, lowercased — dropping everything
+/// else (spaces, unicode) so the minted handle is typable and clears
+/// `validate_session_name`. Falls back to `session` when nothing survives.
+fn sanitize_name_component(basename: &str) -> String {
+    let filtered: String = basename
+        .chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() {
+                Some(c.to_ascii_lowercase())
+            } else if matches!(c, '-' | '_' | '.') {
+                Some(c)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let trimmed = filtered.trim_matches(|c| matches!(c, '-' | '_' | '.'));
+    if trimmed.is_empty() {
+        "session".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Mint a typable session name `<dir-basename>-<hex>` from the project
+/// directory. The caller supplies the hex so the format is unit-testable and
+/// so a collision retry can re-mint with fresh entropy.
+fn autogen_session_name(project_dir: &camino::Utf8Path, hex: &str) -> String {
+    let base = sanitize_name_component(project_dir.file_name().unwrap_or("session"));
+    format!("{base}-{hex}")
+}
+
+/// Four lowercase hex digits of per-call entropy, drawn from the stdlib
+/// hasher's randomized seed — enough to disambiguate sessions from one
+/// directory without pulling in an RNG dependency. Each call reseeds, so a
+/// retry gets a fresh suffix.
+fn random_hex4() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    let seed = RandomState::new().hash_one("minimal-session-name");
+    format!("{:04x}", seed & 0xffff)
+}
+
+/// The daemon collapses the session-store `AlreadyExists` into a plain message
+/// (see `serve_create_session` in `crates/minimald/src/rpc.rs`); match it so an
+/// autogen name clash can be told apart from any other `CreateSession` failure.
+fn is_name_collision(error: &str) -> bool {
+    error.contains("already exists")
+}
+
+/// Whether a failed `CreateSession` should retry under a freshly minted name:
+/// only autogen names (`autogen`), only on a name collision, and only within
+/// the bounded budget. A user-supplied name never retries, so its collision
+/// surfaces verbatim.
+fn should_retry_autogen(autogen: bool, attempts: u32, error: &str) -> bool {
+    autogen && attempts < AUTOGEN_NAME_RETRIES && is_name_collision(error)
+}
+
 /// The default action for a bare `min` (no subcommand): print the top-level
 /// help and exit successfully, the same text `min --help` produces.
 ///
@@ -1381,10 +1444,21 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
         }),
     };
 
+    // A session with no `--name` still deserves a typable handle, so mint
+    // `<dir-basename>-<4 hex>` client-side; without it `min ls`, the attach
+    // picker, and the create announcement fall back to a bare short id. A
+    // user-supplied name is passed through untouched — including a collision,
+    // which must surface as an error rather than be silently suffixed.
+    let autogen = args.name.is_none();
+    let session_name = args
+        .name
+        .clone()
+        .unwrap_or_else(|| autogen_session_name(&utf8_path, &random_hex4()));
+
     // The daemon sources `username` from the authenticated SSH
     // connection context; the client doesn't send it.
     let config = minimald_rpc::SessionConfig {
-        name: args.name.clone(),
+        name: Some(session_name),
         project_path: abs_path,
         network: args.network.into(),
         policy,
@@ -1439,18 +1513,30 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
     };
-    let resp = client
-        .oneshot_rpc::<CreateSession>(CreateSessionRequest { config })
-        .await
-        .context("CreateSession RPC failed")?;
-
-    // Surface the daemon's typed policy/network-mode validation error (e.g.
-    // ingress on a non-own-ip session, privileged host port) rather than a
-    // generic failure line.
-    let created = match resp {
-        minimald_rpc::Errorable::Ok(r) => r,
-        minimald_rpc::Errorable::Err { error } => {
-            bail!("CreateSession failed: {error}");
+    // An autogen name can (rarely) collide with an existing session built
+    // from the same directory; on the daemon's already-exists rejection,
+    // re-mint the hex suffix and retry a bounded number of times. A
+    // user-supplied name never retries — its collision, and any other failure
+    // (e.g. a policy/network-mode validation error), surfaces unchanged.
+    let mut config = config;
+    let mut attempts = 0u32;
+    let created = loop {
+        let resp = client
+            .oneshot_rpc::<CreateSession>(CreateSessionRequest {
+                config: config.clone(),
+            })
+            .await
+            .context("CreateSession RPC failed")?;
+        match resp {
+            minimald_rpc::Errorable::Ok(r) => break r,
+            minimald_rpc::Errorable::Err { error } => {
+                if should_retry_autogen(autogen, attempts, &error) {
+                    attempts += 1;
+                    config.name = Some(autogen_session_name(&utf8_path, &random_hex4()));
+                    continue;
+                }
+                bail!("CreateSession failed: {error}");
+            }
         }
     };
     let id = created.id;
@@ -1693,7 +1779,7 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
         if should_announce_session(global) {
             eprintln!(
                 "Created session {}",
-                session_announce_label(&id, args.name.as_deref())
+                session_announce_label(&id, config.name.as_deref())
             );
         }
         let attach_args = AttachArgs {
@@ -2764,6 +2850,70 @@ mod tests {
         let id = sessions::SessionId::parse_str("a1b2c3d4-0000-0000-0000-000000000000").unwrap();
         assert_eq!(session_announce_label(&id, Some("api")), "api (a1b2c3d4)");
         assert_eq!(session_announce_label(&id, None), "a1b2c3d4");
+    }
+
+    /// A session created without `--name` gets a typable `<dir>-<hex>` handle:
+    /// the basename is lowercased and stripped to the name alphabet, and the
+    /// caller-supplied hex tails it.
+    #[test]
+    fn autogen_session_name_slugs_the_basename() {
+        assert_eq!(
+            autogen_session_name(camino::Utf8Path::new("/home/u/code/foo"), "9c1e"),
+            "foo-9c1e"
+        );
+        // Disallowed characters are dropped and the rest lowercased.
+        assert_eq!(
+            autogen_session_name(camino::Utf8Path::new("/tmp/My Project!"), "4f2a"),
+            "myproject-4f2a"
+        );
+        // A basename that sanitizes to nothing falls back to `session`.
+        assert_eq!(
+            autogen_session_name(camino::Utf8Path::new("/"), "0001"),
+            "session-0001"
+        );
+    }
+
+    /// Sanitization drops out-of-alphabet characters, trims leading/trailing
+    /// separators, and falls back to `session` for an all-symbol basename, so
+    /// the minted name always clears `validate_session_name`.
+    #[test]
+    fn sanitize_name_component_trims_and_falls_back() {
+        assert_eq!(sanitize_name_component("--foo--"), "foo");
+        assert_eq!(sanitize_name_component("café"), "caf");
+        assert_eq!(sanitize_name_component("...."), "session");
+        assert_eq!(sanitize_name_component("a\tb"), "ab");
+    }
+
+    /// The minted suffix is exactly four lowercase hex digits.
+    #[test]
+    fn random_hex4_is_four_lowercase_hex_digits() {
+        let h = random_hex4();
+        assert_eq!(h.len(), 4);
+        assert!(
+            h.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "expected four lowercase hex digits, got {h:?}"
+        );
+    }
+
+    /// Only an autogen name retries on collision, and only within the bounded
+    /// budget; a user-supplied name never retries, so its collision passes
+    /// through, and a non-collision failure is never retried.
+    #[test]
+    fn autogen_collision_retry_is_bounded_and_skips_user_names() {
+        let collision = "A session with that name already exists";
+        assert!(should_retry_autogen(true, 0, collision));
+        assert!(should_retry_autogen(
+            true,
+            AUTOGEN_NAME_RETRIES - 1,
+            collision
+        ));
+        // Budget spent: stop retrying.
+        assert!(!should_retry_autogen(true, AUTOGEN_NAME_RETRIES, collision));
+        // A user-supplied name never retries — its collision surfaces verbatim.
+        assert!(!should_retry_autogen(false, 0, collision));
+        // A non-collision failure is never retried.
+        assert!(!should_retry_autogen(true, 0, "CreateSession failed: boom"));
     }
 
     /// A VM-backed provider dir carries the guest's recorded host key, so
