@@ -747,8 +747,9 @@ where
 /// Accepted forms are:
 ///  * `git-receive-pack min://<session ID>` - handles a git receive-pack, routing
 ///    with the trailing session ID
-///  * `min run <task>` - runs a task, routed via a `MINIMAL_SESSION_ID` env var
-///    that must be set on the channel by the client
+///  * `min task run <task>` (canonical) or `min run <task>` (legacy alias) -
+///    runs a task, routed via a `MINIMAL_SESSION_ID` env var that must be set
+///    on the channel by the client
 ///  * `min package build <args>` - builds package(s), routed via a
 ///    `MINIMAL_SESSION_ID` env var that must be set on the channel by the client
 ///  * `min check <args>` - lints the session's `minimal.toml`, packages,
@@ -841,6 +842,36 @@ pub(crate) async fn handle_exec(
             let task = rem.strip_prefix("run ").unwrap_or("").trim();
             if task.is_empty() {
                 tracing::warn!(%session_id, "execution request rejected: expected `min run <task name>`");
+                session.channel_failure(id)?;
+                return Ok(());
+            }
+            let task = task.to_string();
+            session.channel_success(id)?;
+
+            spawn(async move {
+                let exec_task = ExecTask {
+                    conn,
+                    serv,
+                    session: session_handle,
+                    channel_id: id,
+                    exec: TaskExec { args: None, task },
+                };
+                exec_task.run(channel).await;
+            });
+        }
+        Some("task") => {
+            // `min task run <task>` is the canonical spelling of the legacy
+            // bare `min run <task>`; `run` is its only sub-command. A bare
+            // `min task`, an unknown sub-command, or a prefix match like
+            // `min task runx` is refused before acking.
+            let rest = rem.strip_prefix("task").unwrap_or("").trim();
+            let task = rest
+                .strip_prefix("run")
+                .filter(|task| task.is_empty() || task.starts_with(' '))
+                .map(str::trim)
+                .unwrap_or("");
+            if task.is_empty() {
+                tracing::warn!(%session_id, "execution request rejected: expected `min task run <task name>`");
                 session.channel_failure(id)?;
                 return Ok(());
             }
@@ -1743,6 +1774,46 @@ mod tests {
                 out.stderr.is_empty(),
                 "echo task should produce no stderr: {:?}",
                 out.stderr,
+            );
+        }
+
+        /// `min task run <task>` is the canonical spelling of the legacy
+        /// `min run <task>` and must be accepted by the exec channel; a
+        /// prefix-matched `min task runx` must still be refused. Acceptance
+        /// (vs `channel_failure`) is settled purely by argv parsing before any
+        /// process spawns, so an unpopulated task name is enough to exercise
+        /// the dispatch arm.
+        #[tokio::test]
+        async fn exec_accepts_task_run_canonical_form() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let session_id = fresh_session(&mut client).await;
+            let session_str = session_id.to_string();
+
+            let accepted = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    "min task run some_task",
+                    &[],
+                )
+                .await;
+            assert!(
+                accepted.is_ok(),
+                "`min task run <task>` must be accepted, got {accepted:?}",
+            );
+
+            let rejected = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    "min task runx",
+                    &[],
+                )
+                .await;
+            assert!(
+                rejected.is_err(),
+                "`min task runx` is not `min task run <task>` and must be refused, got {rejected:?}",
             );
         }
 
