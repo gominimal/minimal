@@ -590,6 +590,80 @@ is the belt-and-braces for dumps that go stale later).
   install (no zsh completions in the record) leaves the user's `.zcompdump`
   untouched on uninstall.
 
+### Unit 10 - Presentation
+
+`curl … | sh` is the product's first impression, and it lands on everything
+from a modern terminal to a CI log with no terminal at all. This unit fixes
+what the run looks like and, more importantly, what it must **not** emit when
+nobody is watching. Only R10.1 is a contract; the rest is the shape the
+implementation currently takes, recorded so a rewrite does not have to
+rediscover it.
+
+**R10.1**, **Degradation.** Presentation degrades along two independent axes,
+each probed once at startup:
+
+- *attributes* (bold, dim, and the in-place row rewrite) are emitted **only**
+  when stderr is a terminal, `NO_COLOR` is unset **or empty**, and `TERM` is not
+  `dumb`. Empty counts as absent per the `NO_COLOR` convention
+  (<https://no-color.org>): the variable suppresses only when set to a
+  non-empty value;
+- *glyphs* (the `▸` marker, `→` arrow, `·` separator, and the mark) are emitted
+  only under a UTF-8 locale (`LC_ALL`/`LC_CTYPE`/`LANG`), with ASCII
+  stand-ins otherwise. This axis is independent of the first: UTF-8 in a
+  redirected log is still fine.
+
+`MINIMAL_INSTALL_PLAIN=1` forces both off. It follows that a run whose stderr
+is redirected emits **no escape sequence of any kind** — the property that
+keeps CI logs and any future output parsing clean, and the one thing here
+worth a regression test.
+
+Attributes only, never color: the installer is monochrome, like the CLI's
+prompt theme (`crates/minimal/src/theme.rs`) and the website.
+
+**R10.2**, **Component table.** The component loop prints one row per
+component: the component name in a fixed column, a verb (`downloading`,
+`installed`, `current`, `linked`, `kept`, `removed`, …), and an optional
+detail (a size, a `$HOME`-relative path). On a terminal the in-progress row is
+rewritten in place, so a slow download narrates itself and still leaves one
+line behind; otherwise the two halves are consecutive lines, which is what a
+log wants. Anything printed while a row is open (a warning, the R5.5 prompt, a
+fatal error) closes that row first, so no message lands mid-line. Uninstall
+prints the same table.
+
+**R10.3**, **The mark.** A first install — no prior install record (R6.1) —
+opens with the Minimal mark, character-for-character the one in the README's
+session demo (`docs/public/loadout-demo.cast`). Terminal-only and never on an
+upgrade: a mark in a log file, or on the fifth rerun of the week, is litter.
+The two parts degrade separately along the R10.1 glyph axis: the block mark is
+UTF-8 only, because in an ASCII locale it would render as mojibake, while the
+wordmark line under it is ASCII-safe (its only glyph is the R10.1 separator,
+which has a stand-in) and still prints. So an ASCII-locale terminal opens on
+the wordmark line alone rather than on nothing.
+
+**R10.4**, **The closing card.** Every **successful install** ends on a card
+naming the first commands to run. It is the last output of the run, after every
+bookkeeping note (install record, shell integration, the R6.2 PATH advisory,
+the AppArmor advisory), because a finished installer that ends on a filesystem
+path leaves a new user with no next step. When the resolved `bin` directory is
+not on `$PATH` in this session, the R6.2 advisory is carried **inside** the
+card, above the commands: the rc hook only takes effect in new shells, so
+those commands would not resolve in this one, and saying so is part of the
+next step rather than a footnote after it. No card on a failed install, and
+none in uninstall mode.
+
+**Proof artifacts**:
+
+- **Test** (R10.1): the harness captures every run to a file, so no run's
+  output may contain an ESC byte; asserted on a full install.
+- **Test** (R10.4): a fresh install and an up-to-date rerun both end on the
+  card, it names `min session activate --attach .`, and it is still the parting
+  block when the AppArmor advisory is the last note before it.
+- **Test** (R10.4): a failed install (checksum mismatch) prints no card.
+- **Not automated**: the terminal-only behaviors — attributes, the in-place row
+  rewrite, and the mark (R10.2/R10.3) — are unreachable from the harness, whose
+  output is always redirected. They are verified by eye against a mock bucket
+  before release, not by CI.
+
 ## Non-Goals
 
 - **Uninstall.** ~~The install record (R6.1) is written to enable it later; the
@@ -691,13 +765,14 @@ architecture record; design rationale is captured above.
 1. **Static**: `shellcheck --shell=sh` passes on the installer with no warnings.
 2. **Dash conformance**: the installer's test harness runs the script under
    `dash` (and, where available, macOS `/bin/sh`), not just `bash`, in CI.
-3. **Unit tests** (Units 1-6, 9) pass against fixture pointer files, manifests,
+3. **Unit tests** (Units 1-6, 9, 10) pass against fixture pointer files, manifests,
    and a stubbed bucket/downloader, asserting: downloader/hasher/platform
    selection; target and version validation; field extraction; prefix resolution
    and traversal rejection; skip-on-rerun and checksum-mismatch handling; install
    record and PATH advisory; shell-init generation, rc hooking, and completion
    installation (the `min` CLI fixture is a runnable script, so completion
-   generation exercises the real execute-the-binary path).
+   generation exercises the real execute-the-binary path); and that a redirected
+   run emits no terminal escapes and ends on the closing card (Unit 10).
 4. **End-to-end**: against a real (or local mock) bucket, `curl … | sh` installs
    the current `stable` binaries into temp prefixes; a second run performs zero
    downloads; corrupting one on-disk binary makes the next run re-fetch only that
