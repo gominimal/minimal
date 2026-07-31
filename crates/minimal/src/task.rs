@@ -36,14 +36,20 @@ impl std::fmt::Display for TaskExit {
 
 impl std::error::Error for TaskExit {}
 
-/// Map the bridged exit status to the command result: 0 is success, anything
-/// else becomes the typed [`TaskExit`] main.rs relays as the process exit
-/// code, clamped into `u8` the same way the git-remote helper clamps its
-/// remote status.
-fn exit_outcome(code: u32) -> Result<(), anyhow::Error> {
+/// Map the bridged exit status to the command result: a reported 0 is
+/// success, a reported non-zero becomes the typed [`TaskExit`] main.rs
+/// relays as the process exit code, clamped into `u8` the same way the
+/// git-remote helper clamps its remote status. A channel that closed
+/// WITHOUT reporting a status — a daemon or transport death mid-task —
+/// fails closed as an ordinary error (printed to stderr, process exit 1)
+/// rather than defaulting to success.
+fn exit_outcome(code: Option<u32>) -> Result<(), anyhow::Error> {
     match code {
-        0 => Ok(()),
-        code => Err(TaskExit(u8::try_from(code).unwrap_or(1)).into()),
+        Some(0) => Ok(()),
+        Some(code) => Err(TaskExit(u8::try_from(code).unwrap_or(1)).into()),
+        None => Err(anyhow::anyhow!(
+            "task ended without reporting an exit status"
+        )),
     }
 }
 
@@ -122,6 +128,11 @@ fn unknown_task_message(file: &mfile::File, task: &str) -> String {
 /// handler says how to reach it. Either way the process exits 130; a second
 /// Ctrl-C falls through to the default disposition. Dropping the guard
 /// cancels the handler once the normal destroy/keep path has run.
+///
+/// Note the SIGINT is consumed on the host: it is NOT relayed into the box,
+/// so — unlike interrupting a local command — the task itself gets no
+/// chance to trap it and clean up; the box is torn down (or, with `--keep`,
+/// abandoned) around it.
 struct TaskRunInterrupt {
     task: tokio::task::JoinHandle<()>,
 }
@@ -167,18 +178,24 @@ fn arm_task_run_interrupt(
 
 /// Bridge an acked exec channel to the caller's stdio, mirroring the
 /// git-remote bridge: channel data streams to stdout, extended data
-/// (stream 1) to stderr, and the remote exit status is captured (0 if the
-/// daemon reported none).
+/// (stream 1) to stderr, and the remote exit status is captured. A channel
+/// that closes without ever reporting one — a daemon or transport death
+/// mid-task — yields `None`, which [`exit_outcome`] fails closed rather
+/// than reading as success.
 ///
 /// stdin is pumped into the channel only when it is NOT a terminal: a piped
 /// stdin EOFs and half-closes the channel like the git helper's does, but a
 /// terminal stdin never EOFs — and tokio's stdin is an uncancellable
 /// blocking read that would hold the runtime open after the task exits — so
 /// a terminal caller half-closes immediately and a stdin-reading task sees
-/// EOF instead of hanging.
+/// EOF instead of hanging. The upshot: tasks run non-interactively; stdin
+/// content reaches the task only when piped. That is not just the tokio
+/// constraint — the daemon's exec channel has no PTY (only the shell path
+/// does), so interactive tasks are structurally unsupported here anyway;
+/// interactive work belongs in `min session attach`.
 async fn bridge_exec(
     mut channel: russh::Channel<russh::client::Msg>,
-) -> Result<u32, anyhow::Error> {
+) -> Result<Option<u32>, anyhow::Error> {
     let pump = if std::io::stdin().is_terminal() {
         channel.eof().await.context("half-close task stdin")?;
         None
@@ -196,7 +213,7 @@ async fn bridge_exec(
 
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
-    let mut exit_status = 0;
+    let mut exit_status = None;
     while let Some(msg) = channel.wait().await {
         match msg {
             russh::ChannelMsg::Data { data } => {
@@ -207,7 +224,7 @@ async fn bridge_exec(
                 stderr.write_all(&data).await.context("write task stderr")?;
                 stderr.flush().await.context("flush task stderr")?;
             }
-            russh::ChannelMsg::ExitStatus { exit_status: code } => exit_status = code,
+            russh::ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
             _ => {}
         }
     }
@@ -525,17 +542,33 @@ mod tests {
         assert!(msg.contains("declares no tasks"), "got: {msg}");
     }
 
-    /// Exit-status relay: 0 is success; anything else downcasts to the typed
-    /// `TaskExit`, clamped into `u8` like the git-remote helper's status.
+    /// Exit-status relay: a reported 0 is success; anything else downcasts
+    /// to the typed `TaskExit`, clamped into `u8` like the git-remote
+    /// helper's status.
     #[test]
     fn exit_outcome_relays_the_task_status() {
-        exit_outcome(0).expect("exit 0 is success");
+        exit_outcome(Some(0)).expect("exit 0 is success");
 
-        let err = exit_outcome(7).unwrap_err();
+        let err = exit_outcome(Some(7)).unwrap_err();
         assert_eq!(err.downcast_ref::<TaskExit>(), Some(&TaskExit(7)));
 
         // Out-of-range statuses clamp to 1 rather than truncate.
-        let err = exit_outcome(300).unwrap_err();
+        let err = exit_outcome(Some(300)).unwrap_err();
         assert_eq!(err.downcast_ref::<TaskExit>(), Some(&TaskExit(1)));
+    }
+
+    /// A channel that closed without ever reporting an exit status — a
+    /// daemon or transport death mid-task — must fail closed: a diagnostic
+    /// error (process exit 1 via main's error path), never the old
+    /// default-to-0 false success, and not a silent `TaskExit`.
+    #[test]
+    fn exit_outcome_fails_closed_on_a_missing_status() {
+        let err = exit_outcome(None).expect_err("a missing status is never success");
+        assert!(
+            err.to_string()
+                .contains("task ended without reporting an exit status"),
+            "got: {err}"
+        );
+        assert!(err.downcast_ref::<TaskExit>().is_none());
     }
 }

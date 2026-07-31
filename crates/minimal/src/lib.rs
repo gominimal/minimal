@@ -229,7 +229,11 @@ pub enum TaskCommand {
     /// uploads the project like `min session activate`, runs the task
     /// inside it with output streamed to the terminal, exits with the
     /// task's exit code, and destroys the session afterwards. `--keep`
-    /// retains the session as an attachable box instead.
+    /// retains the session as an attachable box instead. Ctrl-C tears the
+    /// session down (or keeps it with `--keep`) and exits 130 without
+    /// relaying the interrupt to the task itself. Tasks run
+    /// non-interactively: pipe stdin to feed input; use `min session
+    /// attach` for interactive work.
     Run(TaskRunArgs),
 }
 
