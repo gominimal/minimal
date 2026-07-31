@@ -861,7 +861,9 @@ mod tests {
     }
 
     /// Recursively asserts no file under `dir` (including `.git/config`) contains
-    /// the token bytes.
+    /// the token bytes. Only the `test-support` mock tests inject a real token,
+    /// so the helper is gated with them.
+    #[cfg(feature = "test-support")]
     fn assert_no_token_on_disk(dir: &Path, token: &str) {
         fn contains(hay: &[u8], needle: &[u8]) -> bool {
             !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
