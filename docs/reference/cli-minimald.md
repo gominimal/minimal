@@ -45,7 +45,7 @@ minimald completions <SHELL>
 ```
 
 Generates a shell tab-completion script for `minimald`. Supported shells include
-`bash`, `zsh`, `elvish`, `fish`. Usage:
+`bash`, `zsh`, `elvish`, `fish`, `powershell`. Usage:
 `source <(minimald completions bash)`.
 
 ## Known issues
