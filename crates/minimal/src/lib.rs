@@ -51,17 +51,13 @@ pub enum Command {
     Ls(LsArgs),
     /// Shut down the minimald daemon
     //
-    // Deliberate exception to the `<noun> <verb>` convention (documented in
-    // docs/reference/cli.md): `min daemon stop` is the canonical spelling,
-    // and `min stop` — acting on the daemon backend, not on any session —
-    // keeps this bare top-level form as its visible alias. Not an oversight —
-    // do not remove it.
+    // Stays top-level: it acts on the daemon backend, not on any session, and
+    // it is the daemon-lifecycle command people reach for. Documented as a
+    // deliberate exception in docs/reference/cli.md.
     Stop(StopArgs),
     /// Session management subcommands
     #[command(visible_alias = "sessions")]
     Session(SessionArgs),
-    /// Daemon management subcommands
-    Daemon(DaemonArgs),
     /// Loadout management subcommands
     #[command(visible_alias = "loadouts")]
     Loadout(LoadoutArgs),
@@ -187,18 +183,6 @@ pub struct PolicyArgs {
     /// Session identifier (UUID or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
-}
-
-#[derive(Debug, Args)]
-pub struct DaemonArgs {
-    #[command(subcommand)]
-    pub command: DaemonCommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum DaemonCommand {
-    /// Shut down the minimald daemon
-    Stop(StopArgs),
 }
 
 #[derive(Debug, Args)]
@@ -674,9 +658,6 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             SessionCommand::Destroy(args) => cmd_destroy(&cli.global_args, args).await,
             SessionCommand::Rename(args) => cmd_rename(&cli.global_args, args).await,
             SessionCommand::Policy(args) => cmd_session_policy(&cli.global_args, args).await,
-        },
-        Some(Command::Daemon(DaemonArgs { command })) => match command {
-            DaemonCommand::Stop(args) => cmd_stop(&cli.global_args, args).await,
         },
         Some(Command::Loadout(LoadoutArgs {
             command: LoadoutCommand::List(args),
@@ -2877,38 +2858,6 @@ mod tests {
         assert!(canonical.raw && canonical.json);
         let bare = ls_args(&["min", "ls", "--json"]);
         assert!(bare.json && !bare.raw);
-    }
-
-    /// `min daemon stop` is the canonical `<noun> <verb>` spelling of the
-    /// daemon-shutdown command; `min stop` (top-level) is its visible alias.
-    /// Both parse to the same `StopArgs`, so `--force` reaches the one
-    /// `cmd_stop` implementation identically.
-    #[test]
-    fn daemon_stop_spellings_all_reach_stop() {
-        use clap::Parser as _;
-        let stop_args = |args: &[&str]| -> StopArgs {
-            match Cli::try_parse_from(args).unwrap().command {
-                Some(Command::Stop(a))
-                | Some(Command::Daemon(DaemonArgs {
-                    command: DaemonCommand::Stop(a),
-                })) => a,
-                _ => panic!("expected a stop command for {args:?}"),
-            }
-        };
-
-        for spelling in [
-            ["min", "daemon", "stop"].as_slice(),
-            ["min", "stop"].as_slice(),
-        ] {
-            let a = stop_args(spelling);
-            assert!(!a.force, "{spelling:?} must default --force off");
-        }
-
-        // `--force` is accepted on the canonical and the bare form alike.
-        let canonical = stop_args(&["min", "daemon", "stop", "--force"]);
-        assert!(canonical.force);
-        let bare = stop_args(&["min", "stop", "--force"]);
-        assert!(bare.force);
     }
 
     /// `repo_dir` and `minimal_dir` are global, so they must be accepted after
