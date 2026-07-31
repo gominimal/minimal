@@ -318,10 +318,20 @@ n1="$(downloads)"; want_ok "first run downloaded ($n1)" test "$n1" -gt 0
 want_ok "symlink component placed as a symlink (R5.6)" test -L "$H1/bin/git-remote-min"
 check "min" "$(readlink "$H1/bin/git-remote-min")" "symlink points at its manifest target (R5.6)"
 
+# A successful run closes on the getting-started hint, after every bookkeeping
+# note (here the PATH advisory fires), and it is the very last line so it is
+# what the user is left looking at.
+want_ok "fresh install emits the getting-started hint" \
+    grep -q "To get started: open a new terminal" "$OUT"
+check "    min session activate --attach ." "$(tail -n 1 "$OUT")" \
+    "getting-started command is the last line of a fresh install"
+
 reset_dl
 run second "$H1"
 check 0 "$rc" "rerun exits 0"
 check 0 "$(downloads)" "rerun performs zero downloads (R5.1/R2 reruns cheap)"
+check "    min session activate --attach ." "$(tail -n 1 "$OUT")" \
+    "getting-started command is the last line of an up-to-date rerun"
 
 # --- AppArmor components + Ubuntu 24.04+ advisory --------------------------
 # The three noarch apparmor components install under the data prefix on Linux.
@@ -347,6 +357,9 @@ want_ok "advisory points at the shipped loader with sudo bash" \
 # attachment set, so the advised command must attach it explicitly.
 want_ok "advisory carries --path for a custom MINIMAL_BIN" \
     grep -q -- "--path \"$H1/bin/minimald\"" "$OUT"
+# The hint is the parting line even when the AppArmor advisory is the last note.
+check "    min session activate --attach ." "$(tail -n 1 "$OUT")" \
+    "getting-started hint follows the AppArmor advisory"
 
 USERNS_SYSCTL="$root/sysctl-off"
 run aa_unrestricted "$H1"
@@ -433,6 +446,8 @@ reset_dl
 run mismatch "$H2"
 check 1 "$rc" "checksum mismatch exits non-zero (R5.3)"
 want_ok "mismatch names the failure" grep -q "checksum mismatch" "$OUT"
+want_err "no getting-started hint on a failed install" \
+    grep -q "To get started" "$OUT"
 want_err "no file installed on mismatch" test -e "$H2/bin/min"
 if ls "$H2/bin/"min.tmp.* >/dev/null 2>&1
 then bad "temp file left behind"; else ok "no .tmp file left (R5.3)"; fi

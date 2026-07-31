@@ -1050,3 +1050,14 @@ if [ "$os" = linux ] && [ -r "$userns_sysctl" ] \
         say "  details: https://docs.minimal.dev/reference/linux-host-setup"
     fi
 fi
+
+# --- Getting started -------------------------------------------------------
+
+# The parting line, after every bookkeeping note above (install record, PATH,
+# AppArmor): a finished installer otherwise leaves the user with no next step.
+# Emitted last on every successful exit so it is what they are left looking at;
+# if the CLI gains a shorter entry command, only the literal below changes.
+say ""
+say "To get started: open a new terminal, cd into a project, and run:"
+say ""
+say "    min session activate --attach ."
