@@ -131,6 +131,7 @@ impl std::fmt::Debug for DaemonLogRelease {
 pub struct ServerState {
     config: Config,
     sessions: sessions::ManagerHandle,
+    daemon_id: String,
 
     /// Fired by the `Shutdown` RPC handler once the session manager has been
     /// torn down, telling [`Server::run`]'s accept loop to stop accepting,
@@ -165,6 +166,7 @@ impl ServerState {
     ) -> Result<Self, std::io::Error> {
         let minimal_state_dir = config.minimal_state_dir.clone();
         let minimal_cache_dir = config.minimal_cache_dir.clone();
+        let daemon_id = common::random_alphanumeric(5);
         // Construct the per-host switch once, here at daemon scope, so a single
         // gvproxy runs for the host and a single allocator never reuses an
         // address for the daemon's lifetime (R1.4/R1.6). Its config/socket/pid
@@ -204,6 +206,7 @@ impl ServerState {
         let mctx_config = mctx::ConfigBuilder::new()
             .with_cache_dir(minimal_cache_dir.as_utf8_path())
             .with_state_dir(minimal_state_dir.as_utf8_path())
+            .with_daemon_id(daemon_id.clone())
             .build()
             .map_err(|e| std::io::Error::other(format!("mctx config: {e}")))?;
 
@@ -216,6 +219,7 @@ impl ServerState {
             )
             .await?,
             config,
+            daemon_id,
             shutdown: CancellationToken::new(),
             log_release,
             host_key: None,
@@ -305,6 +309,11 @@ impl ServerStateHandle {
     /// of the two answered, and gates the guest-only gvproxy probe.
     pub(crate) async fn in_microvm(&self) -> bool {
         self.0.lock().await.config.in_microvm
+    }
+
+    /// Returns the daemon ID.
+    pub async fn daemon_id(&self) -> String {
+        self.0.lock().await.daemon_id.clone()
     }
 
     /// Returns the daemon's TLS certificate authority (only with

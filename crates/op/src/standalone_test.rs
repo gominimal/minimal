@@ -201,7 +201,7 @@ impl<'a> Runnable for StandaloneTest<'a> {
 
         let (deps, needs_dns, needs_internet) = self.dependencies(build, test, opts).await?;
 
-        let config = sandbox2::config::Config::new("test")
+        let mut config = sandbox2::config::Config::new("test")
             .with_rootfs(deps.into_iter())
             .with_dns(needs_dns)
             .with_network_mode(if !needs_dns && !needs_internet {
@@ -211,6 +211,9 @@ impl<'a> Runnable for StandaloneTest<'a> {
             })
             .with_hostname("test")
             .with_env_var("HOME", "/tmp");
+        if let Some(id) = &opts.daemon_id {
+            config = config.with_daemon_id(id.clone());
+        }
         let mut sandbox = config.build(&opts.exec_base, ()).await?;
 
         self.execute_in_sandbox(&mut sandbox, test).await

@@ -613,6 +613,7 @@ impl SideOp {
                         ctx.stdlib_dir().to_path_buf(),
                         ctx.local_cache(),
                         ctx.op_tracker(),
+                        ctx.daemon_id(),
                     )
                     .with_cancel(check_cancel),
                 );
@@ -806,6 +807,7 @@ impl SideOp {
                 // workers; its internal `rayon` scope needs a runtime entered.
                 let cache = ctx.local_cache();
                 let ot = ctx.op_tracker();
+                let daemon_id = ctx.daemon_id();
                 let runtime = tokio::runtime::Handle::current();
                 let result = tokio::task::spawn_blocking(move || {
                     let _rt = runtime.enter();
@@ -814,6 +816,7 @@ impl SideOp {
                         graph: &graph,
                         exec_base: "/invalid".into(),
                         ot,
+                        daemon_id,
                     };
                     // `tar` writes in small pieces; one send per 512-byte
                     // header would be all overhead. `op::Materialize` flushes.

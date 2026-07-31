@@ -41,6 +41,7 @@ pub struct Shared<B: Backend> {
     pub graph: Graph,
     pub cache: Cache<LocalDir>,
     pub backend: B,
+    pub daemon_id: Option<String>,
     pub fetch_semaphore: Semaphore,
 }
 
@@ -78,6 +79,7 @@ pub struct Orchestrator<B: Backend> {
     pub backend: B,
     pub graph: Graph,
     pub cache: Cache<LocalDir>,
+    pub daemon_id: Option<String>,
 }
 
 impl<B: Backend> Orchestrator<B> {
@@ -86,6 +88,7 @@ impl<B: Backend> Orchestrator<B> {
         let shared = Shared {
             graph: self.graph.clone(),
             cache: self.cache.clone(),
+            daemon_id: self.daemon_id.clone(),
             backend: self.backend,
             fetch_semaphore: Semaphore::new(8),
         };

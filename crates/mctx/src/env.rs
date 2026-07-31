@@ -26,6 +26,7 @@ struct EnvChannel<'a> {
     state_dir: PathBuf,
     has_packages: HashSet<BuildSpecRef>,
 
+    daemon_id: Option<String>,
     ot: Option<OpTracker>,
 }
 
@@ -198,6 +199,7 @@ impl EnvChannel<'_> {
                 check_ctx.stdlib_dir().to_path_buf(),
                 check_ctx.local_cache(),
                 self.ot.clone(),
+                self.daemon_id.clone(),
             ),
         ) {
             Err(e) => return EnvChannel::write_error(e.into(), stream),
@@ -263,6 +265,7 @@ impl EnvChannel<'_> {
                 graph: &graph,
                 exec_base: output_base,
                 ot: self.ot.clone(),
+                daemon_id: self.daemon_id.clone(),
             })
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -640,6 +643,9 @@ impl<'a> Env<'a> {
                 },
             ))
             .with_env_vars(pkg_env_vars.into_iter());
+        if let Some(id) = ctx.daemon_id() {
+            config = config.with_daemon_id(id);
+        }
         if let Some(hn) = &args.hostname {
             config = config.with_hostname(hn);
         }
@@ -647,6 +653,7 @@ impl<'a> Env<'a> {
             config = config.with_username(username);
         }
 
+        let daemon_id = ctx.daemon_id();
         let mut sandbox = config
             .build(
                 base_dir,
@@ -657,6 +664,7 @@ impl<'a> Env<'a> {
                     state_dir: args.state_base_dir.clone(),
                     has_packages: args.transitives.keys().cloned().collect(),
                     ot: args.ot.clone(),
+                    daemon_id,
                 },
             )
             .await?;
@@ -882,6 +890,7 @@ mod tests {
             state_dir: state_dir.path().to_path_buf(),
             has_packages: HashSet::new(),
             ot: None,
+            daemon_id: None,
         };
 
         let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -908,6 +917,7 @@ mod tests {
             state_dir: state_dir.path().to_path_buf(),
             has_packages: HashSet::new(),
             ot: None,
+            daemon_id: None,
         };
 
         let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -934,6 +944,7 @@ mod tests {
             state_dir: state_dir.path().to_path_buf(),
             has_packages: HashSet::new(),
             ot: None,
+            daemon_id: None,
         };
 
         let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -961,6 +972,7 @@ mod tests {
             state_dir: state_dir.path().to_path_buf(),
             has_packages: HashSet::new(),
             ot: None,
+            daemon_id: None,
         };
 
         assert!(!std::fs::exists(rootfs.path().join("bin")).unwrap());

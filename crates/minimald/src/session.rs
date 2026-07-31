@@ -1424,6 +1424,7 @@ impl Session {
             // task-exec path (via `MakeContext`) also feeds it, so task builds
             // surface on the same tracker even though only a mint renders it.
             .with_operation_tracker(self.tracker.clone())
+            .with_daemon_id(self.daemon_ctx.daemon_id().unwrap()) // always set under minimald
             .build()
             .map_err(|e| mctx::Error::from(e).to_string())
     }

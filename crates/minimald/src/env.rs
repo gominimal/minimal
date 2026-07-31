@@ -357,6 +357,7 @@ impl Env {
             .with_own_ip_tap(args.own_ip_tap)
             .with_own_ip_dns(args.own_ip_dns)
             .with_hostname(args.name.clone())
+            .with_daemon_id(ctx.daemon_id().unwrap()) // Always set under minimald
             .with_username(args.username.unwrap_or_else(|| "user".to_string()));
 
         // Wire up the channel actor and build the sandbox around the bridge.
@@ -825,6 +826,7 @@ impl SessionChannel {
                 graph: &graph,
                 exec_base: output_base,
                 ot: self.ot.clone(),
+                daemon_id: build_ctx.daemon_id(),
             })
             .await
             .map_err(std::io::Error::other)?;
