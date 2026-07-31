@@ -215,6 +215,7 @@ jobs:
               run: |
                   set -euo pipefail
                   bin=target/x86_64-unknown-linux-musl/release/minvmd-linux-amd64
+                  syms="$RUNNER_TEMP/minvmd-amd64.strings"
                   # Both spellings are static. x86_64-musl emits a static PIE,
                   # which file(1) calls "static-pie linked"; aarch64-musl emits a
                   # plain static executable, "statically linked". Neither has a
@@ -223,7 +224,15 @@ jobs:
                     || { echo "::error::$bin is not statically linked"; file "$bin"; exit 1; }
                   # The KVM backend's bindgen types are only present when libkrun
                   # is really linked in; the stub carries none of them.
-                  strings -a "$bin" | grep -q 'kvm_run' \
+                  #
+                  # Dump once, then assert against the FILE, never against a live
+                  # pipe: `grep -q` exits at its first match and SIGPIPEs the
+                  # `strings -a` walking a ~10 MB binary, and under `pipefail`
+                  # that producer's death fails the step — so a PASSING check
+                  # reads as a stub build and kills a good release. Same reason
+                  # scripts/build-libkrun-linux.sh materializes its nm output.
+                  strings -a "$bin" > "$syms"
+                  grep -q 'kvm_run' "$syms" \
                     || { echo "::error::$bin does not contain libkrun's KVM backend (stub build?)"; exit 1; }
                   echo "minvmd OK: static, libkrun linked ($(stat -c%s "$bin") bytes)"
             - name: Upload binary (minvmd)
@@ -330,10 +339,14 @@ jobs:
               run: |
                   set -euo pipefail
                   bin=target/aarch64-unknown-linux-musl/release/minvmd-linux-arm64
-                  # See the amd64 job for why both file(1) spellings are accepted.
+                  syms="$RUNNER_TEMP/minvmd-arm64.strings"
+                  # See the amd64 job for why both file(1) spellings are accepted,
+                  # and why the symbol check runs against a dumped file rather
+                  # than a live `strings | grep -q` pipe under pipefail.
                   file "$bin" | grep -qE 'statically linked|static-pie linked' \
                     || { echo "::error::$bin is not statically linked"; file "$bin"; exit 1; }
-                  strings -a "$bin" | grep -q 'kvm_run' \
+                  strings -a "$bin" > "$syms"
+                  grep -q 'kvm_run' "$syms" \
                     || { echo "::error::$bin does not contain libkrun's KVM backend (stub build?)"; exit 1; }
                   echo "minvmd OK: static, libkrun linked ($(stat -c%s "$bin") bytes)"
             - name: Upload binary (minvmd)

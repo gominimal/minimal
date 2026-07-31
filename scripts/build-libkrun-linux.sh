@@ -217,8 +217,12 @@ echo "merging archive members into one relocatable object"
 # Keep exactly the public C API global; localize everything else. Derived from
 # the object rather than hardcoded, so a pin that adds or removes an entry
 # point needs no edit here.
+# `{ grep || true; }`: grep exits 1 when nothing matches, and under `pipefail`
+# that aborts the script right here — so the explanatory error below would never
+# print and a symbol-free merge would fail with no diagnostic at all. Tolerate
+# the no-match status and let the count check report it.
 "${BU_PREFIX}nm" -g --defined-only "$WORK/libkrun-merged.o" \
-  | awk '{print $NF}' | grep '^krun_' | sort -u > "$WORK/keep.syms"
+  | awk '{print $NF}' | { grep '^krun_' || true; } | sort -u > "$WORK/keep.syms"
 count="$(wc -l < "$WORK/keep.syms" | tr -d ' ')"
 [ "$count" -gt 0 ] || { echo "::error::no krun_* symbols found in the merged object" >&2; exit 1; }
 echo "keeping $count krun_* symbols global, localizing the rest"
@@ -250,6 +254,27 @@ leaked="$(awk '$2 ~ /^[A-TV-Z]$/ {print $NF}' "$WORK/final.syms" | grep -v '^kru
 if [ -n "$leaked" ]; then
   echo "::error::symbols outside the krun_* API are still global after localization:" >&2
   echo "$leaked" >&2
+  exit 1
+fi
+
+# The other half of the isolation, and the one that is easy to lose silently:
+# nothing Rust may be left UNDEFINED either. libkrun.a carries its own copy of
+# libstd; if any Rust symbol is undefined here, the final link resolves it
+# against MINVMD's libstd instead, coalescing two independent Rust runtimes
+# into one binary — the fragility this pass is meant to rule out. A clean
+# archive imports only C: musl libc plus the `_Unwind_*` ABI, which is shared
+# on purpose (one unwinder per process is correct; two would be the bug).
+#
+# This is asserted rather than assumed because the failure is invisible at
+# build time and only surfaces at VM boot, and because `ld -r` +
+# `objcopy --keep-global-symbols` is binutils behaviour, not a stability
+# contract — a toolchain upgrade is the plausible way it regresses.
+"${BU_PREFIX}nm" -u "$WORK/libkrun.a" > "$WORK/undef.syms"
+rust_undef="$(awk '{print $NF}' "$WORK/undef.syms" \
+  | { grep -E '^(_ZN|_R[a-zA-Z0-9]|__rust|rust_eh_personality)' || true; } | head -5)"
+if [ -n "$rust_undef" ]; then
+  echo "::error::libkrun.a leaves Rust symbols undefined, so its libstd would coalesce with minvmd's:" >&2
+  echo "$rust_undef" >&2
   exit 1
 fi
 

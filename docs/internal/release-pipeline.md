@@ -40,8 +40,9 @@ override for green-but-unreported commits.
   so it ships as a single self-contained binary with no `lib/` sibling, no
   RUNPATH, and no glibc floor — and both arches ship it, where only amd64 had
   a (dynamic) `minvmd` before. Each job asserts the result is `statically
-  linked` and really contains the KVM backend, since a stub `minvmd` builds
-  and links just as cleanly.
+  linked` or `static-pie linked` (amd64 musl emits a static PIE, which
+  `file(1)` names differently) and really contains the KVM backend, since a
+  stub `minvmd` builds and links just as cleanly.
 - `build-release-macos-arm64` (self-hosted Apple Silicon, gated on the
   `RUN_MACOS_CI` kill-switch): builds `minvmd` (libkrun /
   Hypervisor.framework) and `min`, rewrites minvmd's libkrun linkage to
