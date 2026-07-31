@@ -188,8 +188,9 @@ fn resolve_loadouts_dir(args: &LoadoutListArgs, global: &GlobalArgs) -> PathBuf 
 }
 
 /// List loadouts discovered in the loadouts directory. One row per
-/// `.toml` file; malformed entries are shown with their parse error
-/// so an operator can fix them in place. Loadouts named in
+/// parseable `.toml` file; files that fail to parse are reported on
+/// stderr and make the command exit non-zero, leaving the table of
+/// valid loadouts intact. Loadouts named in
 /// `[loadouts].default_loadouts` in the client config are marked
 /// with a leading `*`.
 pub fn cmd_loadout_list(args: LoadoutListArgs, global: &GlobalArgs) -> Result<(), anyhow::Error> {
@@ -240,10 +241,24 @@ pub fn cmd_loadout_list(args: LoadoutListArgs, global: &GlobalArgs) -> Result<()
     // row unless the user has shadowed it with their own `default.toml`.
     let show_builtin = !present.contains(BUILTIN_DEFAULT_NAME);
 
-    let mut rows: Vec<LoadoutRow> = entries
-        .iter()
-        .map(|entry| LoadoutRow::from_entry(entry, &defaults))
-        .collect();
+    // Partition discovered entries: parsed loadouts become table rows,
+    // while parse failures go to stderr and force a non-zero exit so a
+    // script running `loadout list` can detect a broken file. Keeping
+    // failures out of the table also preserves the layout their
+    // multi-line parse errors would otherwise corrupt.
+    let mut rows: Vec<LoadoutRow> = Vec::with_capacity(entries.len());
+    let mut failures = 0usize;
+    for entry in &entries {
+        match &entry.loadout {
+            Ok(loadout) => rows.push(LoadoutRow::from_entry(entry, loadout, &defaults)),
+            Err(e) => {
+                // `LoadError`'s Display already names the file, so the
+                // path is not repeated here.
+                eprintln!("{e}");
+                failures += 1;
+            }
+        }
+    }
     if show_builtin {
         rows.push(LoadoutRow::builtin_default());
     }
@@ -275,6 +290,12 @@ pub fn cmd_loadout_list(args: LoadoutListArgs, global: &GlobalArgs) -> Result<()
         println!();
         println!("* default (from `[loadouts].default_loadouts`)");
     }
+    if failures > 0 {
+        bail!(
+            "{failures} loadout file{} failed to parse",
+            if failures == 1 { "" } else { "s" }
+        );
+    }
     Ok(())
 }
 
@@ -290,11 +311,12 @@ struct LoadoutRow {
 }
 
 impl LoadoutRow {
-    /// Build a row from a discovered [`LoadoutEntry`]. Failures
-    /// collapse into a single "(error: …)" cell in the counts
-    /// column so the layout stays uniform across the whole listing.
+    /// Build a row from a successfully parsed loadout. Parse failures
+    /// never reach here — the caller reports them on stderr and keeps
+    /// them out of the table (see [`cmd_loadout_list`]).
     fn from_entry(
         entry: &sessions::client::disk::LoadoutEntry,
+        loadout: &sessions::core::loadout::Loadout,
         defaults: &std::collections::HashSet<String>,
     ) -> Self {
         let marker = if defaults.contains(&entry.file_stem) {
@@ -302,28 +324,16 @@ impl LoadoutRow {
         } else {
             " "
         };
-        match &entry.loadout {
-            Ok(l) => Self {
-                marker,
-                name: entry.file_stem.clone(),
-                desc: l.description().unwrap_or("").to_string(),
-                counts: format!(
-                    "{} pkg / {} var / {} patch",
-                    l.packages().len(),
-                    l.vars().len() + l.vars_lenient().len(),
-                    l.patches().iter().count(),
-                ),
-            },
-            Err(e) => Self {
-                marker,
-                name: entry.file_stem.clone(),
-                desc: String::new(),
-                // Uses `entry.path` for a full-path prefix so a user
-                // running with a `--dir` override (or with symlinks
-                // in the tree) can trace which physical file is
-                // broken even if two entries share a `file_stem`.
-                counts: format!("(error at {}: {e})", entry.path.display()),
-            },
+        Self {
+            marker,
+            name: entry.file_stem.clone(),
+            desc: loadout.description().unwrap_or("").to_string(),
+            counts: format!(
+                "{} pkg / {} var / {} patch",
+                loadout.packages().len(),
+                loadout.vars().len() + loadout.vars_lenient().len(),
+                loadout.patches().iter().count(),
+            ),
         }
     }
 
@@ -525,5 +535,29 @@ on_activate = { type = "inline", value = "echo activated" }
         assert_eq!(row.name, format!("{BUILTIN_DEFAULT_NAME} (built-in)"));
         assert_eq!(row.marker, " ");
         assert!(row.counts.starts_with("0 pkg"), "got: {}", row.counts);
+    }
+
+    /// A malformed loadout file makes `cmd_loadout_list` exit non-zero
+    /// instead of silently returning `Ok`, so a script can detect the
+    /// broken file. The parse error is surfaced on stderr, not folded
+    /// into the table.
+    #[test]
+    fn cmd_loadout_list_errors_on_malformed_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loadouts = tmp.path().join("loadouts");
+        std::fs::create_dir_all(&loadouts).unwrap();
+        // Valid TOML but missing the required `name` field → parse failure.
+        std::fs::write(loadouts.join("broken.toml"), "x = 1\n").unwrap();
+        let args = LoadoutListArgs {
+            dir: Some(loadouts),
+        };
+        let global = GlobalArgs {
+            repo_dir: None,
+            minimal_dir: None,
+            config_dir: Some(tmp.path().to_path_buf()),
+            provider: None,
+            no_input: false,
+        };
+        assert!(cmd_loadout_list(args, &global).is_err());
     }
 }
