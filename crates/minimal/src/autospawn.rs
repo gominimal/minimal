@@ -10,6 +10,8 @@ use std::path::Path;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::sync::mpsc;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::thread;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::{Duration, Instant};
@@ -42,6 +44,28 @@ fn spawn_timeout_secs() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&secs| secs > 0)
         .unwrap_or(DEFAULT_SPAWN_TIMEOUT_SECS)
+}
+
+/// How long the autospawn wait may run before the CLI narrates it with a
+/// spinner. A warm boot connects well under this and stays silent; only a cold
+/// VM boot (up to ~1 min) crosses the threshold and shows the narration line.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const BOOT_SPINNER_DELAY: Duration = Duration::from_secs(2);
+
+/// The narration shown once the autospawn wait crosses [`BOOT_SPINNER_DELAY`].
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const BOOT_NARRATION: &str = "Starting the Minimal VM (first run only, ~1 min)…";
+
+/// The actionable error for a failed or timed-out `minvmd run --detach`: it
+/// names the daemon, tells the user to retry, and points at `min bug` for a
+/// diagnostic bundle. `stderr` is minvmd's own captured failure output.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn boot_failure_error(stderr: &str) -> io::Error {
+    io::Error::other(format!(
+        "the Minimal VM (minvmd) failed to start: {}. Re-run your command to retry; \
+         if it keeps failing, run `min bug` to collect a diagnostic bundle.",
+        stderr.trim()
+    ))
 }
 
 /// Poll interval while waiting for a shutting-down minvmd to reach a terminal
@@ -136,30 +160,55 @@ pub fn ensure_minvmd_running(minimal_dir: Option<&Path>) -> io::Result<()> {
 
     // Not running; spawn minvmd run --detach with timeout (R4.5).
     let timeout_secs = spawn_timeout_secs();
-    tracing::info!("spawning minvmd run --detach with timeout {timeout_secs}");
+    tracing::debug!("spawning minvmd run --detach with timeout {timeout_secs}");
     let mut cmd = Command::new("minvmd");
     // Forward the state-dir override so the daemon binds the socket where
     // this client will look for it.
     if let Some(dir) = minimal_dir {
         cmd.arg("--minimal-state-dir").arg(dir);
     }
-    let output = cmd
-        .arg("run")
+    cmd.arg("run")
         .arg("--detach")
         .arg("--timeout")
-        .arg(timeout_secs.to_string())
-        .output()
-        .map_err(|e| io::Error::new(e.kind(), format!("failed to spawn minvmd: {}", e)))?;
+        .arg(timeout_secs.to_string());
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::other(format!(
-            "minvmd run --detach failed: {}",
-            stderr
-        )));
+    // `minvmd run --detach` blocks until the VM is serving (or times out): a
+    // cold first boot can sit here for up to ~1 min. Run it on a thread (so
+    // `.output()` keeps draining its pipes) and narrate the wait with a spinner
+    // once it crosses BOOT_SPINNER_DELAY — a warm boot finishes first and stays
+    // quiet, and the bar is TTY-gated by the shared MultiProgress.
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(cmd.output());
+    });
+    let spinner_at = Instant::now() + BOOT_SPINNER_DELAY;
+    let mut bar = None;
+    let output = loop {
+        match rx.recv_timeout(Duration::from_millis(STOPPING_POLL_MS)) {
+            Ok(result) => break result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if bar.is_none() && Instant::now() >= spinner_at {
+                    bar = Some(crate::client::add_wait_spinner_bar(BOOT_NARRATION));
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(io::Error::other("minvmd spawn thread ended unexpectedly"));
+            }
+        }
+    };
+    // Clear the spinner before the outcome (Ok connect, or the error below)
+    // surfaces, so the narration line does not linger above it.
+    if let Some(bar) = bar {
+        bar.finish_and_clear();
     }
 
-    tracing::info!("minvmd spawned successfully");
+    let output =
+        output.map_err(|e| io::Error::new(e.kind(), format!("failed to spawn minvmd: {e}")))?;
+    if !output.status.success() {
+        return Err(boot_failure_error(&String::from_utf8_lossy(&output.stderr)));
+    }
+
+    tracing::debug!("minvmd spawned successfully");
     Ok(())
 }
 
@@ -369,7 +418,9 @@ fn ensure_minimald_running(socket_path: &Path, minimal_dir: Option<&Path>) -> io
 #[cfg(test)]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod tests {
-    use super::{Decision, classify, is_daemon_running, wait_for_minvmd_stopped};
+    use super::{
+        Decision, boot_failure_error, classify, is_daemon_running, wait_for_minvmd_stopped,
+    };
     use minvmd::lifecycle::Lifecycle;
     use minvmd::state::{State, StateDir};
 
@@ -398,6 +449,19 @@ mod tests {
     #[test]
     fn stopping_waits_for_terminal_state() {
         assert_eq!(classify(Lifecycle::Stopping), Decision::WaitForStopping);
+    }
+
+    /// A failed/timed-out boot must surface an actionable error: it names the
+    /// daemon, tells the user to retry, and points at `min bug`.
+    #[test]
+    fn boot_failure_error_is_actionable() {
+        let msg = boot_failure_error("timed out after 75s").to_string();
+        assert!(msg.contains("minvmd"), "names the daemon: {msg}");
+        assert!(
+            msg.contains("min bug"),
+            "points at the diagnostic bundle: {msg}"
+        );
+        assert!(msg.contains("Re-run"), "suggests retrying: {msg}");
     }
 
     /// The state dir a `--minimal-dir` override resolves to.

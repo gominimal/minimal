@@ -11,7 +11,9 @@ use std::time::Duration;
 use anyhow::Context as _;
 use minimald_rpc::OneshotSshRpc;
 
-/// Add a spinner-style progress bar to the process-global `MultiProgress`.
+/// Build a spinner bar on the process-global `MultiProgress` with the house
+/// animation and a caller-chosen `template`.
+///
 /// Bars must be inserted before any style/message/tick configuration —
 /// otherwise `ProgressBar::hidden`'s defaults would draw directly to stderr
 /// and MP's coordinated redraws couldn't reach the stale lines
@@ -25,7 +27,7 @@ use minimald_rpc::OneshotSshRpc;
 /// entry in `tick_strings` is indicatif's "finished" state — kept
 /// blank so `bar.finish()` / `finish_and_clear` leave no trailing
 /// glyphs behind.
-pub(crate) fn add_spinner_bar(msg: &'static str) -> indicatif::ProgressBar {
+fn spinner_bar(msg: &'static str, template: &str) -> indicatif::ProgressBar {
     const FRAMES: &[&str] = &[
         // build
         "     ",
@@ -52,13 +54,24 @@ pub(crate) fn add_spinner_bar(msg: &'static str) -> indicatif::ProgressBar {
     ];
     let bar = ot::global_progress().add(indicatif::ProgressBar::hidden());
     bar.set_style(
-        indicatif::ProgressStyle::with_template("  {spinner} {msg} — {bytes} ({bytes_per_sec})")
+        indicatif::ProgressStyle::with_template(template)
             .expect("valid template")
             .tick_strings(FRAMES),
     );
     bar.set_message(msg);
     bar.enable_steady_tick(Duration::from_millis(100));
     bar
+}
+
+/// Spinner bar for a byte-counted upload: `  {spinner} {msg} — {bytes} …`.
+pub(crate) fn add_spinner_bar(msg: &'static str) -> indicatif::ProgressBar {
+    spinner_bar(msg, "  {spinner} {msg} — {bytes} ({bytes_per_sec})")
+}
+
+/// Spinner bar for a plain narrated wait with no counter, rendering
+/// `  {spinner} {msg}` — the daemon autospawn wait uses it while the VM boots.
+pub(crate) fn add_wait_spinner_bar(msg: &'static str) -> indicatif::ProgressBar {
+    spinner_bar(msg, "  {spinner} {msg}")
 }
 
 /// Add a file-count progress bar to the process-global `MultiProgress`.
