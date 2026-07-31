@@ -31,7 +31,7 @@ use = "rust"
 state_key = "dev"
 
 [session] # min session attach
-packages = ["base", "vim", "git"]
+packages = ["base", "vim"]
 ```
 
 - `[upstream]` pins the software supply chain: the package registry and the exact commit it is read from.
