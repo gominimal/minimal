@@ -16,6 +16,26 @@ use crate::error::Error;
 
 /// Environment variable naming the GitHub App client id.
 pub const ENV_CLIENT_ID: &str = "MINIMALD_GITHUB_CLIENT_ID";
+
+/// Build-time environment variable carrying the client id shipped with a
+/// release build. Read by `build.rs` only to register a rebuild trigger; the
+/// value itself is baked in by [`BUILTIN_CLIENT_ID`] below.
+pub const CLIENT_ID_BUILD_ENV: &str = "MINIMAL_GITHUB_CLIENT_ID";
+
+/// The GitHub App client id baked in when this crate was compiled.
+///
+/// A GitHub App client id is **public** — the device flow is a public-client
+/// flow with no client secret (see [`crate::device_flow`]), and the id is
+/// visible on the App's own page — so shipping it inside the binary discloses
+/// nothing. This is what lets an installed `min` reach GitHub with no
+/// configuration step: the daemon has no config file, is autospawned rather
+/// than run from a service unit, and on macOS runs inside a microVM whose init
+/// starts with an empty environment, so a runtime variable could not reach it.
+///
+/// `None` in any build that did not set [`CLIENT_ID_BUILD_ENV`] (every dev
+/// build, by default), which leaves the daemon unconfigured and failing closed.
+const BUILTIN_CLIENT_ID: Option<&str> = option_env!("MINIMAL_GITHUB_CLIENT_ID");
+
 /// Environment variable overriding the OAuth/device-flow base URL.
 pub const ENV_OAUTH_BASE: &str = "MINIMALD_GITHUB_OAUTH_BASE_URL";
 /// Environment variable overriding the REST API base URL.
@@ -54,7 +74,23 @@ impl GithubConfig {
     /// Core constructor parameterised over an environment lookup, so tests can
     /// exercise override precedence without touching the process environment.
     fn from_source(get: impl Fn(&str) -> Option<String>) -> Result<Self, Error> {
-        let client_id = get(ENV_CLIENT_ID).filter(|v| !v.trim().is_empty());
+        Self::from_parts(get, builtin_client_id())
+    }
+
+    /// [`from_source`](Self::from_source) with the baked-in client id supplied
+    /// rather than read from the build. Taking `builtin` as an argument keeps
+    /// the tests hermetic: they assert the resolution rules themselves, so they
+    /// hold identically in a dev build (no id baked in) and a release build
+    /// (one baked in) instead of silently depending on how the tree was built.
+    fn from_parts(
+        get: impl Fn(&str) -> Option<String>,
+        builtin: Option<String>,
+    ) -> Result<Self, Error> {
+        // Runtime override first (the mock server, GHES, anyone running their
+        // own App), then the id baked in at build time.
+        let client_id = get(ENV_CLIENT_ID)
+            .filter(|v| !v.trim().is_empty())
+            .or(builtin);
         Ok(Self {
             client_id,
             oauth_base: resolve_url(ENV_OAUTH_BASE, DEFAULT_OAUTH_BASE, &get)?,
@@ -95,6 +131,17 @@ impl GithubConfig {
     }
 }
 
+/// The baked-in client id, treating an empty or whitespace-only build value as
+/// absent so `MINIMAL_GITHUB_CLIENT_ID=` (set but empty, the shape a CI
+/// expression yields when its variable is unset) does not present itself as a
+/// configured App.
+fn builtin_client_id() -> Option<String> {
+    BUILTIN_CLIENT_ID
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
 /// Resolves a base URL from an override env var, falling back to a default that
 /// is a known-good constant.
 fn resolve_url(
@@ -127,7 +174,7 @@ mod tests {
 
     #[test]
     fn defaults_when_unset() {
-        let cfg = GithubConfig::from_source(source(&[])).unwrap();
+        let cfg = GithubConfig::from_parts(source(&[]), None).unwrap();
         assert_eq!(cfg.oauth_base().as_str(), "https://github.com/");
         assert_eq!(cfg.api_base().as_str(), "https://api.github.com/");
         assert_eq!(cfg.git_base().as_str(), "https://github.com/");
@@ -136,11 +183,14 @@ mod tests {
 
     #[test]
     fn overrides_take_precedence() {
-        let cfg = GithubConfig::from_source(source(&[
-            (ENV_CLIENT_ID, "Iv1.abc123"),
-            (ENV_API_BASE, "http://localhost:8080/api"),
-            (ENV_OAUTH_BASE, "http://localhost:8080/oauth"),
-        ]))
+        let cfg = GithubConfig::from_parts(
+            source(&[
+                (ENV_CLIENT_ID, "Iv1.abc123"),
+                (ENV_API_BASE, "http://localhost:8080/api"),
+                (ENV_OAUTH_BASE, "http://localhost:8080/oauth"),
+            ]),
+            None,
+        )
         .unwrap();
         assert_eq!(cfg.client_id().unwrap(), "Iv1.abc123");
         assert_eq!(cfg.api_base().as_str(), "http://localhost:8080/api");
@@ -151,19 +201,75 @@ mod tests {
 
     #[test]
     fn missing_client_id_is_not_configured_error() {
-        let cfg = GithubConfig::from_source(source(&[])).unwrap();
+        let cfg = GithubConfig::from_parts(source(&[]), None).unwrap();
         assert!(matches!(cfg.client_id(), Err(Error::NotConfigured)));
+    }
+
+    /// A shipped build carries its App id with no environment at all — the
+    /// property that makes `min github login` work for an installed user, who
+    /// has no config file, no service unit, and (on macOS) a daemon whose init
+    /// starts with an empty environment.
+    #[test]
+    fn a_baked_in_client_id_configures_an_otherwise_bare_environment() {
+        let cfg =
+            GithubConfig::from_parts(source(&[]), Some("Iv23li.shipped".to_string())).unwrap();
+        assert!(cfg.is_configured());
+        assert_eq!(cfg.client_id().unwrap(), "Iv23li.shipped");
+    }
+
+    /// The runtime variable still wins, so the mock server, GHES, and a
+    /// self-hosted App keep working against a build that ships an id.
+    #[test]
+    fn the_env_override_beats_a_baked_in_client_id() {
+        let cfg = GithubConfig::from_parts(
+            source(&[(ENV_CLIENT_ID, "Iv1.from-env")]),
+            Some("Iv23li.shipped".to_string()),
+        )
+        .unwrap();
+        assert_eq!(cfg.client_id().unwrap(), "Iv1.from-env");
+    }
+
+    /// An empty runtime value falls through to the baked-in id rather than
+    /// blanking it: `MINIMALD_GITHUB_CLIENT_ID=` is an unset-shaped value, not
+    /// a request to be unconfigured.
+    #[test]
+    fn an_empty_env_value_falls_through_to_the_baked_in_id() {
+        let cfg = GithubConfig::from_parts(
+            source(&[(ENV_CLIENT_ID, "   ")]),
+            Some("Iv23li.shipped".to_string()),
+        )
+        .unwrap();
+        assert_eq!(cfg.client_id().unwrap(), "Iv23li.shipped");
+    }
+
+    /// A build that set the variable to an empty string — the shape a CI
+    /// expression yields when its repo variable is unset — must read as
+    /// unconfigured, not as an App whose id is "".
+    #[test]
+    fn an_empty_baked_in_value_is_not_configured() {
+        let cfg = GithubConfig::from_parts(source(&[]), builtin_from("")).unwrap();
+        assert!(!cfg.is_configured());
+        let cfg = GithubConfig::from_parts(source(&[]), builtin_from("  ")).unwrap();
+        assert!(!cfg.is_configured());
+    }
+
+    /// Mirrors [`builtin_client_id`]'s emptiness filter for a supplied value,
+    /// so the test above exercises the same rule the build path applies.
+    fn builtin_from(raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
     }
 
     #[test]
     fn blank_client_id_is_treated_as_unset() {
-        let cfg = GithubConfig::from_source(source(&[(ENV_CLIENT_ID, "   ")])).unwrap();
+        let cfg = GithubConfig::from_parts(source(&[(ENV_CLIENT_ID, "   ")]), None).unwrap();
         assert!(matches!(cfg.client_id(), Err(Error::NotConfigured)));
     }
 
     #[test]
     fn invalid_override_url_is_rejected() {
-        let err = GithubConfig::from_source(source(&[(ENV_API_BASE, "not a url")])).unwrap_err();
+        let err =
+            GithubConfig::from_parts(source(&[(ENV_API_BASE, "not a url")]), None).unwrap_err();
         assert!(matches!(err, Error::InvalidConfig { .. }));
     }
 }

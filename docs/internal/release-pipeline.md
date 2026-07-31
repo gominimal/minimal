@@ -30,6 +30,27 @@ push.
 success on the exact commit being released. `skip_ci_verify` is an admin
 override for green-but-unreported commits.
 
+**GitHub App identity (`MINIMAL_GITHUB_CLIENT_ID`).** The workflow-level `env`
+block forwards the repository variable of the same name into every build job,
+where [`crates/github/build.rs`](../../crates/github/build.rs) registers it as
+a rebuild trigger and `crates/github/src/config.rs` bakes it in via
+`option_env!`. This is the only way a shipped `min` reaches GitHub: there is no
+daemon config file, `minimald` is autospawned rather than run from a service
+unit, and inside the macOS microVM its init starts with an empty environment,
+so no runtime variable could reach it.
+
+It is a repository **variable, not a secret** — a GitHub App client id is
+public, because the device flow is a public-client flow with no client secret.
+Do not move it to `secrets`; masking it only makes build logs harder to read.
+
+An unset variable resolves to the empty string, which the crate treats as "no
+App configured": those binaries fail closed with `Error::NotConfigured` and
+`min github login` reports the unset variable by name. So a release cut before
+the variable is set still builds and ships — GitHub support is simply inert
+until the next cut. `MINIMALD_GITHUB_CLIENT_ID` still overrides the baked-in id
+at runtime, for GHES, the `github-mock` server, and anyone running their own
+App.
+
 **Build jobs.**
 
 - `build-release-linux-{amd64,arm64}`: static musl builds of `mip`, `min`
