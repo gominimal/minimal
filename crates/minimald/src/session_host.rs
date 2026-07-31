@@ -1061,12 +1061,12 @@ const BASELINE_PROMPT_COMMAND: &str = r#"eval "$MINIMAL_MOTD"; unset PROMPT_COMM
 const SESSION_WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_DEFAULT_WD);
 
 /// Payload half of the launcher-baseline orientation banner: a STATIC
-/// template. The daemon knows the session name but not the loadout list,
-/// so the template interpolates `$MINIMAL_SESSION_NAME` (seeded by
-/// [`session_baseline_env`]) and `$MINIMAL_LOADOUTS` (contributed by the
-/// client through the composition's var lane) in-shell at print time,
-/// where both exist; each carries a `${VAR:-fallback}` so a missing var
-/// still renders sanely. Whether the workspace holds a blueprint is a
+/// template. The dynamic parts resolve in-shell at print time: the
+/// template interpolates `$MINIMAL_SESSION_NAME` and `$MINIMAL_LOADOUTS`
+/// (both seeded by [`session_baseline_env`] — the loadout list arrives
+/// from the client as the composition's first-class orientation field,
+/// never as a user var); each carries a `${VAR:-fallback}` so a missing
+/// var still renders sanely. Whether the workspace holds a blueprint is a
 /// SESSION-filesystem fact, so it is not interpolated from anywhere — the
 /// template tests [`SESSION_WORKSPACE_ROOT`] directly (both mfile
 /// layouts, `minimal.toml` and `.minimal/minimal.toml`) when it prints,
@@ -1082,21 +1082,38 @@ const BASELINE_MOTD: &str = constcat::concat!(
 );
 
 /// The launcher-baseline environment seeded beneath every other layer of
-/// [`layer_session_env`]: the session's name as `MINIMAL_SESSION_NAME`,
-/// plus the once-only orientation banner pair. Sitting on the lowest
-/// layer means any composed `PROMPT_COMMAND` — a user loadout's, or the
-/// built-in default's — overrides the baseline banner cleanly, while
-/// `MINIMAL_SESSION_NAME` stays available for that override to
-/// interpolate.
-fn session_baseline_env(session_name: &str) -> Vec<(String, String)> {
-    vec![
+/// [`layer_session_env`]: the session's identity (`MINIMAL_SESSION_NAME`,
+/// plus `MINIMAL_LOADOUTS` when the composition's first-class orientation
+/// field carries a display list) and the once-only orientation banner
+/// pair. ALL orientation env is seeded here, daemon-side, from typed
+/// data — none of it rides the user var lane, so user vars and policy
+/// can never collide with it. Sitting on the lowest layer means any
+/// composed `PROMPT_COMMAND` — a user loadout's, or the built-in
+/// default's — overrides the baseline banner cleanly, while the identity
+/// vars stay available for that override to interpolate.
+///
+/// `loadouts_display` is `None` when the composition carries no display
+/// list (a client that predates the orientation field, or no
+/// composition at all): the var is then left unset so each template's
+/// own `${MINIMAL_LOADOUTS:-…}` fallback renders — the baseline banner
+/// falls back to `none`, the built-in default loadout's MOTD to
+/// `default (built-in)`, each correct for the context it prints in.
+fn session_baseline_env(
+    session_name: &str,
+    loadouts_display: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut env = vec![
         ("MINIMAL_SESSION_NAME".to_string(), session_name.to_string()),
         (
             "PROMPT_COMMAND".to_string(),
             BASELINE_PROMPT_COMMAND.to_string(),
         ),
         ("MINIMAL_MOTD".to_string(), BASELINE_MOTD.to_string()),
-    ]
+    ];
+    if let Some(display) = loadouts_display {
+        env.push(("MINIMAL_LOADOUTS".to_string(), display.to_string()));
+    }
+    env
 }
 
 /// Layers a session shell's environment by precedence, lowest first: the
@@ -1337,8 +1354,16 @@ impl SessionLauncher for SandboxLauncher {
                     .collect()
             })
             .unwrap_or_default();
+        // The banner's loadout list arrives as the composition's
+        // first-class orientation field; empty means "unknown" (an old
+        // client) and seeds nothing — the template's `${…:-}` fallback
+        // renders instead.
+        let loadouts_display = composition
+            .as_ref()
+            .map(|c| c.orientation().loadouts_display.as_str())
+            .filter(|d| !d.is_empty());
         let env_vars = layer_session_env(
-            session_baseline_env(&name),
+            session_baseline_env(&name, loadouts_display),
             attach_env.inherited,
             composition_vars,
             attach_env.connection,
@@ -2074,7 +2099,7 @@ mod tests {
     #[test]
     fn layer_session_env_seeds_baseline_banner() {
         let env = layer_session_env(
-            session_baseline_env("api-server-4f2a"),
+            session_baseline_env("api-server-4f2a", Some("default (built-in)")),
             vec![],
             vec![],
             vec![],
@@ -2083,6 +2108,12 @@ mod tests {
         assert_eq!(
             env.get("MINIMAL_SESSION_NAME").map(String::as_str),
             Some("api-server-4f2a")
+        );
+        // The loadout list is seeded daemon-side from the composition's
+        // first-class orientation field — never from a user var.
+        assert_eq!(
+            env.get("MINIMAL_LOADOUTS").map(String::as_str),
+            Some("default (built-in)")
         );
         let pc = env.get("PROMPT_COMMAND").expect("baseline PROMPT_COMMAND");
         assert!(pc.contains(r#"eval "$MINIMAL_MOTD""#));
@@ -2106,14 +2137,24 @@ mod tests {
         assert!(motd.contains("min init"));
     }
 
+    /// A missing loadout display (old client / no composition) leaves
+    /// `MINIMAL_LOADOUTS` unset so the templates' own `${…:-}` fallbacks
+    /// render, each correct for its surface.
+    #[test]
+    fn baseline_env_omits_loadouts_var_when_display_unknown() {
+        let env = layer_session_env(session_baseline_env("box-1", None), vec![], vec![], vec![]);
+        assert!(!env.contains_key("MINIMAL_LOADOUTS"));
+        assert!(env.contains_key("MINIMAL_SESSION_NAME"));
+    }
+
     /// A composed `PROMPT_COMMAND` — a user loadout's, or the built-in
     /// default's — overrides the baseline banner trigger cleanly, while
-    /// the baseline identity var survives for that override to
+    /// the baseline identity vars survive for that override to
     /// interpolate.
     #[test]
     fn composed_prompt_command_overrides_baseline_banner() {
         let env = layer_session_env(
-            session_baseline_env("box-1"),
+            session_baseline_env("box-1", Some("helix, fish")),
             vec![],
             vec![(
                 "PROMPT_COMMAND".to_string(),
@@ -2129,6 +2170,10 @@ mod tests {
         assert_eq!(
             env.get("MINIMAL_SESSION_NAME").map(String::as_str),
             Some("box-1")
+        );
+        assert_eq!(
+            env.get("MINIMAL_LOADOUTS").map(String::as_str),
+            Some("helix, fish")
         );
     }
 

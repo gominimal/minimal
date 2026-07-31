@@ -30,6 +30,11 @@ pub struct UserComposer {
     ///
     /// [`Source::UserLoadout`]: crate::core::source::Source::UserLoadout
     seen_names: std::collections::HashSet<crate::core::loadout::LoadoutName>,
+    /// First-prompt orientation facts, set via
+    /// [`Self::with_orientation`] and emitted on the composed
+    /// [`WireContribution`] as a first-class field — control plane,
+    /// never a user var, so it bypasses the policy gate by design.
+    orientation: crate::core::compose::Orientation,
     env: StoredEnv,
 }
 
@@ -38,6 +43,7 @@ impl core::fmt::Debug for UserComposer {
         f.debug_struct("UserComposer")
             .field("contribution", &self.contribution)
             .field("seen_names", &self.seen_names)
+            .field("orientation", &self.orientation)
             .field("env", &"<closure>")
             .finish()
     }
@@ -62,6 +68,7 @@ impl UserComposer {
         Self {
             contribution: Contribution::new(),
             seen_names: std::collections::HashSet::new(),
+            orientation: crate::core::compose::Orientation::default(),
             env: default_env(),
         }
     }
@@ -71,6 +78,17 @@ impl UserComposer {
     #[must_use]
     pub fn with_env(mut self, env: StoredEnv) -> Self {
         self.env = env;
+        self
+    }
+
+    /// Set the first-prompt orientation facts to emit on the composed
+    /// contribution. The composer cannot derive these itself — the
+    /// display list depends on HOW the loadouts were selected (the
+    /// zero-config built-in fallback vs user files vs `--no-loadouts`),
+    /// which only the caller knows.
+    #[must_use]
+    pub fn with_orientation(mut self, orientation: crate::core::compose::Orientation) -> Self {
+        self.orientation = orientation;
         self
     }
 
@@ -146,17 +164,24 @@ impl UserComposer {
             options,
             home_fallback.as_deref(),
         )?;
-        Ok((composition_to_wire(composition), final_policy))
+        Ok((
+            composition_to_wire(composition, self.orientation),
+            final_policy,
+        ))
     }
 }
 
-fn composition_to_wire(composition: Composition) -> WireContribution {
+fn composition_to_wire(
+    composition: Composition,
+    orientation: crate::core::compose::Orientation,
+) -> WireContribution {
     let (vars, patches, packages, lifecycle_hooks) = composition.into_parts();
     WireContribution {
         vars: vars.into_iter().map(Into::into).collect(),
         patches: patches.into_iter().map(Into::into).collect(),
         lifecycle_hooks: lifecycle_hooks.into_iter().map(Into::into).collect(),
         requested_packages: packages.into_iter().map(Into::into).collect(),
+        orientation: orientation.into(),
     }
 }
 
@@ -194,6 +219,44 @@ mod tests {
             wire.vars[0].source,
             crate::wire::primitives::WireSource::UserLoadout { ref name } if name == "dev"
         ));
+    }
+
+    /// Orientation set on the composer is emitted on the wire form as
+    /// a first-class field — never as a var, so it bypasses the policy
+    /// gate and can't collide with user vars. An unset orientation
+    /// emits the default (empty display list = "unknown").
+    #[test]
+    fn orientation_rides_the_wire_as_a_field_not_a_var() {
+        let composer = UserComposer::new().with_orientation(crate::core::compose::Orientation {
+            loadouts_display: "default (built-in)".into(),
+        });
+        let (wire, _) = composer
+            .compose(UserPolicy::empty(), ComposeOptions::default())
+            .unwrap();
+        assert_eq!(wire.orientation.loadouts_display, "default (built-in)");
+        assert!(wire.vars.is_empty(), "orientation must not be a var");
+
+        let (wire, _) = UserComposer::new()
+            .compose(UserPolicy::empty(), ComposeOptions::default())
+            .unwrap();
+        assert!(wire.orientation.loadouts_display.is_empty());
+    }
+
+    /// The orientation field survives the daemon-side merge into the
+    /// final [`Composition`] — the launcher reads it from there.
+    ///
+    /// [`Composition`]: crate::core::compose::Composition
+    #[test]
+    fn orientation_survives_extend_from_wire() {
+        let composer = UserComposer::new().with_orientation(crate::core::compose::Orientation {
+            loadouts_display: "helix, fish".into(),
+        });
+        let (wire, _) = composer
+            .compose(UserPolicy::empty(), ComposeOptions::default())
+            .unwrap();
+        let mut composition = crate::core::compose::Composition::default();
+        composition.extend_from_wire(wire).unwrap();
+        assert_eq!(composition.orientation().loadouts_display, "helix, fish");
     }
 
     /// User policy's `ignore` rule still applies on the client-side

@@ -1566,15 +1566,13 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
         let names: Vec<&str> = active.loadouts.iter().map(|l| l.name().as_ref()).collect();
         eprintln!("Applying loadouts: {}", names.join(", "));
     }
-    // The orientation banner's loadout list, contributed as a synthetic
-    // composed var the daemon-seeded banner template (or a loadout's
-    // own MOTD) interpolates in-shell at print time. The banner's other
-    // dynamic clause — blueprint presence — is a session-filesystem
-    // fact, tested by the templates in-shell when they print.
-    let loadout_display = loadouts::loadout_display_list(&active);
-    let (mut contribution, user_policy) =
-        loadouts::compose_user_contribution(active.loadouts, user_policy, compose_options)?;
-    loadouts::push_orientation_var(&mut contribution, &loadout_display);
+    // The contribution carries the banner's loadout display list as a
+    // first-class orientation field (the daemon seeds MINIMAL_LOADOUTS
+    // from it in the launcher baseline). The banner's other dynamic
+    // clause — blueprint presence — is a session-filesystem fact,
+    // tested by the templates in-shell when they print.
+    let (contribution, user_policy) =
+        loadouts::compose_user_contribution(active, user_policy, compose_options)?;
 
     // `--sync` defaults to tarball; `sync_explicit` records whether the
     // user actually typed the flag, which distinguishes a deliberate

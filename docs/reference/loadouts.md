@@ -408,8 +408,13 @@ vars every session carries:
 
 | Var | Value |
 |-----|-------|
-| `MINIMAL_SESSION_NAME` | The session's name, seeded by the daemon's launcher baseline |
-| `MINIMAL_LOADOUTS` | Display list of the active loadouts, contributed by the client: comma-joined names, `default (built-in)` for the zero-config fallback, `none` with `--no-loadouts` |
+| `MINIMAL_SESSION_NAME` | The session's name |
+| `MINIMAL_LOADOUTS` | Display list of the active loadouts: comma-joined names, `default (built-in)` for the zero-config fallback, `none` with `--no-loadouts` |
+
+Both are seeded daemon-side in the launcher baseline; the loadout list
+travels from the client as a first-class field on the composition
+(control-plane data, never a session var), so user vars and user policy
+cannot collide with either.
 
 Because the trigger lives in the baseline layer, a loadout that sets its
 own `PROMPT_COMMAND` replaces the banner cleanly — and can interpolate

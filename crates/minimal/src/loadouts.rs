@@ -181,37 +181,6 @@ pub(crate) fn loadout_display_list(active: &ActiveLoadouts) -> String {
         .join(", ")
 }
 
-/// Source tag for the client's synthetic orientation var; shows up in
-/// provenance-labelled surfaces (daemon logs, conflict errors).
-const ORIENTATION_SOURCE: &str = "session-orientation";
-
-/// Append the synthetic orientation var to the composed contribution:
-/// `MINIMAL_LOADOUTS`, the display list the banner interpolates. It is
-/// static composition truth the client alone knows, riding the existing
-/// composition var lane — no new wire surface — and appended *after* the
-/// user-policy gate on purpose: like the daemon's launcher baseline it
-/// is client infrastructure, not user-declared loadout content, so a
-/// user's `deny`/`ignore` patterns don't silently blind the banner.
-/// (Whether the workspace holds a blueprint is deliberately NOT a var:
-/// it is a session-filesystem fact the banner templates test in-shell
-/// at print time.)
-pub(crate) fn push_orientation_var(
-    contribution: &mut sessions::wire::request::WireContribution,
-    loadout_display: &str,
-) {
-    use sessions::wire::primitives::{WireResolvedVar, WireSessionVar, WireSource};
-    contribution.vars.push(WireSessionVar {
-        var: WireResolvedVar {
-            name: "MINIMAL_LOADOUTS".to_string(),
-            value: loadout_display.to_string(),
-            carries_user_data: false,
-        },
-        source: WireSource::UserLoadout {
-            name: ORIENTATION_SOURCE.to_string(),
-        },
-    });
-}
-
 /// Build the [`ComposeOptions`] the client passes to
 /// `UserComposer::compose`, translating relevant config fields.
 ///
@@ -223,12 +192,17 @@ pub(crate) fn compose_options_from_config(
         .with_follow_symlinks(cfg.loadouts.follow_symlinks)
 }
 
-/// Compose the given loadouts into a
+/// Compose the resolved [`ActiveLoadouts`] into a
 /// [`sessions::wire::request::WireContribution`] under the user's
 /// [`UserPolicy`] loaded from `user_policy.toml`. User-origin items
 /// auto-pass the allow step but the policy's `deny` / `ignore` rules
 /// still apply, so a loadout patch matching a deny rule fails the
 /// composition here rather than at the daemon.
+///
+/// The contribution also carries the first-prompt orientation as a
+/// first-class field (never a var): the loadout display list computed
+/// via [`loadout_display_list`], which the daemon seeds into the banner
+/// env (`MINIMAL_LOADOUTS`) in the launcher baseline.
 ///
 /// Returns the possibly-mutated policy alongside the wire
 /// contribution — a hook (interactive prompt) may have appended
@@ -236,7 +210,7 @@ pub(crate) fn compose_options_from_config(
 ///
 /// [`UserPolicy`]: sessions::core::policy::UserPolicy
 pub(crate) fn compose_user_contribution(
-    loadouts: Vec<sessions::core::loadout::Loadout>,
+    active: ActiveLoadouts,
     policy: sessions::core::policy::UserPolicy,
     options: sessions::core::compose::ComposeOptions,
 ) -> Result<
@@ -246,17 +220,20 @@ pub(crate) fn compose_user_contribution(
     ),
     anyhow::Error,
 > {
+    let loadouts_display = loadout_display_list(&active);
     // Session transition scripts declared in a loadout are not available
     // in this release, so they are silently excluded here — before the
     // loadouts reach the composer — rather than after composition. This
     // keeps a declared hook from participating in composition at all.
     // Drop the `without_lifecycle_hooks` map when the feature ships.
-    let loadouts: Vec<_> = loadouts
+    let loadouts: Vec<_> = active
+        .loadouts
         .into_iter()
         .map(sessions::core::loadout::Loadout::without_lifecycle_hooks)
         .collect();
 
-    let mut composer = sessions::client::composer::UserComposer::new();
+    let mut composer = sessions::client::composer::UserComposer::new()
+        .with_orientation(sessions::core::compose::Orientation { loadouts_display });
     composer
         .add_all(loadouts)
         .map_err(|e| anyhow::anyhow!("composing loadouts: {e}"))?;
@@ -525,7 +502,10 @@ on_activate = { type = "inline", value = "echo activated" }
         assert_eq!(loadout.lifecycle_hooks().len(), 1);
 
         let (wire, _policy) = compose_user_contribution(
-            vec![loadout],
+            ActiveLoadouts {
+                loadouts: vec![loadout],
+                builtin_default: false,
+            },
             sessions::core::policy::UserPolicy::empty(),
             sessions::core::compose::ComposeOptions::default(),
         )
@@ -539,6 +519,8 @@ on_activate = { type = "inline", value = "echo activated" }
         // ...while the loadout's other items compose normally.
         assert_eq!(wire.requested_packages.len(), 1);
         assert_eq!(wire.vars.len(), 1);
+        // The orientation rides as a first-class field, never a var.
+        assert_eq!(wire.orientation.loadouts_display, "dev");
     }
 
     /// The built-in `default` loadout parses (guarding the `expect` in
@@ -605,21 +587,27 @@ on_activate = { type = "inline", value = "echo activated" }
         assert_eq!(loadout_display_list(&active), "helix, fish");
     }
 
-    /// `push_orientation_var` appends exactly the loadout display list —
-    /// the one composition fact the banner needs from the client — to
-    /// the composed contribution, riding the existing var lane. No
-    /// blueprint var: that is a session-filesystem fact the banner
-    /// templates test in-shell at print time.
+    /// The composed contribution carries the loadout display list as a
+    /// first-class orientation field — never a var, so user vars and
+    /// user policy cannot collide with it. (No blueprint field either:
+    /// that is a session-filesystem fact the banner templates test
+    /// in-shell at print time.)
     #[test]
-    fn push_orientation_var_appends_display_list() {
-        let mut contribution = sessions::wire::request::WireContribution::default();
-        push_orientation_var(&mut contribution, "default (built-in)");
-
-        assert_eq!(contribution.vars.len(), 1);
-        let var = &contribution.vars[0];
-        assert_eq!(var.var.name, "MINIMAL_LOADOUTS");
-        assert_eq!(var.var.value, "default (built-in)");
-        assert!(!var.var.carries_user_data);
+    fn compose_carries_orientation_as_field_not_var() {
+        let (wire, _policy) = compose_user_contribution(
+            ActiveLoadouts {
+                loadouts: Vec::new(),
+                builtin_default: true,
+            },
+            sessions::core::policy::UserPolicy::empty(),
+            sessions::core::compose::ComposeOptions::default(),
+        )
+        .expect("empty composition succeeds");
+        assert_eq!(wire.orientation.loadouts_display, "default (built-in)");
+        assert!(
+            wire.vars.iter().all(|v| v.var.name != "MINIMAL_LOADOUTS"),
+            "orientation must not ride the var lane"
+        );
     }
 
     /// Zero-config resolution — no flags, empty `default_loadouts`, no
