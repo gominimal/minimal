@@ -1,0 +1,75 @@
+[package]
+name = "github"
+version = "0.0.1"
+license = "MIT OR Apache-2.0"
+edition.workspace = true
+publish.workspace = true
+
+[features]
+# DEFAULT features are pure domain types with no I/O and no reqwest, so cheap
+# consumers (mfile, minimal) can depend on this crate without pulling an HTTP
+# stack.
+default = []
+
+# CLIENT gates the GitHub REST client (`rest` module) and the OAuth
+# device-flow client (`device_flow` module) behind an explicit opt-in, so
+# `mfile`/`minimal` keep depending on this crate without pulling in reqwest.
+# See the `reqwest` dependency note below for why no TLS backend feature is
+# requested directly here. `dep:tokio` is `device_flow`'s poll-loop backoff
+# sleep (`tokio::time::sleep`); it is the same optional dependency `test-support`
+# already declares below.
+client = ["dep:reqwest", "dep:tokio"]
+
+# TEST-SUPPORT ships a programmable, in-process mock GitHub (`testing` module)
+# plus the `github-mock` binary: an OAuth device-flow + REST fake and an
+# auth-enforcing git smart-HTTP endpoint (backed by `git http-backend`) used to
+# exercise the daemon's auth/refresh/git paths without touching real GitHub.
+#
+# It is hand-rolled on the workspace tokio TCP stack, so it adds NO new external
+# runtime dependency beyond crates already in the lockfile (tokio, serde_json,
+# base64, tempfile). No production code depends on this feature.
+test-support = ["dep:tokio", "dep:base64", "dep:tempfile"]
+
+[dependencies]
+thiserror.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+# For the on-disk grant store (`store.rs`): JSON encoding plus timestamps for
+# token expiry/refresh bookkeeping. Local filesystem I/O only — no network
+# stack, so this stays compatible with the "no HTTP stack" promise above.
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Enabled only by `test-support` (see the feature note above).
+base64 = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+# Enabled only by `client` (see the feature note above). Deliberately no TLS
+# backend feature (`rustls`/`native-tls`) requested here: every rustls-backed
+# provider in the workspace's dependency set (`ring`, `aws-lc-rs`) compiles a
+# C/asm crypto core via `cc`, which this build environment cannot do. Instead
+# this rides on Cargo's per-binary feature unification — whichever sibling
+# crate already linked into the real daemon binary (e.g. `rcache`'s GCS
+# client, which needs HTTPS regardless) enables a TLS feature on this same
+# `reqwest`, and that feature applies here too since it's one dependency
+# graph. In an isolated `cargo build -p github --features client`, this
+# yields an HTTP-only client — sufficient for the mock-backed tests below,
+# since none of them talk TLS. `form` adds the URL-encoded request bodies the
+# OAuth device-flow endpoints expect (`login/device/code`,
+# `login/oauth/access_token`); it is pure-Rust (`serde`/`serde_urlencoded`),
+# so it adds no C/asm compile step.
+reqwest = { workspace = true, optional = true, features = ["form"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# The out-of-process mock used by scripts/session-e2e.sh. Compiled only when the
+# `test-support` feature is on, so the default build (and its consumers) never
+# builds a binary or pulls the tokio HTTP stack.
+[[bin]]
+name = "github-mock"
+path = "src/bin/github-mock.rs"
+required-features = ["test-support"]
