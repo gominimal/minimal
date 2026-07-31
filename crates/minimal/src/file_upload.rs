@@ -43,6 +43,23 @@ pub fn is_vcs_root(dir: &Path) -> bool {
     VCS_MARKERS.iter().any(|marker| dir.join(marker).exists())
 }
 
+/// Returns `true` when activating from `dir` should skip the workspace
+/// upload without prompting: either `dir` is empty (nothing to sync) or
+/// it is the user's home directory (`home`). An empty box has nothing
+/// worth a confirmation, and `$HOME` — even when non-empty or itself a
+/// VCS root — is far too much to bulk-upload on a stray keystroke, so
+/// the home check ignores contents entirely. `home` is `None` when the
+/// caller can't resolve one, leaving only the emptiness check. The
+/// escape hatch for a genuinely wanted upload (`--sync tarball` passed
+/// explicitly) is decided at the call site, not here.
+pub fn is_empty_or_home(dir: &Path, home: Option<&Path>) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if home.is_some_and(|home| canon(dir) == canon(home)) {
+        return true;
+    }
+    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none())
+}
+
 fn is_default_excluded(name: &str) -> bool {
     DEFAULT_EXCLUDED_DIRS.contains(&name)
 }
@@ -1100,6 +1117,34 @@ mod tests {
     fn is_vcs_root_rejects_plain_dir() {
         let dir = tempfile::TempDir::new().unwrap();
         assert!(!is_vcs_root(dir.path()));
+    }
+
+    #[test]
+    fn is_empty_or_home_skips_empty_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(is_empty_or_home(dir.path(), None));
+    }
+
+    #[test]
+    fn is_empty_or_home_skips_home_even_with_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "x").unwrap();
+        assert!(is_empty_or_home(dir.path(), Some(dir.path())));
+    }
+
+    #[test]
+    fn is_empty_or_home_skips_home_that_is_a_vcs_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        assert!(is_empty_or_home(dir.path(), Some(dir.path())));
+    }
+
+    #[test]
+    fn is_empty_or_home_keeps_ordinary_non_empty_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "x").unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        assert!(!is_empty_or_home(dir.path(), Some(home.path())));
     }
 
     // ---- TarZstArchive per-entry API ----
