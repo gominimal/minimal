@@ -969,7 +969,10 @@ impl Context {
         graph: &Graph,
         pkgs: I,
     ) -> Result<(), Error> {
-        let rc = self.remote_cache(false, true).await.unwrap();
+        let rc = self.remote_cache(false, true).await.map_err(|e| match e {
+            RemoteError::Config(msg) => Error::Other(anyhow::anyhow!("{msg}")),
+            other => Error::Other(anyhow::anyhow!("{other}")),
+        })?;
         let mut task_set = tokio::task::JoinSet::new();
         let fetch_start = SystemTime::now();
         let semaphore = Arc::new(Semaphore::new(8));
