@@ -68,6 +68,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                         cache: opts.cache.clone(),
                         graph: opts.graph,
                         exec_base: opts.exec_base.clone(),
+                        daemon_id: opts.daemon_id.clone(),
                     })
                     .await?;
                     match resolved_src {
@@ -317,6 +318,9 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
         if let Some(w) = self.cpu_weight {
             config = config.with_cpu_weight(w);
         }
+        if let Some(id) = &opts.daemon_id {
+            config = config.with_daemon_id(id.clone());
+        }
         let mut sandbox = config.build(&opts.exec_base, channel).await?;
         sandbox.keep_dir(true);
 
@@ -476,6 +480,7 @@ mod tests {
             graph: &dg,
             exec_base: "/not-exists".into(),
             ot: None,
+            daemon_id: None,
         };
 
         let result = futures::executor::block_on(sb.run(&opts)).unwrap();
@@ -514,6 +519,7 @@ mod tests {
             graph: &dg,
             exec_base: "/not-exists".into(),
             ot: None,
+            daemon_id: None,
         };
 
         let err = futures::executor::block_on(sb.run(&opts))

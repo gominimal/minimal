@@ -229,6 +229,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                     graph: &shared.graph,
                     ot: shared.backend.ot.clone(),
                     exec_base: shared.backend.output_base.clone(),
+                    daemon_id: shared.daemon_id.clone(),
                 })
                 .await;
             log_sink.as_ref().iter().for_each(|s| {
@@ -361,6 +362,7 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                 graph: &shared.graph,
                 ot: shared.backend.ot.clone(),
                 exec_base: shared.backend.output_base.clone(),
+                daemon_id: shared.daemon_id.clone(),
             })
             .await;
             drop(shared);
@@ -394,6 +396,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
         num_concurrent_builds: usize,
         graph: Graph,
         cache: Cache<LocalDir>,
+        daemon_id: Option<String>,
         log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
         ot: Option<OpTracker>,
         cancel: tokio_util::sync::CancellationToken,
@@ -411,6 +414,7 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
             },
             graph,
             cache,
+            daemon_id,
         })
     }
 

@@ -3783,6 +3783,7 @@ dependencies = [
  "async-dialog",
  "async-tar",
  "base64 0.23.0",
+ "blake3",
  "boringtun",
  "bytes",
  "camino",
@@ -3823,6 +3824,7 @@ dependencies = [
  "stdlib",
  "switch",
  "sysinfo",
+ "tar",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -3835,6 +3837,8 @@ dependencies = [
  "uuid",
  "version",
  "vt100-ctt",
+ "walkdir",
+ "zstd",
 ]
 
 [[package]]

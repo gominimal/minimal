@@ -52,6 +52,7 @@ pub async fn cmd_materialize(args: MaterializeArgs, ctx: &mut Context) -> Result
             graph: &graph,
             exec_base: "/invalid".into(),
             ot: ctx.op_tracker(),
+            daemon_id: ctx.daemon_id(),
         })
         .await;
 

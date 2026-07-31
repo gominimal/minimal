@@ -21,6 +21,7 @@ mod file_upload;
 pub mod git_remote;
 pub mod loadouts;
 pub mod prompt;
+pub mod task;
 pub mod theme;
 
 #[derive(Parser)]
@@ -62,6 +63,14 @@ pub enum Command {
     /// Loadout management subcommands
     #[command(visible_alias = "loadouts")]
     Loadout(LoadoutArgs),
+    /// Task subcommands: run declared project tasks in ephemeral sessions
+    #[command(visible_alias = "tasks")]
+    Task(TaskArgs),
+    /// Muscle-memory catch for the in-box `min run <task>`: always errors,
+    /// naming the canonical `min task run <task>` (host) and
+    /// `min session attach --command 'min task run <task>'` (in-box) forms.
+    #[command(hide = true)]
+    Run(RunArgs),
     /// Print important directories and file paths for debugging
     Dirs,
     /// Collect a diagnostic bundle (logs, state, config) to send to the
@@ -205,6 +214,49 @@ pub struct LoadoutListArgs {
     /// `<config>/minimal/loadouts` per platform, e.g. `~/.config/minimal/loadouts` on Linux)
     #[arg(long)]
     pub dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct TaskArgs {
+    #[command(subcommand)]
+    pub command: TaskCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TaskCommand {
+    /// Run a declared task in an ephemeral session
+    ///
+    /// Creates a session for the project (named `task-<task>-<hex>`),
+    /// uploads the project like `min session activate`, runs the task
+    /// inside it with output streamed to the terminal, exits with the
+    /// task's exit code, and destroys the session afterwards. `--keep`
+    /// retains the session as an attachable box instead. Ctrl-C tears the
+    /// session down (or keeps it with `--keep`) and exits 130 without
+    /// relaying the interrupt to the task itself. Tasks run
+    /// non-interactively: pipe stdin to feed input; use `min session
+    /// attach` for interactive work.
+    Run(TaskRunArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TaskRunArgs {
+    /// Name of a task declared in the project's minimal.toml
+    pub task: String,
+    /// Project path. Defaults to the directory set by `-C`/`--repo-dir`,
+    /// or the current working directory when neither is given.
+    pub path: Option<String>,
+    /// Keep the session after the task exits instead of destroying it
+    #[arg(long)]
+    pub keep: bool,
+}
+
+/// Arguments for the hidden top-level `run` catch. Everything after `run` is
+/// swallowed (flags included) so any in-box spelling reaches the redirect
+/// error in [`task::cmd_run`] instead of a clap parse error.
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+    pub rest: Vec<String>,
 }
 
 /// WireGuard mesh subcommands for authenticated remote PTask access (UC7 /
@@ -671,6 +723,10 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Loadout(LoadoutArgs {
             command: LoadoutCommand::List(args),
         })) => loadouts::cmd_loadout_list(args, &cli.global_args),
+        Some(Command::Task(TaskArgs { command })) => match command {
+            TaskCommand::Run(args) => task::cmd_task_run(&cli.global_args, args).await,
+        },
+        Some(Command::Run(args)) => task::cmd_run(&args),
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
         #[cfg(feature = "remote-access")]
@@ -815,7 +871,7 @@ async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         .context("Failed to connect to minimald")?;
 
     match resolve_smart_attach(&mut client, global).await? {
-        Some(entry) => {
+        SmartAttach::Attach(entry) => {
             tracing::info!(
                 session_id = %entry.id,
                 session_name = ?entry.name,
@@ -823,11 +879,14 @@ async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
             );
             attach_to_session(&sock, entry.id, None).await
         }
-        None => {
-            // No sessions exist at all: create one from the cwd and attach,
-            // as `min session activate --attach .` would (default sync,
-            // autogen name). The scaffold offer stays suppressed — the one
-            // keystroke into a session must not detour into config authoring.
+        // Two ways to land on create-and-attach: no sessions exist at all
+        // (first run), or the ambiguity picker's `+ Create a new session`
+        // row was chosen. Both activate for the cwd exactly as
+        // `min session activate --attach .` would (default sync, autogen
+        // name) — but with the scaffold offer suppressed, unlike the same
+        // picker row reached through `min session attach`: the one
+        // keystroke into a session must not detour into config authoring.
+        SmartAttach::CreateForCwd | SmartAttach::NoSessions => {
             drop(client);
             activate_session(global, bare_activate_args(), false).await
         }
@@ -959,16 +1018,6 @@ fn entry_handle(entry: &minimald_rpc::ListSessionsEntry) -> String {
             let id = entry.id.to_string();
             id.split('-').next().unwrap_or(&id).to_string()
         }
-    }
-}
-
-/// The lowercase status word for the state report, matching the serde
-/// spelling `min ls --json` emits so the two surfaces agree.
-fn status_label(status: sessions::SessionStatus) -> &'static str {
-    match status {
-        sessions::SessionStatus::Pending => "pending",
-        sessions::SessionStatus::Materializing => "materializing",
-        sessions::SessionStatus::Active => "active",
     }
 }
 
@@ -1183,18 +1232,28 @@ pub fn format_ls(
         return Ok(());
     }
 
-    // Format as a table: ID, Name, Title, Last Activity.
-    // Widths chosen to fit a standard 80-col terminal.
+    // Format as a table. The columns mirror the fields `--json` exposes so
+    // the two surfaces present the same session attributes.
     writeln!(
         out,
-        "{:<36}  {:<20}  {:<20}  LAST ACTIVITY",
-        "SESSION ID", "NAME", "TITLE"
+        "{:<36}  {:<20}  {:<13}  {:<20}  {:<19}  PROJECT PATH",
+        "SESSION ID", "NAME", "STATUS", "TITLE", "LAST ACTIVITY"
     )?;
-    writeln!(out, "{:-<36}  {:-<20}  {:-<20}  {:-<24}", "", "", "", "")?;
+    writeln!(
+        out,
+        "{:-<36}  {:-<20}  {:-<13}  {:-<20}  {:-<19}  {:-<24}",
+        "", "", "", "", "", ""
+    )?;
 
     for entry in &resp.sessions {
         let id = entry.id.to_string();
         let name = entry.name.as_deref().unwrap_or("-");
+        let status = status_label(entry.status);
+        let project_path = entry
+            .project_path
+            .as_ref()
+            .map(paths::HostAbsPath::to_string)
+            .unwrap_or_else(|| "-".to_string());
         let (title, last_activity) = match &entry.attrs {
             Some(attrs) => {
                 let title = attrs
@@ -1214,10 +1273,23 @@ pub fn format_ls(
             }
             None => ("-", "-".to_string()),
         };
-        writeln!(out, "{id:<36}  {name:<20}  {title:<20}  {last_activity}")?;
+        writeln!(
+            out,
+            "{id:<36}  {name:<20}  {status:<13}  {title:<20}  {last_activity:<19}  {project_path}"
+        )?;
     }
 
     Ok(())
+}
+
+/// Human-readable lifecycle status for the `ls` table, using the same
+/// snake_case tokens the `--json` surface emits so the two agree.
+fn status_label(status: sessions::SessionStatus) -> &'static str {
+    match status {
+        sessions::SessionStatus::Pending => "pending",
+        sessions::SessionStatus::Materializing => "materializing",
+        sessions::SessionStatus::Active => "active",
+    }
 }
 
 fn format_memory(bytes: u64) -> String {
@@ -2061,8 +2133,11 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
             (r.id, r.name)
         }
         None => match resolve_smart_attach(&mut client, global).await? {
-            Some(entry) => (entry.id, entry.name),
-            None => bail!("no sessions exist; use 'min session activate' to create one"),
+            SmartAttach::Attach(entry) => (entry.id, entry.name),
+            SmartAttach::CreateForCwd => return activate_new_for_attach(global).await,
+            SmartAttach::NoSessions => {
+                bail!("no sessions exist; use 'min session activate' to create one")
+            }
         },
     };
 
@@ -2080,12 +2155,12 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
 /// and either attaches directly (unambiguous), opens the interactive picker
 /// (ambiguous), or errors (ambiguous but non-interactive).
 ///
-/// Returns `Ok(None)` when no sessions exist at all, which `min session attach`
-/// reports as an error pointing at `min session activate`.
+/// Returns [`SmartAttach::NoSessions`] when no sessions exist at all, which
+/// `min session attach` reports as an error pointing at `min session activate`.
 async fn resolve_smart_attach(
     client: &mut client::Client,
     global: &GlobalArgs,
-) -> Result<Option<minimald_rpc::ListSessionsEntry>, anyhow::Error> {
+) -> Result<SmartAttach, anyhow::Error> {
     use minimald_rpc::ListSessions;
 
     let resp = client
@@ -2094,7 +2169,7 @@ async fn resolve_smart_attach(
         .context("ListSessions RPC failed")?;
     let cwd = attach::cwd_host_path(global)?;
     match attach::resolve_for_attach(&resp.sessions, &cwd) {
-        attach::SmartResolve::NoSessions => Ok(None),
+        attach::SmartResolve::NoSessions => Ok(SmartAttach::NoSessions),
         attach::SmartResolve::Attach(entry) => {
             // Unambiguous auto-resolve: the operator never chose this session,
             // so tell them which one they're landing in. The picker path below
@@ -2106,18 +2181,55 @@ async fn resolve_smart_attach(
                     attach::created_from_suffix(&entry, &cwd)
                 );
             }
-            Ok(Some(entry))
+            Ok(SmartAttach::Attach(entry))
         }
         attach::SmartResolve::Pick(cands) => {
             if global.no_input || !attach::can_pick_interactively() {
                 bail!(attach::ambiguous_no_input_message(&cands, &cwd));
             }
             match attach::pick_session(&cands, &cwd)? {
-                Some(entry) => Ok(Some(entry)),
+                Some(attach::Picked::Session(entry)) => Ok(SmartAttach::Attach(entry)),
+                Some(attach::Picked::CreateNew) => Ok(SmartAttach::CreateForCwd),
                 None => bail!("session selection cancelled"),
             }
         }
     }
+}
+
+/// Outcome of smart attach resolution when the user gave no explicit session.
+enum SmartAttach {
+    /// Attach to this resolved or picked session.
+    Attach(minimald_rpc::ListSessionsEntry),
+    /// The picker's create row was chosen: activate a fresh session for the
+    /// cwd and attach, exactly as `min session activate --attach .` would.
+    CreateForCwd,
+    /// No sessions exist at all.
+    NoSessions,
+}
+
+/// The picker's `+ Create a new session` arm: activate a fresh session for the
+/// cwd and attach. A thin wrapper over [`cmd_activate`] with an autogen name
+/// and default sync, so the create-then-attach path stays the one that
+/// `min session activate --attach .` runs.
+async fn activate_new_for_attach(global: &GlobalArgs) -> Result<(), anyhow::Error> {
+    // `Box::pin` breaks the async recursion cycle: `cmd_activate` chains into
+    // `cmd_attach` (on `--attach`), which reaches back here — an unboxed cycle
+    // is an infinitely sized future (E0733).
+    Box::pin(cmd_activate(
+        global,
+        ActivateArgs {
+            name: None,
+            path: None,
+            sync: None,
+            network: CliNetworkMode::HostNet,
+            ingress: Vec::new(),
+            loadout: Vec::new(),
+            no_loadouts: false,
+            no_prompt: false,
+            attach: true,
+        },
+    ))
+    .await
 }
 
 /// Guard for the interactive attach path: the PTY-backed session shell must be
@@ -2917,7 +3029,17 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
 pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mctx::Error> {
     use op::ProjectOp as _;
     let config = build_config(global)?;
-    let mut ctx = mctx::Context::new(config)?;
+    let mut ctx = match mctx::Context::new(config) {
+        Ok(ctx) => ctx,
+        // Point a user with no `minimal.toml` at `min init`, matching the hint
+        // `min session activate` gives in the same situation.
+        Err(e @ mctx::Error::MFile(mfile::Error::NotFound)) => {
+            return Err(mctx::Error::Other(anyhow::anyhow!(
+                "{e}\nRun 'min init' to give the project its own config."
+            )));
+        }
+        Err(e) => return Err(e),
+    };
 
     let mut env = ctx.project_setup();
     let report = op::UpdateProject.run(&mut env)?;
@@ -3424,6 +3546,66 @@ mod tests {
             .expect("-f without --all must fail to parse")
             .to_string();
         assert!(bare.contains("--all"), "usage must surface --all: {bare}");
+    }
+
+    /// `min task run <task>` parses with `--keep` off by default; the flag
+    /// and the optional path positional are accepted in any order.
+    #[test]
+    fn task_run_parses_task_keep_and_path() {
+        use clap::Parser as _;
+        let run_args = |args: &[&str]| -> TaskRunArgs {
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Command::Task(TaskArgs {
+                    command: TaskCommand::Run(a),
+                })) => a,
+                _ => panic!("expected `task run` for {args:?}"),
+            }
+        };
+
+        let a = run_args(&["min", "task", "run", "build"]);
+        assert_eq!(a.task, "build");
+        assert!(!a.keep);
+        assert!(a.path.is_none());
+
+        let a = run_args(&["min", "task", "run", "build", "--keep"]);
+        assert!(a.keep);
+
+        let a = run_args(&["min", "task", "run", "--keep", "build", "sub/dir"]);
+        assert_eq!(a.task, "build");
+        assert_eq!(a.path.as_deref(), Some("sub/dir"));
+        assert!(a.keep);
+
+        // The task name is required.
+        assert!(Cli::try_parse_from(["min", "task", "run"]).is_err());
+        assert!(Cli::try_parse_from(["min", "task"]).is_err());
+    }
+
+    /// The hidden top-level `run` swallows any spelling — flags included —
+    /// so every muscle-memory invocation reaches the redirect error rather
+    /// than a clap parse error; and it stays hidden from help.
+    #[test]
+    fn hidden_run_swallows_any_spelling_and_stays_hidden() {
+        use clap::CommandFactory as _;
+        use clap::Parser as _;
+
+        match Cli::try_parse_from(["min", "run", "build", "--keep"])
+            .unwrap()
+            .command
+        {
+            Some(Command::Run(a)) => assert_eq!(a.rest, ["build", "--keep"]),
+            _ => panic!("expected the hidden run catch"),
+        }
+        // A bare `min run` parses too; the redirect copy handles it.
+        match Cli::try_parse_from(["min", "run"]).unwrap().command {
+            Some(Command::Run(a)) => assert!(a.rest.is_empty()),
+            _ => panic!("expected the hidden run catch"),
+        }
+
+        let cmd = Cli::command();
+        let run = cmd
+            .find_subcommand("run")
+            .expect("the run subcommand must exist");
+        assert!(run.is_hide_set(), "`min run` must stay hidden from help");
     }
 
     #[test]

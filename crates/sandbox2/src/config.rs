@@ -183,6 +183,10 @@ pub struct Config {
     /// CPU shares, for partitioning CPU when the system is contended. Maps roughly to
     /// cgroups v2 cpu.weights.
     pub cpu_weight: Option<u64>,
+
+    /// Suffix marker to identify the process in the names of temp files/directories. Defaults
+    /// to the PID when not set.
+    pub daemon_id: Option<String>,
 }
 
 /// A command to be run in the sandbox.
@@ -222,6 +226,7 @@ impl Config {
                 working_inputs: Vec::with_capacity(6),
             },
             cpu_weight: None,
+            daemon_id: None,
         }
     }
 
@@ -366,6 +371,12 @@ impl Config {
         self
     }
 
+    /// Sets the identifier for the process/daemon doing the build.
+    pub fn with_daemon_id(mut self, id: String) -> Self {
+        self.daemon_id = Some(id);
+        self
+    }
+
     /// Builds the sandbox using the given configuration, with temporary files and the rootfs
     /// contained within the given directory.
     pub async fn build<P: AsRef<Path>, C: super::Channel>(
@@ -382,7 +393,7 @@ impl Config {
             )
         })?;
 
-        // Create a unique directory name using sandbox name, timestamp, and process ID.
+        // Create a unique directory name using sandbox name, timestamp, and daemon ID.
         // At this layer its plausible that there might be two packages of the same name
         // built at the same time, so we do an atomic directory creation dance /w an attempt
         // counter to make sure each sandbox gets its own folder.
@@ -397,11 +408,14 @@ impl Config {
                 )
             })?
             .as_secs();
-        let pid = std::process::id();
+        let id = self
+            .daemon_id
+            .clone()
+            .unwrap_or_else(|| std::process::id().to_string());
         let build_base_dir = {
             let mut attempt = 0u32;
             loop {
-                let dir_name = format!("{}-{}-{}-{}", self.name, timestamp, attempt, pid);
+                let dir_name = format!("{}-{}-{}-{}", self.name, timestamp, attempt, id);
 
                 let candidate_dir = base_dir.as_ref().join(dir_name);
                 match fs::create_dir(&candidate_dir) {

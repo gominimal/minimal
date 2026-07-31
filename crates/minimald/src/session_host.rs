@@ -24,9 +24,11 @@ use tracing::Instrument as _;
 
 use crate::RequestedPty;
 use crate::session::SessionPaths;
+use crate::session_delta::DeltaSource;
 use crate::sessions::SessionControl;
 #[cfg(not(test))]
 use sessions::NetworkMode;
+use std::sync::Arc;
 
 /// Command sequence for the ctrl-w key chord, when the kitty keyboard protocol
 /// is negotiated.
@@ -44,6 +46,16 @@ const CTRL_W_CSI_27: &[u8] = b"\x1b[27;5;119~";
 /// appearance in the channel output before answering.
 pub(crate) const SHELL_EXIT_PROMPT: &str =
     "Session shell process exited. What would you like to do with this session?";
+
+/// Line rendered above the shell-exit prompt when nothing in the workspace
+/// changed since activation. Exposed for the same test-await purpose as
+/// [`SHELL_EXIT_PROMPT`].
+pub(crate) const SHELL_EXIT_NO_CHANGES: &str = "No files changed since activation.";
+
+/// How many changed-file rows the shell-exit prompt lists before folding the
+/// rest into an "and N more" line, keeping the prompt readable on a 24-row
+/// terminal.
+const DELTA_ROWS_SHOWN: usize = 10;
 
 /// The dimensions of a terminal.
 ///
@@ -346,6 +358,16 @@ struct Binding {
     /// "delete" on the shell-exit prompt. `None` for hosts spawned without a
     /// manager (the test harness), where "delete" degrades to a detach.
     control: Option<SessionControl>,
+    /// Workspace-change detection, shared from the owning [`Host`], so the
+    /// shell-exit prompt can lead with the files changed since activation.
+    /// `None` when the baseline snapshot could not be taken.
+    delta: Option<Arc<DeltaSource>>,
+    /// The session's display name, used to name the archive the shell-exit
+    /// prompt's save-then-delete lane writes.
+    name: String,
+    /// Daemon-side directory the save-then-delete lane archives into
+    /// (`<minimal_state_dir>/archives`). Created on demand at save time.
+    archives_dir: std::path::PathBuf,
 }
 
 impl Binding {
@@ -355,6 +377,9 @@ impl Binding {
         channel: Channel<Msg>,
         stdin_tx: mpsc::Sender<StdinMsg>,
         control: Option<SessionControl>,
+        delta: Option<Arc<DeltaSource>>,
+        name: String,
+        archives_dir: std::path::PathBuf,
     ) -> (mpsc::Sender<BindingMsg>, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(4);
 
@@ -363,6 +388,9 @@ impl Binding {
             stdin_tx,
             receiver: rx,
             control,
+            delta,
+            name,
+            archives_dir,
         };
 
         // The channel id ties every line this binding logs back to the
@@ -482,49 +510,206 @@ impl Binding {
         tracing::info!(reason = ?exit_reason, "binding leaving mainloop");
 
         if exit_reason == MainloopExitReason::ProcessExited {
-            // The shell process exited. For a bash shell, this usually meant someone pressed ctrl-d absent-mindedly.
-            // We presume they didnt want to completely destroy the session, perhaps just detach, but lets prompt
-            // to see where they wanted to go from here.
-            let _ = w.write_all(b"\r\n").await;
-            match async_dialog::Select::new()
-                .with_prompt(SHELL_EXIT_PROMPT)
-                .items([
-                    "Exit, leaving the session filesystem in place and recoverable",
-                    "Delete, all in-session files permanently deleted",
-                ])
-                .interact(rs.make_reader(), &mut w)
-                .await
-            {
-                // User selected detach, keep going to disconnect
-                Ok(Selection::At(0)) => {}
-                // User cancelled selection, safest option is to detach
-                Ok(Selection::Cancelled) => {}
-                // User selected delete: ask the manager to tear the whole
-                // session down (kill the host, remove the on-disk record) before
-                // we close the channel. Awaiting is deadlock-free here — the
-                // destroy cascade waits on the host runtime loop (already exiting
-                // now that the process has ended), never on this binding task.
-                Ok(Selection::At(1)) => match &self.control {
-                    Some(control) => {
-                        let _ = w.write_all(b"\r\nDeleting session...\r\n").await;
-                        if let Err(e) = control.destroy().await {
-                            tracing::warn!(error = %e, "session delete failed");
-                            let _ = w
-                                .write_all(format!("Failed to delete session: {e}\r\n").as_bytes())
-                                .await;
-                        }
-                    }
-                    // No manager wired (test harness): degrade to a detach.
-                    None => tracing::warn!("delete selected but no session control available"),
-                },
-                Ok(Selection::At(_)) => unreachable!(),
-                Err(e) => tracing::warn!(error = %e, "session-exit prompt failed"),
-            }
+            Self::shell_exit_prompt(
+                self.delta.as_ref(),
+                self.control.as_ref(),
+                &self.archives_dir,
+                &self.name,
+                rs.make_reader(),
+                &mut w,
+            )
+            .await;
         }
 
         let _ = ws.eof().await;
         let _ = ws.exit_status(0).await;
         let _ = ws.close().await; // needed to release the remote
+    }
+
+    /// The save half of the shell-exit prompt's save-then-delete lane:
+    /// re-walks the workspace for the added + modified files and archives them
+    /// to `dest`, announcing what is being saved on the way. Returns before
+    /// anything is destroyed on any failure, so the caller can keep the
+    /// session and re-render the prompt. An associated fn rather than a
+    /// method because [`Self::run`] has already split `self.channel` by the
+    /// time it saves.
+    async fn save_changes<W>(
+        delta: Option<&Arc<DeltaSource>>,
+        dest: &std::path::Path,
+        w: &mut W,
+    ) -> io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let delta =
+            delta.ok_or_else(|| io::Error::other("workspace change detection is unavailable"))?;
+        let files = delta
+            .changed_paths()
+            .await
+            .ok_or_else(|| io::Error::other("the workspace could not be re-walked"))?;
+        let n = files.len();
+        let plural = if n == 1 { "" } else { "s" };
+        let _ = w
+            .write_all(
+                format!(
+                    "\r\nSaving {n} changed file{plural} -> {}\r\n",
+                    dest.display()
+                )
+                .as_bytes(),
+            )
+            .await;
+        delta.archive_changed(files, dest.to_path_buf()).await
+    }
+
+    /// The shell-exit prompt, run after the session process ends: leads with
+    /// the files changed since activation (when `delta` is available), then
+    /// offers keep / save-then-delete / delete and drives the chosen
+    /// teardown through `control`. Extracted from [`Binding::run`]'s
+    /// mainloop epilogue purely for readability; the bytes written to the
+    /// channel are identical. An associated fn taking the binding's
+    /// capabilities piecewise because `run` has already moved the channel
+    /// out of `self` by this point.
+    async fn shell_exit_prompt<R, W>(
+        delta: Option<&Arc<DeltaSource>>,
+        control: Option<&SessionControl>,
+        archives_dir: &std::path::Path,
+        name: &str,
+        mut r: R,
+        mut w: W,
+    ) where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        // The shell process exited. For a bash shell, this usually meant someone pressed ctrl-d absent-mindedly.
+        // We presume they didnt want to completely destroy the session, perhaps just detach, but lets prompt
+        // to see where they wanted to go from here.
+        let _ = w.write_all(b"\r\n").await;
+
+        // Lead with what a "delete" would lose. An unavailable delta (no
+        // baseline, or the re-walk failed) renders the plain prompt — the
+        // exit path never blocks on change detection.
+        let changed = match delta {
+            Some(delta) => delta.changed_files().await,
+            None => None,
+        };
+        let mut delete_item = "Delete, all in-session files permanently deleted".to_string();
+        match &changed {
+            Some(rows) if rows.is_empty() => {
+                let _ = w
+                    .write_all(format!("{SHELL_EXIT_NO_CHANGES}\r\n\r\n").as_bytes())
+                    .await;
+                delete_item.push_str(" — nothing will be lost");
+            }
+            Some(rows) => {
+                let n = rows.len();
+                let plural = if n == 1 { "" } else { "s" };
+                let _ = w
+                    .write_all(format!("{n} file{plural} changed since activation:\r\n").as_bytes())
+                    .await;
+                for row in rows.iter().take(DELTA_ROWS_SHOWN) {
+                    let _ = w.write_all(format!("  {row}\r\n").as_bytes()).await;
+                }
+                if n > DELTA_ROWS_SHOWN {
+                    let _ = w
+                        .write_all(
+                            format!("  ... and {} more\r\n", n - DELTA_ROWS_SHOWN).as_bytes(),
+                        )
+                        .await;
+                }
+                let _ = w.write_all(b"\r\n").await;
+            }
+            None => {}
+        }
+        // What each rendered item does. The save lane only exists when the
+        // delta is known non-empty, so selections are mapped through this
+        // list rather than through fixed indices.
+        enum ExitChoice {
+            Keep,
+            SaveThenDelete,
+            Delete,
+        }
+
+        let mut items =
+            vec!["Exit, leaving the session filesystem in place and recoverable".to_string()];
+        let mut choices = vec![ExitChoice::Keep];
+        // Destination for the save-then-delete lane, fixed while the prompt
+        // is up so the rendered path is the path written — including across
+        // a failed-write re-render.
+        let archive_dest = matches!(&changed, Some(rows) if !rows.is_empty()).then(|| {
+            archives_dir.join(format!(
+                "{}-{}.tar.zst",
+                name,
+                chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+            ))
+        });
+        if let Some(dest) = &archive_dest {
+            items.push(format!("Save changes to {}, then delete", dest.display()));
+            choices.push(ExitChoice::SaveThenDelete);
+        }
+        items.push(delete_item);
+        choices.push(ExitChoice::Delete);
+
+        let select = async_dialog::Select::new()
+            .with_prompt(SHELL_EXIT_PROMPT)
+            .items(items);
+        // Loops only while a save attempt fails: the session is left
+        // intact and the prompt re-renders so the user can still pick keep
+        // or delete explicitly. Cancel/EOF always exits as a keep, so the
+        // exit path can never block permanently.
+        let delete = loop {
+            match select.interact(&mut r, &mut w).await {
+                Ok(Selection::At(i)) => match choices[i] {
+                    // User selected detach, keep going to disconnect
+                    ExitChoice::Keep => break false,
+                    ExitChoice::Delete => break true,
+                    // Delete only ever follows a confirmed save: a failed
+                    // archive write keeps the session and re-prompts.
+                    ExitChoice::SaveThenDelete => {
+                        let dest = archive_dest
+                            .as_ref()
+                            .expect("save lane is only rendered with a destination");
+                        match Self::save_changes(delta, dest, &mut w).await {
+                            Ok(()) => break true,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "saving session changes failed");
+                                let _ = w
+                                    .write_all(
+                                        format!("Failed to save changes: {e}\r\n\r\n").as_bytes(),
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                },
+                // User cancelled selection, safest option is to detach
+                Ok(Selection::Cancelled) => break false,
+                Err(e) => {
+                    tracing::warn!(error = %e, "session-exit prompt failed");
+                    break false;
+                }
+            }
+        };
+        // User selected delete (directly or via a confirmed save): ask the
+        // manager to tear the whole session down (kill the host, remove the
+        // on-disk record) before we close the channel. Awaiting is
+        // deadlock-free here — the destroy cascade waits on the host
+        // runtime loop (already exiting now that the process has ended),
+        // never on this binding task.
+        if delete {
+            match control {
+                Some(control) => {
+                    let _ = w.write_all(b"\r\nDeleting session...\r\n").await;
+                    if let Err(e) = control.destroy().await {
+                        tracing::warn!(error = %e, "session delete failed");
+                        let _ = w
+                            .write_all(format!("Failed to delete session: {e}\r\n").as_bytes())
+                            .await;
+                    }
+                }
+                // No manager wired (test harness): degrade to a detach.
+                None => tracing::warn!("delete selected but no session control available"),
+            }
+        }
     }
 }
 
@@ -752,6 +937,20 @@ pub(crate) struct Host<P: SessionProcess, G: Send + 'static> {
     // shell-exit "delete" can tear the whole session down. `None` for hosts
     // built without a manager (the test harness).
     control: Option<SessionControl>,
+
+    // Workspace baseline taken before the process launched, handed to each
+    // binding so the shell-exit prompt can list the files changed during the
+    // session. `None` when the workspace could not be walked at build time;
+    // the prompt then renders without a delta.
+    delta: Option<Arc<DeltaSource>>,
+
+    // The session's display name, handed to each binding so the shell-exit
+    // prompt's save-then-delete lane can name its archive.
+    session_name: String,
+
+    // Daemon-side directory the save-then-delete lane archives into, handed
+    // to each binding alongside `delta`.
+    archives_dir: std::path::PathBuf,
 
     // Keeps launcher-owned resources (the session's `Env`, which owns the
     // sandbox files backing the running process's rootfs along with the context
@@ -1314,6 +1513,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     /// Returns the [`HostHandle`] alongside the [`JoinHandle`] of the runtime
     /// loop, so the owner can await full teardown (process reaped, sandbox guard
     /// dropped) after issuing a [`HostHandle::kill`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn<L>(
         launcher: L,
         name: String,
@@ -1322,12 +1522,22 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
         sz: WinSize,
         channel: Option<Channel<Msg>>,
         control: Option<SessionControl>,
+        archives_dir: std::path::PathBuf,
     ) -> Result<(HostHandle, JoinHandle<Result<i32, std::io::Error>>), std::io::Error>
     where
         L: SessionLauncher<Process = P, Guard = G>,
     {
-        let (host, handle) =
-            Self::build(launcher, name, username, paths, sz, channel, control).await?;
+        let (host, handle) = Self::build(
+            launcher,
+            name,
+            username,
+            paths,
+            sz,
+            channel,
+            control,
+            archives_dir,
+        )
+        .await?;
         let task = tokio::spawn(host.mainloop());
         Ok((handle, task))
     }
@@ -1335,6 +1545,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
     /// Builds the host and its handle from a launcher without spawning the
     /// runtime loop, so callers (notably tests) can drive [`Self::step`]
     /// directly and observe the host's state.
+    #[allow(clippy::too_many_arguments)]
     async fn build<L>(
         launcher: L,
         name: String,
@@ -1343,10 +1554,19 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
         sz: WinSize,
         channel: Option<Channel<Msg>>,
         control: Option<SessionControl>,
+        archives_dir: std::path::PathBuf,
     ) -> Result<(Self, HostHandle), std::io::Error>
     where
         L: SessionLauncher<Process = P, Guard = G>,
     {
+        // Baseline the workspace before the process launches, so nothing the
+        // session writes can leak into the "since activation" reference point.
+        let delta =
+            DeltaSource::arm(paths.working.as_utf8_path().as_std_path().to_path_buf()).await;
+
+        // The launcher consumes `name`; the bindings need it too, to name the
+        // archives the shell-exit prompt's save-then-delete lane writes.
+        let session_name = name.clone();
         let Launched {
             master,
             process,
@@ -1386,6 +1606,9 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             stdin_buf: None,
             net_guard,
             control,
+            delta,
+            session_name,
+            archives_dir,
             _guard: guard,
         };
 
@@ -1642,8 +1865,15 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                 .write_all(&self.parser.screen().state_formatted())
                 .await;
         }
-        let new_binding =
-            Binding::spawn(channel, self.remote_tx.clone(), self.control.clone()).await;
+        let new_binding = Binding::spawn(
+            channel,
+            self.remote_tx.clone(),
+            self.control.clone(),
+            self.delta.clone(),
+            self.session_name.clone(),
+            self.archives_dir.clone(),
+        )
+        .await;
 
         if let Some((old_tx, old_join_hnd)) = self.remote.replace(new_binding) {
             // If there was a binding we just swapped out, tell it to
@@ -1848,6 +2078,7 @@ mod tests {
             DEFAULT_SIZE,
             None,
             None,
+            std::env::temp_dir(),
         )
         .await
         .expect("failed to build host");
@@ -1915,6 +2146,7 @@ mod tests {
             DEFAULT_SIZE,
             None,
             None,
+            std::env::temp_dir(),
         )
         .await
         .expect("failed to build host");
@@ -2019,6 +2251,7 @@ mod tests {
             DEFAULT_SIZE,
             None,
             None,
+            std::env::temp_dir(),
         )
         .await
         .expect("failed to build host");
@@ -2066,6 +2299,7 @@ mod tests {
             DEFAULT_SIZE,
             None,
             None,
+            std::env::temp_dir(),
         )
         .await
         .expect("failed to build host");

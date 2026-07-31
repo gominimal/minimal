@@ -69,6 +69,12 @@ async fn run() -> ExitCode {
     }
 
     if let Err(e) = minimal::run(cli).await {
+        // A task's non-zero exit (`min task run`) is a status to relay, not
+        // an error to print — the task's own output already streamed through
+        // (the git-remote helper's ExitCode precedent).
+        if let Some(&minimal::task::TaskExit(code)) = e.downcast_ref::<minimal::task::TaskExit>() {
+            return ExitCode::from(code);
+        }
         eprintln!("error: {e:#}");
         return ExitCode::FAILURE;
     }
@@ -77,11 +83,11 @@ async fn run() -> ExitCode {
 
 /// Whether the command's stdout is a data contract that tracing must not
 /// pollute, so its logs go to stderr instead. The `completions` handlers emit a
-/// shell shim on stdout, and `session attach -c` carries only the exec'd
-/// command's output — a log line in either would be read as content. A bare
-/// `min` (no subcommand) is one too: its non-TTY twin promises an empty
-/// stdout to pipelines, and its interactive activate path prints only the
-/// session id there.
+/// shell shim on stdout, `session attach -c` carries only the exec'd
+/// command's output, and `task run` streams the task's stdout — a log line
+/// in any of them would be read as content. A bare `min` (no subcommand) is
+/// one too: its non-TTY twin promises an empty stdout to pipelines, and its
+/// interactive activate path prints only the session id there.
 fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
     matches!(
         command,
@@ -93,6 +99,9 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
                         command: Some(_),
                         ..
                     }),
+                })
+                | minimal::Command::Task(minimal::TaskArgs {
+                    command: minimal::TaskCommand::Run(_),
                 })
         )
     )
@@ -127,5 +136,19 @@ mod tests {
     #[test]
     fn bare_min_is_a_stdout_contract() {
         assert!(stdout_is_data_contract(&None));
+    }
+
+    /// `min task run` streams the task's stdout, so tracing must route to
+    /// stderr there like the other stdout contracts.
+    #[test]
+    fn task_run_is_a_stdout_contract() {
+        let cmd = Some(Command::Task(minimal::TaskArgs {
+            command: minimal::TaskCommand::Run(minimal::TaskRunArgs {
+                task: "build".to_string(),
+                path: None,
+                keep: false,
+            }),
+        }));
+        assert!(stdout_is_data_contract(&cmd));
     }
 }

@@ -12,6 +12,7 @@ pub mod net;
 pub mod rpc;
 pub mod server;
 mod session;
+mod session_delta;
 pub mod session_host;
 pub mod session_sop;
 mod sessions;

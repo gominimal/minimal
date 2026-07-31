@@ -111,6 +111,7 @@ mod tests {
             cache_dir.to_path_buf(),
             cache,
             None,
+            None,
         )
     }
 

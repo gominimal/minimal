@@ -77,6 +77,7 @@ pub struct ConfigBuilder {
     no_fetch: Option<bool>,
     offline: Option<bool>,
     num_parallel_builds: Option<usize>,
+    daemon_id: Option<String>,
 
     minimal_state_dir: Option<PathBuf>,
     minimal_cache_dir: Option<PathBuf>,
@@ -156,6 +157,11 @@ impl ConfigBuilder {
         self.ot = Some(ot);
         self
     }
+    /// Use the specified ID to identify this process in temp files.
+    pub fn with_daemon_id(mut self, id: String) -> Self {
+        self.daemon_id = Some(id);
+        self
+    }
     /// Override where the remote cache lives. One value serves both reader and
     /// writer: a `gs://bucket` (or bare bucket name) uses the GCS client;
     /// an `https://…` value reads over plain unauthenticated HTTPS (e.g. a
@@ -197,6 +203,7 @@ impl ConfigBuilder {
             num_parallel_builds: self
                 .num_parallel_builds
                 .unwrap_or_else(common::default_parallelism),
+            daemon_id: self.daemon_id,
 
             minimal_state_dir: self.minimal_state_dir.unwrap_or_else(|| {
                 paths::minimal_state_dir()
@@ -229,6 +236,7 @@ impl Config {
             no_cache: Some(self.no_cache),
             no_fetch: Some(self.no_fetch),
             offline: Some(self.offline),
+            daemon_id: self.daemon_id,
             num_parallel_builds: Some(self.num_parallel_builds),
             minimal_state_dir: Some(self.minimal_state_dir),
             minimal_cache_dir: Some(self.minimal_cache_dir),
@@ -253,6 +261,8 @@ pub struct Config {
     offline: bool,
     /// Maximum number of concurrent builds.
     num_parallel_builds: usize,
+    /// The identifer for this process. Downstream machinery defaults to the PID if not set.
+    daemon_id: Option<String>,
 
     /// Path to the base of the minimal state directory, typically `$XDG_STATE_DIR/minimal`.
     pub(crate) minimal_state_dir: PathBuf,
@@ -351,6 +361,10 @@ impl Config {
     }
     pub(crate) fn layer_cache_dir(&self) -> PathBuf {
         self.minimal_cache_dir.join("lc")
+    }
+
+    pub(crate) fn daemon_id(&self) -> Option<String> {
+        self.daemon_id.clone()
     }
 }
 
