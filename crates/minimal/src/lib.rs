@@ -537,8 +537,8 @@ pub struct DestroyArgs {
     /// Destroy all sessions
     #[arg(long)]
     pub all: bool,
-    /// Skip confirmation when destroying all sessions
-    #[arg(long, short, requires = "all")]
+    /// Skip the destroy confirmation
+    #[arg(long, short)]
     pub force: bool,
 }
 
@@ -1752,10 +1752,15 @@ async fn activate_session(
     let compose_options = loadouts::compose_options_from_config(&cfg);
     let selection = loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts);
     let active = loadouts::resolve_active_loadouts(selection, &cfg, global)?;
-    if !active.is_empty() {
-        let names: Vec<&str> = active.iter().map(|l| l.name().as_ref()).collect();
+    if !active.loadouts.is_empty() {
+        let names: Vec<&str> = active.loadouts.iter().map(|l| l.name().as_ref()).collect();
         eprintln!("Applying loadouts: {}", names.join(", "));
     }
+    // The contribution carries the banner's loadout display list as a
+    // first-class orientation field (the daemon seeds MINIMAL_LOADOUTS
+    // from it in the launcher baseline). The banner's other dynamic
+    // clause — blueprint presence — is a session-filesystem fact,
+    // tested by the templates in-shell when they print.
     let (contribution, user_policy) =
         loadouts::compose_user_contribution(active, user_policy, compose_options)?;
 
@@ -2377,8 +2382,9 @@ pub async fn cmd_session_policy(
 /// so `--config-dir` moves the mesh enrolment along with everything
 /// else.
 ///
-/// Not gated behind `remote-access`: it is a pure path helper the `dirs` debug
-/// command surfaces regardless of whether the mesh commands are compiled in.
+/// Not gated behind `remote-access`: it is a pure path helper the `min bug`
+/// diagnostic bundle captures regardless of whether the mesh commands are
+/// compiled in.
 pub fn mesh_enrolment_path(global: &GlobalArgs) -> PathBuf {
     let base = match &global.minimal_dir {
         Some(dir) => dir.clone(),
@@ -2506,7 +2512,170 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
         .context("a session or --all is required")?;
     let record = resolve_session(&mut client, session).await?;
 
+    // Under --force the at-risk fetch is skipped outright — the gate is
+    // bypassed regardless, so there is nothing to ask the daemon for.
+    let at_risk = if args.force {
+        AtRiskState::Clean
+    } else {
+        assess_at_risk(session_delta(&mut client, record.id).await)
+    };
+    match destroy_gate(
+        args.force,
+        &at_risk,
+        global.no_input,
+        std::io::stdin().is_terminal(),
+    )? {
+        DestroyGate::Proceed => {}
+        DestroyGate::Confirm => {
+            if let AtRiskState::Dirty(lines) = &at_risk {
+                for line in lines {
+                    println!("{line}");
+                }
+            }
+            let label = record.name.as_deref().unwrap_or(session);
+            if !confirm(
+                &format!("Destroy session {label}? This permanently deletes all in-session files."),
+                false,
+            )? {
+                println!("Aborted.");
+                return Ok(());
+            }
+        }
+    }
+
     destroy_session(&mut client, record.id, record.name.as_deref()).await
+}
+
+/// What the daemon's at-risk report means for the destroy gate.
+///
+/// The three-way split is deliberate: proven-clean destroys without a word,
+/// proven-dirty gates with the listing, and unknowable gates without one —
+/// an unreadable tree (stopped session, RPC failure) cannot prove dirt, but
+/// it cannot prove cleanliness either, so the gate stays conservative.
+#[derive(Debug, PartialEq, Eq)]
+enum AtRiskState {
+    /// Proven clean: everything committed and pushed, or nothing changed
+    /// since activation. Destroy proceeds without a prompt.
+    Clean,
+    /// At-risk work, with the rendered listing lines to print above the
+    /// confirm.
+    Dirty(Vec<String>),
+    /// The state could not be determined: gate, but without a listing.
+    Unknowable,
+}
+
+/// Classifies the daemon's [`minimald_rpc::SessionDeltaResponse`] (or its
+/// absence, on RPC failure/timeout) into the destroy gate's three-way
+/// state, rendering the listing lines for the dirty arm.
+fn assess_at_risk(resp: Option<minimald_rpc::SessionDeltaResponse>) -> AtRiskState {
+    use minimald_rpc::SessionDeltaResponse as R;
+    /// Cap on listing rows, matching the shell-exit prompt's.
+    const ROWS_SHOWN: usize = 10;
+    fn push_capped(rows: &[String], out: &mut Vec<String>) {
+        for row in rows.iter().take(ROWS_SHOWN) {
+            out.push(format!("  {row}"));
+        }
+        if rows.len() > ROWS_SHOWN {
+            out.push(format!("  ... and {} more", rows.len() - ROWS_SHOWN));
+        }
+    }
+    match resp {
+        None | Some(R::Unavailable) => AtRiskState::Unknowable,
+        Some(R::Vcs {
+            uncommitted,
+            unpushed_commits,
+        }) => {
+            if uncommitted.is_empty() && unpushed_commits == 0 {
+                return AtRiskState::Clean;
+            }
+            let mut lines = Vec::new();
+            if !uncommitted.is_empty() {
+                let n = uncommitted.len();
+                let s = if n == 1 { "" } else { "s" };
+                lines.push(format!("{n} file{s} with uncommitted changes:"));
+                push_capped(&uncommitted, &mut lines);
+            }
+            if unpushed_commits > 0 {
+                let s = if unpushed_commits == 1 { "" } else { "s" };
+                lines.push(format!(
+                    "{unpushed_commits} commit{s} not pushed to any remote"
+                ));
+            }
+            AtRiskState::Dirty(lines)
+        }
+        Some(R::ChangedSinceActivation { rows }) => {
+            if rows.is_empty() {
+                return AtRiskState::Clean;
+            }
+            let n = rows.len();
+            // Honest wording for the non-VCS fallback: the activation
+            // baseline cannot tell committed work from unsaved work.
+            let (noun, verb) = if n == 1 {
+                ("file", "differs")
+            } else {
+                ("files", "differ")
+            };
+            let mut lines = vec![format!(
+                "{n} {noun} {verb} from activation (may include committed work):"
+            )];
+            push_capped(&rows, &mut lines);
+            AtRiskState::Dirty(lines)
+        }
+    }
+}
+
+/// How a single-session destroy proceeds past its confirmation gate.
+#[derive(Debug, PartialEq, Eq)]
+enum DestroyGate {
+    /// Destroy without prompting: `--force`, or the session is proven
+    /// clean.
+    Proceed,
+    /// Prompt interactively (default No) before destroying.
+    Confirm,
+}
+
+/// Decides whether a single-session destroy proceeds promptless, may
+/// prompt, or must refuse — one match over (force, at-risk state,
+/// interactivity).
+fn destroy_gate(
+    force: bool,
+    at_risk: &AtRiskState,
+    no_input: bool,
+    stdin_is_terminal: bool,
+) -> Result<DestroyGate, anyhow::Error> {
+    let interactive = !no_input && stdin_is_terminal;
+    match (force, at_risk, interactive) {
+        // --force bypasses the gate; a proven-clean session has nothing to
+        // lose, so no friction either — including headless.
+        (true, _, _) | (false, AtRiskState::Clean, _) => Ok(DestroyGate::Proceed),
+        // At-risk (or unknowable) work with a human present: ask.
+        (false, _, true) => Ok(DestroyGate::Confirm),
+        // The `--all` headless precedent: EOF must never read as consent.
+        (false, _, false) => {
+            bail!("refusing to destroy the session without confirmation; pass --force")
+        }
+    }
+}
+
+/// Best-effort fetch of the session's at-risk report for the destroy
+/// confirm. Any failure — RPC error, timeout, a daemon predating the RPC —
+/// reads as `None` (unknowable), and the confirm renders without a listing.
+async fn session_delta(
+    client: &mut client::Client,
+    id: sessions::SessionId,
+) -> Option<minimald_rpc::SessionDeltaResponse> {
+    /// Client-side ceiling on the fetch. The daemon bounds each of its
+    /// computations at 5 s; this sits just above so a slow-but-healthy
+    /// answer still lands while a wedged daemon cannot stall the confirm.
+    const SESSION_DELTA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+    use minimald_rpc::{SessionDelta, SessionDeltaRequest};
+    tokio::time::timeout(
+        SESSION_DELTA_TIMEOUT,
+        client.oneshot_rpc::<SessionDelta>(SessionDeltaRequest { id }),
+    )
+    .await
+    .ok()?
+    .ok()
 }
 
 async fn destroy_all_sessions(
@@ -3538,14 +3707,129 @@ mod tests {
         assert!(parse(&["min", "session", "destroy"]).is_err());
         assert!(parse(&["min", "session", "destroy", "--all", "web"]).is_err());
 
-        // --force only makes sense with --all, and its error no longer hides
-        // that --all is the alternative the bare error omitted.
+        // --force skips the confirm on either target: --all, or — since the
+        // single-session confirm landed — a bare session too.
         assert!(parse(&["min", "session", "destroy", "--all", "--force"]).is_ok());
-        let bare = parse(&["min", "session", "destroy", "-f"])
-            .err()
-            .expect("-f without --all must fail to parse")
-            .to_string();
-        assert!(bare.contains("--all"), "usage must surface --all: {bare}");
+        assert!(parse(&["min", "session", "destroy", "web", "--force"]).is_ok());
+        assert!(parse(&["min", "session", "destroy", "web", "-f"]).is_ok());
+        // ... but never stands in for the required target.
+        assert!(parse(&["min", "session", "destroy", "-f"]).is_err());
+    }
+
+    /// The single-session destroy gate is dirty-only: `--force` and a
+    /// proven-clean session proceed promptless in every mode (including
+    /// headless); dirty and unknowable states prompt interactively and
+    /// refuse headless, naming `--force` — EOF must never read as consent.
+    #[test]
+    fn destroy_gate_fires_only_for_dirty_or_unknowable_state() {
+        let dirty = || AtRiskState::Dirty(vec!["1 file with uncommitted changes:".to_string()]);
+
+        // --force proceeds promptless regardless of state or mode.
+        for state in [AtRiskState::Clean, dirty(), AtRiskState::Unknowable] {
+            assert_eq!(
+                destroy_gate(true, &state, true, false).unwrap(),
+                DestroyGate::Proceed
+            );
+        }
+
+        // Proven clean proceeds without --force — even headless.
+        for (no_input, tty) in [(false, true), (true, true), (false, false)] {
+            assert_eq!(
+                destroy_gate(false, &AtRiskState::Clean, no_input, tty).unwrap(),
+                DestroyGate::Proceed
+            );
+        }
+
+        // Dirty and unknowable prompt interactively...
+        assert_eq!(
+            destroy_gate(false, &dirty(), false, true).unwrap(),
+            DestroyGate::Confirm
+        );
+        assert_eq!(
+            destroy_gate(false, &AtRiskState::Unknowable, false, true).unwrap(),
+            DestroyGate::Confirm
+        );
+
+        // ...and refuse headless (no tty, or --no-input), naming --force.
+        for state in [dirty(), AtRiskState::Unknowable] {
+            for (no_input, tty) in [(true, true), (false, false), (true, false)] {
+                let err = destroy_gate(false, &state, no_input, tty)
+                    .expect_err("headless without --force must refuse")
+                    .to_string();
+                assert!(err.contains("--force"), "error must name --force: {err}");
+            }
+        }
+    }
+
+    /// Classification of the daemon's at-risk report: proven-clean VCS
+    /// state and an empty activation delta are `Clean`; uncommitted or
+    /// unpushed work is `Dirty` with truthful headers; the fallback header
+    /// admits it may include committed work; absent or `Unavailable`
+    /// responses are `Unknowable`.
+    #[test]
+    fn assess_at_risk_classifies_clean_dirty_and_unknowable() {
+        use minimald_rpc::SessionDeltaResponse as R;
+
+        assert_eq!(assess_at_risk(None), AtRiskState::Unknowable);
+        assert_eq!(
+            assess_at_risk(Some(R::Unavailable)),
+            AtRiskState::Unknowable
+        );
+
+        // Committed and pushed: proven clean.
+        assert_eq!(
+            assess_at_risk(Some(R::Vcs {
+                uncommitted: vec![],
+                unpushed_commits: 0
+            })),
+            AtRiskState::Clean
+        );
+        // Nothing changed since activation: clean in fallback mode too.
+        assert_eq!(
+            assess_at_risk(Some(R::ChangedSinceActivation { rows: vec![] })),
+            AtRiskState::Clean
+        );
+
+        // Uncommitted files and unpushed commits both render.
+        let lines = match assess_at_risk(Some(R::Vcs {
+            uncommitted: vec!["M src/main.rs".to_string(), "A notes.md".to_string()],
+            unpushed_commits: 2,
+        })) {
+            AtRiskState::Dirty(lines) => lines,
+            other => panic!("expected Dirty, got {other:?}"),
+        };
+        assert_eq!(lines[0], "2 files with uncommitted changes:");
+        assert!(lines.contains(&"  M src/main.rs".to_string()), "{lines:?}");
+        assert_eq!(
+            lines.last().unwrap(),
+            "2 commits not pushed to any remote",
+            "{lines:?}"
+        );
+
+        // Unpushed commits alone still gate, without a files header.
+        let lines = match assess_at_risk(Some(R::Vcs {
+            uncommitted: vec![],
+            unpushed_commits: 1,
+        })) {
+            AtRiskState::Dirty(lines) => lines,
+            other => panic!("expected Dirty, got {other:?}"),
+        };
+        assert_eq!(lines, vec!["1 commit not pushed to any remote".to_string()]);
+
+        // The fallback header must not over-claim.
+        let lines = match assess_at_risk(Some(R::ChangedSinceActivation {
+            rows: vec!["A scratch.txt".to_string()],
+        })) {
+            AtRiskState::Dirty(lines) => lines,
+            other => panic!("expected Dirty, got {other:?}"),
+        };
+        assert_eq!(
+            lines,
+            vec![
+                "1 file differs from activation (may include committed work):".to_string(),
+                "  A scratch.txt".to_string(),
+            ]
+        );
     }
 
     /// `min task run <task>` parses with `--keep` off by default; the flag

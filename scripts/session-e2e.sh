@@ -126,6 +126,13 @@ if [ -n "$SEED_DIR" ] || { [ ! -e "$PROJECT_DIR/minimal.toml" ] && [ ! -e "$PROJ
   # A dir we own is cleaned wholesale; otherwise track the lone file we dropped.
   [ -n "$SEED_DIR" ] || SEEDED_MFILE="$PROJECT_DIR/minimal.toml"
 fi
+# A dir we own also becomes a VCS root (a bare `.git` marker, exactly like
+# the task seed below): the headless upload gate then ships the seed into
+# the session workspace. The sandbox proof's banner assertion depends on
+# it — the orientation banner tests /workbench/minimal.toml in-shell at
+# print time, so the blueprint must actually be IN the workspace for the
+# `min init` pointer to stay suppressed.
+[ -z "$SEED_DIR" ] || mkdir "$SEED_DIR/.git"
 
 # Fresh state dir — a clean (no-daemon) cold-start on persistent runners:
 # post-#690, all daemon state (minvmd.toml, locks, the bridge socket) lives
@@ -155,6 +162,12 @@ esac
 export XDG_RUNTIME_DIR="$WORK/runtime"
 mkdir -p "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME"
 chmod 700 "$XDG_RUNTIME_DIR"
+
+# Hermetic user config: the CLI resolves loadouts and config.toml under
+# XDG_CONFIG_HOME, and the sandbox proof below asserts the zero-config
+# orientation banner (built-in `default` loadout). An operator's own
+# `default_loadouts`/`default.toml` must not leak into the canonical proof.
+export XDG_CONFIG_HOME="$WORK/config"
 
 # The CLI's tracing layer writes to STDOUT (ot::StdoutWriter, minimal/src/
 # main.rs), so at the default level the autospawn INFO lines interleave with
@@ -263,9 +276,14 @@ fi
 # new session id on stdout. The id is the LAST stdout line (any log lines
 # that slip through the RUST_LOG filter precede it), validated as a UUID.
 echo "::group::cold activate (auto-spawns the daemon)"
+# Explicit name: the sandbox proof asserts the orientation banner
+# interpolates the ACTUAL session name at the first prompt; an autogen
+# name would make that assertion a moving target. The state dir is fresh
+# per run, so a fixed name cannot collide.
+SESSION_NAME="e2e-banner"
 t0=$(now_ms)
 # shellcheck disable=SC2086
-activate_out="$(cd "$PROJECT_DIR" && mnl session activate . ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/activate.err")" \
+activate_out="$(cd "$PROJECT_DIR" && mnl session activate . --name "$SESSION_NAME" ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/activate.err")" \
   || { echo "::error::cold 'min session activate' failed to auto-spawn the daemon / create a session"; fail; }
 t1=$(now_ms)
 sid="$(printf '%s\n' "$activate_out" | tail -n1 | tr -d '\r')"
@@ -291,10 +309,10 @@ echo "warm 'min ls': $((t1 - t0))ms"
 # `min task run` proof: a declared task runs in an ephemeral session — output
 # streamed through, the task's exit code relayed, the session destroyed
 # afterwards (or kept with --keep). Runs against its own tiny seeded project:
-# the shared PROJECT_DIR seed deliberately declares no tasks (and, not being a
-# VCS root, a headless activate skips its upload), so this seed carries the
-# same pinned [upstream] + shell stack PLUS the tasks and a `.git` marker so
-# the headless upload gate ships the config into the session. Skipped when the
+# the shared PROJECT_DIR seed deliberately declares no tasks, so this seed
+# carries the same pinned [upstream] + shell stack PLUS the tasks (and the
+# same `.git` marker, so the headless upload gate ships the config into the
+# session). Skipped when the
 # caller supplied a project we didn't seed — its minimal.toml declares none of
 # these tasks. Short mktemp template on purpose (mirrors the PROJECT_DIR
 # seed): the basename lands in the state root's task-dir paths, inside the
@@ -366,9 +384,21 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     mnl ls 2>&1 || true
     fail
   fi
-  mnl session destroy "$kept" >/dev/null 2>&1 \
+  # The destroy dirty gate: the kept session's task process has exited, so
+  # no host is running and its at-risk state is unknowable — the gate must
+  # refuse a headless (no TTY) destroy without --force, naming the escape
+  # hatch. (Were a host live, the seed's empty `.git` marker would make VCS
+  # mode decline into the activation-delta fallback instead; only a
+  # proven-clean tree may destroy headless without --force.)
+  if mnl session destroy "$kept" >/dev/null 2>"$WORK/destroy-refuse.err"; then
+    echo "::error::headless 'min session destroy' without --force should refuse"
+    fail
+  fi
+  grep -q -- "--force" "$WORK/destroy-refuse.err" \
+    || { echo "::error::headless destroy refusal does not name --force"; cat "$WORK/destroy-refuse.err" 2>/dev/null || true; fail; }
+  mnl session destroy --force "$kept" >/dev/null 2>&1 \
     || { echo "::error::could not destroy kept session $kept"; fail; }
-  echo "task run --keep: session $kept retained OK"
+  echo "task run --keep: session $kept retained; dirty gate refused headless destroy OK"
 
   # Unknown task: an instant client-side error listing what IS declared.
   if (cd "$TASK_SEED_DIR" && mnl task run no-such-task >/dev/null 2>"$WORK/task-unknown.err"); then
@@ -437,7 +467,32 @@ if [[ "$attach_out" != *"$ADD_TOOL_MARKER"* ]]; then
   echo "--- driver stderr ---"; cat "$WORK/exec.err" 2>/dev/null || true
   fail
 fi
-echo "sandbox proof: in-sandbox 'min add $ADD_TOOL' + run OK ($((t1 - t0))ms)"
+# Orientation banner: the first interactive prompt must have printed the
+# two orientation lines, with the ACTUAL session name and loadout list
+# interpolated in-shell from the $MINIMAL_* vars (daemon baseline +
+# client-composed). XDG_CONFIG_HOME is hermetic (see the export above),
+# so the composed loadout is deterministically the built-in `default`.
+if [[ "$attach_out" != *"minimal · session $SESSION_NAME · loadout default (built-in)"* ]]; then
+  echo "::error::attach output lacks the orientation banner line (session name + loadout list)"
+  echo "--- attach output ---"; printf '%s\n' "$attach_out"
+  fail
+fi
+if [[ "$attach_out" != *"detach: ctrl-w"* ]]; then
+  echo "::error::attach output lacks the orientation banner's detach line"
+  echo "--- attach output ---"; printf '%s\n' "$attach_out"
+  fail
+fi
+# The banner tests /workbench/minimal.toml IN-SHELL at print time, so this
+# asserts the workspace's real state: our owned seed is a VCS root whose
+# upload shipped the blueprint, so the `min init` pointer must not have
+# printed. Only asserted for a seed we own — a caller-provided
+# E2E_PROJECT_DIR controls its own upload-gate outcome.
+if [ -n "$SEED_DIR" ] && [[ "$attach_out" == *"no minimal.toml here"* ]]; then
+  echo "::error::banner shows the 'min init' pointer despite the uploaded minimal.toml"
+  echo "--- attach output ---"; printf '%s\n' "$attach_out"
+  fail
+fi
+echo "sandbox proof: in-sandbox 'min add $ADD_TOOL' + run OK, orientation banner rendered ($((t1 - t0))ms)"
 echo "::endgroup::"
 
 # We answered the exit prompt with "Delete", so the session was destroyed and

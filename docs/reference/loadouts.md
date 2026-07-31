@@ -267,7 +267,8 @@ When a session is activated with no loadout flags and an empty
 `default_loadouts`, a built-in `default` loadout applies so a fresh box
 comes up oriented rather than in a bare shell. It contributes **no
 packages** — only a shaped `PS1` and a once-only banner (the minimal
-mark plus a pointer to `min add`), shipped through the
+mark, the [orientation lines](#orientation-banner) naming the session
+and its loadouts, plus a pointer to `min add`), shipped through the
 [MOTD recipe](#vars-in-the-attach-shell). The banner is TTY-gated, prints
 exactly once per session, and renders without color.
 
@@ -358,9 +359,10 @@ patches cannot influence it. Interactive setup travels through the
 environment instead, i.e. through `[vars]`:
 
 - **Prompt**: the session launcher seeds a baseline environment
-  (currently a stock `PS1`) before merging in the composed vars, and a
-  composed var overwrites a baseline entry with the same name. Setting
-  `PS1` in `[vars]` therefore replaces the stock prompt. This baseline is
+  (a stock `PS1`, plus the [orientation banner](#orientation-banner)
+  vars below) before merging in the composed vars, and a composed var
+  overwrites a baseline entry with the same name. Setting `PS1` in
+  `[vars]` therefore replaces the stock prompt. This baseline is
   a layer *beneath* composition, not a contributor: the no-override
   conflict rule above arbitrates between contributors and does not apply
   to the launcher's defaults.
@@ -380,3 +382,41 @@ environment instead, i.e. through `[vars]`:
   and never runs for non-interactive commands; the `[ -t 1 ]` guard keeps
   redirected output clean. Multi-line literal values survive composition
   intact.
+
+### Orientation banner {#orientation-banner}
+
+Unless a loadout overrides it, the first interactive prompt of an
+attached session prints a two-line orientation banner:
+
+```
+minimal · session api-server-4f2a · loadout default (built-in)
+detach: ctrl-w · no minimal.toml here — min init to add one
+```
+
+The second line drops the `min init` pointer when the session workspace
+carries a `minimal.toml` (either layout, `minimal.toml` or
+`.minimal/minimal.toml`) — the template tests the workspace root
+(`/workbench`) in-shell at the moment it prints, so the clause reflects
+the session's actual filesystem: it stays correct when an activation
+skipped the file upload, and disappears after an in-session `min init`
+once a fresh shell launches. The banner is TTY-gated, prints exactly
+once, and is plain text (`NO_COLOR`-safe).
+
+It ships as a *static template* in the launcher baseline (the MOTD
+recipe above), interpolated by the shell at print time from two env
+vars every session carries:
+
+| Var | Value |
+|-----|-------|
+| `MINIMAL_SESSION_NAME` | The session's name |
+| `MINIMAL_LOADOUTS` | Display list of the active loadouts: comma-joined names, `default (built-in)` for the zero-config fallback, `none` with `--no-loadouts` |
+
+Both are seeded daemon-side in the launcher baseline; the loadout list
+travels from the client as a first-class field on the composition
+(control-plane data, never a session var), so user vars and user policy
+cannot collide with either.
+
+Because the trigger lives in the baseline layer, a loadout that sets its
+own `PROMPT_COMMAND` replaces the banner cleanly — and can interpolate
+the same `$MINIMAL_*` vars in its own MOTD, as the built-in `default`
+loadout does for its orientation lines.
