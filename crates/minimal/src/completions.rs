@@ -120,6 +120,19 @@ fn install_one(shell: InstallShell) -> Result<PathBuf, anyhow::Error> {
     let dir = target
         .parent()
         .with_context(|| format!("{} has no parent directory", target.display()))?;
+
+    // bash has no completion search path of its own: the file below is read
+    // only by the separate bash-completion project's loader. Writing it where
+    // nothing will source it is the silent no-op this skips — a warning, not a
+    // failure, exactly as an unwritable dir is handled above.
+    if shell == InstallShell::Bash && !bash_completion_present() {
+        anyhow::bail!(
+            "skipping bash completions: no bash-completion loader found on this system, \
+             so nothing would source {} (install bash-completion >= 2.0, then re-run)",
+            dir.display()
+        );
+    }
+
     let tmp = tmp_sibling(&target);
 
     // Probe that the directory is writable BEFORE generating anything: these
@@ -153,6 +166,18 @@ fn install_one(shell: InstallShell) -> Result<PathBuf, anyhow::Error> {
     }
 
     if shell == InstallShell::Zsh {
+        // The file is only ever autoloaded if its directory is on `$fpath`
+        // before `compinit`, which is a property of the user's startup, not
+        // something writing the file establishes. Point them at the one line
+        // that fixes it whenever we cannot confirm the directory is already there.
+        if !zsh_dir_on_fpath(dir) {
+            eprintln!(
+                "note: zsh loads {} only when its directory is on $fpath before compinit; \
+                 add `fpath+=({})` to your ~/.zshrc if `min` completions do not appear",
+                target.display(),
+                dir.display()
+            );
+        }
         drop_zcompdump();
     }
     Ok(target)
@@ -215,4 +240,58 @@ fn xdg_home(var: &str, fallback: &str) -> Result<PathBuf, anyhow::Error> {
 /// counts as unset, matching the shell's `${VAR:-default}`.
 fn env_non_empty(var: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(var).filter(|value| !value.is_empty())
+}
+
+/// Whether the bash-completion project's loader is installed on this system.
+///
+/// `$BASH_COMPLETION_USER_DIR` is only ever set once that loader is sourced, so
+/// its presence is a positive signal; otherwise probe the standard locations
+/// the project's init script ships to across Linux and Homebrew.
+fn bash_completion_present() -> bool {
+    if env_non_empty("BASH_COMPLETION_USER_DIR").is_some() {
+        return true;
+    }
+    const LOADERS: [&str; 7] = [
+        "/usr/share/bash-completion/bash_completion",
+        "/etc/bash_completion",
+        "/etc/profile.d/bash_completion.sh",
+        "/usr/local/share/bash-completion/bash_completion",
+        "/usr/local/etc/profile.d/bash_completion.sh",
+        "/opt/homebrew/share/bash-completion/bash_completion",
+        "/opt/homebrew/etc/profile.d/bash_completion.sh",
+    ];
+    LOADERS.iter().any(|loader| Path::new(loader).exists())
+}
+
+/// Whether `dir` is on zsh's `$fpath`, as far as this process can tell. zsh ties
+/// the `fpath` array to the exported-when-set `FPATH` scalar; when a setup
+/// exports it we can check membership, otherwise the interactive shell's fpath
+/// is invisible here, so report `false` and let the caller emit its hint.
+fn zsh_dir_on_fpath(dir: &Path) -> bool {
+    env_non_empty("FPATH").is_some_and(|fpath| fpath_contains(&fpath, dir))
+}
+
+/// Whether the `:`-separated `fpath` scalar has `dir` as an entry.
+fn fpath_contains(fpath: &std::ffi::OsStr, dir: &Path) -> bool {
+    std::env::split_paths(fpath).any(|entry| entry == dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fpath_contains;
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    #[test]
+    fn fpath_membership_is_exact() {
+        let fpath = OsString::from("/a:/home/u/.local/share/zsh/completions:/b");
+        let dir = Path::new("/home/u/.local/share/zsh/completions");
+        assert!(fpath_contains(&fpath, dir));
+        // A parent of the completions dir is not the completions dir.
+        assert!(!fpath_contains(
+            &fpath,
+            Path::new("/home/u/.local/share/zsh")
+        ));
+        assert!(!fpath_contains(&OsString::from("/a:/b"), dir));
+    }
 }
