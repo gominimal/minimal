@@ -82,8 +82,15 @@ fn run_alias_message(task: Option<&str>) -> String {
 
 /// Verify `task` is declared in the project's `minimal.toml`, walking up
 /// from `dir` like the activate config discovery does. Errors name the fix:
-/// no config → `min init`; unknown task → the declared list.
+/// untrimmed name → the whitespace rejection; no config → `min init`;
+/// unknown task → the declared list.
 fn check_task_declared(dir: &camino::Utf8Path, task: &str) -> Result<(), anyhow::Error> {
+    // Rejected before any lookup: the daemon trims the task name out of the
+    // exec command string, so a name with leading/trailing whitespace can
+    // never round-trip into the box — even if minimal.toml declares it.
+    if task.trim() != task {
+        bail!(untrimmed_task_message(task));
+    }
     let file = match mfile::File::from_dir_recursive(dir.as_std_path()) {
         Ok(f) => f,
         Err(mfile::Error::NotFound) => bail!(
@@ -100,6 +107,16 @@ fn check_task_declared(dir: &camino::Utf8Path, task: &str) -> Result<(), anyhow:
         bail!(unknown_task_message(&file, task));
     }
     Ok(())
+}
+
+/// The whitespace rejection body: the name is debug-quoted so the offending
+/// whitespace is visible. Split out for unit tests.
+fn untrimmed_task_message(task: &str) -> String {
+    format!(
+        "task name {task:?} has leading or trailing whitespace, which cannot \
+         round-trip through the session exec channel; use {:?}",
+        task.trim()
+    )
 }
 
 /// The unknown-task error body: names the task and lists what IS declared,
@@ -125,9 +142,12 @@ fn unknown_task_message(file: &mfile::File, task: &str) -> String {
 /// connection is parked in the exec bridge, so the handler works over a
 /// fresh connection. Without `--keep` the first Ctrl-C best-effort
 /// `DestroySession`s the box; with it the session is left alive and the
-/// handler says how to reach it. Either way the process exits 130; a second
-/// Ctrl-C falls through to the default disposition. Dropping the guard
-/// cancels the handler once the normal destroy/keep path has run.
+/// handler says how to reach it. Either way the process exits 130. The
+/// destroy leg is bounded: the connect-and-destroy runs under the same
+/// 10-second cleanup ceiling as [`crate::best_effort_destroy`], and a
+/// second Ctrl-C during it abandons the cleanup and exits 130 immediately —
+/// an unresponsive daemon can delay the exit, never prevent it. Dropping
+/// the guard cancels the handler once the normal destroy/keep path has run.
 ///
 /// Note the SIGINT is consumed on the host: it is NOT relayed into the box,
 /// so — unlike interrupting a local command — the task itself gets no
@@ -163,13 +183,34 @@ fn arm_task_run_interrupt(
             std::process::exit(130);
         }
         eprintln!("\nInterrupted; destroying session {session_name}…");
-        if let Ok(sock) = sock
-            && let Ok(mut client) = crate::client::Client::connect(&sock).await
-        {
-            use minimald_rpc::{DestroySession, DestroySessionRequest};
-            let _ = client
-                .oneshot_rpc::<DestroySession>(DestroySessionRequest { id: session_id })
-                .await;
+        // The whole connect-and-destroy is bounded by the same 10-second
+        // cleanup ceiling as `best_effort_destroy` — the interrupt may well
+        // mean the daemon is already wedged — and raced against a second
+        // Ctrl-C, which abandons the cleanup and exits immediately.
+        // `ctrl_c()` keeps the process-wide SIGINT handler installed, so
+        // without that race a second interrupt would be silently swallowed.
+        const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let destroy = async {
+            if let Ok(sock) = sock
+                && let Ok(mut client) = crate::client::Client::connect(&sock).await
+            {
+                use minimald_rpc::{DestroySession, DestroySessionRequest};
+                let _ = client
+                    .oneshot_rpc::<DestroySession>(DestroySessionRequest { id: session_id })
+                    .await;
+            }
+        };
+        tokio::select! {
+            res = tokio::time::timeout(CLEANUP_TIMEOUT, destroy) => {
+                if res.is_err() {
+                    eprintln!(
+                        "DestroySession timed out after {CLEANUP_TIMEOUT:?}; the session may \
+                         still be present (run `min session destroy {session_name}` to clean \
+                         up manually)"
+                    );
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {}
         }
         std::process::exit(130);
     });
@@ -540,6 +581,25 @@ mod tests {
         let none = mfile::File::from_toml_bytes(b"").unwrap();
         let msg = unknown_task_message(&none, "c");
         assert!(msg.contains("declares no tasks"), "got: {msg}");
+    }
+
+    /// A task name with leading/trailing whitespace is rejected before any
+    /// config lookup — the daemon trims the exec command string, so such a
+    /// name can never round-trip — with the name debug-quoted so the
+    /// whitespace is visible.
+    #[test]
+    fn untrimmed_task_names_are_rejected() {
+        let msg = untrimmed_task_message(" build ");
+        assert!(msg.contains("\" build \""), "got: {msg}");
+        assert!(msg.contains("whitespace"), "got: {msg}");
+        assert!(msg.contains("\"build\""), "got: {msg}");
+
+        // The rejection fires before the minimal.toml discovery: a path
+        // that has no config still yields the whitespace error, not the
+        // no-config one.
+        let err = check_task_declared(camino::Utf8Path::new("/nonexistent-task-test"), "build ")
+            .expect_err("an untrimmed name must be rejected");
+        assert!(err.to_string().contains("whitespace"), "got: {err}");
     }
 
     /// Exit-status relay: a reported 0 is success; anything else downcasts

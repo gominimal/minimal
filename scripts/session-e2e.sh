@@ -332,7 +332,10 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     echo "--- task stderr ---"; cat "$WORK/task-run.err" 2>/dev/null || true
     fail
   fi
-  if mnl ls 2>/dev/null | grep -q 'task-e2e-echo-'; then
+  # Capture-then-glob, never `mnl ls | grep -q`: grep's early exit SIGPIPEs
+  # the ls under pipefail and the leftover check would falsely pass.
+  ls_out="$(mnl ls 2>/dev/null)"
+  if [[ "$ls_out" == *task-e2e-echo-* ]]; then
     echo "::error::ephemeral session still listed after 'min task run e2e-echo'"
     fail
   fi
@@ -347,7 +350,8 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     echo "--- task stderr ---"; cat "$WORK/task-fail.err" 2>/dev/null || true
     fail
   fi
-  if mnl ls 2>/dev/null | grep -q 'task-e2e-fail-'; then
+  ls_out="$(mnl ls 2>/dev/null)"
+  if [[ "$ls_out" == *task-e2e-fail-* ]]; then
     echo "::error::ephemeral session still listed after a failing 'min task run'"
     fail
   fi
