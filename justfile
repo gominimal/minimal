@@ -1,7 +1,9 @@
 # justfile — repo-wide task runner; the local twin of the frozen CI workflows
 # (docs/ci-strategy.md §8: CI YAML schedules, the logic lives here + scripts/).
 # OS-specific recipes carry [linux]/[macos] attributes — `just --list` shows
-# only this host's. The comment line directly above a recipe is its caption.
+# only this host's. `just --list` renders ONLY the last comment line above a
+# recipe, so that line must be a standalone summary (warnings included);
+# rationale, CI pointers and caveats go above it, separated by a bare `#`.
 
 scratch      := justfile_directory() / ".scratch"
 arch         := arch()
@@ -159,26 +161,33 @@ _nextest: (_need "cargo-nextest" "cargo install cargo-nextest --locked")
 fmt:
     cargo fmt --all
 
-# Autofix pass: fmt, clippy --fix, fmt again. Clippy's `--fix` can shuffle
-# whitespace during its rewrites, so the trailing `cargo fmt` normalizes
-# whatever landed. `--allow-dirty` skips the clean-worktree check — the
-# usual case here is running mid-edit with staged/unstaged work.
+# Clippy's `--fix` can shuffle whitespace during its rewrites, so the trailing
+# `cargo fmt` normalizes whatever landed. `--allow-dirty` skips the
+# clean-worktree check — the usual case here is running mid-edit with
+# staged/unstaged work.
+#
+# Autofix pass: fmt, clippy --fix, fmt again (safe to run mid-edit).
 fix:
     cargo fmt --all
     cargo clippy {{scope}} --all-targets --fix --allow-dirty -- -D warnings
     cargo fmt --all
 
 # CI: ci.yml `fmt`.
+#
+# Check rustfmt across the workspace without writing (`just fmt` is the fixer).
 fmt-check:
     cargo fmt --all -- --check
 
 # CI: ci.yml `clippy` / the ci-macos.yml `unit` scope.
+#
+# Clippy over all targets at this host's scope, warnings denied.
 clippy:
     cargo clippy {{scope}} --all-targets --locked -- -D warnings
 
 # A local advisories failure may just mean newer RUSTSEC data than CI's last run.
-#
 # CI: ci.yml `cargo-deny` (advisories/bans/licenses/sources).
+#
+# cargo-deny's all-features check: advisories, bans, licenses, sources.
 deny: (_need "cargo-deny" "cargo install cargo-deny --locked")
     cargo deny --all-features check
 
@@ -186,6 +195,8 @@ deny: (_need "cargo-deny" "cargo install cargo-deny --locked")
 # by every crate) still type-checks. cargo-hack drives the check against the
 # declared version; the toolchain the check runs under is fetched by rustup.
 # CI: nightly-tests.yml `msrv` (blocking).
+#
+# The declared MSRV floor still type-checks (cargo-hack).
 msrv: (_need "cargo-hack" "cargo install cargo-hack --locked")
     cargo hack check --rust-version --workspace --all-targets --locked
 
@@ -194,6 +205,8 @@ msrv: (_need "cargo-hack" "cargo install cargo-hack --locked")
 # interprets under miri in seconds. Needs the nightly toolchain + miri component:
 #   rustup toolchain install nightly && rustup +nightly component add miri
 # CI: nightly-tests.yml `miri` (non-blocking). Widen the set as more crates prove clean.
+#
+# miri over `switch`'s vsock/subnet/MAC primitives (needs nightly + the miri component).
 miri:
     cargo +nightly miri test -p switch
 
@@ -275,14 +288,16 @@ test-installer:
         SH="$sh" "$sh" scripts/install_test.sh
     done
 
-# Shellcheck EVERY script under scripts/ (not just the installer's two files).
 # The reviewed harness the frozen ci-shell-installer.yml can't widen to; CI runs
 # the same check through crates/common/tests/shell_lint.rs (part of `just test`).
+#
+# Shellcheck EVERY script under scripts/ (not just the installer's two files).
 lint-shell:
     bash scripts/lint-shell.sh
 
-# Run the promotion provenance gate's test harness (stubbed `gh`, no network,
-# no auth); shellcheck runs when present.
+# Shellcheck runs too, when present.
+#
+# Run the promotion provenance gate's test harness (stubbed `gh`, no network or auth).
 test-promote-gate:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -338,10 +353,11 @@ test-vm: _nextest _kvm artifacts initramfs minvmd-build
       cargo nextest run -p minvmd --profile vm --run-ignored all --no-tests=fail \
       -E 'binary(/_integration$/) and not binary(/_root_integration$/)'
 
-# minimald's netns/tap proofs (the tests sudo their own netns commands).
 # CI: ci-linux-native.yml `minimald-root-integration`. The AppArmor policy
 # can't unlock this surface — its namespaces come from hashed-path test
 # binaries and /usr/bin/unshare, which a per-binary profile can't cover.
+#
+# minimald's netns/tap proofs (the tests sudo their own netns commands).
 [linux]
 test-root-integration: _nextest gvproxy
     @[ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "0" ] || { echo "this host restricts unprivileged user namespaces, which this surface needs from hashed-path test binaries (the AppArmor policy can't cover those); leave this lane to CI, or see docs/reference/linux-host-setup.md before relaxing the restriction host-wide" >&2; exit 1; }
@@ -353,8 +369,9 @@ test-root-integration: _nextest gvproxy
 e2e: _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/session-e2e.sh
 
-# The SAME session e2e against a host-native minimald (no VM).
 # CI: ci-linux-native.yml `native-daemon-e2e`.
+#
+# The SAME session e2e against a host-native minimald (no VM).
 [linux]
 e2e-native:
     cargo build -p minimald --bin minimald -p minimal --bin min --locked
@@ -367,9 +384,10 @@ e2e-native:
 test-lifecycle: (_need "jq" "brew install jq (or apt install jq)") _kvm artifacts initramfs minvmd-build
     XDG_STATE_HOME="{{scratch}}/test-state" ./scripts/minvmd-lifecycle.sh
 
-# Reaps between iterations — this WILL kill this checkout's live dev stack each pass.
+# nightly-tests.yml runs 10 reps, then `just bulk-upload`. The reap between
+# iterations kills THIS checkout's live dev stack — not just the soak's own VMs.
 #
-# Nightly soak parity: N session-e2e reps (nightly-tests.yml runs 10), then `just bulk-upload`.
+# Nightly soak parity: N session-e2e reps; reaps between them — WILL kill your dev stack.
 soak n="10": _kvm artifacts gvproxy initramfs minimal-cli minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/soak-session-e2e.sh {{n}} "{{scratch}}/soak-logs"
 

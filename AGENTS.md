@@ -65,22 +65,31 @@ The CLI reference overview is [docs/reference/cli.md](docs/reference/cli.md).
 
 | Platform | What you can build and test |
 |---|---|
-| Linux amd64 / arm64 | Full workspace: `just ci` builds, lints, and tests everything; all four binaries. |
-| macOS arm64 | Session stack only; see below. |
+| Linux amd64 / arm64 | Full workspace natively: `just ci` builds, lints, and tests everything; all four binaries. |
+| macOS arm64 | Session stack natively (`just ci`); every Linux-only crate via `just test-cross`. |
 
-On macOS, `minimald` does **not** build: its sandbox stack
-(`hakoniwa` → `libcgroups` → `procfs`) is Linux-only. Consequences:
+**Build and test only through `just`.** The recipes carry the per-OS scoping,
+the pinned flags, and the ordering constraints (notably the macOS codesign);
+a hand-rolled `cargo` invocation silently drops them. If something has no
+recipe, add one — the justfile is where local build knowledge lives.
 
-- `just test` and `just clippy` handle the scoping: on macOS they resolve to
-  `-p minvmd -p sessions` automatically (the justfile's `scope` variable). Reach
-  for a raw `cargo` invocation only for something the recipes don't cover.
-- `cargo build -p minimal` works, but `cargo test -p minimal` does not, because the
-  CLI's dev-dependencies pull `minimald` (test support).
-- The `min` CLI's macOS coverage is the end-to-end proof (`scripts/session-e2e.sh`,
+`minimald` does not build **natively** on macOS: its sandbox stack
+(`hakoniwa` → `libcgroups` → `procfs`) is Linux-only. That is a native-host
+limit, not a coverage gap. Consequences:
+
+- `just test`, `just clippy`, and `just fix` scope themselves: on macOS they
+  resolve to `-p minvmd -p sessions` automatically (the justfile's `scope`
+  variable), on Linux to `--workspace`.
+- `just test-cross` covers the Linux-only crates — `minimald` and the `min`
+  CLI's test targets included — by cross-compiling to musl in Docker
+  (`--workspace --exclude minvmd`). It is the macOS answer for anything the
+  darwin scope skips. The first run compiles under emulation and can take an
+  hour+.
+- The `min` CLI's macOS coverage is also proved end-to-end (`scripts/session-e2e.sh`,
   driven by `just e2e`), run in CI on the self-hosted Apple Silicon runner
   against a real microVM.
 
-This scoping is temporary: CI widens to `--workspace` once the tree is
+The native scoping is temporary: CI widens to `--workspace` once the tree is
 mac-buildable (see the comments in `.github/workflows/ci-macos.yml`).
 
 ## System dependencies
@@ -106,56 +115,17 @@ mac-buildable (see the comments in `.github/workflows/ci-macos.yml`).
 
 ## justfile recipes
 
-33 recipes on Linux (`just --summary`; OS-specific recipes carry
-`[linux]`/`[macos]` attributes, so macOS shows a smaller set plus
-`test-cross`). The justfile is the local twin of the frozen CI workflows:
+**Run `just --list` to see every recipe available here, each with its own
+description.** Bare `just` prints the same list. That output is generated from
+the justfile, so it cannot drift; this section deliberately does not restate it.
+`[linux]`/`[macos]` attributes scope recipes per OS, so the list on your host
+already shows only what you can run on it.
+
+The justfile is the local twin of the frozen CI workflows:
 the CI YAML schedules, the logic lives here and in `scripts/`
 (docs/ci-strategy.md §8). `.scratch/` is a shared scratchpad; recipes manage
 only their own artifacts there (which is why `clean` is scoped, never
 `rm -rf .scratch` wholesale).
-
-CI-parity gates:
-
-- `ci`: the local PR gate set, cheapest first: `fmt-check clippy deny test doctest` (+ `test-ignored` on Linux). The canonical pre-PR command per [CONTRIBUTING.md](CONTRIBUTING.md#building-and-testing).
-- `fmt` / `fmt-check`: apply rustfmt across the workspace / the CI check variant (the fixer for a red `fmt-check` is `fmt`).
-- `clippy`: `cargo clippy --all-targets -- -D warnings` (workspace on Linux; the darwin-capable `-p minvmd -p sessions` scope on macOS).
-- `deny`: `cargo deny --all-features check` (advisories/bans/licenses/sources); a local advisories failure may just mean newer RUSTSEC data than CI's last run.
-- `test`: unit + in-process integration tests via nextest (CI profile on Linux; workspace on Linux, darwin scope on macOS).
-- `doctest`: doctests (`cargo test --doc`); nextest can't run them, so they are their own surface.
-- `test-ignored`: Linux: the locally-runnable `#[ignore]` tests that NO CI lane covers (the VM/netns harnesses self-skip here; `just test-vm` runs those for real).
-- `test-cross`: macOS: clippy + tests for the Linux-only crates via `cross` (musl in Docker; excludes `minvmd`). The first run compiles under emulation and can take an hour+.
-- `test-installer`: run the curl|sh installer's test harness under every available POSIX sh (+ shellcheck when present).
-
-e2e & test harnesses (KVM on Linux, HVF on macOS):
-
-- `e2e`: the unified session e2e (`scripts/session-e2e.sh`) against the VM-backed daemon.
-- `e2e-native`: Linux: the SAME session e2e against a host-native `minimald`, no VM.
-- `test-vm`: `minvmd`'s VM harnesses (`tests/*_integration.rs`); on macOS this uses CI's archive pattern with the codesign as the last binary touch.
-- `test-root-integration`: Linux: `minimald`'s netns/tap proofs (the tests sudo their own netns commands); refuses to run where AppArmor restricts unprivileged userns.
-- `test-lifecycle`: daemon lifecycle proof (`run --detach` → Running → `stop` → Stopped), booted switchless like CI's step.
-- `soak n=10`: nightly soak parity: N session-e2e reps; reaps between iterations, which WILL kill this checkout's live dev stack each pass.
-
-Stack bring-up & daemon lifecycle (`just up` = this host's default run mode):
-
-- `up`: macOS: Linux VM over Hypervisor.framework. Linux: host-native `minimald`, no VM, under `.scratch/native-state` (reach it via `min --minimal-dir`). Both end with a `min ls` smoke.
-- `up-kvm`: Linux: native host + one Linux VM over KVM; `minvmd` binds the CLI socket directly.
-- `down`: stop what `just up` started (macOS: delegates to `stop`; Linux: the pidfile-verified native `minimald`).
-- `status` / `stop`: report / stop (SIGTERM → SIGKILL) the supervised `minvmd`.
-- `min *args`: build `min` (+ `minimald` on Linux), then run `min` with `target/debug` on `PATH` (so auto-spawn finds the sibling daemons by name).
-- `env`: print `export` lines wiring the dev-built binaries and guest artifacts into the environment (`eval "$(just env)"`).
-- `shell`: subshell with that environment loaded.
-- `reap`: kill THIS checkout's stranded VM processes (`scripts/reap-vms.sh`); leftovers wedge the next VM's vsock bridge.
-
-Build artifacts and prerequisites:
-
-- `artifacts`: fetch the prebuilt guest kernel + generic rootfs into `.scratch` (skips when present; `clean` to force refresh).
-- `libkrun`: Linux: fetch prebuilt libkrun + libkrunfw into `~/.krun` (macOS links the Homebrew install instead).
-- `gvproxy`: fetch the pinned gvproxy switch binary into `.scratch` (missing = switchless boot).
-- `initramfs`: cross-compile `minimald` (static musl, `FEATURES` baked in) and pack it as the initramfs `/init`.
-- `minvmd-build`: build debug `minvmd` (codesigns last on macOS; links the real libkrun via `LIBKRUN_PREFIX` on Linux).
-- `minimald-build`: Linux: build a host-native `minimald` with the networking features (for `just up`).
-- `minimal-cli`: build the `min` CLI (`cargo build -p minimal`; the binary is `target/debug/min`).
-- `clean`: remove only the bring-up artifacts the justfile manages (never all of `.scratch`).
 
 ## Footguns
 
@@ -254,13 +224,13 @@ PR"): it runs the same gates the PR lanes run (fmt, clippy, cargo-deny,
 the test suite, doctests; plus `just test-ignored` on Linux), dispatched
 for your OS. Platform notes for agents:
 
-- **macOS**: the workspace does not fully build (see
+- **macOS**: the workspace does not build natively (see
   [Platform matrix](#platform-matrix)); `just ci` runs the darwin-capable
-  scope, and `just test-cross` additionally covers the Linux-only crates
-  via `cross` (Docker required).
+  scope, and `just test-cross` covers the Linux-only crates via `cross`
+  (Docker required). A change touching `minimald` or the `min` CLI's tests
+  is unverified until `just test-cross` has run.
 - **VM/daemon-path changes**: also run `just e2e` (the session proof)
   and/or `just test-vm` (the VM integration harnesses).
-- **Tight iteration loops**: `cargo test -p <crate>` on the crate under
-  edit is still the fastest inner loop; agents iterating on a working tree
-  may prefer the auto-fixing clippy variant:
-  `cargo clippy --allow-dirty --fix --all-targets -- -D warnings`.
+- **Tight iteration loops**: `just fix` (fmt → `clippy --fix` → fmt, with
+  `--allow-dirty` so it runs mid-edit) then `just test`. Both carry this
+  host's scope; neither needs a hand-written `cargo` line.
