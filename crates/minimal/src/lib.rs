@@ -45,9 +45,9 @@ pub enum Command {
     /// List sessions
     //
     // Deliberate exception to the `<noun> <verb>` convention (documented in
-    // docs/reference/cli.md): `min ls` is the highest-traffic command in the
-    // CLI and keeps its bare top-level form. Not an oversight — do not move it
-    // under `session`.
+    // docs/reference/cli.md): `min session list` is the canonical spelling,
+    // and `min ls` — the highest-traffic command in the CLI — keeps this bare
+    // top-level form as its visible alias. Not an oversight — do not remove it.
     Ls(LsArgs),
     /// Shut down the minimald daemon
     //
@@ -163,6 +163,9 @@ pub struct SessionArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
+    /// List sessions
+    #[command(visible_alias = "ls")]
+    List(LsArgs),
     /// Activate (create) a new session
     Activate(ActivateArgs),
     /// Attach to an existing session
@@ -649,6 +652,7 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Ls(args)) => cmd_ls(&cli.global_args, args).await,
         Some(Command::Stop(args)) => cmd_stop(&cli.global_args, args).await,
         Some(Command::Session(SessionArgs { command })) => match command {
+            SessionCommand::List(args) => cmd_ls(&cli.global_args, args).await,
             SessionCommand::Activate(args) => cmd_activate(&cli.global_args, args).await,
             SessionCommand::Attach(args) => cmd_attach(&cli.global_args, args).await,
             SessionCommand::Destroy(args) => cmd_destroy(&cli.global_args, args).await,
@@ -1487,28 +1491,41 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
                 eprintln!("Uploading from project root {upload_root} (resolved from {utf8_path})");
             }
             // Guard against accidentally uploading a non-VCS directory
-            // (e.g. `~`): if the resolved project root is not a recognized
-            // VCS root, warn and ask for confirmation before the recursive
-            // upload. On non-interactive stdin (CI, pipes, agents) and under
-            // `--no-prompt` we proceed without prompting — `--sync none`
-            // remains available for explicit opt-out (#770).
-            let should_upload = file_upload::is_vcs_root(upload_root.as_std_path())
-                || args.no_prompt
-                || global.no_input
-                || !can_prompt_interactively()
-                || confirm(
+            // (e.g. `~`). A VCS root uploads unconditionally. For a non-VCS
+            // root an interactive caller gets the confirm (default No); a
+            // headless caller (CI, pipes, agents, `--no-prompt`,
+            // `--no-input`) can't be asked, so it skips the upload with a
+            // warning rather than silently shipping a directory nobody
+            // confirmed — `--sync tarball` (via `sync_explicit`) is the
+            // escape hatch that force-uploads it anyway (#770).
+            let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
+            let should_upload = match file_upload::upload_gate(
+                file_upload::is_vcs_root(upload_root.as_std_path()),
+                sync_explicit,
+                headless,
+            ) {
+                file_upload::UploadGate::Upload => true,
+                file_upload::UploadGate::SkipHeadless => {
+                    eprintln!(
+                        "warning: {upload_root} is not a version control repository root; \
+                         skipping file upload (pass --sync tarball to upload anyway)"
+                    );
+                    false
+                }
+                file_upload::UploadGate::Prompt => confirm(
                     &format!(
                         "{upload_root} is not a version control repository root. \
                          Upload all files from this directory?"
                     ),
                     false,
-                )?;
+                )?,
+            };
             if should_upload {
                 client
                     .upload_workspace_files(id, upload_root.as_std_path())
                     .await
                     .context("Failed to upload project files")?;
-            } else {
+            } else if !headless {
                 eprintln!(
                     "Skipping file upload; the session will start with an \
                      empty workspace."
@@ -2818,6 +2835,42 @@ mod tests {
         use clap::Parser as _;
         let cli = Cli::try_parse_from(["min", "ls"]).unwrap();
         assert!(!cli.global_args.use_minvmd());
+    }
+
+    /// `min session list` is the canonical `<noun> list` spelling of the
+    /// flagship list command; `min ls` (top-level) and `min session ls`
+    /// (noun-level) are visible aliases. All three parse to the same `LsArgs`,
+    /// so `--raw`/`--json` reach the one `cmd_ls` implementation identically.
+    #[test]
+    fn session_list_spellings_all_reach_ls() {
+        use clap::Parser as _;
+        let ls_args = |args: &[&str]| -> LsArgs {
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Command::Ls(a))
+                | Some(Command::Session(SessionArgs {
+                    command: SessionCommand::List(a),
+                })) => a,
+                _ => panic!("expected an ls command for {args:?}"),
+            }
+        };
+
+        for spelling in [
+            ["min", "session", "list"].as_slice(),
+            ["min", "session", "ls"].as_slice(),
+            ["min", "ls"].as_slice(),
+        ] {
+            let a = ls_args(spelling);
+            assert!(
+                !a.raw && !a.json,
+                "{spelling:?} must default both flags off"
+            );
+        }
+
+        // `--raw`/`--json` are accepted on the canonical and the bare form alike.
+        let canonical = ls_args(&["min", "session", "list", "--raw", "--json"]);
+        assert!(canonical.raw && canonical.json);
+        let bare = ls_args(&["min", "ls", "--json"]);
+        assert!(bare.json && !bare.raw);
     }
 
     /// `repo_dir` and `minimal_dir` are global, so they must be accepted after

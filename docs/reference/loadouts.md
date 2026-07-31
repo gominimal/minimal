@@ -285,8 +285,8 @@ directory, one row per file:
 
 ```
   NAME   DESCRIPTION                     CONTRIBUTES
-* dev    helix + zellij with my dotfiles 2 pkg / 4 var / 5 patch / 1 hook
-  extra                                  1 pkg / 0 var / 0 patch / 0 hook
+* dev    helix + zellij with my dotfiles 2 pkg / 4 var / 5 patch
+  extra                                  1 pkg / 0 var / 0 patch
 
 * default (from `[loadouts].default_loadouts`)
 ```
