@@ -2743,7 +2743,17 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
 pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mctx::Error> {
     use op::ProjectOp as _;
     let config = build_config(global)?;
-    let mut ctx = mctx::Context::new(config)?;
+    let mut ctx = match mctx::Context::new(config) {
+        Ok(ctx) => ctx,
+        // Point a user with no `minimal.toml` at `min init`, matching the hint
+        // `min session activate` gives in the same situation.
+        Err(e @ mctx::Error::MFile(mfile::Error::NotFound)) => {
+            return Err(mctx::Error::Other(anyhow::anyhow!(
+                "{e}\nRun 'min init' to give the project its own config."
+            )));
+        }
+        Err(e) => return Err(e),
+    };
 
     let mut env = ctx.project_setup();
     let report = op::UpdateProject.run(&mut env)?;
