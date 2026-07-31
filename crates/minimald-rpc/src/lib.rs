@@ -42,11 +42,18 @@ pub trait OneshotSshRpc {
 }
 
 /// A convinence wrapper to let a response type be able to carry an error.
+///
+/// `Err` is declared **first** on purpose: the enum is `#[serde(untagged)]`, so
+/// serde tries variants in declaration order, and most response types here
+/// default every field. With `Ok` first, an `{"error": ".."}` payload decodes
+/// into `Ok(Default::default())` and the client sees a blank success instead of
+/// the daemon's failure. No response type carries an `error` field, so trying
+/// `Err` first is unambiguous.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum Errorable<S: std::fmt::Debug + PartialEq> {
-    Ok(S),
     Err { error: String },
+    Ok(S),
 }
 
 impl<S: std::fmt::Debug + PartialEq> Errorable<S> {
@@ -1742,18 +1749,31 @@ mod tests {
             ));
         assert_eq!(round_trip(&resp), resp);
 
-        // The client-id-unset failure surfaces via the `Errorable` wrapper.
-        // Note: `Errorable` is `#[serde(untagged)]` with `Ok` tried first, and
-        // every response field here is `#[serde(default)]`, so an `{"error":..}`
-        // payload round-trips into `Ok(default)` rather than `Err` — the same
-        // accepted property the unit-struct/optional responses in this file
-        // already have. We therefore assert the error's construction and
-        // serialized shape, not a round-trip.
+        // The client-id-unset failure surfaces via the `Errorable` wrapper, and
+        // must survive the wire: every field of `GithubBeginLoginResponse` is
+        // `#[serde(default)]`, so an `{"error":..}` payload would decode as a
+        // blank `Ok` if `Errorable` tried `Ok` first (see its declaration).
         let err: Errorable<GithubBeginLoginResponse> =
             Err::<GithubBeginLoginResponse, _>("GitHub App client id is not configured").into();
+        assert_eq!(round_trip(&err), err);
         let json = serde_json::to_string(&err).unwrap();
         assert!(json.contains("client id is not configured"), "got: {json}");
         assert!(err.err().is_some());
+    }
+
+    /// A daemon-side failure must decode as `Err` even when the response type
+    /// defaults every field — otherwise `{"error":..}` lands as a blank `Ok`
+    /// and the client reports success for a refused RPC.
+    #[test]
+    fn errorable_decodes_an_error_payload_as_err_not_a_blank_ok() {
+        let raw = r#"{"error":"grant_id must not be empty"}"#;
+        let resp: Errorable<GithubLogoutResponse> = serde_json::from_str(raw).expect("deserialize");
+        assert_eq!(resp.err().as_deref(), Some("grant_id must not be empty"));
+
+        // The success shape still decodes as `Ok`.
+        let ok: Errorable<GithubLogoutResponse> =
+            serde_json::from_str(r#"{"removed":true}"#).expect("deserialize");
+        assert!(ok.ok().is_some_and(|r| r.removed));
     }
 
     /// A daemon that predates the `expires_in_secs` field still decodes.
