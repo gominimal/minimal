@@ -65,13 +65,6 @@ curl --proto "=https" --tlsv1.2 -fsSL 'https://go.minimal.dev/' | sh -s -- --uni
 
 ## Getting Started
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/public/readme-examples-dark.webp">
-    <img src="docs/public/readme-examples-light.webp" alt="Minimal harness examples" width="880">
-  </picture>
-</p>
-
 The examples below walk through the two most common workflows: starting a brand-new project inside a sandbox, and joining an existing project that already has a `minimal.toml`.
 
 ### Create a new project with Minimal
@@ -191,10 +184,6 @@ composition rules) is in the
 Sandboxes: a pure Rust client, daemon, and VM manager. The sandbox VM is powered by [libkrun](https://github.com/libkrun/libkrun), a custom Linux kernel image, and an Alpine Linux rootfs.
 
 [Packages](https://github.com/gominimal/pkgs/): glibc-based packages built frequently on Minimal's build servers from their canonical sources (GNU, GitHub, GitLab, etc.).
-
-<p align="center">
-  <img src="docs/public/readme-packages.webp" alt="Minimal public packages" width="880">
-</p>
 
 ## Documentation
 
