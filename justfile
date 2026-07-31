@@ -8,15 +8,24 @@
 scratch      := justfile_directory() / ".scratch"
 arch         := arch()
 musl-target  := arch + "-unknown-linux-musl"
-# Flat libkrun link/runtime prefix (Linux; macOS links the Homebrew install).
+# Flat libkrun link/runtime prefix for the DYNAMIC upstream package (Linux;
+# macOS links the Homebrew install). No longer on the dev stack's path — kept
+# for `just libkrun`, which still fetches it.
 krun-prefix  := env('HOME') / ".krun"
+# Prefix for the STATIC libkrun the dev stack links (Linux). Built from the
+# vendored pin, not fetched; `just clean` removes it.
+krun-static  := scratch / "libkrun-static" / musl-target
 # Guest networking features baked into the initramfs (networking-wg deferred).
 features     := "networking-proxy"
 kernel       := scratch / "vmlinuz"
 rootfs       := scratch / "rootfs.img"
 initramfs    := scratch / "initramfs.cpio"
 gvproxy      := scratch / "gvproxy"
-minvmd-bin   := justfile_directory() / "target/debug/minvmd"
+# On Linux minvmd builds for the musl target (static libkrun — the linkage
+# users receive), so it lands under target/<triple>/ rather than target/debug.
+# macOS keeps the native debug dir.
+minvmd-dir   := if os() == "linux" { justfile_directory() / "target" / musl-target / "debug" } else { justfile_directory() / "target/debug" }
+minvmd-bin   := minvmd-dir / "minvmd"
 minimald-bin := justfile_directory() / "target/debug/minimald"
 # The CLI crate is `minimal`; its [[bin]] target is `min`.
 min-bin      := justfile_directory() / "target/debug/min"
@@ -37,8 +46,11 @@ e2e-env    := "E2E_VM=1 E2E_PROJECT_DIR=/tmp" + if os() == "linux" { " E2E_MINIM
 # binaries; MINVMD_* are inert outside the VM recipes. 150s timeouts: the
 # generic guest kernel can spend 40-70s probing hardware before pid-1 starts,
 # overrunning the 60s READY / 75s autospawn / 30s lifecycle defaults.
-export PATH := justfile_directory() / "target/debug:" + env('PATH')
-export LD_LIBRARY_PATH := krun-prefix + if env('LD_LIBRARY_PATH', '') == '' { '' } else { ':' + env('LD_LIBRARY_PATH') }
+#
+# minvmd-dir leads: on Linux it holds the musl build, and `min` autospawns
+# `minvmd` by bare name. No LD_LIBRARY_PATH — minvmd links libkrun statically
+# and dlopens nothing, so there is nothing for the loader to resolve.
+export PATH := minvmd-dir + ":" + justfile_directory() / "target/debug:" + env('PATH')
 export MINVMD_KERNEL_PATH := kernel
 export MINVMD_ROOTFS_PATH := rootfs
 export MINVMD_INITRAMFS := initramfs
@@ -66,10 +78,23 @@ artifacts:
     @[ -f {{kernel}} ] || scripts/fetch-prebuilt.sh kernel {{kernel}} {{arch}}
     @[ -f {{rootfs}} ] || scripts/fetch-prebuilt.sh rootfs {{rootfs}} {{arch}}
 
-# Fetch prebuilt libkrun + libkrunfw into the link/runtime prefix.
+# Not on the dev stack's path any more — see `libkrun-static`. Kept because
+# nightly-tests.yml still builds against the upstream package, and this is how
+# you reproduce that locally.
+#
+# Fetch the prebuilt DYNAMIC libkrun + libkrunfw into the link/runtime prefix.
 [linux]
 libkrun:
     scripts/fetch-prebuilt.sh krun {{krun-prefix}} {{arch}}
+
+# The linkage Linux users actually receive, and what `minvmd-build` and
+# `test-vm` link against. Built from the vendored pin rather than fetched.
+# Skips when already built; `just clean` forces a rebuild.
+#
+# Build the STATIC libkrun (libkrun.a) from the vendored pin.
+[linux]
+libkrun-static:
+    @[ -f {{krun-static}}/libkrun.a ] || scripts/build-libkrun-linux.sh {{krun-static}} {{musl-target}}
 
 # Fetch the pinned gvproxy switch (guest egress + own-IP; missing = switchless boot).
 gvproxy:
@@ -89,10 +114,15 @@ minvmd-build:
     cargo build -p minvmd --bin minvmd --locked
     codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - {{minvmd-bin}}
 
-# Build minvmd (debug); LIBKRUN_PREFIX links the real (non-stub) libkrun.
+# The same target and linkage the release ships, so the dev stack exercises
+# what users run. MINVMD_REQUIRE_LIBKRUN makes a missing libkrun.a an error
+# rather than a silent runtime-bailing stub.
+#
+# Build minvmd (debug, static musl against the vendored libkrun.a).
 [linux]
-minvmd-build: libkrun
-    LIBKRUN_PREFIX="{{krun-prefix}}" cargo build -p minvmd --bin minvmd --locked
+minvmd-build: libkrun-static
+    MINVMD_REQUIRE_LIBKRUN=static LIBKRUN_PREFIX="{{krun-static}}" \
+      cargo build -p minvmd --bin minvmd --locked --target {{musl-target}}
 
 # Build the `min` CLI.
 minimal-cli:
@@ -113,7 +143,7 @@ min *args:
 # Print `export` lines for running the stack by hand: eval "$(just env)".
 env:
     @printf 'export %s="%s"\n' \
-      PATH "$PATH" LD_LIBRARY_PATH "$LD_LIBRARY_PATH" \
+      PATH "$PATH" \
       MINVMD_KERNEL_PATH "$MINVMD_KERNEL_PATH" MINVMD_ROOTFS_PATH "$MINVMD_ROOTFS_PATH" \
       MINVMD_INITRAMFS "$MINVMD_INITRAMFS" \
       MINVMD_GVPROXY_BIN "{{gvproxy}}" \
@@ -133,9 +163,13 @@ status:
 stop:
     @"{{minvmd-bin}}" stop
 
+# The built libkrun.a goes too: it is keyed to the vendored pin, so a stale one
+# would silently outlive a pin bump.
+#
 # Remove the bring-up artifacts this justfile manages (never all of .scratch).
 clean:
     rm -f {{kernel}} {{rootfs}} {{initramfs}} {{gvproxy}}
+    rm -rf {{scratch}}/libkrun-static
 
 # Kill THIS checkout's stranded VM processes (they wedge the next VM's vsock bridge).
 reap:
@@ -349,8 +383,10 @@ test-vm: _nextest artifacts initramfs
 # minvmd's VM harnesses (tests/*_integration.rs). CI: ci-linux-kvm.yml `test-kvm`.
 [linux]
 test-vm: _nextest _kvm artifacts initramfs minvmd-build
-    MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state" LIBKRUN_PREFIX="{{krun-prefix}}" \
-      cargo nextest run -p minvmd --profile vm --run-ignored all --no-tests=fail \
+    MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state" \
+      MINVMD_REQUIRE_LIBKRUN=static LIBKRUN_PREFIX="{{krun-static}}" \
+      cargo nextest run -p minvmd --profile vm --target {{musl-target}} \
+      --run-ignored all --no-tests=fail \
       -E 'binary(/_integration$/) and not binary(/_root_integration$/)'
 
 # CI: ci-linux-native.yml `minimald-root-integration`. The AppArmor policy
