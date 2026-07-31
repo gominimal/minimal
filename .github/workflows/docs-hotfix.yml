@@ -62,6 +62,15 @@ jobs:
             # see gominimal/min-aw ADR-0002). The default GITHUB_TOKEN cannot
             # dispatch other repos; this token carries the App's contents:write
             # permission narrowed to the webapp repo only.
+            #
+            # permission-contents: write is the ONLY permission requested, and
+            # it is the exact one POST /repos/{owner}/{repo}/dispatches needs —
+            # the single call this token makes, in the step below. Without an
+            # explicit permission-* input the minted token inherits the App
+            # installation's full permission set rather than this one, which
+            # zizmor flags high-severity (github-app: "app token inherits
+            # blanket installation permissions") and which made the sole
+            # unsuppressed finding in the nightly hygiene job.
             - name: Mint webapp-repo token (gominimal-aw-bot)
               id: webapp-token
               uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
@@ -70,6 +79,7 @@ jobs:
                   private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
                   owner: gominimal
                   repositories: webapp
+                  permission-contents: write
 
             - name: Dispatch reference-docs-promoted
               env:
