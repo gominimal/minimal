@@ -1811,8 +1811,9 @@ async fn resolve_smart_attach(
             // needs no such line — the selection is its own confirmation.
             if should_announce_session(global) {
                 eprintln!(
-                    "Attaching to session {}",
-                    session_announce_label(&entry.id, entry.name.as_deref())
+                    "Attaching to session {}{}",
+                    session_announce_label(&entry.id, entry.name.as_deref()),
+                    attach::created_from_suffix(&entry, &cwd)
                 );
             }
             Ok(Some(entry))

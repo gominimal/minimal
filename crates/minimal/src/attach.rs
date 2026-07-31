@@ -85,6 +85,18 @@ pub(crate) fn resolve_for_attach(
     }
 }
 
+/// The ` — created from <path>` suffix for the attach announcement. On the
+/// no-cwd-match/single-session branch the operator is by definition somewhere
+/// other than the session's project directory, so naming the origin is a
+/// tripwire against working in the wrong box. Empty when the cwd matched (the
+/// match is its own confirmation) or the record predates `project_path`.
+pub(crate) fn created_from_suffix(entry: &ListSessionsEntry, cwd: &paths::HostAbsPath) -> String {
+    match entry.project_path.as_ref() {
+        Some(path) if path != cwd => format!(" — created from {path}"),
+        _ => String::new(),
+    }
+}
+
 /// Whether the picker can actually run: it draws to stdout and reads
 /// keystrokes from stdin, so both must be a real terminal. A redirected
 /// stdin (a script, a pipe) would hang waiting for a keypress that never
@@ -500,5 +512,37 @@ mod tests {
             !label.contains("0a99-78b1"),
             "full uuid must not appear: {label}"
         );
+    }
+
+    #[test]
+    fn created_from_suffix_names_origin_on_no_cwd_match() {
+        let e = entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            "/elsewhere",
+            SessionStatus::Active,
+        );
+        assert_eq!(
+            created_from_suffix(&e, &cwd("/a")),
+            " — created from /elsewhere"
+        );
+    }
+
+    #[test]
+    fn created_from_suffix_empty_when_cwd_matches() {
+        let e = entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            "/a",
+            SessionStatus::Active,
+        );
+        assert_eq!(created_from_suffix(&e, &cwd("/a")), "");
+    }
+
+    #[test]
+    fn created_from_suffix_empty_when_project_path_absent() {
+        let e = entry_no_path(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            SessionStatus::Active,
+        );
+        assert_eq!(created_from_suffix(&e, &cwd("/a")), "");
     }
 }
