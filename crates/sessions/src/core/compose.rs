@@ -3692,8 +3692,8 @@ mod tests {
     mod extend_from_wire {
         use super::*;
         use crate::wire::primitives::{
-            WireLifecycleHook, WirePackageRef, WireProvenancedHook, WireResolvedPatch,
-            WireResolvedVar, WireSessionPatch, WireSessionVar, WireSource,
+            WireLifecycleHook, WireOrientation, WirePackageRef, WireProvenancedHook,
+            WireResolvedPatch, WireResolvedVar, WireSessionPatch, WireSessionVar, WireSource,
         };
         use crate::wire::request::WireContribution;
 
@@ -3763,7 +3763,7 @@ mod tests {
                 patches,
                 requested_packages: vec![],
                 lifecycle_hooks: vec![],
-                orientation: Default::default(),
+                orientation: WireOrientation::default(),
             }
         }
 
@@ -3794,7 +3794,7 @@ mod tests {
                     hook: WireLifecycleHook::default(),
                     source: WireSource::UserLoadout { name: "dev".into() },
                 }],
-                orientation: Default::default(),
+                orientation: WireOrientation::default(),
             };
 
             let before = Composition::default();
@@ -3901,7 +3901,7 @@ mod tests {
                     source: dev_loadout(),
                 }],
                 lifecycle_hooks: vec![],
-                orientation: Default::default(),
+                orientation: WireOrientation::default(),
             };
             let err = composition.extend_from_wire(wire).unwrap_err();
             assert!(
@@ -3989,7 +3989,7 @@ mod tests {
                     },
                 ],
                 lifecycle_hooks: vec![],
-                orientation: Default::default(),
+                orientation: WireOrientation::default(),
             };
             composition.extend_from_wire(wire).unwrap();
             let names: Vec<&str> = composition
