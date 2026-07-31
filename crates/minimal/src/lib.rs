@@ -5,7 +5,6 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 use clap_complete::Shell;
 use std::io::IsTerminal as _;
 use std::io::Write as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt as _;
 
@@ -19,6 +18,7 @@ pub mod diag;
 pub mod dirs;
 mod file_upload;
 pub mod git_remote;
+pub mod github;
 pub mod loadouts;
 pub mod prompt;
 pub mod task;
@@ -59,6 +59,8 @@ pub enum Command {
     /// Session management subcommands
     #[command(visible_alias = "sessions")]
     Session(SessionArgs),
+    /// GitHub authentication: sign in, inspect status, and sign out (R1.4/R7.2)
+    Github(github::GithubArgs),
     /// Loadout management subcommands
     #[command(visible_alias = "loadouts")]
     Loadout(LoadoutArgs),
@@ -718,6 +720,7 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             SessionCommand::Rename(args) => cmd_rename(&cli.global_args, args).await,
             SessionCommand::Policy(args) => cmd_session_policy(&cli.global_args, args).await,
         },
+        Some(Command::Github(args)) => github::cmd_github(&cli.global_args, args).await,
         Some(Command::Loadout(LoadoutArgs {
             command: LoadoutCommand::List(args),
         })) => loadouts::cmd_loadout_list(args, &cli.global_args),
@@ -1923,6 +1926,10 @@ fn host_key_opts(known_hosts: &std::path::Path) -> [String; 2] {
 /// shell out to `ssh` — the daemon's shell_request handler mints a PTY-backed
 /// session shell, and ssh handles termios/PTY management for us.
 ///
+/// On the success path this does not return: once the ssh child finishes,
+/// the process exits with the child's own outcome ([`attach_exit_code`]),
+/// exactly as when attach `exec()`d ssh in place.
+///
 /// When `args.session` is `None`, the session is resolved from the current
 /// working directory (or the only existing session), opening an interactive
 /// picker when the choice is ambiguous; see [`attach::resolve_for_attach`]
@@ -1957,7 +1964,14 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
         "found session"
     );
 
-    attach_to_session(&sock, id, args.command).await
+    // Close the control connection before handing the terminal to ssh: the
+    // attach traffic runs over ssh's own connection (via the `proxy`
+    // subcommand), and when attach `exec()`d ssh this RPC connection died
+    // with the replaced process image.
+    drop(client);
+
+    let status = attach_to_session(&sock, id, args.command).await?;
+    std::process::exit(attach_exit_code(status));
 }
 
 /// Resolve a session to attach to when the user supplied no explicit session
@@ -2061,10 +2075,19 @@ fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), anyhow::Error
     }
 }
 
-/// Shell out to `ssh` to attach to `id`. Both the interactive (no `command`)
-/// and `--command` (non-interactive exec) paths route through here; the
-/// daemon's shell_request handler mints a PTY-backed shell, and ssh handles
+/// Shell out to `ssh` to attach to `id`, wait for it, and return its exit
+/// status. Both the interactive (no `command`) and `--command`
+/// (non-interactive exec) paths route through here; the daemon's
+/// shell_request handler mints a PTY-backed shell, and ssh handles
 /// termios/PTY management.
+///
+/// ssh runs as a waited-on child rather than an `exec()` replacement so that
+/// control returns to the client after the session shell exits — the seam
+/// post-attach flows (e.g. an exit prompt) hook into. While the child runs,
+/// keyboard signals are ignored in this process (see [`keyboard_signals`])
+/// so a Ctrl-C reaches the foreground ssh / in-session process instead of
+/// killing the waiting client; callers propagate the returned status via
+/// [`attach_exit_code`] so the observable outcome matches the old `exec()`.
 ///
 /// Split from [`cmd_attach`] so the activate-then-attach chain and the
 /// smart-resolution picker can attach without re-resolving an entry they
@@ -2073,7 +2096,7 @@ async fn attach_to_session(
     sock: &std::path::Path,
     id: sessions::SessionId,
     command: Option<String>,
-) -> Result<(), anyhow::Error> {
+) -> Result<std::process::ExitStatus, anyhow::Error> {
     // ProxyCommand points at our own `proxy` subcommand so we don't
     // depend on socat or nc being installed.
     let exe = std::env::current_exe().context("cannot determine current exe")?;
@@ -2147,9 +2170,124 @@ async fn attach_to_session(
         ssh.arg(cmd);
     }
 
-    let err = ssh.exec();
-    // exec() only returns on failure
-    bail!("failed to exec ssh: {err}");
+    // Spawn (inheriting our stdio, so ssh owns the terminal) and wait via
+    // tokio so the runtime thread is not blocked for the whole session.
+    let mut child = tokio::process::Command::from(ssh)
+        .spawn()
+        .context("failed to spawn ssh (is an OpenSSH client installed and on PATH?)")?;
+
+    // Only ignore keyboard signals once the child exists: [`keyboard_signals`]
+    // explains both the why and the ordering constraint.
+    let _guard = keyboard_signals::Ignored::install();
+    child.wait().await.context("failed waiting for ssh")
+}
+
+/// The exit code `min` reports after an attach, given the finished ssh
+/// child's status.
+///
+/// When attach `exec()`d ssh, the shell observed ssh's own wait status.
+/// Mirror it: a normal exit propagates its code verbatim, and death by
+/// signal N maps to the shell's `128 + N` convention — the same `$?` an
+/// exec()'d ssh produced — since a plain exit code cannot express signal
+/// death.
+fn attach_exit_code(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt as _;
+    match status.code() {
+        Some(code) => code,
+        // `wait()` only returns codeless for a signal death, so the fallback
+        // arm is unreachable; `1` keeps the mapping total without masking a
+        // failure as success.
+        None => 128 + status.signal().unwrap_or(1),
+    }
+}
+
+/// Keyboard-generated signals (`SIGINT` from `Ctrl-C`, `SIGQUIT` from
+/// `Ctrl-\`) are delivered to the whole foreground process group, which during
+/// [`attach_to_session`]'s wait contains both the `ssh` child and the waiting
+/// `min` client. When attach `exec()`d ssh there was no waiting parent: the
+/// keystroke reached ssh (or, through the PTY, the in-session process) alone.
+/// Preserve that by ignoring both signals in the parent for exactly as long
+/// as the child runs — the discipline POSIX `system(3)` mandates for its
+/// waiting parent — and restoring the saved dispositions afterwards so any
+/// later interactive code gets normal Ctrl-C behaviour back.
+///
+/// Bound directly to POSIX `signal(2)`: this crate has no libc-crate
+/// dependency, and `tokio::signal` cannot express "ignore" (its handlers
+/// stay registered for the life of the process, so the disposition could
+/// never be restored).
+mod keyboard_signals {
+    use std::os::raw::c_int;
+
+    /// C's `sighandler_t` is a function pointer, but only the integral
+    /// sentinels below ever cross this boundary, so a plain machine word is
+    /// enough (the libc crate declares it the same way on these platforms).
+    type SigHandler = usize;
+
+    const SIG_IGN: SigHandler = 1;
+    const SIG_ERR: SigHandler = usize::MAX;
+
+    /// POSIX-mandated signal numbers, identical on Linux and macOS.
+    pub(super) const SIGINT: c_int = 2;
+    pub(super) const SIGQUIT: c_int = 3;
+
+    unsafe extern "C" {
+        fn signal(signum: c_int, handler: SigHandler) -> SigHandler;
+    }
+
+    /// RAII: ignores SIGINT and SIGQUIT on construction and restores the
+    /// previous dispositions on drop.
+    pub(super) struct Ignored {
+        saved: [(c_int, SigHandler); 2],
+    }
+
+    impl Ignored {
+        /// Install `SIG_IGN` for both keyboard signals.
+        ///
+        /// Must be called AFTER spawning the child: an ignored disposition
+        /// (unlike a caught handler) survives `exec`, so installing it first
+        /// would make the spawned ssh itself ignore Ctrl-C.
+        pub(super) fn install() -> Self {
+            let saved = [SIGINT, SIGQUIT].map(|signum| {
+                // SAFETY: `SIG_IGN` is a valid disposition for both signals,
+                // both signal numbers are valid on every supported platform,
+                // and no handler function is involved, so no callback safety
+                // invariants arise.
+                let prev = unsafe { signal(signum, SIG_IGN) };
+                (signum, prev)
+            });
+            Ignored { saved }
+        }
+    }
+
+    impl Drop for Ignored {
+        fn drop(&mut self) {
+            for (signum, prev) in self.saved {
+                // SIG_ERR means the install itself failed (not possible for
+                // these two well-known signals); "restoring" it would be
+                // meaningless, so leave the ignore in place — fail closed.
+                if prev != SIG_ERR {
+                    // SAFETY: `prev` is a disposition previously returned by
+                    // `signal(2)` for this same signal, so handing it back
+                    // is valid by construction.
+                    unsafe { signal(signum, prev) };
+                }
+            }
+        }
+    }
+
+    /// Test-only probe: whether `signum` is currently ignored. Reads the
+    /// disposition the only way `signal(2)` allows — by replacing it — and
+    /// immediately restores what it saw.
+    #[cfg(test)]
+    pub(super) fn is_ignored(signum: c_int) -> bool {
+        // SAFETY: same argument as `Ignored::install`; the second call
+        // restores the exact value the first returned.
+        let prev = unsafe { signal(signum, SIG_IGN) };
+        if prev != SIG_ERR && prev != SIG_IGN {
+            unsafe { signal(signum, prev) };
+        }
+        prev == SIG_IGN
+    }
 }
 
 /// Print the effective networking policy for a session as JSON.
@@ -2967,6 +3105,49 @@ mod tests {
             "expected an actionable non-TTY error, got: {err}"
         );
         ensure_interactive_attach_tty(true).expect("a real terminal must pass the guard");
+    }
+
+    /// A normally-exited ssh child propagates its exit code verbatim — the
+    /// same `$?` the shell observed when attach `exec()`d ssh in place.
+    #[test]
+    fn attach_exit_code_mirrors_a_normal_exit() {
+        use std::os::unix::process::ExitStatusExt as _;
+        // Raw wait statuses: exit code lives in bits 8–15.
+        let ok = std::process::ExitStatus::from_raw(0);
+        assert_eq!(attach_exit_code(ok), 0);
+        let ssh_err = std::process::ExitStatus::from_raw(255 << 8);
+        assert_eq!(attach_exit_code(ssh_err), 255);
+    }
+
+    /// A signal-killed ssh child maps to the shell's `128 + N` convention,
+    /// matching the `$?` a shell computed for the exec()'d ssh's signal death.
+    #[test]
+    fn attach_exit_code_maps_signal_death_to_128_plus_n() {
+        use std::os::unix::process::ExitStatusExt as _;
+        // Raw wait status: death by signal N carries N in the low 7 bits.
+        let sigint = std::process::ExitStatus::from_raw(2);
+        assert_eq!(attach_exit_code(sigint), 130);
+        let sigterm = std::process::ExitStatus::from_raw(15);
+        assert_eq!(attach_exit_code(sigterm), 143);
+    }
+
+    /// The attach wait must ignore keyboard signals only while the guard is
+    /// held: install → both ignored (a Ctrl-C reaches the foreground ssh
+    /// alone); drop → prior dispositions restored (later interactive code
+    /// needs its Ctrl-C back).
+    #[test]
+    fn keyboard_signal_guard_ignores_while_held_and_restores_on_drop() {
+        // Baseline: nothing in the test process ignores these signals.
+        assert!(!keyboard_signals::is_ignored(keyboard_signals::SIGINT));
+        assert!(!keyboard_signals::is_ignored(keyboard_signals::SIGQUIT));
+
+        let guard = keyboard_signals::Ignored::install();
+        assert!(keyboard_signals::is_ignored(keyboard_signals::SIGINT));
+        assert!(keyboard_signals::is_ignored(keyboard_signals::SIGQUIT));
+
+        drop(guard);
+        assert!(!keyboard_signals::is_ignored(keyboard_signals::SIGINT));
+        assert!(!keyboard_signals::is_ignored(keyboard_signals::SIGQUIT));
     }
 
     /// A bare `min` must be inert: it prints the top-level help and succeeds,
