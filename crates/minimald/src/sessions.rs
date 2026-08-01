@@ -1,10 +1,14 @@
-use std::{collections::BTreeMap, io::ErrorKind::NotFound};
+use std::{
+    collections::{BTreeMap, HashSet},
+    io::ErrorKind::NotFound,
+};
 
 use crate::{
     session::{Session, SessionConfig, SessionHandle},
     session_host::HostAttrs,
     store::{RecordPredicate, SessionRecordHandle, Store, StoreHandle},
 };
+use common::SpecHash;
 use paths::DaemonAbsPath;
 use sessions::SessionId;
 use std::sync::Arc;
@@ -149,8 +153,9 @@ pub struct Manager {
 
     /// Daemon-scoped mctx state (config, stdlib_dir, vcs, cache) cloned
     /// into each session actor, which composes its loadout and builds its
-    /// per-session `mctx::Context` on top. Held behind `Arc` so the
-    /// daemon-level setup work runs once per process rather than per session.
+    /// per-session `mctx::Context` on top. Built once at daemon startup by
+    /// the caller (which keeps its own handle on it, for the housekeeping
+    /// that runs outside any session) and shared here behind an `Arc`.
     daemon_ctx: Arc<mctx::DaemonContext>,
 
     minimal_state_dir: DaemonAbsPath,
@@ -175,7 +180,7 @@ impl Manager {
     pub async fn init(
         minimal_state_dir: DaemonAbsPath,
         minimal_cache_dir: DaemonAbsPath,
-        mctx_config: mctx::Config,
+        daemon_ctx: Arc<mctx::DaemonContext>,
         net_switch: Arc<Mutex<crate::net::SwitchClient>>,
     ) -> Result<ManagerHandle, std::io::Error> {
         let store = Store::init(minimal_state_dir.clone()).await?;
@@ -190,22 +195,6 @@ impl Manager {
         // them linger and confuse `min ls` / hold their names
         // hostage.
         reap_unresumable_records(&store).await?;
-
-        // Build the daemon-scoped mctx state once at startup. Each
-        // `CreateSession` will build a per-session `Context` on top of
-        // this via `Context::from_daemon` rather than repeating the
-        // setup (dir upsert / VCS init / cache init / stdlib
-        // materialization) per session. The caller supplies the
-        // `mctx::Config` so daemon-level flags (offline, num-parallel-
-        // builds, stdlib override, remote cache bucket) propagate.
-        // `mctx::Error` isn't `Send + Sync` (it carries nickel-language
-        // `Rc`s), so we can't preserve the source chain across the
-        // `io::Error` boundary. Stringify and move on; this only fires
-        // at daemon startup, at which point failure aborts the process.
-        let daemon_ctx = Arc::new(
-            mctx::DaemonContext::init(mctx_config)
-                .map_err(|e| std::io::Error::other(format!("mctx daemon init: {e}")))?,
-        );
 
         let running = BTreeMap::new();
         let (sender, receiver) = mpsc::channel(8);
@@ -683,6 +672,31 @@ impl ManagerHandle {
         recv.await.expect("corresponding sessions manager is dead")
     }
 
+    /// The union of what every active session needs: the spec hash of each package
+    /// reachable from any session's tasks, stack, or `[session]` block.
+    ///
+    /// Resolving a session brings its actor up if it isn't running, exactly as
+    /// [`get_session`](Self::get_session) does.
+    pub async fn needed_packages(&self) -> Result<HashSet<SpecHash>, SessionsError> {
+        let mut out = HashSet::new();
+        for info in self.list().await? {
+            if info.status != sessions::SessionStatus::Active {
+                continue;
+            }
+            // Deleted between the list and the lookup: gone, so needs nothing.
+            let Some(session) = self.get_session(SessionKeyPredicate::Id(info.id)).await? else {
+                continue;
+            };
+            let pkgs = session
+                .needed_packages()
+                .await
+                .map_err(|e| SessionsError::other(format!("session {}: {e}", info.id)))?;
+            out.extend(pkgs);
+        }
+
+        Ok(out)
+    }
+
     /// Gets a handle to the session corresponding with the given predicate.
     pub async fn get_session(
         &self,
@@ -735,7 +749,7 @@ impl ManagerHandle {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use paths::HostAbsPath;
     use sessions::daemon::composer::ComposeOutcome;
@@ -914,7 +928,8 @@ mod tests {
             .with_daemon_id("test".to_string())
             .build()
             .unwrap();
-        let mngr = Manager::init(daemon_dir(&state), daemon_dir(&cache), mctx_config, switch)
+        let daemon_ctx = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
+        let mngr = Manager::init(daemon_dir(&state), daemon_dir(&cache), daemon_ctx, switch)
             .await
             .unwrap();
         (state, cache, mngr)
@@ -1454,6 +1469,85 @@ mod tests {
             session(&mngr, id).await.peek_composition().await.is_some(),
             "the create-flow actor should still hold its composition",
         );
+    }
+
+    /// Writes `pkg` as a package of the session's own workspace layer, so its
+    /// graph resolves the name with no upstream layer (and no network) in play.
+    async fn seed_workspace_package(mngr: &ManagerHandle, id: SessionId, pkg: &str) {
+        let paths = session(mngr, id).await.paths().await.unwrap();
+        let dir = paths.working.as_utf8_path().join("packages").join(pkg);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(
+            dir.join("build.ncl"),
+            format!(
+                r#"let {{ BuildSpec, .. }} = import "minimal.ncl" in
+{{
+  name = "{pkg}",
+  build_deps = [],
+  runtime_deps = [],
+  outputs = {{}},
+}} | BuildSpec
+"#
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Brings up an `Active` session called `name` whose workspace declares
+    /// local package `pkg` in its `[session]` block — a session that needs
+    /// exactly one package, and a different one per call.
+    pub(crate) async fn active_session_needing(
+        mngr: &ManagerHandle,
+        name: &str,
+        pkg: &str,
+    ) -> SessionId {
+        let config = minimald_rpc::SessionConfig {
+            name: Some(name.to_string()),
+            ..sample_config()
+        };
+        let id = mngr.create_session(config, None).await.unwrap();
+        seed_workspace_package(mngr, id, pkg).await;
+        seed_workspace_mfile(mngr, id, &format!("[session]\npackages = [\"{pkg}\"]\n")).await;
+
+        let handle = session(mngr, id).await;
+        handle
+            .configure_loadout(WireContribution::default())
+            .await
+            .expect("a project-only loadout gates nothing");
+        // The composition carries packages but no patches, so finalize skips
+        // the patches marker and the record lands `Active`.
+        handle.finalize().await.expect("finalize should succeed");
+        id
+    }
+
+    /// The manager's answer is the union of what each session answered, and
+    /// each session resolved its own package against its own workspace.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn needed_packages_unions_across_sessions() {
+        let (_state, _cache, mngr) = manager().await;
+        let a = active_session_needing(&mngr, "sess-a", "pkg-a").await;
+        let b = active_session_needing(&mngr, "sess-b", "pkg-b").await;
+
+        let from_a = session(&mngr, a).await.needed_packages().await.unwrap();
+        let from_b = session(&mngr, b).await.needed_packages().await.unwrap();
+        assert_eq!(from_a.len(), 1, "session a needs exactly its own package");
+        assert_eq!(from_b.len(), 1, "session b needs exactly its own package");
+        assert_ne!(from_a, from_b, "different packages hash differently");
+
+        let want: HashSet<SpecHash> = from_a.union(&from_b).cloned().collect();
+        assert_eq!(mngr.needed_packages().await.unwrap(), want);
+    }
+
+    /// A session that hasn't composed yet has no workspace context to resolve,
+    /// so it is skipped rather than faulting the whole union.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn needed_packages_skips_sessions_that_arent_active() {
+        let (_state, _cache, mngr) = manager().await;
+        // Created but never configured: the record stays `Pending`.
+        let _pending = mngr.create_session(sample_config(), None).await.unwrap();
+
+        assert!(mngr.needed_packages().await.unwrap().is_empty());
     }
 
     /// The held [`Composition`] actually carries the project

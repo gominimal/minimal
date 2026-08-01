@@ -3800,6 +3800,7 @@ dependencies = [
  "graph",
  "hakoniwa",
  "indoc",
+ "lcache",
  "libc",
  "mctx",
  "mfile",

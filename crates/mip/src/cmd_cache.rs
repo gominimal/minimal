@@ -1,9 +1,11 @@
-use std::{
-    collections::HashSet,
-    time::{Duration, SystemTime},
-};
+//! Command to maintain the local cache.
+
+use std::time::Duration;
 
 use anyhow::anyhow;
+use futures::StreamExt;
+use futures::channel::mpsc;
+use op::{CleanCache, CleanEvent, StaleKind};
 
 use crate::{Context, Error};
 
@@ -41,79 +43,39 @@ fn parse_duration(arg: &str) -> Result<std::time::Duration, anyhow::Error> {
 }
 
 pub async fn cmd_cache(args: CacheArgs, ctx: &mut Context) -> Result<(), Error> {
-    let graph = ctx.graph_from_all_packages()?;
-    let need_objs = ctx
-        .scaffolding_packages()?
-        .into_iter()
-        .map(|bsr| graph.spec_hash(&bsr))
-        .collect::<HashSet<_>>();
+    let CacheArgs::Clean { older_than } = args;
 
-    let cache = ctx.local_cache();
-    let rt = cache.atimes().unwrap();
-    let candidates = cache.iter_entries().filter_map(|e| {
-        if need_objs.contains(&e) {
-            None
-        } else {
-            let last_use = rt.last_read(&e);
-            Some((e, last_use))
-        }
-    });
+    // Everything this project's tasks and stack need, whatever its age.
+    let keep = ctx.needed_packages()?;
 
-    let now = SystemTime::now();
-    match args {
-        CacheArgs::Clean { older_than } => {
-            let cutoff = now.checked_sub(older_than).unwrap();
-            for (spec_hash, last_used) in candidates {
-                if last_used.is_none() || last_used.as_ref().unwrap() < &cutoff {
-                    let ident = if let Ok(meta) = cache.read_meta(&spec_hash) {
-                        format!("{} [{}]", meta.inner, spec_hash.0)
-                    } else {
-                        format!("Object [{}]", spec_hash.0)
-                    };
+    let (tx, rx) = mpsc::unbounded();
+    let renderer = tokio::spawn(print_events(rx));
 
-                    println!("Deleting {}", ident);
-                    cache
-                        .invalidate_dir(&spec_hash)
-                        .map_err(|e| Error::Other(anyhow!(e)))?;
-                }
-            }
-        }
-    }
+    let op = CleanCache {
+        older_than,
+        keep,
+        sweep: vec![
+            (StaleKind::Sandbox, ctx.builds_base_dir()),
+            (StaleKind::Task, ctx.tasks_base_dir()),
+            (StaleKind::TempDir, ctx.cache_base_dir().join("temp")),
+        ],
+        daemon_id: ctx.daemon_id(),
+        events: Some(tx),
+    };
+    let result = op.run(&ctx.local_cache());
 
-    for sandbox in std::fs::read_dir(ctx.builds_base_dir())
-        .map_err(|e| Error::IO("reading sandboxes dir", ctx.builds_base_dir(), e))?
-    {
-        let entry = sandbox.map_err(|e| Error::IO("sandbox entry", ctx.builds_base_dir(), e))?;
-        cleanup_stale("sandbox", entry)?;
-    }
-    for task in std::fs::read_dir(ctx.tasks_base_dir())
-        .map_err(|e| Error::IO("reading tasks dir", ctx.tasks_base_dir(), e))?
-    {
-        let entry = task.map_err(|e| Error::IO("task entry", ctx.tasks_base_dir(), e))?;
-        cleanup_stale("task", entry)?;
-    }
-    for at in std::fs::read_dir(ctx.cache_base_dir().join("temp"))
-        .map_err(|e| Error::IO("reading artifact temp dir", ctx.tasks_base_dir(), e))?
-    {
-        let entry = at.map_err(|e| Error::IO("artifact temp entry", ctx.tasks_base_dir(), e))?;
-        cleanup_stale("tempdir", entry)?;
-    }
+    // Closes the event stream, so the renderer's last lines land before the
+    // outcome is reported.
+    drop(op);
+    let _ = renderer.await;
 
+    result?;
     Ok(())
 }
 
-fn cleanup_stale(kind: &str, entry: std::fs::DirEntry) -> Result<(), Error> {
-    let name = entry.file_name();
-    let s = name.to_str().unwrap();
-    if s.contains("-")
-        && let Some(pid_str) = s.rsplit('-').next()
-        && let Ok(false) = std::fs::exists(format!("/proc/{}", pid_str))
-    {
-        // No such proc entry, therefore PID dead. Clean up directory.
-        println!("Cleaning up stale {} {}", kind, s);
-        common::remove_dir_all(entry.path())
-            .map_err(|e| Error::IO("rm stale sandbox", entry.path(), e))?;
+/// Prints progress until the sender is dropped.
+async fn print_events(mut rx: mpsc::UnboundedReceiver<CleanEvent>) {
+    while let Some(event) = rx.next().await {
+        println!("{}", event.render());
     }
-
-    Ok(())
 }

@@ -1,13 +1,15 @@
+use futures::StreamExt as _;
 #[cfg(feature = "networking-proxy")]
 use minimald_rpc::IssueClientCertResponse;
 use minimald_rpc::{
-    AbortSession, AbortSessionResponse, CreateSession, DestroySession, DestroySessionResponse,
-    Errorable, FinalizeSession, FinalizeSessionResponse, GetMeshStatus, GetSessionPolicy,
-    GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse,
-    GetVersion, GetVersionResponse, IssueClientCert, IssueClientCertRequest, ListSessions,
-    ListSessionsEntry, ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
-    RenameSessionResponse, ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse,
-    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
+    AbortSession, AbortSessionResponse, CleanCacheRequest, CleanCacheUpdate, CreateSession,
+    DestroySession, DestroySessionResponse, Errorable, FinalizeSession, FinalizeSessionResponse,
+    GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
+    GetSessionRecordRequest, GetSessionRecordResponse, GetVersion, GetVersionResponse,
+    IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse,
+    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool,
+    SessionDelta, SessionDeltaRequest, SessionDeltaResponse, Shutdown, ShutdownRequest,
+    ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -626,6 +628,121 @@ async fn serve_get_mesh_status(
         .await
 }
 
+/// Serves [`CLEAN_CACHE_SUBSYSTEM`]: runs a cache clean and streams its
+/// progress back as newline-delimited [`CleanCacheUpdate`]s.
+///
+/// The split between the two error surfaces is the wire contract: anything that
+/// goes wrong before the clean starts leaves the payload stream empty and says
+/// why on extended data, so a client that read no lines knows to look there.
+/// Once the clean is running, its own failure is a terminal `Failed` line. (A
+/// channel that breaks mid-stream also lands on the extended-data arm, where
+/// the write is best-effort — by then the client is already gone.)
+async fn serve_clean_cache(
+    s: ServerStateHandle,
+    mut c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    match clean_cache_stream(&s, &mut c).await {
+        Ok(()) => {
+            c.eof().await?;
+            c.close().await?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = c.extended_data_bytes(1, e.to_string()).await;
+            let _ = c.close().await;
+            Err(e)
+        }
+    }
+}
+
+/// Reads the request, then runs the clean, writing each event out as it
+/// happens. The `Err` arm is for failures that precede the clean; a clean that
+/// runs reports its own outcome on the payload stream.
+async fn clean_cache_stream(
+    s: &ServerStateHandle,
+    c: &mut RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    let req: CleanCacheRequest = read_channel_request(c).await?;
+    let older_than = match req.older_than_secs {
+        0 => None,
+        secs => Some(std::time::Duration::from_secs(secs)),
+    };
+    // Every clean goes through the one actor. No actor means no daemon
+    // housekeeping to ask (a state built outside `Server::run`), and a clean
+    // started here instead would be exactly the unsynchronized second cleaner
+    // the actor exists to prevent.
+    let maintenance = s.maintenance().await.ok_or_else(|| {
+        ConnectionError::Internal("daemon housekeeping is not running".to_string())
+    })?;
+
+    let (events, mut rx) = futures::channel::mpsc::unbounded();
+    let clean = maintenance.clean_now(older_than, Some(events));
+    let mut clean = std::pin::pin!(clean);
+
+    // Drain events as they arrive, until the clean itself resolves. Once the
+    // sender is dropped `rx` yields `None`, which disables that branch for the
+    // rest of this `select!` — the clean's own branch is irrefutable and never
+    // disabled, so the loop parks on it rather than spinning.
+    let report = loop {
+        tokio::select! {
+            Some(event) = rx.next() => write_update(c, &removed(event)).await?,
+            report = &mut clean => break report,
+        }
+    };
+    // The clean is done, so its sender is dropped: whatever is still queued is
+    // the tail, and the loop below ends on its own.
+    while let Some(event) = rx.next().await {
+        write_update(c, &removed(event)).await?;
+    }
+
+    let terminal = match report {
+        Ok(report) => CleanCacheUpdate::Done {
+            entries: report.entries,
+            dirs: report.dirs,
+        },
+        Err(e) => CleanCacheUpdate::Failed {
+            error: e.to_string(),
+        },
+    };
+    write_update(c, &terminal).await
+}
+
+/// The wire form of one reclaimed thing. `render` is the daemon's own
+/// rendering, so the RPC and the daemon log say the same words.
+fn removed(event: op::CleanEvent) -> CleanCacheUpdate {
+    CleanCacheUpdate::Removed {
+        detail: event.render(),
+    }
+}
+
+/// Writes one newline-delimited JSON update.
+async fn write_update(
+    c: &mut RuChannel<Msg>,
+    update: &CleanCacheUpdate,
+) -> Result<(), ConnectionError> {
+    let mut line = serde_json::to_vec(update)?;
+    line.push(b'\n');
+    c.data_bytes(line).await?;
+    Ok(())
+}
+
+/// Reads a JSON request body off `c`, draining until the client half-closes.
+/// The streaming handlers' equivalent of what
+/// [`ServeOneshot::handle_channel`] does inline.
+async fn read_channel_request<T: serde::de::DeserializeOwned>(
+    c: &mut RuChannel<Msg>,
+) -> Result<T, ConnectionError> {
+    let mut buf = Vec::with_capacity(1024);
+    while let Some(msg) = c.wait().await {
+        match msg {
+            russh::ChannelMsg::Data { data } => buf.extend_from_slice(&data),
+            russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    Ok(serde_json::from_slice(&buf)?)
+}
+
 pub(crate) const STREAM_WORKSPACE_FILES: &str =
     constcat::concat!(RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst");
 
@@ -1210,6 +1327,7 @@ pub async fn handle_ssh_rpc(
         | STREAM_WORKSPACE_FILES
         | STREAM_WORKSPACE_PATCHES
         | minimald_rpc::DIAG_BUNDLE_SUBSYSTEM
+        | minimald_rpc::CLEAN_CACHE_SUBSYSTEM
         | IssueClientCert::NAME => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
@@ -1292,6 +1410,7 @@ pub async fn handle_ssh_rpc(
         minimald_rpc::DIAG_BUNDLE_SUBSYSTEM => {
             serve!(crate::diag::serve_stream_diag_bundle(s, config, channel))
         }
+        minimald_rpc::CLEAN_CACHE_SUBSYSTEM => serve!(serve_clean_cache(s, channel)),
         IssueClientCert::NAME => {
             #[cfg(feature = "networking-proxy")]
             serve!(serve_issue_client_cert(s, channel));
@@ -1400,6 +1519,100 @@ mod tests {
                 .await
                 .unwrap(),
             b"nested contents",
+        );
+    }
+
+    /// Drives the `CleanCache` subsystem to completion, returning every update
+    /// it streamed back in order.
+    async fn clean_cache(client: &mut TestClient, req: CleanCacheRequest) -> Vec<CleanCacheUpdate> {
+        let channel = client
+            .open_subsystem(minimald_rpc::CLEAN_CACHE_SUBSYSTEM, &[])
+            .await;
+        let mut stream = channel.into_stream();
+        stream
+            .write_all(&serde_json::to_vec(&req).unwrap())
+            .await
+            .unwrap();
+        // Half-close: the handler reads the request until the client is done.
+        stream.shutdown().await.unwrap();
+
+        let mut body = Vec::new();
+        stream.read_to_end(&mut body).await.unwrap();
+        String::from_utf8(body)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line is an update"))
+            .collect()
+    }
+
+    /// The clean runs through the daemon's actor and reports back: a line per
+    /// thing reclaimed, then exactly one terminal `Done` carrying the totals.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clean_cache_streams_progress_then_a_terminal_done() {
+        use lcache::{EntryMeta, FileSystem, MetaInner};
+        use std::io::Write as _;
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // Two cold entries — nothing has read them, and no session needs them.
+        let cache = server.state.daemon_context().await.local_cache();
+        for byte in [1u8, 2] {
+            let w = cache
+                .write_dir(&common::SpecHash::from_bytes([byte; 32]))
+                .unwrap();
+            w.open_write("f").unwrap().write_all(b"x").unwrap();
+            w.finalize(EntryMeta {
+                inner: MetaInner::Spec(format!("pkg-{byte}")),
+                fetched: false,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+
+        // `older_than_secs` of 1 rather than the daemon default, so entries
+        // written a moment ago are in scope.
+        let updates = clean_cache(
+            &mut client,
+            CleanCacheRequest::default().with_older_than_secs(1),
+        )
+        .await;
+
+        let (terminal, progress) = updates.split_last().expect("at least a terminal update");
+        assert_eq!(
+            *terminal,
+            CleanCacheUpdate::Done {
+                entries: 2,
+                dirs: 0
+            }
+        );
+        assert_eq!(
+            progress.len(),
+            2,
+            "one line per reclaimed entry: {progress:?}"
+        );
+        assert!(
+            progress.iter().all(|u| matches!(u, CleanCacheUpdate::Removed { detail } if detail.starts_with("Deleting package pkg-"))),
+            "progress should name what went: {progress:?}",
+        );
+        assert_eq!(cache.iter_entries().count(), 0);
+    }
+
+    /// An empty cache still terminates the stream properly — a client can
+    /// always read to a terminal update.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clean_cache_with_nothing_to_do_still_terminates() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let updates = clean_cache(&mut client, CleanCacheRequest::default()).await;
+
+        assert_eq!(
+            updates,
+            vec![CleanCacheUpdate::Done {
+                entries: 0,
+                dirs: 0
+            }]
         );
     }
 

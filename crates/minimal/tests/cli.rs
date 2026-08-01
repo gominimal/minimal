@@ -479,14 +479,19 @@ async fn attach_with_no_session_errors_when_ambiguous_and_no_input() {
 
 #[tokio::test]
 async fn destroy_removes_session() {
-    let (daemon, args) = setup().await;
+    let (daemon, mut args) = setup().await;
+    // Pin the gate headless. It reads `no_input || !stdin.is_terminal()`, and
+    // stdin here is whatever the runner handed us: `/dev/null` under nextest
+    // and CI, but a live terminal under a bare `cargo test` — where the gate
+    // would prompt and the test would sit waiting for a keystroke instead.
+    args.no_input = true;
 
     // Create a session via TestClient.
     let session_id = create_session(&daemon, "doomed").await;
 
-    // The session has no running host, so its at-risk state is unknowable
-    // — and this test binary's stdin is not a terminal, so the destroy
-    // gate must refuse headless without --force, naming the escape hatch.
+    // The session has no running host, so its at-risk state is unknowable,
+    // and the gate is headless, so the destroy must refuse without --force,
+    // naming the escape hatch.
     let err = cmd_destroy(
         &args,
         DestroyArgs {
@@ -525,11 +530,14 @@ async fn destroy_removes_session() {
 
 #[tokio::test]
 async fn destroy_by_name() {
-    let (daemon, args) = setup().await;
+    let (daemon, mut args) = setup().await;
+    // Headless by construction, not by whatever stdin the runner gave us —
+    // see `destroy_removes_session`.
+    args.no_input = true;
     let _ = create_session(&daemon, "by-name").await;
 
     // Name resolution precedes the gate: the headless refusal (unknowable
-    // at-risk state, non-terminal stdin) proves the name resolved...
+    // at-risk state, no input) proves the name resolved...
     let err = cmd_destroy(
         &args,
         DestroyArgs {

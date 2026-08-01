@@ -39,6 +39,9 @@ mod subsets;
 use ot::OpTracker;
 pub use subsets::SubsetBuild;
 
+mod cache_clean;
+pub use cache_clean::{CleanCache, CleanEvent, CleanReport, StaleKind};
+
 mod sources;
 pub use sources::{SourceFetcher, SourceLoad};
 mod specs;

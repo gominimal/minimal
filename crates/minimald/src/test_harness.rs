@@ -59,6 +59,12 @@ impl TestServer {
             state_volume_mounted: false,
         };
         let state = ServerStateHandle::new(config, None).await.unwrap();
+        // `Server::run` installs the housekeeping actor; a harness server never
+        // runs it, so do the same here — otherwise the `CleanCache` RPC has
+        // nothing to ask. Its own timer won't fire inside a test's lifetime.
+        let maintenance =
+            crate::maintenance::spawn(state.clone(), tokio_util::sync::CancellationToken::new());
+        state.set_maintenance(maintenance).await;
 
         let host_key = state.host_key().await.unwrap();
         let russh_config = Arc::new(russh::server::Config {

@@ -99,6 +99,8 @@ tokio.workspace = true
 # to the composition-only path from a nickel-declared BuildSpec.
 decode.workspace = true
 indoc.workspace = true
+# `maintenance.rs`'s tests seed the local cache the clean reclaims.
+lcache.workspace = true
 
 # The guest (initramfs pid-1) boot path is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]

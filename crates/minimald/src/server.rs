@@ -133,6 +133,19 @@ pub struct ServerState {
     sessions: sessions::ManagerHandle,
     daemon_id: String,
 
+    /// Daemon-scoped mctx state (dirs, VCS, local cache, stdlib), built once
+    /// at startup and shared with the sessions manager. Held here too so
+    /// daemon-level work that belongs to no session — [`crate::maintenance`]'s
+    /// cache clean — can reach the cache without a project mfile.
+    daemon_ctx: Arc<mctx::DaemonContext>,
+
+    /// The housekeeping actor, installed by [`Server::run`] once the state
+    /// exists (the actor holds a handle to it, so it can't be built in
+    /// [`ServerState::new`]). `None` before that, and for a state built
+    /// directly in a unit test. Held here so that anything wanting a cache
+    /// clean asks the one actor rather than starting its own.
+    maintenance: Option<crate::maintenance::MaintenanceHandle>,
+
     /// Fired by the `Shutdown` RPC handler once the session manager has been
     /// torn down, telling [`Server::run`]'s accept loop to stop accepting,
     /// drain in-flight connections, and return so the process can exit.
@@ -210,16 +223,25 @@ impl ServerState {
             .build()
             .map_err(|e| std::io::Error::other(format!("mctx config: {e}")))?;
 
+        // Build the daemon-scoped mctx state once at startup: every session
+        // stacks a per-session `Context` on it via `Context::from_daemon`.
+        let daemon_ctx = Arc::new(
+            mctx::DaemonContext::init(mctx_config)
+                .map_err(|e| std::io::Error::other(format!("mctx daemon init: {e}")))?,
+        );
+
         Ok(Self {
             sessions: sessions::Manager::init(
                 minimal_state_dir,
                 minimal_cache_dir,
-                mctx_config,
+                Arc::clone(&daemon_ctx),
                 net_switch,
             )
             .await?,
             config,
             daemon_id,
+            daemon_ctx,
+            maintenance: None,
             shutdown: CancellationToken::new(),
             log_release,
             host_key: None,
@@ -275,6 +297,28 @@ impl ServerStateHandle {
     /// Returns a handle to the sessions manager.
     pub async fn sessions_manager(&self) -> sessions::ManagerHandle {
         self.0.lock().await.sessions.clone()
+    }
+
+    /// Returns the daemon-scoped mctx state.
+    pub(crate) async fn daemon_context(&self) -> Arc<mctx::DaemonContext> {
+        Arc::clone(&self.0.lock().await.daemon_ctx)
+    }
+
+    /// Installs the housekeeping actor's handle. Called once by
+    /// [`Server::run`] just after spawning it.
+    pub(crate) async fn set_maintenance(&self, handle: crate::maintenance::MaintenanceHandle) {
+        self.0.lock().await.maintenance = Some(handle);
+    }
+
+    /// The housekeeping actor, for a caller that wants a cache clean run.
+    /// `None` on a state whose server never started it (unit tests).
+    ///
+    /// Going through the actor is the point: it is the one place a clean
+    /// starts, so a requested one queues behind the periodic one instead of
+    /// racing it.
+    #[allow(dead_code)] // No manual trigger is wired to this yet.
+    pub(crate) async fn maintenance(&self) -> Option<crate::maintenance::MaintenanceHandle> {
+        self.0.lock().await.maintenance.clone()
     }
 
     /// Returns a clone of the server shutdown token. [`Server::run`]'s accept
@@ -453,6 +497,13 @@ impl Server {
         // down; ends the accept loop below so the daemon can exit gracefully.
         let shutdown = state.shutdown_token().await;
 
+        // Housekeeping (cache clean) for the daemon's lifetime: periodic, plus
+        // whatever asks the actor for one. It stops on the same token that ends
+        // this loop. Installed on the state so every would-be trigger reaches
+        // the same actor rather than starting a competing clean.
+        let maintenance = crate::maintenance::spawn(state.clone(), shutdown.clone());
+        state.set_maintenance(maintenance.clone()).await;
+
         loop {
             // Drain any completed sessions to prevent unbounded growth.
             while let Some(result) = session_set.try_join_next() {
@@ -526,6 +577,11 @@ impl Server {
                 .instrument(span),
             );
         }
+
+        // Housekeeping has no client waiting on it and nothing to drain, so it
+        // goes first — the token has already stopped it between passes; this
+        // covers the case where it was mid-pass.
+        maintenance.abort();
 
         // Shutdown requested: stop accepting (done — loop exited) and drain
         // in-flight connections. The initiating client's own connection stays
@@ -771,11 +827,27 @@ async fn expose_proxy_on_host(daemon_ip: std::net::Ipv4Addr, port: u16) {
     }
 }
 
+/// A [`Config`] rooted at `dir` (state and cache both), with an ephemeral host
+/// key and no VM trappings — the daemon shape every unit test wants. Lives out
+/// here rather than in `tests` so sibling modules' tests can build a
+/// [`ServerStateHandle`] the same way.
+#[cfg(test)]
+pub(crate) fn test_config(dir: &std::path::Path) -> Config {
+    let path = camino::Utf8PathBuf::from_path_buf(dir.to_path_buf()).unwrap();
+    Config {
+        host_key: HostKey::Ephemeral,
+        minimal_state_dir: DaemonAbsPath::try_new(path.clone()).unwrap(),
+        minimal_cache_dir: DaemonAbsPath::try_new(path).unwrap(),
+        gvproxy_bin: None,
+        in_microvm: false,
+        state_volume_mounted: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use camino::Utf8PathBuf;
     use minimald_rpc::{Shutdown, ShutdownRequest, ShutdownResponse};
     use tempfile::TempDir;
 
@@ -784,15 +856,7 @@ mod tests {
 
     /// A `Config` backed by a fresh tempdir, mirroring `TestServer::new`.
     fn test_config(dir: &TempDir) -> Config {
-        let path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-        Config {
-            host_key: HostKey::Ephemeral,
-            minimal_state_dir: DaemonAbsPath::try_new(path.clone()).unwrap(),
-            minimal_cache_dir: DaemonAbsPath::try_new(path).unwrap(),
-            gvproxy_bin: None,
-            in_microvm: false,
-            state_volume_mounted: false,
-        }
+        super::test_config(dir.path())
     }
 
     /// The volume-log release must run exactly once no matter how many

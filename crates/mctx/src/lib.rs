@@ -263,6 +263,26 @@ impl DaemonContext {
         self.config().daemon_id()
     }
 
+    /// Returns the base directory for build sandboxes.
+    pub fn builds_base_dir(&self) -> PathBuf {
+        self.config.builds_base_dir()
+    }
+
+    /// Returns the base directory for task sandboxes.
+    pub fn tasks_base_dir(&self) -> PathBuf {
+        self.config.task_base_dir()
+    }
+
+    /// Returns the base directory for the artifact/binary cache.
+    ///
+    /// DO NOT USE unless you really know what you are doing — prefer
+    /// [`DaemonContext::local_cache`]. Daemon-scoped twins of the
+    /// [`Context`] accessors of the same name, for callers (housekeeping,
+    /// diagnostics) that have no project mfile to hang a [`Context`] off.
+    pub fn cache_base_dir(&self) -> PathBuf {
+        self.config.built_cache_dir()
+    }
+
     /// Releases the local cache's read tracker (its held-open append-log fd).
     /// Called on daemon shutdown before unmounting the filesystem that holds
     /// the cache; harmless otherwise (read tracking is best-effort).
@@ -946,6 +966,18 @@ impl Context {
 
     /// Returns the list of all packages brought in through tasks, profiles and stacks.
     pub fn scaffolding_packages(&mut self) -> Result<Vec<BuildSpecRef>, Error> {
+        Ok(self.scaffolding_walk()?.0)
+    }
+
+    /// The spec hash of every package this project needs — the packages
+    /// [`scaffolding_packages`](Self::scaffolding_packages) finds, resolved
+    /// against the graph that same walk built.
+    pub fn needed_packages(&mut self) -> Result<HashSet<common::SpecHash>, Error> {
+        let (pkgs, graph) = self.scaffolding_walk()?;
+        Ok(pkgs.iter().map(|bsr| graph.spec_hash(bsr)).collect())
+    }
+
+    fn scaffolding_walk(&mut self) -> Result<(Vec<BuildSpecRef>, Graph), Error> {
         let mut out = std::collections::HashSet::new();
         let mut graph = self.graph_from_all_packages()?;
         let mfile = self.minimal_file().clone();
@@ -965,8 +997,12 @@ impl Context {
             out.extend(h.build_packages.clone());
             out.extend(h.runtime_packages.clone());
         }
+        if let Some(session) = &mfile.session {
+            out.extend(session.packages.clone());
+        }
 
-        out.as_bsrs(&graph)
+        let pkgs = out.as_bsrs(&graph)?;
+        Ok((pkgs, graph))
     }
 
     /// Downloads the specified packages and their dependencies, if they are missing locally
