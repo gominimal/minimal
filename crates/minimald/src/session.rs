@@ -9,6 +9,7 @@ use crate::{
     ChannelConfig,
     session_host::{self, HostAttrs, WinSize},
 };
+use common::SpecHash;
 use mctx::ConfigBuilder;
 use ot::OpTracker;
 use paths::DaemonAbsPath;
@@ -21,6 +22,7 @@ use sessions::{
     store::{DiskSession, SessionObject},
     wire::request::{ContributionVerdict, SessionStep, WireContribution},
 };
+use std::collections::HashSet;
 use std::fmt::{self};
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -1642,6 +1644,26 @@ impl SessionHandle {
         let _ = self.0.send(SessionMessage::MakeContext(send)).await;
         recv.await
             .unwrap_or_else(|_| Err("session actor is gone".to_string()))
+    }
+
+    /// The spec hash of every package this session's project needs: its tasks,
+    /// its stack, and its `[session]` block.
+    ///
+    /// Resolved through this session's own workspace context, so the answer
+    /// reflects the `minimal.toml` currently in its worktree. Spec hashes
+    /// rather than `BuildSpecRef`s because a ref only means something against
+    /// the graph it was resolved in — see [`mctx::Context::needed_packages`].
+    ///
+    /// Runs off the actor: the resolve is nickel evaluation plus a graph
+    /// build, which has no business sitting in the session's mainloop, so it
+    /// goes to the blocking pool like every other graph build in the daemon.
+    pub async fn needed_packages(&self) -> Result<HashSet<SpecHash>, String> {
+        let mut ctx = self.context().await?;
+        // `mctx::Error` isn't `Send` (it carries nickel-language types), so it
+        // is rendered to a string inside the task.
+        tokio::task::spawn_blocking(move || ctx.needed_packages().map_err(|e| e.to_string()))
+            .await
+            .map_err(|e| format!("resolving needed packages: {e}"))?
     }
 
     /// Returns the session record currently held by the live session actor

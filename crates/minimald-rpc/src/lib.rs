@@ -789,6 +789,61 @@ fn default_true() -> bool {
     true
 }
 
+/// Reclaim the daemon's local cache, streaming progress.
+///
+/// Not an [`OneshotSshRpc`]: the client writes one JSON-encoded
+/// [`CleanCacheRequest`] (an empty body asks for the daemon's defaults) and
+/// half-closes, then the daemon streams back one JSON-encoded
+/// [`CleanCacheUpdate`] per line — a `Removed` for each thing reclaimed, then
+/// exactly one terminal `Done` or `Failed` — and closes.
+pub const CLEAN_CACHE_SUBSYSTEM: &str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "CleanCache");
+
+/// Request body for [`CLEAN_CACHE_SUBSYSTEM`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CleanCacheRequest {
+    /// Only reclaim cache entries unread for at least this many seconds; `0`
+    /// means the daemon's default. Note that a small value is honored as
+    /// given — the daemon holds back what its sessions need, not what is
+    /// merely recent.
+    #[serde(default)]
+    pub older_than_secs: u64,
+}
+
+/// The type is `#[non_exhaustive]`, so other crates cannot write a struct
+/// literal for it; this is how a client departs from the defaults.
+impl CleanCacheRequest {
+    #[must_use]
+    pub fn with_older_than_secs(mut self, secs: u64) -> Self {
+        self.older_than_secs = secs;
+        self
+    }
+}
+
+/// One line of a [`CLEAN_CACHE_SUBSYSTEM`] response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CleanCacheUpdate {
+    /// Something was reclaimed. `detail` is the daemon's own rendering of it,
+    /// so every transport reports a clean identically; it is for humans, not
+    /// for parsing.
+    Removed { detail: String },
+    /// Terminal: the clean finished, having removed this many cache entries
+    /// and leftover execution directories.
+    Done { entries: usize, dirs: usize },
+    /// Terminal: the clean ran and failed. Nothing, some, or all of the
+    /// reclaimable set may have gone before it stopped.
+    Failed { error: String },
+}
+
+impl CleanCacheUpdate {
+    /// Whether this update ends the stream.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done { .. } | Self::Failed { .. })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,6 +867,59 @@ mod tests {
         assert_eq!(round_trip(&req), req);
         assert_eq!(
             DIAG_BUNDLE_SUBSYSTEM, "minimald-v1-DiagBundleTarZst",
+            "subsystem name is wire contract; changing it breaks old clients"
+        );
+    }
+
+    /// The clean-cache framing is wire contract: an empty request body means
+    /// the daemon's defaults, the updates are self-describing by `kind`, and
+    /// the subsystem name can't drift without breaking old clients.
+    #[test]
+    fn clean_cache_wire_shapes_round_trip() {
+        let req: CleanCacheRequest = serde_json::from_str("{}").expect("deserialize");
+        assert_eq!(req, CleanCacheRequest::default());
+        assert_eq!(req.older_than_secs, 0);
+        assert_eq!(
+            round_trip(&req.clone().with_older_than_secs(3600)).older_than_secs,
+            3600
+        );
+
+        for update in [
+            CleanCacheUpdate::Removed {
+                detail: "Deleting package curl [abc]".to_string(),
+            },
+            CleanCacheUpdate::Done {
+                entries: 2,
+                dirs: 1,
+            },
+            CleanCacheUpdate::Failed {
+                error: "nope".to_string(),
+            },
+        ] {
+            assert_eq!(round_trip(&update), update);
+        }
+        assert!(
+            !CleanCacheUpdate::Removed {
+                detail: String::new()
+            }
+            .is_terminal()
+        );
+        assert!(
+            CleanCacheUpdate::Done {
+                entries: 0,
+                dirs: 0
+            }
+            .is_terminal()
+        );
+        assert!(
+            CleanCacheUpdate::Failed {
+                error: String::new()
+            }
+            .is_terminal()
+        );
+
+        assert_eq!(
+            CLEAN_CACHE_SUBSYSTEM, "minimald-v1-CleanCache",
             "subsystem name is wire contract; changing it breaks old clients"
         );
     }
