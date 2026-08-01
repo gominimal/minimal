@@ -85,11 +85,13 @@ async fn run() -> ExitCode {
 /// pollute, so its logs go to stderr instead. The `completions` handlers emit a
 /// shell shim on stdout, `session attach -c` carries only the exec'd
 /// command's output, and `task run` streams the task's stdout — a log line
-/// in any of them would be read as content.
+/// in any of them would be read as content. A bare `min` (no subcommand) is
+/// one too: its non-TTY twin promises an empty stdout to pipelines, and its
+/// interactive activate path prints only the session id there.
 fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
     matches!(
         command,
-        Some(
+        None | Some(
             minimal::Command::CompleteSessionStr(_)
                 | minimal::Command::Completions(_)
                 | minimal::Command::Session(minimal::SessionArgs {
@@ -127,6 +129,13 @@ mod tests {
     #[test]
     fn interactive_attach_is_not_a_stdout_contract() {
         assert!(!stdout_is_data_contract(&attach(None)));
+    }
+
+    /// A bare `min` (no subcommand) keeps stdout clean: the non-TTY twin
+    /// promises pipelines an empty stdout, so its tracing must go to stderr.
+    #[test]
+    fn bare_min_is_a_stdout_contract() {
+        assert!(stdout_is_data_contract(&None));
     }
 
     /// `min task run` streams the task's stdout, so tracing must route to

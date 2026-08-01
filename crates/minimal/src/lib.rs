@@ -31,8 +31,9 @@ pub mod theme;
 )]
 #[command(subcommand_required = false)]
 pub struct Cli {
-    // Optional: a bare `min` (no subcommand) prints the top-level help — see
-    // `cmd_default`. Keeps every named subcommand reachable unchanged when one
+    // Optional: a bare `min` (no subcommand) routes into a session in a
+    // terminal, and prints a read-only state report otherwise — see
+    // `cmd_bare`. Keeps every named subcommand reachable unchanged when one
     // is supplied.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -705,9 +706,10 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     client::migrate_legacy_provider_dirs(cli.global_args.minimal_dir.as_deref());
 
     match cli.command {
-        // A bare `min` (no subcommand) prints the top-level help — see
-        // `cmd_default`.
-        None => cmd_default(),
+        // A bare `min` (no subcommand) resolves-or-creates a session in a
+        // terminal, and prints a read-only state report otherwise — see
+        // `cmd_bare`.
+        None => cmd_bare(&cli.global_args).await,
         Some(Command::Ls(args)) => cmd_ls(&cli.global_args, args).await,
         Some(Command::Stop(args)) => cmd_stop(&cli.global_args, args).await,
         Some(Command::Session(SessionArgs { command })) => match command {
@@ -843,18 +845,190 @@ fn should_retry_autogen(autogen: bool, attempts: u32, error: &str) -> bool {
     autogen && attempts < AUTOGEN_NAME_RETRIES && is_name_collision(error)
 }
 
-/// The default action for a bare `min` (no subcommand): print the top-level
-/// help and exit successfully, the same text `min --help` produces.
+/// The default action for a bare `min` (no subcommand).
 ///
-/// Deliberately inert — it starts no daemon, creates no session, and attaches
-/// to nothing. Getting into a session is spelled explicitly:
-/// `min session attach` (which still auto-resolves from the current directory)
-/// or `min session activate`.
-pub fn cmd_default() -> Result<(), anyhow::Error> {
-    use clap::CommandFactory as _;
-    Cli::command()
-        .print_help()
-        .context("Failed to write help output")
+/// In a terminal (stdin and stdout are both TTYs, the same predicate the
+/// attach picker uses) it routes into a session: the smart resolution rules
+/// of `min session attach` with no argument (cwd match → attach, only
+/// session → attach, ambiguity → picker), and when no sessions exist at all
+/// it creates one from the current directory and attaches — equivalent to
+/// `min session activate --attach .`, except the `minimal.toml` scaffold
+/// offer is never made on this path.
+///
+/// Without a terminal it prints a read-only state report on stderr and exits
+/// 0 — see [`cmd_bare_non_tty`]. `min --help` is unaffected: clap handles the
+/// flag before dispatch ever reaches here.
+async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
+    if !attach::can_pick_interactively() {
+        return cmd_bare_non_tty(global).await;
+    }
+
+    ensure_daemon(global)?;
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+        .context("Failed to resolve daemon socket path")?;
+    let mut client = client::Client::connect(&sock)
+        .await
+        .context("Failed to connect to minimald")?;
+
+    match resolve_smart_attach(&mut client, global).await? {
+        SmartAttach::Attach(entry) => {
+            tracing::info!(
+                session_id = %entry.id,
+                session_name = ?entry.name,
+                "found session"
+            );
+            attach_to_session(&sock, entry.id, None).await
+        }
+        // Two ways to land on create-and-attach: no sessions exist at all
+        // (first run), or the ambiguity picker's `+ Create a new session`
+        // row was chosen. Both activate for the cwd exactly as
+        // `min session activate --attach .` would (default sync, autogen
+        // name) — but with the scaffold offer suppressed, unlike the same
+        // picker row reached through `min session attach`: the one
+        // keystroke into a session must not detour into config authoring.
+        SmartAttach::CreateForCwd | SmartAttach::NoSessions => {
+            drop(client);
+            activate_session(global, bare_activate_args(), false).await
+        }
+    }
+}
+
+/// The `ActivateArgs` a bare `min` activates with when no sessions exist:
+/// exactly `min session activate --attach .` — default sync, autogen name,
+/// default network — leaving the path to the `-C`/cwd resolution
+/// [`cmd_activate`] already performs for a missing path argument.
+fn bare_activate_args() -> ActivateArgs {
+    ActivateArgs {
+        name: None,
+        path: None,
+        sync: None,
+        network: CliNetworkMode::HostNet,
+        ingress: Vec::new(),
+        loadout: Vec::new(),
+        no_loadouts: false,
+        no_prompt: false,
+        attach: true,
+    }
+}
+
+/// The non-TTY twin of the bare-`min` router: a read-only state report on
+/// stderr, then exit 0. Nothing is created and nothing is mutated; stdout
+/// stays empty so a pipeline capturing it sees nothing. Listing sessions
+/// requires the daemon, so this takes the same client path `min ls` does
+/// (which may autospawn) — when that fails, the header plus the error reach
+/// stderr and the command exits nonzero, as `min ls` would.
+async fn cmd_bare_non_tty(global: &GlobalArgs) -> Result<(), anyhow::Error> {
+    let cwd = attach::cwd_host_path(global)?;
+    let home = std::env::home_dir().and_then(|h| camino::Utf8PathBuf::from_path_buf(h).ok());
+    let cwd_display = display_with_home_tilde(cwd.as_utf8_path(), home.as_deref());
+
+    let listed = async {
+        ensure_daemon(global)?;
+        let mut client = connect_daemon(global).await?;
+        use minimald_rpc::ListSessions;
+        client
+            .oneshot_rpc::<ListSessions>(())
+            .await
+            .context("ListSessions RPC failed")
+    }
+    .await;
+
+    match listed {
+        Ok(resp) => {
+            let has_mfile = project_has_mfile(cwd.as_utf8_path());
+            eprint!(
+                "{}",
+                render_bare_status(&cwd_display, &resp.sessions, &cwd, has_mfile)
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // The header still identifies what this output is; `main` prints
+            // the error itself after the bubble-up.
+            eprintln!("{}", bare_status_header(&cwd_display));
+            Err(e)
+        }
+    }
+}
+
+/// The first line of the non-TTY state report.
+fn bare_status_header(cwd_display: &str) -> String {
+    format!("No terminal: not attaching. State for {cwd_display}:")
+}
+
+/// Render the bare-`min` non-TTY state report: header, the cwd's session and
+/// blueprint state, and the exact next commands. Pure, so the unit tests can
+/// assert the lines verbatim.
+fn render_bare_status(
+    cwd_display: &str,
+    entries: &[minimald_rpc::ListSessionsEntry],
+    cwd: &paths::HostAbsPath,
+    has_mfile: bool,
+) -> String {
+    let cwd_matches: Vec<&minimald_rpc::ListSessionsEntry> = entries
+        .iter()
+        .filter(|e| e.project_path.as_ref() == Some(cwd))
+        .collect();
+
+    let sessions = if entries.is_empty() {
+        "none".to_string()
+    } else if cwd_matches.is_empty() {
+        format!("0 here ({} elsewhere)", entries.len())
+    } else {
+        let listed: Vec<String> = cwd_matches
+            .iter()
+            .take(2)
+            .map(|e| format!("({}, {})", entry_handle(e), status_label(e.status)))
+            .collect();
+        format!("{} {}", cwd_matches.len(), listed.join(", "))
+    };
+
+    let blueprint = if has_mfile {
+        format!("{} present", mfile::MFILE_NAME)
+    } else {
+        "none (min init to create one)".to_string()
+    };
+
+    let mut out = String::new();
+    out.push_str(&bare_status_header(cwd_display));
+    out.push('\n');
+    out.push_str(&format!("  sessions: {sessions}\n"));
+    out.push_str(&format!("  blueprint: {blueprint}\n"));
+    out.push_str("Next:\n");
+    match cwd_matches.first() {
+        Some(e) => {
+            out.push_str(&format!(
+                "  min session attach --command 'min task run <task>' {}\n",
+                entry_handle(e)
+            ));
+        }
+        None => out.push_str("  min session activate --attach .\n"),
+    }
+    out.push_str("  min ls --json\n");
+    out
+}
+
+/// A session's typable handle for the state report: its name, or the leading
+/// UUID block when unnamed — the same short-id form the attach announcements
+/// use.
+fn entry_handle(entry: &minimald_rpc::ListSessionsEntry) -> String {
+    match &entry.name {
+        Some(name) => name.clone(),
+        None => {
+            let id = entry.id.to_string();
+            id.split('-').next().unwrap_or(&id).to_string()
+        }
+    }
+}
+
+/// Abbreviate a home-prefixed path to `~`/`~/...` for display; any other
+/// path renders absolute, unchanged.
+fn display_with_home_tilde(path: &camino::Utf8Path, home: Option<&camino::Utf8Path>) -> String {
+    match home.and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{rest}"),
+        None => path.to_string(),
+    }
 }
 
 /// Connect to the daemon, resolving the socket path from global args.
@@ -1499,6 +1673,20 @@ fn resolve_upload_root(dir: &camino::Utf8Path) -> Result<camino::Utf8PathBuf, an
 
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
+    activate_session(global, args, true).await
+}
+
+/// The activation flow shared by [`cmd_activate`] and the bare-`min` router.
+/// `offer_scaffold` gates the `minimal.toml` scaffold offer: `cmd_activate`
+/// keeps it (its long-standing behavior, unchanged), while bare `min`
+/// suppresses it — that path must land in a session, never in a config
+/// prompt. Everything else, including the session id on stdout, is
+/// identical for both callers.
+async fn activate_session(
+    global: &GlobalArgs,
+    args: ActivateArgs,
+    offer_scaffold: bool,
+) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
 
     let effective_path = match (&args.path, &global.repo_dir) {
@@ -1515,7 +1703,9 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
     let abs_path =
         paths::HostAbsPath::try_new(utf8_path.clone()).context("Invalid project path")?;
 
-    offer_mfile_scaffold(&utf8_path, global)?;
+    if offer_scaffold {
+        offer_mfile_scaffold(&utf8_path, global)?;
+    }
 
     let mut port_mappings = Vec::with_capacity(args.ingress.len());
     for spec in &args.ingress {
@@ -3138,13 +3328,166 @@ mod tests {
         ensure_interactive_attach_tty(true).expect("a real terminal must pass the guard");
     }
 
-    /// A bare `min` must be inert: it prints the top-level help and succeeds,
-    /// touching no daemon and creating no session. The `Cli` command tree has
-    /// to stay renderable for that (a malformed clap definition panics in
-    /// `print_help`, not at parse time).
+    /// The `Cli` command tree must stay well-formed: a malformed clap
+    /// definition panics in `debug_assert`/render, not at parse time, so
+    /// `min --help` (which bare `min` no longer prints, but which must keep
+    /// working unchanged) stays renderable.
     #[test]
-    fn bare_min_prints_help() {
-        cmd_default().expect("bare `min` must print help and succeed");
+    fn cli_command_tree_stays_renderable() {
+        use clap::CommandFactory as _;
+        Cli::command().debug_assert();
+    }
+
+    /// Entry constructor for the bare-`min` state-report tests.
+    fn twin_entry(
+        id: &str,
+        name: Option<&str>,
+        path: Option<&str>,
+        status: sessions::SessionStatus,
+    ) -> minimald_rpc::ListSessionsEntry {
+        minimald_rpc::ListSessionsEntry {
+            id: sessions::SessionId::parse_str(id).unwrap(),
+            name: name.map(str::to_owned),
+            project_path: path.map(|p| paths::HostAbsPath::try_new(p).unwrap()),
+            status,
+            attrs: None,
+        }
+    }
+
+    /// One cwd-matching session: the report names it with its status, and the
+    /// `Next:` attach line carries its real name — every line verbatim.
+    #[test]
+    fn bare_status_renders_a_cwd_session_verbatim() {
+        let entries = vec![twin_entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            Some("/w"),
+            sessions::SessionStatus::Active,
+        )];
+        let cwd = paths::HostAbsPath::try_new("/w").unwrap();
+        assert_eq!(
+            render_bare_status("~/w", &entries, &cwd, true),
+            "No terminal: not attaching. State for ~/w:\n\
+             \x20 sessions: 1 (web, active)\n\
+             \x20 blueprint: minimal.toml present\n\
+             Next:\n\
+             \x20 min session attach --command 'min task run <task>' web\n\
+             \x20 min ls --json\n"
+        );
+    }
+
+    /// No sessions anywhere and no blueprint: the report says so and the
+    /// `Next:` lines become the create-and-attach pair — every line verbatim.
+    #[test]
+    fn bare_status_renders_the_empty_state_verbatim() {
+        let cwd = paths::HostAbsPath::try_new("/w").unwrap();
+        assert_eq!(
+            render_bare_status("/w", &[], &cwd, false),
+            "No terminal: not attaching. State for /w:\n\
+             \x20 sessions: none\n\
+             \x20 blueprint: none (min init to create one)\n\
+             Next:\n\
+             \x20 min session activate --attach .\n\
+             \x20 min ls --json\n"
+        );
+    }
+
+    /// Sessions exist but none for this cwd: counted as elsewhere, and the
+    /// `Next:` lines still offer create-and-attach (attaching to another
+    /// project's session is not the suggestion).
+    #[test]
+    fn bare_status_counts_elsewhere_sessions() {
+        let entries = vec![
+            twin_entry(
+                "019f5d0f-0a99-78b1-9165-0809440f0052",
+                Some("api"),
+                Some("/other"),
+                sessions::SessionStatus::Active,
+            ),
+            twin_entry(
+                "019f5d0f-0a99-78b1-9165-0809440f0066",
+                None,
+                Some("/third"),
+                sessions::SessionStatus::Pending,
+            ),
+        ];
+        let cwd = paths::HostAbsPath::try_new("/w").unwrap();
+        let out = render_bare_status("/w", &entries, &cwd, true);
+        assert!(
+            out.contains("  sessions: 0 here (2 elsewhere)\n"),
+            "elsewhere count: {out}"
+        );
+        assert!(
+            out.contains("  min session activate --attach .\n"),
+            "no cwd session must suggest activate: {out}"
+        );
+        assert!(
+            !out.contains("session attach --command"),
+            "must not suggest attaching elsewhere: {out}"
+        );
+    }
+
+    /// More than two cwd matches: the count is the full total, the listing
+    /// stops at two, and an unnamed session shows its short id — which is
+    /// also what the attach suggestion substitutes for the first match.
+    #[test]
+    fn bare_status_lists_at_most_two_cwd_sessions() {
+        let entries = vec![
+            twin_entry(
+                "019f5d0f-0a99-78b1-9165-0809440f0052",
+                None,
+                Some("/w"),
+                sessions::SessionStatus::Pending,
+            ),
+            twin_entry(
+                "019f5d0f-0a99-78b1-9165-0809440f0066",
+                Some("web"),
+                Some("/w"),
+                sessions::SessionStatus::Materializing,
+            ),
+            twin_entry(
+                "019f5d0f-0a99-78b1-9165-0809440f0077",
+                Some("spare"),
+                Some("/w"),
+                sessions::SessionStatus::Active,
+            ),
+        ];
+        let cwd = paths::HostAbsPath::try_new("/w").unwrap();
+        let out = render_bare_status("/w", &entries, &cwd, true);
+        assert!(
+            out.contains("  sessions: 3 (019f5d0f, pending), (web, materializing)\n"),
+            "count-then-two listing: {out}"
+        );
+        assert!(
+            !out.contains("spare"),
+            "third session must not be listed: {out}"
+        );
+        assert!(
+            out.contains("  min session attach --command 'min task run <task>' 019f5d0f\n"),
+            "attach suggestion uses the first match's handle: {out}"
+        );
+    }
+
+    /// `~` abbreviation: exactly under home, home itself, and a path outside
+    /// home (which renders absolute, untouched).
+    #[test]
+    fn display_with_home_tilde_abbreviates_only_under_home() {
+        fn p(s: &str) -> &camino::Utf8Path {
+            camino::Utf8Path::new(s)
+        }
+        assert_eq!(
+            display_with_home_tilde(p("/home/u/code/app"), Some(p("/home/u"))),
+            "~/code/app"
+        );
+        assert_eq!(
+            display_with_home_tilde(p("/home/u"), Some(p("/home/u"))),
+            "~"
+        );
+        assert_eq!(
+            display_with_home_tilde(p("/srv/app"), Some(p("/home/u"))),
+            "/srv/app"
+        );
+        assert_eq!(display_with_home_tilde(p("/srv/app"), None), "/srv/app");
     }
 
     /// The attach/create confirmation prefers the session name and appends a
