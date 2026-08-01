@@ -338,7 +338,7 @@ check "min" "$(readlink "$H1/bin/git-remote-min")" "symlink points at its manife
 want_ok "fresh install emits the closing card (R10.4)" \
     grep -qE "Minimal .+ is ready" "$OUT"
 want_ok "the card names the first command (R10.4)" \
-    grep -q "min session activate --attach ." "$OUT"
+    grep -qE "min +build the sandbox and step inside" "$OUT"
 want_card_last "the card closes a fresh install (R10.4)"
 # Nothing on a redirected stream may carry terminal escapes (R10.1): this
 # output is a file, so a stray SGR here would land in every CI log. `run` sets a

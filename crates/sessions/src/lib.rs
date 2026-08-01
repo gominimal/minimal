@@ -319,6 +319,20 @@ pub enum SessionStatus {
     Active,
 }
 
+/// Deserialize a session name, collapsing an empty string to `None`.
+///
+/// An empty-string name could reach storage before the rename/activate
+/// boundary rejected empty names, leaving `null` and `""` as two on-disk
+/// spellings of "no name". Loading both as `None` gives every surface a
+/// single representation: `null | non-empty string`.
+fn deserialize_optional_name<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let name = Option::<String>::deserialize(deserializer)?;
+    Ok(name.filter(|name| !name.is_empty()))
+}
+
 /// The on-disk row/record pertaining to a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
@@ -331,6 +345,7 @@ pub struct Record {
     /// When no name was manually assigned, the user should
     /// be presented with a short name of the form:
     /// <user>-<project/repo-name>-<uuid-suffix>.
+    #[serde(deserialize_with = "deserialize_optional_name")]
     pub name: Option<String>,
 
     /// The username of the creating user, at creation time.
@@ -752,6 +767,22 @@ mod tests {
         });
         let parsed: Record = serde_json::from_value(raw).expect("deserialize");
         assert_eq!(parsed.status, SessionStatus::Active);
+    }
+
+    /// A name persisted as an empty string predates the rename/activate
+    /// validation that now rejects empty names. It must load as `None` so
+    /// `null` is the single representation of "no name" on every surface.
+    #[test]
+    fn record_with_empty_name_deserializes_as_none() {
+        let raw = serde_json::json!({
+            "id": SessionId::nil(),
+            "name": "",
+            "username": null,
+            "project_path": "/p",
+            "attrs": {},
+        });
+        let parsed: Record = serde_json::from_value(raw).expect("deserialize");
+        assert_eq!(parsed.name, None);
     }
 
     #[test]
