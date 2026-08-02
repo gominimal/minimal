@@ -40,6 +40,7 @@ nightly/sanitizer build doesn't perturb the main workspace).
 | `jq_parse_json` | `crates/common/fuzz` | `jq::parse_file` (JSON branch) — build-time project data files | SUPPLY | any |
 | `graph_roundtrip` | `crates/graph/fuzz` | structure-aware round-trip differential: `from_bytes(to_bytes(g)) == g` over arbitrary graphs | — | any |
 | `archive_extract` | `crates/common/fuzz` | `archive::extract_compressed_tar` — tar behind five decompressors, the path build sources, OCI layers, and remote-cache artifacts all take | NET, SUPPLY | any |
+| `path_invariants` | `crates/paths/fuzz` | the realm-tagged path constructors — a differential asserting every route to a `RelPath` enforces the same no-`..` rule | NET | any |
 
 `remote_index_from_reader` builds only on Linux: `rcache` depends on `lcache`,
 which uses `common::renameat2` (a Linux-only syscall wrapper). This is one more
@@ -172,6 +173,7 @@ fuzzer's own crashing input:
 | Local-file filename `..`/absolute traversal | `graph::wire::materialize_local_file` | #656 |
 | Tar `strip_prefix` path traversal (supply-chain arbitrary write) | `common::archive` | #651 |
 | Escaping symlink created when no `strip_prefix` was set — the link-target check only ran on the `Some(..)` branch | `common::archive::extract_tar_impl` | this branch |
+| `EitherPath::new` minted a `RelPath` containing `..`, forging the guarantee the daemon composer trusts for wire-supplied paths | `paths::EitherPath` | this branch |
 
 ## Continuing the campaign
 
@@ -182,13 +184,23 @@ Ideas, roughly in value order, for follow-up on a beefy Linux box:
    fuzzer can't. Doubles as a round-trip differential:
    `from_bytes(to_bytes(g)) == g`.
 2. **Richer seeds** — see [Corpus seeding](#corpus-seeding).
-3. **More targets** — `lcache::ReadTracker::read_records` and
-   `lcache::EntryMeta::read_from` (local cache metadata), the `minimald-rpc`
-   request enums, and `minvmd`'s vsock RPC response decode
-   (`rpc_client.rs`, which `read_to_end`s guest-controlled bytes before
-   `serde_json::from_slice`). The `SpecHash`, `Target::from_str`, and
-   `mfile::File` entries that used to sit here now have targets — see the
-   table above before adding one.
+3. **More targets** — the `minimald-rpc` request enums and `decode`'s
+   construction of packages/profiles/stacks from evaluated config are the
+   meaningful surfaces left. Check the table above before adding one:
+   `SpecHash`, `Target::from_str`, and `mfile::File` used to be listed here
+   and have had targets for some time.
+
+   Being *possible* to fuzz is not the same as being *worth* fuzzing. These
+   were audited and deliberately skipped:
+
+   | Surface | Why not |
+   |---|---|
+   | `lcache::ReadTracker::read_records` | Fixed-size records `read_exact`ed into a stack buffer — no length field to abuse. |
+   | `lcache::EntryMeta::read_from` | Plain `serde_json::from_reader`; serde_json is fuzzed upstream far harder than we would. |
+   | `switch` subnet/MAC math | `SwitchSubnet::new` constrains the prefix to `8..=29` so the reserved-address arithmetic cannot underflow; private fields and no `Deserialize` to bypass the constructor. |
+   | `sessions::primitives` var names | Both the hand-written `Deserialize` and `FromStr` route through `try_new`; there is no second door. |
+   | `minimald::net::wg` | `WgPublicKey::from_str` length-checks its `try_into`; `Ipv4Cidr` validates the prefix and special-cases `/0` in `mask()`. |
+   | `minvmd::rpc_client` response decode | The defect there was a resource bound (an unbounded `read_to_end`), which a fuzzer cannot surface. Fixed with a cap instead. |
 4. **Cheap multipliers** — a libFuzzer dictionary (the JSON keys + tag bytes
    `0x01`–`0x07`, `0xFF`), and a nightly CI fuzz job per target with a
    persisted corpus.
