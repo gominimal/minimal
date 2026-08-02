@@ -7,6 +7,64 @@ use std::path::{Path, PathBuf, StripPrefixError};
 
 const ZSTD_LEVEL: i32 = 5;
 
+/// Cap on how many bytes an xz stream may decompress to before extraction.
+///
+/// Only the xz path needs this: it is the one compression arm that buffers the
+/// entire decompressed tar to disk up front (see `extract_compressed_tar`).
+/// Sized to clear real upstream source tarballs — the largest in common use
+/// (LLVM, the kernel) land in the low single-digit GB uncompressed — while
+/// still bounding a hostile stream. Matches the order of magnitude of
+/// `MAX_PATCH_ENTRY_BYTES` / `MAX_UNPACK_INFLIGHT_BYTES` in `minimald::rpc`.
+const MAX_XZ_DECOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// A [`Write`] wrapper that stops accepting bytes past a cap.
+///
+/// Reports the overflow via [`Self::overflowed`] rather than only through the
+/// `io::Error`, because `lzma_rs` wraps write errors in its own error type and
+/// the distinction between "the stream was malformed" and "the stream was too
+/// big" is worth keeping in the message the caller sees.
+struct LimitedWriter<W> {
+    inner: W,
+    written: u64,
+    max: u64,
+    overflowed: bool,
+}
+
+impl<W: Write> LimitedWriter<W> {
+    fn new(inner: W, max: u64) -> Self {
+        Self {
+            inner,
+            written: 0,
+            max,
+            overflowed: false,
+        }
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for LimitedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.max.saturating_sub(self.written);
+        if (buf.len() as u64) > remaining {
+            self.overflowed = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("decompressed output exceeds {} bytes", self.max),
+            ));
+        }
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Errors which can occur when working with archives.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -18,6 +76,11 @@ pub enum ArchiveError {
     /// the offending archive-relative path. (A symlink/hardlink whose *target*
     /// escapes is skipped with a warning instead — see `extract_tar_impl`.)
     PathTraversal(PathBuf),
+    /// An xz stream decompressed past [`MAX_XZ_DECOMPRESSED_BYTES`].
+    DecompressedTooLarge {
+        /// The cap that was exceeded, in bytes.
+        max: u64,
+    },
 }
 
 impl fmt::Display for ArchiveError {
@@ -33,6 +96,9 @@ impl fmt::Display for ArchiveError {
                     p.display()
                 )
             }
+            ArchiveError::DecompressedTooLarge { max } => {
+                write!(f, "xz stream decompressed too large: over {max} bytes")
+            }
         }
     }
 }
@@ -44,6 +110,7 @@ impl std::error::Error for ArchiveError {
             ArchiveError::StripPrefix(e) => Some(e),
             ArchiveError::CompressionError(_) => None,
             ArchiveError::PathTraversal(_) => None,
+            ArchiveError::DecompressedTooLarge { .. } => None,
         }
     }
 }
@@ -192,8 +259,27 @@ pub fn extract_compressed_tar<R: Read>(
             extract_tar_impl(decoder, dest_dir, strip_prefix)
         }
         Compression::Xz => {
-            let mut decomp_buf = tempfile::tempfile()?;
-            lzma_rs::xz_decompress(&mut std::io::BufReader::new(reader), &mut decomp_buf)?;
+            // The gzip/zstd/bz2 arms hand a streaming decoder straight to the
+            // tar reader, so their disk use is bounded by what the tar
+            // actually unpacks. `lzma_rs` exposes only a one-shot
+            // `xz_decompress(reader, writer)`, so this arm has to materialize
+            // the whole decompressed tar to a tempfile *before* extraction —
+            // and before any entry has been validated. Uncapped, that makes a
+            // few KB of hostile `.tar.xz` a disk-fill primitive. The cap turns
+            // it into a clean error.
+            let mut decomp_buf =
+                LimitedWriter::new(tempfile::tempfile()?, MAX_XZ_DECOMPRESSED_BYTES);
+            let res = lzma_rs::xz_decompress(&mut std::io::BufReader::new(reader), &mut decomp_buf);
+            // Check the cap before the result: lzma_rs wraps our write error in
+            // its own type, and were it ever to swallow one, proceeding would
+            // extract a silently truncated tar.
+            if decomp_buf.overflowed {
+                return Err(ArchiveError::DecompressedTooLarge {
+                    max: MAX_XZ_DECOMPRESSED_BYTES,
+                });
+            }
+            res?;
+            let mut decomp_buf = decomp_buf.into_inner();
             std::io::Seek::rewind(&mut decomp_buf)?;
             extract_tar_impl(decomp_buf, dest_dir, strip_prefix)
         }
@@ -652,6 +738,39 @@ mod tests {
             "write escaped the destination tree",
         );
         Ok(())
+    }
+
+    /// The xz arm's disk bound. Driving the real
+    /// [`MAX_XZ_DECOMPRESSED_BYTES`] through `xz_decompress` would mean
+    /// generating gigabytes, so the cap is tested where it actually lives —
+    /// the writer — and wired into the xz arm by construction.
+    #[test]
+    fn limited_writer_stops_at_cap() {
+        use std::io::Write as _;
+
+        let mut w = LimitedWriter::new(Vec::new(), 8);
+        assert_eq!(w.write(b"1234").unwrap(), 4);
+        assert_eq!(w.write(b"5678").unwrap(), 4);
+        assert!(!w.overflowed, "exactly at the cap is not an overflow");
+
+        let err = w.write(b"9").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(w.overflowed);
+        // Nothing past the cap reached the inner writer.
+        assert_eq!(w.into_inner(), b"12345678");
+    }
+
+    /// A single write larger than the whole cap is rejected outright rather
+    /// than partially accepted — decompressors hand over big buffers, and a
+    /// short write would let the stream continue past the bound.
+    #[test]
+    fn limited_writer_rejects_oversized_single_write() {
+        use std::io::Write as _;
+
+        let mut w = LimitedWriter::new(Vec::new(), 4);
+        assert!(w.write(b"toolong").is_err());
+        assert!(w.overflowed);
+        assert!(w.into_inner().is_empty());
     }
 
     #[test]
