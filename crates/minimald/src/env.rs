@@ -1178,7 +1178,7 @@ fn resolve_output(cwd: &Utf8Path, output: SandboxPath) -> Result<SandboxAbsPath,
                      the working directory `{cwd}` is not an absolute path"
                 ));
             }
-            cwd.join(rel.as_utf8_path())
+            cwd.join(&rel)
         }
     };
     // Normalize here so `sandbox_to_daemon`'s prefix match is sound:

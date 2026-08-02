@@ -983,7 +983,20 @@ pub enum EitherPath<R: Realm> {
     /// Absolute variant.
     Abs(AbsPath<R>),
     /// Relative variant.
-    Rel(RelPath<R>),
+    ///
+    /// Deliberately a bare [`Utf8PathBuf`] and **not** a [`RelPath<R>`].
+    /// `EitherPath` is built from inputs that may legitimately contain `..` —
+    /// a `--output ../artifacts` typed in a sandbox cwd, a
+    /// `--minimal-state-dir ../state` on the daemon command line — so it
+    /// cannot uphold `RelPath`'s no-`..` guarantee. Holding a `RelPath` here
+    /// would mint one that [`RelPath::try_new`] would have rejected, and every
+    /// downstream holder of a `RelPath` is entitled to assume that cannot
+    /// happen. The realm is already carried by `EitherPath<R>` itself, so
+    /// nothing is lost by dropping the inner tag.
+    ///
+    /// Callers who need the guarantee should go through
+    /// [`RelPath::try_new`] explicitly and handle the rejection.
+    Rel(Utf8PathBuf),
 }
 
 impl<R: Realm> Clone for EitherPath<R> {
@@ -1029,9 +1042,10 @@ impl<R: Realm> fmt::Debug for EitherPath<R> {
 impl<R: Realm> EitherPath<R> {
     /// Constructs an `EitherPath` by inspecting whether `p` is absolute.
     ///
-    /// Infallible: every UTF-8 path is either absolute or relative, so the
-    /// invariants of both [`AbsPath::new`] and [`RelPath::new`] are
-    /// guaranteed to hold for exactly one variant.
+    /// Infallible, and only [`AbsPath`]'s invariant is asserted by
+    /// construction: the [`Rel`](Self::Rel) variant holds a bare path
+    /// precisely because this constructor cannot reject a `..`. See that
+    /// variant's docs.
     pub fn new(p: impl Into<Utf8PathBuf>) -> Self {
         let inner = p.into();
         if inner.is_absolute() {
@@ -1040,10 +1054,7 @@ impl<R: Realm> EitherPath<R> {
                 _realm: PhantomData,
             })
         } else {
-            Self::Rel(RelPath {
-                inner,
-                _realm: PhantomData,
-            })
+            Self::Rel(inner)
         }
     }
 
@@ -1052,7 +1063,7 @@ impl<R: Realm> EitherPath<R> {
     pub fn as_utf8_path(&self) -> &Utf8Path {
         match self {
             Self::Abs(p) => p.as_utf8_path(),
-            Self::Rel(p) => p.as_utf8_path(),
+            Self::Rel(p) => p.as_path(),
         }
     }
 
@@ -1078,8 +1089,11 @@ impl<R: Realm> EitherPath<R> {
     }
 
     /// Returns the relative variant, if any.
+    ///
+    /// Yields a bare [`Utf8Path`], not a [`RelPath`] — it may contain `..`.
+    /// Use [`RelPath::try_new`] on it if you need the no-`..` guarantee.
     #[must_use]
-    pub fn as_rel(&self) -> Option<&RelPath<R>> {
+    pub fn as_rel(&self) -> Option<&Utf8Path> {
         match self {
             Self::Abs(_) => None,
             Self::Rel(p) => Some(p),
@@ -1154,7 +1168,10 @@ impl<R: Realm> From<AbsPath<R>> for EitherPath<R> {
 
 impl<R: Realm> From<RelPath<R>> for EitherPath<R> {
     fn from(p: RelPath<R>) -> Self {
-        Self::Rel(p)
+        // Widening: a validated `RelPath` is trivially a valid lenient
+        // relative path. The reverse direction has to go through
+        // `RelPath::try_new` and can fail.
+        Self::Rel(p.inner)
     }
 }
 
@@ -1274,7 +1291,13 @@ impl<R: CwdResolvable> CwdRelative<R> {
                 let cwd = Utf8PathBuf::from_path_buf(cwd).map_err(CwdResolveError::NonUtf8Cwd)?;
                 let cwd_abs = AbsPath::<R>::try_new(cwd.clone())
                     .map_err(|_| CwdResolveError::CwdNotAbsolute(cwd))?;
-                Ok(cwd_abs.join(r))
+                // Not `AbsPath::join`: that takes a validated `RelPath` and
+                // promises the result stays under the base. A cwd-relative CLI
+                // path may legitimately climb out (`--minimal-state-dir
+                // ../state`), so join the raw path instead. Absoluteness — the
+                // only invariant `AbsPath` carries — still holds because
+                // `cwd_abs` is absolute.
+                Ok(AbsPath::new_unchecked(cwd_abs.as_utf8_path().join(r)))
             }
         }
     }
@@ -1544,7 +1567,63 @@ mod tests {
         let lifted_abs: HostPath = abs.clone().into();
         let lifted_rel: HostPath = rel.clone().into();
         assert_eq!(lifted_abs.as_abs(), Some(&abs));
-        assert_eq!(lifted_rel.as_rel(), Some(&rel));
+        // `as_rel` yields a bare `Utf8Path`: the lenient variant carries no
+        // no-`..` guarantee, so it cannot hand back a `RelPath`.
+        assert_eq!(lifted_rel.as_rel(), Some(rel.as_utf8_path()));
+    }
+
+    /// Regression: `EitherPath` must never hand out a value carrying
+    /// `RelPath`'s no-`..` guarantee without having checked it.
+    ///
+    /// Found by the `path_invariants` fuzz target (minimal input: `,/..`).
+    /// `EitherPath::Rel` used to hold a `RelPath<R>` built by struct literal,
+    /// so `EitherPath::new("../../etc/passwd")` minted one that
+    /// `RelPath::try_new` rejects — and `AbsPath::join`, whose containment
+    /// promise rests on that guarantee, would then happily escape its base.
+    #[test]
+    fn either_path_rel_variant_carries_no_relpath_guarantee() {
+        let escaping = "../../etc/passwd";
+        assert!(
+            RelPath::<Host>::try_new(escaping).is_err(),
+            "precondition: try_new rejects `..`",
+        );
+
+        // The lenient variant still accepts it — that is deliberate, CLI and
+        // `--output` paths legitimately climb — but it is no longer a RelPath.
+        let either = EitherPath::<Host>::new(escaping);
+        let rel: &Utf8Path = either.as_rel().expect("classified relative");
+        assert_eq!(rel.as_str(), escaping);
+
+        // And the only route back to a `RelPath` is the checked one.
+        assert!(RelPath::<Host>::try_new(rel).is_err());
+    }
+
+    /// A validated `RelPath` joined onto any base stays under that base, once
+    /// `..`/`.` are resolved. This is the property the daemon composer relies
+    /// on for wire-supplied `SandboxRelPath`s.
+    #[test]
+    fn validated_relpath_join_is_contained() {
+        let base = AbsPath::<Host>::try_new("/srv/sandbox/home").unwrap();
+        for candidate in ["a/b", "./a", "a/./b", "", "x", "a/../b"] {
+            let Ok(rel) = RelPath::<Host>::try_new(candidate) else {
+                continue; // `a/../b` is rejected; that is the point
+            };
+            let joined = base.join(&rel);
+            let mut resolved = Utf8PathBuf::new();
+            for c in joined.as_utf8_path().components() {
+                match c {
+                    camino::Utf8Component::ParentDir => {
+                        resolved.pop();
+                    }
+                    camino::Utf8Component::CurDir => {}
+                    other => resolved.push(other.as_str()),
+                }
+            }
+            assert!(
+                resolved.starts_with("/srv/sandbox/home"),
+                "{candidate:?} escaped: {resolved}",
+            );
+        }
     }
 
     // ---- AsRef / Borrow ----
