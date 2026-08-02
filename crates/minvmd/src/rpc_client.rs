@@ -14,6 +14,14 @@ use anyhow::Context as _;
 use minimald_rpc::OneshotSshRpc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Largest oneshot-RPC response body accepted from the in-VM daemon.
+///
+/// Every response on this path is a small JSON status object; the cap exists
+/// so a wedged or hostile guest cannot make the host buffer without bound.
+/// Generous by two orders of magnitude against the real payloads, so it can
+/// only ever fire on something pathological.
+const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+
 /// russh client handler that accepts any host key. The daemon generates a
 /// fresh host key on every boot and the connection is a local UDS (the
 /// libkrun vsock bridge), so TOFU trust is acceptable.
@@ -117,10 +125,25 @@ async fn call_oneshot<R: OneshotSshRpc>(
     rpc.write_all(&body).await.context("write request")?;
     rpc.shutdown().await.context("shutdown write half")?;
 
+    // Bound the response. These are small JSON status objects, but the peer is
+    // the in-VM daemon across the vsock bridge: an unbounded `read_to_end`
+    // lets a wedged or hostile guest make the host buffer without limit.
+    // `take` the cap plus one byte so hitting the cap is distinguishable from
+    // a response that merely fills it. (Mirrors `MAX_REQUEST_BYTES` in
+    // `minimald::diag`, which bounds the same shape of read in the other
+    // direction.)
     let mut resp_buf = Vec::with_capacity(256);
-    rpc.read_to_end(&mut resp_buf)
+    (&mut rpc)
+        .take(MAX_RESPONSE_BYTES + 1)
+        .read_to_end(&mut resp_buf)
         .await
         .context("read response")?;
+    if resp_buf.len() as u64 > MAX_RESPONSE_BYTES {
+        anyhow::bail!(
+            "{} response too large: over {MAX_RESPONSE_BYTES} bytes",
+            R::NAME
+        );
+    }
 
     serde_json::from_slice(&resp_buf).with_context(|| format!("decode response for {}", R::NAME))
 }
