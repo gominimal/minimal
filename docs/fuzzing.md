@@ -39,6 +39,7 @@ nightly/sanitizer build doesn't perturb the main workspace).
 | `arg_schema_parse` | `crates/args/fuzz` | `ArgSchema::try_from` — hand-written schema/bracketed-list parser | OWN | any |
 | `jq_parse_json` | `crates/common/fuzz` | `jq::parse_file` (JSON branch) — build-time project data files | SUPPLY | any |
 | `graph_roundtrip` | `crates/graph/fuzz` | structure-aware round-trip differential: `from_bytes(to_bytes(g)) == g` over arbitrary graphs | — | any |
+| `archive_extract` | `crates/common/fuzz` | `archive::extract_compressed_tar` — tar behind five decompressors, the path build sources, OCI layers, and remote-cache artifacts all take | NET, SUPPLY | any |
 
 `remote_index_from_reader` builds only on Linux: `rcache` depends on `lcache`,
 which uses `common::renameat2` (a Linux-only syscall wrapper). This is one more
@@ -86,11 +87,38 @@ valid inputs is what unlocks those paths** — seeding a valid graph-with-local-
 file is exactly what surfaced the out-of-bounds slice panic (H1) that the
 unseeded fuzzer missed.
 
-Committed seeds live in `crates/graph/fuzz/seeds/`. Load them before a run:
+Committed seeds live in `crates/graph/fuzz/seeds/` and
+`crates/common/fuzz/seeds/<target>/`. Load them before a run:
 
 ```sh
 mkdir -p crates/graph/fuzz/corpus/graph_from_bytes
 cp crates/graph/fuzz/seeds/* crates/graph/fuzz/corpus/graph_from_bytes/
+
+mkdir -p crates/common/fuzz/corpus/archive_extract
+cp crates/common/fuzz/seeds/archive_extract/* crates/common/fuzz/corpus/archive_extract/
+```
+
+`archive_extract` is the clearest measurement of what seeding buys. Two 15
+minute runs, same target, same four cores — the only difference was 32 seed
+files:
+
+| | unseeded | seeded |
+|---|---|---|
+| Coverage (edges) | 1029 | 4141 |
+| Corpus | 156 | 1225 |
+| Bugs found | 0 | 1 |
+
+Unseeded, the fuzzer burned ~7M executions before it first constructed a valid
+ustar header, and never got past it. Seeded, it started inside the entry-path
+and `strip_prefix` logic and found the symlink bug in the track record below.
+
+Its seeds are generated, not hand-written — `crates/common/fuzz/scripts/gen-seeds.sh`
+builds tarballs with the system `tar` across every compression and
+`strip_prefix` selector, including adversarial payload trees (escaping
+symlinks, absolute-target symlinks, setuid bits). Regenerate with:
+
+```sh
+crates/common/fuzz/scripts/gen-seeds.sh
 ```
 
 Generate new seeds from any code path that produces a valid encoding — build
@@ -143,6 +171,7 @@ fuzzer's own crashing input:
 | Local-file offset out-of-bounds slice panic | `graph::wire::materialize_local_file` | #656 |
 | Local-file filename `..`/absolute traversal | `graph::wire::materialize_local_file` | #656 |
 | Tar `strip_prefix` path traversal (supply-chain arbitrary write) | `common::archive` | #651 |
+| Escaping symlink created when no `strip_prefix` was set — the link-target check only ran on the `Some(..)` branch | `common::archive::extract_tar_impl` | this branch |
 
 ## Continuing the campaign
 
@@ -153,9 +182,13 @@ Ideas, roughly in value order, for follow-up on a beefy Linux box:
    fuzzer can't. Doubles as a round-trip differential:
    `from_bytes(to_bytes(g)) == g`.
 2. **Richer seeds** — see [Corpus seeding](#corpus-seeding).
-3. **More targets** — `common::SpecHash`, `lcache::ReadTracker::read_records`,
-   `toml::from_slice::<mfile::File>`, the `minimald-rpc` request enums,
-   `common::Target::from_str`.
+3. **More targets** — `lcache::ReadTracker::read_records` and
+   `lcache::EntryMeta::read_from` (local cache metadata), the `minimald-rpc`
+   request enums, and `minvmd`'s vsock RPC response decode
+   (`rpc_client.rs`, which `read_to_end`s guest-controlled bytes before
+   `serde_json::from_slice`). The `SpecHash`, `Target::from_str`, and
+   `mfile::File` entries that used to sit here now have targets — see the
+   table above before adding one.
 4. **Cheap multipliers** — a libFuzzer dictionary (the JSON keys + tag bytes
    `0x01`–`0x07`, `0xFF`), and a nightly CI fuzz job per target with a
    persisted corpus.

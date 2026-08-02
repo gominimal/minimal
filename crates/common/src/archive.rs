@@ -238,70 +238,77 @@ fn extract_tar_impl<R: Read>(
 ) -> Result<(), ArchiveError> {
     let mut archive = tar::Archive::new(reader);
 
-    if let Some(prefix) = strip_prefix {
-        for entry in archive.entries()? {
-            let mut entry = entry?;
-            let p = entry.path()?;
-            if p.as_ref().as_os_str() == "pax_global_header" {
+    // Every archive goes through this loop, with or without a prefix to strip.
+    // It used to be the `strip_prefix.is_some()` branch, with `None` handled by
+    // a bare `Archive::unpack` — but that delegated link handling to `tar`,
+    // which writes link targets verbatim, so an escaping symlink was rejected
+    // with a prefix set and created without one. Same bytes, same threat,
+    // opposite outcome; found by the `archive_extract` fuzz target. Callers
+    // reach the `None` path with untrusted input (a package source that
+    // declares no `strip_prefix`, remote-cache artifacts), so the checks below
+    // have to cover it too.
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let p = entry.path()?;
+        if p.as_ref().as_os_str() == "pax_global_header" {
+            continue;
+        }
+        let stripped = match strip_prefix {
+            Some(prefix) => p.strip_prefix(prefix)?.to_owned(),
+            None => p.into_owned(),
+        };
+
+        // `Path::join` lets an entry named `../../x` (or an absolute path)
+        // escape `dest_dir`, and `Entry::unpack` does not contain the write.
+        // Reject any entry that resolves outside the destination tree before
+        // touching the filesystem.
+        let safe_path = normalize_within_root(&stripped)
+            .ok_or_else(|| ArchiveError::PathTraversal(stripped.clone()))?;
+
+        // A symlink/hardlink whose target escapes the tree would let a
+        // subsequent entry be written through it to an arbitrary location
+        // (target is relative to the link's own directory for a symlink,
+        // to the destination root for a hardlink). SKIP such a link rather
+        // than abort: never creating it defeats the write-through vector (a
+        // later entry resolves to a contained regular path instead), while
+        // legitimate upstream tarballs that ship escaping symlinks in test
+        // fixtures (next.js, syft) still extract. The entry-path escape
+        // above stays a hard error — a file writing to `../x` has no benign
+        // form.
+        let entry_type = entry.header().entry_type();
+        if (entry_type.is_symlink() || entry_type.is_hard_link())
+            && let Some(target) = entry.link_name()?
+        {
+            let base = if entry_type.is_symlink() {
+                safe_path.parent().unwrap_or_else(|| Path::new(""))
+            } else {
+                Path::new("")
+            };
+            if normalize_within_root(&base.join(target.as_ref())).is_none() {
+                tracing::warn!(
+                    entry = %stripped.display(),
+                    target = %target.display(),
+                    "skipping tar link whose target escapes the destination"
+                );
                 continue;
             }
-            let stripped = p.strip_prefix(prefix)?.to_owned();
-
-            // `Path::join` lets an entry named `../../x` (or an absolute path)
-            // escape `dest_dir`, and per-entry `Entry::unpack` — unlike the
-            // whole-archive `Archive::unpack` in the else branch — does not
-            // contain the write. Reject any entry that resolves outside the
-            // destination tree before touching the filesystem.
-            let safe_path = normalize_within_root(&stripped)
-                .ok_or_else(|| ArchiveError::PathTraversal(stripped.clone()))?;
-
-            // A symlink/hardlink whose target escapes the tree would let a
-            // subsequent entry be written through it to an arbitrary location
-            // (target is relative to the link's own directory for a symlink,
-            // to the destination root for a hardlink). SKIP such a link rather
-            // than abort: never creating it defeats the write-through vector (a
-            // later entry resolves to a contained regular path instead), while
-            // legitimate upstream tarballs that ship escaping symlinks in test
-            // fixtures (next.js, syft) still extract. The entry-path escape
-            // above stays a hard error — a file writing to `../x` has no benign
-            // form.
-            let entry_type = entry.header().entry_type();
-            if (entry_type.is_symlink() || entry_type.is_hard_link())
-                && let Some(target) = entry.link_name()?
-            {
-                let base = if entry_type.is_symlink() {
-                    safe_path.parent().unwrap_or_else(|| Path::new(""))
-                } else {
-                    Path::new("")
-                };
-                if normalize_within_root(&base.join(target.as_ref())).is_none() {
-                    tracing::warn!(
-                        entry = %stripped.display(),
-                        target = %target.display(),
-                        "skipping tar link whose target escapes the destination"
-                    );
-                    continue;
-                }
-            }
-
-            // Ensure any containing directory exists - most tarballs are good about ordering directory entries
-            // ahead of files within them, but not all.
-            if let Some(dirs) = safe_path.parent()
-                && !dirs.as_os_str().is_empty()
-            {
-                let dir_path = dest_dir.join(dirs);
-                if !std::fs::exists(&dir_path)? {
-                    std::fs::create_dir_all(dir_path)?;
-                }
-            }
-
-            if let tar::Unpacked::File(f) = entry.unpack(dest_dir.join(&safe_path))? {
-                f.sync_all()?;
-                drop(f);
-            };
         }
-    } else {
-        archive.unpack(dest_dir)?;
+
+        // Ensure any containing directory exists - most tarballs are good about ordering directory entries
+        // ahead of files within them, but not all.
+        if let Some(dirs) = safe_path.parent()
+            && !dirs.as_os_str().is_empty()
+        {
+            let dir_path = dest_dir.join(dirs);
+            if !std::fs::exists(&dir_path)? {
+                std::fs::create_dir_all(dir_path)?;
+            }
+        }
+
+        if let tar::Unpacked::File(f) = entry.unpack(dest_dir.join(&safe_path))? {
+            f.sync_all()?;
+            drop(f);
+        };
     }
 
     Ok(())
@@ -558,6 +565,92 @@ mod tests {
             "pwned"
         );
         assert!(extract_dir.path().join("link").is_dir());
+        Ok(())
+    }
+
+    /// Builds a tarball carrying an escaping symlink, and optionally a write
+    /// *through* it. Entry paths are prefixed so the same bytes can be
+    /// extracted with `strip_prefix: Some("prefix")` or with `None`.
+    fn escaping_symlink_tar(write_through: bool) -> Vec<u8> {
+        let mut tar_data = Vec::new();
+        let mut builder = tar::Builder::new(&mut tar_data);
+
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_path("prefix/link").unwrap();
+        link.set_link_name("../../../etc").unwrap();
+        link.set_size(0);
+        link.set_cksum();
+        builder.append(&link, &[][..]).unwrap();
+
+        if write_through {
+            let content = b"pwned";
+            let mut file = tar::Header::new_gnu();
+            file.set_path("prefix/link/passwd").unwrap();
+            file.set_size(content.len() as u64);
+            file.set_cksum();
+            builder.append(&file, &content[..]).unwrap();
+        }
+
+        builder.finish().unwrap();
+        drop(builder);
+        tar_data
+    }
+
+    /// Regression: the escaping-symlink defense must not depend on
+    /// `strip_prefix` being set.
+    ///
+    /// Found by the `archive_extract` fuzz target. `extract_skips_escaping_symlink`
+    /// covers `strip_prefix: Some(..)`, which runs the per-entry loop with its
+    /// `link_name` check. `None` took the `else` branch — a bare
+    /// `tar::Archive::unpack`, which writes link targets verbatim — so the
+    /// identical tarball produced an escaping symlink on disk. Same bytes,
+    /// same threat, opposite outcome.
+    #[test]
+    fn extract_without_strip_prefix_skips_escaping_symlink() -> Result<(), ArchiveError> {
+        let extract_dir = tempfile::tempdir().unwrap();
+
+        extract_compressed_tar(
+            &escaping_symlink_tar(false)[..],
+            Compression::None,
+            extract_dir.path(),
+            None,
+        )?;
+
+        // symlink_metadata sees even a dangling link, so this is a real
+        // "was never created" check.
+        assert!(
+            extract_dir
+                .path()
+                .join("prefix/link")
+                .symlink_metadata()
+                .is_err(),
+            "escaping symlink was created without a strip_prefix",
+        );
+        Ok(())
+    }
+
+    /// The tar-slip write-through vector, exercised on the `strip_prefix: None`
+    /// path. Nothing may land outside the destination tree.
+    #[test]
+    fn extract_without_strip_prefix_contains_write_through() -> Result<(), ArchiveError> {
+        let extract_dir = tempfile::tempdir().unwrap();
+
+        // Extraction may legitimately fail here; what must never happen is a
+        // write escaping the tree.
+        let _ = extract_compressed_tar(
+            &escaping_symlink_tar(true)[..],
+            Compression::None,
+            extract_dir.path(),
+            None,
+        );
+
+        let escaped = extract_dir.path().join("../../../etc/passwd");
+        assert_ne!(
+            std::fs::read_to_string(&escaped).unwrap_or_default(),
+            "pwned",
+            "write escaped the destination tree",
+        );
         Ok(())
     }
 
