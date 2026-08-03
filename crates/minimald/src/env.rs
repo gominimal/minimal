@@ -53,12 +53,12 @@ const MIN_SCRIPT: &str = include_str!("env_min_helper.sh");
 /// Where the session's workspace appears *inside* the sandbox. The daemon sees
 /// the same directory at [`SessionChannel::working`], so this is the prefix
 /// that translates a path typed in the sandbox into one the daemon can write.
-const WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_DEFAULT_WD);
+pub(crate) const WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_DEFAULT_WD);
 
 /// Where the session's home directory appears inside the sandbox, backed by
 /// [`SessionChannel::home`]. The second of the two directories a sandbox path
 /// can name on the daemon's side.
-const HOME_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_HOME);
+pub(crate) const HOME_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_HOME);
 
 /// The parameters used to construct an [`Env`].
 ///
@@ -1191,7 +1191,7 @@ fn resolve_output(cwd: &Utf8Path, output: SandboxPath) -> Result<SandboxAbsPath,
 
 /// Resolves `.` and `..` textually. A `..` at the root stays there, so an
 /// escape can only show up as a path failing the workspace prefix check.
-fn normalize_absolute(path: &Utf8Path) -> Utf8PathBuf {
+pub(crate) fn normalize_absolute(path: &Utf8Path) -> Utf8PathBuf {
     let mut out = Utf8PathBuf::new();
     for component in path.components() {
         match component {
