@@ -362,6 +362,17 @@ fn extract_tar_impl<R: Read>(
         // above stays a hard error — a file writing to `../x` has no benign
         // form.
         let entry_type = entry.header().entry_type();
+        // For a hardlink we must ALSO create the link ourselves (below): the
+        // check here is necessary but not sufficient, because `Entry::unpack`
+        // calls `fields.unpack(None, ..)`, and tar's `target_base: None` arm
+        // uses the link name verbatim — resolving it against the **process
+        // CWD**, not `dest_dir`. (`Archive::unpack` avoids this by routing
+        // through `unpack_in`, which passes `Some(dst)` and validates.) So a
+        // target like `etc/shadow` passes this check and then hardlinks the
+        // real `/etc/shadow` into the destination, sharing the inode — an
+        // escape no path-based containment can see. tar's own source comments
+        // on exactly this asymmetry between symlinks and hardlinks.
+        let mut hardlink_src: Option<PathBuf> = None;
         if (entry_type.is_symlink() || entry_type.is_hard_link())
             && let Some(target) = entry.link_name()?
         {
@@ -370,13 +381,19 @@ fn extract_tar_impl<R: Read>(
             } else {
                 Path::new("")
             };
-            if normalize_within_root(&base.join(target.as_ref())).is_none() {
-                tracing::warn!(
-                    entry = %stripped.display(),
-                    target = %target.display(),
-                    "skipping tar link whose target escapes the destination"
-                );
-                continue;
+            match normalize_within_root(&base.join(target.as_ref())) {
+                None => {
+                    tracing::warn!(
+                        entry = %stripped.display(),
+                        target = %target.display(),
+                        "skipping tar link whose target escapes the destination"
+                    );
+                    continue;
+                }
+                Some(normalized) if entry_type.is_hard_link() => {
+                    hardlink_src = Some(normalized);
+                }
+                Some(_) => {}
             }
         }
 
@@ -389,6 +406,29 @@ fn extract_tar_impl<R: Read>(
             if !std::fs::exists(&dir_path)? {
                 std::fs::create_dir_all(dir_path)?;
             }
+        }
+
+        // Hardlinks: create explicitly, anchored to `dest_dir`, so the target
+        // is the one we validated rather than a CWD-relative path. Mirrors
+        // what `unpack_in`'s `target_base: Some(dst)` arm does.
+        if let Some(rel_src) = hardlink_src {
+            let link_src = dest_dir.join(&rel_src);
+            match std::fs::hard_link(&link_src, dest_dir.join(&safe_path)) {
+                Ok(()) => {}
+                Err(e) => {
+                    // Most often the target has not been extracted yet (or is
+                    // absent from the archive). Skip, consistent with the
+                    // escaping-link policy above: a missing link is benign,
+                    // and aborting would reject tarballs that extract fine.
+                    tracing::warn!(
+                        entry = %stripped.display(),
+                        target = %rel_src.display(),
+                        error = %e,
+                        "skipping tar hardlink that could not be created"
+                    );
+                }
+            }
+            continue;
         }
 
         if let tar::Unpacked::File(f) = entry.unpack(dest_dir.join(&safe_path))? {
@@ -681,6 +721,63 @@ mod tests {
         builder.finish().unwrap();
         drop(builder);
         tar_data
+    }
+
+    /// Regression: a hardlink entry must resolve against `dest_dir`, never the
+    /// process CWD.
+    ///
+    /// `Entry::unpack` calls `fields.unpack(None, ..)`, and tar's
+    /// `target_base: None` arm uses the link name verbatim — so a target like
+    /// `etc/passwd` hardlinks the *real* file (relative to CWD) into the
+    /// destination, sharing its inode. That is an escape no path-based
+    /// containment can detect, because the resulting path really is inside the
+    /// root. `Archive::unpack` never had this hole (it routes through
+    /// `unpack_in`, which passes `Some(dst)`), so unifying both branches onto
+    /// the per-entry loop is what exposed it.
+    ///
+    /// The fuzz oracle is structurally blind here too: it asserts *path*
+    /// containment, and this escape has a contained path.
+    #[test]
+    fn extract_hardlink_does_not_escape_via_cwd() -> Result<(), ArchiveError> {
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let secret = cwd_dir.path().join("secret.txt");
+        std::fs::write(&secret, b"top secret").unwrap();
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Link);
+            link.set_path("loot").unwrap();
+            // Normalizes cleanly, so the containment check passes it; the
+            // danger is entirely in what it is resolved *against*.
+            link.set_link_name("secret.txt").unwrap();
+            link.set_size(0);
+            link.set_cksum();
+            builder.append(&link, &[][..]).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let extract_dir = tempfile::tempdir().unwrap();
+        // Point the process CWD at the directory holding the secret: this is
+        // the daemon's situation (its CWD is `/`, and `etc/shadow` is a real
+        // path from there).
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(cwd_dir.path()).unwrap();
+        let result =
+            extract_compressed_tar(&tar_data[..], Compression::None, extract_dir.path(), None);
+        std::env::set_current_dir(prev).unwrap();
+        result?;
+
+        let loot = extract_dir.path().join("loot");
+        if loot.exists() {
+            let linked = std::fs::read_to_string(&loot).unwrap_or_default();
+            assert_ne!(
+                linked, "top secret",
+                "hardlink resolved against the process CWD and captured a file outside dest_dir"
+            );
+        }
+        Ok(())
     }
 
     /// Regression: the escaping-symlink defense must not depend on
