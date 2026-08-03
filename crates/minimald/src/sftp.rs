@@ -580,7 +580,11 @@ impl russh_sftp::server::Handler for SftpSession {
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(host.as_str())
                 .await?;
-            file.set_permissions(perms).await?;
+            // The handle's own `fstat`, not a second lookup by name: it
+            // describes exactly the object about to be chmodded.
+            let is_dir = file.metadata().await?.is_dir();
+            file.set_permissions(keep_owner_access(perms, is_dir))
+                .await?;
         }
         Ok(ok_status(id))
     }
@@ -605,6 +609,19 @@ impl russh_sftp::server::Handler for SftpSession {
 fn perm_from_mode(mode: Option<u32>) -> Option<std::fs::Permissions> {
     use std::os::unix::fs::PermissionsExt;
     mode.map(|m| std::fs::Permissions::from_mode(m & 0o7777))
+}
+
+/// Floors a client's mode at owner `r-x` for directories, `r--` otherwise;
+/// every other bit passes through.
+///
+/// Without it `chmod 000` is irreversible: `setstat` chmods through an open
+/// handle, so a file the owner cannot read is one no later request can chmod
+/// back. Owner write is not forced — read-only is a thing clients may
+/// legitimately want, and it stays undoable.
+fn keep_owner_access(perms: std::fs::Permissions, is_dir: bool) -> std::fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+    let floor = if is_dir { 0o500 } else { 0o400 };
+    std::fs::Permissions::from_mode(perms.mode() | floor)
 }
 
 fn ok_status(id: u32) -> Status {
@@ -986,6 +1003,56 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o640);
+    }
+
+    #[tokio::test]
+    async fn sftp_setstat_leaves_the_owner_able_to_reach_what_it_chmodded() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+        let paths = session_paths(&server, session_id).await;
+
+        let sftp = client.open_sftp(session_id).await;
+        write(&sftp, "locked.txt", b"still readable").await;
+        sftp.create_dir("/workbench/locked").await.unwrap();
+
+        let chmod = async |path: &str, mode: u32| {
+            let attrs = russh_sftp::protocol::FileAttributes {
+                permissions: Some(mode),
+                ..Default::default()
+            };
+            sftp.set_metadata(path, attrs).await.unwrap();
+        };
+        let mode_of = async |path: &paths::DaemonAbsPath| {
+            tokio::fs::metadata(path.as_str())
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+
+        // The door does not lock behind the client: a file keeps owner read,
+        // a directory keeps owner list-and-traverse.
+        chmod("locked.txt", 0o000).await;
+        let file = paths.working.sub_path_unchecked("locked.txt");
+        assert_eq!(mode_of(&file).await, 0o400);
+        chmod("/workbench/locked", 0o000).await;
+        let dir = paths.working.sub_path_unchecked("locked");
+        assert_eq!(mode_of(&dir).await, 0o500);
+
+        // Which means the request that undoes it still works...
+        chmod("locked.txt", 0o644).await;
+        assert_eq!(mode_of(&file).await, 0o644);
+        // ...and reads through the floor'd mode never stopped working.
+        assert_eq!(sftp.read("locked.txt").await.unwrap(), b"still readable");
+
+        // Everything the client actually asked for survives: group and other
+        // bits, write-protection, and the executable bit.
+        chmod("locked.txt", 0o751).await;
+        assert_eq!(mode_of(&file).await, 0o751);
+        chmod("locked.txt", 0o444).await;
+        assert_eq!(mode_of(&file).await, 0o444);
     }
 
     #[tokio::test]
