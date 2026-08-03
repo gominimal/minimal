@@ -83,7 +83,13 @@ fn assert_contained(root: &Path) {
         return;
     };
 
-    let mut stack = vec![root.to_path_buf()];
+    // Seed from the CANONICAL root, not `root`: on macOS the tempdir is
+    // `/var/folders/...` while its canonical form is `/private/var/folders/...`
+    // (`/var` is a symlink). Descending from the non-canonical form would make
+    // `dir.join(target)` carry a prefix `canonical_root` never matches, so
+    // `escapes()` would fire on in-tree symlinks. Linux `/tmp` is not
+    // symlinked, so this only ever reproduced on macOS.
+    let mut stack = vec![canonical_root.clone()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
