@@ -739,9 +739,22 @@ mod tests {
     /// containment, and this escape has a contained path.
     #[test]
     fn extract_hardlink_does_not_escape_via_cwd() -> Result<(), ArchiveError> {
-        let cwd_dir = tempfile::tempdir().unwrap();
-        let secret = cwd_dir.path().join("secret.txt");
-        std::fs::write(&secret, b"top secret").unwrap();
+        use std::os::unix::fs::MetadataExt;
+
+        // Deliberately does NOT touch the process CWD: `set_current_dir` is
+        // global, and cargo runs tests on parallel threads in one process, so
+        // mutating it would race every other test that uses a relative path.
+        //
+        // Instead use the CWD cargo already provides — the crate root — where
+        // `Cargo.toml` is a real file reachable by a *relative* name. That is
+        // precisely the daemon's situation: its CWD is `/`, so `etc/shadow` is
+        // a live relative path from there.
+        let victim = Path::new("Cargo.toml");
+        assert!(
+            victim.exists(),
+            "expected cargo to run tests with CWD = crate root"
+        );
+        let victim_meta = std::fs::metadata(victim).unwrap();
 
         let mut tar_data = Vec::new();
         {
@@ -749,9 +762,9 @@ mod tests {
             let mut link = tar::Header::new_gnu();
             link.set_entry_type(tar::EntryType::Link);
             link.set_path("loot").unwrap();
-            // Normalizes cleanly, so the containment check passes it; the
-            // danger is entirely in what it is resolved *against*.
-            link.set_link_name("secret.txt").unwrap();
+            // Normalizes cleanly, so the containment check passes it. The
+            // danger is entirely in what it gets resolved *against*.
+            link.set_link_name("Cargo.toml").unwrap();
             link.set_size(0);
             link.set_cksum();
             builder.append(&link, &[][..]).unwrap();
@@ -759,22 +772,18 @@ mod tests {
         }
 
         let extract_dir = tempfile::tempdir().unwrap();
-        // Point the process CWD at the directory holding the secret: this is
-        // the daemon's situation (its CWD is `/`, and `etc/shadow` is a real
-        // path from there).
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(cwd_dir.path()).unwrap();
-        let result =
-            extract_compressed_tar(&tar_data[..], Compression::None, extract_dir.path(), None);
-        std::env::set_current_dir(prev).unwrap();
-        result?;
+        extract_compressed_tar(&tar_data[..], Compression::None, extract_dir.path(), None)?;
 
+        // Assert through the INODE, not the contents: a hardlink escape has a
+        // perfectly contained path, so only identity distinguishes it. No
+        // `unwrap_or_default()` — a read failure must not read as success.
         let loot = extract_dir.path().join("loot");
-        if loot.exists() {
-            let linked = std::fs::read_to_string(&loot).unwrap_or_default();
-            assert_ne!(
-                linked, "top secret",
-                "hardlink resolved against the process CWD and captured a file outside dest_dir"
+        if let Ok(loot_meta) = std::fs::metadata(&loot) {
+            assert!(
+                !(loot_meta.ino() == victim_meta.ino() && loot_meta.dev() == victim_meta.dev()),
+                "hardlink resolved against the process CWD: extracted entry shares an inode \
+                 with {} outside dest_dir",
+                victim.display(),
             );
         }
         Ok(())
@@ -828,12 +837,31 @@ mod tests {
             None,
         );
 
-        let escaped = extract_dir.path().join("../../../etc/passwd");
-        assert_ne!(
-            std::fs::read_to_string(&escaped).unwrap_or_default(),
-            "pwned",
-            "write escaped the destination tree",
+        // The defence is that the escaping link is never created: with no link
+        // present, the follow-up entry writes into a real directory inside the
+        // tree. Assert that directly — it is deterministic, unlike probing for
+        // the escaped file, which may resolve to a system path we could not
+        // have written to anyway (so its absence would prove nothing).
+        let link = extract_dir.path().join("prefix/link");
+        assert!(
+            link.symlink_metadata()
+                .map(|m| !m.file_type().is_symlink())
+                .unwrap_or(true),
+            "escaping symlink was created; a later entry could write through it",
         );
+
+        // Belt and braces: nothing landed where the link *would* have resolved
+        // to. The link lives at `prefix/link`, so its target is relative to
+        // `prefix/` — the previous version of this check was one level too
+        // high. A read error is the expected, good case and is spelled out
+        // rather than coerced to "" by `unwrap_or_default`.
+        let escaped = extract_dir
+            .path()
+            .join("prefix")
+            .join("../../../etc/passwd");
+        if let Ok(contents) = std::fs::read_to_string(&escaped) {
+            assert_ne!(contents, "pwned", "write escaped the destination tree");
+        }
         Ok(())
     }
 

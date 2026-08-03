@@ -60,13 +60,39 @@ trees=(plain deep links modes)
 emit() {
     local name="$1" comp_sel="$2" strip_sel="$3" tarball="$4"
     local dest="$out/${name}_c${comp_sel}_s${strip_sel}"
-    printf "$(printf '\\x%02x\\x%02x' "$comp_sel" "$strip_sel")" > "$dest"
+    printf '%b' "$(printf '\\x%02x\\x%02x' "$comp_sel" "$strip_sel")" > "$dest"
     cat "$tarball" >> "$dest"
 }
 
+# ---------------------------------------------------------------------------
+# Normalized tar metadata. Without this, `tar` stamps each entry with the
+# generating host's uid/gid AND the local account names (uname/gname), which
+# then get committed — a public repo should not carry whoever ran the script.
+# It also makes regeneration non-reproducible, since mtimes and readdir order
+# vary per host.
+#
+# GNU tar and bsdtar (macOS) spell these differently, so pick per flavour.
+# Byte-identical output ACROSS the two implementations is not guaranteed
+# (padding and entry ordering differ); regenerate on one flavour consistently
+# if the committed bytes need to be stable.
+# ---------------------------------------------------------------------------
+umask 022
+export LC_ALL=C
+if tar --version 2>&1 | head -1 | grep -qi 'gnu'; then
+    tar_norm=(--format=ustar --sort=name --mtime='UTC 1970-01-01'
+              --owner=0 --group=0 --numeric-owner)
+else
+    # bsdtar/libarchive: no --sort/--owner/--group; --uname/--gname blank the
+    # names, --numeric-owner keeps them out of the header entirely.
+    tar_norm=(--format=ustar --uid 0 --gid 0 --uname '' --gname ''
+              --numeric-owner)
+fi
+
 for tree in "${trees[@]}"; do
     base="$work/$tree.tar"
-    tar -C "$work/$tree" -cf "$base" .
+    # Fixed mtime on the sources too: bsdtar has no --mtime for create.
+    find "$work/$tree" -exec touch -t 197001010000 {} + 2>/dev/null || true
+    tar "${tar_norm[@]}" -C "$work/$tree" -cf "$base" .
 
     gzip  -kfn "$base"                    # -> .tar.gz  (-n: no timestamp)
     zstd  -qf  "$base" -o "$base.zst"

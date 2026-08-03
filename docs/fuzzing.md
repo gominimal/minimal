@@ -201,6 +201,7 @@ Ideas, roughly in value order, for follow-up on a beefy Linux box:
    | `sessions::primitives` var names | Both the hand-written `Deserialize` and `FromStr` route through `try_new`; there is no second door. |
    | `minimald::net::wg` | `WgPublicKey::from_str` length-checks its `try_into`; `Ipv4Cidr` validates the prefix and special-cases `/0` in `mask()`. |
    | `minvmd::rpc_client` response decode | The defect there was a resource bound (an unbounded `read_to_end`), which a fuzzer cannot surface. Fixed with a cap instead. |
+
 4. **Cheap multipliers** — a libFuzzer dictionary (the JSON keys + tag bytes
    `0x01`–`0x07`, `0xFF`), and a nightly CI fuzz job per target with a
    persisted corpus.
