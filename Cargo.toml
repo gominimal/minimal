@@ -71,7 +71,7 @@ blake3 = { version = "1", features = ["serde"] }
 # WireGuard mesh peer (Unit 4, behind the `networking-wg` feature). Pure-Rust
 # WireGuard avoids a Go/cgo toolchain dependency (spec Design Considerations).
 boringtun = { version = "0.7", default-features = false }
-bytes = "1.11" # keep in sync with reqwest
+bytes = "1.12" # keep in sync with reqwest
 bzip2 = "0.6"
 camino = { version = "1", features = ["serde1"] }
 clap = { version = "4.6", features = ["derive", "env", "string"] }
@@ -82,21 +82,38 @@ copy_dir = "0.1.3"
 chrono = {version = "0.4", features = ["serde", "std"]}
 dirs = "6"
 fd-lock = "4"
-either = { version = "1.16", default-features = false }
+either = { version = "1.17", default-features = false }
 flate2 = "1.1"
 futures = "0.3"
 generational-arena = {version = "0.2", features = ["serde"] }
-# The google-cloud-* / reqwest cluster resolves below its latest releases and
-# cannot be raised yet: reqwest >= 0.13.2 pulls js-sys >= 0.3.85, which requires
-# an exact `wasm-bindgen = "=0.2.108"`, while nickel-lang-core's `format` feature
-# reaches topiary-core -> topiary-tree-sitter-facade, which pins an exact
-# `wasm-bindgen = "=0.2.100"`. The two cannot unify, so `cargo update` leaves the
-# whole cluster pinned. Revisit when topiary relaxes that pin (0.7.3 still has
-# it; 0.6.2 moved to =0.2.103, but 0.7.x went back to =0.2.100).
+# The wasm-bindgen ceiling. nickel-lang-core's `format` feature (needed by
+# `mip check --fix`, crates/check/src/lib.rs) reaches topiary-core ->
+# topiary-tree-sitter-facade -> topiary-web-tree-sitter-sys, which pins an exact
+# `wasm-bindgen = "=0.2.100"` *untargeted* — so it constrains resolution even
+# though we never build wasm32. That caps wasm-bindgen at 0.2.100 and js-sys /
+# web-sys at 0.3.77 for the whole graph, which in turn holds back:
+#
+#   * google-cloud-auth / google-cloud-storage (below), whose 1.15/1.17 releases
+#     want reqwest >= 0.13.4 -> wasm-streams 0.5 -> js-sys >= 0.3.85;
+#   * reqwest, capped at 0.13.1 for the same reason;
+#   * russh-sftp, capped at 2.1.2 (2.2+ want wasm-bindgen-futures >= 0.4.71).
+#
+# It also costs us duplicate copies of sha2/digest/block-buffer/crypto-common/
+# generic-array (google-cloud-storage 1.7 is on the RustCrypto 0.10 line; 1.17
+# moved to 0.11, matching ours), plus base64 0.22 and
+# opentelemetry-semantic-conventions 0.31. Lifting this one pin collapses all of
+# that at once.
+#
+# Revisit when topiary relaxes the pin (0.7.3, the newest release, still has it;
+# 0.6.2 moved to =0.2.103, but 0.7.x went back to =0.2.100). Verified still
+# blocking on 2026-08-03.
 google-cloud-gax = "1.13"
 google-cloud-auth = "1.5"
 google-cloud-storage = "1.7"
-hakoniwa = { version = "1.7.2", features = ["cgroups", "rustslirp"] }
+
+# Tracked as a git rev, not the crates.io release, update when they publish next.
+# Current rev is master @ 2026-08-03.
+hakoniwa = { features = ["cgroups", "rustslirp"], git = "https://github.com/souk4711/hakoniwa.git", rev = "0810ffa37620ef5c57de263c8eaa1f4d7633c14a" }
 http-body = "1"
 hex = "0.4"
 indicatif = "0.18"
@@ -110,14 +127,18 @@ lzma-rs = "0.3"
 # Tracked as a git rev, not the crates.io release: crates.io lags master by a
 # long way (0.18.0 is the newest published, and master has moved well past it).
 # Bump the rev to pick up upstream fixes; revisit crates.io only once its
-# releases catch up. Current rev is master @ 2026-07-26.
-nickel-lang-core = { git = "https://github.com/nickel-lang/nickel.git", rev = "0d306feb13ff38b154a3beb8dccaaa59cdd18ee8", default-features = false, features = ["format"] }
+# releases catch up. Current rev is master @ 2026-08-03.
+nickel-lang-core = { git = "https://github.com/nickel-lang/nickel.git", rev = "21decd294fe404d67d1545d11563016af6ea4090", default-features = false, features = ["format"] }
 
 opentelemetry-semantic-conventions = "0.32"
 # `socket` + `time`: the guest's vsock timekeep listener binds an AF_VSOCK
 # datagram socket and steps CLOCK_REALTIME from the host's updates.
 nix = { version = "0.31", features = ["fs", "socket", "time", "user"] }
 nutype = { version = "0.7", features = ["serde"] }
+# Held at 0.39: 0.40 turns `Object::exports()`/`imports()` from
+# `Result<Vec<_>>` into lazy `Result<_>`-yielding iterators, so crates/check
+# needs a policy for a per-symbol error mid-scan. A deliberate change, not a
+# version bump.
 object = { version = "0.39", default-features = false, features = ["archive", "elf", "read_core", "std"] }
 oci-spec = "0.10"
 path-absolutize = "4.0"
@@ -130,15 +151,15 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem
 regex = "1" # keep in sync with nickel-lang-core
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
-reqwest = { version = "0.13", features = ["stream"], default-features = false } # keep in sync with google-cloud-gax
-rustc-hash = "2.1.2"
+reqwest = { version = "0.13", features = ["stream"], default-features = false } # keep in sync with google-cloud-gax; capped at 0.13.1 by the wasm-bindgen ceiling above
+rustc-hash = "2.1.3"
 serde = { version = "1.0", features = ["derive", "rc"] } # Keep within the same minor version as nickel-lang-core
 prost = "0.14"
 prost-build = "0.14"
 prost-types = "0.14"
 resolv-conf = "0.7"
 russh = { version = "0.62", default-features = false, features = ["aws-lc-rs", "flate2"] }
-russh-sftp = "2.1"
+russh-sftp = "2.1" # capped by the wasm-bindgen ceiling; see google-cloud-* above
 serde_json = { version = "1.0" }
 serial_test = "4"
 sha2 = "0.11"
@@ -148,7 +169,7 @@ smallvec = {version = "1.15", features = ["serde"]}
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 tar = "0.4"
 tempfile = "3.27"
-tokio = { version = "1.52", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
 tokio-stream = "0.1"
 tokio-vsock = "0.7"
 tokio-util = "0.7"
@@ -162,7 +183,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 thiserror = "2"
 url = "2" # keep in sync with reqwest
-uuid = { version = "1.23", features = ["v4", "v7", "serde"] }
+uuid = { version = "1.24", features = ["v4", "v7", "serde"] }
 vt100-ctt = { version = "0.17", default-features = false }
 zstd = "0.13"
 
