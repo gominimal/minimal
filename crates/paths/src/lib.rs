@@ -982,15 +982,9 @@ impl<'de, R: Realm> serde::Deserialize<'de> for RelPath<R> {
 pub enum EitherPath<R: Realm> {
     /// Absolute variant.
     Abs(AbsPath<R>),
-    /// Relative variant — a validated [`RelPath<R>`], so it carries both the
-    /// realm and the no-`..` guarantee.
+    /// Relative variant, carrying the realm and the no-`..` guarantee.
     ///
-    /// It must stay a `RelPath` and not a bare path: the realm marker is the
-    /// mechanism that makes misusing a path a *compile* error, and it is lost
-    /// the moment anything destructures this variant, however the enum itself
-    /// is parameterised. A path that may legitimately climb (`--output
-    /// ../artifacts`) is not an `EitherPath` at all — it is unresolved user
-    /// input, which is what [`CwdRelative`] is for.
+    /// A path that may legitimately climb is a [`CwdRelative`], not this.
     Rel(RelPath<R>),
 }
 
@@ -1036,20 +1030,13 @@ impl<R: Realm> fmt::Debug for EitherPath<R> {
 
 impl<R: Realm> EitherPath<R> {
     /// Constructs an `EitherPath` by inspecting whether `p` is absolute,
-    /// routing through the variant's own constructor either way.
-    ///
-    /// Fallible on purpose. The previous infallible `new` built both variants
-    /// with struct literals, which forged an [`AbsPath`] or a [`RelPath`] that
-    /// [`AbsPath::try_new`]/[`RelPath::try_new`] would have rejected — and
-    /// every downstream holder of one is entitled to assume that cannot
-    /// happen. Going through the real constructors is what keeps
-    /// `RelPath::try_new` the only door.
+    /// routing through [`AbsPath::try_new`] or [`RelPath::try_new`] so each
+    /// variant's invariant is asserted by its own constructor.
     ///
     /// # Errors
     ///
-    /// [`Error::ContainsParentDir`] if `p` is relative and climbs. Such a path
-    /// is unresolved user input, not an `EitherPath`: use [`CwdRelative`] and
-    /// resolve it before it needs to be one.
+    /// [`Error::ContainsParentDir`] if `p` is relative and climbs — use
+    /// [`CwdRelative`] for a path that may, and resolve it first.
     pub fn try_new(p: impl Into<Utf8PathBuf>) -> Result<Self, Error> {
         let inner = p.into();
         if inner.is_absolute() {
@@ -1259,14 +1246,9 @@ pub enum CwdResolveError {
 /// use paths::{CwdRelative, Sandbox};
 /// let _: CwdRelative<Sandbox>;
 /// ```
-/// Storage note: this holds the raw user string, **not** an [`EitherPath`].
-/// A CLI path may legitimately climb (`--minimal-state-dir ../state`), and
-/// `EitherPath::Rel` carries a validated [`RelPath`] which by construction
-/// cannot represent that. Wrapping `EitherPath` was what forced its `Rel`
-/// variant to degrade to a bare path and lose the realm marker; keeping the
-/// unresolved input in its own type localizes "not yet trustworthy" to the
-/// one place that means it. [`Self::resolve`] is the door out, and it yields
-/// an [`AbsPath`].
+/// Holds the path as the user supplied it, which may climb
+/// (`--minimal-state-dir ../state`). [`Self::resolve`] is the only way out,
+/// and it yields an [`AbsPath`].
 pub struct CwdRelative<R: CwdResolvable> {
     raw: Utf8PathBuf,
     _realm: PhantomData<R>,

@@ -1159,17 +1159,12 @@ impl MaterializeArgs {
     }
 }
 
-/// Resolves the `--output` path typed inside the sandbox to an absolute one,
-/// still in the sandbox's namespace. A relative path is joined onto `cwd`, the
-/// directory the user typed it in; an absolute one is already there.
+/// Resolves a `--output` path typed inside the sandbox — absolute, or relative
+/// to `cwd`, the directory the user typed it in — to an absolute path in the
+/// sandbox's mount namespace.
 ///
 /// Which daemon directory it lands in is [`sandbox_to_daemon`]'s decision, so
 /// nothing is stripped here.
-/// Takes the raw user string, not a `SandboxPath`: `--output ../artifacts` is
-/// a legitimate thing to type, and `SandboxPath::Rel` carries a validated
-/// `RelPath` which by construction cannot hold it. This function never wanted
-/// that guarantee anyway — it normalizes `..` itself, two lines below — it was
-/// only using the type to classify absolute-vs-relative.
 fn resolve_output(cwd: &Utf8Path, output: &Utf8Path) -> Result<SandboxAbsPath, String> {
     let absolute = if output.is_absolute() {
         output.to_path_buf()
