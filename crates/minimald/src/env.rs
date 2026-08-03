@@ -1139,7 +1139,7 @@ impl MaterializeArgs {
         }
 
         let output = output.ok_or("`min materialize` requires --output <PATH>")?;
-        let output = resolve_output(cwd, Utf8Path::new(output))?;
+        let output = resolve_output(cwd, Utf8Path::new(output.as_str()))?;
 
         let output_name = match names.len() {
             1 => names.remove(0),
