@@ -1406,7 +1406,9 @@ impl SessionLauncher for SandboxLauncher {
             // The env owns the context, graph and the sandbox files backing the
             // running process's rootfs, so it is `Send + 'static` and can be moved
             // into the host as the guard that keeps those files alive.
-            let mut env = crate::env::Env::build(
+            // Boxed: inlined, this reaches the cache fetchers' client stack and
+            // the launch future's layout overruns rustc's query depth (128).
+            let mut env = Box::pin(crate::env::Env::build(
                 ctx,
                 graph,
                 crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache, session)
@@ -1422,7 +1424,7 @@ impl SessionLauncher for SandboxLauncher {
                     .with_own_ip_tap(own_ip_tap)
                     .with_own_ip_dns(own_ip_dns)
                     .with_username(username),
-            )
+            ))
             .await?;
 
             let mut container = env

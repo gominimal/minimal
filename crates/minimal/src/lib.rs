@@ -696,7 +696,9 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
         trace_id = %ctx.trace_id_hex(),
         span_id = %ctx.span_id_hex(),
     );
-    run_command(cli).instrument(root).await
+    // Boxed: inlined, this dispatch match's deepest arm overruns rustc's
+    // query depth (128) when computing the future's layout.
+    Box::pin(run_command(cli)).instrument(root).await
 }
 
 async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
