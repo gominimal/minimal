@@ -864,7 +864,8 @@ impl FileSet {
                     i += 1;
                 }
                 b'*' | b'?' | b'{' => {
-                    return last_slash.map(|s| HostPath::new(literal[..s].to_owned()));
+                    return last_slash
+                        .and_then(|s| HostPath::try_new(literal[..s].to_owned()).ok());
                 }
                 // Single-byte bracket class `[X]` is a literal `X` —
                 // this is what `expansion::escape_glob_metas` emits to
@@ -884,7 +885,8 @@ impl FileSet {
                 // Multi-character bracket classes (`[abc]`, `[a-z]`,
                 // negations, etc.) are real glob metas — stop here.
                 b'[' => {
-                    return last_slash.map(|s| HostPath::new(literal[..s].to_owned()));
+                    return last_slash
+                        .and_then(|s| HostPath::try_new(literal[..s].to_owned()).ok());
                 }
                 _ => {
                     // Copy the next UTF-8 character whole.
@@ -898,7 +900,7 @@ impl FileSet {
                 }
             }
         }
-        Some(HostPath::new(literal))
+        HostPath::try_new(literal).ok()
     }
 
     /// Walk the host filesystem under [`Self::walk_root`] and collect
@@ -935,7 +937,14 @@ impl FileSet {
             match entry_result {
                 Ok(entry) if !entry.file_type().is_file() => {}
                 Ok(entry) => match Utf8PathBuf::from_path_buf(entry.into_path()) {
-                    Ok(p) if self.is_match(&p) => paths.push(HostPath::new(p)),
+                    Ok(p) if self.is_match(&p) => {
+                        // walkdir yields concrete on-disk paths under `root`, so this
+                        // cannot climb; go through the constructor rather than
+                        // forging one, and skip anything that somehow does.
+                        if let Ok(hp) = HostPath::try_new(p) {
+                            paths.push(hp);
+                        }
+                    }
                     Ok(_) => {}
                     Err(p) => errors.push(PatchError::NonUtf8Path {
                         path_lossy: p.to_string_lossy().into_owned(),
@@ -1597,7 +1606,7 @@ mod tests {
         ];
         for (pattern, expected) in cases {
             let fs = FileSet::try_new(pattern).unwrap();
-            let expected = expected.map(HostPath::new);
+            let expected = expected.map(|p| HostPath::try_new(p).unwrap());
             assert_eq!(fs.walk_root(), expected, "pattern: {pattern}");
         }
     }
@@ -1625,7 +1634,7 @@ mod tests {
         ];
         for (pattern, expected) in cases {
             let fs = FileSet::try_new(pattern).unwrap();
-            let expected = expected.map(HostPath::new);
+            let expected = expected.map(|p| HostPath::try_new(p).unwrap());
             assert_eq!(fs.walk_root(), expected, "pattern: {pattern}");
         }
     }

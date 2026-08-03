@@ -1867,7 +1867,7 @@ mod tests {
 
     fn project_source() -> Source {
         Source::Project {
-            path: paths::HostPath::new("/repo"),
+            path: paths::HostPath::try_new("/repo").unwrap(),
         }
     }
 

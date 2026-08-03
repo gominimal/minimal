@@ -1,0 +1,26 @@
+# Standalone fuzz workspace for the `paths` crate. Its own `[workspace]` keeps
+# the nightly/sanitizer build off the main workspace.
+[package]
+name = "paths-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+camino = "1"
+
+[dependencies.paths]
+path = ".."
+
+[[bin]]
+name = "path_invariants"
+path = "fuzz_targets/path_invariants.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
