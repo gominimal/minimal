@@ -39,7 +39,7 @@ use mctx::{AddDepMode, Context, Error};
 use mfile::{EnvPatches, EnvVarValue};
 use op::Runnable;
 use ot::OpTracker;
-use paths::{DaemonAbsPath, DaemonRelPath, SandboxAbsPath, SandboxPath};
+use paths::{DaemonAbsPath, DaemonRelPath, SandboxAbsPath};
 use sandbox2::config::{Config, SandboxMapped};
 use sandbox2::{Container, Sandbox};
 use sessions::NetworkMode;
@@ -1139,7 +1139,7 @@ impl MaterializeArgs {
         }
 
         let output = output.ok_or("`min materialize` requires --output <PATH>")?;
-        let output = resolve_output(cwd, SandboxPath::new(output))?;
+        let output = resolve_output(cwd, Utf8Path::new(output))?;
 
         let output_name = match names.len() {
             1 => names.remove(0),
@@ -1165,21 +1165,25 @@ impl MaterializeArgs {
 ///
 /// Which daemon directory it lands in is [`sandbox_to_daemon`]'s decision, so
 /// nothing is stripped here.
-fn resolve_output(cwd: &Utf8Path, output: SandboxPath) -> Result<SandboxAbsPath, String> {
-    let absolute = match output {
-        SandboxPath::Abs(abs) => abs.as_utf8_path().to_path_buf(),
-        SandboxPath::Rel(rel) => {
-            if rel.as_str().is_empty() {
-                return Err("`--output` is empty".to_string());
-            }
-            if !cwd.is_absolute() {
-                return Err(format!(
-                    "cannot resolve `--output {rel}`: \
-                     the working directory `{cwd}` is not an absolute path"
-                ));
-            }
-            cwd.join(&rel)
+/// Takes the raw user string, not a `SandboxPath`: `--output ../artifacts` is
+/// a legitimate thing to type, and `SandboxPath::Rel` carries a validated
+/// `RelPath` which by construction cannot hold it. This function never wanted
+/// that guarantee anyway — it normalizes `..` itself, two lines below — it was
+/// only using the type to classify absolute-vs-relative.
+fn resolve_output(cwd: &Utf8Path, output: &Utf8Path) -> Result<SandboxAbsPath, String> {
+    let absolute = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        if output.as_str().is_empty() {
+            return Err("`--output` is empty".to_string());
         }
+        if !cwd.is_absolute() {
+            return Err(format!(
+                "cannot resolve `--output {output}`: \
+                 the working directory `{cwd}` is not an absolute path"
+            ));
+        }
+        cwd.join(output)
     };
     // Normalize here so `sandbox_to_daemon`'s prefix match is sound:
     // `/workbench/../etc/passwd` must not pass on its first component.
@@ -1593,7 +1597,7 @@ mod tests {
             ("/workbench", "/home/somefile", "/home/somefile"),
             ("/home", "/workbench/somefile", "/workbench/somefile"),
         ] {
-            let resolved = resolve_output(Utf8Path::new(cwd), SandboxPath::new(output))
+            let resolved = resolve_output(Utf8Path::new(cwd), Utf8Path::new(output))
                 .unwrap_or_else(|e| panic!("resolving {output:?} from {cwd:?}: {e}"));
             assert_eq!(resolved.as_str(), want, "`-o {output}` from {cwd}");
         }
@@ -1666,7 +1670,7 @@ mod tests {
             ("/home", "../../../../etc/passwd"),
             ("/workbench", "/workbench/../etc/passwd"),
         ] {
-            let resolved = resolve_output(Utf8Path::new(cwd), SandboxPath::new(output))
+            let resolved = resolve_output(Utf8Path::new(cwd), Utf8Path::new(output))
                 .expect("resolution itself does not judge the destination");
             let err = create_artifact(&working, &home, &resolved)
                 .await

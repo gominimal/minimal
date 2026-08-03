@@ -388,7 +388,7 @@ mod tests {
         let cases = [
             WireSource::UserLoadout { name: "dev".into() },
             WireSource::Project {
-                path: paths::HostPath::new("/repo"),
+                path: paths::HostPath::try_new("/repo").unwrap(),
             },
             WireSource::Package {
                 name: "helix".into(),

@@ -982,21 +982,16 @@ impl<'de, R: Realm> serde::Deserialize<'de> for RelPath<R> {
 pub enum EitherPath<R: Realm> {
     /// Absolute variant.
     Abs(AbsPath<R>),
-    /// Relative variant.
+    /// Relative variant — a validated [`RelPath<R>`], so it carries both the
+    /// realm and the no-`..` guarantee.
     ///
-    /// Deliberately a bare [`Utf8PathBuf`] and **not** a [`RelPath<R>`].
-    /// `EitherPath` is built from inputs that may legitimately contain `..` —
-    /// a `--output ../artifacts` typed in a sandbox cwd, a
-    /// `--minimal-state-dir ../state` on the daemon command line — so it
-    /// cannot uphold `RelPath`'s no-`..` guarantee. Holding a `RelPath` here
-    /// would mint one that [`RelPath::try_new`] would have rejected, and every
-    /// downstream holder of a `RelPath` is entitled to assume that cannot
-    /// happen. The realm is already carried by `EitherPath<R>` itself, so
-    /// nothing is lost by dropping the inner tag.
-    ///
-    /// Callers who need the guarantee should go through
-    /// [`RelPath::try_new`] explicitly and handle the rejection.
-    Rel(Utf8PathBuf),
+    /// It must stay a `RelPath` and not a bare path: the realm marker is the
+    /// mechanism that makes misusing a path a *compile* error, and it is lost
+    /// the moment anything destructures this variant, however the enum itself
+    /// is parameterised. A path that may legitimately climb (`--output
+    /// ../artifacts`) is not an `EitherPath` at all — it is unresolved user
+    /// input, which is what [`CwdRelative`] is for.
+    Rel(RelPath<R>),
 }
 
 impl<R: Realm> Clone for EitherPath<R> {
@@ -1040,21 +1035,27 @@ impl<R: Realm> fmt::Debug for EitherPath<R> {
 }
 
 impl<R: Realm> EitherPath<R> {
-    /// Constructs an `EitherPath` by inspecting whether `p` is absolute.
+    /// Constructs an `EitherPath` by inspecting whether `p` is absolute,
+    /// routing through the variant's own constructor either way.
     ///
-    /// Infallible, and only [`AbsPath`]'s invariant is asserted by
-    /// construction: the [`Rel`](Self::Rel) variant holds a bare path
-    /// precisely because this constructor cannot reject a `..`. See that
-    /// variant's docs.
-    pub fn new(p: impl Into<Utf8PathBuf>) -> Self {
+    /// Fallible on purpose. The previous infallible `new` built both variants
+    /// with struct literals, which forged an [`AbsPath`] or a [`RelPath`] that
+    /// [`AbsPath::try_new`]/[`RelPath::try_new`] would have rejected — and
+    /// every downstream holder of one is entitled to assume that cannot
+    /// happen. Going through the real constructors is what keeps
+    /// `RelPath::try_new` the only door.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ContainsParentDir`] if `p` is relative and climbs. Such a path
+    /// is unresolved user input, not an `EitherPath`: use [`CwdRelative`] and
+    /// resolve it before it needs to be one.
+    pub fn try_new(p: impl Into<Utf8PathBuf>) -> Result<Self, Error> {
         let inner = p.into();
         if inner.is_absolute() {
-            Self::Abs(AbsPath {
-                inner,
-                _realm: PhantomData,
-            })
+            Ok(Self::Abs(AbsPath::try_new(inner)?))
         } else {
-            Self::Rel(inner)
+            Ok(Self::Rel(RelPath::try_new(inner)?))
         }
     }
 
@@ -1063,7 +1064,7 @@ impl<R: Realm> EitherPath<R> {
     pub fn as_utf8_path(&self) -> &Utf8Path {
         match self {
             Self::Abs(p) => p.as_utf8_path(),
-            Self::Rel(p) => p.as_path(),
+            Self::Rel(p) => p.as_utf8_path(),
         }
     }
 
@@ -1088,12 +1089,10 @@ impl<R: Realm> EitherPath<R> {
         }
     }
 
-    /// Returns the relative variant, if any.
-    ///
-    /// Yields a bare [`Utf8Path`], not a [`RelPath`] — it may contain `..`.
-    /// Use [`RelPath::try_new`] on it if you need the no-`..` guarantee.
+    /// Returns the relative variant, if any — realm and no-`..` guarantee
+    /// intact, so callers cannot silently launder it into a bare path.
     #[must_use]
-    pub fn as_rel(&self) -> Option<&Utf8Path> {
+    pub fn as_rel(&self) -> Option<&RelPath<R>> {
         match self {
             Self::Abs(_) => None,
             Self::Rel(p) => Some(p),
@@ -1154,9 +1153,9 @@ impl<R: Realm> AsRef<str> for EitherPath<R> {
 }
 
 impl<R: Realm> FromStr for EitherPath<R> {
-    type Err = core::convert::Infallible;
+    type Err = Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(s))
+        Self::try_new(s)
     }
 }
 
@@ -1168,10 +1167,7 @@ impl<R: Realm> From<AbsPath<R>> for EitherPath<R> {
 
 impl<R: Realm> From<RelPath<R>> for EitherPath<R> {
     fn from(p: RelPath<R>) -> Self {
-        // Widening: a validated `RelPath` is trivially a valid lenient
-        // relative path. The reverse direction has to go through
-        // `RelPath::try_new` and can fail.
-        Self::Rel(p.inner)
+        Self::Rel(p)
     }
 }
 
@@ -1193,7 +1189,10 @@ impl<R: Realm> serde::Serialize for EitherPath<R> {
 impl<'de, R: Realm> serde::Deserialize<'de> for EitherPath<R> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let p = Utf8PathBuf::deserialize(deserializer)?;
-        Ok(Self::new(p))
+        // Fallible on the wire too: this is the door `WireSource::Project`
+        // came through, so a climbing path is rejected at the boundary rather
+        // than becoming a forged `RelPath` downstream.
+        Self::try_new(p).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1260,20 +1259,32 @@ pub enum CwdResolveError {
 /// use paths::{CwdRelative, Sandbox};
 /// let _: CwdRelative<Sandbox>;
 /// ```
-pub struct CwdRelative<R: CwdResolvable>(EitherPath<R>);
+/// Storage note: this holds the raw user string, **not** an [`EitherPath`].
+/// A CLI path may legitimately climb (`--minimal-state-dir ../state`), and
+/// `EitherPath::Rel` carries a validated [`RelPath`] which by construction
+/// cannot represent that. Wrapping `EitherPath` was what forced its `Rel`
+/// variant to degrade to a bare path and lose the realm marker; keeping the
+/// unresolved input in its own type localizes "not yet trustworthy" to the
+/// one place that means it. [`Self::resolve`] is the door out, and it yields
+/// an [`AbsPath`].
+pub struct CwdRelative<R: CwdResolvable> {
+    raw: Utf8PathBuf,
+    _realm: PhantomData<R>,
+}
 
 impl<R: CwdResolvable> CwdRelative<R> {
-    /// The path as supplied by the user, before resolution.
+    /// The path as supplied by the user, before resolution. Deliberately a
+    /// bare path: it is unvalidated input until [`Self::resolve`] runs.
     #[must_use]
-    pub fn as_either(&self) -> &EitherPath<R> {
-        &self.0
+    pub fn as_unresolved(&self) -> &Utf8Path {
+        &self.raw
     }
 
-    /// `true` if the wrapped path was absolute (i.e. [`Self::resolve`]
+    /// `true` if the supplied path was absolute (i.e. [`Self::resolve`]
     /// will not consult the cwd).
     #[must_use]
     pub fn is_absolute(&self) -> bool {
-        self.0.is_absolute()
+        self.raw.is_absolute()
     }
 
     /// Resolve to an [`AbsPath<R>`]: absolute as-is, relative joined
@@ -1284,9 +1295,13 @@ impl<R: CwdResolvable> CwdRelative<R> {
     /// Returns [`CwdResolveError`] if `getcwd` fails, returns a
     /// non-UTF-8 path, or somehow returns a non-absolute path.
     pub fn resolve(&self) -> Result<AbsPath<R>, CwdResolveError> {
-        match &self.0 {
-            EitherPath::Abs(p) => Ok(p.clone()),
-            EitherPath::Rel(r) => {
+        if self.raw.is_absolute() {
+            return AbsPath::try_new(self.raw.clone())
+                .map_err(|_| CwdResolveError::CwdNotAbsolute(self.raw.clone()));
+        }
+        {
+            {
+                let r = &self.raw;
                 let cwd = std::env::current_dir().map_err(CwdResolveError::Cwd)?;
                 let cwd = Utf8PathBuf::from_path_buf(cwd).map_err(CwdResolveError::NonUtf8Cwd)?;
                 let cwd_abs = AbsPath::<R>::try_new(cwd.clone())
@@ -1306,25 +1321,36 @@ impl<R: CwdResolvable> CwdRelative<R> {
 impl<R: CwdResolvable> FromStr for CwdRelative<R> {
     type Err = core::convert::Infallible;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(EitherPath::new(s)))
+        // Still infallible: accepting anything is the point — validation
+        // happens at `resolve`, so clap keeps its clean parse step.
+        Ok(Self {
+            raw: s.into(),
+            _realm: PhantomData,
+        })
     }
 }
 
 impl<R: CwdResolvable> From<AbsPath<R>> for CwdRelative<R> {
     fn from(value: AbsPath<R>) -> Self {
-        Self(EitherPath::Abs(value))
+        Self {
+            raw: value.as_utf8_path().to_owned(),
+            _realm: PhantomData,
+        }
     }
 }
 
 impl<R: CwdResolvable> Clone for CwdRelative<R> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self {
+            raw: self.raw.clone(),
+            _realm: PhantomData,
+        }
     }
 }
 
 impl<R: CwdResolvable> PartialEq for CwdRelative<R> {
     fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
+        self.raw == other.raw
     }
 }
 
@@ -1332,19 +1358,19 @@ impl<R: CwdResolvable> Eq for CwdRelative<R> {}
 
 impl<R: CwdResolvable> std::hash::Hash for CwdRelative<R> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
+        self.raw.hash(state);
     }
 }
 
 impl<R: CwdResolvable> fmt::Debug for CwdRelative<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CwdRelative<{}>({})", R::NAME, self.0.as_utf8_path())
+        write!(f, "CwdRelative<{}>({})", R::NAME, self.raw)
     }
 }
 
 impl<R: CwdResolvable> fmt::Display for CwdRelative<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
+        fmt::Display::fmt(&self.raw, f)
     }
 }
 
@@ -1508,15 +1534,15 @@ mod tests {
         let _: DaemonAbsPath = AbsPath::<Daemon>::try_new("/d").unwrap();
         let _: DaemonRelPath = RelPath::<Daemon>::try_new("d").unwrap();
         let _: ConfigRelPath = RelPath::<ConfigRelative>::try_new("c").unwrap();
-        let _: HostPath = EitherPath::<Host>::new("/h");
-        let _: SandboxPath = EitherPath::<Sandbox>::new("s");
-        let _: DaemonPath = EitherPath::<Daemon>::new("/d");
+        let _: HostPath = EitherPath::<Host>::try_new("/h").unwrap();
+        let _: SandboxPath = EitherPath::<Sandbox>::try_new("s").unwrap();
+        let _: DaemonPath = EitherPath::<Daemon>::try_new("/d").unwrap();
     }
 
     #[test]
     fn either_path_new_routes_by_absoluteness() {
-        let abs: HostPath = EitherPath::new("/etc/minimal");
-        let rel: HostPath = EitherPath::new("etc/minimal");
+        let abs: HostPath = EitherPath::try_new("/etc/minimal").unwrap();
+        let rel: HostPath = EitherPath::try_new("etc/minimal").unwrap();
         assert!(abs.is_absolute());
         assert!(!rel.is_absolute());
         assert!(abs.as_abs().is_some());
@@ -1541,8 +1567,8 @@ mod tests {
 
     #[test]
     fn either_path_round_trips_through_toml() {
-        let abs: HostPath = EitherPath::new("/etc/minimal");
-        let rel: HostPath = EitherPath::new("hooks/run.sh");
+        let abs: HostPath = EitherPath::try_new("/etc/minimal").unwrap();
+        let rel: HostPath = EitherPath::try_new("hooks/run.sh").unwrap();
         for original in [abs, rel] {
             let s = toml::to_string(&Wrap {
                 x: original.clone(),
@@ -1555,7 +1581,7 @@ mod tests {
 
     #[test]
     fn either_path_serializes_as_bare_string_without_tag() {
-        let abs: HostPath = EitherPath::new("/etc/minimal");
+        let abs: HostPath = EitherPath::try_new("/etc/minimal").unwrap();
         let s = toml::to_string(&Wrap { x: abs }).unwrap();
         assert_eq!(s.trim(), r#"x = "/etc/minimal""#);
     }
@@ -1567,9 +1593,8 @@ mod tests {
         let lifted_abs: HostPath = abs.clone().into();
         let lifted_rel: HostPath = rel.clone().into();
         assert_eq!(lifted_abs.as_abs(), Some(&abs));
-        // `as_rel` yields a bare `Utf8Path`: the lenient variant carries no
-        // no-`..` guarantee, so it cannot hand back a `RelPath`.
-        assert_eq!(lifted_rel.as_rel(), Some(rel.as_utf8_path()));
+        // `as_rel` hands back a `RelPath`, realm and guarantee intact.
+        assert_eq!(lifted_rel.as_rel(), Some(&rel));
     }
 
     /// Regression: `EitherPath` must never hand out a value carrying
@@ -1577,25 +1602,34 @@ mod tests {
     ///
     /// Found by the `path_invariants` fuzz target (minimal input: `,/..`).
     /// `EitherPath::Rel` used to hold a `RelPath<R>` built by struct literal,
-    /// so `EitherPath::new("../../etc/passwd")` minted one that
+    /// so `EitherPath::try_new("../../etc/passwd").unwrap()` minted one that
     /// `RelPath::try_new` rejects — and `AbsPath::join`, whose containment
     /// promise rests on that guarantee, would then happily escape its base.
     #[test]
-    fn either_path_rel_variant_carries_no_relpath_guarantee() {
+    fn either_path_cannot_forge_a_relpath() {
         let escaping = "../../etc/passwd";
         assert!(
             RelPath::<Host>::try_new(escaping).is_err(),
             "precondition: try_new rejects `..`",
         );
 
-        // The lenient variant still accepts it — that is deliberate, CLI and
-        // `--output` paths legitimately climb — but it is no longer a RelPath.
-        let either = EitherPath::<Host>::new(escaping);
-        let rel: &Utf8Path = either.as_rel().expect("classified relative");
-        assert_eq!(rel.as_str(), escaping);
+        // `EitherPath` routes through the same constructor, so it rejects it
+        // too. It must not become a second door to a `RelPath` that
+        // `RelPath::try_new` would have refused.
+        assert!(
+            matches!(
+                EitherPath::<Host>::try_new(escaping),
+                Err(Error::ContainsParentDir(_))
+            ),
+            "EitherPath must not accept a climbing path",
+        );
 
-        // And the only route back to a `RelPath` is the checked one.
-        assert!(RelPath::<Host>::try_new(rel).is_err());
+        // A path that legitimately climbs is unresolved CLI input, which is
+        // `CwdRelative`'s job — and resolving it yields an absolute path, so
+        // no `RelPath` is ever minted from it.
+        let cli: CwdRelative<Host> = escaping.parse().unwrap();
+        assert!(!cli.is_absolute());
+        assert_eq!(cli.as_unresolved().as_str(), escaping);
     }
 
     /// A validated `RelPath` joined onto any base stays under that base, once
@@ -1636,7 +1670,7 @@ mod tests {
     fn as_ref_into_std_path_works_for_owned_types() {
         let abs = HostAbsPath::try_new("/etc/minimal").unwrap();
         let rel = HostRelPath::try_new("hooks/run.sh").unwrap();
-        let either: HostPath = EitherPath::new("/etc/minimal");
+        let either: HostPath = EitherPath::try_new("/etc/minimal").unwrap();
         assert_eq!(takes_path(&abs), Path::new("/etc/minimal"));
         assert_eq!(takes_path(&rel), Path::new("hooks/run.sh"));
         assert_eq!(takes_path(&either), Path::new("/etc/minimal"));
@@ -1693,8 +1727,8 @@ mod tests {
 
     #[test]
     fn either_path_ord_puts_abs_before_rel() {
-        let abs: HostPath = EitherPath::new("/zz");
-        let rel: HostPath = EitherPath::new("aa");
+        let abs: HostPath = EitherPath::try_new("/zz").unwrap();
+        let rel: HostPath = EitherPath::try_new("aa").unwrap();
         assert!(abs < rel);
     }
 
@@ -1737,8 +1771,8 @@ mod tests {
         let rel: CwdRelative<Host> = "config/foo".parse().unwrap();
         assert!(abs.is_absolute());
         assert!(!rel.is_absolute());
-        assert!(matches!(abs.as_either(), EitherPath::Abs(_)));
-        assert!(matches!(rel.as_either(), EitherPath::Rel(_)));
+        assert!(abs.as_unresolved().is_absolute());
+        assert!(!rel.as_unresolved().is_absolute());
     }
 
     #[test]

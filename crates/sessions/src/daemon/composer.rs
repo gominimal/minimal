@@ -528,7 +528,7 @@ mod tests {
                 c.push_var(ProvenancedVar::new(
                     resolved,
                     Source::Project {
-                        path: paths::HostPath::new("/proj"),
+                        path: paths::HostPath::try_new("/proj").unwrap(),
                     },
                 ));
                 Ok(c)
@@ -584,7 +584,7 @@ mod tests {
                 _env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
             ) -> Result<Contribution, Error> {
                 let src = Source::Project {
-                    path: paths::HostPath::new("/proj"),
+                    path: paths::HostPath::try_new("/proj").unwrap(),
                 };
                 let hook = LifecycleHook::builder()
                     .with_on_activate(HookScript::inline("echo go"))
@@ -632,7 +632,7 @@ mod tests {
         let pv = ProvenancedVar::new(
             resolved,
             Source::Project {
-                path: paths::HostPath::new("/proj"),
+                path: paths::HostPath::try_new("/proj").unwrap(),
             },
         );
         let mut pending_vars = BTreeMap::new();
@@ -784,7 +784,7 @@ mod tests {
     fn resume_from_verdict_passes_through_packages_and_hooks() {
         use crate::core::lifecyclehook::{HookScript, LifecycleHook};
         let src = Source::Project {
-            path: paths::HostPath::new("/proj"),
+            path: paths::HostPath::try_new("/proj").unwrap(),
         };
         let hook = LifecycleHook::builder()
             .with_on_activate(HookScript::inline("echo hi"))

@@ -109,7 +109,7 @@ mod tests {
         })
         .unwrap();
         let session = mf.session.expect("populated block parses");
-        let path = HostPath::new("/some/project");
+        let path = HostPath::try_new("/some/project").unwrap();
         let comp = ProjectComposable::new(path.clone(), session);
 
         // Never touched — no Inherit-shaped vars in this fixture.
@@ -162,7 +162,7 @@ mod tests {
         })
         .unwrap();
         let session = mf.session.expect("populated block parses");
-        let comp = ProjectComposable::new(HostPath::new("/proj"), session);
+        let comp = ProjectComposable::new(HostPath::try_new("/proj").unwrap(), session);
 
         let env = |_: &str| Err(std::env::VarError::NotPresent);
         let err = comp.contribute(&env).expect_err("inherit lookup fails");
@@ -189,7 +189,7 @@ mod tests {
         })
         .unwrap();
         let session = mf.session.expect("populated block parses");
-        let comp = ProjectComposable::new(HostPath::new("/proj"), session);
+        let comp = ProjectComposable::new(HostPath::try_new("/proj").unwrap(), session);
 
         let env = |_: &str| Err(std::env::VarError::NotPresent);
         let contribution = comp.contribute(&env).expect("fallback resolves");
