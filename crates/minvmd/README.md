@@ -235,8 +235,11 @@ CI runs it (informational) in the `boot-e2e` job.
 - The guest rootfs is the **generic** upstream `microvm-rootfs` package (an ext4
   image built from `base` + `socat`) — minimald is delivered by the initramfs, so
   nothing is baked into the rootfs.
-- Session state is on a tmpfs (`/run/minimal`, ephemeral); a persistent data disk
-  (which needs a way to `mke2fs` it) is a follow-up.
+- Session state and cache persist on a per-VM writable **ext4 data volume**
+  (`/dev/vdb`) that minimald format-on-first-boot mounts at `/var/lib/minimal`
+  (`STATE_VOLUME_MOUNTPOINT`) and relocates both state and cache onto. The
+  `/run/minimal` tmpfs is no longer a fallback — guest session state is user
+  data with no host copy. Per spec `08-spec-vm-ext4-volume` (shipped).
 - In CI (`.github/workflows/ci-macos.yml`) the kernel + rootfs are materialized on
   a cheap Linux runner (`scripts/fetch-artifact.sh` — cache pulls of the upstream
   packages' prebuilt aarch64 artifacts) and the initramfs is cross-compiled
