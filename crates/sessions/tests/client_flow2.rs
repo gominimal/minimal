@@ -31,7 +31,7 @@ fn session_id() -> SessionId {
 
 fn project_source() -> WireSource {
     WireSource::Project {
-        path: paths::HostPath::new("/repo"),
+        path: paths::HostPath::try_new("/repo").unwrap(),
     }
 }
 

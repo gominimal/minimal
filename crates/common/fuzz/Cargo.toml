@@ -11,6 +11,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+# `archive_extract` extracts into a throwaway dir per iteration.
+tempfile = "3"
 
 [dependencies.common]
 path = ".."
@@ -32,6 +34,13 @@ bench = false
 [[bin]]
 name = "jq_parse_json"
 path = "fuzz_targets/jq_parse_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_extract"
+path = "fuzz_targets/archive_extract.rs"
 test = false
 doc = false
 bench = false

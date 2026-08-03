@@ -939,7 +939,7 @@ mod tests {
 
     fn project_source() -> Source {
         Source::Project {
-            path: paths::HostPath::new("/proj"),
+            path: paths::HostPath::try_new("/proj").unwrap(),
         }
     }
 
