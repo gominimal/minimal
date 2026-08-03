@@ -169,6 +169,14 @@ async fn vcs_at_risk(root: &Path) -> Option<minimald_rpc::SessionDeltaResponse> 
     if !root.join(".git").exists() {
         return None;
     }
+    // A `.git` entry is only a marker. When it is not a real repository, git
+    // does not fail: it keeps walking up and answers for the nearest enclosing
+    // repo, which would report an unrelated tree's uncommitted files as this
+    // session's work at risk. So the work tree git found has to be this one.
+    let top = run_git(root, &["rev-parse", "--show-toplevel"]).await?;
+    if !is_same_dir(Path::new(top.trim()), root) {
+        return None;
+    }
     let status = run_git(root, &["status", "--porcelain=v1", "-unormal"]).await?;
     let count = run_git(
         root,
@@ -179,6 +187,18 @@ async fn vcs_at_risk(root: &Path) -> Option<minimald_rpc::SessionDeltaResponse> 
         uncommitted: parse_porcelain(&status),
         unpushed_commits: count.trim().parse::<u64>().ok()?,
     })
+}
+
+/// Compares two directory paths by what they name rather than how they are
+/// spelled: git reports the work tree with symlinks resolved (`/tmp` ->
+/// `/private/tmp` on macOS), so the strings need not match even when both
+/// sides mean the same directory. A path that cannot be canonicalized has
+/// nothing to compare and is not a match.
+fn is_same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Runs one git command against `root`'s tree, mirroring the `checkouts`
@@ -643,9 +663,19 @@ mod tests {
         );
 
         // An empty `.git` marker dir is not a repository: VCS mode declines.
-        let fake = tempfile::tempdir().unwrap();
-        std::fs::create_dir(fake.path().join(".git")).unwrap();
-        assert_eq!(vcs_at_risk(fake.path()).await, None);
+        // Nested inside the repo above, so this holds wherever the tempdir
+        // lives — including under a `TMPDIR` that is itself in a checkout,
+        // where git would otherwise answer for the enclosing repo.
+        let fake = root.join("not-a-repo");
+        std::fs::create_dir(&fake).unwrap();
+        std::fs::create_dir(fake.join(".git")).unwrap();
+        assert_eq!(vcs_at_risk(&fake).await, None);
+
+        // Nor does a directory that is merely *inside* a repository report
+        // that repository's state as its own.
+        let plain = root.join("no-marker");
+        std::fs::create_dir(&plain).unwrap();
+        assert_eq!(vcs_at_risk(&plain).await, None);
     }
 
     /// Symlinks are entries, never traversal: a link out of the root must not

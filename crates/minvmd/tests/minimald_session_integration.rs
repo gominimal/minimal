@@ -288,8 +288,9 @@ async fn run_session_exec(
     };
 
     // Upload the project's `minimal.toml` into the session workspace over
-    // SFTP (the subsystem scopes the client's `/` to the workspace root and
-    // reads the same session-id env the exec path does).
+    // SFTP (the subsystem presents the session's working tree at
+    // `/workbench` and its home at `/home`, and reads the same session-id env
+    // the exec path does).
     if let Some(contents) = mfile {
         let channel = handle
             .channel_open_session()
@@ -309,7 +310,7 @@ async fn run_session_exec(
         // `create` (CREATE|WRITE|TRUNCATE), not the high-level `write` helper —
         // the latter opens WRITE-only and so fails on a not-yet-existing file.
         let mut file = sftp
-            .create("/minimal.toml")
+            .create("/workbench/minimal.toml")
             .await
             .map_err(|e| format!("sftp create minimal.toml: {e}"))?;
         file.write_all(contents.as_bytes())

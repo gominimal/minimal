@@ -591,6 +591,17 @@ impl<R: Realm> AbsPath<R> {
         })
     }
 
+    /// Returns true if `base` is a prefix of this path.
+    ///
+    /// Matching is by whole components, so `/srv/work` is not a prefix of
+    /// `/srv/workbench`. `base` is an [`AbsPath`] in the *same* realm: a
+    /// containment check across realms compares paths from two different
+    /// filesystems and is meaningless.
+    #[must_use]
+    pub fn starts_with(&self, base: &AbsPath<R>) -> bool {
+        self.inner.starts_with(&base.inner)
+    }
+
     /// The final component of the path, if any.
     #[must_use]
     pub fn file_name(&self) -> Option<&str> {
@@ -1634,6 +1645,29 @@ mod tests {
         let base = HostAbsPath::try_new("/var").unwrap();
         let full = HostAbsPath::try_new("/home/u").unwrap();
         assert!(full.strip_prefix(&base).is_err());
+    }
+
+    // ---- starts_with ----
+
+    #[test]
+    fn starts_with_matches_a_prefix_and_the_path_itself() {
+        let base = HostAbsPath::try_new("/home/u").unwrap();
+        assert!(
+            HostAbsPath::try_new("/home/u/projects")
+                .unwrap()
+                .starts_with(&base)
+        );
+        assert!(base.starts_with(&base));
+    }
+
+    #[test]
+    fn starts_with_matches_whole_components_only() {
+        let base = HostAbsPath::try_new("/srv/work").unwrap();
+        assert!(
+            !HostAbsPath::try_new("/srv/workbench")
+                .unwrap()
+                .starts_with(&base)
+        );
     }
 
     // ---- file_name / extension / components ----

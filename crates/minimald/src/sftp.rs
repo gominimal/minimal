@@ -5,17 +5,23 @@
 //! holds owned per-channel state — no inner actor — because dispatch through
 //! `run` is already serialised.
 //!
+//! The client sees the two directories a session and the daemon share, under
+//! the names the sandbox gives them: the session's working tree at
+//! [`env::WORKSPACE_ROOT`] and its home at [`env::HOME_ROOT`], side by side
+//! below a synthetic root that holds nothing else. Relative paths resolve
+//! against the working tree, which is also what `realpath(".")` reports, so a
+//! client that never leaves it sees what it saw when the workspace *was* `/`.
+//!
 //! Every client-supplied path is funnelled through [`SftpSession::resolve`],
-//! which joins it against the session workspace, runs it through
-//! [`path_absolutize::Absolutize`], and rejects anything that escapes the
-//! workspace prefix. The client therefore sees the workspace as `/`.
+//! which normalizes it in that namespace, maps it onto the daemon-side
+//! directory it names, and rejects anything landing outside the two — whether
+//! spelled with `..` or reached through a symlink.
 
 use std::collections::HashMap;
 use std::io::SeekFrom;
-use std::path::{Path, PathBuf};
 
-use path_absolutize::Absolutize;
-use paths::DaemonAbsPath;
+use camino::{Utf8Path, Utf8PathBuf};
+use paths::{DaemonAbsPath, DaemonRelPath};
 use russh::ChannelId;
 use russh::server::Session;
 use russh_sftp::protocol::{
@@ -26,10 +32,10 @@ use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::task::spawn;
 
-use crate::MINIMAL_SESSION_ID_ENV;
 use crate::connection::{ConnectionError, ConnectionHandle};
 use crate::server::ServerStateHandle;
 use crate::sessions::SessionKeyPredicate;
+use crate::{MINIMAL_SESSION_ID_ENV, env};
 
 /// The SSH subsystem name used to negotiate an SFTP channel.
 pub const SUBSYSTEM_NAME: &str = "sftp";
@@ -50,7 +56,8 @@ const MAX_READ_LEN: usize = 128 * 1024;
 #[derive(Debug)]
 pub enum SftpError {
     Io(std::io::Error),
-    /// Client-supplied path resolved outside the workspace root.
+    /// Client-supplied path resolved outside the exported directories, or
+    /// named the synthetic root in a request that can only act on a real file.
     PathTraversal,
     /// Client referenced a handle id this session does not know about.
     UnknownHandle,
@@ -96,64 +103,156 @@ enum OpenHandle {
     Dir(Vec<File>),
 }
 
-/// Per-channel SFTP server scoped to a single session's workspace.
+/// What a client-supplied path resolved to.
+enum Target {
+    /// The synthetic root. It has no daemon path of its own: it exists so the
+    /// two exports have somewhere to hang, and so a client can list `/` and
+    /// walk between them.
+    Root,
+    /// A path inside one of the exports, already proven to be contained.
+    Real(DaemonAbsPath),
+}
+
+impl Target {
+    /// The daemon path this names, for requests that can only act on a real
+    /// file. The synthetic root has nothing on disk to open, create, rename,
+    /// remove or chmod, so naming it is refused like any other path outside
+    /// the exports.
+    fn real(self) -> Result<DaemonAbsPath, SftpError> {
+        match self {
+            Target::Real(path) => Ok(path),
+            Target::Root => Err(SftpError::PathTraversal),
+        }
+    }
+}
+
+/// Per-channel SFTP server scoped to a single session's directories.
 pub struct SftpSession {
-    /// Cached at construction because the session contract guarantees
-    /// `workspace_path()` is stable for the session lifetime — fetching it
+    /// The session's working tree, presented at [`env::WORKSPACE_ROOT`].
+    ///
+    /// Canonical, and cached at construction: the session contract guarantees
+    /// both directories are stable for the session lifetime, so fetching them
     /// per-request would round-trip through the session actor for nothing.
     workspace: DaemonAbsPath,
+    /// The session's home directory, presented at [`env::HOME_ROOT`].
+    /// Canonical, for the same reason as [`SftpSession::workspace`].
+    home: DaemonAbsPath,
     handles: HashMap<String, OpenHandle>,
     next_handle_id: u64,
 }
 
 impl SftpSession {
-    /// Construct a handler scoped to the given session workspace.
-    pub fn new(workspace: DaemonAbsPath) -> Self {
-        Self {
-            workspace,
+    /// Constructs a handler scoped to one session's working tree and home.
+    ///
+    /// Both are canonicalized here rather than per-request: containment is
+    /// decided by comparing a canonicalized path against these roots, and a
+    /// root reached through a symlink itself (`/var` -> `/private/var`) would
+    /// fail that comparison for every path under it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`std::io::Error`] if either directory cannot be
+    /// canonicalized — it is missing, unreadable, or not UTF-8.
+    pub async fn new(
+        workspace: DaemonAbsPath,
+        home: DaemonAbsPath,
+    ) -> Result<Self, std::io::Error> {
+        Ok(Self {
+            workspace: canonicalize(&workspace).await?,
+            home: canonicalize(&home).await?,
             handles: HashMap::new(),
             next_handle_id: 0,
-        }
+        })
     }
 
-    /// Resolves a client-supplied SFTP path to a host path, rejecting any
-    /// resolution that escapes the workspace root.
+    /// The exported directories, each paired with the client-facing root it
+    /// appears under. The only place the two are enumerated.
+    fn exports(&self) -> [(&'static str, &DaemonAbsPath); 2] {
+        [
+            (env::WORKSPACE_ROOT, &self.workspace),
+            (env::HOME_ROOT, &self.home),
+        ]
+    }
+
+    /// Resolves a client-supplied SFTP path to something on the daemon,
+    /// rejecting anything that resolves outside the exported directories.
     ///
-    /// SFTP clients address the workspace as if it were the filesystem root,
-    /// so a leading `/` is purely cosmetic and is stripped before joining.
-    /// `absolutize` collapses interior `.`/`..` without touching the disk;
-    /// the prefix check then guarantees the result is still under workspace.
-    async fn resolve(&self, sftp_path: &str) -> Result<PathBuf, SftpError> {
-        let workspace: &Path = self.workspace.as_ref();
-        let rel = sftp_path.trim_start_matches('/');
-        let candidate = workspace.join(rel);
-        let resolved = candidate.absolutize().map_err(SftpError::Io)?;
-        if !resolved.starts_with(workspace) {
+    /// Normalization happens in the *client's* namespace, before the mapping:
+    /// that way `..` is spent against the client-facing root — where
+    /// `/workbench/../home` is the other export and `/workbench/../..` is
+    /// still `/` — and never against the daemon's filesystem. What survives
+    /// names one of the exports, so the mapping is a prefix swap. The
+    /// containment check afterwards is about symlinks, which normalization
+    /// cannot see.
+    async fn resolve(&self, sftp_path: &str) -> Result<Target, SftpError> {
+        // A relative path is resolved against the working tree: it is the
+        // session's working directory, and what `realpath(".")` hands back.
+        let requested = if sftp_path.starts_with('/') {
+            Utf8PathBuf::from(sftp_path)
+        } else {
+            Utf8Path::new(env::WORKSPACE_ROOT).join(sftp_path)
+        };
+        let requested = env::normalize_absolute(&requested);
+
+        if requested == Utf8Path::new("/") {
+            return Ok(Target::Root);
+        }
+
+        // `strip_prefix` matches whole components, so `/workbenchevil` is not
+        // under `/workbench`.
+        let Some((base, rel)) = self
+            .exports()
+            .into_iter()
+            .find_map(|(root, base)| Some((base, requested.strip_prefix(root).ok()?)))
+        else {
+            return Err(SftpError::PathTraversal);
+        };
+
+        let dest = if rel.as_str().is_empty() {
+            base.clone()
+        } else {
+            // The typed join keeps the destination anchored: `join` takes a
+            // `DaemonRelPath`, where joining a raw string could replace the
+            // root outright. `try_new` re-checks the remainder is relative and
+            // `..`-free — normalization above is what makes that hold.
+            let rel = DaemonRelPath::try_new(rel).map_err(|_| SftpError::PathTraversal)?;
+            base.join(&rel)
+        };
+        contained(dest, base).await.map(Target::Real)
+    }
+
+    /// Resolves a path that a request is about to unlink or move over,
+    /// refusing the export roots themselves.
+    ///
+    /// The two directories are the session's layout, and both the daemon and
+    /// the sandbox expect them to stay where they are. Everything *under*
+    /// them is the client's to destroy; an empty one would otherwise be a
+    /// successful `rmdir` or `rename` away from taking the session with it.
+    async fn resolve_below_export(&self, sftp_path: &str) -> Result<DaemonAbsPath, SftpError> {
+        let path = self.resolve(sftp_path).await?.real()?;
+        if self.exports().iter().any(|(_, base)| **base == path) {
             return Err(SftpError::PathTraversal);
         }
-        // Canonicalize, but ignore file not found errors.
-        match tokio::fs::canonicalize(&resolved).await {
-            Ok(canon_path) => {
-                if !canon_path.starts_with(workspace) {
-                    Err(SftpError::PathTraversal)
-                } else {
-                    Ok(canon_path)
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(resolved.into_owned()),
-            Err(e) => Err(SftpError::Io(e)),
-        }
+        Ok(path)
     }
 
-    /// Converts a resolved host path back into the client-facing form, with
-    /// the workspace appearing as `/`.
-    fn client_path(&self, host: &Path) -> String {
-        let workspace: &Path = self.workspace.as_ref();
-        match host.strip_prefix(workspace) {
-            Ok(rel) if rel.as_os_str().is_empty() => "/".to_string(),
-            Ok(rel) => format!("/{}", rel.to_string_lossy()),
-            Err(_) => "/".to_string(),
+    /// Converts a resolved target back into the client-facing form.
+    fn client_path(&self, target: &Target) -> String {
+        let Target::Real(host) = target else {
+            return "/".to_string();
+        };
+        for (root, base) in self.exports() {
+            let Ok(rel) = host.strip_prefix(base) else {
+                continue;
+            };
+            return if rel.as_str().is_empty() {
+                root.to_string()
+            } else {
+                format!("{root}/{rel}")
+            };
         }
+        // Unreachable: `resolve` only hands back paths under an export.
+        "/".to_string()
     }
 
     fn mint_handle(&mut self, h: OpenHandle) -> String {
@@ -181,6 +280,76 @@ impl SftpSession {
     }
 }
 
+/// Proves `dest` really lives under `base`, and returns it with every symlink
+/// on the way already resolved.
+///
+/// `dest` need not exist — SFTP creates files, and `open` with `CREATE` names
+/// one that does not. So the check walks up to the deepest ancestor that does
+/// exist, canonicalizes *that*, and re-appends the missing tail: a symlinked
+/// parent is refused before anything is created through it, which
+/// canonicalizing only existing paths would miss.
+///
+/// `base` is canonical (see [`SftpSession::new`]), so the comparison is
+/// symlink-free on both sides. The walk terminates because `base` exists: it
+/// either finds an existing ancestor at or below `base`, or walks past it and
+/// is refused.
+async fn contained(dest: DaemonAbsPath, base: &DaemonAbsPath) -> Result<DaemonAbsPath, SftpError> {
+    let mut probe = dest;
+    let mut missing: Vec<String> = Vec::new();
+    loop {
+        match canonicalize(&probe).await {
+            Ok(real) => {
+                if !real.starts_with(base) {
+                    return Err(SftpError::PathTraversal);
+                }
+                // `missing` was pushed leaf-last on the way up.
+                return Ok(missing
+                    .iter()
+                    .rev()
+                    .fold(real, |path, name| path.sub_path_unchecked(name)));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling symlink canonicalizes to `NotFound` while still
+                // being a real directory entry. Reading it as "does not exist
+                // yet" would hand back the link's own path, and `open` with
+                // `CREATE` would then follow it and create the file it points
+                // at — outside `base`, which is the whole point of this walk.
+                if fs::symlink_metadata(probe.as_str()).await.is_ok() {
+                    return Err(SftpError::PathTraversal);
+                }
+                let (Some(name), Some(parent)) = (probe.file_name(), probe.parent()) else {
+                    // Ran out of path before finding anything that exists;
+                    // only reachable above `base`, which does exist.
+                    return Err(SftpError::PathTraversal);
+                };
+                missing.push(name.to_string());
+                probe = parent;
+            }
+            Err(e) => return Err(SftpError::Io(e)),
+        }
+    }
+}
+
+/// [`tokio::fs::canonicalize`], keeping the path typed and UTF-8.
+async fn canonicalize(path: &DaemonAbsPath) -> Result<DaemonAbsPath, std::io::Error> {
+    let canonical = fs::canonicalize(path.as_str()).await?;
+    let canonical = Utf8PathBuf::from_path_buf(canonical)
+        .map_err(|p| std::io::Error::other(format!("path is not utf-8: {}", p.display())))?;
+    // `canonicalize` returns an absolute path by construction.
+    Ok(DaemonAbsPath::new_unchecked(canonical))
+}
+
+/// Attributes reported for the synthetic root: a read-only directory. It has
+/// no inode of its own, so there is nothing to stat and the values are fixed.
+fn root_attrs() -> FileAttributes {
+    let mut attrs = FileAttributes {
+        permissions: Some(0o555),
+        ..FileAttributes::default()
+    };
+    attrs.set_dir(true);
+    attrs
+}
+
 impl russh_sftp::server::Handler for SftpSession {
     type Error = SftpError;
 
@@ -189,29 +358,31 @@ impl russh_sftp::server::Handler for SftpSession {
     }
 
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
-        let host = self.resolve(&path).await?;
+        let target = self.resolve(&path).await?;
         Ok(Name {
             id,
-            files: vec![File::dummy(self.client_path(&host))],
+            files: vec![File::dummy(self.client_path(&target))],
         })
     }
 
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
-        let host = self.resolve(&path).await?;
-        let m = fs::metadata(host).await?;
-        Ok(Attrs {
-            id,
-            attrs: FileAttributes::from(&m),
-        })
+        let attrs = match self.resolve(&path).await? {
+            Target::Root => root_attrs(),
+            Target::Real(host) => FileAttributes::from(&fs::metadata(host.as_str()).await?),
+        };
+        Ok(Attrs { id, attrs })
     }
 
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
-        let host = self.resolve(&path).await?;
-        let m = fs::symlink_metadata(host).await?;
-        Ok(Attrs {
-            id,
-            attrs: FileAttributes::from(&m),
-        })
+        // A symlink is already gone by the time we get here: `resolve`
+        // follows links to decide containment, so this reports the target,
+        // as `readdir` does. Nothing under an export can name a link outside
+        // it, so there is nothing to describe that `stat` would not.
+        let attrs = match self.resolve(&path).await? {
+            Target::Root => root_attrs(),
+            Target::Real(host) => FileAttributes::from(&fs::symlink_metadata(host.as_str()).await?),
+        };
+        Ok(Attrs { id, attrs })
     }
 
     async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
@@ -230,8 +401,20 @@ impl russh_sftp::server::Handler for SftpSession {
         pflags: OpenFlags,
         _attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
-        let host = self.resolve(&filename).await?;
+        let host = self.resolve(&filename).await?.real()?;
         let mut opts = OpenOptions::new();
+        // `resolve` proved a path; this opens a *name*, and the two are only
+        // the same until something rewrites the leaf. Both exports are
+        // bind-mounted read-write into the sandbox, so an in-session process
+        // can sit in that gap swapping the leaf for a symlink until an open
+        // lands on it — with the daemon, which is not confined to the
+        // sandbox, doing the following. `O_NOFOLLOW` refuses that leaf
+        // outright. It costs nothing legitimate: `resolve` hands back a
+        // canonical path, so a real symlink is already resolved to its
+        // target by the time we get here and there is no link left to refuse.
+        // A swap higher up the path is not covered here — the ancestor walk
+        // in `contained` is what narrows that.
+        opts.custom_flags(libc::O_NOFOLLOW);
         opts.read(pflags.contains(OpenFlags::READ))
             .write(pflags.contains(OpenFlags::WRITE))
             .append(pflags.contains(OpenFlags::APPEND))
@@ -242,7 +425,7 @@ impl russh_sftp::server::Handler for SftpSession {
         } else if pflags.contains(OpenFlags::CREATE) {
             opts.create(true);
         }
-        let f = opts.open(host).await?;
+        let f = opts.open(host.as_str()).await?;
         let handle = self.mint_handle(OpenHandle::File(f));
         Ok(Handle { id, handle })
     }
@@ -286,22 +469,39 @@ impl russh_sftp::server::Handler for SftpSession {
     }
 
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
-        let host = self.resolve(&path).await?;
+        let host = match self.resolve(&path).await? {
+            // The synthetic root holds the two exports and nothing else —
+            // no "..", since there is nothing above it.
+            Target::Root => {
+                let mut entries = vec![File::new(".".to_string(), root_attrs())];
+                for (root, base) in self.exports() {
+                    let m = fs::metadata(base.as_str()).await?;
+                    // The exports' client-facing roots are their names, since
+                    // they sit directly under `/`.
+                    let name = root.trim_start_matches('/').to_string();
+                    entries.push(File::new(name, FileAttributes::from(&m)));
+                }
+                let handle = self.mint_handle(OpenHandle::Dir(entries));
+                return Ok(Handle { id, handle });
+            }
+            Target::Real(host) => host,
+        };
         let mut entries = Vec::new();
 
-        let m = fs::metadata(&host).await?;
+        let m = fs::metadata(host.as_str()).await?;
         entries.push(File::new(".".to_string(), FileAttributes::from(&m)));
-        if let Some(parent) = host.parent() {
-            let workspace: &Path = self.workspace.as_ref();
-            // Omit ".." at the workspace root so the client can't see it
-            // exists above its root.
-            if parent.starts_with(workspace) {
-                let pm = fs::metadata(parent).await?;
-                entries.push(File::new("..".to_string(), FileAttributes::from(&pm)));
-            }
-        }
+        // At an export root the parent on disk is a daemon directory the
+        // client has no business seeing; ".." there is the synthetic root.
+        let parent = host
+            .parent()
+            .filter(|p| p.starts_with(&self.workspace) || p.starts_with(&self.home));
+        let parent_attrs = match parent {
+            Some(parent) => FileAttributes::from(&fs::metadata(parent.as_str()).await?),
+            None => root_attrs(),
+        };
+        entries.push(File::new("..".to_string(), parent_attrs));
 
-        let mut read = fs::read_dir(&host).await?;
+        let mut read = fs::read_dir(host.as_str()).await?;
         while let Some(e) = read.next_entry().await? {
             let em = e.metadata().await?;
             let name = e.file_name().to_string_lossy().into_owned();
@@ -328,20 +528,20 @@ impl russh_sftp::server::Handler for SftpSession {
         path: String,
         _attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
-        let host = self.resolve(&path).await?;
-        fs::create_dir(host).await?;
+        let host = self.resolve(&path).await?.real()?;
+        fs::create_dir(host.as_str()).await?;
         Ok(ok_status(id))
     }
 
     async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
-        let host = self.resolve(&path).await?;
-        fs::remove_dir(host).await?;
+        let host = self.resolve_below_export(&path).await?;
+        fs::remove_dir(host.as_str()).await?;
         Ok(ok_status(id))
     }
 
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
-        let host = self.resolve(&filename).await?;
-        fs::remove_file(host).await?;
+        let host = self.resolve_below_export(&filename).await?;
+        fs::remove_file(host.as_str()).await?;
         Ok(ok_status(id))
     }
 
@@ -351,9 +551,9 @@ impl russh_sftp::server::Handler for SftpSession {
         oldpath: String,
         newpath: String,
     ) -> Result<Status, Self::Error> {
-        let from = self.resolve(&oldpath).await?;
-        let to = self.resolve(&newpath).await?;
-        fs::rename(from, to).await?;
+        let from = self.resolve_below_export(&oldpath).await?;
+        let to = self.resolve_below_export(&newpath).await?;
+        fs::rename(from.as_str(), to.as_str()).await?;
         Ok(ok_status(id))
     }
 
@@ -363,9 +563,24 @@ impl russh_sftp::server::Handler for SftpSession {
         path: String,
         attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
-        let host = self.resolve(&path).await?;
+        let host = self.resolve(&path).await?.real()?;
         if let Some(perms) = perm_from_mode(attrs.permissions) {
-            fs::set_permissions(host, perms).await?;
+            // `chmod` follows symlinks, so like `open` this re-resolves the
+            // leaf by name and a link swapped in after the check would be
+            // followed out of the export. The other mutating handlers need no
+            // such care: `mkdir`, `rmdir`, `unlink` and `rename` all act on
+            // the link itself rather than what it points at.
+            //
+            // `fchmod` through an `O_NOFOLLOW` handle refuses that leaf the
+            // same way `open` does. `O_NONBLOCK` because this open is the
+            // only thing standing between a fifo planted in the workspace and
+            // a wedged dispatch loop; on a regular file it does nothing.
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(host.as_str())
+                .await?;
+            file.set_permissions(perms).await?;
         }
         Ok(ok_status(id))
     }
@@ -459,22 +674,37 @@ pub(crate) async fn handle_sftp_subsystem(
         }
     };
 
+    // Canonicalizing the session's two directories is the one filesystem
+    // touch before the channel is accepted: a session whose directories are
+    // gone cannot serve any request on this channel anyway.
+    let sftp = match SftpSession::new(paths.working, paths.home).await {
+        Ok(sftp) => sftp,
+        Err(e) => {
+            tracing::warn!(%session_id, error = %e, "sftp subsystem rejected: session directories are unusable");
+            session.channel_failure(id)?;
+            return Ok(());
+        }
+    };
+
     session.channel_success(id)?;
-    spawn(russh_sftp::server::run(
-        channel.into_stream(),
-        SftpSession::new(paths.working),
-    ));
+    spawn(russh_sftp::server::run(channel.into_stream(), sftp));
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use russh_sftp::client::SftpSession as SftpClient;
     use russh_sftp::client::error::Error as SftpClientError;
     use russh_sftp::protocol::{OpenFlags, StatusCode};
     use sessions::SessionId;
+    use std::os::unix::fs::PermissionsExt;
+
     use tokio::io::AsyncWriteExt;
 
+    use crate::env;
+    use crate::session::SessionPaths;
+    use crate::sessions::SessionKeyPredicate;
     use crate::test_harness::TestServer;
 
     /// Creates a fresh session through the public CreateSession RPC and
@@ -482,6 +712,39 @@ mod tests {
     /// before opening an SFTP channel.
     async fn fresh_session(client: &mut crate::test_harness::TestClient) -> SessionId {
         crate::test_harness::create_configured_session(client, "sftp-test", "/tmp").await
+    }
+
+    /// The daemon-side directories behind a session, so a test can check
+    /// *where* a client's write landed rather than only that it round-trips.
+    async fn session_paths(server: &TestServer, id: SessionId) -> SessionPaths {
+        let mngr = server.state.sessions_manager().await;
+        mngr.get_session(SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("session was just created")
+            .paths()
+            .await
+            .unwrap()
+    }
+
+    /// Writes `payload` through the SFTP channel, failing the test on any
+    /// error — the escape tests are the ones interested in error paths.
+    async fn write(sftp: &SftpClient, path: &str, payload: &[u8]) {
+        let mut file = sftp.create(path).await.unwrap();
+        file.write_all(payload).await.unwrap();
+        file.shutdown().await.unwrap();
+    }
+
+    /// Asserts a request was refused with `SSH_FX_PERMISSION_DENIED`, which
+    /// is what every containment failure maps to on the wire.
+    fn assert_denied<T>(result: Result<T, SftpClientError>) {
+        match result {
+            Err(SftpClientError::Status(s)) => {
+                assert_eq!(s.status_code, StatusCode::PermissionDenied);
+            }
+            Err(e) => panic!("expected PermissionDenied, got error {e:?}"),
+            Ok(_) => panic!("expected PermissionDenied, but the request succeeded"),
+        }
     }
 
     #[tokio::test]
@@ -493,16 +756,77 @@ mod tests {
         let sftp = client.open_sftp(session_id).await;
 
         let payload: &[u8] = b"hello from sftp";
-        let mut file = sftp.create("hello.txt").await.unwrap();
-        file.write_all(payload).await.unwrap();
-        file.shutdown().await.unwrap();
+        write(&sftp, "hello.txt", payload).await;
 
         let read_back = sftp.read("hello.txt").await.unwrap();
         assert_eq!(read_back, payload);
+
+        // A relative path is the session's working tree, not its home.
+        let paths = session_paths(&server, session_id).await;
+        let on_disk = tokio::fs::read(paths.working.sub_path_unchecked("hello.txt").as_str())
+            .await
+            .unwrap();
+        assert_eq!(on_disk, payload);
     }
 
     #[tokio::test]
-    async fn sftp_realpath_root_is_workspace_root() {
+    async fn sftp_presents_the_working_tree_and_home_side_by_side() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let sftp = client.open_sftp(session_id).await;
+
+        // The two exports are named after the sandbox's own directories.
+        assert_eq!(env::WORKSPACE_ROOT, "/workbench");
+        assert_eq!(env::HOME_ROOT, "/home");
+
+        write(&sftp, "/workbench/note.txt", b"in the workbench").await;
+        write(&sftp, "/home/note.txt", b"in the home").await;
+
+        // Same file name in each tree, and they do not collide.
+        assert_eq!(
+            sftp.read("/workbench/note.txt").await.unwrap(),
+            b"in the workbench"
+        );
+        assert_eq!(sftp.read("/home/note.txt").await.unwrap(), b"in the home");
+
+        // Each landed in the daemon directory the client's path named.
+        let paths = session_paths(&server, session_id).await;
+        let working = tokio::fs::read(paths.working.sub_path_unchecked("note.txt").as_str())
+            .await
+            .unwrap();
+        assert_eq!(working, b"in the workbench");
+        let home = tokio::fs::read(paths.home.sub_path_unchecked("note.txt").as_str())
+            .await
+            .unwrap();
+        assert_eq!(home, b"in the home");
+    }
+
+    #[tokio::test]
+    async fn sftp_root_lists_exactly_the_two_exports() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let sftp = client.open_sftp(session_id).await;
+
+        let mut names: Vec<String> = sftp
+            .read_dir("/")
+            .await
+            .unwrap()
+            .map(|e| e.file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["home".to_string(), "workbench".to_string()]);
+
+        // The root is synthetic, but it has to look like a directory or
+        // clients refuse to descend into it.
+        assert!(sftp.metadata("/").await.unwrap().is_dir());
+    }
+
+    #[tokio::test]
+    async fn sftp_realpath_reports_client_facing_paths() {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
         let session_id = fresh_session(&mut client).await;
@@ -510,33 +834,189 @@ mod tests {
         let sftp = client.open_sftp(session_id).await;
 
         // SFTP clients ask `realpath(".")` immediately after connect to learn
-        // their root; the server should always present the workspace as `/`.
-        let resolved = sftp.canonicalize(".").await.unwrap();
-        assert_eq!(resolved, "/");
+        // where they start: that is the working tree.
+        assert_eq!(sftp.canonicalize(".").await.unwrap(), env::WORKSPACE_ROOT);
+        assert_eq!(sftp.canonicalize("/").await.unwrap(), "/");
+        assert_eq!(
+            sftp.canonicalize("sub/..").await.unwrap(),
+            env::WORKSPACE_ROOT
+        );
+        // `..` is spent in the client's namespace, so the exports are
+        // reachable from one another and the root is the ceiling.
+        assert_eq!(
+            sftp.canonicalize("/workbench/../home").await.unwrap(),
+            env::HOME_ROOT
+        );
+        assert_eq!(sftp.canonicalize("/home/../..").await.unwrap(), "/");
     }
 
     #[tokio::test]
-    async fn sftp_rejects_paths_escaping_workspace() {
+    async fn sftp_rejects_paths_outside_the_exports() {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
         let session_id = fresh_session(&mut client).await;
 
         let sftp = client.open_sftp(session_id).await;
 
-        // `..` resolves above the workspace root; the resolver must reject
-        // it before any open()/stat() touches the host filesystem.
-        let result = sftp
-            .open_with_flags(
+        // `..` resolves above the working tree, onto the synthetic root,
+        // where `escape.txt` is not one of the two exports.
+        assert_denied(
+            sftp.open_with_flags(
                 "../escape.txt",
                 OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
             )
-            .await;
-        match result {
-            Err(SftpClientError::Status(s)) => {
-                assert_eq!(s.status_code, StatusCode::PermissionDenied);
-            }
-            Err(e) => panic!("expected PermissionDenied, got error {e:?}"),
-            Ok(_) => panic!("expected PermissionDenied, but open succeeded"),
-        }
+            .await,
+        );
+        // Nothing else on the daemon's filesystem is addressable, spelled
+        // absolutely or as a near-miss on an export's name.
+        assert_denied(sftp.read("/etc/passwd").await);
+        assert_denied(sftp.read("/workbenchevil/loot.txt").await);
+        // The root itself is not a file, and cannot be unlinked or replaced.
+        assert_denied(sftp.remove_dir("/").await);
+        assert_denied(sftp.rename("/workbench", "/elsewhere").await);
+    }
+
+    #[tokio::test]
+    async fn sftp_refuses_to_unlink_or_move_the_exports_themselves() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let sftp = client.open_sftp(session_id).await;
+
+        // Both are empty, so the syscalls underneath would happily succeed
+        // and take the session's layout with them.
+        assert_denied(sftp.remove_dir("/workbench").await);
+        assert_denied(sftp.remove_dir("/home").await);
+        assert_denied(sftp.remove_file("/home").await);
+        assert_denied(sftp.rename("/workbench", "/home").await);
+
+        // Everything under them is still the client's to destroy.
+        sftp.create_dir("/workbench/scratch").await.unwrap();
+        sftp.remove_dir("/workbench/scratch").await.unwrap();
+
+        let paths = session_paths(&server, session_id).await;
+        assert!(tokio::fs::try_exists(paths.working.as_str()).await.unwrap());
+        assert!(tokio::fs::try_exists(paths.home.as_str()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn sftp_rejects_paths_leaving_an_export_through_a_symlink() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+        let paths = session_paths(&server, session_id).await;
+
+        // A directory outside both exports, with something worth stealing in
+        // it, and a symlink to it planted in the working tree.
+        let outside = paths
+            .working
+            .parent()
+            .unwrap()
+            .sub_path_unchecked("outside");
+        tokio::fs::create_dir_all(outside.as_str()).await.unwrap();
+        tokio::fs::write(outside.sub_path_unchecked("secret.txt").as_str(), b"secret")
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(
+            outside.as_str(),
+            paths.working.sub_path_unchecked("escape").as_str(),
+        )
+        .unwrap();
+
+        let sftp = client.open_sftp(session_id).await;
+
+        // Reading through the link is refused...
+        assert_denied(sftp.read("escape/secret.txt").await);
+        // ...and so is creating a file through it, which no amount of
+        // canonicalizing the target alone would catch: it does not exist yet.
+        assert_denied(
+            sftp.open_with_flags(
+                "escape/planted.txt",
+                OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
+            )
+            .await,
+        );
+        assert!(
+            !tokio::fs::try_exists(outside.sub_path_unchecked("planted.txt").as_str())
+                .await
+                .unwrap()
+        );
+    }
+
+    /// `O_NOFOLLOW` on the final open guards the swap-the-leaf race, not
+    /// links as such: a link inside an export is resolved by `resolve`, so
+    /// what reaches `open` is its target and there is nothing left to refuse.
+    #[tokio::test]
+    async fn sftp_follows_symlinks_that_stay_inside_an_export() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+        let paths = session_paths(&server, session_id).await;
+
+        tokio::fs::write(
+            paths.working.sub_path_unchecked("target.txt").as_str(),
+            b"through the link",
+        )
+        .await
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "target.txt",
+            paths.working.sub_path_unchecked("link.txt").as_str(),
+        )
+        .unwrap();
+
+        let sftp = client.open_sftp(session_id).await;
+
+        assert_eq!(sftp.read("link.txt").await.unwrap(), b"through the link");
+        assert_eq!(
+            sftp.canonicalize("link.txt").await.unwrap(),
+            "/workbench/target.txt"
+        );
+
+        // `setstat` opens the same way, so it lands on the target too.
+        let attrs = russh_sftp::protocol::FileAttributes {
+            permissions: Some(0o640),
+            ..Default::default()
+        };
+        sftp.set_metadata("link.txt", attrs).await.unwrap();
+        let mode = tokio::fs::metadata(paths.working.sub_path_unchecked("target.txt").as_str())
+            .await
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o640);
+    }
+
+    #[tokio::test]
+    async fn sftp_rejects_creation_through_a_dangling_symlink() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+        let paths = session_paths(&server, session_id).await;
+
+        // The link's target does not exist, so nothing on the way to it can
+        // be canonicalized — the refusal has to come from the link itself.
+        let target = paths
+            .working
+            .parent()
+            .unwrap()
+            .sub_path_unchecked("not-there.txt");
+        std::os::unix::fs::symlink(
+            target.as_str(),
+            paths.working.sub_path_unchecked("dangling").as_str(),
+        )
+        .unwrap();
+
+        let sftp = client.open_sftp(session_id).await;
+
+        assert_denied(
+            sftp.open_with_flags(
+                "dangling",
+                OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
+            )
+            .await,
+        );
+        assert!(!tokio::fs::try_exists(target.as_str()).await.unwrap());
     }
 }
