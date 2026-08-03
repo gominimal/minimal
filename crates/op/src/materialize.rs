@@ -255,6 +255,16 @@ fn extract_raw_file(
 ) -> Result<Report, Error> {
     let rel_path = path.strip_prefix('/').unwrap_or(path);
 
+    // `strip_prefix('/')` removes one leading slash and nothing else, so `..`
+    // survives it untouched — and joining that onto a package directory walks
+    // straight out of the cache. Reject lexical escapes before any filesystem
+    // access: both `../../etc/shadow` and `/../../etc/shadow` land here.
+    let Some(rel_path) = common::archive::normalize_within_root(Path::new(rel_path)) else {
+        return Err(Error::Other(anyhow!(
+            "raw-file output {path:?} escapes the package directory"
+        )));
+    };
+
     let mut closure: Vec<_> =
         Transitives::for_toplevels(opts.graph, opts.graph.top_levels.to_vec(), false)
             .into_keys()
@@ -267,9 +277,35 @@ fn extract_raw_file(
             .cache
             .read_dir(&opts.graph.spec_hash(&bsr))
             .map_err(|e| Error::Other(anyhow!(e)))?;
-        let candidate = dir.path().join(rel_path);
+        let candidate = dir.path().join(&rel_path);
         if !candidate.exists() {
             continue;
+        }
+
+        // The lexical check above cannot see symlinks: a package shipping
+        // `escape -> /etc` makes `<pkg>/escape/passwd` lexically contained
+        // while resolving outside. Decide on the *real* path.
+        //
+        // A containment violation is an error, not a cache miss: `continue`ing
+        // would silently fall through to the next package and hide the fact
+        // that a package tried to serve a file it does not own.
+        let root = dir.path().canonicalize().map_err(|e| {
+            Error::Other(anyhow!(
+                "resolving package dir {}: {e}",
+                dir.path().display()
+            ))
+        })?;
+        let real = candidate.canonicalize().map_err(|e| {
+            Error::Other(anyhow!(
+                "resolving raw-file output {path:?} in {package:?}: {e}",
+                package = package.clone().unwrap_or_default()
+            ))
+        })?;
+        if !real.starts_with(&root) {
+            return Err(Error::Other(anyhow!(
+                "raw-file output {path:?} resolves to {}, outside the package directory",
+                real.display()
+            )));
         }
 
         let package = package.unwrap_or_default();
@@ -408,6 +444,17 @@ mod tests {
     }
 
     fn materialize(graph: &Graph, cache: Cache<LocalDir>, sink: Sink) -> Result<Report, Error> {
+        materialize_path(graph, cache, sink, "/bin/tool")
+    }
+
+    /// As [`materialize`], for a caller that needs to choose the requested
+    /// raw-file path (the containment tests below).
+    fn materialize_path(
+        graph: &Graph,
+        cache: Cache<LocalDir>,
+        sink: Sink,
+        path: &str,
+    ) -> Result<Report, Error> {
         let opts = Options {
             cache,
             graph,
@@ -419,7 +466,7 @@ mod tests {
             Materialize {
                 name: "out".to_string(),
                 spec: OutputSpec::RawFile {
-                    path: "/bin/tool".to_string(),
+                    path: path.to_string(),
                 },
                 sink,
                 events: None,
@@ -626,6 +673,88 @@ mod tests {
         assert!(
             err.to_string().contains("entrypoint"),
             "the error must name the offending field, got: {err}"
+        );
+    }
+
+    /// A `raw-file` output path is attacker-influenceable: it comes from
+    /// `minimal.toml`, and the daemon reads that out of a client-uploaded
+    /// workspace. `strip_prefix('/')` removes one leading slash and nothing
+    /// else, so `..` used to survive into `dir.path().join(..)` and stream a
+    /// daemon-side file straight back to the caller.
+    ///
+    /// Both spellings must be refused, and refused *distinguishably* from
+    /// "no package ships this path" — a containment violation is an error,
+    /// not a cache miss.
+    #[test]
+    fn raw_file_output_cannot_escape_the_package() {
+        for path in ["../../../../etc/passwd", "/../../etc/passwd"] {
+            let tmp = TempDir::new().unwrap();
+            let cache = Cache::at_dir(tmp.path()).unwrap();
+            let graph = graph_from(COLLIDING, "zzz");
+            fake_build(&cache, &graph, "zzz", "bin/tool", b"zzz", 0o755);
+
+            let out = TempDir::new().unwrap();
+            let err = materialize_path(&graph, cache, Sink::Path(out.path().join("got")), path)
+                .expect_err("an escaping raw-file path must be refused");
+
+            assert!(
+                err.to_string().contains("escapes the package directory"),
+                "{path:?} must be refused as a containment violation, got: {err}"
+            );
+        }
+    }
+
+    /// The lexical check cannot see symlinks. A package that ships
+    /// `escape -> /etc` makes `<pkg>/escape/passwd` lexically contained while
+    /// resolving outside it, so containment has to be decided on the resolved
+    /// path as well.
+    #[test]
+    fn raw_file_output_cannot_escape_through_a_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        // Single-package closure: `COLLIDING` ships two, and an unbuilt
+        // second package makes the probe loop fall through to "not found"
+        // before it ever reaches the link.
+        let graph = graph_from(
+            indoc! {r#"
+                let {BuildSpec, OutputData, ..} = import "minimal.ncl" in
+                {
+                    name = "only",
+                    build_deps = [],
+                    cmd = "",
+                    outputs = { f = {glob = "bin/tool"} | OutputData },
+                } | BuildSpec
+            "#},
+            "only",
+        );
+
+        // Build a package whose tree contains a link pointing out of it.
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("passwd"), b"root:x:0:0").unwrap();
+        let hash = graph.spec_hash(graph.by_name("only").expect("package in graph"));
+        let pending = cache.write_dir(&hash).expect("write cache dir");
+        std::fs::create_dir_all(pending.path().join("bin")).unwrap();
+        std::fs::write(pending.path().join("bin/tool"), b"zzz").unwrap();
+        std::os::unix::fs::symlink(outside.path(), pending.path().join("escape")).unwrap();
+        pending
+            .finalize(EntryMeta {
+                inner: MetaInner::Spec("only".to_string()),
+                ..Default::default()
+            })
+            .expect("finalize cache entry");
+
+        let out = TempDir::new().unwrap();
+        let err = materialize_path(
+            &graph,
+            cache,
+            Sink::Path(out.path().join("got")),
+            "/escape/passwd",
+        )
+        .expect_err("a path resolving outside the package must be refused");
+
+        assert!(
+            err.to_string().contains("outside the package directory"),
+            "expected a containment error, got: {err}"
         );
     }
 }

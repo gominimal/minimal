@@ -211,7 +211,14 @@ pub fn extract_compressed_tar<R: Read>(
 /// This is the containment gate for prefix-stripped tar extraction: unlike
 /// [`Path::join`], it refuses entries and link targets that would resolve
 /// outside `dest_dir`.
-fn normalize_within_root(path: &Path) -> Option<PathBuf> {
+/// Public because more than one crate joins an untrusted relative path onto a
+/// root it must not escape. A second implementation is how this class of bug
+/// gets reintroduced — see the tar `strip_prefix` traversal (#651).
+///
+/// Lexical only: it cannot see symlinks, so a caller that then touches the
+/// filesystem must *also* check the resolved path. This is necessary, not
+/// sufficient.
+pub fn normalize_within_root(path: &Path) -> Option<PathBuf> {
     use std::path::Component;
     let mut out = PathBuf::new();
     for comp in path.components() {
