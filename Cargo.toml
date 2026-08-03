@@ -86,30 +86,9 @@ either = { version = "1.17", default-features = false }
 flate2 = "1.1"
 futures = "0.3"
 generational-arena = {version = "0.2", features = ["serde"] }
-# The wasm-bindgen ceiling. nickel-lang-core's `format` feature (needed by
-# `mip check --fix`, crates/check/src/lib.rs) reaches topiary-core ->
-# topiary-tree-sitter-facade -> topiary-web-tree-sitter-sys, which pins an exact
-# `wasm-bindgen = "=0.2.100"` *untargeted* — so it constrains resolution even
-# though we never build wasm32. That caps wasm-bindgen at 0.2.100 and js-sys /
-# web-sys at 0.3.77 for the whole graph, which in turn holds back:
-#
-#   * google-cloud-auth / google-cloud-storage (below), whose 1.15/1.17 releases
-#     want reqwest >= 0.13.4 -> wasm-streams 0.5 -> js-sys >= 0.3.85;
-#   * reqwest, capped at 0.13.1 for the same reason;
-#   * russh-sftp, capped at 2.1.2 (2.2+ want wasm-bindgen-futures >= 0.4.71).
-#
-# It also costs us duplicate copies of sha2/digest/block-buffer/crypto-common/
-# generic-array (google-cloud-storage 1.7 is on the RustCrypto 0.10 line; 1.17
-# moved to 0.11, matching ours), plus base64 0.22 and
-# opentelemetry-semantic-conventions 0.31. Lifting this one pin collapses all of
-# that at once.
-#
-# Revisit when topiary relaxes the pin (0.7.3, the newest release, still has it;
-# 0.6.2 moved to =0.2.103, but 0.7.x went back to =0.2.100). Verified still
-# blocking on 2026-08-03.
 google-cloud-gax = "1.13"
-google-cloud-auth = "1.5"
-google-cloud-storage = "1.7"
+google-cloud-auth = "1.15"
+google-cloud-storage = "1.17"
 
 # Tracked as a git rev, not the crates.io release, update when they publish next.
 # Current rev is master @ 2026-08-03.
@@ -151,7 +130,7 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem
 regex = "1" # keep in sync with nickel-lang-core
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
-reqwest = { version = "0.13", features = ["stream"], default-features = false } # keep in sync with google-cloud-gax; capped at 0.13.1 by the wasm-bindgen ceiling above
+reqwest = { version = "0.13.4", features = ["stream"], default-features = false } # keep in sync with google-cloud-gax
 rustc-hash = "2.1.3"
 serde = { version = "1.0", features = ["derive", "rc"] } # Keep within the same minor version as nickel-lang-core
 prost = "0.14"
@@ -159,7 +138,7 @@ prost-build = "0.14"
 prost-types = "0.14"
 resolv-conf = "0.7"
 russh = { version = "0.62", default-features = false, features = ["aws-lc-rs", "flate2"] }
-russh-sftp = "2.1" # capped by the wasm-bindgen ceiling; see google-cloud-* above
+russh-sftp = "2.4"
 serde_json = { version = "1.0" }
 serial_test = "4"
 sha2 = "0.11"
@@ -222,3 +201,28 @@ switch = { path = "crates/switch" }
 version = { path = "crates/version" }
 
 stdlib = { path = "crates/stdlib" }
+
+# Lifts the wasm-bindgen ceiling.
+#
+# nickel-lang-core's `format` feature (what `mip check --fix` formats .ncl
+# files with, crates/check/src/lib.rs) reaches topiary-core ->
+# topiary-tree-sitter-facade -> topiary-web-tree-sitter-sys. Released 0.7.3
+# pins an exact `wasm-bindgen = "=0.2.100"` *untargeted*, so it constrains
+# resolution even though we never build wasm32 — capping wasm-bindgen at
+# 0.2.100 and js-sys/web-sys at 0.3.77 for the entire graph. That in turn
+# pinned google-cloud-auth/storage, reqwest and russh-sftp well below their
+# current releases, and forced duplicate copies of the RustCrypto 0.10 stack
+# (sha2/digest/block-buffer/crypto-common) alongside our 0.11.
+#
+# Upstream already fixed it — master moved to a caret `wasm-bindgen = "0.2"`
+# and target-gates topiary-web-tree-sitter-sys behind
+# `cfg(target_arch = "wasm32")` — but has not cut a release carrying it.
+# Master's workspace version is still 0.7.3, so this patch satisfies
+# nickel's `topiary-core = "^0.7"` unchanged.
+#
+# Only the two wasm crates are patched: topiary-core has no wasm-bindgen
+# dependency of its own and stays on crates.io 0.7.3, so .ncl formatting
+# output is untouched. Drop this section once topiary publishes >0.7.3.
+[patch.crates-io]
+topiary-tree-sitter-facade = { git = "https://github.com/tweag/topiary.git", rev = "838c74ab4058f82bc3c6a12380f22c10f22ac814" }
+topiary-web-tree-sitter-sys = { git = "https://github.com/tweag/topiary.git", rev = "838c74ab4058f82bc3c6a12380f22c10f22ac814" }

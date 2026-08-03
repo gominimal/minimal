@@ -27,6 +27,7 @@ use russh::server::Session;
 use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode,
 };
+use russh_sftp::server::StatusReply;
 use sessions::SessionId;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -49,10 +50,15 @@ const MAX_READ_LEN: usize = 128 * 1024;
 
 /// Error returned by SFTP handler methods.
 ///
-/// `russh_sftp` requires only `Into<StatusCode>`: every failed request maps
-/// to a single `SSH_FXP_STATUS` packet, so we lose any structured detail at
-/// the wire boundary regardless. The enum exists so the handler can report
-/// the *cause* in logs even though the wire only carries a status code.
+/// `russh_sftp` requires `Into<StatusReply>`: every failed request maps to a
+/// single `SSH_FXP_STATUS` packet, so we lose any structured detail at the
+/// wire boundary regardless. The enum exists so the handler can report the
+/// *cause* in logs even though the wire only carries a status code.
+///
+/// `StatusReply` can also carry a human-readable message, which we
+/// deliberately leave unset: `russh_sftp` then falls back to the status
+/// code's own text, and an `Io` variant's message can embed host paths that
+/// have no business crossing the export boundary.
 #[derive(Debug)]
 pub enum SftpError {
     Io(std::io::Error),
@@ -90,6 +96,12 @@ impl From<SftpError> for StatusCode {
             SftpError::Eof => StatusCode::Eof,
             SftpError::Unsupported => StatusCode::OpUnsupported,
         }
+    }
+}
+
+impl From<SftpError> for StatusReply {
+    fn from(e: SftpError) -> StatusReply {
+        StatusReply::new(e.into())
     }
 }
 
@@ -339,8 +351,18 @@ async fn canonicalize(path: &DaemonAbsPath) -> Result<DaemonAbsPath, std::io::Er
     Ok(DaemonAbsPath::new_unchecked(canonical))
 }
 
-/// Attributes reported for the synthetic root: a read-only directory. It has
-/// no inode of its own, so there is nothing to stat and the values are fixed.
+/// Attributes reported for the synthetic root: a read-only directory.
+///
+/// It has no inode of its own, so mode is the only thing we can honestly
+/// state. Everything else — size, uid/gid, atime/mtime — is left unset, and
+/// SFTP's per-field flags mean an unset field is absent from the packet
+/// rather than zero. `set_dir` writes `S_IFDIR` into the mode, which is what
+/// makes a client's `stat("/")` report a directory.
+///
+/// (Before russh-sftp 2.2, `FileAttributes::default()` supplied dummy zeros
+/// rather than absent fields, so root used to advertise size 0, uid/gid 0 and
+/// epoch timestamps. `FileAttributes::dummy()` is the name for that now, and
+/// this is deliberately not it.)
 fn root_attrs() -> FileAttributes {
     let mut attrs = FileAttributes {
         permissions: Some(0o555),
@@ -840,6 +862,29 @@ mod tests {
         // The root is synthetic, but it has to look like a directory or
         // clients refuse to descend into it.
         assert!(sftp.metadata("/").await.unwrap().is_dir());
+    }
+
+    #[tokio::test]
+    async fn sftp_root_states_only_its_mode() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let sftp = client.open_sftp(session_id).await;
+        let attrs = sftp.metadata("/").await.unwrap();
+
+        // The root has no inode, so mode is the only field it can honestly
+        // state. The rest stay absent rather than being reported as zero —
+        // `FileAttributes::default()` supplied dummy zeros before
+        // russh-sftp 2.2, and a silent return to that would have root
+        // claiming uid 0, size 0 and an epoch mtime.
+        assert!(attrs.is_dir());
+        assert_eq!(attrs.permissions.unwrap() & 0o7777, 0o555);
+        assert_eq!(attrs.size, None);
+        assert_eq!(attrs.uid, None);
+        assert_eq!(attrs.gid, None);
+        assert_eq!(attrs.atime, None);
+        assert_eq!(attrs.mtime, None);
     }
 
     #[tokio::test]
