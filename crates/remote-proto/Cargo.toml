@@ -17,6 +17,16 @@ prost-build.workspace = true
 tonic-prost-build.workspace = true
 
 [package.metadata.cargo-machete]
-# These are consumed by the tonic/prost code generated into OUT_DIR and pulled
-# in via `include!` in src/lib.rs, which cargo-machete's source scan cannot see.
-ignored = ["prost", "prost-types", "tonic", "tonic-prost"]
+# The runtime deps are consumed by the tonic/prost code generated into OUT_DIR
+# and pulled in via `include!` in src/lib.rs, which cargo-machete's source scan
+# cannot see. prost-build and tonic-prost-build are build-time codegen deps
+# invoked from build.rs to compile the .proto files; cargo-machete's scan does
+# not trace them either, so they are false positives too.
+ignored = [
+    "prost",
+    "prost-types",
+    "tonic",
+    "tonic-prost",
+    "prost-build",
+    "tonic-prost-build",
+]
