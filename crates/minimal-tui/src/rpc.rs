@@ -267,8 +267,18 @@ pub async fn activate(
     };
 
     let flow = async {
-        let upload_root = resolve_upload_root(project_path.as_utf8_path())?;
-        if !minimal_client::file_upload::is_vcs_root(upload_root.as_std_path()) {
+        // The upload-root walk and VCS-root stat are blocking filesystem
+        // traversals; run them off the async worker so a stalled mount
+        // can't stall the runtime.
+        let dir = project_path.as_utf8_path().to_path_buf();
+        let (upload_root, is_repo) = tokio::task::spawn_blocking(move || {
+            let root = resolve_upload_root(&dir)?;
+            let repo = minimal_client::file_upload::is_vcs_root(root.as_std_path());
+            Ok::<_, anyhow::Error>((root, repo))
+        })
+        .await
+        .context("resolving the upload root")??;
+        if !is_repo {
             anyhow::bail!(
                 "refusing to upload '{upload_root}': not a repository root (no .git, .hg, or .jj). \
                  Run `min session activate` to upload a non-repo directory with confirmation"

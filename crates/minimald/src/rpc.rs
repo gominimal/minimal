@@ -577,7 +577,7 @@ async fn serve_session_delta(
         .await
 }
 
-/// `GetSessionScreen` (`min dash` Preview tab): a read-only snapshot of the
+/// `GetSessionScreen` (`min dash` Preview section): a read-only snapshot of the
 /// session's terminal screen. Unlike attach, this mints nothing and resizes
 /// nothing — a session with no live host answers with an error the TUI
 /// renders as "session not active".

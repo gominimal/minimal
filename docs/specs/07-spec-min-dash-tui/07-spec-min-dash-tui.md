@@ -38,8 +38,8 @@ read-only snapshot of the session's live terminal output via a new
 `GetSessionScreen` RPC.
 
 The TUI follows an Elm-style architecture (model/update/view) with a tokio
-event loop driving crossterm input and a periodic refresh tick. It reuses the
-existing `minimal` SSH client transport (`client.rs`) for all RPCs.
+event loop driving crossterm input and a periodic refresh tick. It uses the
+shared `minimal-client` SSH transport (extracted from `minimal`) for all RPCs.
 
 ### Layout
 
@@ -78,10 +78,10 @@ on detach.)
 
 ## Non-Goals
 
-- N1: Attaching to a session from within the TUI. The current `cmd_attach`
-  path shells out to `ssh` via `CommandExt::exec()`, which replaces the
-  process. A future "suspend TUI → spawn ssh → resume on detach" flow is
-  possible future work (see Possible Future Work).
+- N1: An embedded in-TUI terminal for attach. `enter` attaches in place by
+  suspending the TUI, shelling out to `ssh`, and resuming on detach (see the
+  "Implemented revision" note above). A rendered in-pane terminal emulator —
+  attach living inside the TUI rather than replacing it — is not in scope.
 - N2: Remote `minimald` session management. The `mesh` subcommand
   (`main.rs:101-143`) provides WireGuard networking for inter-PTask traffic,
   not remote session RPC. No remote daemon transport exists yet (see Possible
@@ -531,7 +531,7 @@ snapshot tests (insta). The `GetSessionScreen` integration test in
 `minimald` passes: `cargo test -p minimald -- get_session_screen`.
 
 **Proof artifact 2 (File):**
-`grep -q 'Dash' crates/minimal/src/main.rs` — the subcommand exists.
+`grep -q 'Command::Dash' crates/minimal/src/lib.rs` — the subcommand exists.
 `grep -q 'GetSessionScreen' crates/minimald-rpc/src/lib.rs` — the RPC is
 defined.
 `grep -q 'ratatui' Cargo.toml` — the dependency is pinned.

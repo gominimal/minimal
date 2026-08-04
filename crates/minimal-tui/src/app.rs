@@ -694,7 +694,6 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                     model.action = Some(Action::Create(form));
                 }
                 (KeyCode::Enter, CreateField::Network) => {
-                    model.action = None;
                     // Create on the provider the user is pointing at: the
                     // focused session's provider, or the provider whose
                     // group header the cursor sits on.
@@ -707,6 +706,7 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                     };
                     let Some(provider) = label else {
                         model.status = Some("no provider to create on".to_string());
+                        model.action = Some(Action::Create(form));
                         return Vec::new();
                     };
                     if !model
@@ -715,8 +715,10 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                         .any(|pv| pv.label == provider && pv.reachable)
                     {
                         model.status = Some(format!("error: provider '{provider}' is unreachable"));
+                        model.action = Some(Action::Create(form));
                         return Vec::new();
                     }
+                    model.action = None;
                     return vec![Effect::Create {
                         provider,
                         name: match form.name.trim() {

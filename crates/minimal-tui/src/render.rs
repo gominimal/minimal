@@ -733,8 +733,12 @@ mod tests {
 
     #[test]
     fn shorten_home_only_shortens_at_a_path_boundary() {
-        let home = dirs::home_dir().unwrap();
-        let home = home.to_str().unwrap();
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let Some(home) = home.to_str() else {
+            return;
+        };
         assert_eq!(shorten_home(&format!("{home}/src/api")), "~/src/api");
         assert_eq!(shorten_home(home), "~");
         // A sibling that merely shares the home prefix is not under home.

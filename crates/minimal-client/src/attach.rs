@@ -185,6 +185,16 @@ mod tests {
         );
     }
 
+    /// No recorded host key yet (first boot): the check is waived rather
+    /// than failing the attach, and nothing is written to a real known_hosts.
+    #[test]
+    fn host_key_opts_waive_when_no_known_hosts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let [strict, hosts_file] = host_key_opts(&tmp.path().join(paths::KNOWN_HOSTS_FILE));
+        assert_eq!(strict, "StrictHostKeyChecking=no");
+        assert_eq!(hosts_file, "UserKnownHostsFile=/dev/null");
+    }
+
     /// ssh re-parses the option value as a config line, so the path must survive
     /// its quote and backslash handling intact. These expectations were checked
     /// against OpenSSH's own parser with `ssh -G`.
