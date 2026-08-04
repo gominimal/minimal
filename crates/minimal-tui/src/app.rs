@@ -24,11 +24,17 @@ use crate::state::{self, DashState};
 /// How often the session list refreshes.
 const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Identifies a session in the model: its provider (index into
-/// [`Model::providers`]) plus its daemon-assigned id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// How often the driver attempts to (re)connect missing providers, so a
+/// daemon restarted after startup rejoins the dashboard.
+const REDISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Identifies a session in the model: its provider's label plus its
+/// daemon-assigned id. The label — not a list index — is the identity, so
+/// a provider dropping out of one refresh can't re-index every key onto
+/// the wrong daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionKey {
-    pub provider: usize,
+    pub provider: String,
     pub id: SessionId,
 }
 
@@ -38,6 +44,10 @@ pub struct ProviderView {
     pub label: String,
     pub version: String,
     pub collapsed: bool,
+    /// False when the last refresh couldn't reach the daemon: the group
+    /// stays in the sidebar (with its sessions cleared — stale sessions
+    /// aren't actionable) so it can rejoin when the daemon comes back.
+    pub reachable: bool,
     pub sessions: Vec<minimald_rpc::ListSessionsEntry>,
 }
 
@@ -102,8 +112,12 @@ pub type ScreenFetch = Result<Option<minimald_rpc::ScreenSnapshot>, String>;
 pub enum Msg {
     Key(KeyEvent),
     Tick,
-    /// A full re-list of every provider.
-    Refreshed(Vec<ProviderData>),
+    /// A refresh pass: every reachable provider's data, plus the labels of
+    /// providers whose connection failed mid-run.
+    Refreshed {
+        ok: Vec<ProviderData>,
+        failed: Vec<String>,
+    },
     /// Detail-pane data for a session.
     DetailLoaded(SessionKey, Box<Detail>),
     /// A screen fetch for the Preview section.
@@ -112,7 +126,7 @@ pub enum Msg {
     ActionDone(Result<String, String>),
     /// A create completed; the new session gets focused after the refresh.
     Created {
-        provider: usize,
+        provider: String,
         id: SessionId,
     },
 }
@@ -127,7 +141,7 @@ pub enum Effect {
     Destroy(SessionKey),
     Rename(SessionKey, String),
     Create {
-        provider: usize,
+        provider: String,
         name: Option<String>,
         path: String,
         network: NetworkMode,
@@ -140,7 +154,7 @@ pub enum Effect {
 }
 
 /// One line in the flattened sidebar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
     ProviderHeader(usize),
     Session(SessionKey),
@@ -153,6 +167,9 @@ pub struct Model {
     pub providers: Vec<ProviderView>,
     /// Index into [`Model::visible_rows`].
     pub cursor: usize,
+    /// Sidebar scroll offset (a row index), adjusted at render time to
+    /// keep the cursor inside the viewport.
+    pub scroll: usize,
     pub filter: FilterState,
     pub details: HashMap<SessionKey, Detail>,
     pub screens: HashMap<SessionKey, ScreenFetch>,
@@ -190,6 +207,7 @@ impl Model {
         Self {
             providers: Vec::new(),
             cursor: 0,
+            scroll: 0,
             filter: FilterState::default(),
             details: HashMap::new(),
             screens: HashMap::new(),
@@ -232,18 +250,19 @@ impl Model {
             if !self.filter.input.is_empty() {
                 matched.sort_by_key(|m| std::cmp::Reverse(m.0));
             }
-            rows.extend(
-                matched
-                    .into_iter()
-                    .map(|(_, id)| Row::Session(SessionKey { provider: p, id })),
-            );
+            rows.extend(matched.into_iter().map(|(_, id)| {
+                Row::Session(SessionKey {
+                    provider: provider.label.clone(),
+                    id,
+                })
+            }));
         }
         rows
     }
 
     /// The row under the cursor.
     pub fn cursor_row(&self) -> Option<Row> {
-        self.visible_rows().get(self.cursor).copied()
+        self.visible_rows().get(self.cursor).cloned()
     }
 
     /// The session under the cursor, if the cursor is on a session row.
@@ -255,9 +274,10 @@ impl Model {
     }
 
     /// Look up a session's list entry by key.
-    pub fn entry(&self, key: SessionKey) -> Option<&minimald_rpc::ListSessionsEntry> {
+    pub fn entry(&self, key: &SessionKey) -> Option<&minimald_rpc::ListSessionsEntry> {
         self.providers
-            .get(key.provider)?
+            .iter()
+            .find(|p| p.label == key.provider)?
             .sessions
             .iter()
             .find(|e| e.id == key.id)
@@ -265,7 +285,7 @@ impl Model {
 
     /// A session's display name: its assigned name, or the generated short
     /// form `<project>-<id-suffix>` for anonymous sessions.
-    pub fn display_name(&self, key: SessionKey) -> String {
+    pub fn display_name(&self, key: &SessionKey) -> String {
         match self.entry(key) {
             Some(entry) => display_name_of(entry),
             None => key.id.to_string(),
@@ -286,7 +306,7 @@ impl Model {
     }
 
     /// The latest bell timestamp in a session's live attrs.
-    fn latest_bell(&self, key: SessionKey) -> Option<DateTime<Utc>> {
+    fn latest_bell(&self, key: &SessionKey) -> Option<DateTime<Utc>> {
         let attrs = &self.entry(key)?.attrs;
         [
             attrs.as_ref()?.audible_bell.as_ref().map(|b| b.last),
@@ -298,9 +318,9 @@ impl Model {
     }
 
     /// Whether an unacknowledged bell lights the session's `●` indicator.
-    pub fn has_unseen_bell(&self, key: SessionKey) -> bool {
+    pub fn has_unseen_bell(&self, key: &SessionKey) -> bool {
         match self.latest_bell(key) {
-            Some(latest) => self.bells_seen.get(&key).is_none_or(|seen| latest > *seen),
+            Some(latest) => self.bells_seen.get(key).is_none_or(|seen| latest > *seen),
             None => false,
         }
     }
@@ -311,7 +331,7 @@ impl Model {
     /// spinner when stdout flowed in the last 5s, `○` when the user typed
     /// recently but nothing came back, `●` for an unacknowledged bell,
     /// blank when idle.
-    pub fn indicator(&self, key: SessionKey) -> String {
+    pub fn indicator(&self, key: &SessionKey) -> String {
         const SPINNER: &[&str] = &["◐", "◓", "◑", "◒"];
         const RECENT: chrono::Duration = chrono::Duration::seconds(5);
         if let Some(entry) = self.entry(key)
@@ -341,8 +361,7 @@ impl Model {
     /// file.
     fn focus_for_state(&self) -> Option<(String, SessionId)> {
         let key = self.focused()?;
-        let label = self.providers.get(key.provider)?.label.clone();
-        Some((label, key.id))
+        Some((key.provider, key.id))
     }
 }
 
@@ -366,6 +385,16 @@ pub fn network_mode_label(mode: NetworkMode) -> &'static str {
     }
 }
 
+/// The canonical sidebar order for provider groups; unknown labels sort
+/// last, alphabetically.
+fn provider_rank(label: &str) -> u8 {
+    match label {
+        "host" => 0,
+        "vm" => 1,
+        _ => 2,
+    }
+}
+
 /// The pure state transition. Returns the effects the driver should run.
 pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
     match msg {
@@ -380,51 +409,76 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             }
             effects
         }
-        Msg::Refreshed(data) => {
+        Msg::Refreshed { ok, failed } => {
             model.now = Utc::now();
+            // Upsert providers by label: one whose refresh failed keeps its
+            // slot (marked unreachable, sessions cleared) instead of
+            // dropping out and re-indexing every session key onto the wrong
+            // daemon.
+            let focused_before = model.focused().map(|key| (key.provider.clone(), key.id));
+            let mut views: HashMap<String, ProviderView> = model
+                .providers
+                .drain(..)
+                .map(|v| (v.label.clone(), v))
+                .collect();
+            for data in ok {
+                let view = views
+                    .entry(data.label.clone())
+                    .or_insert_with(|| ProviderView {
+                        label: data.label.clone(),
+                        version: String::new(),
+                        collapsed: false,
+                        reachable: true,
+                        sessions: Vec::new(),
+                    });
+                view.version = data.version;
+                view.sessions = data.sessions;
+                view.reachable = true;
+            }
+            for label in &failed {
+                if let Some(view) = views.get_mut(label) {
+                    view.reachable = false;
+                    view.sessions.clear();
+                }
+            }
+            model.providers = views.into_values().collect();
+            model.providers.sort_by(|a, b| {
+                provider_rank(&a.label)
+                    .cmp(&provider_rank(&b.label))
+                    .then_with(|| a.label.cmp(&b.label))
+            });
+
             // The cursor tracks the focused session's identity across
             // refreshes, not its row index — a session appearing or
             // disappearing above the cursor must not silently move focus.
-            let focused_before = model
-                .focused()
-                .map(|key| (model.providers[key.provider].label.clone(), key.id));
-            let collapsed: HashMap<String, bool> = model
-                .providers
-                .iter()
-                .map(|p| (p.label.clone(), p.collapsed))
-                .collect();
-            model.providers = data
-                .into_iter()
-                .map(|d| ProviderView {
-                    collapsed: collapsed.get(&d.label).copied().unwrap_or(false),
-                    label: d.label,
-                    version: d.version,
-                    sessions: d.sessions,
-                })
-                .collect();
-
             // Restore the pending focus (startup's last-session memory, or a
             // freshly created session) if it still exists; otherwise keep
             // the previously focused session when it survives the refresh,
-            // else fall back to the first row.
+            // else fall back to the first session row — row 0 is a provider
+            // header, where d/r are dead keys.
             let focus_target = model.pending_focus.take().or(focused_before);
             if let Some((label, id)) = focus_target {
                 let target = model.visible_rows().iter().position(|row| {
                     matches!(row, Row::Session(key)
                             if key.id == id
-                                && model.providers[key.provider].label == label)
+                                && key.provider == label)
                 });
-                model.cursor = target.unwrap_or(0);
+                model.cursor = target.unwrap_or_else(|| {
+                    model
+                        .visible_rows()
+                        .iter()
+                        .position(|r| matches!(r, Row::Session(_)))
+                        .unwrap_or(0)
+                });
             }
             model.clamp_cursor();
             // Keep detail/screen caches only for sessions that still exist.
             let live: std::collections::HashSet<SessionKey> = model
                 .providers
                 .iter()
-                .enumerate()
-                .flat_map(|(p, pv)| {
-                    pv.sessions.iter().map(move |e| SessionKey {
-                        provider: p,
+                .flat_map(|pv| {
+                    pv.sessions.iter().map(|e| SessionKey {
+                        provider: pv.label.clone(),
                         id: e.id,
                     })
                 })
@@ -455,13 +509,8 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             vec![Effect::Refresh]
         }
         Msg::Created { provider, id } => {
-            let label = model
-                .providers
-                .get(provider)
-                .map(|p| p.label.clone())
-                .unwrap_or_default();
             model.status = Some("session created".to_string());
-            model.pending_focus = Some((label, id));
+            model.pending_focus = Some((provider, id));
             vec![Effect::Refresh]
         }
         Msg::Key(key) => update_key(model, key),
@@ -478,20 +527,22 @@ fn update_key(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
     }
 
     let rows = model.visible_rows();
+    // Char bindings require no modifiers: a wildcard modifier match would
+    // reroute chords like Ctrl-D into the destroy prompt.
     match (key.code, key.modifiers) {
-        (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+        (KeyCode::Char('q'), KeyModifiers::NONE) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             model.quit = true;
             vec![Effect::SaveState]
         }
-        (KeyCode::Char('/'), _) => {
+        (KeyCode::Char('/'), KeyModifiers::NONE) => {
             model.filter.editing = true;
             Vec::new()
         }
-        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+        (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
             model.cursor = model.cursor.saturating_sub(1);
             on_focus_change(model)
         }
-        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+        (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
             if model.cursor + 1 < rows.len() {
                 model.cursor += 1;
             }
@@ -508,23 +559,23 @@ fn update_key(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
             // Enter on a session attaches to it (suspend TUI → ssh →
             // resume on detach); its bells count as seen either way.
             Some(Row::Session(key)) => {
-                acknowledge_bells(model, key);
+                acknowledge_bells(model, &key);
                 vec![Effect::Attach(key), Effect::SaveState]
             }
             None => Vec::new(),
         },
-        (KeyCode::Char('d'), _) => match model.focused() {
+        (KeyCode::Char('d'), KeyModifiers::NONE) => match model.focused() {
             Some(key) => {
-                let name = model.display_name(key);
+                let name = model.display_name(&key);
                 model.action = Some(Action::ConfirmDestroy(key, name));
                 Vec::new()
             }
             None => Vec::new(),
         },
-        (KeyCode::Char('r'), _) => match model.focused() {
+        (KeyCode::Char('r'), KeyModifiers::NONE) => match model.focused() {
             Some(key) => {
                 let input = model
-                    .entry(key)
+                    .entry(&key)
                     .and_then(|e| e.name.clone())
                     .unwrap_or_default();
                 model.action = Some(Action::Rename { key, input });
@@ -532,7 +583,7 @@ fn update_key(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
             }
             None => Vec::new(),
         },
-        (KeyCode::Char('n'), _) => {
+        (KeyCode::Char('n'), KeyModifiers::NONE) => {
             let path = std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
@@ -562,7 +613,7 @@ fn update_filter(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
             model.filter.input.pop();
             model.clamp_cursor();
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) => {
             model.filter.input.push(c);
             model.clamp_cursor();
         }
@@ -577,12 +628,12 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
         return Vec::new();
     };
     match action {
-        Action::ConfirmDestroy(target, _) => match key.code {
-            KeyCode::Char('y') => {
+        Action::ConfirmDestroy(target, _) => match (key.code, key.modifiers) {
+            (KeyCode::Char('y'), KeyModifiers::NONE) => {
                 model.action = None;
                 vec![Effect::Destroy(target)]
             }
-            KeyCode::Char('n') | KeyCode::Esc => {
+            (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, _) => {
                 model.action = None;
                 Vec::new()
             }
@@ -644,13 +695,26 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                 }
                 (KeyCode::Enter, CreateField::Network) => {
                     model.action = None;
-                    let provider = model
-                        .focused()
-                        .map(|k| k.provider)
-                        .filter(|p| *p < model.providers.len())
-                        .unwrap_or(0);
-                    if model.providers.is_empty() {
+                    // Create on the provider the user is pointing at: the
+                    // focused session's provider, or the provider whose
+                    // group header the cursor sits on.
+                    let label = match model.cursor_row() {
+                        Some(Row::Session(key)) => Some(key.provider),
+                        Some(Row::ProviderHeader(p)) => {
+                            model.providers.get(p).map(|pv| pv.label.clone())
+                        }
+                        None => None,
+                    };
+                    let Some(provider) = label else {
                         model.status = Some("no provider to create on".to_string());
+                        return Vec::new();
+                    };
+                    if !model
+                        .providers
+                        .iter()
+                        .any(|pv| pv.label == provider && pv.reachable)
+                    {
+                        model.status = Some(format!("error: provider '{provider}' is unreachable"));
                         return Vec::new();
                     }
                     return vec![Effect::Create {
@@ -683,7 +747,11 @@ fn line_edit(input: &mut String, key: &KeyEvent) {
             input.pop();
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => input.clear(),
-        KeyCode::Char(c) => input.push(c),
+        // Only plain (or shifted) chars are text: a Ctrl chord is a command,
+        // not input.
+        KeyCode::Char(c) if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            input.push(c);
+        }
         _ => {}
     }
 }
@@ -705,16 +773,16 @@ fn prev_field(field: CreateField) -> CreateField {
 }
 
 /// Mark the focused session's bells as seen up to now.
-fn acknowledge_bells(model: &mut Model, key: SessionKey) {
+fn acknowledge_bells(model: &mut Model, key: &SessionKey) {
     let seen = model.latest_bell(key).unwrap_or_else(Utc::now);
-    model.bells_seen.insert(key, seen);
+    model.bells_seen.insert(key.clone(), seen);
 }
 
 /// Effects triggered by the cursor landing on a (possibly different)
 /// session: acknowledge its bells and fetch detail data not yet cached.
 fn on_focus_change(model: &mut Model) -> Vec<Effect> {
     if let Some(key) = model.focused() {
-        acknowledge_bells(model, key);
+        acknowledge_bells(model, &key);
     }
     fetch_focused(model)
 }
@@ -736,16 +804,28 @@ fn fetch_focused(model: &Model) -> Vec<Effect> {
 pub struct DashOptions {
     /// `--minimal-dir` override; `None` uses the platform default state dir.
     pub minimal_dir: Option<PathBuf>,
+    /// The loadout contribution the CLI composed at startup (default
+    /// loadouts + user policy), re-sent with every create so `n` in dash
+    /// matches `min session activate`. Composition needs the CLI crate's
+    /// config plumbing, which lives above this crate.
+    pub contribution: sessions::wire::request::WireContribution,
 }
 
 /// Entry point for `min dash`: discover providers, then drive the
 /// Elm loop until the user quits.
 pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
-    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-        anyhow::bail!("min dash requires a terminal");
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout())
+        || !std::io::IsTerminal::is_terminal(&std::io::stdin())
+    {
+        // stdin too: crossterm falls back to /dev/tty for input, so a
+        // redirected stdin would still yield a working TUI — whose attach
+        // then spawns `ssh -tt` reading /dev/null, the #953 hang.
+        anyhow::bail!("min dash requires an interactive terminal on stdin and stdout");
     }
 
     let mut providers = rpc::discover(opts.minimal_dir.as_deref()).await;
+    let contribution = opts.contribution.clone();
+    let mut last_rediscovery = std::time::Instant::now();
     let saved = state::load(opts.minimal_dir.as_deref());
     let mut model = Model::new(Utc::now());
     model.pending_focus = saved
@@ -769,7 +849,7 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
     let mut inbox: VecDeque<Msg> = VecDeque::from([Msg::Tick]);
     loop {
         terminal
-            .draw(|frame| crate::render::view(&model, frame))
+            .draw(|frame| crate::render::view(&mut model, frame))
             .context("draw frame")?;
 
         let msg = match inbox.pop_front() {
@@ -799,12 +879,17 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                 Effect::SaveState => save_state(&model, opts.minimal_dir.as_deref()),
                 // Attach suspends the TUI around a blocking ssh child; it
                 // needs the terminal guard, so it can't live in exec_effect.
-                Effect::Attach(key) => {
-                    if let Some(p) = providers.get(key.provider) {
-                        attach_and_resume(&mut terminal, &p.sock, key, &mut model);
+                Effect::Attach(key) => match providers.iter().find(|p| p.label == key.provider) {
+                    Some(p) => {
+                        let sock = p.sock.clone();
+                        attach_and_resume(&mut terminal, &sock, key.id, &mut model);
                         inbox.push_back(Msg::Tick);
                     }
-                }
+                    None => {
+                        model.status =
+                            Some(format!("error: provider '{}' is unreachable", key.provider));
+                    }
+                },
                 // Create runs the upload+compose flow on a background task
                 // with its own connection, so the UI keeps redrawing (the
                 // status line shows progress).
@@ -813,10 +898,11 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                     name,
                     path,
                     network,
-                } => {
-                    if let Some(p) = providers.get(provider) {
+                } => match providers.iter().find(|p| p.label == provider) {
+                    Some(p) => {
                         let sock = p.sock.clone();
                         let tx = bg_tx.clone();
+                        let contribution = contribution.clone();
                         model.status = Some(format!(
                             "creating {}…",
                             name.as_deref().unwrap_or("session")
@@ -832,7 +918,7 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                 )?;
                                 let abs = paths::HostAbsPath::try_new(utf8)
                                     .context("invalid project path")?;
-                                rpc::activate(&sock, name, abs, network).await
+                                rpc::activate(&sock, name, abs, network, contribution).await
                             }
                             .await;
                             let msg = match result {
@@ -842,9 +928,19 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                             let _ = tx.send(msg).await;
                         });
                     }
-                }
+                    None => {
+                        model.status = Some(format!("error: provider '{provider}' is unreachable"));
+                    }
+                },
                 other => {
-                    if let Some(follow_up) = exec_effect(&mut providers, other).await {
+                    if let Some(follow_up) = exec_effect(
+                        &mut providers,
+                        other,
+                        opts.minimal_dir.as_deref(),
+                        &mut last_rediscovery,
+                    )
+                    .await
+                    {
                         inbox.push_back(follow_up);
                     }
                 }
@@ -878,22 +974,44 @@ fn save_state(model: &Model, minimal_dir: Option<&std::path::Path>) {
 
 /// Execute one effect against the daemon connections, producing the
 /// follow-up message for [`update`].
-async fn exec_effect(providers: &mut [rpc::Provider], effect: Effect) -> Option<Msg> {
+async fn exec_effect(
+    providers: &mut Vec<rpc::Provider>,
+    effect: Effect,
+    minimal_dir: Option<&std::path::Path>,
+    last_rediscovery: &mut std::time::Instant,
+) -> Option<Msg> {
     match effect {
         Effect::Refresh => {
-            let mut data = Vec::with_capacity(providers.len());
-            for provider in providers.iter_mut() {
-                match rpc::refresh(provider).await {
-                    Ok(d) => data.push(d),
+            // Give a daemon that (re)appeared since startup a chance to
+            // join, throttled so a wedged acceptor can't stall the loop.
+            if last_rediscovery.elapsed() >= REDISCOVERY_INTERVAL {
+                *last_rediscovery = std::time::Instant::now();
+                rpc::connect_missing(providers, minimal_dir).await;
+            }
+            let mut ok = Vec::with_capacity(providers.len());
+            let mut failed = Vec::new();
+            let mut i = 0;
+            while i < providers.len() {
+                match rpc::refresh(&mut providers[i]).await {
+                    Ok(d) => {
+                        ok.push(d);
+                        i += 1;
+                    }
                     Err(e) => {
-                        tracing::warn!(provider = provider.label, error = %e, "refresh failed");
+                        // A failed refresh means a dead connection: drop it
+                        // so the rediscovery pass can rebuild it, and mark
+                        // the provider unreachable in the model rather than
+                        // re-indexing its sessions onto another daemon.
+                        let gone = providers.remove(i);
+                        tracing::warn!(provider = gone.label, error = %e, "refresh failed; dropping the connection");
+                        failed.push(gone.label.to_string());
                     }
                 }
             }
-            Some(Msg::Refreshed(data))
+            Some(Msg::Refreshed { ok, failed })
         }
         Effect::FetchDetail(key) => {
-            let provider = providers.get_mut(key.provider)?;
+            let provider = providers.iter_mut().find(|p| p.label == key.provider)?;
             match rpc::fetch_detail(provider, key.id).await {
                 Ok((record, policy)) => {
                     Some(Msg::DetailLoaded(key, Box::new(Detail { record, policy })))
@@ -905,26 +1023,30 @@ async fn exec_effect(providers: &mut [rpc::Provider], effect: Effect) -> Option<
             }
         }
         Effect::FetchScreen(key) => {
-            let provider = providers.get_mut(key.provider)?;
+            let provider = providers.iter_mut().find(|p| p.label == key.provider)?;
             let fetch = rpc::fetch_screen(provider, key.id)
                 .await
                 .map_err(|e| format!("{e:#}"));
             Some(Msg::ScreenLoaded(key, fetch))
         }
         Effect::Destroy(key) => {
-            let provider = providers.get_mut(key.provider)?;
-            let result = rpc::destroy(provider, key.id)
-                .await
-                .map(|()| "session destroyed".to_string())
-                .map_err(|e| format!("{e:#}"));
+            let result = match providers.iter_mut().find(|p| p.label == key.provider) {
+                Some(provider) => rpc::destroy(provider, key.id)
+                    .await
+                    .map(|()| "session destroyed".to_string())
+                    .map_err(|e| format!("{e:#}")),
+                None => Err(format!("provider '{}' is unreachable", key.provider)),
+            };
             Some(Msg::ActionDone(result))
         }
         Effect::Rename(key, new_name) => {
-            let provider = providers.get_mut(key.provider)?;
-            let result = rpc::rename(provider, key.id, &new_name)
-                .await
-                .map(|()| format!("renamed to {new_name}"))
-                .map_err(|e| format!("{e:#}"));
+            let result = match providers.iter_mut().find(|p| p.label == key.provider) {
+                Some(provider) => rpc::rename(provider, key.id, &new_name)
+                    .await
+                    .map(|()| format!("renamed to {new_name}"))
+                    .map_err(|e| format!("{e:#}")),
+                None => Err(format!("provider '{}' is unreachable", key.provider)),
+            };
             Some(Msg::ActionDone(result))
         }
         // Handled inline by the run loop: SaveState is local disk, Attach
@@ -938,10 +1060,10 @@ async fn exec_effect(providers: &mut [rpc::Provider], effect: Effect) -> Option<
 fn attach_and_resume(
     terminal: &mut TerminalGuard,
     sock: &std::path::Path,
-    key: SessionKey,
+    id: SessionId,
     model: &mut Model,
 ) {
-    let result = minimal_client::attach::attach_command(sock, key.id, None).and_then(|mut cmd| {
+    let result = minimal_client::attach::attach_command(sock, id, None).and_then(|mut cmd| {
         terminal.suspend();
         let status = cmd.status();
         // A failed resume leaves the TUI unusable; report it over the
@@ -1020,6 +1142,13 @@ mod tests {
         SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012x}")).unwrap()
     }
 
+    fn skey(provider: &str, n: u128) -> SessionKey {
+        SessionKey {
+            provider: provider.to_string(),
+            id: id(n),
+        }
+    }
+
     fn entry(n: u128, name: Option<&str>) -> minimald_rpc::ListSessionsEntry {
         entry_at(n, name, "/src/api")
     }
@@ -1047,7 +1176,13 @@ mod tests {
             .unwrap()
             .to_utc();
         let mut model = Model::new(now);
-        update(&mut model, Msg::Refreshed(providers));
+        update(
+            &mut model,
+            Msg::Refreshed {
+                ok: providers,
+                failed: Vec::new(),
+            },
+        );
         model
     }
 
@@ -1077,13 +1212,7 @@ mod tests {
         assert_eq!(model.cursor, 0);
         update(&mut model, key(KeyCode::Down));
         assert_eq!(model.cursor, 1);
-        assert_eq!(
-            model.focused(),
-            Some(SessionKey {
-                provider: 0,
-                id: id(1)
-            })
-        );
+        assert_eq!(model.focused(), Some(skey("host", 1)));
         update(&mut model, key(KeyCode::Up));
         assert_eq!(model.cursor, 0);
         // Can't move above the first row.
@@ -1121,13 +1250,7 @@ mod tests {
             .iter()
             .filter(|r| matches!(r, Row::Session(_)))
             .collect();
-        assert_eq!(
-            sessions,
-            [&Row::Session(SessionKey {
-                provider: 1,
-                id: id(3)
-            })]
-        );
+        assert_eq!(sessions, [&Row::Session(skey("vm", 3))]);
         update(&mut model, key(KeyCode::Esc));
         assert!(!model.filter.editing);
         assert!(model.filter.input.is_empty());
@@ -1148,13 +1271,7 @@ mod tests {
         for c in "api".chars() {
             update(&mut model, key(KeyCode::Char(c)));
         }
-        assert_eq!(
-            model.focused(),
-            Some(SessionKey {
-                provider: 0,
-                id: id(1)
-            })
-        );
+        assert_eq!(model.focused(), Some(skey("host", 1)));
     }
 
     #[test]
@@ -1166,17 +1283,20 @@ mod tests {
         // not move focus.
         update(
             &mut model,
-            Msg::Refreshed(vec![
-                provider(
-                    "host",
-                    vec![
-                        entry(9, Some("new")),
-                        entry(1, Some("api-staging")),
-                        entry(2, None),
-                    ],
-                ),
-                provider("vm", vec![entry(3, Some("bench"))]),
-            ]),
+            Msg::Refreshed {
+                ok: vec![
+                    provider(
+                        "host",
+                        vec![
+                            entry(9, Some("new")),
+                            entry(1, Some("api-staging")),
+                            entry(2, None),
+                        ],
+                    ),
+                    provider("vm", vec![entry(3, Some("bench"))]),
+                ],
+                failed: Vec::new(),
+            },
         );
         assert_eq!(model.focused().map(|k| k.id), Some(id(1)));
     }
@@ -1190,18 +1310,15 @@ mod tests {
         model.pending_focus = Some(("vm".to_string(), id(3)));
         update(
             &mut model,
-            Msg::Refreshed(vec![
-                provider("host", vec![entry(1, Some("api-staging"))]),
-                provider("vm", vec![entry(3, Some("bench"))]),
-            ]),
+            Msg::Refreshed {
+                ok: vec![
+                    provider("host", vec![entry(1, Some("api-staging"))]),
+                    provider("vm", vec![entry(3, Some("bench"))]),
+                ],
+                failed: Vec::new(),
+            },
         );
-        assert_eq!(
-            model.focused(),
-            Some(SessionKey {
-                provider: 1,
-                id: id(3)
-            })
-        );
+        assert_eq!(model.focused(), Some(skey("vm", 3)));
     }
 
     #[test]
@@ -1213,9 +1330,14 @@ mod tests {
         model.pending_focus = Some(("vm".to_string(), id(99)));
         update(
             &mut model,
-            Msg::Refreshed(vec![provider("host", vec![entry(1, Some("api"))])]),
+            Msg::Refreshed {
+                ok: vec![provider("host", vec![entry(1, Some("api"))])],
+                failed: Vec::new(),
+            },
         );
-        assert_eq!(model.cursor, 0);
+        // The fallback is the first session row, not row 0 (a provider
+        // header, where d/r are dead keys).
+        assert_eq!(model.focused(), Some(skey("host", 1)));
     }
 
     #[test]
@@ -1297,11 +1419,7 @@ mod tests {
         // Focus the session (row 1) — the bell was already in the attrs at
         // focus time, so it's acknowledged and doesn't light the indicator.
         update(&mut model, key(KeyCode::Down));
-        let k = SessionKey {
-            provider: 0,
-            id: id(1),
-        };
-        assert!(!model.has_unseen_bell(k));
+        assert!(!model.has_unseen_bell(&skey("host", 1)));
     }
 
     #[test]
@@ -1316,13 +1434,7 @@ mod tests {
         // A second focus of the same session is served from the cache.
         update(
             &mut model,
-            Msg::DetailLoaded(
-                SessionKey {
-                    provider: 0,
-                    id: id(1),
-                },
-                Box::default(),
-            ),
+            Msg::DetailLoaded(skey("host", 1), Box::default()),
         );
         update(&mut model, key(KeyCode::Down));
         let effects = update(&mut model, key(KeyCode::Up));
@@ -1345,11 +1457,7 @@ mod tests {
         // Refreshed overwrites `now` with the wall clock; pin it back.
         let mut model = model_with(vec![provider("host", vec![hot])]);
         model.now = now;
-        let key = SessionKey {
-            provider: 0,
-            id: id(1),
-        };
-        assert_eq!(model.indicator(key), "◐");
+        assert_eq!(model.indicator(&skey("host", 1)), "◐");
     }
 
     #[test]
@@ -1367,21 +1475,13 @@ mod tests {
         });
         let mut model = model_with(vec![provider("host", vec![waiting])]);
         model.now = now;
-        let key = SessionKey {
-            provider: 0,
-            id: id(1),
-        };
-        assert_eq!(model.indicator(key), "○");
+        assert_eq!(model.indicator(&skey("host", 1)), "○");
     }
 
     #[test]
     fn indicator_blank_when_idle() {
         let model = two_providers();
-        let key = SessionKey {
-            provider: 0,
-            id: id(1),
-        };
-        assert_eq!(model.indicator(key), "");
+        assert_eq!(model.indicator(&skey("host", 1)), "");
     }
     #[test]
     fn tick_fetches_the_focused_sessions_screen() {
@@ -1393,6 +1493,132 @@ mod tests {
             effects
                 .iter()
                 .any(|e| matches!(e, Effect::FetchScreen(k) if k.id == id(1)))
+        );
+    }
+
+    /// Ctrl-D is a shell reflex, not "destroy": modified chords must not
+    /// reach the bare-key bindings.
+    #[test]
+    fn ctrl_chords_do_not_reach_the_bare_key_bindings() {
+        let mut model = two_providers();
+        update(&mut model, key(KeyCode::Down));
+        for code in [KeyCode::Char('d'), KeyCode::Char('r'), KeyCode::Char('n')] {
+            let effects = update(
+                &mut model,
+                Msg::Key(KeyEvent::new(code, KeyModifiers::CONTROL)),
+            );
+            assert!(model.action.is_none(), "{code:?} opened a modal");
+            assert!(effects.is_empty(), "{code:?} produced effects");
+        }
+        // Ctrl-C still quits (it is an explicit binding).
+        update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        );
+        assert!(model.quit);
+    }
+
+    /// A failed refresh keeps the provider's slot (marked unreachable)
+    /// instead of dropping it and re-indexing every session key onto the
+    /// surviving daemon.
+    #[test]
+    fn a_failed_refresh_marks_the_provider_unreachable() {
+        let mut model = two_providers();
+        update(
+            &mut model,
+            Msg::Refreshed {
+                ok: vec![provider("host", vec![entry(1, Some("api-staging"))])],
+                failed: vec!["vm".to_string()],
+            },
+        );
+        let vm = model
+            .providers
+            .iter()
+            .find(|p| p.label == "vm")
+            .expect("the vm slot must survive its failed refresh");
+        assert!(!vm.reachable);
+        assert!(vm.sessions.is_empty());
+        // The host's sessions still resolve to the host provider by label.
+        assert_eq!(model.entry(&skey("host", 1)).map(|e| e.id), Some(id(1)));
+    }
+
+    /// A provider that comes back rejoins with its sessions and is marked
+    /// reachable again.
+    #[test]
+    fn a_reconnected_provider_rejoins() {
+        let mut model = two_providers();
+        update(
+            &mut model,
+            Msg::Refreshed {
+                ok: vec![provider("host", vec![entry(1, Some("api-staging"))])],
+                failed: vec!["vm".to_string()],
+            },
+        );
+        update(
+            &mut model,
+            Msg::Refreshed {
+                ok: vec![
+                    provider("host", vec![entry(1, Some("api-staging"))]),
+                    provider("vm", vec![entry(3, Some("bench"))]),
+                ],
+                failed: Vec::new(),
+            },
+        );
+        let vm = model.providers.iter().find(|p| p.label == "vm").unwrap();
+        assert!(vm.reachable);
+        assert_eq!(model.entry(&skey("vm", 3)).map(|e| e.id), Some(id(3)));
+        // Canonical group order is preserved after the rejoin.
+        let labels: Vec<&str> = model.providers.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, ["host", "vm"]);
+    }
+
+    /// Opening the create form from a provider's group header targets THAT
+    /// provider, not the first one in the list.
+    #[test]
+    fn create_from_a_provider_header_targets_that_provider() {
+        let mut model = two_providers();
+        // Rows: host header, api-staging, (unnamed), vm header, bench.
+        for _ in 0..3 {
+            update(&mut model, key(KeyCode::Down));
+        }
+        assert!(matches!(model.cursor_row(), Some(Row::ProviderHeader(1))));
+        update(&mut model, key(KeyCode::Char('n')));
+        update(&mut model, key(KeyCode::Enter)); // name -> path
+        update(&mut model, key(KeyCode::Enter)); // path -> network
+        let effects = update(&mut model, key(KeyCode::Enter)); // submit
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Create { provider, .. } if provider == "vm")),
+            "expected a create targeted at vm, got {effects:?}"
+        );
+    }
+
+    /// Creating on a provider marked unreachable fails loudly instead of
+    /// silently targeting another daemon.
+    #[test]
+    fn create_on_an_unreachable_provider_errors() {
+        let mut model = two_providers();
+        update(
+            &mut model,
+            Msg::Refreshed {
+                ok: vec![provider("host", vec![entry(1, Some("api-staging"))])],
+                failed: vec!["vm".to_string()],
+            },
+        );
+        // Rows: host header, api-staging, vm header (sessions cleared).
+        for _ in 0..2 {
+            update(&mut model, key(KeyCode::Down));
+        }
+        assert!(matches!(model.cursor_row(), Some(Row::ProviderHeader(_))));
+        update(&mut model, key(KeyCode::Char('n')));
+        update(&mut model, key(KeyCode::Enter));
+        update(&mut model, key(KeyCode::Enter));
+        let effects = update(&mut model, key(KeyCode::Enter));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Create { .. })));
+        assert_eq!(
+            model.status.as_deref(),
+            Some("error: provider 'vm' is unreachable")
         );
     }
 }

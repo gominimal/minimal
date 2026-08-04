@@ -56,7 +56,7 @@ All three spellings take the same flags and produce identical output.
 
 ### `dash`
 
-```
+```text
 min dash
 ```
 

@@ -1179,8 +1179,21 @@ pub async fn cmd_dash(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     if !host_up && !vm_up {
         ensure_daemon(global)?;
     }
+    // Compose the default loadout contribution up front, mirroring
+    // cmd_activate: the TUI can't reach this crate's config/loadout
+    // plumbing (it sits below), and an empty contribution would silently
+    // skip `default_loadouts` and the user policy for sessions created
+    // from the dashboard.
+    let cfg = config::read_client_config(global)?;
+    let user_policy = config::read_user_policy(global)?;
+    let compose_options = loadouts::compose_options_from_config(&cfg);
+    let active =
+        loadouts::resolve_active_loadouts(loadouts::LoadoutSelection::Defaults, &cfg, global)?;
+    let (contribution, _user_policy) =
+        loadouts::compose_user_contribution(active, user_policy, compose_options)?;
     minimal_tui::run(minimal_tui::DashOptions {
         minimal_dir: global.minimal_dir.clone(),
+        contribution,
     })
     .await
 }

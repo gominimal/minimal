@@ -848,6 +848,59 @@ fn wire_color(color: vt100_ctt::Color) -> Option<String> {
     }
 }
 
+/// Convert a vt100 screen into the [`minimald_rpc::ScreenSnapshot`] wire
+/// type. Wide-glyph continuation cells are dropped rather than emitted as
+/// spaces: consumers flatten cells into width-aware text, so a placeholder
+/// cell would add a phantom column per wide glyph and skew the row.
+fn screen_to_snapshot(screen: &vt100_ctt::Screen) -> minimald_rpc::ScreenSnapshot {
+    use minimald_rpc::{ScreenCell, ScreenRow, ScreenSnapshot};
+    let (rows, cols) = screen.size();
+    let lines = (0..rows)
+        .map(|row| ScreenRow {
+            cells: (0..cols)
+                .filter_map(|col| match screen.cell(row, col) {
+                    Some(cell) if cell.is_wide_continuation() => None,
+                    Some(cell) => Some(ScreenCell {
+                        // A cell's contents can be wider than one char
+                        // (wide glyphs); the wire type is a single char,
+                        // so keep the first.
+                        ch: cell.contents().chars().next().unwrap_or(' '),
+                        fg: wire_color(cell.fgcolor()),
+                        bg: wire_color(cell.bgcolor()),
+                        bold: cell.bold(),
+                        italic: cell.italic(),
+                        underline: cell.underline(),
+                        reverse: cell.inverse(),
+                    }),
+                    None => Some(ScreenCell {
+                        ch: ' ',
+                        fg: None,
+                        bg: None,
+                        bold: false,
+                        italic: false,
+                        underline: false,
+                        reverse: false,
+                    }),
+                })
+                .collect(),
+        })
+        .collect();
+    let (cursor_row, cursor_col) = match screen.hide_cursor() {
+        true => (None, None),
+        false => {
+            let (row, col) = screen.cursor_position();
+            (Some(row), Some(col))
+        }
+    };
+    ScreenSnapshot {
+        rows,
+        cols,
+        cursor_row,
+        cursor_col,
+        lines,
+    }
+}
+
 /// Handles callback events from the terminal parser, transmitting them to the host.
 struct ParserEventHandler(WeakHostHandle);
 impl vt100_ctt::Callbacks for ParserEventHandler {
@@ -2001,52 +2054,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     /// of the grid. Read-only — no PTY resize and no I/O relay, unlike
     /// `attach`.
     fn screen_snapshot(&self) -> minimald_rpc::ScreenSnapshot {
-        use minimald_rpc::{ScreenCell, ScreenRow, ScreenSnapshot};
-        let screen = self.parser.screen();
-        let (rows, cols) = screen.size();
-        let lines = (0..rows)
-            .map(|row| ScreenRow {
-                cells: (0..cols)
-                    .map(|col| match screen.cell(row, col) {
-                        Some(cell) => ScreenCell {
-                            // A cell's contents can be wider than one char
-                            // (wide glyphs); the wire type is a single char,
-                            // so keep the first.
-                            ch: cell.contents().chars().next().unwrap_or(' '),
-                            fg: wire_color(cell.fgcolor()),
-                            bg: wire_color(cell.bgcolor()),
-                            bold: cell.bold(),
-                            italic: cell.italic(),
-                            underline: cell.underline(),
-                            reverse: cell.inverse(),
-                        },
-                        None => ScreenCell {
-                            ch: ' ',
-                            fg: None,
-                            bg: None,
-                            bold: false,
-                            italic: false,
-                            underline: false,
-                            reverse: false,
-                        },
-                    })
-                    .collect(),
-            })
-            .collect();
-        let (cursor_row, cursor_col) = match screen.hide_cursor() {
-            true => (None, None),
-            false => {
-                let (row, col) = screen.cursor_position();
-                (Some(row), Some(col))
-            }
-        };
-        ScreenSnapshot {
-            rows,
-            cols,
-            cursor_row,
-            cursor_col,
-            lines,
-        }
+        screen_to_snapshot(self.parser.screen())
     }
 
     pub async fn step(&mut self) -> Result<(), ()> {
@@ -2469,6 +2477,18 @@ mod tests {
         assert!(pty.master_fd() >= 0);
         assert!(pty.slave_fd() >= 0);
         assert_ne!(pty.master_fd(), pty.slave_fd());
+    }
+
+    /// A wide glyph occupies two grid cells; the snapshot must emit only the
+    /// glyph itself, not a placeholder space for its continuation cell, so
+    /// the flattened row keeps the terminal's display width.
+    #[test]
+    fn screen_snapshot_drops_wide_continuation_cells() {
+        let mut parser = vt100_ctt::Parser::new(2, 10, 0);
+        parser.process("abあcd".as_bytes());
+        let snapshot = screen_to_snapshot(parser.screen());
+        let text: String = snapshot.lines[0].cells.iter().map(|c| c.ch).collect();
+        assert_eq!(text.trim_end(), "abあcd");
     }
 
     #[test]

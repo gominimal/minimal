@@ -14,8 +14,9 @@ use crate::app::{
 };
 
 /// Render the whole frame: sidebar left, detail pane right, footer line at
-/// the bottom.
-pub fn view(model: &Model, frame: &mut Frame) {
+/// the bottom. Takes `&mut Model` because the sidebar adjusts the model's
+/// scroll offset to keep the cursor inside its viewport.
+pub fn view(model: &mut Model, frame: &mut Frame) {
     let [main, footer] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
     let [sidebar, detail] =
@@ -49,7 +50,7 @@ fn pad_truncate(s: &str, w: usize) -> String {
     format!("{cut}…")
 }
 
-fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
+fn render_sidebar(model: &mut Model, frame: &mut Frame, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .padding(ratatui::widgets::Padding::horizontal(1))
@@ -61,41 +62,58 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
     let inner_width = inner.width as usize;
     frame.render_widget(block, area);
 
-    let mut lines: Vec<Line> = Vec::new();
-    // The filter line and its separator sit atop the list, per the spec's
-    // layout mock. Dim while the filter isn't being edited.
+    // The filter line and its separator pin to the top, per the spec's
+    // layout mock (dim while the filter isn't being edited); the session
+    // list scrolls beneath them.
+    let [filter_area, list_area] =
+        Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(inner);
     let filter_style = if model.filter.editing {
         Style::default()
     } else {
         Style::default().fg(Color::Gray)
     };
-    lines.push(Line::from(vec![
-        Span::styled("/ ", filter_style),
-        Span::styled(
-            if model.filter.editing {
-                format!("{}▏", model.filter.input)
-            } else {
-                model.filter.input.clone()
-            },
-            filter_style,
-        ),
-    ]));
-    lines.push(Line::styled(
-        "─".repeat(inner_width),
-        Style::default().fg(Color::Gray),
-    ));
+    let filter_lines = vec![
+        Line::from(vec![
+            Span::styled("/ ", filter_style),
+            Span::styled(
+                if model.filter.editing {
+                    format!("{}▏", model.filter.input)
+                } else {
+                    model.filter.input.clone()
+                },
+                filter_style,
+            ),
+        ]),
+        Line::styled("─".repeat(inner_width), Style::default().fg(Color::Gray)),
+    ];
+    frame.render_widget(Paragraph::new(filter_lines), filter_area);
 
     let rows = model.visible_rows();
+    // Keep the cursor inside the viewport: with no scroll offset it (and
+    // the sessions d/r would act on) can sit on rows nobody can see.
+    let height = usize::from(list_area.height);
+    if model.cursor < model.scroll {
+        model.scroll = model.cursor;
+    } else if height > 0 && model.cursor >= model.scroll + height {
+        model.scroll = model.cursor + 1 - height;
+    }
+    model.scroll = model.scroll.min(rows.len().saturating_sub(height));
+
+    let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
         let selected = i == model.cursor;
         let line = match row {
             Row::ProviderHeader(p) => {
                 let provider = &model.providers[*p];
                 let arrow = if provider.collapsed { "▸" } else { "▼" };
-                // A listed provider is reachable by construction; the dot is
-                // the group's health mark.
-                let version = pad_truncate(
-                    &format!("v{}", provider.version),
+                // The dot is the group's health mark: green while the last
+                // refresh reached the daemon, red once it drops.
+                let (status, dot) = match provider.reachable {
+                    true => (format!("v{}", provider.version), Color::Green),
+                    false => ("unreachable".to_string(), Color::Red),
+                };
+                let status = pad_truncate(
+                    &status,
                     inner_width.saturating_sub(UnicodeWidthStr::width(provider.label.as_str()) + 7),
                 );
                 Line::from(vec![
@@ -103,16 +121,16 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
                         format!("{arrow} {}  ", provider.label),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(version, Style::default().fg(Color::Gray)),
-                    Span::styled(" ●", Style::default().fg(Color::Green)),
+                    Span::styled(status, Style::default().fg(Color::Gray)),
+                    Span::styled(" ●", Style::default().fg(dot)),
                 ])
             }
             Row::Session(key) => {
-                let Some(entry) = model.entry(*key) else {
+                let Some(entry) = model.entry(key) else {
                     continue;
                 };
                 let name = display_name_of(entry);
-                let indicator = model.indicator(*key);
+                let indicator = model.indicator(key);
                 // The list RPC carries no network mode; it fills in once
                 // the session's detail has been fetched.
                 let net = model
@@ -161,7 +179,10 @@ fn render_sidebar(model: &Model, frame: &mut Frame, area: Rect) {
             Style::default().fg(Color::Gray),
         ));
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((model.scroll as u16, 0)),
+        list_area,
+    );
 }
 
 /// A dim section divider with a centered-left label, e.g.
@@ -184,7 +205,7 @@ fn render_detail(model: &Model, frame: &mut Frame, area: Rect) {
     let mut block = Block::default()
         .borders(Borders::ALL)
         .padding(ratatui::widgets::Padding::horizontal(1));
-    if let Some(key) = focused {
+    if let Some(ref key) = focused {
         let name = model.display_name(key);
         let id = key.id.to_string();
         let short = id.split('-').next().unwrap_or(&id);
@@ -209,9 +230,15 @@ fn render_detail(model: &Model, frame: &mut Frame, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Fixed-size sections first; Preview takes the remainder.
+    // Fixed-size sections first; Preview takes the remainder. The policy
+    // section is sized by its WRAPPED height — the lines render wrapped,
+    // and sizing by the unwrapped count would clip long lines — and
+    // capped so an over-long policy clips itself instead of collapsing
+    // the preview to one row.
     const INFO_HEIGHT: u16 = 4;
-    let policy_height = policy_lines(model, key).len() as u16;
+    let policy_height = wrapped_height(&policy_lines(model, &key), inner.width)
+        .min(usize::from(inner.height.saturating_sub(INFO_HEIGHT + 5)))
+        .max(1) as u16;
     let [
         info_area,
         policy_div,
@@ -226,27 +253,44 @@ fn render_detail(model: &Model, frame: &mut Frame, area: Rect) {
         Constraint::Min(1),
     ])
     .areas(inner);
-    render_info(model, key, frame, info_area);
+    render_info(model, &key, frame, info_area);
     frame.render_widget(Paragraph::new(divider("Policy", inner.width)), policy_div);
-    render_policy(model, key, frame, policy_area);
+    render_policy(model, &key, frame, policy_area);
     frame.render_widget(
         Paragraph::new(divider("Preview (live screen snapshot)", inner.width)),
         preview_div,
     );
-    render_preview_body(model, key, frame, preview_area);
+    render_preview_body(model, &key, frame, preview_area);
+}
+
+/// The number of terminal rows `lines` occupy when wrapped to `width`.
+fn wrapped_height(lines: &[Line], width: u16) -> usize {
+    let w = usize::from(width).max(1);
+    lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(w))
+        .sum::<usize>()
+        .max(1)
 }
 
 /// Shorten the user's home directory prefix to `~`, the way the spec's
-/// mock renders project paths (`~/src/api`).
+/// mock renders project paths (`~/src/api`). The match must land on a
+/// path boundary: `/home/norrie-scratch` is not under `/home/norrie`.
 fn shorten_home(path: &str) -> String {
-    match dirs::home_dir().and_then(|h| h.to_str().map(str::to_owned)) {
-        Some(home) if path.starts_with(&home) => format!("~{}", &path[home.len()..]),
+    let Some(home) = dirs::home_dir().and_then(|h| h.to_str().map(str::to_owned)) else {
+        return path.to_string();
+    };
+    if path == home {
+        return "~".to_string();
+    }
+    match path.strip_prefix(&home) {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
         _ => path.to_string(),
     }
 }
 
-fn render_info(model: &Model, key: SessionKey, frame: &mut Frame, area: Rect) {
-    let detail = model.details.get(&key);
+fn render_info(model: &Model, key: &SessionKey, frame: &mut Frame, area: Rect) {
+    let detail = model.details.get(key);
     let entry = model.entry(key);
 
     // Two-column field layout, per the spec's mock:
@@ -304,7 +348,7 @@ fn render_info(model: &Model, key: SessionKey, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn idle_text(model: &Model, key: SessionKey) -> String {
+fn idle_text(model: &Model, key: &SessionKey) -> String {
     let Some(attrs) = model.entry(key).and_then(|e| e.attrs.as_ref()) else {
         return "-".to_string();
     };
@@ -320,7 +364,7 @@ fn idle_text(model: &Model, key: SessionKey) -> String {
 
 /// Bells in the spec mock's form: `●2 (last 3m)` — total count across
 /// audible and visual bells, and the age of the most recent one.
-fn bell_text(model: &Model, key: SessionKey) -> String {
+fn bell_text(model: &Model, key: &SessionKey) -> String {
     let Some(attrs) = model.entry(key).and_then(|e| e.attrs.as_ref()) else {
         return "-".to_string();
     };
@@ -349,7 +393,7 @@ fn format_duration(d: chrono::Duration) -> String {
     }
 }
 
-fn render_policy(model: &Model, key: SessionKey, frame: &mut Frame, area: Rect) {
+fn render_policy(model: &Model, key: &SessionKey, frame: &mut Frame, area: Rect) {
     frame.render_widget(
         Paragraph::new(policy_lines(model, key)).wrap(Wrap { trim: false }),
         area,
@@ -357,9 +401,10 @@ fn render_policy(model: &Model, key: SessionKey, frame: &mut Frame, area: Rect) 
 }
 
 /// The Policy section's lines. The stacked layout sizes the section by
-/// `policy_lines(...).len()`, so height and content can never drift.
-fn policy_lines(model: &Model, key: SessionKey) -> Vec<Line<'static>> {
-    let detail = model.details.get(&key);
+/// these lines' wrapped height ([`wrapped_height`]), so height and
+/// content can't drift apart.
+fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
+    let detail = model.details.get(key);
     let record = detail.and_then(|d| d.record.as_ref());
     let mut lines: Vec<Line> = Vec::new();
 
@@ -435,8 +480,8 @@ fn policy_list(lines: &mut Vec<Line>, label: &str, values: &Option<Vec<String>>)
 }
 
 /// The Preview section's body (its divider is drawn by [`render_detail`]).
-fn render_preview_body(model: &Model, key: SessionKey, frame: &mut Frame, area: Rect) {
-    let Some(fetch) = model.screens.get(&key) else {
+fn render_preview_body(model: &Model, key: &SessionKey, frame: &mut Frame, area: Rect) {
+    let Some(fetch) = model.screens.get(key) else {
         frame.render_widget(
             Paragraph::new("loading preview…").style(Style::default().fg(Color::Gray)),
             area,
@@ -552,6 +597,7 @@ fn wire_color(s: &str) -> Color {
     }
     if let Some(hex) = s.strip_prefix('#')
         && hex.len() == 6
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
         && let (Ok(r), Ok(g), Ok(b)) = (
             u8::from_str_radix(&hex[0..2], 16),
             u8::from_str_radix(&hex[2..4], 16),
@@ -664,6 +710,8 @@ mod tests {
         assert_eq!(wire_color("idx:196"), Color::Indexed(196));
         assert_eq!(wire_color("#ff0080"), Color::Rgb(255, 0, 128));
         assert_eq!(wire_color("bogus"), Color::Reset);
+        // A 6-byte non-ASCII payload must not panic on char-boundary slicing.
+        assert_eq!(wire_color("#€bcd"), Color::Reset);
     }
 
     #[test]
@@ -681,5 +729,23 @@ mod tests {
         assert_eq!(style.fg, Some(Color::Indexed(1)));
         assert!(style.add_modifier.contains(Modifier::BOLD));
         assert!(style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn shorten_home_only_shortens_at_a_path_boundary() {
+        let home = dirs::home_dir().unwrap();
+        let home = home.to_str().unwrap();
+        assert_eq!(shorten_home(&format!("{home}/src/api")), "~/src/api");
+        assert_eq!(shorten_home(home), "~");
+        // A sibling that merely shares the home prefix is not under home.
+        let sibling = format!("{home}-scratch/api");
+        assert_eq!(shorten_home(&sibling), sibling);
+    }
+
+    #[test]
+    fn wrapped_height_counts_terminal_rows() {
+        let lines = vec![Line::raw("short"), Line::raw("a".repeat(25)), Line::raw("")];
+        // Width 10: 1 + 3 + 1 rows.
+        assert_eq!(wrapped_height(&lines, 10), 5);
     }
 }

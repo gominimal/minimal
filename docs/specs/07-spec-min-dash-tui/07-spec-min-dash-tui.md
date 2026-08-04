@@ -1,17 +1,17 @@
 ---
 id: spec-min-dash-tui
-title: "min dash — session manager TUI for minimal2"
+title: "min dash — session manager TUI for minimal"
 kind: spec
 status: shipped
 tracking-issue:
 supersedes:
 ---
 
-# min dash — session manager TUI for minimal2
+# min dash — session manager TUI for minimal
 
 ## Context
 
-`minimal2` is the CLI that pairs with `minimald`. It exposes session
+`minimal` is the CLI that pairs with `minimald`. It exposes session
 lifecycle commands — `ls`, `activate`, `attach`, `destroy`, `session policy` —
 as flat one-shot subcommands. Each invocation connects, does one thing, prints
 to stdout, and exits. There is no way to browse sessions, inspect their live
@@ -30,7 +30,7 @@ available providers on the host.
 
 ## Introduction/Overview
 
-`min dash` is a new subcommand on `minimal2` backed by a new `minimal-tui`
+`min dash` is a new subcommand on `minimal` backed by a new `minimal-tui`
 sub-crate. It renders a master-detail split: a filterable session list on the
 left (grouped by provider), and a detail pane on the right that stacks the
 Info, Policy, and Preview sections vertically. The Preview section shows a
@@ -39,7 +39,7 @@ read-only snapshot of the session's live terminal output via a new
 
 The TUI follows an Elm-style architecture (model/update/view) with a tokio
 event loop driving crossterm input and a periodic refresh tick. It reuses the
-existing `minimal2` SSH client transport (`client.rs`) for all RPCs.
+existing `minimal` SSH client transport (`client.rs`) for all RPCs.
 
 ### Layout
 
@@ -74,7 +74,7 @@ on detach.)
 - G5: The TUI remembers the last-focused session across invocations via a
   small state file, so re-opening `min dash` restores the cursor.
 - G6: The TUI is isolated in a sub-crate so `ratatui`/`crossterm` do not enter
-  the compile path of the lean `minimal2` CLI binary.
+  the compile path of the lean `minimal` CLI binary.
 
 ## Non-Goals
 
@@ -93,14 +93,14 @@ on detach.)
   Future Work).
 - N4: Customizable keybindings. The initial keybind set is fixed.
 - N5: Windows support. The SSH transport is UDS-based; the TUI targets the
-  same platforms `minimal2` already supports (Linux, macOS).
+  same platforms `minimal` already supports (Linux, macOS).
 
 ## Architecture
 
 ### Crate structure
 
 A new sub-crate `crates/minimal-tui` (library + the TUI logic) is called from
-a new `Dash` subcommand in `minimal2`. The `minimal2/src/client.rs` SSH client
+a new `Dash` subcommand in `minimal`. The `minimal/src/client.rs` SSH client
 (~167 lines) is extracted into a shared `minimal-client` lib so both the CLI
 and the TUI use the same transport without duplicating it.
 
@@ -116,7 +116,7 @@ crates/
       filter.rs      fuzzy filter over session list
       state.rs       dash-state.json load/save
     Cargo.toml
-  minimal-client/   ← new: extracted from minimal2/src/client.rs
+  minimal-client/   ← new: extracted from minimal/src/client.rs
     src/lib.rs
     Cargo.toml
 ```
@@ -163,10 +163,20 @@ On startup the TUI probes both known socket paths:
 
 Each reachable socket becomes a "provider" in the model. The TUI connects to
 each, calls `ListSessions`, and aggregates the results into one list grouped
-by provider. On macOS only the VM path exists (no native minimald); on Linux
-both can run simultaneously — they are independent daemons on independent
-sockets. If neither is running, the TUI auto-spawns the default provider
-(reusing `autospawn::ensure_daemon_running`).
+by provider. On macOS only the VM path exists (no native minimald); both
+probes resolve to the same socket there, so discovery dedupes by socket path
+and keeps a single provider (labeled `vm`). On Linux both can run
+simultaneously — they are independent daemons on independent sockets. If
+neither is running, the TUI auto-spawns the default provider (reusing
+`autospawn::ensure_daemon_running`).
+
+Discovery is not one-shot: a throttled rediscovery pass (~every 10s)
+connects providers that appear mid-run. A provider whose refresh fails keeps
+its sidebar slot, marked unreachable (red health dot, sessions cleared),
+and rejoins when the daemon comes back. Sessions are keyed by provider
+label, never by list index, so a provider dropping out of one refresh cannot
+misroute actions to another daemon. UI-loop RPCs carry a short deadline so
+an unresponsive daemon fails the refresh instead of freezing the TUI.
 
 ### Sidebar row indicators
 
@@ -297,11 +307,11 @@ else uses existing RPCs.
 `common`, `chrono`, `serde`, `serde_json`, `dirs`, `camino`). Add to
 workspace `members` and `workspace.dependencies`.
 
-**R1.2** Extract `minimal2/src/client.rs` into `crates/minimal-client`
-(shared lib). Update `minimal2` to depend on `minimal-client`. Both
-`minimal2` and `minimal-tui` depend on `minimal-client`.
+**R1.2** Extract `minimal/src/client.rs` into `crates/minimal-client`
+(shared lib). Update `minimal` to depend on `minimal-client`. Both
+`minimal` and `minimal-tui` depend on `minimal-client`.
 
-**R1.3** Add `Dash` subcommand to `minimal2`'s `Command` enum. The handler
+**R1.3** Add `Dash` subcommand to `minimal`'s `Command` enum. The handler
 calls `minimal_tui::run(global_args)` which enters the TUI event loop and
 returns when the user quits.
 
@@ -382,9 +392,16 @@ and move cursor to the next session.
 `Enter`, call `RenameSession`. On success, update the model.
 
 **R6.3** `n` opens a create form: name (optional), project path (default:
-cwd), network mode (HostNet/OwnIp/NoNet, default: HostNet). On confirm, call
+cwd), network mode (HostNet/OwnIp/NoNet, default: HostNet). The create
+targets the provider the cursor points at (the focused session's provider,
+or the provider whose group header is selected). On confirm, call
 `CreateSession` with a `sessions::Record`. On success, refresh the list and
-focus the new session.
+focus the new session. The upload root resolves like the CLI's (walk up to
+the nearest `minimal.toml` repo root); a root that is not a VCS checkout is
+refused with a pointer to `min session activate` (the CLI's #770
+confirmation has no TUI form). The create sends the loadout contribution the
+CLI composed at `min dash` startup, so `default_loadouts` and the user
+policy apply to dashboard-created sessions too.
 
 ### Unit 7 — Last-session memory
 
@@ -514,7 +531,7 @@ snapshot tests (insta). The `GetSessionScreen` integration test in
 `minimald` passes: `cargo test -p minimald -- get_session_screen`.
 
 **Proof artifact 2 (File):**
-`grep -q 'Dash' crates/minimal2/src/main.rs` — the subcommand exists.
+`grep -q 'Dash' crates/minimal/src/main.rs` — the subcommand exists.
 `grep -q 'GetSessionScreen' crates/minimald-rpc/src/lib.rs` — the RPC is
 defined.
 `grep -q 'ratatui' Cargo.toml` — the dependency is pinned.

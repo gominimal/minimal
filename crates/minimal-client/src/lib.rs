@@ -149,6 +149,14 @@ const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// milliseconds, so this only bounds the pathological case. Mirrors `minvmd`'s
 /// own client, which guards the same bridge.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for a whole oneshot RPC round-trip.
+///
+/// The handshake deadline covers a peer that never speaks SSH; it does not
+/// cover a peer that handshakes and then wedges (a suspended microVM behind
+/// libkrun's always-accepting bridge), where the reply wait would block
+/// forever. Generous — a healthy daemon answers in milliseconds, so this
+/// only bounds the pathological case.
+const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// russh client handler that accepts any ephemeral host key.
 ///
@@ -249,6 +257,9 @@ impl Client {
     /// extended-data (stream 1) — where the daemon writes handler errors
     /// (#901) — is visible instead of silently discarded by the stream's
     /// `AsyncRead` impl.
+    ///
+    /// Bounded by [`RPC_TIMEOUT`]: on expiry the in-flight channel is
+    /// dropped with the future, which closes it.
     pub async fn oneshot_rpc<R: OneshotSshRpc>(
         &mut self,
         request: R::Request<'_>,
@@ -256,53 +267,59 @@ impl Client {
     where
         <R as OneshotSshRpc>::Response: serde::de::DeserializeOwned,
     {
-        let mut channel = self
-            .handle
-            .channel_open_session()
-            .await
-            .with_context(|| format!("open channel for {}", R::NAME))?;
+        let rpc = async {
+            let mut channel = self
+                .handle
+                .channel_open_session()
+                .await
+                .with_context(|| format!("open channel for {}", R::NAME))?;
 
-        send_traceparent(&channel).await;
-        // want_reply = true so an unknown subsystem (CLI/daemon version
-        // skew) surfaces as a Failure instead of the client writing into a
-        // channel nobody serves (#901).
-        channel
-            .request_subsystem(true, R::NAME)
-            .await
-            .with_context(|| format!("request subsystem {}", R::NAME))?;
+            send_traceparent(&channel).await;
+            // want_reply = true so an unknown subsystem (CLI/daemon version
+            // skew) surfaces as a Failure instead of the client writing into a
+            // channel nobody serves (#901).
+            channel
+                .request_subsystem(true, R::NAME)
+                .await
+                .with_context(|| format!("request subsystem {}", R::NAME))?;
 
-        let body = serde_json::to_vec(&request).context("serialize request")?;
-        channel.data_bytes(body).await.context("write request")?;
-        channel.eof().await.context("shutdown write half")?;
+            let body = serde_json::to_vec(&request).context("serialize request")?;
+            channel.data_bytes(body).await.context("write request")?;
+            channel.eof().await.context("shutdown write half")?;
 
-        // Drain the channel with wait() rather than into_stream() so that
-        // extended-data (stream 1) — where the daemon writes handler errors
-        // (#901) — is visible instead of silently discarded by the stream's
-        // AsyncRead impl.
-        let mut resp_buf = Vec::with_capacity(256);
-        let mut err_buf = Vec::new();
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                russh::ChannelMsg::Data { data } => {
-                    resp_buf.extend_from_slice(&data);
+            // Drain the channel with wait() rather than into_stream() so that
+            // extended-data (stream 1) — where the daemon writes handler errors
+            // (#901) — is visible instead of silently discarded by the stream's
+            // AsyncRead impl.
+            let mut resp_buf = Vec::with_capacity(256);
+            let mut err_buf = Vec::new();
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    russh::ChannelMsg::Data { data } => {
+                        resp_buf.extend_from_slice(&data);
+                    }
+                    russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                        err_buf.extend_from_slice(&data);
+                    }
+                    _ => {}
                 }
-                russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
-                    err_buf.extend_from_slice(&data);
-                }
-                _ => {}
             }
-        }
 
-        if !err_buf.is_empty() {
-            anyhow::bail!(
-                "{} RPC failed on the daemon side: {}",
-                R::NAME,
-                String::from_utf8_lossy(&err_buf)
-            );
-        }
+            if !err_buf.is_empty() {
+                anyhow::bail!(
+                    "{} RPC failed on the daemon side: {}",
+                    R::NAME,
+                    String::from_utf8_lossy(&err_buf)
+                );
+            }
 
-        serde_json::from_slice(&resp_buf)
-            .with_context(|| format!("decode response for {}", R::NAME))
+            serde_json::from_slice(&resp_buf)
+                .with_context(|| format!("decode response for {}", R::NAME))
+        };
+
+        tokio::time::timeout(RPC_TIMEOUT, rpc)
+            .await
+            .map_err(|_| anyhow::anyhow!("{} RPC timed out after {RPC_TIMEOUT:?}", R::NAME))?
     }
 
     /// Open a session channel and issue an `exec` request for `command`,

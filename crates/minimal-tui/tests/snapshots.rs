@@ -36,7 +36,13 @@ fn fixed_model(providers: Vec<ProviderData>) -> Model {
         .unwrap()
         .to_utc();
     let mut model = Model::new(now);
-    app::update(&mut model, Msg::Refreshed(providers));
+    app::update(
+        &mut model,
+        Msg::Refreshed {
+            ok: providers,
+            failed: Vec::new(),
+        },
+    );
     model
 }
 
@@ -53,7 +59,7 @@ fn record(name: Option<&str>, network: NetworkMode) -> sessions::Record {
     }
 }
 
-fn render(model: &Model) -> String {
+fn render(model: &mut Model) -> String {
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| render::view(model, frame)).unwrap();
@@ -62,28 +68,28 @@ fn render(model: &Model) -> String {
 
 #[test]
 fn empty_list() {
-    insta::assert_snapshot!(render(&fixed_model(vec![])));
+    insta::assert_snapshot!(render(&mut fixed_model(vec![])));
 }
 
 #[test]
 fn single_provider() {
-    let model = fixed_model(vec![provider(
+    let mut model = fixed_model(vec![provider(
         "host",
         vec![
             entry(1, Some("api-staging"), "/src/api"),
             entry(2, None, "/src/web"),
         ],
     )]);
-    insta::assert_snapshot!(render(&model));
+    insta::assert_snapshot!(render(&mut model));
 }
 
 #[test]
 fn two_providers() {
-    let model = fixed_model(vec![
+    let mut model = fixed_model(vec![
         provider("host", vec![entry(1, Some("api-staging"), "/src/api")]),
         provider("vm", vec![entry(3, Some("bench"), "/src/bench")]),
     ]);
-    insta::assert_snapshot!(render(&model));
+    insta::assert_snapshot!(render(&mut model));
 }
 
 #[test]
@@ -94,7 +100,7 @@ fn filtered() {
     ]);
     model.filter.input = "bench".to_string();
     model.clamp_cursor();
-    insta::assert_snapshot!(render(&model));
+    insta::assert_snapshot!(render(&mut model));
 }
 
 #[test]
@@ -104,7 +110,7 @@ fn preview_section_with_screen_snapshot() {
         vec![entry(1, Some("api-staging"), "/src/api")],
     )]);
     let key = SessionKey {
-        provider: 0,
+        provider: "host".to_string(),
         id: id(1),
     };
     // A synthetic live screen: a build log over a shell prompt, with one
@@ -144,7 +150,7 @@ fn preview_section_with_screen_snapshot() {
         })),
     );
     model.cursor = 1;
-    insta::assert_snapshot!(render(&model));
+    insta::assert_snapshot!(render(&mut model));
 }
 
 #[test]
@@ -154,7 +160,7 @@ fn detail_pane_with_policy() {
         vec![entry(1, Some("api-staging"), "/src/api")],
     )]);
     let key = SessionKey {
-        provider: 0,
+        provider: "host".to_string(),
         id: id(1),
     };
     model.details.insert(
@@ -180,7 +186,7 @@ fn detail_pane_with_policy() {
     );
     // Focus the session.
     model.cursor = 1;
-    insta::assert_snapshot!(render(&model));
+    insta::assert_snapshot!(render(&mut model));
 }
 
 /// A session with fresh stdout renders its activity spinner in the sidebar
@@ -200,7 +206,7 @@ fn sidebar_shows_activity_indicator_for_recent_stdout() {
     });
     let mut model = fixed_model(vec![provider("host", vec![hot])]);
     model.now = now;
-    assert!(render(&model).contains('◐'));
+    assert!(render(&mut model).contains('◐'));
 }
 
 /// An unacknowledged bell renders `●`; focusing the session acknowledges
@@ -224,7 +230,7 @@ fn sidebar_shows_bell_indicator() {
     });
     let mut model = fixed_model(vec![provider("host", vec![ringing])]);
     model.now = now;
-    assert!(render(&model).contains('●'));
+    assert!(render(&mut model).contains('●'));
     // Provider headers also render ● (health); the bell assert above counts
     // on both. After focusing the session, its bell is acknowledged and only
     // the header dot remains — check the session row specifically.
@@ -236,10 +242,59 @@ fn sidebar_shows_bell_indicator() {
             crossterm::event::KeyModifiers::NONE,
         )),
     );
-    let rendered = render(&model);
+    let rendered = render(&mut model);
     let row = rendered
         .lines()
         .find(|l| l.contains("loud"))
         .expect("session row");
     assert!(!row.contains('●'), "bell must clear on focus: {row}");
+}
+
+/// The sidebar scrolls so the cursor's row is always drawn: with more
+/// sessions than the pane has rows, moving the cursor to the last session
+/// must bring it (and its selection marker) into view.
+#[test]
+fn sidebar_scrolls_to_keep_the_cursor_visible() {
+    // 40 sessions overflow the ~25-row list pane.
+    let sessions = (0..40)
+        .map(|n| entry(n, Some(&format!("s{n:02}")), "/src/x"))
+        .collect();
+    let mut model = fixed_model(vec![provider("host", sessions)]);
+    model.cursor = model.visible_rows().len() - 1;
+    let rendered = render(&mut model);
+    assert!(
+        rendered.contains("▸ s39"),
+        "the cursor's row must be drawn:\n{rendered}"
+    );
+    // And the top of the list has scrolled away.
+    assert!(
+        !rendered.lines().any(|l| l.contains("s00")),
+        "s00 should be scrolled off:\n{rendered}"
+    );
+}
+
+/// A provider whose refresh failed keeps its group header, marked
+/// unreachable (red health dot), instead of vanishing from the sidebar.
+#[test]
+fn sidebar_marks_a_failed_provider_unreachable() {
+    let mut model = fixed_model(vec![
+        provider("host", vec![entry(1, Some("api"), "/src/api")]),
+        provider("vm", vec![entry(3, Some("bench"), "/src/bench")]),
+    ]);
+    app::update(
+        &mut model,
+        Msg::Refreshed {
+            ok: vec![provider("host", vec![entry(1, Some("api"), "/src/api")])],
+            failed: vec!["vm".to_string()],
+        },
+    );
+    let rendered = render(&mut model);
+    let header = rendered
+        .lines()
+        .find(|l| l.contains("vm"))
+        .expect("vm group header must survive");
+    assert!(
+        header.contains("unreachable"),
+        "expected the unreachable mark: {header}"
+    );
 }
