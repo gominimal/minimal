@@ -9,8 +9,9 @@
 //! the names the sandbox gives them: the session's working tree at
 //! [`env::WORKSPACE_ROOT`] and its home at [`env::HOME_ROOT`], side by side
 //! below a synthetic root that holds nothing else. Relative paths resolve
-//! against the working tree, which is also what `realpath(".")` reports, so a
-//! client that never leaves it sees what it saw when the workspace *was* `/`.
+//! against the home directory, which is also what `realpath(".")` reports:
+//! that is what the sandbox sets `$HOME` to, and where SFTP and SCP put a
+//! client that never spells a path out in full.
 //!
 //! Every client-supplied path is funnelled through [`SftpSession::resolve`],
 //! which normalizes it in that namespace, maps it onto the daemon-side
@@ -197,12 +198,15 @@ impl SftpSession {
     /// containment check afterwards is about symlinks, which normalization
     /// cannot see.
     async fn resolve(&self, sftp_path: &str) -> Result<Target, SftpError> {
-        // A relative path is resolved against the working tree: it is the
-        // session's working directory, and what `realpath(".")` hands back.
+        // A relative path is resolved against the home directory, and it is
+        // what `realpath(".")` hands back. SFTP and SCP both start a client at
+        // `$HOME`, which the sandbox points at `HOME_ROOT`. The attach shell's
+        // initial cwd is the working tree instead: the two surfaces genuinely
+        // differ, and each follows the convention of its own protocol.
         let requested = if sftp_path.starts_with('/') {
             Utf8PathBuf::from(sftp_path)
         } else {
-            Utf8Path::new(env::WORKSPACE_ROOT).join(sftp_path)
+            Utf8Path::new(env::HOME_ROOT).join(sftp_path)
         };
         let requested = env::normalize_absolute(&requested);
 
@@ -800,12 +804,18 @@ mod tests {
         let read_back = sftp.read("hello.txt").await.unwrap();
         assert_eq!(read_back, payload);
 
-        // A relative path is the session's working tree, not its home.
+        // A relative path is the session's home, not its working tree: an
+        // SFTP client that never spells out a path is where `$HOME` is.
         let paths = session_paths(&server, session_id).await;
-        let on_disk = tokio::fs::read(paths.working.sub_path_unchecked("hello.txt").as_str())
+        let on_disk = tokio::fs::read(paths.home.sub_path_unchecked("hello.txt").as_str())
             .await
             .unwrap();
         assert_eq!(on_disk, payload);
+        assert!(
+            !tokio::fs::try_exists(paths.working.sub_path_unchecked("hello.txt").as_str())
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -896,13 +906,11 @@ mod tests {
         let sftp = client.open_sftp(session_id).await;
 
         // SFTP clients ask `realpath(".")` immediately after connect to learn
-        // where they start: that is the working tree.
-        assert_eq!(sftp.canonicalize(".").await.unwrap(), env::WORKSPACE_ROOT);
+        // where they start: that is the home directory, as it is for `sftp`
+        // and `scp` against any other server.
+        assert_eq!(sftp.canonicalize(".").await.unwrap(), env::HOME_ROOT);
         assert_eq!(sftp.canonicalize("/").await.unwrap(), "/");
-        assert_eq!(
-            sftp.canonicalize("sub/..").await.unwrap(),
-            env::WORKSPACE_ROOT
-        );
+        assert_eq!(sftp.canonicalize("sub/..").await.unwrap(), env::HOME_ROOT);
         // `..` is spent in the client's namespace, so the exports are
         // reachable from one another and the root is the ceiling.
         assert_eq!(
@@ -920,7 +928,7 @@ mod tests {
 
         let sftp = client.open_sftp(session_id).await;
 
-        // `..` resolves above the working tree, onto the synthetic root,
+        // `..` resolves above the home directory, onto the synthetic root,
         // where `escape.txt` is not one of the two exports.
         assert_denied(
             sftp.open_with_flags(
@@ -989,12 +997,12 @@ mod tests {
         let sftp = client.open_sftp(session_id).await;
 
         // Reading through the link is refused...
-        assert_denied(sftp.read("escape/secret.txt").await);
+        assert_denied(sftp.read("/workbench/escape/secret.txt").await);
         // ...and so is creating a file through it, which no amount of
         // canonicalizing the target alone would catch: it does not exist yet.
         assert_denied(
             sftp.open_with_flags(
-                "escape/planted.txt",
+                "/workbench/escape/planted.txt",
                 OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
             )
             .await,
@@ -1030,9 +1038,12 @@ mod tests {
 
         let sftp = client.open_sftp(session_id).await;
 
-        assert_eq!(sftp.read("link.txt").await.unwrap(), b"through the link");
         assert_eq!(
-            sftp.canonicalize("link.txt").await.unwrap(),
+            sftp.read("/workbench/link.txt").await.unwrap(),
+            b"through the link"
+        );
+        assert_eq!(
+            sftp.canonicalize("/workbench/link.txt").await.unwrap(),
             "/workbench/target.txt"
         );
 
@@ -1041,7 +1052,9 @@ mod tests {
             permissions: Some(0o640),
             ..Default::default()
         };
-        sftp.set_metadata("link.txt", attrs).await.unwrap();
+        sftp.set_metadata("/workbench/link.txt", attrs)
+            .await
+            .unwrap();
         let mode = tokio::fs::metadata(paths.working.sub_path_unchecked("target.txt").as_str())
             .await
             .unwrap()
@@ -1058,7 +1071,7 @@ mod tests {
         let paths = session_paths(&server, session_id).await;
 
         let sftp = client.open_sftp(session_id).await;
-        write(&sftp, "locked.txt", b"still readable").await;
+        write(&sftp, "/workbench/locked.txt", b"still readable").await;
         sftp.create_dir("/workbench/locked").await.unwrap();
 
         let chmod = async |path: &str, mode: u32| {
@@ -1079,7 +1092,7 @@ mod tests {
 
         // The door does not lock behind the client: a file keeps owner read,
         // a directory keeps owner list-and-traverse.
-        chmod("locked.txt", 0o000).await;
+        chmod("/workbench/locked.txt", 0o000).await;
         let file = paths.working.sub_path_unchecked("locked.txt");
         assert_eq!(mode_of(&file).await, 0o400);
         chmod("/workbench/locked", 0o000).await;
@@ -1087,16 +1100,19 @@ mod tests {
         assert_eq!(mode_of(&dir).await, 0o500);
 
         // Which means the request that undoes it still works...
-        chmod("locked.txt", 0o644).await;
+        chmod("/workbench/locked.txt", 0o644).await;
         assert_eq!(mode_of(&file).await, 0o644);
         // ...and reads through the floor'd mode never stopped working.
-        assert_eq!(sftp.read("locked.txt").await.unwrap(), b"still readable");
+        assert_eq!(
+            sftp.read("/workbench/locked.txt").await.unwrap(),
+            b"still readable"
+        );
 
         // Everything the client actually asked for survives: group and other
         // bits, write-protection, and the executable bit.
-        chmod("locked.txt", 0o751).await;
+        chmod("/workbench/locked.txt", 0o751).await;
         assert_eq!(mode_of(&file).await, 0o751);
-        chmod("locked.txt", 0o444).await;
+        chmod("/workbench/locked.txt", 0o444).await;
         assert_eq!(mode_of(&file).await, 0o444);
     }
 
@@ -1124,7 +1140,7 @@ mod tests {
 
         assert_denied(
             sftp.open_with_flags(
-                "dangling",
+                "/workbench/dangling",
                 OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
             )
             .await,
