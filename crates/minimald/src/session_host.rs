@@ -10,6 +10,7 @@ use russh::Channel;
 use russh::server::Msg;
 #[cfg(not(test))]
 use sandbox2::Network;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::io::{Read, Write};
@@ -719,6 +720,15 @@ impl Binding {
 /// driven against a real sandboxed process or a test double. The unused
 /// `hakoniwa::ExitStatus` payload is reduced to a portable exit code.
 pub(crate) trait SessionProcess: Send + 'static {
+    /// Returns the PID of hakoniwa's container supervisor — **not** the PID of
+    /// the shell it exec'd.
+    ///
+    /// The supervisor unshared the sandbox's namespaces itself, so this is a
+    /// valid handle for all of them except the PID namespace, which it created
+    /// for its children without entering. Use
+    /// [`Host::session_leader_pid`](Host::session_leader_pid) for the shell's
+    /// own PID; see [`crate::nsenter`] for why the distinction matters.
+    fn container_pid(&self) -> u32;
     /// Returns `Some(code)` if the process has exited, `None` if still running.
     fn try_wait(&mut self) -> io::Result<Option<i32>>;
     /// Blocks until the process exits, returning its exit code.
@@ -734,10 +744,10 @@ pub(crate) trait SessionProcess: Send + 'static {
 pub(crate) trait SessionLauncher {
     /// The running-process handle this launcher produces.
     type Process: SessionProcess;
-    /// A value held for the session's lifetime purely for its `Drop` (e.g. the
-    /// sandbox files backing the running process's rootfs). Dropped after
-    /// [`Self::Process`].
-    type Guard: Send + 'static;
+    /// A value held for the session's lifetime, for its `Drop` (it owns the
+    /// sandbox files backing the running process's rootfs) and as the live view
+    /// of the session's environment. Dropped after [`Self::Process`].
+    type Guard: SessionGuard;
 
     fn launch(
         self,
@@ -746,6 +756,42 @@ pub(crate) trait SessionLauncher {
         paths: SessionPaths,
         sz: WinSize,
     ) -> impl Future<Output = io::Result<Launched<Self::Process, Self::Guard>>> + Send;
+}
+
+/// Where a command should start in a session, and with what environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SessionEnvironment {
+    /// Absolute path inside the sandbox: `/workbench` for a session.
+    pub(crate) cwd: String,
+    /// The composed session variables, layout defaults included, plus anything
+    /// installed into the session since it launched.
+    pub(crate) vars: BTreeMap<String, String>,
+}
+
+/// The launcher-owned value a [`Host`] holds for its session's lifetime.
+///
+/// Primarily a `Drop` guard — it owns the sandbox files backing the running
+/// process's rootfs — but it is also the live handle to the session's
+/// environment.
+pub(crate) trait SessionGuard: Send + 'static {
+    /// The working directory and environment a command should run with in this
+    /// session, as of now.
+    fn command_environment(&self) -> SessionEnvironment;
+}
+
+/// The mock launcher has no sandbox, so there is nothing to describe.
+#[cfg(test)]
+impl SessionGuard for () {
+    fn command_environment(&self) -> SessionEnvironment {
+        SessionEnvironment::default()
+    }
+}
+
+#[cfg(not(test))]
+impl SessionGuard for crate::env::Env {
+    fn command_environment(&self) -> SessionEnvironment {
+        crate::env::Env::command_environment(self)
+    }
 }
 
 /// The product of [`SessionLauncher::launch`].
@@ -772,6 +818,15 @@ enum Message {
     /// git repository, the changed-since-activation delta otherwise) and
     /// reply with it; `Unavailable` when neither can be computed.
     GetAtRisk(oneshot::Sender<minimald_rpc::SessionDeltaResponse>),
+    /// Build a command that runs `program` inside this session's sandbox, for
+    /// the caller to give stdio to and spawn. The host builds it because only
+    /// the host can: it holds the session process (whose namespaces are joined)
+    /// and the guard (which knows the session's current environment).
+    CommandInSession {
+        program: std::ffi::OsString,
+        args: Vec<std::ffi::OsString>,
+        reply: oneshot::Sender<Result<std::process::Command, crate::nsenter::NsenterError>>,
+    },
 
     SetTitleCallback(String),
     VisualBellCallback,
@@ -863,6 +918,54 @@ impl HostHandle {
         }
     }
 
+    /// Whether both handles address the same host.
+    pub fn same_host(&self, other: &Self) -> bool {
+        self.sender.same_channel(&other.sender)
+    }
+
+    /// Whether the host's runtime loop is still running.
+    ///
+    /// A cheap, non-blocking check — the channel closes when the loop ends — so
+    /// a caller deciding whether to reuse a host or mint a new one does not
+    /// have to round-trip through it.
+    pub fn is_alive(&self) -> bool {
+        !self.sender.is_closed()
+    }
+
+    /// Builds a command that runs `program` inside this session's sandbox,
+    /// joining the namespaces of the running session process.
+    ///
+    /// The returned command has no stdio configured: that belongs to whoever is
+    /// wiring it up (an SSH exec channel pipes all three, an interactive
+    /// attach would hand it a PTY). See [`Host::command_in_session`].
+    ///
+    /// # Errors
+    ///
+    /// The session process having exited, its namespaces being unreadable, or
+    /// the host having stopped between this call and its reply.
+    pub async fn command_in_session<I, S>(
+        &self,
+        program: impl AsRef<std::ffi::OsStr>,
+        args: I,
+    ) -> io::Result<std::process::Command>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let (reply, recv) = oneshot::channel();
+        let message = Message::CommandInSession {
+            program: program.as_ref().to_os_string(),
+            args: args
+                .into_iter()
+                .map(|a| a.as_ref().to_os_string())
+                .collect(),
+            reply,
+        };
+        let dead = || io::Error::other("session host stopped before the command could be built");
+        self.sender.send(message).await.map_err(|_| dead())?;
+        recv.await.map_err(|_| dead())?.map_err(io::Error::other)
+    }
+
     /// Returns the terminal attributes.
     pub async fn get_attrs(&self) -> Result<HostAttrs, ()> {
         let (send, recv) = oneshot::channel();
@@ -914,7 +1017,7 @@ pub struct HostAttrs {
 /// Generic over the [`SessionProcess`] it supervises and the [`SessionLauncher`]
 /// guard kept alive for the session, so the runtime loop can be driven against a
 /// real sandboxed process or a test double.
-pub(crate) struct Host<P: SessionProcess, G: Send + 'static> {
+pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     /// Channel for actor messages via [`HostHandle`].
     receiver: mpsc::Receiver<Message>,
 
@@ -981,9 +1084,9 @@ pub(crate) struct Host<P: SessionProcess, G: Send + 'static> {
     // sandbox files backing the running process's rootfs along with the context
     // and graph) alive for as long as this host (and thus the session process)
     // lives. Declared last so it is dropped after `process`: the process is torn
-    // down before the sandbox files backing its rootfs are removed. Never read;
-    // held purely for its `Drop`.
-    _guard: G,
+    // down before the sandbox files backing its rootfs are removed. Also read,
+    // via `SessionGuard`, for the session's current environment.
+    guard: G,
 }
 
 /// A launched session process backed by a sandboxed [`hakoniwa::Child`].
@@ -992,6 +1095,10 @@ pub(crate) struct SandboxProcess(hakoniwa::Child);
 
 #[cfg(not(test))]
 impl SessionProcess for SandboxProcess {
+    fn container_pid(&self) -> u32 {
+        self.0.id()
+    }
+
     fn try_wait(&mut self) -> io::Result<Option<i32>> {
         self.0
             .try_wait()
@@ -1557,6 +1664,10 @@ pub(crate) struct MockProcess(std::process::Child);
 
 #[cfg(test)]
 impl SessionProcess for MockProcess {
+    fn container_pid(&self) -> u32 {
+        self.0.id()
+    }
+
     fn try_wait(&mut self) -> io::Result<Option<i32>> {
         Ok(self.0.try_wait()?.map(|s| s.code().unwrap_or(-1)))
     }
@@ -1623,7 +1734,53 @@ impl SessionLauncher for MockLauncher {
     }
 }
 
-impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
+impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
+    /// The PID of hakoniwa's container supervisor for this session.
+    ///
+    /// Correct as a handle for every namespace the sandbox unshared *except*
+    /// the PID namespace — which is what the own-IP tap wiring uses it for. To
+    /// address the session's PID namespace, or to name the shell itself, use
+    /// [`Self::session_leader_pid`].
+    // Reachable only through `session_leader_pid`, which the exec path uses;
+    // kept as the named counterpart so the distinction stays visible.
+    #[allow(dead_code)]
+    pub(crate) fn container_pid(&self) -> u32 {
+        self.process.container_pid()
+    }
+
+    /// The PID of the session shell itself — the process hakoniwa exec'd inside
+    /// every one of the sandbox's namespaces.
+    ///
+    /// # Errors
+    ///
+    /// [`NsenterError::NoSessionLeader`](crate::nsenter::NsenterError::NoSessionLeader)
+    /// once the shell has exited; the session's namespaces do not outlive it.
+    pub(crate) fn session_leader_pid(&self) -> Result<u32, crate::nsenter::NsenterError> {
+        crate::nsenter::session_leader_pid(self.process.container_pid())
+    }
+
+    /// Builds a command that runs `program` inside this session's sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the shell's PID cannot be resolved or pinned; see
+    /// [`Self::session_leader_pid`].
+    pub(crate) fn command_in_session<I, S>(
+        &self,
+        program: impl AsRef<std::ffi::OsStr>,
+        args: I,
+    ) -> Result<std::process::Command, crate::nsenter::NsenterError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let environment = self.guard.command_environment();
+        crate::nsenter::Injection::new(self.session_leader_pid()?, program, args)
+            .with_cwd(environment.cwd)
+            .with_env(environment.vars)
+            .command()
+    }
+
     /// Spawns a session host from the given launcher, wiring it to `channel` if
     /// one is supplied, and drives its runtime loop on a background task.
     ///
@@ -1727,7 +1884,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             workspace_root,
             session_name,
             archives_dir,
-            _guard: guard,
+            guard,
         };
 
         if let Some(channel) = channel {
@@ -1857,6 +2014,13 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                     }
                     Message::GetAttrs(s) => {
                         let _ = s.send(self.attrs.clone());
+                    }
+                    Message::CommandInSession {
+                        program,
+                        args,
+                        reply,
+                    } => {
+                        let _ = reply.send(self.command_in_session(program, args));
                     }
                     Message::GetAtRisk(s) => {
                         // Computed on a spawned task: the git commands and
