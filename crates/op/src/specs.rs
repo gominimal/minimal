@@ -33,9 +33,8 @@ pub struct SpecBuild<'a, SF: crate::SourceFetcher> {
     /// Does not override `Local` or `Source` variant build_deps - those will
     /// always be made present automatically.
     ///
-    /// Ordered, because `rootfs_mapped` passes these to the sandbox, which hardlinks them
-    /// first-writer-wins: with a `HashSet` the winner of a path two deps both install was
-    /// decided by a per-process `RandomState` seed and so varied between runs.
+    /// Ordered: `rootfs_mapped` passes these to the sandbox, which hardlinks
+    /// them first-writer-wins, so iteration order must be deterministic.
     pub override_deps: Option<BTreeSet<PathBuf>>,
 
     /// Optional async writer that receives a copy of the sandbox's stdout stream.
