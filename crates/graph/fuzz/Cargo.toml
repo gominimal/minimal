@@ -32,3 +32,12 @@ doc = false
 bench = false
 
 [workspace]
+
+# Mirrors the root workspace's patch. A `fuzz/` dir is its own workspace — that
+# is what keeps the nightly/sanitizer build off the main one — and `[patch]`
+# does not cross a workspace boundary, so the root's entry does not apply here.
+# Without this the topiary/wasm-bindgen dependency graph fails to resolve and
+# every target in this workspace stops building.
+[patch.crates-io]
+topiary-tree-sitter-facade = { git = "https://github.com/tweag/topiary.git", rev = "838c74ab4058f82bc3c6a12380f22c10f22ac814" }
+topiary-web-tree-sitter-sys = { git = "https://github.com/tweag/topiary.git", rev = "838c74ab4058f82bc3c6a12380f22c10f22ac814" }
