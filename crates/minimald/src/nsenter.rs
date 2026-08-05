@@ -9,13 +9,42 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use nix::sched::CloneFlags;
 
 /// `argv[1]` the daemon re-execs itself with to run [`shim_main`].
 pub const SUBCOMMAND: &str = "__nsenter";
+
+/// Where this daemon can re-exec itself from. Registered by [`set_shim_exe`].
+static SHIM_EXE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Registers `path` as the [`SUBCOMMAND`] shim, overriding `current_exe()` for
+/// every later [`Injection`].
+///
+/// For the microVM's pid-1, whose `current_exe()` is the initramfs `/init` —
+/// unreachable once it switches into the rootfs, so every re-exec is an ENOENT
+/// (#1175). Its boot path stages a runnable copy and names it here.
+///
+/// First registration wins: a stale path is worse than the one in use.
+pub fn set_shim_exe(path: impl Into<PathBuf>) {
+    let path = path.into();
+    if let Err(rejected) = SHIM_EXE.set(path) {
+        tracing::warn!(
+            in_use = %SHIM_EXE.get().expect("set failed, so a value is present").display(),
+            rejected = %rejected.display(),
+            "the nsenter shim path is already registered; keeping the first one",
+        );
+    }
+}
+
+/// The registered shim executable, if [`set_shim_exe`] has been called.
+#[must_use]
+pub fn shim_exe() -> Option<&'static Path> {
+    SHIM_EXE.get().map(PathBuf::as_path)
+}
 
 /// Descriptor number the pidfd is placed on, the shim joins the namespaces
 /// associated with this process.
@@ -350,7 +379,8 @@ impl Injection {
     ///
     /// The daemon always wants the running executable — it re-execs itself.
     /// This is for callers that are not the daemon: an integration test driving
-    /// the real shim out of `CARGO_BIN_EXE_minimald`, say.
+    /// the real shim out of `CARGO_BIN_EXE_minimald`, say. A daemon whose own
+    /// path is unrunnable uses [`set_shim_exe`] instead.
     pub fn with_shim(mut self, shim_exe: impl Into<PathBuf>) -> Self {
         self.shim_exe = Some(shim_exe.into());
         self
@@ -368,7 +398,7 @@ impl Injection {
     /// [`NsenterError::PidfdOpen`] if the session program exited before it
     /// could be pinned, [`NsenterError::ReadNamespace`] if its namespaces
     /// cannot be enumerated, [`NsenterError::CurrentExe`] if no shim was named
-    /// and this binary cannot be located.
+    /// or registered and this binary cannot be located.
     pub fn command(self) -> Result<Command, NsenterError> {
         // Resolved here rather than in the shim: the daemon holds the session's
         // PID and the shim holds only a pidfd, and naming the namespaces on the
@@ -376,7 +406,8 @@ impl Injection {
         // joined process.
         let namespaces = namespaces_to_join(self.leader_pid)?;
         let pidfd = pidfd_open(self.leader_pid)?;
-        let shim = match self.shim_exe {
+        // Caller's choice, then the registration, then our own path.
+        let shim = match self.shim_exe.or_else(|| shim_exe().map(Path::to_path_buf)) {
             Some(exe) => exe,
             None => {
                 std::env::current_exe().map_err(|source| NsenterError::CurrentExe { source })?
@@ -595,6 +626,47 @@ mod tests {
         let _ = sh.kill();
         let _ = sh.wait();
         assert_eq!(resolved.expect("resolving the sole child"), expected);
+    }
+
+    /// The production path: no shim is named per injection (only tests do
+    /// that), so this resolution order is what keeps #1175 fixed. One test,
+    /// because [`SHIM_EXE`] is process-wide and set once.
+    #[test]
+    fn the_registered_shim_overrides_current_exe_and_yields_to_an_explicit_one() {
+        // A plain child shares all our namespaces, so nothing is joined and no
+        // privilege is needed.
+        let mut sleep = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawning /bin/sleep");
+        let target = sleep.id();
+        let injection = || Injection::new(target, "/bin/true", Vec::<&str>::new());
+
+        let unregistered = injection().command().map(|c| c.get_program().to_owned());
+        set_shim_exe("/run/minimald");
+        let registered = injection().command().map(|c| c.get_program().to_owned());
+        let explicit = injection()
+            .with_shim("/usr/bin/minimald")
+            .command()
+            .map(|c| c.get_program().to_owned());
+
+        let _ = sleep.kill();
+        let _ = sleep.wait();
+        assert_eq!(
+            PathBuf::from(unregistered.expect("building the command")),
+            std::env::current_exe().expect("locating the test binary"),
+            "with nothing registered the daemon re-execs itself",
+        );
+        assert_eq!(
+            registered.expect("building the command"),
+            OsStr::new("/run/minimald"),
+            "the registered shim replaces current_exe()",
+        );
+        assert_eq!(
+            explicit.expect("building the command"),
+            OsStr::new("/usr/bin/minimald"),
+            "a per-injection shim still wins over the registration",
+        );
     }
 
     #[test]
