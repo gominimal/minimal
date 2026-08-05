@@ -307,6 +307,11 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         project_path: abs_path,
         network: sessions::NetworkMode::HostNet,
         policy: sessions::SessionPolicy::default(),
+        // Same default as an activate with no flags, matching the
+        // loadout handling below. `min task run` has no `--no-hooks` of
+        // its own; a `--keep` session is attachable later, so its hooks
+        // should behave like any other session's.
+        hooks_enabled: true,
         attrs: Default::default(),
     };
 
@@ -324,11 +329,16 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         let names: Vec<&str> = active.loadouts.iter().map(|l| l.name().as_ref()).collect();
         eprintln!("Applying loadouts: {}", names.join(", "));
     }
+    // Same pre-daemon staging as an activate, so a broken hook script
+    // path fails here rather than after the ephemeral session exists.
+    let hook_scripts =
+        crate::loadouts::stage_loadout_hook_scripts(&active, global, &utf8_path, true)?;
+
     // Same first-class orientation field as an activate: a `--keep`
     // task session is attachable later, and its banner should orient
     // too.
     let (contribution, user_policy) =
-        crate::loadouts::compose_user_contribution(active, user_policy, compose_options)?;
+        crate::loadouts::compose_user_contribution(active, user_policy, compose_options, true)?;
 
     // Upload per the normal activate rules: tarball sync (the default), the
     // same empty/`$HOME` and non-VCS-root gates, no `--sync` escape hatch.
@@ -502,7 +512,9 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 
     collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
     collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
-    if let Err(e) = crate::upload_and_finalize(&mut client, id, &collected_patches).await {
+    if let Err(e) =
+        crate::upload_and_finalize(&mut client, id, &collected_patches, &hook_scripts).await
+    {
         crate::best_effort_destroy(&mut client, id).await;
         return Err(e);
     }

@@ -171,6 +171,7 @@ async fn run_session_exec(
                     .map_err(|e| format!("project_path: {e}"))?,
                 network: sessions::NetworkMode::default(),
                 policy: Default::default(),
+                hooks_enabled: true,
                 attrs: Default::default(),
             },
         };
@@ -281,7 +282,7 @@ async fn run_session_exec(
         let resp: Errorable<FinalizeSessionResponse> = serde_json_lenient::from_slice(&resp_buf)
             .map_err(|e| format!("decode response: {e}"))?;
         match resp {
-            Errorable::Ok(FinalizeSessionResponse) => {}
+            Errorable::Ok(_) => {}
             Errorable::Err { error } => return Err(format!("FinalizeSession failed: {error}")),
         }
     }

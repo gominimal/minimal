@@ -201,22 +201,105 @@ matches; see [`follow_symlinks`](#follow_symlinks) and the
 
 _Optional_
 
-Each hook groups up to three scripts (`on_activate`, `on_destroy`, and
-`on_failure`), and at least one must be present. An optional `description`
-labels the hook. Scripts are either inline or a path to a file:
+Each hook groups up to four scripts — `on_activate` when the session is
+created, `on_destroy` when it is destroyed, `on_attach` when you connect,
+and `on_detach` when you disconnect — and at least one must be present. An
+optional `description` labels the hook. Scripts are either inline or a path
+to a file:
 
 ```toml
 [[lifecycle_hooks]]
 description = "warm caches"
 on_activate = { type = "inline",   value = "cargo fetch || true" }
-on_failure  = { type = "external", value = "./cleanup.sh" }
+on_detach   = { type = "external", value = "./cleanup.sh", timeout = 120 }
 ```
 
-External script paths must be relative (absolute paths are rejected at
-parse time) and are anchored to the configuration directory the file was
-loaded from. Hooks from multiple contributors concatenate in declaration
-order. Note: in the current release hooks are composed and recorded with
-the session, but executing them is not yet wired up.
+Each script may set a `timeout` in whole seconds, defaulting to 60 and
+capped at 300; a script that exceeds the cap is rejected when the file is
+parsed.
+
+Scripts run under POSIX `sh` unless they open with a shebang, in which case
+they run under what it names — so a hook can be written in whatever you
+already think in:
+
+```toml
+[[lifecycle_hooks]]
+on_activate = { type = "inline", value = "#!/usr/bin/env fish\nset -gx ...\n" }
+on_detach   = { type = "external", value = "./teardown.py" }   # #!/usr/bin/env python3
+```
+
+The interpreter must be present *in the session*, and it is handed the
+script on standard input rather than as a file. That covers every shell and
+scripting language in common use; it does not cover one that insists on a
+file argument (`awk -f`). The shebang is parsed the way the kernel parses
+one — the interpreter is the first word, everything after it is a single
+argument (so `#!/usr/bin/env -S python3 -u` works, `-S` and all), and there
+is no quoting, so an interpreter path cannot contain spaces. Give an
+absolute path or a bare command for `env` to find: a relative path would
+resolve against the daemon, not the session. Default to POSIX `sh` where you
+can — it is the one interpreter a session is guaranteed to have.
+
+External script paths must be relative (absolute paths and `..` components
+are rejected at parse time). A loadout's scripts are anchored at a directory
+beside the loadout file, named after the loadout — so `dev.toml`'s scripts
+live in `dev/`:
+
+```
+<config>/minimal/loadouts/
+├── dev.toml
+└── dev/
+    ├── activate.sh
+    └── teardown.sh
+```
+
+A script must resolve to a regular file inside that directory. Symlinks are
+rejected rather than followed, at every path component — a symlink is the one
+way a path that passes every other check could still reach outside the
+anchor. All of this is checked on your machine before a session is created,
+so a mistyped path fails immediately and names the file.
+
+Hooks from multiple contributors concatenate in declaration order, and run in
+that order for the setup transitions (`on_activate`, `on_attach`) and in
+reverse for the teardown ones (`on_destroy`, `on_detach`) — so a project sets
+up before your loadouts and tears down after them.
+
+They execute inside the running session, sharing its packages, variables,
+files, and network. `on_attach` runs on the terminal you are attached to, so
+its output reaches you and `[ -t 1 ]` is true. The other three have no
+terminal and their output is captured into the daemon log — `on_detach`
+included, because the shell it would have run on is often the very thing
+that just went away (leaving a session by exiting its shell is a detach).
+
+On top of the session's own variables, each hook is given a few describing
+the run it is part of:
+
+| Variable | Value |
+|---|---|
+| `MINIMAL_SESSION_ID` | The session's id. |
+| `MINIMAL_SESSION_NAME` | Its display name. |
+| `MINIMAL_HOOK_EVENT` | The transition: `on_activate`, `on_destroy`, `on_attach`, or `on_detach`. |
+| `MINIMAL_HOOK_SOURCE_KIND` | `loadout` or `project` — for branching. |
+| `MINIMAL_HOOK_SOURCE_NAME` | The loadout's name, or the project's path as you refer to it on your own machine (not the daemon's copy of the tree). |
+| `MINIMAL_HOOK_INDEX` / `MINIMAL_HOOK_COUNT` | Position within this transition's run, 1-based — for logging, e.g. `[2/3]`. |
+
+Each teardown transition runs all of its hooks under a **single shared time
+budget** rather than giving each one its own timeout — `on_detach` and
+`on_destroy` get a budget each, not one between them. A session has to stay
+destroyable, and per-script caps alone would let enough hooks add up to hold
+one open. A hook that runs into the end of the budget is cut short and says
+so, and one the budget leaves no room for at all is reported as not run —
+either way the log distinguishes it from a hook that exhausted its own
+`timeout`, and teardown continues.
+
+A failing `on_activate` **fails the activation** — the session does not become
+attachable, and the error names the hook and what it printed. The other three
+never block their transition: a failing attach, detach, or destroy hook is
+logged and the session carries on. A session must always be attachable and
+always destroyable.
+
+`on_failure` was an earlier spelling that never executed; it has been
+removed. A hook file that still declares it is rejected with an error
+pointing at `on_destroy`.
 
 ### `follow_symlinks` - Symlink handling for patch sources {#follow_symlinks}
 
@@ -338,8 +421,8 @@ configuration. Merge semantics across all contributors:
   `ignore` list to drop all contributors of that variable.
 - **Patches** with the same destination and different sources are likewise
   a conflict.
-- **Lifecycle hooks** concatenate in declaration order (execution is not
-  yet wired up in the current release).
+- **Lifecycle hooks** concatenate in declaration order; setup transitions
+  run in that order and teardown transitions in reverse.
 
 Two loadouts with the same name cannot be applied together.
 

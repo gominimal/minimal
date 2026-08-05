@@ -13,7 +13,7 @@ use sessions::client::handler::handle_response;
 use sessions::core::compose::{ComposeError, ComposeOptions, SessionVar};
 use sessions::core::decision::ItemDecision;
 use sessions::core::hooks::{HookResult, PolicyHooks, Unapproved};
-use sessions::core::policy::{PatchPolicy, UserPolicy, VarsPolicy};
+use sessions::core::policy::{PatchesPolicy, UserPolicy, VarsPolicy};
 use sessions::wire::policy::{WirePatchVerdict, WireVarVerdict};
 use sessions::wire::primitives::{
     PendingId, WirePendingPatch, WirePendingVar, WireResolvedVar, WireSessionVar, WireSource,
@@ -91,9 +91,9 @@ impl PolicyHooks for PassThroughHooks {
     }
     fn on_patch_unapproved(
         &self,
-        _: PatchPolicy,
+        _: PatchesPolicy,
         items: &[Unapproved<'_, camino::Utf8Path>],
-    ) -> HookResult<PatchPolicy> {
+    ) -> HookResult<PatchesPolicy> {
         HookResult::decided(vec![ItemDecision::AllowOnce; items.len()])
     }
 }
@@ -109,9 +109,9 @@ impl PolicyHooks for AbortHooks {
     }
     fn on_patch_unapproved(
         &self,
-        _: PatchPolicy,
+        _: PatchesPolicy,
         _: &[Unapproved<'_, camino::Utf8Path>],
-    ) -> HookResult<PatchPolicy> {
+    ) -> HookResult<PatchesPolicy> {
         HookResult::abort()
     }
 }
@@ -128,10 +128,20 @@ impl PolicyHooks for PanicHooks {
     }
     fn on_patch_unapproved(
         &self,
-        _: PatchPolicy,
+        _: PatchesPolicy,
         _: &[Unapproved<'_, camino::Utf8Path>],
-    ) -> HookResult<PatchPolicy> {
+    ) -> HookResult<PatchesPolicy> {
         panic!("patch hook should not have been invoked")
+    }
+    // Overridden rather than left to the trait's fail-closed default:
+    // the default aborts, which a test asserting "no prompt happened"
+    // could not distinguish from a policy that decided on its own.
+    fn on_hook_unapproved(
+        &self,
+        _: sessions::core::policy::HooksPolicy,
+        _: &[Unapproved<'_, camino::Utf8Path>],
+    ) -> HookResult<sessions::core::policy::HooksPolicy> {
+        panic!("lifecycle-hook prompt should not have been invoked")
     }
 }
 
@@ -477,7 +487,8 @@ fn patch_source_uses_gated_vars() {
         root.join("helix").as_str(),
         "dev",
     )];
-    let policy = UserPolicy::empty().with_patches(PatchPolicy::empty().with_allow(["/**/*.toml"]));
+    let policy =
+        UserPolicy::empty().with_patches(PatchesPolicy::empty().with_allow(["/**/*.toml"]));
 
     let (verdict, _) = handle_response(
         response,
@@ -532,7 +543,7 @@ fn patch_source_uses_batch_approved_vars() {
                 .try_with_allow(["HELIX_CONFIG"])
                 .unwrap(),
         )
-        .with_patches(PatchPolicy::empty().with_allow(["/**/*.toml"]));
+        .with_patches(PatchesPolicy::empty().with_allow(["/**/*.toml"]));
 
     let (verdict, _) = handle_response(
         response,
@@ -633,7 +644,7 @@ fn multi_file_patch_yields_per_file_verdicts() {
         lifecycle_hooks: vec![],
     };
     let policy = UserPolicy::empty().with_patches(
-        PatchPolicy::empty()
+        PatchesPolicy::empty()
             .with_allow(["/**/*.toml"])
             .with_deny(["/**/*.bak"]),
     );
@@ -678,29 +689,39 @@ fn multi_file_patch_yields_per_file_verdicts() {
     );
 }
 
-/// Lifecycle hooks in the response are silently dropped — the
-/// verdict has no hook field. This test asserts the handler doesn't
-/// fail or otherwise observe them, since there's no per-hook policy.
-#[test]
-fn lifecycle_hooks_are_dropped() {
-    use sessions::wire::primitives::{WireHookScript, WireLifecycleHook, WireProvenancedHook};
-
-    let response = ContributionResponse {
+/// Build a one-hook response from `source`.
+fn hook_response(source: WireSource) -> ContributionResponse {
+    use sessions::wire::primitives::{
+        PendingId, WireHookScript, WireLifecycleHook, WirePendingHook,
+    };
+    ContributionResponse {
         session_id: session_id(),
         vars: vec![],
         patches: vec![],
-        lifecycle_hooks: vec![WireProvenancedHook {
+        lifecycle_hooks: vec![WirePendingHook {
+            id: PendingId::new(0),
             hook: WireLifecycleHook {
                 on_activate: Some(WireHookScript::Inline {
                     body: "echo hi".into(),
+                    timeout_secs: 60,
                 }),
                 ..Default::default()
             },
-            source: package_source("helix"),
+            source,
         }],
-    };
+    }
+}
+
+/// A hook tagged as coming from a **package** is denied outright,
+/// without consulting the prompt (`PanicHooks` would fire if it were
+/// consulted). Packages have no legitimate way to declare a hook, so
+/// one appearing here is a bug or a bypass attempt and must not run.
+#[test]
+fn package_declared_hook_is_denied_without_prompting() {
+    use sessions::wire::policy::WireHookVerdict;
+
     let (verdict, _) = handle_response(
-        response,
+        hook_response(package_source("helix")),
         &[],
         UserPolicy::empty(),
         &PanicHooks,
@@ -710,6 +731,117 @@ fn lifecycle_hooks_are_dropped() {
     .unwrap();
     assert!(verdict.vars.is_empty());
     assert!(verdict.patches.is_empty());
+    assert!(
+        matches!(
+            verdict.lifecycle_hooks.as_slice(),
+            [WireHookVerdict::Denied { .. }]
+        ),
+        "got: {:?}",
+        verdict.lifecycle_hooks,
+    );
+}
+
+/// A project-declared hook with an empty policy has no rule to decide
+/// it, so it routes to the prompt rather than being auto-approved.
+/// `PanicHooks` panics when consulted, which is exactly the signal
+/// that the gate reached the prompt.
+#[test]
+#[should_panic(expected = "lifecycle-hook prompt should not have been invoked")]
+fn project_declared_hook_with_no_rule_reaches_the_prompt() {
+    let _ = handle_response(
+        hook_response(project_source()),
+        &[],
+        UserPolicy::empty(),
+        &PanicHooks,
+        ComposeOptions::default(),
+        &pinned_env(&[]),
+    );
+}
+
+/// An `allow` rule matching the project root approves its hooks
+/// without prompting.
+#[test]
+fn project_hook_allowed_by_policy_skips_the_prompt() {
+    use sessions::core::policy::HooksPolicy;
+    use sessions::wire::policy::WireHookVerdict;
+
+    let policy = UserPolicy::empty().with_hooks(HooksPolicy::empty().with_allow(["/repo"]));
+    let (verdict, _) = handle_response(
+        hook_response(project_source()),
+        &[],
+        policy,
+        &PanicHooks,
+        ComposeOptions::default(),
+        &pinned_env(&[]),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            verdict.lifecycle_hooks.as_slice(),
+            [WireHookVerdict::Approved { .. }]
+        ),
+        "got: {:?}",
+        verdict.lifecycle_hooks,
+    );
+}
+
+/// A `deny` rule refuses the project's hooks without prompting, and
+/// beats an overlapping `allow` — the same emergency-stop precedence
+/// the other two domains use.
+#[test]
+fn project_hook_denied_by_policy_beats_allow() {
+    use sessions::core::policy::HooksPolicy;
+    use sessions::wire::policy::WireHookVerdict;
+
+    let policy = UserPolicy::empty().with_hooks(
+        HooksPolicy::empty()
+            .with_allow(["/repo"])
+            .with_deny(["/repo"]),
+    );
+    let (verdict, _) = handle_response(
+        hook_response(project_source()),
+        &[],
+        policy,
+        &PanicHooks,
+        ComposeOptions::default(),
+        &pinned_env(&[]),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            verdict.lifecycle_hooks.as_slice(),
+            [WireHookVerdict::Denied { .. }]
+        ),
+        "got: {:?}",
+        verdict.lifecycle_hooks,
+    );
+}
+
+/// An `ignore` rule drops the project's hooks silently — no prompt,
+/// and no denial that would abort the activation.
+#[test]
+fn project_hook_ignored_by_policy_is_dropped_quietly() {
+    use sessions::core::policy::HooksPolicy;
+    use sessions::wire::policy::WireHookVerdict;
+
+    let policy = UserPolicy::empty().with_hooks(HooksPolicy::empty().with_ignore(["/repo"]));
+    let (verdict, _) = handle_response(
+        hook_response(project_source()),
+        &[],
+        policy,
+        &PanicHooks,
+        ComposeOptions::default(),
+        &pinned_env(&[]),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            verdict.lifecycle_hooks.as_slice(),
+            [WireHookVerdict::Ignored { .. }]
+        ),
+        "got: {:?}",
+        verdict.lifecycle_hooks,
+    );
 }
 
 /// Patch-side parity for `policy_ignore_per_item`: a file matched
@@ -734,7 +866,7 @@ fn patch_policy_ignore_produces_ignored_verdict() {
         lifecycle_hooks: vec![],
     };
     let policy = UserPolicy::empty().with_patches(
-        PatchPolicy::empty()
+        PatchesPolicy::empty()
             .with_ignore(["/**/draft.toml"])
             .with_allow(["/**/*.toml"]),
     );
@@ -778,9 +910,9 @@ fn unapproved_vars_batched_into_one_hook_call() {
         }
         fn on_patch_unapproved(
             &self,
-            _: PatchPolicy,
+            _: PatchesPolicy,
             _: &[Unapproved<'_, camino::Utf8Path>],
-        ) -> HookResult<PatchPolicy> {
+        ) -> HookResult<PatchesPolicy> {
             panic!("patch hook not expected")
         }
     }
@@ -853,9 +985,9 @@ fn hook_use_rule_with_updated_policy_approves() {
         }
         fn on_patch_unapproved(
             &self,
-            _: PatchPolicy,
+            _: PatchesPolicy,
             _: &[Unapproved<'_, camino::Utf8Path>],
-        ) -> HookResult<PatchPolicy> {
+        ) -> HookResult<PatchesPolicy> {
             panic!("not expected")
         }
     }
@@ -900,9 +1032,9 @@ fn hook_use_rule_without_decision_errors_as_hook_contract() {
         }
         fn on_patch_unapproved(
             &self,
-            _: PatchPolicy,
+            _: PatchesPolicy,
             _: &[Unapproved<'_, camino::Utf8Path>],
-        ) -> HookResult<PatchPolicy> {
+        ) -> HookResult<PatchesPolicy> {
             panic!("not expected")
         }
     }
@@ -950,9 +1082,9 @@ fn hook_wrong_decision_count_errors_as_hook_contract() {
         }
         fn on_patch_unapproved(
             &self,
-            _: PatchPolicy,
+            _: PatchesPolicy,
             _: &[Unapproved<'_, camino::Utf8Path>],
-        ) -> HookResult<PatchPolicy> {
+        ) -> HookResult<PatchesPolicy> {
             panic!("not expected")
         }
     }
@@ -1047,9 +1179,9 @@ fn unapproved_files_batched_into_one_hook_call() {
         }
         fn on_patch_unapproved(
             &self,
-            _: PatchPolicy,
+            _: PatchesPolicy,
             items: &[Unapproved<'_, camino::Utf8Path>],
-        ) -> HookResult<PatchPolicy> {
+        ) -> HookResult<PatchesPolicy> {
             *self.calls.borrow_mut() += 1;
             self.batch_sizes.borrow_mut().push(items.len());
             HookResult::decided(vec![ItemDecision::AllowOnce; items.len()])

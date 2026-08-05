@@ -264,6 +264,10 @@ async fn run_session_exec(
                     .map_err(|e| format!("project_path: {e}"))?,
                 network: sessions::NetworkMode::default(),
                 policy: Default::default(),
+                // The serde default, and what every non-`--no-hooks`
+                // activation sends. This session only runs an exec, so
+                // it declares no hooks either way.
+                hooks_enabled: true,
                 attrs: Default::default(),
             },
         };

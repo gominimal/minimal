@@ -186,9 +186,14 @@ impl Loadout {
     }
 
     /// Drop every lifecycle hook from this loadout, returning the
-    /// hookless loadout. Used to exclude session transition scripts
-    /// before composition while the feature is gated off for a release,
-    /// so a declared hook cannot participate in composition at all.
+    /// hookless loadout.
+    ///
+    /// Backs `min session activate --no-hooks`: the client applies this
+    /// before composing, so a hook the user opted out of never reaches
+    /// the composer, never rides the wire, and has no script staged for
+    /// it. The session record carries the same flag, because the
+    /// attach, detach, and destroy transitions fire from processes that
+    /// never saw the original command line.
     #[must_use]
     pub fn without_lifecycle_hooks(mut self) -> Self {
         self.lifecycle_hooks.clear();

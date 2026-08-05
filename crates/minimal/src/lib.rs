@@ -219,6 +219,9 @@ pub enum SessionCommand {
     #[command(name = "setup-zed", verbatim_doc_comment)]
     #[command(hide = true)]
     SetupZed(SetupZedArgs),
+    /// List the lifecycle hooks composed into a session, and where each
+    /// was declared
+    Hooks(HooksArgs),
 }
 
 #[derive(Debug, Args)]
@@ -232,6 +235,17 @@ pub struct SetupZedArgs {
     /// Print the connection entry as JSON instead of editing any file
     #[arg(long)]
     pub print: bool,
+}
+
+/// Args for `min session hooks`.
+#[derive(Debug, Args)]
+pub struct HooksArgs {
+    /// Session identifier (UUID or session name)
+    #[arg(add = completion::session_completer())]
+    pub session: String,
+    /// Emit the raw JSON the daemon returned instead of a table
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -472,6 +486,15 @@ pub struct ActivateArgs {
     /// `default_loadouts`). Conflicts with `--loadout`.
     #[arg(long, conflicts_with = "loadout")]
     pub no_loadouts: bool,
+    /// Run none of the session's lifecycle hooks, from either the
+    /// loadouts or the project's `minimal.toml`.
+    ///
+    /// The choice is recorded on the session, so it also applies to the
+    /// attach, detach, and destroy transitions later in its life — not
+    /// just to this activation. Use it to bring up a session whose
+    /// project declares hooks you have not reviewed.
+    #[arg(long)]
+    pub no_hooks: bool,
     /// Fail instead of prompting when the daemon returns items the
     /// user policy can't auto-decide. Useful for CI and other
     /// non-interactive contexts — the error message includes a
@@ -766,6 +789,7 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             SessionCommand::Rename(args) => cmd_rename(&cli.global_args, args).await,
             SessionCommand::Policy(args) => cmd_session_policy(&cli.global_args, args).await,
             SessionCommand::SetupZed(args) => cmd_session_setup_zed(&cli.global_args, args).await,
+            SessionCommand::Hooks(args) => cmd_session_hooks(&cli.global_args, args).await,
         },
         Some(Command::Loadout(LoadoutArgs {
             command: LoadoutCommand::List(args),
@@ -954,6 +978,7 @@ fn bare_activate_args() -> ActivateArgs {
         ingress: Vec::new(),
         loadout: Vec::new(),
         no_loadouts: false,
+        no_hooks: false,
         no_prompt: false,
         attach: true,
     }
@@ -1126,6 +1151,15 @@ impl From<SessionLookup> for minimald_rpc::GetSessionPolicyRequest {
     }
 }
 
+impl From<SessionLookup> for minimald_rpc::GetSessionHooksRequest {
+    fn from(l: SessionLookup) -> Self {
+        match l {
+            SessionLookup::Id(id) => Self::Id(id),
+            SessionLookup::Name(n) => Self::Name(n),
+        }
+    }
+}
+
 /// Resolve a session by UUID or name, returning its record.
 ///
 /// Used by commands that need the full record before proceeding (destroy,
@@ -1235,8 +1269,10 @@ pub async fn cmd_dash(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     let compose_options = loadouts::compose_options_from_config(&cfg);
     let active =
         loadouts::resolve_active_loadouts(loadouts::LoadoutSelection::Defaults, &cfg, global)?;
+    // `true`: the dashboard has no `--no-hooks`, matching the `hooks_enabled`
+    // the TUI sends on `CreateSession`.
     let (contribution, _user_policy) =
-        loadouts::compose_user_contribution(active, user_policy, compose_options)?;
+        loadouts::compose_user_contribution(active, user_policy, compose_options, true)?;
     minimal_tui::run(minimal_tui::DashOptions {
         minimal_dir: global.minimal_dir.clone(),
         contribution,
@@ -1581,19 +1617,31 @@ async fn best_effort_destroy(client: &mut client::Client, session_id: sessions::
     }
 }
 
-/// Upload the composition's patches (if any) and finalize the
-/// session. The session is `Materializing` at entry; `Active` on
-/// success. On upload/finalize failure the session is left in
-/// `Materializing` — the caller is responsible for destroying it.
+/// Upload the composition's patches and external hook scripts (if
+/// any) and finalize the session. The session is `Materializing` at
+/// entry; `Active` on success. On upload/finalize failure the session
+/// is left in `Materializing` — the caller is responsible for
+/// destroying it.
+///
+/// Both uploads precede `FinalizeSession`, which gates on each
+/// upload's ready-marker: a session must not become attachable while
+/// either its patches or its hook scripts are still missing from the
+/// daemon.
 async fn upload_and_finalize(
     client: &mut client::Client,
     session_id: sessions::SessionId,
     patches: &[(std::path::PathBuf, paths::SandboxRelPath)],
+    hook_scripts: &[sessions::client::hookscripts::StagedScript],
 ) -> Result<(), anyhow::Error> {
     client
         .upload_patches(session_id, patches)
         .await
         .context("Failed to upload composition patches")?;
+
+    client
+        .upload_hook_scripts(session_id, hook_scripts)
+        .await
+        .context("Failed to upload lifecycle hook scripts")?;
 
     use minimald_rpc::{FinalizeSession, FinalizeSessionRequest};
     let resp = client
@@ -1601,7 +1649,18 @@ async fn upload_and_finalize(
         .await
         .context("FinalizeSession RPC failed")?;
     match resp {
-        minimald_rpc::Errorable::Ok(_) => Ok(()),
+        minimald_rpc::Errorable::Ok(ok) => {
+            // An activate hook runs headlessly, so without this the only
+            // trace of it is the daemon log. Say what ran — the user
+            // agreed to let this code execute, and is owed the receipt.
+            for hook in &ok.activate_hooks {
+                match hook.description.as_deref() {
+                    Some(d) => eprintln!("Ran activation hook from {}: {d}", hook.declared_by),
+                    None => eprintln!("Ran activation hook from {}", hook.declared_by),
+                }
+            }
+            Ok(())
+        }
         minimald_rpc::Errorable::Err { error } => {
             bail!("FinalizeSession failed: {error}");
         }
@@ -1817,6 +1876,7 @@ async fn activate_session(
         project_path: abs_path,
         network: args.network.into(),
         policy,
+        hooks_enabled: !args.no_hooks,
         attrs: Default::default(),
     };
 
@@ -1840,8 +1900,24 @@ async fn activate_session(
     // from it in the launcher baseline). The banner's other dynamic
     // clause — blueprint presence — is a session-filesystem fact,
     // tested by the templates in-shell when they print.
+    // Resolve the loadouts' external hook scripts before anything
+    // touches the daemon: a mistyped path, a symlinked script, or a
+    // missing loadout script directory should fail here, on this
+    // machine, rather than after a session exists on the daemon.
+    let hook_scripts =
+        loadouts::stage_loadout_hook_scripts(&active, global, &utf8_path, !args.no_hooks)?;
+
+    // Same idea for the *project's* hooks, which the daemon composes from
+    // the uploaded mfile and which therefore never pass through the
+    // staging above. Nothing here is uploaded — the project tree carries
+    // its own scripts — but the checks a staging pass would have made are
+    // still worth making on this machine, before a session exists.
+    if !args.no_hooks {
+        loadouts::check_project_hooks(&utf8_path)?;
+    }
+
     let (contribution, user_policy) =
-        loadouts::compose_user_contribution(active, user_policy, compose_options)?;
+        loadouts::compose_user_contribution(active, user_policy, compose_options, !args.no_hooks)?;
 
     // `--sync` defaults to tarball; `sync_explicit` records whether the
     // user actually typed the flag, which distinguishes a deliberate
@@ -2116,7 +2192,7 @@ async fn activate_session(
     // are exact matches (same source), so collapsing is safe.
     collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
     collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
-    if let Err(e) = upload_and_finalize(&mut client, id, &collected_patches).await {
+    if let Err(e) = upload_and_finalize(&mut client, id, &collected_patches, &hook_scripts).await {
         // Best-effort teardown: the session is stuck in
         // Materializing on the daemon. Destroy it so the operator's
         // `min ls` doesn't fill with half-finalized sessions.
@@ -2291,6 +2367,7 @@ async fn activate_new_for_attach(global: &GlobalArgs) -> Result<(), anyhow::Erro
             ingress: Vec::new(),
             loadout: Vec::new(),
             no_loadouts: false,
+            no_hooks: false,
             no_prompt: false,
             attach: true,
         },
@@ -2481,6 +2558,105 @@ pub async fn cmd_session_setup_zed(
     );
 
     Ok(())
+}
+
+/// `min session hooks`: list the lifecycle hooks composed into a
+/// session, with the loadout or project that declared each.
+///
+/// Shows what will actually run, not what was asked for: the daemon
+/// answers from the composition, which holds only the hooks that
+/// survived the user-policy gate. A session activated with `--no-hooks`,
+/// or one whose project was never allow-listed, lists nothing.
+///
+/// Rows are in setup order — project first, then loadouts in the order
+/// they were applied. Teardown runs the reverse.
+async fn cmd_session_hooks(global: &GlobalArgs, args: HooksArgs) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+    let mut client = connect_daemon(global).await?;
+
+    use minimald_rpc::{GetSessionHooks, GetSessionHooksRequest};
+    let lookup: GetSessionHooksRequest = SessionLookup::parse(&args.session).into();
+    let resp = client
+        .oneshot_rpc::<GetSessionHooks>(lookup)
+        .await
+        .context("GetSessionHooks RPC failed")?;
+
+    let hooks = match resp {
+        minimald_rpc::Errorable::Ok(hooks) => hooks,
+        minimald_rpc::Errorable::Err { error } => bail!("{error}"),
+    };
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json_lenient::to_string(&hooks).context("Failed to serialize hooks")?
+        );
+        return Ok(());
+    }
+
+    if hooks.is_empty() {
+        println!("No lifecycle hooks are composed into this session.");
+        return Ok(());
+    }
+
+    // One row per *script*, not per hook: a hook may declare up to four,
+    // and "when does this run" is the question the listing exists to
+    // answer.
+    for provenanced in &hooks {
+        let hook = &provenanced.hook;
+        let source = render_hook_source(&provenanced.source);
+        for (event, script) in [
+            ("on_activate", hook.on_activate.as_ref()),
+            ("on_destroy", hook.on_destroy.as_ref()),
+            ("on_attach", hook.on_attach.as_ref()),
+            ("on_detach", hook.on_detach.as_ref()),
+        ] {
+            let Some(script) = script else { continue };
+            let (kind, body, timeout) = render_hook_script(script);
+            print!("{event:<12} {kind:<9} {timeout:>4}s  {source}");
+            match hook.description.as_deref() {
+                Some(d) => println!("  — {d}"),
+                None => println!(),
+            }
+            println!("             {body}");
+        }
+    }
+    Ok(())
+}
+
+/// Human-readable origin for a hook row.
+fn render_hook_source(source: &sessions::wire::primitives::WireSource) -> String {
+    use sessions::wire::primitives::WireSource;
+    match source {
+        WireSource::UserLoadout { name } => format!("loadout {name}"),
+        WireSource::Project { path } => format!("project {path}"),
+        WireSource::Package { name } => format!("package {name}"),
+    }
+}
+
+/// `(kind, one-line body, timeout seconds)` for a hook script.
+///
+/// An inline body is collapsed to its first line so a multi-line script
+/// cannot break the row alignment; the full text is available via
+/// `--json`.
+fn render_hook_script(
+    script: &sessions::wire::primitives::WireHookScript,
+) -> (&'static str, String, u64) {
+    use sessions::wire::primitives::WireHookScript;
+    match script {
+        WireHookScript::Inline { body, timeout_secs } => {
+            let first = body.lines().next().unwrap_or("").trim();
+            let shown = if body.lines().count() > 1 {
+                format!("{first} …")
+            } else {
+                first.to_string()
+            };
+            ("inline", shown, *timeout_secs)
+        }
+        WireHookScript::External { path, timeout_secs } => {
+            ("external", path.as_str().to_string(), *timeout_secs)
+        }
+    }
 }
 
 /// The local mesh-enrolment record path. `--minimal-dir` still wins for

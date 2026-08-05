@@ -11,7 +11,7 @@ use camino::Utf8Path;
 use sessions::client::composer::UserComposer;
 use sessions::core::compose::{ComposeError, ComposeOptions, StoredEnv};
 use sessions::core::loadout::Loadout;
-use sessions::core::policy::{PatchPolicy, UserPolicy, VarsPolicy};
+use sessions::core::policy::{PatchesPolicy, UserPolicy, VarsPolicy};
 use sessions::core::source::Source;
 use sessions::wire::primitives::WireSource;
 
@@ -348,7 +348,7 @@ _TMP = { inherit = true }
     assert_eq!(names, ["EDITOR"]);
 }
 
-/// `PatchPolicy::ignore` drops a matching user-origin patch file. The
+/// `PatchesPolicy::ignore` drops a matching user-origin patch file. The
 /// patch-side analogue of [`ignore_filters_user_var`].
 ///
 /// Both the source pattern and the deny pattern use `**` — the source
@@ -380,7 +380,7 @@ source = "{root}/dotfiles/helix/themes/**/*"
     );
     let loadout: Loadout = toml::from_str(&src).unwrap();
 
-    let patch_policy = PatchPolicy::empty().with_ignore(["/**/*.bak"]);
+    let patch_policy = PatchesPolicy::empty().with_ignore(["/**/*.bak"]);
     let policy = UserPolicy::empty().with_patches(patch_policy);
     let mut composer = UserComposer::new().with_env(pinned_env(&[]));
     composer.add(loadout).unwrap();
@@ -417,7 +417,7 @@ source = "{root}/dotfiles/secrets/id_rsa"
     );
     let loadout: Loadout = toml::from_str(&src).unwrap();
 
-    let patch_policy = PatchPolicy::empty().with_deny(["/**/id_rsa"]);
+    let patch_policy = PatchesPolicy::empty().with_deny(["/**/id_rsa"]);
     let policy = UserPolicy::empty().with_patches(patch_policy);
 
     let mut composer = UserComposer::new().with_env(pinned_env(&[]));

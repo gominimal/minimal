@@ -362,6 +362,38 @@ fn validate_strict_var_name(name: &str) -> Result<(), &'static str> {
 /// a `$VAR` is substituted *inside* it, the value's commas would
 /// otherwise split into extra alternatives. Bracket-escaping `,`
 /// preserves the value's intent regardless of context.
+/// Turn a literal path into a policy pattern that matches exactly it.
+///
+/// Policy entries are patterns: they go through variable expansion and
+/// then become globs. Anything storing a path a user *chose* — the
+/// prompt writing an approved project into `[hooks] allow`, say — has
+/// to say so, or the path is reinterpreted. Both directions bite:
+/// `/tmp/build*` stored raw matches every sibling `build…` project, and
+/// `/home/d/proj[1]` stored raw matches nothing at all, including
+/// itself. The first is a consent bypass and the second is a rule that
+/// silently never fires.
+///
+/// Escapes both layers this passes through — `$` for the expander,
+/// glob metacharacters for globset. A leading `~` is *not* escapable
+/// (the expander has no syntax for it), which is harmless for the
+/// callers there are: they store absolute paths, so the character
+/// cannot lead.
+#[must_use]
+pub fn literal_policy_pattern(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    // Split on the expander's one mid-path metacharacter and escape the
+    // runs between: `$` doubles to `$$`, everything else is glob-escaped
+    // wholesale. The remaining thing the expander reads — a leading `~` —
+    // is positional and cannot appear in a run.
+    for (i, run) in path.split('$').enumerate() {
+        if i > 0 {
+            out.push_str("$$");
+        }
+        escape_glob_metas(run, &mut out);
+    }
+    out
+}
+
 fn escape_glob_metas(value: &str, out: &mut String) {
     for c in value.chars() {
         match c {
@@ -802,6 +834,62 @@ mod tests {
         let vars = [sv("HOME", "/home/u")];
         let fs = expand_policy_pattern("~/.ssh/**", vars.as_slice(), None).unwrap();
         assert_eq!(fs.pattern(), "/home/u/.ssh/**");
+    }
+
+    /// A path stored through [`literal_policy_pattern`] matches
+    /// exactly itself — and, critically, nothing else. The unescaped
+    /// forms of these fail in both directions: `/tmp/build*` matches
+    /// every sibling, and `/home/d/proj[1]` matches nothing at all.
+    #[test]
+    fn a_literal_policy_pattern_matches_itself_and_only_itself() {
+        let vars: [ResolvedVar; 0] = [];
+        let cases: [(&str, &str); 5] = [
+            // Wildcards: the over-match direction.
+            ("/tmp/build*", "/tmp/build-someone-elses-project"),
+            ("/tmp/proj?", "/tmp/projX"),
+            // Brackets and braces: the matches-nothing direction.
+            ("/home/d/proj[1]", "/home/d/proj1"),
+            ("/home/d/{a,b}", "/home/d/a"),
+            // The expander's own metacharacter, before globbing runs.
+            ("/home/d/$HOME/proj", "/home/d//home/u/proj"),
+        ];
+        for (literal, sibling) in cases {
+            let fs = expand_policy_pattern(&literal_policy_pattern(literal), vars.as_slice(), None)
+                .unwrap_or_else(|e| panic!("{literal:?} should expand: {e:?}"));
+            assert!(
+                fs.is_match(literal),
+                "{literal:?} should match itself (stored as {:?})",
+                fs.pattern(),
+            );
+            assert!(
+                !fs.is_match(sibling),
+                "{literal:?} should not match {sibling:?} (stored as {:?})",
+                fs.pattern(),
+            );
+        }
+    }
+
+    /// What storing the path raw would do, pinned so the reason for
+    /// [`literal_policy_pattern`] is visible rather than folklore: one
+    /// project's approval reaches another project entirely.
+    #[test]
+    fn an_unescaped_path_is_read_as_a_pattern_and_over_matches() {
+        let vars: [ResolvedVar; 0] = [];
+        let fs = expand_policy_pattern("/tmp/build*", vars.as_slice(), None).unwrap();
+        assert!(
+            fs.is_match("/tmp/build-someone-elses-project"),
+            "this is the behaviour `literal_policy_pattern` exists to prevent",
+        );
+    }
+
+    /// An ordinary path is stored unchanged, so escaping costs nothing
+    /// in readability for the paths people actually have.
+    #[test]
+    fn a_literal_policy_pattern_leaves_an_ordinary_path_alone() {
+        assert_eq!(
+            literal_policy_pattern("/home/dev/my-project"),
+            "/home/dev/my-project",
+        );
     }
 
     /// Substitution and `..` normalization still apply — dropping

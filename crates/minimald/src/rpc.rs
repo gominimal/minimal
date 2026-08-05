@@ -347,7 +347,7 @@ async fn serve_finalize_session(
                 });
             };
             Ok(match h.finalize().await {
-                Ok(()) => Errorable::Ok(FinalizeSessionResponse),
+                Ok(activate_hooks) => Errorable::Ok(FinalizeSessionResponse { activate_hooks }),
                 Err(e) => Errorable::Err {
                     error: e.to_string(),
                 },
@@ -550,6 +550,59 @@ async fn serve_get_session_policy(
                 // session record, not a hardcoded default.
                 Some(record) => Ok(Errorable::Ok(record.policy)),
             }
+        })
+        .await
+}
+
+/// `GetSessionHooks`: the lifecycle hooks composed into a session, each
+/// with the loadout or project that declared it.
+///
+/// Read from the persisted composition snapshot, so it answers for a
+/// session with no running host and survives a daemon restart. A session
+/// whose snapshot is missing (activated before snapshots existed, or
+/// reaped mid-write) reports an empty list rather than failing: "no
+/// hooks recorded" is the honest answer, and there is nothing to run.
+async fn serve_get_session_hooks(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    minimald_rpc::GetSessionHooks
+        .handle_channel(c, async |req| {
+            let mngr = s.sessions_manager().await;
+            let predicate = match req {
+                minimald_rpc::GetSessionHooksRequest::Id(id) => SessionKeyPredicate::Id(id),
+                minimald_rpc::GetSessionHooksRequest::Name(name) => SessionKeyPredicate::Name(name),
+            };
+            // The record first, only to tell "no such session" from "a
+            // session with nothing recorded" — both of which the
+            // composition read answers with `None`.
+            if mngr
+                .get_record(predicate.clone())
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?
+                .is_none()
+            {
+                return Ok(Errorable::Err {
+                    error: "no session found".to_string(),
+                });
+            }
+            // Read-only: `get_composition` goes to the store rather than
+            // the actor, so listing a stopped session's hooks does not
+            // start it. Reporting on a session is not a reason to run one.
+            let composition = mngr
+                .get_composition(predicate)
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            let hooks = composition
+                .map(|c| {
+                    c.lifecycle_hooks()
+                        .iter()
+                        .cloned()
+                        .map(Into::into)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Ok(Errorable::Ok(hooks))
         })
         .await
 }
@@ -782,6 +835,23 @@ pub(crate) const STREAM_WORKSPACE_PATCHES: &str =
 /// marker exists" note in `finalize_session_handler`.
 pub(crate) const PATCHES_READY_MARKER: &str = ".patches_ready";
 
+pub(crate) const STREAM_WORKSPACE_HOOK_SCRIPTS: &str =
+    constcat::concat!(RPC_SUBSYSTEM_PREFIX, "WorkspaceHookScriptsTarZst");
+
+/// Marker file the hook-script unpacker drops after a successful
+/// atomic swap. `FinalizeSession` requires it before promoting a
+/// session whose composition declares external hook scripts, so a
+/// client that skipped the upload can't leave an `Active` session
+/// whose hooks reference files that were never staged.
+pub(crate) const HOOKS_READY_MARKER: &str = ".hooks_ready";
+
+/// Per-entry size cap on incoming hook scripts. A lifecycle hook is a
+/// shell script; a megabyte is already far past anything reasonable,
+/// and the cap exists to stop a forged tar header from driving
+/// `Vec::with_capacity` into an allocation failure, not to constrain
+/// legitimate use.
+const MAX_HOOK_SCRIPT_BYTES: u64 = 1024 * 1024;
+
 /// Per-entry size cap on incoming patch archives. Legitimate patch files are
 /// dotfiles (KB to a few MB); this ceiling is generous but bounded so a peer
 /// forging a tar header can't push `Vec::with_capacity` into an allocation
@@ -965,43 +1035,67 @@ async fn served(fut: impl Future<Output = Result<(), ConnectionError>>) {
     }
 }
 
-/// Unpacks the composition-patches tarball streamed over `c`.
+/// What distinguishes one tar-upload stream from another.
 ///
-/// The unpack is **atomic**: entries land in a `<patches_dir>.tmp`
-/// staging dir first, then get swapped into place via rename once
-/// the stream ends cleanly. A mid-stream failure leaves the tmp
-/// tree behind (removed on the next successful run) but never
-/// pollutes `patches/`.
+/// Everything else about unpacking — validation, staging, the atomic
+/// swap, the marker — is identical across streams and lives in
+/// [`unpack_tar_zst_into`]. Adding a stream means describing it here,
+/// not writing a second unpacker: the entry guards are security
+/// checks, and a second copy is a second place for a fix to miss.
+struct UnpackTarget {
+    /// Live directory the staged tree is swapped into.
+    dir: std::path::PathBuf,
+    /// Marker filename dropped after a successful swap. Preconditions
+    /// in `FinalizeSession` read it, so it is written last.
+    marker: &'static str,
+    /// Ceiling on a single entry's *declared* size. Guards against a
+    /// forged header driving `Vec::with_capacity` into an allocation
+    /// failure, not against legitimate volume.
+    max_entry_bytes: u64,
+    /// Serializes the swap against another upload on the same stream
+    /// and session.
+    lock: Arc<tokio::sync::Mutex<()>>,
+    /// Noun for error messages — "patch", "hook script".
+    label: &'static str,
+}
+
+/// Unpack a zstd-compressed tarball streamed over `c` into
+/// `target.dir`.
 ///
-/// Every archive entry's path is validated against traversal —
-/// `SandboxRelPath::try_new` already rejects absolute paths and
-/// `..` components on the client side, but the client is untrusted
-/// so we re-check the wire form here. Absolute + traversal paths
-/// are dropped with an error before any file is written.
+/// The unpack is **atomic**: entries land in a per-upload staging dir
+/// first, then swap into place once the stream ends cleanly. A
+/// mid-stream failure leaves the staging tree behind (removed on the
+/// next run) but never pollutes the live directory.
 ///
-/// On success, drops [`PATCHES_READY_MARKER`] under the patches
-/// dir. `FinalizeSession` uses that marker as its precondition
-/// for the `Materializing → Active` transition, so this write
-/// order matters: marker only appears once every patch is on disk.
-#[tracing::instrument(level = "debug", skip_all)]
-async fn unpack_workspace_patches(
-    s: &ServerStateHandle,
-    config: &ChannelConfig,
-    c: &mut RuChannel<Msg>,
-) -> Result<(), String> {
+/// Every entry is validated before a byte reaches disk. The client
+/// already rejects absolute and `..` paths at the wire-schema level,
+/// but the client is untrusted, so the same checks run again here —
+/// a peer writing raw tar bytes bypasses every client-side layer.
+///
+/// On success, drops `target.marker` under `target.dir`. The write
+/// order matters: the marker only appears once every entry is on disk,
+/// which is what lets `FinalizeSession` treat its presence as proof
+/// the upload completed.
+#[tracing::instrument(level = "debug", skip_all, fields(stream = target.label))]
+async fn unpack_tar_zst_into(target: UnpackTarget, c: &mut RuChannel<Msg>) -> Result<(), String> {
     use std::path::Path as StdPath;
 
-    let (session_handle, paths) = upload_session_handle(s, config).await?;
-    let patches_dir = paths.patches.as_utf8_path().as_std_path().to_path_buf();
+    let UnpackTarget {
+        dir,
+        marker,
+        max_entry_bytes,
+        lock,
+        label,
+    } = target;
 
     // Per-upload unique staging path so two concurrent uploads for
     // the same session never share a staging tree. The nanosecond
-    // clock is fine as a discriminator — the per-session upload
-    // lock below serializes the swap, so we don't need a strong
-    // guarantee against collisions, only against name reuse across
-    // the two in-flight tasks.
+    // clock is fine as a discriminator — the swap lock below
+    // serializes the install, so we don't need a strong guarantee
+    // against collisions, only against name reuse across the two
+    // in-flight tasks.
     let staging_dir = {
-        let mut d = patches_dir.clone();
+        let mut d = dir.clone();
         let suffix = format!(
             ".upload.{}.tmp",
             std::time::SystemTime::now()
@@ -1016,7 +1110,7 @@ async fn unpack_workspace_patches(
                 n.push(&suffix);
                 n
             })
-            .unwrap_or_else(|| format!("patches{suffix}").into());
+            .unwrap_or_else(|| format!("upload{suffix}").into());
         d.set_file_name(name);
         d
     };
@@ -1027,7 +1121,7 @@ async fn unpack_workspace_patches(
     let _ = tokio::fs::remove_dir_all(&staging_dir).await;
     tokio::fs::create_dir_all(&staging_dir)
         .await
-        .map_err(|e| format!("creating patch staging dir: {e}"))?;
+        .map_err(|e| format!("creating {label} staging dir: {e}"))?;
 
     // Zstd decode + tar walk + per-entry unpack. Tar itself is a
     // stream format so decoding entries is sequential, but writing
@@ -1049,7 +1143,7 @@ async fn unpack_workspace_patches(
     use tokio::io::AsyncReadExt as _;
     let mut entries = archive
         .entries()
-        .map_err(|e| format!("reading patch tar entries: {e}"))?;
+        .map_err(|e| format!("reading {label} tar entries: {e}"))?;
     let write_concurrency = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -1070,62 +1164,56 @@ async fn unpack_workspace_patches(
     // racing the next upload's `remove_dir_all` at the top of this
     // function and burning blocking-pool slots for results nobody
     // reads.
-    //
-    // `unpack_loop` returns Err on any per-entry problem;
-    // `abort_and_drain` afterward cancels stragglers regardless of
-    // outcome so no writes outlive this function.
     let mut inflight: tokio::task::JoinSet<Result<(), String>> = tokio::task::JoinSet::new();
     let loop_result: Result<(), String> = async {
         while let Some(entry) = entries.next().await {
-            let mut entry = entry.map_err(|e| format!("reading patch tar entry: {e}"))?;
+            let mut entry = entry.map_err(|e| format!("reading {label} tar entry: {e}"))?;
             let entry_path = entry
                 .path()
                 .map_err(|e| format!("decoding entry path: {e}"))?
                 .into_owned();
             if !safe_relative_path(&entry_path) {
                 return Err(format!(
-                    "patch archive entry rejected: `{}` contains an absolute path or a `..` component",
+                    "{label} archive entry rejected: `{}` contains an absolute path or a \
+                     `..` component",
                     entry_path.display()
                 ));
             }
-            // Reject a patch destination that would clobber the
-            // patches-ready marker. Marker + user patch would
-            // otherwise race, and `materialize_patches_into_home`
-            // would silently copy the emptied marker into the
-            // sandbox home, zeroing whatever the user had there.
-            if entry_path == StdPath::new(PATCHES_READY_MARKER) {
+            // Reject an entry that would clobber the ready marker.
+            // Marker + uploaded file would otherwise race, and for
+            // patches `materialize_patches_into_home` would silently
+            // copy the emptied marker into the sandbox home, zeroing
+            // whatever the user had there.
+            if entry_path == StdPath::new(marker) {
                 return Err(format!(
-                    "patch archive entry rejected: `{}` collides with the daemon's \
-                     patches-ready marker filename",
+                    "{label} archive entry rejected: `{}` collides with the daemon's \
+                     ready-marker filename",
                     entry_path.display()
                 ));
             }
-            // Patches are individual files copied verbatim into the
-            // sandbox home. The client's uploader
-            // (`Client::upload_patches` → `TarZstArchive::add_file`)
-            // only ever emits `EntryType::Regular` — symlink sources
-            // are read through (their target's bytes get archived as
-            // a regular file, dropping the link relation on the
-            // client side, on purpose) and directory sources fan
-            // out into per-file Regular entries. Every non-Regular
-            // entry type is out of scope: we do not create
-            // directories, symlinks, hardlinks, or device nodes in
-            // the sandbox home from a patch archive. Blindly running
-            // `tokio::fs::write` for any of those would silently
-            // land an empty file at that path — a directory entry
-            // would then break `create_dir_all(parent)` for its
-            // children, and a symlink entry would drop the link
-            // target on the floor. Fail loudly instead.
+            // Only regular files are unpacked. The client's uploader
+            // (`TarZstArchive::add_file`) only ever emits
+            // `EntryType::Regular` — symlink sources are read through
+            // (their target's bytes get archived as a regular file,
+            // dropping the link relation on purpose) and directory
+            // sources fan out into per-file Regular entries. Every
+            // other entry type is out of scope: we do not create
+            // directories, symlinks, hardlinks, or device nodes from
+            // an uploaded archive. Blindly running `tokio::fs::write`
+            // for any of those would silently land an empty file at
+            // that path — a directory entry would then break
+            // `create_dir_all(parent)` for its children, and a
+            // symlink entry would drop the link target on the floor.
+            // Fail loudly instead.
             let entry_type = entry.header().entry_type();
             if !matches!(
                 entry_type,
                 async_tar::EntryType::Regular | async_tar::EntryType::Continuous
             ) {
                 return Err(format!(
-                    "patch archive entry rejected: `{}` is {:?}; only regular files are \
-                     supported",
+                    "{label} archive entry rejected: `{}` is {entry_type:?}; only regular \
+                     files are supported",
                     entry_path.display(),
-                    entry_type,
                 ));
             }
             let entry_size = entry.header().size().unwrap_or(0);
@@ -1133,10 +1221,10 @@ async fn unpack_workspace_patches(
             // `Vec::with_capacity` into an allocation panic or OOM
             // (allocator abort → whole daemon down) before we ever
             // reserve budget.
-            if entry_size > MAX_PATCH_ENTRY_BYTES {
+            if entry_size > max_entry_bytes {
                 return Err(format!(
-                    "patch archive entry rejected: `{}` declares {entry_size} bytes, \
-                     exceeds the {MAX_PATCH_ENTRY_BYTES}-byte per-entry cap",
+                    "{label} archive entry rejected: `{}` declares {entry_size} bytes, \
+                     exceeds the {max_entry_bytes}-byte per-entry cap",
                     entry_path.display()
                 ));
             }
@@ -1150,7 +1238,7 @@ async fn unpack_workspace_patches(
                     Some(Ok(Ok(()))) => {}
                     Some(Ok(Err(e))) => return Err(e),
                     Some(Err(join_err)) => {
-                        return Err(format!("write task panicked: {join_err}"))
+                        return Err(format!("write task panicked: {join_err}"));
                     }
                     None => break,
                 }
@@ -1178,9 +1266,9 @@ async fn unpack_workspace_patches(
             let path_display = entry_path.display().to_string();
             inflight.spawn(async move {
                 if let Some(parent) = dest.parent() {
-                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                        format!("creating parent dir for `{path_display}`: {e}")
-                    })?;
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .map_err(|e| format!("creating parent dir for `{path_display}`: {e}"))?;
                 }
                 tokio::fs::write(&dest, &body)
                     .await
@@ -1216,25 +1304,18 @@ async fn unpack_workspace_patches(
     }
     loop_result?;
 
-    // Serialize the swap + marker-write against any other
-    // in-flight `WorkspacePatchesTarZst` upload for this same
-    // session. Two concurrent uploads would otherwise race on
-    // `patches_dir` — one's `RENAME_EXCHANGE` could observe an
-    // unexpected mid-swap state, or the marker could get written
-    // pointing at the wrong upload's contents. The staging phase
-    // above ran without the lock (all writes went to a per-upload
-    // unique dir), so we only pay the serialization cost across
-    // the seconds-of-work install step, not the minutes-of-work
-    // unpack.
-    let _swap_guard = session_handle
-        .patches_upload_lock()
-        .await
-        .map_err(|e| format!("session is gone: {e}"))?
-        .lock_owned()
-        .await;
+    // Serialize the swap + marker-write against any other in-flight
+    // upload on this stream for this session. Two concurrent uploads
+    // would otherwise race on the live dir — one's `RENAME_EXCHANGE`
+    // could observe an unexpected mid-swap state, or the marker could
+    // get written pointing at the wrong upload's contents. The staging
+    // phase above ran without the lock (all writes went to a per-upload
+    // unique dir), so we only pay the serialization cost across the
+    // seconds-of-work install step, not the minutes-of-work unpack.
+    let _swap_guard = lock.lock_owned().await;
 
     // Install the new tree. Two shapes depending on whether a
-    // prior `patches/` exists:
+    // prior tree exists:
     //
     // 1. **Prior tree present** — `renameat2(RENAME_EXCHANGE)` swaps
     //    the staging tree and the live tree atomically. At every
@@ -1242,12 +1323,11 @@ async fn unpack_workspace_patches(
     //    trees, and each carries a valid marker (the old one from
     //    the prior successful unpack, the new one written below).
     //    A `FinalizeSession` racing the swap can't observe a gap
-    //    where `patches/` doesn't exist or where the marker is
-    //    absent, only "old contents + old marker" or "new contents
-    //    + new marker."  We swap the trees first (contents on
-    //    disk), then delete the old contents that ended up under
-    //    `staging_dir` after the swap, then write the new marker
-    //    over the old one.
+    //    where the dir doesn't exist or where the marker is absent,
+    //    only "old contents + old marker" or "new contents + new
+    //    marker." We swap the trees first (contents on disk), then
+    //    delete the old contents that ended up under `staging_dir`
+    //    after the swap, then write the new marker over the old one.
     // 2. **First install** — no prior tree, so `RENAME_EXCHANGE`
     //    fails with `ENOENT`. Plain `rename` is atomic in this
     //    case (nothing to displace), so we fall through to it.
@@ -1259,20 +1339,16 @@ async fn unpack_workspace_patches(
     // where the nix item is configured out.
     let swap_result = tokio::task::spawn_blocking({
         let staging_dir = staging_dir.clone();
-        let patches_dir = patches_dir.clone();
+        let dir = dir.clone();
         move || {
-            common::renameat2::renameat2_cwd(
-                &staging_dir,
-                &patches_dir,
-                common::renameat2::RENAME_EXCHANGE,
-            )
+            common::renameat2::renameat2_cwd(&staging_dir, &dir, common::renameat2::RENAME_EXCHANGE)
         }
     })
     .await
     .map_err(|e| format!("atomic-swap task panicked: {e}"))?;
     match swap_result {
         Ok(()) => {
-            // `staging_dir` now holds the previous `patches/` tree
+            // `staging_dir` now holds the previous tree
             // (post-exchange). Drop it — a partial cleanup here is
             // fine; the next unpack's leading `remove_dir_all`
             // covers it.
@@ -1282,26 +1358,98 @@ async fn unpack_workspace_patches(
             // No prior tree — the `RENAME_EXCHANGE` requires both
             // sides to exist. Plain rename is atomic when the
             // destination doesn't exist yet.
-            tokio::fs::rename(&staging_dir, &patches_dir)
+            tokio::fs::rename(&staging_dir, &dir)
                 .await
-                .map_err(|e| format!("swapping patches dir into place: {e}"))?;
+                .map_err(|e| format!("swapping {label} dir into place: {e}"))?;
         }
         Err(e) => {
-            return Err(format!("atomic-swap of patches dir failed: {e}"));
+            return Err(format!("atomic-swap of {label} dir failed: {e}"));
         }
     }
 
-    // Marker last, so `patches/`'s newly-swapped contents can never
-    // coexist with a stale marker. If we crash between the swap and
-    // this write, the next upload's swap replaces the whole tree
-    // and rewrites the marker — FinalizeSession is what fails safe,
-    // not this handler.
-    let marker = patches_dir.join(StdPath::new(PATCHES_READY_MARKER));
-    tokio::fs::write(&marker, b"")
+    // Marker last, so the newly-swapped contents can never coexist
+    // with a stale marker. If we crash between the swap and this
+    // write, the next upload's swap replaces the whole tree and
+    // rewrites the marker — FinalizeSession is what fails safe, not
+    // this handler.
+    let marker_path = dir.join(StdPath::new(marker));
+    tokio::fs::write(&marker_path, b"")
         .await
-        .map_err(|e| format!("writing patches-ready marker: {e}"))?;
+        .map_err(|e| format!("writing {label}-ready marker: {e}"))?;
 
     Ok(())
+}
+
+/// Unpacks the composition-patches tarball streamed over `c` into
+/// `<workspace>/patches/`, keyed by each patch's sandbox-home-relative
+/// destination. See [`unpack_tar_zst_into`] for the mechanics.
+async fn unpack_workspace_patches(
+    s: &ServerStateHandle,
+    config: &ChannelConfig,
+    c: &mut RuChannel<Msg>,
+) -> Result<(), String> {
+    let (session_handle, paths) = upload_session_handle(s, config).await?;
+    let lock = session_handle
+        .patches_upload_lock()
+        .await
+        .map_err(|e| format!("session is gone: {e}"))?;
+    unpack_tar_zst_into(
+        UnpackTarget {
+            dir: paths.patches.as_utf8_path().as_std_path().to_path_buf(),
+            marker: PATCHES_READY_MARKER,
+            max_entry_bytes: MAX_PATCH_ENTRY_BYTES,
+            lock,
+            label: "patch",
+        },
+        c,
+    )
+    .await
+}
+
+/// Unpacks the external-hook-scripts tarball streamed over `c` into
+/// `<workspace>/hooks/`.
+///
+/// Entry paths are the staged paths
+/// [`staged_script_path`](sessions::core::lifecyclehook::staged_script_path)
+/// produced on the client; the daemon re-derives the same paths from
+/// the composition when it goes looking for a script, so nothing here
+/// needs a manifest.
+async fn unpack_workspace_hook_scripts(
+    s: &ServerStateHandle,
+    config: &ChannelConfig,
+    c: &mut RuChannel<Msg>,
+) -> Result<(), String> {
+    let (session_handle, paths) = upload_session_handle(s, config).await?;
+    let lock = session_handle
+        .hook_scripts_upload_lock()
+        .await
+        .map_err(|e| format!("session is gone: {e}"))?;
+    unpack_tar_zst_into(
+        UnpackTarget {
+            dir: paths.hooks.as_utf8_path().as_std_path().to_path_buf(),
+            marker: HOOKS_READY_MARKER,
+            max_entry_bytes: MAX_HOOK_SCRIPT_BYTES,
+            lock,
+            label: "hook script",
+        },
+        c,
+    )
+    .await
+}
+async fn serve_stream_workspace_hook_scripts(
+    s: ServerStateHandle,
+    config: ChannelConfig,
+    mut c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    let outcome = match unpack_workspace_hook_scripts(&s, &config, &mut c).await {
+        Ok(()) => Ok(()),
+        Err(msg) => {
+            let _ = c.extended_data_bytes(1, msg.clone()).await;
+            Err(ConnectionError::Internal(msg))
+        }
+    };
+    let _ = c.close().await;
+    outcome
 }
 
 /// Returns true if `p` is a relative path with no `..` components.
@@ -1347,11 +1495,13 @@ pub async fn handle_ssh_rpc(
         | Shutdown::NAME
         | AbortSession::NAME
         | GetSessionPolicy::NAME
+        | minimald_rpc::GetSessionHooks::NAME
         | SessionDelta::NAME
         | GetSessionScreen::NAME
         | GetMeshStatus::NAME
         | STREAM_WORKSPACE_FILES
         | STREAM_WORKSPACE_PATCHES
+        | STREAM_WORKSPACE_HOOK_SCRIPTS
         | minimald_rpc::DIAG_BUNDLE_SUBSYSTEM
         | minimald_rpc::CLEAN_CACHE_SUBSYSTEM
         | IssueClientCert::NAME => {
@@ -1429,11 +1579,15 @@ pub async fn handle_ssh_rpc(
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
+        minimald_rpc::GetSessionHooks::NAME => serve!(serve_get_session_hooks(s, channel)),
         SessionDelta::NAME => serve!(serve_session_delta(s, channel)),
         GetSessionScreen::NAME => serve!(serve_get_session_screen(s, channel)),
         GetMeshStatus::NAME => serve!(serve_get_mesh_status(s, channel)),
         STREAM_WORKSPACE_FILES => serve!(serve_stream_workspace_files(s, config, channel)),
         STREAM_WORKSPACE_PATCHES => serve!(serve_stream_workspace_patches(s, config, channel)),
+        STREAM_WORKSPACE_HOOK_SCRIPTS => {
+            serve!(serve_stream_workspace_hook_scripts(s, config, channel))
+        }
         minimald_rpc::DIAG_BUNDLE_SUBSYSTEM => {
             serve!(crate::diag::serve_stream_diag_bundle(s, config, channel))
         }
@@ -1756,6 +1910,344 @@ mod tests {
         );
     }
 
+    /// Build a tar+zstd archive with full control over each entry's
+    /// type and declared size, so tests can produce the malformed
+    /// shapes a hostile peer would hand-craft — `tar_zst` can only
+    /// build well-formed regular-file entries.
+    ///
+    /// `declared_size` overrides the header's size field without
+    /// changing the body, which is how the forged-header case is
+    /// reproduced.
+    async fn tar_zst_raw(entries: &[(&str, &[u8], async_tar::EntryType, Option<u64>)]) -> Vec<u8> {
+        let mut tar = async_tar::Builder::new(Vec::new());
+        for (path, contents, entry_type, declared_size) in entries {
+            let mut header = async_tar::Header::new_gnu();
+            header.set_size(declared_size.unwrap_or(contents.len() as u64));
+            header.set_mode(0o644);
+            header.set_entry_type(*entry_type);
+            tar.append_data(&mut header, path, *contents).await.unwrap();
+        }
+        let tar_bytes = tar.into_inner().await.unwrap();
+        let mut encoder = async_compression::tokio::write::ZstdEncoder::new(Vec::new());
+        encoder.write_all(&tar_bytes).await.unwrap();
+        encoder.shutdown().await.unwrap();
+        encoder.into_inner()
+    }
+
+    /// Build a tar+zstd archive whose entry name is written straight
+    /// into the header's raw name field, bypassing the path validation
+    /// `Builder::append_data` performs.
+    ///
+    /// This is the only way to produce the archive shape the daemon's
+    /// traversal guard exists for: `async_tar`'s builder refuses to
+    /// *construct* a `..` entry, so a well-behaved client cannot make
+    /// one — but a hostile peer writing tar bytes by hand can, and that
+    /// is the case the guard has to catch.
+    async fn tar_zst_forged_name(name: &[u8], contents: &[u8]) -> Vec<u8> {
+        let mut header = async_tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(async_tar::EntryType::Regular);
+        // Raw name write: `set_path` would reject or normalize this.
+        {
+            let gnu = header.as_gnu_mut().expect("new_gnu produces a GNU header");
+            gnu.name[..name.len()].copy_from_slice(name);
+        }
+        header.set_cksum();
+
+        let mut tar = async_tar::Builder::new(Vec::new());
+        tar.append(&header, contents).await.unwrap();
+        let tar_bytes = tar.into_inner().await.unwrap();
+
+        let mut encoder = async_compression::tokio::write::ZstdEncoder::new(Vec::new());
+        encoder.write_all(&tar_bytes).await.unwrap();
+        encoder.shutdown().await.unwrap();
+        encoder.into_inner()
+    }
+
+    /// Push `payload` through `subsystem` for `session_id` and return
+    /// whatever the daemon relayed on stderr — empty on success. Keeps
+    /// the channel (rather than `into_stream`) so extended data stays
+    /// readable, which is how a rejection is signalled.
+    async fn upload_and_collect_stderr(
+        client: &mut TestClient,
+        subsystem: &str,
+        session_id: SessionId,
+        payload: &[u8],
+    ) -> String {
+        use russh::ChannelMsg;
+        let mut channel = client
+            .open_subsystem(
+                subsystem,
+                &[(MINIMAL_SESSION_ID_ENV, &session_id.to_string())],
+            )
+            .await;
+        channel.data(payload).await.unwrap();
+        channel.eof().await.unwrap();
+        let mut stderr = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            if let ChannelMsg::ExtendedData { data, ext: 1 } = msg {
+                stderr.extend_from_slice(&data);
+            }
+        }
+        String::from_utf8_lossy(&stderr).into_owned()
+    }
+
+    /// Resolve a session's staged-patches and staged-hooks dirs.
+    async fn staged_dirs(
+        server: &TestServer,
+        session_id: SessionId,
+    ) -> (camino::Utf8PathBuf, camino::Utf8PathBuf) {
+        let mngr = server.state.sessions_manager().await;
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("session should be retrievable");
+        let paths = handle.paths().await.unwrap();
+        (
+            paths.patches.as_utf8_path().to_owned(),
+            paths.hooks.as_utf8_path().to_owned(),
+        )
+    }
+
+    /// A `..` entry is refused end-to-end, not merely by the
+    /// `safe_relative_path` unit above: the guard has to actually be
+    /// wired into the unpack loop, before any byte reaches disk.
+    #[tokio::test]
+    async fn stream_workspace_patches_rejects_traversal_end_to_end() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let payload = tar_zst_forged_name(b"../escape.toml", b"pwned\n").await;
+        let stderr =
+            upload_and_collect_stderr(&mut client, STREAM_WORKSPACE_PATCHES, session_id, &payload)
+                .await;
+
+        assert!(
+            stderr.contains("`..`") || stderr.contains("absolute path"),
+            "expected a traversal rejection, got: {stderr:?}",
+        );
+        let (patches, _) = staged_dirs(&server, session_id).await;
+        assert!(
+            !tokio::fs::try_exists(patches.join(PATCHES_READY_MARKER))
+                .await
+                .unwrap_or(false),
+            "a rejected upload must not leave a ready marker",
+        );
+    }
+
+    /// An entry named exactly like the ready marker is refused: it
+    /// would otherwise be copied into the sandbox home by
+    /// `materialize_patches_into_home`, zeroing whatever the user had
+    /// at that path.
+    #[tokio::test]
+    async fn stream_workspace_patches_rejects_marker_collision() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let payload = tar_zst(&[(PATCHES_READY_MARKER, b"")]).await;
+        let stderr =
+            upload_and_collect_stderr(&mut client, STREAM_WORKSPACE_PATCHES, session_id, &payload)
+                .await;
+
+        assert!(
+            stderr.contains("ready-marker"),
+            "expected a marker-collision rejection, got: {stderr:?}",
+        );
+    }
+
+    /// Only regular files are unpacked. A directory entry would
+    /// otherwise be written as an empty *file*, which then breaks
+    /// `create_dir_all` for anything nested beneath it.
+    #[tokio::test]
+    async fn stream_workspace_patches_rejects_non_regular_entry() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let payload = tar_zst_raw(&[("adir", b"", async_tar::EntryType::Directory, None)]).await;
+        let stderr =
+            upload_and_collect_stderr(&mut client, STREAM_WORKSPACE_PATCHES, session_id, &payload)
+                .await;
+
+        assert!(
+            stderr.contains("only regular files"),
+            "expected a non-regular-entry rejection, got: {stderr:?}",
+        );
+    }
+
+    /// A forged header declaring more bytes than the per-entry cap is
+    /// refused on the header alone, before the body is read — the
+    /// check that stops `Vec::with_capacity` being driven into an
+    /// allocation failure.
+    #[tokio::test]
+    async fn stream_workspace_patches_rejects_oversize_declared_entry() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let payload = tar_zst_raw(&[(
+            "big.toml",
+            b"small body",
+            async_tar::EntryType::Regular,
+            Some(MAX_PATCH_ENTRY_BYTES + 1),
+        )])
+        .await;
+        let stderr =
+            upload_and_collect_stderr(&mut client, STREAM_WORKSPACE_PATCHES, session_id, &payload)
+                .await;
+
+        assert!(
+            stderr.contains("per-entry cap"),
+            "expected an oversize rejection, got: {stderr:?}",
+        );
+    }
+
+    /// A second upload replaces the first tree wholesale rather than
+    /// merging into it, and the marker survives. Exercises both swap
+    /// branches: the first upload takes the plain-rename path (no
+    /// prior tree), the second takes `RENAME_EXCHANGE`.
+    #[tokio::test]
+    async fn stream_workspace_patches_second_upload_replaces_the_tree() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let first = tar_zst(&[("only-in-first.toml", b"a\n")]).await;
+        assert_eq!(
+            upload_and_collect_stderr(&mut client, STREAM_WORKSPACE_PATCHES, session_id, &first)
+                .await,
+            "",
+        );
+        let second = tar_zst(&[("only-in-second.toml", b"b\n")]).await;
+        assert_eq!(
+            upload_and_collect_stderr(&mut client, STREAM_WORKSPACE_PATCHES, session_id, &second)
+                .await,
+            "",
+        );
+
+        let (patches, _) = staged_dirs(&server, session_id).await;
+        assert!(
+            tokio::fs::try_exists(patches.join("only-in-second.toml"))
+                .await
+                .unwrap(),
+            "the second upload's contents must be present",
+        );
+        assert!(
+            !tokio::fs::try_exists(patches.join("only-in-first.toml"))
+                .await
+                .unwrap(),
+            "the first upload's contents must be gone, not merged",
+        );
+        assert!(
+            tokio::fs::try_exists(patches.join(PATCHES_READY_MARKER))
+                .await
+                .unwrap(),
+            "the marker must survive the swap",
+        );
+    }
+
+    // -- hook scripts ---------------------------------------------------
+
+    /// The hook-script stream unpacks under `<workspace>/hooks/` at the
+    /// staged path the client derived, and drops its own ready marker.
+    #[tokio::test]
+    async fn stream_workspace_hook_scripts_unpacks_and_writes_marker() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let payload = tar_zst(&[
+            ("loadout/dev/activate.sh", b"echo hi\n"),
+            ("project/scripts/setup.sh", b"echo setup\n"),
+        ])
+        .await;
+        let stderr = upload_and_collect_stderr(
+            &mut client,
+            STREAM_WORKSPACE_HOOK_SCRIPTS,
+            session_id,
+            &payload,
+        )
+        .await;
+        assert_eq!(stderr, "", "upload should succeed");
+
+        let (_, hooks) = staged_dirs(&server, session_id).await;
+        assert_eq!(
+            tokio::fs::read(hooks.join("loadout/dev/activate.sh"))
+                .await
+                .unwrap(),
+            b"echo hi\n",
+        );
+        assert_eq!(
+            tokio::fs::read(hooks.join("project/scripts/setup.sh"))
+                .await
+                .unwrap(),
+            b"echo setup\n",
+        );
+        assert!(
+            tokio::fs::try_exists(hooks.join(HOOKS_READY_MARKER))
+                .await
+                .unwrap(),
+            "hooks-ready marker must be written on successful unpack",
+        );
+    }
+
+    /// The hook-script stream enforces the same entry guards as the
+    /// patch stream. Parameterized over the malformed shapes so the two
+    /// paths can't drift in what they refuse.
+    #[tokio::test]
+    async fn stream_workspace_hook_scripts_rejects_malformed_entries() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "`..`",
+                tar_zst_forged_name(b"../escape.sh", b"pwned\n").await,
+            ),
+            ("ready-marker", tar_zst(&[(HOOKS_READY_MARKER, b"")]).await),
+            (
+                "only regular files",
+                tar_zst_raw(&[("adir", b"", async_tar::EntryType::Directory, None)]).await,
+            ),
+            (
+                "per-entry cap",
+                tar_zst_raw(&[(
+                    "big.sh",
+                    b"small",
+                    async_tar::EntryType::Regular,
+                    Some(MAX_HOOK_SCRIPT_BYTES + 1),
+                )])
+                .await,
+            ),
+        ];
+        for (needle, payload) in cases {
+            let stderr = upload_and_collect_stderr(
+                &mut client,
+                STREAM_WORKSPACE_HOOK_SCRIPTS,
+                session_id,
+                &payload,
+            )
+            .await;
+            assert!(
+                stderr.contains(needle),
+                "expected a rejection mentioning {needle:?}, got: {stderr:?}",
+            );
+        }
+
+        let (_, hooks) = staged_dirs(&server, session_id).await;
+        assert!(
+            !tokio::fs::try_exists(hooks.join(HOOKS_READY_MARKER))
+                .await
+                .unwrap_or(false),
+            "no rejected upload may leave a ready marker",
+        );
+    }
+
     /// Unit test on the daemon-side traversal guard — the piece
     /// covering a malicious peer that hand-crafts a raw tar with
     /// `..` entries (the client's own `async_tar` builder refuses
@@ -1946,6 +2438,7 @@ mod tests {
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: NetworkMode::OwnIp,
                     policy: SessionPolicy::new(Some(egress.clone()), None),
+                    hooks_enabled: true,
                     attrs: Default::default(),
                 },
             })
@@ -2051,6 +2544,7 @@ mod tests {
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: NetworkMode::HostNet,
                     policy: SessionPolicy::new(Some(egress), None),
+                    hooks_enabled: true,
                     attrs: Default::default(),
                 },
             })
@@ -2138,6 +2632,7 @@ mod tests {
                 session_id: SessionId::nil(),
                 vars: vec![],
                 patches: vec![],
+                lifecycle_hooks: vec![],
             })
             .await;
         match resp {
