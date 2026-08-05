@@ -244,10 +244,7 @@ enum SessionInner {
         composition: Option<Arc<Composition>>,
         /// The running host, if minted, paired with the `JoinHandle` of its
         /// runtime loop so teardown can be awaited on destroy.
-        host: Option<(
-            session_host::HostHandle,
-            JoinHandle<Result<i32, std::io::Error>>,
-        )>,
+        host: Option<LaunchedHost>,
         /// Side operations.
         sops: Vec<SideOp>,
     },
@@ -263,6 +260,22 @@ enum Teardown {
     SelfInitiated,
 }
 
+/// A launched host: its handle, paired with the `JoinHandle` of its runtime
+/// loop so teardown can be awaited on destroy.
+type LaunchedHost = (
+    session_host::HostHandle,
+    JoinHandle<Result<i32, std::io::Error>>,
+);
+
+/// The PTY size a host minted with nothing attached starts at. A client that
+/// attaches later resizes it; until then only an unattached shell sees it.
+const UNATTACHED_WIN_SIZE: WinSize = WinSize {
+    rows: 24,
+    cols: 80,
+    xpixel: 0,
+    ypixel: 0,
+};
+
 enum SessionMessage {
     GetPaths(oneshot::Sender<SessionPaths>),
     MakeContext(oneshot::Sender<Result<mctx::Context, String>>),
@@ -274,6 +287,15 @@ enum SessionMessage {
         ChannelConfig,
     ),
     GetHostAttrs(oneshot::Sender<Option<HostAttrs>>),
+    /// Hand back this session's host, minting one — with no channel bound to
+    /// it — if the session has none running. Used by the exec path, which runs
+    /// a command inside the session's sandbox and so needs the sandbox up, but
+    /// has no terminal to attach and nothing to render progress to.
+    EnsureHost(
+        oneshot::Sender<Result<session_host::HostHandle, AttachError>>,
+        SessionHandle,
+        String,
+    ),
     /// The workspace's at-risk report (what a destroy would lose), served
     /// to the `SessionDelta` RPC for the destroy confirm. `Unavailable`
     /// without a running host, or when the host cannot compute it.
@@ -625,6 +647,9 @@ impl Session {
                     self.attach(session_hnd, conn_username, channel, config)
                         .await,
                 );
+            }
+            SessionMessage::EnsureHost(r, session_hnd, conn_username) => {
+                let _ = r.send(self.ensure_host(session_hnd, conn_username).await);
             }
             SessionMessage::GetHostAttrs(r) => {
                 let _ = r.send(match &self.inner {
@@ -1286,17 +1311,27 @@ impl Session {
         }
     }
 
-    async fn mint_session_host(
+    /// Launches a host for this session.
+    ///
+    /// The one path both callers take: [`Self::attach`], which has a client
+    /// channel and passes it in as `progress` so the sandbox coming up is
+    /// rendered on the client's terminal, and [`Self::ensure_host`], which has
+    /// no channel at all. The channel goes in and comes back out because
+    /// progress rendering borrows it for the duration; storing the result is
+    /// left to the caller, since attach only keeps a host it could bind to.
+    async fn launch_host(
         &mut self,
         session_hnd: SessionHandle,
         conn_username: String,
-        channel: Channel<Msg>,
         sz: WinSize,
         attach_env: session_host::AttachEnv,
-    ) -> Result<(), AttachError> {
+        progress: Option<ChannelProgress>,
+    ) -> Result<(Option<Channel<Msg>>, LaunchedHost), AttachError> {
         let record = self.record.record().await.unwrap();
         let paths = self.paths().await;
-        let name = registry_name(&record);
+        let launcher = self
+            .session_launcher(session_hnd, &record, attach_env)
+            .await?;
         // Where the shell-exit prompt's save-then-delete lane archives the
         // changed files. Daemon-side and session-independent; created on
         // demand at save time.
@@ -1305,33 +1340,103 @@ impl Session {
             .as_utf8_path()
             .as_std_path()
             .join("archives");
+        let spawn = Box::pin(session_host::Host::spawn(
+            launcher,
+            registry_name(&record),
+            conn_username,
+            paths,
+            sz,
+            None,
+            // Mint a handle to this session ID in the sessions actor/manager.
+            Some(SessionControl::new(self.manager.clone(), record.id)),
+            archives_dir,
+        ));
 
-        // Mint a handle to this session ID in the sessions actor/manager.
-        let control = SessionControl::new(self.manager.clone(), record.id);
+        let (channel, spawned) = match progress {
+            Some(progress) => {
+                let (channel, spawned) = progress.run(spawn).await;
+                (Some(channel), spawned)
+            }
+            None => (None, spawn.await),
+        };
+        Ok((channel, spawned.map_err(AttachError::SpawnFailed)?))
+    }
 
-        // Spawn/setup the session in a closure that reports progress down the terminal.
-        let launcher = self
-            .session_launcher(session_hnd, &record, attach_env)
-            .await?;
-        let progress = ChannelProgress::new(channel, self.tracker.clone(), (sz.cols, sz.rows));
-        let (channel, spawned) = progress
-            .run(Box::pin(session_host::Host::spawn(
-                launcher,
-                name,
+    /// Hands back this session's host, launching one if none is running.
+    ///
+    /// Unlike [`Self::attach`] there is no channel: the host is minted with
+    /// nothing bound to it, because the caller wants the *sandbox* — to run a
+    /// command inside it — not a terminal. A client that attaches later reuses
+    /// this host and resizes its PTY, so the placeholder size is only ever what
+    /// an unattached session's shell sees.
+    ///
+    /// Gated on the same `Active` record status as `attach`, without its
+    /// draft-session shortcut: composing a loadout is a client-driven flow, and
+    /// an exec request is not the place to start one.
+    async fn ensure_host(
+        &mut self,
+        session_hnd: SessionHandle,
+        conn_username: String,
+    ) -> Result<session_host::HostHandle, AttachError> {
+        {
+            let record = self
+                .record
+                .record()
+                .await
+                .map_err(AttachError::LoadoutFailed)?;
+            if record.status != SessionStatus::Active {
+                return Err(AttachError::SessionPending);
+            }
+        }
+
+        let running = match &self.inner {
+            SessionInner::Draft { .. } => return Err(AttachError::SessionPending),
+            SessionInner::Active {
+                host: Some((h, _)), ..
+            } if h.is_alive() => Some(h.clone()),
+            SessionInner::Active { .. } => None,
+        };
+        if let Some(host) = running {
+            return Ok(host);
+        }
+
+        let (_, launched) = self
+            .launch_host(
+                session_hnd,
                 conn_username,
-                paths,
-                sz,
+                UNATTACHED_WIN_SIZE,
+                session_host::AttachEnv::default(),
                 None,
-                Some(control),
-                archives_dir,
-            )))
-            .await;
-        let h = spawned.map_err(AttachError::SpawnFailed)?;
+            )
+            .await?;
+
+        let host = launched.0.clone();
+        let SessionInner::Active { host: slot, .. } = &mut self.inner else {
+            unreachable!("ensure_host returns early on a Draft session");
+        };
+        *slot = Some(launched);
+        Ok(host)
+    }
+
+    async fn mint_session_host(
+        &mut self,
+        session_hnd: SessionHandle,
+        conn_username: String,
+        channel: Channel<Msg>,
+        sz: WinSize,
+        attach_env: session_host::AttachEnv,
+    ) -> Result<(), AttachError> {
+        let progress = ChannelProgress::new(channel, self.tracker.clone(), (sz.cols, sz.rows));
+        let (channel, launched) = self
+            .launch_host(session_hnd, conn_username, sz, attach_env, Some(progress))
+            .await?;
+        let channel = channel.expect("progress hands back the channel it was given");
 
         // Wire the channel to the freshly launched host. A failure here means
         // the host died in the window between launch and attach; surface it as
-        // a spawn failure rather than leaving a dead, channel-less host.
-        h.0.attach(channel, sz).await.map_err(|_| {
+        // a spawn failure rather than leaving a dead, channel-less host — which
+        // is why the host is stored only once it is bound.
+        launched.0.attach(channel, sz).await.map_err(|_| {
             AttachError::SpawnFailed(std::io::Error::other(
                 "session host exited before its channel could attach",
             ))
@@ -1339,7 +1444,7 @@ impl Session {
         let SessionInner::Active { host, .. } = &mut self.inner else {
             unreachable!("mint_session_host is only reachable from the Active state");
         };
-        *host = Some(h);
+        *host = Some(launched);
         Ok(())
     }
 
@@ -1815,6 +1920,40 @@ impl SessionHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(SessionMessage::Destroy(send)).await;
         recv.await.unwrap_or(Ok(()))
+    }
+
+    /// This session's host, launching one with nothing bound to it if the
+    /// session has none running.
+    ///
+    /// For callers that need the session's *sandbox* rather than its terminal —
+    /// an SSH exec request runs its command inside the sandbox, which means the
+    /// session process whose namespaces it joins has to exist.
+    ///
+    /// # Errors
+    ///
+    /// [`AttachError::SessionPending`] on a session that is not yet `Active`,
+    /// and [`AttachError::SpawnFailed`] if the host cannot be launched or the
+    /// session actor is gone.
+    pub async fn ensure_host(
+        &self,
+        conn_username: String,
+    ) -> Result<session_host::HostHandle, AttachError> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .0
+            .send(SessionMessage::EnsureHost(
+                send,
+                self.clone(),
+                conn_username,
+            ))
+            .await;
+        match recv.await {
+            Ok(result) => result,
+            Err(_) => Err(AttachError::SpawnFailed(std::io::Error::other(
+                "session actor terminated before the host could be launched",
+            ))),
+        }
     }
 
     pub async fn attach(
@@ -2836,6 +2975,48 @@ mod tests {
             handle.peek_composition().await.is_none(),
             "session with a missing sidecar should fall back to baseline \
              (composition None), not hold a stale composition"
+        );
+    }
+
+    /// An exec request needs the session's sandbox up, not a terminal: a
+    /// session sitting idle with nobody attached must still be able to launch
+    /// a host, and a second request must reuse it rather than starting a
+    /// second shell in the same session.
+    #[tokio::test]
+    async fn ensure_host_launches_an_unattached_host_and_then_reuses_it() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_configured_session(&mut client, "ensure-host", "/tmp").await;
+
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("session should resolve");
+
+        assert!(
+            handle.get_attrs().await.is_none(),
+            "no client has attached, so the session should have no host yet"
+        );
+
+        let host = handle
+            .ensure_host("tester".to_string())
+            .await
+            .expect("an Active session should be able to launch a host");
+        assert!(host.is_alive());
+        assert!(
+            handle.get_attrs().await.is_some(),
+            "the session should now be holding the host it launched"
+        );
+
+        let again = handle
+            .ensure_host("tester".to_string())
+            .await
+            .expect("a second request should be served by the running host");
+        assert!(
+            again.same_host(&host),
+            "a second exec request minted a second host instead of reusing the first"
         );
     }
 }

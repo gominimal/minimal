@@ -112,6 +112,24 @@ impl<C: Channel> Drop for Sandbox<C> {
 
 // Sandbox initialization
 impl<C: Channel> Sandbox<C> {
+    /// The working directory a command in this sandbox starts in, as an
+    /// absolute path inside the sandbox.
+    ///
+    /// Exposed so a caller that runs a process in this sandbox by some route
+    /// other than [`Self::command`] — minimald joining a live session's
+    /// namespaces — starts it where the sandbox's own process started.
+    #[must_use]
+    pub fn command_cwd(&self) -> String {
+        self.config.command_cwd()
+    }
+
+    /// The environment a command in this sandbox is launched with, before any
+    /// per-invocation additions. Companion to [`Self::command_cwd`].
+    #[must_use]
+    pub fn command_env(&self) -> std::collections::BTreeMap<String, String> {
+        self.config.command_env()
+    }
+
     /// Creates a new sandbox, containing all filesystem state within `base_dir`.
     pub(crate) fn new(base_dir: PathBuf, config: Config, channel: C) -> Result<Self, Error> {
         // Setup the rootfs
@@ -369,114 +387,12 @@ impl Container {
     {
         let mut command = self.container.command(program);
         command.args(args);
-        command.current_dir(match &sandbox.config.wd {
-            WdSetup::BoundDir { .. } => format!(
-                "/{}",
-                sandbox.config.wd.bound_dir_sandbox_cwd().to_str().unwrap()
-            ),
-            WdSetup::Isolated { .. } => "/build".to_string(),
-            WdSetup::Session {
-                home: _,
-                working: _,
-                working_name_override,
-            } => {
-                format!(
-                    "/{}",
-                    working_name_override
-                        .as_ref()
-                        .cloned()
-                        .unwrap_or_else(|| SESSION_DEFAULT_WD.to_string())
-                )
-            }
-        });
-
-        // Set XDG vars
-        if let WdSetup::Session { .. } = &sandbox.config.wd {
-            command.env("XDG_STATE_HOME", "/home/.local/state");
-            command.env("XDG_CONFIG_HOME", "/home/.config");
-            command.env("XDG_DATA_HOME", "/home/.local/share");
-            command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin"); // adds /home/.local/bin
-            // A styled default shell prompt for interactive sessions. Set as a
-            // plain default here (not forced) so a user's composition var can
-            // override it: the composed `env_vars` are applied further down and
-            // win on key collision.
-            command.env(
-                "PS1",
-                r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ ",
-            );
-            // Login-shell identity, mirroring what sshd/pam would set from
-            // `/etc/passwd`. `USER`/`LOGNAME` track the configured username;
-            // `SHELL` points at the session shell (the `bash` package installs
-            // to `/usr/bin/bash`). All plain defaults, so composition vars win.
-            if let Some(user) = &sandbox.config.username {
-                command.env("USER", user);
-                command.env("LOGNAME", user);
-            }
-            command.env("SHELL", "/usr/bin/bash");
-        } else {
-            // Both build and BoundWd layouts
-            command.env("XDG_STATE_HOME", "/state/state");
-            command.env("XDG_CONFIG_HOME", "/state/home");
-            command.env("XDG_DATA_HOME", "/state/data");
-            command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
-        }
-        command.env("XDG_CACHE_HOME", "/state/cache");
-        command.env("XDG_RUNTIME_DIR", "/run");
-
-        // Set HOME
-        match &sandbox.config.wd {
-            WdSetup::Isolated { .. } => {
-                command.env("HOME", "/state/home");
-            }
-            WdSetup::Session { .. } => {
-                command.env("HOME", "/home");
-            }
-            WdSetup::BoundDir { .. } => {
-                if let Ok(h) = std::env::var("HOME") {
-                    command.env("HOME", &h);
-                } else {
-                    command.env("HOME", "/state/home");
-                }
-            }
-        };
-
-        if let WdSetup::Isolated { .. } = sandbox.config.wd {
-            command.env("OUTPUT_DIR", "/build/output");
-            command.env("GIT_TERMINAL_PROMPT", "0");
-            command.env("SOURCE_DATE_EPOCH", "0");
-            command.env("PYTHONHASHSEED", "0");
-        }
-
-        // Locale. Sessions get a safe, always-present `C.UTF-8` floor: it's
-        // built into glibc so it never triggers "cannot set locale" warnings
-        // the way `en_US.utf8` does when that locale isn't generated in the
-        // rootfs, and setting only `LANG` (the lowest-precedence locale knob,
-        // no `LC_ALL`) lets a session's composed `env_vars` or a client's
-        // forwarded `LANG`/`LC_*` override it. Build/task sandboxes keep the
-        // fixed `en_US.utf8` + `LC_ALL` they always had, for output stability.
-        if let WdSetup::Session { .. } = &sandbox.config.wd {
-            command.env("LANG", "C.UTF-8");
-        } else {
-            command.env("LANG", "en_US.utf8");
-            command.env("LC_ALL", "en_US.utf8");
-        }
-        command.env("IS_SANDBOX", "1");
-        if let WdSetup::BoundDir { .. } = sandbox.config.wd {
-            //  Quality-of-life wiring for task sandboxes
-            if let Ok(term) = std::env::var("TERM") {
-                command.env("TERM", &term);
-            }
-            if let Ok(ct) = std::env::var("COLORTERM") {
-                command.env("COLORTERM", &ct);
-            }
-            if let Ok(lsc) = std::env::var("LS_COLORS") {
-                command.env("LS_COLORS", &lsc);
-            }
-        }
-
-        sandbox.config.env_vars.iter().for_each(|(var, val)| {
-            command.env(var, val);
-        });
+        // Both are derived from the config rather than built here, so that a
+        // process injected into a *running* sandbox (minimald's `nsenter`) can
+        // reproduce the same working directory and environment without a second
+        // definition of them drifting from this one.
+        command.current_dir(sandbox.config.command_cwd());
+        command.envs(sandbox.config.command_env());
         for (k, v) in envs.into_iter() {
             command.env(k.as_ref(), v.as_ref());
         }

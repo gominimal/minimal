@@ -23,7 +23,7 @@
 //!   requests one at a time on the runtime, so every handler is a plain
 //!   `async fn` that `.await`s — no nested runtimes, no sync/async bridge writers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::Permissions;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -226,9 +226,38 @@ pub struct Env {
     sandbox: Sandbox<BridgeChannel>,
     /// The command-channel actor task. `Some` until [`Drop`] aborts it.
     actor: Option<JoinHandle<()>>,
+    /// Variables the channel actor has added since launch; see
+    /// [`SessionChannel::runtime_env`].
+    runtime_env: RuntimeEnv,
     /// Extra directories kept alive for the environment's lifetime (e.g. a
     /// temporary `/state` directory). Dropped after the sandbox.
     _temp_dirs: Vec<TempDir>,
+}
+
+/// Environment variables a *running* session has acquired, on top of the ones
+/// it was launched with. Usually happens due to `min add`.
+///
+/// Shared between [`Env`] and the [`SessionChannel`] actor that learns of them.
+#[derive(Clone, Default)]
+pub(crate) struct RuntimeEnv(Arc<Mutex<BTreeMap<String, String>>>);
+
+impl RuntimeEnv {
+    /// Records a variable the session has just acquired. Last write wins, as it
+    /// does in the shell, where a later `export` overrides an earlier one.
+    fn record(&self, key: &str, value: &str) {
+        self.0
+            .lock()
+            .expect("runtime env lock is never held across a panic")
+            .insert(key.to_string(), value.to_string());
+    }
+
+    /// Everything recorded so far.
+    fn snapshot(&self) -> BTreeMap<String, String> {
+        self.0
+            .lock()
+            .expect("runtime env lock is never held across a panic")
+            .clone()
+    }
 }
 
 /// Derive the composition-path state-dir set by picking up any
@@ -375,11 +404,13 @@ impl Env {
         install_min_helpers(&sandbox.rootfs()).map_err(std::io::Error::other)?;
         sandbox.keep_dir(false);
 
+        let runtime_env = RuntimeEnv::default();
         let channel = SessionChannel {
             rootfs: DaemonAbsPath::try_new(
                 Utf8PathBuf::try_from(sandbox.rootfs().to_path_buf()).unwrap(),
             )
             .unwrap(),
+            runtime_env: runtime_env.clone(),
             state_dir: args.state_base_dir.clone(),
             working: args.cwd.clone(),
             home: args.home.clone(),
@@ -395,6 +426,7 @@ impl Env {
         Ok(Self {
             sandbox,
             actor: Some(actor),
+            runtime_env,
             _temp_dirs: Vec::new(),
         })
     }
@@ -426,6 +458,19 @@ impl Env {
         self.sandbox
             .command(container, program, args, [("", ""); 0])
             .map_err(sandbox_err_to_io)
+    }
+
+    /// The working directory and environment a command should run with in this
+    /// session **as it stands now** — `/workbench`, the composed session
+    /// variables, and anything `min add` has installed since launch.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn command_environment(&self) -> crate::session_host::SessionEnvironment {
+        let mut vars = self.sandbox.command_env();
+        vars.extend(self.runtime_env.snapshot());
+        crate::session_host::SessionEnvironment {
+            cwd: self.sandbox.command_cwd(),
+            vars,
+        }
     }
 }
 
@@ -523,6 +568,8 @@ struct SessionChannel {
     /// Weak handle to the owning session actor, used by session-scoped commands
     /// (e.g. `min build`) to drive side-ops.
     session: crate::session::WeakSessionHandle,
+    /// Accumulates env vars of newly-installed packages, shared with the owning [`Env`].
+    runtime_env: RuntimeEnv,
     rx: mpsc::Receiver<ChannelRequest>,
 }
 
@@ -621,6 +668,12 @@ impl SessionChannel {
         }
     }
 
+    /// Record and transmit a newly-acquired variable to the session shell.
+    fn announce_env(&self, stream: &mut UnixStream, key: &str, value: &str) {
+        self.runtime_env.record(key, value);
+        let _ = writeln!(stream, "set_env:{key}:{value}");
+    }
+
     /// Resolves a space-separated list of package names to `(name, ref)` pairs,
     /// returning the first unknown name as `Err`.
     fn parse_pkgs_line<'a>(&self, pkgs: &'a str) -> Result<Vec<(&'a str, BuildSpecRef)>, &'a str> {
@@ -674,7 +727,7 @@ impl SessionChannel {
                     }
                 }
                 for (k, v) in &setup.env_vars {
-                    let _ = writeln!(stream, "set_env:{k}:{v}");
+                    self.announce_env(stream, k, v);
                 }
             }
             Err(e) => {
@@ -1411,6 +1464,7 @@ mod tests {
             has_packages: HashSet::new(),
             ot: None,
             session: crate::session::WeakSessionHandle::dangling(),
+            runtime_env: RuntimeEnv::default(),
             ctx,
             graph,
             rx,
@@ -1440,6 +1494,49 @@ mod tests {
         assert!(
             lines[0].contains("error: unhandled input 'garbage-input'"),
             "unexpected output: {lines:?}"
+        );
+    }
+
+    /// A variable a running session acquires has to reach two places: the shell,
+    /// which exports it, and the daemon, which hands it to anything injected
+    /// into the session later. `min add` is the source in production; this
+    /// drives the announcement directly, since installing a package would mean
+    /// building one.
+    #[tokio::test]
+    async fn an_acquired_var_reaches_both_the_shell_and_the_daemon() {
+        let (_state, _rootfs, _cwd, chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+
+        chan.announce_env(&mut ours, "GOCACHE", "/state/gocache");
+        drop(ours);
+
+        assert_eq!(read_lines(&theirs), vec!["set_env:GOCACHE:/state/gocache"]);
+        assert_eq!(
+            chan.runtime_env
+                .snapshot()
+                .get("GOCACHE")
+                .map(String::as_str),
+            Some("/state/gocache"),
+            "the daemon's view is missing a variable the shell was given"
+        );
+    }
+
+    /// Installing over an earlier install replaces the value, as the shell's
+    /// second `export` does.
+    #[tokio::test]
+    async fn a_reannounced_var_takes_the_newer_value() {
+        let (_state, _rootfs, _cwd, chan) = setup_channel();
+        let (mut ours, _theirs) = UnixStream::pair().unwrap();
+
+        chan.announce_env(&mut ours, "PYTHONPATH", "/first");
+        chan.announce_env(&mut ours, "PYTHONPATH", "/second");
+
+        assert_eq!(
+            chan.runtime_env
+                .snapshot()
+                .get("PYTHONPATH")
+                .map(String::as_str),
+            Some("/second")
         );
     }
 

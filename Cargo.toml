@@ -112,7 +112,7 @@ nickel-lang-core = { git = "https://github.com/nickel-lang/nickel.git", rev = "2
 opentelemetry-semantic-conventions = "0.32"
 # `socket` + `time`: the guest's vsock timekeep listener binds an AF_VSOCK
 # datagram socket and steps CLOCK_REALTIME from the host's updates.
-nix = { version = "0.31", features = ["fs", "socket", "time", "user"] }
+nix = { version = "0.31", features = ["fs", "sched", "socket", "time", "user"] }
 nutype = { version = "0.7", features = ["serde"] }
 # Held at 0.39: 0.40 turns `Object::exports()`/`imports()` from
 # `Result<Vec<_>>` into lazy `Result<_>`-yielding iterators, so crates/check
