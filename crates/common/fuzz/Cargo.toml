@@ -45,6 +45,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "normalize_within_root"
+path = "fuzz_targets/normalize_within_root.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 
 # Mirrors the root workspace's patch. A `fuzz/` dir is its own workspace — that
