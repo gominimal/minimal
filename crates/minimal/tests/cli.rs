@@ -311,7 +311,9 @@ async fn activate_uploads_project_files() {
     cmd_activate(&args, activate_args).await.unwrap();
 
     // Look up the session and verify the uploaded files landed in the
-    // session's workspace directory by reading them back over SFTP.
+    // session's workspace directory by reading them back over SFTP. The
+    // workspace is spelled out: SFTP starts a client at the session's home,
+    // so a relative path would name the wrong one of the two exports.
     let mut sftp_client = daemon.server.connect().await;
     let sessions = {
         use minimald_rpc::ListSessions;
@@ -323,13 +325,13 @@ async fn activate_uploads_project_files() {
 
     let sftp = sftp_client.open_sftp(session_id).await;
 
-    let hello = sftp.read("hello.txt").await.unwrap();
+    let hello = sftp.read("/workbench/hello.txt").await.unwrap();
     assert_eq!(hello, b"hello world");
 
-    let nested = sftp.read("subdir/nested.txt").await.unwrap();
+    let nested = sftp.read("/workbench/subdir/nested.txt").await.unwrap();
     assert_eq!(nested, b"nested");
 
-    let mfile = sftp.read("minimal.toml").await.unwrap();
+    let mfile = sftp.read("/workbench/minimal.toml").await.unwrap();
     assert!(mfile.starts_with(b"# test"));
 }
 
@@ -403,8 +405,10 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
         "session project_path should match -C/--repo-dir, not cwd"
     );
 
+    // Spelled out for the same reason as above: the upload lands in the
+    // workspace, but SFTP's relative paths resolve against the home.
     let sftp = client.open_sftp(session.id).await;
-    let hello = sftp.read("hello.txt").await.unwrap();
+    let hello = sftp.read("/workbench/hello.txt").await.unwrap();
     assert_eq!(hello, b"hello world");
 }
 
