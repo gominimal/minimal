@@ -1,4 +1,8 @@
-use std::{collections::HashSet, path::PathBuf, time::Instant};
+use std::{
+    collections::{BTreeSet, HashSet},
+    path::PathBuf,
+    time::Instant,
+};
 
 use crate::{Error, Materialized, Options, Runnable, SubsetBuild};
 use anyhow::anyhow;
@@ -28,7 +32,11 @@ pub struct SpecBuild<'a, SF: crate::SourceFetcher> {
     ///
     /// Does not override `Local` or `Source` variant build_deps - those will
     /// always be made present automatically.
-    pub override_deps: Option<HashSet<PathBuf>>,
+    ///
+    /// Ordered, because `rootfs_mapped` passes these to the sandbox, which hardlinks them
+    /// first-writer-wins: with a `HashSet` the winner of a path two deps both install was
+    /// decided by a per-process `RandomState` seed and so varied between runs.
+    pub override_deps: Option<BTreeSet<PathBuf>>,
 
     /// Optional async writer that receives a copy of the sandbox's stdout stream.
     pub stdout_writer: Option<Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync>>,
