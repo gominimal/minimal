@@ -1,6 +1,6 @@
 use crate::network::Network;
 use crate::{Error, Sandbox};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,30 @@ impl PartialEq for SandboxMapped {
     }
 }
 impl Eq for SandboxMapped {}
+
+// Ordered on (variant tag, path), mirroring the `PartialEq`/`Hash` key above,
+// so `BTreeSet<SandboxMapped>` iterates — and the rootfs therefore assembles —
+// in the same order in every process. Assembly is first-writer-wins
+// hardlinking, so an unordered collection let a per-process hash seed decide
+// which entry provided a path that two entries both contain.
+impl PartialOrd for SandboxMapped {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for SandboxMapped {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        fn key(m: &SandboxMapped) -> (u8, &Path) {
+            match m {
+                SandboxMapped::File(p) => (0, p),
+                SandboxMapped::Dir(p) => (1, p),
+                SandboxMapped::TempDir(t) => (2, t.path()),
+                SandboxMapped::FileCopy(p) => (3, p),
+            }
+        }
+        key(self).cmp(&key(other))
+    }
+}
 
 impl Hash for SandboxMapped {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -143,7 +167,10 @@ pub struct Config {
     ///    into the sandbox.
     pub wd: WdSetup,
     /// The set of files that should be mapped into the root filesystem of the sandbox.
-    pub rootfs: HashSet<SandboxMapped>,
+    ///
+    /// `BTreeSet`: iteration order is assembly order (entries are hardlinked
+    /// first-writer-wins), so it must be deterministic across processes.
+    pub rootfs: BTreeSet<SandboxMapped>,
 
     /// Synthesize DNS config.
     pub setup_dns_config: bool,
@@ -332,7 +359,7 @@ impl Config {
             hostname: None,
             username: None,
             keep_dirs: false,
-            rootfs: HashSet::with_capacity(64),
+            rootfs: BTreeSet::new(),
             state_dir: None,
             wd: WdSetup::Isolated {
                 working_inputs: Vec::with_capacity(6),
