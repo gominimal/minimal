@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use anyhow::anyhow;
 use graph::{BuildSpec, BuildSpecRef, SpecTest, SubsetInput, Transitives};
@@ -34,7 +34,7 @@ impl<'a> StandaloneTest<'a> {
         build: &BuildSpec,
         test: &SpecTest,
         opts: &Options<'a>,
-    ) -> Result<(Vec<SandboxMapped>, bool, bool), Error> {
+    ) -> Result<(BTreeSet<SandboxMapped>, bool, bool), Error> {
         let transitives = Transitives::for_toplevels(
             opts.graph,
             {
@@ -45,24 +45,16 @@ impl<'a> StandaloneTest<'a> {
             false,
         );
 
-        let mut dependencies = Vec::new();
-        let mut seen = HashSet::new();
+        let mut dependencies = BTreeSet::new();
         let (mut needs_dns, mut need_internet) = (false, false);
 
-        // Sorted, because the rootfs is assembled by hardlinking these first-writer-wins: with
-        // an unordered collection the winner of a path two dependencies both install was
-        // decided by a per-process `RandomState` seed and so varied between runs.
-        let mut build_deps: Vec<_> = transitives.into_iter().collect();
-        build_deps.sort_by_key(|(bsr, _)| *opts.graph.spec_hash(bsr).0.as_bytes());
+        let build_deps: Vec<_> = transitives.into_iter().collect();
         for (bsr, dep_info) in build_deps.into_iter() {
             match dep_info.outputs {
                 // Regular build
                 None => {
                     let cache_dir = opts.cache.read_dir(&opts.graph.spec_hash(&bsr))?;
-                    let path = cache_dir.path().to_path_buf();
-                    if seen.insert(path.clone()) {
-                        dependencies.push(SandboxMapped::Dir(path));
-                    }
+                    dependencies.insert(SandboxMapped::Dir(cache_dir.path().to_path_buf()));
                 }
                 // Subset
                 Some(outputs) => {
@@ -73,32 +65,31 @@ impl<'a> StandaloneTest<'a> {
                     let subset_hash = opts.graph.subset_hash(&subset);
 
                     // If the subset exists use it, otherwise build it
-                    let path = match opts.cache.read_dir(&subset_hash) {
-                        Ok(cache_dir) => cache_dir,
-                        Err(CacheErr::NotFound) => {
-                            let mut sb = SubsetBuild {
-                                subset: &subset,
-                                from_dir: None,
-                            };
-                            let pending_dir = sb.run(opts).await?;
-                            pending_dir.finalize(lcache::EntryMeta {
-                                inner: MetaInner::Subset(subset.as_spec(opts.graph)),
-                                fetched: false,
-                                origin: Some(build.from.as_ref().clone()),
-                                ..Default::default()
-                            })?;
+                    dependencies.insert(SandboxMapped::Dir(
+                        match opts.cache.read_dir(&subset_hash) {
+                            Ok(cache_dir) => cache_dir,
+                            Err(CacheErr::NotFound) => {
+                                let mut sb = SubsetBuild {
+                                    subset: &subset,
+                                    from_dir: None,
+                                };
+                                let pending_dir = sb.run(opts).await?;
+                                pending_dir.finalize(lcache::EntryMeta {
+                                    inner: MetaInner::Subset(subset.as_spec(opts.graph)),
+                                    fetched: false,
+                                    origin: Some(build.from.as_ref().clone()),
+                                    ..Default::default()
+                                })?;
 
-                            opts.cache.read_dir(&subset_hash)?
+                                opts.cache.read_dir(&subset_hash)?
+                            }
+                            Err(e) => {
+                                return Err(e.into());
+                            }
                         }
-                        Err(e) => {
-                            return Err(e.into());
-                        }
-                    }
-                    .path()
-                    .to_path_buf();
-                    if seen.insert(path.clone()) {
-                        dependencies.push(SandboxMapped::Dir(path));
-                    }
+                        .path()
+                        .to_path_buf(),
+                    ));
                 }
             }
 
