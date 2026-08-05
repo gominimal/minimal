@@ -58,35 +58,39 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    // 2. Every constructor that yields a `RelPath` must agree with `try_new`.
-    //    `EitherPath::new` is infallible and picks a variant by absoluteness
-    //    alone, so it must not mint a `Rel` that `try_new` would have refused
-    //    — otherwise the type's guarantee is forgeable.
-    match EitherPath::<Host>::new(s) {
-        EitherPath::Rel(rel) => {
-            // The lenient variant is a bare path by design, so the check is
-            // no longer "did it forge a RelPath" but "can it still be turned
-            // into one only when genuinely valid". A path that survives
-            // `try_new` must join contained.
-            assert_eq!(
-                rel,
-                s,
-                "EitherPath::Rel altered the path it was given: {s:?}",
+    // 2. `EitherPath::try_new` must agree exactly with the per-variant
+    //    constructors it claims to route through. It succeeds iff whichever
+    //    variant applies would have succeeded — no third answer.
+    let either = EitherPath::<Host>::try_new(s);
+    let abs_ok = AbsPath::<Host>::try_new(s).is_ok();
+    let rel_ok = RelPath::<Host>::try_new(s).is_ok();
+    assert_eq!(
+        either.is_ok(),
+        abs_ok || rel_ok,
+        "EitherPath::try_new disagrees with AbsPath/RelPath::try_new: {s:?}",
+    );
+
+    match either {
+        // A `Rel` variant now carries the no-`..` guarantee, so it must be
+        // joinable without escaping — the wire-trust claim.
+        Ok(EitherPath::Rel(rel)) => {
+            assert!(rel_ok, "EitherPath minted a Rel try_new rejects: {s:?}");
+            let joined = base.join(&rel).as_utf8_path().to_path_buf();
+            assert!(
+                !escapes(&joined, BASE),
+                "EitherPath's RelPath escaped its base: input={s:?} joined={joined:?}",
             );
-            if let Ok(checked) = RelPath::<Host>::try_new(rel) {
-                let joined = base.join(&checked).as_utf8_path().to_path_buf();
-                assert!(
-                    !escapes(&joined, BASE),
-                    "validated RelPath escaped its base: input={s:?} joined={joined:?}",
-                );
-            }
         }
-        EitherPath::Abs(abs) => {
+        Ok(EitherPath::Abs(abs)) => {
             assert!(
                 abs.as_utf8_path().is_absolute(),
                 "EitherPath classified a relative path as Abs: {s:?}",
             );
         }
+        Err(_) => assert!(
+            !abs_ok && !rel_ok,
+            "EitherPath rejected what its constructors accept: {s:?}",
+        ),
     }
 
     // 3. `FromStr` must be exactly `try_new` — a divergence would let callers
@@ -102,12 +106,13 @@ fuzz_target!(|data: &[u8]| {
         "RelPath FromStr/try_new disagree: {s:?}",
     );
 
-    // 4. The two constructors partition the space: exactly one of absolute /
-    //    relative holds, and the classification must match the variant.
-    let abs_ok = AbsPath::<Host>::try_new(s).is_ok();
-    assert_eq!(
-        abs_ok,
-        EitherPath::<Host>::new(s).is_absolute(),
-        "AbsPath::try_new and EitherPath disagree on absoluteness: {s:?}",
-    );
+    // 4. Classification must match absoluteness whenever construction
+    //    succeeds. (`abs_ok`/`rel_ok` computed above.)
+    if let Ok(e) = EitherPath::<Host>::try_new(s) {
+        assert_eq!(
+            abs_ok,
+            e.is_absolute(),
+            "AbsPath::try_new and EitherPath disagree on absoluteness: {s:?}",
+        );
+    }
 });

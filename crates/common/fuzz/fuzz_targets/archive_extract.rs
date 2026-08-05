@@ -62,17 +62,87 @@ fuzz_target!(|data: &[u8]| {
     };
     let strip = PREFIXES[usize::from(control[1] % 4)].map(str::to_owned);
 
-    let Ok(dest) = tempfile::tempdir() else {
+    // Sandbox under the fuzz target dir (gitignored) rather than `/tmp`, and
+    // deliberately so: hard links cannot cross devices. A tar hardlink target
+    // is resolved against the *process CWD* by `tar::Entry::unpack`, and the
+    // CWD here is the crate root — so a `/tmp` destination on another mount
+    // turns every inode escape into a silent EXDEV instead of a finding.
+    let sandbox = match tempfile::tempdir_in("fuzz/target") {
+        Ok(d) => d,
+        // Before the first build there is no fuzz/target; the run is still
+        // useful for path escapes even if inode escapes go unseen.
+        Err(_) => match tempfile::tempdir() {
+            Ok(d) => d,
+            Err(_) => return,
+        },
+    };
+    let dest = sandbox.path().join("dest");
+    if std::fs::create_dir(&dest).is_err() {
+        return;
+    }
+
+    // A file OUTSIDE the destination but on the same device: nothing that
+    // lands inside may share its inode.
+    let sentinel = sandbox.path().join("sentinel");
+    if std::fs::write(&sentinel, b"sentinel").is_err() {
+        return;
+    }
+    let Ok(sentinel_meta) = std::fs::metadata(&sentinel) else {
         return;
     };
 
-    let _ = extract_compressed_tar(body, compression, dest.path(), strip.as_ref());
+    let _ = extract_compressed_tar(body, compression, &dest, strip.as_ref());
 
-    // The real assertion: whatever the call returned, nothing may have landed
-    // outside the destination root. A partial extraction on the error path
-    // still has to obey containment.
-    assert_contained(dest.path());
+    // Whatever the call returned, nothing may have landed outside the
+    // destination root. A partial extraction on the error path still has to
+    // obey containment.
+    assert_contained(&dest);
+    assert_no_inode_escape(&dest, &sentinel_meta);
 });
+
+/// Fails if anything extracted shares an inode with a file outside the
+/// destination.
+///
+/// [`assert_contained`] is a *path* oracle and structurally cannot see this. A
+/// hardlink's path really is inside the tree and `canonicalize` agrees, because
+/// a hardlink has no target to resolve — it is a second name for one inode.
+/// The escape is by identity, not by location.
+///
+/// Not hypothetical: `tar::Entry::unpack` validates a hardlink target only when
+/// handed a `target_base`, which the whole-archive `unpack_in` supplies and a
+/// per-entry call does not, so a relative target resolves against the process
+/// CWD. A path-only oracle watched that happen and reported success.
+fn assert_no_inode_escape(root: &Path, sentinel: &std::fs::Metadata) {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue; // assert_contained's job
+            }
+            if kind.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            assert!(
+                !(meta.ino() == sentinel.ino() && meta.dev() == sentinel.dev()),
+                "inode escape: {} is a hardlink to a file outside the destination",
+                path.display(),
+            );
+        }
+    }
+}
 
 /// Walks the extracted tree and fails if any entry — including a symlink
 /// target — resolves outside `root`. Symlinks are checked without following
