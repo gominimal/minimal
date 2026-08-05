@@ -306,6 +306,39 @@ t1=$(now_ms)
 echo "warm 'min ls': $((t1 - t0))ms"
 
 # ---------------------------------------------------------------------------
+# Non-interactive exec proof: `min session attach <sid> -c '<cmd>'` runs the
+# command in the session's namespaces and relays its stdout and exit code. The
+# daemon services this by re-execing ITSELF as the nsenter shim, which is a
+# different path from the interactive attach below and the one that broke in
+# #1175 (in the VM, pid-1's `current_exe()` is the unreachable initramfs
+# `/init`, so every exec died with ENOENT while interactive attach worked).
+# Ordered before the pty proof, which deletes the session.
+echo "::group::session exec proof (min session attach -c)"
+# shellcheck disable=SC2016 # $PWD must expand in the SESSION's shell, not here.
+exec_out="$(mnl session attach "$sid" -c 'echo EXEC_OK $PWD' 2>"$WORK/attach-c.err")" || {
+  echo "::error::'min session attach $sid -c' failed"
+  echo "--- stdout ---"; printf '%s\n' "$exec_out"
+  echo "--- stderr ---"; cat "$WORK/attach-c.err" 2>/dev/null || true
+  fail
+}
+# The cwd proves it ran in the session's mount namespace, not on the host.
+if [[ "$exec_out" != *"EXEC_OK /workbench"* ]]; then
+  echo "::error::'min session attach -c' did not run in the session (expected 'EXEC_OK /workbench')"
+  echo "--- stdout ---"; printf '%s\n' "$exec_out"
+  echo "--- stderr ---"; cat "$WORK/attach-c.err" 2>/dev/null || true
+  fail
+fi
+# The command's exit code must be the CLI's, not a blanket 0/1.
+mnl session attach "$sid" -c 'exit 7' >/dev/null 2>&1
+rc=$?
+if [ "$rc" -ne 7 ]; then
+  echo "::error::'min session attach -c \"exit 7\"' exited $rc (expected the command's 7)"
+  fail
+fi
+echo "session exec proof OK"
+echo "::endgroup::"
+
+# ---------------------------------------------------------------------------
 # `min task run` proof: a declared task runs in an ephemeral session — output
 # streamed through, the task's exit code relayed, the session destroyed
 # afterwards (or kept with --keep). Runs against its own tiny seeded project:

@@ -519,7 +519,18 @@ impl Exec for SessionExec {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
-            command.spawn().map(TokioProcess)
+            // This spawns the shim — us, re-exec'd — not the user's command, so
+            // a bare ENOENT reads as a missing shell. Name the path (#1175).
+            let shim = command.as_std().get_program().to_owned();
+            command.spawn().map(TokioProcess).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "re-execing {} as the session-namespace shim: {e}",
+                        std::path::Path::new(&shim).display()
+                    ),
+                )
+            })
         })
         .boxed()
     }
