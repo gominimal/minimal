@@ -175,6 +175,54 @@ fuzzer's own crashing input:
 | Escaping symlink created when no `strip_prefix` was set — the link-target check only ran on the `Some(..)` branch | `common::archive::extract_tar_impl` | this branch |
 | `EitherPath::new` minted a `RelPath` containing `..`, forging the guarantee the daemon composer trusts for wire-supplied paths | `paths::EitherPath` | this branch |
 
+## Reading the prose
+
+Fuzzing is not the only tool, and it has not been the most productive one
+here. The most serious finding of the last campaign — a remote arbitrary write
+chaining the workspace uploader to the SFTP subsystem — came from **grepping
+doc comments**, not from any target.
+
+Two kinds of comment are worth searching for:
+
+```sh
+# 1. Comments asserting a containment or safety property. These are claims;
+#    write the test the sentence implies and try to falsify it.
+rg 'guarantees|cannot escape|must never|is proof|invariant|safe because' crates/*/src
+
+# 2. Comments explaining a threat. These mean the threat is real and someone
+#    thought hard about it — so check whether EVERY sibling path is covered.
+rg 'untrusted|attacker|hostile|traversal|escapes the' crates/*/src
+```
+
+The second is the higher-yield one, for an uncomfortable reason: **a good
+security comment marks where an author's attention was — and where it
+stopped.** Every finding so far has had the same shape, two sibling paths to
+one operation with only one of them hardened:
+
+| Hardened | Unhardened sibling |
+|---|---|
+| `extract_tar_impl` with a `strip_prefix` | the same function without one |
+| `RelPath::try_new` | `EitherPath`'s struct literal |
+| `unpack_workspace_patches` ("the client is untrusted so we re-check") | `unpack_workspace_files` |
+
+None was a case of the threat being unknown. Each was knowledge that failed to
+reach the function next door. When you find a careful defence, the next
+question is *what else does this?* — and that is a grep, not a fuzz target.
+
+Two corollaries for target design, both learned by getting them wrong:
+
+- **Match the oracle to the bug class.** All of the above are silent: no panic,
+  no sanitizer trip. A panic-only target watches them happen and reports
+  success. `assert_contained` in `archive_extract` exists for that reason — and
+  was itself blind to hardlink *inode* escapes, because a hardlink's path
+  really is inside the tree. Ask what a successful exploit would look like on
+  disk, then assert that it did not happen.
+- **Assert what the code promises, not what you assume.** An idempotence check
+  on `redact` fired immediately and wrongly: re-masking a placeholder is
+  key-based redaction working as designed, and the module's stated asymmetry
+  (false positives fine, false negatives not) permits it. The property that
+  holds is monotonicity.
+
 ## Continuing the campaign
 
 Ideas, roughly in value order, for follow-up on a beefy Linux box:
