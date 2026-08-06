@@ -71,7 +71,6 @@ impl tokio::io::AsyncWrite for SharedBuf {
 
 mod naming;
 mod outputs;
-mod profile;
 mod sources;
 mod stack;
 
@@ -142,30 +141,6 @@ impl CheckResult {
     pub(crate) fn parse_failure(msg: String) -> Self {
         CheckResult {
             check: "parse".into(),
-            verdict: CheckVerdict::Fail,
-            err: vec![msg],
-        }
-    }
-
-    pub(crate) fn profile_name_skip() -> Self {
-        CheckResult {
-            check: "profile name matches dir".into(),
-            verdict: CheckVerdict::Skip,
-            err: vec![],
-        }
-    }
-
-    pub(crate) fn profile_name_pass() -> Self {
-        CheckResult {
-            check: "profile name matches dir".into(),
-            verdict: CheckVerdict::Pass,
-            err: vec![],
-        }
-    }
-
-    pub(crate) fn profile_name_fail(msg: String) -> Self {
-        CheckResult {
-            check: "profile name matches dir".into(),
             verdict: CheckVerdict::Fail,
             err: vec![msg],
         }
@@ -243,7 +218,6 @@ impl CheckResult {
 pub enum CheckObj {
     Package(String),
     Stack(String),
-    Profile(String),
 }
 
 impl Display for CheckObj {
@@ -251,7 +225,6 @@ impl Display for CheckObj {
         match self {
             CheckObj::Package(n) => write!(f, "package: {}", n),
             CheckObj::Stack(n) => write!(f, "stack: {}", n),
-            CheckObj::Profile(n) => write!(f, "profile: {}", n),
         }
     }
 }
@@ -419,18 +392,11 @@ pub(crate) fn bail_if_cancelled(cancel: &CancellationToken) -> Result<(), Error>
 #[tracing::instrument(skip_all, err)]
 pub fn run_checks(
     packages_dir: Option<PathBuf>,
-    profiles_dir: Option<PathBuf>,
     stacks_dir: Option<PathBuf>,
     ctx: CheckCtx,
 ) -> Result<FuturesUnordered<CheckFuture>, Error> {
     let results = if let Some(packages_dir) = packages_dir {
         package_check_futures(packages_dir, ctx.clone())?
-    } else {
-        vec![]
-    };
-
-    let profile_results = if let Some(profiles_dir) = profiles_dir {
-        profile_check_futures(profiles_dir, ctx.clone())?
     } else {
         vec![]
     };
@@ -443,7 +409,6 @@ pub fn run_checks(
 
     Ok(results
         .into_iter()
-        .chain(profile_results)
         .chain(stack_results)
         .collect::<FuturesUnordered<_>>())
 }
@@ -487,61 +452,6 @@ fn package_check_futures(packages_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<Che
             })
         })
         .collect::<Vec<_>>())
-}
-
-#[tracing::instrument(skip_all, err)]
-fn profile_check_futures(profiles_dir: PathBuf, ctx: CheckCtx) -> Result<Vec<CheckFuture>, Error> {
-    let dirs: Vec<std::ffi::OsString> = match std::fs::read_dir(&profiles_dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e) => return Err(Error::IO("reading profile dirs", profiles_dir.clone(), e)),
-        Ok(dirs) => dirs
-            .filter_map(|e| match e {
-                Err(e) => Some(Err(e)),
-                Ok(e) => {
-                    if !e.file_type().unwrap().is_dir() {
-                        None
-                    } else {
-                        Some(Ok(e.file_name()))
-                    }
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| Error::IO("listing profiles", profiles_dir.clone(), e))?
-            .into_iter()
-            // Filter based on any given filter names
-            .filter_map(|dir| {
-                let n = dir.as_os_str().to_str().unwrap().to_string();
-                if ctx.filter_names.is_empty() || ctx.filter_names.contains(&n) {
-                    Some(dir)
-                } else {
-                    None
-                }
-            })
-            .collect(),
-    };
-
-    Ok(dirs
-        .into_iter()
-        .map::<CheckFuture, _>(move |pd| {
-            let ctx = ctx.clone();
-            let profiles_dir = profiles_dir.clone();
-
-            Box::pin(async move {
-                let name = pd.to_str().unwrap().to_string();
-                let _permit = tokio::select! {
-                    biased;
-                    _ = ctx.cancel.cancelled() => {
-                        return (CheckObj::Profile(name), Err(Error::Cancelled));
-                    }
-                    permit = ctx.semaphore.acquire() => permit.unwrap(),
-                };
-                (
-                    CheckObj::Profile(name.clone()),
-                    profile::check_profile(name, &ctx, profiles_dir).await,
-                )
-            })
-        })
-        .collect())
 }
 
 #[tracing::instrument(skip_all, err)]
@@ -1461,7 +1371,6 @@ mod tests {
 
         let mut stream = run_checks(
             Some(dir.join("packages")),
-            Some(dir.join("profiles")),
             Some(dir.join("stacks")),
             make_ctx(&dir).with_cancel(cancel),
         )
@@ -1477,7 +1386,7 @@ mod tests {
             seen.push(obj);
         }
 
-        assert_eq!(seen.len(), 3, "expected one check per object, got {seen:?}");
+        assert_eq!(seen.len(), 2, "expected one check per object, got {seen:?}");
         std::fs::remove_dir_all(&dir).expect("cleanup test tmp dir");
     }
 }

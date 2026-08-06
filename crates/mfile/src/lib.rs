@@ -293,7 +293,7 @@ impl From<EnvPatches> for Vec<common::FsMapping> {
 /// Default settings applied to minimal's use in the repo and to objects in the mfile.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Defaults {
-    /// The default profile to use for tasks which don't set their own profile.
+    /// Removed feature, emits warning if set.
     #[serde(default)]
     pub profile: Option<String>,
     /// The default state_key to use for tasks which don't set their own state_key.
@@ -729,13 +729,11 @@ pub enum Layout {
     /// The 'abridged' layout. The minimal file is located at `./{MFILE_NAME}`.
     ///
     /// If present, the packages directory is at ./packages.
-    /// If present, the profiles directory is at ./profiles.
     /// If present, the stacks directory is at ./stacks.
     Root,
     /// The 'full' layout. The minimal file is located at `./.minimal/{MFILE_NAME}`.
     ///
     /// If present, the packages directory is at ./.minimal/packages.
-    /// If present, the profiles directory is at ./.minimal/profiles.
     /// If present, the stacks directory is at ./.minimal/stacks.
     DotMinimal,
 }
@@ -749,7 +747,7 @@ pub struct File {
     /// The schema for any parameters which configure this layer.
     pub params: Option<args::ArgsSpec>,
 
-    /// Default profile, state_key etc.
+    /// Default state_key etc.
     #[serde(default, alias = "default")]
     pub defaults: Defaults,
     /// The stack configured on this repository, if any.
@@ -930,6 +928,9 @@ impl File {
             );
             was_unknown_fields = true;
         }
+        if let Some(p) = &self.defaults.profile {
+            tracing::warn!("[defaults]profile = \"{p}\" defined, profiles were removed in 0.5.1");
+        }
         if let Some(stack) = &self.stack
             && !stack.extra.is_empty()
         {
@@ -959,6 +960,11 @@ impl File {
                     task.extra.keys().cloned().collect::<Vec<_>>().join(",")
                 );
                 was_unknown_fields = true;
+            }
+            if let Some(p) = &task.profile {
+                tracing::warn!(
+                    "[tasks.{task_name}]profile = \"{p}\" defined, profiles were removed in 0.5.1"
+                );
             }
         }
         for (output_name, output) in &self.outputs {

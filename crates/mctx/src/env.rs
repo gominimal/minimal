@@ -147,7 +147,6 @@ impl EnvChannel<'_> {
     fn run_check(&mut self, stream: &mut UnixStream, _rootfs: &Path, args: &str) {
         let mut flag_packages = false;
         let mut flag_stacks = false;
-        let mut flag_profiles = false;
         let mut fix = false;
         let mut filter_names: Vec<String> = Vec::new();
 
@@ -155,14 +154,13 @@ impl EnvChannel<'_> {
             match token {
                 "--packages" => flag_packages = true,
                 "--stacks" => flag_stacks = true,
-                "--profiles" => flag_profiles = true,
                 "--fix" => fix = true,
                 _ => filter_names.push(token.to_string()),
             }
         }
 
         // If no kind flags specified, check everything (same as cmd_check default).
-        let check_all = !flag_packages && !flag_stacks && !flag_profiles;
+        let check_all = !flag_packages && !flag_stacks;
 
         let mut check_ctx = match self.ctx.cloned_reinit() {
             Err(e) => return EnvChannel::write_error(e, stream),
@@ -178,11 +176,6 @@ impl EnvChannel<'_> {
         let mut checks_stream = match check::run_checks(
             if check_all || flag_packages {
                 Some(upstream_dir.join("packages"))
-            } else {
-                None
-            },
-            if check_all || flag_profiles {
-                Some(upstream_dir.join("profiles"))
             } else {
                 None
             },

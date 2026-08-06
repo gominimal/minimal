@@ -1,6 +1,6 @@
 ---
 title: Tasks
-description: "Full task schema reference: packages, exec/bash commands, state_key, env_vars, patches, profiles, args, and interactive mode."
+description: "Full task schema reference: packages, exec/bash commands, state_key, env_vars, patches, args, and interactive mode."
 ---
 
 # Tasks
@@ -17,7 +17,7 @@ Tasks are defined in a `[tasks.<task-name>]` block in your minimal file.
 _Optional_
 
 `packages` lists additional [packages](../concepts/packages.md) which will be installed in the tasks'
-runtime environment. Packages listed here are in addition to any installed due to the profile or stack.
+runtime environment. Packages listed here are in addition to any installed due to the stack.
 
 ```toml
 [tasks.my_task]
@@ -100,7 +100,7 @@ state_key = "dev" # Cache build artifacts under 'dev'
 _Optional. `env_vars` is an alias of the canonical `vars` key; both parse_
 
 `env_vars` sets environment variables in the tasks' runtime environment. Variables
-set here take precedence over any inherited from the profile.
+set here take precedence over any inherited from the stack.
 
 ```toml
 [tasks.my_task]
@@ -128,27 +128,6 @@ _Optional, Default `false`_
 interactive = true
 ```
 
-
-### `profile` - Inherit customization from a profile
-
-_Optional_
-
-`profile` applies the configuration in the named profile to the tasks' runtime environment.
-
-```toml
-[tasks.my_task]
-profile = "dev" # Initializes package/env_vars based on the 'dev' profile
-```
-
-`profile` can be set to the empty string to avoid applying any default profile.
-
-```toml
-[defaults]
-profile = "dev"
-
-[tasks.my_task]
-profile = "" # No profile applied to `my_task`
-```
 
 ### `patches` - Map in files/directories from the system
 

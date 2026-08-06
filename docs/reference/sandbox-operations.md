@@ -44,18 +44,17 @@ Searches for and lists packages related to the search term.
 
 ### `check [<OPTIONS>] [FILTER_NAMES...]`
 
-Validates minimal configuration including packages, stacks, and profiles.
+Validates minimal configuration including packages & stacks.
 
 | Flag | Description |
 |------|-------------|
 | `--fix` | Attempt to fix any issues |
 | `--packages` | Check packages defined in the codebase |
 | `--stacks` | Check stacks defined in the codebase |
-| `--profiles` | Check profiles defined in the codebase |
 
 If no type flags are specified, all types are checked by default.
 
-If filter names are specified, any package, stack, or profile matching a specified name is checked.
+If filter names are specified, any package or stack matching a specified name is checked.
 
 `min check` is the in-sandbox equivalent of the [`mip check`](./cli-mip.md#check)
 command, with a reduced flag set (no `--skip-checkers`, and no short flag
