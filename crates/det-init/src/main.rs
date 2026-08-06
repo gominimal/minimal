@@ -149,6 +149,37 @@ async fn async_main() -> Result<(), MainError> {
         let _ = guest::emit_simple_ready_marker().await;
         return Err(MainError::IO(e, "entering rootfs"));
     }
+    // Remove the daemon copy that `enter_rootfs` stages at /run/minimald.
+    //
+    // Upstream added `stage_self_exe()` (minimald::guest, commit 4882ef32) so that
+    // `min session attach -c '<cmd>'` keeps working after pivot_root makes the initramfs /init
+    // unreachable. We never use that path — a detonation is one-shot and runs the sample directly,
+    // never re-execing pid-1 — so for us it is pure liability: a WORLD-EXECUTABLE (0755) copy of
+    // det-init sitting on the /run tmpfs that the untrusted sample can reach.
+    //
+    // What it buys an attacker is small but real: `is_detonation_init()` refuses to act as pid-1
+    // unless pid==1 AND argv[0]=="init", so a sample-exec'd copy cannot shut the VM down; as uid
+    // 65534 it fails `enter_rootfs` with EPERM. But it reaches `emit_simple_ready_marker()` first,
+    // and a guest->host AF_VSOCK connect needs no privilege — so it hands `nobody` a one-command
+    // host-facing beacon it otherwise has no way to produce.
+    //
+    // The reason to care is not the severity. It is that an UNRELATED upstream commit silently
+    // changed what exists inside our trust boundary, through a dependency we already had, and
+    // nothing would have told us. Detonation guests should contain what we put there and nothing
+    // else, so this restores the pre-4882ef32 contents.
+    match std::fs::remove_file(guest::STAGED_SELF_EXE) {
+        Ok(()) => tracing::info!(
+            path = guest::STAGED_SELF_EXE,
+            "removed the staged daemon copy"
+        ),
+        // Absent is the desired state, not an error — upstream stages it best-effort, and older
+        // minimald revisions never staged it at all.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(error = %e, path = guest::STAGED_SELF_EXE, "could not remove the staged daemon copy")
+        }
+    }
+
     // The per-VM writable data volume (#672) is the build-env scratch space.
     // Best-effort: a single-sample detonation can run without it (rootfs + /tmp
     // tmpfs suffice); a real ecosystem install that needs GiB of scratch wants
@@ -311,6 +342,22 @@ async fn async_main() -> Result<(), MainError> {
     tracing::info!("fired deny-channel tripwire (expected EPERM on the tripwire path)");
 
     let sample_cmd = load_sample_command()?;
+    // Last gate before the sample gets a uid: assert nothing world-EXECUTABLE is sitting on the
+    // /run tmpfs it can reach. Removing /run/minimald above fixes the instance we know about; this
+    // catches the NEXT one. Upstream added that staged binary in a commit about session exec, with
+    // no reason to think about detonation guests — and it landed inside our trust boundary
+    // silently. The generalisation is that our guest's contents are only as predictable as a
+    // dependency we do not control, so we check rather than assume.
+    //
+    // Fails the boot rather than warning. A detonation that aborts is an honest ERROR the bake's
+    // smoke gate catches before any image ships; a detonation that runs with an unexpected
+    // executable in reach produces a verdict whose trust model we cannot describe. The observer's
+    // own files are 0600 (/run/det-events.jsonl) and a plain marker (/run/mon.ready), so this is
+    // quiet in the expected case.
+    if let Err(e) = assert_no_world_executables_in_run() {
+        return Err(e);
+    }
+
     tracing::info!("dropping privileges and launching the sample as a child");
     // Fork-and-reap (not exec): keep pid-1 alive so we can drain the observer
     // after the sample exits, before `main` takes the VM down. The sample never
@@ -410,6 +457,54 @@ fn emit_feed_to_stdout() {
 /// initramfs `/init` (this binary) as pid-1. Both halves are load-bearing — it
 /// gates `reboot(2)` via [`guest::shut_down_vm`], and `argv[0]` alone is
 /// caller-controlled while pid-1 alone could be a container init. Mirrors
+/// Assert nothing world-executable is on the `/run` tmpfs before the sample gets a uid.
+///
+/// The sample runs as uid 65534 with `/run` reachable. Our own files there are not executable —
+/// the observer's feed is 0600 and its ready-marker is a plain file — so a mode with any execute
+/// bit set for group/other is something we did not put there.
+///
+/// This exists because upstream's `enter_rootfs` began staging a 0755 copy of the daemon at
+/// `/run/minimald` (commit 4882ef32) for reasons entirely about session exec. We remove that one
+/// explicitly; this catches whatever the next such change stages.
+fn assert_no_world_executables_in_run() -> Result<(), MainError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = match std::fs::read_dir("/run") {
+        Ok(d) => d,
+        // No /run to inspect is not a finding — do not fail a detonation over a missing tmpfs.
+        Err(_) => return Ok(()),
+    };
+    let mut offenders = Vec::new();
+    for entry in dir.flatten() {
+        let path = entry.path();
+        let Ok(md) = entry.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        // 0o011 = execute for group or other. Owner-execute alone is root-only and harmless here.
+        if md.permissions().mode() & 0o011 != 0 {
+            offenders.push(format!(
+                "{} (mode {:o})",
+                path.display(),
+                md.permissions().mode() & 0o7777
+            ));
+        }
+    }
+    if offenders.is_empty() {
+        return Ok(());
+    }
+    tracing::error!(
+        offenders = offenders.join(", "),
+        "world-executable file(s) on /run before droppriv — the untrusted sample could execute \
+         them. Something (most likely an upstream guest-boot change) staged a binary inside the \
+         detonation guest that we did not put there; refusing to detonate rather than run with a \
+         trust model we cannot describe"
+    );
+    Err(MainError::Other(format!(
+        "world-executable file(s) on /run before droppriv: {}",
+        offenders.join(", ")
+    )))
+}
+
 /// `minimald::is_minimal_microvm`.
 fn is_detonation_init() -> bool {
     std::process::id() == 1
