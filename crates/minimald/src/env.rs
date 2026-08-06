@@ -851,22 +851,32 @@ impl SessionChannel {
 
     /// Implements `min patched-pkg <pkgname>`.
     async fn run_patched_pkg(&mut self, stream: &mut UnixStream, pkg_name: &str) {
-        let mut build_ctx = match self.ctx.cloned_reinit() {
-            Err(e) => return Self::write_error(&e, stream),
-            Ok(ctx) => ctx,
-        };
-        let graph = match build_ctx.graph_from_package_names([pkg_name]) {
-            Err(e) => return Self::write_error(&e, stream),
-            Ok(g) => g,
+        let (ctx, mut graph, new_has_packages) = if let Ok(v) = self.refresh(stream).await {
+            v
+        } else {
+            return;
         };
 
-        let bsr = graph.top_levels[0];
+        let bsr = match graph.by_name(pkg_name) {
+            None => {
+                Self::write_error(
+                    &Error::Graph(Box::new(graph::Error::NoSuchPkg {
+                        name: pkg_name.to_string(),
+                    })),
+                    stream,
+                );
+                return;
+            }
+            Some(bsr) => *bsr,
+        };
+        graph.top_levels = vec![bsr];
+
         let result: std::io::Result<()> = async {
-            let remote_storage = build_ctx.remote_storage().await.map_err(err_to_io)?;
-            let output_base = build_ctx.builds_base_dir();
+            let remote_storage = ctx.remote_storage().await.map_err(err_to_io)?;
+            let output_base = ctx.builds_base_dir();
             let _ = std::fs::create_dir_all(&output_base);
 
-            let cache = build_ctx.local_cache();
+            let cache = ctx.local_cache();
             let (stdout_writer, stderr_writer) = StreamWriter::pair(stream)?;
             let res = op::PatchedBuild {
                 spec: &bsr,
@@ -879,7 +889,7 @@ impl SessionChannel {
                 graph: &graph,
                 exec_base: output_base,
                 ot: self.ot.clone(),
-                daemon_id: build_ctx.daemon_id(),
+                daemon_id: ctx.daemon_id(),
             })
             .await
             .map_err(std::io::Error::other)?;
@@ -900,19 +910,21 @@ impl SessionChannel {
             "msg:Written to cache with hash {}",
             graph.spec_hash(&bsr).0
         );
+
+        self.ctx = ctx;
+        self.graph = graph;
+        self.has_packages = new_has_packages;
     }
 
     /// Implements `min run <task>`.
     async fn run_task(&mut self, stream: &mut UnixStream, task_name: &str, args: &str) {
-        let mut build_ctx = match self.ctx.cloned_reinit() {
-            Err(e) => return Self::write_error(&e, stream),
-            Ok(ctx) => ctx,
+        let (mut ctx, graph, _) = if let Ok(v) = self.refresh(stream).await {
+            v
+        } else {
+            return;
         };
-        let graph = match build_ctx.graph_from_all_packages() {
-            Err(e) => return Self::write_error(&e, stream),
-            Ok(g) => g,
-        };
-        let (task, mut graph) = match build_ctx.task(graph, task_name) {
+
+        let (task, mut graph) = match ctx.task(graph, task_name) {
             Err(e) => return Self::write_error(&e, stream),
             Ok(None) => {
                 let _ = writeln!(stream, "error: no such task '{task_name}'");
@@ -920,6 +932,7 @@ impl SessionChannel {
             }
             Ok(Some(v)) => v,
         };
+
         let parsed_args = if !task.args.is_empty() {
             match task.args.parse(args) {
                 Err(e) => {
@@ -936,7 +949,7 @@ impl SessionChannel {
         };
 
         let result: Result<(), Error> = async {
-            let mut env = build_ctx
+            let mut env = ctx
                 .make_env(
                     task_name,
                     &mut graph,
@@ -1126,6 +1139,45 @@ impl SessionChannel {
             let _ = writeln!(stream, "msg:{line}");
         }
         let _ = writeln!(stream, "error: sandbox command failed.");
+    }
+
+    /// Refreshes and returns internals by re-reading the minimal.toml.
+    async fn refresh(
+        &mut self,
+        stream: &mut UnixStream,
+    ) -> Result<(Context, Graph, HashSet<BuildSpecRef>), ()> {
+        let error = |e: &Error, stream: &mut UnixStream| {
+            Self::write_error(e, stream);
+            Err(())
+        };
+
+        let mut ctx = match self.ctx.cloned_reinit() {
+            Err(e) => return error(&e, stream),
+            Ok(ctx) => ctx,
+        };
+        let graph = match ctx.graph_from_all_packages() {
+            Err(e) => return error(&e, stream),
+            Ok(g) => g,
+        };
+
+        // Recompute BuildSpecRefs for the new graph.
+        let new_has_packages = self
+            .has_packages
+            .iter()
+            .map(|bsr| &self.graph.get(bsr).expect("bsrs always exist").name)
+            .map(|name| match graph.by_name(name) {
+                Some(bsr) => Ok(*bsr),
+                None => Err(name.clone()),
+            })
+            .collect::<Result<HashSet<BuildSpecRef>, String>>()
+            .map_err(|e| {
+                Self::write_error(
+                    &Error::Graph(Box::new(graph::Error::NoSuchPkg { name: e })),
+                    stream,
+                );
+            })?;
+
+        Ok((ctx, graph, new_has_packages))
     }
 }
 
