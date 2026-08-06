@@ -453,6 +453,11 @@ impl<C: Channel> Sandbox<C> {
         container
             .rootfs(self.rootfs())
             .unwrap()
+            // By default hakoniwa sets UID and GID to the current ones
+            // We explicitly set it to 1000 here to match the user/group
+            // we create for the sandbox
+            .uidmap(1000)
+            .gidmap(1000)
             .devfsmount("/dev")
             .tmpfsmount("/tmp")
             .unshare(hakoniwa::Namespace::Cgroup)
