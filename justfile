@@ -105,6 +105,25 @@ gvproxy:
 initramfs:
     FEATURES={{features}} scripts/build-initramfs.sh {{initramfs}} {{musl-target}}
 
+# Compiles the guest minimald here, then hands the binary to
+# scripts/build-initramfs.sh via MINIMALD_BIN (its prebuilt mode), so the script
+# packs the cpio without compiling anything itself. That sidesteps the script's
+# `cross` fallback, which is what `just initramfs` lands on when it can't prove a
+# usable host toolchain — on macOS it can never prove one, because it compares a
+# raw `uname -m` ("arm64") against the target triple's arch ("aarch64").
+#
+# REQUIREMENTS — all must already be on PATH; use `just initramfs` (Docker +
+# `cross`) instead when they are not:
+#   - a Rust toolchain with the `{{musl-target}}` target installed
+#   - cargo-zigbuild and zig, which supply the musl linker for the cross link
+#
+# Build minimald → initramfs /init using the cross toolchain on PATH (no container).
+initramfs-nodocker:
+    cargo zigbuild -p minimald --profile initramfs \
+      --target {{musl-target}} --features {{features}}
+    MINIMALD_BIN="{{justfile_directory()}}/target/{{musl-target}}/initramfs/minimald" \
+      scripts/build-initramfs.sh {{initramfs}} {{musl-target}}
+
 # The ad-hoc (-s -) hypervisor-entitlement codesign must be the LAST touch:
 # any later cargo call that relinks minvmd drops it (EINVAL from krun_start_enter).
 #
@@ -462,6 +481,15 @@ _smoke *args:
 # Bring the stack up: Linux VM over Hypervisor.framework (`min ls` autospawns minvmd).
 [macos]
 up: artifacts gvproxy initramfs minvmd-build minimal-cli && (_smoke)
+
+# `just up` with the initramfs built from the cross toolchain on PATH rather than
+# through `cross` — see `initramfs-nodocker` for what that requires. The iteration
+# loop for a guest-minimald change: this rebuilds and repacks /init every run.
+# minvmd-build stays LAST so its codesign is the final touch on the binary.
+#
+# Bring the stack up, building the initramfs without a container.
+[macos]
+up-nodocker: artifacts gvproxy initramfs-nodocker minvmd-build minimal-cli && (_smoke)
 
 # Bring the stack up: host-native minimald, no VM (`just up-kvm` for the VM stack).
 [linux]
