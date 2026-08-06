@@ -1714,7 +1714,6 @@ pub(crate) mod tests {
             .await
             .start_check(CheckOpts {
                 packages: true,
-                profiles: true,
                 stacks: true,
                 fix: false,
                 filter_names: vec![],

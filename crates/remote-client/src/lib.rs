@@ -485,7 +485,6 @@ where
                 filter_names: args.filter_names.clone(),
                 skip_checkers: args.skip_checkers.clone(),
                 packages: args.packages,
-                profiles: args.profiles,
                 harnesses: args.harnesses,
                 remote_cache_gcs_bucket: args.remote_cache_gcs_bucket.clone(),
             })),
@@ -523,7 +522,6 @@ where
                         Some(check_response::Msg::Check(c)) => {
                             let obj = match c.obj.and_then(|o| o.msg) {
                                 Some(check_object::Msg::Package(n)) => check::CheckObj::Package(n),
-                                Some(check_object::Msg::Profile(n)) => check::CheckObj::Profile(n),
                                 Some(check_object::Msg::Harness(n)) => check::CheckObj::Stack(n),
                                 None => {
                                     let _ = tx.unbounded_send((
@@ -591,7 +589,6 @@ pub struct CheckArgs {
     pub filter_names: Vec<String>,
     pub skip_checkers: Vec<String>,
     pub packages: bool,
-    pub profiles: bool,
     pub harnesses: bool,
     pub remote_cache_gcs_bucket: Option<String>,
 }
@@ -1093,7 +1090,6 @@ mod tests {
             filter_names: vec![],
             skip_checkers: vec![],
             packages: true,
-            profiles: false,
             harnesses: false,
             remote_cache_gcs_bucket: None,
         };

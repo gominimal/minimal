@@ -585,42 +585,6 @@ impl Graph {
             }
         }
 
-        // Load/union profiles
-        for (name, mut profile) in loader.from.profiles {
-            // Apply any inheritance
-            if let Some(base_profile_name) = &profile.from_profile {
-                match slf.profiles.get(base_profile_name) {
-                    None => {
-                        return Err(Error::NoSuchProfile {
-                            name: base_profile_name.clone(),
-                        });
-                    }
-                    Some(base_profile) => {
-                        let mut new = base_profile.clone();
-                        new.union(&profile);
-                        profile = new;
-                    }
-                }
-            }
-
-            // Verify all packages exist
-            for pkg in &profile.packages {
-                if slf.by_name(pkg).is_none() {
-                    return Err(Error::NoSuchPkg { name: pkg.clone() });
-                }
-            }
-
-            if let Some(existing) = slf.profiles.get_mut(&name) {
-                // Its illegal to shadow a profile of the same name from upstream,
-                // unless you inherit from some upstream profile.
-                if profile.from_profile.is_none() {
-                    return Err(Error::ConflictingProfile { name });
-                }
-                *existing = profile;
-            } else {
-                slf.profiles.insert(name, profile);
-            }
-        }
         // Load stacks
         for (name, stack) in loader.from.stacks {
             // Verify all packages exist
@@ -649,9 +613,9 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use decode::{Layer, LoadOptions, Profile};
+    use decode::{Layer, LoadOptions};
     use indoc::indoc;
-    use mfile::{EnvVarValue, MFILE_NAME};
+    use mfile::MFILE_NAME;
     use tempfile::TempDir;
 
     #[test]
@@ -725,109 +689,6 @@ mod tests {
                 .into_iter()
                 .map(|b| b.name)
                 .collect::<Vec<String>>()
-        );
-    }
-
-    #[test]
-    fn ingest_profile() {
-        let layer = Layer::new_for_test(
-            indoc! {
-                "
-                let {layer, profile, ..} = import \"minimal.ncl\" in
-
-                layer {
-                  builds = [],
-                  profiles = [
-                    profile {
-                      name = \"profile 1\",
-                    }
-                  ],
-                }
-                "
-            }
-            .to_string(),
-        )
-        .unwrap_or_else(|e| {
-            e.report_to_stderr();
-            panic!("spec parsing failed");
-        });
-
-        let dp = Graph::new().ingest(layer).unwrap();
-        assert_eq!(
-            dp.profiles.get("profile 1"),
-            Some(&Profile {
-                name: "profile 1".to_string(),
-                from_profile: None,
-                packages: vec![],
-                env_vars: Default::default(),
-                patch: Default::default(),
-            })
-        );
-    }
-
-    #[test]
-    fn profile_overwrites_on_conflict() {
-        let mut dp = Graph::new();
-        dp.profiles.insert(
-            "prof".to_string(),
-            Profile {
-                name: "prof".to_string(),
-                from_profile: None,
-                packages: vec!["base".to_string()],
-                env_vars: IndexMap::from_iter([(
-                    "CC".to_string(),
-                    EnvVarValue::Value("gcc".to_string()),
-                )]),
-                patch: Default::default(),
-            },
-        );
-        dp.builds.insert(BuildSpec {
-            name: "base".to_string(),
-            ..Default::default()
-        });
-
-        let layer = Layer::new_for_test(
-            indoc! {
-                "
-                let {build, layer, profile, ..} = import \"minimal.ncl\" in
-
-                layer {
-                  builds = [
-                    build{name = \"extra\", build_deps = [], cmd = \"\"},
-                  ],
-                  profiles = [
-                    profile {
-                      name = \"prof\",
-                      from_profile = \"prof\",
-                      packages = [\"extra\"],
-                      env_vars = {
-                        CC = \"clang\",
-                      }
-                    }
-                  ],
-                }
-                "
-            }
-            .to_string(),
-        )
-        .unwrap_or_else(|e| {
-            e.report_to_stderr();
-            panic!("spec parsing failed");
-        });
-        let dp = dp.ingest(layer).unwrap();
-
-        assert_eq!(
-            dp.profiles.get("prof"),
-            Some(&Profile {
-                name: "prof".to_string(),
-                from_profile: Some("prof".to_string()),
-                packages: vec!["base".to_string(), "extra".to_string()],
-                env_vars: IndexMap::from_iter([(
-                    "CC".to_string(),
-                    EnvVarValue::Value("clang".to_string())
-                )]),
-                patch: Default::default(),
-            })
         );
     }
 

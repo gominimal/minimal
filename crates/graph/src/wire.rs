@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BuildDep, BuildSpec, BuildSpecRef, Graph, RuntimeDep, SubsetInput};
 use common::SpecOrigin;
-use decode::{Profile, Stack};
+use decode::Stack;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -32,7 +32,7 @@ const TAG_HEADER: u8 = 0x01;
 const TAG_BUILD_SPEC: u8 = 0x02;
 const TAG_LOCAL_FILE_DATA: u8 = 0x03;
 const TAG_TOP_LEVELS: u8 = 0x04;
-const TAG_PROFILE: u8 = 0x05;
+const TAG_PROFILE: u8 = 0x05; // profiles were removed, tag is ignored
 const TAG_STACK: u8 = 0x06;
 const TAG_SUPPLY_CHAIN: u8 = 0x07;
 const TAG_FOOTER: u8 = 0xFF;
@@ -216,12 +216,6 @@ fn default_file_mode() -> u32 {
 }
 
 #[derive(Serialize, Deserialize)]
-struct ProfileRecord {
-    name: String,
-    profile: Profile,
-}
-
-#[derive(Serialize, Deserialize)]
 struct StackRecord {
     name: String,
     stack: Stack,
@@ -300,15 +294,6 @@ impl<W: Write> GraphWriter<W> {
             .map(|bsr| bsr.0.into_raw_parts())
             .collect();
         self.write_record(TAG_TOP_LEVELS, &serde_json::to_vec(&top_levels)?)?;
-
-        // ── Profiles ──
-        for (name, profile) in graph.iter_profiles() {
-            let record = ProfileRecord {
-                name: name.clone(),
-                profile: profile.clone(),
-            };
-            self.write_record(TAG_PROFILE, &serde_json::to_vec(&record)?)?;
-        }
 
         // ── Stacks ──
         for (name, stack) in graph.iter_stacks() {
@@ -470,7 +455,6 @@ impl<R: Read> GraphReader<R> {
         let mut file_counter: usize = 0;
 
         let mut top_levels_raw: Vec<(usize, u64)> = Vec::new();
-        let mut profiles: HashMap<String, Profile> = HashMap::new();
         let mut stacks: HashMap<String, Stack> = HashMap::new();
         let mut supply_chain: Vec<SpecOrigin> = Vec::new();
 
@@ -529,8 +513,7 @@ impl<R: Read> GraphReader<R> {
                 }
 
                 TAG_PROFILE => {
-                    let record: ProfileRecord = serde_json::from_slice(&payload)?;
-                    profiles.insert(record.name, record.profile);
+                    // Removed 2026-08-06, ignore for now
                 }
 
                 TAG_STACK => {
@@ -577,15 +560,7 @@ impl<R: Read> GraphReader<R> {
         }
 
         Ok((
-            Graph::from_parts(
-                arena,
-                top_levels,
-                profiles,
-                stacks,
-                by_name,
-                supply_chain,
-                target,
-            ),
+            Graph::from_parts(arena, top_levels, stacks, by_name, supply_chain, target),
             temp_dir,
         ))
     }
@@ -802,16 +777,6 @@ impl<W: AsyncWrite + Unpin> AsyncGraphWriter<W> {
         self.write_record(TAG_TOP_LEVELS, &serde_json::to_vec(&top_levels)?)
             .await?;
 
-        // Profiles
-        for (name, profile) in graph.iter_profiles() {
-            let record = ProfileRecord {
-                name: name.clone(),
-                profile: profile.clone(),
-            };
-            self.write_record(TAG_PROFILE, &serde_json::to_vec(&record)?)
-                .await?;
-        }
-
         // Stacks
         for (name, stack) in graph.iter_stacks() {
             let record = StackRecord {
@@ -956,7 +921,6 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
         let mut file_counter: usize = 0;
 
         let mut top_levels_raw: Vec<(usize, u64)> = Vec::new();
-        let mut profiles: HashMap<String, Profile> = HashMap::new();
         let mut stacks: HashMap<String, Stack> = HashMap::new();
         let mut supply_chain: Vec<SpecOrigin> = Vec::new();
 
@@ -1010,8 +974,7 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
                 }
 
                 TAG_PROFILE => {
-                    let record: ProfileRecord = serde_json::from_slice(&payload)?;
-                    profiles.insert(record.name, record.profile);
+                    // Profiles removed 2026-08-06, tag ignored for now
                 }
 
                 TAG_STACK => {
@@ -1055,15 +1018,7 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
         }
 
         Ok((
-            Graph::from_parts(
-                arena,
-                top_levels,
-                profiles,
-                stacks,
-                by_name,
-                supply_chain,
-                target,
-            ),
+            Graph::from_parts(arena, top_levels, stacks, by_name, supply_chain, target),
             temp_dir,
         ))
     }

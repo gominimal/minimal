@@ -192,33 +192,16 @@ let CmdSpec = std.contract.any_of [
         }
     ),
 
-    Profile | doc "The initial configuration/wiring for an environment." = {
-        ty | Tys = 'Profile,
-        name
-          | String,
-        from_profile
-          | String | optional,
-
-        packages
-          | Array String | optional,
-        env_vars
-          | {_ : String} | optional,
-
-        # Only one of patch or patches may be set.
-        patch
-          | {_: {_ : String}} | optional,
-        patches
-        | {_: {_ : String}} | optional,
-    },
-    profile | Dyn -> Profile | doc "Constructs a profile." =
-      fun spec => spec | Profile,
+    # # Profiles were removed 2026-08-06, left to avoid breaking old spec-files
+    # profile | Dyn -> Dyn =
+    #     fun spec => spec,
 
     # Intended for internal use
     Layer | doc "Implementation detail: the set of build-specs and profiles to be ingested." = {
         ty | Tys = 'Layer,
 
         builds | Array BuildSpec,
-        profiles | Array Profile,
+        profiles | Array Dyn, # Profiles were removed 2026-08-06.
         stacks | Array Stack,
     },
     layer | Dyn -> Layer | doc "Constructs a layer." =
