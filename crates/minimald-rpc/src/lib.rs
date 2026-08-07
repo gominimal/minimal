@@ -204,14 +204,6 @@ impl OneshotSshRpc for GetSessionRecord {
 /// An RPC to snapshot a session's terminal screen without attaching.
 pub struct GetSessionScreen;
 
-/// Request for [`GetSessionScreen`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GetSessionScreenRequest {
-    Id(SessionId),
-    Name(String),
-}
-
 /// A single terminal cell.
 ///
 /// Colors are strings so the wire contract stays free of any terminal
@@ -246,7 +238,7 @@ pub struct ScreenSnapshot {
 
 impl OneshotSshRpc for GetSessionScreen {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionScreen");
-    type Request<'a> = GetSessionScreenRequest;
+    type Request<'a> = SessionId;
     type Response = Errorable<ScreenSnapshot>;
 }
 

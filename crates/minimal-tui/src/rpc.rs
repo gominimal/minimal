@@ -185,12 +185,9 @@ pub async fn fetch_screen(
     provider: &mut Provider,
     id: SessionId,
 ) -> Result<Option<minimald_rpc::ScreenSnapshot>, anyhow::Error> {
-    let resp = timed::<minimald_rpc::GetSessionScreen>(
-        &mut provider.client,
-        minimald_rpc::GetSessionScreenRequest::Id(id),
-    )
-    .await
-    .context("GetSessionScreen RPC failed")?;
+    let resp = timed::<minimald_rpc::GetSessionScreen>(&mut provider.client, id)
+        .await
+        .context("GetSessionScreen RPC failed")?;
     Ok(resp.ok())
 }
 

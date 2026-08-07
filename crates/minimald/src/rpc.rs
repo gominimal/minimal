@@ -5,11 +5,11 @@ use minimald_rpc::{
     AbortSession, AbortSessionResponse, CleanCacheRequest, CleanCacheUpdate, CreateSession,
     DestroySession, DestroySessionResponse, Errorable, FinalizeSession, FinalizeSessionResponse,
     GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
-    GetSessionRecordRequest, GetSessionRecordResponse, GetVersion, GetVersionResponse,
-    IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse,
-    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool,
-    SessionDelta, SessionDeltaRequest, SessionDeltaResponse, Shutdown, ShutdownRequest,
-    ShutdownResponse, SubmitVerdict,
+    GetSessionRecordRequest, GetSessionRecordResponse, GetSessionScreen, GetVersion,
+    GetVersionResponse, IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry,
+    ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
+    RenameSessionResponse, ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse,
+    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -585,17 +585,11 @@ async fn serve_get_session_screen(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
 ) -> Result<(), ConnectionError> {
-    minimald_rpc::GetSessionScreen
-        .handle_channel(c, async |req| {
+    GetSessionScreen
+        .handle_channel(c, async |id| {
             let mngr = s.sessions_manager().await;
-            let predicate = match req {
-                minimald_rpc::GetSessionScreenRequest::Id(id) => SessionKeyPredicate::Id(id),
-                minimald_rpc::GetSessionScreenRequest::Name(name) => {
-                    SessionKeyPredicate::Name(name)
-                }
-            };
             let snapshot = mngr
-                .get_screen(predicate)
+                .get_screen(SessionKeyPredicate::Id(id))
                 .await
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             Ok(match snapshot {
@@ -1354,7 +1348,7 @@ pub async fn handle_ssh_rpc(
         | AbortSession::NAME
         | GetSessionPolicy::NAME
         | SessionDelta::NAME
-        | minimald_rpc::GetSessionScreen::NAME
+        | GetSessionScreen::NAME
         | GetMeshStatus::NAME
         | STREAM_WORKSPACE_FILES
         | STREAM_WORKSPACE_PATCHES
@@ -1436,7 +1430,7 @@ pub async fn handle_ssh_rpc(
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
         SessionDelta::NAME => serve!(serve_session_delta(s, channel)),
-        minimald_rpc::GetSessionScreen::NAME => serve!(serve_get_session_screen(s, channel)),
+        GetSessionScreen::NAME => serve!(serve_get_session_screen(s, channel)),
         GetMeshStatus::NAME => serve!(serve_get_mesh_status(s, channel)),
         STREAM_WORKSPACE_FILES => serve!(serve_stream_workspace_files(s, config, channel)),
         STREAM_WORKSPACE_PATCHES => serve!(serve_stream_workspace_patches(s, config, channel)),
@@ -1971,17 +1965,13 @@ mod tests {
 
     #[tokio::test]
     async fn get_session_screen_snapshots_the_live_terminal() {
-        use minimald_rpc::{GetSessionScreen, GetSessionScreenRequest};
-
         let server = TestServer::new().await;
         let mut client = server.connect().await;
         let session_id = fresh_session(&mut client).await;
 
         // Before anything attaches there is no host: the RPC answers with a
         // soft error instead of minting one.
-        let inactive = client
-            .call::<GetSessionScreen>(&GetSessionScreenRequest::Id(session_id))
-            .await;
+        let inactive = client.call::<GetSessionScreen>(&session_id).await;
         assert!(
             matches!(&inactive, Errorable::Err { error } if error.contains("not active")),
             "expected a not-active error, got {inactive:?}",
@@ -1996,9 +1986,7 @@ mod tests {
         // until the parser has seen it.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let snapshot = loop {
-            let resp = client
-                .call::<GetSessionScreen>(&GetSessionScreenRequest::Id(session_id))
-                .await;
+            let resp = client.call::<GetSessionScreen>(&session_id).await;
             match resp {
                 Errorable::Ok(snap) => {
                     let text: String = snap
@@ -2020,12 +2008,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         };
         assert_eq!((snapshot.rows, snapshot.cols), (24, 80));
-
-        // The name form of the request resolves the same session.
-        let by_name = client
-            .call::<GetSessionScreen>(&GetSessionScreenRequest::Name("stream-test".to_string()))
-            .await;
-        assert!(matches!(by_name, Errorable::Ok(_)));
     }
 
     #[tokio::test]
