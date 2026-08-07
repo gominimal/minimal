@@ -4,6 +4,7 @@ use std::io::IsTerminal as _;
 use std::process::ExitCode;
 
 use clap::{CommandFactory as _, Parser};
+use minimal::ExecArgs;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 /// Custom main: handle shell completion requests before launching the async world.
@@ -125,7 +126,7 @@ impl std::io::Write for DashLog {
 
 /// Whether the command's stdout is a data contract that tracing must not
 /// pollute, so its logs go to stderr instead. The `completions` handlers emit a
-/// shell shim on stdout, `session attach -c` carries only the exec'd
+/// shell shim on stdout, `session exec` carries only the exec'd
 /// command's output, and `task run` streams the task's stdout — a log line
 /// in any of them would be read as content. A bare `min` (no subcommand) is
 /// one too: its non-TTY twin promises an empty stdout to pipelines, and its
@@ -137,10 +138,7 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
             minimal::Command::CompleteSessionStr(_)
                 | minimal::Command::Completions(_)
                 | minimal::Command::Session(minimal::SessionArgs {
-                    command: minimal::SessionCommand::Attach(minimal::AttachArgs {
-                        command: Some(_),
-                        ..
-                    }),
+                    command: minimal::SessionCommand::Exec(ExecArgs { .. }),
                 })
                 | minimal::Command::Task(minimal::TaskArgs {
                     command: minimal::TaskCommand::Run(_),
@@ -152,26 +150,7 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minimal::{AttachArgs, Command, SessionArgs, SessionCommand};
-
-    fn attach(command: Option<&str>) -> Option<Command> {
-        Some(Command::Session(SessionArgs {
-            command: SessionCommand::Attach(AttachArgs {
-                session: None,
-                command: command.map(str::to_owned),
-            }),
-        }))
-    }
-
-    #[test]
-    fn attach_with_command_is_a_stdout_contract() {
-        assert!(stdout_is_data_contract(&attach(Some("min check"))));
-    }
-
-    #[test]
-    fn interactive_attach_is_not_a_stdout_contract() {
-        assert!(!stdout_is_data_contract(&attach(None)));
-    }
+    use minimal::Command;
 
     /// A bare `min` (no subcommand) keeps stdout clean: the non-TTY twin
     /// promises pipelines an empty stdout, so its tracing must go to stderr.

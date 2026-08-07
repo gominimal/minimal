@@ -189,12 +189,24 @@ pub enum SessionCommand {
     Activate(ActivateArgs),
     /// Attach to an existing session
     Attach(AttachArgs),
+    /// Execute a command in an existing session
+    Exec(ExecArgs),
     /// Destroy (terminate) a session
     Destroy(DestroyArgs),
     /// Rename an existing session
     Rename(RenameArgs),
     /// Print the effective networking policy for a session as JSON
     Policy(PolicyArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ExecArgs {
+    /// Session identifier (UUID or session name).
+    #[arg(add = completion::session_completer())]
+    pub session: String,
+    /// Command to execute in the session context
+    #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -521,9 +533,6 @@ pub struct AttachArgs {
     /// ambiguous. See `--no-input` to skip the picker in scripts.
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
-    /// Command to exec in the session context (non-interactive)
-    #[arg(long, short, hide = true)]
-    pub command: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -717,6 +726,7 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             SessionCommand::List(args) => cmd_ls(&cli.global_args, args).await,
             SessionCommand::Activate(args) => cmd_activate(&cli.global_args, args).await,
             SessionCommand::Attach(args) => cmd_attach(&cli.global_args, args).await,
+            SessionCommand::Exec(args) => cmd_exec(&cli.global_args, args).await,
             SessionCommand::Destroy(args) => cmd_destroy(&cli.global_args, args).await,
             SessionCommand::Rename(args) => cmd_rename(&cli.global_args, args).await,
             SessionCommand::Policy(args) => cmd_session_policy(&cli.global_args, args).await,
@@ -879,7 +889,7 @@ async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
                 session_name = ?entry.name,
                 "found session"
             );
-            attach_to_session(&sock, entry.id, None).await
+            session_via_ssh(&sock, entry.id, vec![]).await
         }
         // Two ways to land on create-and-attach: no sessions exist at all
         // (first run), or the ambiguity picker's `+ Create a new session`
@@ -2098,7 +2108,6 @@ async fn activate_session(
         }
         let attach_args = AttachArgs {
             session: Some(id.to_string()),
-            command: None,
         };
         return cmd_attach(global, attach_args).await;
     }
@@ -2144,7 +2153,31 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
         "found session"
     );
 
-    attach_to_session(&sock, id, args.command).await
+    session_via_ssh(&sock, id, vec![]).await
+}
+
+/// Executes a command in an existing session.
+///
+/// The session is resolved using the provided predicate, and the connection
+/// is provided by shelling out to `ssh`.
+pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+        .context("Failed to resolve daemon socket path")?;
+
+    let mut client = client::Client::connect(&sock)
+        .await
+        .context("Failed to connect to minimald")?;
+
+    let r = resolve_session(&mut client, &args.session).await?;
+    tracing::info!(
+        session_id = %r.id,
+        session_name = ?r.name,
+        "found session"
+    );
+
+    session_via_ssh(&sock, r.id, args.command).await
 }
 
 /// Resolve a session to attach to when the user supplied no explicit session
@@ -2248,28 +2281,25 @@ fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), anyhow::Error
     }
 }
 
-/// Shell out to `ssh` to attach to `id`. Both the interactive (no `command`)
-/// and `--command` (non-interactive exec) paths route through here; the
-/// daemon's shell_request handler mints a PTY-backed shell, and ssh handles
-/// termios/PTY management.
+/// Shell out to `ssh` to attach to `id` or run a command.
 ///
 /// Split from [`cmd_attach`] so the activate-then-attach chain and the
 /// smart-resolution picker can attach without re-resolving an entry they
 /// already hold.
-async fn attach_to_session(
+async fn session_via_ssh(
     sock: &std::path::Path,
     id: sessions::SessionId,
-    command: Option<String>,
+    command: Vec<String>,
 ) -> Result<(), anyhow::Error> {
     // The command itself lives in minimal-client, shared with the dash TUI's
     // suspend-attach-resume flow.
-    let mut ssh = minimal_client::attach::attach_command(sock, id, command.as_deref())?;
+    let mut ssh = minimal_client::attach::attach_command(sock, id, &command)?;
 
     // `-tt` over a *non-terminal* stdin is a trap: ssh still forces the
     // remote PTY, yet the interactive shell reading it never sees an EOF from a
     // redirected local stdin (`< /dev/null`, a pipe), so the command blocks
     // forever (#953). Fail fast instead of hanging.
-    if command.is_none() {
+    if command.is_empty() {
         ensure_interactive_attach_tty(std::io::stdin().is_terminal())?;
     }
 

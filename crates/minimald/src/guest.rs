@@ -315,7 +315,7 @@ fn stage_self_exe() {
             error = %e,
             path = STAGED_SELF_EXE,
             "could not stage the daemon binary; running a command in a session \
-             (`min session attach -c`) will fail with ENOENT",
+             (`min session exec`) will fail with ENOENT",
         ),
     }
 }
