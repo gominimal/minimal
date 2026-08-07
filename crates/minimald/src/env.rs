@@ -692,7 +692,15 @@ impl SessionChannel {
             .iter()
             .all(|(_n, bsr)| self.graph.top_levels.contains(bsr))
         {
-            return; // Already installed.
+            // Already installed. Say so rather than returning silently: this
+            // path is indistinguishable from a successful injection on the
+            // wire, so a stale `top_levels` would otherwise read as success.
+            let _ = writeln!(
+                stream,
+                "msg:Already installed: {}",
+                pkgs.iter().map(|t| t.0).collect::<Vec<_>>().join(", ")
+            );
+            return;
         }
 
         let mut new_graph = self.graph.clone();
@@ -851,7 +859,7 @@ impl SessionChannel {
 
     /// Implements `min patched-pkg <pkgname>`.
     async fn run_patched_pkg(&mut self, stream: &mut UnixStream, pkg_name: &str) {
-        let (ctx, mut graph, new_has_packages) = if let Ok(v) = self.refresh(stream).await {
+        let (ctx, graph, new_has_packages) = if let Ok(v) = self.refresh(stream).await {
             v
         } else {
             return;
@@ -869,7 +877,13 @@ impl SessionChannel {
             }
             Some(bsr) => *bsr,
         };
-        graph.top_levels = vec![bsr];
+
+        // Scope the build to the requested package on a throwaway clone. The
+        // session graph's own `top_levels` is its record of what is installed;
+        // narrowing that to `[bsr]` would make the next `min add <pkg>` take
+        // `install`'s already-installed path and silently inject nothing.
+        let mut build_graph = graph.clone();
+        build_graph.top_levels = vec![bsr];
 
         let result: std::io::Result<()> = async {
             let remote_storage = ctx.remote_storage().await.map_err(err_to_io)?;
@@ -886,7 +900,7 @@ impl SessionChannel {
             }
             .run(&op::Options {
                 cache,
-                graph: &graph,
+                graph: &build_graph,
                 exec_base: output_base,
                 ot: self.ot.clone(),
                 daemon_id: ctx.daemon_id(),
@@ -1142,6 +1156,12 @@ impl SessionChannel {
     }
 
     /// Refreshes and returns internals by re-reading the minimal.toml.
+    ///
+    /// The returned graph carries the session's own top-levels, not the ones a
+    /// fresh parse hands out: [`Self::install`] reads `top_levels` as the set
+    /// of packages already injected into the live rootfs, so a refresh that
+    /// reset it would either re-inject everything or (worse) claim packages are
+    /// present that never were.
     async fn refresh(
         &mut self,
         stream: &mut UnixStream,
@@ -1155,29 +1175,42 @@ impl SessionChannel {
             Err(e) => return error(&e, stream),
             Ok(ctx) => ctx,
         };
-        let graph = match ctx.graph_from_all_packages() {
+        let mut graph = match ctx.graph_from_all_packages() {
             Err(e) => return error(&e, stream),
             Ok(g) => g,
         };
 
         // Recompute BuildSpecRefs for the new graph.
-        let new_has_packages = self
-            .has_packages
-            .iter()
-            .map(|bsr| &self.graph.get(bsr).expect("bsrs always exist").name)
-            .map(|name| match graph.by_name(name) {
-                Some(bsr) => Ok(*bsr),
-                None => Err(name.clone()),
-            })
-            .collect::<Result<HashSet<BuildSpecRef>, String>>()
-            .map_err(|e| {
-                Self::write_error(
-                    &Error::Graph(Box::new(graph::Error::NoSuchPkg { name: e })),
-                    stream,
-                );
-            })?;
+        let no_such = |name: String| Error::Graph(Box::new(graph::Error::NoSuchPkg { name }));
+        let new_top_levels: Vec<BuildSpecRef> =
+            match Self::remap_refs(&self.graph, &graph, &self.graph.top_levels) {
+                Err(name) => return error(&no_such(name), stream),
+                Ok(v) => v,
+            };
+        let new_has_packages: HashSet<BuildSpecRef> =
+            match Self::remap_refs(&self.graph, &graph, &self.has_packages) {
+                Err(name) => return error(&no_such(name), stream),
+                Ok(v) => v,
+            };
+        graph.top_levels = new_top_levels;
 
         Ok((ctx, graph, new_has_packages))
+    }
+
+    /// Re-resolves refs taken against `from` into refs against `to`. Refs are
+    /// graph-local, so the only identity that survives a re-parse is the
+    /// package name; a name `to` no longer declares comes back as `Err`.
+    fn remap_refs<'a, C: FromIterator<BuildSpecRef>>(
+        from: &Graph,
+        to: &Graph,
+        bsrs: impl IntoIterator<Item = &'a BuildSpecRef>,
+    ) -> Result<C, String> {
+        bsrs.into_iter()
+            .map(|bsr| {
+                let name = &from.get(bsr).expect("bsrs always exist").name;
+                to.by_name(name).copied().ok_or_else(|| name.clone())
+            })
+            .collect()
     }
 }
 
@@ -1605,6 +1638,104 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.contains("uroot")),
             "expected 'uroot' in search results, got: {lines:?}"
+        );
+    }
+
+    /// Names the packages `bsrs` refers to, sorted, for comparing sets across
+    /// two parses of the same repo (refs are graph-local; names are not).
+    fn names<'a>(graph: &Graph, bsrs: impl IntoIterator<Item = &'a BuildSpecRef>) -> Vec<String> {
+        let mut out: Vec<String> = bsrs
+            .into_iter()
+            .map(|bsr| graph.get(bsr).expect("bsr in graph").name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A refresh re-parses the mfile, so its graph's `top_levels` are the
+    /// packages the *repo* declares. The session means something else by that
+    /// field — the packages it has injected into its rootfs — and `install`
+    /// reads it to decide whether `min add` has any work to do. A refresh that
+    /// let the repo's answer through would make `min add <declared-pkg>` take
+    /// the already-installed path and inject nothing.
+    #[tokio::test]
+    async fn refresh_does_not_adopt_the_repos_top_levels() {
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel();
+        let (mut ours, _theirs) = UnixStream::pair().unwrap();
+
+        // The fixture declares `uroot`; this session has installed nothing.
+        assert!(
+            chan.graph.by_name("uroot").is_some(),
+            "fixture no longer declares uroot"
+        );
+        chan.graph.top_levels = vec![];
+        chan.has_packages = HashSet::new();
+
+        let (_ctx, graph, has_packages) = chan
+            .refresh(&mut ours)
+            .await
+            .expect("refresh should succeed");
+
+        assert!(
+            graph.top_levels.is_empty(),
+            "refresh adopted the repo's top-levels as the installed set: {:?}",
+            names(&graph, &graph.top_levels)
+        );
+        assert!(has_packages.is_empty());
+    }
+
+    /// The other half: refs are graph-local, so what the session *has*
+    /// installed has to be re-resolved by name onto the reparsed graph rather
+    /// than carried over or dropped.
+    #[tokio::test]
+    async fn refresh_remaps_the_installed_set_onto_the_new_graph() {
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel();
+        let (mut ours, _theirs) = UnixStream::pair().unwrap();
+
+        let uroot = *chan.graph.by_name("uroot").expect("fakerepo has uroot");
+        chan.graph.top_levels = vec![uroot];
+        chan.has_packages = HashSet::from([uroot]);
+
+        let (_ctx, graph, has_packages) = chan
+            .refresh(&mut ours)
+            .await
+            .expect("refresh should succeed");
+
+        assert_eq!(
+            names(&graph, &graph.top_levels),
+            vec!["uroot".to_string()],
+            "refresh dropped the session's top-levels"
+        );
+        assert_eq!(names(&graph, &has_packages), vec!["uroot".to_string()]);
+        for bsr in graph.top_levels.iter().chain(has_packages.iter()) {
+            assert!(
+                graph.get(bsr).is_some(),
+                "a ref from the old graph leaked into the new one"
+            );
+        }
+    }
+
+    /// Adding a package the session already has is a no-op, but it must be a
+    /// *visible* one: the wire carries no other signal, so a silent return is
+    /// indistinguishable from a successful injection.
+    #[tokio::test]
+    async fn installing_an_already_installed_package_reports_it() {
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+
+        let uroot = *chan.graph.by_name("uroot").expect("fakerepo has uroot");
+        chan.graph.top_levels = vec![uroot];
+
+        // Driven directly rather than through `handle`, which would also
+        // record the dependency in the fixture's checked-in minimal.toml.
+        chan.install(&[("uroot", uroot)], &mut ours).await;
+        drop(ours);
+
+        let lines = read_lines(&theirs);
+        assert_eq!(
+            lines,
+            vec!["msg:Already installed: uroot".to_string()],
+            "unexpected output: {lines:?}"
         );
     }
 
