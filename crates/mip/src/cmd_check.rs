@@ -35,10 +35,6 @@ pub struct CheckKind {
     /// Check stacks defined in the codebase
     #[arg(long)]
     stacks: bool,
-
-    /// Check profiles defined in the codebase
-    #[arg(long)]
-    profiles: bool,
 }
 
 impl CheckKind {
@@ -47,9 +43,6 @@ impl CheckKind {
     }
     fn check_stacks(&self) -> bool {
         self == &CheckKind::default() || self.stacks
-    }
-    fn check_profiles(&self) -> bool {
-        self == &CheckKind::default() || self.profiles
     }
 }
 
@@ -113,11 +106,6 @@ pub async fn cmd_check(args: CheckArgs, ctx: &mut Context) -> Result<(), Error> 
     let mut checks_stream = check::run_checks(
         if args.kind.check_packages() {
             Some(upstream_dir.join("packages"))
-        } else {
-            None
-        },
-        if args.kind.check_profiles() {
-            Some(upstream_dir.join("profiles"))
         } else {
             None
         },

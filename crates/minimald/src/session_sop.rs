@@ -226,7 +226,6 @@ struct Inner<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckOpts {
     pub packages: bool,
-    pub profiles: bool,
     pub stacks: bool,
     pub fix: bool,
     pub filter_names: Vec<String>,
@@ -248,13 +247,12 @@ impl CheckOpts {
     /// run reports success — turning `min check --packags` into a silent pass
     /// for anything scripting the exit status.
     pub fn from_args(args: &str) -> Result<Self, String> {
-        let (mut packages, mut profiles, mut stacks, mut fix) = (false, false, false, false);
+        let (mut packages, mut stacks, mut fix) = (false, false, false);
         let mut filter_names = Vec::new();
 
         for token in args.split_whitespace() {
             match token {
                 "--packages" => packages = true,
-                "--profiles" => profiles = true,
                 "--stacks" => stacks = true,
                 "--fix" => fix = true,
                 // Anything leading with a dash, not just `--`: `mip check`
@@ -271,13 +269,12 @@ impl CheckOpts {
         }
 
         // No kind flag specified means check everything.
-        if !packages && !profiles && !stacks {
-            (packages, profiles, stacks) = (true, true, true);
+        if !packages && !stacks {
+            (packages, stacks) = (true, true);
         }
 
         Ok(Self {
             packages,
-            profiles,
             stacks,
             fix,
             filter_names,
@@ -603,7 +600,6 @@ impl SideOp {
             tokio::task::spawn(async move {
                 let stream = check::run_checks(
                     (check_opts.packages).then(|| dir.join("packages")),
-                    (check_opts.profiles).then(|| dir.join("profiles")),
                     (check_opts.stacks).then(|| dir.join("stacks")),
                     check::CheckCtx::new(
                         check_opts.filter_names,
@@ -877,7 +873,6 @@ mod tests {
             CheckOpts::from_args("").unwrap(),
             CheckOpts {
                 packages: true,
-                profiles: true,
                 stacks: true,
                 fix: false,
                 filter_names: vec![],
@@ -892,7 +887,6 @@ mod tests {
     fn check_opts_kind_flag_excludes_the_others() {
         let opts = CheckOpts::from_args("--packages").unwrap();
         assert!(opts.packages);
-        assert!(!opts.profiles, "an explicit --packages excludes profiles");
         assert!(!opts.stacks, "an explicit --packages excludes stacks");
     }
 
@@ -903,7 +897,7 @@ mod tests {
         let opts = CheckOpts::from_args("uroot --fix  busybox --stacks").unwrap();
         assert_eq!(opts.filter_names, vec!["uroot", "busybox"]);
         assert!(opts.fix);
-        assert!(opts.stacks && !opts.packages && !opts.profiles);
+        assert!(opts.stacks && !opts.packages);
     }
 
     /// A mistyped flag must be an error, never a name filter. Treated as a

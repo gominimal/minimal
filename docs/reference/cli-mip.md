@@ -170,18 +170,17 @@ whose owning process is no longer running.
 mip check [OPTIONS] [FILTER_NAMES]...
 ```
 
-Validates minimal configuration including packages, stacks, and profiles.
+Validates minimal configuration including packages & stacks.
 
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--fix` | `-f` | Attempt to fix any issues |
 | `--packages` | | Check packages defined in the codebase |
 | `--stacks` | | Check stacks defined in the codebase |
-| `--profiles` | | Check profiles defined in the codebase |
 | `--skip-checkers <NAMES>` | `-s` | Checker names to skip, comma-separated |
 
 If no type flags are specified, all types are checked. If filter names
-are given, any package, stack, or profile matching a name is checked.
+are given, any package or stack matching a name is checked.
 
 ### `completions`
 

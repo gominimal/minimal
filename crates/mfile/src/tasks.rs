@@ -8,7 +8,7 @@ pub struct Task {
     /// Indicates that this task should share durable state with other tasks with the same key.
     #[serde(default)]
     pub state_key: Option<String>,
-    /// Load packages, environment variables etc from the given profile.
+    /// Removed feature: emits warning if set.
     #[serde(default)]
     pub profile: Option<String>,
 

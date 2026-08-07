@@ -8,7 +8,7 @@
 #![allow(clippy::single_match)]
 
 use common::{SpecOrigin, Target};
-use decode::{Profile, Stack};
+use decode::Stack;
 use nickel_lang_core::term::IndexMap;
 
 use generational_arena::Arena;
@@ -82,8 +82,6 @@ pub struct Graph {
     /// constructing this dependency graph.
     pub top_levels: Vec<BuildSpecRef>,
 
-    /// Profiles (custom packages, env vars etc) by name.
-    pub(crate) profiles: HashMap<String, Profile>,
     /// Stacks (a way to build a directory of software) by name.
     pub(crate) stacks: HashMap<String, Stack>,
 
@@ -120,7 +118,6 @@ impl Graph {
             builds: Arena::with_capacity(4096),
             by_name: HashMap::with_capacity(2048),
             top_levels: Vec::new(),
-            profiles: HashMap::with_capacity(32),
             stacks: HashMap::with_capacity(32),
             supply_chain: Vec::with_capacity(6),
             target: Target::host(),
@@ -267,37 +264,14 @@ impl Graph {
         }
 
         match &task.profile {
-            None => Ok(()),
-            Some(s) if s.is_empty() => Ok(()),
-            Some(profile) => {
-                if let Some(profile) = self.profiles.get(profile) {
-                    // Upsert the packages list
-                    task.packages.extend(
-                        profile
-                            .packages
-                            .iter()
-                            .filter(|p| !task.packages.contains(p))
-                            .cloned()
-                            .collect::<Vec<_>>(),
-                    );
-                    // Set environment variables, but only if they are not set already
-                    for (k, v) in &profile.env_vars {
-                        if !task.vars.contains_key(k) {
-                            task.vars.insert(k.clone(), v.clone());
-                        }
-                    }
-                    // Union any file patches, if they are not set already
-                    let mut patches = profile.patch.clone();
-                    patches.union(&task.patch);
-                    task.patch = patches;
-                    Ok(())
-                } else {
-                    Err(Error::NoSuchProfile {
-                        name: profile.clone(),
-                    })
-                }
+            Some(profile) if !profile.is_empty() => {
+                tracing::warn!(
+                    "Ignoring declared profile `{profile}`, profile support was removed"
+                );
             }
-        }
+            _ => (),
+        };
+        Ok(())
     }
 
     /// Returns the named stack, if it exists.
@@ -398,11 +372,6 @@ impl Graph {
             .collect()
     }
 
-    /// Returns an iterator over all profiles configured in the graph.
-    pub fn iter_profiles(&self) -> impl Iterator<Item = (&String, &Profile)> {
-        self.profiles.iter()
-    }
-
     /// Returns the links in the software supply chain used to build this graph.
     pub fn software_supply_chain(&self) -> &Vec<SpecOrigin> {
         &self.supply_chain
@@ -485,7 +454,6 @@ impl Graph {
     pub(crate) fn from_parts(
         builds: Arena<BuildSpec>,
         top_levels: Vec<BuildSpecRef>,
-        profiles: HashMap<String, Profile>,
         stacks: HashMap<String, Stack>,
         by_name: HashMap<String, BuildSpecRef>,
         supply_chain: Vec<SpecOrigin>,
@@ -494,7 +462,6 @@ impl Graph {
         Self {
             builds,
             top_levels,
-            profiles,
             stacks,
             by_name,
             supply_chain,

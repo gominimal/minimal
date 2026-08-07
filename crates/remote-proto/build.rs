@@ -8,19 +8,21 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-env-changed=PROTOC_INCLUDE");
     let include_paths: Vec<&str> = includes.iter().map(String::as_str).collect();
 
-    prost_build::compile_protos(
-        &[
-            "protos/streams.proto",
-            "protos/tarball_format.proto",
-            "protos/res/orchestrate_build.proto",
-            "protos/res/create_env.proto",
-            "protos/res/download.proto",
-            "protos/res/task.proto",
-            "protos/res/check.proto",
-            "protos/res/remote_execution_service.proto",
-        ],
-        &include_paths,
-    )?;
+    let proto_files = &[
+        "protos/streams.proto",
+        "protos/tarball_format.proto",
+        "protos/res/orchestrate_build.proto",
+        "protos/res/create_env.proto",
+        "protos/res/download.proto",
+        "protos/res/task.proto",
+        "protos/res/check.proto",
+        "protos/res/remote_execution_service.proto",
+    ];
+    for f in proto_files {
+        println!("cargo:rerun-if-changed={f}");
+    }
+
+    prost_build::compile_protos(proto_files, &include_paths)?;
 
     tonic_prost_build::configure()
         .compile_protos(

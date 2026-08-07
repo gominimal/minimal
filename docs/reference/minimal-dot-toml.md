@@ -52,7 +52,7 @@ exec = "bash -l"
 
 ### `[upstream]` - Where software comes from {#upstream}
 
-The `[upstream]` section defines the precise source of packages, stacks, and profiles. This represents the
+The `[upstream]` section defines the precise source of packages & stacks. This represents the
 preceding link in the [software supply chain](../concepts/software-supply-chain.md).
 
 ```toml
@@ -69,7 +69,7 @@ place; expect a diff on these fields after running it.
 
 #### `[[upstream.sideload]]` - Additional software sideloaded into your supply chain {#sideload}
 
-Sideload entries let you load in additional packages, stacks, and profiles from a separate repository, but those packages
+Sideload entries let you load in additional packages or stacks from a separate repository, but those packages
 are built using the version of packages from your upstream.
 
 Each sideload entry is loaded in order from the specified repository, and follows the same schema as `[upstream]` (the canonical table name is `sideloads`; `sideload` is an accepted alias):
@@ -81,7 +81,7 @@ branch = "<branch>"
 locked_commit = "<commit hash>" # Updated via `mip update`
 ```
 
-Sideload repositories have the same layout as an upstream: that is having a `minimal.toml` file, and `packages/` / `stacks/` / `profiles/`
+Sideload repositories have the same layout as an upstream: that is having a `minimal.toml` file, and `packages/` / `stacks/`
 directories as needed.
 
 ### `[stack]` - How to build code in your repo {#stack}
@@ -111,11 +111,8 @@ additional package dependencies for build time or run time respectively.
 
 ```toml
 [defaults]
-profile = "<profile name>" # optional
 state_key = "<state key>"  # optional
 ```
-
-When set, `defaults.profile` will set a [profile](../concepts/profiles.md) on all tasks which do not set a profile.
 
 When set, `defaults.state_key` will set a state key on all tasks which do not set `state_key`.
 
