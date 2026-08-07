@@ -43,13 +43,14 @@ clap.workspace = true
 clap_complete = { workspace = true, features = ["unstable-dynamic"] }
 camino.workspace = true
 chrono.workspace = true
-constcat.workspace = true
 diagnostics.workspace = true
 dirs.workspace = true
 indicatif.workspace = true
 nix.workspace = true
 mctx.workspace = true
 mfile.workspace = true
+minimal-client.workspace = true
+minimal-tui.workspace = true
 minimald-rpc.workspace = true
 op.workspace = true
 paths.workspace = true

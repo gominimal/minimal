@@ -121,6 +121,14 @@ enum ManagerMessage {
     List(Responder<Vec<SessionInfo>>),
     GetRecord(SessionKeyPredicate, Responder<Option<sessions::Record>>),
     GetSession(SessionKeyPredicate, Responder<Option<SessionHandle>>),
+    /// Snapshot a running session's terminal screen (`min dash`'s
+    /// `GetSessionScreen`). Read-only against the `running` map — unlike
+    /// [`GetSession`](Self::GetSession) it never starts an actor, and a
+    /// session with no live host answers `None`.
+    GetScreen(
+        SessionKeyPredicate,
+        Responder<Option<minimald_rpc::ScreenSnapshot>>,
+    ),
     CreateSession(Box<CreateSessionMsg>),
     DeleteSession(SessionId, Responder<()>),
     Shutdown(bool, Responder<Result<(), ()>>),
@@ -431,6 +439,27 @@ impl Manager {
             ManagerMessage::GetSession(pred, r) => {
                 r.handle(self.resolve_session(pred)).await;
             }
+            // Snapshot a running session's screen without starting its
+            // actor. A name resolves through the store to its id, then the
+            // `running` map answers only for live actors.
+            ManagerMessage::GetScreen(pred, r) => {
+                r.handle(async {
+                    let id = match pred {
+                        SessionKeyPredicate::Id(id) => id,
+                        SessionKeyPredicate::Name(name) => {
+                            match self.store.find(RecordPredicate::Name(name)).await? {
+                                Some(handle) => handle.record().await?.id,
+                                None => return Ok(None),
+                            }
+                        }
+                    };
+                    Ok::<_, SessionsError>(match self.running.get(&id) {
+                        Some(h) => h.get_screen().await,
+                        None => None,
+                    })
+                })
+                .await;
+            }
             // Create a session: allocate the record (as `Pending`) and spawn
             // the session actor. Composing the loadout and promoting the
             // record still belong to the actor; the RPC handler drives that
@@ -707,6 +736,21 @@ impl ManagerHandle {
         let _ = self
             .sender
             .send(ManagerMessage::GetSession(pred, send))
+            .await;
+        recv.await.expect("corresponding sessions manager is dead")
+    }
+
+    /// Snapshots the terminal screen of a running session. `Ok(None)` when
+    /// the session is unknown or has no live host — never starts an actor.
+    pub async fn get_screen(
+        &self,
+        pred: SessionKeyPredicate,
+    ) -> Result<Option<minimald_rpc::ScreenSnapshot>, SessionsError> {
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .sender
+            .send(ManagerMessage::GetScreen(pred, send))
             .await;
         recv.await.expect("corresponding sessions manager is dead")
     }
@@ -1714,7 +1758,6 @@ pub(crate) mod tests {
             .await
             .start_check(CheckOpts {
                 packages: true,
-                profiles: true,
                 stacks: true,
                 fix: false,
                 filter_names: vec![],

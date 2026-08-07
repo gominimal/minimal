@@ -23,7 +23,7 @@
 //!   requests one at a time on the runtime, so every handler is a plain
 //!   `async fn` that `.await`s — no nested runtimes, no sync/async bridge writers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::Permissions;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -226,9 +226,38 @@ pub struct Env {
     sandbox: Sandbox<BridgeChannel>,
     /// The command-channel actor task. `Some` until [`Drop`] aborts it.
     actor: Option<JoinHandle<()>>,
+    /// Variables the channel actor has added since launch; see
+    /// [`SessionChannel::runtime_env`].
+    runtime_env: RuntimeEnv,
     /// Extra directories kept alive for the environment's lifetime (e.g. a
     /// temporary `/state` directory). Dropped after the sandbox.
     _temp_dirs: Vec<TempDir>,
+}
+
+/// Environment variables a *running* session has acquired, on top of the ones
+/// it was launched with. Usually happens due to `min add`.
+///
+/// Shared between [`Env`] and the [`SessionChannel`] actor that learns of them.
+#[derive(Clone, Default)]
+pub(crate) struct RuntimeEnv(Arc<Mutex<BTreeMap<String, String>>>);
+
+impl RuntimeEnv {
+    /// Records a variable the session has just acquired. Last write wins, as it
+    /// does in the shell, where a later `export` overrides an earlier one.
+    fn record(&self, key: &str, value: &str) {
+        self.0
+            .lock()
+            .expect("runtime env lock is never held across a panic")
+            .insert(key.to_string(), value.to_string());
+    }
+
+    /// Everything recorded so far.
+    fn snapshot(&self) -> BTreeMap<String, String> {
+        self.0
+            .lock()
+            .expect("runtime env lock is never held across a panic")
+            .clone()
+    }
 }
 
 /// Derive the composition-path state-dir set by picking up any
@@ -375,11 +404,13 @@ impl Env {
         install_min_helpers(&sandbox.rootfs()).map_err(std::io::Error::other)?;
         sandbox.keep_dir(false);
 
+        let runtime_env = RuntimeEnv::default();
         let channel = SessionChannel {
             rootfs: DaemonAbsPath::try_new(
                 Utf8PathBuf::try_from(sandbox.rootfs().to_path_buf()).unwrap(),
             )
             .unwrap(),
+            runtime_env: runtime_env.clone(),
             state_dir: args.state_base_dir.clone(),
             working: args.cwd.clone(),
             home: args.home.clone(),
@@ -395,6 +426,7 @@ impl Env {
         Ok(Self {
             sandbox,
             actor: Some(actor),
+            runtime_env,
             _temp_dirs: Vec::new(),
         })
     }
@@ -426,6 +458,19 @@ impl Env {
         self.sandbox
             .command(container, program, args, [("", ""); 0])
             .map_err(sandbox_err_to_io)
+    }
+
+    /// The working directory and environment a command should run with in this
+    /// session **as it stands now** — `/workbench`, the composed session
+    /// variables, and anything `min add` has installed since launch.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn command_environment(&self) -> crate::session_host::SessionEnvironment {
+        let mut vars = self.sandbox.command_env();
+        vars.extend(self.runtime_env.snapshot());
+        crate::session_host::SessionEnvironment {
+            cwd: self.sandbox.command_cwd(),
+            vars,
+        }
     }
 }
 
@@ -523,6 +568,8 @@ struct SessionChannel {
     /// Weak handle to the owning session actor, used by session-scoped commands
     /// (e.g. `min build`) to drive side-ops.
     session: crate::session::WeakSessionHandle,
+    /// Accumulates env vars of newly-installed packages, shared with the owning [`Env`].
+    runtime_env: RuntimeEnv,
     rx: mpsc::Receiver<ChannelRequest>,
 }
 
@@ -621,6 +668,12 @@ impl SessionChannel {
         }
     }
 
+    /// Record and transmit a newly-acquired variable to the session shell.
+    fn announce_env(&self, stream: &mut UnixStream, key: &str, value: &str) {
+        self.runtime_env.record(key, value);
+        let _ = writeln!(stream, "set_env:{key}:{value}");
+    }
+
     /// Resolves a space-separated list of package names to `(name, ref)` pairs,
     /// returning the first unknown name as `Err`.
     fn parse_pkgs_line<'a>(&self, pkgs: &'a str) -> Result<Vec<(&'a str, BuildSpecRef)>, &'a str> {
@@ -639,7 +692,15 @@ impl SessionChannel {
             .iter()
             .all(|(_n, bsr)| self.graph.top_levels.contains(bsr))
         {
-            return; // Already installed.
+            // Already installed. Say so rather than returning silently: this
+            // path is indistinguishable from a successful injection on the
+            // wire, so a stale `top_levels` would otherwise read as success.
+            let _ = writeln!(
+                stream,
+                "msg:Already installed: {}",
+                pkgs.iter().map(|t| t.0).collect::<Vec<_>>().join(", ")
+            );
+            return;
         }
 
         let mut new_graph = self.graph.clone();
@@ -674,7 +735,7 @@ impl SessionChannel {
                     }
                 }
                 for (k, v) in &setup.env_vars {
-                    let _ = writeln!(stream, "set_env:{k}:{v}");
+                    self.announce_env(stream, k, v);
                 }
             }
             Err(e) => {
@@ -798,22 +859,38 @@ impl SessionChannel {
 
     /// Implements `min patched-pkg <pkgname>`.
     async fn run_patched_pkg(&mut self, stream: &mut UnixStream, pkg_name: &str) {
-        let mut build_ctx = match self.ctx.cloned_reinit() {
-            Err(e) => return Self::write_error(&e, stream),
-            Ok(ctx) => ctx,
-        };
-        let graph = match build_ctx.graph_from_package_names([pkg_name]) {
-            Err(e) => return Self::write_error(&e, stream),
-            Ok(g) => g,
+        let (ctx, graph, new_has_packages) = if let Ok(v) = self.refresh(stream).await {
+            v
+        } else {
+            return;
         };
 
-        let bsr = graph.top_levels[0];
+        let bsr = match graph.by_name(pkg_name) {
+            None => {
+                Self::write_error(
+                    &Error::Graph(Box::new(graph::Error::NoSuchPkg {
+                        name: pkg_name.to_string(),
+                    })),
+                    stream,
+                );
+                return;
+            }
+            Some(bsr) => *bsr,
+        };
+
+        // Scope the build to the requested package on a throwaway clone. The
+        // session graph's own `top_levels` is its record of what is installed;
+        // narrowing that to `[bsr]` would make the next `min add <pkg>` take
+        // `install`'s already-installed path and silently inject nothing.
+        let mut build_graph = graph.clone();
+        build_graph.top_levels = vec![bsr];
+
         let result: std::io::Result<()> = async {
-            let remote_storage = build_ctx.remote_storage().await.map_err(err_to_io)?;
-            let output_base = build_ctx.builds_base_dir();
+            let remote_storage = ctx.remote_storage().await.map_err(err_to_io)?;
+            let output_base = ctx.builds_base_dir();
             let _ = std::fs::create_dir_all(&output_base);
 
-            let cache = build_ctx.local_cache();
+            let cache = ctx.local_cache();
             let (stdout_writer, stderr_writer) = StreamWriter::pair(stream)?;
             let res = op::PatchedBuild {
                 spec: &bsr,
@@ -823,10 +900,10 @@ impl SessionChannel {
             }
             .run(&op::Options {
                 cache,
-                graph: &graph,
+                graph: &build_graph,
                 exec_base: output_base,
                 ot: self.ot.clone(),
-                daemon_id: build_ctx.daemon_id(),
+                daemon_id: ctx.daemon_id(),
             })
             .await
             .map_err(std::io::Error::other)?;
@@ -847,19 +924,21 @@ impl SessionChannel {
             "msg:Written to cache with hash {}",
             graph.spec_hash(&bsr).0
         );
+
+        self.ctx = ctx;
+        self.graph = graph;
+        self.has_packages = new_has_packages;
     }
 
     /// Implements `min run <task>`.
     async fn run_task(&mut self, stream: &mut UnixStream, task_name: &str, args: &str) {
-        let mut build_ctx = match self.ctx.cloned_reinit() {
-            Err(e) => return Self::write_error(&e, stream),
-            Ok(ctx) => ctx,
+        let (mut ctx, graph, _) = if let Ok(v) = self.refresh(stream).await {
+            v
+        } else {
+            return;
         };
-        let graph = match build_ctx.graph_from_all_packages() {
-            Err(e) => return Self::write_error(&e, stream),
-            Ok(g) => g,
-        };
-        let (task, mut graph) = match build_ctx.task(graph, task_name) {
+
+        let (task, mut graph) = match ctx.task(graph, task_name) {
             Err(e) => return Self::write_error(&e, stream),
             Ok(None) => {
                 let _ = writeln!(stream, "error: no such task '{task_name}'");
@@ -867,6 +946,7 @@ impl SessionChannel {
             }
             Ok(Some(v)) => v,
         };
+
         let parsed_args = if !task.args.is_empty() {
             match task.args.parse(args) {
                 Err(e) => {
@@ -883,7 +963,7 @@ impl SessionChannel {
         };
 
         let result: Result<(), Error> = async {
-            let mut env = build_ctx
+            let mut env = ctx
                 .make_env(
                     task_name,
                     &mut graph,
@@ -1073,6 +1153,64 @@ impl SessionChannel {
             let _ = writeln!(stream, "msg:{line}");
         }
         let _ = writeln!(stream, "error: sandbox command failed.");
+    }
+
+    /// Refreshes and returns internals by re-reading the minimal.toml.
+    ///
+    /// The returned graph carries the session's own top-levels, not the ones a
+    /// fresh parse hands out: [`Self::install`] reads `top_levels` as the set
+    /// of packages already injected into the live rootfs, so a refresh that
+    /// reset it would either re-inject everything or (worse) claim packages are
+    /// present that never were.
+    async fn refresh(
+        &mut self,
+        stream: &mut UnixStream,
+    ) -> Result<(Context, Graph, HashSet<BuildSpecRef>), ()> {
+        let error = |e: &Error, stream: &mut UnixStream| {
+            Self::write_error(e, stream);
+            Err(())
+        };
+
+        let mut ctx = match self.ctx.cloned_reinit() {
+            Err(e) => return error(&e, stream),
+            Ok(ctx) => ctx,
+        };
+        let mut graph = match ctx.graph_from_all_packages() {
+            Err(e) => return error(&e, stream),
+            Ok(g) => g,
+        };
+
+        // Recompute BuildSpecRefs for the new graph.
+        let no_such = |name: String| Error::Graph(Box::new(graph::Error::NoSuchPkg { name }));
+        let new_top_levels: Vec<BuildSpecRef> =
+            match Self::remap_refs(&self.graph, &graph, &self.graph.top_levels) {
+                Err(name) => return error(&no_such(name), stream),
+                Ok(v) => v,
+            };
+        let new_has_packages: HashSet<BuildSpecRef> =
+            match Self::remap_refs(&self.graph, &graph, &self.has_packages) {
+                Err(name) => return error(&no_such(name), stream),
+                Ok(v) => v,
+            };
+        graph.top_levels = new_top_levels;
+
+        Ok((ctx, graph, new_has_packages))
+    }
+
+    /// Re-resolves refs taken against `from` into refs against `to`. Refs are
+    /// graph-local, so the only identity that survives a re-parse is the
+    /// package name; a name `to` no longer declares comes back as `Err`.
+    fn remap_refs<'a, C: FromIterator<BuildSpecRef>>(
+        from: &Graph,
+        to: &Graph,
+        bsrs: impl IntoIterator<Item = &'a BuildSpecRef>,
+    ) -> Result<C, String> {
+        bsrs.into_iter()
+            .map(|bsr| {
+                let name = &from.get(bsr).expect("bsrs always exist").name;
+                to.by_name(name).copied().ok_or_else(|| name.clone())
+            })
+            .collect()
     }
 }
 
@@ -1411,6 +1549,7 @@ mod tests {
             has_packages: HashSet::new(),
             ot: None,
             session: crate::session::WeakSessionHandle::dangling(),
+            runtime_env: RuntimeEnv::default(),
             ctx,
             graph,
             rx,
@@ -1443,6 +1582,49 @@ mod tests {
         );
     }
 
+    /// A variable a running session acquires has to reach two places: the shell,
+    /// which exports it, and the daemon, which hands it to anything injected
+    /// into the session later. `min add` is the source in production; this
+    /// drives the announcement directly, since installing a package would mean
+    /// building one.
+    #[tokio::test]
+    async fn an_acquired_var_reaches_both_the_shell_and_the_daemon() {
+        let (_state, _rootfs, _cwd, chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+
+        chan.announce_env(&mut ours, "GOCACHE", "/state/gocache");
+        drop(ours);
+
+        assert_eq!(read_lines(&theirs), vec!["set_env:GOCACHE:/state/gocache"]);
+        assert_eq!(
+            chan.runtime_env
+                .snapshot()
+                .get("GOCACHE")
+                .map(String::as_str),
+            Some("/state/gocache"),
+            "the daemon's view is missing a variable the shell was given"
+        );
+    }
+
+    /// Installing over an earlier install replaces the value, as the shell's
+    /// second `export` does.
+    #[tokio::test]
+    async fn a_reannounced_var_takes_the_newer_value() {
+        let (_state, _rootfs, _cwd, chan) = setup_channel();
+        let (mut ours, _theirs) = UnixStream::pair().unwrap();
+
+        chan.announce_env(&mut ours, "PYTHONPATH", "/first");
+        chan.announce_env(&mut ours, "PYTHONPATH", "/second");
+
+        assert_eq!(
+            chan.runtime_env
+                .snapshot()
+                .get("PYTHONPATH")
+                .map(String::as_str),
+            Some("/second")
+        );
+    }
+
     #[tokio::test]
     async fn search_finds_known_package() {
         let (_state, _rootfs, _cwd, mut chan) = setup_channel();
@@ -1456,6 +1638,104 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.contains("uroot")),
             "expected 'uroot' in search results, got: {lines:?}"
+        );
+    }
+
+    /// Names the packages `bsrs` refers to, sorted, for comparing sets across
+    /// two parses of the same repo (refs are graph-local; names are not).
+    fn names<'a>(graph: &Graph, bsrs: impl IntoIterator<Item = &'a BuildSpecRef>) -> Vec<String> {
+        let mut out: Vec<String> = bsrs
+            .into_iter()
+            .map(|bsr| graph.get(bsr).expect("bsr in graph").name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A refresh re-parses the mfile, so its graph's `top_levels` are the
+    /// packages the *repo* declares. The session means something else by that
+    /// field — the packages it has injected into its rootfs — and `install`
+    /// reads it to decide whether `min add` has any work to do. A refresh that
+    /// let the repo's answer through would make `min add <declared-pkg>` take
+    /// the already-installed path and inject nothing.
+    #[tokio::test]
+    async fn refresh_does_not_adopt_the_repos_top_levels() {
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel();
+        let (mut ours, _theirs) = UnixStream::pair().unwrap();
+
+        // The fixture declares `uroot`; this session has installed nothing.
+        assert!(
+            chan.graph.by_name("uroot").is_some(),
+            "fixture no longer declares uroot"
+        );
+        chan.graph.top_levels = vec![];
+        chan.has_packages = HashSet::new();
+
+        let (_ctx, graph, has_packages) = chan
+            .refresh(&mut ours)
+            .await
+            .expect("refresh should succeed");
+
+        assert!(
+            graph.top_levels.is_empty(),
+            "refresh adopted the repo's top-levels as the installed set: {:?}",
+            names(&graph, &graph.top_levels)
+        );
+        assert!(has_packages.is_empty());
+    }
+
+    /// The other half: refs are graph-local, so what the session *has*
+    /// installed has to be re-resolved by name onto the reparsed graph rather
+    /// than carried over or dropped.
+    #[tokio::test]
+    async fn refresh_remaps_the_installed_set_onto_the_new_graph() {
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel();
+        let (mut ours, _theirs) = UnixStream::pair().unwrap();
+
+        let uroot = *chan.graph.by_name("uroot").expect("fakerepo has uroot");
+        chan.graph.top_levels = vec![uroot];
+        chan.has_packages = HashSet::from([uroot]);
+
+        let (_ctx, graph, has_packages) = chan
+            .refresh(&mut ours)
+            .await
+            .expect("refresh should succeed");
+
+        assert_eq!(
+            names(&graph, &graph.top_levels),
+            vec!["uroot".to_string()],
+            "refresh dropped the session's top-levels"
+        );
+        assert_eq!(names(&graph, &has_packages), vec!["uroot".to_string()]);
+        for bsr in graph.top_levels.iter().chain(has_packages.iter()) {
+            assert!(
+                graph.get(bsr).is_some(),
+                "a ref from the old graph leaked into the new one"
+            );
+        }
+    }
+
+    /// Adding a package the session already has is a no-op, but it must be a
+    /// *visible* one: the wire carries no other signal, so a silent return is
+    /// indistinguishable from a successful injection.
+    #[tokio::test]
+    async fn installing_an_already_installed_package_reports_it() {
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+
+        let uroot = *chan.graph.by_name("uroot").expect("fakerepo has uroot");
+        chan.graph.top_levels = vec![uroot];
+
+        // Driven directly rather than through `handle`, which would also
+        // record the dependency in the fixture's checked-in minimal.toml.
+        chan.install(&[("uroot", uroot)], &mut ours).await;
+        drop(ours);
+
+        let lines = read_lines(&theirs);
+        assert_eq!(
+            lines,
+            vec!["msg:Already installed: uroot".to_string()],
+            "unexpected output: {lines:?}"
         );
     }
 

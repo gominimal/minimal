@@ -5,11 +5,11 @@ use minimald_rpc::{
     AbortSession, AbortSessionResponse, CleanCacheRequest, CleanCacheUpdate, CreateSession,
     DestroySession, DestroySessionResponse, Errorable, FinalizeSession, FinalizeSessionResponse,
     GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord,
-    GetSessionRecordRequest, GetSessionRecordResponse, GetVersion, GetVersionResponse,
-    IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry, ListSessionsResponse,
-    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool,
-    SessionDelta, SessionDeltaRequest, SessionDeltaResponse, Shutdown, ShutdownRequest,
-    ShutdownResponse, SubmitVerdict,
+    GetSessionRecordRequest, GetSessionRecordResponse, GetSessionScreen, GetVersion,
+    GetVersionResponse, IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry,
+    ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
+    RenameSessionResponse, ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse,
+    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -573,6 +573,31 @@ async fn serve_session_delta(
                     Ok(None) | Err(_) => SessionDeltaResponse::Unavailable,
                 },
             )
+        })
+        .await
+}
+
+/// `GetSessionScreen` (`min dash` Preview section): a read-only snapshot of the
+/// session's terminal screen. Unlike attach, this mints nothing and resizes
+/// nothing — a session with no live host answers with an error the TUI
+/// renders as "session not active".
+async fn serve_get_session_screen(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    GetSessionScreen
+        .handle_channel(c, async |id| {
+            let mngr = s.sessions_manager().await;
+            let snapshot = mngr
+                .get_screen(SessionKeyPredicate::Id(id))
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            Ok(match snapshot {
+                Some(snap) => Errorable::Ok(snap),
+                None => Errorable::Err {
+                    error: "session is not active".to_string(),
+                },
+            })
         })
         .await
 }
@@ -1323,6 +1348,7 @@ pub async fn handle_ssh_rpc(
         | AbortSession::NAME
         | GetSessionPolicy::NAME
         | SessionDelta::NAME
+        | GetSessionScreen::NAME
         | GetMeshStatus::NAME
         | STREAM_WORKSPACE_FILES
         | STREAM_WORKSPACE_PATCHES
@@ -1404,6 +1430,7 @@ pub async fn handle_ssh_rpc(
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
         SessionDelta::NAME => serve!(serve_session_delta(s, channel)),
+        GetSessionScreen::NAME => serve!(serve_get_session_screen(s, channel)),
         GetMeshStatus::NAME => serve!(serve_get_mesh_status(s, channel)),
         STREAM_WORKSPACE_FILES => serve!(serve_stream_workspace_files(s, config, channel)),
         STREAM_WORKSPACE_PATCHES => serve!(serve_stream_workspace_patches(s, config, channel)),
@@ -1934,6 +1961,53 @@ mod tests {
         // The configured ingress was `None`, and the read reflects that rather
         // than the old hardcoded `Some(IngressPolicy::default())`.
         assert_eq!(policy.ingress, None);
+    }
+
+    #[tokio::test]
+    async fn get_session_screen_snapshots_the_live_terminal() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        // Before anything attaches there is no host: the RPC answers with a
+        // soft error instead of minting one.
+        let inactive = client.call::<GetSessionScreen>(&session_id).await;
+        assert!(
+            matches!(&inactive, Errorable::Err { error } if error.contains("not active")),
+            "expected a not-active error, got {inactive:?}",
+        );
+
+        // Attach a shell (the mock launcher runs an echo program), then write
+        // a line the program echoes back prefixed with `got:`.
+        let shell = client.open_shell(session_id).await;
+        shell.data_bytes(&b"hello-screen\n"[..]).await.unwrap();
+
+        // The echo round-trips through the pty asynchronously; poll the RPC
+        // until the parser has seen it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let snapshot = loop {
+            let resp = client.call::<GetSessionScreen>(&session_id).await;
+            match resp {
+                Errorable::Ok(snap) => {
+                    let text: String = snap
+                        .lines
+                        .iter()
+                        .map(|row| row.cells.iter().map(|c| c.ch).collect::<String>())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if text.contains("got:hello-screen") {
+                        break snap;
+                    }
+                }
+                Errorable::Err { .. } => {}
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the echo to reach the screen snapshot",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!((snapshot.rows, snapshot.cols), (24, 80));
     }
 
     #[tokio::test]

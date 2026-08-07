@@ -4,6 +4,7 @@ use std::io::IsTerminal as _;
 use std::process::ExitCode;
 
 use clap::{CommandFactory as _, Parser};
+use minimal::ExecArgs;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 /// Custom main: handle shell completion requests before launching the async world.
@@ -47,10 +48,38 @@ async fn run() -> ExitCode {
     minimal::theme::install();
 
     let registry = tracing_subscriber::registry().with(filter);
-    // Commands whose stdout is a data contract route tracing to stderr, so a log
-    // line never lands in captured output. ANSI is gated on the destination
-    // being a real terminal, so a redirected stream carries no escape codes.
-    if stdout_is_data_contract(&cli.command) {
+    // `min dash` owns the terminal (alternate screen); a log line landing on
+    // stdout/stderr would corrupt the frame. Log to <state>/dash.log
+    // instead, discarding if the state dir can't be written.
+    if matches!(cli.command, Some(minimal::Command::Dash)) {
+        // Honor `--minimal-dir` so an isolated daemon's logs stay isolated.
+        let base = cli
+            .global_args
+            .minimal_dir
+            .clone()
+            .unwrap_or_else(|| paths::minimal_state_dir().as_utf8_path().into());
+        // Open the log file once; MakeWriter is per-write, so the closure
+        // must not re-open it per log event.
+        let file = {
+            let path = base.join("dash.log");
+            let _ = std::fs::create_dir_all(&base);
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map(std::sync::Arc::new)
+                .ok()
+        };
+        let log = move || -> Box<dyn std::io::Write + Send> {
+            match &file {
+                Some(f) => Box::new(DashLog(f.clone())),
+                None => Box::new(std::io::sink()),
+            }
+        };
+        registry
+            .with(fmt::layer().with_writer(log).with_ansi(false))
+            .init();
+    } else if stdout_is_data_contract(&cli.command) {
         registry
             .with(
                 fmt::layer()
@@ -81,9 +110,23 @@ async fn run() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// A cheaply clonable writer over the dash log file: every clone writes
+/// through the same opened file (append mode) instead of re-opening it.
+struct DashLog(std::sync::Arc<std::fs::File>);
+
+impl std::io::Write for DashLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&*self.0).write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&*self.0).flush()
+    }
+}
+
 /// Whether the command's stdout is a data contract that tracing must not
 /// pollute, so its logs go to stderr instead. The `completions` handlers emit a
-/// shell shim on stdout, `session attach -c` carries only the exec'd
+/// shell shim on stdout, `session exec` carries only the exec'd
 /// command's output, and `task run` streams the task's stdout — a log line
 /// in any of them would be read as content. A bare `min` (no subcommand) is
 /// one too: its non-TTY twin promises an empty stdout to pipelines, and its
@@ -95,10 +138,7 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
             minimal::Command::CompleteSessionStr(_)
                 | minimal::Command::Completions(_)
                 | minimal::Command::Session(minimal::SessionArgs {
-                    command: minimal::SessionCommand::Attach(minimal::AttachArgs {
-                        command: Some(_),
-                        ..
-                    }),
+                    command: minimal::SessionCommand::Exec(ExecArgs { .. }),
                 })
                 | minimal::Command::Task(minimal::TaskArgs {
                     command: minimal::TaskCommand::Run(_),
@@ -110,26 +150,7 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minimal::{AttachArgs, Command, SessionArgs, SessionCommand};
-
-    fn attach(command: Option<&str>) -> Option<Command> {
-        Some(Command::Session(SessionArgs {
-            command: SessionCommand::Attach(AttachArgs {
-                session: None,
-                command: command.map(str::to_owned),
-            }),
-        }))
-    }
-
-    #[test]
-    fn attach_with_command_is_a_stdout_contract() {
-        assert!(stdout_is_data_contract(&attach(Some("min check"))));
-    }
-
-    #[test]
-    fn interactive_attach_is_not_a_stdout_contract() {
-        assert!(!stdout_is_data_contract(&attach(None)));
-    }
+    use minimal::Command;
 
     /// A bare `min` (no subcommand) keeps stdout clean: the non-TTY twin
     /// promises pipelines an empty stdout, so its tracing must go to stderr.

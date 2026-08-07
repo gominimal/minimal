@@ -34,24 +34,27 @@ or build dependency in `minimal.toml`.
 
 `min add` is the in-sandbox counterpart of [`mip add`](./cli-mip.md#add); note the flag surfaces differ (`mip add` requires one of `--runtime`, `--build`, or `--task <TASK>`).
 
+`min package add` is the canonical noun-verb spelling; `min add` is an accepted alias.
+
 ### `search <TERM>`
 
 Searches for and lists packages related to the search term.
 
+`min package search` is the canonical noun-verb spelling; `min search` is an accepted alias.
+
 ### `check [<OPTIONS>] [FILTER_NAMES...]`
 
-Validates minimal configuration including packages, stacks, and profiles.
+Validates minimal configuration including packages & stacks.
 
 | Flag | Description |
 |------|-------------|
 | `--fix` | Attempt to fix any issues |
 | `--packages` | Check packages defined in the codebase |
 | `--stacks` | Check stacks defined in the codebase |
-| `--profiles` | Check profiles defined in the codebase |
 
 If no type flags are specified, all types are checked by default.
 
-If filter names are specified, any package, stack, or profile matching a specified name is checked.
+If filter names are specified, any package or stack matching a specified name is checked.
 
 `min check` is the in-sandbox equivalent of the [`mip check`](./cli-mip.md#check)
 command, with a reduced flag set (no `--skip-checkers`, and no short flag
@@ -62,6 +65,8 @@ aliases).
 Runs the specified task in a new Minimal sandbox. Interactive tasks are not supported.
 
 `min run` is the in-sandbox equivalent of the [`mip run`](./cli-mip.md#run) command.
+
+`min task run` is the canonical noun-verb spelling; the bare `min run` is a legacy alias.
 
 ### `package build <PACKAGES...>`
 

@@ -1,6 +1,6 @@
 use crate::network::Network;
 use crate::{Error, Sandbox};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,30 @@ impl PartialEq for SandboxMapped {
     }
 }
 impl Eq for SandboxMapped {}
+
+// Ordered on (variant tag, path), mirroring the `PartialEq`/`Hash` key above,
+// so `BTreeSet<SandboxMapped>` iterates — and the rootfs therefore assembles —
+// in the same order in every process. Assembly is first-writer-wins
+// hardlinking, so an unordered collection let a per-process hash seed decide
+// which entry provided a path that two entries both contain.
+impl PartialOrd for SandboxMapped {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for SandboxMapped {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        fn key(m: &SandboxMapped) -> (u8, &Path) {
+            match m {
+                SandboxMapped::File(p) => (0, p),
+                SandboxMapped::Dir(p) => (1, p),
+                SandboxMapped::TempDir(t) => (2, t.path()),
+                SandboxMapped::FileCopy(p) => (3, p),
+            }
+        }
+        key(self).cmp(&key(other))
+    }
+}
 
 impl Hash for SandboxMapped {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -143,7 +167,10 @@ pub struct Config {
     ///    into the sandbox.
     pub wd: WdSetup,
     /// The set of files that should be mapped into the root filesystem of the sandbox.
-    pub rootfs: HashSet<SandboxMapped>,
+    ///
+    /// `BTreeSet`: iteration order is assembly order (entries are hardlinked
+    /// first-writer-wins), so it must be deterministic across processes.
+    pub rootfs: BTreeSet<SandboxMapped>,
 
     /// Synthesize DNS config.
     pub setup_dns_config: bool,
@@ -207,6 +234,118 @@ pub struct Invocation {
 }
 
 impl Config {
+    /// The working directory a command in this sandbox starts in, as an
+    /// absolute path inside the sandbox — `/workbench` for a session (unless
+    /// the name is overridden), `/build` for a task.
+    #[must_use]
+    pub fn command_cwd(&self) -> String {
+        match &self.wd {
+            WdSetup::BoundDir { .. } => {
+                format!("/{}", self.wd.bound_dir_sandbox_cwd().to_str().unwrap())
+            }
+            WdSetup::Isolated { .. } => "/build".to_string(),
+            WdSetup::Session {
+                working_name_override,
+                ..
+            } => format!(
+                "/{}",
+                working_name_override
+                    .clone()
+                    .unwrap_or_else(|| crate::SESSION_DEFAULT_WD.to_string())
+            ),
+        }
+    }
+
+    /// The environment a command in this sandbox is launched with, before any
+    /// per-invocation additions.
+    ///
+    /// The layout defaults come first and the configured
+    /// [`env_vars`](Self::env_vars) last, so a composition's variables win on a
+    /// key collision — `PS1`, `LANG` and the login-shell identity are floors,
+    /// not policy.
+    #[must_use]
+    pub fn command_env(&self) -> BTreeMap<String, String> {
+        let mut env = BTreeMap::new();
+        let mut set = |k: &str, v: &str| {
+            env.insert(k.to_string(), v.to_string());
+        };
+
+        // XDG vars
+        if let WdSetup::Session { .. } = &self.wd {
+            set("XDG_STATE_HOME", "/home/.local/state");
+            set("XDG_CONFIG_HOME", "/home/.config");
+            set("XDG_DATA_HOME", "/home/.local/share");
+            set("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin"); // adds /home/.local/bin
+            // A styled default shell prompt for interactive sessions. Set as a
+            // plain default here (not forced) so a user's composition var can
+            // override it: the composed `env_vars` are applied further down and
+            // win on key collision.
+            set(
+                "PS1",
+                r"\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ ",
+            );
+            // Login-shell identity, mirroring what sshd/pam would set from
+            // `/etc/passwd`. `USER`/`LOGNAME` track the configured username;
+            // `SHELL` points at the session shell (the `bash` package installs
+            // to `/usr/bin/bash`). All plain defaults, so composition vars win.
+            if let Some(user) = &self.username {
+                set("USER", user);
+                set("LOGNAME", user);
+            }
+            set("SHELL", "/usr/bin/bash");
+        } else {
+            // Both build and BoundWd layouts
+            set("XDG_STATE_HOME", "/state/state");
+            set("XDG_CONFIG_HOME", "/state/home");
+            set("XDG_DATA_HOME", "/state/data");
+            set("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        }
+        set("XDG_CACHE_HOME", "/state/cache");
+        set("XDG_RUNTIME_DIR", "/run");
+
+        match &self.wd {
+            WdSetup::Isolated { .. } => set("HOME", "/state/home"),
+            WdSetup::Session { .. } => set("HOME", "/home"),
+            WdSetup::BoundDir { .. } => match std::env::var("HOME") {
+                Ok(h) => set("HOME", &h),
+                Err(_) => set("HOME", "/state/home"),
+            },
+        }
+
+        if let WdSetup::Isolated { .. } = self.wd {
+            set("OUTPUT_DIR", "/build/output");
+            set("GIT_TERMINAL_PROMPT", "0");
+            set("SOURCE_DATE_EPOCH", "0");
+            set("PYTHONHASHSEED", "0");
+        }
+
+        // Locale. Sessions get a safe, always-present `C.UTF-8` floor: it's
+        // built into glibc so it never triggers "cannot set locale" warnings
+        // the way `en_US.utf8` does when that locale isn't generated in the
+        // rootfs, and setting only `LANG` (the lowest-precedence locale knob,
+        // no `LC_ALL`) lets a session's composed `env_vars` or a client's
+        // forwarded `LANG`/`LC_*` override it. Build/task sandboxes keep the
+        // fixed `en_US.utf8` + `LC_ALL` they always had, for output stability.
+        if let WdSetup::Session { .. } = &self.wd {
+            set("LANG", "C.UTF-8");
+        } else {
+            set("LANG", "en_US.utf8");
+            set("LC_ALL", "en_US.utf8");
+        }
+        set("IS_SANDBOX", "1");
+        if let WdSetup::BoundDir { .. } = self.wd {
+            //  Quality-of-life wiring for task sandboxes
+            for var in ["TERM", "COLORTERM", "LS_COLORS"] {
+                if let Ok(value) = std::env::var(var) {
+                    set(var, &value);
+                }
+            }
+        }
+
+        self.env_vars.iter().for_each(|(var, val)| set(var, val));
+        env
+    }
+
     /// Initializes an empty config with the given name.
     pub fn new<S: Into<String>>(name: S) -> Self {
         Self {
@@ -220,7 +359,7 @@ impl Config {
             hostname: None,
             username: None,
             keep_dirs: false,
-            rootfs: HashSet::with_capacity(64),
+            rootfs: BTreeSet::new(),
             state_dir: None,
             wd: WdSetup::Isolated {
                 working_inputs: Vec::with_capacity(6),
@@ -510,5 +649,66 @@ impl Config {
         .map_err(|e| Error::IO("synthesizing user/group configuration", sd, e))?;
 
         Sandbox::new(build_base_dir, self, channel)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_config() -> Config {
+        let mut config = Config::new("test");
+        config.wd = WdSetup::Session {
+            home: PathBuf::from("/tmp/home"),
+            working: PathBuf::from("/tmp/working"),
+            working_name_override: None,
+        };
+        config.username = Some("dev".to_string());
+        config
+    }
+
+    /// The pair a session's shell is launched with is the pair anything
+    /// injected into that session later has to be given, so both come from
+    /// here. `/workbench` is the contract the session layout promises.
+    #[test]
+    fn a_session_starts_in_workbench_with_its_login_identity() {
+        let config = session_config();
+
+        assert_eq!(config.command_cwd(), "/workbench");
+        let env = config.command_env();
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/home"));
+        assert_eq!(env.get("USER").map(String::as_str), Some("dev"));
+        assert_eq!(env.get("LANG").map(String::as_str), Some("C.UTF-8"));
+    }
+
+    /// Composed variables are policy; the layout defaults are only a floor.
+    #[test]
+    fn configured_vars_override_the_layout_defaults() {
+        let mut config = session_config();
+        config
+            .env_vars
+            .insert("LANG".to_string(), "en_GB.UTF-8".to_string());
+        config
+            .env_vars
+            .insert("EDITOR".to_string(), "hx".to_string());
+
+        let env = config.command_env();
+
+        assert_eq!(env.get("LANG").map(String::as_str), Some("en_GB.UTF-8"));
+        assert_eq!(env.get("EDITOR").map(String::as_str), Some("hx"));
+    }
+
+    /// A build sandbox keeps the layout it always had — the extraction of this
+    /// logic out of `command_inner` must not have moved the task plane.
+    #[test]
+    fn a_build_sandbox_keeps_its_own_layout() {
+        let config = Config::new("test");
+
+        assert_eq!(config.command_cwd(), "/build");
+        let env = config.command_env();
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/state/home"));
+        assert_eq!(env.get("SOURCE_DATE_EPOCH").map(String::as_str), Some("0"));
+        assert_eq!(env.get("LC_ALL").map(String::as_str), Some("en_US.utf8"));
+        assert_eq!(env.get("PS1"), None);
     }
 }

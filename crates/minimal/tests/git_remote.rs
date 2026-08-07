@@ -79,8 +79,10 @@ async fn git_push_through_min_binary_lands_commit_in_workspace() {
     );
 
     // The daemon's post-receive hook checks out the pushed branch into the
-    // session worktree; read the file back over SFTP to prove it landed.
+    // session worktree; read the file back over SFTP to prove it landed. The
+    // worktree is spelled out because SFTP's relative paths resolve against
+    // the session's home, not its workspace.
     let sftp = client.open_sftp(session_id).await;
-    let contents = sftp.read("hello.txt").await.unwrap();
+    let contents = sftp.read("/workbench/hello.txt").await.unwrap();
     assert_eq!(contents, b"hi there\n");
 }

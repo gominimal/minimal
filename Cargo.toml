@@ -18,6 +18,8 @@ members = [
     "crates/paths",
     "crates/mip",
     "crates/minimal",
+    "crates/minimal-client",
+    "crates/minimal-tui",
     "crates/minimald",
     "crates/minimald-rpc",
     "crates/minvmd",
@@ -80,6 +82,7 @@ codespan-reporting = { version = "0.13", features = ["serialization"] } # Keep i
 constcat = "0.6"
 copy_dir = "0.1.3"
 chrono = {version = "0.4", features = ["serde", "std"]}
+crossterm = { version = "0.29", features = ["event-stream"] }
 dirs = "6"
 fd-lock = "4"
 either = { version = "1.17", default-features = false }
@@ -98,6 +101,7 @@ hex = "0.4"
 indicatif = "0.18"
 indoc = "^2.0"
 inquire = { version = "0.9", default-features = false, features = ["crossterm", "fuzzy"] }
+insta = "1.48"
 jaq-all = "0.2.0"
 json-subscriber = "0.3"
 libc = "0.2"
@@ -112,7 +116,7 @@ nickel-lang-core = { git = "https://github.com/nickel-lang/nickel.git", rev = "2
 opentelemetry-semantic-conventions = "0.32"
 # `socket` + `time`: the guest's vsock timekeep listener binds an AF_VSOCK
 # datagram socket and steps CLOCK_REALTIME from the host's updates.
-nix = { version = "0.31", features = ["fs", "socket", "time", "user"] }
+nix = { version = "0.31", features = ["fs", "sched", "socket", "time", "user"] }
 nutype = { version = "0.7", features = ["serde"] }
 # Held at 0.39: 0.40 turns `Object::exports()`/`imports()` from
 # `Result<Vec<_>>` into lazy `Result<_>`-yielding iterators, so crates/check
@@ -126,6 +130,7 @@ rand = "0.10"
 # WireGuard keypair generation (`networking-wg`).
 rand_core = { version = "0.6", features = ["getrandom"] }
 rayon = "1.12"
+ratatui = "0.30"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 regex = "1" # keep in sync with nickel-lang-core
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std"] }
@@ -161,6 +166,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 thiserror = "2"
+unicode-width = "0.2"
 url = "2" # keep in sync with reqwest
 uuid = { version = "1.24", features = ["v4", "v7", "serde"] }
 vt100-ctt = { version = "0.17", default-features = false }
@@ -186,6 +192,8 @@ common = { path = "crates/common" }
 decode = { path = "crates/decode" }
 diagnostics = { path = "crates/diagnostics" }
 mctx = { path = "crates/mctx" }
+minimal-client = { path = "crates/minimal-client" }
+minimal-tui = { path = "crates/minimal-tui" }
 minimald-rpc = { path = "crates/minimald-rpc" }
 mlog = { path = "crates/mlog" }
 mfile = { path = "crates/mfile" }

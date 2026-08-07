@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use anyhow::anyhow;
 use graph::{BuildSpec, BuildSpecRef, SpecTest, SubsetInput, Transitives};
@@ -34,7 +34,7 @@ impl<'a> StandaloneTest<'a> {
         build: &BuildSpec,
         test: &SpecTest,
         opts: &Options<'a>,
-    ) -> Result<(HashSet<SandboxMapped>, bool, bool), Error> {
+    ) -> Result<(BTreeSet<SandboxMapped>, bool, bool), Error> {
         let transitives = Transitives::for_toplevels(
             opts.graph,
             {
@@ -45,7 +45,7 @@ impl<'a> StandaloneTest<'a> {
             false,
         );
 
-        let mut dependencies = HashSet::new();
+        let mut dependencies = BTreeSet::new();
         let (mut needs_dns, mut need_internet) = (false, false);
 
         let build_deps: Vec<_> = transitives.into_iter().collect();

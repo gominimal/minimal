@@ -10,6 +10,7 @@ pub mod guest;
 mod maintenance;
 #[cfg(target_os = "linux")]
 pub mod net;
+pub mod nsenter;
 pub mod rpc;
 pub mod server;
 mod session;

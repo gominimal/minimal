@@ -201,6 +201,47 @@ impl OneshotSshRpc for GetSessionRecord {
     type Response = GetSessionRecordResponse;
 }
 
+/// An RPC to snapshot a session's terminal screen without attaching.
+pub struct GetSessionScreen;
+
+/// A single terminal cell.
+///
+/// Colors are strings so the wire contract stays free of any terminal
+/// library's color type: an ANSI-256 palette index is `"idx:<n>"` and a
+/// truecolor value is `"#rrggbb"`. `None` is the terminal default.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScreenCell {
+    pub ch: char,
+    pub fg: Option<String>,
+    pub bg: Option<String>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub reverse: bool,
+}
+
+/// A row of terminal cells.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScreenRow {
+    pub cells: Vec<ScreenCell>,
+}
+
+/// The terminal screen snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScreenSnapshot {
+    pub rows: u16,
+    pub cols: u16,
+    pub cursor_row: Option<u16>,
+    pub cursor_col: Option<u16>,
+    pub lines: Vec<ScreenRow>,
+}
+
+impl OneshotSshRpc for GetSessionScreen {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionScreen");
+    type Request<'a> = SessionId;
+    type Response = Errorable<ScreenSnapshot>;
+}
+
 /// An RPC to create a new session.
 ///
 /// Allocates the session's record and brings its actor up; the

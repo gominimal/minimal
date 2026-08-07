@@ -10,6 +10,7 @@ use russh::Channel;
 use russh::server::Msg;
 #[cfg(not(test))]
 use sandbox2::Network;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::io::{Read, Write};
@@ -719,6 +720,15 @@ impl Binding {
 /// driven against a real sandboxed process or a test double. The unused
 /// `hakoniwa::ExitStatus` payload is reduced to a portable exit code.
 pub(crate) trait SessionProcess: Send + 'static {
+    /// Returns the PID of hakoniwa's container supervisor — **not** the PID of
+    /// the shell it exec'd.
+    ///
+    /// The supervisor unshared the sandbox's namespaces itself, so this is a
+    /// valid handle for all of them except the PID namespace, which it created
+    /// for its children without entering. Use
+    /// [`Host::session_leader_pid`](Host::session_leader_pid) for the shell's
+    /// own PID; see [`crate::nsenter`] for why the distinction matters.
+    fn container_pid(&self) -> u32;
     /// Returns `Some(code)` if the process has exited, `None` if still running.
     fn try_wait(&mut self) -> io::Result<Option<i32>>;
     /// Blocks until the process exits, returning its exit code.
@@ -734,10 +744,10 @@ pub(crate) trait SessionProcess: Send + 'static {
 pub(crate) trait SessionLauncher {
     /// The running-process handle this launcher produces.
     type Process: SessionProcess;
-    /// A value held for the session's lifetime purely for its `Drop` (e.g. the
-    /// sandbox files backing the running process's rootfs). Dropped after
-    /// [`Self::Process`].
-    type Guard: Send + 'static;
+    /// A value held for the session's lifetime, for its `Drop` (it owns the
+    /// sandbox files backing the running process's rootfs) and as the live view
+    /// of the session's environment. Dropped after [`Self::Process`].
+    type Guard: SessionGuard;
 
     fn launch(
         self,
@@ -746,6 +756,42 @@ pub(crate) trait SessionLauncher {
         paths: SessionPaths,
         sz: WinSize,
     ) -> impl Future<Output = io::Result<Launched<Self::Process, Self::Guard>>> + Send;
+}
+
+/// Where a command should start in a session, and with what environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SessionEnvironment {
+    /// Absolute path inside the sandbox: `/workbench` for a session.
+    pub(crate) cwd: String,
+    /// The composed session variables, layout defaults included, plus anything
+    /// installed into the session since it launched.
+    pub(crate) vars: BTreeMap<String, String>,
+}
+
+/// The launcher-owned value a [`Host`] holds for its session's lifetime.
+///
+/// Primarily a `Drop` guard — it owns the sandbox files backing the running
+/// process's rootfs — but it is also the live handle to the session's
+/// environment.
+pub(crate) trait SessionGuard: Send + 'static {
+    /// The working directory and environment a command should run with in this
+    /// session, as of now.
+    fn command_environment(&self) -> SessionEnvironment;
+}
+
+/// The mock launcher has no sandbox, so there is nothing to describe.
+#[cfg(test)]
+impl SessionGuard for () {
+    fn command_environment(&self) -> SessionEnvironment {
+        SessionEnvironment::default()
+    }
+}
+
+#[cfg(not(test))]
+impl SessionGuard for crate::env::Env {
+    fn command_environment(&self) -> SessionEnvironment {
+        crate::env::Env::command_environment(self)
+    }
 }
 
 /// The product of [`SessionLauncher::launch`].
@@ -772,15 +818,91 @@ enum Message {
     /// git repository, the changed-since-activation delta otherwise) and
     /// reply with it; `Unavailable` when neither can be computed.
     GetAtRisk(oneshot::Sender<minimald_rpc::SessionDeltaResponse>),
+    /// Build a command that runs `program` inside this session's sandbox, for
+    /// the caller to give stdio to and spawn. The host builds it because only
+    /// the host can: it holds the session process (whose namespaces are joined)
+    /// and the guard (which knows the session's current environment).
+    CommandInSession {
+        program: std::ffi::OsString,
+        args: Vec<std::ffi::OsString>,
+        reply: oneshot::Sender<Result<std::process::Command, crate::nsenter::NsenterError>>,
+    },
+
+    /// Snapshot the terminal screen for a read-only preview (`min dash`).
+    /// Answered straight off the parser — no PTY resize, no I/O relay.
+    GetScreen(oneshot::Sender<minimald_rpc::ScreenSnapshot>),
 
     SetTitleCallback(String),
     VisualBellCallback,
     AudibleBellCallback,
 }
 
+/// Renders a vt100 cell color into the string form the
+/// [`minimald_rpc::ScreenCell`] wire type uses: `"idx:<n>"` for an ANSI-256
+/// palette index, `"#rrggbb"` for truecolor, `None` for the terminal default.
+fn wire_color(color: vt100_ctt::Color) -> Option<String> {
+    match color {
+        vt100_ctt::Color::Default => None,
+        vt100_ctt::Color::Idx(n) => Some(format!("idx:{n}")),
+        vt100_ctt::Color::Rgb(r, g, b) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
+    }
+}
+
+/// Convert a vt100 screen into the [`minimald_rpc::ScreenSnapshot`] wire
+/// type. Wide-glyph continuation cells are dropped rather than emitted as
+/// spaces: consumers flatten cells into width-aware text, so a placeholder
+/// cell would add a phantom column per wide glyph and skew the row.
+fn screen_to_snapshot(screen: &vt100_ctt::Screen) -> minimald_rpc::ScreenSnapshot {
+    use minimald_rpc::{ScreenCell, ScreenRow, ScreenSnapshot};
+    let (rows, cols) = screen.size();
+    let lines = (0..rows)
+        .map(|row| ScreenRow {
+            cells: (0..cols)
+                .filter_map(|col| match screen.cell(row, col) {
+                    Some(cell) if cell.is_wide_continuation() => None,
+                    Some(cell) => Some(ScreenCell {
+                        // A cell's contents can be wider than one char
+                        // (wide glyphs); the wire type is a single char,
+                        // so keep the first.
+                        ch: cell.contents().chars().next().unwrap_or(' '),
+                        fg: wire_color(cell.fgcolor()),
+                        bg: wire_color(cell.bgcolor()),
+                        bold: cell.bold(),
+                        italic: cell.italic(),
+                        underline: cell.underline(),
+                        reverse: cell.inverse(),
+                    }),
+                    None => Some(ScreenCell {
+                        ch: ' ',
+                        fg: None,
+                        bg: None,
+                        bold: false,
+                        italic: false,
+                        underline: false,
+                        reverse: false,
+                    }),
+                })
+                .collect(),
+        })
+        .collect();
+    let (cursor_row, cursor_col) = match screen.hide_cursor() {
+        true => (None, None),
+        false => {
+            let (row, col) = screen.cursor_position();
+            (Some(row), Some(col))
+        }
+    };
+    ScreenSnapshot {
+        rows,
+        cols,
+        cursor_row,
+        cursor_col,
+        lines,
+    }
+}
+
 /// Handles callback events from the terminal parser, transmitting them to the host.
 struct ParserEventHandler(WeakHostHandle);
-
 impl vt100_ctt::Callbacks for ParserEventHandler {
     fn set_window_title(&mut self, _: &mut vt100_ctt::Screen, title: &[u8]) {
         self.0.set_title_cb(title);
@@ -863,6 +985,54 @@ impl HostHandle {
         }
     }
 
+    /// Whether both handles address the same host.
+    pub fn same_host(&self, other: &Self) -> bool {
+        self.sender.same_channel(&other.sender)
+    }
+
+    /// Whether the host's runtime loop is still running.
+    ///
+    /// A cheap, non-blocking check — the channel closes when the loop ends — so
+    /// a caller deciding whether to reuse a host or mint a new one does not
+    /// have to round-trip through it.
+    pub fn is_alive(&self) -> bool {
+        !self.sender.is_closed()
+    }
+
+    /// Builds a command that runs `program` inside this session's sandbox,
+    /// joining the namespaces of the running session process.
+    ///
+    /// The returned command has no stdio configured: that belongs to whoever is
+    /// wiring it up (an SSH exec channel pipes all three, an interactive
+    /// attach would hand it a PTY). See [`Host::command_in_session`].
+    ///
+    /// # Errors
+    ///
+    /// The session process having exited, its namespaces being unreadable, or
+    /// the host having stopped between this call and its reply.
+    pub async fn command_in_session<I, S>(
+        &self,
+        program: impl AsRef<std::ffi::OsStr>,
+        args: I,
+    ) -> io::Result<std::process::Command>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let (reply, recv) = oneshot::channel();
+        let message = Message::CommandInSession {
+            program: program.as_ref().to_os_string(),
+            args: args
+                .into_iter()
+                .map(|a| a.as_ref().to_os_string())
+                .collect(),
+            reply,
+        };
+        let dead = || io::Error::other("session host stopped before the command could be built");
+        self.sender.send(message).await.map_err(|_| dead())?;
+        recv.await.map_err(|_| dead())?.map_err(io::Error::other)
+    }
+
     /// Returns the terminal attributes.
     pub async fn get_attrs(&self) -> Result<HostAttrs, ()> {
         let (send, recv) = oneshot::channel();
@@ -870,6 +1040,18 @@ impl HostHandle {
         match self.sender.send(Message::GetAttrs(send)).await {
             Ok(()) => Ok(recv.await.expect("host died")),
             Err(SendError(Message::GetAttrs(_))) => Err(()),
+            Err(e) => unreachable!("{:?}", e),
+        }
+    }
+
+    /// Returns a snapshot of the terminal screen. A dead host reads as
+    /// `Err(())` rather than a panic, matching [`Self::get_attrs`].
+    pub async fn get_screen(&self) -> Result<minimald_rpc::ScreenSnapshot, ()> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        match self.sender.send(Message::GetScreen(send)).await {
+            Ok(()) => recv.await.map_err(|_| ()),
+            Err(SendError(Message::GetScreen(_))) => Err(()),
             Err(e) => unreachable!("{:?}", e),
         }
     }
@@ -914,7 +1096,7 @@ pub struct HostAttrs {
 /// Generic over the [`SessionProcess`] it supervises and the [`SessionLauncher`]
 /// guard kept alive for the session, so the runtime loop can be driven against a
 /// real sandboxed process or a test double.
-pub(crate) struct Host<P: SessionProcess, G: Send + 'static> {
+pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     /// Channel for actor messages via [`HostHandle`].
     receiver: mpsc::Receiver<Message>,
 
@@ -981,9 +1163,9 @@ pub(crate) struct Host<P: SessionProcess, G: Send + 'static> {
     // sandbox files backing the running process's rootfs along with the context
     // and graph) alive for as long as this host (and thus the session process)
     // lives. Declared last so it is dropped after `process`: the process is torn
-    // down before the sandbox files backing its rootfs are removed. Never read;
-    // held purely for its `Drop`.
-    _guard: G,
+    // down before the sandbox files backing its rootfs are removed. Also read,
+    // via `SessionGuard`, for the session's current environment.
+    guard: G,
 }
 
 /// A launched session process backed by a sandboxed [`hakoniwa::Child`].
@@ -992,6 +1174,10 @@ pub(crate) struct SandboxProcess(hakoniwa::Child);
 
 #[cfg(not(test))]
 impl SessionProcess for SandboxProcess {
+    fn container_pid(&self) -> u32 {
+        self.0.id()
+    }
+
     fn try_wait(&mut self) -> io::Result<Option<i32>> {
         self.0
             .try_wait()
@@ -1557,6 +1743,10 @@ pub(crate) struct MockProcess(std::process::Child);
 
 #[cfg(test)]
 impl SessionProcess for MockProcess {
+    fn container_pid(&self) -> u32 {
+        self.0.id()
+    }
+
     fn try_wait(&mut self) -> io::Result<Option<i32>> {
         Ok(self.0.try_wait()?.map(|s| s.code().unwrap_or(-1)))
     }
@@ -1623,7 +1813,53 @@ impl SessionLauncher for MockLauncher {
     }
 }
 
-impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
+impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
+    /// The PID of hakoniwa's container supervisor for this session.
+    ///
+    /// Correct as a handle for every namespace the sandbox unshared *except*
+    /// the PID namespace — which is what the own-IP tap wiring uses it for. To
+    /// address the session's PID namespace, or to name the shell itself, use
+    /// [`Self::session_leader_pid`].
+    // Reachable only through `session_leader_pid`, which the exec path uses;
+    // kept as the named counterpart so the distinction stays visible.
+    #[allow(dead_code)]
+    pub(crate) fn container_pid(&self) -> u32 {
+        self.process.container_pid()
+    }
+
+    /// The PID of the session shell itself — the process hakoniwa exec'd inside
+    /// every one of the sandbox's namespaces.
+    ///
+    /// # Errors
+    ///
+    /// [`NsenterError::NoSessionLeader`](crate::nsenter::NsenterError::NoSessionLeader)
+    /// once the shell has exited; the session's namespaces do not outlive it.
+    pub(crate) fn session_leader_pid(&self) -> Result<u32, crate::nsenter::NsenterError> {
+        crate::nsenter::session_leader_pid(self.process.container_pid())
+    }
+
+    /// Builds a command that runs `program` inside this session's sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the shell's PID cannot be resolved or pinned; see
+    /// [`Self::session_leader_pid`].
+    pub(crate) fn command_in_session<I, S>(
+        &self,
+        program: impl AsRef<std::ffi::OsStr>,
+        args: I,
+    ) -> Result<std::process::Command, crate::nsenter::NsenterError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let environment = self.guard.command_environment();
+        crate::nsenter::Injection::new(self.session_leader_pid()?, program, args)
+            .with_cwd(environment.cwd)
+            .with_env(environment.vars)
+            .command()
+    }
+
     /// Spawns a session host from the given launcher, wiring it to `channel` if
     /// one is supplied, and drives its runtime loop on a background task.
     ///
@@ -1727,7 +1963,7 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
             workspace_root,
             session_name,
             archives_dir,
-            _guard: guard,
+            guard,
         };
 
         if let Some(channel) = channel {
@@ -1812,6 +2048,15 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
         }
     }
 
+    /// Snapshots the visible terminal screen into the structured
+    /// [`minimald_rpc::ScreenSnapshot`] wire type: dimensions, the cursor
+    /// position (omitted when the session hid its cursor), and every cell
+    /// of the grid. Read-only — no PTY resize and no I/O relay, unlike
+    /// `attach`.
+    fn screen_snapshot(&self) -> minimald_rpc::ScreenSnapshot {
+        screen_to_snapshot(self.parser.screen())
+    }
+
     pub async fn step(&mut self) -> Result<(), ()> {
         tokio::select! {
             // Read actor messages.
@@ -1857,6 +2102,16 @@ impl<P: SessionProcess, G: Send + 'static> Host<P, G> {
                     }
                     Message::GetAttrs(s) => {
                         let _ = s.send(self.attrs.clone());
+                    }
+                    Message::GetScreen(s) => {
+                        let _ = s.send(self.screen_snapshot());
+                    }
+                    Message::CommandInSession {
+                        program,
+                        args,
+                        reply,
+                    } => {
+                        let _ = reply.send(self.command_in_session(program, args));
                     }
                     Message::GetAtRisk(s) => {
                         // Computed on a spawned task: the git commands and
@@ -2222,6 +2477,18 @@ mod tests {
         assert!(pty.master_fd() >= 0);
         assert!(pty.slave_fd() >= 0);
         assert_ne!(pty.master_fd(), pty.slave_fd());
+    }
+
+    /// A wide glyph occupies two grid cells; the snapshot must emit only the
+    /// glyph itself, not a placeholder space for its continuation cell, so
+    /// the flattened row keeps the terminal's display width.
+    #[test]
+    fn screen_snapshot_drops_wide_continuation_cells() {
+        let mut parser = vt100_ctt::Parser::new(2, 10, 0);
+        parser.process("abあcd".as_bytes());
+        let snapshot = screen_to_snapshot(parser.screen());
+        let text: String = snapshot.lines[0].cells.iter().map(|c| c.ch).collect();
+        assert_eq!(text.trim_end(), "abあcd");
     }
 
     #[test]

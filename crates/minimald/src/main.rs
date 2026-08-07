@@ -144,6 +144,12 @@ enum Command {
     Completions(CompletionsArgs),
     /// Runs the minimald server in the foreground.
     Run(ListenArgs),
+    /// Internal: join a session's namespaces and run a program there.
+    ///
+    /// Not a supported command line — this is the daemon re-execing itself to
+    /// power launching a process in existing namespaces.
+    #[command(name = minimald::nsenter::SUBCOMMAND, hide = true)]
+    Nsenter(minimald::nsenter::ShimArgs),
 }
 
 /// The arguments for the completions subcommand.
@@ -259,6 +265,15 @@ impl From<russh::keys::Error> for MainError {
     }
 }
 
+/// Flattens an error and its `source()` chain into one line, so a typed error
+/// reaching [`MainError::Other`] keeps the context its variants carry.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    std::iter::successors(err.source(), |e| e.source()).fold(err.to_string(), |mut acc, e| {
+        acc.push_str(&format!(": {e}"));
+        acc
+    })
+}
+
 /// Open (creating if absent) a lock file; only its fd matters, for flock.
 fn open_lock_file(path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
@@ -270,6 +285,23 @@ fn open_lock_file(path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs:
 }
 
 fn main() -> Result<(), MainError> {
+    // We re-exec to power some machinery for joining namespaces, do that before async/other-threads
+    // are setup.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == minimald::nsenter::SUBCOMMAND)
+    {
+        let Command::Nsenter(args) = Cli::parse().command else {
+            unreachable!(
+                "argv[1] is {}, so clap parsed that subcommand",
+                minimald::nsenter::SUBCOMMAND
+            )
+        };
+        let code =
+            minimald::nsenter::shim_main(args).map_err(|e| MainError::Other(error_chain(&e)))?;
+        std::process::exit(code);
+    }
+
     let runtime = Builder::new_multi_thread()
         .thread_name("minimald-worker")
         .thread_stack_size(8 * 1024 * 1024)
@@ -408,7 +440,7 @@ async fn async_main() -> Result<(), MainError> {
     // would indicate we are operating in a single-purpose micro-vm.
     //
     // If we are not the init process, we load our config from CLI args.
-    let mut cli = if is_minimal_microvm() {
+    let cli = if is_minimal_microvm() {
         Cli {
             command: Command::Run(ListenArgs {
                 instance_num: 0,
@@ -441,12 +473,16 @@ async fn async_main() -> Result<(), MainError> {
     };
 
     // Handle non-{launch,run} commands.
-    if let Command::Completions(CompletionsArgs { shell }) = cli.command {
-        let mut cmd = Cli::command();
-        let name = cmd.get_name().to_string();
-        clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
-        return Ok(());
-    }
+    let mut cli = match cli.command {
+        Command::Nsenter(_) => unreachable!("nsenter is intercepted before CLI args are parsed"),
+        Command::Completions(CompletionsArgs { shell }) => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+            return Ok(());
+        }
+        _ => cli,
+    };
 
     // Install tracing. A foreground run logs to stdout only. A detached
     // native daemon (stdio null'd, marked by `MINIMALD_DETACHED`) and the

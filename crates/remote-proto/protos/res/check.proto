@@ -26,22 +26,23 @@ message CheckRequest {
   repeated string skip_checkers = 4;
   // Run checks over packages.
   bool packages = 5;
-  // Run checks over profiles.
-  bool profiles = 6;
   // Run checks over harnesses.
   bool harnesses = 7;
 
   // Configure the provided GCS bucket name as the remote cache.
   optional string remote_cache_gcs_bucket = 8;
+
+  reserved 6; // was profiles, removed 2026-08-06
 }
 
 // Something that was checked.
 message CheckObject {
   oneof msg {
     string package = 1;
-    string profile = 2;
     string harness = 3;
   }
+
+  reserved 2; // was profiles, removed 2026-08-06
 }
 
 // Something that was checked.

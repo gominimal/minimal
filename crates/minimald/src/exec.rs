@@ -29,6 +29,7 @@ use tokio::{
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     spawn,
 };
+use tracing::Instrument as _;
 
 use crate::{
     ChannelConfig, MINIMAL_SESSION_ID_ENV,
@@ -477,6 +478,64 @@ impl Exec for TokioExec {
     }
 }
 
+/// An [`Exec`] that runs a command *inside* the session's sandbox, joining the
+/// namespaces of the running session process.
+///
+/// `argv` is handed to the session's shell rather than split here, matching
+/// what `ssh host '...'` does everywhere else: the client wrote a shell command,
+/// and quoting, globs, pipes and redirections are part of what it means.
+#[derive(Debug, Clone)]
+pub struct SessionExec {
+    pub argv: String,
+    /// The SSH username, needed only if the session has no host running and one
+    /// has to be launched to service this request.
+    pub conn_username: String,
+}
+
+/// The shell a session's exec requests run under — the same absolute path the
+/// session launcher execs for an interactive shell, since the generic rootfs
+/// has no `/bin/bash`.
+const SESSION_SHELL: &str = "/usr/bin/bash";
+
+impl Exec for SessionExec {
+    type Process = TokioProcess;
+
+    fn exec(self, session: SessionHandle) -> BoxStream<'static, io::Result<Self::Process>> {
+        stream::once(async move {
+            // Launching the sandbox is part of servicing the request: an exec
+            // against an idle session should work, not fail because nobody
+            // happens to be holding a terminal open.
+            let host = session
+                .ensure_host(self.conn_username)
+                .await
+                .map_err(|e| io::Error::other(format!("{e}")))?;
+            let command = host
+                .command_in_session(SESSION_SHELL, ["-c", &self.argv])
+                .await?;
+
+            let mut command = Command::from(command);
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            // This spawns the shim — us, re-exec'd — not the user's command, so
+            // a bare ENOENT reads as a missing shell. Name the path (#1175).
+            let shim = command.as_std().get_program().to_owned();
+            command.spawn().map(TokioProcess).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "re-execing {} as the session-namespace shim: {e}",
+                        std::path::Path::new(&shim).display()
+                    ),
+                )
+            })
+        })
+        .boxed()
+    }
+}
+
 /// `Process` implementation backed by [`tokio::process::Child`].
 #[derive(Debug)]
 pub struct TokioProcess(Child);
@@ -781,6 +840,7 @@ pub(crate) async fn handle_exec(
         session.channel_failure(id)?;
         return Ok(());
     };
+    let conn_username = conn_lock.ssh_username.clone().unwrap_or_default();
     drop(conn_lock);
 
     if let Some(ident) = argv.strip_prefix("git-receive-pack min://") {
@@ -824,18 +884,24 @@ pub(crate) async fn handle_exec(
         }
     };
 
+    // Logged for every accepted form, before the dispatch that decides which
+    // one it is: an operator reading the log should see what a client asked to
+    // run, whether it was serviced by the daemon, handed to the session, or
+    // refused below.
+    tracing::info!(%session_id, command = %argv, "exec request");
+
     let rem = match argv.strip_prefix("min ") {
         Some(c) => c,
+        // Not one of the daemon's own commands, so it is a command for the
+        // session: run it in the sandbox, the way `ssh host '<cmd>'` runs it on
+        // the host it names.
         None => {
-            tracing::warn!(%session_id, "execution request rejected: not an accepted command form");
-            // Accept the channel so the client gets a diagnostic on stderr: a
-            // bare `channel_failure` reaches it only as "exec request failed",
-            // naming neither the rejected command nor what would be accepted.
-            // Nothing is run — the request still fails with a non-zero exit.
+            let span = exec_span(&config, session_id, &argv);
             session.channel_success(id)?;
-            spawn(async move {
-                reject_unsupported_exec(channel, argv).await;
-            });
+            spawn(
+                run_in_session(serv, conn, session_handle, id, channel, argv, conn_username)
+                    .instrument(span),
+            );
             return Ok(());
         }
     }
@@ -932,8 +998,6 @@ pub(crate) async fn handle_exec(
         }
         Some(other) => {
             tracing::warn!(%session_id, "execution request rejected: unexpected min sub-command `{other}`");
-            // As with the missing-`min ` case above, report the rejection on
-            // stderr rather than failing the channel opaquely.
             session.channel_success(id)?;
             spawn(async move {
                 reject_unsupported_exec(channel, argv).await;
@@ -969,6 +1033,70 @@ fn unsupported_command_message(rejected: &str) -> String {
         "minimald: unsupported command '{rejected}'; accepted: \
          min run <task>, min package build [args...], min check [args...]\n"
     )
+}
+
+/// The tracing span an in-session exec runs under, mirroring the `rpc` span in
+/// [`crate::rpc::handle_ssh_rpc`].
+///
+/// The client's propagated trace context is adopted — same trace id, fresh span
+/// id, the client's span as parent — so one `trace_id` grep joins the CLI's log
+/// with the daemon's. A missing or malformed value mints a fresh context:
+/// propagation is a diagnostic aid and must never fail a request. The command
+/// rides on the span, so every record the exec emits names what was asked for.
+fn exec_span(config: &ChannelConfig, session_id: SessionId, argv: &str) -> tracing::Span {
+    use minimald_rpc::trace::{TRACEPARENT_ENV, TraceContext};
+
+    let client_ctx = config
+        .env_vars
+        .get(TRACEPARENT_ENV)
+        .and_then(|v| TraceContext::parse_traceparent(v));
+    let ctx = client_ctx
+        .as_ref()
+        .map(TraceContext::child)
+        .unwrap_or_else(TraceContext::mint);
+    let span = tracing::info_span!(
+        "exec",
+        %session_id,
+        command = %argv,
+        trace_id = %ctx.trace_id_hex(),
+        span_id = %ctx.span_id_hex(),
+        parent_span_id = tracing::field::Empty,
+    );
+    if let Some(client_ctx) = &client_ctx {
+        span.record(
+            "parent_span_id",
+            tracing::field::display(client_ctx.span_id_hex()),
+        );
+    }
+    span
+}
+
+/// Runs `argv` inside the session's sandbox, streamed over the SSH channel.
+///
+/// The fallback for every exec request the daemon does not service itself. It
+/// needs the session's sandbox up, which [`SessionExec`] arranges — launching a
+/// host for an idle session if there isn't one.
+#[allow(clippy::too_many_arguments)]
+async fn run_in_session(
+    serv: ServerStateHandle,
+    conn: ConnectionHandle,
+    session: SessionHandle,
+    channel_id: ChannelId,
+    channel: Channel<Msg>,
+    argv: String,
+    conn_username: String,
+) {
+    let exec_task = ExecTask {
+        conn,
+        serv,
+        session,
+        channel_id,
+        exec: SessionExec {
+            argv,
+            conn_username,
+        },
+    };
+    exec_task.run(channel).await;
 }
 
 /// Streams a `min package build [--verbose] [--rebuild] [pkgs...]` exec over the SSH
@@ -1712,44 +1840,59 @@ mod tests {
             create_configured_session(client, "exec-test", "/tmp").await
         }
 
-        /// An exec request that isn't an accepted form must never start a
-        /// process — the daemon services only specific safe invocations. The
-        /// refusal is reported on stderr (exit 1) rather than failing the
-        /// channel opaquely, so the client sees what was rejected and what it
-        /// could run instead.
+        /// A path in the daemon's own filesystem that a command would create if
+        /// it ran there. Unique per call so parallel tests cannot collide.
+        fn daemon_marker(tag: &str) -> std::path::PathBuf {
+            std::env::temp_dir().join(format!(
+                "minimald-exec-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id(),
+            ))
+        }
+
+        /// An exec request the daemon does not service itself is handed to the
+        /// session's sandbox — and must never run on the daemon's own
+        /// filesystem.
+        ///
+        /// The marker file is what pins that: had the command run here, it
+        /// would exist. This harness launches a mock host with no sandbox to
+        /// join, so the command fails rather than running in-session; where it
+        /// was *sent* is the part that matters and the part that can be proved
+        /// without a real sandbox.
         #[tokio::test]
-        async fn exec_rejects_arbitrary_command() {
+        async fn an_unrecognised_command_never_runs_on_the_daemon() {
             let server = TestServer::new().await;
             let mut client = server.connect().await;
             let session_id = fresh_session(&mut client).await;
             let session_str = session_id.to_string();
+            let marker = daemon_marker("arbitrary");
+            let _ = std::fs::remove_file(&marker);
 
             let out = client
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    "printf pwned",
+                    &format!("printf pwned > {}", marker.display()),
                     &[],
                 )
                 .await
-                .expect("the rejection is reported over the channel, not a channel failure");
+                .expect("the request is serviced over the channel, not a channel failure");
 
-            assert_eq!(
+            assert!(
+                !marker.exists(),
+                "an exec request ran on the daemon's filesystem, creating {}",
+                marker.display(),
+            );
+            assert_ne!(
                 out.exit_status,
-                Some(1),
-                "an arbitrary command must not exit 0; stdout was {:?}",
+                Some(0),
+                "the mock harness has no sandbox to run in, so this cannot succeed; stdout was {:?}",
                 String::from_utf8_lossy(&out.stdout),
             );
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(
-                stderr.contains("printf pwned"),
-                "the rejected command should be named on stderr, got {stderr:?}",
-            );
-            assert!(
-                stderr.contains("min run <task>")
-                    && stderr.contains("min package build [args...]")
-                    && stderr.contains("min check [args...]"),
-                "the accepted forms should be listed on stderr, got {stderr:?}",
+                !stderr.contains("unsupported command"),
+                "the command should be routed to the session, not refused, got {stderr:?}",
             );
         }
 
@@ -1950,36 +2093,44 @@ mod tests {
             );
         }
 
-        /// `min check` takes its flags after the sub-command, so a form the
-        /// parser accepts must still route — a prefix-matched `min checkx`
-        /// must not run, and its refusal is reported on stderr with a non-zero
-        /// exit rather than an opaque channel failure.
+        /// `min check` takes its flags after the sub-command, so a prefix match
+        /// like `min checkx` must not be serviced as `min check`. A `min`
+        /// sub-command the daemon doesn't know is refused outright rather than
+        /// handed to the session — and refusing it means never running it, on
+        /// the daemon's filesystem least of all.
         #[tokio::test]
-        async fn exec_rejects_a_check_lookalike_subcommand() {
+        async fn a_check_lookalike_is_not_serviced_as_check() {
             let server = TestServer::new().await;
             let mut client = server.connect().await;
             let session_id = fresh_session(&mut client).await;
             let session_str = session_id.to_string();
+            let marker = daemon_marker("checkx");
+            let _ = std::fs::remove_file(&marker);
 
             let out = client
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    "min checkx",
+                    &format!("min checkx > {}", marker.display()),
                     &[],
                 )
                 .await
-                .expect("the rejection is reported over the channel, not a channel failure");
+                .expect("the request is serviced over the channel, not a channel failure");
 
-            assert_eq!(
+            assert!(
+                !marker.exists(),
+                "`min checkx` ran on the daemon's filesystem, creating {}",
+                marker.display(),
+            );
+            assert_ne!(
                 out.exit_status,
-                Some(1),
-                "`min checkx` is not `min check` and must not exit 0; stdout was {:?}",
+                Some(0),
+                "`min checkx` is not `min check` and must not succeed; stdout was {:?}",
                 String::from_utf8_lossy(&out.stdout),
             );
             assert!(
                 String::from_utf8_lossy(&out.stderr).contains("min checkx"),
-                "the rejected command should be named on stderr, got {:?}",
+                "the refusal should name the rejected command, got {:?}",
                 String::from_utf8_lossy(&out.stderr),
             );
         }

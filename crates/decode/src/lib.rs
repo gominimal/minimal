@@ -29,8 +29,6 @@ pub mod attrs;
 pub use attrs::AttrValue;
 pub mod builds;
 use builds::BuildDecl;
-mod profiles;
-pub use profiles::Profile;
 mod decl_tests;
 pub use decl_tests::Test;
 mod stacks;
@@ -72,7 +70,6 @@ pub struct Layer {
     pub builds: Arena<BuildDecl>,
     pub top_levels: Vec<generational_arena::Index>,
 
-    pub profiles: HashMap<String, Profile>,
     pub stacks: HashMap<String, Stack>,
 
     read_ids: HashMap<u64, generational_arena::Index>,
@@ -174,7 +171,6 @@ impl Layer {
             builds: Arena::with_capacity(512),
             read_ids: HashMap::with_capacity(512),
 
-            profiles: HashMap::with_capacity(16),
             stacks: HashMap::with_capacity(32),
         };
 
@@ -199,18 +195,6 @@ impl Layer {
                         .into_opt()
                         .expect("Layer record must not be empty");
 
-                    if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("profiles")) {
-                        let rt = eval_if_closure(&rt, &mut program)?;
-                        if let Some(a) = rt.as_array() {
-                            layer.profiles = HashMap::from_iter(
-                                a.iter()
-                                    .map(|p| layer.ingest_profile(p, &mut program))
-                                    .collect::<Result<Vec<_>, Error>>()?
-                                    .into_iter()
-                                    .map(|p| (p.name.clone(), p)),
-                            );
-                        }
-                    };
                     if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("stacks")) {
                         let rt = eval_if_closure(&rt, &mut program)?;
                         if let Some(a) = rt.as_array() {
@@ -270,14 +254,6 @@ impl Layer {
 
         // Thanks to [DeclAccumulator], all transitive builds would have been ingested
         Ok(self.read_ids[&id])
-    }
-
-    fn ingest_profile(
-        &mut self,
-        rt: &NickelValue,
-        program: &mut Program<CacheImpl>,
-    ) -> Result<Profile, Error> {
-        Profile::from_term(rt, program)
     }
 
     fn ingest_stack(
@@ -397,6 +373,7 @@ pub(crate) fn is_record(val: &NickelValue) -> bool {
     val.as_record().is_some()
 }
 
+#[allow(dead_code)]
 pub(crate) fn patches_from_term(
     rt: &NickelValue,
     program: &mut Program<CacheImpl>,
@@ -863,7 +840,7 @@ mod tests {
         let layer = Layer::new_for_test(
             indoc! {
                 "
-                let {layer, stack, profile, BuildSpec, ..} = import \"minimal.ncl\" in
+                let {layer, stack, BuildSpec, ..} = import \"minimal.ncl\" in
 
                 layer {
                   builds = [
@@ -872,17 +849,6 @@ mod tests {
                         build_deps = [],
                         cmd = \"\",
                     } | BuildSpec,
-                  ],
-
-                  profiles = [
-                    profile {
-                        name = \"uwu\",
-                        from_profile = \"rust\",
-                        packages = [\"gcc\", \"rust\"],
-                        env_vars = {
-                            CC = \"gcc\",
-                        },
-                    }
                   ],
 
                   stacks = [
@@ -913,19 +879,6 @@ mod tests {
                 .unwrap()
                 .name,
             "build",
-        );
-        assert_eq!(
-            layer.profiles.get("uwu"),
-            Some(&Profile {
-                name: "uwu".to_string(),
-                from_profile: Some("rust".to_string()),
-                packages: vec!["gcc".to_string(), "rust".to_string()],
-                env_vars: IndexMap::from_iter([(
-                    "CC".to_string(),
-                    EnvVarValue::Value("gcc".to_string())
-                )]),
-                patch: Default::default(),
-            }),
         );
         assert_eq!(
             layer.stacks.get("uwu"),

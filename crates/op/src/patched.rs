@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use anyhow::anyhow;
 use graph::{BuildSpecRef, Transitives};
@@ -37,7 +37,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
         let build = opts.graph.get(self.spec).unwrap();
 
         // Select dependencies by name to be used in the build.
-        let mut dependencies = HashSet::new();
+        let mut dependencies = BTreeSet::new();
         let transitives = Transitives::new(opts.graph, self.spec, true);
         let build_deps: Vec<_> = transitives
             .transitive_runtime_deps

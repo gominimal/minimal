@@ -11,13 +11,16 @@ use tokio::io::AsyncWriteExt as _;
 
 mod attach;
 pub mod autospawn;
-pub mod client;
+// The SSH client transport lives in the shared `minimal-client` crate (used
+// by the TUI as well); re-exported here so internal `crate::client::...`
+// paths and downstream users of `minimal::client` keep working.
+pub use minimal_client as client;
 pub mod completion;
 pub mod completions;
 pub mod config;
 pub mod diag;
 pub mod dirs;
-mod file_upload;
+use minimal_client::file_upload;
 pub mod git_remote;
 pub mod loadouts;
 pub mod prompt;
@@ -157,6 +160,12 @@ pub enum Command {
     /// Never starts a daemon and never fails: no daemon means no output.
     #[command(name = completion::COMPLETE_SESSION_STR, hide = true)]
     CompleteSessionStr(CompleteSessionStrArgs),
+    /// Open the interactive session manager TUI (`dash`)
+    ///
+    /// Full-screen terminal UI for browsing, inspecting, and managing
+    /// sessions across every running provider on the host (native minimald
+    /// and the minvmd microVM). Requires a terminal.
+    Dash,
     /// Print or install the shell tab-completion integration
     #[command(
         visible_alias = "completion",
@@ -180,12 +189,24 @@ pub enum SessionCommand {
     Activate(ActivateArgs),
     /// Attach to an existing session
     Attach(AttachArgs),
+    /// Execute a command in an existing session
+    Exec(ExecArgs),
     /// Destroy (terminate) a session
     Destroy(DestroyArgs),
     /// Rename an existing session
     Rename(RenameArgs),
     /// Print the effective networking policy for a session as JSON
     Policy(PolicyArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ExecArgs {
+    /// Session identifier (UUID or session name).
+    #[arg(add = completion::session_completer())]
+    pub session: String,
+    /// Command to execute in the session context
+    #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -512,9 +533,6 @@ pub struct AttachArgs {
     /// ambiguous. See `--no-input` to skip the picker in scripts.
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
-    /// Command to exec in the session context (non-interactive)
-    #[arg(long, short, hide = true)]
-    pub command: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -678,19 +696,9 @@ pub struct CompletionsInstallArgs {
     pub shells: Vec<completions::InstallShell>,
 }
 
-/// The process-wide trace context, minted once at command dispatch. The
-/// root span carries its ids into every log line, and the SSH client sends
-/// the same context to the daemon as a `TRACEPARENT` channel env request —
-/// one grep joins host and guest records.
-pub(crate) fn trace_context() -> &'static minimald_rpc::trace::TraceContext {
-    static CONTEXT: std::sync::OnceLock<minimald_rpc::trace::TraceContext> =
-        std::sync::OnceLock::new();
-    CONTEXT.get_or_init(minimald_rpc::trace::TraceContext::mint)
-}
-
 pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
     use tracing::Instrument as _;
-    let ctx = trace_context();
+    let ctx = minimal_client::trace_context();
     let root = tracing::info_span!(
         "cmd",
         trace_id = %ctx.trace_id_hex(),
@@ -718,6 +726,7 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             SessionCommand::List(args) => cmd_ls(&cli.global_args, args).await,
             SessionCommand::Activate(args) => cmd_activate(&cli.global_args, args).await,
             SessionCommand::Attach(args) => cmd_attach(&cli.global_args, args).await,
+            SessionCommand::Exec(args) => cmd_exec(&cli.global_args, args).await,
             SessionCommand::Destroy(args) => cmd_destroy(&cli.global_args, args).await,
             SessionCommand::Rename(args) => cmd_rename(&cli.global_args, args).await,
             SessionCommand::Policy(args) => cmd_session_policy(&cli.global_args, args).await,
@@ -759,6 +768,7 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             CompletionsCommand::Print(args) => completions::cmd_print(args.shell),
             CompletionsCommand::Install(args) => completions::cmd_install(&args.shells),
         },
+        Some(Command::Dash) => cmd_dash(&cli.global_args).await,
     }
 }
 
@@ -879,7 +889,7 @@ async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
                 session_name = ?entry.name,
                 "found session"
             );
-            attach_to_session(&sock, entry.id, None).await
+            session_via_ssh(&sock, entry.id, vec![]).await
         }
         // Two ways to land on create-and-attach: no sessions exist at all
         // (first run), or the ambiguity picker's `+ Create a new session`
@@ -1166,6 +1176,37 @@ fn confirm(question: &str, default: bool) -> Result<bool, anyhow::Error> {
 /// shim rendered by [`completions::cmd_print`] sets it, and the `CompleteEnv`
 /// call in `main.rs` reads it.
 pub const COMPLETE_VAR: &str = "COMPLETE";
+
+/// Open the session manager TUI.
+///
+/// The TUI probes both provider sockets itself; if neither daemon is
+/// running, autospawn the default backend first so the dashboard has
+/// something to show (mirroring what the flat subcommands do).
+pub async fn cmd_dash(global: &GlobalArgs) -> Result<(), anyhow::Error> {
+    let dir = global.minimal_dir.as_deref();
+    let host_up = autospawn::is_daemon_running(false, dir).unwrap_or(false);
+    let vm_up = autospawn::is_daemon_running(true, dir).unwrap_or(false);
+    if !host_up && !vm_up {
+        ensure_daemon(global)?;
+    }
+    // Compose the default loadout contribution up front, mirroring
+    // cmd_activate: the TUI can't reach this crate's config/loadout
+    // plumbing (it sits below), and an empty contribution would silently
+    // skip `default_loadouts` and the user policy for sessions created
+    // from the dashboard.
+    let cfg = config::read_client_config(global)?;
+    let user_policy = config::read_user_policy(global)?;
+    let compose_options = loadouts::compose_options_from_config(&cfg);
+    let active =
+        loadouts::resolve_active_loadouts(loadouts::LoadoutSelection::Defaults, &cfg, global)?;
+    let (contribution, _user_policy) =
+        loadouts::compose_user_contribution(active, user_policy, compose_options)?;
+    minimal_tui::run(minimal_tui::DashOptions {
+        minimal_dir: global.minimal_dir.clone(),
+        contribution,
+    })
+    .await
+}
 
 /// List sessions via the `ListSessions` RPC.
 pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Error> {
@@ -2067,53 +2108,11 @@ async fn activate_session(
         }
         let attach_args = AttachArgs {
             session: Some(id.to_string()),
-            command: None,
         };
         return cmd_attach(global, attach_args).await;
     }
 
     Ok(())
-}
-
-/// Shell-quote a string for safe interpolation into `sh -c`.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\"'\"'"))
-}
-
-/// Quote a path for use as an `ssh -o` option value.
-///
-/// ssh re-parses the value as a config line, splitting on whitespace to allow a
-/// file list and honouring `\` escapes inside quotes. So the quotes carry a path
-/// with spaces, and `\`/`"` must be escaped within them — unescaped, a `"`
-/// resolves the option to the wrong file and a trailing `\` swallows the closing
-/// quote, both of which make ssh reject the line outright.
-fn ssh_opt_quote(path: &std::path::Path) -> String {
-    // Backslashes first: escaping quotes introduces backslashes of its own.
-    let escaped = path
-        .display()
-        .to_string()
-        .replace('\\', r"\\")
-        .replace('"', "\\\"");
-    format!("\"{escaped}\"")
-}
-
-/// The `ssh` host-key options for attaching, given the `known_hosts` sitting
-/// next to the daemon socket.
-///
-/// minvmd records the guest's host key there from the boot beacon, so when the
-/// file is present we pin against it. A native minimald also writes this.
-fn host_key_opts(known_hosts: &std::path::Path) -> [String; 2] {
-    if known_hosts.is_file() {
-        [
-            "StrictHostKeyChecking=yes".to_string(),
-            format!("UserKnownHostsFile={}", ssh_opt_quote(known_hosts)),
-        ]
-    } else {
-        [
-            "StrictHostKeyChecking=no".to_string(),
-            "UserKnownHostsFile=/dev/null".to_string(),
-        ]
-    }
 }
 
 /// Attach to an existing session. Both interactive and `--command` paths
@@ -2154,7 +2153,31 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
         "found session"
     );
 
-    attach_to_session(&sock, id, args.command).await
+    session_via_ssh(&sock, id, vec![]).await
+}
+
+/// Executes a command in an existing session.
+///
+/// The session is resolved using the provided predicate, and the connection
+/// is provided by shelling out to `ssh`.
+pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+        .context("Failed to resolve daemon socket path")?;
+
+    let mut client = client::Client::connect(&sock)
+        .await
+        .context("Failed to connect to minimald")?;
+
+    let r = resolve_session(&mut client, &args.session).await?;
+    tracing::info!(
+        session_id = %r.id,
+        session_name = ?r.name,
+        "found session"
+    );
+
+    session_via_ssh(&sock, r.id, args.command).await
 }
 
 /// Resolve a session to attach to when the user supplied no explicit session
@@ -2258,90 +2281,26 @@ fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), anyhow::Error
     }
 }
 
-/// Shell out to `ssh` to attach to `id`. Both the interactive (no `command`)
-/// and `--command` (non-interactive exec) paths route through here; the
-/// daemon's shell_request handler mints a PTY-backed shell, and ssh handles
-/// termios/PTY management.
+/// Shell out to `ssh` to attach to `id` or run a command.
 ///
 /// Split from [`cmd_attach`] so the activate-then-attach chain and the
 /// smart-resolution picker can attach without re-resolving an entry they
 /// already hold.
-async fn attach_to_session(
+async fn session_via_ssh(
     sock: &std::path::Path,
     id: sessions::SessionId,
-    command: Option<String>,
+    command: Vec<String>,
 ) -> Result<(), anyhow::Error> {
-    // ProxyCommand points at our own `proxy` subcommand so we don't
-    // depend on socat or nc being installed.
-    let exe = std::env::current_exe().context("cannot determine current exe")?;
-    let proxy_cmd = format!(
-        "{} proxy --socket {}",
-        shell_quote(&exe.display().to_string()),
-        shell_quote(&sock.display().to_string()),
-    );
+    // The command itself lives in minimal-client, shared with the dash TUI's
+    // suspend-attach-resume flow.
+    let mut ssh = minimal_client::attach::attach_command(sock, id, &command)?;
 
-    let [strict, known_hosts_file] = host_key_opts(&sock.with_file_name(paths::KNOWN_HOSTS_FILE));
-
-    let mut ssh = std::process::Command::new("ssh");
-    // Pin the shell ssh uses to run the ProxyCommand. ssh launches a
-    // ProxyCommand via `$SHELL -c` and execs `$SHELL` with no PATH lookup, so a
-    // caller whose `$SHELL` is a bare name (`fish`) or points at a shell absent
-    // from this context fails with "<shell>: No such file or directory" and the
-    // transport dies at "banner exchange … Broken pipe". Our ProxyCommand is a
-    // full-path `min proxy …` that needs nothing but a POSIX `sh`, so force the
-    // always-present `/bin/sh` rather than inherit the user's interactive shell.
-    ssh.env("SHELL", "/bin/sh");
-    ssh.env("MINIMAL_SESSION_ID", id.to_string()).args([
-        "-o",
-        "SendEnv=MINIMAL_SESSION_ID",
-        // Forward the user's locale and timezone into the session, mirroring a
-        // conventional `SendEnv LANG LC_* TZ`. The daemon accepts only these
-        // (its `AcceptEnv` allowlist) and folds them in below any loadout.
-        // `TERM` needs no `SendEnv`: ssh always carries it in the PTY request.
-        "-o",
-        "SendEnv=LANG",
-        "-o",
-        "SendEnv=LC_*",
-        "-o",
-        "SendEnv=TZ",
-        "-o",
-        &format!("ProxyCommand={proxy_cmd}"),
-        "-o",
-        &strict,
-        "-o",
-        &known_hosts_file,
-    ]);
-
-    // The interactive path opens the in-sandbox session shell via the daemon's
-    // `shell_request`, which requires a PTY. Force one with `-tt` so ssh
-    // allocates it even when our stdin is a pty driven programmatically rather
-    // than the controlling terminal (as scripts/e2e-attach-pty.py does);
-    // without it ssh skips the PTY and the daemon rejects the shell. The
-    // `--command` path is a non-interactive exec and needs no PTY.
-    //
-    // But `-tt` over a *non-terminal* stdin is a trap: ssh still forces the
+    // `-tt` over a *non-terminal* stdin is a trap: ssh still forces the
     // remote PTY, yet the interactive shell reading it never sees an EOF from a
     // redirected local stdin (`< /dev/null`, a pipe), so the command blocks
     // forever (#953). Fail fast instead of hanging.
-    if command.is_none() {
+    if command.is_empty() {
         ensure_interactive_attach_tty(std::io::stdin().is_terminal())?;
-        ssh.arg("-tt");
-    }
-    // The SSH host identity must match the known_hosts entry the daemon wrote,
-    // which it keys on the provider-instance name — the provider dir's basename
-    // (`local-minimald<N>` / `local-minvmd<N>`). Derive it from the socket path
-    // so the client and daemon can never disagree on the name.
-    let host_alias = sock
-        .parent()
-        .and_then(std::path::Path::file_name)
-        .and_then(|n| n.to_str())
-        .context("daemon socket path has no provider-dir parent")?;
-    ssh.arg(host_alias);
-
-    // If a command was provided, pass it to ssh (non-interactive exec).
-    // Otherwise, ssh opens an interactive shell via shell_request.
-    if let Some(cmd) = command {
-        ssh.arg(cmd);
     }
 
     let err = ssh.exec();
@@ -2965,8 +2924,8 @@ pub async fn cmd_ssh_forward(
     let exe = std::env::current_exe().context("cannot determine current exe")?;
     let proxy_cmd = format!(
         "{} proxy --socket {}",
-        shell_quote(&exe.display().to_string()),
-        shell_quote(&sock.display().to_string()),
+        minimal_client::attach::shell_quote(&exe.display().to_string()),
+        minimal_client::attach::shell_quote(&sock.display().to_string()),
     );
 
     let session_id = record.id.to_string();
@@ -3565,56 +3524,6 @@ mod tests {
         assert!(!should_retry_autogen(false, 0, collision));
         // A non-collision failure is never retried.
         assert!(!should_retry_autogen(true, 0, "CreateSession failed: boom"));
-    }
-
-    /// A VM-backed provider dir carries the guest's recorded host key, so
-    /// attach must verify against it rather than waive the check.
-    #[test]
-    fn host_key_opts_pin_to_an_adjacent_known_hosts() {
-        let tmp = tempfile::tempdir().unwrap();
-        let known_hosts = tmp.path().join(paths::KNOWN_HOSTS_FILE);
-        std::fs::write(&known_hosts, "local-minimald0 ssh-ed25519 AAAA...\n").unwrap();
-
-        let [strict, hosts_file] = host_key_opts(&known_hosts);
-        assert_eq!(strict, "StrictHostKeyChecking=yes");
-        assert_eq!(
-            hosts_file,
-            format!("UserKnownHostsFile=\"{}\"", known_hosts.display())
-        );
-    }
-
-    /// ssh re-parses the option value as a config line, so the path must survive
-    /// its quote and backslash handling intact. These expectations were checked
-    /// against OpenSSH's own parser with `ssh -G`.
-    #[test]
-    fn ssh_opt_quote_escapes_backslashes_and_quotes() {
-        let q = |s: &str| ssh_opt_quote(std::path::Path::new(s));
-
-        assert_eq!(q("/state/known_hosts"), r#""/state/known_hosts""#);
-        // A space is why we quote at all: ssh would otherwise read a file list.
-        assert_eq!(q("/st ate/known_hosts"), r#""/st ate/known_hosts""#);
-        assert_eq!(q(r#"/st"ate/known_hosts"#), r#""/st\"ate/known_hosts""#);
-        assert_eq!(q(r"/st\ate/known_hosts"), r#""/st\\ate/known_hosts""#);
-        // A trailing backslash must not escape the closing quote.
-        assert_eq!(q(r"/state\"), r#""/state\\""#);
-    }
-
-    /// The assembled option for a state dir carrying every character ssh's
-    /// parser treats specially.
-    #[test]
-    fn host_key_opts_pin_to_a_path_needing_escapes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(r#"sp ace q"uote back\slash"#);
-        std::fs::create_dir_all(&dir).unwrap();
-        let known_hosts = dir.join(paths::KNOWN_HOSTS_FILE);
-        std::fs::write(&known_hosts, "local-minimald0 ssh-ed25519 AAAA...\n").unwrap();
-
-        let [strict, hosts_file] = host_key_opts(&known_hosts);
-        assert_eq!(strict, "StrictHostKeyChecking=yes");
-        assert!(
-            hosts_file.contains(r#"q\"uote"#) && hosts_file.contains(r"back\\slash"),
-            "path must reach ssh escaped, got: {hosts_file}"
-        );
     }
 
     #[test]
