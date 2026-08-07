@@ -420,16 +420,10 @@ async fn attach_with_no_session_errors_when_no_sessions_exist() {
     let (_daemon, mut global) = setup().await;
     global.no_input = true;
 
-    let err = cmd_attach(
-        &global,
-        AttachArgs {
-            session: None,
-            command: None,
-        },
-    )
-    .await
-    .unwrap_err()
-    .to_string();
+    let err = cmd_attach(&global, AttachArgs { session: None })
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(
         err.contains("no sessions exist"),
         "expected a 'no sessions' error, got: {err}"
@@ -457,16 +451,10 @@ async fn attach_with_no_session_errors_when_ambiguous_and_no_input() {
     // resolver, it equals the sessions' project_path above.
     global.repo_dir = Some(cwd.path().to_path_buf());
 
-    let err = cmd_attach(
-        &global,
-        AttachArgs {
-            session: None,
-            command: None,
-        },
-    )
-    .await
-    .unwrap_err()
-    .to_string();
+    let err = cmd_attach(&global, AttachArgs { session: None })
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(
         err.contains("Multiple sessions match"),
         "expected an ambiguity error, got: {err}"

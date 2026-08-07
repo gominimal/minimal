@@ -60,7 +60,7 @@ pub fn host_key_opts(known_hosts: &Path) -> [String; 2] {
 pub fn attach_command(
     sock: &Path,
     id: sessions::SessionId,
-    command: Option<&str>,
+    command: &[String],
 ) -> Result<std::process::Command, anyhow::Error> {
     // ProxyCommand points at our own `proxy` subcommand so we don't
     // depend on socat or nc being installed.
@@ -113,7 +113,7 @@ pub fn attach_command(
     // remote PTY, yet the interactive shell reading it never sees an EOF from a
     // redirected local stdin (`< /dev/null`, a pipe), so the command blocks
     // forever (#953). Callers must guarantee a terminal on stdin.
-    if command.is_none() {
+    if command.is_empty() {
         ssh.arg("-tt");
     }
 
@@ -130,7 +130,7 @@ pub fn attach_command(
 
     // If a command was provided, pass it to ssh (non-interactive exec).
     // Otherwise, ssh opens an interactive shell via shell_request.
-    if let Some(cmd) = command {
+    for cmd in command.iter() {
         ssh.arg(cmd);
     }
 
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn attach_command_targets_the_provider_alias() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None).unwrap();
+        let cmd = attach_command(&sock, sessions::SessionId::nil(), &[]).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -161,13 +161,21 @@ mod tests {
     #[test]
     fn attach_command_with_exec_has_no_forced_pty() {
         let sock = PathBuf::from("/tmp/x/providers/local-minvmd0/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), Some("min run test")).unwrap();
+        let cmd = attach_command(
+            &sock,
+            sessions::SessionId::nil(),
+            &["min".to_string(), "run".to_string(), "test".to_string()],
+        )
+        .unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert!(!args.iter().any(|a| a == "-tt"));
-        assert_eq!(args.last().map(String::as_str), Some("min run test"));
+        assert_eq!(
+            args.into_iter().rev().take(3).rev().collect::<Vec<_>>(),
+            vec!["min".to_string(), "run".to_string(), "test".to_string()]
+        );
     }
     /// A VM-backed provider dir carries the guest's recorded host key, so
     /// attach must verify against it rather than waive the check.
