@@ -47,10 +47,38 @@ async fn run() -> ExitCode {
     minimal::theme::install();
 
     let registry = tracing_subscriber::registry().with(filter);
-    // Commands whose stdout is a data contract route tracing to stderr, so a log
-    // line never lands in captured output. ANSI is gated on the destination
-    // being a real terminal, so a redirected stream carries no escape codes.
-    if stdout_is_data_contract(&cli.command) {
+    // `min dash` owns the terminal (alternate screen); a log line landing on
+    // stdout/stderr would corrupt the frame. Log to <state>/dash.log
+    // instead, discarding if the state dir can't be written.
+    if matches!(cli.command, Some(minimal::Command::Dash)) {
+        // Honor `--minimal-dir` so an isolated daemon's logs stay isolated.
+        let base = cli
+            .global_args
+            .minimal_dir
+            .clone()
+            .unwrap_or_else(|| paths::minimal_state_dir().as_utf8_path().into());
+        // Open the log file once; MakeWriter is per-write, so the closure
+        // must not re-open it per log event.
+        let file = {
+            let path = base.join("dash.log");
+            let _ = std::fs::create_dir_all(&base);
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map(std::sync::Arc::new)
+                .ok()
+        };
+        let log = move || -> Box<dyn std::io::Write + Send> {
+            match &file {
+                Some(f) => Box::new(DashLog(f.clone())),
+                None => Box::new(std::io::sink()),
+            }
+        };
+        registry
+            .with(fmt::layer().with_writer(log).with_ansi(false))
+            .init();
+    } else if stdout_is_data_contract(&cli.command) {
         registry
             .with(
                 fmt::layer()
@@ -79,6 +107,20 @@ async fn run() -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// A cheaply clonable writer over the dash log file: every clone writes
+/// through the same opened file (append mode) instead of re-opening it.
+struct DashLog(std::sync::Arc<std::fs::File>);
+
+impl std::io::Write for DashLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&*self.0).write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&*self.0).flush()
+    }
 }
 
 /// Whether the command's stdout is a data contract that tracing must not

@@ -1,0 +1,32 @@
+[package]
+name = "minimal-tui"
+description = "min dash — interactive session manager TUI for minimald sessions"
+rust-version.workspace = true
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+camino.workspace = true
+chrono.workspace = true
+common.workspace = true
+crossterm.workspace = true
+dirs.workspace = true
+futures.workspace = true
+mfile.workspace = true
+minimal-client.workspace = true
+minimald-rpc.workspace = true
+paths.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sessions.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+tempfile.workspace = true

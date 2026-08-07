@@ -4,12 +4,25 @@
 //! domain socket, authenticates (passwordless), and invokes oneshot RPCs
 //! defined in the `minimald-rpc` wire contract.
 
+pub mod attach;
+pub mod file_upload;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use minimald_rpc::OneshotSshRpc;
+
+/// The process-wide trace context, minted once at command dispatch. The
+/// root span carries its ids into every log line, and the SSH client sends
+/// the same context to the daemon as a `TRACEPARENT` channel env request —
+/// one grep joins host and guest records.
+pub fn trace_context() -> &'static minimald_rpc::trace::TraceContext {
+    static CONTEXT: std::sync::OnceLock<minimald_rpc::trace::TraceContext> =
+        std::sync::OnceLock::new();
+    CONTEXT.get_or_init(minimald_rpc::trace::TraceContext::mint)
+}
 
 /// Build a spinner bar on the process-global `MultiProgress` with the house
 /// animation and a caller-chosen `template`.
@@ -64,13 +77,13 @@ fn spinner_bar(msg: &'static str, template: &str) -> indicatif::ProgressBar {
 }
 
 /// Spinner bar for a byte-counted upload: `  {spinner} {msg} — {bytes} …`.
-pub(crate) fn add_spinner_bar(msg: &'static str) -> indicatif::ProgressBar {
+pub fn add_spinner_bar(msg: &'static str) -> indicatif::ProgressBar {
     spinner_bar(msg, "  {spinner} {msg} — {bytes} ({bytes_per_sec})")
 }
 
 /// Spinner bar for a plain narrated wait with no counter, rendering
 /// `  {spinner} {msg}` — the daemon autospawn wait uses it while the VM boots.
-pub(crate) fn add_wait_spinner_bar(msg: &'static str) -> indicatif::ProgressBar {
+pub fn add_wait_spinner_bar(msg: &'static str) -> indicatif::ProgressBar {
     spinner_bar(msg, "  {spinner} {msg}")
 }
 
@@ -136,6 +149,14 @@ const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// milliseconds, so this only bounds the pathological case. Mirrors `minvmd`'s
 /// own client, which guards the same bridge.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for a whole oneshot RPC round-trip.
+///
+/// The handshake deadline covers a peer that never speaks SSH; it does not
+/// cover a peer that handshakes and then wedges (a suspended microVM behind
+/// libkrun's always-accepting bridge), where the reply wait would block
+/// forever. Generous — a healthy daemon answers in milliseconds, so this
+/// only bounds the pathological case.
+const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// russh client handler that accepts any ephemeral host key.
 ///
@@ -236,6 +257,9 @@ impl Client {
     /// extended-data (stream 1) — where the daemon writes handler errors
     /// (#901) — is visible instead of silently discarded by the stream's
     /// `AsyncRead` impl.
+    ///
+    /// Bounded by [`RPC_TIMEOUT`]: on expiry the in-flight channel is
+    /// dropped with the future, which closes it.
     pub async fn oneshot_rpc<R: OneshotSshRpc>(
         &mut self,
         request: R::Request<'_>,
@@ -243,53 +267,59 @@ impl Client {
     where
         <R as OneshotSshRpc>::Response: serde::de::DeserializeOwned,
     {
-        let mut channel = self
-            .handle
-            .channel_open_session()
-            .await
-            .with_context(|| format!("open channel for {}", R::NAME))?;
+        let rpc = async {
+            let mut channel = self
+                .handle
+                .channel_open_session()
+                .await
+                .with_context(|| format!("open channel for {}", R::NAME))?;
 
-        send_traceparent(&channel).await;
-        // want_reply = true so an unknown subsystem (CLI/daemon version
-        // skew) surfaces as a Failure instead of the client writing into a
-        // channel nobody serves (#901).
-        channel
-            .request_subsystem(true, R::NAME)
-            .await
-            .with_context(|| format!("request subsystem {}", R::NAME))?;
+            send_traceparent(&channel).await;
+            // want_reply = true so an unknown subsystem (CLI/daemon version
+            // skew) surfaces as a Failure instead of the client writing into a
+            // channel nobody serves (#901).
+            channel
+                .request_subsystem(true, R::NAME)
+                .await
+                .with_context(|| format!("request subsystem {}", R::NAME))?;
 
-        let body = serde_json::to_vec(&request).context("serialize request")?;
-        channel.data_bytes(body).await.context("write request")?;
-        channel.eof().await.context("shutdown write half")?;
+            let body = serde_json::to_vec(&request).context("serialize request")?;
+            channel.data_bytes(body).await.context("write request")?;
+            channel.eof().await.context("shutdown write half")?;
 
-        // Drain the channel with wait() rather than into_stream() so that
-        // extended-data (stream 1) — where the daemon writes handler errors
-        // (#901) — is visible instead of silently discarded by the stream's
-        // AsyncRead impl.
-        let mut resp_buf = Vec::with_capacity(256);
-        let mut err_buf = Vec::new();
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                russh::ChannelMsg::Data { data } => {
-                    resp_buf.extend_from_slice(&data);
+            // Drain the channel with wait() rather than into_stream() so that
+            // extended-data (stream 1) — where the daemon writes handler errors
+            // (#901) — is visible instead of silently discarded by the stream's
+            // AsyncRead impl.
+            let mut resp_buf = Vec::with_capacity(256);
+            let mut err_buf = Vec::new();
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    russh::ChannelMsg::Data { data } => {
+                        resp_buf.extend_from_slice(&data);
+                    }
+                    russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                        err_buf.extend_from_slice(&data);
+                    }
+                    _ => {}
                 }
-                russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
-                    err_buf.extend_from_slice(&data);
-                }
-                _ => {}
             }
-        }
 
-        if !err_buf.is_empty() {
-            anyhow::bail!(
-                "{} RPC failed on the daemon side: {}",
-                R::NAME,
-                String::from_utf8_lossy(&err_buf)
-            );
-        }
+            if !err_buf.is_empty() {
+                anyhow::bail!(
+                    "{} RPC failed on the daemon side: {}",
+                    R::NAME,
+                    String::from_utf8_lossy(&err_buf)
+                );
+            }
 
-        serde_json::from_slice(&resp_buf)
-            .with_context(|| format!("decode response for {}", R::NAME))
+            serde_json::from_slice(&resp_buf)
+                .with_context(|| format!("decode response for {}", R::NAME))
+        };
+
+        tokio::time::timeout(RPC_TIMEOUT, rpc)
+            .await
+            .map_err(|_| anyhow::anyhow!("{} RPC timed out after {RPC_TIMEOUT:?}", R::NAME))?
     }
 
     /// Open a session channel and issue an `exec` request for `command`,
@@ -370,25 +400,50 @@ impl Client {
         // wipes the bar off the terminal on success so it doesn't hang
         // around above the next line.
         let bar = add_spinner_bar("Uploading project files");
-        let bar_for_wrap = bar.clone();
         let result = self
-            .stream_upload(
-                session_id,
-                constcat::concat!(minimald_rpc::RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst"),
-                "workspace file",
-                async |writer| {
-                    // `writer` is already `Box<dyn AsyncWrite + ...>`
-                    // from `stream_upload`, and `stream_tar_zstd` is
-                    // generic over `W: AsyncWrite + Unpin + Send` —
-                    // `ProgressWriter<Box<...>>` satisfies that
-                    // directly, no second heap allocation needed.
-                    let writer = crate::file_upload::ProgressWriter::new(writer, bar_for_wrap);
-                    crate::file_upload::stream_tar_zstd(dir, writer).await
-                },
-            )
+            .upload_workspace_files_with(session_id, dir, &bar)
             .await;
         bar.finish_and_clear();
         result
+    }
+
+    /// [`Self::upload_workspace_files`] without terminal progress output.
+    /// For callers that own the screen themselves (the `min dash` TUI),
+    /// where a progress bar would corrupt the frame.
+    pub async fn upload_workspace_files_quiet(
+        &mut self,
+        session_id: sessions::SessionId,
+        dir: &Path,
+    ) -> Result<(), anyhow::Error> {
+        // A hidden bar that is never added to the global MultiProgress
+        // renders nowhere; the upload plumbing still gets its counter.
+        let bar = indicatif::ProgressBar::hidden();
+        self.upload_workspace_files_with(session_id, dir, &bar)
+            .await
+    }
+
+    async fn upload_workspace_files_with(
+        &mut self,
+        session_id: sessions::SessionId,
+        dir: &Path,
+        bar: &indicatif::ProgressBar,
+    ) -> Result<(), anyhow::Error> {
+        let bar_for_wrap = bar.clone();
+        self.stream_upload(
+            session_id,
+            constcat::concat!(minimald_rpc::RPC_SUBSYSTEM_PREFIX, "WorkspaceFilesTarZst"),
+            "workspace file",
+            async |writer| {
+                // `writer` is already `Box<dyn AsyncWrite + ...>`
+                // from `stream_upload`, and `stream_tar_zstd` is
+                // generic over `W: AsyncWrite + Unpin + Send` —
+                // `ProgressWriter<Box<...>>` satisfies that
+                // directly, no second heap allocation needed.
+                let writer = crate::file_upload::ProgressWriter::new(writer, bar_for_wrap);
+                crate::file_upload::stream_tar_zstd(dir, writer).await
+            },
+        )
+        .await
     }
 
     /// Stream a zstd-compressed tarball of composition patches to the
@@ -724,7 +779,7 @@ fn append_daemon_error(buf: &mut Vec<u8>, data: &[u8]) {
 /// minvmd-backed regardless of the flag; keying on the compile target keeps the
 /// in-guest CLI (Linux, native) and the host CLI (macOS, minvmd) each pointed at
 /// the dir their local daemon actually uses.
-pub(crate) fn client_provider_kind(use_minvmd: bool) -> paths::ProviderKind {
+pub fn client_provider_kind(use_minvmd: bool) -> paths::ProviderKind {
     if use_minvmd || cfg!(target_os = "macos") {
         paths::ProviderKind::Minvmd
     } else {
@@ -753,7 +808,7 @@ fn resolve_state_base(
 /// before the CLI resolves a provider dir, so an upgraded client finds an
 /// existing instance instead of missing it. Best-effort: a bad `--minimal-dir`
 /// is left for the resolve/connect path to report.
-pub(crate) fn migrate_legacy_provider_dirs(minimal_dir_override: Option<&std::path::Path>) {
+pub fn migrate_legacy_provider_dirs(minimal_dir_override: Option<&std::path::Path>) {
     if let Ok(base) = resolve_state_base(minimal_dir_override) {
         paths::migrate_legacy_provider_dirs(&base);
     }
@@ -762,7 +817,7 @@ pub(crate) fn migrate_legacy_provider_dirs(minimal_dir_override: Option<&std::pa
 /// Resolve the provider-instance dir (`<state dir>/providers/local-<kind>0`) the
 /// daemon and CLI agree on: `--minimal-dir` when set, else the default minimal
 /// state dir. `use_minvmd` selects the backend's dir (see [`client_provider_kind`]).
-pub(crate) fn resolve_provider_dir(
+pub fn resolve_provider_dir(
     minimal_dir_override: Option<&std::path::Path>,
     use_minvmd: bool,
 ) -> std::io::Result<std::path::PathBuf> {
@@ -791,7 +846,7 @@ pub fn resolve_socket_path(
 async fn send_traceparent(channel: &russh::Channel<russh::client::Msg>) {
     use minimald_rpc::trace::TRACEPARENT_ENV;
     let _ = channel
-        .set_env(false, TRACEPARENT_ENV, crate::trace_context().traceparent())
+        .set_env(false, TRACEPARENT_ENV, trace_context().traceparent())
         .await;
 }
 
