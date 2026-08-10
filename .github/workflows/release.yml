@@ -133,7 +133,7 @@ jobs:
               # shrinking the entry so it survives; save-if keeps branch/dry-run
               # dispatches read-only so they don't churn the budget and evict
               # main's warm cache. Registry + git caches come for free.
-              uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 # zizmor: ignore[cache-poisoning] trusted-ref release build; save-if gates writes, provenance verified downstream
+              uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 # zizmor: ignore[cache-poisoning] trusted-ref release build; save-if gates writes, provenance verified downstream
               with:
                   shared-key: release-amd64
                   save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -279,7 +279,7 @@ jobs:
               # keeps branch/dry-run dispatches read-only. writes target/ and
               # reads ~/.cargo on the host, so rust-cache caches them the same as a
               # native build.
-              uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 # zizmor: ignore[cache-poisoning] trusted-ref release build; save-if gates writes, provenance verified downstream
+              uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 # zizmor: ignore[cache-poisoning] trusted-ref release build; save-if gates writes, provenance verified downstream
               with:
                   shared-key: release-arm64
                   save-if: ${{ github.ref == 'refs/heads/main' }}
