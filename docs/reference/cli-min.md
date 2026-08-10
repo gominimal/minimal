@@ -16,7 +16,7 @@ and stdout are both a terminal: it follows the smart-resolution rules of
 `min session attach` with no argument (cwd match → attach, only session →
 attach, ambiguity → picker), and when no sessions exist it creates one from
 the current directory and attaches. Without a terminal it instead prints a
-read-only state report on stderr and exits. Use `min --help` to print this
+read-only state report on stderr and exits successfully. Use `min --help` to print this
 help.
 
 Commands are spelled `min <noun> <verb>`, and every noun accepts its singular
