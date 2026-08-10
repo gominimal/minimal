@@ -317,32 +317,6 @@ pub fn extract_compressed_tar<R: Read>(
 /// Lexical only: it cannot see symlinks, so a caller that then touches the
 /// filesystem must *also* check the resolved path. This is necessary, not
 /// sufficient.
-/// Resolves a tar link entry's target relative to the destination root,
-/// returning `None` if it would escape.
-///
-/// The base differs by link kind and is the half most easily got wrong on a
-/// reimplementation: a symlink target is interpreted relative to the *link's
-/// own directory*, a hardlink target relative to the *destination root*.
-///
-/// Public because `minimald` unpacks the client's uploaded workspace tarball
-/// through `async_tar` and has to apply the identical rule. Callers that need
-/// only a yes/no can `.is_none()` it; the hardlink path needs the normalized
-/// value, since `tar::Entry::unpack` resolves a relative target against the
-/// process CWD and must not be trusted with it.
-#[must_use]
-pub fn normalize_link_target(
-    entry_path: &Path,
-    target: &Path,
-    is_symlink: bool,
-) -> Option<PathBuf> {
-    let base = if is_symlink {
-        entry_path.parent().unwrap_or_else(|| Path::new(""))
-    } else {
-        Path::new("")
-    };
-    normalize_within_root(&base.join(target))
-}
-
 pub fn normalize_within_root(path: &Path) -> Option<PathBuf> {
     use std::path::Component;
     let mut out = PathBuf::new();
@@ -422,7 +396,12 @@ fn extract_tar_impl<R: Read>(
         if (entry_type.is_symlink() || entry_type.is_hard_link())
             && let Some(target) = entry.link_name()?
         {
-            match normalize_link_target(&safe_path, target.as_ref(), entry_type.is_symlink()) {
+            let base = if entry_type.is_symlink() {
+                safe_path.parent().unwrap_or_else(|| Path::new(""))
+            } else {
+                Path::new("")
+            };
+            match normalize_within_root(&base.join(target.as_ref())) {
                 None => {
                     tracing::warn!(
                         entry = %stripped.display(),
