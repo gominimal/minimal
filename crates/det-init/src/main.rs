@@ -203,6 +203,29 @@ async fn async_main() -> Result<(), MainError> {
     // without them just degrades coverage (the host caps the verdict at REVIEW).
     mount_fs("none", "/sys/kernel/security", "securityfs");
     mount_fs("bpf", "/sys/fs/bpf", "bpf");
+
+    // ── Make the sample's $HOME writable ───────────────────────────────────
+    // The guest rootfs is mounted MS_RDONLY (minimald::guest::enter_rootfs), and the sample's HOME
+    // is HONEYTOKEN_HOME on that rootfs. Every package manager caches under $HOME by default
+    // (npm ~/.npm, pip ~/.cache/pip, cargo ~/.cargo, gem ~/.gem, gradle ~/.gradle), so any install
+    // that does not explicitly redirect its cache dies on EROFS/ENOENT the moment it writes a
+    // fetched package to disk — AFTER a successful HTTPS fetch, which is why npm reports it as
+    // "Invalid response body while trying to fetch <url>: ENOENT ... mkdir '/home/det/.npm'". A
+    // filesystem error wearing a network error's clothes; it cost a full investigation.
+    //
+    // Two reasons this matters beyond broken installs:
+    //   - COVERAGE: a package whose install script writes to $HOME never gets to misbehave, so we
+    //     observe a failed install instead of its behaviour.
+    //   - EVASION: a malicious package can test $HOME writability, conclude it is in a sandbox,
+    //     and stay inert. We would sign a clean verdict for a package that simply declined to act.
+    //
+    // Overlay a tmpfs and restore the decoys into it, rather than moving HOME to /tmp: the
+    // honeytoken paths are a byte-match contract with src/audit.rs::HONEYTOKEN_PATHS, and moving
+    // them would silently disarm credential-theft detection AND the smoke gate's malicious case.
+    //
+    // Done HERE — before the observer starts — deliberately: a mount performed by pid 1 after the
+    // LSM hooks attach reads as a container-escape signal (see the mount-provenance note below).
+    remount_home_writable();
     raise_memlock_rlimit();
 
     // ── Stage the deny-channel tripwire BEFORE the LSM attaches ────────────
@@ -525,6 +548,105 @@ fn init_tracing() {
 
 /// `mount(2)` a pseudo-filesystem, tolerating `EBUSY` (already mounted). Failures
 /// are logged, not fatal — a missing bpffs just degrades coverage.
+/// Overlay a writable tmpfs on the sample's `$HOME`, preserving whatever decoys the rootfs planted.
+///
+/// The contents are captured from the read-only rootfs FIRST and rewritten afterwards, so this
+/// cannot drift from `assemble-buildenv-rootfs.sh`: whatever is planted there is what comes back.
+/// Hardcoding the honeytoken list here would be a second copy of a contract that already exists in
+/// two places (that script and `src/audit.rs::HONEYTOKEN_PATHS`), and the third copy is always the
+/// one that rots.
+///
+/// `mode=1777` is the sticky bit: uid 65534 can create its caches but cannot unlink or replace the
+/// root-owned decoys, so a sample cannot disarm honeytoken detection by deleting the bait.
+///
+/// Best-effort. If this fails the sample still runs — it just hits the old EROFS behaviour — which
+/// is strictly better than refusing to detonate.
+fn remount_home_writable() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // 1. Capture the planted decoys (relative path, bytes) before the mount hides them.
+    fn walk(
+        dir: &std::path::Path,
+        base: &std::path::Path,
+        out: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+    ) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            match e.file_type() {
+                Ok(t) if t.is_dir() => walk(&p, base, out),
+                Ok(t) if t.is_file() => {
+                    if let (Ok(rel), Ok(bytes)) = (p.strip_prefix(base), std::fs::read(&p)) {
+                        out.push((rel.to_path_buf(), bytes));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let home = std::path::Path::new(HONEYTOKEN_HOME);
+    let mut saved = Vec::new();
+    walk(home, home, &mut saved);
+
+    // 2. tmpfs over $HOME. `size=` bounds it so a sample cannot exhaust guest RAM by filling it.
+    let (Ok(src), Ok(tgt), Ok(fst), Ok(data)) = (
+        CString::new("tmpfs"),
+        CString::new(HONEYTOKEN_HOME),
+        CString::new("tmpfs"),
+        CString::new("mode=1777,size=256m"),
+    ) else {
+        tracing::warn!("invalid tmpfs mount argument for $HOME");
+        return;
+    };
+    // SAFETY: mount(2) with valid, call-lifetime C strings and a valid data string.
+    let rc = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            tgt.as_ptr(),
+            fst.as_ptr(),
+            0,
+            data.as_ptr() as *const libc::c_void,
+        )
+    };
+    if rc != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            path = HONEYTOKEN_HOME,
+            "could not make $HOME writable; package managers that use the default cache will fail"
+        );
+        return;
+    }
+
+    // 3. Restore the decoys, root-owned and world-readable so the sample can still READ them (that
+    //    read is the detection signal) but not rewrite them.
+    let mut restored = 0usize;
+    for (rel, bytes) in &saved {
+        let dst = home.join(rel);
+        if let Some(parent) = dst.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(&dst, bytes).is_ok() {
+            let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644));
+            restored += 1;
+        }
+    }
+    tracing::info!(
+        path = HONEYTOKEN_HOME,
+        restored,
+        planted = saved.len(),
+        "made $HOME writable (tmpfs) and restored the decoys"
+    );
+    if restored != saved.len() {
+        tracing::warn!(
+            restored,
+            planted = saved.len(),
+            "not every decoy was restored — honeytoken detection may be degraded this run"
+        );
+    }
+}
+
 fn mount_fs(source: &str, target: &str, fstype: &str) {
     let _ = std::fs::create_dir_all(target);
     let (Ok(c_source), Ok(c_target), Ok(c_fstype)) = (
