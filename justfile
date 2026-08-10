@@ -38,7 +38,7 @@ native-dir   := scratch / "native-state"
 scope      := if os() == "macos" { "-p minvmd -p sessions" } else { "--workspace" }
 # Crates carrying a `fuzz/` workspace. `rcache` is Linux-only: it pulls in
 # `lcache`, which uses the Linux-only `common::renameat2`.
-fuzz-crates := if os() == "macos" { "args common graph mfile paths" } else { "args common graph mfile paths rcache" }
+fuzz-crates := if os() == "macos" { "args common diagnostics graph mfile paths" } else { "args common diagnostics graph mfile paths rcache" }
 ci-profile := if os() == "macos" { "" } else { "--profile ci" }
 e2e-env    := "E2E_VM=1 E2E_PROJECT_DIR=/tmp" + if os() == "linux" { " E2E_MINIMAL_ARGS='--provider local-minvmd'" } else { "" }
 

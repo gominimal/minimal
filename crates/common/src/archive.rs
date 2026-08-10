@@ -269,7 +269,20 @@ pub fn extract_compressed_tar<R: Read>(
             // it into a clean error.
             let mut decomp_buf =
                 LimitedWriter::new(tempfile::tempfile()?, MAX_XZ_DECOMPRESSED_BYTES);
-            let res = lzma_rs::xz_decompress(&mut std::io::BufReader::new(reader), &mut decomp_buf);
+            // `lzma_rs` panics on some malformed streams: `backward_size + 1`
+            // in its xz footer check overflows at `u32::MAX` (decode/xz.rs).
+            // Release wraps it (overflow-checks off), but overflow-checked
+            // builds abort, violating this fn's never-panic contract. xz is the
+            // only pure-Rust arm; contain it rather than trust every lzma_rs
+            // edge case.
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                lzma_rs::xz_decompress(&mut std::io::BufReader::new(reader), &mut decomp_buf)
+            }))
+            .unwrap_or_else(|_| {
+                Err(lzma_rs::error::Error::XzError(
+                    "xz decoder panicked on malformed input".to_string(),
+                ))
+            });
             // Check the cap before the result: lzma_rs wraps our write error in
             // its own type, and were it ever to swallow one, proceeding would
             // extract a silently truncated tar.
@@ -903,6 +916,24 @@ mod tests {
         assert!(w.write(b"toolong").is_err());
         assert!(w.overflowed);
         assert!(w.into_inner().is_empty());
+    }
+
+    /// A malformed xz stream must yield an `ArchiveError`, not a panic (the
+    /// `catch_unwind` guard in `extract_compressed_tar`). Fixture is the
+    /// fuzz-produced overflow stream, minus its two control bytes. The fuzz
+    /// target can't assert this — `libfuzzer-sys`'s panic hook aborts before
+    /// `catch_unwind` runs — so it's proved here.
+    #[test]
+    fn extract_xz_panic_is_contained() {
+        let stream = include_bytes!("../tests/data/xz_backward_size_overflow.tar.xz");
+        let extract_dir = tempfile::tempdir().unwrap();
+
+        let err = extract_compressed_tar(&stream[..], Compression::Xz, extract_dir.path(), None)
+            .expect_err("a malformed xz stream must error");
+        assert!(
+            matches!(err, ArchiveError::CompressionError(_) | ArchiveError::IO(_)),
+            "expected a compression/IO error, got {err:?}",
+        );
     }
 
     #[test]
