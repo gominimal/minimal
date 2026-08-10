@@ -59,7 +59,7 @@ jobs:
         # SHOULD run everything anyway: they write the main-only caches and
         # provide the soak signal. Dispatch likewise runs everything.
         if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d
         with:
           filters: |
             native:
@@ -179,7 +179,7 @@ jobs:
       - name: Install nextest
         # Convention selection is a nextest filterset (binary(/_root_integration$/));
         # cargo test cannot select test targets by pattern.
-        uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2
+        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
         with:
           tool: nextest
       - name: Enable unprivileged user namespaces
