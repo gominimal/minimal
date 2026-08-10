@@ -26,6 +26,7 @@ pub mod loadouts;
 pub mod prompt;
 pub mod task;
 pub mod theme;
+pub mod zed;
 
 #[derive(Parser)]
 #[command(name = "min", version = version::VERSION, long_version = version::LONG_VERSION)]
@@ -197,6 +198,40 @@ pub enum SessionCommand {
     Rename(RenameArgs),
     /// Print the effective networking policy for a session as JSON
     Policy(PolicyArgs),
+    /// Register a session as an SSH remote in Zed's settings
+    ///
+    /// Upserts an entry into the `ssh_connections` array of Zed's
+    /// `settings.json`, pointing it at this session over the same transport
+    /// `min session attach` uses: our own `proxy` subcommand as an SSH
+    /// `ProxyCommand`, with the session selected by `MINIMAL_SESSION_ID`.
+    /// Re-running refreshes the entry in place.
+    ///
+    /// Rewriting the file re-renders it from parsed JSON, so comments and key
+    /// ordering are not preserved; the previous contents are kept alongside as
+    /// `settings.json.bak`. Use `--print` to emit just the entry instead.
+    ///
+    /// Example:
+    ///
+    ///   min session setup-zed my-box
+    ///
+    /// Hidden while the Zed integration settles: it still parses and runs, it
+    /// just stays out of `min session --help` and shell completions.
+    #[command(name = "setup-zed", verbatim_doc_comment)]
+    #[command(hide = true)]
+    SetupZed(SetupZedArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SetupZedArgs {
+    /// Session identifier (UUID or session name)
+    #[arg(add = completion::session_completer())]
+    pub session: String,
+    /// Zed settings file to edit (default: `~/.config/zed/settings.json`)
+    #[arg(long, value_name = "FILE")]
+    pub settings: Option<PathBuf>,
+    /// Print the connection entry as JSON instead of editing any file
+    #[arg(long)]
+    pub print: bool,
 }
 
 #[derive(Debug, Args)]
@@ -730,6 +765,7 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             SessionCommand::Destroy(args) => cmd_destroy(&cli.global_args, args).await,
             SessionCommand::Rename(args) => cmd_rename(&cli.global_args, args).await,
             SessionCommand::Policy(args) => cmd_session_policy(&cli.global_args, args).await,
+            SessionCommand::SetupZed(args) => cmd_session_setup_zed(&cli.global_args, args).await,
         },
         Some(Command::Loadout(LoadoutArgs {
             command: LoadoutCommand::List(args),
@@ -2338,6 +2374,115 @@ pub async fn cmd_session_policy(
     }
 }
 
+/// Register a session as an SSH remote in Zed's `settings.json`.
+///
+/// Zed drives its own `ssh` for remote projects, so the entry has to carry the
+/// whole transport in `args`: the `ProxyCommand` onto the daemon socket, the
+/// session selector, and the host-key options. See [`zed`] for why each is
+/// there and how the upsert identifies an existing entry.
+pub async fn cmd_session_setup_zed(
+    global: &GlobalArgs,
+    args: SetupZedArgs,
+) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+        .context("Failed to resolve daemon socket path")?;
+
+    let mut daemon_client = client::Client::connect(&sock)
+        .await
+        .context("Failed to connect to minimald")?;
+    let record = resolve_session(&mut daemon_client, &args.session).await?;
+
+    // Pin the socket explicitly rather than leaning on `min proxy`'s own
+    // resolution: Zed launches the ProxyCommand from its own environment, which
+    // carries none of this invocation's `--minimal-dir` / provider selection.
+    let exe = std::env::current_exe().context("cannot determine current exe")?;
+    let proxy_command = format!(
+        "{} proxy --socket {}",
+        minimal_client::attach::shell_quote(&exe.display().to_string()),
+        minimal_client::attach::shell_quote(&sock.display().to_string()),
+    );
+
+    // Same host identity as attach: the provider-instance alias the daemon
+    // keyed its known_hosts entry on, derived from the socket path so the two
+    // cannot disagree.
+    let host = sock
+        .parent()
+        .and_then(std::path::Path::file_name)
+        .and_then(|n| n.to_str())
+        .context("daemon socket path has no provider-dir parent")?
+        .to_string();
+
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .context("cannot determine the local username (neither USER nor LOGNAME is set)")?;
+
+    let conn = zed::Connection {
+        host,
+        username,
+        session_id: record.id.to_string(),
+        proxy_command,
+        host_key_opts: minimal_client::attach::host_key_opts(
+            &sock.with_file_name(paths::KNOWN_HOSTS_FILE),
+        ),
+    };
+
+    if args.print {
+        println!(
+            "{}",
+            serde_json_lenient::to_string_pretty(&conn.entry())
+                .context("Failed to serialize the Zed connection entry")?
+        );
+        return Ok(());
+    }
+
+    let path = match &args.settings {
+        Some(p) => p.clone(),
+        None => zed::default_settings_path()?,
+    };
+
+    let mut settings = zed::read_settings(&path)?;
+    let outcome = zed::upsert(&mut settings, &conn)?;
+
+    let name = record.name.as_deref().unwrap_or("-");
+    if outcome == zed::Outcome::Unchanged {
+        println!(
+            "Zed already has session {} ({}) at {}",
+            record.id,
+            name,
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let backup = zed::write_settings(&path, &settings)?;
+    let verb = if outcome == zed::Outcome::Inserted {
+        "Added"
+    } else {
+        "Updated"
+    };
+    println!(
+        "{} session {} ({}) in {}",
+        verb,
+        record.id,
+        name,
+        path.display()
+    );
+    if let Some(backup) = backup {
+        println!(
+            "Previous settings saved to {} (comments and key order are not preserved on rewrite)",
+            backup.display()
+        );
+    }
+    println!(
+        "Open it from Zed's remote-project picker, under host {}",
+        conn.host
+    );
+
+    Ok(())
+}
+
 /// The local mesh-enrolment record path. `--minimal-dir` still wins for
 /// the historical "everything lives under the state dir" workflow;
 /// otherwise falls through to the loadout-subsystem's config dir
@@ -3582,6 +3727,59 @@ mod tests {
         assert!(canonical.raw && !canonical.json);
         let bare = ls_args(&["min", "ls", "--json"]);
         assert!(bare.json && !bare.raw);
+    }
+
+    /// `setup-zed` takes the session the way every other session verb does —
+    /// `min session <verb> <session>`. The project path is not an option: it is
+    /// always the in-box workspace root.
+    #[test]
+    fn setup_zed_parses_as_a_session_verb() {
+        use clap::Parser as _;
+        let setup_zed_args = |args: &[&str]| -> SetupZedArgs {
+            match Cli::try_parse_from(args).unwrap().command {
+                Some(Command::Session(SessionArgs {
+                    command: SessionCommand::SetupZed(a),
+                })) => a,
+                _ => panic!("expected a setup-zed command for {args:?}"),
+            }
+        };
+
+        let args = setup_zed_args(&["min", "session", "setup-zed", "my-box"]);
+        assert_eq!(args.session, "my-box");
+        assert!(!args.print);
+        assert!(args.settings.is_none());
+
+        let printing = setup_zed_args(&["min", "session", "setup-zed", "my-box", "--print"]);
+        assert!(printing.print);
+
+        // The project path is fixed, so there is no flag to set it.
+        assert!(
+            Cli::try_parse_from([
+                "min",
+                "session",
+                "setup-zed",
+                "my-box",
+                "--path",
+                "/elsewhere"
+            ])
+            .is_err(),
+            "--path must not be accepted"
+        );
+    }
+
+    /// Hidden for now: absent from `min session --help` and from the
+    /// completions clap generates, while still parsing and running.
+    #[test]
+    fn setup_zed_is_hidden() {
+        use clap::CommandFactory as _;
+        let cli = Cli::command();
+        let session = cli.find_subcommand("session").expect("session subcommand");
+        let setup_zed = session
+            .find_subcommand("setup-zed")
+            .expect("setup-zed subcommand");
+        assert!(setup_zed.is_hide_set(), "setup-zed must stay hidden");
+        // The visible siblings are unaffected.
+        assert!(!session.find_subcommand("attach").unwrap().is_hide_set());
     }
 
     /// `--raw` and `--json` select mutually exclusive output formats, so
