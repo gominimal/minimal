@@ -213,9 +213,30 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
                         && let Ok(imports) = elf.imports()
                     {
                         let path_in_build = path.strip_prefix(cached_build.path()).unwrap();
-                        for import in imports.iter() {
+                        // `imports()` is a lazy iterator that reports per-import
+                        // parse errors as items. A malformed entry only costs us
+                        // one symbol's worth of coverage, so — like the
+                        // unparseable-import-table case above — skip it and keep
+                        // scanning rather than failing the whole check.
+                        for import in imports {
+                            let import = match import {
+                                Ok(import) => import,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        path = %path.display(),
+                                        "skipping unparseable import: {e}"
+                                    );
+                                    continue;
+                                }
+                            };
+                            // `name()` is a name-or-ordinal: importing by ordinal
+                            // is a PE concept, and there is no symbol name for
+                            // us to resolve against a dependency's exports.
+                            let Some(symbol_name) = import.name().into_name() else {
+                                continue;
+                            };
                             let lib = String::from_utf8(import.library().to_vec()).unwrap();
-                            let symbol = String::from_utf8(import.name().to_vec()).unwrap();
+                            let symbol = String::from_utf8(symbol_name.to_vec()).unwrap();
                             if lib.is_empty() {
                                 continue;
                             }
