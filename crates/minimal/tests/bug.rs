@@ -98,8 +98,8 @@ async fn bug_without_daemon_still_produces_a_bundle() {
     cmd_bug(&args, bug_args(&out)).await.unwrap();
 
     let files = unpack(&out).await;
-    let manifest: serde_json::Value =
-        serde_json::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
+    let manifest: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
     assert_eq!(manifest["schema_version"], 1);
     assert!(!manifest["collected"].as_array().unwrap().is_empty());
 
@@ -181,8 +181,8 @@ async fn planted_secrets_never_reach_the_bundle() {
 
     // Key material is never collected, and that is recorded.
     assert!(find(&files, "client.key").is_none());
-    let manifest: serde_json::Value =
-        serde_json::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
+    let manifest: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
     assert!(
         manifest["skipped"]
             .as_array()
@@ -255,8 +255,8 @@ async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
 
     assert!(find(&files, "providers/local-minvmd0/run.log").is_some());
     assert!(find(&files, "providers/remote-x/run.log").is_none());
-    let manifest: serde_json::Value =
-        serde_json::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
+    let manifest: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
     let skipped = manifest["skipped"].as_array().unwrap();
     assert!(
         skipped
@@ -299,9 +299,9 @@ async fn a_custom_tail_cap_applies_to_every_log() {
         assert_eq!(contents.len(), 100, "{suffix} honors the requested cap");
     }
 
-    let manifest: serde_json::Value =
-        serde_json::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
-    let capped: Vec<&serde_json::Value> = manifest["collected"]
+    let manifest: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
+    let capped: Vec<&serde_json_lenient::Value> = manifest["collected"]
         .as_array()
         .unwrap()
         .iter()
@@ -373,14 +373,15 @@ async fn bug_with_daemon_nests_a_verified_guest_bundle() {
     cmd_bug(&args, bug_args(&out)).await.unwrap();
 
     let files = unpack(&out).await;
-    let manifest: serde_json::Value =
-        serde_json::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
+    let manifest: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
 
     // R7.1: every stage of the probe reached the live daemon, and the
     // connection it opened was the one the download reused.
-    let probe: serde_json::Value =
-        serde_json::from_slice(find(&files, "local-minimald0/socket-probe.json").expect("probe"))
-            .unwrap();
+    let probe: serde_json_lenient::Value = serde_json_lenient::from_slice(
+        find(&files, "local-minimald0/socket-probe.json").expect("probe"),
+    )
+    .unwrap();
     for stage in ["stat", "connect", "handshake", "get_version"] {
         assert_eq!(probe[stage]["outcome"], "ok", "stage {stage}: {probe}");
     }
@@ -396,12 +397,14 @@ async fn bug_with_daemon_nests_a_verified_guest_bundle() {
     let nested_path = out_dir.path().join("nested.tar.zst");
     std::fs::write(&nested_path, nested).unwrap();
     let guest_files = unpack(&nested_path).await;
-    let guest_manifest: serde_json::Value =
-        serde_json::from_slice(find(&guest_files, "manifest.json").expect("guest manifest"))
-            .unwrap();
+    let guest_manifest: serde_json_lenient::Value = serde_json_lenient::from_slice(
+        find(&guest_files, "manifest.json").expect("guest manifest"),
+    )
+    .unwrap();
     assert_eq!(guest_manifest["schema_version"], 1);
-    let guest_meta: serde_json::Value =
-        serde_json::from_slice(find(&guest_files, "meta.json").expect("guest meta")).unwrap();
+    let guest_meta: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&guest_files, "meta.json").expect("guest meta"))
+            .unwrap();
     assert_eq!(guest_meta["in_microvm"], false);
 
     // The verification passed: no check recorded a failure against it.
@@ -455,9 +458,10 @@ async fn bug_with_stale_socket_reports_the_connect_stage_and_falls_back() {
         .unwrap();
 
     let files = unpack(&out).await;
-    let probe: serde_json::Value =
-        serde_json::from_slice(find(&files, "local-minvmd0/socket-probe.json").expect("probe"))
-            .unwrap();
+    let probe: serde_json_lenient::Value = serde_json_lenient::from_slice(
+        find(&files, "local-minvmd0/socket-probe.json").expect("probe"),
+    )
+    .unwrap();
     assert_eq!(probe["stat"]["outcome"], "ok");
     assert_ne!(probe["connect"]["outcome"], "ok");
     assert!(
@@ -475,9 +479,10 @@ async fn bug_with_stale_socket_reports_the_connect_stage_and_falls_back() {
         String::from_utf8_lossy(error)
     );
 
-    let volume: serde_json::Value =
-        serde_json::from_slice(find(&files, "guest/volume-meta.json").expect("volume meta"))
-            .unwrap();
+    let volume: serde_json_lenient::Value = serde_json_lenient::from_slice(
+        find(&files, "guest/volume-meta.json").expect("volume meta"),
+    )
+    .unwrap();
     assert_eq!(volume["exists"], true);
     assert_eq!(volume["bytes"], 4096);
     assert!(volume["mtime_unix"].is_u64(), "the stall-dating signal");

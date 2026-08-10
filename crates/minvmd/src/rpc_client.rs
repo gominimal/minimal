@@ -120,7 +120,7 @@ async fn call_oneshot<R: OneshotSshRpc>(
         .await
         .with_context(|| format!("request subsystem {}", R::NAME))?;
 
-    let body = serde_json::to_vec(&request).context("serialize request")?;
+    let body = serde_json_lenient::to_vec(&request).context("serialize request")?;
     let mut rpc = channel.into_stream();
     rpc.write_all(&body).await.context("write request")?;
     rpc.shutdown().await.context("shutdown write half")?;
@@ -145,7 +145,8 @@ async fn call_oneshot<R: OneshotSshRpc>(
         );
     }
 
-    serde_json::from_slice(&resp_buf).with_context(|| format!("decode response for {}", R::NAME))
+    serde_json_lenient::from_slice(&resp_buf)
+        .with_context(|| format!("decode response for {}", R::NAME))
 }
 
 #[cfg(test)]

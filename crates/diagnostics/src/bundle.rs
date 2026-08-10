@@ -252,7 +252,7 @@ impl<W: BundleSink> BundleWriter<W> {
         // full disk, a broken pipe, an abandoned stream — would abort the
         // process instead of surfacing the error. Record the outcome, close the
         // archive either way, and report afterwards.
-        let recorded = match serde_json::to_vec_pretty(&manifest) {
+        let recorded = match serde_json_lenient::to_vec_pretty(&manifest) {
             Ok(json) => self.append("manifest.json", &json).await,
             Err(e) => Err(anyhow::Error::new(e).context("serializing manifest")),
         };
@@ -432,7 +432,8 @@ pub(crate) mod tests {
         let files = unpack_bundle(&out, "minimal-diag-test").await;
         assert_eq!(files["host/system.json"], b"{}");
 
-        let manifest: serde_json::Value = serde_json::from_slice(&files["manifest.json"]).unwrap();
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
         assert_eq!(manifest["schema_version"], 1);
         assert_eq!(manifest["version"], "test-version");
         assert_eq!(manifest["collected"][0]["path"], "host/system.json");
@@ -496,7 +497,8 @@ pub(crate) mod tests {
 
         let files = unpack_bundle(&out, "r").await;
         assert_eq!(files["logs/big.log"].len(), 10);
-        let manifest: serde_json::Value = serde_json::from_slice(&files["manifest.json"]).unwrap();
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
         assert_eq!(manifest["collected"][0]["redaction"], "tail-capped");
     }
 

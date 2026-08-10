@@ -42,7 +42,8 @@ fn set_then_show_reports_persisted_value_and_source() {
 
     let (ok, out, err) = run(tmp.path(), &["config", "show", "--json"]);
     assert!(ok, "config show must succeed; stderr: {err}");
-    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    let v: serde_json_lenient::Value =
+        serde_json_lenient::from_str(out.trim()).expect("valid JSON");
     assert_eq!(v["ram_mib"], 3072, "persisted value must be reported");
     assert_eq!(
         v["ram_mib_source"], "config",
@@ -71,7 +72,7 @@ fn set_merges_without_clobbering_the_other_field() {
     );
 
     let (_ok, out, _err) = run(tmp.path(), &["config", "show", "--json"]);
-    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let v: serde_json_lenient::Value = serde_json_lenient::from_str(out.trim()).unwrap();
     assert_eq!(
         v["ram_mib"], 3072,
         "earlier ram_mib must survive a later set"
@@ -97,7 +98,8 @@ fn status_json_schema_when_stopped() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // No daemon running → status exits 1 (stopped) but still prints JSON.
     let (_ok, out, _err) = run(tmp.path(), &["status", "--json"]);
-    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("valid JSON");
+    let v: serde_json_lenient::Value =
+        serde_json_lenient::from_str(out.trim()).expect("valid JSON");
     for key in [
         "state",
         "vmm_pid",

@@ -55,7 +55,8 @@ fn argv0_matches(args: &str, markers: &[&str]) -> bool {
 fn scrub_arg(arg: &str) -> Cow<'_, str> {
     match arg.split_once('=') {
         Some((key, value)) if is_sensitive_key(key) => {
-            let placeholder = redaction_placeholder(&serde_json::Value::String(value.to_string()));
+            let placeholder =
+                redaction_placeholder(&serde_json_lenient::Value::String(value.to_string()));
             Cow::Owned(format!(
                 "{key}={}",
                 placeholder.as_str().unwrap_or("<redacted>")

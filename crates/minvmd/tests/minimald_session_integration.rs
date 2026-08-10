@@ -267,7 +267,8 @@ async fn run_session_exec(
                 attrs: Default::default(),
             },
         };
-        let body = serde_json::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
+        let body =
+            serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
 
         let mut rpc = channel.into_stream();
         rpc.write_all(&body)
@@ -281,7 +282,8 @@ async fn run_session_exec(
             .await
             .map_err(|e| format!("read response: {e}"))?;
         let resp: <CreateSession as OneshotSshRpc>::Response =
-            serde_json::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
+            serde_json_lenient::from_slice(&resp_buf)
+                .map_err(|e| format!("decode response: {e}"))?;
         resp.ok()
             .ok_or_else(|| "CreateSession returned an error".to_string())?
             .id
@@ -344,7 +346,8 @@ async fn run_session_exec(
             session_id,
             contribution: Default::default(),
         };
-        let body = serde_json::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
+        let body =
+            serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
 
         let mut rpc = channel.into_stream();
         rpc.write_all(&body)
@@ -358,7 +361,8 @@ async fn run_session_exec(
             .await
             .map_err(|e| format!("read response: {e}"))?;
         let resp: <ConfigureLoadout as OneshotSshRpc>::Response =
-            serde_json::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
+            serde_json_lenient::from_slice(&resp_buf)
+                .map_err(|e| format!("decode response: {e}"))?;
         match resp.ok() {
             // The uploaded mfile declares only tasks, so nothing needs a
             // client gate and the loadout finalizes in one shot.
@@ -390,7 +394,8 @@ async fn run_session_exec(
             .map_err(|e| format!("request_subsystem: {e}"))?;
 
         let req = FinalizeSessionRequest { session_id };
-        let body = serde_json::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
+        let body =
+            serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
 
         let mut rpc = channel.into_stream();
         rpc.write_all(&body)
@@ -404,7 +409,8 @@ async fn run_session_exec(
             .await
             .map_err(|e| format!("read response: {e}"))?;
         let resp: <FinalizeSession as OneshotSshRpc>::Response =
-            serde_json::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
+            serde_json_lenient::from_slice(&resp_buf)
+                .map_err(|e| format!("decode response: {e}"))?;
         resp.ok()
             .ok_or_else(|| "FinalizeSession returned an error".to_string())?;
     }

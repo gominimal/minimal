@@ -283,7 +283,7 @@ impl Client {
                 .await
                 .with_context(|| format!("request subsystem {}", R::NAME))?;
 
-            let body = serde_json::to_vec(&request).context("serialize request")?;
+            let body = serde_json_lenient::to_vec(&request).context("serialize request")?;
             channel.data_bytes(body).await.context("write request")?;
             channel.eof().await.context("shutdown write half")?;
 
@@ -313,7 +313,7 @@ impl Client {
                 );
             }
 
-            serde_json::from_slice(&resp_buf)
+            serde_json_lenient::from_slice(&resp_buf)
                 .with_context(|| format!("decode response for {}", R::NAME))
         };
 
@@ -667,7 +667,7 @@ impl Client {
                  (daemon may predate the diagnostics RPC — upgrade minimald)",
             )?;
 
-        let body = serde_json::to_vec(req).context("serialize diag request")?;
+        let body = serde_json_lenient::to_vec(req).context("serialize diag request")?;
         channel
             .data(&body[..])
             .await

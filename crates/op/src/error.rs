@@ -44,8 +44,8 @@ impl From<oci_spec::OciSpecError> for Error {
     }
 }
 
-impl From<serde_json::Error> for Error {
-    fn from(e: serde_json::Error) -> Self {
+impl From<serde_json_lenient::Error> for Error {
+    fn from(e: serde_json_lenient::Error) -> Self {
         Self::Other(e.into())
     }
 }

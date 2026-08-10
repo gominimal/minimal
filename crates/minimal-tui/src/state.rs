@@ -38,7 +38,7 @@ pub fn load(base: Option<&std::path::Path>) -> DashState {
     let Ok(bytes) = std::fs::read(state_path(base)) else {
         return DashState::default();
     };
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    serde_json_lenient::from_slice(&bytes).unwrap_or_default()
 }
 
 /// Writes the state file with owner-only permissions, matching the socket
@@ -48,7 +48,7 @@ pub fn save(base: Option<&std::path::Path>, state: &DashState) -> io::Result<()>
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let bytes = serde_json::to_vec_pretty(state).map_err(io::Error::other)?;
+    let bytes = serde_json_lenient::to_vec_pretty(state).map_err(io::Error::other)?;
     std::fs::write(&path, bytes)?;
     #[cfg(unix)]
     {
@@ -68,14 +68,17 @@ mod tests {
             last_session_id: Some("a1b2".to_string()),
             last_provider: Some("host".to_string()),
         };
-        let json = serde_json::to_string(&state).unwrap();
-        assert_eq!(serde_json::from_str::<DashState>(&json).unwrap(), state);
+        let json = serde_json_lenient::to_string(&state).unwrap();
+        assert_eq!(
+            serde_json_lenient::from_str::<DashState>(&json).unwrap(),
+            state
+        );
     }
 
     #[test]
     fn empty_file_reads_as_default() {
         assert_eq!(
-            serde_json::from_slice::<DashState>(b"").unwrap_or_default(),
+            serde_json_lenient::from_slice::<DashState>(b"").unwrap_or_default(),
             DashState::default()
         );
     }

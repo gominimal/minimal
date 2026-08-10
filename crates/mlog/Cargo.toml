@@ -15,4 +15,4 @@ tracing-subscriber.workspace = true
 version.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+serde_json_lenient.workspace = true

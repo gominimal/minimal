@@ -375,8 +375,8 @@ mod tests {
     where
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let json = serde_json::to_string(value).expect("serialize");
-        serde_json::from_str(&json).expect("deserialize")
+        let json = serde_json_lenient::to_string(value).expect("serialize");
+        serde_json_lenient::from_str(&json).expect("deserialize")
     }
 
     fn user_source() -> WireSource {
@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn source_uses_explicit_kind_tag() {
-        let json = serde_json::to_string(&user_source()).unwrap();
+        let json = serde_json_lenient::to_string(&user_source()).unwrap();
         assert!(
             json.contains(r#""kind":"user_loadout""#),
             "expected `kind` tag, got: {json}"
@@ -437,11 +437,11 @@ mod tests {
     /// value present in the wire round-trips verbatim.
     #[test]
     fn resolved_var_default_carries_user_data_is_false() {
-        let raw = serde_json::json!({
+        let raw = serde_json_lenient::json!({
             "name": "EDITOR",
             "value": "hx",
         });
-        let v: WireResolvedVar = serde_json::from_value(raw).expect("deserialize");
+        let v: WireResolvedVar = serde_json_lenient::from_value(raw).expect("deserialize");
         assert!(!v.carries_user_data);
     }
 
@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn empty_lifecycle_hook_omits_unset_fields() {
         let h = WireLifecycleHook::default();
-        let json = serde_json::to_string(&h).unwrap();
+        let json = serde_json_lenient::to_string(&h).unwrap();
         assert_eq!(json, "{}");
         assert_eq!(round_trip(&h), h);
     }
@@ -542,7 +542,7 @@ mod tests {
     #[test]
     fn pending_id_round_trips_transparently() {
         let id = PendingId::new(42);
-        let json = serde_json::to_string(&id).unwrap();
+        let json = serde_json_lenient::to_string(&id).unwrap();
         // `serde(transparent)` produces a bare integer.
         assert_eq!(json, "42");
         assert_eq!(round_trip(&id), id);
@@ -587,7 +587,7 @@ mod tests {
             description: None,
             source: WireSource::UserLoadout { name: "dev".into() },
         };
-        let json = serde_json::to_string(&p).unwrap();
+        let json = serde_json_lenient::to_string(&p).unwrap();
         assert!(!json.contains("description"), "got: {json}");
     }
 }

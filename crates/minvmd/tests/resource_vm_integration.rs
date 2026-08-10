@@ -51,8 +51,8 @@ fn minvmd(state: &Path, args: &[&str]) -> Output {
         .expect("spawning minvmd")
 }
 
-fn json(out: &Output) -> serde_json::Value {
-    serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null)
+fn json(out: &Output) -> serde_json_lenient::Value {
+    serde_json_lenient::from_slice(&out.stdout).unwrap_or(serde_json_lenient::Value::Null)
 }
 
 #[test]

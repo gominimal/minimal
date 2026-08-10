@@ -40,7 +40,7 @@ pub async fn system(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
     // Which filesystems matter is this binary's policy: the state dir, the
     // cache dir, and the invoking directory the archive is written into.
     let info = diagnostics::system_info(&[&paths.state, &paths.cache, &paths.cwd]).await;
-    let json = serde_json::to_vec_pretty(&info).context("serializing system info")?;
+    let json = serde_json_lenient::to_vec_pretty(&info).context("serializing system info")?;
     w.add_bytes("host/system.json", &json, Redaction::None)
         .await
 }
@@ -49,7 +49,7 @@ pub async fn system(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
 
 pub async fn env(w: &mut BundleWriter) -> Result<(), anyhow::Error> {
     let env = masked_process_env(is_env_value_allowlisted);
-    let json = serde_json::to_vec_pretty(&env).context("serializing env")?;
+    let json = serde_json_lenient::to_vec_pretty(&env).context("serializing env")?;
     w.add_bytes("host/env.json", &json, Redaction::Keys).await
 }
 
@@ -106,7 +106,7 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
     ]
     .into_iter()
     .collect();
-    let json = serde_json::to_vec_pretty(&certs).context("serializing cert metadata")?;
+    let json = serde_json_lenient::to_vec_pretty(&certs).context("serializing cert metadata")?;
     w.add_bytes("config/client-cert.json", &json, Redaction::ListingOnly)
         .await?;
 
@@ -567,7 +567,7 @@ pub async fn provider_files(
     let status = tokio::task::spawn_blocking(move || provider_status(&status_dir))
         .await
         .context("provider status worker")?;
-    let json = serde_json::to_vec_pretty(&status).context("serializing provider status")?;
+    let json = serde_json_lenient::to_vec_pretty(&status).context("serializing provider status")?;
     w.add_bytes(
         &format!("providers/{name}/status.json"),
         &json,
@@ -681,7 +681,8 @@ mod tests {
             .await
             .unwrap();
         let files = unpack(&out, "r").await;
-        let manifest: serde_json::Value = serde_json::from_slice(&files["manifest.json"]).unwrap();
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
         manifest["skipped"]
             .as_array()
             .unwrap()
@@ -827,7 +828,8 @@ mod tests {
             }
         }
 
-        let manifest: serde_json::Value = serde_json::from_slice(&files["manifest.json"]).unwrap();
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
         let skipped = manifest["skipped"].as_array().unwrap();
         for skip in skipped {
             let (what, reason) = (

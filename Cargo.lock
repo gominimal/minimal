@@ -802,7 +802,7 @@ dependencies = [
  "mfile",
  "rand 0.10.2",
  "serde",
- "serde_json",
+ "serde_json_lenient",
  "tempfile",
  "tracing",
 ]
@@ -1015,7 +1015,7 @@ dependencies = [
  "reqwest",
  "resolv-conf",
  "serde",
- "serde_json",
+ "serde_json_lenient",
  "sha2 0.11.0",
  "tar",
  "tempfile",
@@ -1693,7 +1693,7 @@ dependencies = [
  "chrono",
  "libc",
  "serde",
- "serde_json",
+ "serde_json_lenient",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -2559,7 +2559,7 @@ dependencies = [
  "mfile",
  "nickel-lang-core",
  "serde",
- "serde_json",
+ "serde_json_lenient",
  "smallvec",
  "tempfile",
  "tokio",
@@ -3606,7 +3606,7 @@ dependencies = [
  "libc",
  "path-absolutize",
  "serde",
- "serde_json",
+ "serde_json_lenient",
  "tempfile",
  "tracing",
 ]
@@ -4020,7 +4020,7 @@ dependencies = [
  "paths",
  "russh",
  "serde",
- "serde_json",
+ "serde_json_lenient",
  "sessions",
  "tempfile",
  "tokio",
@@ -4046,7 +4046,7 @@ dependencies = [
  "paths",
  "russh",
  "serde",
- "serde_json",
+ "serde_json_lenient",
  "sessions",
  "tempfile",
  "tokio",
@@ -4077,7 +4077,7 @@ dependencies = [
  "paths",
  "ratatui",
  "serde",
- "serde_json",
+ "serde_json_lenient",
  "sessions",
  "tempfile",
  "tokio",
@@ -4130,7 +4130,7 @@ dependencies = [
  "rustls",
  "sandbox2",
  "serde",
- "serde_json",
+ "serde_json_lenient",
  "sessions",
  "size",
  "stdlib",
@@ -4163,7 +4163,7 @@ dependencies = [
  "paths",
  "rand 0.10.2",
  "serde",
- "serde_json",
+ "serde_json_lenient",
  "sessions",
 ]
 
@@ -4192,7 +4192,7 @@ dependencies = [
  "russh",
  "russh-sftp",
  "serde",
- "serde_json",
+ "serde_json_lenient",
  "serial_test",
  "sessions",
  "switch",
@@ -4248,7 +4248,7 @@ dependencies = [
  "rcache",
  "remote-client",
  "serde",
- "serde_json",
+ "serde_json_lenient",
  "serial_test",
  "smallvec",
  "tokio",
@@ -4278,7 +4278,7 @@ version = "0.0.1"
 dependencies = [
  "json-subscriber",
  "opentelemetry-semantic-conventions",
- "serde_json",
+ "serde_json_lenient",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -4734,7 +4734,7 @@ dependencies = [
  "ot",
  "rayon",
  "sandbox2",
- "serde_json",
+ "serde_json_lenient",
  "sha2 0.11.0",
  "shlex",
  "size",
@@ -6562,6 +6562,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_json_lenient"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e033097bf0d2b59a62b42c18ebbb797503839b26afdda2c4e1415cb6c813540"
+dependencies = [
+ "itoa",
+ "memchr",
+ "ryu",
+ "serde",
+]
+
+[[package]]
 name = "serde_spanned"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6673,7 +6685,7 @@ dependencies = [
  "nutype",
  "paths",
  "serde",
- "serde_json",
+ "serde_json_lenient",
  "tempfile",
  "thiserror 2.0.19",
  "toml",

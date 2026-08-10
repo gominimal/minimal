@@ -507,8 +507,9 @@ on_activate = {{ type = "inline", value = "echo activated" }}
         .compose(UserPolicy::empty(), ComposeOptions::default())
         .unwrap();
 
-    let json = serde_json::to_string(&contribution).unwrap();
-    let decoded: sessions::wire::request::WireContribution = serde_json::from_str(&json).unwrap();
+    let json = serde_json_lenient::to_string(&contribution).unwrap();
+    let decoded: sessions::wire::request::WireContribution =
+        serde_json_lenient::from_str(&json).unwrap();
 
     assert_eq!(decoded.vars.len(), 1);
     assert_eq!(decoded.vars[0].var.value, "sjn_IV");

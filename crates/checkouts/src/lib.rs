@@ -115,7 +115,7 @@ impl ManagerState {
         let path = dir.join("state.json");
         if path.exists() {
             let f = fs::File::open(path)?;
-            Ok(serde_json::from_reader(f).map_err(Error::StatefileInvalid)?)
+            Ok(serde_json_lenient::from_reader(f).map_err(Error::StatefileInvalid)?)
         } else {
             Ok(Default::default())
         }
@@ -125,7 +125,7 @@ impl ManagerState {
     fn write_to(&self, dir: &Path) -> Result<(), Error> {
         let path = dir.join("state.json");
         let f = fs::File::create(path)?;
-        match serde_json::to_writer(f, self) {
+        match serde_json_lenient::to_writer(f, self) {
             Ok(()) => Ok(()),
             Err(e) => {
                 if e.is_io() {

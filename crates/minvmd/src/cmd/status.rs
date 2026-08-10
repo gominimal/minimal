@@ -154,7 +154,7 @@ fn lifecycle_state_str(lc: Lifecycle) -> &'static str {
 }
 
 fn print_json(report: &StatusReport) -> Result<()> {
-    let json = serde_json::to_string(report).context("serialising status report")?;
+    let json = serde_json_lenient::to_string(report).context("serialising status report")?;
     println!("{json}");
     Ok(())
 }
@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn report_schema_when_stopped_has_null_metrics() {
         let report = build_report(&State::stopped(), None, 2, 2048, None);
-        let v = serde_json::to_value(&report).unwrap();
+        let v = serde_json_lenient::to_value(&report).unwrap();
         for key in [
             "state",
             "vmm_pid",
@@ -338,7 +338,7 @@ mod tests {
             disk_written_bytes: 0,
         };
         let report = build_report(&state, Some(42), 4, 1024, Some(metrics));
-        let v = serde_json::to_value(&report).unwrap();
+        let v = serde_json_lenient::to_value(&report).unwrap();
         assert_eq!(v["state"], "running");
         assert_eq!(v["vcpus"], 4);
         assert!(

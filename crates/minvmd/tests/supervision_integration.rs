@@ -81,13 +81,13 @@ fn minvmd(state: &Path, args: &[&str]) -> Output {
     child.wait_with_output().expect("collecting minvmd output")
 }
 
-fn json(out: &Output) -> serde_json::Value {
-    serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null)
+fn json(out: &Output) -> serde_json_lenient::Value {
+    serde_json_lenient::from_slice(&out.stdout).unwrap_or(serde_json_lenient::Value::Null)
 }
 
 /// Boot the supervised VM (detached) and poll `status` until Running; returns
 /// the running status JSON (which carries `vmm_pid`). Panics past the deadline.
-fn boot_to_running(sd: &Path) -> serde_json::Value {
+fn boot_to_running(sd: &Path) -> serde_json_lenient::Value {
     let run = minvmd(sd, &["run", "--detach", "--timeout", "60"]);
     assert!(
         run.status.success(),

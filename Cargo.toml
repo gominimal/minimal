@@ -140,7 +140,7 @@ prost-types = "0.14"
 resolv-conf = "0.7"
 russh = { version = "0.62", default-features = false, features = ["aws-lc-rs", "flate2"] }
 russh-sftp = "2.4"
-serde_json = { version = "1.0" }
+serde_json_lenient = { version = "0.2" }
 serial_test = "4"
 sha2 = "0.11"
 shlex = "2.0"

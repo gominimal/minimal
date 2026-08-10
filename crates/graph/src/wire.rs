@@ -1,7 +1,7 @@
 //! Streaming wire format for [`Graph`] serialization.
 //!
 //! Uses a custom length-delimited framing: **1-byte tag + unsigned LEB128 varint
-//! length + payload bytes**.  Individual record payloads are JSON (via `serde_json`)
+//! length + payload bytes**.  Individual record payloads are JSON (via `serde_json_lenient`)
 //! except [`TAG_LOCAL_FILE_DATA`] which carries raw file bytes.
 //!
 //! ## Stream order
@@ -69,7 +69,7 @@ fn check_record_len(len: u64) -> Result<(), WireError> {
 #[derive(Debug)]
 pub enum WireError {
     Io(io::Error),
-    Json(serde_json::Error),
+    Json(serde_json_lenient::Error),
     InvalidTag(u8),
     UnexpectedRecord { expected: &'static str, got: u8 },
     DanglingRef { wire_ref: (usize, u64) },
@@ -85,8 +85,8 @@ impl From<io::Error> for WireError {
     }
 }
 
-impl From<serde_json::Error> for WireError {
-    fn from(e: serde_json::Error) -> Self {
+impl From<serde_json_lenient::Error> for WireError {
+    fn from(e: serde_json_lenient::Error) -> Self {
         Self::Json(e)
     }
 }
@@ -262,7 +262,7 @@ impl<W: Write> GraphWriter<W> {
             build_count: graph.len(),
             target: Some(graph.target().clone()),
         };
-        self.write_record(TAG_HEADER, &serde_json::to_vec(&header)?)?;
+        self.write_record(TAG_HEADER, &serde_json_lenient::to_vec(&header)?)?;
 
         // ── BuildSpecs + LocalFileData ──
         for (bsr, spec) in graph.iter() {
@@ -272,7 +272,7 @@ impl<W: Write> GraphWriter<W> {
                 arena_gen,
                 spec: spec.clone(),
             };
-            self.write_record(TAG_BUILD_SPEC, &serde_json::to_vec(&record)?)?;
+            self.write_record(TAG_BUILD_SPEC, &serde_json_lenient::to_vec(&record)?)?;
 
             // Inline local files immediately after the spec
             for dep in &spec.build_deps {
@@ -293,7 +293,7 @@ impl<W: Write> GraphWriter<W> {
             .iter()
             .map(|bsr| bsr.0.into_raw_parts())
             .collect();
-        self.write_record(TAG_TOP_LEVELS, &serde_json::to_vec(&top_levels)?)?;
+        self.write_record(TAG_TOP_LEVELS, &serde_json_lenient::to_vec(&top_levels)?)?;
 
         // ── Stacks ──
         for (name, stack) in graph.iter_stacks() {
@@ -301,13 +301,13 @@ impl<W: Write> GraphWriter<W> {
                 name: name.clone(),
                 stack: stack.clone(),
             };
-            self.write_record(TAG_STACK, &serde_json::to_vec(&record)?)?;
+            self.write_record(TAG_STACK, &serde_json_lenient::to_vec(&record)?)?;
         }
 
         // ── SupplyChain ──
         self.write_record(
             TAG_SUPPLY_CHAIN,
-            &serde_json::to_vec(graph.software_supply_chain())?,
+            &serde_json_lenient::to_vec(graph.software_supply_chain())?,
         )?;
 
         // ── Footer ── (NOT hashed itself)
@@ -335,7 +335,7 @@ impl<W: Write> GraphWriter<W> {
             data_len: file_data.len() as u64,
             file_mode,
         };
-        let header_json = serde_json::to_vec(&header)?;
+        let header_json = serde_json_lenient::to_vec(&header)?;
 
         // Payload = varint(header_json.len) + header_json + file_data
         let (vbuf, vlen) = varint_bytes(header_json.len() as u64);
@@ -442,7 +442,7 @@ impl<R: Read> GraphReader<R> {
                 got: tag,
             });
         }
-        let header: HeaderRecord = serde_json::from_slice(&payload)?;
+        let header: HeaderRecord = serde_json_lenient::from_slice(&payload)?;
         if header.version != STREAM_VERSION {
             return Err(WireError::UnsupportedVersion(header.version));
         }
@@ -464,7 +464,7 @@ impl<R: Read> GraphReader<R> {
 
             match tag {
                 TAG_BUILD_SPEC => {
-                    let record: BuildSpecRecord = serde_json::from_slice(&payload)?;
+                    let record: BuildSpecRecord = serde_json_lenient::from_slice(&payload)?;
                     let old_idx = Index::from_raw_parts(record.arena_idx, record.arena_gen);
                     let mut spec = record.spec;
 
@@ -509,7 +509,7 @@ impl<R: Read> GraphReader<R> {
                 }
 
                 TAG_TOP_LEVELS => {
-                    top_levels_raw = serde_json::from_slice(&payload)?;
+                    top_levels_raw = serde_json_lenient::from_slice(&payload)?;
                 }
 
                 TAG_PROFILE => {
@@ -517,12 +517,12 @@ impl<R: Read> GraphReader<R> {
                 }
 
                 TAG_STACK => {
-                    let record: StackRecord = serde_json::from_slice(&payload)?;
+                    let record: StackRecord = serde_json_lenient::from_slice(&payload)?;
                     stacks.insert(record.name, record.stack);
                 }
 
                 TAG_SUPPLY_CHAIN => {
-                    supply_chain = serde_json::from_slice(&payload)?;
+                    supply_chain = serde_json_lenient::from_slice(&payload)?;
                 }
 
                 TAG_FOOTER => {
@@ -590,7 +590,7 @@ fn materialize_local_file(
                 "local file header exceeds payload",
             )
         })?;
-    let file_header: LocalFileHeader = serde_json::from_slice(&payload[pos..header_end])?;
+    let file_header: LocalFileHeader = serde_json_lenient::from_slice(&payload[pos..header_end])?;
     let data_start = header_end;
     let data_end = data_start
         .checked_add(file_header.data_len as usize)
@@ -741,7 +741,7 @@ impl<W: AsyncWrite + Unpin> AsyncGraphWriter<W> {
             build_count: graph.len(),
             target: Some(graph.target().clone()),
         };
-        self.write_record(TAG_HEADER, &serde_json::to_vec(&header)?)
+        self.write_record(TAG_HEADER, &serde_json_lenient::to_vec(&header)?)
             .await?;
 
         // BuildSpecs + LocalFileData
@@ -752,7 +752,7 @@ impl<W: AsyncWrite + Unpin> AsyncGraphWriter<W> {
                 arena_gen,
                 spec: spec.clone(),
             };
-            self.write_record(TAG_BUILD_SPEC, &serde_json::to_vec(&record)?)
+            self.write_record(TAG_BUILD_SPEC, &serde_json_lenient::to_vec(&record)?)
                 .await?;
 
             for dep in &spec.build_deps {
@@ -774,7 +774,7 @@ impl<W: AsyncWrite + Unpin> AsyncGraphWriter<W> {
             .iter()
             .map(|bsr| bsr.0.into_raw_parts())
             .collect();
-        self.write_record(TAG_TOP_LEVELS, &serde_json::to_vec(&top_levels)?)
+        self.write_record(TAG_TOP_LEVELS, &serde_json_lenient::to_vec(&top_levels)?)
             .await?;
 
         // Stacks
@@ -783,14 +783,14 @@ impl<W: AsyncWrite + Unpin> AsyncGraphWriter<W> {
                 name: name.clone(),
                 stack: stack.clone(),
             };
-            self.write_record(TAG_STACK, &serde_json::to_vec(&record)?)
+            self.write_record(TAG_STACK, &serde_json_lenient::to_vec(&record)?)
                 .await?;
         }
 
         // SupplyChain
         self.write_record(
             TAG_SUPPLY_CHAIN,
-            &serde_json::to_vec(graph.software_supply_chain())?,
+            &serde_json_lenient::to_vec(graph.software_supply_chain())?,
         )
         .await?;
 
@@ -819,7 +819,7 @@ impl<W: AsyncWrite + Unpin> AsyncGraphWriter<W> {
             data_len: file_data.len() as u64,
             file_mode,
         };
-        let header_json = serde_json::to_vec(&header)?;
+        let header_json = serde_json_lenient::to_vec(&header)?;
 
         let (vbuf, vlen) = varint_bytes(header_json.len() as u64);
         let mut payload = Vec::with_capacity(vlen + header_json.len() + file_data.len());
@@ -908,7 +908,7 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
                 got: tag,
             });
         }
-        let header: HeaderRecord = serde_json::from_slice(&payload)?;
+        let header: HeaderRecord = serde_json_lenient::from_slice(&payload)?;
         if header.version != STREAM_VERSION {
             return Err(WireError::UnsupportedVersion(header.version));
         }
@@ -929,7 +929,7 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
 
             match tag {
                 TAG_BUILD_SPEC => {
-                    let record: BuildSpecRecord = serde_json::from_slice(&payload)?;
+                    let record: BuildSpecRecord = serde_json_lenient::from_slice(&payload)?;
                     let old_idx = Index::from_raw_parts(record.arena_idx, record.arena_gen);
                     let mut spec = record.spec;
 
@@ -970,7 +970,7 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
                 }
 
                 TAG_TOP_LEVELS => {
-                    top_levels_raw = serde_json::from_slice(&payload)?;
+                    top_levels_raw = serde_json_lenient::from_slice(&payload)?;
                 }
 
                 TAG_PROFILE => {
@@ -978,12 +978,12 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
                 }
 
                 TAG_STACK => {
-                    let record: StackRecord = serde_json::from_slice(&payload)?;
+                    let record: StackRecord = serde_json_lenient::from_slice(&payload)?;
                     stacks.insert(record.name, record.stack);
                 }
 
                 TAG_SUPPLY_CHAIN => {
-                    supply_chain = serde_json::from_slice(&payload)?;
+                    supply_chain = serde_json_lenient::from_slice(&payload)?;
                 }
 
                 TAG_FOOTER => {
@@ -1141,7 +1141,7 @@ mod tests {
     #[test]
     fn local_file_name_traversal_is_rejected() {
         let data = b"x";
-        let header = serde_json::to_vec(&LocalFileHeader {
+        let header = serde_json_lenient::to_vec(&LocalFileHeader {
             filename: "../escape".into(),
             file_hash: blake3::hash(data),
             data_len: data.len() as u64,
@@ -1242,7 +1242,7 @@ mod tests {
             build_count: 0,
             target: None,
         };
-        let payload = serde_json::to_vec(&header).unwrap();
+        let payload = serde_json_lenient::to_vec(&header).unwrap();
         let mut buf = Vec::new();
         buf.push(TAG_HEADER);
         encode_varint(payload.len() as u64, &mut buf);

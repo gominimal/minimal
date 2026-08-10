@@ -98,8 +98,8 @@ mod tests {
     where
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let json = serde_json::to_string(value).expect("serialize");
-        serde_json::from_str(&json).expect("deserialize")
+        let json = serde_json_lenient::to_string(value).expect("serialize");
+        serde_json_lenient::from_str(&json).expect("deserialize")
     }
 
     #[test]
@@ -155,7 +155,7 @@ mod tests {
             id: PendingId::new(7),
             name: "x".into(),
         };
-        let json = serde_json::to_string(&v).unwrap();
+        let json = serde_json_lenient::to_string(&v).unwrap();
         assert!(
             json.contains(r#""kind":"denied""#),
             "expected `kind` tag, got: {json}"

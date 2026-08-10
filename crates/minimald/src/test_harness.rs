@@ -217,7 +217,7 @@ impl TestClient {
         let mut channel = self.handle.channel_open_session().await.unwrap();
         channel.request_subsystem(true, R::NAME).await.unwrap();
 
-        let body = serde_json::to_vec(req).expect("request serializes");
+        let body = serde_json_lenient::to_vec(req).expect("request serializes");
         channel.data_bytes(body).await.unwrap();
         channel.eof().await.unwrap();
 
@@ -241,7 +241,7 @@ impl TestClient {
             );
         }
 
-        serde_json::from_slice(&resp_buf).expect("response deserializes")
+        serde_json_lenient::from_slice(&resp_buf).expect("response deserializes")
     }
 
     /// Opens an SFTP session attached to the given minimald session.

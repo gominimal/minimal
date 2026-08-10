@@ -352,7 +352,7 @@ pub async fn volume_fallback(
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs()),
     };
-    let json = serde_json::to_vec_pretty(&info).context("serializing volume meta")?;
+    let json = serde_json_lenient::to_vec_pretty(&info).context("serializing volume meta")?;
     w.add_bytes(
         &format!("providers/{provider}/guest/volume-meta.json"),
         &json,
@@ -687,7 +687,9 @@ pub(crate) mod tests {
             if entry.path().unwrap().ends_with("volume-meta.json") {
                 let mut buf = Vec::new();
                 entry.read_to_end(&mut buf).await.unwrap();
-                meta = Some(serde_json::from_slice::<serde_json::Value>(&buf).unwrap());
+                meta = Some(
+                    serde_json_lenient::from_slice::<serde_json_lenient::Value>(&buf).unwrap(),
+                );
             }
         }
         assert_eq!(meta.expect("volume-meta.json")["exists"], false);

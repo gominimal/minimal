@@ -174,7 +174,8 @@ async fn run_session_exec(
                 attrs: Default::default(),
             },
         };
-        let body = serde_json::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
+        let body =
+            serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
 
         let mut rpc = channel.into_stream();
         rpc.write_all(&body)
@@ -187,8 +188,8 @@ async fn run_session_exec(
         rpc.read_to_end(&mut resp_buf)
             .await
             .map_err(|e| format!("read response: {e}"))?;
-        let resp: CreateSessionResponse =
-            serde_json::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
+        let resp: CreateSessionResponse = serde_json_lenient::from_slice(&resp_buf)
+            .map_err(|e| format!("decode response: {e}"))?;
         resp.id
     };
 
@@ -210,7 +211,8 @@ async fn run_session_exec(
             session_id,
             contribution: Default::default(),
         };
-        let body = serde_json::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
+        let body =
+            serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
 
         let mut rpc = channel.into_stream();
         rpc.write_all(&body)
@@ -227,7 +229,8 @@ async fn run_session_exec(
         // would turn a daemon-side error into a confusing "missing field
         // `kind`" decode failure, swallowing the message it carries.
         let resp: Errorable<ConfigureLoadoutResponse> =
-            serde_json::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
+            serde_json_lenient::from_slice(&resp_buf)
+                .map_err(|e| format!("decode response: {e}"))?;
         match resp {
             Errorable::Ok(ConfigureLoadoutResponse::Materialized) => {
                 // Compose finished in one shot; fall through to the
@@ -261,7 +264,8 @@ async fn run_session_exec(
             .map_err(|e| format!("request_subsystem: {e}"))?;
 
         let req = FinalizeSessionRequest { session_id };
-        let body = serde_json::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
+        let body =
+            serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
 
         let mut rpc = channel.into_stream();
         rpc.write_all(&body)
@@ -274,8 +278,8 @@ async fn run_session_exec(
         rpc.read_to_end(&mut resp_buf)
             .await
             .map_err(|e| format!("read response: {e}"))?;
-        let resp: Errorable<FinalizeSessionResponse> =
-            serde_json::from_slice(&resp_buf).map_err(|e| format!("decode response: {e}"))?;
+        let resp: Errorable<FinalizeSessionResponse> = serde_json_lenient::from_slice(&resp_buf)
+            .map_err(|e| format!("decode response: {e}"))?;
         match resp {
             Errorable::Ok(FinalizeSessionResponse) => {}
             Errorable::Err { error } => return Err(format!("FinalizeSession failed: {error}")),

@@ -168,8 +168,8 @@ mod tests {
     where
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let json = serde_json::to_string(value).expect("serialize");
-        serde_json::from_str(&json).expect("deserialize")
+        let json = serde_json_lenient::to_string(value).expect("serialize");
+        serde_json_lenient::from_str(&json).expect("deserialize")
     }
 
     fn session_id() -> SessionId {
@@ -236,7 +236,7 @@ mod tests {
         let s = SessionStep::Fault {
             error: WireError::UnknownSessionId,
         };
-        let json = serde_json::to_string(&s).unwrap();
+        let json = serde_json_lenient::to_string(&s).unwrap();
         assert!(
             json.contains(r#""kind":"fault""#),
             "expected `kind` tag, got: {json}"
@@ -274,7 +274,7 @@ mod tests {
         // hypothetical future writer that omits it) should default to
         // version 1, not 0.
         let json = r#"{"vars":[],"patches":[],"packages":[],"lifecycle_hooks":[]}"#;
-        let c: WireComposition = serde_json::from_str(json).unwrap();
+        let c: WireComposition = serde_json_lenient::from_str(json).unwrap();
         assert_eq!(c.version, COMPOSITION_SNAPSHOT_VERSION);
     }
 
@@ -285,12 +285,12 @@ mod tests {
     #[test]
     fn orientation_field_defaults_when_absent() {
         let json = r#"{"vars":[],"patches":[],"lifecycle_hooks":[],"requested_packages":[]}"#;
-        let c: WireContribution = serde_json::from_str(json).unwrap();
+        let c: WireContribution = serde_json_lenient::from_str(json).unwrap();
         assert_eq!(c.orientation, WireOrientation::default());
         assert!(c.orientation.loadouts_display.is_empty());
 
         let json = r#"{"vars":[],"patches":[],"packages":[],"lifecycle_hooks":[]}"#;
-        let c: WireComposition = serde_json::from_str(json).unwrap();
+        let c: WireComposition = serde_json_lenient::from_str(json).unwrap();
         assert_eq!(c.orientation, WireOrientation::default());
     }
 

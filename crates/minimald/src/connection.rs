@@ -234,7 +234,7 @@ pub enum ConnectionError {
     Internal(String),
 
     /// Failed to (de)serialize a JSON-encoded RPC message.
-    Json(serde_json::Error),
+    Json(serde_json_lenient::Error),
 
     /// An operation was attempted after the session was launched
     /// (i.e. setting env vars after exec), which is both non-sensical and
@@ -248,8 +248,8 @@ impl From<russh::Error> for ConnectionError {
     }
 }
 
-impl From<serde_json::Error> for ConnectionError {
-    fn from(value: serde_json::Error) -> Self {
+impl From<serde_json_lenient::Error> for ConnectionError {
+    fn from(value: serde_json_lenient::Error) -> Self {
         ConnectionError::Json(value)
     }
 }

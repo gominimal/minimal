@@ -13,7 +13,7 @@ path-absolutize.workspace = true
 tempfile.workspace = true
 
 serde.workspace = true
-serde_json.workspace = true
+serde_json_lenient.workspace = true
 
 common = { workspace = true }
 graph = { workspace = true }

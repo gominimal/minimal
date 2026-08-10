@@ -246,7 +246,7 @@ pub(crate) async fn post_json<T: Serialize>(
     path: &str,
     body: &T,
 ) -> io::Result<()> {
-    let body = serde_json::to_vec(body).map_err(io::Error::other)?;
+    let body = serde_json_lenient::to_vec(body).map_err(io::Error::other)?;
     let mut request = Vec::with_capacity(128 + body.len());
     // HTTP/1.1 keep-alive (no `Connection: close`): gvproxy must respond *without*
     // closing the connection. On the KVM libkrun `add_vsock_port2(listen=false)`
@@ -513,7 +513,7 @@ mod tests {
         // are trailing-dotted, against it); the record label is lowercased
         // (gvproxy matches labels case-sensitively); the IP is dotted-quad.
         let body = dns_add_body("Local", "Web", Ipv4Addr::new(100, 64, 0, 5));
-        let json = serde_json::to_string(&body).unwrap();
+        let json = serde_json_lenient::to_string(&body).unwrap();
         assert_eq!(
             json,
             r#"{"name":"min.internal.","records":[{"name":"web.local","ip":"100.64.0.5"}]}"#
@@ -543,7 +543,7 @@ mod tests {
             proto: IpProto::Udp,
         };
         let req = expose_request(&mapping, Ipv4Addr::new(100, 64, 0, 7));
-        let json = serde_json::to_string(&req).unwrap();
+        let json = serde_json_lenient::to_string(&req).unwrap();
         assert!(json.contains("\"local\":\"127.0.0.1:5353\""), "got: {json}");
         assert!(json.contains("\"remote\":\"100.64.0.7:53\""), "got: {json}");
         assert!(json.contains("\"protocol\":\"udp\""), "got: {json}");

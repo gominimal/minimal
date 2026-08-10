@@ -29,7 +29,7 @@ pub enum Error {
     Other(String),
 
     /// Failed to read the statefile.
-    StatefileInvalid(serde_json::Error),
+    StatefileInvalid(serde_json_lenient::Error),
 
     /// The manager is in offline mode and the requested checkout would require a
     /// network operation (clone of an unknown remote, or fetch of a known remote).

@@ -333,7 +333,7 @@ fn classify_record_for_reconcile(
     // Distinguish I/O failure (transient — skip, retry next startup) from
     // syntactic/data corruption (definitive — DropMissing so the index
     // doesn't keep pointing at unreadable content).
-    let record: Record = match serde_json::from_reader(file) {
+    let record: Record = match serde_json_lenient::from_reader(file) {
         Ok(r) => r,
         Err(e) if e.is_io() => return Some(ReconcileFix::Skip { reason: e.into() }),
         Err(_) => return Some(ReconcileFix::DropMissing),
@@ -400,7 +400,7 @@ impl DiskLoader {
         std::fs::create_dir_all(minimal_dir.as_utf8_path().join("sessions"))?;
         let index_file = minimal_dir.as_utf8_path().join("sessions/index.json");
         let index = if std::fs::exists(&index_file)? {
-            serde_json::from_reader(std::fs::File::open(index_file)?)?
+            serde_json_lenient::from_reader(std::fs::File::open(index_file)?)?
         } else {
             Index::default()
         };
@@ -592,7 +592,7 @@ impl DiskLoader {
             }
             let record_file = path.join("record.json");
             let record: Record = match std::fs::File::open(&record_file)
-                .and_then(|f| serde_json::from_reader(f).map_err(std::io::Error::from))
+                .and_then(|f| serde_json_lenient::from_reader(f).map_err(std::io::Error::from))
             {
                 Ok(r) => r,
                 Err(e) => {
@@ -646,7 +646,7 @@ impl DiskLoader {
         let tmp_file = sessions_dir.join("index.json.tmp");
 
         let file = std::fs::File::create(&tmp_file)?;
-        serde_json::to_writer(&file, &self.index)?;
+        serde_json_lenient::to_writer(&file, &self.index)?;
         file.sync_all()?;
         drop(file);
 
@@ -670,7 +670,7 @@ impl DiskLoader {
         let tmp_file = session_dir.join("record.json.tmp");
 
         let file = std::fs::File::create(&tmp_file)?;
-        serde_json::to_writer(&file, &record)?;
+        serde_json_lenient::to_writer(&file, &record)?;
         file.sync_all()?;
         drop(file);
 
@@ -815,7 +815,7 @@ impl Loader for DiskLoader {
             .join("sessions")
             .join(&short)
             .join("record.json");
-        let record: Record = serde_json::from_reader(std::fs::File::open(record_file)?)?;
+        let record: Record = serde_json_lenient::from_reader(std::fs::File::open(record_file)?)?;
         Ok(DiskSession {
             minimal_state_dir: self.minimal_dir.clone(),
             key: key.clone(),
@@ -954,8 +954,8 @@ impl Loader for DiskLoader {
             .join("composition.json");
         match std::fs::read(&path) {
             Ok(bytes) => {
-                let wire: crate::wire::request::WireComposition = serde_json::from_slice(&bytes)
-                    .map_err(|e| {
+                let wire: crate::wire::request::WireComposition =
+                    serde_json_lenient::from_slice(&bytes).map_err(|e| {
                         std::io::Error::other(format!(
                             "parsing composition snapshot at {}: {e}",
                             path.as_str()
@@ -991,7 +991,7 @@ impl Loader for DiskLoader {
         let tmp = session_dir.join("composition.json.tmp");
 
         let wire = crate::wire::request::WireComposition::from(composition);
-        let json = serde_json::to_vec_pretty(&wire)
+        let json = serde_json_lenient::to_vec_pretty(&wire)
             .map_err(|e| std::io::Error::other(format!("serializing composition snapshot: {e}")))?;
         std::fs::write(&tmp, &json)?;
 
@@ -1545,7 +1545,7 @@ mod tests {
         new_record.name = Some("squatter".into());
         std::fs::write(
             dir.join("record.json").as_std_path(),
-            serde_json::to_vec(&new_record).unwrap(),
+            serde_json_lenient::to_vec(&new_record).unwrap(),
         )
         .unwrap();
 
@@ -1560,7 +1560,7 @@ mod tests {
         let err = loader.save(&stale_key, &stale_record).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
         // The squatting session's record on disk is untouched.
-        let reread: Record = serde_json::from_reader(
+        let reread: Record = serde_json_lenient::from_reader(
             std::fs::File::open(dir.join("record.json").as_std_path()).unwrap(),
         )
         .unwrap();
@@ -1629,7 +1629,7 @@ mod tests {
         new_record.name = Some("squatter".into());
         std::fs::write(
             dir.join("record.json").as_std_path(),
-            serde_json::to_vec(&new_record).unwrap(),
+            serde_json_lenient::to_vec(&new_record).unwrap(),
         )
         .unwrap();
 
@@ -1797,7 +1797,7 @@ mod tests {
         // index doesn't know about it. We rewrite the index to a
         // default empty Index.
         let sessions_dir = root.as_utf8_path().join("sessions");
-        let empty = serde_json::to_vec(&Index::default()).unwrap();
+        let empty = serde_json_lenient::to_vec(&Index::default()).unwrap();
         std::fs::write(sessions_dir.join("index.json").as_std_path(), empty).unwrap();
 
         let loader = DiskLoader::new(root).unwrap();
@@ -1830,7 +1830,7 @@ mod tests {
         let mut orphan_record = sample_record();
         orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
         let record_file = orphan_dir.join("record.json");
-        let buf = serde_json::to_vec(&orphan_record).unwrap();
+        let buf = serde_json_lenient::to_vec(&orphan_record).unwrap();
         std::fs::write(record_file.as_std_path(), buf).unwrap();
 
         let loader = DiskLoader::new(root.clone()).unwrap();
@@ -1860,9 +1860,9 @@ mod tests {
         let dir = session_dir_path(&root, &short);
         let record_file = dir.join("record.json");
         let buf = std::fs::read(&record_file).unwrap();
-        let mut record: Record = serde_json::from_slice(&buf).unwrap();
+        let mut record: Record = serde_json_lenient::from_slice(&buf).unwrap();
         record.name = Some("after-rename".to_string());
-        std::fs::write(&record_file, serde_json::to_vec(&record).unwrap()).unwrap();
+        std::fs::write(&record_file, serde_json_lenient::to_vec(&record).unwrap()).unwrap();
 
         let loader = DiskLoader::new(root).unwrap();
         // The index is reconciled: the new name resolves, the old one
@@ -1919,7 +1919,7 @@ mod tests {
         // simulate "remove_dir_all crashed mid-walk". The external
         // tombstone is also present.
         let sessions_dir = root.as_utf8_path().join("sessions");
-        let empty = serde_json::to_vec(&Index::default()).unwrap();
+        let empty = serde_json_lenient::to_vec(&Index::default()).unwrap();
         std::fs::write(sessions_dir.join("index.json").as_std_path(), empty).unwrap();
         let dir = session_dir_path(&root, &short);
         std::fs::write(tombstone_path(&root, &short), b"").unwrap();

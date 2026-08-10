@@ -14,7 +14,7 @@ use sessions::SessionId;
 
 use minimald::test_harness::unwrap_ready;
 
-use serde_json::Value;
+use serde_json_lenient::Value;
 
 // --- version ---
 
@@ -172,7 +172,8 @@ async fn ls_json_empty() {
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
-    let parsed: Value = serde_json::from_str(&text).expect("json output should be valid JSON");
+    let parsed: Value =
+        serde_json_lenient::from_str(&text).expect("json output should be valid JSON");
     assert!(parsed["resource_pool"]["cpu_cores"].as_u64().unwrap() > 0);
     assert!(parsed["resource_pool"]["memory_bytes"].as_u64().unwrap() > 0);
     assert!(parsed["sessions"].is_array());
@@ -200,7 +201,8 @@ async fn ls_json_with_sessions() {
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
-    let parsed: Value = serde_json::from_str(&text).expect("json output should be valid JSON");
+    let parsed: Value =
+        serde_json_lenient::from_str(&text).expect("json output should be valid JSON");
     let sessions = parsed["sessions"]
         .as_array()
         .expect("sessions should be an array");
