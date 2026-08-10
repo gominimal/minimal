@@ -118,7 +118,21 @@ pub fn redact_toml(input: &str) -> Result<String, toml::de::Error> {
     let table: toml::Table = input.parse()?;
     let mut value = toml::Value::Table(table);
     redact_toml_value(&mut value, false);
-    Ok(toml::to_string_pretty(&value).expect("re-serializing a just-parsed TOML value"))
+    let rendered = toml::to_string_pretty(&value).expect("re-serializing a just-parsed TOML value");
+
+    // Parsing back is not paranoia about our own masking — it is that the
+    // round trip is not guaranteed to survive. A document of deeply nested
+    // inline tables parses at one depth and re-serializes into a form that
+    // trips the parser's recursion limit, so `to_string_pretty` succeeds and
+    // the output is unreadable. Found by the `redact_roundtrip` fuzz target.
+    //
+    // Erroring keeps this function's contract consistent: unparseable input is
+    // already an error precisely so callers withhold the file rather than pass
+    // it through, and a bundle carrying TOML no consumer can read is the same
+    // failure one step later. Costs a second parse of a config-sized file on a
+    // path that runs when a support bundle is built.
+    rendered.parse::<toml::Table>()?;
+    Ok(rendered)
 }
 
 fn redact_toml_value(value: &mut toml::Value, mask_all: bool) {

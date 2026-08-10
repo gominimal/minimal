@@ -101,10 +101,15 @@ fuzz_target!(|data: &[u8]| {
     // the caller, per `redact_toml`'s contract.
     if s.parse::<toml::Table>().is_ok() {
         // Must not panic — including the `.expect()` on re-serialization.
-        let redacted = redact_toml(s).expect("input parsed, so redact_toml must not error");
+        // An `Err` is allowed: a document whose re-serialized form trips the
+        // parser's recursion limit is reported rather than emitted, so the
+        // caller withholds the file. Only the success path makes a promise.
+        let Ok(redacted) = redact_toml(s) else {
+            return;
+        };
 
-        // The output has to still be a TOML document, or the bundle carries a
-        // file no consumer can read.
+        // Whatever it does return has to still be a TOML document, or the
+        // bundle carries a file no consumer can read.
         let reparsed: toml::Table = redacted
             .parse()
             .expect("redacted output must still parse as TOML");
