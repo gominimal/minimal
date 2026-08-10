@@ -275,16 +275,32 @@ impl CheckCache {
                 let elf = object::File::parse(&*data)
                     .map_err(|e| anyhow!("parsing {}: {e}", full_path.display()))?;
 
-                let exports = elf.exports().unwrap();
-                let likely_glibc_stub_lib = exports.iter().any(|e| {
-                    e.name().ends_with(b"__libpthread_version_placeholder")
-                        || e.name().ends_with(b"__libdl_version_placeholder")
-                        || e.name().ends_with(b"__librt_version_placeholder")
+                // `exports()` is a lazy iterator that reports per-export parse
+                // errors as items, and it re-parses the export tables on every
+                // call, so collect once. A dropped export would surface as a
+                // bogus "missing symbol" against every dependent of this
+                // library, so a bad entry fails the whole lookup instead.
+                let exports = elf
+                    .exports()
+                    .and_then(|exports| exports.collect::<Result<Vec<_>, _>>())
+                    .map_err(|e| anyhow!("reading exports of {}: {e}", full_path.display()))?;
+                // `name()` is a name-or-ordinal: exporting by ordinal is a PE
+                // concept, and such an export carries no name for a dependent
+                // to link against, so it is not a symbol we can record.
+                let export_names: Vec<&[u8]> = exports
+                    .iter()
+                    .filter_map(|e| e.name().into_name())
+                    .collect();
+
+                let likely_glibc_stub_lib = export_names.iter().any(|name| {
+                    name.ends_with(b"__libpthread_version_placeholder")
+                        || name.ends_with(b"__libdl_version_placeholder")
+                        || name.ends_with(b"__librt_version_placeholder")
                 });
 
-                let mut symbols: HashSet<String> = exports
+                let mut symbols: HashSet<String> = export_names
                     .iter()
-                    .map(|e| String::from_utf8(e.name().to_vec()).unwrap())
+                    .map(|name| String::from_utf8(name.to_vec()).unwrap())
                     .chain(elf.dynamic_symbols().map(|s| s.name().unwrap().to_string()))
                     .collect();
 

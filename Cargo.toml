@@ -118,11 +118,7 @@ opentelemetry-semantic-conventions = "0.32"
 # datagram socket and steps CLOCK_REALTIME from the host's updates.
 nix = { version = "0.31", features = ["fs", "sched", "socket", "time", "user"] }
 nutype = { version = "0.7", features = ["serde"] }
-# Held at 0.39: 0.40 turns `Object::exports()`/`imports()` from
-# `Result<Vec<_>>` into lazy `Result<_>`-yielding iterators, so crates/check
-# needs a policy for a per-symbol error mid-scan. A deliberate change, not a
-# version bump.
-object = { version = "0.39", default-features = false, features = ["archive", "elf", "read_core", "std"] }
+object = { version = "0.40", default-features = false, features = ["archive", "elf", "read_core", "std"] }
 oci-spec = "0.10"
 path-absolutize = "4.0"
 rand = "0.10"
