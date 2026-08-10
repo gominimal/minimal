@@ -441,9 +441,9 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "base64"
-version = "0.23.0"
+version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64ct"
@@ -536,9 +536,9 @@ dependencies = [
 
 [[package]]
 name = "blake3"
-version = "1.8.5"
+version = "1.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
+checksum = "76ae7bad254120e9e4c63bafc385310756f90c484eac0e36b8317cf09cb92a77"
 dependencies = [
  "arrayref",
  "arrayvec 0.7.8",
@@ -783,7 +783,7 @@ dependencies = [
  "lcache",
  "moka",
  "nickel-lang-core",
- "object 0.39.1",
+ "object 0.40.0",
  "op",
  "ot",
  "path-absolutize",
@@ -862,9 +862,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.5"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "301b56658598e48f3648647ac6fc887be7e7108eddfa4e9b63fcf3ec58c0cadf"
+checksum = "473c7e07f409a8d772161724aa8db6a765a2532a70f9667eeb7b49d3d02fbdca"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -872,9 +872,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.5"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94a65403d1a1bd28f7dc68eb8506e8874808ee5eecb59298de588e2e1407a078"
+checksum = "7b48fea5a88e9ae728a2dcbedbfc0e730f7d60da42e1cb049a83c9fb8b789889"
 dependencies = [
  "anstream",
  "anstyle",
@@ -884,9 +884,9 @@ dependencies = [
 
 [[package]]
 name = "clap_complete"
-version = "4.6.8"
+version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f84a88507dbd05c695f2cb5e8558e747179134005e9893882dec964190ed89"
+checksum = "3be2ad0423bdbbb0e25bc89add796f3559706d4a95e1bc98e4d9662a957b6a19"
 dependencies = [
  "clap",
  "clap_lex",
@@ -1959,7 +1959,7 @@ checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
 dependencies = [
  "cfg-if",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3233,9 +3233,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jaq-all"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6071acf3aac775e865a510075f7efb30076b0a4077d2864393312761c8aa23fa"
+checksum = "b9729ff642d7995e5f6e4545ce25e699e9525cbe97ea63d5e75c7aeda9abec6c"
 dependencies = [
  "codesnake",
  "jaq-core",
@@ -3258,9 +3258,9 @@ dependencies = [
 
 [[package]]
 name = "jaq-fmts"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c199bdc175b37e68d6273bf581187743f8fd4aaa36dc8dfe091fde101298620b"
+checksum = "abe3b8669aa003e5d7a4ac187d411c4d50ae08aa08595ce3705f7298b70a0f3e"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -3273,16 +3273,16 @@ dependencies = [
  "jaq-std",
  "memmap2",
  "num-bigint",
- "saphyr-parser",
+ "saphyr-parser 0.0.8",
  "toml-span",
  "xmlparser",
 ]
 
 [[package]]
 name = "jaq-json"
-version = "2.0.1"
+version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4ec9aaad7340e6990c6c1878ef3b46dbec624e535d7f786cc9ddcf94f773d33"
+checksum = "48d801b0b57f10064c4e9f5a4f6c97d0ccf62649b179ff8ac23cd494a3120ee9"
 dependencies = [
  "bstr",
  "bytes",
@@ -4094,7 +4094,7 @@ dependencies = [
  "async-compression",
  "async-dialog",
  "async-tar",
- "base64 0.23.0",
+ "base64 0.23.1",
  "blake3",
  "boringtun",
  "bytes",
@@ -4442,7 +4442,7 @@ dependencies = [
  "paste",
  "pretty",
  "regex",
- "saphyr-parser",
+ "saphyr-parser 0.0.6",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -4478,7 +4478,7 @@ dependencies = [
  "ouroboros",
  "pretty",
  "regex",
- "saphyr-parser",
+ "saphyr-parser 0.0.6",
  "serde",
  "serde_json",
  "simple-counter",
@@ -4670,9 +4670,9 @@ dependencies = [
 
 [[package]]
 name = "object"
-version = "0.39.1"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+checksum = "dd229a0361b9d0d4396176e02d65897f487eebeab7caa6d443855ee152ca0b9c"
 dependencies = [
  "memchr",
 ]
@@ -6386,6 +6386,16 @@ checksum = "4fb771b59f6b1985d1406325ec28f97cfb14256abcec4fdfb37b36a1766d6af7"
 dependencies = [
  "arraydeque",
  "hashlink",
+]
+
+[[package]]
+name = "saphyr-parser"
+version = "0.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "554aa12c59a0030f9b96ef955b83d07932371bbec0da172b6fac351da64b5c7e"
+dependencies = [
+ "arraydeque",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -8559,15 +8569,6 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
-dependencies = [
- "windows-targets",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets",
 ]
