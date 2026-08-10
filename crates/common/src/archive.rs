@@ -961,13 +961,8 @@ mod tests {
         let stream = include_bytes!("../tests/data/xz_backward_size_overflow.tar.xz");
         let extract_dir = tempfile::tempdir().unwrap();
 
-        let err = extract_compressed_tar(
-            &stream[..],
-            Compression::Xz,
-            extract_dir.path(),
-            None,
-        )
-        .expect_err("a malformed xz stream must error");
+        let err = extract_compressed_tar(&stream[..], Compression::Xz, extract_dir.path(), None)
+            .expect_err("a malformed xz stream must error");
         assert!(
             matches!(err, ArchiveError::CompressionError(_) | ArchiveError::IO(_)),
             "expected a compression/IO error, got {err:?}",
