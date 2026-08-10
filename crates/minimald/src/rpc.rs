@@ -945,18 +945,14 @@ async fn unpack_workspace_files(
 /// Unpacks a client-streamed tarball entry by entry, rejecting anything that
 /// would land outside `dest`.
 ///
-/// `async_tar::Archive::unpack` cannot be used here. Like the synchronous
-/// `tar` crate it writes link targets verbatim, so a tarball carrying
-/// `link -> /` plants an escaping symlink in the workspace — and the SFTP
-/// subsystem is scoped to that very directory, so a follow-up write through
-/// the link leaves the workspace entirely. Both halves are client-supplied.
-///
-/// `unpack_workspace_patches` below already iterates per-entry for exactly
-/// this reason ("the client is untrusted so we re-check the wire form here");
-/// this path did not, and the two share an upload channel.
-///
-/// The rules come from `common::archive` rather than being restated: a second
-/// implementation of a containment check is how this class of bug returns.
+/// `async_tar::Archive::unpack` writes link targets verbatim, so `link -> /`
+/// plants an escaping symlink in the shared workspace. The sftp path
+/// canonicalizes and refuses to follow it (`SftpSession::contained`), but the
+/// other consumers of that dir (sandbox mount, attach shell, `op::materialize`)
+/// shouldn't have to — so don't plant it. Escaping entry paths (tar-slip) are
+/// rejected the same way. `unpack_workspace_patches` below already validates
+/// per-entry; this path didn't, and they share an upload channel. Containment
+/// rules come from `common::archive`, not a second copy.
 async fn unpack_validated<R>(reader: R, dest: &std::path::Path) -> Result<(), String>
 where
     R: tokio::io::AsyncRead + Unpin + Send,
@@ -1579,13 +1575,9 @@ mod tests {
         buf
     }
 
-    /// Regression: the workspace uploader must not plant a link whose target
-    /// leaves the workspace.
-    ///
-    /// It used to call `async_tar::Archive::unpack`, which writes link targets
-    /// verbatim. The SFTP subsystem is scoped to the same directory, so a
-    /// client could upload `link -> /` and then write through it — a remote
-    /// arbitrary write assembled from two client-supplied halves.
+    /// Regression: the uploader must not plant a link whose target leaves the
+    /// workspace. `async_tar::Archive::unpack` writes link targets verbatim;
+    /// `unpack_validated` drops the escaping link and keeps the rest.
     #[tokio::test]
     async fn unpack_validated_skips_links_escaping_the_workspace() {
         for symlink in [true, false] {

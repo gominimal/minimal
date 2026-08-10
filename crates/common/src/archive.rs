@@ -269,17 +269,12 @@ pub fn extract_compressed_tar<R: Read>(
             // it into a clean error.
             let mut decomp_buf =
                 LimitedWriter::new(tempfile::tempfile()?, MAX_XZ_DECOMPRESSED_BYTES);
-            // `lzma_rs` panics on some malformed streams rather than returning
-            // an error: `backward_size + 1` in its xz footer check overflows on
-            // `u32::MAX` (decode/xz.rs). The shipped release profile has
-            // overflow-checks off, so that particular one wraps harmlessly —
-            // but any build with them on (tests, dev, this crate's fuzz target)
-            // aborts instead, and `extract_compressed_tar`'s contract is that a
-            // malformed archive yields an `ArchiveError` and never panics.
-            //
-            // Of the five arms only xz runs a pure-Rust decoder; the others
-            // bind long-hardened C libraries. Contain it here rather than
-            // trusting every future lzma_rs edge case.
+            // `lzma_rs` panics on some malformed streams: `backward_size + 1`
+            // in its xz footer check overflows at `u32::MAX` (decode/xz.rs).
+            // Release wraps it (overflow-checks off), but overflow-checked
+            // builds abort, violating this fn's never-panic contract. xz is the
+            // only pure-Rust arm; contain it rather than trust every lzma_rs
+            // edge case.
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 lzma_rs::xz_decompress(&mut std::io::BufReader::new(reader), &mut decomp_buf)
             }))
@@ -944,18 +939,11 @@ mod tests {
         assert!(w.into_inner().is_empty());
     }
 
-    /// A malformed xz stream must yield an `ArchiveError`, not a panic.
-    ///
-    /// `lzma_rs` overflows `backward_size + 1` in its xz footer check
-    /// (decode/xz.rs) on `u32::MAX`. The shipped release profile has
-    /// overflow-checks off so that one wraps, but tests and dev builds abort,
-    /// and `extract_compressed_tar` promises never to panic on malformed
-    /// input. The fixture is the stream the `archive_extract` fuzz target
-    /// produced, minus its two control bytes.
-    ///
-    /// This test is where that guard is proved: the fuzz target cannot check
-    /// it, because `libfuzzer-sys`'s panic hook aborts before `catch_unwind`
-    /// can run.
+    /// A malformed xz stream must yield an `ArchiveError`, not a panic (the
+    /// `catch_unwind` guard in `extract_compressed_tar`). Fixture is the
+    /// fuzz-produced overflow stream, minus its two control bytes. The fuzz
+    /// target can't assert this — `libfuzzer-sys`'s panic hook aborts before
+    /// `catch_unwind` runs — so it's proved here.
     #[test]
     fn extract_xz_panic_is_contained() {
         let stream = include_bytes!("../tests/data/xz_backward_size_overflow.tar.xz");
