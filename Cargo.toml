@@ -102,7 +102,7 @@ indicatif = "0.18"
 indoc = "^2.0"
 inquire = { version = "0.9", default-features = false, features = ["crossterm", "fuzzy"] }
 insta = "1.48"
-jaq-all = "0.2.0"
+jaq-all = "0.3.0"
 json-subscriber = "0.3"
 libc = "0.2"
 lzma-rs = "0.3"
