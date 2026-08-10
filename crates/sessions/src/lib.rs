@@ -758,14 +758,14 @@ mod tests {
     fn record_without_status_field_deserializes_as_active() {
         // Build a JSON document deliberately missing the `status`
         // field, with the rest of the fields set to plausible values.
-        let raw = serde_json::json!({
+        let raw = serde_json_lenient::json!({
             "id": SessionId::nil(),
             "name": null,
             "username": null,
             "project_path": "/p",
             "attrs": {},
         });
-        let parsed: Record = serde_json::from_value(raw).expect("deserialize");
+        let parsed: Record = serde_json_lenient::from_value(raw).expect("deserialize");
         assert_eq!(parsed.status, SessionStatus::Active);
     }
 
@@ -774,14 +774,14 @@ mod tests {
     /// `null` is the single representation of "no name" on every surface.
     #[test]
     fn record_with_empty_name_deserializes_as_none() {
-        let raw = serde_json::json!({
+        let raw = serde_json_lenient::json!({
             "id": SessionId::nil(),
             "name": "",
             "username": null,
             "project_path": "/p",
             "attrs": {},
         });
-        let parsed: Record = serde_json::from_value(raw).expect("deserialize");
+        let parsed: Record = serde_json_lenient::from_value(raw).expect("deserialize");
         assert_eq!(parsed.name, None);
     }
 
@@ -797,7 +797,8 @@ mod tests {
     #[test]
     fn legacy_draft_string_deserializes_as_pending() {
         let parsed: SessionStatus =
-            serde_json::from_value(serde_json::json!("draft")).expect("deserialize");
+            serde_json_lenient::from_value(serde_json_lenient::json!("draft"))
+                .expect("deserialize");
         assert_eq!(parsed, SessionStatus::Pending);
     }
 
@@ -805,7 +806,7 @@ mod tests {
     /// read-only.
     #[test]
     fn pending_serializes_as_pending_not_draft() {
-        let s = serde_json::to_string(&SessionStatus::Pending).expect("serialize");
+        let s = serde_json_lenient::to_string(&SessionStatus::Pending).expect("serialize");
         assert_eq!(s, "\"pending\"");
     }
 }

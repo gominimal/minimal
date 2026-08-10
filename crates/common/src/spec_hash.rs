@@ -121,11 +121,11 @@ mod tests {
         let spec_hash = SpecHash(hash);
 
         // Serialize to JSON
-        let serialized = serde_json::to_string(&spec_hash).expect("Failed to serialize");
+        let serialized = serde_json_lenient::to_string(&spec_hash).expect("Failed to serialize");
 
         // Deserialize from JSON
         let deserialized: SpecHash =
-            serde_json::from_str(&serialized).expect("Failed to deserialize");
+            serde_json_lenient::from_str(&serialized).expect("Failed to deserialize");
 
         // Verify roundtrip
         assert_eq!(spec_hash, deserialized);

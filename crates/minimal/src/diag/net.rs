@@ -166,7 +166,7 @@ pub async fn add_probe(
     provider: &str,
     probe: &SocketProbe,
 ) -> Result<(), anyhow::Error> {
-    let json = serde_json::to_vec_pretty(probe).context("serializing socket probe")?;
+    let json = serde_json_lenient::to_vec_pretty(probe).context("serializing socket probe")?;
     w.add_bytes(
         &format!("providers/{provider}/socket-probe.json"),
         &json,

@@ -126,7 +126,7 @@ impl OciImage<'_> {
             arch: arch.to_string(),
         });
 
-        let image_config_bytes = serde_json::to_vec(
+        let image_config_bytes = serde_json_lenient::to_vec(
             &ImageConfigurationBuilder::default()
                 .architecture(arch)
                 .os("linux")
@@ -176,7 +176,7 @@ impl OciImage<'_> {
         tb.append(&th, image_config_bytes.as_slice())?;
 
         // Image manifest - written out as blob object by hash
-        let image_manifest_bytes = serde_json::to_vec(
+        let image_manifest_bytes = serde_json_lenient::to_vec(
             &ImageManifestBuilder::default()
                 .schema_version(SCHEMA_VERSION)
                 .config(

@@ -301,7 +301,7 @@ impl LayerCache for LayerCacheDir {
             .map_err(|e| {
                 tracing::warn!("LayerCacheDir::insert failed open: {}", e);
             })?;
-        serde_json::to_writer(f, layer).map_err(|e| {
+        serde_json_lenient::to_writer(f, layer).map_err(|e| {
             tracing::warn!("LayerCacheDir::insert failed to serialize layer: {}", e);
             std::fs::remove_file(p).ok(); // best effort
         })?;
@@ -312,7 +312,7 @@ impl LayerCache for LayerCacheDir {
         let p = self.0.join(lo.input_hash().to_hex().as_ref());
 
         if let Ok(f) = std::fs::File::open(&p) {
-            let layer: Layer = serde_json::from_reader(f).map_err(|e| {
+            let layer: Layer = serde_json_lenient::from_reader(f).map_err(|e| {
                 tracing::warn!("LayerCacheDir::get failed to deserialize: {}", e);
                 std::fs::remove_file(&p).ok(); // best effort, delete broken file
             })?;

@@ -244,7 +244,7 @@ Ideas, roughly in value order, for follow-up on a beefy Linux box:
    | Surface | Why not |
    |---|---|
    | `lcache::ReadTracker::read_records` | Fixed-size records `read_exact`ed into a stack buffer — no length field to abuse. |
-   | `lcache::EntryMeta::read_from` | Plain `serde_json::from_reader`; serde_json is fuzzed upstream far harder than we would. |
+   | `lcache::EntryMeta::read_from` | Plain `serde_json_lenient::from_reader`; the serde_json parser it forks is fuzzed upstream far harder than we would. |
    | `switch` subnet/MAC math | `SwitchSubnet::new` constrains the prefix to `8..=29` so the reserved-address arithmetic cannot underflow; private fields and no `Deserialize` to bypass the constructor. |
    | `sessions::primitives` var names | Both the hand-written `Deserialize` and `FromStr` route through `try_new`; there is no second door. |
    | `minimald::net::wg` | `WgPublicKey::from_str` length-checks its `try_into`; `Ipv4Cidr` validates the prefix and special-cases `/0` in `mask()`. |

@@ -153,7 +153,7 @@ mod tests {
             info.disks[1].total_bytes.is_none(),
             "a missing path is Nones, not an error"
         );
-        let json = serde_json::to_value(&info).unwrap();
+        let json = serde_json_lenient::to_value(&info).unwrap();
         assert!(json["euid"].is_u64());
     }
 }

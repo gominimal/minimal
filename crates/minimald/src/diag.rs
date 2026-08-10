@@ -237,7 +237,7 @@ async fn read_request(
     if buf.is_empty() {
         return Ok(DiagBundleRequest::default());
     }
-    serde_json::from_slice(&buf).map_err(|e| format!("parsing diag request: {e}"))
+    serde_json_lenient::from_slice(&buf).map_err(|e| format!("parsing diag request: {e}"))
 }
 
 /// The per-log tail cap this run honors: the daemon default when the request
@@ -406,7 +406,7 @@ async fn meta<W: BundleSink>(
             .as_deref()
             .map(scrubbed_cmdline),
     };
-    let json = serde_json::to_vec_pretty(&info).context("serializing meta")?;
+    let json = serde_json_lenient::to_vec_pretty(&info).context("serializing meta")?;
     // `Keys`, not `None`: `kernel_cmdline` goes through the same key-based
     // scrub a process argv does, so this is no longer a verbatim capture.
     w.add_bytes("meta.json", &json, Redaction::Keys).await
@@ -625,10 +625,11 @@ async fn sessions<W: BundleSink>(
         };
         // Records can hold user env-var values (loadout vars); mask
         // secret-shaped content before it leaves the machine.
-        match serde_json::from_slice::<serde_json::Value>(&raw) {
+        match serde_json_lenient::from_slice::<serde_json_lenient::Value>(&raw) {
             Ok(mut value) => {
                 redact_json(&mut value);
-                let json = serde_json::to_vec_pretty(&value).context("serializing record")?;
+                let json =
+                    serde_json_lenient::to_vec_pretty(&value).context("serializing record")?;
                 w.add_bytes(
                     &format!("sessions/{short}/record.json.redacted"),
                     &json,
@@ -691,7 +692,7 @@ fn io_kind(e: &anyhow::Error) -> Option<std::io::ErrorKind> {
 /// `MINIMALD_*` detach markers, the resolved dirs.
 async fn env<W: BundleSink>(w: &mut BundleWriter<W>) -> Result<(), anyhow::Error> {
     let env = masked_process_env(is_env_value_allowlisted);
-    let json = serde_json::to_vec_pretty(&env).context("serializing env")?;
+    let json = serde_json_lenient::to_vec_pretty(&env).context("serializing env")?;
     w.add_bytes("env.json", &json, Redaction::Keys).await
 }
 
@@ -741,7 +742,7 @@ async fn gvproxy_probe<W: BundleSink>(w: &mut BundleWriter<W>) -> Result<(), any
             http_head: None,
         },
     };
-    let json = serde_json::to_vec_pretty(&probe).context("serializing gvproxy probe")?;
+    let json = serde_json_lenient::to_vec_pretty(&probe).context("serializing gvproxy probe")?;
     w.add_bytes("net/gvproxy.json", &json, Redaction::None)
         .await
 }
@@ -779,7 +780,7 @@ async fn disk<W: BundleSink>(
             .await
             .unwrap_or_else(|e| format!("<unreadable: {e}>")),
     };
-    let json = serde_json::to_vec_pretty(&info).context("serializing disk info")?;
+    let json = serde_json_lenient::to_vec_pretty(&info).context("serializing disk info")?;
     w.add_bytes("disk.json", &json, Redaction::None).await
 }
 
@@ -820,7 +821,7 @@ mod tests {
 
     /// Fetches a default bundle and decodes it to `path -> contents`.
     async fn fetch_bundle(server: &TestServer) -> BTreeMap<String, Vec<u8>> {
-        let body = serde_json::to_vec(&DiagBundleRequest::default()).unwrap();
+        let body = serde_json_lenient::to_vec(&DiagBundleRequest::default()).unwrap();
         let (payload, stderr) = request_bundle(server, &body).await;
         assert!(!payload.is_empty(), "no bundle streamed; stderr: {stderr}");
 
@@ -848,8 +849,8 @@ mod tests {
         }
     }
 
-    fn manifest(files: &BTreeMap<String, Vec<u8>>) -> serde_json::Value {
-        serde_json::from_slice(&files["manifest.json"]).expect("manifest is valid JSON")
+    fn manifest(files: &BTreeMap<String, Vec<u8>>) -> serde_json_lenient::Value {
+        serde_json_lenient::from_slice(&files["manifest.json"]).expect("manifest is valid JSON")
     }
 
     #[tokio::test]
@@ -857,7 +858,8 @@ mod tests {
         let server = TestServer::new().await;
         let files = fetch_bundle(&server).await;
 
-        let meta: serde_json::Value = serde_json::from_slice(&files["meta.json"]).unwrap();
+        let meta: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["meta.json"]).unwrap();
         assert_eq!(meta["version"], version::VERSION);
         assert_eq!(meta["in_microvm"], false);
         assert_eq!(meta["pid"], std::process::id());
@@ -937,7 +939,8 @@ mod tests {
         );
 
         // Every value the policy does not allow is masked, names always kept.
-        let env: BTreeMap<String, String> = serde_json::from_slice(&files["env.json"]).unwrap();
+        let env: BTreeMap<String, String> =
+            serde_json_lenient::from_slice(&files["env.json"]).unwrap();
         assert!(!env.is_empty());
         for (name, value) in &env {
             assert!(
@@ -955,7 +958,8 @@ mod tests {
     async fn meta_carries_the_guest_kernel_identity() {
         let server = TestServer::new().await;
         let files = fetch_bundle(&server).await;
-        let meta: serde_json::Value = serde_json::from_slice(&files["meta.json"]).unwrap();
+        let meta: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["meta.json"]).unwrap();
 
         let banner = meta["kernel"].as_str().expect("/proc/version is readable");
         assert!(
@@ -1122,7 +1126,7 @@ mod tests {
             .find(|(path, _)| path.ends_with("record.json.redacted"))
             .map(|(_, contents)| contents)
             .expect("a redacted session record should be bundled");
-        let value: serde_json::Value = serde_json::from_slice(record).unwrap();
+        let value: serde_json_lenient::Value = serde_json_lenient::from_slice(record).unwrap();
         assert_eq!(value["name"], "diag-test", "non-secret fields survive");
     }
 
@@ -1284,7 +1288,8 @@ mod tests {
     async fn state_listing_is_optional() {
         let server = TestServer::new().await;
         let body =
-            serde_json::to_vec(&DiagBundleRequest::default().with_state_listing(false)).unwrap();
+            serde_json_lenient::to_vec(&DiagBundleRequest::default().with_state_listing(false))
+                .unwrap();
         let (payload, stderr) = request_bundle(&server, &body).await;
         assert!(!payload.is_empty(), "stderr: {stderr}");
 

@@ -232,7 +232,8 @@ mod tests {
             .unwrap();
 
         let files = crate::bundle::tests::unpack_bundle(&out, "r").await;
-        let manifest: serde_json::Value = serde_json::from_slice(&files["manifest.json"]).unwrap();
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
         let recorded = format!("{}{}", manifest["collected"], manifest["skipped"]);
         assert!(
             recorded.contains("logs/kmsg.txt"),

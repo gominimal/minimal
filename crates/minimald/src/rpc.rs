@@ -70,9 +70,9 @@ trait ServeOneshot: OneshotSshRpc {
         // through the same match so the client always sees a legible message
         // on extended data instead of an opaque EOF (#901).
         let result: Result<Vec<u8>, ConnectionError> = async {
-            let request: Self::Request<'_> = serde_json::from_slice(&buf)?;
+            let request: Self::Request<'_> = serde_json_lenient::from_slice(&buf)?;
             let response = handler(request).await?;
-            Ok(serde_json::to_vec(&response)?)
+            Ok(serde_json_lenient::to_vec(&response)?)
         }
         .await;
 
@@ -745,7 +745,7 @@ async fn write_update(
     c: &mut RuChannel<Msg>,
     update: &CleanCacheUpdate,
 ) -> Result<(), ConnectionError> {
-    let mut line = serde_json::to_vec(update)?;
+    let mut line = serde_json_lenient::to_vec(update)?;
     line.push(b'\n');
     c.data_bytes(line).await?;
     Ok(())
@@ -765,7 +765,7 @@ async fn read_channel_request<T: serde::de::DeserializeOwned>(
             _ => {}
         }
     }
-    Ok(serde_json::from_slice(&buf)?)
+    Ok(serde_json_lenient::from_slice(&buf)?)
 }
 
 pub(crate) const STREAM_WORKSPACE_FILES: &str =
@@ -1557,7 +1557,7 @@ mod tests {
             .await;
         let mut stream = channel.into_stream();
         stream
-            .write_all(&serde_json::to_vec(&req).unwrap())
+            .write_all(&serde_json_lenient::to_vec(&req).unwrap())
             .await
             .unwrap();
         // Half-close: the handler reads the request until the client is done.
@@ -1568,7 +1568,7 @@ mod tests {
         String::from_utf8(body)
             .unwrap()
             .lines()
-            .map(|line| serde_json::from_str(line).expect("each line is an update"))
+            .map(|line| serde_json_lenient::from_str(line).expect("each line is an update"))
             .collect()
     }
 
@@ -1791,7 +1791,7 @@ mod tests {
         let mut client = server.connect().await;
 
         // Send invalid JSON to a known subsystem: handle_channel will fail
-        // at serde_json::from_slice, which now writes the error to extended
+        // at serde_json_lenient::from_slice, which now writes the error to extended
         // data before closing the channel.
         let mut channel = client.open_subsystem(GetVersion::NAME, &[]).await;
         channel

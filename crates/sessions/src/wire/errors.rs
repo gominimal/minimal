@@ -87,8 +87,8 @@ mod tests {
     where
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let json = serde_json::to_string(value).expect("serialize");
-        serde_json::from_str(&json).expect("deserialize")
+        let json = serde_json_lenient::to_string(value).expect("serialize");
+        serde_json_lenient::from_str(&json).expect("deserialize")
     }
 
     #[test]
@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn uses_explicit_kind_tag() {
         let e = WireError::UnknownSessionId;
-        let json = serde_json::to_string(&e).unwrap();
+        let json = serde_json_lenient::to_string(&e).unwrap();
         assert!(
             json.contains(r#""kind":"unknown_session_id""#),
             "expected `kind` tag, got: {json}"

@@ -37,13 +37,14 @@ impl clap::FromArgMatches for RunArgs {
         let variant = match (task_name, upstream, task_spec) {
             (Some(name), None, None) => RunVariant::ByName { task_name: name },
             (None, Some(ups), Some(spec)) => {
-                let upstream: mfile::LinkConfig = serde_json::from_str(&ups).map_err(|e| {
-                    clap::Error::raw(
-                        clap::error::ErrorKind::ValueValidation,
-                        format!("invalid --upstream JSON: {e}\n"),
-                    )
-                })?;
-                let task: mfile::Task = serde_json::from_str(&spec).map_err(|e| {
+                let upstream: mfile::LinkConfig =
+                    serde_json_lenient::from_str(&ups).map_err(|e| {
+                        clap::Error::raw(
+                            clap::error::ErrorKind::ValueValidation,
+                            format!("invalid --upstream JSON: {e}\n"),
+                        )
+                    })?;
+                let task: mfile::Task = serde_json_lenient::from_str(&spec).map_err(|e| {
                     clap::Error::raw(
                         clap::error::ErrorKind::ValueValidation,
                         format!("invalid --task-spec JSON: {e}\n"),

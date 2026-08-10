@@ -33,7 +33,7 @@ clap_complete.workspace = true
 dirs.workspace = true
 blake3.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json_lenient.workspace = true
 
 rayon.workspace = true
 tokio.workspace = true

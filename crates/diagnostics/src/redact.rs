@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::Value;
+use serde_json_lenient::Value;
 
 /// Key substrings that mark a value as sensitive, matched case-insensitively.
 const SENSITIVE_KEY_PARTS: &[&str] = &[
@@ -196,7 +196,7 @@ pub fn masked_process_env(is_value_allowed: impl Fn(&str) -> bool) -> BTreeMap<S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json_lenient::json;
 
     #[test]
     fn sensitive_keys_match_case_insensitively() {

@@ -894,7 +894,7 @@ mod tests {
     /// bare `{}` probe (or an older client) still gets a full bundle.
     #[test]
     fn diag_bundle_request_defaults_from_empty_object() {
-        let req: DiagBundleRequest = serde_json::from_str("{}").expect("deserialize");
+        let req: DiagBundleRequest = serde_json_lenient::from_str("{}").expect("deserialize");
         assert_eq!(req, DiagBundleRequest::default());
         assert_eq!(req.log_tail_bytes, 0);
         assert!(req.include_state_listing);
@@ -917,7 +917,7 @@ mod tests {
     /// the subsystem name can't drift without breaking old clients.
     #[test]
     fn clean_cache_wire_shapes_round_trip() {
-        let req: CleanCacheRequest = serde_json::from_str("{}").expect("deserialize");
+        let req: CleanCacheRequest = serde_json_lenient::from_str("{}").expect("deserialize");
         assert_eq!(req, CleanCacheRequest::default());
         assert_eq!(req.older_than_secs, 0);
         assert_eq!(
@@ -973,8 +973,8 @@ mod tests {
             internal_port: 80,
             proto: IpProto::Tcp,
         };
-        let json = serde_json::to_string(&mapping).unwrap();
-        let rt: PortMapping = serde_json::from_str(&json).unwrap();
+        let json = serde_json_lenient::to_string(&mapping).unwrap();
+        let rt: PortMapping = serde_json_lenient::from_str(&json).unwrap();
         assert_eq!(rt, mapping);
 
         // IngressPolicy default and round-trip
@@ -982,21 +982,21 @@ mod tests {
             port_mappings: vec![mapping],
             dynamic_allowed_range: Some((10000, 20000)),
         };
-        let json = serde_json::to_string(&ingress).unwrap();
-        let rt: IngressPolicy = serde_json::from_str(&json).unwrap();
+        let json = serde_json_lenient::to_string(&ingress).unwrap();
+        let rt: IngressPolicy = serde_json_lenient::from_str(&json).unwrap();
         assert_eq!(rt, ingress);
 
         // EgressPolicy default serializes without error
         let egress = EgressPolicy::default();
-        let json = serde_json::to_string(&egress).unwrap();
-        let _: EgressPolicy = serde_json::from_str(&json).unwrap();
+        let json = serde_json_lenient::to_string(&egress).unwrap();
+        let _: EgressPolicy = serde_json_lenient::from_str(&json).unwrap();
 
         // SessionPolicy with null egress and default ingress matches expected CLI output
         let policy = SessionPolicy {
             egress: None,
             ingress: Some(IngressPolicy::default()),
         };
-        let json = serde_json::to_string(&policy).unwrap();
+        let json = serde_json_lenient::to_string(&policy).unwrap();
         assert!(json.contains("\"egress\":null"), "got: {json}");
         assert!(json.contains("\"port_mappings\":[]"), "got: {json}");
         assert!(
@@ -1009,8 +1009,8 @@ mod tests {
     where
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let json = serde_json::to_string(value).expect("serialize");
-        serde_json::from_str(&json).expect("deserialize")
+        let json = serde_json_lenient::to_string(value).expect("serialize");
+        serde_json_lenient::from_str(&json).expect("deserialize")
     }
 
     /// Regression: the daemon reports "no such session" from `GetSessionPolicy`
@@ -1022,7 +1022,7 @@ mod tests {
     #[test]
     fn errorable_session_policy_decodes_daemon_error_as_err() {
         let decoded: Errorable<SessionPolicy> =
-            serde_json::from_str(r#"{"error":"no session found"}"#).expect("deserialize");
+            serde_json_lenient::from_str(r#"{"error":"no session found"}"#).expect("deserialize");
         assert_eq!(
             decoded,
             Errorable::Err {
@@ -1032,7 +1032,7 @@ mod tests {
 
         // A real policy response still decodes as the `Ok` arm.
         let decoded: Errorable<SessionPolicy> =
-            serde_json::from_str(r#"{"egress":null,"ingress":null}"#).expect("deserialize");
+            serde_json_lenient::from_str(r#"{"egress":null,"ingress":null}"#).expect("deserialize");
         assert_eq!(
             decoded,
             Errorable::Ok(SessionPolicy {
@@ -1052,14 +1052,14 @@ mod tests {
             unpushed_commits: 3,
         };
         assert_eq!(round_trip(&vcs), vcs);
-        let json = serde_json::to_string(&vcs).unwrap();
+        let json = serde_json_lenient::to_string(&vcs).unwrap();
         assert!(json.contains(r#""kind":"vcs""#), "got: {json}");
 
         let fallback = SessionDeltaResponse::ChangedSinceActivation {
             rows: vec!["A scratch.txt".to_string()],
         };
         assert_eq!(round_trip(&fallback), fallback);
-        let json = serde_json::to_string(&fallback).unwrap();
+        let json = serde_json_lenient::to_string(&fallback).unwrap();
         assert!(
             json.contains(r#""kind":"changed_since_activation""#),
             "got: {json}"
@@ -1067,7 +1067,7 @@ mod tests {
 
         let unavailable = SessionDeltaResponse::Unavailable;
         assert_eq!(round_trip(&unavailable), unavailable);
-        let json = serde_json::to_string(&unavailable).unwrap();
+        let json = serde_json_lenient::to_string(&unavailable).unwrap();
         assert!(json.contains(r#""kind":"unavailable""#), "got: {json}");
     }
 
@@ -1098,7 +1098,7 @@ mod tests {
     #[test]
     fn list_sessions_accepts_response_without_resource_pool() {
         let resp: ListSessionsResponse =
-            serde_json::from_str(r#"{"sessions":[]}"#).expect("deserialize");
+            serde_json_lenient::from_str(r#"{"sessions":[]}"#).expect("deserialize");
         assert!(resp.resource_pool.is_none());
         assert!(resp.sessions.is_empty());
     }
@@ -1109,7 +1109,7 @@ mod tests {
     /// deserialization.
     #[test]
     fn list_sessions_entry_accepts_response_without_project_path_and_status() {
-        let resp: ListSessionsResponse = serde_json::from_str(
+        let resp: ListSessionsResponse = serde_json_lenient::from_str(
             r#"{"sessions":[{"id":"00000000-0000-0000-0000-000000000001","name":"old"}]}"#,
         )
         .expect("deserialize");
@@ -1141,10 +1141,11 @@ mod tests {
     /// entirely; it defaults to empty rather than failing to parse.
     #[test]
     fn configure_loadout_request_accepts_missing_contribution_field() {
-        let raw = serde_json::json!({
+        let raw = serde_json_lenient::json!({
             "session_id": "00000000-0000-0000-0000-000000000001",
         });
-        let req: ConfigureLoadoutRequest = serde_json::from_value(raw).expect("deserialize");
+        let req: ConfigureLoadoutRequest =
+            serde_json_lenient::from_value(raw).expect("deserialize");
         assert_eq!(req.contribution, WireContribution::default());
     }
 
@@ -1152,7 +1153,7 @@ mod tests {
     fn configure_loadout_response_materialized_round_trips() {
         let resp = ConfigureLoadoutResponse::Materialized;
         assert_eq!(round_trip(&resp), resp);
-        let json = serde_json::to_string(&resp).unwrap();
+        let json = serde_json_lenient::to_string(&resp).unwrap();
         assert!(json.contains(r#""kind":"materialized""#), "got: {json}");
     }
 
@@ -1168,7 +1169,7 @@ mod tests {
             },
         };
         assert_eq!(round_trip(&resp), resp);
-        let json = serde_json::to_string(&resp).unwrap();
+        let json = serde_json_lenient::to_string(&resp).unwrap();
         assert!(json.contains(r#""kind":"pending""#), "got: {json}");
     }
 }

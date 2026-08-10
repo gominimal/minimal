@@ -22,7 +22,7 @@ fd-lock.workspace = true
 libc.workspace = true
 serde = { workspace = true }
 thiserror.workspace = true
-serde_json.workspace = true
+serde_json_lenient.workspace = true
 toml.workspace = true
 # Cross-platform per-process resource sampling (CPU%, RSS, disk I/O) of the VMM
 # child PID, and host capacity (cores/memory) for `config set` validation (#747).

@@ -157,7 +157,7 @@ pub async fn cmd_dump(args: DumpArgs, ctx: &mut Context) -> Result<(), Error> {
             packages: true,
             stacks: false,
         } => {
-            serde_json::to_writer_pretty(&w, &out_packages).unwrap();
+            serde_json_lenient::to_writer_pretty(&w, &out_packages).unwrap();
         }
         DumpKind {
             packages: false,
@@ -168,7 +168,7 @@ pub async fn cmd_dump(args: DumpArgs, ctx: &mut Context) -> Result<(), Error> {
                 args.name.as_deref(),
                 args.exact,
             );
-            serde_json::to_writer_pretty(&w, &out_stacks).unwrap();
+            serde_json_lenient::to_writer_pretty(&w, &out_stacks).unwrap();
         }
         // The `DumpKind` clap group is `required = true, multiple = false`,
         // so exactly one of `--packages`/`--stacks` is ever set.

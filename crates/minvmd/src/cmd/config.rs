@@ -151,7 +151,7 @@ pub fn run_show(json: bool) -> Result<()> {
     let ram_source = source(env_ram_mib().is_some(), cfg.ram_mib.is_some());
 
     if json {
-        let out = serde_json::json!({
+        let out = serde_json_lenient::json!({
             "vcpus": vcpus,
             "ram_mib": ram_mib,
             "vcpus_source": vcpus_source,

@@ -92,7 +92,7 @@ impl EntryMeta {
             dir_hex,
             &hash_hex.as_str()[2..]
         ))?;
-        serde_json::to_writer(f, self).map_err(std::io::Error::from)?;
+        serde_json_lenient::to_writer(f, self).map_err(std::io::Error::from)?;
         Ok(())
     }
 
@@ -106,12 +106,12 @@ impl EntryMeta {
             dir_hex,
             &hash_hex.as_str()[2..]
         ))?;
-        serde_json::from_reader(f).map_err(|e| CacheErr::IO(std::io::Error::from(e)))
+        serde_json_lenient::from_reader(f).map_err(|e| CacheErr::IO(std::io::Error::from(e)))
     }
 
     /// Reads metadata from a file handle.
     pub(crate) fn read_from<R: Read>(reader: R) -> Result<Self, CacheErr> {
-        serde_json::from_reader(reader).map_err(|e| CacheErr::IO(std::io::Error::from(e)))
+        serde_json_lenient::from_reader(reader).map_err(|e| CacheErr::IO(std::io::Error::from(e)))
     }
 
     /// Lists all metadata entries in the cache that match a given spec name.
@@ -182,7 +182,7 @@ mod tests {
     fn deserialize_smoketest() {
         // format as of 2025-10-28
         assert_eq!(
-            serde_json::from_str::<EntryMeta>(
+            serde_json_lenient::from_str::<EntryMeta>(
                 "{\"inner\":{\"Spec\":\"setuptools\"},\"fetched\":true,\"epoch_millis\":1760653637323}"
             ).unwrap(),
             EntryMeta {

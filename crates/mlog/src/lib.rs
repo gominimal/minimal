@@ -81,8 +81,9 @@ mod json_log_shape {
 
         let bytes = buf.0.lock().unwrap().clone();
         let line = String::from_utf8(bytes).unwrap();
-        let json: serde_json::Value = serde_json::from_str(line.lines().next().unwrap())
-            .unwrap_or_else(|e| panic!("not JSON: {e}: {line}"));
+        let json: serde_json_lenient::Value =
+            serde_json_lenient::from_str(line.lines().next().unwrap())
+                .unwrap_or_else(|e| panic!("not JSON: {e}: {line}"));
         assert_eq!(json["service.name"], "testsvc");
         assert_eq!(json["service.version"], version::LONG_VERSION);
         assert_eq!(

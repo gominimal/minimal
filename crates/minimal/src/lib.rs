@@ -1233,8 +1233,8 @@ pub fn format_ls(
     resp: &minimald_rpc::ListSessionsResponse,
 ) -> Result<(), anyhow::Error> {
     if args.json {
-        let json =
-            serde_json::to_string_pretty(resp).context("Failed to serialize session list")?;
+        let json = serde_json_lenient::to_string_pretty(resp)
+            .context("Failed to serialize session list")?;
         writeln!(out, "{json}")?;
         return Ok(());
     }
@@ -2327,7 +2327,8 @@ pub async fn cmd_session_policy(
 
     match resp {
         minimald_rpc::Errorable::Ok(policy) => {
-            let json = serde_json::to_string(&policy).context("Failed to serialize policy")?;
+            let json =
+                serde_json_lenient::to_string(&policy).context("Failed to serialize policy")?;
             println!("{json}");
             Ok(())
         }
