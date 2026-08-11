@@ -455,6 +455,36 @@ follow_symlinks  = false
 A missing file is equivalent to the defaults; unknown keys are rejected so
 a typo (`[loadout]` for `[loadouts]`) fails loudly.
 
+### Session keys {#session-keys}
+
+The detach chord is configurable. The leader key (the chord that enters
+command mode) and its command-mode subcommand keys live under a
+`[session-keys]` section in the same `config.toml`:
+
+```toml
+[session-keys]
+leader = "ctrl-]"
+bell_on_leader = false
+
+[session-keys.subcommands]
+detach = "d"
+forward = "ctrl-]"
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `leader` | `ctrl-]` | The chord that enters command mode, as a logical key name (`"ctrl-]"`, `"ctrl-^"`, `"d"`, …). Rejected loudly at load if termios-special (`ctrl-c`, `ctrl-w`, `ctrl-\`, … — consumed by the line discipline before the app) or wrapping-ambiguous (`ctrl-i` = TAB, `ctrl-m` = CR, …) |
+| `bell_on_leader` | `false` | Ring the terminal bell (BEL `0x07`) on entering command mode. The terminal renders it per its own bell config; minimal picks no modality |
+| `subcommands.detach` | `d` | The command-mode key that detaches the channel |
+| `subcommands.forward` | `ctrl-]` | The command-mode key that verbatim-forwards a leader byte down the PTY (for nested sessions). Defaults to the resolved `leader`, so a double-press forwards |
+
+The leader is negotiated with the daemon per attach channel — sent as env
+vars alongside `MINIMAL_SESSION_ID` — so two clients with different configs on
+the same session each get their own chord. The daemon re-validates the leader
+as a silent backstop: a chord it rejects is logged and falls back to the
+default rather than garbling the screen. As with `[loadouts]`, every field
+defaults and unknown keys are rejected, so an old config keeps parsing.
+
 ## Listing loadouts
 
 [`min loadout list`](./cli-min.md#loadout-list-alias-ls) (alias:
@@ -701,7 +731,7 @@ attached session prints a two-line orientation banner:
 
 ```
 minimal · session api-server-4f2a · loadout default (built-in)
-detach: ctrl-w · no minimal.toml here — min init to add one
+detach: ctrl-] then d · no minimal.toml here — min init to add one
 ```
 
 The second line drops the `min init` pointer when the session workspace

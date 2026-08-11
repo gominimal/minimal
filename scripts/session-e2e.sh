@@ -1110,7 +1110,7 @@ if [[ "$attach_out" != *"minimal · session $SESSION_NAME · loadout default (bu
   echo "--- attach output ---"; printf '%s\n' "$attach_out"
   fail
 fi
-if [[ "$attach_out" != *"detach: ctrl-w"* ]]; then
+if [[ "$attach_out" != *"detach: ctrl-] then d"* ]]; then
   echo "::error::attach output lacks the orientation banner's detach line"
   echo "--- attach output ---"; printf '%s\n' "$attach_out"
   fail

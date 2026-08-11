@@ -73,7 +73,7 @@ terminal.
 
 Keys: `↑`/`↓` (or `k`/`j`) move, `/` fuzzy-filters by name, ID, and
 project path, `enter` attaches to the focused session (suspend TUI → ssh →
-resume on `ctrl-w` detach) or collapses a provider group, `d` destroys
+resume on `ctrl-]` then `d` detach) or collapses a provider group, `d` destroys
 (with confirmation — also cancels an in-flight create/upload), `r`
 renames, `n` creates a session through the full activate flow (project
 upload, loadout compose, finalize), `q` quits. The cursor's last position

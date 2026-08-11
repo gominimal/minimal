@@ -445,13 +445,14 @@ refresh). The user detaches with `Ctrl-W` (already handled by the daemon at
 `session_host.rs:1123`), which tears down the SSH channel; `ssh` exits; the
 TUI resumes.
 
-Complexity: the `Ctrl-W` detach keybind may conflict with applications
-inside the session (e.g. vim's window commands). Making it configurable
-requires a settings mechanism that doesn't exist yet, and the keybind needs
-to be negotiated or accepted on both sides. The daemon currently recognizes
-three `Ctrl-W` encodings (`0x17`, kitty `CSI 119;5u`, modifyOtherKeys
-`CSI 27;5;119~` at `session_host.rs:35-40`) — a configurable chord would need
-to add the user's choice to that set.
+Complexity: the detach chord is now configurable. The leader key (default
+`ctrl-]`, `0x1d`) is negotiated per-channel at attach — the client sends it
+as env vars alongside `MINIMAL_SESSION_ID`, and the daemon re-validates it
+(termios-special chords are rejected as a safety backstop). The daemon's
+matcher derives the full encoding set (plain byte, kitty, modifyOtherKeys)
+from the negotiated key, so a remapped leader gets its CSI forms
+automatically. The old `ctrl-w` default was itself termios-special
+(`VWERASE`) and is retired; `0x17` is now an ordinary forwarded key.
 
 ### F2: Remote minimald sessions
 
