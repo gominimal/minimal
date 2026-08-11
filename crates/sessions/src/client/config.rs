@@ -187,24 +187,28 @@ impl SessionKeysConfig {
     /// Resolve this config into the negotiated [`keys::SessionKeys`],
     /// filling omitted fields with the shipped defaults (`forward`
     /// falls back to the resolved leader, so a double-press
-    /// forwards) and validating the leader loudly.
+    /// forwards), rejecting an unsafe leader or a detach key that
+    /// shadows another binding loudly.
     ///
     /// # Errors
     ///
     /// Returns [`keys::KeyError`] when the resolved leader is
-    /// termios-special or wrapping-ambiguous.
+    /// termios-special or wrapping-ambiguous, or the detach key
+    /// aliases the leader or forward key (shadowing a binding).
     pub fn to_session_keys(&self) -> Result<keys::SessionKeys, keys::KeyError> {
         let default = keys::SessionKeys::default();
         let leader = self.leader.unwrap_or(default.leader);
         keys::validate_leader(&leader)?;
         let detach_key = self.subcommands.detach.unwrap_or(default.detach_key);
         let forward_key = self.subcommands.forward.unwrap_or(leader);
-        Ok(keys::SessionKeys {
+        let keys = keys::SessionKeys {
             leader,
             detach_key,
             forward_key,
             bell_on_leader: self.bell_on_leader,
-        })
+        };
+        keys::validate_detach_unaliased(&keys)?;
+        Ok(keys)
     }
 }
 
