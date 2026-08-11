@@ -29,7 +29,7 @@ use crate::session_delta::DeltaSource;
 use crate::sessions::SessionControl;
 #[cfg(not(test))]
 use sessions::NetworkMode;
-use sessions::keys::{CommandMode, KeyAction, SessionKeys};
+use sessions::keys::{ChordMatcher, FeedOutcome, KeyAction, SessionKeys};
 use std::sync::Arc;
 
 /// Header of the prompt shown over the channel when a session's shell process
@@ -1551,17 +1551,15 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // to each binding alongside `delta`.
     archives_dir: std::path::PathBuf,
 
-    // The negotiated per-channel session keys: the leader chord that enters
-    // command mode, the detach/forward subcommand keys, and the bell flag.
-    // Refreshed from the channel's env vars on every attach (so two clients
-    // with different configs on the same session each get their own chord);
-    // defaults to `ctrl-]` / `d` when a client sends no keys.
-    session_keys: SessionKeys,
-
-    // Per-channel command-mode state for the session-key state machine: idle
-    // (keystrokes forward) or awaiting the subcommand that follows a
-    // swallowed leader. Reset to idle on every attach.
-    command_mode: CommandMode,
+    // The per-channel session-key chord matcher: the negotiated leader chord
+    // that enters command mode, the detach/forward subcommand keys, the bell
+    // flag, plus the command-mode state and the pending split-candidate
+    // buffer. Refreshed from the channel's env vars on every attach (so two
+    // clients with different configs on the same session each get their own
+    // chord, and a reattach never inherits a stale awaiting-subcommand state
+    // or half a split candidate); defaults to `ctrl-]` / `d` when a client
+    // sends no keys.
+    chord_matcher: ChordMatcher,
 
     // Keeps launcher-owned resources (the session's `Env`, which owns the
     // sandbox files backing the running process's rootfs along with the context
@@ -2916,8 +2914,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             archives_dir,
             connection_env,
             home_dir,
-            session_keys: SessionKeys::default(),
-            command_mode: CommandMode::Idle,
+            chord_matcher: ChordMatcher::new(SessionKeys::default()),
             guard,
         };
 
@@ -3277,56 +3274,59 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     StdinMsg::Bytes(b) => {
                         self.attrs.stdin_last = Some(SystemTime::now());
 
-                        // Session-key command-mode state machine: the leader
-                        // chord is swallowed and enters command mode; the next
-                        // keystroke is the subcommand — detach, forward, or an
-                        // unbound key that cancels. The leader is never
-                        // forwarded except via the explicit forward subcommand.
-                        let (next_mode, action) =
-                            self.session_keys.advance(self.command_mode, &b);
-                        match action {
-                            KeyAction::Forward => {
-                                self.stdin_buf = Some((b, 0));
-                            }
-                            KeyAction::Swallow => {}
-                            KeyAction::EnterCommandMode => {
-                                // Ring the terminal bell on the channel back to
-                                // the user (never the PTY, so the app never
-                                // sees it) when the client opted in.
-                                if self.session_keys.bell_on_leader
-                                    && let Some((tx, _)) = self.remote.as_ref()
-                                {
-                                    let _ = tx.send(BindingMsg::Stdin(vec![0x07])).await;
+                        // Session-key chord matching over the stdin byte
+                        // stream: the leader chord is swallowed and enters
+                        // command mode; the next keystroke is the subcommand —
+                        // detach, forward, or an unbound key that cancels. The
+                        // leader is never forwarded except via the explicit
+                        // forward subcommand. Coalesced and split chunks are
+                        // handled by the matcher; the decisions below only map
+                        // outcomes to I/O, with every PTY-bound byte (data
+                        // runs and verbatim leaders) collected in stream order.
+                        let mut forward: Vec<u8> = Vec::new();
+                        for outcome in self.chord_matcher.feed(&b) {
+                            match outcome {
+                                FeedOutcome::Forward(bytes) => {
+                                    forward.extend_from_slice(&bytes);
                                 }
-                            }
-                            KeyAction::Detach => {
-                                let uc = self.unwind_codes();
-                                if let Some((tx, _hnd)) = self.remote.as_mut() {
-                                    match tx.send(BindingMsg::TeardownDueToDetach(uc)).await {
-                                        Ok(()) => {},
-                                        Err(e) => {
-                                            tracing::warn!("failed sending detach signal to remote: {e}");
-                                        }
-                                    };
-                                    self.remote = None;
+                                FeedOutcome::Action(KeyAction::Swallow) => {}
+                                FeedOutcome::Action(KeyAction::EnterCommandMode) => {
+                                    // Ring the terminal bell on the channel back
+                                    // to the user (never the PTY, so the app
+                                    // never sees it) when the client opted in.
+                                    if self.chord_matcher.keys().bell_on_leader
+                                        && let Some((tx, _)) = self.remote.as_ref()
+                                    {
+                                        let _ = tx.send(BindingMsg::Stdin(vec![0x07])).await;
+                                    }
                                 }
-                            }
-                            KeyAction::ForwardLeader => {
-                                // Verbatim-forward a leader byte down the PTY
-                                // and exit command mode, handing the next
-                                // keystroke to the layer below (a nested daemon,
-                                // if any). Safe to over-send: a stray leader
-                                // past the deepest layer hits the app's own
-                                // non-destructive leader binding.
-                                self.stdin_buf = Some((
-                                    bytes::Bytes::from(vec![
-                                        self.session_keys.leader.plain_byte(),
-                                    ]),
-                                    0,
-                                ));
+                                FeedOutcome::Action(KeyAction::Detach) => {
+                                    let uc = self.unwind_codes();
+                                    if let Some((tx, _hnd)) = self.remote.as_mut() {
+                                        match tx.send(BindingMsg::TeardownDueToDetach(uc)).await {
+                                            Ok(()) => {},
+                                            Err(e) => {
+                                                tracing::warn!("failed sending detach signal to remote: {e}");
+                                            }
+                                        };
+                                        self.remote = None;
+                                    }
+                                }
+                                FeedOutcome::Action(KeyAction::ForwardLeader) => {
+                                    // Queue a verbatim leader byte in the PTY
+                                    // stream, handing the next keystroke to the
+                                    // layer below (a nested daemon *that
+                                    // negotiated the same leader*, if any).
+                                    // Safe to over-send: a stray leader past the
+                                    // deepest layer hits the app's own
+                                    // non-destructive leader binding.
+                                    forward.push(self.chord_matcher.keys().leader.plain_byte());
+                                }
                             }
                         }
-                        self.command_mode = next_mode;
+                        if !forward.is_empty() {
+                            self.stdin_buf = Some((bytes::Bytes::from(forward), 0));
+                        }
                     }
                     StdinMsg::TerminalUpdate(sz) => {
                         self.set_size(WinSize::from(&sz));
@@ -3396,13 +3396,12 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         self.connection_env.extend(connection);
         self.publish_connection_env().await;
 
-        // A new channel means a fresh key negotiation and a fresh command-mode
-        // state: two clients with different configs on the same session each
-        // get their own chord, and a reattach never inherits a stale
-        // awaiting-subcommand state.
-        self.session_keys = keys;
-        self.command_mode = CommandMode::Idle;
-
+        // A new channel means a fresh matcher: fresh key negotiation, idle
+        // command-mode state, and no pending split candidate — two clients
+        // with different configs on the same session each get their own
+        // chord, and a reattach never inherits a stale awaiting-subcommand
+        // state.
+        self.chord_matcher = ChordMatcher::new(keys);
 
         if !skip_flush {
             self.parser.screen_mut().set_size(sz.rows, sz.cols);

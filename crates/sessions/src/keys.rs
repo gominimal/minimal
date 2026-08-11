@@ -47,6 +47,12 @@ pub const BELL_ENV: &str = "MINIMAL_BELL_ON_LEADER";
 ///
 /// Note this includes the *old* default `ctrl-w` (`0x17`, `VWERASE`), which
 /// the hard-cut to `ctrl-]` retires as a latent footgun.
+///
+/// DEL (`0x7f`, `VERASE` on Linux) is absent deliberately: no parseable
+/// [`Key`] can produce it — `ctrl-?` is rejected and plain keys stop at
+/// `0x7e` — so a `0x7f` entry would be dead weight suggesting a hazard that
+/// cannot arise. The *other* erase char, `ctrl-h` (`0x08`), is parseable and
+/// lives in [`AMBIGUOUS`] instead.
 const TERMIOS_SPECIAL: &[u8] = &[
     0x03, // ctrl-C  VINTR   (SIGINT)
     0x04, // ctrl-D  VEOF
@@ -59,19 +65,28 @@ const TERMIOS_SPECIAL: &[u8] = &[
     0x17, // ctrl-W  VWERASE
     0x1a, // ctrl-Z  VSUSP   (SIGTSTP)
     0x1c, // ctrl-\  VQUIT   (SIGQUIT)
-    0x7f, // DEL     VERASE
 ];
 
 /// Control bytes that alias another commonly-typed key, so binding the leader
-/// to one is fragile across terminals: `NUL` (`ctrl-@`), `TAB` (`ctrl-i`),
-/// `LF` (`ctrl-j`), `CR` (`ctrl-m`), `ESC` (`ctrl-[`).
+/// to one is fragile across terminals. Each entry names the aliased key so
+/// the validation error can say *which* collision the user would hit:
+/// `ctrl-@` = `NUL`, `ctrl-h` = `Backspace` wherever the tty erase char is
+/// `^H` (the default on the BSDs, vs Linux's `^?`), `ctrl-i` = `TAB`,
+/// `ctrl-j` = `LF`, `ctrl-m` = `CR`, `ctrl-[` = `ESC`.
 ///
 /// The parser's `ctrl-<glyph>` range (`@`..`~`, codepoint `0x40`..`0x7e`)
 /// already excludes `ctrl-<digit>` forms, so the historical case-wrapping
 /// aliases (`ctrl-2` = `ctrl-@`, `ctrl-6` = `ctrl-^`, …) — which depend on
 /// terminal-specific digit mappings — cannot arise; users get the canonical
 /// `ctrl-@`/`ctrl-^` forms or a parse error.
-const AMBIGUOUS: &[u8] = &[0x00, 0x09, 0x0a, 0x0d, 0x1b];
+const AMBIGUOUS: &[(u8, &str)] = &[
+    (0x00, "NUL (also ctrl-Space)"),
+    (0x08, "Backspace (tty erase is ^H on the BSDs)"),
+    (0x09, "TAB"),
+    (0x0a, "LF"),
+    (0x0d, "CR (Enter)"),
+    (0x1b, "ESC"),
+];
 
 /// A logical key as expressed in config: a base glyph plus an optional Ctrl
 /// modifier. Alt/Shift are not configurable yet; the parser rejects them.
@@ -106,9 +121,70 @@ pub enum KeyError {
         "termios-special leader `{0}`: the kernel line discipline consumes it before the app (see termios(3))"
     )]
     TermiosSpecial(String),
-    /// The leader aliases another commonly-typed key (e.g. `ctrl-i` = `TAB`).
-    #[error("wrapping-ambiguous leader `{0}`: it aliases another key (e.g. ctrl-i = TAB)")]
-    Ambiguous(String),
+    /// The leader aliases another commonly-typed key; the second field
+    /// names what it aliases (e.g. `ctrl-i` aliases `TAB`).
+    #[error("wrapping-ambiguous leader `{0}`: it aliases {1}")]
+    Ambiguous(String, &'static str),
+    /// The detach key equals the leader or the forward key: command mode
+    /// checks the detach key first, so the other binding would be
+    /// unreachable. The second field names the shadowed binding.
+    #[error("conflicting session keys: the detach key `{0}` shadows {1}")]
+    ConflictingDetach(String, &'static str),
+}
+
+/// A tiny stack buffer for rendering one wire-form encoding without a heap
+/// allocation. The longest form is `\x1b[27;5;<cp>~`; parsed codepoints are
+/// ASCII (`<= 0x7e`, at most 3 digits), so 32 bytes is generous. Pushes past
+/// the end panic rather than truncate — the parse invariants make that
+/// unreachable, and a panic beats a silently wrong encoding.
+#[derive(Default)]
+struct Scratch {
+    buf: [u8; 32],
+    len: usize,
+}
+
+impl Scratch {
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn push(&mut self, b: u8) -> &mut Self {
+        self.buf[self.len] = b;
+        self.len += 1;
+        self
+    }
+
+    fn push_str(&mut self, s: &str) -> &mut Self {
+        self.buf[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+        self.len += s.len();
+        self
+    }
+
+    fn push_dec(&mut self, n: u32) -> &mut Self {
+        let mut digits = [0u8; 10];
+        let mut i = digits.len();
+        let mut n = n;
+        loop {
+            i -= 1;
+            // `n % 10` is a single digit; the cast cannot truncate.
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                digits[i] = b'0' + (n % 10) as u8;
+            }
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        let end = self.len + (digits.len() - i);
+        self.buf[self.len..end].copy_from_slice(&digits[i..]);
+        self.len = end;
+        self
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
 }
 
 impl Key {
@@ -184,39 +260,109 @@ impl Key {
     }
 
     /// All wire forms this key can arrive as, across the plain, kitty, and
-    /// modifyOtherKeys keyboard protocols. A keystroke matches this key when
-    /// the *whole* received chunk equals any form (matching mirrors the
-    /// existing chord matcher: a chunk that is the chord plus more bytes is
-    /// not a match, so pastes never trigger command mode).
+    /// modifyOtherKeys keyboard protocols.
     ///
     /// The kitty and modifyOtherKeys modifier field is `1 + bitmask`, where
     /// Control is bit `4` — so a Ctrl-chord uses `5` (matching the shipped
-    /// `ctrl-w` encodings), and a plain key uses `1`. modifyOtherKeys only
-    /// CSI-encodes *modified* keys, so plain keys have no modifyOtherKeys
-    /// form (they arrive as [`Self::plain_byte`]); the kitty form is still
-    /// included since kitty can CSI-encode unmodified keys under "report all
-    /// keys", and it cannot false-match another key.
+    /// `ctrl-w` encodings), and a plain key uses `1`. Kitty *omits* the
+    /// modifier field entirely when it would be `1`, so a plain key needs
+    /// both kitty forms (`CSI <cp> u` and `CSI <cp> ; 1 u`) or terminals in
+    /// report-all-keys mode go unmatched. modifyOtherKeys only CSI-encodes
+    /// *modified* keys, so plain keys have no modifyOtherKeys form (they
+    /// arrive as [`Self::plain_byte`]); the kitty forms are still included
+    /// since kitty can CSI-encode unmodified keys under "report all keys",
+    /// and they cannot false-match another key.
     #[must_use]
     pub fn encodings(&self) -> Vec<Vec<u8>> {
-        let mods = 1 + u32::from(self.ctrl) * 4;
-        let cp = self.codepoint;
-        let mut out = Vec::with_capacity(3);
-        out.push(vec![self.plain_byte()]);
-        out.push(format!("\x1b[{cp};{mods}u").into_bytes());
-        if self.ctrl {
-            out.push(format!("\x1b[27;{mods};{cp}~").into_bytes());
-        }
+        let mut out = Vec::with_capacity(4);
+        self.for_each_form(|form| out.push(form.to_vec()));
         out
+    }
+
+    /// Runs `f` over every wire form, rendering each into a stack buffer —
+    /// the allocation-free path the matchers use (one call per received
+    /// chunk in the daemon's stdin hot loop; `format!`-per-form would heap-
+    /// allocate 2–3 strings a keystroke). Kept private so the test-facing
+    /// [`Self::encodings`] stays the single ordered rendering of the forms,
+    /// and `encodings()` derives from this so the two can never drift.
+    ///
+    /// Two properties the chord matcher relies on:
+    /// - No form is a prefix of another form of the same key: the bare byte
+    ///   and any CSI differ at the first byte, and the kitty forms diverge
+    ///   at the `u` vs `;` after the codepoint digits. Exact-prefix matching
+    ///   is therefore unambiguous.
+    /// - Every multi-byte form starts with a byte that cannot be a plain
+    ///   keystroke (`0x1b`), so a plain byte and a CSI never alias.
+    fn for_each_form(self, mut f: impl FnMut(&[u8])) {
+        f(&[self.plain_byte()]);
+        let mods = 1 + u32::from(self.ctrl) * 4;
+        let mut scratch = Scratch::default();
+        // Kitty without the modifier field (omitted when it would be 1).
+        // Applies to plain keys only; Ctrl-chords always carry `;5`.
+        if !self.ctrl {
+            scratch
+                .push_str("\x1b[")
+                .push_dec(self.codepoint)
+                .push(b'u');
+            f(scratch.as_bytes());
+            scratch.clear();
+        }
+        scratch
+            .push_str("\x1b[")
+            .push_dec(self.codepoint)
+            .push(b';')
+            .push_dec(mods)
+            .push(b'u');
+        f(scratch.as_bytes());
+        if self.ctrl {
+            scratch.clear();
+            scratch
+                .push_str("\x1b[27;")
+                .push_dec(mods)
+                .push(b';')
+                .push_dec(self.codepoint)
+                .push(b'~');
+            f(scratch.as_bytes());
+        }
+    }
+
+    /// The length of the longest wire form that is a prefix of `buf` — i.e.
+    /// a complete occurrence of this key at the start of `buf`, possibly
+    /// with more bytes after. The streaming chord matcher uses this to
+    /// consume a key out of a coalesced chunk.
+    fn match_prefix_len(self, buf: &[u8]) -> Option<usize> {
+        let mut best = None;
+        self.for_each_form(|form| {
+            if buf.len() >= form.len()
+                && buf[..form.len()] == *form
+                && best.is_none_or(|l: usize| form.len() > l)
+            {
+                best = Some(form.len());
+            }
+        });
+        best
+    }
+
+    /// Whether `prefix` is a *strict* prefix of some wire form — a partial
+    /// keypress, i.e. an escape sequence split across chunk boundaries.
+    fn is_form_prefix(self, prefix: &[u8]) -> bool {
+        let mut hit = false;
+        self.for_each_form(|form| {
+            hit |= prefix.len() < form.len() && form.starts_with(prefix);
+        });
+        hit
     }
 
     /// Whether a received stdin chunk is exactly this key, across all its
     /// wire forms (plain, kitty, modifyOtherKeys). A chunk that is the key
-    /// plus more bytes — a paste — is not a match, so pastes never trigger
-    /// command mode. This is the whole-chunk match the daemon's chord matcher
-    /// has always used, now derived from the key instead of hardcoded.
+    /// plus more bytes — a paste — is not a match; this whole-chunk equality
+    /// is the unit of the paste guard the streaming matcher ([`ChordMatcher`])
+    /// composes into partial-chunk matching.
     #[must_use]
     pub fn matches_chunk(&self, chunk: &[u8]) -> bool {
-        self.encodings().iter().any(|e| e.as_slice() == chunk)
+        let mut hit = false;
+        self.for_each_form(|form| hit |= form == chunk);
+        hit
     }
 
     /// The canonical config-string form, for display and round-tripping.
@@ -267,9 +413,39 @@ pub fn validate_leader(key: &Key) -> Result<(), KeyError> {
         if TERMIOS_SPECIAL.contains(&byte) {
             return Err(KeyError::TermiosSpecial(key.as_config_str()));
         }
-        if AMBIGUOUS.contains(&byte) {
-            return Err(KeyError::Ambiguous(key.as_config_str()));
+        if let Some((_, alias)) = AMBIGUOUS.iter().find(|(b, _)| *b == byte) {
+            return Err(KeyError::Ambiguous(key.as_config_str(), alias));
         }
+    }
+    Ok(())
+}
+
+/// Validates the binding *set*, catching shadowed keys [`validate_leader`]
+/// can't see (it only judges the leader in isolation). Command mode checks
+/// the detach key before the forward key, and the leader is consumed before
+/// either, so a detach key equal to the leader or the forward key makes that
+/// other binding unreachable. `forward` == `leader` is *not* a conflict — it
+/// is the shipped default (a double-press forwards).
+///
+/// Like [`validate_leader`], this runs loudly at client config load and
+/// silently at the daemon (which falls the colliding field back to default).
+///
+/// # Errors
+///
+/// Returns [`KeyError::ConflictingDetach`] when the detach key aliases the
+/// leader or the forward key.
+pub fn validate_detach_unaliased(keys: &SessionKeys) -> Result<(), KeyError> {
+    if keys.detach_key == keys.leader {
+        return Err(KeyError::ConflictingDetach(
+            keys.detach_key.as_config_str(),
+            "the leader chord",
+        ));
+    }
+    if keys.detach_key == keys.forward_key {
+        return Err(KeyError::ConflictingDetach(
+            keys.detach_key.as_config_str(),
+            "the forward key",
+        ));
     }
     Ok(())
 }
@@ -308,23 +484,25 @@ pub enum CommandMode {
     AwaitingSubcommand,
 }
 
-/// What the session-key state machine does with one stdin chunk. The daemon
-/// maps each variant to its I/O effect; the decision itself is pure, so the
-/// transitions are unit-testable without a PTY or ssh channel.
+/// A non-forward effect the chord matcher decided for received bytes. The
+/// daemon maps each variant to its I/O effect; the decision itself is pure,
+/// so the transitions are unit-testable without a PTY or ssh channel. Bytes
+/// to forward arrive as data in [`FeedOutcome::Forward`], not as an action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyAction {
-    /// Forward the chunk verbatim to the PTY.
-    Forward,
-    /// Swallow the chunk — an unbound command-mode key that cancels command
-    /// mode (the key is dropped, not forwarded, mirroring tmux).
+    /// Swallow an unbound command-mode token — a keypress (or an escape
+    /// sequence that proved not to be a bound subcommand) drops as a unit
+    /// and cancels command mode (mirroring tmux); subsequent bytes are back
+    /// in idle mode and forward normally.
     Swallow,
     /// The leader matched: swallow it and enter command mode.
     EnterCommandMode,
     /// The detach subcommand matched: tear down the attach channel (detach,
     /// not exit — the session and its process keep running).
     Detach,
-    /// The forward subcommand matched: write a leader byte down the PTY so a
-    /// nested daemon, if any, swallows it and enters its own command mode.
+    /// The forward subcommand matched: write a leader byte down the PTY —
+    /// a nested daemon *that negotiated the same leader*, if any, swallows
+    /// it and enters its own command mode.
     ForwardLeader,
 }
 
@@ -378,56 +556,218 @@ impl SessionKeys {
         }
     }
 
-    /// Re-validates the leader at the trust boundary (the daemon). On failure
-    /// — a termios-special or ambiguous chord a buggy or malicious client
-    /// could send — returns the default keys so a bad chord never garbles the
-    /// screen. The client's load-time validation is the loud/UX gate; this is
-    /// the silent safety backstop.
+    /// Re-validates the negotiated keys at the trust boundary (the daemon),
+    /// falling back *per field*: a termios-special or ambiguous leader a
+    /// buggy or malicious client could send reverts to the default leader
+    /// without touching valid subcommand remaps, and a detach key that
+    /// shadows the leader or the forward key reverts to the default detach
+    /// key. The client's load-time validation is the loud/UX gate; this is
+    /// the silent safety backstop — bad input degrades the smallest field,
+    /// never garbling the screen.
     #[must_use]
-    pub fn validated_or_default(self) -> Self {
-        match validate_leader(&self.leader) {
-            Ok(()) => self,
-            Err(e) => {
+    pub fn validated_or_default(mut self) -> Self {
+        let default = Self::default();
+        if let Err(e) = validate_leader(&self.leader) {
+            tracing::warn!(
+                error = %e,
+                leader = self.leader.as_config_str(),
+                "rejecting negotiated session leader; falling back to the default leader",
+            );
+            // A forward that only ever *defaulted* to this rejected leader
+            // moves with it (`from_env` falls forward back to the leader when
+            // the client sent no explicit forward); an explicit forward remap
+            // is a distinct, safe field and survives.
+            if self.forward_key == self.leader {
+                self.forward_key = default.leader;
+            }
+            self.leader = default.leader;
+        }
+        if let Err(e) = validate_detach_unaliased(&self) {
+            tracing::warn!(
+                error = %e,
+                "conflicting negotiated keys; falling back to the default detach key",
+            );
+            self.detach_key = default.detach_key;
+            if let Err(e) = validate_detach_unaliased(&self) {
+                // Degenerate config (e.g. a plain `d` leader colliding with
+                // the default `d` detach): detach still fires on a second
+                // press of the leader, so leave the binding in place, but
+                // make the shadowing loud in the log.
                 tracing::warn!(
                     error = %e,
-                    leader = self.leader.as_config_str(),
-                    "rejecting negotiated session leader; falling back to default",
+                    "detach key still conflicts after fallback; keeping the shadowing binding",
                 );
-                Self::default()
             }
+        }
+        self
+    }
+}
+
+/// One decision the streaming chord matcher made for some received bytes.
+/// Outcomes arrive in stream order; the daemon maps each to its I/O effect
+/// (writes the forwarded bytes down the PTY, rings the terminal bell on the
+/// channel, tears the channel down on detach).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedOutcome {
+    /// Bytes that are not part of any chord: write them to the PTY.
+    Forward(Vec<u8>),
+    /// A non-forward effect of a matched chord or an unbound command-mode
+    /// token.
+    Action(KeyAction),
+}
+
+/// The streaming session-key chord matcher: one per attach channel, fed each
+/// stdin chunk as it arrives off the SSH channel.
+///
+/// Whole-chunk matching (`advance` before this) silently broke the moment SSH
+/// coalesced the leader and its subcommand into one message (`\x1dd`), split
+/// a multi-byte kitty encoding across two messages, or coalesced a fast
+/// double-press in command mode. This matcher consumes a byte stream instead:
+/// it scans positionally, matches a key's wire forms as prefixes anywhere in
+/// the stream (longest form wins), and holds a trailing *strict prefix* of
+/// some form in a small buffer until the next chunk resolves it. The buffer
+/// is bounded by the longest wire form (under 16 bytes), so it cannot grow.
+///
+/// Two consequences of the streaming model:
+///
+/// - There is no paste guard at the chord layer: a leader byte mid-chunk is a
+///   chord, indistinguishable from coalesced keystrokes. Real pastes are the
+///   terminal's and the app's business (bracketed paste), not this layer's.
+/// - A chunk *ending* in a strict prefix of some form (e.g. a bare `ESC`,
+///   which prefixes every kitty form) is held until the next chunk proves or
+///   disproves it — a one-keystroke delay on such bytes, versus silently
+///   missing split multi-byte chords.
+///
+/// The matcher owns the [`CommandMode`] and the pending buffer, so a fresh
+/// attach constructs a fresh matcher and can never inherit a stale
+/// awaiting-subcommand state or half a candidate.
+pub struct ChordMatcher {
+    keys: SessionKeys,
+    mode: CommandMode,
+    /// Held strict prefix of some wire form (split across chunks). Never
+    /// longer than the key's longest form minus one byte.
+    pending: Vec<u8>,
+}
+
+impl ChordMatcher {
+    /// A fresh matcher in [`CommandMode::Idle`] acting on `keys`.
+    #[must_use]
+    pub fn new(keys: SessionKeys) -> Self {
+        Self {
+            keys,
+            mode: CommandMode::Idle,
+            pending: Vec::new(),
         }
     }
 
-    /// Advance the command-mode state machine by one stdin chunk, returning
-    /// the next state and the action to take. Pure: no I/O.
-    ///
-    /// In [`CommandMode::Idle`], a chunk matching the leader enters command
-    /// mode (the leader is swallowed); anything else forwards. In
-    /// [`CommandMode::AwaitingSubcommand`], the next chunk is the subcommand:
-    /// the detach key detaches, the forward key verbatim-forwards a leader
-    /// byte, and any other key is swallowed and cancels command mode — so a
-    /// stray leader can always be cancelled by pressing any unbound key (no
-    /// stuck state, no explicit cancel key).
+    /// The negotiated keys this matcher acts on (for host-side effects like
+    /// the bell flag and the verbatim leader byte).
     #[must_use]
-    pub fn advance(&self, mode: CommandMode, chunk: &[u8]) -> (CommandMode, KeyAction) {
-        match mode {
-            CommandMode::Idle => {
-                if self.leader.matches_chunk(chunk) {
-                    (CommandMode::AwaitingSubcommand, KeyAction::EnterCommandMode)
-                } else {
-                    (CommandMode::Idle, KeyAction::Forward)
+    pub fn keys(&self) -> &SessionKeys {
+        &self.keys
+    }
+
+    /// The current command-mode state (observability and tests).
+    #[must_use]
+    pub fn mode(&self) -> CommandMode {
+        self.mode
+    }
+
+    /// Whether `prefix` is a strict prefix of a wire form of either bound
+    /// subcommand key.
+    fn is_subcommand_form_prefix(&self, prefix: &[u8]) -> bool {
+        self.keys.detach_key.is_form_prefix(prefix) || self.keys.forward_key.is_form_prefix(prefix)
+    }
+
+    /// Feed one stdin chunk, returning the ordered decisions taken. Each
+    /// `Forward` outcome is one contiguous run of data bytes in stream order;
+    /// chord bytes themselves are consumed.
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<FeedOutcome> {
+        let mut out = Vec::new();
+        // Reassemble: any held partial candidate continues into this chunk.
+        let owned;
+        let buf: &[u8] = if self.pending.is_empty() {
+            chunk
+        } else {
+            let mut v = std::mem::take(&mut self.pending);
+            v.extend_from_slice(chunk);
+            owned = v;
+            owned.as_slice()
+        };
+
+        // `i` walks the stream; `frs` marks the start of the current run of
+        // data bytes awaiting a single `Forward` outcome.
+        let mut i = 0;
+        let mut frs = 0;
+        while i < buf.len() {
+            match self.mode {
+                CommandMode::Idle => {
+                    if let Some(len) = self.keys.leader.match_prefix_len(&buf[i..]) {
+                        if frs < i {
+                            out.push(FeedOutcome::Forward(buf[frs..i].to_vec()));
+                        }
+                        out.push(FeedOutcome::Action(KeyAction::EnterCommandMode));
+                        i += len;
+                        frs = i;
+                        self.mode = CommandMode::AwaitingSubcommand;
+                    } else if self.keys.leader.is_form_prefix(&buf[i..]) {
+                        // Trailing split candidate: flush the data run, hold
+                        // the candidate until the next chunk resolves it.
+                        if frs < i {
+                            out.push(FeedOutcome::Forward(buf[frs..i].to_vec()));
+                        }
+                        self.pending.extend_from_slice(&buf[i..]);
+                        return out;
+                    } else {
+                        i += 1;
+                    }
                 }
-            }
-            CommandMode::AwaitingSubcommand => {
-                if self.detach_key.matches_chunk(chunk) {
-                    (CommandMode::Idle, KeyAction::Detach)
-                } else if self.forward_key.matches_chunk(chunk) {
-                    (CommandMode::Idle, KeyAction::ForwardLeader)
-                } else {
-                    (CommandMode::Idle, KeyAction::Swallow)
+                CommandMode::AwaitingSubcommand => {
+                    let rest = &buf[i..];
+                    if let Some(len) = self.keys.detach_key.match_prefix_len(rest) {
+                        out.push(FeedOutcome::Action(KeyAction::Detach));
+                        self.mode = CommandMode::Idle;
+                        i += len;
+                        frs = i;
+                        continue;
+                    }
+                    if let Some(len) = self.keys.forward_key.match_prefix_len(rest) {
+                        out.push(FeedOutcome::Action(KeyAction::ForwardLeader));
+                        self.mode = CommandMode::Idle;
+                        i += len;
+                        frs = i;
+                        continue;
+                    }
+                    // No whole subcommand here; could one be split across
+                    // chunks? Walk the longest run from `i` that stays a
+                    // strict prefix of some subcommand form: `end` lands on
+                    // the first byte that breaks it.
+                    let mut end = i;
+                    while end < buf.len() && self.is_subcommand_form_prefix(&buf[i..=end]) {
+                        end += 1;
+                    }
+                    if end == buf.len() {
+                        // The remainder is a strict prefix: hold it and stay
+                        // awaiting (a split CSI completing on the next chunk).
+                        self.pending.extend_from_slice(&buf[i..]);
+                        return out;
+                    }
+                    // Not a subcommand and never going to be: swallow the
+                    // token — the longest partial candidate plus the byte
+                    // that broke it — as a unit (so a failed partial CSI
+                    // never leaks half a sequence to the PTY) and cancel
+                    // command mode, tmux-style. Bytes after resume in idle.
+                    out.push(FeedOutcome::Action(KeyAction::Swallow));
+                    i = end + 1;
+                    frs = i;
+                    self.mode = CommandMode::Idle;
                 }
             }
         }
+        if frs < buf.len() {
+            out.push(FeedOutcome::Forward(buf[frs..].to_vec()));
+        }
+        out
     }
 }
 
@@ -570,7 +910,15 @@ mod tests {
     #[test]
     fn plain_key_has_no_modifyotherkeys_form() {
         let d = Key::parse("d").unwrap();
-        assert_eq!(d.encodings(), vec![vec![0x64], b"\x1b[100;1u".to_vec(),]);
+        assert_eq!(
+            d.encodings(),
+            vec![
+                vec![0x64],
+                // Kitty omits the modifier field when it would be 1.
+                b"\x1b[100u".to_vec(),
+                b"\x1b[100;1u".to_vec(),
+            ]
+        );
     }
 
     #[test]
@@ -584,6 +932,9 @@ mod tests {
     fn validate_accepts_safe_leaders() {
         assert!(validate_leader(&Key::parse("ctrl-]").unwrap()).is_ok());
         assert!(validate_leader(&Key::parse("ctrl-^").unwrap()).is_ok());
+        // `ctrl-_` is `0x1f`, the highest control byte: the upper boundary of
+        // the accepted set, next to the rejected `ctrl-^`+1 range edge.
+        assert!(validate_leader(&Key::parse("ctrl-_").unwrap()).is_ok());
         // A plain-printable leader is a poor choice but not unsafe.
         assert!(validate_leader(&Key::parse("d").unwrap()).is_ok());
     }
@@ -604,10 +955,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_ambiguous() {
-        for bad in ["ctrl-@", "ctrl-i", "ctrl-j", "ctrl-m", "ctrl-["] {
+        for bad in ["ctrl-@", "ctrl-h", "ctrl-i", "ctrl-j", "ctrl-m", "ctrl-["] {
             let err = validate_leader(&Key::parse(bad).unwrap()).unwrap_err();
             assert!(
-                matches!(err, KeyError::Ambiguous(_)),
+                matches!(err, KeyError::Ambiguous(..)),
                 "{bad} should be ambiguous, got {err:?}"
             );
         }
@@ -720,80 +1071,198 @@ mod tests {
     }
 
     #[test]
-    fn advance_idle_forwards_non_leader() {
-        let keys = SessionKeys::default();
+    fn feed_forwards_plain_data() {
+        let mut m = ChordMatcher::new(SessionKeys::default());
         assert_eq!(
-            keys.advance(CommandMode::Idle, b"hello"),
-            (CommandMode::Idle, KeyAction::Forward),
+            m.feed(b"hello"),
+            vec![FeedOutcome::Forward(b"hello".to_vec())]
         );
+        assert_eq!(m.mode(), CommandMode::Idle);
     }
 
     #[test]
-    fn advance_idle_leader_enters_command_mode() {
-        let keys = SessionKeys::default();
+    fn feed_idle_leader_enters_command_mode() {
         // Every leader encoding enters command mode.
         for chunk in [&[0x1d][..], b"\x1b[93;5u", b"\x1b[27;5;93~"] {
+            let mut m = ChordMatcher::new(SessionKeys::default());
             assert_eq!(
-                keys.advance(CommandMode::Idle, chunk),
-                (CommandMode::AwaitingSubcommand, KeyAction::EnterCommandMode),
+                m.feed(chunk),
+                vec![FeedOutcome::Action(KeyAction::EnterCommandMode)],
                 "chunk={chunk:?}",
             );
+            assert_eq!(m.mode(), CommandMode::AwaitingSubcommand);
         }
     }
 
     #[test]
-    fn advance_command_mode_detach_key_detaches() {
-        let keys = SessionKeys::default();
-        // The leader enters command mode; `d` detaches and returns to idle.
-        let (mode, _) = keys.advance(CommandMode::Idle, &[0x1d]);
-        assert_eq!(mode, CommandMode::AwaitingSubcommand);
+    fn feed_coalesced_leader_and_detach() {
+        // SSH coalescing `ctrl-]` and `d` into one message must still detach:
+        // the whole-chunk matcher model silently failed here.
+        let mut m = ChordMatcher::new(SessionKeys::default());
         assert_eq!(
-            keys.advance(mode, b"d"),
-            (CommandMode::Idle, KeyAction::Detach),
+            m.feed(b"\x1dd"),
+            vec![
+                FeedOutcome::Action(KeyAction::EnterCommandMode),
+                FeedOutcome::Action(KeyAction::Detach),
+            ],
+        );
+        assert_eq!(m.mode(), CommandMode::Idle);
+    }
+
+    #[test]
+    fn feed_data_before_leader_still_fires_chord() {
+        let mut m = ChordMatcher::new(SessionKeys::default());
+        assert_eq!(
+            m.feed(b"ab\x1dd"),
+            vec![
+                FeedOutcome::Forward(b"ab".to_vec()),
+                FeedOutcome::Action(KeyAction::EnterCommandMode),
+                FeedOutcome::Action(KeyAction::Detach),
+            ],
         );
     }
 
     #[test]
-    fn advance_command_mode_forward_key_forwards_leader() {
-        let keys = SessionKeys::default();
+    fn feed_command_mode_detach_key_detaches() {
+        let mut m = ChordMatcher::new(SessionKeys::default());
+        assert_eq!(
+            m.feed(&[0x1d]),
+            vec![FeedOutcome::Action(KeyAction::EnterCommandMode)]
+        );
+        assert_eq!(m.feed(b"d"), vec![FeedOutcome::Action(KeyAction::Detach)]);
+        assert_eq!(m.mode(), CommandMode::Idle);
+    }
+
+    #[test]
+    fn feed_command_mode_forward_key_forwards_leader() {
         // Default forward key is the leader itself: a double-press forwards.
-        let (mode, _) = keys.advance(CommandMode::Idle, &[0x1d]);
+        let mut m = ChordMatcher::new(SessionKeys::default());
         assert_eq!(
-            keys.advance(mode, &[0x1d]),
-            (CommandMode::Idle, KeyAction::ForwardLeader),
+            m.feed(&[0x1d]),
+            vec![FeedOutcome::Action(KeyAction::EnterCommandMode)]
         );
+        assert_eq!(
+            m.feed(&[0x1d]),
+            vec![FeedOutcome::Action(KeyAction::ForwardLeader)]
+        );
+        assert_eq!(m.mode(), CommandMode::Idle);
     }
 
     #[test]
-    fn advance_command_mode_unbound_key_swallows_and_cancels() {
-        let keys = SessionKeys::default();
-        let (mode, _) = keys.advance(CommandMode::Idle, &[0x1d]);
+    fn feed_command_mode_unbound_key_swallows_and_cancels() {
+        let mut m = ChordMatcher::new(SessionKeys::default());
+        assert_eq!(
+            m.feed(&[0x1d]),
+            vec![FeedOutcome::Action(KeyAction::EnterCommandMode)]
+        );
         // An unbound key is swallowed (not forwarded) and exits command mode.
-        assert_eq!(
-            keys.advance(mode, b"x"),
-            (CommandMode::Idle, KeyAction::Swallow),
-        );
+        assert_eq!(m.feed(b"x"), vec![FeedOutcome::Action(KeyAction::Swallow)]);
         // After the cancel, idle resumes: a normal key forwards again.
+        assert_eq!(m.feed(b"x"), vec![FeedOutcome::Forward(b"x".to_vec())]);
+    }
+
+    #[test]
+    fn feed_command_mode_double_press_eats_nothing() {
+        // A fast `dd` arriving in one chunk detaches and forwards the second
+        // `d` — the whole-chunk matcher swallowed both bytes as "unbound".
+        let mut m = ChordMatcher::new(SessionKeys::default());
         assert_eq!(
-            keys.advance(CommandMode::Idle, b"x"),
-            (CommandMode::Idle, KeyAction::Forward),
+            m.feed(b"\x1ddd"),
+            vec![
+                FeedOutcome::Action(KeyAction::EnterCommandMode),
+                FeedOutcome::Action(KeyAction::Detach),
+                FeedOutcome::Forward(b"d".to_vec()),
+            ],
         );
     }
 
     #[test]
-    fn advance_command_mode_paste_is_unbound_swallow() {
-        let keys = SessionKeys::default();
-        let (mode, _) = keys.advance(CommandMode::Idle, &[0x1d]);
-        // A multi-byte paste in command mode matches no subcommand: swallowed,
-        // command mode cancelled (the paste is dropped, not forwarded).
+    fn feed_command_mode_paste_detach_fires_then_forwards_rest() {
+        // No paste guard at the chord layer (see the ChordMatcher docs): a
+        // pasted "detach" in command mode begins with the detach byte and is
+        // indistinguishable from coalesced keystrokes. Real pastes are
+        // bracketed-paste's business.
+        let mut m = ChordMatcher::new(SessionKeys::default());
         assert_eq!(
-            keys.advance(mode, b"detach"),
-            (CommandMode::Idle, KeyAction::Swallow),
+            m.feed(&[0x1d]),
+            vec![FeedOutcome::Action(KeyAction::EnterCommandMode)]
+        );
+        assert_eq!(
+            m.feed(b"detach"),
+            vec![
+                FeedOutcome::Action(KeyAction::Detach),
+                FeedOutcome::Forward(b"etach".to_vec()),
+            ],
         );
     }
 
     #[test]
-    fn advance_remapped_leader_uses_negotiated_keys() {
+    fn feed_split_kitty_leader_across_chunks() {
+        let mut m = ChordMatcher::new(SessionKeys::default());
+        // A kitty form split at a chunk boundary: nothing forwards while the
+        // candidate is pending...
+        assert_eq!(m.feed(b"\x1b[9"), vec![]);
+        // ...and the chord fires when the form completes.
+        assert_eq!(
+            m.feed(b"3;5u"),
+            vec![FeedOutcome::Action(KeyAction::EnterCommandMode)]
+        );
+    }
+
+    #[test]
+    fn feed_split_detach_kitty_form_across_chunks() {
+        let mut m = ChordMatcher::new(SessionKeys::default());
+        assert_eq!(
+            m.feed(&[0x1d]),
+            vec![FeedOutcome::Action(KeyAction::EnterCommandMode)]
+        );
+        assert_eq!(m.feed(b"\x1b[10"), vec![]);
+        assert_eq!(m.feed(b"0u"), vec![FeedOutcome::Action(KeyAction::Detach)]);
+        assert_eq!(m.mode(), CommandMode::Idle);
+    }
+
+    #[test]
+    fn feed_held_candidate_flushes_as_data_on_mismatch() {
+        // A bare ESC ends the chunk: held as a possible kitty prefix...
+        let mut m = ChordMatcher::new(SessionKeys::default());
+        assert_eq!(m.feed(b"\x1b"), vec![]);
+        // ...but it wasn't one, so it and the next byte forward as data.
+        assert_eq!(m.feed(b"x"), vec![FeedOutcome::Forward(b"\x1bx".to_vec())]);
+        assert_eq!(m.mode(), CommandMode::Idle);
+    }
+
+    #[test]
+    fn feed_held_idle_candidate_flushes_before_a_real_leader() {
+        // ESC held idle, then the leader byte arrives: the ESC is data, the
+        // leader is the chord.
+        let mut m = ChordMatcher::new(SessionKeys::default());
+        assert_eq!(m.feed(b"\x1b"), vec![]);
+        assert_eq!(
+            m.feed(&[0x1d]),
+            vec![
+                FeedOutcome::Forward(b"\x1b".to_vec()),
+                FeedOutcome::Action(KeyAction::EnterCommandMode),
+            ],
+        );
+    }
+
+    #[test]
+    fn feed_held_subcommand_candidate_swallows_as_a_unit_on_mismatch() {
+        // In command mode, ESC is a prefix of the bound subcommands' kitty
+        // forms, so it is held. When `[A` proves it is none of them, the
+        // whole failed token drops: no half-sequence leaks to the PTY.
+        let mut m = ChordMatcher::new(SessionKeys::default());
+        assert_eq!(
+            m.feed(&[0x1d]),
+            vec![FeedOutcome::Action(KeyAction::EnterCommandMode)]
+        );
+        assert_eq!(m.feed(b"\x1b"), vec![]);
+        assert_eq!(m.feed(b"[A"), vec![FeedOutcome::Action(KeyAction::Swallow)]);
+        assert_eq!(m.mode(), CommandMode::Idle);
+    }
+
+    #[test]
+    fn feed_remapped_leader_uses_negotiated_keys() {
         // A client that remapped leader=ctrl-^, detach=x, forward=ctrl-].
         let mut env = BTreeMap::new();
         env.insert(LEADER_ENV.to_string(), "ctrl-^".to_string());
@@ -801,25 +1270,92 @@ mod tests {
         env.insert(FORWARD_KEY_ENV.to_string(), "ctrl-]".to_string());
         let keys = SessionKeys::from_env(&env);
 
-        // The old default leader (ctrl-]) no longer enters command mode.
+        // The old default leader (ctrl-], 0x1d) no longer enters command mode.
+        let mut m = ChordMatcher::new(keys);
+        assert_eq!(m.feed(&[0x1d]), vec![FeedOutcome::Forward(vec![0x1d])]);
+        // The remapped leader (ctrl-^, 0x1e) coalesced with the remapped
+        // detach key (x) detaches.
         assert_eq!(
-            keys.advance(CommandMode::Idle, &[0x1d]),
-            (CommandMode::Idle, KeyAction::Forward),
+            m.feed(b"\x1ex"),
+            vec![
+                FeedOutcome::Action(KeyAction::EnterCommandMode),
+                FeedOutcome::Action(KeyAction::Detach),
+            ],
         );
-        // The remapped leader (ctrl-^, 0x1e) does.
+        // The remapped forward key (ctrl-]) forwards the leader.
+        let mut m = ChordMatcher::new(keys);
         assert_eq!(
-            keys.advance(CommandMode::Idle, &[0x1e]),
-            (CommandMode::AwaitingSubcommand, KeyAction::EnterCommandMode),
+            m.feed(b"\x1e\x1d"),
+            vec![
+                FeedOutcome::Action(KeyAction::EnterCommandMode),
+                FeedOutcome::Action(KeyAction::ForwardLeader),
+            ],
         );
-        // The remapped detach key (x) detaches.
-        assert_eq!(
-            keys.advance(CommandMode::AwaitingSubcommand, b"x"),
-            (CommandMode::Idle, KeyAction::Detach),
-        );
-        // The remapped forward key (ctrl-]) forwards.
-        assert_eq!(
-            keys.advance(CommandMode::AwaitingSubcommand, &[0x1d]),
-            (CommandMode::Idle, KeyAction::ForwardLeader),
-        );
+    }
+
+    #[test]
+    fn matches_chunk_accepts_plain_key_kitty_forms() {
+        // Kitty report-all-keys mode sends `d` without the modifier field.
+        let d = Key::parse("d").unwrap();
+        assert!(d.matches_chunk(b"d"));
+        assert!(d.matches_chunk(b"\x1b[100u"));
+        assert!(d.matches_chunk(b"\x1b[100;1u"));
+    }
+
+    #[test]
+    fn validate_detach_unaliased_accepts_shipped_default() {
+        // forward == leader is the shipped default: not a conflict.
+        assert!(validate_detach_unaliased(&SessionKeys::default()).is_ok());
+    }
+
+    #[test]
+    fn validate_detach_unaliased_rejects_shadowing() {
+        // detach == leader shadows the forward binding (the default forward
+        // is the leader; the leader is consumed before either).
+        let err = validate_detach_unaliased(&SessionKeys {
+            detach_key: SessionKeys::default().leader,
+            ..SessionKeys::default()
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            KeyError::ConflictingDetach(ref d, s) if d == "ctrl-]" && s == "the leader chord"
+        ));
+        // detach == forward (distinct from the leader) shadows the forward key.
+        let err = validate_detach_unaliased(&SessionKeys {
+            detach_key: Key::parse("x").unwrap(),
+            forward_key: Key::parse("x").unwrap(),
+            ..SessionKeys::default()
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            KeyError::ConflictingDetach(ref d, s) if d == "x" && s == "the forward key"
+        ));
+    }
+
+    #[test]
+    fn validated_or_default_is_field_scoped_for_a_bad_leader() {
+        // A bad leader reverts; valid subcommand remaps survive.
+        let mut env = BTreeMap::new();
+        env.insert(LEADER_ENV.to_string(), "ctrl-c".to_string());
+        env.insert(DETACH_KEY_ENV.to_string(), "x".to_string());
+        let keys = SessionKeys::from_env(&env).validated_or_default();
+        assert_eq!(keys.leader, SessionKeys::default().leader);
+        assert_eq!(keys.detach_key, Key::parse("x").unwrap());
+    }
+
+    #[test]
+    fn validated_or_default_reverts_a_shadowing_detach_key() {
+        // detach == leader reaches forward-of-leader unreachable; the detach
+        // field alone reverts.
+        let default = SessionKeys::default();
+        let keys = SessionKeys {
+            detach_key: default.leader,
+            ..default
+        };
+        let keys = keys.validated_or_default();
+        assert_eq!(keys.detach_key, default.detach_key);
+        assert_eq!(keys.leader, default.leader);
     }
 }
