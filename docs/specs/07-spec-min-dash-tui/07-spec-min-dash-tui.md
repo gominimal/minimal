@@ -441,8 +441,9 @@ Currently `cmd_attach` shells out to `ssh` via `CommandExt::exec()`, which
 replaces the process. A TUI-native attach would: suspend the TUI (leave
 alternate screen, `disable_raw_mode`), spawn `ssh` as a child, wait for it
 to exit, then resume the TUI (re-enter alternate screen, `enable_raw_mode`,
-refresh). The user detaches with `Ctrl-W` (already handled by the daemon at
-`session_host.rs:1123`), which tears down the SSH channel; `ssh` exits; the
+refresh). The user detaches with the negotiated chord (default `ctrl-]` then
+`d`), handled per channel by the daemon's session-key matcher in
+`session_host.rs`, which tears down the SSH channel; `ssh` exits; the
 TUI resumes.
 
 Complexity: the detach chord is now configurable. The leader key (default

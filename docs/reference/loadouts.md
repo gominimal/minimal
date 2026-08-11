@@ -481,9 +481,21 @@ forward = "ctrl-]"
 The leader is negotiated with the daemon per attach channel — sent as env
 vars alongside `MINIMAL_SESSION_ID` — so two clients with different configs on
 the same session each get their own chord. The daemon re-validates the leader
-as a silent backstop: a chord it rejects is logged and falls back to the
-default rather than garbling the screen. As with `[loadouts]`, every field
+as a silent backstop: a chord it rejects is logged and only that field falls
+back to the default — your valid `detach`/`forward` remaps survive — never
+garbling the screen. As with `[loadouts]`, every field
 defaults and unknown keys are rejected, so an old config keeps parsing.
+
+Two caveats on that per-channel model:
+
+- **The banner's detach hint is mint-scoped.** The orientation banner prints
+  `MINIMAL_DETACH_HINT`, seeded from the channel that minted the shell. A
+  second client attaching with a remapped chord gets a *working* chord, but
+  the banner still advertises the minting channel's; trust your config over
+  the banner in that case.
+- **Bindings must not shadow each other.** A `detach` that equals the
+  `leader` or the `forward` key makes that other binding unreachable and is
+  rejected at load; the daemon's backstop reverts just the detach field.
 
 ## Listing loadouts
 
