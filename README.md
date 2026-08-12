@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/public/readme-banner.webp" alt="Minimal: now open source — github.com/gominimal/minimal" width="880">
+  <img src="docs/public/readme-banner.webp" alt="Minimal — build software you can trust" width="880">
 </p>
 
 <h1 align="center">Minimal</h1>
