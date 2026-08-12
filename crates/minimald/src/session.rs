@@ -7,6 +7,7 @@ use crate::sessions::{SessionControl, WeakManagerHandle, composables};
 use crate::store::SessionRecordHandle;
 use crate::{
     ChannelConfig,
+    session_delta::DeltaSource,
     session_host::{self, HostAttrs, WinSize},
 };
 use common::SpecHash;
@@ -439,6 +440,32 @@ const TEARDOWN_HOOK_BUDGET: std::time::Duration = std::time::Duration::from_secs
 /// against a wedge, not a performance budget.
 const HOOK_LAUNCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// This session's workspace baseline for the shell-exit prompt's change
+/// detection, established once before the first host launches and reused
+/// across every host teardown and rebuild. Re-arming the baseline at each
+/// launch would re-snapshot an already-modified workspace when a "keep
+/// filesystem" exit is followed by a reattach, so the next exit would detect
+/// no changes and drop the save-then-delete option.
+enum WorkspaceBaseline {
+    /// No host has launched yet; the baseline is armed on the first launch.
+    Unarmed,
+    /// Armed once at first launch and reused for the session's lifetime. Holds
+    /// the arm result verbatim — including the `None` of a walk that timed out
+    /// — so a rebuild never re-snapshots against a dirty tree.
+    Armed(Option<Arc<DeltaSource>>),
+}
+
+// Opaque so `Session`'s derived `Debug` need not dump the whole baseline
+// snapshot: only whether the baseline is armed and present is informative.
+impl fmt::Debug for WorkspaceBaseline {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unarmed => f.write_str("Unarmed"),
+            Self::Armed(delta) => write!(f, "Armed(present: {})", delta.is_some()),
+        }
+    }
+}
+
 /// The PTY size a host minted with nothing attached starts at. A client that
 /// attaches later resizes it; until then only an unattached shell sees it.
 const UNATTACHED_WIN_SIZE: WinSize = WinSize {
@@ -595,6 +622,11 @@ pub struct Session {
     /// Session state machine.
     inner: SessionInner,
 
+    /// Workspace baseline for the shell-exit prompt, armed once and reused
+    /// across host rebuilds so a reattach after a "keep filesystem" exit still
+    /// reports the changes made before that exit. See [`WorkspaceBaseline`].
+    workspace_baseline: WorkspaceBaseline,
+
     /// Serializes `WorkspacePatchesTarZst` uploads for this session: two
     /// concurrent uploads would race on the single `<workspace>/patches/`
     /// tree and step on each other.
@@ -649,6 +681,7 @@ impl Session {
             net_switch,
             tracker: OpTracker::new_root(),
             inner,
+            workspace_baseline: WorkspaceBaseline::Unarmed,
             patches_upload_lock: Arc::new(Mutex::new(())),
             hook_scripts_upload_lock: Arc::new(Mutex::new(())),
             manager,
@@ -1694,6 +1727,19 @@ impl Session {
             .as_utf8_path()
             .as_std_path()
             .join("archives");
+        // Arm the workspace baseline once, before this session's first host
+        // launches; a host rebuilt on reattach reuses it rather than
+        // re-snapshotting the already-modified workspace. See
+        // [`WorkspaceBaseline`].
+        let delta = match &self.workspace_baseline {
+            WorkspaceBaseline::Armed(delta) => delta.clone(),
+            WorkspaceBaseline::Unarmed => {
+                let workspace_root = paths.working.as_utf8_path().as_std_path().to_path_buf();
+                let delta = DeltaSource::arm(workspace_root).await;
+                self.workspace_baseline = WorkspaceBaseline::Armed(delta.clone());
+                delta
+            }
+        };
         let spawn = Box::pin(session_host::Host::spawn(
             launcher,
             registry_name(&record),
@@ -1703,6 +1749,7 @@ impl Session {
             None,
             // Mint a handle to this session ID in the sessions actor/manager.
             Some(SessionControl::new(self.manager.clone(), record.id)),
+            delta,
             archives_dir,
             record.id,
             // The host runs attach and detach itself: it owns the terminal
@@ -2980,6 +3027,80 @@ mod tests {
         assert!(
             rows.contains(&"M seeded.txt".to_string()),
             "expected the modified file; got: {rows:?}"
+        );
+    }
+
+    /// Regression: the shell-exit prompt's change detection survives a host
+    /// teardown and rebuild within one session. After a "keep filesystem" exit
+    /// and a reattach, the workspace baseline is still the one taken at first
+    /// activation — not re-snapshotted against the now-dirty tree — so a file
+    /// changed before the first exit is still reported on the second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_baseline_survives_keep_exit_and_reattach() {
+        use minimald_rpc::{SessionDelta, SessionDeltaRequest, SessionDeltaResponse};
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        // First activation arms the baseline against the pristine workspace.
+        let mut channel = client.open_shell(session_id).await;
+        await_echo(&mut channel).await;
+
+        // A change made during the session, daemon-side as an in-session shell
+        // would: the baseline predates it, so the exit prompt must report it.
+        let paths = session_paths(&server, session_id).await;
+        let working = paths.working.as_utf8_path();
+        tokio::fs::write(working.join("scratch.txt"), b"made in session")
+            .await
+            .unwrap();
+
+        // Exit the shell and pick the default first option ("keep filesystem"):
+        // Enter with no arrow. The host tears down; the session and its files
+        // stay in place.
+        channel
+            .data_bytes(format!("{}\n", crate::session_host::MOCK_EXIT_LINE).into_bytes())
+            .await
+            .unwrap();
+        let mut answered_prompt = false;
+        let mut prompt_out = Vec::new();
+        while let Ok(msg) = tokio::time::timeout(Duration::from_secs(10), channel.wait()).await {
+            match msg {
+                Some(ChannelMsg::Data { data }) => {
+                    prompt_out.extend_from_slice(&data);
+                    if !answered_prompt
+                        && String::from_utf8_lossy(&prompt_out)
+                            .contains(crate::session_host::SHELL_EXIT_PROMPT)
+                    {
+                        channel.data_bytes(b"\r".to_vec()).await.unwrap();
+                        answered_prompt = true;
+                    }
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert!(
+            answered_prompt,
+            "expected the session-exit prompt to render"
+        );
+
+        // Reattach mints a new host for the same session.
+        let mut channel = client.open_shell(session_id).await;
+        await_echo(&mut channel).await;
+
+        // The pre-exit change must still be reported: the reattach reused the
+        // activation baseline instead of re-arming against the dirty tree.
+        let resp = client
+            .call::<SessionDelta>(&SessionDeltaRequest { id: session_id })
+            .await;
+        let rows = match resp {
+            SessionDeltaResponse::ChangedSinceActivation { rows } => rows,
+            other => panic!("expected the activation-delta fallback, got {other:?}"),
+        };
+        assert!(
+            rows.contains(&"A scratch.txt".to_string()),
+            "the pre-exit change must survive reattach; got: {rows:?}"
         );
     }
 
