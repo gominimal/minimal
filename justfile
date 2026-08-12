@@ -285,7 +285,15 @@ fuzz-check:
 #
 # Run one fuzz target: `just fuzz graph graph_from_bytes -max_total_time=60`.
 fuzz crate target *args: (_need "cargo-fuzz" "cargo install cargo-fuzz --locked")
-    cd crates/{{crate}} && cargo +nightly fuzz run {{target}} -- -rss_limit_mb=2048 {{args}}
+    #!/usr/bin/env sh
+    set -eu
+    cd crates/{{crate}}
+    # libFuzzer never loads a dictionary on its own — it has to be passed. Any
+    # target with a `fuzz/<target>.dict` gets it automatically; a dict only
+    # biases mutation, so a target without one is not an error.
+    dict=""
+    [ -f "fuzz/{{target}}.dict" ] && dict="-dict=fuzz/{{target}}.dict"
+    cargo +nightly fuzz run {{target}} -- -rss_limit_mb=2048 $dict {{args}}
 
 # Unit + in-process integration tests. CI: every lane's core-tests suite.
 test: _nextest

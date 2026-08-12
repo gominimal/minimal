@@ -1,3 +1,4 @@
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
 use jaq_all::jaq_core::Filter;
@@ -15,30 +16,56 @@ pub struct JqError {
 }
 
 /// Parses the given bytes based on heuristics regarding the given path (i.e. file extension).
+///
+/// The parse call into the third-party jaq stack is wrapped in [`guard`]: this
+/// module's contract is to return `Err` on bad input, never to abort the
+/// process, but `jaq`/`hifijson` can panic on adversarial data (a fuzzer found
+/// an `Ord` total-order violation in std's sort on numbers that overflow to
+/// ±inf). Since `parse_file`'s input is supply-chain-influenced (upstream
+/// project data files, via `decode::stacks`), a hostile file must not take the
+/// tool down.
 pub fn parse_file<P: AsRef<Path>>(path: P, data: Vec<u8>) -> Result<Val, JqError> {
-    match path.as_ref().extension().map(|oss| oss.to_str()) {
-        Some(Some("toml")) => Ok(jaq_all::fmts::read::toml::parse(
-            &String::from_utf8(data).map_err(|e| JqError {
-                err: e.to_string(),
-                relevant_file: Some(path.as_ref().to_str().unwrap().to_string()),
+    let path = path.as_ref();
+    let err = |e: String| JqError {
+        err: e,
+        relevant_file: Some(path.to_string_lossy().into_owned()),
+        relevant_jq: None,
+    };
+    match path.extension().map(|oss| oss.to_str()) {
+        Some(Some("toml")) => guard(path, || {
+            let text = String::from_utf8(data).map_err(|e| err(e.to_string()))?;
+            jaq_all::fmts::read::toml::parse(&text).map_err(|e| err(e.to_string()))
+        }),
+        Some(Some("json")) => guard(path, || {
+            jaq_all::fmts::read::json::parse_single(&data).map_err(|e| err(e.to_string()))
+        }),
+        _ => Err(err("cannot handle file extension".to_string())),
+    }
+}
+
+/// Runs a call into the third-party jaq parser with panic containment,
+/// converting a caught unwind into the [`JqError`] the signature promises.
+///
+/// This relies on the default `panic = "unwind"` strategy. The `jq_parse_json`
+/// fuzz target builds `panic = "abort"` (libfuzzer-sys installs an abort hook),
+/// so it cannot observe this containment — the regression is proven by
+/// `parse_file_contains_jaq_panic` below, an ordinary `#[test]`, per
+/// docs/fuzzing.md §7.
+fn guard<T>(path: &Path, f: impl FnOnce() -> Result<T, JqError>) -> Result<T, JqError> {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(panic) => {
+            let detail = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            Err(JqError {
+                err: format!("jq parser panicked on this input: {detail}"),
+                relevant_file: Some(path.to_string_lossy().into_owned()),
                 relevant_jq: None,
-            })?,
-        )
-        .map_err(|e| JqError {
-            err: e.to_string(),
-            relevant_file: Some(path.as_ref().to_str().unwrap().to_string()),
-            relevant_jq: None,
-        })?),
-        Some(Some("json")) => jaq_all::fmts::read::json::parse_single(&data).map_err(|e| JqError {
-            err: e.to_string(),
-            relevant_file: Some(path.as_ref().to_str().unwrap().to_string()),
-            relevant_jq: None,
-        }),
-        _ => Err(JqError {
-            err: "cannot handle file extension".to_string(),
-            relevant_file: Some(path.as_ref().to_str().unwrap().to_string()),
-            relevant_jq: None,
-        }),
+            })
+        }
     }
 }
 
@@ -106,5 +133,25 @@ mod tests {
     #[test]
     fn parse_file_accepts_valid_json() {
         assert!(parse_file("x.json", b"{\"a\": 1}".to_vec()).is_ok());
+    }
+
+    #[test]
+    fn parse_file_contains_jaq_panic() {
+        // Regression for a fuzzer-found abort: the jaq/hifijson JSON parser
+        // panics via an `Ord` total-order violation in std's sort on inputs
+        // with numbers that overflow f64 to ±inf. `parse_file` must contain
+        // that unwind and return a `JqError`, not abort the process. The fuzz
+        // target can't prove this (it builds panic=abort), so this test does.
+        // Input is the minimized crash artifact.
+        let repro = include_bytes!("testdata/jq_ord_violation_repro");
+        let err = parse_file("x.json", repro.to_vec())
+            .expect_err("jaq panic must be contained as an error, not abort");
+        // Assert the panic path specifically — not just any error — so this
+        // can't pass vacuously if the reproducer ever stops panicking.
+        assert!(
+            err.err.contains("jq parser panicked"),
+            "expected a contained panic, got: {}",
+            err.err
+        );
     }
 }
