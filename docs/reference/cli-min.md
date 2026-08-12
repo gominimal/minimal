@@ -11,9 +11,13 @@ development sessions. Most commands start the daemon automatically when it
 isn't running, with `bug`, `stop`, and `version` being the exceptions. The 
 daemon starts natively on Linux (and under `--provider local-minvmd`) or 
 inside the [`minvmd`](./cli-minvmd.md) microVM host daemon on macOS. 
-Running bare `min` with no subcommand prints this help and exits; use
-`min session attach` to get into a session for the current directory, or
-`min session activate` to create one.
+Running bare `min` with no subcommand routes you into a session when stdin
+and stdout are both a terminal: it follows the smart-resolution rules of
+`min session attach` with no argument (cwd match → attach, only session →
+attach, ambiguity → picker), and when no sessions exist it creates one from
+the current directory and attaches. Without a terminal it instead prints a
+read-only state report on stderr and exits successfully. Use `min --help` to print this
+help.
 
 Commands are spelled `min <noun> <verb>`, and every noun accepts its singular
 and plural form (`session`/`sessions`, `loadout`/`loadouts`). A handful of
