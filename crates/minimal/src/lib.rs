@@ -3192,9 +3192,25 @@ pub async fn cmd_login(global: &GlobalArgs, args: LoginArgs) -> Result<(), anyho
 // VCS checkouts, and `minimal.toml` — they do not go through minimald.
 // -----------------------------------------------------------------------
 
+/// The process-global operation tracker, its stderr renderer spawned on first
+/// use. Package commands attach it to their `mctx::Config` so long-running work
+/// — fetching and extracting cached packages — draws a live progress tree,
+/// mirroring how `mip` wires the same tracker. Spawned once: the CLI owns a
+/// single terminal and a single root, and `render_to_stderr` must be called
+/// only once per process.
+fn operation_tracker() -> ot::OpTracker {
+    static ROOT: std::sync::OnceLock<ot::OpTracker> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let root = ot::OpTracker::new_root();
+        ot::render_to_stderr(root.clone());
+        root
+    })
+    .clone()
+}
+
 /// Build an `mctx::Config` from the shared global args.
 pub fn build_config(global: &GlobalArgs) -> Result<mctx::Config, mctx::Error> {
-    let mut builder = mctx::ConfigBuilder::new();
+    let mut builder = mctx::ConfigBuilder::new().with_operation_tracker(operation_tracker());
     if let Some(dir) = &global.minimal_dir {
         builder = builder.with_state_dir(dir).with_cache_dir(dir);
     }
