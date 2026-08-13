@@ -515,6 +515,32 @@ async fn async_main() -> Result<(), MainError> {
         return spawn_detached(&cli);
     }
 
+    // Pin the path this daemon re-execs itself from as the `__nsenter` shim,
+    // now, while the file is certainly still there. Resolved per-spawn instead,
+    // `current_exe()` reads `/proc/self/exe`, which the kernel reports as a
+    // dangling `<path> (deleted)` once the binary has been replaced — so every
+    // lifecycle hook and in-session exec fails with `ENOENT` after any rebuild
+    // of a running daemon. `just min` rebuilds `-p minimald` on every
+    // invocation, so a dev daemon meets that the first time its source changes.
+    // The path resolved here keeps naming whatever now lives at it.
+    //
+    // Not in the microVM: pid-1's own path is the initramfs `/init`, which is
+    // unreachable after the rootfs switch, so the guest stages a runnable copy
+    // and registers *that* (#1175). Registration is first-wins, so claiming it
+    // here would lock the guest's out.
+    if !is_minimal_microvm() {
+        match std::env::current_exe() {
+            Ok(exe) => minimald::nsenter::set_shim_exe(exe),
+            // Non-fatal: without a registration each injection falls back to
+            // resolving `current_exe()` itself, which is the prior behaviour.
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not resolve this daemon's executable to register as the nsenter shim; \
+                 in-session exec will re-resolve it per spawn",
+            ),
+        }
+    }
+
     // Handle setup specific to operating in a micro-vm.
     use minimald::guest;
     // Before anything forks from us and inherits the limits. Best effort: the

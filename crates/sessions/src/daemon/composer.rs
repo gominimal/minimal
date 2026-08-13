@@ -24,8 +24,6 @@ use crate::wire::request::{ContributionResponse, ContributionVerdict, WireContri
 pub struct PendingComposeState {
     /// Daemon-collected packages (no per-item wire verdict).
     pub daemon_packages: Vec<ProvenancedPackage>,
-    /// Daemon-collected lifecycle hooks (no per-item wire verdict).
-    pub daemon_lifecycle_hooks: Vec<ProvenancedHook>,
     /// Daemon-collected vars keyed by the [`PendingId`] shipped on
     /// the wire response. Supplies source provenance the verdict
     /// omits.
@@ -33,6 +31,12 @@ pub struct PendingComposeState {
     /// Daemon-collected patches keyed by [`PendingId`]. Supplies
     /// destination and source provenance the verdict omits.
     pub pending_patches: BTreeMap<PendingId, ProvenancedPatch>,
+    /// Daemon-collected lifecycle hooks keyed by [`PendingId`]. The
+    /// hook itself lives here rather than being reconstructed from the
+    /// verdict, so an approval carries back only a decision — the
+    /// client cannot substitute a different script for the one it was
+    /// shown.
+    pub pending_hooks: BTreeMap<PendingId, ProvenancedHook>,
     /// Client's already-gated wire contribution, untouched.
     pub client_contribution: WireContribution,
 }
@@ -170,31 +174,34 @@ impl SessionComposer {
             lifecycle_hooks,
         } = contribution;
 
-        // All-decided fast path: only items the client must gate are
-        // vars and patches. Packages and lifecycle hooks have no
-        // per-item verdict in the wire schema, so a daemon
-        // contribution carrying only those (or carrying nothing)
-        // assembles directly into the Composition.
+        // All-decided fast path: packages are the only domain with no
+        // per-item verdict, so a daemon contribution carrying nothing
+        // else assembles directly into the Composition.
+        //
+        // Lifecycle hooks must be counted here. They used to ride the
+        // response for information only, which meant a project whose
+        // sole contribution was hooks took this path and never faced
+        // the gate — precisely the case the hooks policy exists to
+        // catch.
         tracing::info!(
             daemon_vars = vars.len(),
             daemon_patches = patches.len(),
             daemon_packages = packages.len(),
+            daemon_hooks = lifecycle_hooks.len(),
             "compose: daemon-side contribution collected",
         );
-        if vars.is_empty() && patches.is_empty() {
-            let mut composition = Composition::from_daemon_passthrough(packages, lifecycle_hooks);
+        if vars.is_empty() && patches.is_empty() && lifecycle_hooks.is_empty() {
+            let mut composition = Composition::from_daemon_passthrough(packages, Vec::new());
             composition.extend_from_wire(client)?;
             return Ok(ComposeOutcome::Ready(composition));
         }
 
-        // Daemon-collected vars or patches: route them back to the
-        // client for gating. Lifecycle hooks ride in the response
-        // for audit; a separate copy is retained on the stash for
-        // Phase 4 to install. Packages aren't on the wire at all —
-        // they only live on the stash. Vars and patches are stashed
-        // by `PendingId` so `resume_from_verdict` can reattach
-        // provenance to whatever the client approves.
-        let transform = contribution_to_pending(vars, patches, lifecycle_hooks.clone());
+        // Daemon-collected vars, patches, or hooks: route them back to
+        // the client for gating. Packages aren't on the wire at all —
+        // they only live on the stash. Every gated domain is stashed by
+        // `PendingId` so `resume_from_verdict` can reattach provenance
+        // to whatever the client approves.
+        let transform = contribution_to_pending(vars, patches, lifecycle_hooks);
         let response = ContributionResponse {
             session_id,
             vars: transform.wire.vars,
@@ -205,9 +212,9 @@ impl SessionComposer {
             response,
             state: PendingComposeState {
                 daemon_packages: packages,
-                daemon_lifecycle_hooks: lifecycle_hooks,
                 pending_vars: transform.pending_vars,
                 pending_patches: transform.pending_patches,
+                pending_hooks: transform.pending_hooks,
                 client_contribution: client,
             },
         })
@@ -240,20 +247,86 @@ pub fn resume_from_verdict(
 ) -> Result<Composition, ComposeError> {
     let PendingComposeState {
         daemon_packages,
-        daemon_lifecycle_hooks,
         pending_vars,
         pending_patches,
+        pending_hooks,
         client_contribution,
     } = state;
 
-    let mut composition =
-        Composition::from_daemon_passthrough(daemon_packages, daemon_lifecycle_hooks);
+    let accepted_hooks = apply_hook_verdicts(pending_hooks, verdict.lifecycle_hooks)?;
+    let mut composition = Composition::from_daemon_passthrough(daemon_packages, accepted_hooks);
 
     let accepted_vars = apply_var_verdicts(pending_vars, verdict.vars)?;
     let accepted_patches = apply_patch_verdicts(&pending_patches, verdict.patches)?;
     composition.extend_with(accepted_vars, accepted_patches)?;
     composition.extend_from_wire(client_contribution)?;
     Ok(composition)
+}
+
+/// Walk the hook verdict, keeping the hooks the client approved.
+///
+/// A hook the verdict never mentions is **dropped**, not kept: the
+/// stash is the daemon's, and silence from the client must fail closed.
+/// That is what makes a verdict from a client predating this gate safe
+/// — it simply carries no hook decisions, so no project hook runs.
+///
+/// A `Denied` verdict aborts the whole resume, matching vars and
+/// patches: a project-declared item the user explicitly refused can't
+/// be silently dropped, because the resulting session would differ from
+/// what the project declared without anyone being told.
+///
+/// # Errors
+///
+/// - [`ComposeError::InvalidWireItem`] if a verdict names a
+///   [`PendingId`] that isn't in the stash.
+/// - [`ComposeError::Denied`] if any hook was refused.
+fn apply_hook_verdicts(
+    mut pending_hooks: BTreeMap<PendingId, ProvenancedHook>,
+    hook_verdicts: Vec<crate::wire::policy::WireHookVerdict>,
+) -> Result<Vec<ProvenancedHook>, ComposeError> {
+    use crate::wire::policy::WireHookVerdict as V;
+
+    let mut accepted = Vec::new();
+    for v in hook_verdicts {
+        let (id, approved) = match v {
+            V::Approved { id } => (id, true),
+            V::Denied { id } => {
+                let from = pending_hooks.get(&id).map(|h| h.source().clone());
+                return Err(match from {
+                    Some(from) => ComposeError::Denied {
+                        what: "lifecycle hook".to_string(),
+                        from,
+                    },
+                    None => ComposeError::InvalidWireItem {
+                        what: "hook verdict for an unknown pending id",
+                        context: format!("id {}", id.get()),
+                    },
+                });
+            }
+            V::Ignored { id } => (id, false),
+        };
+        let hook = pending_hooks
+            .remove(&id)
+            .ok_or_else(|| ComposeError::InvalidWireItem {
+                what: "hook verdict for an unknown pending id",
+                context: format!("id {}", id.get()),
+            })?;
+        if approved {
+            accepted.push(hook);
+        }
+    }
+    // Anything still in the stash went unaddressed. Log it rather than
+    // failing: an older client legitimately sends no hook verdicts at
+    // all, and refusing the whole activation for that would break it
+    // against a newer daemon for no security gain — the hooks are
+    // already dropped.
+    if !pending_hooks.is_empty() {
+        tracing::info!(
+            dropped = pending_hooks.len(),
+            "compose: lifecycle hooks with no client verdict were dropped",
+        );
+    }
+    Ok(accepted)
 }
 
 /// Walk the var verdict, draining `pending_vars` as items are
@@ -556,21 +629,24 @@ mod tests {
                 // Stash is empty (no packages or hooks collected); the
                 // client's wire contribution is the default we passed.
                 assert!(state.daemon_packages.is_empty());
-                assert!(state.daemon_lifecycle_hooks.is_empty());
+                assert!(state.pending_hooks.is_empty());
                 assert_eq!(state.client_contribution, WireContribution::default());
             }
             ComposeOutcome::Ready(_) => panic!("expected Pending, got Ready"),
         }
     }
 
-    /// A daemon contribution carrying packages and lifecycle hooks
-    /// (but no vars or patches) takes the all-decided fast path —
-    /// neither domain has a per-item verdict slot, so they pass
-    /// through verbatim into the assembled [`Composition`].
-    /// Regression guard for branching on `vars + patches` (not
-    /// `Contribution::is_empty()`).
+    /// A daemon contribution carrying packages **and lifecycle hooks**
+    /// does *not* take the all-decided fast path: hooks now carry a
+    /// per-item verdict, so the client must gate them.
+    ///
+    /// This inverts the previous contract, deliberately. When hooks
+    /// were pass-through, a project whose only contribution was hooks
+    /// composed straight to `Ready` and never faced the policy — the
+    /// exact hole the hooks gate exists to close. Packages still have
+    /// no verdict and would take the fast path on their own.
     #[test]
-    fn daemon_collected_packages_and_hooks_route_to_ready() {
+    fn daemon_collected_hooks_route_to_pending_not_ready() {
         use crate::core::compose::{Composable, Contribution, Error};
         use crate::core::lifecyclehook::{HookScript, LifecycleHook};
         use crate::core::source::ProvenancedHook;
@@ -600,18 +676,60 @@ mod tests {
         let mut composer = SessionComposer::new(WireContribution::default());
         composer.add(ProjectPkgAndHook).unwrap();
 
+        match composer
+            .compose(nil_id(), ComposeOptions::default())
+            .unwrap()
+        {
+            ComposeOutcome::Pending { response, state } => {
+                // The hook is on the wire with an id the verdict can
+                // name, and stashed daemon-side under that same id.
+                assert_eq!(response.vars.len(), 0);
+                assert_eq!(response.patches.len(), 0);
+                assert_eq!(response.lifecycle_hooks.len(), 1);
+                let id = response.lifecycle_hooks[0].id;
+                assert!(state.pending_hooks.contains_key(&id));
+                // The package needs no verdict, so it waits on the
+                // stash rather than riding the response.
+                assert_eq!(state.daemon_packages.len(), 1);
+                assert_eq!(state.daemon_packages[0].package(), "ripgrep");
+            }
+            ComposeOutcome::Ready(_) => {
+                panic!("hooks must force a client gate, not compose straight to Ready")
+            }
+        }
+    }
+
+    /// Packages alone still take the fast path — adding the hooks
+    /// check to that branch must not have made every package-bearing
+    /// project pay for a round-trip.
+    #[test]
+    fn daemon_collected_packages_alone_still_route_to_ready() {
+        use crate::core::compose::{Composable, Contribution, Error};
+
+        struct ProjectPkgOnly;
+        impl Composable for ProjectPkgOnly {
+            fn contribute(
+                self,
+                _env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+            ) -> Result<Contribution, Error> {
+                let src = Source::Project {
+                    path: paths::HostPath::try_new("/proj").unwrap(),
+                };
+                let mut c = Contribution::new();
+                c.push_package(ProvenancedPackage::new("ripgrep", src));
+                Ok(c)
+            }
+        }
+
+        let mut composer = SessionComposer::new(WireContribution::default());
+        composer.add(ProjectPkgOnly).unwrap();
         let res = unwrap_ready(
             composer
                 .compose(nil_id(), ComposeOptions::default())
                 .unwrap(),
         );
-        // Vars and patches are untouched; pkg and hook passed
-        // through onto the Composition.
-        assert!(res.vars().is_empty());
-        assert!(res.patches().is_empty());
         assert_eq!(res.packages().len(), 1);
-        assert_eq!(res.packages()[0].package(), "ripgrep");
-        assert_eq!(res.lifecycle_hooks().len(), 1);
+        assert!(res.lifecycle_hooks().is_empty());
     }
 
     // ============================================================
@@ -639,7 +757,7 @@ mod tests {
         pending_vars.insert(PendingId::new(0), pv);
         let state = PendingComposeState {
             daemon_packages: Vec::new(),
-            daemon_lifecycle_hooks: Vec::new(),
+            pending_hooks: BTreeMap::new(),
             pending_vars,
             pending_patches: BTreeMap::new(),
             client_contribution: WireContribution::default(),
@@ -664,6 +782,7 @@ mod tests {
                 },
             }],
             patches: vec![],
+            lifecycle_hooks: vec![],
         };
         let comp = resume_from_verdict(state, verdict).unwrap();
         assert_eq!(comp.vars().len(), 1);
@@ -683,6 +802,7 @@ mod tests {
                 name: "PROJECT_VAR".into(),
             }],
             patches: vec![],
+            lifecycle_hooks: vec![],
         };
         let comp = resume_from_verdict(state, verdict).unwrap();
         assert!(comp.vars().is_empty());
@@ -699,6 +819,7 @@ mod tests {
                 name: "PROJECT_VAR".into(),
             }],
             patches: vec![],
+            lifecycle_hooks: vec![],
         };
         let err = resume_from_verdict(state, verdict).unwrap_err();
         match err {
@@ -726,6 +847,7 @@ mod tests {
                 },
             }],
             patches: vec![],
+            lifecycle_hooks: vec![],
         };
         let err = resume_from_verdict(state, verdict).unwrap_err();
         assert!(
@@ -744,6 +866,7 @@ mod tests {
             session_id: id,
             vars: vec![],
             patches: vec![],
+            lifecycle_hooks: vec![],
         };
         let err = resume_from_verdict(state, verdict).unwrap_err();
         assert!(
@@ -760,7 +883,7 @@ mod tests {
     fn resume_from_verdict_empty_inputs_yields_empty_composition() {
         let state = PendingComposeState {
             daemon_packages: Vec::new(),
-            daemon_lifecycle_hooks: Vec::new(),
+            pending_hooks: BTreeMap::new(),
             pending_vars: BTreeMap::new(),
             pending_patches: BTreeMap::new(),
             client_contribution: WireContribution::default(),
@@ -769,6 +892,7 @@ mod tests {
             session_id: SessionId::nil(),
             vars: vec![],
             patches: vec![],
+            lifecycle_hooks: vec![],
         };
         let comp = resume_from_verdict(state, verdict).unwrap();
         assert!(comp.vars().is_empty());
@@ -777,11 +901,9 @@ mod tests {
         assert!(comp.lifecycle_hooks().is_empty());
     }
 
-    /// Daemon-stashed packages and lifecycle hooks pass through the
-    /// resume into the assembled `Composition` (they have no
-    /// per-item verdict and are never on the wire round-trip).
-    #[test]
-    fn resume_from_verdict_passes_through_packages_and_hooks() {
+    /// Build a `PendingComposeState` holding one package and one
+    /// project-declared hook, both from `/proj`.
+    fn state_with_one_package_and_hook() -> PendingComposeState {
         use crate::core::lifecyclehook::{HookScript, LifecycleHook};
         let src = Source::Project {
             path: paths::HostPath::try_new("/proj").unwrap(),
@@ -790,22 +912,107 @@ mod tests {
             .with_on_activate(HookScript::inline("echo hi"))
             .build()
             .unwrap();
-        let state = PendingComposeState {
+        PendingComposeState {
             daemon_packages: vec![ProvenancedPackage::new("ripgrep", src.clone())],
-            daemon_lifecycle_hooks: vec![ProvenancedHook::new(hook, src)],
             pending_vars: BTreeMap::new(),
             pending_patches: BTreeMap::new(),
+            pending_hooks: [(PendingId::new(0), ProvenancedHook::new(hook, src))]
+                .into_iter()
+                .collect(),
             client_contribution: WireContribution::default(),
-        };
+        }
+    }
+
+    /// Packages pass through the resume (no per-item verdict); an
+    /// **approved** hook composes in.
+    #[test]
+    fn resume_from_verdict_passes_packages_and_keeps_approved_hooks() {
+        use crate::wire::policy::WireHookVerdict;
         let verdict = ContributionVerdict {
             session_id: SessionId::nil(),
             vars: vec![],
             patches: vec![],
+            lifecycle_hooks: vec![WireHookVerdict::Approved {
+                id: PendingId::new(0),
+            }],
         };
-        let comp = resume_from_verdict(state, verdict).unwrap();
+        let comp = resume_from_verdict(state_with_one_package_and_hook(), verdict).unwrap();
         assert_eq!(comp.packages().len(), 1);
         assert_eq!(comp.packages()[0].package(), "ripgrep");
         assert_eq!(comp.lifecycle_hooks().len(), 1);
+    }
+
+    /// A hook the verdict never mentions is dropped rather than kept.
+    ///
+    /// This is the compatibility contract for a client that predates
+    /// the hooks gate: its verdict carries no hook decisions at all, so
+    /// silence must mean "do not run", never "run unchecked". Packages
+    /// are unaffected — they were never gated.
+    #[test]
+    fn resume_from_verdict_drops_hooks_with_no_verdict() {
+        let verdict = ContributionVerdict {
+            session_id: SessionId::nil(),
+            vars: vec![],
+            patches: vec![],
+            lifecycle_hooks: vec![],
+        };
+        let comp = resume_from_verdict(state_with_one_package_and_hook(), verdict).unwrap();
+        assert_eq!(comp.packages().len(), 1);
+        assert!(
+            comp.lifecycle_hooks().is_empty(),
+            "a hook with no verdict must not run",
+        );
+    }
+
+    /// An `Ignored` hook is dropped without failing the activation,
+    /// while a `Denied` one aborts the whole resume — the same split
+    /// the var and patch domains use.
+    #[test]
+    fn resume_from_verdict_ignores_or_denies_hooks() {
+        use crate::wire::policy::WireHookVerdict;
+        let ignored = ContributionVerdict {
+            session_id: SessionId::nil(),
+            vars: vec![],
+            patches: vec![],
+            lifecycle_hooks: vec![WireHookVerdict::Ignored {
+                id: PendingId::new(0),
+            }],
+        };
+        let comp = resume_from_verdict(state_with_one_package_and_hook(), ignored).unwrap();
+        assert!(comp.lifecycle_hooks().is_empty());
+
+        let denied = ContributionVerdict {
+            session_id: SessionId::nil(),
+            vars: vec![],
+            patches: vec![],
+            lifecycle_hooks: vec![WireHookVerdict::Denied {
+                id: PendingId::new(0),
+            }],
+        };
+        let err = resume_from_verdict(state_with_one_package_and_hook(), denied)
+            .expect_err("a denied hook must abort the resume");
+        assert!(matches!(err, ComposeError::Denied { .. }), "got: {err:?}");
+    }
+
+    /// A verdict naming an id the daemon never issued is a protocol
+    /// fault, not something to silently skip.
+    #[test]
+    fn resume_from_verdict_rejects_unknown_hook_id() {
+        use crate::wire::policy::WireHookVerdict;
+        let verdict = ContributionVerdict {
+            session_id: SessionId::nil(),
+            vars: vec![],
+            patches: vec![],
+            lifecycle_hooks: vec![WireHookVerdict::Approved {
+                id: PendingId::new(99),
+            }],
+        };
+        let err = resume_from_verdict(state_with_one_package_and_hook(), verdict)
+            .expect_err("unknown pending id must fault");
+        assert!(
+            matches!(err, ComposeError::InvalidWireItem { .. }),
+            "got: {err:?}",
+        );
     }
 
     /// The client's stashed wire contribution merges in on top of
@@ -825,7 +1032,7 @@ mod tests {
         };
         let state = PendingComposeState {
             daemon_packages: Vec::new(),
-            daemon_lifecycle_hooks: Vec::new(),
+            pending_hooks: BTreeMap::new(),
             pending_vars: BTreeMap::new(),
             pending_patches: BTreeMap::new(),
             client_contribution: client,
@@ -834,6 +1041,7 @@ mod tests {
             session_id: SessionId::nil(),
             vars: vec![],
             patches: vec![],
+            lifecycle_hooks: vec![],
         };
         let comp = resume_from_verdict(state, verdict).unwrap();
         assert_eq!(comp.vars().len(), 1);

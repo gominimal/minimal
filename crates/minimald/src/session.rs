@@ -71,6 +71,130 @@ async fn materialize_patches_into_home(
     Ok(())
 }
 
+/// Run the session's hooks for `event` and log what each one did.
+///
+/// Returns an empty list when there is nothing to run *or nothing to
+/// run it in*: a session with no composition, or with no live host,
+/// has no namespaces to join. That is not an error — a session that
+/// was never attached, whose shell has exited, or that came up from
+/// disk after a daemon restart genuinely has no sandbox for a hook to
+/// enter, and teardown must proceed regardless.
+async fn run_session_hooks(
+    inner: &SessionInner,
+    record: &SessionRecordHandle,
+    event: crate::hooks::HookEvent,
+) -> Vec<crate::hooks::HookOutcome> {
+    use sessions::store::SessionObject as _;
+
+    let SessionInner::Active {
+        composition: Some(composition),
+        host: Some((handle, _)),
+        ..
+    } = inner
+    else {
+        return Vec::new();
+    };
+    let object = match record.object().await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(
+                event = event.as_str(),
+                error = %e,
+                "reading the session record failed; skipping lifecycle hooks",
+            );
+            return Vec::new();
+        }
+    };
+    let name = registry_name(object.record());
+    let ctx = crate::hooks::HookContext {
+        session_id: *record.id(),
+        session_name: &name,
+        composition,
+        hooks_dir: object.hooks_path(),
+        workspace: object.workspace_path(),
+    };
+    // Teardown runs under one budget across all of its hooks; setup runs
+    // unbounded (see [`crate::hooks::run_hooks`]). Every event reaching
+    // this function is headless, and the two teardown ones are the pair
+    // that must not be able to hold a session open.
+    let budget = event.is_teardown().then_some(TEARDOWN_HOOK_BUDGET);
+    let outcomes = crate::hooks::run_hooks(
+        handle,
+        &ctx,
+        event,
+        crate::hooks::HookOutput::Capture,
+        budget,
+    )
+    .await;
+    log_hook_outcomes(&name, &outcomes);
+    outcomes
+}
+
+/// Emit one record per hook run. Failures are warnings so an operator
+/// sees them without turning on debug logging; the captured tail rides
+/// along because a hook's own output is usually the only explanation
+/// of why it failed.
+fn log_hook_outcomes(session: &str, outcomes: &[crate::hooks::HookOutcome]) {
+    for o in outcomes {
+        if o.failed() {
+            tracing::warn!(
+                session,
+                event = o.event,
+                declared_by = %o.declared_by,
+                status = ?o.status,
+                output = %o.output,
+                "lifecycle hook failed",
+            );
+        } else {
+            tracing::info!(
+                session,
+                event = o.event,
+                declared_by = %o.declared_by,
+                "lifecycle hook ran",
+            );
+        }
+    }
+}
+
+/// True when `composition` has a hook whose external script can only
+/// reach the daemon through the hook-script upload — and which therefore
+/// must not be finalized until that upload lands.
+///
+/// Two exclusions, and both are the difference between a session that
+/// activates and one that cannot:
+///
+/// - **Inline** hooks carry their body in the composition, so a session
+///   whose hooks are all inline uploads nothing and must not wait on a
+///   marker that will never appear.
+/// - **Project** hooks name a path inside the project, and the project
+///   tree is uploaded wholesale by the activation that precedes this.
+///   Their scripts arrive with it, which is why the client stages only
+///   *loadout* scripts and why [`crate::hooks::read_script`] falls back
+///   to the workspace for a project source. Gating on the marker here
+///   would demand an upload that is never sent, and no project could
+///   ever declare an external hook script.
+fn composition_needs_staged_scripts(composition: &Composition) -> bool {
+    use sessions::core::lifecyclehook::{HookScript, HookScriptBody};
+    use sessions::core::source::{Provenanced, Source};
+    composition
+        .lifecycle_hooks()
+        .iter()
+        .filter(|ph| !matches!(ph.source(), Source::Project { .. }))
+        .any(|ph| {
+            let hook = ph.hook();
+            [
+                hook.on_activate(),
+                hook.on_destroy(),
+                hook.on_attach(),
+                hook.on_detach(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(HookScript::body)
+            .any(|b| matches!(b, HookScriptBody::External(_)))
+        })
+}
+
 /// Load the persisted composition snapshot for an `Active` session
 /// brought up from disk after a daemon restart. Returns `None` (with
 /// a warning log) when the sidecar is missing or corrupt. The
@@ -190,6 +314,12 @@ pub struct SessionPaths {
     /// may not exist yet — it's created on the first successful
     /// upload.
     pub patches: DaemonAbsPath,
+    /// Where the daemon stages client-uploaded external lifecycle-hook
+    /// scripts (`WorkspaceHookScriptsTarZst` unpacks under this dir,
+    /// keyed by the script's staged path). Like `patches`, it may not
+    /// exist yet — a session whose hooks are all inline never uploads
+    /// anything here.
+    pub hooks: DaemonAbsPath,
 }
 
 /// Everything a [`Session`] actor needs at spawn time. Every session actor
@@ -267,6 +397,48 @@ type LaunchedHost = (
     JoinHandle<Result<i32, std::io::Error>>,
 );
 
+/// Where in the session lifecycle a host launch is happening, which decides
+/// whether the launch has to wait for an `Active` record.
+///
+/// Only [`Session::finalize`]'s launch is `Activating`. Every other
+/// launch happens after the session is attachable and keeps the status gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchPhase {
+    /// A launch against a session that is already `Active`: an attach, or an
+    /// exec's [`Session::ensure_host`]. Both check the record's status
+    /// themselves before getting here; the gate in [`Session::context`] is
+    /// their backstop.
+    Attached,
+    /// The pre-activation launch inside [`Session::finalize`]. It runs while
+    /// the record is still `Materializing` by construction — promoting to
+    /// `Active` is what finalize does *after* the activation hooks this host
+    /// exists to run — so it cannot take the `Active` gate without
+    /// deadlocking against itself.
+    Activating,
+}
+
+/// How long *all* of a teardown transition's hooks get, together.
+///
+/// A hook's own timeout is capped at
+/// [`MAX_HOOK_TIMEOUT`](sessions::core::lifecyclehook::MAX_HOOK_TIMEOUT)
+/// to keep one from holding a session open, but nothing bounds how many
+/// hooks a composition may carry — so without a total, N of them at the
+/// cap would hold a destroy for N×5 minutes and defeat the point. This
+/// is that total. Wide enough that an honest teardown never meets it;
+/// the hooks are a courtesy, and the destroy is the contract.
+const TEARDOWN_HOOK_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long a teardown transition will wait for the sandbox it needs to
+/// run its hooks in.
+///
+/// Nothing else about a host launch is time-bounded, because every other
+/// caller is a user waiting on their own attach. A teardown is not: the
+/// hooks are a courtesy and the destroy is the contract, so the launch
+/// gets a deadline and the session is torn down either way. Generous
+/// enough to cover a cold cache on a loaded box — this is a backstop
+/// against a wedge, not a performance budget.
+const HOOK_LAUNCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The PTY size a host minted with nothing attached starts at. A client that
 /// attaches later resizes it; until then only an unattached shell sees it.
 const UNATTACHED_WIN_SIZE: WinSize = WinSize {
@@ -327,7 +499,11 @@ enum SessionMessage {
     /// patches-ready marker under `<workspace>/patches/`. Idempotent
     /// on an already-`Active` session; refused with `InvalidInput`
     /// on `Pending` (configure the loadout first).
-    Finalize(oneshot::Sender<Result<(), std::io::Error>>),
+    Finalize(oneshot::Sender<Result<Vec<minimald_rpc::RanHook>, std::io::Error>>),
+    /// Run this session's `on_detach` hooks, sent by a binding that has
+    /// left a session which outlives it. Answered when they have run (or
+    /// been skipped), so a departing binding can await them.
+    RunDetachHooks(oneshot::Sender<()>),
     /// Abort a `Draft` session: delete its record and stop the actor.
     /// Refused with `InvalidInput` on an `Active` session (use `Destroy`).
     Abort(oneshot::Sender<Result<(), std::io::Error>>),
@@ -346,9 +522,16 @@ enum SessionMessage {
     /// record.
     Destroy(oneshot::Sender<Result<(), std::io::Error>>),
     GetRecord(oneshot::Sender<Record>),
+    /// Hand back the session's composition, if it has one. Sourced from
+    /// the persisted snapshot: `Session::run` loads it at spawn, so this
+    /// answers for an actor brought up from disk after a restart.
+    GetComposition(oneshot::Sender<Option<Arc<Composition>>>),
     /// Hand back an `Arc` clone of this session's patches-upload lock, see
     /// [`Session::patches_upload_lock`].
     GetPatchesUploadLock(oneshot::Sender<Arc<Mutex<()>>>),
+    /// Hand back an `Arc` clone of this session's hook-scripts-upload lock,
+    /// see [`Session::hook_scripts_upload_lock`].
+    GetHookScriptsUploadLock(oneshot::Sender<Arc<Mutex<()>>>),
     /// Kick off a background package build as a session side-op. Replies with
     /// the receiver end of the build's event stream.
     StartBuild {
@@ -417,6 +600,13 @@ pub struct Session {
     /// tree and step on each other.
     patches_upload_lock: Arc<Mutex<()>>,
 
+    /// The same, for `WorkspaceHookScriptsTarZst` uploads and the
+    /// `<workspace>/hooks/` tree. A separate lock from the patches one:
+    /// the two uploads target different trees and run back-to-back, so
+    /// sharing a lock would serialize them against each other for no
+    /// reason.
+    hook_scripts_upload_lock: Arc<Mutex<()>>,
+
     /// A non-owning handle to the [`Manager`](crate::sessions::Manager), used to
     /// build the [`SessionControl`] handed to each [`Binding`] so a shell-exit
     /// "delete" tears this session down through the manager (record removal and
@@ -460,6 +650,7 @@ impl Session {
             tracker: OpTracker::new_root(),
             inner,
             patches_upload_lock: Arc::new(Mutex::new(())),
+            hook_scripts_upload_lock: Arc::new(Mutex::new(())),
             manager,
             weak_self,
             #[cfg(target_os = "linux")]
@@ -687,7 +878,21 @@ impl Session {
                 });
             }
             SessionMessage::ConfigureLoadout(contribution, r) => {
-                let _ = r.send(self.configure_loadout(contribution).await);
+                // Honour what the user chose at `min session activate`.
+                let hooks_enabled = match self.record.record().await {
+                    Ok(rec) => rec.hooks_enabled,
+                    // Unreadable record: compose without hooks. Failing
+                    // closed is the only safe default for a domain whose
+                    // approval grants code execution.
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "reading hooks_enabled failed; composing without lifecycle hooks",
+                        );
+                        false
+                    }
+                };
+                let _ = r.send(self.configure_loadout(contribution, hooks_enabled).await);
             }
             SessionMessage::SubmitVerdict(msg) => {
                 let (verdict, r) = *msg;
@@ -737,7 +942,20 @@ impl Session {
                 let _ = r.send(());
                 return ControlFlow::Break(Teardown::ManagerInitiated);
             }
+            SessionMessage::RunDetachHooks(r) => {
+                self.run_hooks_headless(crate::hooks::HookEvent::Detach)
+                    .await;
+                let _ = r.send(());
+            }
             SessionMessage::Destroy(r) => {
+                // Before `stop_running`: a destroy hook runs *inside* the
+                // session, so the sandbox it joins has to still exist — or
+                // be minted, which is what this does when the session's
+                // shell has already gone. Failures are logged, never
+                // propagated: a session must stay destroyable whatever its
+                // hooks do.
+                self.run_hooks_headless(crate::hooks::HookEvent::Destroy)
+                    .await;
                 self.stop_running(false).await;
                 // Withdraw the hostname before the fallible record delete, so
                 // a delete failure leaves a stale on-disk record (repairable
@@ -751,6 +969,9 @@ impl Session {
             SessionMessage::GetPatchesUploadLock(r) => {
                 let _ = r.send(Arc::clone(&self.patches_upload_lock));
             }
+            SessionMessage::GetHookScriptsUploadLock(r) => {
+                let _ = r.send(Arc::clone(&self.hook_scripts_upload_lock));
+            }
             SessionMessage::StartBuild {
                 rebuild,
                 pkgs,
@@ -763,6 +984,9 @@ impl Session {
             }
             SessionMessage::StartMaterialize { opts, reply } => {
                 let _ = reply.send(self.start_materialize(opts).await);
+            }
+            SessionMessage::GetComposition(r) => {
+                let _ = r.send(self.composition());
             }
             SessionMessage::GetRecord(r) => {
                 let _ = r.send(self.record.record().await.unwrap());
@@ -794,9 +1018,14 @@ impl Session {
     /// but a fresh stash starts numbering from 0 again). The client must
     /// `AbortSession` and create a new session to retry rather than
     /// silently strand its outstanding verdict submission.
+    /// `hooks_enabled` is passed rather than read from the record
+    /// because the two callers disagree: the `ConfigureLoadout` RPC
+    /// honours what the user chose at activation, while the attach
+    /// shortcut always composes with hooks off (see its call site).
     async fn configure_loadout(
         &mut self,
         contribution: WireContribution,
+        hooks_enabled: bool,
     ) -> Result<Option<ContributionResponse>, std::io::Error> {
         match &self.inner {
             SessionInner::Active { .. } => {
@@ -828,7 +1057,19 @@ impl Session {
         // Phase 1+2: resolve the project and drive the composer. Kept fully
         // synchronous — its non-`Send` intermediaries must not cross an
         // `.await`.
-        let outcome = composables::run_compose(&self.daemon_ctx, &workspace_path, contribution)?;
+        // A session activated with `--no-hooks` drops the project's
+        // hooks here, the same way the client already dropped its
+        // loadouts' before sending. Both ends honour the flag, so the
+        // composition — and the snapshot persisted from it — records
+        // that the session has no hooks at all, rather than carrying
+        // hooks that every later transition has to remember to skip.
+        let outcome = composables::run_compose(
+            &self.daemon_ctx,
+            &workspace_path,
+            &self.record.record().await?.project_path,
+            contribution,
+            hooks_enabled,
+        )?;
 
         match outcome {
             // The composition is complete: promote the record
@@ -949,12 +1190,13 @@ impl Session {
     /// with `WrongState`; refuses `Materializing` sessions without
     /// a patches-ready marker with a "patches upload never
     /// finished" fault.
-    async fn finalize(&mut self) -> Result<(), std::io::Error> {
+    async fn finalize(&mut self) -> Result<Vec<minimald_rpc::RanHook>, std::io::Error> {
         let record = self.record.record().await?;
         match record.status {
             SessionStatus::Active => {
-                // Already finalized — retry is a no-op.
-                Ok(())
+                // Already finalized — retry is a no-op, and its hooks ran
+                // on the finalize that did the work.
+                Ok(Vec::new())
             }
             SessionStatus::Materializing => {
                 // Guard against a `Materializing` record whose
@@ -1035,6 +1277,41 @@ impl Session {
                     }
                 }
 
+                // Same precondition for hook scripts that arrive by
+                // upload. Without it, a client that skipped that upload
+                // would produce an `Active` session whose hooks name
+                // files that were never staged — and the first symptom
+                // would be an activation hook failing at some later
+                // point, far from the cause. Which hooks those are is
+                // narrower than "any external script": see
+                // [`composition_needs_staged_scripts`].
+                let needs_staged_scripts = matches!(
+                    &self.inner,
+                    SessionInner::Active {
+                        composition: Some(c),
+                        ..
+                    } if composition_needs_staged_scripts(c)
+                );
+                if needs_staged_scripts {
+                    let marker = paths_obj
+                        .hooks_path()
+                        .as_utf8_path()
+                        .join(crate::rpc::HOOKS_READY_MARKER);
+                    let marker_present = tokio::fs::try_exists(&marker).await.map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("checking hooks-ready marker at {}: {e}", marker.as_str()),
+                        )
+                    })?;
+                    if !marker_present {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "hook-script upload never completed; cannot finalize \
+                             (upload hook scripts, then retry FinalizeSession)",
+                        ));
+                    }
+                }
+
                 // Materialize the composition's patches into the
                 // session's home dir. Done here — once — rather
                 // than on every attach so the sandbox home is
@@ -1053,12 +1330,66 @@ impl Session {
                     materialize_patches_into_home(&patches_dir, &home, comp).await?;
                 }
 
+                // Activate hooks run here — after the patches are in the
+                // sandbox home, before the session becomes attachable —
+                // so setup work and its failures land at
+                // `min session activate` rather than at some later
+                // attach.
+                //
+                // A hook runs *inside* the session, which means a shell
+                // has to exist for its namespaces to be joined. Nothing
+                // launches one this early, so this does, and keeps it:
+                // the next attach reuses it, and whatever the hooks put
+                // in `/tmp` survives into the session instead of dying
+                // with a throwaway sandbox. Gated on there actually
+                // being activate hooks, so a session without them pays
+                // nothing and comes up exactly as before.
+                let mut ran: Vec<minimald_rpc::RanHook> = Vec::new();
+                if self.has_hooks_for(crate::hooks::HookEvent::Activate) {
+                    self.launch_host_for_hooks(LaunchPhase::Activating).await?;
+                    let outcomes = run_session_hooks(
+                        &self.inner,
+                        &self.record,
+                        crate::hooks::HookEvent::Activate,
+                    )
+                    .await;
+                    // Unlike every other transition, an activate failure
+                    // aborts: a development environment whose setup
+                    // script failed is not the environment the user
+                    // asked for, and handing back a quietly-wrong
+                    // session is worse than refusing.
+                    if let Some(failed) = outcomes.iter().find(|o| o.failed()) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "activation hook from {} failed ({:?}); the session was not \
+                                 activated{}",
+                                failed.declared_by,
+                                failed.status,
+                                if failed.output.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(":\n{}", failed.output)
+                                },
+                            ),
+                        ));
+                    }
+                    // Nothing failed, so every outcome here is a hook that
+                    // ran. Reported back so the client can say what it did
+                    // — an activate hook is headless, and without this the
+                    // only trace is the daemon log.
+                    ran.extend(outcomes.iter().map(|o| minimald_rpc::RanHook {
+                        declared_by: o.declared_by.clone(),
+                        description: o.description.clone(),
+                    }));
+                }
+
                 let mut record = record;
                 record.status = SessionStatus::Active;
                 self.record.write(record.clone()).await?;
                 #[cfg(target_os = "linux")]
                 self.register_hostname(&record);
-                Ok(())
+                Ok(ran)
             }
             SessionStatus::Pending => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1246,7 +1577,16 @@ impl Session {
         // reachable for `DestroySession`) and refuse the attach with
         // an actionable error naming the required explicit flow.
         if let SessionInner::Draft { pending: None } = &self.inner {
-            self.configure_loadout(WireContribution::default())
+            // Hooks are forced off on this path regardless of the
+            // record. The shortcut composes with no client in the loop,
+            // and a project hook needs a client-side policy decision it
+            // has no way to obtain — composing with hooks on would
+            // return `Pending`, which this path cannot resolve, and
+            // every attach to a hook-declaring project would fail.
+            // A session that wants its project's hooks has to come up
+            // through `min session activate`, where the user is present
+            // to answer for them.
+            self.configure_loadout(WireContribution::default(), false)
                 .await
                 .map_err(AttachError::LoadoutFailed)?;
             let has_patches = matches!(
@@ -1324,12 +1664,14 @@ impl Session {
 
     /// Launches a host for this session.
     ///
-    /// The one path both callers take: [`Self::attach`], which has a client
+    /// The one path all callers take: [`Self::attach`], which has a client
     /// channel and passes it in as `progress` so the sandbox coming up is
-    /// rendered on the client's terminal, and [`Self::ensure_host`], which has
-    /// no channel at all. The channel goes in and comes back out because
-    /// progress rendering borrows it for the duration; storing the result is
-    /// left to the caller, since attach only keeps a host it could bind to.
+    /// rendered on the client's terminal, [`Self::ensure_host`], which has
+    /// no channel at all, and [`Self::launch_host_for_hooks`], which
+    /// runs before the session is `Active` (hence `phase`). The channel goes
+    /// in and comes back out because progress rendering borrows it for the
+    /// duration; storing the result is left to the caller, since attach only
+    /// keeps a host it could bind to.
     async fn launch_host(
         &mut self,
         session_hnd: SessionHandle,
@@ -1337,11 +1679,12 @@ impl Session {
         sz: WinSize,
         attach_env: session_host::AttachEnv,
         progress: Option<ChannelProgress>,
+        phase: LaunchPhase,
     ) -> Result<(Option<Channel<Msg>>, LaunchedHost), AttachError> {
         let record = self.record.record().await.unwrap();
         let paths = self.paths().await;
         let launcher = self
-            .session_launcher(session_hnd, &record, attach_env)
+            .session_launcher(session_hnd, &record, attach_env, phase)
             .await?;
         // Where the shell-exit prompt's save-then-delete lane archives the
         // changed files. Daemon-side and session-independent; created on
@@ -1361,6 +1704,10 @@ impl Session {
             // Mint a handle to this session ID in the sessions actor/manager.
             Some(SessionControl::new(self.manager.clone(), record.id)),
             archives_dir,
+            record.id,
+            // The host runs attach and detach itself: it owns the terminal
+            // they write to and the process whose namespaces they join.
+            self.composition(),
         ));
 
         let (channel, spawned) = match progress {
@@ -1418,6 +1765,7 @@ impl Session {
                 UNATTACHED_WIN_SIZE,
                 session_host::AttachEnv::default(),
                 None,
+                LaunchPhase::Attached,
             )
             .await?;
 
@@ -1439,7 +1787,14 @@ impl Session {
     ) -> Result<(), AttachError> {
         let progress = ChannelProgress::new(channel, self.tracker.clone(), (sz.cols, sz.rows));
         let (channel, launched) = self
-            .launch_host(session_hnd, conn_username, sz, attach_env, Some(progress))
+            .launch_host(
+                session_hnd,
+                conn_username,
+                sz,
+                attach_env,
+                Some(progress),
+                LaunchPhase::Attached,
+            )
             .await?;
         let channel = channel.expect("progress hands back the channel it was given");
 
@@ -1454,6 +1809,144 @@ impl Session {
         })?;
         let SessionInner::Active { host, .. } = &mut self.inner else {
             unreachable!("mint_session_host is only reachable from the Active state");
+        };
+        *host = Some(launched);
+        Ok(())
+    }
+
+    /// True when this session's composition declares at least one script for
+    /// `event`. Gates the headless host launches ([`Self::finalize`]'s and
+    /// [`Self::run_detach_hooks`]'s): without it, a transition would pay for
+    /// a sandbox no hook is going to use.
+    fn has_hooks_for(&self, event: crate::hooks::HookEvent) -> bool {
+        let SessionInner::Active {
+            composition: Some(c),
+            ..
+        } = &self.inner
+        else {
+            return false;
+        };
+        c.lifecycle_hooks()
+            .iter()
+            .any(|ph| event.script_of(ph.hook()).is_some())
+    }
+
+    /// Runs this session's hooks for `event` headlessly, minting a host
+    /// first when none is running.
+    ///
+    /// The launch is what makes this reliable. A hook runs *inside* the
+    /// session, so it needs a process whose namespaces it can join, and
+    /// neither teardown transition is guaranteed one: the host slot outlives
+    /// the host process, so a session whose shell has exited still holds a
+    /// handle to a host that can no longer run anything, and a session that
+    /// was never attached may have no host at all. Minting here — the same
+    /// launch [`Self::finalize`] does for activation — covers both, and a
+    /// session whose shell is still up (the ctrl-w detach, a destroy from a
+    /// second terminal) reuses it rather than starting a second one.
+    ///
+    /// Best effort, and *bounded*: a teardown that cannot run its hooks
+    /// still happens, so every failure is logged, none is propagated, and
+    /// nothing here may block indefinitely — see [`HOOK_LAUNCH_TIMEOUT`].
+    /// Activation is the exception and keeps its own path in
+    /// [`Self::finalize`] — a failed activate hook aborts the activation
+    /// rather than being logged past.
+    async fn run_hooks_headless(&mut self, event: crate::hooks::HookEvent) {
+        if !self.has_hooks_for(event) {
+            return;
+        }
+        // `Attached`, not `Activating`: both transitions only happen once the
+        // session is `Active`, so neither has reason to skip the status gate.
+        // A session torn down before it activated (an aborted finalize leaves
+        // it `Materializing`) is refused here and skips its hooks — teardown
+        // for setup that never completed.
+        //
+        // Timed out rather than simply awaited: this runs on the destroy
+        // path, and building a sandbox reaches the filesystem, the package
+        // cache, and (for an own-IP session) the network switch. A session
+        // must always be destroyable, so a launch that wedges has to cost
+        // its hooks rather than the whole teardown.
+        match tokio::time::timeout(
+            HOOK_LAUNCH_TIMEOUT,
+            self.launch_host_for_hooks(LaunchPhase::Attached),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    event = event.as_str(),
+                    error = %e,
+                    "launching the session to run its hooks failed; skipping them",
+                );
+                return;
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    event = event.as_str(),
+                    timeout_secs = HOOK_LAUNCH_TIMEOUT.as_secs(),
+                    "launching the session to run its hooks timed out; skipping them",
+                );
+                return;
+            }
+        }
+        run_session_hooks(&self.inner, &self.record, event).await;
+    }
+
+    /// Launch the session host so lifecycle hooks have namespaces to
+    /// join, and keep it as the session's host.
+    ///
+    /// Headless: there is no client channel, no PTY negotiated, and no
+    /// forwarded locale — neither the activating RPC nor a departing
+    /// binding is an attach. The window size is a placeholder the first
+    /// real attach replaces.
+    ///
+    /// A host that is still *running* (an attach raced the finalize; a
+    /// ctrl-w detach left the shell up) is left alone. A dead one is
+    /// replaced rather than reused: the slot outlives the process, so a
+    /// session whose shell exited still holds a handle to a host that can no
+    /// longer run anything — which is exactly the state a detach hook meets
+    /// on the shell-exit path. Mirrors [`Self::ensure_host`]'s liveness
+    /// check for the same reason.
+    async fn launch_host_for_hooks(&mut self, phase: LaunchPhase) -> Result<(), std::io::Error> {
+        if matches!(
+            &self.inner,
+            SessionInner::Active { host: Some((h, _)), .. } if h.is_alive()
+        ) {
+            return Ok(());
+        }
+        let session_hnd = self.weak_self.upgrade().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "session actor is shutting down; cannot run lifecycle hooks",
+            )
+        })?;
+        let username = self
+            .record
+            .record()
+            .await?
+            .username
+            .unwrap_or_else(|| "user".to_string());
+        let launched = self
+            .launch_host(
+                session_hnd,
+                username,
+                WinSize {
+                    rows: 24,
+                    cols: 80,
+                    xpixel: 0,
+                    ypixel: 0,
+                },
+                session_host::AttachEnv::default(),
+                None,
+                phase,
+            )
+            .await
+            .map_err(|e| {
+                std::io::Error::other(format!("launching the session to run its hooks: {e}"))
+            })?
+            .1;
+        let SessionInner::Active { host, .. } = &mut self.inner else {
+            unreachable!("a headless hook launch only reaches here from the Active state");
         };
         *host = Some(launched);
         Ok(())
@@ -1477,6 +1970,7 @@ impl Session {
         session: SessionHandle,
         record: &Record,
         attach_env: session_host::AttachEnv,
+        phase: LaunchPhase,
     ) -> Result<session_host::SandboxLauncher, AttachError> {
         // R2.1: reject a policy that is incompatible with the network mode
         // (e.g. egress on a non-`OwnIp` PTask) before launching the host.
@@ -1489,10 +1983,18 @@ impl Session {
         // ingress configured on any other mode.
         let ingress = record.policy.ingress.clone();
         Ok(session_host::SandboxLauncher {
-            ctx: self
-                .context(true)
-                .await
-                .map_err(AttachError::ContextCreationFailed)?,
+            ctx: match phase {
+                LaunchPhase::Attached => self.context(true).await,
+                // The activation launch runs inside `finalize`, before the
+                // record is promoted, so the status gate in `context` would
+                // reject it — see [`LaunchPhase::Activating`]. Everything
+                // that gate protects has already been established by the
+                // time finalize gets here: the session is composed (checked
+                // before any of this runs) and its patches are materialized
+                // into the home dir.
+                LaunchPhase::Activating => self.build_context(true).await,
+            }
+            .map_err(AttachError::ContextCreationFailed)?,
             attach_env,
             network_mode,
             net_switch: Arc::clone(&self.net_switch),
@@ -1513,6 +2015,7 @@ impl Session {
         _session: SessionHandle,
         record: &Record,
         _attach_env: session_host::AttachEnv,
+        _phase: LaunchPhase,
     ) -> Result<session_host::MockLauncher, AttachError> {
         // Mirror the production R2.1 gate so test launches reject a
         // policy/network-mode mismatch the same way production does.
@@ -1536,6 +2039,13 @@ impl Session {
     /// session would execute against an unpopulated home dir —
     /// the exact lifecycle escape the `Materializing` state was
     /// added to prevent.
+    ///
+    /// The one caller that legitimately runs before the promotion —
+    /// [`Session::finalize`]'s activation-hook launch — reaches
+    /// [`Self::build_context`] directly instead, via
+    /// [`LaunchPhase::Activating`]. It materializes the home dir first, so
+    /// it satisfies the invariant this gate protects without being able to
+    /// satisfy the gate itself.
     async fn context(&mut self, scaffold_if_missing: bool) -> Result<mctx::Context, String> {
         if matches!(&self.inner, SessionInner::Draft { .. }) {
             return Err("session is pending composition".to_string());
@@ -1623,6 +2133,7 @@ impl Session {
             cache: obj.cache_path(),
             home: obj.home_path(),
             patches: obj.patches_path(),
+            hooks: obj.hooks_path(),
         }
     }
 }
@@ -1638,6 +2149,16 @@ impl SessionHandle {
         WeakSessionHandle(self.0.downgrade())
     }
 
+    /// The session's composition, if it has one. See
+    /// [`SessionMessage::GetComposition`].
+    pub async fn composition(&self) -> Result<Option<Arc<Composition>>, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        let _ = self.0.send(SessionMessage::GetComposition(send)).await;
+        recv.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
+        })
+    }
+
     /// Handle to the per-session patches-upload lock, owned by the session
     /// actor.
     ///
@@ -1650,6 +2171,21 @@ impl SessionHandle {
         let _ = self
             .0
             .send(SessionMessage::GetPatchesUploadLock(send))
+            .await;
+        recv.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
+        })
+    }
+
+    /// Handle to the per-session hook-scripts-upload lock, owned by the
+    /// session actor. Serializes `WorkspaceHookScriptsTarZst` RPCs the
+    /// same way [`Self::patches_upload_lock`] serializes patch uploads.
+    pub async fn hook_scripts_upload_lock(&self) -> Result<Arc<Mutex<()>>, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .0
+            .send(SessionMessage::GetHookScriptsUploadLock(send))
             .await;
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
@@ -1761,6 +2297,17 @@ impl SessionHandle {
         recv.await.ok().flatten()
     }
 
+    /// Runs this session's `on_detach` hooks, awaiting them so a departing
+    /// binding doesn't race its own teardown. A dead actor means there is
+    /// no session to run them against, which is not an error worth raising
+    /// on a path whose whole job is leaving.
+    pub async fn run_detach_hooks(&self) {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.0.send(SessionMessage::RunDetachHooks(send)).await;
+        let _ = recv.await;
+    }
+
     /// Returns a minimal context initialized on this sessions' worktree.
     pub async fn context(&self) -> Result<mctx::Context, String> {
         let (send, recv) = oneshot::channel();
@@ -1857,7 +2404,7 @@ impl SessionHandle {
     /// `WorkspacePatchesTarZst` upload. Idempotent on already-Active
     /// sessions. See [`Session::finalize`] for the state-machine
     /// contract.
-    pub(crate) async fn finalize(&self) -> Result<(), std::io::Error> {
+    pub(crate) async fn finalize(&self) -> Result<Vec<minimald_rpc::RanHook>, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(SessionMessage::Finalize(send)).await;
@@ -3037,5 +3584,538 @@ mod tests {
             again.same_host(&host),
             "a second exec request minted a second host instead of reusing the first"
         );
+    }
+
+    // ---- lifecycle hooks -------------------------------------------------
+    //
+    // Hooks run inside the session, which under test means the host-side
+    // command `session_host::Host::command_in_session` builds for the mock
+    // launcher. What these cover is the wiring above that: which transitions
+    // run hooks, when they run relative to teardown, and whether a session
+    // with no live host gets one minted first.
+
+    /// A hook body that records having run by creating `marker`. A redirect
+    /// rather than `touch(1)`: a hook gets only the session's own
+    /// environment, so nothing here should depend on inheriting a PATH.
+    fn marker_body(marker: &std::path::Path) -> String {
+        format!("echo ran > {}", marker.display())
+    }
+
+    /// An inline hook script. The timeout is generous because a loaded box
+    /// slowing a hook down should not read as a hook that didn't fire.
+    fn inline(body: String) -> sessions::wire::primitives::WireHookScript {
+        sessions::wire::primitives::WireHookScript::Inline {
+            body,
+            timeout_secs: 60,
+        }
+    }
+
+    /// Creates an `Active` session whose composition carries `hook`.
+    ///
+    /// The hook is delivered through the client contribution, the way a
+    /// loadout's are — no policy gate applies to those — so these tests
+    /// drive the actor's hook wiring without also driving the project-hook
+    /// approval flow. Provenance doesn't change how a hook is run.
+    /// A client contribution carrying one hook, sourced from a loadout —
+    /// no policy gate applies to those, so a test drives the actor's hook
+    /// wiring without also driving the project-approval flow.
+    fn contribution_with_hook(
+        hook: sessions::wire::primitives::WireLifecycleHook,
+    ) -> sessions::wire::request::WireContribution {
+        sessions::wire::request::WireContribution {
+            lifecycle_hooks: vec![sessions::wire::primitives::WireProvenancedHook {
+                hook,
+                source: sessions::wire::primitives::WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The session's on-disk status, or `None` once it is gone.
+    async fn record_status(
+        client: &mut TestClient,
+        id: SessionId,
+    ) -> Option<sessions::SessionStatus> {
+        client
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(id))
+            .await
+            .record
+            .map(|r| r.status)
+    }
+
+    async fn session_with_hook(
+        client: &mut TestClient,
+        name: &str,
+        hook: sessions::wire::primitives::WireLifecycleHook,
+    ) -> SessionId {
+        use crate::test_harness::{create_session_req, unwrap_ready};
+        use minimald_rpc::{
+            ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+            FinalizeSessionRequest,
+        };
+
+        let id = client
+            .call::<CreateSession>(&create_session_req(name, "/uwu"))
+            .await
+            .unwrap()
+            .id;
+        unwrap_ready(
+            client
+                .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                    session_id: id,
+                    contribution: sessions::wire::request::WireContribution {
+                        lifecycle_hooks: vec![sessions::wire::primitives::WireProvenancedHook {
+                            hook,
+                            source: sessions::wire::primitives::WireSource::UserLoadout {
+                                name: "test".to_string(),
+                            },
+                        }],
+                        ..Default::default()
+                    },
+                })
+                .await
+                .unwrap(),
+        );
+        match client
+            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+            .await
+        {
+            Errorable::Ok(_) => id,
+            Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+        }
+    }
+
+    /// Destroys `id` through the RPC surface a client uses.
+    async fn destroy_session(client: &mut TestClient, id: SessionId) {
+        use minimald_rpc::{DestroySession, DestroySessionRequest, Errorable};
+        match client
+            .call::<DestroySession>(&DestroySessionRequest { id })
+            .await
+        {
+            Errorable::Ok(_) => {}
+            Errorable::Err { error } => panic!("DestroySession failed: {error}"),
+        }
+    }
+
+    /// Waits for `marker` to appear, so a test can observe a hook that runs
+    /// off the path it is driving (a detach is reported by the departing
+    /// binding, not by the RPC the test called).
+    async fn await_marker(marker: &std::path::Path) -> bool {
+        for _ in 0..100 {
+            if marker.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// The finalize gate waits only for scripts that actually arrive by
+    /// upload.
+    ///
+    /// The client stages *loadout* scripts; a project's ride along with
+    /// the project tree, which the activation already uploads. Counting
+    /// a project's external script here would demand an upload nobody
+    /// sends — and no project could declare one at all, because the
+    /// session would fail to finalize every time.
+    #[test]
+    fn only_uploaded_hook_scripts_gate_the_finalize() {
+        use super::{Composition, composition_needs_staged_scripts};
+        use sessions::core::lifecyclehook::{HookScript, LifecycleHook};
+        use sessions::core::source::{ProvenancedHook, Source};
+        use sessions::wire::primitives::WireProvenancedHook;
+        use sessions::wire::request::{COMPOSITION_SNAPSHOT_VERSION, WireComposition};
+
+        let composition_of = |hook: ProvenancedHook| {
+            Composition::try_from(WireComposition {
+                version: COMPOSITION_SNAPSHOT_VERSION,
+                vars: Vec::new(),
+                patches: Vec::new(),
+                packages: Vec::new(),
+                lifecycle_hooks: vec![WireProvenancedHook::from(hook)],
+                orientation: Default::default(),
+            })
+            .expect("a hook with a script converts back")
+        };
+        let with_activate = |script: HookScript, source: Source| {
+            composition_of(ProvenancedHook::new(
+                LifecycleHook::builder()
+                    .with_on_activate(script)
+                    .build()
+                    .unwrap(),
+                source,
+            ))
+        };
+        let external = || HookScript::try_external("scripts/setup.sh").unwrap();
+        let project = || Source::Project {
+            path: paths::HostPath::try_new("/home/dev/proj").unwrap(),
+        };
+        let loadout = || Source::UserLoadout {
+            name: "dev".to_string(),
+        };
+
+        assert!(
+            !composition_needs_staged_scripts(&with_activate(external(), project())),
+            "a project's script arrives with the project tree, not the hook-script upload",
+        );
+        assert!(
+            composition_needs_staged_scripts(&with_activate(external(), loadout())),
+            "a loadout's script only ever arrives by upload",
+        );
+        // An inline hook uploads nothing, whoever declared it.
+        assert!(!composition_needs_staged_scripts(&with_activate(
+            HookScript::inline("true"),
+            loadout()
+        )));
+    }
+
+    /// Activation runs `on_activate`, and the session it hands back is
+    /// attachable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activation_runs_its_activate_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("activated");
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = session_with_hook(
+            &mut client,
+            "activate-hooks",
+            sessions::wire::primitives::WireLifecycleHook {
+                on_activate: Some(inline(marker_body(&marker))),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert!(marker.exists(), "on_activate did not run");
+        assert_eq!(
+            record_status(&mut client, session_id).await,
+            Some(sessions::SessionStatus::Active),
+            "a session whose activate hook succeeded should be attachable",
+        );
+    }
+
+    /// A failing `on_activate` fails the *activation*: the session does
+    /// not become attachable, and the error names the hook's source and
+    /// what it printed. Unlike every other transition, this one is a gate
+    /// — a development environment whose setup script failed is not the
+    /// environment that was asked for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_activate_hook_blocks_the_session() {
+        use crate::test_harness::create_session_req;
+        use minimald_rpc::{
+            ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+            FinalizeSessionRequest,
+        };
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = client
+            .call::<CreateSession>(&create_session_req("activate-fails", "/uwu"))
+            .await
+            .unwrap()
+            .id;
+        crate::test_harness::unwrap_ready(
+            client
+                .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                    session_id: id,
+                    contribution: contribution_with_hook(
+                        sessions::wire::primitives::WireLifecycleHook {
+                            on_activate: Some(inline(
+                                "echo ACTIVATE_SAID_NO >&2; exit 3".to_string(),
+                            )),
+                            ..Default::default()
+                        },
+                    ),
+                })
+                .await
+                .unwrap(),
+        );
+
+        let error = match client
+            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+            .await
+        {
+            Errorable::Err { error } => error,
+            Errorable::Ok(_) => panic!("finalize should have failed on the activate hook"),
+        };
+        assert!(
+            error.contains("ACTIVATE_SAID_NO"),
+            "the error should carry what the hook printed: {error}",
+        );
+        assert!(
+            error.contains("test"),
+            "the error should name where the hook was declared: {error}",
+        );
+        // The gate that matters: not attachable.
+        assert_ne!(
+            record_status(&mut client, id).await,
+            Some(sessions::SessionStatus::Active),
+            "a session whose activate hook failed must not be attachable",
+        );
+    }
+
+    // `on_attach` has no unit test here, deliberately. It is the one
+    // transition that runs in the user's shell rather than headlessly, so
+    // it goes through `Host::hook_plan`, which resolves the sandbox's
+    // session leader out of `/proc` — and the mock launcher's program is a
+    // plain childless `/bin/sh`, so there is no leader to find. Faking one
+    // would need a second test seam in `InjectedCommands` and would then
+    // prove only that the call happens, not the property the transition
+    // exists for: that the hook's output reaches the attached terminal.
+    // The session e2e asserts exactly that, against a real sandbox and a
+    // real pty ("lifecycle hooks: the four transitions").
+    //
+    /// Destroy runs the session's `on_destroy` hooks in the ordinary case:
+    /// a session with a live host, which the hooks join rather than
+    /// replace. `DestroySession` answers only once they have run, so the
+    /// marker is there by the time the call returns — no polling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn destroy_runs_its_destroy_hooks_against_a_live_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("destroyed");
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = session_with_hook(
+            &mut client,
+            "destroy-hooks",
+            sessions::wire::primitives::WireLifecycleHook {
+                on_destroy: Some(inline(marker_body(&marker))),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Bring a host up and leave it running, so destroy meets the state
+        // it has always handled: a session with somewhere to run.
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("the session should be retrievable");
+        let host = handle
+            .ensure_host("tester".to_string())
+            .await
+            .expect("an Active session should be able to launch a host");
+        assert!(host.is_alive());
+        drop(handle);
+
+        destroy_session(&mut client, session_id).await;
+
+        assert!(marker.exists(), "destroy did not run its on_destroy hook");
+        assert!(
+            !record_exists(&mut client, session_id).await,
+            "the session record should be gone after a destroy"
+        );
+    }
+
+    /// The regression this exists for: a session whose shell has exited
+    /// still holds a *handle* to a host that can no longer run anything, so
+    /// destroy has to mint one rather than reuse the corpse. Before the fix
+    /// the hook came back `NotRun { "session host stopped ..." }` and the
+    /// session was destroyed silently.
+    ///
+    /// Drives the reported flow exactly: attach, exit the shell, keep the
+    /// session at the prompt, then destroy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn destroy_runs_its_hooks_after_the_session_shell_has_exited() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("destroyed");
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = session_with_hook(
+            &mut client,
+            "destroy-after-exit",
+            sessions::wire::primitives::WireLifecycleHook {
+                on_destroy: Some(inline(marker_body(&marker))),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Exit the shell and answer the prompt with the default (keep), the
+        // way the reported repro does. This is what leaves the stale handle.
+        let mut channel = client.open_shell(session_id).await;
+        channel
+            .data_bytes(format!("{}\n", crate::session_host::MOCK_EXIT_LINE).into_bytes())
+            .await
+            .unwrap();
+        let mut prompt_out = Vec::new();
+        let mut answered = false;
+        while let Ok(msg) = tokio::time::timeout(Duration::from_secs(10), channel.wait()).await {
+            match msg {
+                Some(ChannelMsg::Data { data }) => {
+                    prompt_out.extend_from_slice(&data);
+                    if !answered
+                        && String::from_utf8_lossy(&prompt_out)
+                            .contains(crate::session_host::SHELL_EXIT_PROMPT)
+                    {
+                        channel.data_bytes(b"\r".to_vec()).await.unwrap();
+                        answered = true;
+                    }
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert!(answered, "expected the session-exit prompt to render");
+        assert!(
+            record_exists(&mut client, session_id).await,
+            "keeping at the prompt must leave the session alive"
+        );
+
+        destroy_session(&mut client, session_id).await;
+
+        assert!(
+            marker.exists(),
+            "destroy skipped its hooks for a session whose shell had exited"
+        );
+    }
+
+    /// A session that was never attached has no host at all — the same hole
+    /// from the other side. Nothing here declares an `on_activate`, so
+    /// finalize mints nothing and destroy is the first transition that needs
+    /// a sandbox.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn destroy_runs_its_hooks_for_a_session_that_was_never_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("destroyed");
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = session_with_hook(
+            &mut client,
+            "destroy-never-attached",
+            sessions::wire::primitives::WireLifecycleHook {
+                on_destroy: Some(inline(marker_body(&marker))),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        destroy_session(&mut client, session_id).await;
+
+        assert!(
+            marker.exists(),
+            "destroy skipped its hooks for a session that never had a host"
+        );
+    }
+
+    /// A destroy hook that fails is reported, not obeyed: the session is
+    /// still torn down and its record still deleted. A session that a bad
+    /// hook could pin would be unremovable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_destroy_hook_still_destroys_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("destroyed");
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = session_with_hook(
+            &mut client,
+            "destroy-hook-fails",
+            sessions::wire::primitives::WireLifecycleHook {
+                on_destroy: Some(inline(format!("{}; exit 3", marker_body(&marker)))),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        destroy_session(&mut client, session_id).await;
+
+        assert!(marker.exists(), "the hook should still have run");
+        assert!(
+            !record_exists(&mut client, session_id).await,
+            "a failing destroy hook must not keep the session alive"
+        );
+    }
+
+    /// Leaving a session that outlives the binding runs its `on_detach`
+    /// hooks — including on the shell-exit path, where the shell that would
+    /// once have run them is exactly what has gone away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detach_runs_its_detach_hooks_after_the_shell_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("detached");
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = session_with_hook(
+            &mut client,
+            "detach-hooks",
+            sessions::wire::primitives::WireLifecycleHook {
+                on_detach: Some(inline(marker_body(&marker))),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let mut channel = client.open_shell(session_id).await;
+        channel
+            .data_bytes(format!("{}\n", crate::session_host::MOCK_EXIT_LINE).into_bytes())
+            .await
+            .unwrap();
+        let mut prompt_out = Vec::new();
+        let mut answered = false;
+        while let Ok(msg) = tokio::time::timeout(Duration::from_secs(10), channel.wait()).await {
+            match msg {
+                Some(ChannelMsg::Data { data }) => {
+                    prompt_out.extend_from_slice(&data);
+                    if !answered
+                        && String::from_utf8_lossy(&prompt_out)
+                            .contains(crate::session_host::SHELL_EXIT_PROMPT)
+                    {
+                        channel.data_bytes(b"\r".to_vec()).await.unwrap();
+                        answered = true;
+                    }
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert!(answered, "expected the session-exit prompt to render");
+
+        // Reported by the departing binding rather than by anything this
+        // test called, so it lands shortly after the channel closes.
+        assert!(
+            await_marker(&marker).await,
+            "keeping the session at the exit prompt did not run its detach hooks"
+        );
+    }
+
+    /// A session that declares nothing for a transition runs nothing — and
+    /// in particular is not made to pay for a sandbox launch on the way out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_with_no_destroy_hook_runs_nothing_on_destroy() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("should-not-exist");
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        // Declares an `on_attach` only: the composition carries a hook, but
+        // not one destroy should reach for.
+        let session_id = session_with_hook(
+            &mut client,
+            "no-destroy-hook",
+            sessions::wire::primitives::WireLifecycleHook {
+                on_attach: Some(inline(marker_body(&marker))),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        destroy_session(&mut client, session_id).await;
+
+        assert!(
+            !marker.exists(),
+            "destroy ran a hook declared for another transition"
+        );
+        assert!(!record_exists(&mut client, session_id).await);
     }
 }

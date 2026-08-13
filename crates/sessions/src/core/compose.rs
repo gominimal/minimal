@@ -16,15 +16,14 @@ use std::collections::BTreeMap;
 use crate::core::decision::{CheckOutcome, Decision, ItemDecision};
 use crate::core::enumerate::{ExpandedProvenancedPatch, PatchFile, enumerate_patch_files};
 use crate::core::hooks::{HookResult, PolicyHooks, Unapproved};
-use crate::core::policy::{PatchPolicy, UserPolicy, VarsPolicy};
+use crate::core::policy::{PatchesPolicy, UserPolicy, VarsPolicy};
 use crate::core::primitives::{ResolvedPatch, ResolvedVar, VarError};
 use crate::core::source::{
     Provenanced, ProvenancedHook, ProvenancedPackage, ProvenancedPatch, ProvenancedVar, Source,
 };
 use crate::wire::policy::{WirePatchVerdict, WireVarVerdict};
 use crate::wire::primitives::{
-    PendingId, WirePendingPatch, WirePendingVar, WireProvenancedHook, WireSessionPatch,
-    WireSessionVar,
+    PendingId, WirePendingHook, WirePendingPatch, WirePendingVar, WireSessionPatch, WireSessionVar,
 };
 
 /// Errors produced while a [`Composable`] materializes its
@@ -167,7 +166,7 @@ impl fmt::Display for Conflict {
                 for (source, src) in disagreeing_sources {
                     write!(f, "\n  - {src:?} (from {source})")?;
                 }
-                // PatchPolicy matches against *source* paths, not
+                // PatchesPolicy matches against *source* paths, not
                 // destinations — the hint must steer the user to a
                 // pattern that matches the sources shown above, not
                 // the destination.
@@ -766,6 +765,7 @@ pub enum ComposeError {
 pub(crate) enum HookDomain {
     Var,
     Patch,
+    Hook,
 }
 
 impl ComposeError {
@@ -777,6 +777,9 @@ impl ComposeError {
         let kind = match domain {
             HookDomain::Var => "UseRule returned for a var the policy still cannot decide",
             HookDomain::Patch => "UseRule returned for a patch file the policy still cannot decide",
+            HookDomain::Hook => {
+                "UseRule returned for a project whose hooks the policy still cannot decide"
+            }
         };
         Self::HookContract {
             kind,
@@ -794,6 +797,7 @@ impl ComposeError {
         let kind = match domain {
             HookDomain::Var => "var-domain hook returned the wrong number of decisions",
             HookDomain::Patch => "patch-domain hook returned the wrong number of decisions",
+            HookDomain::Hook => "lifecycle-hook-domain hook returned the wrong number of decisions",
         };
         Self::HookContract {
             kind,
@@ -1144,10 +1148,34 @@ impl Composition {
     }
 
     /// The lifecycle hooks contributed to the session, each paired
-    /// with its source. Pass-through; no policy gate.
+    /// with its source, in **setup order**: the project's hooks first,
+    /// then each loadout's in the order the loadouts were selected.
+    ///
+    /// This is the order the setup transitions (`on_activate`,
+    /// `on_attach`) run in, and it is a contract, not an accident of
+    /// assembly: the daemon builds its own contribution first and
+    /// appends the client's via
+    /// [`extend_from_wire`](Self::extend_from_wire), which is what puts
+    /// the project ahead of the loadouts. A project maintainer relies on
+    /// setting up before any developer's personal hooks do.
+    /// [`lifecycle_hooks_teardown`](Self::lifecycle_hooks_teardown) is
+    /// the matching reverse order.
     #[must_use]
     pub fn lifecycle_hooks(&self) -> &[ProvenancedHook] {
         &self.lifecycle_hooks
+    }
+
+    /// The lifecycle hooks in **teardown order** — the exact reverse of
+    /// [`lifecycle_hooks`](Self::lifecycle_hooks), so the project tears
+    /// down last, after every loadout that layered on top of it.
+    ///
+    /// The transitions that use this are `on_detach` and `on_destroy`.
+    /// Exposed as its own accessor rather than left to each caller to
+    /// `.rev()`: a caller that forgets would silently tear down in setup
+    /// order, which no test of a single-contributor session would catch.
+    #[must_use]
+    pub fn lifecycle_hooks_teardown(&self) -> impl DoubleEndedIterator<Item = &ProvenancedHook> {
+        self.lifecycle_hooks.iter().rev()
     }
 
     /// Consume the [`Composition`] and return the underlying vectors
@@ -1387,9 +1415,9 @@ pub(crate) fn prompt_var_hook(
 /// the resolved vars.
 pub(crate) fn prompt_patch_hook(
     hooks: &dyn PolicyHooks,
-    policy: PatchPolicy,
+    policy: PatchesPolicy,
     view: &[Unapproved<'_, camino::Utf8Path>],
-) -> Result<(Vec<ItemDecision>, PatchPolicy, bool), ComposeError> {
+) -> Result<(Vec<ItemDecision>, PatchesPolicy, bool), ComposeError> {
     match hooks.on_patch_unapproved(policy.clone(), view) {
         HookResult::Abort => Err(ComposeError::Aborted),
         HookResult::Decided {
@@ -1408,6 +1436,32 @@ pub(crate) fn prompt_patch_hook(
                 None => (policy, false),
             };
             Ok((decisions, policy, updated))
+        }
+    }
+}
+
+/// Invoke the lifecycle-hook-domain hook on a batch of projects whose
+/// hooks the policy couldn't decide. Same shape as
+/// [`prompt_var_hook`]; one decision per **project**, not per script.
+pub(crate) fn prompt_hook_hook(
+    hooks: &dyn PolicyHooks,
+    policy: crate::core::policy::HooksPolicy,
+    view: &[Unapproved<'_, camino::Utf8Path>],
+) -> Result<(Vec<ItemDecision>, crate::core::policy::HooksPolicy), ComposeError> {
+    match hooks.on_hook_unapproved(policy.clone(), view) {
+        HookResult::Abort => Err(ComposeError::Aborted),
+        HookResult::Decided {
+            decisions,
+            updated_policy,
+        } => {
+            if decisions.len() != view.len() {
+                return Err(ComposeError::hook_decision_count_mismatch(
+                    HookDomain::Hook,
+                    view.len(),
+                    decisions.len(),
+                ));
+            }
+            Ok((decisions, updated_policy.unwrap_or(policy)))
         }
     }
 }
@@ -1568,12 +1622,12 @@ pub(crate) fn expand_patch_sources(
 /// `hooks` is `None` for user-only composition — see [`gate_vars`].
 pub(crate) fn gate_patches(
     items: Vec<ProvenancedPatch>,
-    mut policy: PatchPolicy,
+    mut policy: PatchesPolicy,
     hooks: Option<&dyn PolicyHooks>,
     options: ComposeOptions,
     gated_vars: &[SessionVar],
     home_fallback: Option<&str>,
-) -> Result<(Vec<SessionPatch>, PatchPolicy), ComposeError> {
+) -> Result<(Vec<SessionPatch>, PatchesPolicy), ComposeError> {
     let name_of = |pf: &PatchFile| pf.user_facing().as_str().to_owned();
     let source_of = |pf: PatchFile| pf.provenance;
 
@@ -1703,7 +1757,11 @@ pub(crate) fn compose_contribution(
         packages,
         lifecycle_hooks,
     } = contribution;
-    let (vars_policy, patches_policy) = policy.into_parts();
+    // The hooks policy passes straight through: this is the *loadout*
+    // composition, and a loadout's hooks are the user's own files. Only
+    // project-declared hooks face the gate, on the daemon-response path
+    // in `client::handler`.
+    let (vars_policy, patches_policy, hooks_policy) = policy.into_parts();
     let (gated_vars, vars_policy) = gate_vars(vars, vars_policy, hooks)?;
     // Conflict detection runs post-gate so that the user's `ignore`
     // policy can drop offending contributors before they're compared.
@@ -1741,7 +1799,8 @@ pub(crate) fn compose_contribution(
     check_patch_prefix_collisions(gated_patches.iter(), |p| p.patch().destination())?;
     let final_policy = UserPolicy::empty()
         .with_vars(vars_policy)
-        .with_patches(patches_policy);
+        .with_patches(patches_policy)
+        .with_hooks(hooks_policy);
     let composition = Composition {
         vars: gated_vars,
         patches: gated_patches,
@@ -1766,6 +1825,7 @@ pub(crate) struct PendingTransform {
     pub(crate) wire: WirePending,
     pub(crate) pending_vars: BTreeMap<PendingId, ProvenancedVar>,
     pub(crate) pending_patches: BTreeMap<PendingId, ProvenancedPatch>,
+    pub(crate) pending_hooks: BTreeMap<PendingId, ProvenancedHook>,
 }
 
 /// Wire-shaped pending payload — the subset of [`PendingTransform`]
@@ -1774,7 +1834,7 @@ pub(crate) struct PendingTransform {
 pub(crate) struct WirePending {
     pub(crate) vars: Vec<WirePendingVar>,
     pub(crate) patches: Vec<WirePendingPatch>,
-    pub(crate) lifecycle_hooks: Vec<WireProvenancedHook>,
+    pub(crate) lifecycle_hooks: Vec<WirePendingHook>,
 }
 
 /// Convert daemon-collected vars, patches, and lifecycle hooks into
@@ -1830,8 +1890,21 @@ pub(crate) fn contribution_to_pending(
         pending_patches.insert(id, pp);
     }
 
-    let wire_hooks: Vec<WireProvenancedHook> =
-        lifecycle_hooks.into_iter().map(Into::into).collect();
+    // Hooks are stashed by id like vars and patches, rather than
+    // shipped as a pass-through list. The daemon must be able to drop
+    // the ones the client refuses, and it can only do that if each hook
+    // has an id the verdict can name.
+    let mut pending_hooks: BTreeMap<PendingId, ProvenancedHook> = BTreeMap::new();
+    let mut wire_hooks: Vec<WirePendingHook> = Vec::with_capacity(lifecycle_hooks.len());
+    for (i, ph) in lifecycle_hooks.into_iter().enumerate() {
+        let id = PendingId::new(u32::try_from(i).expect("pending hook index fits in u32"));
+        wire_hooks.push(WirePendingHook {
+            id,
+            hook: ph.hook().clone().into(),
+            source: ph.source().clone().into(),
+        });
+        pending_hooks.insert(id, ph);
+    }
 
     PendingTransform {
         wire: WirePending {
@@ -1841,6 +1914,7 @@ pub(crate) fn contribution_to_pending(
         },
         pending_vars,
         pending_patches,
+        pending_hooks,
     }
 }
 
@@ -2025,9 +2099,9 @@ mod tests {
 
         fn on_patch_unapproved(
             &self,
-            _policy: PatchPolicy,
+            _policy: PatchesPolicy,
             _items: &[Unapproved<'_, camino::Utf8Path>],
-        ) -> HookResult<PatchPolicy> {
+        ) -> HookResult<PatchesPolicy> {
             panic!("patch hook not expected in these tests")
         }
     }
@@ -2046,9 +2120,9 @@ mod tests {
         }
         fn on_patch_unapproved(
             &self,
-            _: PatchPolicy,
+            _: PatchesPolicy,
             _: &[Unapproved<'_, camino::Utf8Path>],
-        ) -> HookResult<PatchPolicy> {
+        ) -> HookResult<PatchesPolicy> {
             panic!("patch hook should not have been invoked")
         }
     }
@@ -2066,9 +2140,9 @@ mod tests {
         }
         fn on_patch_unapproved(
             &self,
-            _: PatchPolicy,
+            _: PatchesPolicy,
             items: &[Unapproved<'_, camino::Utf8Path>],
-        ) -> HookResult<PatchPolicy> {
+        ) -> HookResult<PatchesPolicy> {
             HookResult::decided(vec![ItemDecision::AllowOnce; items.len()])
         }
     }
@@ -2266,7 +2340,7 @@ mod tests {
         fn user_origin_single_file_short_circuits() {
             let (_tmp, patch) = single_file_patch("hello.txt", "config/hello.txt");
             let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty();
+            let policy = PatchesPolicy::empty();
             let (resolved, _) = gate_patches(
                 vec![pp],
                 policy,
@@ -2284,7 +2358,7 @@ mod tests {
         fn project_origin_goes_through_prompt() {
             let (_tmp, patch) = single_file_patch("conf.toml", "etc/conf.toml");
             let pp = ProvenancedPatch::new(patch, project_source());
-            let policy = PatchPolicy::empty();
+            let policy = PatchesPolicy::empty();
             let (resolved, _) = gate_patches(
                 vec![pp],
                 policy,
@@ -2302,7 +2376,7 @@ mod tests {
         fn deny_via_policy_errors() {
             let (_tmp, patch) = single_file_patch("secret.pem", "config/x");
             let pp = ProvenancedPatch::new(patch, project_source());
-            let policy = PatchPolicy::empty().with_deny(["/**/*.pem"]);
+            let policy = PatchesPolicy::empty().with_deny(["/**/*.pem"]);
             let err = gate_patches(
                 vec![pp],
                 policy,
@@ -2321,7 +2395,7 @@ mod tests {
         fn user_loadout_honors_deny() {
             let (_tmp, patch) = single_file_patch("secret.pem", "config/x");
             let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty().with_deny(["/**/*.pem"]);
+            let policy = PatchesPolicy::empty().with_deny(["/**/*.pem"]);
             let err = gate_patches(
                 vec![pp],
                 policy,
@@ -2338,7 +2412,7 @@ mod tests {
         fn user_loadout_still_honors_ignore() {
             let (_tmp, patch) = single_file_patch("trash.bak", "config/x");
             let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty().with_ignore(["/**/*.bak"]);
+            let policy = PatchesPolicy::empty().with_ignore(["/**/*.bak"]);
             let (resolved, _) = gate_patches(
                 vec![pp],
                 policy,
@@ -2374,7 +2448,7 @@ mod tests {
             let pattern = format!("{root}/**/*.lua");
             let patch = Patch::new(pattern, PatchDest::try_new("nvim").unwrap());
             let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty();
+            let policy = PatchesPolicy::empty();
             let (mut resolved, _) = gate_patches(
                 vec![pp],
                 policy,
@@ -2404,7 +2478,7 @@ mod tests {
                 PatchDest::try_new("x").unwrap(),
             );
             let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty();
+            let policy = PatchesPolicy::empty();
             let (patches, _policy) = gate_patches(
                 vec![pp],
                 policy,
@@ -2441,7 +2515,7 @@ mod tests {
                 ),
                 user_source(),
             );
-            let policy = PatchPolicy::empty();
+            let policy = PatchesPolicy::empty();
             let (patches, _) = gate_patches(
                 vec![present, missing],
                 policy,
@@ -2462,7 +2536,7 @@ mod tests {
         fn tilde_pattern_with_missing_home_var_errors() {
             let patch = Patch::new("~/dotfiles/conf", PatchDest::try_new("conf").unwrap());
             let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty();
+            let policy = PatchesPolicy::empty();
             let err = gate_patches(
                 vec![pp],
                 policy,
@@ -2491,7 +2565,7 @@ mod tests {
 
             let patch = Patch::new("~/dotfiles/conf", PatchDest::try_new("conf").unwrap());
             let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty();
+            let policy = PatchesPolicy::empty();
             let vars = [home_var(root.as_str())];
             let (resolved, _) = gate_patches(
                 vec![pp],
@@ -2522,7 +2596,7 @@ mod tests {
             );
             let pp = ProvenancedPatch::new(patch, project_source());
 
-            let policy = PatchPolicy::empty().with_deny(["~/.ssh/**"]);
+            let policy = PatchesPolicy::empty().with_deny(["~/.ssh/**"]);
             let vars = [home_var(root.as_str())];
 
             let err = gate_patches(
@@ -2541,7 +2615,7 @@ mod tests {
         fn policy_tilde_pattern_without_home_var_errors() {
             let (_tmp, patch) = single_file_patch("conf.toml", "conf");
             let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty().with_deny(["~/.ssh/**"]);
+            let policy = PatchesPolicy::empty().with_deny(["~/.ssh/**"]);
             let err = gate_patches(
                 vec![pp],
                 policy,
@@ -2568,7 +2642,7 @@ mod tests {
         fn user_prefixed_tilde_is_rejected() {
             let (_tmp, patch) = single_file_patch("conf.toml", "conf");
             let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty().with_deny(["~someuser/.ssh/**"]);
+            let policy = PatchesPolicy::empty().with_deny(["~someuser/.ssh/**"]);
             let err = gate_patches(
                 vec![pp],
                 policy,
@@ -2599,7 +2673,7 @@ mod tests {
             let patch = Patch::new(file.as_str(), PatchDest::try_new("hello.txt").unwrap());
             let pp = ProvenancedPatch::new(patch, user_source());
 
-            let policy = PatchPolicy::empty().with_allow(["~/.config/**"]);
+            let policy = PatchesPolicy::empty().with_allow(["~/.config/**"]);
             let vars = [home_var(root.as_str())];
 
             let (_resolved, policy_out) = gate_patches(
@@ -2628,9 +2702,9 @@ mod tests {
                 }
                 fn on_patch_unapproved(
                     &self,
-                    policy: PatchPolicy,
+                    policy: PatchesPolicy,
                     items: &[Unapproved<'_, camino::Utf8Path>],
-                ) -> HookResult<PatchPolicy> {
+                ) -> HookResult<PatchesPolicy> {
                     let updated = policy.with_deny(["~/*.pem"]);
                     HookResult::decided_with_policy(
                         vec![ItemDecision::UseRule; items.len()],
@@ -2647,7 +2721,7 @@ mod tests {
             let patch = Patch::new(file.as_str(), PatchDest::try_new("secret.pem").unwrap());
             let pp = ProvenancedPatch::new(patch, project_source());
 
-            let policy = PatchPolicy::empty();
+            let policy = PatchesPolicy::empty();
             let vars = [home_var(root.as_str())];
 
             let err = gate_patches(
@@ -2675,9 +2749,9 @@ mod tests {
                 }
                 fn on_patch_unapproved(
                     &self,
-                    policy: PatchPolicy,
+                    policy: PatchesPolicy,
                     items: &[Unapproved<'_, camino::Utf8Path>],
-                ) -> HookResult<PatchPolicy> {
+                ) -> HookResult<PatchesPolicy> {
                     let updated = policy.with_deny(["$NOT_RESOLVED/*"]);
                     HookResult::decided_with_policy(
                         vec![ItemDecision::UseRule; items.len()],
@@ -2687,7 +2761,7 @@ mod tests {
             }
             let (_tmp, patch) = single_file_patch("conf.toml", "conf");
             let pp = ProvenancedPatch::new(patch, project_source());
-            let policy = PatchPolicy::empty();
+            let policy = PatchesPolicy::empty();
             let err = gate_patches(
                 vec![pp],
                 policy,
@@ -2728,7 +2802,7 @@ mod tests {
                 PatchDest::try_new("etc").unwrap(),
             );
             let pp = ProvenancedPatch::new(patch, user_source());
-            let policy = PatchPolicy::empty();
+            let policy = PatchesPolicy::empty();
             let (resolved, _) = gate_patches(
                 vec![pp],
                 policy,
@@ -2763,7 +2837,7 @@ mod tests {
                 PatchDest::try_new("etc").unwrap(),
             );
             let pp = ProvenancedPatch::new(patch, project_source());
-            let policy = PatchPolicy::empty().with_deny([format!("{denied_dir}/**")]);
+            let policy = PatchesPolicy::empty().with_deny([format!("{denied_dir}/**")]);
             let err = gate_patches(
                 vec![pp],
                 policy,
@@ -2790,7 +2864,7 @@ mod tests {
                 PatchDest::try_new("etc").unwrap(),
             );
             let pp = ProvenancedPatch::new(patch, project_source());
-            let policy = PatchPolicy::empty().with_allow([format!("{root}/**")]);
+            let policy = PatchesPolicy::empty().with_allow([format!("{root}/**")]);
             let (resolved, _) = gate_patches(
                 vec![pp],
                 policy,
@@ -2829,7 +2903,7 @@ mod tests {
             );
             let pp = ProvenancedPatch::new(patch, project_source());
 
-            let policy = PatchPolicy::empty().with_allow([format!("{link}/**")]);
+            let policy = PatchesPolicy::empty().with_allow([format!("{link}/**")]);
             let (resolved, _) = gate_patches(
                 vec![pp],
                 policy,
@@ -3269,7 +3343,7 @@ mod tests {
 
         fn hook(body: &str, source: Source) -> ProvenancedHook {
             let lh = LifecycleHook::builder()
-                .with_on_activate(HookScript::Inline(body.into()))
+                .with_on_activate(HookScript::inline(body))
                 .build()
                 .expect("at least one callback set");
             ProvenancedHook::new(lh, source)
@@ -3474,6 +3548,80 @@ mod tests {
             assert_eq!(left.lifecycle_hooks.len(), 2);
         }
 
+        // ---------------- hook ordering contract ----------------
+
+        /// The composed hook list is project-first, loadouts-after, and
+        /// the teardown view is its exact reverse.
+        ///
+        /// This is the property project maintainers depend on — set up
+        /// before any developer's personal hooks, tear down after them —
+        /// and it falls out of *how* a composition is assembled (daemon
+        /// pass-through first, client contribution appended), so nothing
+        /// but a test stops a future refactor of that assembly from
+        /// silently inverting it.
+        #[test]
+        fn hooks_compose_project_first_and_tear_down_in_reverse() {
+            use crate::wire::request::WireContribution;
+
+            // Daemon side: the project's hooks are installed first.
+            let mut composition = Composition::from_daemon_passthrough(
+                Vec::new(),
+                vec![hook("project", project_source())],
+            );
+            // Client side: the loadouts' hooks arrive already gated and
+            // are appended.
+            composition
+                .extend_from_wire(WireContribution {
+                    lifecycle_hooks: vec![hook("loadout", user_source()).into()],
+                    ..Default::default()
+                })
+                .expect("appending a gated contribution");
+
+            let setup: Vec<&Source> = composition
+                .lifecycle_hooks()
+                .iter()
+                .map(Provenanced::source)
+                .collect();
+            assert_eq!(
+                setup,
+                vec![&project_source(), &user_source()],
+                "setup order must be project, then loadouts",
+            );
+
+            let teardown: Vec<&Source> = composition
+                .lifecycle_hooks_teardown()
+                .map(Provenanced::source)
+                .collect();
+            assert_eq!(
+                teardown,
+                vec![&user_source(), &project_source()],
+                "teardown order must be the exact reverse of setup",
+            );
+        }
+
+        /// The teardown view is a pure reordering: same hooks, same
+        /// count, nothing dropped. Guards against a future
+        /// implementation that filters while reversing.
+        #[test]
+        fn teardown_view_is_a_pure_reversal() {
+            let mut composition = Composition::from_daemon_passthrough(
+                Vec::new(),
+                vec![
+                    hook("a", project_source()),
+                    hook("b", user_source()),
+                    hook("c", user_source()),
+                ],
+            );
+            // Touch `composition` mutably so the borrow shape matches
+            // real use, then compare the two views.
+            let forward: Vec<_> = composition.lifecycle_hooks().to_vec();
+            let mut reversed: Vec<_> = composition.lifecycle_hooks_teardown().cloned().collect();
+            assert_eq!(reversed.len(), forward.len());
+            reversed.reverse();
+            assert_eq!(reversed, forward);
+            let _ = &mut composition;
+        }
+
         // ---------------- package-supplied fs / user-data filter ----------------
 
         /// A package may not supply patches, nor vars that carry user
@@ -3594,9 +3742,9 @@ mod tests {
             }
             fn on_patch_unapproved(
                 &self,
-                _: PatchPolicy,
+                _: PatchesPolicy,
                 _: &[crate::core::hooks::Unapproved<'_, camino::Utf8Path>],
-            ) -> crate::core::hooks::HookResult<PatchPolicy> {
+            ) -> crate::core::hooks::HookResult<PatchesPolicy> {
                 panic!("hook should not have been invoked")
             }
         }

@@ -1,8 +1,8 @@
-//! Policy types: per-domain `VarsPolicy` and `PatchPolicy`, plus the
+//! Policy types: per-domain `VarsPolicy` and `PatchesPolicy`, plus the
 //! top-level `UserPolicy` that bundles them.
 //!
 //! [`UserPolicy`] bundles the per-domain policies — [`VarsPolicy`] for
-//! environment variables and [`PatchPolicy`] for file patches. Both
+//! environment variables and [`PatchesPolicy`] for file patches. Both
 //! gate every declaration regardless of origin; user-origin
 //! declarations from a [`Loadout`] don't need to be explicitly
 //! `allow`-listed (they auto-pass that check), but `ignore` and
@@ -354,7 +354,7 @@ impl VarsPolicy {
 }
 
 // =====================================================================
-// PatchPolicy
+// PatchesPolicy
 // =====================================================================
 
 /// Policy gating which patches are honored, checked per source file
@@ -377,7 +377,7 @@ impl VarsPolicy {
 ///
 /// [`Loadout`]: crate::core::loadout::Loadout
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PatchPolicy {
+pub struct PatchesPolicy {
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
@@ -416,7 +416,7 @@ where
     })
 }
 
-impl PatchPolicy {
+impl PatchesPolicy {
     /// Construct an empty policy. Build it up with [`Self::with_allow`],
     /// [`Self::with_deny`], and [`Self::with_ignore`].
     #[must_use]
@@ -486,7 +486,7 @@ impl PatchPolicy {
     }
 
     /// Expand the raw patterns against `resolved_vars` and produce an
-    /// [`ExpandedPatchPolicy`] suitable for matching.
+    /// [`ExpandedPatchesPolicy`] suitable for matching.
     ///
     /// Every pattern is run through
     /// [`crate::core::expansion::expand_source`]; the first failure stops
@@ -500,7 +500,7 @@ impl PatchPolicy {
         &self,
         resolved_vars: &(impl crate::core::expansion::VarLookup + ?Sized),
         home_fallback: Option<&str>,
-    ) -> Result<ExpandedPatchPolicy, crate::core::expansion::ExpandError> {
+    ) -> Result<ExpandedPatchesPolicy, crate::core::expansion::ExpandError> {
         let expand_one =
             |raws: &[String]| -> Result<Vec<FileSet>, crate::core::expansion::ExpandError> {
                 // Policy patterns are matchers, not walk seeds — they
@@ -521,7 +521,206 @@ impl PatchPolicy {
         let allow = expand_one(&self.allow)?;
         let deny = expand_one(&self.deny)?;
         let ignore = expand_one(&self.ignore)?;
-        Ok(ExpandedPatchPolicy::from_expanded(allow, deny, ignore))
+        Ok(ExpandedPatchesPolicy::from_expanded(allow, deny, ignore))
+    }
+}
+
+// =====================================================================
+// HooksPolicy
+// =====================================================================
+
+/// The user's policy for which **projects** may run lifecycle hooks in
+/// their sessions, matched by project root path.
+///
+/// A lifecycle hook is arbitrary code a project asks to execute inside
+/// the session, so unlike vars and patches — where the risk is a
+/// project pulling the user's data *in* — the risk here is execution
+/// itself. A project must therefore be allow-listed by path before any
+/// hook it declares will run.
+///
+/// Only project-declared hooks are gated. A hook from a
+/// [`Loadout`](crate::core::loadout::Loadout) is the user's own file,
+/// already under their control, and passes without a rule. A hook
+/// tagged [`Source::Package`] is refused outright: packages have no
+/// legitimate way to contribute one, so its presence means either a bug
+/// or an attempt to smuggle execution past this gate.
+///
+/// Precedence mirrors the other domains: `deny` first (the emergency
+/// stop, so an overlapping deny+ignore resolves as denied), then
+/// `ignore` (silent skip, no prompt), then `allow`. A project matching
+/// none of the three routes to a prompt. Patterns may contain `~/` or
+/// `$VAR` and are expanded at gate time, exactly like
+/// [`PatchesPolicy`]'s, while the stored form stays raw so the policy
+/// round-trips losslessly.
+///
+/// ```toml
+/// [hooks]
+/// allow  = ["~/work/**"]
+/// deny   = ["~/downloads/**"]
+/// ignore = ["~/scratch/**"]
+/// ```
+///
+/// [`Source::Package`]: crate::core::source::Source::Package
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HooksPolicy {
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_one_or_many"
+    )]
+    allow: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_one_or_many"
+    )]
+    deny: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_one_or_many"
+    )]
+    ignore: Vec<String>,
+}
+
+impl HooksPolicy {
+    /// Construct an empty policy — no project may run hooks without
+    /// being prompted for.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Replace the `allow` set with raw project-root patterns.
+    #[must_use]
+    pub fn with_allow<I, S>(self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            allow: patterns.into_iter().map(Into::into).collect(),
+            ..self
+        }
+    }
+
+    /// Replace the `deny` set with raw project-root patterns.
+    #[must_use]
+    pub fn with_deny<I, S>(self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            deny: patterns.into_iter().map(Into::into).collect(),
+            ..self
+        }
+    }
+
+    /// Replace the `ignore` set with raw project-root patterns.
+    #[must_use]
+    pub fn with_ignore<I, S>(self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            ignore: patterns.into_iter().map(Into::into).collect(),
+            ..self
+        }
+    }
+
+    /// Raw project-root patterns whose hooks may run.
+    #[must_use]
+    pub fn allow(&self) -> &[String] {
+        &self.allow
+    }
+
+    /// Raw project-root patterns whose hooks are refused outright.
+    #[must_use]
+    pub fn deny(&self) -> &[String] {
+        &self.deny
+    }
+
+    /// Raw project-root patterns whose hooks are dropped silently,
+    /// without a prompt.
+    #[must_use]
+    pub fn ignore(&self) -> &[String] {
+        &self.ignore
+    }
+
+    /// Expand the raw patterns against `resolved_vars` into a matcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`crate::core::expansion::ExpandError`]
+    /// produced by any pattern.
+    pub fn expand_with(
+        &self,
+        resolved_vars: &(impl crate::core::expansion::VarLookup + ?Sized),
+        home_fallback: Option<&str>,
+    ) -> Result<ExpandedHooksPolicy, crate::core::expansion::ExpandError> {
+        let expand_one =
+            |raws: &[String]| -> Result<Vec<FileSet>, crate::core::expansion::ExpandError> {
+                raws.iter()
+                    .map(|r| {
+                        crate::core::expansion::expand_policy_pattern(
+                            r,
+                            resolved_vars,
+                            home_fallback,
+                        )
+                    })
+                    .collect()
+            };
+        Ok(ExpandedHooksPolicy {
+            allow: expand_one(&self.allow)?,
+            deny: expand_one(&self.deny)?,
+            ignore: expand_one(&self.ignore)?,
+        })
+    }
+}
+
+/// A [`HooksPolicy`] with its patterns expanded into concrete globs,
+/// ready to match project roots. Produced by
+/// [`HooksPolicy::expand_with`].
+#[derive(Clone, Debug)]
+pub struct ExpandedHooksPolicy {
+    allow: Vec<FileSet>,
+    deny: Vec<FileSet>,
+    ignore: Vec<FileSet>,
+}
+
+impl ExpandedHooksPolicy {
+    /// Categorize one hook against this policy, by the source that
+    /// declared it.
+    ///
+    /// - [`Source::UserLoadout`] → allowed. The user's own file.
+    /// - [`Source::Package`] → denied. Packages cannot declare hooks;
+    ///   one appearing here is a bug or an attempt to bypass the gate,
+    ///   and either way must not execute.
+    /// - [`Source::Project`] → matched by project root: `deny`, then
+    ///   `ignore`, then `allow`, else a prompt.
+    ///
+    /// [`Source::UserLoadout`]: crate::core::source::Source::UserLoadout
+    /// [`Source::Package`]: crate::core::source::Source::Package
+    /// [`Source::Project`]: crate::core::source::Source::Project
+    #[must_use]
+    pub fn check<T: Provenanced>(&self, item: T) -> CheckOutcome<T> {
+        let path = match item.source() {
+            Source::UserLoadout { .. } => return CheckOutcome::Decided(Decision::Allowed(item)),
+            Source::Package { .. } => return CheckOutcome::Decided(Decision::Denied(item)),
+            Source::Project { path } => path.as_utf8_path().to_owned(),
+        };
+        if filesets_match(&self.deny, &path) {
+            return CheckOutcome::Decided(Decision::Denied(item));
+        }
+        if filesets_match(&self.ignore, &path) {
+            return CheckOutcome::Decided(Decision::Ignored);
+        }
+        if filesets_match(&self.allow, &path) {
+            return CheckOutcome::Decided(Decision::Allowed(item));
+        }
+        CheckOutcome::NeedsApproval(item)
     }
 }
 
@@ -535,8 +734,10 @@ impl PatchPolicy {
 pub struct UserPolicy {
     #[serde(default, skip_serializing_if = "vars_policy_is_default")]
     vars: VarsPolicy,
-    #[serde(default, skip_serializing_if = "patch_policy_is_default")]
-    patches: PatchPolicy,
+    #[serde(default, skip_serializing_if = "patches_policy_is_default")]
+    patches: PatchesPolicy,
+    #[serde(default, skip_serializing_if = "hooks_policy_is_default")]
+    hooks: HooksPolicy,
 }
 
 impl UserPolicy {
@@ -565,7 +766,7 @@ impl UserPolicy {
 
     /// Replace the patches policy.
     #[must_use]
-    pub fn with_patches(self, patches: PatchPolicy) -> Self {
+    pub fn with_patches(self, patches: PatchesPolicy) -> Self {
         Self { patches, ..self }
     }
 
@@ -577,8 +778,20 @@ impl UserPolicy {
 
     /// The patches policy in effect.
     #[must_use]
-    pub fn patches(&self) -> &PatchPolicy {
+    pub fn patches(&self) -> &PatchesPolicy {
         &self.patches
+    }
+
+    /// Replace the lifecycle-hooks policy.
+    #[must_use]
+    pub fn with_hooks(self, hooks: HooksPolicy) -> Self {
+        Self { hooks, ..self }
+    }
+
+    /// The lifecycle-hooks policy in effect.
+    #[must_use]
+    pub fn hooks(&self) -> &HooksPolicy {
+        &self.hooks
     }
 
     /// Consume the policy and return the underlying narrow policies.
@@ -587,8 +800,8 @@ impl UserPolicy {
     /// policy into the corresponding per-domain gate and rebuilds a
     /// `UserPolicy` from the (possibly updated) results.
     #[must_use]
-    pub fn into_parts(self) -> (VarsPolicy, PatchPolicy) {
-        (self.vars, self.patches)
+    pub fn into_parts(self) -> (VarsPolicy, PatchesPolicy, HooksPolicy) {
+        (self.vars, self.patches, self.hooks)
     }
 }
 
@@ -596,33 +809,37 @@ fn vars_policy_is_default(p: &VarsPolicy) -> bool {
     p == &VarsPolicy::default()
 }
 
-fn patch_policy_is_default(p: &PatchPolicy) -> bool {
-    p == &PatchPolicy::default()
+fn patches_policy_is_default(p: &PatchesPolicy) -> bool {
+    p == &PatchesPolicy::default()
+}
+
+fn hooks_policy_is_default(p: &HooksPolicy) -> bool {
+    p == &HooksPolicy::default()
 }
 
 // =====================================================================
-// ExpandedPatchPolicy
+// ExpandedPatchesPolicy
 // =====================================================================
 
-/// A [`PatchPolicy`] with all `~/` and `$VAR` references expanded into
+/// A [`PatchesPolicy`] with all `~/` and `$VAR` references expanded into
 /// concrete glob patterns against a set of resolved session vars.
 ///
-/// Produced from a raw [`PatchPolicy`] via
-/// [`PatchPolicy::expand_with`] at the patch gate's main entry point;
+/// Produced from a raw [`PatchesPolicy`] via
+/// [`PatchesPolicy::expand_with`] at the patch gate's main entry point;
 /// the gate matches against this form, not the raw policy. The raw
 /// policy is preserved separately so it can round-trip through
 /// serialization unchanged.
 #[derive(Clone, Debug)]
-pub struct ExpandedPatchPolicy {
+pub struct ExpandedPatchesPolicy {
     allow: Vec<FileSet>,
     deny: Vec<FileSet>,
     ignore: Vec<FileSet>,
 }
 
-impl ExpandedPatchPolicy {
-    /// Construct an `ExpandedPatchPolicy` from already-expanded
+impl ExpandedPatchesPolicy {
+    /// Construct an `ExpandedPatchesPolicy` from already-expanded
     /// lists. Crate-internal so external callers must go through
-    /// [`PatchPolicy::expand_with`] and can't bypass expansion.
+    /// [`PatchesPolicy::expand_with`] and can't bypass expansion.
     pub(crate) fn from_expanded(
         allow: Vec<FileSet>,
         deny: Vec<FileSet>,
@@ -721,7 +938,7 @@ impl ExpandedPatchPolicy {
 }
 
 /// Path-level decision used internally by
-/// [`ExpandedPatchPolicy::decide`]. The public-facing outcome
+/// [`ExpandedPatchesPolicy::decide`]. The public-facing outcome
 /// ([`CheckOutcome`]) carries the item; this type doesn't, so it can
 /// be computed for the same item against multiple paths and combined.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -983,7 +1200,7 @@ mod tests {
     }
 
     // =================================================================
-    // PatchPolicy tests
+    // PatchesPolicy tests
     // =================================================================
 
     #[test]
@@ -993,7 +1210,7 @@ mod tests {
             deny = ["~/.ssh/**", "**/*.pem"]
             ignore = ["**/.DS_Store"]
         "#;
-        let policy: PatchPolicy = toml::from_str(src).unwrap();
+        let policy: PatchesPolicy = toml::from_str(src).unwrap();
         assert_eq!(patterns(policy.allow()), ["~/.config/**", "/etc/xdg/**"]);
         assert_eq!(patterns(policy.deny()), ["~/.ssh/**", "**/*.pem"]);
         assert_eq!(patterns(policy.ignore()), ["**/.DS_Store"]);
@@ -1001,7 +1218,7 @@ mod tests {
 
     #[test]
     fn patch_policy_defaults_when_omitted() {
-        let policy: PatchPolicy = toml::from_str("").unwrap();
+        let policy: PatchesPolicy = toml::from_str("").unwrap();
         assert!(policy.allow().is_empty());
         assert!(policy.deny().is_empty());
         assert!(policy.ignore().is_empty());
@@ -1009,13 +1226,13 @@ mod tests {
 
     #[test]
     fn patch_policy_accepts_bare_string_for_each_field() {
-        let policy: PatchPolicy = toml::from_str(r#"deny = "~/.ssh/**""#).unwrap();
+        let policy: PatchesPolicy = toml::from_str(r#"deny = "~/.ssh/**""#).unwrap();
         assert_eq!(patterns(policy.deny()), ["~/.ssh/**"]);
     }
 
     #[test]
     fn patch_policy_builder_methods() {
-        let p = PatchPolicy::empty()
+        let p = PatchesPolicy::empty()
             .with_allow(["~/.config/**"])
             .with_deny(["~/.ssh/**", "**/*.pem"])
             .with_ignore(["**/.DS_Store"]);
@@ -1030,20 +1247,20 @@ mod tests {
         // glob is held verbatim and only fails at expansion-time, after
         // var substitution gets a chance to fix it. This documents that
         // shift.
-        let p = PatchPolicy::empty().with_allow(["[bad"]);
+        let p = PatchesPolicy::empty().with_allow(["[bad"]);
         assert_eq!(patterns(p.allow()), ["[bad"]);
     }
 
     #[test]
     fn patch_policy_skips_empty_fields_on_serialize() {
-        let p = PatchPolicy::empty().with_allow(["A"]);
+        let p = PatchesPolicy::empty().with_allow(["A"]);
         let s = toml::to_string(&p).unwrap();
         assert!(s.contains("allow"), "expected allow, got: {s}");
         assert!(!s.contains("deny"), "expected no deny, got: {s}");
         assert!(!s.contains("ignore"), "expected no ignore, got: {s}");
     }
 
-    // ---- PatchPolicy::expand_with ----
+    // ---- PatchesPolicy::expand_with ----
 
     /// Build a `ResolvedVar` with the given name + value.
     fn sv(name: &str, value: &str) -> crate::core::primitives::ResolvedVar {
@@ -1059,7 +1276,7 @@ mod tests {
     /// `HOME` get the same substituted prefix.
     #[test]
     fn expand_with_substitutes_all_three_lists() {
-        let policy = PatchPolicy::empty()
+        let policy = PatchesPolicy::empty()
             .with_allow(["~/cfg/**"])
             .with_deny(["$HOME/.ssh/**"])
             .with_ignore(["~/.DS_Store"]);
@@ -1078,7 +1295,7 @@ mod tests {
     /// failure.
     #[test]
     fn expand_with_propagates_first_undefined_var() {
-        let policy = PatchPolicy::empty()
+        let policy = PatchesPolicy::empty()
             .with_allow(["/etc/**"])
             .with_deny(["$NOPE/*"]);
         let vars: [crate::core::primitives::ResolvedVar; 0] = [];
@@ -1099,7 +1316,7 @@ mod tests {
     /// resolved-vars set at all.
     #[test]
     fn expand_with_empty_vars_works_when_no_expansion_needed() {
-        let policy = PatchPolicy::empty()
+        let policy = PatchesPolicy::empty()
             .with_allow(["/etc/xdg/**"])
             .with_deny(["/**/*.pem"])
             .with_ignore(["/**/.DS_Store"]);
@@ -1114,7 +1331,7 @@ mod tests {
     /// Deny wins when a path matches both `deny` and `ignore`. Same
     /// invariant as [`vars_policy_check_deny_wins_over_ignore_on_overlap`],
     /// on the patch-side gate. Goes through
-    /// [`ExpandedPatchPolicy::check`] with a `link` of `None` so only
+    /// [`ExpandedPatchesPolicy::check`] with a `link` of `None` so only
     /// the single-path `decide` codepath is exercised.
     #[test]
     fn patch_policy_check_deny_wins_over_ignore_on_overlap() {
@@ -1126,7 +1343,7 @@ mod tests {
                 &self.source
             }
         }
-        let policy = PatchPolicy::empty()
+        let policy = PatchesPolicy::empty()
             .with_deny(["/etc/secret/**"])
             .with_ignore(["/etc/secret/**"]);
         let vars: [crate::core::primitives::ResolvedVar; 0] = [];
@@ -1157,7 +1374,7 @@ mod tests {
                 &self.source
             }
         }
-        let policy = PatchPolicy::empty().with_deny(["**/*.pem"]);
+        let policy = PatchesPolicy::empty().with_deny(["**/*.pem"]);
         let vars: [crate::core::primitives::ResolvedVar; 0] = [];
         let expanded = policy
             .expand_with(vars.as_slice(), None)
@@ -1212,7 +1429,7 @@ mod tests {
         "#;
         let p: UserPolicy = toml::from_str(src).unwrap();
         assert_eq!(p.vars().allow().raw_patterns(), &["X"]);
-        assert_eq!(p.patches(), &PatchPolicy::default());
+        assert_eq!(p.patches(), &PatchesPolicy::default());
     }
 
     #[test]

@@ -356,8 +356,10 @@ fn fold_stack_vars_into_session<'a, I>(
 /// lands.
 pub(crate) fn build_composables(
     project_path: &DaemonAbsPath,
+    declared_path: &paths::HostAbsPath,
     resolution: &ProjectResolution,
     contribution: &WireContribution,
+    hooks_enabled: bool,
 ) -> Result<
     (
         Option<mfile::ProjectComposable>,
@@ -449,15 +451,26 @@ pub(crate) fn build_composables(
         if let Some(gstack) = graph_stack {
             fold_stack_vars_into_session(&mut effective, &gstack.name, &gstack.build_env_vars);
         }
+        // `--no-hooks`: drop the project's transition scripts before
+        // they reach the composer. Cleared here, ahead of the
+        // is-empty recheck below, so a `[session]` block whose only
+        // material was hooks collapses to no composable at all
+        // rather than an empty one.
+        if !hooks_enabled {
+            effective.lifecycle_hooks.clear();
+        }
         // Post-fold recheck: every stack var could theoretically
         // fail both strict and lenient validation, leaving
         // `effective` empty despite the pre-check. Rare, but the
         // recheck is cheap.
         (!effective.is_empty()).then(|| {
-            mfile::ProjectComposable::new(
-                paths::AbsPath::<paths::Host>::new_unchecked(project_path.as_utf8_path()).into(),
-                effective,
-            )
+            // The *declared* path, not the workspace this mfile was
+            // read from. Provenance is identity, and the workspace is
+            // per-session (`.../sessions/<id>/tree`) — stamping that
+            // would give the same project a different identity on every
+            // activation, which the hooks policy matches against and
+            // every error message quotes back at the user.
+            mfile::ProjectComposable::new(declared_path.clone().into(), effective)
         })
     };
 
@@ -551,14 +564,26 @@ pub(crate) fn build_composables(
 /// callers on an async runtime should wrap it in a blocking-safe
 /// helper. Kept free of `.await`s so its non-`Send` intermediaries
 /// ([`mctx::Context`], nickel-`Rc`-carrying errors) never cross one.
+/// `project_path` is where the mfile is *read* from — the session's
+/// daemon-side workspace. `declared_path` is where the project lives on
+/// the user's machine, taken from the session record: the two are
+/// different filesystems, and only the second is a stable identity for
+/// the project (see [`build_composables`]).
 pub(crate) fn run_compose(
     daemon_ctx: &Arc<mctx::DaemonContext>,
     project_path: &DaemonAbsPath,
+    declared_path: &paths::HostAbsPath,
     contribution: WireContribution,
+    hooks_enabled: bool,
 ) -> Result<ComposeOutcome, std::io::Error> {
     let resolution = resolve_project_ctx_and_graph(daemon_ctx, project_path)?;
-    let (project_composable, package_composables) =
-        build_composables(project_path, &resolution, &contribution)?;
+    let (project_composable, package_composables) = build_composables(
+        project_path,
+        declared_path,
+        &resolution,
+        &contribution,
+        hooks_enabled,
+    )?;
     run_composer(contribution, project_composable, package_composables)
 }
 

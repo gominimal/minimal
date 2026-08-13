@@ -55,6 +55,7 @@ fn record(name: Option<&str>, network: NetworkMode) -> sessions::Record {
         network,
         policy: sessions::SessionPolicy::default(),
         status: sessions::SessionStatus::Active,
+        hooks_enabled: true,
         attrs: Default::default(),
     }
 }

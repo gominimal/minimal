@@ -8,8 +8,12 @@
 //! `~/${PROJECT_ROOT}` can reference a `PROJECT_ROOT` approved
 //! moments earlier in the same response.
 //!
-//! Lifecycle hooks are pass-through — no per-hook policy exists, so
-//! rejecting a hook means aborting the session.
+//! Lifecycle hooks are gated last, against the hooks policy, by the
+//! project root that declared them: a hook is arbitrary code, so a
+//! project must be allow-listed before any of its hooks run. Hooks are
+//! decided per project rather than per script — a project's hooks are
+//! approved as a set — so the prompt fires once per project no matter
+//! how many scripts it declares.
 //!
 //! Per-domain verdicts are correlated by `id`, not slice position:
 //! auto-decided items come out in input order but hook-routed items
@@ -22,11 +26,13 @@ use crate::core::compose::{
 use crate::core::decision::{CheckOutcome, Decision, ItemDecision};
 use crate::core::enumerate::enumerate_patch_files;
 use crate::core::hooks::{PolicyHooks, Unapproved};
-use crate::core::policy::{ExpandedPatchPolicy, PatchPolicy, UserPolicy, VarsPolicy};
+use crate::core::policy::{
+    ExpandedPatchesPolicy, HooksPolicy, PatchesPolicy, UserPolicy, VarsPolicy,
+};
 use crate::core::primitives::{Patch, PatchDest};
 use crate::core::source::{Provenanced, ProvenancedPatch, Source};
-use crate::wire::policy::{WirePatchVerdict, WireVarVerdict};
-use crate::wire::primitives::{WirePendingPatch, WirePendingVar};
+use crate::wire::policy::{WireHookVerdict, WirePatchVerdict, WireVarVerdict};
+use crate::wire::primitives::{WirePendingHook, WirePendingPatch, WirePendingVar};
 use crate::wire::request::{ContributionResponse, ContributionVerdict};
 
 /// Gate the daemon's pending items against `policy`, prompting via
@@ -54,7 +60,7 @@ pub fn handle_response(
     env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
 ) -> Result<(ContributionVerdict, UserPolicy), ComposeError> {
     let session_id = response.session_id;
-    let (vars_policy, patches_policy) = policy.into_parts();
+    let (vars_policy, patches_policy, hooks_policy) = policy.into_parts();
 
     let (var_out, vars_policy) = gate_pending_vars(response.vars, vars_policy, hooks, env)?;
 
@@ -70,18 +76,165 @@ pub fn handle_response(
         env,
     )?;
 
+    // Hooks gate last so its policy patterns can expand against the
+    // same resolved var set the patch gate used.
+    let (hook_verdicts, hooks_policy) = gate_pending_hooks(
+        response.lifecycle_hooks,
+        hooks_policy,
+        hooks,
+        &combined_vars,
+        env,
+    )?;
+
     let final_policy = UserPolicy::empty()
         .with_vars(vars_policy)
-        .with_patches(patches_policy);
+        .with_patches(patches_policy)
+        .with_hooks(hooks_policy);
 
     Ok((
         ContributionVerdict {
             session_id,
             vars: var_out.verdicts,
             patches: patch_verdicts,
+            lifecycle_hooks: hook_verdicts,
         },
         final_policy,
     ))
+}
+
+// =====================================================================
+// Lifecycle hooks
+// =====================================================================
+
+/// One project whose hooks still need a decision: the root path the
+/// prompt shows, the original [`Source`] (kept rather than rebuilt from
+/// the path, so a re-check after the prompt matches on exactly what the
+/// policy saw the first time), and the ids waiting on that decision.
+type UndecidedProject = (
+    camino::Utf8PathBuf,
+    Source,
+    Vec<crate::wire::primitives::PendingId>,
+);
+
+/// Gate the daemon's pending lifecycle hooks against the hooks policy.
+///
+/// Decisions are made **per project**, not per hook: a project's hooks
+/// are approved or refused as a set, so a project declaring five hooks
+/// prompts once rather than five times, and can't end up half-approved.
+/// Every hook from one project therefore receives that project's single
+/// decision.
+fn gate_pending_hooks(
+    pending: Vec<WirePendingHook>,
+    policy: HooksPolicy,
+    hooks: &dyn PolicyHooks,
+    combined_vars: &[SessionVar],
+    env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<(Vec<WireHookVerdict>, HooksPolicy), ComposeError> {
+    if pending.is_empty() {
+        return Ok((Vec::new(), policy));
+    }
+    let home_fallback = env("HOME").ok();
+    let expanded = policy.expand_with(combined_vars, home_fallback.as_deref())?;
+
+    // Pass 1: classify each hook. `Provenanced` is what the policy
+    // reads, so a lightweight (id, source) pair stands in for the hook
+    // itself here — the daemon holds the hook and only needs a verdict.
+    let mut verdicts: Vec<WireHookVerdict> = Vec::with_capacity(pending.len());
+    // Distinct projects still needing a decision, in first-seen order.
+    let mut unapproved: Vec<UndecidedProject> = Vec::new();
+    for p in pending {
+        let source: Source = p.source.into();
+        match expanded.check(HookRef {
+            id: p.id,
+            source: source.clone(),
+        }) {
+            CheckOutcome::Decided(Decision::Allowed(h)) => {
+                verdicts.push(WireHookVerdict::Approved { id: h.id });
+            }
+            CheckOutcome::Decided(Decision::Denied(h)) => {
+                verdicts.push(WireHookVerdict::Denied { id: h.id });
+            }
+            CheckOutcome::Decided(Decision::Ignored) => {
+                verdicts.push(WireHookVerdict::Ignored { id: p.id });
+            }
+            CheckOutcome::NeedsApproval(h) => {
+                // Only `Source::Project` reaches here — the other two
+                // variants are always decided — so the path is present.
+                let root = match &h.source {
+                    Source::Project { path } => path.as_utf8_path().to_owned(),
+                    other => {
+                        return Err(ComposeError::InvalidWireItem {
+                            what: "lifecycle hook needing approval from a non-project source",
+                            context: format!("{other:?}"),
+                        });
+                    }
+                };
+                match unapproved.iter_mut().find(|(p, _, _)| *p == root) {
+                    Some((_, _, ids)) => ids.push(h.id),
+                    None => unapproved.push((root, h.source, vec![h.id])),
+                }
+            }
+        }
+    }
+    if unapproved.is_empty() {
+        return Ok((verdicts, policy));
+    }
+
+    // Pass 2: prompt once per project.
+    let view: Vec<Unapproved<'_, camino::Utf8Path>> = unapproved
+        .iter()
+        .map(|(root, source, _)| Unapproved {
+            item: root.as_path(),
+            source,
+        })
+        .collect();
+    let (decisions, policy) = crate::core::compose::prompt_hook_hook(hooks, policy, &view)?;
+
+    // Pass 3: apply one decision to every hook from that project.
+    let expanded = policy.expand_with(combined_vars, home_fallback.as_deref())?;
+    for ((root, source, ids), decision) in unapproved.into_iter().zip(decisions) {
+        for id in ids {
+            let verdict = match decision {
+                ItemDecision::AllowOnce => WireHookVerdict::Approved { id },
+                ItemDecision::IgnoreOnce => WireHookVerdict::Ignored { id },
+                ItemDecision::UseRule => match expanded.check(HookRef {
+                    id,
+                    source: source.clone(),
+                }) {
+                    CheckOutcome::Decided(Decision::Allowed(h)) => {
+                        WireHookVerdict::Approved { id: h.id }
+                    }
+                    CheckOutcome::Decided(Decision::Denied(h)) => {
+                        WireHookVerdict::Denied { id: h.id }
+                    }
+                    CheckOutcome::Decided(Decision::Ignored) => WireHookVerdict::Ignored { id },
+                    CheckOutcome::NeedsApproval(_) => {
+                        return Err(ComposeError::use_rule_undecided(
+                            HookDomain::Hook,
+                            format!("lifecycle hooks from project `{root}`"),
+                        ));
+                    }
+                },
+            };
+            verdicts.push(verdict);
+        }
+    }
+    Ok((verdicts, policy))
+}
+
+/// The minimum a hook needs to face the policy: its correlation id and
+/// the source that declared it. The hook body stays on the daemon, so
+/// the client never has to ship one back — only a decision.
+#[derive(Clone, Debug)]
+struct HookRef {
+    id: crate::wire::primitives::PendingId,
+    source: Source,
+}
+
+impl Provenanced for HookRef {
+    fn source(&self) -> &Source {
+        &self.source
+    }
 }
 
 // =====================================================================
@@ -273,12 +426,12 @@ fn classify_var(policy: &VarsPolicy, pending: PendingVar) -> VarClassification {
 
 fn gate_pending_patches(
     pending: Vec<WirePendingPatch>,
-    policy: PatchPolicy,
+    policy: PatchesPolicy,
     hooks: &dyn PolicyHooks,
     options: ComposeOptions,
     combined_vars: &[SessionVar],
     env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
-) -> Result<(Vec<WirePatchVerdict>, PatchPolicy), ComposeError> {
+) -> Result<(Vec<WirePatchVerdict>, PatchesPolicy), ComposeError> {
     if pending.is_empty() {
         return Ok((Vec::new(), policy));
     }
@@ -328,7 +481,7 @@ fn gate_pending_patches(
 /// that need the hook.
 fn enumerate_and_classify_patches(
     pending: Vec<WirePendingPatch>,
-    policy: &ExpandedPatchPolicy,
+    policy: &ExpandedPatchesPolicy,
     combined_vars: &[SessionVar],
     home_fallback: Option<&str>,
     follow_symlinks: bool,
@@ -403,7 +556,7 @@ fn enumerate_and_classify_patches(
 
 /// Apply a hook's `ItemDecision` to a single pending patch file.
 fn apply_patch_decision(
-    policy: &ExpandedPatchPolicy,
+    policy: &ExpandedPatchesPolicy,
     pending: PendingPatchFile,
     decision: ItemDecision,
 ) -> Result<WirePatchVerdict, ComposeError> {
@@ -436,7 +589,7 @@ enum PatchClassification {
 }
 
 fn classify_patch_file(
-    policy: &ExpandedPatchPolicy,
+    policy: &ExpandedPatchesPolicy,
     pending: PendingPatchFile,
 ) -> PatchClassification {
     let (id, pf) = pending.into_parts();

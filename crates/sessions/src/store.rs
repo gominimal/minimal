@@ -28,6 +28,17 @@ pub trait SessionObject: Sized + Send + Clone + 'static + std::fmt::Debug {
     /// materialize into the sandbox home. Each entry is stored
     /// under the patch's sandbox-home-relative destination path.
     fn patches_path(&self) -> DaemonAbsPath;
+    /// Directory the daemon stages the client-uploaded external
+    /// lifecycle-hook scripts into. Each entry is stored under the
+    /// path [`staged_script_path`] derives from its hook's source, so
+    /// the daemon can find a script again from the composition alone.
+    ///
+    /// Deliberately not under [`patches_path`](Self::patches_path):
+    /// the whole patch tree is copied into the sandbox home when the
+    /// session finalizes, and hook scripts are not dotfiles.
+    ///
+    /// [`staged_script_path`]: crate::core::lifecyclehook::staged_script_path
+    fn hooks_path(&self) -> DaemonAbsPath;
 }
 
 /// Describes the primary key a [`Loader`] uses to reference
@@ -228,6 +239,9 @@ impl SessionObject for DiskSession {
     }
     fn patches_path(&self) -> DaemonAbsPath {
         sub_path!(self.root_path(), "patches")
+    }
+    fn hooks_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root_path(), "hooks")
     }
 }
 
@@ -1036,6 +1050,10 @@ mod tests {
                 None,
             ),
             status: SessionStatus::default(),
+            // Deliberately the non-default (`--no-hooks`): `true` is the
+            // serde default, so a fixture using it would round-trip
+            // green even if the field were dropped on write.
+            hooks_enabled: false,
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),
@@ -1061,6 +1079,11 @@ mod tests {
         // is the authoritative source the GetSessionPolicy RPC reads back.
         assert_eq!(got.record().network, input.network);
         assert_eq!(got.record().policy, input.policy);
+        // Likewise `--no-hooks`: the attach, detach, and destroy
+        // transitions read this back off disk, long after the flag that
+        // set it is gone.
+        assert_eq!(got.record().hooks_enabled, input.hooks_enabled);
+        assert!(!got.record().hooks_enabled);
 
         // Check find_by_id as well.
         assert_eq!(
