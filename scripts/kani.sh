@@ -22,6 +22,12 @@
 # harnesses at once; the whole suite solves in seconds sequentially.
 set -eu
 
+# Build artifacts land in the REAL workspace's target dir (not the
+# scratch copy): CI's rust-cache persists ./target across runs and
+# local runs stay incremental — without this, every invocation
+# recompiles the whole dep tree from scratch.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target/kani}"
+
 ws="$(mktemp -d "${TMPDIR:-/tmp}/kani-ws.XXXXXX")"
 cleanup() { rm -rf "$ws"; }
 trap cleanup EXIT INT TERM
