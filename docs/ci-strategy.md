@@ -4,11 +4,12 @@
 > ([#687](https://github.com/gominimal/minimal/issues/687)) implements, adopted
 > policy, not aspiration. A few terms map to this repo's shape:
 >
-> - The strategy's single-workflow + `preflight` is realised as **five
+> - The strategy's single-workflow + `preflight` is realised as **six
 >   always-triggered lane workflows** (`ci`, `ci-linux-native`, `ci-linux-kvm`,
->   `ci-macos`, `ci-shell-installer`), each with an in-workflow `changes` job
->   (dorny/paths-filter) and an `if: always()` aggregator; the five aggregators
->   are the required checks.
+>   `ci-macos`, `ci-shell-installer`, `ci-kani`), each with an in-workflow
+>   `changes` job (dorny/paths-filter) and an `if: always()` aggregator; the
+>   first five aggregators are the required checks (`ci-kani-success` is
+>   advisory until promoted).
 > - The "compile once per triple, fan out" archive pattern lives in the KVM
 >   and macOS lanes (`cargo nextest archive` + prebuilt binaries → a
 >   toolchain-free test job; the mac mini compiles nothing, per §7); the same

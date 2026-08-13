@@ -32,7 +32,7 @@ ws="$(mktemp -d "${TMPDIR:-/tmp}/kani-ws.XXXXXX")"
 cleanup() { rm -rf "$ws"; }
 trap cleanup EXIT INT TERM
 
-rsync -a --exclude target --exclude .git --exclude 'crates/*/fuzz/target' \
+rsync -a --exclude target --exclude .git --exclude .claude --exclude .scratch \
     --exclude 'crates/*/fuzz/corpus' ./ "$ws/"
 
 # Relax the single workspace-level floor (every crate inherits it).
@@ -43,10 +43,15 @@ cd "$ws"
 # Assert the harness COUNT, not just exit status: `cargo kani` exits 0
 # on a crate with zero harnesses, so if the #[cfg(kani)] modules ever
 # stop compiling in, the lane would go green having proved nothing.
+# Streams output while running (a silent 8-minute compile is
+# undiagnosable in CI); avoids pipe-to-tee, which swallows exit status
+# in POSIX sh. The log file lives in the scratch ws, cleaned by trap.
 expect() { # crate expected_count
-    out="$(cargo kani -p "$1" --output-format=terse 2>&1)" || { printf '%s\n' "$out"; exit 1; }
-    printf '%s\n' "$out"
-    printf '%s' "$out" | grep -q "Complete - $2 successfully verified harnesses, 0 failures" || {
+    log="$ws/kani-$1.log"
+    cargo kani -p "$1" --output-format=terse 2>&1 | tee "$log"
+    # tee masks cargo's status (no pipefail in sh): the count grep below
+    # is the gate, and a failed run cannot print the success line.
+    grep -q "Complete - $2 successfully verified harnesses, 0 failures" "$log" || {
         echo "FATAL: expected $2 verified harnesses in $1 — vacuous or failing lane" >&2
         exit 1
     }

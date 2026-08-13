@@ -266,7 +266,7 @@ miri:
 # Kani bounded-verification harnesses over the pure security cores
 # (rcache index_file parse, sessions PathDecision lattice). See
 # scripts/kani.sh for install + the 0.67.0 pin rationale. #1109.
-kani:
+kani: (_need "cargo-kani" "cargo install --locked kani-verifier --version 0.67.0 && cargo kani setup")
     ./scripts/kani.sh
 
 # Each `fuzz/` dir is its OWN workspace (so the nightly/sanitizer build can't
