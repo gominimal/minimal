@@ -40,5 +40,16 @@ sed -i.kani-bak 's/^package\.rust-version = "[0-9.][0-9.]*"/package.rust-version
 rm -f "$ws/Cargo.toml.kani-bak"
 
 cd "$ws"
-cargo kani -p sessions --output-format=terse
-cargo kani -p rcache --output-format=terse
+# Assert the harness COUNT, not just exit status: `cargo kani` exits 0
+# on a crate with zero harnesses, so if the #[cfg(kani)] modules ever
+# stop compiling in, the lane would go green having proved nothing.
+expect() { # crate expected_count
+    out="$(cargo kani -p "$1" --output-format=terse 2>&1)" || { printf '%s\n' "$out"; exit 1; }
+    printf '%s\n' "$out"
+    printf '%s' "$out" | grep -q "Complete - $2 successfully verified harnesses, 0 failures" || {
+        echo "FATAL: expected $2 verified harnesses in $1 — vacuous or failing lane" >&2
+        exit 1
+    }
+}
+expect sessions 6
+expect rcache 3

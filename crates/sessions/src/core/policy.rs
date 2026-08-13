@@ -1363,10 +1363,17 @@ mod tests {
 ///
 /// The domain is a 4-variant `Copy` enum, so every proof here is
 /// **exhaustive** — Kani enumerates all 16 (or 64) input states with no
-/// unwind bound and no `kani::assume`. Together the laws discharge the
-/// reorder-attack defense stated on [`ExpandedPatchPolicy::check`]: no
-/// permutation or regrouping of per-path decisions can downgrade a
-/// deny, and a decision folded in twice cannot change the outcome.
+/// unwind bound and no `kani::assume`. Together the laws prove the
+/// combine ALGEBRA: no permutation or regrouping of per-path decisions
+/// can downgrade a deny, and a decision folded in twice cannot change
+/// the outcome. They deliberately do NOT prove the WIRING that feeds
+/// the algebra — that a caller actually combines both paths' decisions
+/// — which is live-fire unit-test territory (see
+/// `symlink_link_denied_wins_over_allowed_target` and its mirror in
+/// `compose.rs`). Versus the existing truth-table tests, the proofs'
+/// marginal value is robustness to change: add a fifth variant and
+/// `kani::any()` covers it automatically, where a hand-written table
+/// silently under-covers.
 ///
 /// `severity` below restates the doc's precedence — `Denied` >
 /// `Ignored` > `NeedsApproval` > `Allowed` — as an explicit rank so the

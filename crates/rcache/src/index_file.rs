@@ -295,28 +295,38 @@ mod kani_proofs {
 
     const RECORD: usize = WIRE_RECORD_LEN as usize;
 
-    /// Decoding an arbitrary record at any truncation never panics.
-    /// On success, exactly the whole record was consumed.
+    /// Decoding an arbitrary record at any truncation never panics,
+    /// and succeeds IFF the input is one full record with zero flags —
+    /// stated as an iff so neither arm can silently become unreachable
+    /// (a one-sided `Ok =>` postcondition still "verifies" when a
+    /// changed reader makes `Ok` impossible; mutation-tested). On
+    /// success exactly the whole record was consumed — the property
+    /// the callers' `len % 68 == 0` arithmetic silently relies on.
     #[kani::proof]
     fn read_record_never_panics() {
         let bytes: [u8; RECORD] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= RECORD);
         let mut cur = Cursor::new(&bytes[..len]);
-        match read_wire_kv(&mut cur) {
-            Ok(_) => assert_eq!(cur.position(), WIRE_RECORD_LEN),
-            Err(_) => {}
+        let res = read_wire_kv(&mut cur);
+        let full_and_zero_flags =
+            len == RECORD && bytes[32] == 0 && bytes[33] == 0 && bytes[34] == 0 && bytes[35] == 0;
+        assert_eq!(res.is_ok(), full_and_zero_flags);
+        if res.is_ok() {
+            assert_eq!(cur.position(), WIRE_RECORD_LEN);
         }
     }
 
     /// The flags forward-compat gate always fires: any record whose 4
-    /// flag bytes are not all zero fails to decode.
+    /// flag bytes are not all zero fails to decode — and fails at the
+    /// flags field (position 36), before the sha256 bytes are consumed.
     #[kani::proof]
     fn nonzero_flags_always_rejected() {
         let bytes: [u8; RECORD] = kani::any();
         kani::assume(bytes[32] != 0 || bytes[33] != 0 || bytes[34] != 0 || bytes[35] != 0);
         let mut cur = Cursor::new(&bytes[..]);
         assert!(read_wire_kv(&mut cur).is_err());
+        assert_eq!(cur.position(), 36);
     }
 
     /// Encode→decode round-trips every record exactly, and the encoded
@@ -331,8 +341,14 @@ mod kani_proofs {
 
         let mut out = Vec::new();
         write_wire_kv(&mut out, &k, &v).expect("Vec write is infallible");
+        // Pin the exact field OFFSETS, not just round-trip equality: a
+        // wire-layout permutation both sides agree on (key and sha256
+        // swapped, say) round-trips fine but breaks every other reader
+        // of index.shisha. Mutation-tested.
         assert_eq!(out.len(), RECORD);
+        assert_eq!(&out[0..32], &key[..]);
         assert_eq!(&out[32..36], &[0u8; 4]);
+        assert_eq!(&out[36..68], &sha256[..]);
 
         let (k2, v2) =
             read_wire_kv(&mut Cursor::new(&out[..])).expect("own serialization always decodes");
