@@ -2879,7 +2879,7 @@ mod tests {
                 PatchDest::try_new("etc").unwrap(),
             );
             let pp = ProvenancedPatch::new(patch, project_source());
-            let policy = PatchPolicy::empty().with_deny([format!("{denied_dir}/**")]);
+            let policy = PatchesPolicy::empty().with_deny([format!("{denied_dir}/**")]);
             let err = gate_patches(
                 vec![pp],
                 policy,
