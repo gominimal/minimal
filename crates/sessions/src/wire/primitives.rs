@@ -141,8 +141,19 @@ pub struct WireSessionPatch {
     pub source: WireSource,
 }
 
+/// Timeout a peer that predates the `timeout_secs` field is assumed to
+/// have meant. Matches
+/// [`DEFAULT_HOOK_TIMEOUT`](crate::core::lifecyclehook::DEFAULT_HOOK_TIMEOUT).
+fn default_hook_timeout_secs() -> u64 {
+    crate::core::lifecyclehook::DEFAULT_HOOK_TIMEOUT.as_secs()
+}
+
 /// A lifecycle hook script. Mirrors
 /// [`crate::core::lifecyclehook::HookScript`].
+///
+/// `timeout_secs` is serde-defaulted so payloads from peers that predate
+/// the field deserialize cleanly. The domain conversion clamps it into
+/// range rather than rejecting, so a skewed peer can't fault a load.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WireHookScript {
@@ -150,26 +161,53 @@ pub enum WireHookScript {
     Inline {
         /// Script body.
         body: String,
+        /// Timeout in whole seconds.
+        #[serde(default = "default_hook_timeout_secs")]
+        timeout_secs: u64,
     },
-    /// Path to a script file, resolved against the config dir at
-    /// apply time.
+    /// Path to a script file, resolved against its anchor at apply time.
     External {
         /// Config-relative path to the script.
         path: paths::ConfigRelPath,
+        /// Timeout in whole seconds.
+        #[serde(default = "default_hook_timeout_secs")]
+        timeout_secs: u64,
     },
 }
 
 /// A lifecycle hook. Mirrors
 /// [`crate::core::lifecyclehook::LifecycleHook`].
+///
+/// Every field is serde-defaulted and skipped when unset, so this shape
+/// tolerates version skew in both directions: a peer that predates
+/// `description` / `on_attach` / `on_detach` simply omits them, and the
+/// removed `on_failure` sent by an older peer is ignored rather than
+/// faulting the message (unknown fields are not denied here — leniency is
+/// deliberate on the wire, unlike the config-file form).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct WireLifecycleHook {
+    /// Free-form description, carried so `min session hooks` can label
+    /// each hook with what its author called it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Run on session activation, if set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_activate: Option<WireHookScript>,
     /// Run on session destruction, if set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_destroy: Option<WireHookScript>,
-    /// Run on session failure, if set.
+    /// Run when a client attaches, if set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_attach: Option<WireHookScript>,
+    /// Run when a client detaches, if set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_detach: Option<WireHookScript>,
+    /// The removed `on_failure` transition, captured only so a v1
+    /// snapshot carrying one can be reported rather than silently
+    /// losing a script. Never written (it is skipped when unset, and
+    /// nothing sets it) and never converted into a
+    /// [`LifecycleHook`](crate::core::lifecyclehook::LifecycleHook) —
+    /// see that conversion for where the warning is logged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_failure: Option<WireHookScript>,
 }
@@ -242,6 +280,22 @@ pub struct WirePendingVar {
     /// this field existed (backward-compatible).
     #[serde(default)]
     pub carries_user_data: bool,
+}
+
+/// Daemon → Client: a lifecycle hook from the project that the client
+/// must run through the user's hooks policy before it may execute.
+///
+/// Carries the hook itself so the client can show the user what it is
+/// being asked to approve — a prompt that named only the project would
+/// be asking for consent to code the user cannot see.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WirePendingHook {
+    /// Correlation id; the client echoes it back on the verdict.
+    pub id: PendingId,
+    /// The hook awaiting a decision.
+    pub hook: WireLifecycleHook,
+    /// Where it came from — the project root the policy matches.
+    pub source: WireSource,
 }
 
 /// Daemon → Client: a patch from a package or the project that the
@@ -325,20 +379,27 @@ impl From<crate::core::compose::SessionPatch> for WireSessionPatch {
 
 impl From<crate::core::lifecyclehook::HookScript> for WireHookScript {
     fn from(s: crate::core::lifecyclehook::HookScript) -> Self {
-        match s {
-            crate::core::lifecyclehook::HookScript::Inline(body) => Self::Inline { body },
-            crate::core::lifecyclehook::HookScript::External(path) => Self::External { path },
+        use crate::core::lifecyclehook::HookScriptBody;
+        let (body, timeout) = s.into_parts();
+        let timeout_secs = timeout.as_secs();
+        match body {
+            HookScriptBody::Inline(body) => Self::Inline { body, timeout_secs },
+            HookScriptBody::External(path) => Self::External { path, timeout_secs },
         }
     }
 }
 
 impl From<crate::core::lifecyclehook::LifecycleHook> for WireLifecycleHook {
     fn from(h: crate::core::lifecyclehook::LifecycleHook) -> Self {
-        let (_description, on_activate, on_destroy, on_failure) = h.into_parts();
+        let (description, on_activate, on_destroy, on_attach, on_detach) = h.into_parts();
         Self {
+            description,
             on_activate: on_activate.map(Into::into),
             on_destroy: on_destroy.map(Into::into),
-            on_failure: on_failure.map(Into::into),
+            on_attach: on_attach.map(Into::into),
+            // Never emitted: the domain type has no such transition.
+            on_failure: None,
+            on_detach: on_detach.map(Into::into),
         }
     }
 }
@@ -484,9 +545,11 @@ mod tests {
         let cases = [
             WireHookScript::Inline {
                 body: "echo hi".into(),
+                timeout_secs: 60,
             },
             WireHookScript::External {
                 path: paths::ConfigRelPath::try_new("hooks/run.sh").unwrap(),
+                timeout_secs: 120,
             },
         ];
         for s in cases {
@@ -494,18 +557,52 @@ mod tests {
         }
     }
 
+    /// A payload from a peer that predates `timeout_secs` deserializes to
+    /// the default rather than failing or landing on zero.
+    #[test]
+    fn hook_script_timeout_defaults_when_absent() {
+        let raw = serde_json_lenient::json!({ "kind": "inline", "body": "echo hi" });
+        let s: WireHookScript = serde_json_lenient::from_value(raw).expect("deserialize");
+        assert_eq!(
+            s,
+            WireHookScript::Inline {
+                body: "echo hi".into(),
+                timeout_secs: default_hook_timeout_secs(),
+            },
+        );
+    }
+
     #[test]
     fn lifecycle_hook_round_trips_with_optional_fields() {
         let h = WireLifecycleHook {
+            description: Some("warm caches".into()),
             on_activate: Some(WireHookScript::Inline {
                 body: "echo activated".into(),
+                timeout_secs: 60,
             }),
             on_destroy: None,
-            on_failure: Some(WireHookScript::External {
-                path: paths::ConfigRelPath::try_new("fail.sh").unwrap(),
+            on_attach: None,
+            on_detach: Some(WireHookScript::External {
+                path: paths::ConfigRelPath::try_new("detach.sh").unwrap(),
+                timeout_secs: 30,
             }),
+            on_failure: None,
         };
         assert_eq!(round_trip(&h), h);
+    }
+
+    /// A message from a peer that still sends the removed `on_failure`
+    /// deserializes cleanly, dropping the field. Wire-level leniency is
+    /// deliberate: version skew must not fault a session.
+    #[test]
+    fn lifecycle_hook_ignores_legacy_on_failure() {
+        let raw = serde_json_lenient::json!({
+            "on_activate": { "kind": "inline", "body": "x" },
+            "on_failure":  { "kind": "inline", "body": "old" },
+        });
+        let h: WireLifecycleHook = serde_json_lenient::from_value(raw).expect("deserialize");
+        assert!(h.on_activate.is_some());
+        assert!(h.description.is_none());
     }
 
     #[test]
@@ -522,12 +619,28 @@ mod tests {
             hook: WireLifecycleHook {
                 on_activate: Some(WireHookScript::Inline {
                     body: "echo hi".into(),
+                    timeout_secs: 60,
                 }),
                 ..Default::default()
             },
             source: user_source(),
         };
         assert_eq!(round_trip(&h), h);
+    }
+
+    /// The domain → wire → domain trip preserves a non-default timeout.
+    /// Guards the seam that made `timeout` unusable under adjacent
+    /// tagging: a value that survives TOML but is dropped on the wire is
+    /// equally broken.
+    #[test]
+    fn timeout_survives_domain_wire_round_trip() {
+        use crate::core::lifecyclehook::HookScript;
+        let original = HookScript::inline("x")
+            .with_timeout(std::time::Duration::from_mins(2))
+            .unwrap();
+        let wire: WireHookScript = original.clone().into();
+        let back: HookScript = round_trip(&wire).into();
+        assert_eq!(back, original);
     }
 
     #[test]

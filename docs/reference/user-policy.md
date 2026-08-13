@@ -17,18 +17,27 @@ choice on every activation. The allow list does not apply to values specified in
 loadouts, only the ignore and deny lists do.
 
 The policy is enforced **only on the client**, inside `min`, never on the
-daemon (see [Sessions](../concepts/sessions.md)). It gates two domains:
+daemon (see [Sessions](../concepts/sessions.md)). It gates three domains:
 
 - **Variables** — matched by variable **name**.
 - **Patches** — matched by the **source file paths** a patch enumerates on
   the host (the patch's `dest` is never matched).
+- **Lifecycle hooks** — matched by the **project root path** that declared
+  them.
 
-Packages and lifecycle hooks are not gated by the user policy as they do not request user data.
+The first two exist to stop a project pulling *your data* into a session. The
+third exists for a different reason: a [lifecycle
+hook](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points) is
+arbitrary code the project asks to run inside your session, so the risk is
+execution rather than disclosure. A project must be allow-listed before any
+hook it declares will run. Hooks declared in your own loadouts are not gated —
+they are your files already.
 
 Packages are effectively out of scope. A package cannot supply file
 patches, nor environment variables that carry host data (values inherited from
-your shell); Because packages cannot transfer host data into a session, the policy's protective
-purpose does not apply to them.
+your shell), nor lifecycle hooks; because packages cannot transfer host data
+into a session or ask to execute code, the policy's protective purpose does not
+apply to them.
 
 ## Where the policy lives
 
@@ -64,12 +73,13 @@ ignore = ["**/.DS_Store"]
 
 ## Schema
 
-The file has two optional sections, `[vars]` and `[patches]`. Each holds three
-optional keys — `allow`, `deny`, and `ignore` — and each key is a list of glob
-patterns. Every key defaults to empty, so any section or key may be omitted; an
-empty file is a valid empty policy.
+The file has three optional sections, `[vars]`, `[patches]`, and `[hooks]`.
+Each holds three optional keys — `allow`, `deny`, and `ignore` — and each key
+is a list of glob patterns. Every key defaults to empty, so any section or key
+may be omitted; an empty file is a valid empty policy.
 
-Each of the six lists accepts either a single bare string or a list of strings:
+Each of the nine lists accepts either a single bare string or a list of
+strings:
 
 ```toml
 [vars]
@@ -135,10 +145,43 @@ deny   = ["~/.ssh/**", "**/*.pem"]
 ignore = ["**/.DS_Store"]
 ```
 
+### `[hooks]` — Lifecycle-script rules
+
+Patterns match the **project root path** that declared the hook — as you refer
+to that project on your own machine, not the daemon's copy of it. The script's
+own contents and any file it names are never matched: this section decides
+*whose* code may run, not which code.
+
+| Key | Matches project roots whose… |
+|-----|------------------------------|
+| `allow` | hooks may run |
+| `deny` | hooks may never run, and whose presence fails the activation |
+| `ignore` | hooks are silently dropped without prompting |
+
+Only the project is arbitrated here. Your loadouts' hooks are your own files
+and run without consulting this section; packages cannot declare hooks at all,
+and any that appear are denied outright.
+
+Patterns expand the same way patch patterns do (`~/`, `$NAME`, `${NAME}`).
+They are globs, so a path containing glob metacharacters must be escaped to
+match itself — the prompt does that for you when you choose a permanent rule,
+which is why a hand-written entry is best kept to a plain path.
+
+A project matching nothing in this section is **undecided**, not allowed: it
+reaches the prompt, and under `--no-prompt` it fails the activation with a
+snippet naming the project. Silence is never consent — a hook is arbitrary
+code from someone else.
+
+```toml
+[hooks]
+allow = ["~/work/**"]
+deny  = ["/tmp/**"]
+```
+
 ## How a contribution is decided
 
-Every variable and every patch source is categorized against the relevant
-section in a fixed precedence:
+Every variable, every patch source, and every project that declares lifecycle
+hooks is categorized against the relevant section in a fixed precedence:
 
 1. **`deny`** — if it matches, the composition fails. Deny takes precedence
    over every other rule, including `ignore`: an item matched by both `deny`

@@ -7,6 +7,7 @@ pub mod env;
 mod exec;
 #[cfg(target_os = "linux")]
 pub mod guest;
+mod hooks;
 mod maintenance;
 #[cfg(target_os = "linux")]
 pub mod net;

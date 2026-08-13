@@ -17,8 +17,8 @@ use crate::core::primitives::{Patch, ResolvedVar};
 ///
 /// `Source` is what makes the origin-aware allow step possible
 /// ([`VarsPolicy::check`](crate::core::policy::VarsPolicy::check) /
-/// [`PatchPolicy::check`](crate::core::policy::PatchPolicy::check) inspect
-/// this) and what error messages name when an item is rejected.
+/// [`ExpandedPatchesPolicy::check`](crate::core::policy::ExpandedPatchesPolicy::check)
+/// inspect this) and what error messages name when an item is rejected.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Source {

@@ -1944,4 +1944,34 @@ mod tests {
             IndexSourceMode::Closure
         );
     }
+
+    /// The demo project under `crates/sessions/example_project` must
+    /// stay parseable as a real `File`, hooks and all.
+    ///
+    /// It is documentation people copy from, and nothing else reads it,
+    /// so without this it can rot silently. Lifecycle hooks make that
+    /// sharper: `LifecycleHookBuilder` and `HookScriptRepr` both deny
+    /// unknown fields, so a misspelled key there is a hard parse error
+    /// rather than a quietly-ignored line.
+    #[test]
+    fn example_project_parses_with_its_lifecycle_hooks() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../sessions/example_project/minimal.toml"
+        );
+        let src = std::fs::read_to_string(path).expect("example project is readable");
+        let file: File = toml::from_str(&src).expect("example project must parse as an mfile");
+
+        let session = file
+            .session
+            .expect("the example declares a [session] block");
+        assert_eq!(session.lifecycle_hooks.len(), 1);
+        let hook = &session.lifecycle_hooks[0];
+        // All four transitions, so each can be exercised from the demo.
+        assert!(hook.on_activate().is_some());
+        assert!(hook.on_attach().is_some());
+        assert!(hook.on_detach().is_some());
+        assert!(hook.on_destroy().is_some());
+        assert!(hook.description().is_some());
+    }
 }

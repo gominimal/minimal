@@ -47,7 +47,7 @@
 //!   construction or matching time.
 //! - **The composer** (see [`crate::core::compose`]) expands leading
 //!   `~` in patch *source* patterns and in
-//!   [`PatchPolicy`](crate::core::policy::PatchPolicy) patterns at the
+//!   [`PatchesPolicy`](crate::core::policy::PatchesPolicy) patterns at the
 //!   start of the patch gate, against the composer's `HOME` env lookup.
 //!   Patterns retain their `~` form in returned policies for
 //!   round-trippability.

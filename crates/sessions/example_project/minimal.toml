@@ -46,6 +46,18 @@
 #   GOCACHE       — no prompt. Package `env_state_wiring` values
 #   GOMODCACHE      are `Specified` (the package attr declares the
 #                   literal), so `carries_user_data` is false.
+#   hooks         — prompts once, for the project as a whole. A
+#                   project's lifecycle hooks are arbitrary code it
+#                   asked to run inside your session, so the gate
+#                   asks before any of them run, and the answer is
+#                   per-project rather than per-script. Approve
+#                   permanently and it lands in `[hooks] allow` in
+#                   `user_policy.toml`; decline and the session
+#                   still comes up, just without them. Loadout
+#                   hooks are not gated — those are your own files.
+#
+# `min session activate --no-hooks` skips the question and the
+# hooks entirely, for the run where you just want the box.
 #
 # `claude-code` also contributes a patch source that resolves to
 # `~/.claude`. If you don't have that directory the client emits a
@@ -96,3 +108,41 @@ LANG = { inherit = true, default = "C.UTF-8" }
 # fires. Export `TZ=America/New_York` in your shell and re-run to
 # force the env-hit path.
 TZ = { inherit = true, default = "UTC" }
+
+# One hook covering all four transitions, so each can be observed
+# without arranging anything. Scripts run under POSIX `sh` unless they
+# open with a shebang, and every command here is a shell builtin or a
+# coreutil the baseline already carries — so nothing depends on a
+# package being installed or has a failure mode of its own.
+#
+# The two transitions with nowhere to print (`on_activate`,
+# `on_detach`) leave a marker file in `/home` instead, which you can
+# see from inside the session; the two that do print, print.
+#
+# WHERE THE OUTPUT GOES differs by transition, and it is the part
+# that surprises people:
+#
+#   on_attach              — your terminal. It runs on the PTY you
+#                            are attached to, printing just after
+#                            the session binds, so you see it
+#                            directly.
+#   the other three        — the daemon log, not your terminal.
+#                            There is no PTY to write to at any of
+#                            them: activate and destroy have none,
+#                            and a detach is the terminal leaving.
+#                            Look for `lifecycle hook ran` records.
+#
+# A script can also read `$MINIMAL_HOOK_EVENT`, one of the metadata
+# variables the runner sets alongside the session's own
+# environment — see `MINIMAL_HOOK_SOURCE_KIND`,
+# `MINIMAL_HOOK_SOURCE_NAME`, `MINIMAL_HOOK_INDEX`, and
+# `MINIMAL_HOOK_COUNT` for the rest.
+#
+# `min session hooks <session>` lists these back, showing where
+# each was declared and what will actually run.
+[[session.lifecycle_hooks]]
+description = "print at each transition"
+on_activate = { type = "inline", value = "touch /home/alpha.txt" }
+on_attach   = { type = "inline", value = "echo \"beta\"" }
+on_detach   = { type = "inline", value = "touch /home/gamma.txt" }
+on_destroy  = { type = "inline", value = "echo \"omega\"" }

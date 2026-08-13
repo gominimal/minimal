@@ -478,7 +478,7 @@ Below, in numbered prose:
    batch plus the composer's `HOME` env lookup as tilde fallback).
    Walk the filesystem under each expanded root and fan out to one
    `PatchFile` per matching file. Expand `~` and `$VAR` in
-   `PatchPolicy` patterns the same way, against a temporary copy
+   `PatchesPolicy` patterns the same way, against a temporary copy
    (the raw policy is preserved for round-trip).
 3. **Pass 1 — Categorize.** Each item runs through `Policy::check`,
    which steps through:
@@ -605,7 +605,7 @@ overload:
   in Phase 3 each file gets its own `WirePatchVerdict` so a Denied
   doesn't abort, it just rejects that file.
 - **Hook gets narrow policy by value.** The gate hands the hook an
-  owned `VarsPolicy` or `PatchPolicy` — never `&mut UserPolicy`. To
+  owned `VarsPolicy` or `PatchesPolicy` — never `&mut UserPolicy`. To
   add a rule, the hook returns the modified copy in
   `HookResult::Decided.updated_policy`; the gate installs it before
   Pass 3.
@@ -619,7 +619,7 @@ overload:
   malicious client can't submit `"../../etc/foo"` to escape the
   sandbox home.
 - **Source `~` is expanded at gate time; dest has no `~` to expand.**
-  Patch source `FileSet` patterns and `PatchPolicy` patterns expand
+  Patch source `FileSet` patterns and `PatchesPolicy` patterns expand
   `~` against a resolved `HOME` — a session var named `HOME` first,
   else the client-side fallback (`UserComposer`'s `env("HOME")` in
   Phase 1, `handle_response`'s `env("HOME")` in Phase 3). The

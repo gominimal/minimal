@@ -77,6 +77,7 @@ fn build_record(
         network: config.network,
         policy: config.policy,
         status,
+        hooks_enabled: config.hooks_enabled,
         attrs: config.attrs,
     };
     record
@@ -129,6 +130,20 @@ enum ManagerMessage {
         SessionKeyPredicate,
         Responder<Option<minimald_rpc::ScreenSnapshot>>,
     ),
+    /// Read a session's persisted composition snapshot. Read-only
+    /// against the store — like [`GetRecord`](Self::GetRecord) and
+    /// unlike [`GetSession`](Self::GetSession), it never starts an
+    /// actor, so inspecting a stopped session leaves it stopped.
+    GetComposition(
+        SessionKeyPredicate,
+        Responder<Option<sessions::core::compose::Composition>>,
+    ),
+    /// How many session actors are live. Test-only, and the only way
+    /// to observe the read-only-ness of [`GetRecord`](Self::GetRecord)
+    /// and [`GetComposition`](Self::GetComposition) — "did that query
+    /// start an actor?" is otherwise invisible from outside.
+    #[cfg(test)]
+    RunningCount(Responder<usize>),
     CreateSession(Box<CreateSessionMsg>),
     DeleteSession(SessionId, Responder<()>),
     Shutdown(bool, Responder<Result<(), ()>>),
@@ -434,6 +449,20 @@ impl Manager {
                 })
                 .await;
             }
+            #[cfg(test)]
+            ManagerMessage::RunningCount(r) => {
+                let n = self.running.len();
+                r.handle(async move { Ok::<_, SessionsError>(n) }).await;
+            }
+            ManagerMessage::GetComposition(pred, r) => {
+                r.handle(async {
+                    Ok::<_, SessionsError>(match self.store.find(pred.into()).await? {
+                        Some(handle) => handle.load_composition().await?,
+                        None => None,
+                    })
+                })
+                .await;
+            }
             // Get the session actor for the predicate, starting it
             // if the session is known but not running.
             ManagerMessage::GetSession(pred, r) => {
@@ -495,8 +524,39 @@ impl Manager {
                                     format!("no session with ID `{}`", id.as_ref()),
                                 )
                             })?;
-                    match self.running.remove(&id) {
-                        // A live actor owns its full teardown.
+                    // Teardown belongs to the actor, so an idle session gets
+                    // one brought up rather than having its record deleted
+                    // out from under it. That used to be a fair shortcut —
+                    // "nothing to undo" — but a session's `on_destroy` hooks
+                    // now run on this path, and skipping the actor skipped
+                    // them silently for any session whose actor had been
+                    // reaped (every session, after a daemon restart).
+                    //
+                    // Spawning is cheap: the actor reads its record and
+                    // composition, and only mints a sandbox if there are
+                    // destroy hooks to run in one.
+                    let actor = match self.running.remove(&id) {
+                        Some(hnd) => Some(hnd),
+                        None => match Session::run(self.session_config(handle.clone())).await {
+                            Ok(hnd) => Some(hnd),
+                            // A record the actor refuses to come up on — a
+                            // restart-orphaned `Materializing` one is the
+                            // known case — must still be destroyable, so
+                            // fall through to deleting it directly. A
+                            // session that cannot be torn down is worse
+                            // than one torn down without its hooks.
+                            Err(e) => {
+                                tracing::warn!(
+                                    session_id = %id,
+                                    error = %e,
+                                    "could not start the session to run its destroy hooks; \
+                                     removing its record without them",
+                                );
+                                None
+                            }
+                        },
+                    };
+                    match actor {
                         Some(hnd) => {
                             hnd.destroy().await?;
                             // Belt-and-braces: a dead actor (self-terminated
@@ -510,8 +570,6 @@ impl Manager {
                                 return Err(e);
                             }
                         }
-                        // Never spawned: no host or hostname registration to
-                        // undo, so just remove the on-disk record.
                         None => handle.delete().await?,
                     }
                     Ok(())
@@ -630,6 +688,29 @@ impl SessionControl {
             )),
         }
     }
+
+    /// Reports that a binding has left a session that outlives it, so the
+    /// session runs its `on_detach` hooks.
+    ///
+    /// Returns nothing: leaving is not a fallible operation from the
+    /// departing side, and every way this can come up empty — the manager
+    /// already shut down, the session already gone — means there is nothing
+    /// left to run hooks against. Those are logged where they can be
+    /// explained, not raised here.
+    pub async fn detached(&self) {
+        let Some(mngr) = self.manager.upgrade() else {
+            return;
+        };
+        match mngr.get_session(SessionKeyPredicate::Id(self.id)).await {
+            Ok(Some(session)) => session.run_detach_hooks().await,
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                error = %e,
+                session = %self.id,
+                "could not reach the session to run its detach hooks",
+            ),
+        }
+    }
 }
 
 impl ManagerHandle {
@@ -657,6 +738,37 @@ impl ManagerHandle {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.sender.send(ManagerMessage::List(send)).await;
+        recv.await.expect("corresponding sessions manager is dead")
+    }
+
+    /// How many session actors are live. See
+    /// [`ManagerMessage::RunningCount`].
+    #[cfg(test)]
+    pub(crate) async fn running_count(&self) -> usize {
+        let (send, recv) = Responder::channel();
+        let _ = self.sender.send(ManagerMessage::RunningCount(send)).await;
+        recv.await
+            .expect("corresponding sessions manager is dead")
+            .expect("counting live actors cannot fail")
+    }
+
+    /// Reads a session's persisted composition snapshot.
+    ///
+    /// Read-only: unlike [`Self::get_session`] this never brings the
+    /// session's actor up, so a query about a stopped session does not
+    /// start it. `None` for an unknown session and for one with no
+    /// snapshot — the two are indistinguishable here on purpose, since
+    /// both mean "nothing recorded to report".
+    pub async fn get_composition(
+        &self,
+        pred: SessionKeyPredicate,
+    ) -> Result<Option<sessions::core::compose::Composition>, SessionsError> {
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .sender
+            .send(ManagerMessage::GetComposition(pred, send))
+            .await;
         recv.await.expect("corresponding sessions manager is dead")
     }
 
@@ -801,8 +913,11 @@ pub(crate) mod tests {
     use std::io::ErrorKind;
     use tempfile::TempDir;
 
-    fn daemon_dir(tmp: &TempDir) -> DaemonAbsPath {
-        DaemonAbsPath::try_new(tmp.path().to_str().unwrap()).unwrap()
+    /// A stand-in for the client-side project path a session record
+    /// carries — the identity the composer stamps onto the project's
+    /// contributions, distinct from the daemon workspace it reads.
+    fn declared_path() -> paths::HostAbsPath {
+        paths::HostAbsPath::try_new("/home/dev/myproject").unwrap()
     }
 
     /// Resolves the session's live actor and peeks its held
@@ -908,6 +1023,7 @@ pub(crate) mod tests {
                 })
                 .collect(),
             patches: vec![],
+            lifecycle_hooks: vec![],
         }
     }
 
@@ -917,6 +1033,7 @@ pub(crate) mod tests {
             project_path: HostAbsPath::try_new("/proj").unwrap(),
             network: sessions::NetworkMode::default(),
             policy: Default::default(),
+            hooks_enabled: true,
             attrs: Default::default(),
         }
     }
@@ -940,10 +1057,20 @@ pub(crate) mod tests {
         mngr: &ManagerHandle,
         config: minimald_rpc::SessionConfig,
     ) -> SessionId {
+        create_active_session_contributing(mngr, config, WireContribution::default()).await
+    }
+
+    /// [`create_active_session_with`] carrying a client contribution —
+    /// the way a test gets lifecycle hooks into a session's composition.
+    async fn create_active_session_contributing(
+        mngr: &ManagerHandle,
+        config: minimald_rpc::SessionConfig,
+        contribution: WireContribution,
+    ) -> SessionId {
         let id = mngr.create_session(config, None).await.unwrap();
         let handle = session(mngr, id).await;
         let response = handle
-            .configure_loadout(WireContribution::default())
+            .configure_loadout(contribution)
             .await
             .expect("configuring an empty loadout should succeed");
         assert!(response.is_none(), "an empty loadout should finalize");
@@ -957,26 +1084,40 @@ pub(crate) mod tests {
     async fn manager() -> (TempDir, TempDir, ManagerHandle) {
         let state = TempDir::new().unwrap();
         let cache = TempDir::new().unwrap();
+        let mngr = manager_over(state.path(), cache.path()).await;
+        (state, cache, mngr)
+    }
+
+    /// A manager rooted at existing state and cache directories, so a
+    /// test can stand a second one up over the first's store — the way
+    /// a daemon restart sees a session it never started.
+    async fn manager_over(state: &std::path::Path, cache: &std::path::Path) -> ManagerHandle {
+        let state = state.to_path_buf();
+        let cache = cache.to_path_buf();
         // These tests never start an `OwnIp` launch (they use the mock
         // launcher), so the switch is never spawned; a placeholder binary path
         // is sufficient.
         let switch = Arc::new(Mutex::new(crate::net::SwitchClient::new(
             "/nonexistent/gvproxy",
-            state.path().join("gvproxy"),
+            state.join("gvproxy"),
         )));
         // Tests use per-TempDir cache/state dirs so they don't pollute the
         // shared daemon paths a real invocation would touch.
         let mctx_config = mctx::ConfigBuilder::new()
-            .with_cache_dir(cache.path())
-            .with_state_dir(state.path())
+            .with_cache_dir(&cache)
+            .with_state_dir(&state)
             .with_daemon_id("test".to_string())
             .build()
             .unwrap();
         let daemon_ctx = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
-        let mngr = Manager::init(daemon_dir(&state), daemon_dir(&cache), daemon_ctx, switch)
+        Manager::init(daemon_abs(&state), daemon_abs(&cache), daemon_ctx, switch)
             .await
-            .unwrap();
-        (state, cache, mngr)
+            .unwrap()
+    }
+
+    /// A [`DaemonAbsPath`] for a test directory.
+    fn daemon_abs(p: &std::path::Path) -> DaemonAbsPath {
+        DaemonAbsPath::try_new(p.to_str().unwrap()).unwrap()
     }
 
     /// Destroying a known-but-not-running session removes its record so it no
@@ -1000,7 +1141,107 @@ pub(crate) mod tests {
         let _ = create_active_session(&mngr).await;
     }
 
-    /// Destroying a session that has been brought up (its actor is running, but
+    /// Destroying a session whose actor is not running must still go
+    /// through that actor, because teardown is the actor's job — and now
+    /// includes running the session's `on_destroy` hooks.
+    ///
+    /// The shortcut this replaced ("never spawned, so nothing to undo —
+    /// just remove the record") predated hooks and skipped them in
+    /// silence for every session whose actor had been reaped, which after
+    /// a daemon restart is all of them. Asserted through the live-actor
+    /// count: the destroy has to bring one up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn destroying_an_idle_session_goes_through_its_actor() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("destroyed");
+
+        let (state, cache, mngr) = manager().await;
+        // A destroy hook is the discriminator: both the actor path and the
+        // old shortcut delete the record, so only the hook's side effect
+        // tells them apart.
+        let id = create_active_session_contributing(
+            &mngr,
+            sample_config(),
+            WireContribution {
+                lifecycle_hooks: vec![sessions::wire::primitives::WireProvenancedHook {
+                    hook: sessions::wire::primitives::WireLifecycleHook {
+                        on_destroy: Some(sessions::wire::primitives::WireHookScript::Inline {
+                            body: format!("echo ran > {}", marker.display()),
+                            timeout_secs: 60,
+                        }),
+                        ..Default::default()
+                    },
+                    source: sessions::wire::primitives::WireSource::UserLoadout {
+                        name: "test".to_string(),
+                    },
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // A second manager over the same store knows the session from disk
+        // and has never run it — a daemon restart's view, and the state the
+        // old shortcut applied to.
+        let restarted = manager_over(state.path(), cache.path()).await;
+        assert_eq!(restarted.running_count().await, 0);
+
+        restarted.delete_session(id).await.unwrap();
+
+        assert!(
+            marker.exists(),
+            "destroying an idle session skipped its on_destroy hook",
+        );
+        assert!(
+            restarted
+                .get_record(SessionKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .is_none(),
+            "the record should be gone after destroy"
+        );
+    }
+
+    /// Reading a session's composition must not resurrect it.
+    ///
+    /// `min session hooks` is a report, and a report has no business
+    /// starting what it reports on — `get_session` would, since it
+    /// brings an actor up from disk on demand. Asserted against the
+    /// live-actor count because that is the only place the difference
+    /// shows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reading_a_composition_does_not_start_the_session() {
+        let (state, cache, mngr) = manager().await;
+        let id = create_active_session(&mngr).await;
+
+        // A second manager over the same store: it knows the session
+        // from disk and has never run it, which is the state a daemon
+        // restart leaves and the one where "did this start an actor?"
+        // is answerable.
+        let restarted = manager_over(state.path(), cache.path()).await;
+        assert_eq!(
+            restarted.running_count().await,
+            0,
+            "a fresh manager should not have started anything",
+        );
+
+        // The read answers for the session...
+        let composition = restarted
+            .get_composition(SessionKeyPredicate::Id(id))
+            .await
+            .expect("reading the snapshot should succeed");
+        assert!(
+            composition.is_some(),
+            "an Active session should have a persisted composition",
+        );
+        // ...without bringing it up. `get_session` here would.
+        assert_eq!(
+            restarted.running_count().await,
+            0,
+            "reading the composition started the session's actor",
+        );
+    }
+
     /// no host is attached) tears the actor down and removes the record.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn destroy_tears_down_a_running_session() {
@@ -1215,6 +1456,7 @@ pub(crate) mod tests {
                 session_id: id,
                 vars: vec![],
                 patches: vec![],
+                lifecycle_hooks: vec![],
             })
             .await
             .expect("actor reply should succeed");
@@ -1275,6 +1517,7 @@ pub(crate) mod tests {
                 })
                 .collect(),
             patches: vec![],
+            lifecycle_hooks: vec![],
         };
         let step = handle
             .submit_verdict(verdict)
@@ -1663,8 +1906,14 @@ pub(crate) mod tests {
                 name: "test".into(),
             },
         });
-        let (project, packages) =
-            build_composables(&path, &ProjectResolution::NoMFile, &contribution).unwrap();
+        let (project, packages) = build_composables(
+            &path,
+            &declared_path(),
+            &ProjectResolution::NoMFile,
+            &contribution,
+            true,
+        )
+        .unwrap();
         assert!(project.is_none(), "NoMFile → no ProjectComposable");
         assert!(packages.is_empty(), "NoMFile → no PackageComposables");
     }
@@ -1706,8 +1955,10 @@ pub(crate) mod tests {
         let path = DaemonAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
         let (project_composable, packages) = build_composables(
             &path,
+            &declared_path(),
             &ProjectResolution::MFileOnly(ctx),
             &WireContribution::default(),
+            true,
         )
         .unwrap();
         assert!(
@@ -1718,6 +1969,33 @@ pub(crate) mod tests {
             packages.is_empty(),
             "MFileOnly → no PackageComposables (no graph to walk)",
         );
+
+        // Provenance names the project as the *user* knows it, not the
+        // per-session workspace the mfile was read out of. The hooks
+        // policy matches projects by this path and every error message
+        // quotes it, so a per-session value would be unmatchable and
+        // unrecognizable — see `build_composables`.
+        use sessions::core::compose::Composable as _;
+        let contribution = project_composable
+            .unwrap()
+            .contribute(&|_| Err(std::env::VarError::NotPresent))
+            .expect("the fixture's [session] block contributes cleanly");
+        let sources: Vec<_> = contribution
+            .packages()
+            .iter()
+            .map(sessions::core::source::Provenanced::source)
+            .collect();
+        assert!(!sources.is_empty(), "fixture should contribute a package");
+        for source in sources {
+            let sessions::core::source::Source::Project { path } = source else {
+                panic!("project material should carry Source::Project, got {source:?}");
+            };
+            assert_eq!(
+                path.as_utf8_path().as_str(),
+                declared_path().as_utf8_path().as_str(),
+                "provenance should name the declared project path, not the workspace",
+            );
+        }
     }
 
     /// [`run_composer`] with an empty client contribution and no

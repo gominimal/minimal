@@ -5,7 +5,7 @@
 //! per item (and, optionally, a mutated policy snapshot).
 
 use crate::core::decision::ItemDecision;
-use crate::core::policy::{PatchPolicy, VarsPolicy};
+use crate::core::policy::{HooksPolicy, PatchesPolicy, VarsPolicy};
 use crate::core::source::Source;
 
 /// One item the policy could not decide, borrowed from the gate
@@ -93,7 +93,7 @@ impl<P> HookResult<P> {
 /// decide on its own.
 ///
 /// Hooks receive an owned copy of the *narrow* domain policy
-/// (`VarsPolicy` / `PatchPolicy`); they cannot mutate the gate's
+/// (`VarsPolicy` / `PatchesPolicy`); they cannot mutate the gate's
 /// state directly. To add rules, return a modified policy snapshot in
 /// [`HookResult::Decided::updated_policy`] — wider mutations to the
 /// full [`UserPolicy`](crate::core::policy::UserPolicy) are not
@@ -120,7 +120,37 @@ pub trait PolicyHooks {
 
     fn on_patch_unapproved(
         &self,
-        policy: PatchPolicy,
+        policy: PatchesPolicy,
         items: &[Unapproved<'_, camino::Utf8Path>],
-    ) -> HookResult<PatchPolicy>;
+    ) -> HookResult<PatchesPolicy>;
+
+    /// Decide whether a project's lifecycle hooks may run.
+    ///
+    /// Each item's borrowed value is the **project root path**, not a
+    /// script — one entry per project awaiting a decision, deduplicated
+    /// by the gate, because a project's hooks are allowed or refused as
+    /// a set rather than one script at a time. Approving here grants
+    /// arbitrary code execution inside the session, so an implementation
+    /// that prompts should say so plainly.
+    ///
+    /// The `~`-form guidance for patch policies applies here too:
+    /// return added rules in `~`-form and let the gate expand them.
+    ///
+    /// # Default
+    ///
+    /// Aborts. Approving a hook grants arbitrary code execution, so an
+    /// implementation that hasn't considered this domain must not be
+    /// able to grant it by omission. Aborting fails closed *and*
+    /// loudly: the activation stops with a visible error rather than
+    /// quietly composing a session whose hooks were dropped. Every
+    /// implementation that can actually ask the user should override
+    /// this; the default exists for test doubles and for
+    /// var/patch-only consumers.
+    fn on_hook_unapproved(
+        &self,
+        _policy: HooksPolicy,
+        _items: &[Unapproved<'_, camino::Utf8Path>],
+    ) -> HookResult<HooksPolicy> {
+        HookResult::Abort
+    }
 }

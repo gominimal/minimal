@@ -540,6 +540,80 @@ impl Client {
         result
     }
 
+    /// Stream a zstd-compressed tarball of external lifecycle-hook
+    /// scripts to the daemon's `WorkspaceHookScriptsTarZst` subsystem,
+    /// which unpacks each entry under `<workspace>/hooks/<staged>`.
+    ///
+    /// `scripts` comes from
+    /// [`stage_external_scripts`](sessions::client::hookscripts::stage_external_scripts),
+    /// which has already resolved every path against its anchor and
+    /// refused anything symlinked or outside it. An empty list is a
+    /// no-op — no channel is opened, and no hooks-ready marker is
+    /// written, which is what lets `FinalizeSession` skip its marker
+    /// check for an all-inline composition.
+    ///
+    /// A separate stream from
+    /// [`upload_patches`](Self::upload_patches) rather than extra
+    /// entries in that archive: patch destinations are arbitrary
+    /// home-relative paths, so any prefix reserved inside the patch
+    /// archive is one a user could legitimately claim, and the whole
+    /// patch tree is copied into the sandbox home at finalize — which
+    /// is not where scripts belong.
+    pub async fn upload_hook_scripts(
+        &mut self,
+        session_id: sessions::SessionId,
+        scripts: &[sessions::client::hookscripts::StagedScript],
+    ) -> Result<(), anyhow::Error> {
+        if scripts.is_empty() {
+            return Ok(());
+        }
+        self.stream_upload(
+            session_id,
+            constcat::concat!(
+                minimald_rpc::RPC_SUBSYSTEM_PREFIX,
+                "WorkspaceHookScriptsTarZst"
+            ),
+            "hook script",
+            async |writer| {
+                crate::file_upload::stream_via_pipe(writer, async |tx| {
+                    let mut archive = crate::file_upload::TarZstArchive::new(tx);
+                    // Always finalize, even on a build error:
+                    // `async_tar::Builder` panics from `Drop` if
+                    // dropped unfinished, and `?` here is not an
+                    // unwind. Same pattern as `upload_patches`.
+                    let build_result: Result<(), anyhow::Error> = async {
+                        for s in scripts {
+                            archive
+                                .add_file(
+                                    s.host_path.as_std_path(),
+                                    s.staged.as_str(),
+                                    crate::file_upload::AddFileOptions {
+                                        // 0644: the executor runs
+                                        // `bash <script>`, which
+                                        // reads rather than execs.
+                                        mode_override: Some(0o644),
+                                    },
+                                )
+                                .await
+                                .with_context(|| {
+                                    format!("adding hook script {} → {}", s.host_path, s.staged,)
+                                })?;
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    let finish_result = archive.finish().await;
+                    match (build_result, finish_result) {
+                        (Err(build), _) => Err(build),
+                        (Ok(()), r) => r,
+                    }
+                })
+                .await
+            },
+        )
+        .await
+    }
+
     /// Common plumbing behind [`Self::upload_workspace_files`] and
     /// [`Self::upload_patches`]: open a channel, set the session-id
     /// env var, request a subsystem, drive `stream` over the

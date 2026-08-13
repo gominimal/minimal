@@ -114,6 +114,11 @@ mac-buildable (see the comments in `.github/workflows/ci-macos.yml`).
   Homebrew (`brew install slp/krun/libkrun`) for the VM recipes (`just up`,
   `just test-vm`, `just e2e`); `jq`, `zstd`, and `cpio` (`brew install jq zstd
   cpio`) for the `artifacts`/`initramfs` scripts those recipes run.
+- **python3**, on any host running `just e2e` / `just e2e-native`: the session
+  e2e drives its interactive attaches through a real pty
+  ([scripts/e2e-attach-pty.py](scripts/e2e-attach-pty.py)), because only a tty
+  can answer the session-exit prompt. Stdlib only — no packages to install —
+  but the interpreter must be on `PATH`.
 
 ## justfile recipes
 
