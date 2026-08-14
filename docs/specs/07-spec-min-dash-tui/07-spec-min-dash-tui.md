@@ -501,8 +501,8 @@ the Preview section — the same stream carries screen-change events.
 
 The initial keybind set is fixed. A future keybind configuration (e.g. via
 `dash-state.json` or a `minimal.toml` section) would let users remap keys,
-particularly important if `Ctrl-W` attach/detach (F1) conflicts with
-in-session applications.
+particularly important if the attach/detach leader chord (F1, default
+`ctrl-]`) conflicts with in-session applications.
 
 ## Security Considerations
 
