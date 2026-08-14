@@ -673,6 +673,14 @@ impl ChordMatcher {
         self.mode
     }
 
+    /// Whether a split candidate is currently held in the pending buffer —
+    /// the last chunk ended mid-form and the next chunk (or an idle flush)
+    /// must resolve it.
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// Whether `prefix` is a strict prefix of a wire form of either bound
     /// subcommand key.
     fn is_subcommand_form_prefix(&self, prefix: &[u8]) -> bool {
@@ -768,6 +776,26 @@ impl ChordMatcher {
             out.push(FeedOutcome::Forward(buf[frs..].to_vec()));
         }
         out
+    }
+
+    /// Release any held split candidate as data, cancelling command mode.
+    ///
+    /// A held candidate is a *strict* prefix of some wire form, so on its own
+    /// it can never complete a chord — the stream stopped mid-keystroke. The
+    /// caller invokes this after an idle gap (see the daemon's stdin loop) so
+    /// a lone `ESC` (a prefix of every kitty form) is forwarded to the PTY
+    /// instead of being held until the next, possibly never-arriving, chunk —
+    /// which would wedge it in e.g. vim insert mode. Command mode is
+    /// cancelled, tmux-style, since the subcommand never completed.
+    ///
+    /// Returns the held bytes (empty when nothing is held); the daemon writes
+    /// them to the PTY as ordinary data.
+    pub fn flush(&mut self) -> Vec<u8> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        self.mode = CommandMode::Idle;
+        std::mem::take(&mut self.pending)
     }
 }
 
@@ -1259,6 +1287,47 @@ mod tests {
         assert_eq!(m.feed(b"\x1b"), vec![]);
         assert_eq!(m.feed(b"[A"), vec![FeedOutcome::Action(KeyAction::Swallow)]);
         assert_eq!(m.mode(), CommandMode::Idle);
+    }
+
+    #[test]
+    fn flush_empty_is_a_noop() {
+        let mut m = ChordMatcher::new(SessionKeys::default());
+        assert!(!m.has_pending());
+        assert_eq!(m.flush(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn flush_releases_held_idle_candidate_as_data() {
+        // A bare ESC ends the chunk: held as a possible kitty prefix of the
+        // leader. The stream goes quiet, so the idle flush releases it as
+        // data instead of holding it for a next chunk that never comes.
+        let mut m = ChordMatcher::new(SessionKeys::default());
+        assert_eq!(m.feed(b"\x1b"), vec![]);
+        assert!(m.has_pending());
+        assert_eq!(m.mode(), CommandMode::Idle);
+        assert_eq!(m.flush(), vec![0x1b]);
+        assert!(!m.has_pending());
+        // A second flush is a no-op.
+        assert_eq!(m.flush(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn flush_cancels_command_mode_and_releases_held_subcommand() {
+        // In command mode, a bare ESC is a prefix of the bound subcommands'
+        // kitty forms, so it is held. The stream goes quiet: the idle flush
+        // releases the ESC as data and cancels command mode (the subcommand
+        // never completed).
+        let mut m = ChordMatcher::new(SessionKeys::default());
+        assert_eq!(
+            m.feed(&[0x1d]),
+            vec![FeedOutcome::Action(KeyAction::EnterCommandMode)]
+        );
+        assert_eq!(m.feed(b"\x1b"), vec![]);
+        assert!(m.has_pending());
+        assert_eq!(m.mode(), CommandMode::AwaitingSubcommand);
+        assert_eq!(m.flush(), vec![0x1b]);
+        assert_eq!(m.mode(), CommandMode::Idle);
+        assert!(!m.has_pending());
     }
 
     #[test]

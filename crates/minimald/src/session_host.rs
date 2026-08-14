@@ -38,6 +38,13 @@ use std::sync::Arc;
 pub(crate) const SHELL_EXIT_PROMPT: &str =
     "Session shell process exited. What would you like to do with this session?";
 
+/// How long a held chord-matcher split candidate (e.g. a lone `ESC`, a strict
+/// prefix of every kitty form) is held before being flushed to the PTY as
+/// data. Long enough that a chord split across SSH chunks (which reassemble
+/// within milliseconds) still resolves as a chord, short enough that a bare
+/// `ESC` reaching the app (e.g. leaving vim insert mode) is imperceptible.
+const CHORD_FLUSH_IDLE: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Line rendered above the shell-exit prompt when nothing in the workspace
 /// changed since activation. Exposed for the same test-await purpose as
 /// [`SHELL_EXIT_PROMPT`].
@@ -1561,6 +1568,12 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // sends no keys.
     chord_matcher: ChordMatcher,
 
+    // Deadline for flushing a held chord-matcher split candidate: armed when a
+    // stdin chunk leaves the matcher holding a partial form (e.g. a lone `ESC`,
+    // a prefix of every kitty form), cleared when the next chunk resolves it or
+    // the idle gap elapses and the candidate is flushed to the PTY as data.
+    chord_flush_deadline: Option<tokio::time::Instant>,
+
     // Keeps launcher-owned resources (the session's `Env`, which owns the
     // sandbox files backing the running process's rootfs along with the context
     // and graph) alive for as long as this host (and thus the session process)
@@ -2915,6 +2928,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             connection_env,
             home_dir,
             chord_matcher: ChordMatcher::new(SessionKeys::default()),
+            chord_flush_deadline: None,
             guard,
         };
 
@@ -3146,6 +3160,12 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     }
 
     pub async fn step(&mut self) -> Result<(), ()> {
+        // Snapshot the chord-flush deadline for the select below: the arm
+        // sleeps until this absolute instant, so the timer survives the select
+        // being rebuilt on every `step()` call (a bare `sleep` would restart
+        // each iteration and never fire while other events keep waking the
+        // loop).
+        let chord_flush_deadline = self.chord_flush_deadline;
         tokio::select! {
             // Read actor messages.
             Some(msg) = self.receiver.recv() => {
@@ -3327,6 +3347,16 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                         if !forward.is_empty() {
                             self.stdin_buf = Some((bytes::Bytes::from(forward), 0));
                         }
+
+                        // Arm (or clear) the idle-flush timer: a chunk that
+                        // leaves the matcher holding a split candidate (a lone
+                        // `ESC`, a prefix of every kitty form) must not wedge
+                        // that candidate forever — flush it to the PTY as data
+                        // once the stream goes quiet.
+                        self.chord_flush_deadline = self
+                            .chord_matcher
+                            .has_pending()
+                            .then(|| tokio::time::Instant::now() + CHORD_FLUSH_IDLE);
                     }
                     StdinMsg::TerminalUpdate(sz) => {
                         self.set_size(WinSize::from(&sz));
@@ -3373,6 +3403,24 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     Err(_would_block) => {},
                 }
             }
+            // Flush a held chord-matcher split candidate once the stream goes
+            // quiet. A lone `ESC` is a strict prefix of every kitty form, so
+            // the matcher holds it for the next chunk; without this, a bare
+            // `ESC` (e.g. leaving vim insert mode) would be held until the
+            // user's next keystroke. `pending()` keeps the arm inert while no
+            // candidate is held.
+            _ = async {
+                match chord_flush_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                self.chord_flush_deadline = None;
+                let flushed = self.chord_matcher.flush();
+                if !flushed.is_empty() {
+                    self.stdin_buf = Some((bytes::Bytes::from(flushed), 0));
+                }
+            }
 
         }
 
@@ -3402,6 +3450,9 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         // chord, and a reattach never inherits a stale awaiting-subcommand
         // state.
         self.chord_matcher = ChordMatcher::new(keys);
+        // A fresh matcher holds no candidate, so any pending idle-flush
+        // deadline from the previous channel is stale.
+        self.chord_flush_deadline = None;
 
         if !skip_flush {
             self.parser.screen_mut().set_size(sz.rows, sz.cols);
