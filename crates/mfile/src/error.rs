@@ -9,6 +9,7 @@ pub enum Error {
     NotFound,
     ConflictingLayouts(Vec<PathBuf>),
     MissingParamDefault(String),
+    InvalidCredential(sessions::core::primitives::CredentialError),
 }
 
 impl fmt::Display for Error {
@@ -31,6 +32,7 @@ impl fmt::Display for Error {
             Error::MissingParamDefault(e) => {
                 write!(f, "invalid parameter: `{}` does not define a default", e)
             }
+            Error::InvalidCredential(e) => write!(f, "invalid credential lane: {}", e),
         }
     }
 }
@@ -43,6 +45,7 @@ impl std::error::Error for Error {
             Error::NotFound => None,
             Error::ConflictingLayouts(_) => None,
             Error::MissingParamDefault(_) => None,
+            Error::InvalidCredential(e) => Some(e),
         }
     }
 }

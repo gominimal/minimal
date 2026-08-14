@@ -396,6 +396,12 @@ pub struct Session {
     /// client's loadout).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_hooks: Vec<sessions::core::lifecyclehook::LifecycleHook>,
+    /// Outbound credential lanes this project asks for, keyed by lane
+    /// name. The project supplies the name and the injection shape only;
+    /// the user's binding file is the authority on where the secret comes
+    /// from and which upstream it may reach.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub credentials: BTreeMap<String, sessions::core::primitives::Credential>,
 
     /// Any fields which are not understood by this version of minimal.
     #[serde(flatten)]
@@ -418,7 +424,7 @@ impl Session {
     /// contributions.
     ///
     /// The exhaustive `let Self { ... } = self` destructure in the
-    /// body is what makes this drift-proof: if a sixth primitive
+    /// body is what makes this drift-proof: if another primitive
     /// lands on [`Session`], the pattern fails to compile until it's
     /// added here. Naming the method is orthogonal — kept as
     /// `is_empty` because that's the idiomatic Rust name for the
@@ -431,6 +437,7 @@ impl Session {
             vars_lenient,
             patches,
             lifecycle_hooks,
+            credentials,
             extra: _,
         } = self;
         packages.is_empty()
@@ -438,6 +445,7 @@ impl Session {
             && vars_lenient.is_empty()
             && patches.is_empty()
             && lifecycle_hooks.is_empty()
+            && credentials.is_empty()
     }
 }
 
@@ -842,7 +850,9 @@ impl File {
     /// # Errors
     ///
     /// Returns [`Error::MissingParamDefault`] if any `[params.X]` entry has
-    /// no `default` field.
+    /// no `default` field, or [`Error::InvalidCredential`] if a
+    /// `[session.credentials.X]` lane breaks the lane-name grammar or the
+    /// header/prefix rules.
     pub fn validate(&self) -> Result<(), Error> {
         if let Some(params) = &self.params {
             for (n, s) in params.0.iter() {
@@ -850,6 +860,12 @@ impl File {
                     return Err(Error::MissingParamDefault(n.clone()));
                 }
             }
+        }
+        if let Some(session) = &self.session {
+            sessions::core::primitives::validate_credential_lanes(
+                session.credentials.iter().map(|(n, c)| (n.as_str(), c)),
+            )
+            .map_err(Error::InvalidCredential)?;
         }
         self.warn_unknown_fields();
         Ok(())
@@ -1804,6 +1820,70 @@ mod tests {
         .unwrap();
         let session = mf.session.expect("populated block parses");
         assert!(session.extra.contains_key("weird_new_thing"));
+    }
+
+    /// A `[session.credentials.*]` block round-trips both declared
+    /// shapes — a bare header, and a header with a prefix — and clears
+    /// `validate`.
+    #[test]
+    fn session_credentials_parse_and_validate() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session.credentials.anthropic]
+            inject = { header = "x-api-key" }
+
+            [session.credentials.github-mcp]
+            inject = { header = "Authorization", prefix = "Bearer " }
+            "#
+        })
+        .unwrap();
+        mf.validate().expect("valid lanes");
+        let session = mf.session.expect("credentials imply a session block");
+        assert!(!session.is_empty());
+        assert_eq!(session.credentials["anthropic"].inject.header, "x-api-key");
+        assert_eq!(session.credentials["github-mcp"].inject.prefix, "Bearer ");
+    }
+
+    /// No `extra` catch-all on `Credential`: a pasted secret must fail to
+    /// parse rather than be ingested and re-emitted by `File`'s
+    /// `Serialize`.
+    #[test]
+    fn session_credentials_reject_an_unknown_key() {
+        let err = toml::from_str::<File>(indoc! {
+            r#"
+            [session.credentials.anthropic]
+            inject = { header = "x-api-key" }
+            value = "sk-secret"
+            "#
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "got: {err}");
+    }
+
+    #[test]
+    fn session_credentials_reject_a_non_conforming_lane_name() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session.credentials.Anthropic_Prod]
+            inject = { header = "x-api-key" }
+            "#
+        })
+        .unwrap();
+        let err = mf.validate().unwrap_err();
+        assert!(err.to_string().contains("Anthropic_Prod"), "got: {err}");
+    }
+
+    #[test]
+    fn session_credentials_reject_a_forged_header_line() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session.credentials.anthropic]
+            inject = { header = "x-api-key", prefix = "a\r\nX-Evil: 1" }
+            "#
+        })
+        .unwrap();
+        let err = mf.validate().unwrap_err();
+        assert!(err.to_string().contains("CR or LF"), "got: {err}");
     }
 
     #[test]

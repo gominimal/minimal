@@ -56,8 +56,17 @@
 //!   and absolute paths are rejected at construction.
 //! - **The apply layer** is responsible for `$VAR` expansion and
 //!   canonicalization across the board.
+//!
+//! # Credential lanes
+//!
+//! [`Credential`] is what a project asks for and [`CredentialBinding`] is
+//! what the user grants. They are separate types because they are
+//! separate authorities: the project names a lane and an injection shape,
+//! the user names the secret's source and the single upstream it may
+//! reach. Neither type has a field that can hold a credential value.
 
 use core::fmt;
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use camino::{Utf8Component, Utf8PathBuf};
@@ -107,6 +116,48 @@ pub enum VarError {
     InvalidGlobSet {
         #[source]
         source: globset::Error,
+    },
+}
+
+/// Errors produced when validating credential-lane primitives.
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum CredentialError {
+    /// A lane name failed the `^[a-z0-9][a-z0-9-]*$` grammar. The name is
+    /// simultaneously a map key, a URL path segment, and an environment
+    /// variable suffix, so it is constrained to what all three accept.
+    #[error("credential lane name `{0}` must match `[a-z0-9][a-z0-9-]*`")]
+    InvalidLaneName(String),
+    /// Two lanes mangle to the same environment variable suffix, so the
+    /// box would get whichever one merged last instead of both.
+    #[error(
+        "credential lanes `{first}` and `{second}` both map to the \
+         environment variable suffix `{suffix}`"
+    )]
+    LaneSuffixCollision {
+        first: String,
+        second: String,
+        suffix: String,
+    },
+    /// A header name was empty or carried something that cannot appear in
+    /// a request head.
+    #[error("credential lane `{lane}` header `{header}` is not a header token")]
+    InvalidHeader { lane: String, header: String },
+    /// A prefix carried CR or LF, which would let the declaration inject
+    /// extra header lines into the rewritten request head.
+    #[error("credential lane `{lane}` prefix must not contain CR or LF")]
+    PrefixControlChars { lane: String },
+    /// A binding's upstream was not `https://`. Plain `http://` would put
+    /// the user's secret on the wire in cleartext.
+    #[error("credential lane `{lane}` upstream `{upstream}` must be an https:// URL")]
+    InsecureUpstream { lane: String, upstream: String },
+    /// The binding file was not valid TOML, or a binding had the wrong
+    /// shape (an unknown key, or a source that names neither `env` nor
+    /// `file`).
+    #[error("invalid credential binding: {source}")]
+    Binding {
+        #[from]
+        source: toml::de::Error,
     },
 }
 
@@ -1316,6 +1367,285 @@ impl From<crate::wire::primitives::WireResolvedPatch> for ResolvedPatch {
 }
 
 // =====================================================================
+// Credential lanes
+// =====================================================================
+
+/// A credential lane a project asks for, declared as
+/// `[session.credentials.<lane>]`.
+///
+/// `deny_unknown_fields`, and the absence of an `extra` catch-all, break
+/// mfile's flatten-unknown-keys convention deliberately. Every other
+/// section collects unknown keys into a `HashMap<String, toml::Value>` on
+/// a type that derives `Serialize`, so a catch-all here would ingest and
+/// re-emit a plaintext secret someone pasted as `value = "sk-…"`.
+/// Refusing to parse it is what keeps "a secret never enters this struct"
+/// mechanically true. The precedent is
+/// [`HookScriptRepr`](crate::core::lifecyclehook::HookScriptRepr), where a
+/// silently-skipped key meant a script quietly running with the wrong
+/// timeout.
+///
+/// The project declares the lane name and the injection shape and nothing
+/// else. Where the credential comes from and where it may be sent are both
+/// the user's [`CredentialBinding`]: a project that could name the upstream
+/// could point a bound lane at a host it controls and have the user's key
+/// delivered there.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Credential {
+    /// How the broker places the credential in the outbound request.
+    pub inject: CredentialInject,
+}
+
+impl Credential {
+    /// Construct a lane declaration from its injection shape.
+    #[must_use]
+    pub fn new(inject: CredentialInject) -> Self {
+        Self { inject }
+    }
+
+    /// Validate the injection shape, naming `lane` in any error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::InvalidHeader`] or
+    /// [`CredentialError::PrefixControlChars`].
+    pub fn validate(&self, lane: &str) -> Result<(), CredentialError> {
+        self.inject.validate(lane)
+    }
+}
+
+/// How the broker injects a lane's credential: the header to set, and an
+/// optional prefix placed before the value (`"Bearer "` for a bearer
+/// token).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialInject {
+    /// The header name, e.g. `x-api-key` or `Authorization`.
+    pub header: String,
+    /// Text placed immediately before the credential value. Empty by
+    /// default; note the trailing space belongs in the prefix itself.
+    #[serde(default)]
+    pub prefix: String,
+}
+
+impl CredentialInject {
+    /// Construct an injection with no prefix.
+    #[must_use]
+    pub fn new(header: impl Into<String>) -> Self {
+        Self {
+            header: header.into(),
+            prefix: String::new(),
+        }
+    }
+
+    /// Set the prefix placed before the credential value.
+    #[must_use]
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = prefix.into();
+        self
+    }
+
+    /// Validate the header and prefix, naming `lane` in any error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::InvalidHeader`] if `header` is empty or
+    /// contains anything but visible ASCII (`:` excluded, since it
+    /// terminates the field name), or
+    /// [`CredentialError::PrefixControlChars`] if `prefix` contains CR or
+    /// LF — either would let a declaration forge extra header lines in the
+    /// rewritten request head.
+    pub fn validate(&self, lane: &str) -> Result<(), CredentialError> {
+        let is_token = !self.header.is_empty()
+            && self
+                .header
+                .bytes()
+                .all(|b| b.is_ascii_graphic() && b != b':');
+        if !is_token {
+            return Err(CredentialError::InvalidHeader {
+                lane: lane.to_owned(),
+                header: self.header.clone(),
+            });
+        }
+        if self.prefix.contains(['\r', '\n']) {
+            return Err(CredentialError::PrefixControlChars {
+                lane: lane.to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The environment variable suffix a lane name mangles to: upcased, with
+/// `-` replaced by `_`. `github-mcp` names
+/// `MINIMAL_CREDENTIAL_ENDPOINT_GITHUB_MCP`.
+#[must_use]
+pub fn credential_env_suffix(lane: &str) -> String {
+    lane.to_ascii_uppercase().replace('-', "_")
+}
+
+/// Validate a lane name against `^[a-z0-9][a-z0-9-]*$`.
+///
+/// # Errors
+///
+/// Returns [`CredentialError::InvalidLaneName`].
+pub fn validate_credential_lane_name(lane: &str) -> Result<(), CredentialError> {
+    let mut chars = lane.chars();
+    let head_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    let tail_ok = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if head_ok && tail_ok {
+        Ok(())
+    } else {
+        Err(CredentialError::InvalidLaneName(lane.to_owned()))
+    }
+}
+
+/// Validate a whole set of lanes: each name against the grammar, each
+/// injection shape, and the mangled environment suffixes against each
+/// other.
+///
+/// Taking an iterator rather than one map is what lets the composer run
+/// the same check across lanes merged from several sources, where two
+/// declarations of one name are a real possibility.
+///
+/// # Errors
+///
+/// Returns the first [`CredentialError`] any lane produces, or
+/// [`CredentialError::LaneSuffixCollision`] if two lanes share a suffix.
+pub fn validate_credential_lanes<'a>(
+    lanes: impl IntoIterator<Item = (&'a str, &'a Credential)>,
+) -> Result<(), CredentialError> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for (lane, credential) in lanes {
+        validate_credential_lane_name(lane)?;
+        credential.validate(lane)?;
+        let suffix = credential_env_suffix(lane);
+        if let Some(first) = seen.insert(suffix.clone(), lane) {
+            return Err(CredentialError::LaneSuffixCollision {
+                first: first.to_owned(),
+                second: lane.to_owned(),
+                suffix,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Where a bound credential's value comes from. The wire form is a
+/// single-key table:
+///
+/// ```toml
+/// source = { env = "ANTHROPIC_API_KEY" }
+/// source = { file = "~/.secrets/github-mcp-token" }
+/// ```
+///
+/// Reading either is deliberately not this type's job: resolution runs on
+/// the host, in the client, and the value never reaches the daemon.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialSource {
+    /// Read the named variable from the client's process environment.
+    Env(String),
+    /// Read a host file. The path is stored as written — `~` and `$VAR`
+    /// are the resolver's business, exactly as for a [`Patch`] source.
+    File(String),
+}
+
+/// The user's binding for one lane: where the secret comes from, and the
+/// single upstream it may be sent to.
+///
+/// Both halves are the user's on purpose. The policy gate is keyed by
+/// project path, like `[hooks]`, so a project already inside an allow glob
+/// clears it without a prompt — if that project could also name the
+/// upstream, an approved lane would exfiltrate the user's key to a host of
+/// the project's choosing.
+///
+/// Construct through [`CredentialBindings::from_toml_str`]: a directly
+/// deserialised binding has not been through [`Self::validate`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialBinding {
+    /// The one upstream this lane may reach, `https://` only.
+    pub upstream: String,
+    /// Where the credential value is read from.
+    pub source: CredentialSource,
+}
+
+impl CredentialBinding {
+    /// Validate the binding, naming `lane` in any error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::InsecureUpstream`] unless `upstream` is
+    /// an `https://` URL with a non-empty authority. Only the scheme is
+    /// checked here; the broker parses the URL properly when it originates
+    /// the connection.
+    pub fn validate(&self, lane: &str) -> Result<(), CredentialError> {
+        let secure = self
+            .upstream
+            .split_at_checked("https://".len())
+            .is_some_and(|(scheme, rest)| {
+                scheme.eq_ignore_ascii_case("https://") && !rest.is_empty()
+            });
+        if secure {
+            Ok(())
+        } else {
+            Err(CredentialError::InsecureUpstream {
+                lane: lane.to_owned(),
+                upstream: self.upstream.clone(),
+            })
+        }
+    }
+}
+
+/// A whole credential binding file: lane name → [`CredentialBinding`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct CredentialBindings(BTreeMap<String, CredentialBinding>);
+
+impl CredentialBindings {
+    /// Parse and validate a binding file's contents. Filesystem lookup and
+    /// value resolution live elsewhere; this is text in, validated
+    /// bindings out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::Binding`] for malformed TOML,
+    /// [`CredentialError::InvalidLaneName`] for a name outside the lane
+    /// grammar, or [`CredentialError::InsecureUpstream`] for a non-https
+    /// upstream.
+    pub fn from_toml_str(contents: &str) -> Result<Self, CredentialError> {
+        let bindings: BTreeMap<String, CredentialBinding> = toml::from_str(contents)?;
+        for (lane, binding) in &bindings {
+            validate_credential_lane_name(lane)?;
+            binding.validate(lane)?;
+        }
+        Ok(Self(bindings))
+    }
+
+    /// The binding for `lane`, if the user bound one.
+    #[must_use]
+    pub fn get(&self, lane: &str) -> Option<&CredentialBinding> {
+        self.0.get(lane)
+    }
+
+    /// Iterate the bound lanes in name order.
+    pub fn lanes(&self) -> impl Iterator<Item = (&str, &CredentialBinding)> {
+        self.0
+            .iter()
+            .map(|(lane, binding)| (lane.as_str(), binding))
+    }
+
+    /// Returns `true` if the user bound no lanes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+// =====================================================================
 // Tests
 // =====================================================================
 
@@ -1787,6 +2117,133 @@ mod tests {
         built.push(make("b"));
         assert_eq!(collected, built);
         assert_eq!(collected.len(), 2);
+    }
+
+    // ---- Credential lanes ----
+
+    fn lane(header: &str) -> Credential {
+        Credential::new(CredentialInject::new(header))
+    }
+
+    #[test]
+    fn credential_parses_from_the_declared_toml_shape() {
+        let c: Credential =
+            parse(r#"x = { inject = { header = "Authorization", prefix = "Bearer " } }"#);
+        assert_eq!(c.inject.header, "Authorization");
+        assert_eq!(c.inject.prefix, "Bearer ");
+    }
+
+    #[test]
+    fn credential_rejects_a_value_bearing_key() {
+        // The whole point of `deny_unknown_fields`: a pasted secret must
+        // fail to parse rather than be ingested and re-emitted.
+        let err = toml::from_str::<Wrap<Credential>>(
+            r#"x = { inject = { header = "x-api-key" }, value = "sk-secret" }"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "got: {err}");
+    }
+
+    #[test]
+    fn credential_lane_names_follow_the_wire_grammar() {
+        for name in ["anthropic", "github-mcp", "s3", "0"] {
+            assert!(
+                validate_credential_lane_name(name).is_ok(),
+                "rejected: {name}"
+            );
+        }
+        for name in [
+            "",
+            "-lead",
+            "Upper",
+            "under_score",
+            "trailing.dot",
+            "with space",
+        ] {
+            assert!(
+                validate_credential_lane_name(name).is_err(),
+                "accepted: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_lanes_reject_colliding_env_suffixes() {
+        let c = lane("x-api-key");
+        let err = validate_credential_lanes([("anthropic", &c), ("anthropic", &c)]).unwrap_err();
+        assert!(err.to_string().contains("ANTHROPIC"), "got: {err}");
+    }
+
+    #[test]
+    fn credential_header_must_be_a_header_token() {
+        for header in ["", "x-api key", "x-api-key:", "héader"] {
+            let err = lane(header).validate("anthropic").unwrap_err();
+            assert!(
+                matches!(err, CredentialError::InvalidHeader { .. }),
+                "accepted: {header}",
+            );
+        }
+    }
+
+    #[test]
+    fn credential_prefix_may_not_forge_a_header_line() {
+        let c = Credential::new(
+            CredentialInject::new("Authorization").with_prefix("Bearer \r\nX-Evil: 1"),
+        );
+        let err = c.validate("github-mcp").unwrap_err();
+        assert!(matches!(err, CredentialError::PrefixControlChars { .. }));
+    }
+
+    #[test]
+    fn bindings_parse_both_source_forms() {
+        let bindings = CredentialBindings::from_toml_str(indoc::indoc! {
+            r#"
+            [anthropic]
+            upstream = "https://api.anthropic.com"
+            source   = { env = "ANTHROPIC_API_KEY" }
+
+            [github-mcp]
+            upstream = "https://api.githubcopilot.com/mcp/"
+            source   = { file = "~/.secrets/github-mcp-token" }
+            "#
+        })
+        .unwrap();
+        assert_eq!(
+            bindings.get("anthropic").map(|b| &b.source),
+            Some(&CredentialSource::Env("ANTHROPIC_API_KEY".into())),
+        );
+        assert_eq!(
+            bindings.get("github-mcp").map(|b| &b.source),
+            Some(&CredentialSource::File(
+                "~/.secrets/github-mcp-token".into()
+            )),
+        );
+    }
+
+    #[test]
+    fn bindings_reject_a_plaintext_upstream() {
+        let err = CredentialBindings::from_toml_str(indoc::indoc! {
+            r#"
+            [anthropic]
+            upstream = "http://api.anthropic.com"
+            source   = { env = "ANTHROPIC_API_KEY" }
+            "#
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("https://"), "got: {err}");
+    }
+
+    #[test]
+    fn bindings_reject_an_unknown_source_kind() {
+        let err = CredentialBindings::from_toml_str(indoc::indoc! {
+            r#"
+            [anthropic]
+            upstream = "https://api.anthropic.com"
+            source   = { vault = "secret/anthropic" }
+            "#
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("vault"), "got: {err}");
     }
 
     #[test]
