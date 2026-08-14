@@ -5,6 +5,8 @@
 //! the wire schema can evolve independently of the TOML wire forms
 //! used at config load. Nothing here uses `#[serde(untagged)]`.
 
+use std::collections::BTreeMap;
+
 /// Origin of a contributed item. Mirrors [`crate::core::source::Source`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -238,6 +240,15 @@ pub struct WireCredentialLane {
     pub upstream: String,
     /// The header the broker injects the credential into.
     pub header: String,
+    /// Static, non-secret headers the broker attaches alongside the
+    /// credential. Defaulted for version skew, like every other field
+    /// added after the shape shipped.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub also: BTreeMap<String, String>,
+    /// The additional variable name the lane's endpoint is published
+    /// under, if the project declared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_var: Option<String>,
     /// Where the lane was declared.
     pub source: WireSource,
 }
@@ -261,6 +272,14 @@ pub struct WirePendingCredential {
     /// a peer that omits it lands on "no prefix" rather than faulting.
     #[serde(default)]
     pub prefix: String,
+    /// Static, non-secret headers the broker attaches alongside the
+    /// credential. Defaulted on the same reasoning as `prefix`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub also: BTreeMap<String, String>,
+    /// The additional variable name the lane's endpoint is published
+    /// under, if the project declared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_var: Option<String>,
     /// Where it came from — the project root the policy matches.
     pub source: WireSource,
 }
@@ -464,6 +483,8 @@ impl From<crate::core::compose::SessionCredential> for WireCredentialLane {
             lane: lane.lane().to_owned(),
             upstream: lane.upstream().to_owned(),
             header: lane.header().to_owned(),
+            also: lane.also().clone(),
+            endpoint_var: lane.endpoint_var().map(ToOwned::to_owned),
             source: source.into(),
         }
     }

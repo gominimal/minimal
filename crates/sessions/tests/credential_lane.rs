@@ -71,9 +71,23 @@ fn lane_response(source: WireSource) -> ContributionResponse {
             lane: "anthropic".into(),
             header: "x-api-key".into(),
             prefix: String::new(),
+            also: std::collections::BTreeMap::new(),
+            endpoint_var: None,
             source,
         }],
     }
+}
+
+/// The same lane, declaring the endpoint alias and the static header a
+/// project may ask for on top of the injection shape.
+fn lane_response_with_extras(source: WireSource) -> ContributionResponse {
+    let mut response = lane_response(source);
+    let pending = &mut response.credentials[0];
+    pending.endpoint_var = Some("ANTHROPIC_BASE_URL".into());
+    pending.also = [("X-MCP-Readonly".to_owned(), "true".to_owned())]
+        .into_iter()
+        .collect();
+    response
 }
 
 fn gate(
@@ -263,6 +277,32 @@ fn undecided_project_reaches_the_prompt_with_the_full_descriptor() {
     assert_eq!(shown[0].lane(), "anthropic");
     assert_eq!(shown[0].upstream(), "https://api.anthropic.com");
     assert_eq!(shown[0].header(), "x-api-key");
+}
+
+/// The prompt is also shown what the lane publishes and what it will
+/// carry: an `endpoint_var` names a variable the box's software reads a
+/// base URL from, and an `also` header is attached where the box cannot
+/// remove it. Consent that hid either would be consent to less than
+/// what happens.
+#[test]
+fn the_prompt_is_shown_the_declared_extras() {
+    let hook = RecordingHook(RefCell::new(Vec::new()));
+    gate(
+        lane_response_with_extras(project_source("/repo")),
+        UserPolicy::empty(),
+        &hook,
+    )
+    .unwrap();
+
+    let shown = hook.0.borrow();
+    assert_eq!(shown[0].endpoint_var(), Some("ANTHROPIC_BASE_URL"));
+    assert_eq!(
+        shown[0].also().get("X-MCP-Readonly").map(String::as_str),
+        Some("true"),
+    );
+    let rendered = shown[0].to_string();
+    assert!(rendered.contains("ANTHROPIC_BASE_URL"), "got: {rendered}");
+    assert!(rendered.contains("X-MCP-Readonly"), "got: {rendered}");
 }
 
 /// A lane tagged as coming from a **package** is refused outright,

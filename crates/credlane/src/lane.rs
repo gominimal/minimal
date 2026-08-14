@@ -5,6 +5,7 @@
 //! the user's binding, the header from the declaration the user approved, and
 //! the secret from a host-side resolver — the box supplies only a selector.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,8 @@ impl fmt::Debug for Secret {
 pub struct Inject {
     header: String,
     prefix: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    also: BTreeMap<String, String>,
 }
 
 impl Inject {
@@ -53,13 +56,38 @@ impl Inject {
         Self {
             header: header.into(),
             prefix: prefix.into(),
+            also: BTreeMap::new(),
         }
+    }
+
+    /// Adds the declaration's static extra headers.
+    #[must_use]
+    pub fn with_also(
+        mut self,
+        also: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        self.also = also
+            .into_iter()
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect();
+        self
     }
 
     /// The header name to strip from the inbound request and then set.
     #[must_use]
     pub fn header(&self) -> &str {
         &self.header
+    }
+
+    /// The static headers the broker attaches alongside the credential.
+    ///
+    /// They are attached host-side because a box can omit a header it was told
+    /// to send but cannot remove one the broker adds: the facade this design
+    /// replaced pinned `X-MCP-Readonly: true` on every request, and moving that
+    /// into the box would have made it advisory.
+    #[must_use]
+    pub fn also(&self) -> &BTreeMap<String, String> {
+        &self.also
     }
 
     /// The value to set it to, for this lane's secret.
@@ -76,6 +104,7 @@ pub struct Lane {
     upstream: Url,
     inject: Inject,
     secret: Secret,
+    methods: Vec<String>,
 }
 
 impl Lane {
@@ -90,7 +119,25 @@ impl Lane {
             upstream,
             inject,
             secret,
+            methods: Vec::new(),
         }
+    }
+
+    /// Narrows the lane to `methods`. An empty set is every method, which is
+    /// what a binding without the field means.
+    #[must_use]
+    pub fn with_methods(mut self, methods: impl IntoIterator<Item = String>) -> Self {
+        self.methods = methods.into_iter().collect();
+        self
+    }
+
+    /// Whether this lane covers `method`.
+    ///
+    /// Compared exactly, as HTTP methods are case-sensitive and a binding's
+    /// entries are uppercase by parse-time constraint.
+    #[must_use]
+    pub fn allows_method(&self, method: &str) -> bool {
+        self.methods.is_empty() || self.methods.iter().any(|allowed| allowed == method)
     }
 
     /// The lane name — the selector a box's URL leads with.

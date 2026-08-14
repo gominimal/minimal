@@ -528,7 +528,9 @@ pub async fn register_approved(
 ///
 /// The upstream is read from the binding, not from the verdict that carries a
 /// copy of it: the binding file is the one authority on where a credential may
-/// be sent, and the project has no upstream field to disagree with it.
+/// be sent, and the project has no upstream field to disagree with it. The
+/// method set comes from there for the same reason — narrowing a grant is the
+/// grantor's — while the injection shape is the project's declaration.
 fn lane_registration(
     pending: &WirePendingCredential,
     bindings: &Bindings,
@@ -553,8 +555,9 @@ fn lane_registration(
     Ok(LaneRegistration {
         lane: pending.lane.clone(),
         upstream,
-        inject: Inject::new(&pending.header, &pending.prefix),
+        inject: Inject::new(&pending.header, &pending.prefix).with_also(pending.also.clone()),
         secret,
+        methods: binding.methods.clone(),
     })
 }
 
@@ -695,6 +698,8 @@ mod tests {
             lane: lane.to_owned(),
             header: "Authorization".into(),
             prefix: "Bearer ".into(),
+            also: std::collections::BTreeMap::new(),
+            endpoint_var: None,
             source: WireSource::UserLoadout { name: "dev".into() },
         }
     }
@@ -878,10 +883,73 @@ mod tests {
                 "Bearer sk-live-hunter2"
             );
             assert!(
+                lane.allows_method("GET"),
+                "a binding with no `methods` covers every one"
+            );
+            assert!(
                 broker
                     .resolve(registration.token().expose(), "github-mcp", Instant::now())
                     .is_err(),
                 "an ignored lane must not be registered"
+            );
+        })
+        .await;
+    }
+
+    /// R10.4 and R10.3 on the registration path: the verb set is the user's,
+    /// read from the binding, and the extra headers are the project's, read
+    /// from the declaration. Both are constraints, so both have to survive
+    /// the trip to the broker — dropping either widens the grant silently.
+    #[tokio::test]
+    async fn registering_carries_the_bound_methods_and_the_declared_extra_headers() {
+        with_broker(|broker| async move {
+            let approved = verdict_for(
+                session(1),
+                vec![WireCredentialVerdict::Approved {
+                    id: PendingId::new(1),
+                    upstream: "https://api.github.com/gists".into(),
+                }],
+            );
+            let bindings = Bindings::new(
+                "/config/credentials.toml",
+                CredentialBindings::from_toml_str(
+                    "[gist-sink]\n\
+                     upstream = \"https://api.github.com/gists\"\n\
+                     source = { env = \"GH_PAT\" }\n\
+                     methods = [\"POST\"]\n",
+                )
+                .unwrap(),
+            );
+            let mut declared = pending(1, "gist-sink");
+            declared.also = std::collections::BTreeMap::from([(
+                "X-MCP-Readonly".to_owned(),
+                "true".to_owned(),
+            )]);
+
+            let registration = register_approved(
+                &[declared],
+                &approved,
+                &bindings,
+                &env_of(&[("GH_PAT", "ghp-live-hunter2")]),
+            )
+            .await
+            .expect("registration")
+            .expect("an approved lane registers");
+
+            let lane = broker
+                .resolve(registration.token().expose(), "gist-sink", Instant::now())
+                .expect("the minted token authorises the approved lane");
+            assert!(lane.allows_method("POST"));
+            assert!(
+                !lane.allows_method("GET"),
+                "a method outside the binding's set must not be covered"
+            );
+            assert_eq!(
+                lane.inject()
+                    .also()
+                    .get("X-MCP-Readonly")
+                    .map(String::as_str),
+                Some("true")
             );
         })
         .await;

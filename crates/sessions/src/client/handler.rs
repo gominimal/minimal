@@ -26,6 +26,8 @@
 //! auto-decided items come out in input order but hook-routed items
 //! land at the end.
 
+use std::collections::BTreeMap;
+
 use crate::core::compose::{
     ComposeError, ComposeOptions, CredentialLane, HookDomain, PendingPatchFile, PendingVar,
     SessionVar, expand_patch_sources,
@@ -142,6 +144,8 @@ struct PendingCredential {
     id: PendingId,
     lane: String,
     header: String,
+    also: BTreeMap<String, String>,
+    endpoint_var: Option<String>,
     source: Source,
 }
 
@@ -169,11 +173,10 @@ impl PendingCredential {
                     lane: self.lane.clone(),
                     from: self.source.clone(),
                 })?;
-        Ok(CredentialLane::new(
-            &self.lane,
-            &binding.upstream,
-            &self.header,
-        ))
+        Ok(
+            CredentialLane::new(&self.lane, &binding.upstream, &self.header)
+                .with_extras(self.endpoint_var.clone(), self.also.clone()),
+        )
     }
 }
 
@@ -203,12 +206,14 @@ fn gate_pending_credentials(
     // Pass 1: classify. Lanes the policy can decide emit a verdict
     // immediately; the rest queue for one prompt each.
     let mut verdicts: Vec<WireCredentialVerdict> = Vec::with_capacity(pending.len());
-    let mut unapproved: Vec<(PendingCredential, CredentialLane)> = Vec::new();
+    let mut unapproved: Vec<(Box<PendingCredential>, CredentialLane)> = Vec::new();
     for p in pending {
         let item = PendingCredential {
             id: p.id,
             lane: p.lane,
             header: p.header,
+            also: p.also,
+            endpoint_var: p.endpoint_var,
             source: p.source.into(),
         };
         match classify_credential(&expanded, item, bindings)? {
@@ -237,7 +242,7 @@ fn gate_pending_credentials(
                 upstream: lane.upstream().to_owned(),
             },
             ItemDecision::IgnoreOnce => WireCredentialVerdict::Ignored { id: item.id },
-            ItemDecision::UseRule => match classify_credential(&expanded, item, bindings)? {
+            ItemDecision::UseRule => match classify_credential(&expanded, *item, bindings)? {
                 CredentialClassification::Decided(v) => v,
                 CredentialClassification::Pending(item, _) => {
                     return Err(ComposeError::use_rule_undecided(
@@ -254,10 +259,12 @@ fn gate_pending_credentials(
 
 /// Result of running one pending lane through the policy. The
 /// `Pending` arm carries the descriptor alongside the item so the
-/// binding lookup isn't repeated for the prompt.
+/// binding lookup isn't repeated for the prompt. The item is boxed
+/// because a declaration is several times the size of a verdict, and
+/// every decided lane would otherwise pay for it.
 enum CredentialClassification {
     Decided(WireCredentialVerdict),
-    Pending(PendingCredential, CredentialLane),
+    Pending(Box<PendingCredential>, CredentialLane),
 }
 
 fn classify_credential(
@@ -283,7 +290,7 @@ fn classify_credential(
         )),
         CheckOutcome::NeedsApproval(item) => {
             let lane = item.describe(bindings)?;
-            Ok(CredentialClassification::Pending(item, lane))
+            Ok(CredentialClassification::Pending(Box::new(item), lane))
         }
     }
 }

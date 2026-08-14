@@ -197,11 +197,28 @@ A project declares that it wants a lane, under `[session.credentials]`:
 
 ```toml
 [session.credentials.anthropic]
-inject = { header = "x-api-key" }
+inject       = { header = "x-api-key" }
+endpoint_var = "ANTHROPIC_BASE_URL"
 
 [session.credentials.github-mcp]
-inject = { header = "Authorization", prefix = "Bearer " }
+inject = { header = "Authorization", prefix = "Bearer ", also = { "X-MCP-Readonly" = "true" } }
 ```
+
+`endpoint_var` names an additional variable the endpoint is published under, so
+software that reads a base URL from a fixed name gets it without a line of
+per-project shell. Porting a real workflow onto an earlier draft of this design
+turned that one missing field into endpoint-resolution glue in twelve places —
+two hooks per tree, six trees, five different target names — because the
+endpoint is only knowable at launch and could not be written as a
+`[session.vars]` constant the way a fixed broker address could. The alias is
+published in the same layer as the canonical variables (above the composition),
+so a loadout still cannot shadow it, and it still names no upstream.
+
+`inject.also` carries additional **static, non-secret** headers. They exist
+because attaching a constraint host-side is different in kind from asking the
+box to send one: the broker this design replaced pinned `X-MCP-Readonly: true`
+on every MCP request, and a box could neither see nor drop it. Moved into the
+box, an escaped agent simply omits it.
 
 It lives under `[session]`, not at the top level, for two mechanical reasons.
 `build_composables` short-circuits on `has_material`, which consults only
@@ -225,7 +242,18 @@ source   = { env = "ANTHROPIC_API_KEY" }
 [github-mcp]
 upstream = "https://api.githubcopilot.com/mcp/"
 source   = { file = "~/.secrets/github-mcp-token" }
+
+[gist-sink]
+upstream = "https://api.github.com/gists"
+source   = { file = "~/.secrets/github-mcp-token" }
+methods  = ["POST"]
 ```
+
+`methods` narrows a lane to a verb set. Without it the lane is strictly coarser
+than the host-side facade it replaces: a facade exposing `POST /sink` granted
+one operation, while a lane granting an origin and a path prefix grants every
+method the upstream honours on it. Narrowing is the user's to choose, and it
+belongs on the binding for the same reason the upstream does.
 
 This is the correction the first draft of this spec got wrong, and it is the
 whole security argument. If the project supplied `upstream`, then an allow-listed
@@ -376,14 +404,42 @@ session X". It cannot scope a credential.
 
 ### Delivering the endpoint to the box
 
-**One environment variable per lane**, because the box's software needs a
-distinct base URL per lane anyway (`ANTHROPIC_BASE_URL` for one, an MCP server
-URL for the other):
+**Per lane**, because the box's software needs a distinct base URL per lane
+anyway (`ANTHROPIC_BASE_URL` for one, an MCP server URL for the other):
 
 | Variable | Value |
 |---|---|
-| `MINIMAL_CREDENTIAL_ENDPOINT_<LANE>` | `http://<host>:<port>/<lane>` |
+| `MINIMAL_CREDENTIAL_ENDPOINT_<LANE>` | `http://<host>:<port>/<lane>` — safe to log |
+| `MINIMAL_CREDENTIAL_URL_<LANE>` | `http://<host>:<port>/t/<token>/<lane>` — self-authenticating |
+| `MINIMAL_CREDENTIAL_UPSTREAM_<LANE>` | the bound upstream, so the box knows how much path the binding already covers |
+| `MINIMAL_CREDENTIAL_LANES` | space-separated names of the lanes that survived the gate |
 | `MINIMAL_CREDENTIAL_TOKEN` | the session's token |
+| the lane's `endpoint_var`, if declared | same as `MINIMAL_CREDENTIAL_ENDPOINT_<LANE>` |
+
+**Why two forms of the URL.** An earlier draft published only the plain endpoint
+and required the token in an `X-Minimal-Credential-Token` header. That was a
+mistake, and porting a real six-harness workflow onto it is what exposed it: the
+mechanism this design replaces made an *unauthenticated URL* the capability, so
+every consumer needed exactly one field — `url`. Requiring a header means every
+consumer needs a second, header-shaped knob, and agent harnesses expose base-URL
+knobs far more often than header maps. One of the six harnesses (goose) has no
+header route on either leg it uses — its streamable-HTTP extension parses
+`<url> [timeout=<n>]` and nothing else — so the header-only design simply could
+not be adopted there.
+
+So the broker accepts the token **either** in the header **or** as a `/t/<token>`
+prefix on the path, and both variables are published. Software with a header
+slot should prefer `MINIMAL_CREDENTIAL_ENDPOINT_*`, because that value is safe
+to put in a log or a checked-in config; software with only a URL slot uses
+`MINIMAL_CREDENTIAL_URL_*` and works unmodified. The security properties are
+identical — the token is the same capability either way, and the path form is no
+more exposed inside a box than the header form, which already sits in `env`.
+
+`MINIMAL_CREDENTIAL_LANES` exists so a box can tell a *denied* lane from a
+*misspelled* one. A lane the gate refuses is simply absent from the
+environment, which is indistinguishable from a typo at the point of use and
+surfaces as a confusing `401` deep inside an agent instead of an error at
+launch.
 
 They are layered **above** the composition in `layer_session_env`
 (`crates/minimald/src/session_host.rs:1523-1544`), not into `session_baseline_env`
@@ -402,6 +458,15 @@ variable arrives as execve envp and there is no confidential-env mechanism in
 this tree — and acceptable precisely because it is a scoped, revocable
 capability. What leaks from a compromised box is a handle that dies with the box,
 not a key that outlives it.
+
+Its exposure inside the box is wider than `env` alone, though, and the guide
+says so rather than leaving it to be discovered. Porting a real workflow put the
+token in an agent's config file, in `argv` (one harness passes MCP headers as
+command-line flags, so it shows in `ps`), and in a trace the workflow already
+wrote — and one of those config files lives in the project directory, which
+`--sync` copies **back to the host**. A capability that dies with the box is
+still a capability while the box lives; treat the token like any other
+credential inside the box even though it is not one outside it.
 
 ### The broker's request path
 
@@ -530,6 +595,11 @@ Two honest limits:
 
 > Requirement IDs use the format **R{unit}.{seq}**. Do not renumber after
 > approval.
+>
+> **Unit 10 is a second pass**, added after porting a real six-harness workflow
+> onto Units 1–9 exposed gaps that only appear when something other than a
+> purpose-built example has to adopt the lane. It supersedes nothing; it adds
+> what that port showed was missing.
 
 ### Unit 1: schema and validation
 
@@ -693,6 +763,40 @@ pinning the fail-open decision.
   nine rule arrays become twelve); a guide page on giving an agent an outbound
   credential; a `min session credentials` entry in the CLI reference.
 
+### Unit 10: what adopting the lane showed was missing
+
+Everything here comes from porting a six-harness workflow off a host-side
+Python broker and onto Units 1–9.
+
+- **R10.1**: The broker accepts the token as a `/t/<token>` path prefix as well
+  as in `X-Minimal-Credential-Token`, and publishes
+  `MINIMAL_CREDENTIAL_URL_<LANE>` carrying it. Without this the lane cannot be
+  adopted by software with a URL slot and no header slot, which is what it
+  replaces. The path form is stripped before the selector is read, so lane
+  resolution and the traversal rule are unchanged.
+- **R10.2**: `endpoint_var = "NAME"` on a lane declaration publishes the
+  endpoint under that additional name, in the same layer as the canonical
+  variables so it cannot be shadowed. The name is validated as an environment
+  variable name, and two lanes claiming one name is a parse error.
+- **R10.3**: `inject.also = { … }` carries additional static headers, attached
+  where the box cannot remove them. Values are validated exactly as `prefix` is
+  — no CR, no LF — and a key colliding with `inject.header` or the token header
+  is a parse error.
+- **R10.4**: `methods = ["POST", …]` on a **binding** restricts a lane to a verb
+  set. A request outside it gets the one indistinguishable refusal. Absent means
+  every method, as today.
+- **R10.5**: `MINIMAL_CREDENTIAL_LANES` lists the lanes that survived the gate,
+  space-separated, so a box can distinguish a denied lane from a misspelled one.
+- **R10.6**: `MINIMAL_CREDENTIAL_UPSTREAM_<LANE>` publishes the bound upstream,
+  so a box can tell how much of the path the binding already covers. It is not a
+  secret — it is already in `composition.json` and in `min session credentials`.
+
+**Proof:** behavioural tests — a request authenticated by path prefix reaches
+the upstream and one with a bad path token is refused identically; `endpoint_var`
+appears in the box environment and a loadout cannot shadow it; an `also` header
+arrives at the upstream and cannot be removed by the box; a method outside
+`methods` is refused; `MINIMAL_CREDENTIAL_LANES` names exactly the gated set.
+
 ## Testing
 
 Schema and validation are unit-tested in `mfile`: round-trip, unknown-key
@@ -747,7 +851,9 @@ tmpfs, so log-reading assertions are native-lane only.
 | Refusals enumerate what exists | Unknown lane, out-of-scope lane, malformed selector, and missing/expired token are one identical response | |
 | Another local process reaches the broker | The token is required regardless of transport | On native-Linux `HostNet` the box shares the host netns and can already reach every loopback service; loopback is not a boundary there and the design does not pretend it is |
 | A box opens the broker's control UDS and registers its own lane, or reads a resolved value | The control socket is placed outside every path bind-mounted into a sandbox (R2.2a) and is `0600` | `/state` and `/run` *are* mounted in (`crates/sandbox2/src/lib.rs:539-540`), and `/run` already carries `minenv_sock`. Registration itself carries no token — filesystem placement and mode are the *entire* control, which is why R2.2a is a requirement with a test and not a note |
-| The broker forwards the box's capability token to the upstream | `X-Minimal-Credential-Token` is removed from the rewritten head (R6.2) | Without this every upstream is handed a live credential-lane token |
+| The broker forwards the box's capability token to the upstream | `X-Minimal-Credential-Token` is removed from the rewritten head, and a `/t/<token>` prefix is stripped from the target (R6.2, R10.1) | Without this every upstream is handed a live credential-lane token |
+| A box drops a host-imposed constraint by not sending it | `inject.also` headers are attached by the broker, where the box cannot reach them (R10.3) | The facade this replaces pinned `X-MCP-Readonly: true` on every MCP request; moved into the box, an escaped agent simply omits it |
+| A lane grants more than the operation it was approved for | `methods` narrows a binding to a verb set (R10.4), and a narrower bound path narrows the lane | Honest limit: a route-scoped facade granted one operation; a lane grants origin + path-prefix + method-set. Narrower than before only if the user narrows it |
 
 The lane narrows what a compromised box yields from a long-lived key to a
 short-lived, scoped, revocable handle. It does not stop a box that legitimately
@@ -757,6 +863,32 @@ exactly as for hooks.
 
 ## Known gaps
 
+- **A lane is transport, not a facade — and that is a real reduction in
+  granularity.** The mechanism this replaces could expose `POST /sink` as one
+  operation and build the upstream request itself; a lane hands the box an
+  origin, a path prefix, and (with `methods`) a verb set, and the request body
+  is the box's to build. For anything narrower than that, a host-side facade is
+  still the right tool, and this design does not replace it.
+- **One lane is one upstream, so one secret with two destinations needs two
+  bindings.** A token valid for both `api.githubcopilot.com` and
+  `api.github.com` is pasted twice, rotated in two places, and shows as two
+  entries at the prompt. A named source referenced by several lanes would
+  collapse it without weakening anything — the security property is that the
+  *user* owns the destination set, not that it be a single URL.
+- **Every non-shell consumer re-derives the lane-name mangling.** The
+  `<lane>` → `<SUFFIX>` rule (upcase, `-`→`_`) is an ABI, and a TypeScript or
+  Python consumer that cannot source the shell helper spells the variable names
+  as literals. Renaming a lane keeps compiling and starts failing at runtime. An
+  in-box `min credential url <lane>` would make the rule an implementation
+  detail; the in-box `min` shim already exists to host it.
+- **Adopting a lane can pull tooling into the box.** Work a facade did
+  host-side — building a request envelope, say — lands in the box on adoption,
+  and the box may need packages it did not need before purely to speak an
+  upstream's request shape.
+- **Protocol translation is a non-goal, and for some adopters that is the whole
+  route.** A facade that translated between API dialects has no lane equivalent;
+  such a workflow keeps a translating sidecar, and the lane carries only the
+  credential.
 - **The control socket outlives the daemon.** Shutting `minimald` down leaves
   `credlane.sock` on the runtime dir. Harmless — the next bind removes a stale
   socket, and it refuses to unlink a non-socket — but it should be unlinked on

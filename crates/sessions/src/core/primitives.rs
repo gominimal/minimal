@@ -147,6 +147,40 @@ pub enum CredentialError {
     /// extra header lines into the rewritten request head.
     #[error("credential lane `{lane}` prefix must not contain CR or LF")]
     PrefixControlChars { lane: String },
+    /// An `inject.also` value carried CR or LF — the same forgery
+    /// `PrefixControlChars` refuses, on the other half of the header line.
+    #[error(
+        "credential lane `{lane}` `inject.also` value for `{header}` must not contain CR or LF"
+    )]
+    AlsoValueControlChars { lane: String, header: String },
+    /// An `inject.also` key names the header the credential is injected
+    /// into, or the header the box presents its token in. One header
+    /// cannot be both injected and overridden, and which of the two won
+    /// would decide whether the credential or a static string reached the
+    /// upstream.
+    #[error(
+        "credential lane `{lane}` `inject.also` key `{header}` collides with \
+         a header the broker already controls"
+    )]
+    AlsoHeaderCollision { lane: String, header: String },
+    /// An `endpoint_var` was not a legal environment variable name, so
+    /// the box could not read it back even if it were published.
+    #[error("credential lane `{lane}` endpoint_var `{name}` must match `[A-Za-z_][A-Za-z0-9_]*`")]
+    InvalidEndpointVar { lane: String, name: String },
+    /// Two lanes claim the same `endpoint_var`. Publishing both would
+    /// hand the box one endpoint under a name it believes means the
+    /// other — the same silent mis-aim [`Self::LaneSuffixCollision`]
+    /// refuses for the canonical variables.
+    #[error("credential lanes `{first}` and `{second}` both claim endpoint_var `{name}`")]
+    EndpointVarCollision {
+        first: String,
+        second: String,
+        name: String,
+    },
+    /// A binding's `methods` entry was not a non-empty uppercase ASCII
+    /// method token, so it could never match a request line.
+    #[error("credential lane `{lane}` method `{method}` must be a non-empty uppercase HTTP token")]
+    InvalidMethod { lane: String, method: String },
     /// A binding's upstream was not `https://`. Plain `http://` would put
     /// the user's secret on the wire in cleartext.
     #[error("credential lane `{lane}` upstream `{upstream}` must be an https:// URL")]
@@ -1394,23 +1428,53 @@ impl From<crate::wire::primitives::WireResolvedPatch> for ResolvedPatch {
 pub struct Credential {
     /// How the broker places the credential in the outbound request.
     pub inject: CredentialInject,
+    /// An additional environment variable the lane's endpoint is
+    /// published under, so software that reads a base URL from a fixed
+    /// name (`ANTHROPIC_BASE_URL`) needs no per-project shell to find it.
+    /// The endpoint is only knowable at launch, so it cannot be written
+    /// as a `[session.vars]` constant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_var: Option<String>,
 }
 
 impl Credential {
     /// Construct a lane declaration from its injection shape.
     #[must_use]
     pub fn new(inject: CredentialInject) -> Self {
-        Self { inject }
+        Self {
+            inject,
+            endpoint_var: None,
+        }
     }
 
-    /// Validate the injection shape, naming `lane` in any error.
+    /// Publish the lane's endpoint under an additional variable name.
+    #[must_use]
+    pub fn with_endpoint_var(mut self, name: impl Into<String>) -> Self {
+        self.endpoint_var = Some(name.into());
+        self
+    }
+
+    /// Validate the injection shape and the endpoint alias, naming `lane`
+    /// in any error.
     ///
     /// # Errors
     ///
-    /// Returns [`CredentialError::InvalidHeader`] or
-    /// [`CredentialError::PrefixControlChars`].
+    /// Returns [`CredentialError::InvalidHeader`],
+    /// [`CredentialError::PrefixControlChars`],
+    /// [`CredentialError::AlsoValueControlChars`],
+    /// [`CredentialError::AlsoHeaderCollision`], or
+    /// [`CredentialError::InvalidEndpointVar`].
     pub fn validate(&self, lane: &str) -> Result<(), CredentialError> {
-        self.inject.validate(lane)
+        self.inject.validate(lane)?;
+        if let Some(name) = &self.endpoint_var
+            && !is_env_var_name(name)
+        {
+            return Err(CredentialError::InvalidEndpointVar {
+                lane: lane.to_owned(),
+                name: name.clone(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1426,15 +1490,24 @@ pub struct CredentialInject {
     /// default; note the trailing space belongs in the prefix itself.
     #[serde(default)]
     pub prefix: String,
+    /// Additional **static, non-secret** headers the broker attaches to
+    /// every request on this lane.
+    ///
+    /// They exist because attaching a constraint host-side is different
+    /// in kind from asking the box to send one: a box can omit a header
+    /// it was told to send, but cannot remove one the broker adds.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub also: BTreeMap<String, String>,
 }
 
 impl CredentialInject {
-    /// Construct an injection with no prefix.
+    /// Construct an injection with no prefix and no extra headers.
     #[must_use]
     pub fn new(header: impl Into<String>) -> Self {
         Self {
             header: header.into(),
             prefix: String::new(),
+            also: BTreeMap::new(),
         }
     }
 
@@ -1445,23 +1518,29 @@ impl CredentialInject {
         self
     }
 
-    /// Validate the header and prefix, naming `lane` in any error.
+    /// Add a static header the broker attaches alongside the credential.
+    #[must_use]
+    pub fn with_also(mut self, header: impl Into<String>, value: impl Into<String>) -> Self {
+        self.also.insert(header.into(), value.into());
+        self
+    }
+
+    /// Validate the header, the prefix, and the static extras, naming
+    /// `lane` in any error.
     ///
     /// # Errors
     ///
-    /// Returns [`CredentialError::InvalidHeader`] if `header` is empty or
-    /// contains anything but visible ASCII (`:` excluded, since it
-    /// terminates the field name), or
-    /// [`CredentialError::PrefixControlChars`] if `prefix` contains CR or
-    /// LF — either would let a declaration forge extra header lines in the
-    /// rewritten request head.
+    /// Returns [`CredentialError::InvalidHeader`] if `header` — or an
+    /// `also` key — is empty or contains anything but visible ASCII (`:`
+    /// excluded, since it terminates the field name);
+    /// [`CredentialError::PrefixControlChars`] or
+    /// [`CredentialError::AlsoValueControlChars`] if a value contains CR
+    /// or LF, either of which would let a declaration forge extra header
+    /// lines in the rewritten request head; or
+    /// [`CredentialError::AlsoHeaderCollision`] if an `also` key names a
+    /// header the broker already sets.
     pub fn validate(&self, lane: &str) -> Result<(), CredentialError> {
-        let is_token = !self.header.is_empty()
-            && self
-                .header
-                .bytes()
-                .all(|b| b.is_ascii_graphic() && b != b':');
-        if !is_token {
+        if !is_header_token(&self.header) {
             return Err(CredentialError::InvalidHeader {
                 lane: lane.to_owned(),
                 header: self.header.clone(),
@@ -1472,8 +1551,53 @@ impl CredentialInject {
                 lane: lane.to_owned(),
             });
         }
+        for (header, value) in &self.also {
+            if !is_header_token(header) {
+                return Err(CredentialError::InvalidHeader {
+                    lane: lane.to_owned(),
+                    header: header.clone(),
+                });
+            }
+            if header.eq_ignore_ascii_case(&self.header)
+                || header.eq_ignore_ascii_case(CREDENTIAL_TOKEN_HEADER)
+            {
+                return Err(CredentialError::AlsoHeaderCollision {
+                    lane: lane.to_owned(),
+                    header: header.clone(),
+                });
+            }
+            if value.contains(['\r', '\n']) {
+                return Err(CredentialError::AlsoValueControlChars {
+                    lane: lane.to_owned(),
+                    header: header.clone(),
+                });
+            }
+        }
         Ok(())
     }
+}
+
+/// The header a box presents its credential-lane token in, named here
+/// because a declaration may not collide with it: the token header is
+/// *removed* on the way out while an injected header is *replaced*, so
+/// one header cannot be both.
+pub const CREDENTIAL_TOKEN_HEADER: &str = "X-Minimal-Credential-Token";
+
+/// A non-empty run of visible ASCII with no `:`, which terminates a field
+/// name. Deliberately stricter than RFC 9110's token so nothing that
+/// could reshape a request head survives.
+fn is_header_token(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_graphic() && b != b':')
+}
+
+/// `^[A-Za-z_][A-Za-z0-9_]*$` — what execve envp and every shell accept
+/// as a variable name.
+fn is_env_var_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The environment variable suffix a lane name mangles to: upcased, with
@@ -1503,8 +1627,8 @@ pub fn validate_credential_lane_name(lane: &str) -> Result<(), CredentialError> 
 }
 
 /// Validate a whole set of lanes: each name against the grammar, each
-/// injection shape, and the mangled environment suffixes against each
-/// other.
+/// injection shape and endpoint alias, and both the mangled environment
+/// suffixes and the declared aliases against each other.
 ///
 /// Taking an iterator rather than one map is what lets the composer run
 /// the same check across lanes merged from several sources, where two
@@ -1512,12 +1636,14 @@ pub fn validate_credential_lane_name(lane: &str) -> Result<(), CredentialError> 
 ///
 /// # Errors
 ///
-/// Returns the first [`CredentialError`] any lane produces, or
-/// [`CredentialError::LaneSuffixCollision`] if two lanes share a suffix.
+/// Returns the first [`CredentialError`] any lane produces,
+/// [`CredentialError::LaneSuffixCollision`] if two lanes share a suffix,
+/// or [`CredentialError::EndpointVarCollision`] if two claim one alias.
 pub fn validate_credential_lanes<'a>(
     lanes: impl IntoIterator<Item = (&'a str, &'a Credential)>,
 ) -> Result<(), CredentialError> {
     let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    let mut aliases: BTreeMap<&str, &str> = BTreeMap::new();
     for (lane, credential) in lanes {
         validate_credential_lane_name(lane)?;
         credential.validate(lane)?;
@@ -1527,6 +1653,15 @@ pub fn validate_credential_lanes<'a>(
                 first: first.to_owned(),
                 second: lane.to_owned(),
                 suffix,
+            });
+        }
+        if let Some(name) = credential.endpoint_var.as_deref()
+            && let Some(first) = aliases.insert(name, lane)
+        {
+            return Err(CredentialError::EndpointVarCollision {
+                first: first.to_owned(),
+                second: lane.to_owned(),
+                name: name.to_owned(),
             });
         }
     }
@@ -1571,9 +1706,27 @@ pub struct CredentialBinding {
     pub upstream: String,
     /// Where the credential value is read from.
     pub source: CredentialSource,
+    /// The HTTP methods this grant covers. Empty means every method, as
+    /// before the field existed.
+    ///
+    /// It is the user's, on the binding, for the same reason `upstream`
+    /// is: narrowing a grant is the grantor's to choose. Without it a
+    /// lane is strictly coarser than the host-side facade it replaces —
+    /// a facade exposing `POST /sink` granted one operation, a lane
+    /// granting an origin and a path prefix grants every method the
+    /// upstream honours on it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
 }
 
 impl CredentialBinding {
+    /// Whether this binding permits `method`, which an empty
+    /// [`Self::methods`] always does.
+    #[must_use]
+    pub fn allows_method(&self, method: &str) -> bool {
+        self.methods.is_empty() || self.methods.iter().any(|m| m == method)
+    }
+
     /// Validate the binding, naming `lane` in any error.
     ///
     /// # Errors
@@ -1581,8 +1734,18 @@ impl CredentialBinding {
     /// Returns [`CredentialError::InsecureUpstream`] unless `upstream` is
     /// an `https://` URL with a non-empty authority. Only the scheme is
     /// checked here; the broker parses the URL properly when it originates
-    /// the connection.
+    /// the connection. Returns [`CredentialError::InvalidMethod`] for a
+    /// `methods` entry that is not a non-empty uppercase ASCII token, which
+    /// could never match a request line.
     pub fn validate(&self, lane: &str) -> Result<(), CredentialError> {
+        for method in &self.methods {
+            if !is_header_token(method) || method.bytes().any(|b| b.is_ascii_lowercase()) {
+                return Err(CredentialError::InvalidMethod {
+                    lane: lane.to_owned(),
+                    method: method.clone(),
+                });
+            }
+        }
         let secure = self
             .upstream
             .split_at_checked("https://".len())
@@ -2192,6 +2355,123 @@ mod tests {
         );
         let err = c.validate("github-mcp").unwrap_err();
         assert!(matches!(err, CredentialError::PrefixControlChars { .. }));
+    }
+
+    #[test]
+    fn credential_endpoint_var_round_trips_and_is_validated() {
+        let c: Credential = parse(
+            r#"x = { inject = { header = "x-api-key" }, endpoint_var = "ANTHROPIC_BASE_URL" }"#,
+        );
+        assert_eq!(c.endpoint_var.as_deref(), Some("ANTHROPIC_BASE_URL"));
+        c.validate("anthropic").expect("a legal env var name");
+
+        for name in ["", "1BASE", "BASE URL", "BASE-URL", "BASE=URL"] {
+            let err = Credential::new(CredentialInject::new("x-api-key"))
+                .with_endpoint_var(name)
+                .validate("anthropic")
+                .unwrap_err();
+            assert!(
+                matches!(err, CredentialError::InvalidEndpointVar { .. }),
+                "accepted: {name}",
+            );
+        }
+    }
+
+    #[test]
+    fn credential_lanes_reject_two_claims_on_one_endpoint_var() {
+        let a = lane("x-api-key").with_endpoint_var("BASE_URL");
+        let b = lane("Authorization").with_endpoint_var("BASE_URL");
+        let err = validate_credential_lanes([("anthropic", &a), ("github-mcp", &b)]).unwrap_err();
+        assert!(
+            matches!(err, CredentialError::EndpointVarCollision { .. }),
+            "got: {err}",
+        );
+        assert!(err.to_string().contains("BASE_URL"), "got: {err}");
+    }
+
+    #[test]
+    fn credential_also_headers_round_trip() {
+        let c: Credential = parse(
+            r#"x = { inject = { header = "Authorization", prefix = "Bearer ", also = { "X-MCP-Readonly" = "true" } } }"#,
+        );
+        assert_eq!(
+            c.inject.also.get("X-MCP-Readonly").map(String::as_str),
+            Some("true"),
+        );
+        c.validate("github-mcp").expect("a static extra header");
+    }
+
+    #[test]
+    fn credential_also_may_not_claim_a_header_the_broker_controls() {
+        // Case-insensitively: one header cannot be both injected (the
+        // credential) or removed (the token) and overridden by a static
+        // string the project chose.
+        for header in ["x-API-key", "X-Minimal-Credential-TOKEN"] {
+            let c = Credential::new(CredentialInject::new("x-api-key").with_also(header, "1"));
+            let err = c.validate("anthropic").unwrap_err();
+            assert!(
+                matches!(err, CredentialError::AlsoHeaderCollision { .. }),
+                "accepted: {header}",
+            );
+        }
+    }
+
+    #[test]
+    fn credential_also_value_may_not_forge_a_header_line() {
+        let c = Credential::new(
+            CredentialInject::new("x-api-key").with_also("X-MCP-Readonly", "true\r\nX-Evil: 1"),
+        );
+        let err = c.validate("github-mcp").unwrap_err();
+        assert!(matches!(err, CredentialError::AlsoValueControlChars { .. }));
+    }
+
+    #[test]
+    fn bindings_carry_a_method_narrowing() {
+        let bindings = CredentialBindings::from_toml_str(indoc::indoc! {
+            r#"
+            [gist-sink]
+            upstream = "https://api.github.com/gists"
+            source   = { file = "~/.secrets/github-mcp-token" }
+            methods  = ["POST"]
+            "#
+        })
+        .unwrap();
+        let binding = bindings.get("gist-sink").expect("bound");
+        assert_eq!(binding.methods, ["POST"]);
+        assert!(binding.allows_method("POST"));
+        assert!(!binding.allows_method("GET"));
+    }
+
+    #[test]
+    fn bindings_with_no_methods_allow_every_method() {
+        let bindings = CredentialBindings::from_toml_str(indoc::indoc! {
+            r#"
+            [anthropic]
+            upstream = "https://api.anthropic.com"
+            source   = { env = "ANTHROPIC_API_KEY" }
+            "#
+        })
+        .unwrap();
+        let binding = bindings.get("anthropic").expect("bound");
+        assert!(binding.methods.is_empty());
+        assert!(binding.allows_method("DELETE"));
+    }
+
+    #[test]
+    fn bindings_reject_a_method_that_could_never_match_a_request_line() {
+        for method in ["post", "", "PO ST", "Post"] {
+            let err = CredentialBindings::from_toml_str(&format!(
+                "[gist-sink]\n\
+                 upstream = \"https://api.github.com/gists\"\n\
+                 source = {{ env = \"TOK\" }}\n\
+                 methods = [\"{method}\"]\n"
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(err, CredentialError::InvalidMethod { .. }),
+                "accepted: {method}",
+            );
+        }
     }
 
     #[test]

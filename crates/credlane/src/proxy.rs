@@ -43,6 +43,21 @@ use crate::token::Refused;
 /// header is *replaced*. One header cannot be both.
 pub const TOKEN_HEADER: &str = "X-Minimal-Credential-Token";
 
+/// The leading path segment marking the token form, `/t/<token>/<lane>/…`.
+///
+/// It exists because the mechanism this design replaces made an
+/// unauthenticated URL the whole capability, so a consumer needed exactly one
+/// field. Software with only a URL slot — one of the six harnesses that tried
+/// to adopt the lane parses `<url> [timeout=<n>]` and nothing else — cannot
+/// present a header at all.
+///
+/// A leading `t` is *always* the token form, never a lane: the name is
+/// reserved at registration (`server::RegisterError::Reserved`) rather than
+/// disambiguated positionally, because a token and a lane name are both
+/// lowercase alphanumerics and no position rule can tell `/t/abc` holding a
+/// short token from lane `t` holding path `abc`.
+pub const TOKEN_PATH_PREFIX: &str = "t";
+
 /// Structured-log component for everything on this path.
 const COMPONENT: &str = "credential-broker";
 
@@ -253,14 +268,32 @@ fn plan<T: LaneTable>(buffered: &Buffered, lanes: &T, now: Instant) -> Result<Fo
         return Err(Refused);
     }
     let selector = Selector::parse(head.target)?;
-    let token = head.value(TOKEN_HEADER).ok_or(Refused)?;
+    let token = agreed_token(selector.token, head.value(TOKEN_HEADER))?;
     let lane = lanes.resolve(token, selector.lane, now)?;
+    // After resolution, because the verb set is the binding's, and before the
+    // caller connects, so a method outside it never dials the upstream.
+    if !lane.allows_method(head.method) {
+        return Err(Refused);
+    }
     let target = selector.upstream_target(lane.upstream());
     Ok(Forward {
         head: rewrite(&head, &lane, &target)?,
         lane: lane.name().to_owned(),
         upstream: lane.upstream().clone(),
     })
+}
+
+/// The token a request presents, in either form.
+///
+/// Presenting both is ordinary — a URL-slot consumer that also has a header map
+/// — and legal only while they agree. Two different tokens are two different
+/// questions, and honouring either answers the one that was not asked.
+fn agreed_token<'a>(path: Option<&'a str>, header: Option<&'a str>) -> Result<&'a str, Refused> {
+    match (path, header) {
+        (Some(path), Some(header)) if path != header => Err(Refused),
+        (Some(token), _) | (None, Some(token)) => Ok(token),
+        (None, None) => Err(Refused),
+    }
 }
 
 /// A buffered request head and the body bytes the same read already took.
@@ -412,8 +445,25 @@ fn is_visible(text: &str) -> bool {
     text.bytes().all(|b| b.is_ascii_graphic())
 }
 
+/// Whether `name` is a field name and nothing more: visible ASCII without the
+/// `:` that terminates it. The same predicate a declaration is parsed against.
+fn is_header_name(name: &str) -> bool {
+    !name.is_empty() && is_visible(name) && !name.contains(':')
+}
+
+/// Whether `value` can be a field value: no control byte but tab, so it cannot
+/// end the line it is written on.
+fn is_field_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|b| b == b'\t' || (b >= 0x20 && b != 0x7f))
+}
+
 /// What the box's request target selects.
 struct Selector<'a> {
+    /// The token a `/t/<token>` prefix carried, if it did. Consumed here and
+    /// never composed into the upstream target.
+    token: Option<&'a str>,
     lane: &'a str,
     /// The rest of the path, still percent-encoded. The decode below is a
     /// validation, not a rewrite: the upstream is entitled to the bytes the box
@@ -431,7 +481,20 @@ impl<'a> Selector<'a> {
             None => (path_and_query, None),
         };
         let mut segments = path.strip_prefix('/').ok_or(Refused)?.split('/');
-        let lane = segments.next().ok_or(Refused)?;
+        let leading = segments.next().ok_or(Refused)?;
+        // Stripped before anything reads the selector, so lane resolution, the
+        // traversal rule below and the path composition are the same code on
+        // either form of the URL.
+        let token = if leading == TOKEN_PATH_PREFIX {
+            Some(path_token(segments.next().ok_or(Refused)?)?)
+        } else {
+            None
+        };
+        let lane = if token.is_some() {
+            segments.next().ok_or(Refused)?
+        } else {
+            leading
+        };
         // The grammar is the same one the lane name was parsed against, so a
         // percent-encoded or otherwise dressed-up selector never matches.
         validate_credential_lane_name(lane).map_err(|_| Refused)?;
@@ -439,6 +502,7 @@ impl<'a> Selector<'a> {
             .map(checked_segment)
             .collect::<Result<Vec<_>, Refused>>()?;
         Ok(Self {
+            token,
             lane,
             remainder,
             query,
@@ -482,6 +546,17 @@ fn origin_form(target: &str) -> Option<&str> {
     }
     let (_, authority_and_path) = target.split_once("://")?;
     Some(&authority_and_path[authority_and_path.find('/')?..])
+}
+
+/// A token carried as a path segment.
+///
+/// Bare alphanumerics, which is what a hex-encoded mint produces: a segment
+/// needing an escape to be written could decode into a second one, and the
+/// authorisation runs on the bytes as sent. Missing and malformed are the same
+/// refusal as an unknown token, so `/t/` answers nothing about token shape.
+fn path_token(segment: &str) -> Result<&str, Refused> {
+    let well_formed = !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_alphanumeric());
+    well_formed.then_some(segment).ok_or(Refused)
 }
 
 /// A remainder segment that cannot escape the bound upstream's path.
@@ -533,11 +608,9 @@ fn percent_decode(segment: &str) -> Result<Vec<u8>, Refused> {
 /// whatever a resolver read — and a secret file with a trailing newline is the
 /// ordinary case, not the adversarial one.
 fn rewrite(head: &Head<'_>, lane: &Lane, target: &str) -> Result<String, Refused> {
-    let value = lane.inject().header_value(lane.secret());
-    if !value
-        .bytes()
-        .all(|b| b == b'\t' || (b >= 0x20 && b != 0x7f))
-    {
+    let inject = lane.inject();
+    let value = inject.header_value(lane.secret());
+    if !is_field_value(&value) {
         tracing::warn!(
             component = COMPONENT,
             lane = %lane.name(),
@@ -547,7 +620,7 @@ fn rewrite(head: &Head<'_>, lane: &Lane, target: &str) -> Result<String, Refused
         return Err(Refused);
     }
     let hop_by_hop = head.hop_by_hop();
-    let injected = lane.inject().header();
+    let injected = inject.header();
     let mut out = format!(
         "{} {target} HTTP/1.1\r\nHost: {}\r\n",
         head.method,
@@ -558,12 +631,31 @@ fn rewrite(head: &Head<'_>, lane: &Lane, target: &str) -> Result<String, Refused
         let relayed = lowered != "host"
             && !hop_by_hop.contains(&lowered)
             && !name.eq_ignore_ascii_case(TOKEN_HEADER)
-            && !name.eq_ignore_ascii_case(injected);
+            && !name.eq_ignore_ascii_case(injected)
+            // A host-attached header is stripped exactly as the credential's is:
+            // a box that could leave its own copy in place would be choosing
+            // which of the two the upstream read, which is the constraint gone.
+            && !inject.also().keys().any(|extra| extra.eq_ignore_ascii_case(name));
         if relayed {
             push_header(&mut out, name, value);
         }
     }
     push_header(&mut out, injected, &value);
+    for (name, value) in inject.also() {
+        // Both halves are validated where the declaration is parsed; re-checked
+        // here because this is the process the box cannot reach, and the one
+        // that would do the forging.
+        if !is_header_name(name) || !is_field_value(value) {
+            tracing::warn!(
+                component = COMPONENT,
+                lane = %lane.name(),
+                header = %name,
+                "an inject.also header cannot be attached and the request is refused"
+            );
+            return Err(Refused);
+        }
+        push_header(&mut out, name, value);
+    }
     // Not merely stripping the inbound `Connection`: HTTP/1.1 is persistent by
     // default, so stripping keep-alive is a no-op and request 2 on a pooled
     // socket would reach the upstream with no credential at all.
@@ -595,6 +687,7 @@ mod tests {
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tokio::sync::oneshot;
 
@@ -625,16 +718,23 @@ mod tests {
         }
     }
 
-    /// The plaintext upstream leg. `#[cfg(test)]` on purpose: production
-    /// upstreams are `https://` by parse-time constraint, and a plaintext
-    /// connector reachable from the daemon would be a downgrade waiting to be
-    /// wired up.
-    struct PlaintextUpstream;
+    /// The plaintext upstream leg, counting the connections it opens.
+    /// `#[cfg(test)]` on purpose: production upstreams are `https://` by
+    /// parse-time constraint, and a plaintext connector reachable from the
+    /// daemon would be a downgrade waiting to be wired up.
+    ///
+    /// The count is what distinguishes a refusal that never dialled from one
+    /// that dialled and sent nothing; a backend recording requests cannot.
+    #[derive(Default)]
+    struct PlaintextUpstream {
+        dialled: Arc<AtomicUsize>,
+    }
 
     impl Connector for PlaintextUpstream {
         type Stream = TcpStream;
 
         async fn connect(&self, upstream: &Url) -> io::Result<Self::Stream> {
+            self.dialled.fetch_add(1, Ordering::SeqCst);
             let host = upstream.host_str().unwrap_or("127.0.0.1").to_owned();
             let port = upstream.port_or_known_default().unwrap_or(80);
             TcpStream::connect((host, port)).await
@@ -652,6 +752,16 @@ mod tests {
 
     /// Starts a broker holding `lanes`, with a token scoped to `scope`.
     async fn spawn_broker(lanes: Vec<Lane>, scope: &[&str]) -> (SocketAddr, Token) {
+        let (addr, token, _dialled) = spawn_counting_broker(lanes, scope).await;
+        (addr, token)
+    }
+
+    /// As [`spawn_broker`], plus the count of upstream connections the broker
+    /// has opened.
+    async fn spawn_counting_broker(
+        lanes: Vec<Lane>,
+        scope: &[&str],
+    ) -> (SocketAddr, Token, Arc<AtomicUsize>) {
         let mut store = TokenStore::new();
         let (token, _) = store.mint(
             sessions::SessionId::nil(),
@@ -668,12 +778,10 @@ mod tests {
         };
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve(
-            listener,
-            Arc::new(table),
-            Arc::new(PlaintextUpstream),
-        ));
-        (addr, token)
+        let connector = PlaintextUpstream::default();
+        let dialled = Arc::clone(&connector.dialled);
+        tokio::spawn(serve(listener, Arc::new(table), Arc::new(connector)));
+        (addr, token, dialled)
     }
 
     /// Reads one whole request: the head, plus a `Content-Length` body when the
@@ -738,6 +846,12 @@ mod tests {
 
     fn get(target: &str, token: &str) -> String {
         format!("GET {target} HTTP/1.1\r\nHost: broker.invalid\r\n{TOKEN_HEADER}: {token}\r\n\r\n")
+    }
+
+    /// A request carrying no token header, which is the whole point of the URL
+    /// form: the target is the only place a token can be.
+    fn get_bare(target: &str) -> String {
+        format!("GET {target} HTTP/1.1\r\nHost: broker.invalid\r\n\r\n")
     }
 
     /// Sends `request`, half-closes, and reads the whole response. The
@@ -1049,6 +1163,171 @@ mod tests {
             "{forwarded}"
         );
         assert!(!forwarded.contains("evil.example"), "{forwarded}");
+    }
+
+    #[tokio::test]
+    async fn a_token_in_the_path_authenticates_and_never_reaches_the_upstream() {
+        let (upstream, seen) = spawn_backend().await;
+        let (broker, token) = spawn_broker(
+            vec![lane("anthropic", &upstream, "x-api-key")],
+            &["anthropic"],
+        )
+        .await;
+
+        let target = format!("/t/{}/anthropic/v1/messages", token.expose());
+        let response = round_trip(broker, &get_bare(&target)).await;
+
+        assert!(response.contains("200 OK"), "{response}");
+        let forwarded = sole_request(&seen);
+        assert!(
+            forwarded.starts_with("GET /base/v1/messages HTTP/1.1\r\n"),
+            "the token segment must be consumed, not composed into the path: {forwarded}"
+        );
+        assert!(
+            !forwarded.contains(token.expose()),
+            "the token must not reach the upstream in either carrier: {forwarded}"
+        );
+        assert!(
+            forwarded.contains(&format!("x-api-key: {SECRET}")),
+            "{forwarded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_path_token_is_refused_exactly_as_an_unknown_one_is() {
+        let (upstream, seen) = spawn_backend().await;
+        let (broker, token) = spawn_broker(
+            vec![lane("anthropic", &upstream, "x-api-key")],
+            &["anthropic"],
+        )
+        .await;
+
+        let baseline = round_trip(broker, &get("/anthropic/v1", "not-a-token")).await;
+        for target in [
+            "/t".to_owned(),
+            "/t/".to_owned(),
+            "/t//anthropic/v1".to_owned(),
+            // Well-formed but wrong, and dressed-up forms of the right one: a
+            // token that needs an escape to be written could decode into a
+            // second path segment.
+            "/t/deadbeef/anthropic/v1".to_owned(),
+            format!("/t/{}%2f/anthropic/v1", token.expose()),
+            format!("/t/{}./anthropic/v1", token.expose()),
+        ] {
+            assert_eq!(
+                round_trip(broker, &get_bare(&target)).await,
+                baseline,
+                "{target} must be refused exactly as an unknown token is"
+            );
+        }
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn two_carriers_are_honoured_only_when_they_agree() {
+        let (upstream, seen) = spawn_backend().await;
+        let (broker, token) = spawn_broker(
+            vec![lane("anthropic", &upstream, "x-api-key")],
+            &["anthropic"],
+        )
+        .await;
+
+        let both = |header: &str| {
+            format!(
+                "GET /t/{}/anthropic/v1 HTTP/1.1\r\nHost: broker.invalid\r\n\
+                 {TOKEN_HEADER}: {header}\r\n\r\n",
+                token.expose()
+            )
+        };
+        assert!(
+            round_trip(broker, &both(token.expose()))
+                .await
+                .contains("200 OK"),
+            "a URL-slot consumer that also has a header map is ordinary"
+        );
+
+        let baseline = round_trip(broker, &get("/anthropic/v1", "not-a-token")).await;
+        assert_eq!(
+            round_trip(broker, &both("deadbeef")).await,
+            baseline,
+            "two different tokens are two different questions"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_declared_extra_header_is_attached_and_the_box_cannot_displace_it() {
+        let (upstream, seen) = spawn_backend().await;
+        let guarded = Lane::new(
+            "github-mcp",
+            Url::parse(&upstream).unwrap(),
+            Inject::new("authorization", "Bearer ").with_also([("X-MCP-Readonly", "true")]),
+            Secret::new(SECRET),
+        );
+        let (broker, token) = spawn_broker(vec![guarded], &["github-mcp"]).await;
+
+        // The box contradicts the guard rail and duplicates it in a second
+        // casing: an attach that does not strip first leaves the upstream to
+        // choose which line it believes.
+        let request = format!(
+            "GET /github-mcp/mcp HTTP/1.1\r\nHost: broker.invalid\r\n\
+             {TOKEN_HEADER}: {}\r\nX-MCP-Readonly: false\r\nx-mcp-readonly: false\r\n\r\n",
+            token.expose()
+        );
+        round_trip(broker, &request).await;
+
+        let forwarded = sole_request(&seen);
+        assert!(
+            !forwarded.contains("false"),
+            "the box's contradiction must not survive: {forwarded}"
+        );
+        assert_eq!(
+            forwarded
+                .to_ascii_lowercase()
+                .matches("x-mcp-readonly:")
+                .count(),
+            1,
+            "exactly one guard rail must reach the upstream: {forwarded}"
+        );
+        assert!(forwarded.contains("X-MCP-Readonly: true"), "{forwarded}");
+    }
+
+    #[tokio::test]
+    async fn a_method_outside_the_binding_is_refused_without_dialling_the_upstream() {
+        let (upstream, seen) = spawn_backend().await;
+        let post_only =
+            lane("gist-sink", &upstream, "authorization").with_methods(["POST".to_owned()]);
+        let (broker, token, dialled) = spawn_counting_broker(vec![post_only], &["gist-sink"]).await;
+
+        let allowed = format!(
+            "POST /gist-sink/gists HTTP/1.1\r\nHost: broker.invalid\r\n\
+             {TOKEN_HEADER}: {}\r\nContent-Length: 0\r\n\r\n",
+            token.expose()
+        );
+        assert!(round_trip(broker, &allowed).await.contains("200 OK"));
+        assert_eq!(dialled.load(Ordering::SeqCst), 1);
+
+        let baseline = round_trip(broker, &get("/gist-sink/gists", "not-a-token")).await;
+        // `post` last: methods are case-sensitive, so a narrowing compared
+        // case-insensitively would widen the binding the user wrote.
+        for method in ["GET", "DELETE", "post"] {
+            let request = format!(
+                "{method} /gist-sink/gists HTTP/1.1\r\nHost: broker.invalid\r\n\
+                 {TOKEN_HEADER}: {}\r\n\r\n",
+                token.expose()
+            );
+            assert_eq!(
+                round_trip(broker, &request).await,
+                baseline,
+                "{method} must be refused exactly as an unknown token is"
+            );
+        }
+        assert_eq!(
+            dialled.load(Ordering::SeqCst),
+            1,
+            "a refused method must never open a connection to the upstream"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[test]

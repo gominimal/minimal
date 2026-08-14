@@ -1558,18 +1558,47 @@ fn layer_session_env(
 /// (`ANTHROPIC_BASE_URL` for one, an MCP server URL for another).
 const CREDENTIAL_ENDPOINT_PREFIX: &str = "MINIMAL_CREDENTIAL_ENDPOINT_";
 
+/// Prefix of the per-lane self-authenticating URL: the endpoint with the
+/// token as a `/t/<token>` path prefix.
+///
+/// It exists because the mechanism this lane replaces made an
+/// unauthenticated URL *be* the capability, so a consumer needed exactly
+/// one field. Agent harnesses expose a base-URL knob far more often than a
+/// header map, and one of the six ported onto this design (goose) has no
+/// header route at all — header-only could not be adopted there. Software
+/// with a header slot should still prefer the plain endpoint, which is safe
+/// to log or check in.
+const CREDENTIAL_URL_PREFIX: &str = "MINIMAL_CREDENTIAL_URL_";
+
+/// Prefix of the per-lane bound upstream, so a box can tell how much of the
+/// path the binding already covers. Not a secret: it is the user's own
+/// binding, already in `composition.json` and in `min session credentials`.
+const CREDENTIAL_UPSTREAM_PREFIX: &str = "MINIMAL_CREDENTIAL_UPSTREAM_";
+
+/// The lanes that survived the gate, so a box can tell a *denied* lane from
+/// a *misspelled* one: either is simply absent from the environment, which
+/// surfaces as a confusing `401` deep inside an agent rather than an error
+/// at launch.
+const CREDENTIAL_LANES_VAR: &str = "MINIMAL_CREDENTIAL_LANES";
+
 /// The one token variable. One per session, not per lane: the token's
 /// scope *is* the set of lanes it was minted for.
 const CREDENTIAL_TOKEN_VAR: &str = "MINIMAL_CREDENTIAL_TOKEN";
 
-/// The credential-lane layer of [`layer_session_env`]: an endpoint
-/// variable per composed lane, plus the session's token.
+/// The credential-lane layer of [`layer_session_env`]: per composed lane an
+/// endpoint, a self-authenticating URL, the bound upstream, and any name the
+/// declaration asked the endpoint be aliased to, plus the gated lane list and
+/// the session's token.
 ///
 /// Every part is required. A box with no composed lane, one whose
 /// activation minted no token, and one whose network mode leaves the
 /// broker unreachable (`NoNet`, hence no `endpoint`) each get *nothing* —
 /// never an empty variable, which reads as a configured endpoint to the
 /// software that finds it and fails far from the cause.
+///
+/// Aliases are emitted ahead of the canonical variables, and the layer is
+/// inserted last-wins, so a declaration that aliases an endpoint to a
+/// `MINIMAL_CREDENTIAL_*` name shadows nothing.
 fn credential_env(
     lanes: &[sessions::core::compose::SessionCredential],
     endpoint: Option<credlane::BrokerEndpoint>,
@@ -1581,21 +1610,34 @@ fn credential_env(
     if lanes.is_empty() {
         return Vec::new();
     }
-    lanes
-        .iter()
-        .map(|c| {
-            let lane = c.lane().lane();
-            let suffix = sessions::core::primitives::credential_env_suffix(lane);
-            (
-                format!("{CREDENTIAL_ENDPOINT_PREFIX}{suffix}"),
-                endpoint.lane_url(lane),
-            )
-        })
-        .chain(std::iter::once((
-            CREDENTIAL_TOKEN_VAR.to_string(),
-            token.to_string(),
-        )))
-        .collect()
+    let mut aliases = Vec::new();
+    let mut env = Vec::with_capacity(lanes.len() * 3 + 2);
+    let mut names: Vec<&str> = Vec::with_capacity(lanes.len());
+    for credential in lanes {
+        let lane = credential.lane().lane();
+        let suffix = sessions::core::primitives::credential_env_suffix(lane);
+        let lane_url = endpoint.lane_url(lane);
+        if let Some(alias) = credential.lane().endpoint_var() {
+            aliases.push((alias.to_owned(), lane_url.clone()));
+        }
+        env.push((format!("{CREDENTIAL_ENDPOINT_PREFIX}{suffix}"), lane_url));
+        env.push((
+            format!("{CREDENTIAL_URL_PREFIX}{suffix}"),
+            // Built from the parser's own constant: the URL form and the
+            // segment the broker consumes cannot drift apart.
+            format!("{endpoint}/{}/{token}/{lane}", credlane::TOKEN_PATH_PREFIX),
+        ));
+        env.push((
+            format!("{CREDENTIAL_UPSTREAM_PREFIX}{suffix}"),
+            credential.lane().upstream().to_owned(),
+        ));
+        names.push(lane);
+    }
+    names.sort_unstable();
+    env.push((CREDENTIAL_LANES_VAR.to_string(), names.join(" ")));
+    env.push((CREDENTIAL_TOKEN_VAR.to_string(), token.to_string()));
+    aliases.extend(env);
+    aliases
 }
 
 /// The real [`SessionLauncher`]: evaluates a minimal context into a graph,
@@ -2917,10 +2959,21 @@ mod tests {
 
     /// A lane as it reaches the launcher: post-gate, upstream bound.
     fn lane(name: &str) -> sessions::core::compose::SessionCredential {
+        aliased_lane(name, None)
+    }
+
+    /// The same, carrying the extra name the declaration asked its
+    /// endpoint be published under.
+    fn aliased_lane(
+        name: &str,
+        endpoint_var: Option<&str>,
+    ) -> sessions::core::compose::SessionCredential {
         sessions::wire::primitives::WireCredentialLane {
             lane: name.to_owned(),
-            upstream: "https://api.example/".to_owned(),
+            upstream: format!("https://api.example/{name}/"),
             header: "Authorization".to_owned(),
+            also: std::collections::BTreeMap::new(),
+            endpoint_var: endpoint_var.map(ToOwned::to_owned),
             source: sessions::wire::primitives::WireSource::UserLoadout {
                 name: "dev".to_owned(),
             },
@@ -2967,8 +3020,161 @@ mod tests {
             env.keys()
                 .filter(|k| k.starts_with("MINIMAL_CREDENTIAL_"))
                 .count(),
-            3,
-            "two endpoints and one token, nothing else"
+            8,
+            "endpoint, URL, and upstream per lane, plus the lane list and \
+             one token — nothing else"
+        );
+    }
+
+    /// R10.6: the bound upstream, so a box can tell how much of the path
+    /// the binding already covers.
+    #[test]
+    fn each_lane_publishes_the_upstream_its_binding_bound() {
+        let vars = credential_env(
+            &[lane("anthropic"), lane("github-mcp")],
+            broker_endpoint(sessions::NetworkMode::HostNet),
+            Some("tok-live-hunter2"),
+        );
+        let get = |key: &str| vars.iter().find(|(k, _)| k == key).unwrap().1.clone();
+
+        assert_eq!(
+            get("MINIMAL_CREDENTIAL_UPSTREAM_ANTHROPIC"),
+            "https://api.example/anthropic/"
+        );
+        assert_eq!(
+            get("MINIMAL_CREDENTIAL_UPSTREAM_GITHUB_MCP"),
+            "https://api.example/github-mcp/"
+        );
+    }
+
+    /// R10.1: two forms of the same lane. Software with a header slot uses
+    /// the endpoint, which is safe to log; software with only a URL slot
+    /// uses the self-authenticating form and works unmodified.
+    #[test]
+    fn the_url_form_carries_the_token_and_the_endpoint_form_does_not() {
+        let vars = credential_env(
+            &[lane("anthropic")],
+            broker_endpoint(sessions::NetworkMode::HostNet),
+            Some("tok-live-hunter2"),
+        );
+        let get = |key: &str| vars.iter().find(|(k, _)| k == key).unwrap().1.clone();
+
+        let endpoint = get("MINIMAL_CREDENTIAL_ENDPOINT_ANTHROPIC");
+        let url = get("MINIMAL_CREDENTIAL_URL_ANTHROPIC");
+        assert!(
+            !endpoint.contains("tok-live-hunter2"),
+            "the loggable form must not carry the token: {endpoint}"
+        );
+        let origin = endpoint.strip_suffix("/anthropic").expect(&endpoint);
+        assert_eq!(url, format!("{origin}/t/tok-live-hunter2/anthropic"));
+    }
+
+    /// R10.5: a denied lane is simply absent from the environment, which is
+    /// indistinguishable from a typo at the point of use — so the gated set
+    /// is named outright, sorted rather than in composition order.
+    #[test]
+    fn the_lane_list_names_exactly_the_gated_set() {
+        let vars = credential_env(
+            &[lane("github-mcp"), lane("anthropic")],
+            broker_endpoint(sessions::NetworkMode::HostNet),
+            Some("tok-live-hunter2"),
+        );
+        let lanes = vars
+            .iter()
+            .find(|(k, _)| k == "MINIMAL_CREDENTIAL_LANES")
+            .unwrap();
+        assert_eq!(lanes.1, "anthropic github-mcp");
+    }
+
+    /// R10.2: the alias exists so software that reads a base URL from a
+    /// fixed name needs no per-project shell, so it must carry the same
+    /// value as the canonical variable, not a second-guessed one.
+    #[test]
+    fn an_endpoint_var_publishes_the_endpoint_under_both_names() {
+        let env = layer_session_env(
+            session_baseline_env("box-1", None),
+            vec![],
+            vec![],
+            vec![],
+            credential_env(
+                &[aliased_lane("anthropic", Some("ANTHROPIC_BASE_URL"))],
+                broker_endpoint(sessions::NetworkMode::HostNet),
+                Some("tok-live-hunter2"),
+            ),
+        );
+
+        assert_eq!(
+            env["ANTHROPIC_BASE_URL"], env["MINIMAL_CREDENTIAL_ENDPOINT_ANTHROPIC"],
+            "the alias is the endpoint under a second name"
+        );
+        assert!(
+            !env["ANTHROPIC_BASE_URL"].contains("tok-live-hunter2"),
+            "the alias is the loggable form: {}",
+            env["ANTHROPIC_BASE_URL"]
+        );
+    }
+
+    /// The shadowing property, for the alias: it is published in the same
+    /// layer as the canonical variables precisely so a loadout declaring
+    /// the aliased name cannot point the box's requests — token attached —
+    /// at a host it chose.
+    #[test]
+    fn a_composed_var_cannot_shadow_an_endpoint_var_alias() {
+        let sv = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let env = layer_session_env(
+            session_baseline_env("box-1", None),
+            vec![sv(
+                "ANTHROPIC_BASE_URL",
+                "http://inherited.attacker.example",
+            )],
+            vec![sv("ANTHROPIC_BASE_URL", "http://composed.attacker.example")],
+            vec![sv(
+                "ANTHROPIC_BASE_URL",
+                "http://connection.attacker.example",
+            )],
+            credential_env(
+                &[aliased_lane("anthropic", Some("ANTHROPIC_BASE_URL"))],
+                broker_endpoint(sessions::NetworkMode::HostNet),
+                Some("tok-live-hunter2"),
+            ),
+        );
+
+        assert!(
+            !env["ANTHROPIC_BASE_URL"].contains("attacker"),
+            "no lower layer may win the aliased name: {}",
+            env["ANTHROPIC_BASE_URL"]
+        );
+        assert_eq!(
+            env["ANTHROPIC_BASE_URL"],
+            env["MINIMAL_CREDENTIAL_ENDPOINT_ANTHROPIC"]
+        );
+    }
+
+    /// An alias naming a canonical variable is a declaration reaching for
+    /// the token variable or another lane's endpoint; the canonical value
+    /// wins, so the layer stays self-consistent.
+    #[test]
+    fn an_endpoint_var_cannot_displace_a_canonical_credential_variable() {
+        let env = layer_session_env(
+            session_baseline_env("box-1", None),
+            vec![],
+            vec![],
+            vec![],
+            credential_env(
+                &[
+                    aliased_lane("anthropic", Some("MINIMAL_CREDENTIAL_TOKEN")),
+                    aliased_lane("github-mcp", Some("MINIMAL_CREDENTIAL_ENDPOINT_ANTHROPIC")),
+                ],
+                broker_endpoint(sessions::NetworkMode::HostNet),
+                Some("tok-live-hunter2"),
+            ),
+        );
+
+        assert_eq!(env["MINIMAL_CREDENTIAL_TOKEN"], "tok-live-hunter2");
+        assert!(
+            env["MINIMAL_CREDENTIAL_ENDPOINT_ANTHROPIC"].ends_with("/anthropic"),
+            "{}",
+            env["MINIMAL_CREDENTIAL_ENDPOINT_ANTHROPIC"]
         );
     }
 
@@ -3006,11 +3212,12 @@ mod tests {
     }
 
     /// An empty netns reaches no broker, so a `NoNet` box is handed
-    /// nothing rather than a URL it cannot dial.
+    /// nothing rather than a URL it cannot dial — the declaration's alias
+    /// included, which would otherwise read as a configured base URL.
     #[test]
     fn a_no_net_session_gets_no_credential_variables() {
         let vars = credential_env(
-            &[lane("anthropic")],
+            &[aliased_lane("anthropic", Some("ANTHROPIC_BASE_URL"))],
             broker_endpoint(sessions::NetworkMode::NoNet),
             Some("tok-live-hunter2"),
         );
@@ -3032,7 +3239,7 @@ mod tests {
     #[test]
     fn a_session_finalized_without_a_token_gets_no_credential_variables() {
         let vars = credential_env(
-            &[lane("anthropic")],
+            &[aliased_lane("anthropic", Some("ANTHROPIC_BASE_URL"))],
             broker_endpoint(sessions::NetworkMode::HostNet),
             None,
         );

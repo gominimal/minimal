@@ -140,6 +140,10 @@ pub struct LaneRegistration {
     pub inject: Inject,
     /// The resolved credential value.
     pub secret: Secret,
+    /// The methods the *user's* binding covers. Empty is every method, which
+    /// is what a binding without the field means.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
 }
 
 /// A control request. One per connection, one line of JSON.
@@ -229,6 +233,14 @@ pub enum RegisterError {
         /// The scheme it was bound with.
         scheme: String,
     },
+    /// The lane name is the one the `/t/<token>` URL form claims.
+    #[error(
+        "lane {lane}: the name is reserved for the /t/<token>/<lane> URL form; rename the lane"
+    )]
+    Reserved {
+        /// The offending lane.
+        lane: String,
+    },
 }
 
 /// The broker's live registrations: the token store plus the lanes each
@@ -280,6 +292,12 @@ impl Broker {
                     lane: reg.lane.clone(),
                     source,
                 })?;
+                // Reserved rather than positionally disambiguated: a leading
+                // `t` is always the token form, so a lane by that name would be
+                // reachable only by header — a trap discovered at runtime.
+                if reg.lane == proxy::TOKEN_PATH_PREFIX {
+                    return Err(RegisterError::Reserved { lane: reg.lane });
+                }
                 if reg.upstream.scheme() != "https" {
                     return Err(RegisterError::Upstream {
                         lane: reg.lane,
@@ -288,7 +306,8 @@ impl Broker {
                 }
                 Ok((
                     reg.lane.clone(),
-                    Lane::new(reg.lane, reg.upstream, reg.inject, reg.secret),
+                    Lane::new(reg.lane, reg.upstream, reg.inject, reg.secret)
+                        .with_methods(reg.methods),
                 ))
             })
             .collect::<Result<_, RegisterError>>()?;
@@ -739,6 +758,7 @@ mod tests {
             upstream: Url::parse(upstream).unwrap(),
             inject: Inject::new("Authorization", "Bearer "),
             secret: Secret::new(secret),
+            methods: Vec::new(),
         }
     }
 

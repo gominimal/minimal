@@ -212,6 +212,8 @@ pub enum SessionStep {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::wire::primitives::{PendingId, WireResolvedVar, WireSource, WireVarSpec};
 
@@ -253,6 +255,10 @@ mod tests {
                 lane: "anthropic".into(),
                 header: "x-api-key".into(),
                 prefix: String::new(),
+                also: [("X-MCP-Readonly".to_owned(), "true".to_owned())]
+                    .into_iter()
+                    .collect(),
+                endpoint_var: Some("ANTHROPIC_BASE_URL".into()),
                 source: WireSource::Project {
                     path: paths::HostPath::try_new("/repo").unwrap(),
                 },
@@ -351,6 +357,8 @@ mod tests {
                 lane: "anthropic".into(),
                 upstream: "https://api.anthropic.com".into(),
                 header: "x-api-key".into(),
+                also: BTreeMap::new(),
+                endpoint_var: None,
                 source: WireSource::Project {
                     path: paths::HostPath::try_new("/repo").unwrap(),
                 },
@@ -361,13 +369,19 @@ mod tests {
 
     /// A persisted lane survives the snapshot → domain → snapshot trip
     /// intact, so a restart re-applies the lane the user approved rather
-    /// than a differently-pointed one.
+    /// than a differently-pointed one — including what the project
+    /// declared beyond the header, which decides what the box's
+    /// environment names and what the broker attaches.
     #[test]
     fn composition_snapshot_round_trips_a_lane() {
         let lane = WireCredentialLane {
             lane: "anthropic".into(),
             upstream: "https://api.anthropic.com".into(),
             header: "x-api-key".into(),
+            also: [("X-MCP-Readonly".to_owned(), "true".to_owned())]
+                .into_iter()
+                .collect(),
+            endpoint_var: Some("ANTHROPIC_BASE_URL".into()),
             source: WireSource::Project {
                 path: paths::HostPath::try_new("/repo").unwrap(),
             },
@@ -379,6 +393,24 @@ mod tests {
         let composition = crate::core::compose::Composition::try_from(snapshot)
             .expect("snapshot with a lane loads");
         assert_eq!(WireComposition::from(&composition).credentials, [lane]);
+    }
+
+    /// A peer that predates the Unit 10 declaration fields sends a lane
+    /// without them. They must default rather than fault the message, so
+    /// the session composes with the lane it does understand.
+    #[test]
+    fn lane_without_the_declaration_extras_deserializes_empty() {
+        let json = r#"{"lane":"anthropic","upstream":"https://api.anthropic.com",
+            "header":"x-api-key","source":{"kind":"user_loadout","name":"dev"}}"#;
+        let lane: WireCredentialLane = serde_json_lenient::from_str(json).unwrap();
+        assert!(lane.also.is_empty());
+        assert_eq!(lane.endpoint_var, None);
+
+        let json = r#"{"id":1,"lane":"anthropic","header":"x-api-key",
+            "source":{"kind":"user_loadout","name":"dev"}}"#;
+        let pending: WirePendingCredential = serde_json_lenient::from_str(json).unwrap();
+        assert!(pending.also.is_empty());
+        assert_eq!(pending.endpoint_var, None);
     }
 
     /// A snapshot written before lanes existed loads as "no lanes",

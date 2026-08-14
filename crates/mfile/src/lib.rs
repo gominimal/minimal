@@ -1873,6 +1873,99 @@ mod tests {
         assert!(err.to_string().contains("Anthropic_Prod"), "got: {err}");
     }
 
+    /// The two declaration fields a real workflow needed: an endpoint
+    /// published under a name its software already reads, and a static
+    /// header attached where the box cannot drop it.
+    #[test]
+    fn session_credentials_parse_endpoint_var_and_also() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session.credentials.anthropic]
+            inject       = { header = "x-api-key" }
+            endpoint_var = "ANTHROPIC_BASE_URL"
+
+            [session.credentials.github-mcp]
+            inject = { header = "Authorization", prefix = "Bearer ", also = { "X-MCP-Readonly" = "true" } }
+            "#
+        })
+        .unwrap();
+        mf.validate().expect("valid lanes");
+        let session = mf.session.expect("credentials imply a session block");
+        assert_eq!(
+            session.credentials["anthropic"].endpoint_var.as_deref(),
+            Some("ANTHROPIC_BASE_URL"),
+        );
+        assert_eq!(
+            session.credentials["github-mcp"]
+                .inject
+                .also
+                .get("X-MCP-Readonly")
+                .map(String::as_str),
+            Some("true"),
+        );
+    }
+
+    #[test]
+    fn session_credentials_reject_a_non_env_endpoint_var() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session.credentials.anthropic]
+            inject       = { header = "x-api-key" }
+            endpoint_var = "ANTHROPIC-BASE-URL"
+            "#
+        })
+        .unwrap();
+        let err = mf.validate().unwrap_err();
+        assert!(err.to_string().contains("ANTHROPIC-BASE-URL"), "got: {err}");
+    }
+
+    /// Two lanes cannot claim one alias: the box would get one lane's
+    /// endpoint under a name it believes means the other.
+    #[test]
+    fn session_credentials_reject_two_claims_on_one_endpoint_var() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session.credentials.anthropic]
+            inject       = { header = "x-api-key" }
+            endpoint_var = "BASE_URL"
+
+            [session.credentials.anthropic-eu]
+            inject       = { header = "x-api-key" }
+            endpoint_var = "BASE_URL"
+            "#
+        })
+        .unwrap();
+        let err = mf.validate().unwrap_err();
+        assert!(err.to_string().contains("BASE_URL"), "got: {err}");
+    }
+
+    /// One header cannot be both injected and overridden.
+    #[test]
+    fn session_credentials_reject_an_also_key_the_broker_controls() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session.credentials.anthropic]
+            inject = { header = "x-api-key", also = { "X-API-Key" = "static" } }
+            "#
+        })
+        .unwrap();
+        let err = mf.validate().unwrap_err();
+        assert!(err.to_string().contains("X-API-Key"), "got: {err}");
+    }
+
+    #[test]
+    fn session_credentials_reject_a_forged_also_value() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [session.credentials.anthropic]
+            inject = { header = "x-api-key", also = { "X-MCP-Readonly" = "true\r\nX-Evil: 1" } }
+            "#
+        })
+        .unwrap();
+        let err = mf.validate().unwrap_err();
+        assert!(err.to_string().contains("CR or LF"), "got: {err}");
+    }
+
     #[test]
     fn session_credentials_reject_a_forged_header_line() {
         let mf: File = toml::from_str(indoc! {

@@ -20,7 +20,7 @@ pub mod token;
 
 pub use endpoint::{BoxLocation, BrokerEndpoint};
 pub use lane::{Inject, Lane, Secret};
-pub use proxy::{Connector, LaneTable, TOKEN_HEADER, TlsUpstream};
+pub use proxy::{Connector, LaneTable, TOKEN_HEADER, TOKEN_PATH_PREFIX, TlsUpstream};
 pub use server::{
     Broker, BrokerConfig, BrokerProcess, LaneRegistration, Request, Response, control_socket_path,
 };

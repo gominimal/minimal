@@ -294,8 +294,10 @@ pub fn resume_from_verdict(
 /// this gate safe — it carries no lane decisions, so no lane exists.
 ///
 /// The upstream comes off the verdict rather than the stash because the
-/// daemon holds no bindings; the header comes off the stash rather than
-/// the verdict so an approval cannot rewrite what the user was shown.
+/// daemon holds no bindings; everything the *project* declared — the
+/// header, the static extras, the endpoint alias — comes off the stash
+/// rather than the verdict, so an approval cannot rewrite what the user
+/// was shown.
 ///
 /// # Errors
 ///
@@ -318,7 +320,8 @@ fn apply_credential_verdicts(
                 let pc = pending.remove(&id).ok_or_else(|| unknown(id))?;
                 let (lane, credential, source) = pc.into_parts();
                 accepted.push(SessionCredential::new(
-                    CredentialLane::new(lane, upstream, credential.inject.header),
+                    CredentialLane::new(lane, upstream, credential.inject.header)
+                        .with_extras(credential.endpoint_var, credential.inject.also),
                     source,
                 ));
             }
@@ -1162,6 +1165,56 @@ mod tests {
         }
     }
 
+    /// The same shape, declaring what Unit 10 added: the endpoint alias
+    /// and a static header. Both are the project's, so both must reach
+    /// the client that gates them.
+    struct ProjectLaneWithExtras;
+    impl Composable for ProjectLaneWithExtras {
+        fn contribute(
+            self,
+            _env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+        ) -> Result<Contribution, Error> {
+            let mut c = Contribution::new();
+            c.push_credential(ProvenancedCredential::new(
+                "anthropic",
+                lane_with_extras(),
+                Source::Project {
+                    path: paths::HostPath::try_new("/proj").unwrap(),
+                },
+            ));
+            Ok(c)
+        }
+    }
+
+    fn lane_with_extras() -> crate::core::primitives::Credential {
+        crate::core::primitives::Credential::new(
+            crate::core::primitives::CredentialInject::new("x-api-key")
+                .with_also("X-MCP-Readonly", "true"),
+        )
+        .with_endpoint_var("ANTHROPIC_BASE_URL")
+    }
+
+    /// The declaration's extras ride the pending lane to the client.
+    /// Without them the client gates — and the box is handed — a lane
+    /// stripped of the two things the project asked for.
+    #[test]
+    fn pending_lane_ships_the_declared_extras() {
+        let mut composer = SessionComposer::new(WireContribution::default());
+        composer.add(ProjectLaneWithExtras).unwrap();
+        let ComposeOutcome::Pending { response, .. } = composer
+            .compose(nil_id(), ComposeOptions::default())
+            .unwrap()
+        else {
+            panic!("expected Pending")
+        };
+        let pending = &response.credentials[0];
+        assert_eq!(pending.endpoint_var.as_deref(), Some("ANTHROPIC_BASE_URL"));
+        assert_eq!(
+            pending.also.get("X-MCP-Readonly").map(String::as_str),
+            Some("true"),
+        );
+    }
+
     /// The pending lane the daemon ships carries no upstream: it has no
     /// bindings, and a project that could name one could redirect the
     /// user's credential.
@@ -1179,28 +1232,41 @@ mod tests {
         assert!(!rendered.contains("upstream"), "got: {rendered}");
     }
 
-    fn state_with_one_lane() -> PendingComposeState {
+    fn state_with_lanes(
+        lanes: Vec<(&str, crate::core::primitives::Credential)>,
+    ) -> PendingComposeState {
         PendingComposeState {
             daemon_packages: Vec::new(),
             pending_vars: BTreeMap::new(),
             pending_patches: BTreeMap::new(),
             pending_hooks: BTreeMap::new(),
-            pending_credentials: [(
-                PendingId::new(0),
-                ProvenancedCredential::new(
-                    "anthropic",
-                    crate::core::primitives::Credential::new(
-                        crate::core::primitives::CredentialInject::new("x-api-key"),
-                    ),
-                    Source::Project {
-                        path: paths::HostPath::try_new("/proj").unwrap(),
-                    },
-                ),
-            )]
-            .into_iter()
-            .collect(),
+            pending_credentials: lanes
+                .into_iter()
+                .enumerate()
+                .map(|(i, (lane, credential))| {
+                    (
+                        PendingId::new(u32::try_from(i).unwrap()),
+                        ProvenancedCredential::new(
+                            lane,
+                            credential,
+                            Source::Project {
+                                path: paths::HostPath::try_new("/proj").unwrap(),
+                            },
+                        ),
+                    )
+                })
+                .collect(),
             client_contribution: WireContribution::default(),
         }
+    }
+
+    fn state_with_one_lane() -> PendingComposeState {
+        state_with_lanes(vec![(
+            "anthropic",
+            crate::core::primitives::Credential::new(
+                crate::core::primitives::CredentialInject::new("x-api-key"),
+            ),
+        )])
     }
 
     fn verdict_with_credentials(credentials: Vec<WireCredentialVerdict>) -> ContributionVerdict {
@@ -1228,6 +1294,60 @@ mod tests {
         assert_eq!(lane.lane(), "anthropic");
         assert_eq!(lane.upstream(), "https://api.anthropic.com");
         assert_eq!(lane.header(), "x-api-key");
+    }
+
+    /// The declaration's extras come off the daemon's stash, like the
+    /// header: the client answers only "where", so an approval cannot
+    /// rewrite which variable the endpoint is published under or which
+    /// static headers the broker attaches.
+    #[test]
+    fn resume_from_verdict_keeps_the_declared_extras() {
+        let verdict = verdict_with_credentials(vec![WireCredentialVerdict::Approved {
+            id: PendingId::new(0),
+            upstream: "https://api.anthropic.com".into(),
+        }]);
+        let comp = resume_from_verdict(
+            state_with_lanes(vec![("anthropic", lane_with_extras())]),
+            verdict,
+        )
+        .unwrap();
+        let lane = comp.credentials()[0].lane();
+        assert_eq!(lane.endpoint_var(), Some("ANTHROPIC_BASE_URL"));
+        assert_eq!(
+            lane.also().get("X-MCP-Readonly").map(String::as_str),
+            Some("true"),
+        );
+    }
+
+    /// Two lanes claiming one `endpoint_var` is a conflict, checked
+    /// where lane-name uniqueness is. Left unchecked the box gets one
+    /// lane's endpoint under a name it believes means the other — the
+    /// same silent mis-aim a duplicated lane name produces.
+    #[test]
+    fn two_lanes_claiming_one_endpoint_var_conflict() {
+        let state = state_with_lanes(vec![
+            ("anthropic", lane_with_extras()),
+            ("anthropic-eu", lane_with_extras()),
+        ]);
+        let verdict = verdict_with_credentials(vec![
+            WireCredentialVerdict::Approved {
+                id: PendingId::new(0),
+                upstream: "https://api.anthropic.com".into(),
+            },
+            WireCredentialVerdict::Approved {
+                id: PendingId::new(1),
+                upstream: "https://api.eu.anthropic.com".into(),
+            },
+        ]);
+        let err = resume_from_verdict(state, verdict)
+            .expect_err("two claims on one endpoint variable must conflict");
+        match err {
+            ComposeError::Conflict { source, .. } => {
+                let rendered = source.to_string();
+                assert!(rendered.contains("ANTHROPIC_BASE_URL"), "got: {rendered}");
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
     }
 
     /// A lane the verdict never mentions is dropped, not kept: a client

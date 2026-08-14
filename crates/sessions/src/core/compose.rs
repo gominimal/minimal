@@ -316,16 +316,17 @@ fn check_credential_lane_conflicts<'a>(
     items: impl IntoIterator<Item = &'a SessionCredential> + Clone,
 ) -> Result<(), Conflict> {
     // `validate_credential_lanes` reads a declaration, not a descriptor,
-    // so the header is lifted back into one. Nothing else about the
-    // declaration survives the gate, and nothing else is checked.
+    // so the parts of one that survive the gate are lifted back into
+    // it: the header, and the endpoint alias two sources can claim the
+    // same way they can claim one lane name.
     let declared: Vec<(String, Credential)> = items
         .clone()
         .into_iter()
         .map(|c| {
-            (
-                c.lane().lane().to_owned(),
-                Credential::new(CredentialInject::new(c.lane().header())),
-            )
+            let lane = c.lane();
+            let mut declaration = Credential::new(CredentialInject::new(lane.header()));
+            declaration.endpoint_var = lane.endpoint_var().map(ToOwned::to_owned);
+            (lane.lane().to_owned(), declaration)
         })
         .collect();
     validate_credential_lanes(declared.iter().map(|(lane, c)| (lane.as_str(), c))).map_err(
@@ -1067,6 +1068,8 @@ pub struct CredentialLane {
     lane: String,
     upstream: String,
     header: String,
+    endpoint_var: Option<String>,
+    also: BTreeMap<String, String>,
 }
 
 impl CredentialLane {
@@ -1082,7 +1085,25 @@ impl CredentialLane {
             lane: lane.into(),
             upstream: upstream.into(),
             header: header.into(),
+            endpoint_var: None,
+            also: BTreeMap::new(),
         }
+    }
+
+    /// Attach what the project declared beyond the header: the extra
+    /// name its endpoint is published under, and the static headers the
+    /// broker adds alongside the credential. Both are constants a box
+    /// may read, so neither breaks the no-value rule this type exists to
+    /// enforce.
+    #[must_use]
+    pub fn with_extras(
+        mut self,
+        endpoint_var: Option<String>,
+        also: BTreeMap<String, String>,
+    ) -> Self {
+        self.endpoint_var = endpoint_var;
+        self.also = also;
+        self
     }
 
     /// The lane name — the selector the box's URL leads with, and the
@@ -1103,18 +1124,42 @@ impl CredentialLane {
     pub fn header(&self) -> &str {
         &self.header
     }
+
+    /// The additional variable name the endpoint is published under, if
+    /// the declaration asked for one.
+    #[must_use]
+    pub fn endpoint_var(&self) -> Option<&str> {
+        self.endpoint_var.as_deref()
+    }
+
+    /// The static headers the broker attaches alongside the credential.
+    #[must_use]
+    pub fn also(&self) -> &BTreeMap<String, String> {
+        &self.also
+    }
 }
 
 impl fmt::Display for CredentialLane {
     /// The one-line review form: what the lane is called, where it
-    /// reaches, and how the credential gets there.
+    /// reaches, and how the credential gets there — plus anything else
+    /// approving it puts on the wire or in the box's environment, since
+    /// consent covers those too.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             lane,
             upstream,
             header,
+            endpoint_var,
+            also,
         } = self;
-        write!(f, "`{lane}` → {upstream} (header `{header}`)")
+        write!(f, "`{lane}` → {upstream} (header `{header}`")?;
+        for name in also.keys() {
+            write!(f, ", header `{name}`")?;
+        }
+        if let Some(var) = endpoint_var {
+            write!(f, ", published as ${var}")?;
+        }
+        write!(f, ")")
     }
 }
 
@@ -1157,7 +1202,7 @@ impl Provenanced for SessionCredential {
 impl From<WireCredentialLane> for SessionCredential {
     fn from(c: WireCredentialLane) -> Self {
         Self::new(
-            CredentialLane::new(c.lane, c.upstream, c.header),
+            CredentialLane::new(c.lane, c.upstream, c.header).with_extras(c.endpoint_var, c.also),
             c.source.into(),
         )
     }
@@ -2242,6 +2287,8 @@ pub(crate) fn contribution_to_pending(
             lane: pc.lane().to_string(),
             header: pc.credential().inject.header.clone(),
             prefix: pc.credential().inject.prefix.clone(),
+            also: pc.credential().inject.also.clone(),
+            endpoint_var: pc.credential().endpoint_var.clone(),
             source: pc.source().clone().into(),
         });
         pending_credentials.insert(id, pc);
