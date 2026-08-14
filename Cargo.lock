@@ -1209,6 +1209,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "credlane"
+version = "0.0.1"
+dependencies = [
+ "blake3",
+ "hex",
+ "rand 0.10.2",
+ "rustls",
+ "rustls-platform-verifier",
+ "serde",
+ "serde_json_lenient",
+ "sessions",
+ "switch",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

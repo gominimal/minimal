@@ -1,0 +1,30 @@
+[package]
+name = "credlane"
+version = "0.0.1"
+rust-version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+blake3.workspace = true
+hex.workspace = true
+rand.workspace = true
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
+serde = { workspace = true, features = ["derive"] }
+# `NetworkMode`: the endpoint a box is handed follows from its network mode.
+sessions.workspace = true
+switch.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tokio-rustls.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+serde_json_lenient.workspace = true
+tempfile.workspace = true
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
