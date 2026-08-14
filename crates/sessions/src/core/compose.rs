@@ -1428,22 +1428,29 @@ impl Composition {
     pub fn credentials(&self) -> &[SessionCredential] {
         &self.credentials
     }
+}
 
-    /// Consume the [`Composition`] and return the four materializable
-    /// domains for moving into downstream layers. Credential lanes are
-    /// left behind — read them with [`Self::credentials`]; they are
-    /// delivered as endpoint variables layered above the composition,
-    /// never materialized from it.
+/// What [`Composition::into_parts`] yields, named so the signature stays
+/// readable as domains are added.
+pub type CompositionParts = (
+    Vec<SessionVar>,
+    Vec<SessionPatch>,
+    Vec<ProvenancedPackage>,
+    Vec<ProvenancedHook>,
+    Vec<SessionCredential>,
+);
+
+impl Composition {
+    /// Consume the [`Composition`] and return every domain for moving
+    /// into downstream layers.
+    ///
+    /// Credential lanes ride along so the client can put them on the
+    /// wire, but they are descriptors only — lane, bound upstream, and
+    /// header. Nothing here can carry a secret, and the endpoint
+    /// variables a box actually sees are layered above the composition
+    /// rather than materialized from it.
     #[must_use]
-    pub fn into_parts(
-        self,
-    ) -> (
-        Vec<SessionVar>,
-        Vec<SessionPatch>,
-        Vec<ProvenancedPackage>,
-        Vec<ProvenancedHook>,
-        Vec<SessionCredential>,
-    ) {
+    pub fn into_parts(self) -> CompositionParts {
         (
             self.vars,
             self.patches,
