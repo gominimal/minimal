@@ -2871,15 +2871,29 @@ async fn cmd_session_credentials(
         return Ok(());
     }
 
+    // Sized to content, not fixed: an upstream is a whole URL, and a column
+    // narrower than one runs the next column's values into it.
+    let rows: Vec<(&str, &str, &str, String)> = lanes
+        .iter()
+        .map(|l| {
+            (
+                l.lane.as_str(),
+                l.header.as_str(),
+                l.upstream.as_str(),
+                render_hook_source(&l.source),
+            )
+        })
+        .collect();
+    let lane_w = rows.iter().map(|r| r.0.len()).chain([4]).max().unwrap_or(4);
+    let header_w = rows.iter().map(|r| r.1.len()).chain([6]).max().unwrap_or(6);
+    let upstream_w = rows.iter().map(|r| r.2.len()).chain([8]).max().unwrap_or(8);
+
     println!(
-        "{:<20}  {:<15}  {:<20}  SOURCE",
+        "{:<lane_w$}  {:<header_w$}  {:<upstream_w$}  SOURCE",
         "LANE", "HEADER", "UPSTREAM"
     );
-    println!("{:-<20}  {:-<15}  {:-<20}  {:-<24}", "", "", "", "");
-    for lane in &lanes {
-        let (name, header, upstream) = (&lane.lane, &lane.header, &lane.upstream);
-        let source = render_hook_source(&lane.source);
-        println!("{name:<20}  {header:<15}  {upstream:<20}  {source}");
+    for (name, header, upstream, source) in &rows {
+        println!("{name:<lane_w$}  {header:<header_w$}  {upstream:<upstream_w$}  {source}");
     }
     Ok(())
 }

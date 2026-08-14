@@ -132,19 +132,27 @@ same predicate `start_host_proxies` uses to choose its bind address
 
 ### It is not a fifth binary
 
-A new compiled binary **cannot ship without editing
-`.github/workflows/release.yml`**, which is frozen and CODEOWNER-gated. Every
-shipped binary is an explicit `cargo build` + `mv` + `upload-artifact` triple
-there (`release.yml:153-184`, `:291-320`, `:384-456`); there is no discovery over
-workspace bin targets, and `scripts/stage-release.sh` hard-fails on a component
-whose artifact no workflow step produced (`stage-release.sh:220-230`).
-
 The broker ships as a **subcommand of the daemon that already runs host-side** —
-`minvmd broker` and `minimald broker` — with the logic in the shared crate. Zero
-workflow edits, zero new install components, and it inherits the macOS
-Developer-ID signing a new Mach-O would otherwise need.
+`minvmd broker` and `minimald broker` — with the logic in a shared crate.
 
-This departs from the "sibling of `gvproxy-min`" shape deliberately.
+The reason is distribution surface, not the release workflow. A fifth binary
+would need: a `cargo build` + rename + `upload-artifact` triple per platform in
+`release.yml` (`:153-184`, `:291-320`, `:384-456` — there is no discovery over
+workspace bin targets); a `COMPONENTS` row in `scripts/stage-release.sh`, which
+hard-fails on a component no workflow step produced (`:220-230`); a second
+Developer-ID signing path on the self-hosted macOS runner; its own completions;
+and a name chosen not to collide on a user's `PATH`, which is the whole reason
+the switch ships as `gvproxy-min` and not `gvproxy`
+(`crates/switch/src/lib.rs:38-47`). A subcommand of an already-shipped binary
+needs none of it, and the broker has to be spawned and supervised by a daemon
+regardless — so the separate binary buys nothing it does not already have.
+
+An earlier draft of this spec argued instead that `.github/workflows/` is frozen
+and therefore a fifth binary was impossible. That overstated it: the freeze is
+CODEOWNER review, not a prohibition, so the workflow edit is a cost to weigh
+rather than a wall. The conclusion is unchanged, but it rests on the costs above.
+
+This also departs from the "sibling of `gvproxy-min`" shape deliberately.
 `gvproxy-min` is a vendored upstream binary that is *downloaded*
 (`scripts/fetch-gvproxy.sh`), not precedent for shipping a fifth first-party one.
 
@@ -749,6 +757,10 @@ exactly as for hooks.
 
 ## Known gaps
 
+- **The control socket outlives the daemon.** Shutting `minimald` down leaves
+  `credlane.sock` on the runtime dir. Harmless — the next bind removes a stale
+  socket, and it refuses to unlink a non-socket — but it should be unlinked on
+  the way out. Observed on a native-Linux run.
 - **Only the client can revoke.** `minimald` is guest-side on DM1/3/4 and cannot
   reach the broker's control socket, so daemon-driven teardowns (connection-close
   reap, aborted create, killed CLI) leave a token live until its TTL. A
