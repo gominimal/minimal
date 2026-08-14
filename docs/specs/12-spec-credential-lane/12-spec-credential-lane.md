@@ -482,8 +482,13 @@ Its exposure inside the box is wider than `env` alone, though, and the guide
 says so rather than leaving it to be discovered. Porting a real workflow put the
 token in an agent's config file, in `argv` (one harness passes MCP headers as
 command-line flags, so it shows in `ps`), and in a trace the workflow already
-wrote — and one of those config files lives in the project directory, which
-`--sync` copies **back to the host**. A capability that dies with the box is
+wrote — and one of those config files lives in the project directory, where a
+`git add` or anything else that copies files out of the box will take it with
+them. (An earlier draft blamed `--sync` for carrying it back to the host. That
+was wrong: `SyncMode` is `Tarball` or `None` and only ever streams the project
+*into* the session — `crates/minimal/src/lib.rs`. The exposure is real, but the
+project directory is the reason, not the sync direction.) A capability that dies
+with the box is
 still a capability while the box lives; treat the token like any other
 credential inside the box even though it is not one outside it.
 

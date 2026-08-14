@@ -180,16 +180,36 @@ for the full walkthrough.
 
 ```toml
 [session.credentials.anthropic]
-inject = { header = "x-api-key" }
+inject       = { header = "x-api-key" }
+endpoint_var = "ANTHROPIC_BASE_URL"
 
 [session.credentials.github-mcp]
-inject = { header = "Authorization", prefix = "Bearer " }
+inject = { header = "Authorization", prefix = "Bearer ", also = { "X-MCP-Readonly" = "true" } }
 ```
 
 | Field | Description |
 |-------|-------------|
 | `inject.header` | The HTTP header the broker injects the resolved credential into on the upstream leg. |
 | `inject.prefix` | Optional. Text prepended to the value before injection, e.g. `"Bearer "`. Defaults to empty. |
+| `inject.also` | Optional. Static, non-secret headers the broker attaches to every request on this lane. |
+| `endpoint_var` | Optional. An additional environment variable name the lane's endpoint is published under, alongside the canonical `MINIMAL_CREDENTIAL_ENDPOINT_<LANE>`. |
+
+`endpoint_var` exists so software that reads a base URL from a fixed name gets
+it without per-project shell: the endpoint is only knowable at launch, so it
+cannot be written as a `[session.vars]` constant. The name must match
+`^[A-Za-z_][A-Za-z0-9_]*$`, and two lanes claiming the same name is an error.
+An alias is published in the same layer as the canonical variables and cannot
+displace one: a lane aliasing its endpoint to `MINIMAL_CREDENTIAL_TOKEN` gets
+the real token, not the endpoint.
+
+`inject.also` headers are attached by the broker, on the host, rather than
+being asked of the box — a box can omit a header it was told to send, but it
+cannot remove one the broker adds, and a box's own copy of an `also` header is
+stripped from the request before the broker attaches its own. Each key must be
+a header name (visible ASCII, no `:`) and each value must contain no CR or LF;
+a key naming `inject.header` or the token header
+`X-Minimal-Credential-Token` is an error, since the broker replaces the first
+and removes the second and one header cannot be both.
 
 **The project declares only the lane's shape.** It never names the upstream
 host and never holds a secret: the lane name (`anthropic`, `github-mcp`) is

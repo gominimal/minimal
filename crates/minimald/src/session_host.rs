@@ -3150,9 +3150,26 @@ mod tests {
         );
     }
 
-    /// An alias naming a canonical variable is a declaration reaching for
-    /// the token variable or another lane's endpoint; the canonical value
-    /// wins, so the layer stays self-consistent.
+    /// The parse-time rule that reserves `endpoint_var` names is written
+    /// against a namespace, not a list. If a variable published here ever falls
+    /// outside it, a declaration could claim that name and be silently
+    /// overwritten instead of refused.
+    #[test]
+    fn every_published_credential_variable_is_inside_the_reserved_namespace() {
+        use sessions::core::primitives::CREDENTIAL_VAR_NAMESPACE as NS;
+        for name in [
+            CREDENTIAL_ENDPOINT_PREFIX,
+            CREDENTIAL_URL_PREFIX,
+            CREDENTIAL_UPSTREAM_PREFIX,
+            CREDENTIAL_LANES_VAR,
+            CREDENTIAL_TOKEN_VAR,
+        ] {
+            assert!(name.starts_with(NS), "{name} is outside {NS}");
+        }
+    }
+
+    /// An alias naming a canonical variable is refused at parse; this is the
+    /// layer's own defence, for a descriptor that reached it another way.
     #[test]
     fn an_endpoint_var_cannot_displace_a_canonical_credential_variable() {
         let env = layer_session_env(

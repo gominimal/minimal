@@ -167,6 +167,13 @@ pub enum CredentialError {
     /// the box could not read it back even if it were published.
     #[error("credential lane `{lane}` endpoint_var `{name}` must match `[A-Za-z_][A-Za-z0-9_]*`")]
     InvalidEndpointVar { lane: String, name: String },
+    /// An `endpoint_var` claimed a name the credential layer publishes itself,
+    /// where it would be overwritten rather than honoured.
+    #[error(
+        "credential lane `{lane}` endpoint_var `{name}` is reserved: \
+         `{CREDENTIAL_VAR_NAMESPACE}*` names are published by the session itself"
+    )]
+    ReservedEndpointVar { lane: String, name: String },
     /// Two lanes claim the same `endpoint_var`. Publishing both would
     /// hand the box one endpoint under a name it believes means the
     /// other — the same silent mis-aim [`Self::LaneSuffixCollision`]
@@ -1466,13 +1473,19 @@ impl Credential {
     /// [`CredentialError::InvalidEndpointVar`].
     pub fn validate(&self, lane: &str) -> Result<(), CredentialError> {
         self.inject.validate(lane)?;
-        if let Some(name) = &self.endpoint_var
-            && !is_env_var_name(name)
-        {
-            return Err(CredentialError::InvalidEndpointVar {
-                lane: lane.to_owned(),
-                name: name.clone(),
-            });
+        if let Some(name) = &self.endpoint_var {
+            if !is_env_var_name(name) {
+                return Err(CredentialError::InvalidEndpointVar {
+                    lane: lane.to_owned(),
+                    name: name.clone(),
+                });
+            }
+            if name.starts_with(CREDENTIAL_VAR_NAMESPACE) {
+                return Err(CredentialError::ReservedEndpointVar {
+                    lane: lane.to_owned(),
+                    name: name.clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -1589,6 +1602,14 @@ pub const CREDENTIAL_TOKEN_HEADER: &str = "X-Minimal-Credential-Token";
 fn is_header_token(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_graphic() && b != b':')
 }
+
+/// The prefix every variable the credential layer publishes shares.
+///
+/// Named here so a declaration can be refused for claiming one: the layer emits
+/// aliases before canonical names and the map is last-wins, so an `endpoint_var`
+/// inside this namespace is silently ignored rather than honoured — a rule that
+/// is invisible at the point someone writes it.
+pub const CREDENTIAL_VAR_NAMESPACE: &str = "MINIMAL_CREDENTIAL_";
 
 /// `^[A-Za-z_][A-Za-z0-9_]*$` — what execve envp and every shell accept
 /// as a variable name.
@@ -2375,6 +2396,37 @@ mod tests {
                 "accepted: {name}",
             );
         }
+    }
+
+    /// The layer publishes aliases before canonical names into a last-wins map,
+    /// so one of these would simply not take effect. Refused at parse instead,
+    /// because nothing at the point of writing it would say so.
+    #[test]
+    fn an_endpoint_var_may_not_claim_a_name_the_session_publishes_itself() {
+        for name in [
+            "MINIMAL_CREDENTIAL_TOKEN",
+            "MINIMAL_CREDENTIAL_LANES",
+            "MINIMAL_CREDENTIAL_ENDPOINT_ANTHROPIC",
+            "MINIMAL_CREDENTIAL_URL_ANTHROPIC",
+            "MINIMAL_CREDENTIAL_UPSTREAM_ANTHROPIC",
+            // Not a name in use today, but inside the namespace one could be
+            // added to without warning.
+            "MINIMAL_CREDENTIAL_",
+        ] {
+            let err = Credential::new(CredentialInject::new("x-api-key"))
+                .with_endpoint_var(name)
+                .validate("anthropic")
+                .unwrap_err();
+            assert!(
+                matches!(err, CredentialError::ReservedEndpointVar { .. }),
+                "accepted: {name}",
+            );
+        }
+        // The namespace is the whole rule, not a list of today's names.
+        Credential::new(CredentialInject::new("x-api-key"))
+            .with_endpoint_var("MINIMAL_ANTHROPIC_BASE_URL")
+            .validate("anthropic")
+            .expect("only the credential namespace is reserved");
     }
 
     #[test]
