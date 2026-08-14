@@ -51,6 +51,7 @@ fn ls_shows_shared_resource_pool() {
             name: None,
             project_path: Some(paths::HostAbsPath::try_new("/p").unwrap()),
             status: sessions::SessionStatus::Active,
+            git: None,
             attrs: None,
         }],
     };
@@ -81,6 +82,7 @@ fn ls_table_exposes_project_path_and_status() {
             name: Some("s1".to_string()),
             project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
             status: sessions::SessionStatus::Active,
+            git: None,
             attrs: None,
         }],
     };

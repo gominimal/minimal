@@ -19,8 +19,26 @@ fn entry(n: u128, name: Option<&str>, project: &str) -> minimald_rpc::ListSessio
         name: name.map(str::to_owned),
         project_path: Some(paths::HostAbsPath::try_new(project).unwrap()),
         status: sessions::SessionStatus::Active,
+        git: None,
         attrs: None,
     }
+}
+
+/// An entry backed by a git repository: branch in the sidebar row, repo
+/// root in the detail Info section.
+fn entry_with_git(
+    n: u128,
+    name: &str,
+    project: &str,
+    worktree: bool,
+) -> minimald_rpc::ListSessionsEntry {
+    let mut e = entry(n, Some(name), project);
+    e.git = Some(Box::new(minimald_rpc::GitInfo {
+        branch: "main".to_string(),
+        repo_root: project.to_string(),
+        is_worktree: worktree,
+    }));
+    e
 }
 
 fn provider(label: &str, sessions: Vec<minimald_rpc::ListSessionsEntry>) -> ProviderData {
@@ -188,6 +206,51 @@ fn detail_pane_with_policy() {
     // Focus the session.
     model.cursor = 1;
     insta::assert_snapshot!(render(&mut model));
+}
+
+/// Git info from the list RPC renders: the branch in the sidebar row
+/// (TestBackend text — the glyph is what matters) and the repo root,
+/// tagged as a worktree, in the detail Info section.
+#[test]
+fn sidebar_and_info_show_git_context() {
+    let mut model = fixed_model(vec![provider(
+        "host",
+        vec![
+            entry_with_git(1, "api-staging", "/src/api", false),
+            entry_with_git(2, "web-wt", "/src/web-wt", true),
+        ],
+    )]);
+    let rendered = render(&mut model);
+    let api_row = rendered
+        .lines()
+        .find(|l| l.contains("api-staging"))
+        .expect("session row");
+    assert!(api_row.contains('⎇'), "branch glyph missing: {api_row}");
+    assert!(api_row.contains("main"), "branch name missing: {api_row}");
+
+    // Focus the worktree session: its repo root and the worktree tag
+    // appear in the right column of the Info section.
+    model.cursor = 2;
+    let rendered = render(&mut model);
+    assert!(
+        rendered.contains("/src/web-wt (worktree)"),
+        "worktree-tagged repo root missing:\n{rendered}"
+    );
+    // A plain repo root renders without the tag.
+    model.cursor = 1;
+    let rendered = render(&mut model);
+    let info_row = rendered
+        .lines()
+        .find(|l| l.contains("repo"))
+        .expect("repo row in info section");
+    assert!(
+        info_row.contains("/src/api"),
+        "repo root missing: {info_row}"
+    );
+    assert!(
+        !info_row.contains("worktree"),
+        "plain repo must not be tagged: {info_row}"
+    );
 }
 
 /// A session with fresh stdout renders its activity spinner in the sidebar

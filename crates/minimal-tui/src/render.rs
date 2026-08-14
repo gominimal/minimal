@@ -145,8 +145,21 @@ fn render_sidebar(model: &mut Model, frame: &mut Frame, area: Rect) {
                 // and the terminal swallows the indicator cell at the right
                 // edge (this was the "no activity indicator" bug).
                 let marker = if selected { "▸ " } else { "  " };
+                // Branch segment (` ⎇ feature` + two-space gutter) only
+                // when the daemon answered git info; skipping it entirely
+                // keeps the no-git layout byte-identical to before.
+                let branch = entry
+                    .git
+                    .as_ref()
+                    .map(|g| format!(" ⎇ {}", g.branch))
+                    .unwrap_or_default();
                 let right = format!("{net} {indicator:>2}");
-                let right_w = UnicodeWidthStr::width(right.as_str());
+                let right_w = UnicodeWidthStr::width(right.as_str())
+                    + if branch.is_empty() {
+                        0
+                    } else {
+                        UnicodeWidthStr::width(branch.as_str()) + 2
+                    };
                 let left = pad_truncate(
                     &format!("  {marker}{name}"),
                     inner_width.saturating_sub(right_w),
@@ -154,21 +167,28 @@ fn render_sidebar(model: &mut Model, frame: &mut Frame, area: Rect) {
                 let gap = inner_width
                     .saturating_sub(UnicodeWidthStr::width(left.as_str()))
                     .saturating_sub(right_w);
-                Line::from(vec![
-                    Span::styled(
-                        format!("{left}{}", " ".repeat(gap)),
-                        if selected {
-                            Style::default().add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default()
-                        },
-                    ),
-                    Span::styled(net.to_string(), Style::default().fg(Color::Gray)),
-                    Span::styled(
-                        format!(" {indicator:>2}"),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                ])
+                let name_span = Span::styled(
+                    format!("{left}{}", " ".repeat(gap)),
+                    if selected {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                );
+                let mut spans = vec![name_span];
+                if !branch.is_empty() {
+                    spans.push(Span::styled(branch, Style::default().fg(Color::Gray)));
+                    spans.push(Span::raw("  "));
+                }
+                spans.push(Span::styled(
+                    net.to_string(),
+                    Style::default().fg(Color::Gray),
+                ));
+                spans.push(Span::styled(
+                    format!(" {indicator:>2}"),
+                    Style::default().fg(Color::Yellow),
+                ));
+                Line::from(spans)
             }
         };
         lines.push(line);
@@ -311,6 +331,16 @@ fn render_info(model: &Model, key: &SessionKey, frame: &mut Frame, area: Rect) {
         .and_then(|a| a.title.as_ref())
         .map(|t| t.value.clone())
         .unwrap_or_else(|| "-".to_string());
+    // The repo's toplevel, tagged when the project lives in a linked
+    // worktree (its .git lives in the main repo). Absent entirely for
+    // non-repo projects so their layout doesn't shift.
+    let repo = entry.and_then(|e| e.git.as_ref()).map(|g| {
+        let root = shorten_home(&g.repo_root);
+        match g.is_worktree {
+            true => format!("{root} (worktree)"),
+            false => root,
+        }
+    });
     let left = [
         ("project", project),
         ("user", user),
@@ -321,7 +351,12 @@ fn render_info(model: &Model, key: &SessionKey, frame: &mut Frame, area: Rect) {
         .and_then(|d| d.record.as_ref())
         .map(|r| format!("{:?}", r.network))
         .unwrap_or_else(|| "?".to_string());
-    let right = [("net", net), ("idle", idle_text(model, key))];
+    // The Info section is four rows tall; the branch rides in the sidebar
+    // row, so only the repo root joins the right column here.
+    let mut right = vec![("net", net), ("idle", idle_text(model, key))];
+    if let Some(repo) = repo {
+        right.push(("repo", repo));
+    }
 
     // Left column takes half the pane; the right column starts after a
     // two-space gutter. Labels are dim in both columns.
