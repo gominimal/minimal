@@ -169,9 +169,15 @@ becomes `ANTHROPIC`, `github-mcp` becomes `GITHUB_MCP`. A lane that declares
 `MINIMAL_CREDENTIAL_LANES` is there so the box can tell a lane it was denied
 from a lane it misspelled: either is simply absent from the environment, which
 otherwise surfaces as a confusing `401` deep inside an agent rather than an
-error at launch. The variables appear only when the box holds at least one
-lane and can reach the broker — a `NoNet` box gets none of them, never an empty
-one, which would read as a configured endpoint and fail far from the cause.
+error at launch. So it is set to the empty string, not left out, when you were
+granted nothing: empty means "the broker is there and you hold no lane", and
+that is a different thing from a lane you misspelled.
+
+The per-lane variables appear only when the box holds that lane and can reach
+the broker — a `NoNet` box gets none of them, never an empty one, which would
+read as a configured endpoint and fail far from the cause. `NoNet` is also the
+one case where `MINIMAL_CREDENTIAL_LANES` itself is absent: there is no
+credential plane to report on.
 
 ### Presenting the token
 

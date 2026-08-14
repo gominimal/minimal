@@ -1604,12 +1604,19 @@ fn credential_env(
     endpoint: Option<credlane::BrokerEndpoint>,
     token: Option<&str>,
 ) -> Vec<(String, String)> {
-    let (Some(endpoint), Some(token)) = (endpoint, token) else {
+    // No endpoint is no credential plane to report on at all — a `NoNet` box, or
+    // a deployment whose broker never started.
+    let Some(endpoint) = endpoint else {
         return Vec::new();
     };
-    if lanes.is_empty() {
-        return Vec::new();
-    }
+    // The lane list is published even when it is empty, and that is the whole
+    // point of it: a box denied every lane it asked for must be able to tell
+    // that from a box on a deployment that has no credential plane. Unset is the
+    // latter, empty the former. Nothing else is published, because with no lane
+    // there is no registration and so no token.
+    let (Some(token), false) = (token, lanes.is_empty()) else {
+        return vec![(CREDENTIAL_LANES_VAR.to_owned(), String::new())];
+    };
     let mut aliases = Vec::new();
     let mut env = Vec::with_capacity(lanes.len() * 3 + 2);
     let mut names: Vec<&str> = Vec::with_capacity(lanes.len());
@@ -3241,26 +3248,35 @@ mod tests {
         assert!(vars.is_empty(), "{vars:?}");
     }
 
+    /// Holding no lane is a fact worth stating. A box that asked for lanes and
+    /// was denied every one sees the same environment as a box that asked for
+    /// none — so the distinction that has to survive is *empty* versus *unset*,
+    /// and unset is reserved for a deployment with no credential plane.
     #[test]
-    fn a_session_with_no_lanes_gets_no_credential_variables() {
-        let vars = credential_env(
-            &[],
-            broker_endpoint(sessions::NetworkMode::HostNet),
-            Some("tok-live-hunter2"),
-        );
-        assert!(vars.is_empty(), "not even a bare token: {vars:?}");
+    fn a_session_with_no_lanes_gets_an_empty_lane_list_and_nothing_else() {
+        for token in [Some("tok-live-hunter2"), None] {
+            let vars = credential_env(&[], broker_endpoint(sessions::NetworkMode::HostNet), token);
+            assert_eq!(
+                vars,
+                vec![("MINIMAL_CREDENTIAL_LANES".to_owned(), String::new())],
+                "not even a bare token: {vars:?}"
+            );
+        }
     }
 
-    /// A finalize that carried no token leaves the lanes unusable, so the
-    /// endpoints are not published either.
+    /// A finalize that carried no token leaves the lanes unusable, so no
+    /// endpoint is published — but the box still learns it holds nothing.
     #[test]
-    fn a_session_finalized_without_a_token_gets_no_credential_variables() {
+    fn a_session_finalized_without_a_token_gets_an_empty_lane_list() {
         let vars = credential_env(
             &[aliased_lane("anthropic", Some("ANTHROPIC_BASE_URL"))],
             broker_endpoint(sessions::NetworkMode::HostNet),
             None,
         );
-        assert!(vars.is_empty(), "{vars:?}");
+        assert_eq!(
+            vars,
+            vec![("MINIMAL_CREDENTIAL_LANES".to_owned(), String::new())]
+        );
     }
 
     #[test]

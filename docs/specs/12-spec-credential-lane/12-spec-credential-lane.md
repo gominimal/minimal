@@ -460,6 +460,14 @@ environment, which is indistinguishable from a typo at the point of use and
 surfaces as a confusing `401` deep inside an agent instead of an error at
 launch.
 
+It is therefore published **empty rather than omitted** when a box holds no
+lane. Porting the harnesses caught the first cut getting this backwards: it
+returned early on an empty set, so a box denied *every* lane it asked for saw no
+variable at all — indistinguishable from a deployment with no credential plane,
+which is the one case the variable exists to disambiguate. Unset now means only
+"no broker is reachable" (a `NoNet` box, or one whose broker never started);
+empty means "a broker is there and you hold nothing".
+
 They are layered **above** the composition in `layer_session_env`
 (`crates/minimald/src/session_host.rs:1523-1544`), not into `session_baseline_env`
 where `MINIMAL_SESSION_NAME` lives. That baseline is the *lowest* layer and
@@ -819,6 +827,8 @@ Python broker and onto Units 1–9.
   every method, as today.
 - **R10.5**: `MINIMAL_CREDENTIAL_LANES` lists the lanes that survived the gate,
   space-separated, so a box can distinguish a denied lane from a misspelled one.
+  Published empty, not omitted, when none survived; omitted only where no broker
+  is reachable at all.
 - **R10.6**: `MINIMAL_CREDENTIAL_UPSTREAM_<LANE>` publishes the bound upstream,
   so a box can tell how much of the path the binding already covers. It is not a
   secret — it is already in `composition.json` and in `min session credentials`.
@@ -926,6 +936,16 @@ exactly as for hooks.
   entries at the prompt. A named source referenced by several lanes would
   collapse it without weakening anything — the security property is that the
   *user* owns the destination set, not that it be a single URL.
+- **`endpoint_var` closes a third of the glue it was designed for.** Adopting it
+  across the six harnesses reached 4 of the 12 sites, and the misses are
+  structural, not incidental: it publishes *the endpoint*, *verbatim*, *as an
+  environment variable*. Two harnesses (opencode, codex) need the endpoint with
+  `/v1` appended, so they keep a line of shell to append it; one (goose) needs
+  the token-bearing URL form, which `endpoint_var` cannot name; and the config-
+  field and CLI-flag sites are not environment variables at all, so no alias
+  reaches them. A `url_var` twin and an optional suffix would close most of the
+  remaining eight. Both are additive and neither changes the security model — the
+  project still names only a variable, never an upstream.
 - **Every non-shell consumer re-derives the lane-name mangling.** The
   `<lane>` → `<SUFFIX>` rule (upcase, `-`→`_`) is an ABI, and a TypeScript or
   Python consumer that cannot source the shell helper spells the variable names
