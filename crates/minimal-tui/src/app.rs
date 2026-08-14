@@ -138,6 +138,10 @@ pub enum Effect {
     Refresh,
     FetchDetail(SessionKey),
     FetchScreen(SessionKey),
+    /// Resize the session's terminal to the Preview pane's `(rows, cols)` so
+    /// the next snapshot matches the pane. Best-effort; a failure (old daemon)
+    /// is ignored and the preview keeps its clipped behavior.
+    SetScreenSize(SessionKey, u16, u16),
     Destroy(SessionKey),
     Rename(SessionKey, String),
     Create {
@@ -173,6 +177,12 @@ pub struct Model {
     pub filter: FilterState,
     pub details: HashMap<SessionKey, Detail>,
     pub screens: HashMap<SessionKey, ScreenFetch>,
+    /// The Preview pane's `(rows, cols)` from the last render, stashed by
+    /// `render_detail`. Compared against the focused session's last snapshot
+    /// size on each tick; a mismatch triggers a best-effort
+    /// `SetSessionScreenSize` so the daemon's PTY (and thus the next
+    /// snapshot) matches the pane. `None` when no session is focused.
+    pub preview_pane: Option<(u16, u16)>,
     /// The most recent bell timestamp acknowledged for a session; a bell
     /// newer than this lights the `●` indicator.
     pub bells_seen: HashMap<SessionKey, DateTime<Utc>>,
@@ -211,6 +221,7 @@ impl Model {
             filter: FilterState::default(),
             details: HashMap::new(),
             screens: HashMap::new(),
+            preview_pane: None,
             bells_seen: HashMap::new(),
             action: None,
             status: None,
@@ -405,6 +416,21 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             // so the focused session's screen refreshes on every tick.
             let mut effects = vec![Effect::Refresh];
             if let Some(key) = model.focused() {
+                // Match the session's PTY to the Preview pane so a
+                // full-screen app renders without clipping. Only when the
+                // last snapshot's size differs from the pane — a steady
+                // state issues no resize. Best-effort: `exec_effect` ignores
+                // a failure (a daemon that predates the RPC).
+                if let Some((rows, cols)) = model.preview_pane
+                    && let Some(snap) = model
+                        .screens
+                        .get(&key)
+                        .and_then(|fetch| fetch.as_ref().ok())
+                        .and_then(|o| o.as_ref())
+                    && (snap.rows, snap.cols) != (rows, cols)
+                {
+                    effects.push(Effect::SetScreenSize(key.clone(), rows, cols));
+                }
                 effects.push(Effect::FetchScreen(key));
             }
             effects
@@ -1031,6 +1057,17 @@ async fn exec_effect(
                 .map_err(|e| format!("{e:#}"));
             Some(Msg::ScreenLoaded(key, fetch))
         }
+        Effect::SetScreenSize(key, rows, cols) => {
+            // Best-effort: a daemon that predates SetSessionScreenSize
+            // answers "request subsystem"; the preview keeps its clipped
+            // behavior and the next tick retries against the new snapshot.
+            if let Some(provider) = providers.iter_mut().find(|p| p.label == key.provider)
+                && let Err(e) = rpc::set_screen_size(provider, key.id, rows, cols).await
+            {
+                tracing::debug!(error = %e, "SetSessionScreenSize failed; preview stays clipped");
+            }
+            None
+        }
         Effect::Destroy(key) => {
             let result = match providers.iter_mut().find(|p| p.label == key.provider) {
                 Some(provider) => rpc::destroy(provider, key.id)
@@ -1495,6 +1532,54 @@ mod tests {
             effects
                 .iter()
                 .any(|e| matches!(e, Effect::FetchScreen(k) if k.id == id(1)))
+        );
+    }
+
+    /// A tick matches the session's PTY to the stashed Preview pane when the
+    /// last snapshot's size disagrees; a steady state (sizes agree) issues no
+    /// resize.
+    #[test]
+    fn tick_resizes_the_pty_when_the_pane_and_snapshot_disagree() {
+        let mut model = two_providers();
+        update(&mut model, key(KeyCode::Down));
+        let key = skey("host", 1);
+        // The pane is 20x80, but the last snapshot came from the attach
+        // terminal's 24x80: the mismatch must trigger a resize.
+        model.preview_pane = Some((20, 80));
+        model.screens.insert(
+            key.clone(),
+            Ok(Some(minimald_rpc::ScreenSnapshot {
+                rows: 24,
+                cols: 80,
+                cursor_row: None,
+                cursor_col: None,
+                lines: Vec::new(),
+            })),
+        );
+        let effects = update(&mut model, Msg::Tick);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetScreenSize(k, 20, 80) if *k == key)),
+            "expected a SetScreenSize effect, got {effects:?}"
+        );
+        // Once the snapshot matches the pane, the steady state is quiet.
+        model.screens.insert(
+            key.clone(),
+            Ok(Some(minimald_rpc::ScreenSnapshot {
+                rows: 20,
+                cols: 80,
+                cursor_row: None,
+                cursor_col: None,
+                lines: Vec::new(),
+            })),
+        );
+        let effects = update(&mut model, Msg::Tick);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetScreenSize(..))),
+            "steady state must not resize, got {effects:?}"
         );
     }
 

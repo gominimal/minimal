@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     session::{Session, SessionConfig, SessionHandle},
-    session_host::HostAttrs,
+    session_host::{HostAttrs, WinSize},
     store::{RecordPredicate, SessionRecordHandle, Store, StoreHandle},
 };
 use common::SpecHash;
@@ -130,6 +130,11 @@ enum ManagerMessage {
         SessionKeyPredicate,
         Responder<Option<minimald_rpc::ScreenSnapshot>>,
     ),
+    /// Resize a running session's terminal (`min dash`'s
+    /// `SetSessionScreenSize`). Read-only against the `running` map — like
+    /// [`GetScreen`](Self::GetScreen) it never starts an actor, and a
+    /// session with no live host is a no-op.
+    SetScreenSize(SessionKeyPredicate, WinSize, Responder<()>),
     /// Read a session's persisted composition snapshot. Read-only
     /// against the store — like [`GetRecord`](Self::GetRecord) and
     /// unlike [`GetSession`](Self::GetSession), it never starts an
@@ -486,6 +491,25 @@ impl Manager {
                         Some(h) => h.get_screen().await,
                         None => None,
                     })
+                })
+                .await;
+            }
+            ManagerMessage::SetScreenSize(pred, sz, r) => {
+                r.handle(async {
+                    let id = match pred {
+                        SessionKeyPredicate::Id(id) => id,
+                        SessionKeyPredicate::Name(name) => {
+                            match self.store.find(RecordPredicate::Name(name)).await? {
+                                Some(handle) => handle.record().await?.id,
+                                None => return Ok(()),
+                            }
+                        }
+                    };
+                    // A session with no live host has nothing to resize.
+                    if let Some(h) = self.running.get(&id) {
+                        h.set_screen_size(sz).await;
+                    }
+                    Ok::<(), SessionsError>(())
                 })
                 .await;
             }
@@ -863,6 +887,23 @@ impl ManagerHandle {
         let _ = self
             .sender
             .send(ManagerMessage::GetScreen(pred, send))
+            .await;
+        recv.await.expect("corresponding sessions manager is dead")
+    }
+
+    /// Resizes a running session's terminal to `sz` without attaching
+    /// (`min dash`'s `SetSessionScreenSize`). Never starts an actor; a
+    /// session with no live host is a no-op.
+    pub async fn set_screen_size(
+        &self,
+        pred: SessionKeyPredicate,
+        sz: WinSize,
+    ) -> Result<(), SessionsError> {
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .sender
+            .send(ManagerMessage::SetScreenSize(pred, sz, send))
             .await;
         recv.await.expect("corresponding sessions manager is dead")
     }

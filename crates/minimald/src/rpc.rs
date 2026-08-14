@@ -9,7 +9,8 @@ use minimald_rpc::{
     GetVersionResponse, IssueClientCert, IssueClientCertRequest, ListSessions, ListSessionsEntry,
     ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
     RenameSessionResponse, ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse,
-    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
+    SetSessionScreenSize, SetSessionScreenSizeRequest, Shutdown, ShutdownRequest, ShutdownResponse,
+    SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -27,6 +28,7 @@ use crate::{
     ChannelConfig,
     connection::{ConnectionError, ConnectionHandle},
     server::ServerStateHandle,
+    session_host::WinSize,
     sessions::SessionKeyPredicate,
 };
 
@@ -651,6 +653,37 @@ async fn serve_get_session_screen(
                     error: "session is not active".to_string(),
                 },
             })
+        })
+        .await
+}
+
+/// `SetSessionScreenSize` (`min dash` Preview pane): resize the session's
+/// terminal to the pane's size without attaching, so the next
+/// `GetSessionScreen` snapshot renders without clipping. Best-effort by
+/// contract: a session with no live host is a no-op, and the pixel fields are
+/// left zero (the PTY only needs rows/cols to reflow a full-screen app).
+async fn serve_set_session_screen_size(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    SetSessionScreenSize
+        .handle_channel(c, async |req: SetSessionScreenSizeRequest| {
+            let mngr = s.sessions_manager().await;
+            let sz = WinSize {
+                rows: req.rows,
+                cols: req.cols,
+                xpixel: 0,
+                ypixel: 0,
+            };
+            match mngr
+                .set_screen_size(SessionKeyPredicate::Id(req.id), sz)
+                .await
+            {
+                Ok(()) => Ok(Errorable::Ok(())),
+                Err(e) => Ok(Errorable::Err {
+                    error: e.to_string(),
+                }),
+            }
         })
         .await
 }
@@ -1498,6 +1531,7 @@ pub async fn handle_ssh_rpc(
         | minimald_rpc::GetSessionHooks::NAME
         | SessionDelta::NAME
         | GetSessionScreen::NAME
+        | SetSessionScreenSize::NAME
         | GetMeshStatus::NAME
         | STREAM_WORKSPACE_FILES
         | STREAM_WORKSPACE_PATCHES
@@ -1582,6 +1616,7 @@ pub async fn handle_ssh_rpc(
         minimald_rpc::GetSessionHooks::NAME => serve!(serve_get_session_hooks(s, channel)),
         SessionDelta::NAME => serve!(serve_session_delta(s, channel)),
         GetSessionScreen::NAME => serve!(serve_get_session_screen(s, channel)),
+        SetSessionScreenSize::NAME => serve!(serve_set_session_screen_size(s, channel)),
         GetMeshStatus::NAME => serve!(serve_get_mesh_status(s, channel)),
         STREAM_WORKSPACE_FILES => serve!(serve_stream_workspace_files(s, config, channel)),
         STREAM_WORKSPACE_PATCHES => serve!(serve_stream_workspace_patches(s, config, channel)),
@@ -2501,6 +2536,56 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         };
         assert_eq!((snapshot.rows, snapshot.cols), (24, 80));
+    }
+
+    #[tokio::test]
+    async fn set_session_screen_size_resizes_the_live_terminal() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        // A session with no live host is a no-op, not an error.
+        let inactive = client
+            .call::<SetSessionScreenSize>(&SetSessionScreenSizeRequest {
+                id: session_id,
+                rows: 30,
+                cols: 100,
+            })
+            .await;
+        assert!(
+            matches!(&inactive, Errorable::Ok(())),
+            "expected a no-op Ok for a hostless session, got {inactive:?}",
+        );
+
+        // Attach a shell (the mock launcher runs an echo program), then
+        // resize the PTY and poll until the next snapshot reports it. The
+        // resize goes in the loop: the host came up asynchronously with the
+        // attach, so a resize that beat it is a silent no-op and must be
+        // retried (what the TUI's tick does too).
+        let shell = client.open_shell(session_id).await;
+        shell.data_bytes(&b"hello-screen\n"[..]).await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            client
+                .call::<SetSessionScreenSize>(&SetSessionScreenSizeRequest {
+                    id: session_id,
+                    rows: 30,
+                    cols: 100,
+                })
+                .await
+                .unwrap();
+            let resp = client.call::<GetSessionScreen>(&session_id).await;
+            match resp {
+                Errorable::Ok(snap) if (snap.rows, snap.cols) == (30, 100) => break,
+                _ => {}
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the resize to reach the screen snapshot",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]

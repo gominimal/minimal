@@ -943,6 +943,11 @@ enum Message {
     /// Answered straight off the parser — no PTY resize, no I/O relay.
     GetScreen(oneshot::Sender<minimald_rpc::ScreenSnapshot>),
 
+    /// Resize the PTY and parser screen to `sz` without attaching, so a
+    /// preview consumer (`min dash`) can match the session's terminal to its
+    /// pane. The ack is sent once the size is applied.
+    SetScreenSize(WinSize, oneshot::Sender<()>),
+
     SetTitleCallback(String),
     VisualBellCallback,
     AudibleBellCallback,
@@ -1186,6 +1191,19 @@ impl HostHandle {
         match self.sender.send(Message::GetScreen(send)).await {
             Ok(()) => recv.await.map_err(|_| ()),
             Err(SendError(Message::GetScreen(_))) => Err(()),
+            Err(e) => unreachable!("{:?}", e),
+        }
+    }
+
+    /// Resize the session's PTY and parser screen to `sz` without attaching
+    /// (the TUI's Preview pane matching its size to the session's terminal).
+    /// A dead host reads as `Err(())`, matching [`Self::get_attrs`].
+    pub async fn set_screen_size(&self, sz: WinSize) -> Result<(), ()> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        match self.sender.send(Message::SetScreenSize(sz, send)).await {
+            Ok(()) => recv.await.map_err(|_| ()),
+            Err(SendError(Message::SetScreenSize(_, _))) => Err(()),
             Err(e) => unreachable!("{:?}", e),
         }
     }
@@ -2452,6 +2470,10 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     }
                     Message::GetScreen(s) => {
                         let _ = s.send(self.screen_snapshot());
+                    }
+                    Message::SetScreenSize(sz, r) => {
+                        self.set_size(sz);
+                        let _ = r.send(());
                     }
                     Message::CommandInSession {
                         program,

@@ -198,7 +198,7 @@ fn divider(label: &str, width: u16) -> Line<'static> {
     )
 }
 
-fn render_detail(model: &Model, frame: &mut Frame, area: Rect) {
+fn render_detail(model: &mut Model, frame: &mut Frame, area: Rect) {
     // The detail pane is one vertical stack: Info fields, a Policy section,
     // then the live Preview filling the rest. No tabs.
     let focused = model.focused();
@@ -219,6 +219,7 @@ fn render_detail(model: &Model, frame: &mut Frame, area: Rect) {
     }
 
     let Some(key) = focused else {
+        model.preview_pane = None;
         frame.render_widget(
             Paragraph::new("no session selected")
                 .style(Style::default().fg(Color::Gray))
@@ -253,6 +254,9 @@ fn render_detail(model: &Model, frame: &mut Frame, area: Rect) {
         Constraint::Min(1),
     ])
     .areas(inner);
+    // Stash the pane's size so the tick handler can match the session's
+    // PTY to it (best-effort SetSessionScreenSize).
+    model.preview_pane = Some((preview_area.height, preview_area.width));
     render_info(model, &key, frame, info_area);
     frame.render_widget(Paragraph::new(divider("Policy", inner.width)), policy_div);
     render_policy(model, &key, frame, policy_area);

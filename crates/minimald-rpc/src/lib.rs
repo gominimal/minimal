@@ -242,6 +242,26 @@ impl OneshotSshRpc for GetSessionScreen {
     type Response = Errorable<ScreenSnapshot>;
 }
 
+/// An RPC to resize a session's terminal to a given size without attaching.
+/// `min dash` uses it to match the Preview pane to the session's PTY so a
+/// [`GetSessionScreen`] snapshot renders without clipping a full-screen app.
+/// A session with no live host is a no-op.
+pub struct SetSessionScreenSize;
+
+/// Request for [`SetSessionScreenSize`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetSessionScreenSizeRequest {
+    pub id: SessionId,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+impl OneshotSshRpc for SetSessionScreenSize {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "SetSessionScreenSize");
+    type Request<'a> = SetSessionScreenSizeRequest;
+    type Response = Errorable<()>;
+}
+
 /// An RPC to create a new session.
 ///
 /// Allocates the session's record and brings its actor up; the

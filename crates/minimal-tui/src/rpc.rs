@@ -191,6 +191,28 @@ pub async fn fetch_screen(
     Ok(resp.ok())
 }
 
+/// Resize the session's terminal to the Preview pane's size so the next
+/// `GetSessionScreen` snapshot renders without clipping. Callers treat a
+/// failure as a no-op: a daemon that predates `SetSessionScreenSize` answers
+/// "request subsystem" and the preview keeps today's clipped behavior.
+pub async fn set_screen_size(
+    provider: &mut Provider,
+    id: SessionId,
+    rows: u16,
+    cols: u16,
+) -> Result<(), anyhow::Error> {
+    let resp = timed::<minimald_rpc::SetSessionScreenSize>(
+        &mut provider.client,
+        minimald_rpc::SetSessionScreenSizeRequest { id, rows, cols },
+    )
+    .await
+    .context("SetSessionScreenSize RPC failed")?;
+    match resp {
+        Errorable::Ok(()) => Ok(()),
+        Errorable::Err { error } => Err(anyhow::anyhow!(error)),
+    }
+}
+
 pub async fn destroy(provider: &mut Provider, id: SessionId) -> Result<(), anyhow::Error> {
     match timed::<DestroySession>(&mut provider.client, DestroySessionRequest { id })
         .await
