@@ -14,8 +14,10 @@
 
 pub mod endpoint;
 pub mod lane;
+pub mod proxy;
 pub mod token;
 
 pub use endpoint::{BoxLocation, BrokerEndpoint};
 pub use lane::{Inject, Lane, Secret};
+pub use proxy::{Connector, LaneTable, TOKEN_HEADER, TlsUpstream};
 pub use token::{Refused, RegistrationHandle, Token, TokenStore};
