@@ -579,12 +579,18 @@ impl<'a> Env<'a> {
     ) -> Result<Self, Error> {
         let base_dir = ctx.daemon.config.task_base_dir();
 
+        // `dropped_credentials` is discarded: a task never maps a host
+        // credential in, and `SetupForPackages::build` already warned per
+        // dropped mapping. Reaching a credentialed upstream from a task is the
+        // credential lane's job, and it is session-scoped for now
+        // (docs/specs/12-spec-credential-lane).
         let SetupForPackages {
             fs_mappings: mut patch,
             needs_dns,
             needs_internet,
             state_dirs,
             env_vars: mut pkg_env_vars,
+            dropped_credentials: _,
         } = SetupForPackages::build(graph, args.transitives.keys())
             .map_err(|e| Error::IO("package setup", "".into(), e))?;
 

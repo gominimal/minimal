@@ -327,6 +327,7 @@ impl Env {
                 fs_mappings: _,
                 needs_dns: _,
                 needs_internet: _,
+                dropped_credentials: _,
                 state_dirs,
                 env_vars,
             } = SetupForPackages::build(&graph, transitives.keys())

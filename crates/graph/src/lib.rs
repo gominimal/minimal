@@ -181,7 +181,9 @@ pub use builds::{
 };
 
 mod env_setup;
-pub use env_setup::SetupForPackages;
+pub use env_setup::{
+    CREDENTIAL_CLASS_TAG, DroppedCredential, SetupForPackages, is_credential_class,
+};
 
 // Re-exported so downstream crates can inspect the `Stack` a
 // `Graph::stack(name)` lookup returns without pulling in `decode`
