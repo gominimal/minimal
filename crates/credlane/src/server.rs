@@ -636,6 +636,37 @@ impl BrokerProcess {
             // panic) must not orphan a process holding the control socket.
             .kill_on_drop(true);
 
+        // `kill_on_drop` only fires when Rust runs the destructor, so a
+        // supervisor that is signalled — the ordinary way a daemon ends — leaves
+        // the broker holding the port and the control socket, and every later
+        // boot fails against it. The kernel is the only thing that can close
+        // that window.
+        //
+        // Linux only, and keyed to the *thread* that spawns rather than the
+        // process: safe here because both supervisors spawn from a tokio worker,
+        // which lives as long as the runtime does. macOS has no equivalent, so
+        // there the reaper script stays the backstop.
+        #[cfg(target_os = "linux")]
+        // SAFETY: `pre_exec` runs between fork and exec, where only
+        // async-signal-safe calls are permitted. `prctl` is one, and this call
+        // sets a flag on the calling thread with no allocation, no locking, and
+        // no effect on the parent.
+        unsafe {
+            let supervisor = libc::getpid();
+            cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                // The supervisor can die in the window between fork and the
+                // `prctl` above, in which case the signal has already been
+                // missed and this child would run forever unparented.
+                if libc::getppid() != supervisor {
+                    return Err(io::Error::other("supervisor exited during spawn"));
+                }
+                Ok(())
+            });
+        }
+
         tracing::info!(
             component = COMPONENT,
             daemon = %daemon.display(),

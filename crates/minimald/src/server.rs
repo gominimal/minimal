@@ -486,8 +486,11 @@ impl Server {
         // :7655) for the server's lifetime and, in a microVM (DM1), publish them
         // on the macOS host loopback. minimald is Linux-only, and the PTask
         // hostname registry they route against only exists on Linux.
+        // The broker handle is bound for the accept loop's lifetime: it kills
+        // its child on drop, so letting it fall out of scope here would take
+        // every session's credential lanes down with it.
         #[cfg(target_os = "linux")]
-        start_host_proxies(&state, in_microvm).await;
+        let mut broker = start_host_proxies(&state, in_microvm).await;
 
         let russh_config = build_russh_config(&state)
             .await
@@ -613,6 +616,14 @@ impl Server {
                 }
             }
         }
+        // After the drain, so a connection still finishing a request keeps its
+        // lanes; `kill_on_drop` would otherwise cut them at an arbitrary point.
+        #[cfg(target_os = "linux")]
+        if let Some(broker) = broker.as_mut()
+            && let Err(error) = broker.stop().await
+        {
+            tracing::warn!(%error, "credential broker did not stop cleanly");
+        }
         Ok(())
     }
 }
@@ -703,8 +714,15 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::session
 /// directly. A bind failure warns and is skipped — the daemon keeps serving. The
 /// serve loops run on detached tasks; this returns once the listeners are bound
 /// and (DM1) exposed.
+///
+/// The credential broker is the exception: on native Linux (DM2) it runs as a
+/// supervised child process, and the returned handle must be held for the
+/// daemon's lifetime — dropping it kills the broker.
 #[cfg(target_os = "linux")]
-async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
+async fn start_host_proxies(
+    state: &ServerStateHandle,
+    in_microvm: bool,
+) -> Option<credlane::server::BrokerProcess> {
     use crate::net::proxy::{self, Router};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -780,23 +798,37 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
     // behind the VM wall on a control socket the client cannot reach — the
     // host's `minvmd` owns it on those platforms instead.
     //
-    // Run in-process rather than as a supervised child the way `minvmd` does
-    // it: on this path the daemon already *is* the host, so there is no
-    // boundary to cross, and the other host listeners above are spawned the
-    // same way.
-    if !in_microvm {
-        match credlane::server::control_socket_path() {
-            Ok(control_socket) => {
-                let config = credlane::server::BrokerConfig::new(control_socket);
-                tokio::spawn(async move {
-                    if let Err(error) = credlane::server::run(config).await {
-                        tracing::error!(%error, "credential broker exited");
-                    }
-                });
-            }
-            Err(error) => {
-                tracing::warn!(%error, "no runtime dir for the broker control socket");
-            }
+    // A supervised child, not an in-process task, and the same `<daemon>
+    // broker` argv `minvmd` spawns: the broker is the one listener here that
+    // holds plaintext credentials, so it gets an address space of its own that
+    // no other part of this daemon can read, and one restart path on both
+    // deployment models rather than two.
+    //
+    // Best-effort for the same reason gvproxy is: a broker that will not start
+    // costs a box its credential lanes, not its boot.
+    if in_microvm {
+        return None;
+    }
+    let control_socket = match credlane::server::control_socket_path() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(%error, "no runtime dir for the broker control socket");
+            return None;
+        }
+    };
+    let daemon = match std::env::current_exe() {
+        Ok(daemon) => daemon,
+        Err(error) => {
+            tracing::warn!(%error, "cannot locate this binary to spawn the broker");
+            return None;
+        }
+    };
+    let config = credlane::server::BrokerConfig::new(control_socket);
+    match credlane::server::BrokerProcess::spawn(&daemon, &config).await {
+        Ok(broker) => Some(broker),
+        Err(error) => {
+            tracing::warn!(%error, "failed to spawn the credential broker");
+            None
         }
     }
 }
