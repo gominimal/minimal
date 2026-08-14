@@ -8,31 +8,43 @@
 //! `~/${PROJECT_ROOT}` can reference a `PROJECT_ROOT` approved
 //! moments earlier in the same response.
 //!
-//! Lifecycle hooks are gated last, against the hooks policy, by the
-//! project root that declared them: a hook is arbitrary code, so a
+//! Lifecycle hooks are gated after that, against the hooks policy, by
+//! the project root that declared them: a hook is arbitrary code, so a
 //! project must be allow-listed before any of its hooks run. Hooks are
 //! decided per project rather than per script — a project's hooks are
 //! approved as a set — so the prompt fires once per project no matter
 //! how many scripts it declares.
+//!
+//! Credential lanes are gated last, keyed on the project root exactly as
+//! hooks are, and are where the client's own binding file enters the
+//! flow: the daemon ships a lane name and an injection shape, and the
+//! client answers with the upstream the *user* bound that name to. The
+//! daemon never holds a binding, so an approved lane cannot be pointed
+//! at a host the project chose.
 //!
 //! Per-domain verdicts are correlated by `id`, not slice position:
 //! auto-decided items come out in input order but hook-routed items
 //! land at the end.
 
 use crate::core::compose::{
-    ComposeError, ComposeOptions, HookDomain, PendingPatchFile, PendingVar, SessionVar,
-    expand_patch_sources,
+    ComposeError, ComposeOptions, CredentialLane, HookDomain, PendingPatchFile, PendingVar,
+    SessionVar, expand_patch_sources,
 };
 use crate::core::decision::{CheckOutcome, Decision, ItemDecision};
 use crate::core::enumerate::enumerate_patch_files;
 use crate::core::hooks::{PolicyHooks, Unapproved};
 use crate::core::policy::{
-    ExpandedPatchesPolicy, HooksPolicy, PatchesPolicy, UserPolicy, VarsPolicy,
+    CredentialsPolicy, ExpandedCredentialsPolicy, ExpandedPatchesPolicy, HooksPolicy,
+    PatchesPolicy, UserPolicy, VarsPolicy,
 };
-use crate::core::primitives::{Patch, PatchDest};
+use crate::core::primitives::{CredentialBindings, Patch, PatchDest};
 use crate::core::source::{Provenanced, ProvenancedPatch, Source};
-use crate::wire::policy::{WireHookVerdict, WirePatchVerdict, WireVarVerdict};
-use crate::wire::primitives::{WirePendingHook, WirePendingPatch, WirePendingVar};
+use crate::wire::policy::{
+    WireCredentialVerdict, WireHookVerdict, WirePatchVerdict, WireVarVerdict,
+};
+use crate::wire::primitives::{
+    PendingId, WirePendingCredential, WirePendingHook, WirePendingPatch, WirePendingVar,
+};
 use crate::wire::request::{ContributionResponse, ContributionVerdict};
 
 /// Gate the daemon's pending items against `policy`, prompting via
@@ -41,7 +53,9 @@ use crate::wire::request::{ContributionResponse, ContributionVerdict};
 ///
 /// `gated_vars` is the client's already-gated var set from the
 /// loadout phase; pending patch sources may reference both those
-/// and any vars approved in this response.
+/// and any vars approved in this response. `bindings` is the user's
+/// credential binding file — the sole authority on which upstream a
+/// lane may reach, and the reason this gate runs client-side.
 ///
 /// # Errors
 ///
@@ -57,10 +71,11 @@ pub fn handle_response(
     policy: UserPolicy,
     hooks: &dyn PolicyHooks,
     options: ComposeOptions,
+    bindings: &CredentialBindings,
     env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
 ) -> Result<(ContributionVerdict, UserPolicy), ComposeError> {
     let session_id = response.session_id;
-    let (vars_policy, patches_policy, hooks_policy) = policy.into_parts();
+    let (vars_policy, patches_policy, hooks_policy, credentials_policy) = policy.into_parts();
 
     let (var_out, vars_policy) = gate_pending_vars(response.vars, vars_policy, hooks, env)?;
 
@@ -86,10 +101,20 @@ pub fn handle_response(
         env,
     )?;
 
+    let (credential_verdicts, credentials_policy) = gate_pending_credentials(
+        response.credentials,
+        credentials_policy,
+        hooks,
+        bindings,
+        &combined_vars,
+        env,
+    )?;
+
     let final_policy = UserPolicy::empty()
         .with_vars(vars_policy)
         .with_patches(patches_policy)
-        .with_hooks(hooks_policy);
+        .with_hooks(hooks_policy)
+        .with_credentials(credentials_policy);
 
     Ok((
         ContributionVerdict {
@@ -97,9 +122,170 @@ pub fn handle_response(
             vars: var_out.verdicts,
             patches: patch_verdicts,
             lifecycle_hooks: hook_verdicts,
+            credentials: credential_verdicts,
         },
         final_policy,
     ))
+}
+
+// =====================================================================
+// Credential lanes
+// =====================================================================
+
+/// The minimum a lane needs to face the policy: its correlation id, the
+/// declaration the daemon shipped, and the source the policy matches on.
+/// The upstream is deliberately absent — it is resolved from the user's
+/// bindings only once the policy has decided it wants the lane, so a
+/// denied or ignored lane never requires a binding the user didn't make.
+#[derive(Debug)]
+struct PendingCredential {
+    id: PendingId,
+    lane: String,
+    header: String,
+    source: Source,
+}
+
+impl Provenanced for PendingCredential {
+    fn source(&self) -> &Source {
+        &self.source
+    }
+}
+
+impl PendingCredential {
+    /// Pair the declaration with the upstream the user bound the lane
+    /// to, producing what the prompt shows and the verdict carries.
+    ///
+    /// # Errors
+    ///
+    /// [`ComposeError::UnboundCredentialLane`] when the user has no
+    /// binding for this name. Failing here rather than composing a lane
+    /// with no destination is what keeps "the binding is the authority"
+    /// true even for a project the policy already trusts.
+    fn describe(&self, bindings: &CredentialBindings) -> Result<CredentialLane, ComposeError> {
+        let binding =
+            bindings
+                .get(&self.lane)
+                .ok_or_else(|| ComposeError::UnboundCredentialLane {
+                    lane: self.lane.clone(),
+                    from: self.source.clone(),
+                })?;
+        Ok(CredentialLane::new(
+            &self.lane,
+            &binding.upstream,
+            &self.header,
+        ))
+    }
+}
+
+/// Gate the daemon's pending credential lanes against the credentials
+/// policy.
+///
+/// Decisions are per **lane**, not per project as hooks are: two lanes
+/// from one project name two different upstreams and two different
+/// secrets, so approving them as a set would ask for consent to a
+/// destination the user was never shown. The rule a permanent approval
+/// records is still the project root, so the second lane of an
+/// allow-listed project decides without asking again.
+fn gate_pending_credentials(
+    pending: Vec<WirePendingCredential>,
+    policy: CredentialsPolicy,
+    hooks: &dyn PolicyHooks,
+    bindings: &CredentialBindings,
+    combined_vars: &[SessionVar],
+    env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<(Vec<WireCredentialVerdict>, CredentialsPolicy), ComposeError> {
+    if pending.is_empty() {
+        return Ok((Vec::new(), policy));
+    }
+    let home_fallback = env("HOME").ok();
+    let expanded = policy.expand_with(combined_vars, home_fallback.as_deref())?;
+
+    // Pass 1: classify. Lanes the policy can decide emit a verdict
+    // immediately; the rest queue for one prompt each.
+    let mut verdicts: Vec<WireCredentialVerdict> = Vec::with_capacity(pending.len());
+    let mut unapproved: Vec<(PendingCredential, CredentialLane)> = Vec::new();
+    for p in pending {
+        let item = PendingCredential {
+            id: p.id,
+            lane: p.lane,
+            header: p.header,
+            source: p.source.into(),
+        };
+        match classify_credential(&expanded, item, bindings)? {
+            CredentialClassification::Decided(v) => verdicts.push(v),
+            CredentialClassification::Pending(item, lane) => unapproved.push((item, lane)),
+        }
+    }
+    if unapproved.is_empty() {
+        return Ok((verdicts, policy));
+    }
+
+    // Pass 2: prompt, showing the lane, the bound upstream, and the
+    // header — the destination is the whole of what consent is about.
+    let view: Vec<Unapproved<'_, CredentialLane>> = unapproved
+        .iter()
+        .map(|(item, lane)| Unapproved::new(lane, item.source()))
+        .collect();
+    let (decisions, policy) = crate::core::compose::prompt_credential_hook(hooks, policy, &view)?;
+
+    // Pass 3: apply.
+    let expanded = policy.expand_with(combined_vars, home_fallback.as_deref())?;
+    for ((item, lane), decision) in unapproved.into_iter().zip(decisions) {
+        let verdict = match decision {
+            ItemDecision::AllowOnce => WireCredentialVerdict::Approved {
+                id: item.id,
+                upstream: lane.upstream().to_owned(),
+            },
+            ItemDecision::IgnoreOnce => WireCredentialVerdict::Ignored { id: item.id },
+            ItemDecision::UseRule => match classify_credential(&expanded, item, bindings)? {
+                CredentialClassification::Decided(v) => v,
+                CredentialClassification::Pending(item, _) => {
+                    return Err(ComposeError::use_rule_undecided(
+                        HookDomain::Credential,
+                        format!("credential lane `{}`", item.lane),
+                    ));
+                }
+            },
+        };
+        verdicts.push(verdict);
+    }
+    Ok((verdicts, policy))
+}
+
+/// Result of running one pending lane through the policy. The
+/// `Pending` arm carries the descriptor alongside the item so the
+/// binding lookup isn't repeated for the prompt.
+enum CredentialClassification {
+    Decided(WireCredentialVerdict),
+    Pending(PendingCredential, CredentialLane),
+}
+
+fn classify_credential(
+    policy: &ExpandedCredentialsPolicy,
+    item: PendingCredential,
+    bindings: &CredentialBindings,
+) -> Result<CredentialClassification, ComposeError> {
+    // Captured before `check` takes ownership: the `Ignored` arm doesn't
+    // hand the item back and still needs the id to correlate.
+    let id = item.id;
+    match policy.check(item) {
+        CheckOutcome::Decided(Decision::Allowed(item)) => {
+            let upstream = item.describe(bindings)?.upstream().to_owned();
+            Ok(CredentialClassification::Decided(
+                WireCredentialVerdict::Approved { id, upstream },
+            ))
+        }
+        CheckOutcome::Decided(Decision::Denied(_)) => Ok(CredentialClassification::Decided(
+            WireCredentialVerdict::Denied { id },
+        )),
+        CheckOutcome::Decided(Decision::Ignored) => Ok(CredentialClassification::Decided(
+            WireCredentialVerdict::Ignored { id },
+        )),
+        CheckOutcome::NeedsApproval(item) => {
+            let lane = item.describe(bindings)?;
+            Ok(CredentialClassification::Pending(item, lane))
+        }
+    }
 }
 
 // =====================================================================

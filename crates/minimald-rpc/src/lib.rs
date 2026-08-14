@@ -1293,6 +1293,7 @@ mod tests {
                 vars: vec![],
                 patches: vec![],
                 lifecycle_hooks: vec![],
+                credentials: vec![],
             },
         };
         assert_eq!(round_trip(&resp), resp);

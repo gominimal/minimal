@@ -226,6 +226,63 @@ impl Provenanced for ProvenancedHook {
     }
 }
 
+/// A credential lane declaration tagged with its [`Source`].
+///
+/// A declaration is a lane name plus an injection shape and nothing
+/// else. Where the secret comes from and which upstream it may reach are
+/// the user's binding, so there is no field here — nor on
+/// [`Credential`](crate::core::primitives::Credential) — that could name
+/// either. What the declarer asks for is a name the user may have bound;
+/// the worst a hostile project can do is ask for one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProvenancedCredential {
+    lane: String,
+    credential: crate::core::primitives::Credential,
+    source: Source,
+}
+
+impl ProvenancedCredential {
+    /// Construct from a lane name, its declaration, and the origin.
+    #[must_use]
+    pub fn new(
+        lane: impl Into<String>,
+        credential: crate::core::primitives::Credential,
+        source: Source,
+    ) -> Self {
+        Self {
+            lane: lane.into(),
+            credential,
+            source,
+        }
+    }
+
+    /// The lane name — the selector a box's URL leads with, and the
+    /// name the user's binding file keys on.
+    #[must_use]
+    pub fn lane(&self) -> &str {
+        &self.lane
+    }
+
+    /// The declaration: how the broker places the credential in the
+    /// outbound request.
+    #[must_use]
+    pub fn credential(&self) -> &crate::core::primitives::Credential {
+        &self.credential
+    }
+
+    /// Consume and return `(lane, credential, source)`.
+    #[must_use]
+    pub fn into_parts(self) -> (String, crate::core::primitives::Credential, Source) {
+        (self.lane, self.credential, self.source)
+    }
+}
+
+impl Provenanced for ProvenancedCredential {
+    fn source(&self) -> &Source {
+        &self.source
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wire → domain conversions
 // ---------------------------------------------------------------------------

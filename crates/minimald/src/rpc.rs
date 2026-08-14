@@ -2633,6 +2633,7 @@ mod tests {
                 vars: vec![],
                 patches: vec![],
                 lifecycle_hooks: vec![],
+                credentials: vec![],
             })
             .await;
         match resp {

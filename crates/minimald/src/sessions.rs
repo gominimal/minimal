@@ -1024,6 +1024,16 @@ pub(crate) mod tests {
                 .collect(),
             patches: vec![],
             lifecycle_hooks: vec![],
+            credentials: response
+                .credentials
+                .iter()
+                .map(
+                    |pc| sessions::wire::policy::WireCredentialVerdict::Approved {
+                        id: pc.id,
+                        upstream: format!("https://{}.example", pc.lane),
+                    },
+                )
+                .collect(),
         }
     }
 
@@ -1457,6 +1467,7 @@ pub(crate) mod tests {
                 vars: vec![],
                 patches: vec![],
                 lifecycle_hooks: vec![],
+                credentials: vec![],
             })
             .await
             .expect("actor reply should succeed");
@@ -1518,6 +1529,7 @@ pub(crate) mod tests {
                 .collect(),
             patches: vec![],
             lifecycle_hooks: vec![],
+            credentials: vec![],
         };
         let step = handle
             .submit_verdict(verdict)

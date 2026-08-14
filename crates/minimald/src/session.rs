@@ -3735,6 +3735,7 @@ mod tests {
                 patches: Vec::new(),
                 packages: Vec::new(),
                 lifecycle_hooks: vec![WireProvenancedHook::from(hook)],
+                credentials: Vec::new(),
                 orientation: Default::default(),
             })
             .expect("a hook with a script converts back")

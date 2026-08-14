@@ -16,14 +16,18 @@ use std::collections::BTreeMap;
 use crate::core::decision::{CheckOutcome, Decision, ItemDecision};
 use crate::core::enumerate::{ExpandedProvenancedPatch, PatchFile, enumerate_patch_files};
 use crate::core::hooks::{HookResult, PolicyHooks, Unapproved};
-use crate::core::policy::{PatchesPolicy, UserPolicy, VarsPolicy};
-use crate::core::primitives::{ResolvedPatch, ResolvedVar, VarError};
+use crate::core::policy::{CredentialsPolicy, PatchesPolicy, UserPolicy, VarsPolicy};
+use crate::core::primitives::{
+    Credential, CredentialInject, ResolvedPatch, ResolvedVar, VarError, validate_credential_lanes,
+};
 use crate::core::source::{
-    Provenanced, ProvenancedHook, ProvenancedPackage, ProvenancedPatch, ProvenancedVar, Source,
+    Provenanced, ProvenancedCredential, ProvenancedHook, ProvenancedPackage, ProvenancedPatch,
+    ProvenancedVar, Source,
 };
 use crate::wire::policy::{WirePatchVerdict, WireVarVerdict};
 use crate::wire::primitives::{
-    PendingId, WirePendingHook, WirePendingPatch, WirePendingVar, WireSessionPatch, WireSessionVar,
+    PendingId, WireCredentialLane, WirePendingCredential, WirePendingHook, WirePendingPatch,
+    WirePendingVar, WireSessionPatch, WireSessionVar,
 };
 
 /// Errors produced while a [`Composable`] materializes its
@@ -119,6 +123,19 @@ pub enum Conflict {
     /// contributors instead of a mid-Finalize `NotADirectory` /
     /// `IsADirectory` fault that leaves the session stuck in
     /// `Materializing`.
+    /// Two contributors declared the same credential lane, or two names
+    /// that mangle onto the same environment-variable suffix. Either way
+    /// the two lanes would collapse onto one
+    /// `MINIMAL_CREDENTIAL_ENDPOINT_*` variable and the box would
+    /// silently reach whichever merged last — with the other lane's
+    /// credential in play.
+    CredentialLaneCollision {
+        /// What the lane validator objected to.
+        reason: crate::core::primitives::CredentialError,
+        /// Every lane in the merged set, paired with the source that
+        /// declared it, so the two that collided are visible.
+        declarations: Vec<(Source, String)>,
+    },
     PatchDestPrefixCollision {
         /// The shorter destination — the one that would land as a
         /// file directly under `<home>`.
@@ -175,6 +192,21 @@ impl fmt::Display for Conflict {
                     "\nhint: add a pattern matching the conflicting source path(s) \
                      above to your patch policy's ignore list to drop both, \
                      or remove one of the contributors"
+                )
+            }
+            Self::CredentialLaneCollision {
+                reason,
+                declarations,
+            } => {
+                write!(f, "credential lanes collide: {reason}")?;
+                for (source, lane) in declarations {
+                    write!(f, "\n  - `{lane}` (from {source})")?;
+                }
+                write!(
+                    f,
+                    "\nhint: rename one of the lanes, or drop a contributor \
+                     by adding its project root to your credentials policy's \
+                     ignore list"
                 )
             }
             Self::PatchDestPrefixCollision {
@@ -269,6 +301,42 @@ fn check_patch_mismatches<'a, T: Provenanced + 'a>(
             disagreeing_sources: collect_contributions(group, &pattern),
         })
         .map_or(Ok(()), Err)
+}
+
+/// Reject a merged lane set that two sources can't share: a duplicated
+/// name, or two names that mangle onto one environment-variable suffix.
+///
+/// Runs post-gate with the var and patch checks, on the same reasoning —
+/// the user's `ignore` rules get to drop a contributor before it is
+/// compared. [`validate_credential_lanes`] is the single definition of
+/// what a usable lane set looks like; feeding it the merged set is what
+/// makes "unique per composition" mean the same thing here as it does at
+/// parse time for one file.
+fn check_credential_lane_conflicts<'a>(
+    items: impl IntoIterator<Item = &'a SessionCredential> + Clone,
+) -> Result<(), Conflict> {
+    // `validate_credential_lanes` reads a declaration, not a descriptor,
+    // so the header is lifted back into one. Nothing else about the
+    // declaration survives the gate, and nothing else is checked.
+    let declared: Vec<(String, Credential)> = items
+        .clone()
+        .into_iter()
+        .map(|c| {
+            (
+                c.lane().lane().to_owned(),
+                Credential::new(CredentialInject::new(c.lane().header())),
+            )
+        })
+        .collect();
+    validate_credential_lanes(declared.iter().map(|(lane, c)| (lane.as_str(), c))).map_err(
+        |reason| Conflict::CredentialLaneCollision {
+            reason,
+            declarations: items
+                .into_iter()
+                .map(|c| (c.source().clone(), c.lane().lane().to_owned()))
+                .collect(),
+        },
+    )
 }
 
 /// Reject two patches whose destinations are prefixes of one another
@@ -421,6 +489,7 @@ pub struct Contribution {
     pub(crate) patches: Vec<ProvenancedPatch>,
     pub(crate) packages: Vec<ProvenancedPackage>,
     pub(crate) lifecycle_hooks: Vec<ProvenancedHook>,
+    pub(crate) credentials: Vec<ProvenancedCredential>,
 }
 
 impl Contribution {
@@ -448,6 +517,11 @@ impl Contribution {
     /// Append a lifecycle hook in place.
     pub fn push_hook(&mut self, h: ProvenancedHook) {
         self.lifecycle_hooks.push(h);
+    }
+
+    /// Append a credential lane declaration in place.
+    pub fn push_credential(&mut self, c: ProvenancedCredential) {
+        self.credentials.push(c);
     }
 
     /// Overwrite the `follow_symlinks` override on every currently
@@ -482,6 +556,10 @@ impl Contribution {
         self.packages.extend(other.packages);
         dedupe_by_name(&mut self.packages, ProvenancedPackage::package);
         self.lifecycle_hooks.extend(other.lifecycle_hooks);
+        // Lanes concatenate here and are checked for name collisions
+        // post-gate, so an `ignore` rule still gets to drop a
+        // contributor before two names are compared.
+        self.credentials.extend(other.credentials);
         Ok(())
     }
 
@@ -520,6 +598,7 @@ impl Contribution {
             && self.patches.is_empty()
             && self.packages.is_empty()
             && self.lifecycle_hooks.is_empty()
+            && self.credentials.is_empty()
     }
 
     /// All vars contributed so far.
@@ -544,6 +623,12 @@ impl Contribution {
     #[must_use]
     pub fn lifecycle_hooks(&self) -> &[ProvenancedHook] {
         &self.lifecycle_hooks
+    }
+
+    /// All credential lane declarations contributed so far.
+    #[must_use]
+    pub fn credentials(&self) -> &[ProvenancedCredential] {
+        &self.credentials
     }
 }
 
@@ -602,8 +687,9 @@ pub trait Composable {
 }
 
 /// Build a [`Contribution`] from a loadout-shaped primitive set
-/// (packages, strict vars, lenient vars, patches, lifecycle hooks)
-/// against a single [`Source`], resolving each var against `env`.
+/// (packages, strict vars, lenient vars, patches, lifecycle hooks,
+/// credential lanes) against a single [`Source`], resolving each var
+/// against `env`.
 ///
 /// Shared by [`crate::core::loadout::Loadout`]'s and every project /
 /// package composable's `contribute` — the only per-source
@@ -611,10 +697,10 @@ pub trait Composable {
 /// so lifting the loop bodies into one helper prevents the impls
 /// from drifting when a new primitive lands.
 ///
-/// Positional args over a named struct because wrapping five fields
+/// Positional args over a named struct because wrapping the fields
 /// in a `Primitives`-shaped struct at every callsite (only to
 /// immediately destructure inside the fn) is pure ceremony given
-/// the shape isn't otherwise reused. If a sixth primitive lands,
+/// the shape isn't otherwise reused. When a primitive lands,
 /// this signature grows and every caller breaks compile-time —
 /// the intended way to spot missed updates.
 ///
@@ -623,6 +709,10 @@ pub trait Composable {
 /// See [`Composable::contribute`] — the same
 /// [`ResolvedVar::resolve_with`](crate::core::primitives::ResolvedVar::resolve_with)
 /// failure modes propagate.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per primitive domain is the point: the arity is what breaks every caller when a domain lands"
+)]
 pub fn contribute_primitives(
     source: &crate::core::source::Source,
     packages: Vec<String>,
@@ -633,11 +723,13 @@ pub fn contribute_primitives(
     vars_lenient: Vec<crate::core::primitives::LenientVarEntry>,
     patches: crate::core::primitives::Patches,
     lifecycle_hooks: Vec<crate::core::lifecyclehook::LifecycleHook>,
+    credentials: std::collections::BTreeMap<String, Credential>,
     env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
 ) -> Result<Contribution, Error> {
     use crate::core::primitives::ResolvedVar;
     use crate::core::source::{
-        ProvenancedHook, ProvenancedPackage, ProvenancedPatch, ProvenancedVar,
+        ProvenancedCredential, ProvenancedHook, ProvenancedPackage, ProvenancedPatch,
+        ProvenancedVar,
     };
 
     let mut c = Contribution::new();
@@ -658,6 +750,9 @@ pub fn contribute_primitives(
     }
     for hook in lifecycle_hooks {
         c.push_hook(ProvenancedHook::new(hook, source.clone()));
+    }
+    for (lane, credential) in credentials {
+        c.push_credential(ProvenancedCredential::new(lane, credential, source.clone()));
     }
     Ok(c)
 }
@@ -743,6 +838,33 @@ pub enum ComposeError {
         #[source]
         source: std::env::VarError,
     },
+    /// A project declared a credential lane the user has no binding
+    /// for. Fails the activation rather than composing a lane with no
+    /// destination: the project names only the lane, so an unbound name
+    /// means the user has not said where the secret comes from or which
+    /// upstream it may reach.
+    #[error(
+        "credential lane `{lane}` (from {from}) is not bound; \
+         add a `[{lane}]` entry with `upstream` and `source` to your \
+         credential binding file"
+    )]
+    UnboundCredentialLane {
+        /// The lane name the project declared.
+        lane: String,
+        /// The declaring source.
+        from: Source,
+    },
+    /// A credential lane reached a composition path that cannot bind it
+    /// to an upstream. Only project-declared lanes round-trip through
+    /// the client today, and that round trip is where the binding
+    /// supplies the upstream.
+    #[error("credential lane `{lane}` (from {from}) cannot be composed from this source")]
+    UnbindableCredentialLane {
+        /// The lane name.
+        lane: String,
+        /// The declaring source.
+        from: Source,
+    },
     /// Two contributors disagreed on a var value or patch source.
     /// Surfaces from the post-gate checks in
     /// [`compose_contribution`] (each side's own composition) and
@@ -766,6 +888,7 @@ pub(crate) enum HookDomain {
     Var,
     Patch,
     Hook,
+    Credential,
 }
 
 impl ComposeError {
@@ -779,6 +902,9 @@ impl ComposeError {
             HookDomain::Patch => "UseRule returned for a patch file the policy still cannot decide",
             HookDomain::Hook => {
                 "UseRule returned for a project whose hooks the policy still cannot decide"
+            }
+            HookDomain::Credential => {
+                "UseRule returned for a credential lane the policy still cannot decide"
             }
         };
         Self::HookContract {
@@ -798,6 +924,9 @@ impl ComposeError {
             HookDomain::Var => "var-domain hook returned the wrong number of decisions",
             HookDomain::Patch => "patch-domain hook returned the wrong number of decisions",
             HookDomain::Hook => "lifecycle-hook-domain hook returned the wrong number of decisions",
+            HookDomain::Credential => {
+                "credential-domain hook returned the wrong number of decisions"
+            }
         };
         Self::HookContract {
             kind,
@@ -919,6 +1048,118 @@ impl From<WireSessionPatch> for SessionPatch {
             patch: p.patch.into(),
             source: p.source.into(),
         }
+    }
+}
+
+/// What a credential lane looks like on the composition path: the lane
+/// name, the upstream the **user's binding** bound it to, and the header
+/// the broker injects into.
+///
+/// This is the whole of it, deliberately. No field here can hold a
+/// credential value, so "the daemon never sees a secret" is a property
+/// of the type rather than of the code that fills it in — which matters
+/// because everything on this path is copied into `composition.json`
+/// and logged at `debug`. The upstream is the user's and never the
+/// project's, so an approved lane cannot be pointed at a host the
+/// project chose.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CredentialLane {
+    lane: String,
+    upstream: String,
+    header: String,
+}
+
+impl CredentialLane {
+    /// Construct a descriptor from a lane name, the bound upstream, and
+    /// the header the broker injects into.
+    #[must_use]
+    pub fn new(
+        lane: impl Into<String>,
+        upstream: impl Into<String>,
+        header: impl Into<String>,
+    ) -> Self {
+        Self {
+            lane: lane.into(),
+            upstream: upstream.into(),
+            header: header.into(),
+        }
+    }
+
+    /// The lane name — the selector the box's URL leads with, and the
+    /// suffix of the endpoint variable it is handed.
+    #[must_use]
+    pub fn lane(&self) -> &str {
+        &self.lane
+    }
+
+    /// The one upstream this lane may reach, from the user's binding.
+    #[must_use]
+    pub fn upstream(&self) -> &str {
+        &self.upstream
+    }
+
+    /// The header the broker sets on the outbound request.
+    #[must_use]
+    pub fn header(&self) -> &str {
+        &self.header
+    }
+}
+
+impl fmt::Display for CredentialLane {
+    /// The one-line review form: what the lane is called, where it
+    /// reaches, and how the credential gets there.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            lane,
+            upstream,
+            header,
+        } = self;
+        write!(f, "`{lane}` → {upstream} (header `{header}`)")
+    }
+}
+
+/// One credential lane that survived the policy gate, paired with its
+/// origin. See [`SessionVar`] for the typestate rationale.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SessionCredential {
+    lane: CredentialLane,
+    source: Source,
+}
+
+impl SessionCredential {
+    /// Direct construction. Crate-internal so external callers can only
+    /// obtain one via the gate or from a [`WireCredentialLane`] — both
+    /// post-gate by construction.
+    #[must_use]
+    pub(crate) fn new(lane: CredentialLane, source: Source) -> Self {
+        Self { lane, source }
+    }
+
+    /// The lane descriptor that survived the gate.
+    #[must_use]
+    pub fn lane(&self) -> &CredentialLane {
+        &self.lane
+    }
+
+    /// Consume the [`SessionCredential`] and return `(lane, source)`.
+    #[must_use]
+    pub fn into_parts(self) -> (CredentialLane, Source) {
+        (self.lane, self.source)
+    }
+}
+
+impl Provenanced for SessionCredential {
+    fn source(&self) -> &Source {
+        &self.source
+    }
+}
+
+impl From<WireCredentialLane> for SessionCredential {
+    fn from(c: WireCredentialLane) -> Self {
+        Self::new(
+            CredentialLane::new(c.lane, c.upstream, c.header),
+            c.source.into(),
+        )
     }
 }
 
@@ -1112,6 +1353,7 @@ pub struct Composition {
     patches: Vec<SessionPatch>,
     packages: Vec<ProvenancedPackage>,
     lifecycle_hooks: Vec<ProvenancedHook>,
+    credentials: Vec<SessionCredential>,
     /// First-prompt orientation facts; see [`Orientation`]. Client-set:
     /// the daemon-side passthrough never populates it, and
     /// [`Self::extend_from_wire`] installs the client's value.
@@ -1178,8 +1420,20 @@ impl Composition {
         self.lifecycle_hooks.iter().rev()
     }
 
-    /// Consume the [`Composition`] and return the underlying vectors
-    /// for moving into downstream layers.
+    /// The credential lanes that survived the policy gate, each paired
+    /// with the source that declared it. Lane names are unique across
+    /// the whole composition — see
+    /// [`check_credential_lane_conflicts`].
+    #[must_use]
+    pub fn credentials(&self) -> &[SessionCredential] {
+        &self.credentials
+    }
+
+    /// Consume the [`Composition`] and return the four materializable
+    /// domains for moving into downstream layers. Credential lanes are
+    /// left behind — read them with [`Self::credentials`]; they are
+    /// delivered as endpoint variables layered above the composition,
+    /// never materialized from it.
     #[must_use]
     pub fn into_parts(
         self,
@@ -1188,8 +1442,15 @@ impl Composition {
         Vec<SessionPatch>,
         Vec<ProvenancedPackage>,
         Vec<ProvenancedHook>,
+        Vec<SessionCredential>,
     ) {
-        (self.vars, self.patches, self.packages, self.lifecycle_hooks)
+        (
+            self.vars,
+            self.patches,
+            self.packages,
+            self.lifecycle_hooks,
+            self.credentials,
+        )
     }
 
     /// Append an already-gated wire contribution. The wire form has
@@ -1239,11 +1500,16 @@ impl Composition {
             .into_iter()
             .map(Into::into)
             .collect();
+        let incoming_credentials: Vec<SessionCredential> = wire
+            .credentials
+            .into_iter()
+            .map(SessionCredential::from)
+            .collect();
 
         // Run conflict checks against the chained union before
         // touching `self`. `Conflict` propagates through
         // `ComposeError::Conflict` via the `#[from]` impl.
-        self.check_incoming_conflicts(&incoming_vars, &incoming_patches)?;
+        self.check_incoming_conflicts(&incoming_vars, &incoming_patches, &incoming_credentials)?;
 
         // Checks passed — commit. The client is the sole source of
         // orientation (the daemon passthrough never populates it), so
@@ -1253,6 +1519,7 @@ impl Composition {
         self.packages.extend(incoming_packages);
         dedupe_by_name(&mut self.packages, ProvenancedPackage::package);
         self.lifecycle_hooks.extend(incoming_hooks);
+        self.credentials.extend(incoming_credentials);
         self.orientation = wire.orientation.into();
         Ok(())
     }
@@ -1270,26 +1537,29 @@ impl Composition {
             patches: Vec::new(),
             packages,
             lifecycle_hooks,
+            credentials: Vec::new(),
             orientation: Orientation::default(),
         }
     }
 
-    /// Append already-gated vars and patches. Atomic: conflict
-    /// checks run against the union before any mutation; on `Err`,
-    /// `self` is untouched.
+    /// Append already-gated vars, patches, and credential lanes.
+    /// Atomic: conflict checks run against the union before any
+    /// mutation; on `Err`, `self` is untouched.
     ///
     /// # Errors
     ///
-    /// [`ComposeError::Conflict`] if an incoming var or patch
-    /// disagrees with one already in `self`.
+    /// [`ComposeError::Conflict`] if an incoming item disagrees with
+    /// one already in `self`, or if two lanes share a name.
     pub(crate) fn extend_with(
         &mut self,
         vars: Vec<SessionVar>,
         patches: Vec<SessionPatch>,
+        credentials: Vec<SessionCredential>,
     ) -> Result<(), ComposeError> {
-        self.check_incoming_conflicts(&vars, &patches)?;
+        self.check_incoming_conflicts(&vars, &patches, &credentials)?;
         self.vars.extend(vars);
         self.patches.extend(patches);
+        self.credentials.extend(credentials);
         Ok(())
     }
 
@@ -1301,6 +1571,7 @@ impl Composition {
         &self,
         incoming_vars: &[SessionVar],
         incoming_patches: &[SessionPatch],
+        incoming_credentials: &[SessionCredential],
     ) -> Result<(), ComposeError> {
         check_var_mismatches(
             self.vars.iter().chain(incoming_vars.iter()),
@@ -1315,6 +1586,7 @@ impl Composition {
         check_patch_prefix_collisions(self.patches.iter().chain(incoming_patches.iter()), |p| {
             p.patch().destination()
         })?;
+        check_credential_lane_conflicts(self.credentials.iter().chain(incoming_credentials))?;
         Ok(())
     }
 }
@@ -1347,6 +1619,7 @@ impl TryFrom<crate::wire::request::WireComposition> for Composition {
             patches: wire.patches.into_iter().map(Into::into).collect(),
             packages: wire.packages.into_iter().map(Into::into).collect(),
             lifecycle_hooks: hooks,
+            credentials: wire.credentials.into_iter().map(Into::into).collect(),
             orientation: wire.orientation.into(),
         })
     }
@@ -1457,6 +1730,32 @@ pub(crate) fn prompt_hook_hook(
             if decisions.len() != view.len() {
                 return Err(ComposeError::hook_decision_count_mismatch(
                     HookDomain::Hook,
+                    view.len(),
+                    decisions.len(),
+                ));
+            }
+            Ok((decisions, updated_policy.unwrap_or(policy)))
+        }
+    }
+}
+
+/// Invoke the credential-domain hook on a batch of lanes the policy
+/// couldn't decide. Same shape as [`prompt_var_hook`]; one decision per
+/// **lane**, because each names a distinct upstream the user has to see.
+pub(crate) fn prompt_credential_hook(
+    hooks: &dyn PolicyHooks,
+    policy: CredentialsPolicy,
+    view: &[Unapproved<'_, CredentialLane>],
+) -> Result<(Vec<ItemDecision>, CredentialsPolicy), ComposeError> {
+    match hooks.on_credential_unapproved(policy.clone(), view) {
+        HookResult::Abort => Err(ComposeError::Aborted),
+        HookResult::Decided {
+            decisions,
+            updated_policy,
+        } => {
+            if decisions.len() != view.len() {
+                return Err(ComposeError::hook_decision_count_mismatch(
+                    HookDomain::Credential,
                     view.len(),
                     decisions.len(),
                 ));
@@ -1756,12 +2055,25 @@ pub(crate) fn compose_contribution(
         patches,
         packages,
         lifecycle_hooks,
+        credentials,
     } = contribution;
     // The hooks policy passes straight through: this is the *loadout*
     // composition, and a loadout's hooks are the user's own files. Only
     // project-declared hooks face the gate, on the daemon-response path
-    // in `client::handler`.
-    let (vars_policy, patches_policy, hooks_policy) = policy.into_parts();
+    // in `client::handler`. The credentials policy passes through for
+    // the same reason.
+    let (vars_policy, patches_policy, hooks_policy, credentials_policy) = policy.into_parts();
+    // A lane needs the user's binding to supply an upstream, and this
+    // path has no binding in hand — only the daemon-response round trip
+    // does. `Loadout` has no `credentials` field, so nothing reaches
+    // here today; surfacing rather than dropping is what keeps the day
+    // that changes from silently composing a lane with no destination.
+    if let Some(c) = credentials.first() {
+        return Err(ComposeError::UnbindableCredentialLane {
+            lane: c.lane().to_owned(),
+            from: c.source().clone(),
+        });
+    }
     let (gated_vars, vars_policy) = gate_vars(vars, vars_policy, hooks)?;
     // Conflict detection runs post-gate so that the user's `ignore`
     // policy can drop offending contributors before they're compared.
@@ -1800,12 +2112,14 @@ pub(crate) fn compose_contribution(
     let final_policy = UserPolicy::empty()
         .with_vars(vars_policy)
         .with_patches(patches_policy)
-        .with_hooks(hooks_policy);
+        .with_hooks(hooks_policy)
+        .with_credentials(credentials_policy);
     let composition = Composition {
         vars: gated_vars,
         patches: gated_patches,
         packages,
         lifecycle_hooks,
+        credentials: Vec::new(),
         // Orientation never passes through the gate: it is control-plane
         // data the caller attaches outside the composition pipeline (see
         // `UserComposer::with_orientation`).
@@ -1826,6 +2140,7 @@ pub(crate) struct PendingTransform {
     pub(crate) pending_vars: BTreeMap<PendingId, ProvenancedVar>,
     pub(crate) pending_patches: BTreeMap<PendingId, ProvenancedPatch>,
     pub(crate) pending_hooks: BTreeMap<PendingId, ProvenancedHook>,
+    pub(crate) pending_credentials: BTreeMap<PendingId, ProvenancedCredential>,
 }
 
 /// Wire-shaped pending payload — the subset of [`PendingTransform`]
@@ -1835,11 +2150,12 @@ pub(crate) struct WirePending {
     pub(crate) vars: Vec<WirePendingVar>,
     pub(crate) patches: Vec<WirePendingPatch>,
     pub(crate) lifecycle_hooks: Vec<WirePendingHook>,
+    pub(crate) credentials: Vec<WirePendingCredential>,
 }
 
-/// Convert daemon-collected vars, patches, and lifecycle hooks into
-/// their wire pending shape plus a per-item [`PendingId`] stash.
-/// Pure: no policy consulted, no env touched.
+/// Convert daemon-collected vars, patches, lifecycle hooks, and
+/// credential lanes into their wire pending shape plus a per-item
+/// [`PendingId`] stash. Pure: no policy consulted, no env touched.
 ///
 /// Ids are assigned by position within each domain; correlation is
 /// per `(domain, id)`.
@@ -1851,6 +2167,7 @@ pub(crate) fn contribution_to_pending(
     vars: Vec<ProvenancedVar>,
     patches: Vec<ProvenancedPatch>,
     lifecycle_hooks: Vec<ProvenancedHook>,
+    credentials: Vec<ProvenancedCredential>,
 ) -> PendingTransform {
     let mut pending_vars: BTreeMap<PendingId, ProvenancedVar> = BTreeMap::new();
     let mut wire_vars: Vec<WirePendingVar> = Vec::with_capacity(vars.len());
@@ -1906,15 +2223,34 @@ pub(crate) fn contribution_to_pending(
         pending_hooks.insert(id, ph);
     }
 
+    // Lanes ship their declaration — name and injection shape — and
+    // nothing more: the daemon has no upstream to send, because only the
+    // client holds the bindings. The upstream comes back on the verdict.
+    let mut pending_credentials: BTreeMap<PendingId, ProvenancedCredential> = BTreeMap::new();
+    let mut wire_credentials: Vec<WirePendingCredential> = Vec::with_capacity(credentials.len());
+    for (i, pc) in credentials.into_iter().enumerate() {
+        let id = PendingId::new(u32::try_from(i).expect("pending credential index fits in u32"));
+        wire_credentials.push(WirePendingCredential {
+            id,
+            lane: pc.lane().to_string(),
+            header: pc.credential().inject.header.clone(),
+            prefix: pc.credential().inject.prefix.clone(),
+            source: pc.source().clone().into(),
+        });
+        pending_credentials.insert(id, pc);
+    }
+
     PendingTransform {
         wire: WirePending {
             vars: wire_vars,
             patches: wire_patches,
             lifecycle_hooks: wire_hooks,
+            credentials: wire_credentials,
         },
         pending_vars,
         pending_patches,
         pending_hooks,
+        pending_credentials,
     }
 }
 
@@ -1989,6 +2325,7 @@ mod tests {
             vec![ProvenancedVar::new(daemon, project_source())],
             vec![],
             vec![],
+            vec![],
         );
         let wire = &transform.wire.vars[0];
         // Shipped as the spec, not the daemon's baked-in value.
@@ -2018,6 +2355,7 @@ mod tests {
                 .unwrap();
         let transform = contribution_to_pending(
             vec![ProvenancedVar::new(daemon, project_source())],
+            vec![],
             vec![],
             vec![],
         );
@@ -3360,6 +3698,7 @@ mod tests {
                 patches,
                 packages,
                 lifecycle_hooks: hooks,
+                credentials: Vec::new(),
             }
         }
 
@@ -3899,6 +4238,7 @@ mod tests {
                 packages: Vec::new(),
                 lifecycle_hooks: Vec::new(),
                 orientation: Orientation::default(),
+                credentials: Vec::new(),
             }
         }
 
@@ -3912,6 +4252,7 @@ mod tests {
                 requested_packages: vec![],
                 lifecycle_hooks: vec![],
                 orientation: WireOrientation::default(),
+                credentials: Vec::new(),
             }
         }
 
@@ -3943,6 +4284,7 @@ mod tests {
                     source: WireSource::UserLoadout { name: "dev".into() },
                 }],
                 orientation: WireOrientation::default(),
+                credentials: Vec::new(),
             };
 
             let before = Composition::default();
@@ -4050,6 +4392,7 @@ mod tests {
                 }],
                 lifecycle_hooks: vec![],
                 orientation: WireOrientation::default(),
+                credentials: Vec::new(),
             };
             let err = composition.extend_from_wire(wire).unwrap_err();
             assert!(
@@ -4122,6 +4465,7 @@ mod tests {
                 )],
                 lifecycle_hooks: vec![],
                 orientation: Orientation::default(),
+                credentials: Vec::new(),
             };
             let wire = WireContribution {
                 vars: vec![],
@@ -4138,6 +4482,7 @@ mod tests {
                 ],
                 lifecycle_hooks: vec![],
                 orientation: WireOrientation::default(),
+                credentials: Vec::new(),
             };
             composition.extend_from_wire(wire).unwrap();
             let names: Vec<&str> = composition

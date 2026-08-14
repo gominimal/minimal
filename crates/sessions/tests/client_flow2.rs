@@ -14,6 +14,7 @@ use sessions::core::compose::{ComposeError, ComposeOptions, SessionVar};
 use sessions::core::decision::ItemDecision;
 use sessions::core::hooks::{HookResult, PolicyHooks, Unapproved};
 use sessions::core::policy::{PatchesPolicy, UserPolicy, VarsPolicy};
+use sessions::core::primitives::CredentialBindings;
 use sessions::wire::policy::{WirePatchVerdict, WireVarVerdict};
 use sessions::wire::primitives::{
     PendingId, WirePendingPatch, WirePendingVar, WireResolvedVar, WireSessionVar, WireSource,
@@ -151,6 +152,7 @@ fn empty_response() -> ContributionResponse {
         vars: vec![],
         patches: vec![],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     }
 }
 
@@ -167,6 +169,7 @@ fn empty_response_produces_empty_verdict() {
         UserPolicy::empty(),
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[]),
     )
     .unwrap();
@@ -191,6 +194,7 @@ fn specified_var_allow_listed_is_approved() {
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
     let vars_policy = VarsPolicy::empty().try_with_allow(["EDITOR"]).unwrap();
     let policy = UserPolicy::empty().with_vars(vars_policy);
@@ -201,6 +205,7 @@ fn specified_var_allow_listed_is_approved() {
         policy,
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[]),
     )
     .unwrap();
@@ -229,6 +234,7 @@ fn inherit_var_resolves_against_env() {
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
     let policy =
         UserPolicy::empty().with_vars(VarsPolicy::empty().try_with_allow(["LANG"]).unwrap());
@@ -240,6 +246,7 @@ fn inherit_var_resolves_against_env() {
         policy,
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &env,
     )
     .unwrap();
@@ -265,6 +272,7 @@ fn inherit_with_default_falls_back() {
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
     let policy =
         UserPolicy::empty().with_vars(VarsPolicy::empty().try_with_allow(["LANG"]).unwrap());
@@ -275,6 +283,7 @@ fn inherit_with_default_falls_back() {
         policy,
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[]),
     )
     .unwrap();
@@ -298,6 +307,7 @@ fn inherit_var_missing_env_errors() {
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
     let err = handle_response(
         response,
@@ -305,6 +315,7 @@ fn inherit_var_missing_env_errors() {
         UserPolicy::empty(),
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[]),
     )
     .unwrap_err();
@@ -342,6 +353,7 @@ fn policy_deny_per_item() {
         ],
         patches: vec![],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
     let vars_policy = VarsPolicy::empty()
         .try_with_deny(["AWS_*"])
@@ -356,6 +368,7 @@ fn policy_deny_per_item() {
         policy,
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[("AWS_KEY", "leaked"), ("EDITOR", "hx")]),
     )
     .unwrap();
@@ -387,6 +400,7 @@ fn policy_ignore_per_item() {
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
     let vars_policy = VarsPolicy::empty().try_with_ignore(["_*"]).unwrap();
     let policy = UserPolicy::empty().with_vars(vars_policy);
@@ -397,6 +411,7 @@ fn policy_ignore_per_item() {
         policy,
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[("_TMP", "x")]),
     )
     .unwrap();
@@ -419,6 +434,7 @@ fn hook_approves_unapproved() {
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
     let (verdict, _) = handle_response(
         response,
@@ -426,6 +442,7 @@ fn hook_approves_unapproved() {
         UserPolicy::empty(),
         &PassThroughHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[("MY_VAR", "v")]),
     )
     .unwrap();
@@ -448,6 +465,7 @@ fn hook_abort_propagates() {
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
     let err = handle_response(
         response,
@@ -455,6 +473,7 @@ fn hook_abort_propagates() {
         UserPolicy::empty(),
         &AbortHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[("MY_VAR", "v")]),
     )
     .unwrap_err();
@@ -481,6 +500,7 @@ fn patch_source_uses_gated_vars() {
             source: package_source("helix"),
         }],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
     let gated = vec![gated_var(
         "HELIX_CONFIG",
@@ -496,6 +516,7 @@ fn patch_source_uses_gated_vars() {
         policy,
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[]),
     )
     .unwrap();
@@ -536,6 +557,7 @@ fn patch_source_uses_batch_approved_vars() {
             source: package_source("helix"),
         }],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
     let policy = UserPolicy::empty()
         .with_vars(
@@ -551,6 +573,7 @@ fn patch_source_uses_batch_approved_vars() {
         policy,
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[]),
     )
     .unwrap();
@@ -584,6 +607,7 @@ fn allow_rule_gates_env_derived_var() {
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
     let policy = UserPolicy::empty().with_vars(
         VarsPolicy::empty()
@@ -597,6 +621,7 @@ fn allow_rule_gates_env_derived_var() {
         policy,
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         // `Inherit` needs the env to actually resolve the value —
         // pin it here so the test doesn't depend on the ambient
         // shell.
@@ -642,6 +667,7 @@ fn multi_file_patch_yields_per_file_verdicts() {
             source: project_source(),
         }],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
     let policy = UserPolicy::empty().with_patches(
         PatchesPolicy::empty()
@@ -655,6 +681,7 @@ fn multi_file_patch_yields_per_file_verdicts() {
         policy,
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[]),
     )
     .unwrap();
@@ -709,6 +736,7 @@ fn hook_response(source: WireSource) -> ContributionResponse {
             },
             source,
         }],
+        credentials: vec![],
     }
 }
 
@@ -726,6 +754,7 @@ fn package_declared_hook_is_denied_without_prompting() {
         UserPolicy::empty(),
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[]),
     )
     .unwrap();
@@ -754,6 +783,7 @@ fn project_declared_hook_with_no_rule_reaches_the_prompt() {
         UserPolicy::empty(),
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[]),
     );
 }
@@ -772,6 +802,7 @@ fn project_hook_allowed_by_policy_skips_the_prompt() {
         policy,
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[]),
     )
     .unwrap();
@@ -804,6 +835,7 @@ fn project_hook_denied_by_policy_beats_allow() {
         policy,
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[]),
     )
     .unwrap();
@@ -831,6 +863,7 @@ fn project_hook_ignored_by_policy_is_dropped_quietly() {
         policy,
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[]),
     )
     .unwrap();
@@ -864,6 +897,7 @@ fn patch_policy_ignore_produces_ignored_verdict() {
             source: project_source(),
         }],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
     let policy = UserPolicy::empty().with_patches(
         PatchesPolicy::empty()
@@ -877,6 +911,7 @@ fn patch_policy_ignore_produces_ignored_verdict() {
         policy,
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[]),
     )
     .unwrap();
@@ -939,6 +974,7 @@ fn unapproved_vars_batched_into_one_hook_call() {
         ],
         patches: vec![],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
 
     let hook = CountingHook {
@@ -951,6 +987,7 @@ fn unapproved_vars_batched_into_one_hook_call() {
         UserPolicy::empty(),
         &hook,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[("ONE", "1"), ("TWO", "2")]),
     )
     .unwrap();
@@ -1004,6 +1041,7 @@ fn hook_use_rule_with_updated_policy_approves() {
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
     let (verdict, _) = handle_response(
         response,
@@ -1011,6 +1049,7 @@ fn hook_use_rule_with_updated_policy_approves() {
         UserPolicy::empty(),
         &UseRuleHook,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[("MY_VAR", "v")]),
     )
     .unwrap();
@@ -1051,6 +1090,7 @@ fn hook_use_rule_without_decision_errors_as_hook_contract() {
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
     let err = handle_response(
         response,
@@ -1058,6 +1098,7 @@ fn hook_use_rule_without_decision_errors_as_hook_contract() {
         UserPolicy::empty(),
         &BadUseRuleHook,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[("MY_VAR", "v")]),
     )
     .unwrap_err();
@@ -1101,6 +1142,7 @@ fn hook_wrong_decision_count_errors_as_hook_contract() {
         }],
         patches: vec![],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
     let err = handle_response(
         response,
@@ -1108,6 +1150,7 @@ fn hook_wrong_decision_count_errors_as_hook_contract() {
         UserPolicy::empty(),
         &WrongCountHook,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[("MY_VAR", "v")]),
     )
     .unwrap_err();
@@ -1136,6 +1179,7 @@ fn invalid_pending_patch_dest_errors() {
             source: package_source("p"),
         }],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
     let err = handle_response(
         response,
@@ -1143,6 +1187,7 @@ fn invalid_pending_patch_dest_errors() {
         UserPolicy::empty(),
         &PanicHooks,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[]),
     )
     .unwrap_err();
@@ -1212,6 +1257,7 @@ fn unapproved_files_batched_into_one_hook_call() {
             },
         ],
         lifecycle_hooks: vec![],
+        credentials: vec![],
     };
 
     let hook = CountingHook {
@@ -1224,6 +1270,7 @@ fn unapproved_files_batched_into_one_hook_call() {
         UserPolicy::empty(),
         &hook,
         ComposeOptions::default(),
+        &CredentialBindings::default(),
         &pinned_env(&[]),
     )
     .unwrap();

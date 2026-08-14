@@ -66,7 +66,9 @@ impl Composable for ProjectComposable {
         // block are composed like any other primitive. Unlike a
         // loadout's, they face the user's `[hooks]` policy before they
         // will run — a project is not the user, and a hook is arbitrary
-        // code. That gate is the composer's; nothing is dropped here.
+        // code. Credential lanes are the same shape: the declaration
+        // travels, and the user's `[credentials]` policy decides. Both
+        // gates are the composer's; nothing is dropped here.
         contribute_primitives(
             &source,
             self.session.packages,
@@ -74,6 +76,7 @@ impl Composable for ProjectComposable {
             self.session.vars_lenient,
             self.session.patches,
             self.session.lifecycle_hooks,
+            self.session.credentials,
             env,
         )
     }
@@ -105,6 +108,9 @@ mod tests {
 
             [[session.lifecycle_hooks]]
             on_activate = { type = "inline", value = "cargo check --workspace >/dev/null 2>&1 || true" }
+
+            [session.credentials.anthropic]
+            inject = { header = "x-api-key" }
             "#
         })
         .unwrap();
@@ -123,6 +129,15 @@ mod tests {
         // is disabled downstream (output + execution), not by dropping it
         // here.
         assert_eq!(contribution.lifecycle_hooks().len(), 1);
+        // The lane travels as a declaration — name and injection shape.
+        // It gets an upstream only from the user's binding, later, on
+        // the client.
+        assert_eq!(contribution.credentials().len(), 1);
+        assert_eq!(contribution.credentials()[0].lane(), "anthropic");
+        assert_eq!(
+            contribution.credentials()[0].credential().inject.header,
+            "x-api-key"
+        );
 
         // Provenance is Source::Project everywhere, carrying the
         // path this composable was constructed with.
@@ -138,6 +153,9 @@ mod tests {
         }
         for ph in contribution.lifecycle_hooks() {
             assert_eq!(ph.source(), &expected_source);
+        }
+        for pc in contribution.credentials() {
+            assert_eq!(pc.source(), &expected_source);
         }
     }
 

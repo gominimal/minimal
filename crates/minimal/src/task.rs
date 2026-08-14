@@ -457,12 +457,13 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // `NoPromptHook` anywhere else (there is no `--no-prompt` flag here;
     // a non-TTY implies it).
     if let minimald_rpc::ConfigureLoadoutResponse::Pending { response } = configured {
+        let bindings = crate::config::read_credential_bindings(global)?;
         let non_interactive = global.no_input || !crate::can_prompt_interactively();
         if non_interactive {
             let session_id = response.session_id;
             let hooks = crate::prompt::NoPromptHook::new();
             let verdict =
-                match crate::compute_verdict(response, user_policy, compose_options, &hooks) {
+                match crate::compute_verdict(response, user_policy, compose_options, &hooks, &bindings) {
                     Ok((verdict, _final_policy)) => verdict,
                     Err(e) => {
                         crate::send_abort(&mut client, session_id).await;
@@ -493,6 +494,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
                 user_policy,
                 compose_options,
                 &hooks,
+                &bindings,
             )
             .await;
             if let Ok((_, _, ref approved)) = result {

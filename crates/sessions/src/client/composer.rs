@@ -175,12 +175,13 @@ fn composition_to_wire(
     composition: Composition,
     orientation: crate::core::compose::Orientation,
 ) -> WireContribution {
-    let (vars, patches, packages, lifecycle_hooks) = composition.into_parts();
+    let (vars, patches, packages, lifecycle_hooks, credentials) = composition.into_parts();
     WireContribution {
         vars: vars.into_iter().map(Into::into).collect(),
         patches: patches.into_iter().map(Into::into).collect(),
         lifecycle_hooks: lifecycle_hooks.into_iter().map(Into::into).collect(),
         requested_packages: packages.into_iter().map(Into::into).collect(),
+        credentials: credentials.into_iter().map(Into::into).collect(),
         orientation: orientation.into(),
     }
 }

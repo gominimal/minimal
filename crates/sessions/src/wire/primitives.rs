@@ -222,6 +222,49 @@ pub struct WireProvenancedHook {
     pub source: WireSource,
 }
 
+/// A credential lane + its origin. Mirrors
+/// [`crate::core::compose::SessionCredential`].
+///
+/// Flat rather than nested so the absence of a value-bearing field is
+/// visible at a glance: this shape is written verbatim to
+/// `composition.json`, which is world-readable, and logged at `debug`.
+/// `upstream` is the one the **user's** binding named — the client fills
+/// it in on the verdict, since only the client holds the bindings.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WireCredentialLane {
+    /// Lane name.
+    pub lane: String,
+    /// The single upstream this lane may reach.
+    pub upstream: String,
+    /// The header the broker injects the credential into.
+    pub header: String,
+    /// Where the lane was declared.
+    pub source: WireSource,
+}
+
+/// Daemon → Client: a credential lane the project declared, which the
+/// client must run through the user's credentials policy before it may
+/// be registered with the broker.
+///
+/// Carries the declaration but no upstream: the daemon has none to send,
+/// because the binding that names it is the client's. The client answers
+/// with the upstream it resolved.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WirePendingCredential {
+    /// Correlation id; the client echoes it back on the verdict.
+    pub id: PendingId,
+    /// Lane name — the key the user's binding file is looked up by.
+    pub lane: String,
+    /// The header the broker will inject into.
+    pub header: String,
+    /// Text placed immediately before the credential value. Defaulted so
+    /// a peer that omits it lands on "no prefix" rather than faulting.
+    #[serde(default)]
+    pub prefix: String,
+    /// Where it came from — the project root the policy matches.
+    pub source: WireSource,
+}
+
 /// A package the client requested be installed. Mirrors
 /// [`crate::core::source::ProvenancedPackage`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -409,6 +452,18 @@ impl From<crate::core::source::ProvenancedHook> for WireProvenancedHook {
         let (hook, source) = h.into_parts();
         Self {
             hook: hook.into(),
+            source: source.into(),
+        }
+    }
+}
+
+impl From<crate::core::compose::SessionCredential> for WireCredentialLane {
+    fn from(c: crate::core::compose::SessionCredential) -> Self {
+        let (lane, source) = c.into_parts();
+        Self {
+            lane: lane.lane().to_owned(),
+            upstream: lane.upstream().to_owned(),
+            header: lane.header().to_owned(),
             source: source.into(),
         }
     }

@@ -44,7 +44,9 @@ use std::collections::BTreeMap;
 use nutype::nutype;
 
 use crate::core::lifecyclehook::LifecycleHook;
-use crate::core::primitives::{LenientVarEntry, Patch, Patches, StrictVarName, VarName, VarValue};
+use crate::core::primitives::{
+    Credential, LenientVarEntry, Patch, Patches, StrictVarName, VarName, VarValue,
+};
 
 /// A loadout's identifier — trimmed, non-empty, and free of path
 /// separators and NUL bytes.
@@ -88,6 +90,11 @@ pub struct Loadout {
     /// Scripts run at session-level transition points.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     lifecycle_hooks: Vec<LifecycleHook>,
+    /// Credential lanes this loadout asks for, keyed by lane name. A
+    /// loadout is the user's own file, so these are not gated; a
+    /// project's are.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    credentials: BTreeMap<String, Credential>,
     /// Override the composer's default follow-symlinks behavior for
     /// this loadout's patches. `None` falls through to
     /// `ComposeOptions::follow_symlinks`.
@@ -119,6 +126,7 @@ impl Loadout {
             vars_lenient: Vec::new(),
             patches: Patches::empty(),
             lifecycle_hooks: Vec::new(),
+            credentials: BTreeMap::new(),
             follow_symlinks: None,
         }
     }
@@ -270,6 +278,12 @@ impl Loadout {
     pub fn lifecycle_hooks(&self) -> &[LifecycleHook] {
         &self.lifecycle_hooks
     }
+
+    /// Credential lanes this loadout asks for.
+    #[must_use]
+    pub fn credentials(&self) -> &BTreeMap<String, Credential> {
+        &self.credentials
+    }
 }
 
 impl crate::core::compose::Composable for Loadout {
@@ -355,6 +369,7 @@ impl crate::core::compose::Composable for Loadout {
             Vec::new(),
             self.patches,
             self.lifecycle_hooks,
+            self.credentials,
             env,
         )?;
         contribution.merge(std::mem::take(&mut rest)).ok();

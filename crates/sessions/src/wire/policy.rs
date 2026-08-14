@@ -118,6 +118,40 @@ pub enum WireHookVerdict {
     },
 }
 
+/// The client's decision about one pending credential lane.
+///
+/// `Approved` is the only variant carrying data back, and what it
+/// carries is the **bound upstream**: the daemon has no bindings, so
+/// this is the only point at which a lane learns where it may reach.
+/// The value it may send is not here and never crosses this boundary —
+/// the client registers that with the broker directly, host-side.
+///
+/// `Denied` aborts the activation, matching every other domain: a lane
+/// the user explicitly refused must not leave a session that silently
+/// differs from what the project asked for.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireCredentialVerdict {
+    /// User policy or prompt approved this lane; it composes in.
+    Approved {
+        /// Matches the corresponding `WirePendingCredential::id`.
+        id: PendingId,
+        /// The upstream the user's binding bound this lane to.
+        upstream: String,
+    },
+    /// User policy or prompt refused this lane.
+    Denied {
+        /// Matches the corresponding `WirePendingCredential::id`.
+        id: PendingId,
+    },
+    /// User policy's `ignore` rule matched; drop it without failing the
+    /// activation.
+    Ignored {
+        /// Matches the corresponding `WirePendingCredential::id`.
+        id: PendingId,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +204,25 @@ mod tests {
             WirePatchVerdict::Ignored {
                 id: PendingId::new(3),
                 host_path: paths::HostAbsPath::try_new("/home/u/.cache").unwrap(),
+            },
+        ];
+        for v in cases {
+            assert_eq!(round_trip(&v), v);
+        }
+    }
+
+    #[test]
+    fn credential_verdict_round_trips_all_variants() {
+        let cases = [
+            WireCredentialVerdict::Approved {
+                id: PendingId::new(1),
+                upstream: "https://api.anthropic.com".into(),
+            },
+            WireCredentialVerdict::Denied {
+                id: PendingId::new(2),
+            },
+            WireCredentialVerdict::Ignored {
+                id: PendingId::new(3),
             },
         ];
         for v in cases {

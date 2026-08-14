@@ -4,8 +4,9 @@
 //! per domain and waits for a [`HookResult`] with one [`ItemDecision`]
 //! per item (and, optionally, a mutated policy snapshot).
 
+use crate::core::compose::CredentialLane;
 use crate::core::decision::ItemDecision;
-use crate::core::policy::{HooksPolicy, PatchesPolicy, VarsPolicy};
+use crate::core::policy::{CredentialsPolicy, HooksPolicy, PatchesPolicy, VarsPolicy};
 use crate::core::source::Source;
 
 /// One item the policy could not decide, borrowed from the gate
@@ -151,6 +152,37 @@ pub trait PolicyHooks {
         _policy: HooksPolicy,
         _items: &[Unapproved<'_, camino::Utf8Path>],
     ) -> HookResult<HooksPolicy> {
+        HookResult::Abort
+    }
+
+    /// Decide whether a project may use a credential lane.
+    ///
+    /// One item per lane, not per project: each lane names a distinct
+    /// upstream and a distinct secret, so approving them as a set would
+    /// ask for consent to destinations the user was never shown. The
+    /// rule a permanent approval records is still the project root
+    /// (that is what the policy matches), which is why the sibling lanes
+    /// of an allow-listed project decide without asking again.
+    ///
+    /// The item is the whole [`CredentialLane`] descriptor — lane name,
+    /// the **bound** upstream, and the header — for the same reason
+    /// `WirePendingHook` ships the hook body: a prompt that named only
+    /// the project would be asking for consent to a destination the user
+    /// cannot see. `item.source()` carries the project root the rule is
+    /// keyed on.
+    ///
+    /// # Default
+    ///
+    /// Aborts. Approving a lane lets a project spend the user's
+    /// credential against the bound upstream, so an implementation that
+    /// hasn't considered this domain must not be able to grant it by
+    /// omission — the same fail-closed-and-loudly default
+    /// [`Self::on_hook_unapproved`] takes.
+    fn on_credential_unapproved(
+        &self,
+        _policy: CredentialsPolicy,
+        _items: &[Unapproved<'_, CredentialLane>],
+    ) -> HookResult<CredentialsPolicy> {
         HookResult::Abort
     }
 }

@@ -501,27 +501,83 @@ impl PatchesPolicy {
         resolved_vars: &(impl crate::core::expansion::VarLookup + ?Sized),
         home_fallback: Option<&str>,
     ) -> Result<ExpandedPatchesPolicy, crate::core::expansion::ExpandError> {
-        let expand_one =
-            |raws: &[String]| -> Result<Vec<FileSet>, crate::core::expansion::ExpandError> {
-                // Policy patterns are matchers, not walk seeds — they
-                // check paths another patch produced. A bare glob
-                // like `**/*.pem` should mean "any `.pem` anywhere,"
-                // so we skip the "must be absolute" check that
-                // `expand_source` enforces for walker inputs.
-                raws.iter()
-                    .map(|r| {
-                        crate::core::expansion::expand_policy_pattern(
-                            r,
-                            resolved_vars,
-                            home_fallback,
-                        )
-                    })
-                    .collect()
-            };
-        let allow = expand_one(&self.allow)?;
-        let deny = expand_one(&self.deny)?;
-        let ignore = expand_one(&self.ignore)?;
-        Ok(ExpandedPatchesPolicy::from_expanded(allow, deny, ignore))
+        Ok(ExpandedPatchesPolicy::from_expanded(
+            expand_patterns(&self.allow, resolved_vars, home_fallback)?,
+            expand_patterns(&self.deny, resolved_vars, home_fallback)?,
+            expand_patterns(&self.ignore, resolved_vars, home_fallback)?,
+        ))
+    }
+}
+
+/// Expand one rule list into matchers.
+///
+/// Policy patterns are matchers, not walk seeds — they check paths
+/// another declaration produced. A bare glob like `**/*.pem` should mean
+/// "any `.pem` anywhere," so this skips the "must be absolute" check
+/// that `expand_source` enforces for walker inputs.
+fn expand_patterns(
+    raws: &[String],
+    resolved_vars: &(impl crate::core::expansion::VarLookup + ?Sized),
+    home_fallback: Option<&str>,
+) -> Result<Vec<FileSet>, crate::core::expansion::ExpandError> {
+    raws.iter()
+        .map(|r| crate::core::expansion::expand_policy_pattern(r, resolved_vars, home_fallback))
+        .collect()
+}
+
+/// Expanded allow/deny/ignore globs matched against a **project root
+/// path**.
+///
+/// Shared by the `[hooks]` and `[credentials]` gates, which ask the same
+/// question — "does the user trust this project" — and must not drift
+/// apart in how they answer it.
+#[derive(Clone, Debug)]
+struct ProjectRules {
+    allow: Vec<FileSet>,
+    deny: Vec<FileSet>,
+    ignore: Vec<FileSet>,
+}
+
+impl ProjectRules {
+    /// Expand a domain's three raw rule lists into matchers.
+    fn expand(
+        allow: &[String],
+        deny: &[String],
+        ignore: &[String],
+        resolved_vars: &(impl crate::core::expansion::VarLookup + ?Sized),
+        home_fallback: Option<&str>,
+    ) -> Result<Self, crate::core::expansion::ExpandError> {
+        Ok(Self {
+            allow: expand_patterns(allow, resolved_vars, home_fallback)?,
+            deny: expand_patterns(deny, resolved_vars, home_fallback)?,
+            ignore: expand_patterns(ignore, resolved_vars, home_fallback)?,
+        })
+    }
+
+    /// Categorize one item by the source that declared it.
+    ///
+    /// - [`Source::UserLoadout`] → allowed. The user's own file.
+    /// - [`Source::Package`] → denied. A package has no legitimate way
+    ///   to contribute one, so its presence is a bug or an attempt to
+    ///   bypass the gate — either way it must not take effect.
+    /// - [`Source::Project`] → matched by project root: `deny`, then
+    ///   `ignore`, then `allow`, else a prompt.
+    fn check<T: Provenanced>(&self, item: T) -> CheckOutcome<T> {
+        let path = match item.source() {
+            Source::UserLoadout { .. } => return CheckOutcome::Decided(Decision::Allowed(item)),
+            Source::Package { .. } => return CheckOutcome::Decided(Decision::Denied(item)),
+            Source::Project { path } => path.as_utf8_path().to_owned(),
+        };
+        if filesets_match(&self.deny, &path) {
+            return CheckOutcome::Decided(Decision::Denied(item));
+        }
+        if filesets_match(&self.ignore, &path) {
+            return CheckOutcome::Decided(Decision::Ignored);
+        }
+        if filesets_match(&self.allow, &path) {
+            return CheckOutcome::Decided(Decision::Allowed(item));
+        }
+        CheckOutcome::NeedsApproval(item)
     }
 }
 
@@ -660,23 +716,14 @@ impl HooksPolicy {
         resolved_vars: &(impl crate::core::expansion::VarLookup + ?Sized),
         home_fallback: Option<&str>,
     ) -> Result<ExpandedHooksPolicy, crate::core::expansion::ExpandError> {
-        let expand_one =
-            |raws: &[String]| -> Result<Vec<FileSet>, crate::core::expansion::ExpandError> {
-                raws.iter()
-                    .map(|r| {
-                        crate::core::expansion::expand_policy_pattern(
-                            r,
-                            resolved_vars,
-                            home_fallback,
-                        )
-                    })
-                    .collect()
-            };
-        Ok(ExpandedHooksPolicy {
-            allow: expand_one(&self.allow)?,
-            deny: expand_one(&self.deny)?,
-            ignore: expand_one(&self.ignore)?,
-        })
+        ProjectRules::expand(
+            &self.allow,
+            &self.deny,
+            &self.ignore,
+            resolved_vars,
+            home_fallback,
+        )
+        .map(ExpandedHooksPolicy)
     }
 }
 
@@ -684,43 +731,175 @@ impl HooksPolicy {
 /// ready to match project roots. Produced by
 /// [`HooksPolicy::expand_with`].
 #[derive(Clone, Debug)]
-pub struct ExpandedHooksPolicy {
-    allow: Vec<FileSet>,
-    deny: Vec<FileSet>,
-    ignore: Vec<FileSet>,
-}
+pub struct ExpandedHooksPolicy(ProjectRules);
 
 impl ExpandedHooksPolicy {
     /// Categorize one hook against this policy, by the source that
-    /// declared it.
-    ///
-    /// - [`Source::UserLoadout`] → allowed. The user's own file.
-    /// - [`Source::Package`] → denied. Packages cannot declare hooks;
-    ///   one appearing here is a bug or an attempt to bypass the gate,
-    ///   and either way must not execute.
-    /// - [`Source::Project`] → matched by project root: `deny`, then
-    ///   `ignore`, then `allow`, else a prompt.
-    ///
-    /// [`Source::UserLoadout`]: crate::core::source::Source::UserLoadout
-    /// [`Source::Package`]: crate::core::source::Source::Package
-    /// [`Source::Project`]: crate::core::source::Source::Project
+    /// declared it. See [`ProjectRules::check`] for the precedence; a
+    /// package-declared hook is refused outright because packages
+    /// cannot legitimately contribute one.
     #[must_use]
     pub fn check<T: Provenanced>(&self, item: T) -> CheckOutcome<T> {
-        let path = match item.source() {
-            Source::UserLoadout { .. } => return CheckOutcome::Decided(Decision::Allowed(item)),
-            Source::Package { .. } => return CheckOutcome::Decided(Decision::Denied(item)),
-            Source::Project { path } => path.as_utf8_path().to_owned(),
-        };
-        if filesets_match(&self.deny, &path) {
-            return CheckOutcome::Decided(Decision::Denied(item));
+        self.0.check(item)
+    }
+}
+
+// =====================================================================
+// CredentialsPolicy
+// =====================================================================
+
+/// The user's policy for which **projects** may use their credential
+/// lanes, matched by project root path.
+///
+/// A lane lets a project's session reach an upstream authenticated as
+/// the user, without ever holding the credential. The value stays out of
+/// the box, so the risk this gate answers is not disclosure but *use*:
+/// an approved project can spend the user's key against the upstream the
+/// user bound it to. Path is the right key rather than lane name, for the
+/// same reason it is for hooks — the question is "do I trust this project
+/// with my credentials", and a name-keyed rule would let an untrusted
+/// project inherit a decision made about a trusted one.
+///
+/// A lane from a [`Loadout`](crate::core::loadout::Loadout) is the user's
+/// own declaration and passes without a rule. A lane tagged
+/// [`Source::Package`] is refused outright: a package cannot declare one.
+///
+/// Precedence mirrors the other domains: `deny` first (the emergency
+/// stop, so an overlapping deny+ignore resolves as denied), then `ignore`
+/// (silent skip, no prompt), then `allow`. A project matching none of the
+/// three routes to a prompt — silence is not consent.
+///
+/// ```toml
+/// [credentials]
+/// allow  = ["~/work/**"]
+/// deny   = ["~/downloads/**"]
+/// ignore = ["~/scratch/**"]
+/// ```
+///
+/// [`Source::Package`]: crate::core::source::Source::Package
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CredentialsPolicy {
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_one_or_many"
+    )]
+    allow: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_one_or_many"
+    )]
+    deny: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_one_or_many"
+    )]
+    ignore: Vec<String>,
+}
+
+impl CredentialsPolicy {
+    /// Construct an empty policy — no project may use a credential lane
+    /// without being prompted for.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Replace the `allow` set with raw project-root patterns.
+    #[must_use]
+    pub fn with_allow<I, S>(self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            allow: patterns.into_iter().map(Into::into).collect(),
+            ..self
         }
-        if filesets_match(&self.ignore, &path) {
-            return CheckOutcome::Decided(Decision::Ignored);
+    }
+
+    /// Replace the `deny` set with raw project-root patterns.
+    #[must_use]
+    pub fn with_deny<I, S>(self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            deny: patterns.into_iter().map(Into::into).collect(),
+            ..self
         }
-        if filesets_match(&self.allow, &path) {
-            return CheckOutcome::Decided(Decision::Allowed(item));
+    }
+
+    /// Replace the `ignore` set with raw project-root patterns.
+    #[must_use]
+    pub fn with_ignore<I, S>(self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            ignore: patterns.into_iter().map(Into::into).collect(),
+            ..self
         }
-        CheckOutcome::NeedsApproval(item)
+    }
+
+    /// Raw project-root patterns whose credential lanes may be used.
+    #[must_use]
+    pub fn allow(&self) -> &[String] {
+        &self.allow
+    }
+
+    /// Raw project-root patterns whose credential lanes are refused
+    /// outright.
+    #[must_use]
+    pub fn deny(&self) -> &[String] {
+        &self.deny
+    }
+
+    /// Raw project-root patterns whose credential lanes are dropped
+    /// silently, without a prompt.
+    #[must_use]
+    pub fn ignore(&self) -> &[String] {
+        &self.ignore
+    }
+
+    /// Expand the raw patterns against `resolved_vars` into a matcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`crate::core::expansion::ExpandError`]
+    /// produced by any pattern.
+    pub fn expand_with(
+        &self,
+        resolved_vars: &(impl crate::core::expansion::VarLookup + ?Sized),
+        home_fallback: Option<&str>,
+    ) -> Result<ExpandedCredentialsPolicy, crate::core::expansion::ExpandError> {
+        ProjectRules::expand(
+            &self.allow,
+            &self.deny,
+            &self.ignore,
+            resolved_vars,
+            home_fallback,
+        )
+        .map(ExpandedCredentialsPolicy)
+    }
+}
+
+/// A [`CredentialsPolicy`] with its patterns expanded into concrete
+/// globs, ready to match project roots. Produced by
+/// [`CredentialsPolicy::expand_with`].
+#[derive(Clone, Debug)]
+pub struct ExpandedCredentialsPolicy(ProjectRules);
+
+impl ExpandedCredentialsPolicy {
+    /// Categorize one credential lane against this policy, by the source
+    /// that declared it. See [`ProjectRules::check`] for the precedence.
+    #[must_use]
+    pub fn check<T: Provenanced>(&self, item: T) -> CheckOutcome<T> {
+        self.0.check(item)
     }
 }
 
@@ -738,6 +917,8 @@ pub struct UserPolicy {
     patches: PatchesPolicy,
     #[serde(default, skip_serializing_if = "hooks_policy_is_default")]
     hooks: HooksPolicy,
+    #[serde(default, skip_serializing_if = "credentials_policy_is_default")]
+    credentials: CredentialsPolicy,
 }
 
 impl UserPolicy {
@@ -794,14 +975,29 @@ impl UserPolicy {
         &self.hooks
     }
 
+    /// Replace the credential-lanes policy.
+    #[must_use]
+    pub fn with_credentials(self, credentials: CredentialsPolicy) -> Self {
+        Self {
+            credentials,
+            ..self
+        }
+    }
+
+    /// The credential-lanes policy in effect.
+    #[must_use]
+    pub fn credentials(&self) -> &CredentialsPolicy {
+        &self.credentials
+    }
+
     /// Consume the policy and return the underlying narrow policies.
     ///
     /// Used by the composition pipeline, which moves each narrow
     /// policy into the corresponding per-domain gate and rebuilds a
     /// `UserPolicy` from the (possibly updated) results.
     #[must_use]
-    pub fn into_parts(self) -> (VarsPolicy, PatchesPolicy, HooksPolicy) {
-        (self.vars, self.patches, self.hooks)
+    pub fn into_parts(self) -> (VarsPolicy, PatchesPolicy, HooksPolicy, CredentialsPolicy) {
+        (self.vars, self.patches, self.hooks, self.credentials)
     }
 }
 
@@ -815,6 +1011,10 @@ fn patches_policy_is_default(p: &PatchesPolicy) -> bool {
 
 fn hooks_policy_is_default(p: &HooksPolicy) -> bool {
     p == &HooksPolicy::default()
+}
+
+fn credentials_policy_is_default(p: &CredentialsPolicy) -> bool {
+    p == &CredentialsPolicy::default()
 }
 
 // =====================================================================
@@ -1389,6 +1589,135 @@ mod tests {
             matches!(outcome, CheckOutcome::Decided(Decision::Denied(_))),
             "non-absolute deny pattern must still match at check time",
         );
+    }
+
+    // =================================================================
+    // CredentialsPolicy tests
+    // =================================================================
+
+    mod credentials {
+        use super::*;
+
+        /// A lane declaration reduced to what the gate reads: its
+        /// provenance.
+        struct Lane(Source);
+        impl Provenanced for Lane {
+            fn source(&self) -> &Source {
+                &self.0
+            }
+        }
+
+        fn project(path: &str) -> Lane {
+            Lane(Source::Project {
+                path: paths::HostPath::try_new(path).unwrap(),
+            })
+        }
+
+        fn decide(policy: &CredentialsPolicy, item: Lane) -> CheckOutcome<Lane> {
+            let vars: [crate::core::primitives::ResolvedVar; 0] = [];
+            policy
+                .expand_with(vars.as_slice(), None)
+                .expect("policy patterns expand")
+                .check(item)
+        }
+
+        #[test]
+        fn allowed_project_needs_no_prompt() {
+            let policy = CredentialsPolicy::empty().with_allow(["/work/**"]);
+            assert!(matches!(
+                decide(&policy, project("/work/repo")),
+                CheckOutcome::Decided(Decision::Allowed(_)),
+            ));
+        }
+
+        #[test]
+        fn denied_project_is_refused() {
+            let policy = CredentialsPolicy::empty().with_deny(["/work/**"]);
+            assert!(matches!(
+                decide(&policy, project("/work/repo")),
+                CheckOutcome::Decided(Decision::Denied(_)),
+            ));
+        }
+
+        #[test]
+        fn ignored_project_is_dropped_without_a_prompt() {
+            let policy = CredentialsPolicy::empty().with_ignore(["/scratch/**"]);
+            assert!(matches!(
+                decide(&policy, project("/scratch/x")),
+                CheckOutcome::Decided(Decision::Ignored),
+            ));
+        }
+
+        /// Silence is not consent: a project no rule mentions reaches
+        /// the prompt rather than composing in.
+        #[test]
+        fn unmatched_project_needs_approval() {
+            assert!(matches!(
+                decide(&CredentialsPolicy::empty(), project("/elsewhere")),
+                CheckOutcome::NeedsApproval(_),
+            ));
+        }
+
+        /// Deny is the emergency stop, so an overlapping ignore must not
+        /// hide it.
+        #[test]
+        fn deny_wins_over_ignore_on_overlap() {
+            let policy = CredentialsPolicy::empty()
+                .with_deny(["/work/**"])
+                .with_ignore(["/work/**"]);
+            assert!(matches!(
+                decide(&policy, project("/work/repo")),
+                CheckOutcome::Decided(Decision::Denied(_)),
+            ));
+        }
+
+        /// A package has no legitimate way to declare a lane, so one
+        /// appearing here is refused whatever the rules say — including
+        /// an `allow` that would otherwise match everything.
+        #[test]
+        fn package_declared_lane_is_denied_outright() {
+            let policy = CredentialsPolicy::empty().with_allow(["**"]);
+            let item = Lane(Source::Package {
+                name: "claude-code".into(),
+            });
+            assert!(matches!(
+                decide(&policy, item),
+                CheckOutcome::Decided(Decision::Denied(_)),
+            ));
+        }
+
+        /// The user's own loadout needs no rule — it is the user
+        /// declaring something about themselves.
+        #[test]
+        fn loadout_declared_lane_is_auto_allowed() {
+            let item = Lane(Source::UserLoadout { name: "dev".into() });
+            assert!(matches!(
+                decide(&CredentialsPolicy::empty(), item),
+                CheckOutcome::Decided(Decision::Allowed(_)),
+            ));
+        }
+
+        #[test]
+        fn section_round_trips_through_toml() {
+            let src = r#"
+                [credentials]
+                allow  = ["~/work/**"]
+                deny   = "~/downloads/**"
+                ignore = ["~/scratch/**"]
+            "#;
+            let p: UserPolicy = toml::from_str(src).unwrap();
+            assert_eq!(p.credentials().allow(), ["~/work/**"]);
+            assert_eq!(p.credentials().deny(), ["~/downloads/**"]);
+            assert_eq!(p.credentials().ignore(), ["~/scratch/**"]);
+        }
+
+        /// An empty credentials policy leaves no `[credentials]` section
+        /// behind, matching every other domain.
+        #[test]
+        fn empty_section_is_skipped_on_serialize() {
+            let s = toml::to_string(&UserPolicy::empty()).unwrap();
+            assert!(!s.contains("[credentials"), "got: {s}");
+        }
     }
 
     // =================================================================

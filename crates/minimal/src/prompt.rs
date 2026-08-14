@@ -25,9 +25,12 @@ use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use sessions::core::compose::CredentialLane;
 use sessions::core::decision::ItemDecision;
 use sessions::core::hooks::{HookResult, PolicyHooks, Unapproved};
-use sessions::core::policy::{HooksPolicy, PatchesPolicy, VarNameGlobs, VarsPolicy};
+use sessions::core::policy::{
+    CredentialsPolicy, HooksPolicy, PatchesPolicy, VarNameGlobs, VarsPolicy,
+};
 use sessions::core::source::Source;
 
 /// One choice a user makes at a prompt. Names carry both intent
@@ -177,6 +180,8 @@ pub struct InteractivePrompt {
     patches_policy: RefCell<PatchesPolicy>,
     /// Same shape again, for the lifecycle-hooks side.
     hooks_policy: RefCell<HooksPolicy>,
+    /// Same shape again, for the credential-lanes side.
+    credentials_policy: RefCell<CredentialsPolicy>,
 }
 
 impl InteractivePrompt {
@@ -186,13 +191,14 @@ impl InteractivePrompt {
     /// composer.
     #[must_use]
     pub fn new(policy_path: &Path, initial: sessions::core::policy::UserPolicy) -> Self {
-        let (vars, patches, hooks) = initial.into_parts();
+        let (vars, patches, hooks, credentials) = initial.into_parts();
         Self {
             prompter: Box::new(InquirePrompter),
             can_persist: is_writable(policy_path),
             vars_policy: RefCell::new(vars),
             patches_policy: RefCell::new(patches),
             hooks_policy: RefCell::new(hooks),
+            credentials_policy: RefCell::new(credentials),
         }
     }
 
@@ -208,6 +214,7 @@ impl InteractivePrompt {
             .with_vars(self.vars_policy.into_inner())
             .with_patches(self.patches_policy.into_inner())
             .with_hooks(self.hooks_policy.into_inner())
+            .with_credentials(self.credentials_policy.into_inner())
     }
 
     /// Test seam: injectable prompter + explicit `can_persist`.
@@ -220,6 +227,7 @@ impl InteractivePrompt {
             vars_policy: RefCell::new(VarsPolicy::empty()),
             patches_policy: RefCell::new(PatchesPolicy::empty()),
             hooks_policy: RefCell::new(HooksPolicy::empty()),
+            credentials_policy: RefCell::new(CredentialsPolicy::empty()),
         }
     }
 
@@ -410,6 +418,59 @@ impl PolicyHooks for InteractivePrompt {
             HookResult::decided(decisions)
         }
     }
+
+    fn on_credential_unapproved(
+        &self,
+        _policy: CredentialsPolicy,
+        items: &[Unapproved<'_, CredentialLane>],
+    ) -> HookResult<CredentialsPolicy> {
+        let choices = self.choices();
+        let mut decisions = Vec::with_capacity(items.len());
+        let mut policy_touched = false;
+        let mut policy = self.credentials_policy.borrow_mut();
+        for item in items {
+            let lane = item.item();
+            // Names the destination, not just the asker. Consent to "a
+            // project wants a credential" is meaningless without the
+            // upstream it will be spent against — and that upstream is
+            // the user's own binding, which is the fact worth showing.
+            let msg = format!(
+                "{} wants to use your credential lane {lane}. \
+                 The value never enters the session; the session can spend it \
+                 against that upstream.",
+                source_label(item.source()),
+            );
+            let choice = match self.prompter.ask(&msg, choices) {
+                Ok(c) => c,
+                Err(_) => return HookResult::Abort,
+            };
+            match apply_credential_choice(
+                &mut policy,
+                project_root(item.source()),
+                choice,
+                &mut policy_touched,
+            ) {
+                CredentialStep::Decision(d) => decisions.push(d),
+                CredentialStep::Abort => return HookResult::Abort,
+            }
+        }
+        if policy_touched {
+            HookResult::decided_with_policy(decisions, policy.clone())
+        } else {
+            HookResult::decided(decisions)
+        }
+    }
+}
+
+/// The project root a rule would be keyed on, or `None` for a source
+/// that isn't a project. The gate decides loadout- and package-origin
+/// items on its own, so `None` only reaches a prompt if that ever
+/// changes — and then a permanent rule has nothing to match on.
+fn project_root(source: &Source) -> Option<&str> {
+    match source {
+        Source::Project { path } => Some(path.as_utf8_path().as_str()),
+        _ => None,
+    }
 }
 
 // =====================================================================
@@ -578,6 +639,95 @@ fn apply_hook_choice(
     }
 }
 
+/// Outcome of applying a credentials-side [`UserChoice`]. Same shape as
+/// [`HookStep`].
+enum CredentialStep {
+    Decision(ItemDecision),
+    Abort,
+}
+
+/// Apply one [`UserChoice`] to the credentials policy for a project
+/// root.
+///
+/// The permanent variants record the project root, so approving one lane
+/// covers the rest that project declares — the grain the policy matches
+/// on. A `root` of `None` can't be turned into a rule, so the permanent
+/// choices degrade to their once-only twins with a warning rather than
+/// dead-ending the composer on a `UseRule` no rule can satisfy.
+fn apply_credential_choice(
+    policy: &mut CredentialsPolicy,
+    root: Option<&str>,
+    choice: UserChoice,
+    touched: &mut bool,
+) -> CredentialStep {
+    let Some(root) = root else {
+        return match choice {
+            UserChoice::AllowOnce | UserChoice::AllowPermanent => {
+                CredentialStep::Decision(ItemDecision::AllowOnce)
+            }
+            UserChoice::IgnoreOnce | UserChoice::IgnorePermanent => {
+                CredentialStep::Decision(ItemDecision::IgnoreOnce)
+            }
+            UserChoice::Abort | UserChoice::DenyPermanent => CredentialStep::Abort,
+        };
+    };
+    match choice {
+        UserChoice::AllowOnce => CredentialStep::Decision(ItemDecision::AllowOnce),
+        UserChoice::IgnoreOnce => CredentialStep::Decision(ItemDecision::IgnoreOnce),
+        UserChoice::AllowPermanent => {
+            *policy = append_credential_pattern(policy.clone(), HookBucket::Allow, root);
+            *touched = true;
+            CredentialStep::Decision(ItemDecision::UseRule)
+        }
+        UserChoice::IgnorePermanent => {
+            *policy = append_credential_pattern(policy.clone(), HookBucket::Ignore, root);
+            *touched = true;
+            CredentialStep::Decision(ItemDecision::UseRule)
+        }
+        UserChoice::Abort => CredentialStep::Abort,
+        UserChoice::DenyPermanent => {
+            *policy = append_credential_pattern(policy.clone(), HookBucket::Deny, root);
+            *touched = true;
+            CredentialStep::Abort
+        }
+    }
+}
+
+/// Append `root` as a pattern into the requested credentials-policy
+/// bucket. Escaped for the same reason [`append_hook_pattern`] escapes:
+/// the user picked one project, and a raw path carrying glob
+/// metacharacters would either reach its siblings or match nothing.
+fn append_credential_pattern(
+    policy: CredentialsPolicy,
+    bucket: HookBucket,
+    root: &str,
+) -> CredentialsPolicy {
+    let root = sessions::core::expansion::literal_policy_pattern(root);
+    let extend = |existing: &[String]| -> Vec<String> {
+        existing
+            .iter()
+            .cloned()
+            .chain(std::iter::once(root.clone()))
+            .collect()
+    };
+    match bucket {
+        HookBucket::Allow => {
+            let p = extend(policy.allow());
+            policy.with_allow(p)
+        }
+        HookBucket::Deny => {
+            let p = extend(policy.deny());
+            policy.with_deny(p)
+        }
+        HookBucket::Ignore => {
+            let p = extend(policy.ignore());
+            policy.with_ignore(p)
+        }
+    }
+}
+
+/// Which rule list a project-root pattern lands in. Shared by the hooks
+/// and credentials sides, which key on the same thing.
 enum HookBucket {
     Allow,
     Deny,
@@ -722,6 +872,7 @@ pub struct UnapprovedSummary {
     vars: Vec<String>,
     patches: Vec<String>,
     hooks: Vec<String>,
+    credentials: Vec<String>,
 }
 
 impl UnapprovedSummary {
@@ -762,6 +913,15 @@ impl UnapprovedSummary {
             hooks.insert("allow", toml_edit::value(allow));
             doc.insert("hooks", toml_edit::Item::Table(hooks));
         }
+        if !self.credentials.is_empty() {
+            let mut credentials = toml_edit::Table::new();
+            let mut allow = toml_edit::Array::new();
+            for root in &self.credentials {
+                allow.push(root.as_str());
+            }
+            credentials.insert("allow", toml_edit::value(allow));
+            doc.insert("credentials", toml_edit::Item::Table(credentials));
+        }
         doc.to_string()
     }
 
@@ -769,7 +929,7 @@ impl UnapprovedSummary {
     /// would require approval").
     #[must_use]
     pub fn count(&self) -> usize {
-        self.vars.len() + self.patches.len() + self.hooks.len()
+        self.vars.len() + self.patches.len() + self.hooks.len() + self.credentials.len()
     }
 }
 
@@ -852,6 +1012,22 @@ impl PolicyHooks for NoPromptHook {
         let mut seen = self.seen.borrow_mut();
         for item in items {
             insert_unique(&mut seen.hooks, item.item().as_str().to_owned());
+        }
+        HookResult::decided(vec![ItemDecision::AllowOnce; items.len()])
+    }
+
+    /// Records each project whose credential lanes would need approval.
+    /// The rule is keyed on the project root, not the lane, so that is
+    /// what the snippet lists — one entry however many lanes the project
+    /// declares.
+    fn on_credential_unapproved(
+        &self,
+        _policy: CredentialsPolicy,
+        items: &[Unapproved<'_, CredentialLane>],
+    ) -> HookResult<CredentialsPolicy> {
+        let mut seen = self.seen.borrow_mut();
+        for root in items.iter().filter_map(|i| project_root(i.source())) {
+            insert_unique(&mut seen.credentials, root.to_owned());
         }
         HookResult::decided(vec![ItemDecision::AllowOnce; items.len()])
     }
@@ -969,8 +1145,8 @@ impl Drop for RemoveOnDrop<'_> {
     }
 }
 
-/// Upsert the nine rule arrays (`vars`, `patches`, and `hooks`, each
-/// with `allow`/`deny`/`ignore`) from `policy` into `doc`, replacing
+/// Upsert the twelve rule arrays (`vars`, `patches`, `hooks`, and
+/// `credentials`, each with `allow`/`deny`/`ignore`) into `doc`, replacing
 /// each in place while leaving surrounding structure, comments, and
 /// unrelated keys intact. Empty arrays are removed rather than
 /// written as `[]` so a minimal policy doesn't render bloated
@@ -994,6 +1170,11 @@ fn merge_policy_into_document(
     upsert_string_array(doc, "hooks", "deny", hooks.deny());
     upsert_string_array(doc, "hooks", "ignore", hooks.ignore());
 
+    let credentials = policy.credentials();
+    upsert_string_array(doc, "credentials", "allow", credentials.allow());
+    upsert_string_array(doc, "credentials", "deny", credentials.deny());
+    upsert_string_array(doc, "credentials", "ignore", credentials.ignore());
+
     // Drop sections that end up empty. Keeps the file minimal after a
     // rule the user hand-added gets emptied by some future policy
     // operation (defensive — today's flow only appends, never
@@ -1001,6 +1182,7 @@ fn merge_policy_into_document(
     remove_empty_section(doc, "vars");
     remove_empty_section(doc, "patches");
     remove_empty_section(doc, "hooks");
+    remove_empty_section(doc, "credentials");
 }
 
 fn upsert_string_array(
@@ -1428,6 +1610,131 @@ mod tests {
         assert!(matches!(step, HookStep::Abort));
         assert!(touched);
         assert_eq!(policy.deny(), &["/repo".to_string()]);
+    }
+
+    // ---- Credential lanes ----
+
+    fn lane() -> CredentialLane {
+        CredentialLane::new("anthropic", "https://api.anthropic.com", "x-api-key")
+    }
+
+    /// The prompt has to name the destination, not just the asker:
+    /// consenting to "a project wants a credential" without seeing the
+    /// upstream it will be spent against is consent to nothing. Asserted
+    /// on the message the prompter is actually handed.
+    #[test]
+    fn credential_prompt_shows_lane_upstream_and_header() {
+        /// Prompter that records what it was asked, and always allows.
+        struct Recording(std::rc::Rc<RefCell<Vec<String>>>);
+        impl Prompter for Recording {
+            fn ask(&self, message: &str, _: &[UserChoice]) -> io::Result<UserChoice> {
+                self.0.borrow_mut().push(message.to_owned());
+                Ok(UserChoice::AllowOnce)
+            }
+        }
+
+        let asked = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let hook =
+            InteractivePrompt::with_prompter(Box::new(Recording(std::rc::Rc::clone(&asked))), true);
+        let source = project_source();
+        let lane = lane();
+        let items = [Unapproved::new(&lane, &source)];
+        let _ = hook.on_credential_unapproved(CredentialsPolicy::empty(), &items);
+
+        let asked = asked.borrow();
+        let msg = asked.first().expect("the user was asked");
+        assert!(msg.contains("anthropic"), "lane name missing: {msg}");
+        assert!(
+            msg.contains("https://api.anthropic.com"),
+            "bound upstream missing: {msg}",
+        );
+        assert!(msg.contains("x-api-key"), "header missing: {msg}");
+        assert!(msg.contains("/proj"), "asking project missing: {msg}");
+    }
+
+    /// A project the user permanently allows lands in the credentials
+    /// policy's `allow` list, so its other lanes — and its next
+    /// activation — decide without asking again.
+    #[test]
+    fn credential_allow_permanent_appends_project_to_allow() {
+        let mut policy = CredentialsPolicy::empty();
+        let mut touched = false;
+        let step = apply_credential_choice(
+            &mut policy,
+            Some("/repo"),
+            UserChoice::AllowPermanent,
+            &mut touched,
+        );
+        assert!(matches!(
+            step,
+            CredentialStep::Decision(ItemDecision::UseRule)
+        ));
+        assert!(touched);
+        assert_eq!(policy.allow(), &["/repo".to_string()]);
+        assert!(policy.deny().is_empty());
+    }
+
+    /// A permanent denial records the rule *and* aborts — "never" and
+    /// "not now" at once, as in every other domain.
+    #[test]
+    fn credential_deny_permanent_records_rule_and_aborts() {
+        let mut policy = CredentialsPolicy::empty();
+        let mut touched = false;
+        let step = apply_credential_choice(
+            &mut policy,
+            Some("/repo"),
+            UserChoice::DenyPermanent,
+            &mut touched,
+        );
+        assert!(matches!(step, CredentialStep::Abort));
+        assert!(touched);
+        assert_eq!(policy.deny(), &["/repo".to_string()]);
+    }
+
+    /// `--no-prompt` records the project whose lanes need approval and
+    /// renders a `[credentials] allow` block. Without it the error would
+    /// tell an operator how to unblock the vars and hooks while staying
+    /// silent about the lane that also blocked them.
+    #[test]
+    fn no_prompt_hook_renders_credentials_allow_block() {
+        let hook = NoPromptHook::new();
+        let source = project_source();
+        let lane = lane();
+        // Two lanes from one project collapse to a single rule: the
+        // policy is keyed on the path, not the lane name.
+        let other = CredentialLane::new("github-mcp", "https://api.github.com", "Authorization");
+        let items = [
+            Unapproved::new(&lane, &source),
+            Unapproved::new(&other, &source),
+        ];
+        let out = hook.on_credential_unapproved(CredentialsPolicy::empty(), &items);
+        match out {
+            HookResult::Decided { decisions, .. } => assert_eq!(decisions.len(), 2),
+            HookResult::Abort => panic!("expected fake-approve Decided, got Abort"),
+        }
+
+        let summary = hook.into_summary();
+        assert_eq!(summary.credentials, vec!["/proj"]);
+        let snippet = summary.as_toml_snippet();
+        assert!(snippet.contains("[credentials]"), "got: {snippet}");
+        let parsed: UserPolicy =
+            toml::from_str(&snippet).expect("snippet must be valid user_policy.toml");
+        assert_eq!(parsed.credentials().allow(), &["/proj".to_string()]);
+    }
+
+    /// A credentials rule persists into `user_policy.toml` and reads
+    /// back as the same policy — the round trip the permanent choices
+    /// depend on.
+    #[test]
+    fn save_user_policy_round_trips_credentials_section() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("user_policy.toml");
+        let policy = UserPolicy::empty()
+            .with_credentials(CredentialsPolicy::empty().with_allow(["~/work/**"]));
+        save_user_policy(&path, &policy).unwrap();
+        let round =
+            sessions::core::policy::read_user_policy_file(&path).expect("re-read must succeed");
+        assert_eq!(round, policy);
     }
 
     /// The TOML snippet builder groups by domain, quotes correctly,

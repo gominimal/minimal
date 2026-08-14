@@ -1456,6 +1456,7 @@ fn compute_verdict(
     policy: sessions::core::policy::UserPolicy,
     options: sessions::core::compose::ComposeOptions,
     hooks: &dyn sessions::core::hooks::PolicyHooks,
+    bindings: &sessions::core::primitives::CredentialBindings,
 ) -> Result<
     (
         sessions::wire::request::ContributionVerdict,
@@ -1463,9 +1464,15 @@ fn compute_verdict(
     ),
     sessions::core::compose::ComposeError,
 > {
-    sessions::client::handler::handle_response(response, &[], policy, hooks, options, &|name| {
-        std::env::var(name)
-    })
+    sessions::client::handler::handle_response(
+        response,
+        &[],
+        policy,
+        hooks,
+        options,
+        bindings,
+        &|name| std::env::var(name),
+    )
 }
 
 /// Ship the verdict to the daemon and wait for `Active`. Every
@@ -1515,6 +1522,7 @@ async fn drive_pending_to_active(
     policy: sessions::core::policy::UserPolicy,
     options: sessions::core::compose::ComposeOptions,
     hooks: &dyn sessions::core::hooks::PolicyHooks,
+    bindings: &sessions::core::primitives::CredentialBindings,
 ) -> Result<
     (
         sessions::SessionId,
@@ -1524,7 +1532,8 @@ async fn drive_pending_to_active(
     anyhow::Error,
 > {
     let session_id = response.session_id;
-    let (verdict, final_policy) = match compute_verdict(response, policy, options, hooks) {
+    let (verdict, final_policy) = match compute_verdict(response, policy, options, hooks, bindings)
+    {
         Ok(v) => v,
         Err(e) => {
             send_abort(client, session_id).await;
@@ -2103,6 +2112,7 @@ async fn activate_session(
     // item it would have prompted for so we can print a
     // `user_policy.toml` snippet on the error path.
     if let minimald_rpc::ConfigureLoadoutResponse::Pending { response } = configured {
+        let bindings = config::read_credential_bindings(global)?;
         let non_interactive = args.no_prompt || global.no_input || !can_prompt_interactively();
         if non_interactive {
             // NoPromptHook fake-approves every unapproved item so
@@ -2115,7 +2125,8 @@ async fn activate_session(
             // do we submit and let the session go Active.
             let session_id = response.session_id;
             let hooks = prompt::NoPromptHook::new();
-            let verdict = match compute_verdict(response, user_policy, compose_options, &hooks) {
+            let verdict =
+                match compute_verdict(response, user_policy, compose_options, &hooks, &bindings) {
                 Ok((verdict, _final_policy)) => verdict,
                 Err(e) => {
                     send_abort(&mut client, session_id).await;
@@ -2153,6 +2164,7 @@ async fn activate_session(
                 user_policy,
                 compose_options,
                 &hooks,
+                &bindings,
             )
             .await;
             if let Ok((_, _, ref approved)) = result {

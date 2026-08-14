@@ -6,14 +6,15 @@ use std::collections::BTreeMap;
 
 use crate::SessionId;
 use crate::core::compose::{
-    Composable, ComposeError, ComposeOptions, Composition, Contribution, Error, SessionPatch,
-    SessionVar, StoredEnv, contribution_to_pending, deferring_env,
+    Composable, ComposeError, ComposeOptions, Composition, Contribution, CredentialLane, Error,
+    SessionCredential, SessionPatch, SessionVar, StoredEnv, contribution_to_pending, deferring_env,
 };
 use crate::core::primitives::ResolvedPatch;
 use crate::core::source::{
-    Provenanced, ProvenancedHook, ProvenancedPackage, ProvenancedPatch, ProvenancedVar, Source,
+    Provenanced, ProvenancedCredential, ProvenancedHook, ProvenancedPackage, ProvenancedPatch,
+    ProvenancedVar, Source,
 };
-use crate::wire::policy::{WirePatchVerdict, WireVarVerdict};
+use crate::wire::policy::{WireCredentialVerdict, WirePatchVerdict, WireVarVerdict};
 use crate::wire::primitives::PendingId;
 use crate::wire::request::{ContributionResponse, ContributionVerdict, WireContribution};
 
@@ -37,6 +38,12 @@ pub struct PendingComposeState {
     /// client cannot substitute a different script for the one it was
     /// shown.
     pub pending_hooks: BTreeMap<PendingId, ProvenancedHook>,
+    /// Daemon-collected credential lanes keyed by [`PendingId`]. The
+    /// declaration stays here rather than being reconstructed from the
+    /// verdict, so an approval carries back only a decision and an
+    /// upstream — the client cannot substitute a different header for
+    /// the one the user was shown.
+    pub pending_credentials: BTreeMap<PendingId, ProvenancedCredential>,
     /// Client's already-gated wire contribution, untouched.
     pub client_contribution: WireContribution,
 }
@@ -46,6 +53,10 @@ pub struct PendingComposeState {
 /// `Pending` when the client must supply a verdict before the
 /// composition can finalize via [`resume_from_verdict`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing `Pending` would put an allocation on the common path and change the shape every daemon-side match destructures, to save bytes on a value constructed once per session creation"
+)]
 pub enum ComposeOutcome {
     /// All items decided; the assembled composition is ready.
     Ready(Composition),
@@ -172,41 +183,49 @@ impl SessionComposer {
             patches,
             packages,
             lifecycle_hooks,
+            credentials,
         } = contribution;
 
         // All-decided fast path: packages are the only domain with no
         // per-item verdict, so a daemon contribution carrying nothing
         // else assembles directly into the Composition.
         //
-        // Lifecycle hooks must be counted here. They used to ride the
-        // response for information only, which meant a project whose
-        // sole contribution was hooks took this path and never faced
-        // the gate — precisely the case the hooks policy exists to
-        // catch.
+        // Every gated domain must be counted here. Lifecycle hooks used
+        // to ride the response for information only, which meant a
+        // project whose sole contribution was hooks took this path and
+        // never faced the gate — precisely the case that policy exists
+        // to catch. Credential lanes are gated for the same reason and
+        // must not repeat it.
         tracing::info!(
             daemon_vars = vars.len(),
             daemon_patches = patches.len(),
             daemon_packages = packages.len(),
             daemon_hooks = lifecycle_hooks.len(),
+            daemon_credentials = credentials.len(),
             "compose: daemon-side contribution collected",
         );
-        if vars.is_empty() && patches.is_empty() && lifecycle_hooks.is_empty() {
+        if vars.is_empty()
+            && patches.is_empty()
+            && lifecycle_hooks.is_empty()
+            && credentials.is_empty()
+        {
             let mut composition = Composition::from_daemon_passthrough(packages, Vec::new());
             composition.extend_from_wire(client)?;
             return Ok(ComposeOutcome::Ready(composition));
         }
 
-        // Daemon-collected vars, patches, or hooks: route them back to
-        // the client for gating. Packages aren't on the wire at all —
-        // they only live on the stash. Every gated domain is stashed by
-        // `PendingId` so `resume_from_verdict` can reattach provenance
-        // to whatever the client approves.
-        let transform = contribution_to_pending(vars, patches, lifecycle_hooks);
+        // Daemon-collected vars, patches, hooks, or lanes: route them
+        // back to the client for gating. Packages aren't on the wire at
+        // all — they only live on the stash. Every gated domain is
+        // stashed by `PendingId` so `resume_from_verdict` can reattach
+        // provenance to whatever the client approves.
+        let transform = contribution_to_pending(vars, patches, lifecycle_hooks, credentials);
         let response = ContributionResponse {
             session_id,
             vars: transform.wire.vars,
             patches: transform.wire.patches,
             lifecycle_hooks: transform.wire.lifecycle_hooks,
+            credentials: transform.wire.credentials,
         };
         Ok(ComposeOutcome::Pending {
             response,
@@ -215,6 +234,7 @@ impl SessionComposer {
                 pending_vars: transform.pending_vars,
                 pending_patches: transform.pending_patches,
                 pending_hooks: transform.pending_hooks,
+                pending_credentials: transform.pending_credentials,
                 client_contribution: client,
             },
         })
@@ -250,6 +270,7 @@ pub fn resume_from_verdict(
         pending_vars,
         pending_patches,
         pending_hooks,
+        pending_credentials,
         client_contribution,
     } = state;
 
@@ -258,9 +279,68 @@ pub fn resume_from_verdict(
 
     let accepted_vars = apply_var_verdicts(pending_vars, verdict.vars)?;
     let accepted_patches = apply_patch_verdicts(&pending_patches, verdict.patches)?;
-    composition.extend_with(accepted_vars, accepted_patches)?;
+    let accepted_credentials = apply_credential_verdicts(pending_credentials, verdict.credentials)?;
+    composition.extend_with(accepted_vars, accepted_patches, accepted_credentials)?;
     composition.extend_from_wire(client_contribution)?;
     Ok(composition)
+}
+
+/// Walk the credential verdict, keeping the lanes the client approved
+/// and pairing each with the upstream the client's binding named.
+///
+/// A lane the verdict never mentions is **dropped**, exactly as a hook
+/// is: the stash is the daemon's and silence from the client must fail
+/// closed, which is what makes a verdict from a client that predates
+/// this gate safe — it carries no lane decisions, so no lane exists.
+///
+/// The upstream comes off the verdict rather than the stash because the
+/// daemon holds no bindings; the header comes off the stash rather than
+/// the verdict so an approval cannot rewrite what the user was shown.
+///
+/// # Errors
+///
+/// - [`ComposeError::InvalidWireItem`] if a verdict names a
+///   [`PendingId`] that isn't in the stash.
+/// - [`ComposeError::Denied`] if any lane was refused.
+fn apply_credential_verdicts(
+    mut pending: BTreeMap<PendingId, ProvenancedCredential>,
+    verdicts: Vec<WireCredentialVerdict>,
+) -> Result<Vec<SessionCredential>, ComposeError> {
+    let unknown = |id: PendingId| ComposeError::InvalidWireItem {
+        what: "credential verdict for an unknown pending id",
+        context: format!("id {}", id.get()),
+    };
+
+    let mut accepted = Vec::new();
+    for v in verdicts {
+        match v {
+            WireCredentialVerdict::Approved { id, upstream } => {
+                let pc = pending.remove(&id).ok_or_else(|| unknown(id))?;
+                let (lane, credential, source) = pc.into_parts();
+                accepted.push(SessionCredential::new(
+                    CredentialLane::new(lane, upstream, credential.inject.header),
+                    source,
+                ));
+            }
+            WireCredentialVerdict::Ignored { id } => {
+                pending.remove(&id).ok_or_else(|| unknown(id))?;
+            }
+            WireCredentialVerdict::Denied { id } => {
+                let pc = pending.get(&id).ok_or_else(|| unknown(id))?;
+                return Err(ComposeError::Denied {
+                    what: format!("credential lane `{}`", pc.lane()),
+                    from: pc.source().clone(),
+                });
+            }
+        }
+    }
+    if !pending.is_empty() {
+        tracing::info!(
+            dropped = pending.len(),
+            "compose: credential lanes with no client verdict were dropped",
+        );
+    }
+    Ok(accepted)
 }
 
 /// Walk the hook verdict, keeping the hooks the client approved.
@@ -758,6 +838,7 @@ mod tests {
         let state = PendingComposeState {
             daemon_packages: Vec::new(),
             pending_hooks: BTreeMap::new(),
+            pending_credentials: BTreeMap::new(),
             pending_vars,
             pending_patches: BTreeMap::new(),
             client_contribution: WireContribution::default(),
@@ -783,6 +864,7 @@ mod tests {
             }],
             patches: vec![],
             lifecycle_hooks: vec![],
+            credentials: vec![],
         };
         let comp = resume_from_verdict(state, verdict).unwrap();
         assert_eq!(comp.vars().len(), 1);
@@ -803,6 +885,7 @@ mod tests {
             }],
             patches: vec![],
             lifecycle_hooks: vec![],
+            credentials: vec![],
         };
         let comp = resume_from_verdict(state, verdict).unwrap();
         assert!(comp.vars().is_empty());
@@ -820,6 +903,7 @@ mod tests {
             }],
             patches: vec![],
             lifecycle_hooks: vec![],
+            credentials: vec![],
         };
         let err = resume_from_verdict(state, verdict).unwrap_err();
         match err {
@@ -848,6 +932,7 @@ mod tests {
             }],
             patches: vec![],
             lifecycle_hooks: vec![],
+            credentials: vec![],
         };
         let err = resume_from_verdict(state, verdict).unwrap_err();
         assert!(
@@ -867,6 +952,7 @@ mod tests {
             vars: vec![],
             patches: vec![],
             lifecycle_hooks: vec![],
+            credentials: vec![],
         };
         let err = resume_from_verdict(state, verdict).unwrap_err();
         assert!(
@@ -884,6 +970,7 @@ mod tests {
         let state = PendingComposeState {
             daemon_packages: Vec::new(),
             pending_hooks: BTreeMap::new(),
+            pending_credentials: BTreeMap::new(),
             pending_vars: BTreeMap::new(),
             pending_patches: BTreeMap::new(),
             client_contribution: WireContribution::default(),
@@ -893,6 +980,7 @@ mod tests {
             vars: vec![],
             patches: vec![],
             lifecycle_hooks: vec![],
+            credentials: vec![],
         };
         let comp = resume_from_verdict(state, verdict).unwrap();
         assert!(comp.vars().is_empty());
@@ -919,6 +1007,7 @@ mod tests {
             pending_hooks: [(PendingId::new(0), ProvenancedHook::new(hook, src))]
                 .into_iter()
                 .collect(),
+            pending_credentials: BTreeMap::new(),
             client_contribution: WireContribution::default(),
         }
     }
@@ -935,6 +1024,7 @@ mod tests {
             lifecycle_hooks: vec![WireHookVerdict::Approved {
                 id: PendingId::new(0),
             }],
+            credentials: vec![],
         };
         let comp = resume_from_verdict(state_with_one_package_and_hook(), verdict).unwrap();
         assert_eq!(comp.packages().len(), 1);
@@ -955,6 +1045,7 @@ mod tests {
             vars: vec![],
             patches: vec![],
             lifecycle_hooks: vec![],
+            credentials: vec![],
         };
         let comp = resume_from_verdict(state_with_one_package_and_hook(), verdict).unwrap();
         assert_eq!(comp.packages().len(), 1);
@@ -977,6 +1068,7 @@ mod tests {
             lifecycle_hooks: vec![WireHookVerdict::Ignored {
                 id: PendingId::new(0),
             }],
+            credentials: vec![],
         };
         let comp = resume_from_verdict(state_with_one_package_and_hook(), ignored).unwrap();
         assert!(comp.lifecycle_hooks().is_empty());
@@ -988,6 +1080,7 @@ mod tests {
             lifecycle_hooks: vec![WireHookVerdict::Denied {
                 id: PendingId::new(0),
             }],
+            credentials: vec![],
         };
         let err = resume_from_verdict(state_with_one_package_and_hook(), denied)
             .expect_err("a denied hook must abort the resume");
@@ -1006,8 +1099,183 @@ mod tests {
             lifecycle_hooks: vec![WireHookVerdict::Approved {
                 id: PendingId::new(99),
             }],
+            credentials: vec![],
         };
         let err = resume_from_verdict(state_with_one_package_and_hook(), verdict)
+            .expect_err("unknown pending id must fault");
+        assert!(
+            matches!(err, ComposeError::InvalidWireItem { .. }),
+            "got: {err:?}",
+        );
+    }
+
+    // ============================================================
+    // Credential lanes
+    // ============================================================
+
+    /// A composable whose *only* contribution is a credential lane —
+    /// the shape `has_material`'s short-circuit and the all-decided
+    /// fast path both have to account for.
+    struct ProjectLaneOnly;
+    impl Composable for ProjectLaneOnly {
+        fn contribute(
+            self,
+            _env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+        ) -> Result<Contribution, Error> {
+            let mut c = Contribution::new();
+            c.push_credential(ProvenancedCredential::new(
+                "anthropic",
+                crate::core::primitives::Credential::new(
+                    crate::core::primitives::CredentialInject::new("x-api-key"),
+                ),
+                Source::Project {
+                    path: paths::HostPath::try_new("/proj").unwrap(),
+                },
+            ));
+            Ok(c)
+        }
+    }
+
+    /// A project whose only declaration is a credential lane must face
+    /// the gate. This is the hooks regression restated: a domain left
+    /// out of the all-decided fast path composes straight to `Ready`
+    /// and is never seen by the policy that exists to catch it.
+    #[test]
+    fn credentials_only_project_routes_to_pending_not_ready() {
+        let mut composer = SessionComposer::new(WireContribution::default());
+        composer.add(ProjectLaneOnly).unwrap();
+
+        match composer
+            .compose(nil_id(), ComposeOptions::default())
+            .unwrap()
+        {
+            ComposeOutcome::Pending { response, state } => {
+                assert_eq!(response.credentials.len(), 1);
+                let pending = &response.credentials[0];
+                assert_eq!(pending.lane, "anthropic");
+                assert_eq!(pending.header, "x-api-key");
+                assert!(state.pending_credentials.contains_key(&pending.id));
+            }
+            ComposeOutcome::Ready(_) => {
+                panic!("a credentials-only project must face the gate, not compose to Ready")
+            }
+        }
+    }
+
+    /// The pending lane the daemon ships carries no upstream: it has no
+    /// bindings, and a project that could name one could redirect the
+    /// user's credential.
+    #[test]
+    fn pending_lane_ships_no_upstream() {
+        let mut composer = SessionComposer::new(WireContribution::default());
+        composer.add(ProjectLaneOnly).unwrap();
+        let ComposeOutcome::Pending { response, .. } = composer
+            .compose(nil_id(), ComposeOptions::default())
+            .unwrap()
+        else {
+            panic!("expected Pending")
+        };
+        let rendered = serde_json_lenient::to_string(&response.credentials[0]).unwrap();
+        assert!(!rendered.contains("upstream"), "got: {rendered}");
+    }
+
+    fn state_with_one_lane() -> PendingComposeState {
+        PendingComposeState {
+            daemon_packages: Vec::new(),
+            pending_vars: BTreeMap::new(),
+            pending_patches: BTreeMap::new(),
+            pending_hooks: BTreeMap::new(),
+            pending_credentials: [(
+                PendingId::new(0),
+                ProvenancedCredential::new(
+                    "anthropic",
+                    crate::core::primitives::Credential::new(
+                        crate::core::primitives::CredentialInject::new("x-api-key"),
+                    ),
+                    Source::Project {
+                        path: paths::HostPath::try_new("/proj").unwrap(),
+                    },
+                ),
+            )]
+            .into_iter()
+            .collect(),
+            client_contribution: WireContribution::default(),
+        }
+    }
+
+    fn verdict_with_credentials(credentials: Vec<WireCredentialVerdict>) -> ContributionVerdict {
+        ContributionVerdict {
+            session_id: SessionId::nil(),
+            vars: vec![],
+            patches: vec![],
+            lifecycle_hooks: vec![],
+            credentials,
+        }
+    }
+
+    /// An approved lane composes in with the client's upstream and the
+    /// daemon's own header — the client answers "where", the stash says
+    /// "how", so an approval can't rewrite what the user was shown.
+    #[test]
+    fn resume_from_verdict_keeps_approved_lane() {
+        let verdict = verdict_with_credentials(vec![WireCredentialVerdict::Approved {
+            id: PendingId::new(0),
+            upstream: "https://api.anthropic.com".into(),
+        }]);
+        let comp = resume_from_verdict(state_with_one_lane(), verdict).unwrap();
+        assert_eq!(comp.credentials().len(), 1);
+        let lane = comp.credentials()[0].lane();
+        assert_eq!(lane.lane(), "anthropic");
+        assert_eq!(lane.upstream(), "https://api.anthropic.com");
+        assert_eq!(lane.header(), "x-api-key");
+    }
+
+    /// A lane the verdict never mentions is dropped, not kept: a client
+    /// that predates this gate sends no lane decisions, and silence must
+    /// mean "no lane" rather than "an unvetted one".
+    #[test]
+    fn resume_from_verdict_drops_lanes_with_no_verdict() {
+        let comp = resume_from_verdict(state_with_one_lane(), verdict_with_credentials(vec![]))
+            .expect("a verdict with no lane decisions is legal");
+        assert!(
+            comp.credentials().is_empty(),
+            "a lane with no verdict must not compose in",
+        );
+    }
+
+    /// `Ignored` drops the lane quietly; `Denied` aborts the whole
+    /// resume, the same split every other domain uses.
+    #[test]
+    fn resume_from_verdict_ignores_or_denies_lanes() {
+        let ignored = verdict_with_credentials(vec![WireCredentialVerdict::Ignored {
+            id: PendingId::new(0),
+        }]);
+        let comp = resume_from_verdict(state_with_one_lane(), ignored).unwrap();
+        assert!(comp.credentials().is_empty());
+
+        let denied = verdict_with_credentials(vec![WireCredentialVerdict::Denied {
+            id: PendingId::new(0),
+        }]);
+        let err = resume_from_verdict(state_with_one_lane(), denied)
+            .expect_err("a denied lane must abort the resume");
+        match err {
+            ComposeError::Denied { what, from } => {
+                assert!(what.contains("anthropic"), "got: {what}");
+                assert!(matches!(from, Source::Project { .. }));
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    /// A verdict naming an id the daemon never issued is a protocol
+    /// fault.
+    #[test]
+    fn resume_from_verdict_rejects_unknown_lane_id() {
+        let verdict = verdict_with_credentials(vec![WireCredentialVerdict::Approved {
+            id: PendingId::new(99),
+            upstream: "https://api.anthropic.com".into(),
+        }]);
+        let err = resume_from_verdict(state_with_one_lane(), verdict)
             .expect_err("unknown pending id must fault");
         assert!(
             matches!(err, ComposeError::InvalidWireItem { .. }),
@@ -1033,6 +1301,7 @@ mod tests {
         let state = PendingComposeState {
             daemon_packages: Vec::new(),
             pending_hooks: BTreeMap::new(),
+            pending_credentials: BTreeMap::new(),
             pending_vars: BTreeMap::new(),
             pending_patches: BTreeMap::new(),
             client_contribution: client,
@@ -1042,6 +1311,7 @@ mod tests {
             vars: vec![],
             patches: vec![],
             lifecycle_hooks: vec![],
+            credentials: vec![],
         };
         let comp = resume_from_verdict(state, verdict).unwrap();
         assert_eq!(comp.vars().len(), 1);

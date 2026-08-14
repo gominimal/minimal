@@ -782,6 +782,7 @@ mod tests {
             patches: Vec::new(),
             packages: Vec::new(),
             lifecycle_hooks: hooks.into_iter().map(WireProvenancedHook::from).collect(),
+            credentials: Vec::new(),
             orientation: Default::default(),
         };
         Composition::try_from(wire).expect("hooks with at least one script convert back")

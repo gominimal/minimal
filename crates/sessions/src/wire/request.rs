@@ -10,10 +10,10 @@
 //! 3. Client → daemon: [`ContributionVerdict`] with per-item decisions.
 
 use super::errors::WireError;
-use super::policy::{WireHookVerdict, WirePatchVerdict, WireVarVerdict};
+use super::policy::{WireCredentialVerdict, WireHookVerdict, WirePatchVerdict, WireVarVerdict};
 use super::primitives::{
-    WireOrientation, WirePackageRef, WirePendingHook, WirePendingPatch, WirePendingVar,
-    WireProvenancedHook, WireSessionPatch, WireSessionVar,
+    WireCredentialLane, WireOrientation, WirePackageRef, WirePendingCredential, WirePendingHook,
+    WirePendingPatch, WirePendingVar, WireProvenancedHook, WireSessionPatch, WireSessionVar,
 };
 use crate::SessionId;
 
@@ -24,6 +24,13 @@ use crate::SessionId;
 ///   or per-script `timeout`.
 /// - **2** — hooks carry `description`, `on_attach`, `on_detach`, and a
 ///   per-script `timeout_secs`; `on_failure` is gone.
+///
+/// Credential lanes did **not** bump this. The field is purely additive
+/// and serde-defaulted, so the shape is tolerated in both directions: an
+/// older daemon ignores a key it doesn't know, and a newer one reads a
+/// snapshot without the key as "no lanes" — which is also the correct
+/// answer, since a session composed before lanes existed has none. A
+/// bump is for a change an older daemon *cannot* tolerate.
 pub const COMPOSITION_SNAPSHOT_VERSION: u32 = 2;
 
 /// Version assumed for a sidecar with no `version` field. Those were
@@ -49,6 +56,13 @@ pub struct WireContribution {
     /// that predate the field deserialize cleanly.
     #[serde(default)]
     pub orientation: WireOrientation,
+    /// Credential lanes that passed the user policy gate client-side.
+    /// Empty until a loadout can declare one — a project's lanes travel
+    /// the other way, as pending items the client votes on.
+    /// Serde-defaulted so payloads from clients that predate the field
+    /// deserialize cleanly.
+    #[serde(default)]
+    pub credentials: Vec<WireCredentialLane>,
 }
 
 /// Persisted composition snapshot, written by the daemon as a sidecar
@@ -83,6 +97,12 @@ pub struct WireComposition {
     /// deserialize cleanly.
     #[serde(default)]
     pub orientation: WireOrientation,
+    /// Credential lanes that survived the policy gate: lane name, bound
+    /// upstream, and injected header. No value is here, which is what
+    /// makes this sidecar's `0644` mode survivable. Serde-defaulted so
+    /// sidecars written before the field existed deserialize cleanly.
+    #[serde(default)]
+    pub credentials: Vec<WireCredentialLane>,
 }
 
 fn default_composition_version() -> u32 {
@@ -103,6 +123,7 @@ impl From<&crate::core::compose::Composition> for WireComposition {
                 .map(Into::into)
                 .collect(),
             orientation: c.orientation().clone().into(),
+            credentials: c.credentials().iter().cloned().map(Into::into).collect(),
         }
     }
 }
@@ -124,6 +145,12 @@ pub struct ContributionResponse {
     /// hooks only — a loadout's are the user's own and never reach the
     /// daemon-side pending set.
     pub lifecycle_hooks: Vec<WirePendingHook>,
+    /// Credential lanes awaiting the credentials-policy gate.
+    /// Project-declared only, for the same reason as hooks.
+    /// Serde-defaulted so a response from a daemon that predates the
+    /// gate deserializes as "no lanes".
+    #[serde(default)]
+    pub credentials: Vec<WirePendingCredential>,
 }
 
 /// Client → Daemon: per-item verdicts on the [`ContributionResponse`]'s
@@ -142,6 +169,12 @@ pub struct ContributionVerdict {
     /// client can never accidentally approve one by omission.
     #[serde(default)]
     pub lifecycle_hooks: Vec<WireHookVerdict>,
+    /// One verdict per pending credential lane. Serde-defaulted on the
+    /// same fail-closed contract as `lifecycle_hooks`: a lane the
+    /// verdict never mentions is dropped, so a client that predates
+    /// this gate yields zero lanes rather than unvetted ones.
+    #[serde(default)]
+    pub credentials: Vec<WireCredentialVerdict>,
 }
 
 /// Daemon's reply to a `SubmitVerdict`: composition finalized (the
@@ -215,6 +248,15 @@ mod tests {
             }],
             patches: vec![],
             lifecycle_hooks: vec![],
+            credentials: vec![WirePendingCredential {
+                id: PendingId::new(2),
+                lane: "anthropic".into(),
+                header: "x-api-key".into(),
+                prefix: String::new(),
+                source: WireSource::Project {
+                    path: paths::HostPath::try_new("/repo").unwrap(),
+                },
+            }],
         };
         assert_eq!(round_trip(&r), r);
     }
@@ -238,16 +280,20 @@ mod tests {
             lifecycle_hooks: vec![WireHookVerdict::Approved {
                 id: PendingId::new(3),
             }],
+            credentials: vec![WireCredentialVerdict::Approved {
+                id: PendingId::new(4),
+                upstream: "https://api.anthropic.com".into(),
+            }],
         };
         assert_eq!(round_trip(&v), v);
     }
 
-    /// A verdict from a client that predates the hooks gate carries no
-    /// `lifecycle_hooks` key at all. It must deserialize to an empty
-    /// list — which the daemon treats as "approve nothing" — rather
+    /// A verdict from a client that predates the hooks and credentials
+    /// gates carries neither key at all. It must deserialize to empty
+    /// lists — which the daemon treats as "approve nothing" — rather
     /// than failing the message.
     #[test]
-    fn contribution_verdict_without_hook_field_deserializes_empty() {
+    fn contribution_verdict_without_gated_fields_deserializes_empty() {
         let json = format!(
             r#"{{"session_id":"{}","vars":[],"patches":[]}}"#,
             session_id()
@@ -255,6 +301,7 @@ mod tests {
         let v: ContributionVerdict =
             serde_json_lenient::from_str(&json).expect("legacy verdict must load");
         assert!(v.lifecycle_hooks.is_empty());
+        assert!(v.credentials.is_empty());
     }
 
     #[test]
@@ -300,8 +347,47 @@ mod tests {
             orientation: WireOrientation {
                 loadouts_display: "dev".into(),
             },
+            credentials: vec![WireCredentialLane {
+                lane: "anthropic".into(),
+                upstream: "https://api.anthropic.com".into(),
+                header: "x-api-key".into(),
+                source: WireSource::Project {
+                    path: paths::HostPath::try_new("/repo").unwrap(),
+                },
+            }],
         };
         assert_eq!(round_trip(&c), c);
+    }
+
+    /// A persisted lane survives the snapshot → domain → snapshot trip
+    /// intact, so a restart re-applies the lane the user approved rather
+    /// than a differently-pointed one.
+    #[test]
+    fn composition_snapshot_round_trips_a_lane() {
+        let lane = WireCredentialLane {
+            lane: "anthropic".into(),
+            upstream: "https://api.anthropic.com".into(),
+            header: "x-api-key".into(),
+            source: WireSource::Project {
+                path: paths::HostPath::try_new("/repo").unwrap(),
+            },
+        };
+        let snapshot = WireComposition {
+            credentials: vec![lane.clone()],
+            ..Default::default()
+        };
+        let composition = crate::core::compose::Composition::try_from(snapshot)
+            .expect("snapshot with a lane loads");
+        assert_eq!(WireComposition::from(&composition).credentials, [lane]);
+    }
+
+    /// A snapshot written before lanes existed loads as "no lanes",
+    /// which is also the truth about that session.
+    #[test]
+    fn composition_snapshot_without_credentials_deserializes_empty() {
+        let json = r#"{"version":2,"vars":[],"patches":[],"packages":[],"lifecycle_hooks":[]}"#;
+        let c: WireComposition = serde_json_lenient::from_str(json).unwrap();
+        assert!(c.credentials.is_empty());
     }
 
     #[test]
@@ -378,6 +464,7 @@ mod tests {
             orientation: WireOrientation {
                 loadouts_display: "default (built-in)".into(),
             },
+            credentials: vec![],
         };
         assert_eq!(round_trip(&c), c);
     }

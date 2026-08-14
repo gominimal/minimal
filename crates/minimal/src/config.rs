@@ -50,3 +50,31 @@ pub fn read_user_policy(
 pub fn user_policy_path(global: &GlobalArgs) -> PathBuf {
     resolve_minimal_config_dir(global).join("user_policy.toml")
 }
+
+/// Absolute path to `credentials.toml` under the resolved config dir.
+///
+/// It is deliberately not in the project tree: the binding names the
+/// upstream a lane may reach and where its secret comes from, so a
+/// project that could write it could redirect a credential.
+pub fn credentials_path(global: &GlobalArgs) -> PathBuf {
+    resolve_minimal_config_dir(global).join("credentials.toml")
+}
+
+/// Reads the user's credential bindings.
+///
+/// A missing file is an empty set, so an install with no bindings
+/// activates fine; a project that declares a lane nobody bound fails
+/// later, naming the lane, rather than here.
+pub fn read_credential_bindings(
+    global: &GlobalArgs,
+) -> Result<sessions::core::primitives::CredentialBindings, anyhow::Error> {
+    let path = credentials_path(global);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => sessions::core::primitives::CredentialBindings::from_toml_str(&text)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(sessions::core::primitives::CredentialBindings::default())
+        }
+        Err(e) => Err(anyhow::anyhow!("{}: {e}", path.display())),
+    }
+}
