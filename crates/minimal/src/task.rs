@@ -462,14 +462,19 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         if non_interactive {
             let session_id = response.session_id;
             let hooks = crate::prompt::NoPromptHook::new();
-            let verdict =
-                match crate::compute_verdict(response, user_policy, compose_options, &hooks, &bindings) {
-                    Ok((verdict, _final_policy)) => verdict,
-                    Err(e) => {
-                        crate::send_abort(&mut client, session_id).await;
-                        bail!("Composition gating failed: {e}");
-                    }
-                };
+            let verdict = match crate::compute_verdict(
+                response,
+                user_policy,
+                compose_options,
+                &hooks,
+                &bindings,
+            ) {
+                Ok((verdict, _final_policy)) => verdict,
+                Err(e) => {
+                    crate::send_abort(&mut client, session_id).await;
+                    bail!("Composition gating failed: {e}");
+                }
+            };
             let summary = hooks.into_summary();
             if summary.count() > 0 {
                 crate::send_abort(&mut client, session_id).await;
@@ -514,8 +519,11 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 
     collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
     collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
+    // No registration on this path: the task flow does not gate credential
+    // lanes, so there is no token to hand over and a task box gets no
+    // credential variables.
     if let Err(e) =
-        crate::upload_and_finalize(&mut client, id, &collected_patches, &hook_scripts).await
+        crate::upload_and_finalize(&mut client, id, &collected_patches, &hook_scripts, None).await
     {
         crate::best_effort_destroy(&mut client, id).await;
         return Err(e);

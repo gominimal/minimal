@@ -813,7 +813,10 @@ async fn create_session_at(
         }
     }
     match client
-        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            credential_token: None,
+        })
         .await
     {
         minimald_rpc::Errorable::Ok(_) => {}

@@ -160,6 +160,26 @@ first line; `--json` emits the full records.
 Answered from the persisted composition, so it works after a daemon restart
 and for a session nobody is attached to.
 
+### `session credentials`
+
+```
+min session credentials <SESSION> [--json]
+```
+
+Lists the [credential lanes](../guide/credentials.md) composed into `SESSION`
+(a UUID or session name), with the bound upstream, the header the broker
+injects into, and the loadout or project that declared each lane. There is no
+value column, at any width: the composition descriptor this reads from has no
+field that can hold a credential value, and neither does this listing.
+
+This shows what a box can actually reach, not what was asked for: the daemon
+answers from the session's composition, which holds only the lanes that
+survived your [user policy](./user-policy.md). A project whose credential
+lanes you never allow-listed lists nothing.
+
+Answered from the persisted composition, so it works after a daemon restart
+and for a session nobody is attached to.
+
 ### `stop`
 
 ```

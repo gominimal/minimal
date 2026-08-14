@@ -18,6 +18,7 @@ pub use minimal_client as client;
 pub mod completion;
 pub mod completions;
 pub mod config;
+pub mod credentials;
 pub mod diag;
 pub mod dirs;
 use minimal_client::file_upload;
@@ -222,6 +223,9 @@ pub enum SessionCommand {
     /// List the lifecycle hooks composed into a session, and where each
     /// was declared
     Hooks(HooksArgs),
+    /// List the credential lanes composed into a session, and where each
+    /// was declared
+    Credentials(CredentialsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -240,6 +244,17 @@ pub struct SetupZedArgs {
 /// Args for `min session hooks`.
 #[derive(Debug, Args)]
 pub struct HooksArgs {
+    /// Session identifier (UUID or session name)
+    #[arg(add = completion::session_completer())]
+    pub session: String,
+    /// Emit the raw JSON the daemon returned instead of a table
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Args for `min session credentials`.
+#[derive(Debug, Args)]
+pub struct CredentialsArgs {
     /// Session identifier (UUID or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
@@ -790,6 +805,9 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             SessionCommand::Policy(args) => cmd_session_policy(&cli.global_args, args).await,
             SessionCommand::SetupZed(args) => cmd_session_setup_zed(&cli.global_args, args).await,
             SessionCommand::Hooks(args) => cmd_session_hooks(&cli.global_args, args).await,
+            SessionCommand::Credentials(args) => {
+                cmd_session_credentials(&cli.global_args, args).await
+            }
         },
         Some(Command::Loadout(LoadoutArgs {
             command: LoadoutCommand::List(args),
@@ -1160,6 +1178,15 @@ impl From<SessionLookup> for minimald_rpc::GetSessionHooksRequest {
     }
 }
 
+impl From<SessionLookup> for minimald_rpc::GetSessionCredentialsRequest {
+    fn from(l: SessionLookup) -> Self {
+        match l {
+            SessionLookup::Id(id) => Self::Id(id),
+            SessionLookup::Name(n) => Self::Name(n),
+        }
+    }
+}
+
 /// Resolve a session by UUID or name, returning its record.
 ///
 /// Used by commands that need the full record before proceeding (destroy,
@@ -1516,6 +1543,12 @@ async fn submit_verdict_and_wait(
 /// only surfaced during Phase 3 and won't otherwise be available
 /// to the client-side upload step. Any gating failure aborts the
 /// daemon-side session before propagating.
+///
+/// `min task run` drives this; `min session create` drives
+/// [`drive_pending_to_active_with_credentials`], which is this plus
+/// the broker registration that has to land between the gate and the
+/// submit. Tasks join it once they carry a credential token of their
+/// own.
 async fn drive_pending_to_active(
     client: &mut client::Client,
     response: sessions::wire::request::ContributionResponse,
@@ -1547,6 +1580,116 @@ async fn drive_pending_to_active(
     let approved_patches: Vec<_> = approved_patches_from_verdict(&verdict).collect();
     let id = submit_verdict_and_wait(client, session_id, verdict).await?;
     Ok((id, final_policy, approved_patches))
+}
+
+/// What a gated activation hands back: the daemon-side patches to
+/// upload, and the broker registration the approved credential lanes
+/// produced.
+///
+/// Not the session id or the post-gate policy, which the older
+/// [`drive_pending_to_active`] returns and neither caller reads: the
+/// id is the one the caller created, and the interactive hook holds
+/// the policy.
+struct Activated {
+    patches: Vec<(std::path::PathBuf, paths::SandboxRelPath)>,
+    credentials: Option<credentials::Registration>,
+}
+
+/// [`drive_pending_to_active`] with the credential lanes registered
+/// between the gate and the submit.
+///
+/// The order is forced: the lanes to register are the ones the gate
+/// approved, and a box must not reach `Active` believing in a lane
+/// whose value could not be resolved — so a resolution or broker
+/// failure aborts the daemon-side session, and a submit failure after
+/// a successful registration revokes it again.
+async fn drive_pending_to_active_with_credentials(
+    client: &mut client::Client,
+    response: sessions::wire::request::ContributionResponse,
+    policy: sessions::core::policy::UserPolicy,
+    options: sessions::core::compose::ComposeOptions,
+    hooks: &dyn sessions::core::hooks::PolicyHooks,
+    bindings: &credentials::Bindings,
+) -> Result<Activated, anyhow::Error> {
+    let session_id = response.session_id;
+    // Snapshotted before the gate consumes the response: the verdict
+    // says which ids survived it, and only the pending set says which
+    // lane each id was.
+    let pending_credentials = response.credentials.clone();
+    let (verdict, _final_policy) =
+        match compute_verdict(response, policy, options, hooks, bindings.bindings()) {
+            Ok(v) => v,
+            Err(e) => {
+                send_abort(client, session_id).await;
+                return Err(bindings.gating_failure(&e));
+            }
+        };
+    let approved_patches: Vec<_> = approved_patches_from_verdict(&verdict).collect();
+    let registration =
+        register_credentials(client, session_id, &pending_credentials, &verdict, bindings).await?;
+    if let Err(e) = submit_verdict_and_wait(client, session_id, verdict).await {
+        revoke_credentials(registration.as_ref()).await;
+        return Err(e);
+    }
+    Ok(Activated {
+        patches: approved_patches,
+        credentials: registration,
+    })
+}
+
+/// Resolve every approved lane's value on this host and register it
+/// with the broker, aborting the daemon-side session if that fails.
+///
+/// Resolution runs here, in the client, and the values go to the
+/// broker over its control socket: the daemon is guest-side on the
+/// microVM deployment models and never holds a credential.
+async fn register_credentials(
+    client: &mut client::Client,
+    session_id: sessions::SessionId,
+    pending: &[sessions::wire::primitives::WirePendingCredential],
+    verdict: &sessions::wire::request::ContributionVerdict,
+    bindings: &credentials::Bindings,
+) -> Result<Option<credentials::Registration>, anyhow::Error> {
+    match credentials::register_approved(pending, verdict, bindings, &|name| std::env::var(name))
+        .await
+    {
+        Ok(registration) => Ok(registration),
+        Err(e) => {
+            send_abort(client, session_id).await;
+            Err(anyhow::Error::new(e).context("Registering credential lanes failed"))
+        }
+    }
+}
+
+/// Drop a registration whose activation then failed. A registration
+/// that outlives its session is bounded only by the broker's token
+/// TTL, so this is worth attempting — and, on a path that is already
+/// failing, not worth failing on.
+async fn revoke_credentials(registration: Option<&credentials::Registration>) {
+    if let Some(registration) = registration
+        && let Err(e) = registration.revoke().await
+    {
+        eprintln!("warning: failed to revoke this session's credential lanes: {e}");
+    }
+}
+
+/// Drop the credential-lane registrations a destroyed session left behind,
+/// naming it by session id: the process that activated it held the handle
+/// and has long since exited.
+///
+/// Best-effort in every direction. No broker running, a session that never
+/// had a lane, a token already expired — all ordinary, and a session must
+/// always be destroyable, so nothing here fails or delays the destroy.
+async fn revoke_session_credentials(id: sessions::SessionId) {
+    /// Revocation is a local UDS round trip; a wedged broker must not become
+    /// a session that cannot be destroyed.
+    const REVOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    match tokio::time::timeout(REVOKE_TIMEOUT, credentials::revoke_session(id)).await {
+        Ok(Ok(live)) => tracing::debug!(%id, live, "revoked the session's credential lanes"),
+        Ok(Err(e)) => tracing::debug!(%id, error = %e, "no credential lanes were revoked"),
+        Err(_elapsed) => tracing::debug!(%id, "the credential broker did not answer a revocation"),
+    }
 }
 
 /// Collect the sandbox destinations of every `Approved` patch
@@ -1636,11 +1779,17 @@ async fn best_effort_destroy(client: &mut client::Client, session_id: sessions::
 /// upload's ready-marker: a session must not become attachable while
 /// either its patches or its hook scripts are still missing from the
 /// daemon.
+///
+/// `credentials` is where the broker registration is handed over: the
+/// token rides this RPC because it can only exist once the gate has
+/// decided which lanes the box gets, and it is the last thing the daemon
+/// needs before a box can be launched with its endpoint variables.
 async fn upload_and_finalize(
     client: &mut client::Client,
     session_id: sessions::SessionId,
     patches: &[(std::path::PathBuf, paths::SandboxRelPath)],
     hook_scripts: &[sessions::client::hookscripts::StagedScript],
+    credentials: Option<&credentials::Registration>,
 ) -> Result<(), anyhow::Error> {
     client
         .upload_patches(session_id, patches)
@@ -1654,7 +1803,10 @@ async fn upload_and_finalize(
 
     use minimald_rpc::{FinalizeSession, FinalizeSessionRequest};
     let resp = client
-        .oneshot_rpc::<FinalizeSession>(FinalizeSessionRequest { session_id })
+        .oneshot_rpc::<FinalizeSession>(FinalizeSessionRequest {
+            session_id,
+            credential_token: credentials.map(|r| r.token().expose().to_owned()),
+        })
         .await
         .context("FinalizeSession RPC failed")?;
     match resp {
@@ -2111,8 +2263,13 @@ async fn activate_session(
     // Both fall through to `NoPromptHook`, which accumulates every
     // item it would have prompted for so we can print a
     // `user_policy.toml` snippet on the error path.
+    // The broker registration the approved credential lanes produce,
+    // kept for the rest of the activation: it is revoked if anything
+    // downstream fails, so a box that never starts leaves no live
+    // token behind.
+    let mut credential_registration: Option<credentials::Registration> = None;
     if let minimald_rpc::ConfigureLoadoutResponse::Pending { response } = configured {
-        let bindings = config::read_credential_bindings(global)?;
+        let bindings = credentials::Bindings::read(global)?;
         let non_interactive = args.no_prompt || global.no_input || !can_prompt_interactively();
         if non_interactive {
             // NoPromptHook fake-approves every unapproved item so
@@ -2124,13 +2281,21 @@ async fn activate_session(
             // sent item was already handled by the user's policy)
             // do we submit and let the session go Active.
             let session_id = response.session_id;
+            // Snapshotted before the gate consumes the response, as in
+            // `drive_pending_to_active`.
+            let pending_credentials = response.credentials.clone();
             let hooks = prompt::NoPromptHook::new();
-            let verdict =
-                match compute_verdict(response, user_policy, compose_options, &hooks, &bindings) {
+            let verdict = match compute_verdict(
+                response,
+                user_policy,
+                compose_options,
+                &hooks,
+                bindings.bindings(),
+            ) {
                 Ok((verdict, _final_policy)) => verdict,
                 Err(e) => {
                     send_abort(&mut client, session_id).await;
-                    bail!("Composition gating failed: {e}");
+                    return Err(bindings.gating_failure(&e));
                 }
             };
             let summary = hooks.into_summary();
@@ -2148,7 +2313,19 @@ async fn activate_session(
                 );
             }
             collected_patches.extend(approved_patches_from_verdict(&verdict));
-            submit_verdict_and_wait(&mut client, session_id, verdict).await?;
+            let registration = register_credentials(
+                &mut client,
+                session_id,
+                &pending_credentials,
+                &verdict,
+                &bindings,
+            )
+            .await?;
+            if let Err(e) = submit_verdict_and_wait(&mut client, session_id, verdict).await {
+                revoke_credentials(registration.as_ref()).await;
+                return Err(e);
+            }
+            credential_registration = registration;
         } else {
             // The hook stashes policy mutations in interior
             // `RefCell`s so a `DenyPermanent` (which returns
@@ -2158,7 +2335,7 @@ async fn activate_session(
             // unconditionally before propagating the result, so a
             // deny-and-abort still writes the rule.
             let hooks = prompt::InteractivePrompt::new(&policy_path, user_policy.clone());
-            let result = drive_pending_to_active(
+            let result = drive_pending_to_active_with_credentials(
                 &mut client,
                 response,
                 user_policy,
@@ -2167,8 +2344,8 @@ async fn activate_session(
                 &bindings,
             )
             .await;
-            if let Ok((_, _, ref approved)) = result {
-                collected_patches.extend(approved.iter().cloned());
+            if let Ok(ref activated) = result {
+                collected_patches.extend(activated.patches.iter().cloned());
             }
             let final_policy = hooks.into_final_policy();
             if final_policy != initial_policy {
@@ -2186,7 +2363,7 @@ async fn activate_session(
                     Err(e) => eprintln!("warning: failed to update {}: {e}", policy_path.display()),
                 }
             }
-            result?;
+            credential_registration = result?.credentials;
         }
     }
 
@@ -2204,12 +2381,30 @@ async fn activate_session(
     // are exact matches (same source), so collapsing is safe.
     collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
     collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
-    if let Err(e) = upload_and_finalize(&mut client, id, &collected_patches, &hook_scripts).await {
+    if let Err(e) = upload_and_finalize(
+        &mut client,
+        id,
+        &collected_patches,
+        &hook_scripts,
+        credential_registration.as_ref(),
+    )
+    .await
+    {
         // Best-effort teardown: the session is stuck in
         // Materializing on the daemon. Destroy it so the operator's
         // `min ls` doesn't fill with half-finalized sessions.
         best_effort_destroy(&mut client, id).await;
+        revoke_credentials(credential_registration.as_ref()).await;
         return Err(e);
+    }
+
+    if let Some(registration) = &credential_registration {
+        tracing::debug!(
+            session = %id,
+            lanes = registration.lanes().join(","),
+            handle = %registration.handle(),
+            "credential lanes registered with the broker"
+        );
     }
 
     // The session is `Active` now — a Ctrl-C must no longer tear it down
@@ -2636,7 +2831,61 @@ async fn cmd_session_hooks(global: &GlobalArgs, args: HooksArgs) -> Result<(), a
     Ok(())
 }
 
-/// Human-readable origin for a hook row.
+/// `min session credentials`: list the credential lanes composed into a
+/// session, with the loadout or project that declared each.
+///
+/// Shows what a box may actually reach, not what was asked for: the
+/// daemon answers from the composition, which holds only the lanes that
+/// survived the user-policy gate. There is no value column at any
+/// width — the composition descriptor this reads from has no field that
+/// can hold a credential value, and neither does this table.
+async fn cmd_session_credentials(
+    global: &GlobalArgs,
+    args: CredentialsArgs,
+) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+    let mut client = connect_daemon(global).await?;
+
+    use minimald_rpc::{GetSessionCredentials, GetSessionCredentialsRequest};
+    let lookup: GetSessionCredentialsRequest = SessionLookup::parse(&args.session).into();
+    let resp = client
+        .oneshot_rpc::<GetSessionCredentials>(lookup)
+        .await
+        .context("GetSessionCredentials RPC failed")?;
+
+    let lanes = match resp {
+        minimald_rpc::Errorable::Ok(lanes) => lanes,
+        minimald_rpc::Errorable::Err { error } => bail!("{error}"),
+    };
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json_lenient::to_string(&lanes).context("Failed to serialize credentials")?
+        );
+        return Ok(());
+    }
+
+    if lanes.is_empty() {
+        println!("No credential lanes are composed into this session.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<20}  {:<15}  {:<20}  SOURCE",
+        "LANE", "HEADER", "UPSTREAM"
+    );
+    println!("{:-<20}  {:-<15}  {:-<20}  {:-<24}", "", "", "", "");
+    for lane in &lanes {
+        let (name, header, upstream) = (&lane.lane, &lane.header, &lane.upstream);
+        let source = render_hook_source(&lane.source);
+        println!("{name:<20}  {header:<15}  {upstream:<20}  {source}");
+    }
+    Ok(())
+}
+
+/// Human-readable origin for a composed item's row (hooks, credential
+/// lanes).
 fn render_hook_source(source: &sessions::wire::primitives::WireSource) -> String {
     use sessions::wire::primitives::WireSource;
     match source {
@@ -3033,6 +3282,9 @@ async fn destroy_session(
         .context("DestroySession RPC failed")?;
 
     if resp.ok().is_some() {
+        // After the daemon has let go of it: a destroy that failed leaves the
+        // box running, and a running box keeps its lanes.
+        revoke_session_credentials(id).await;
         println!("Destroyed session {} ({})", id, name.unwrap_or("-"));
     } else {
         bail!("DestroySession returned an error from the daemon");

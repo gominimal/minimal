@@ -43,6 +43,9 @@ clap.workspace = true
 clap_complete = { workspace = true, features = ["unstable-dynamic"] }
 camino.workspace = true
 chrono.workspace = true
+# Credential lanes are resolved host-side, here: the control protocol and the
+# socket-path derivation both have to be the broker's own, not a second copy.
+credlane.workspace = true
 diagnostics.workspace = true
 dirs.workspace = true
 indicatif.workspace = true
@@ -62,6 +65,7 @@ sessions.workspace = true
 # /logs into a temp dir before the readable files are tail-capped into the
 # bundle.
 tempfile.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 # Iterating `async_tar::Archive::entries()` (a `Stream`) for the bounded
 # streaming verification of a nested guest bundle.
@@ -70,6 +74,9 @@ toml.workspace = true
 toml_edit.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# A bound upstream reaches the broker as a parsed `Url`, so the client parses
+# it where the binding is read rather than shipping a bare string.
+url.workspace = true
 version.workspace = true
 
 # default-features = false drops minvmd's `libkrun` feature: the CLI only uses
