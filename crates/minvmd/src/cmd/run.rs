@@ -323,6 +323,39 @@ fn run_foreground() -> Result<()> {
         }
     };
 
+    // The credential broker binds this host's loopback, which is exactly what
+    // the switch NATs its host alias to — so it belongs wherever gvproxy does,
+    // and on this platform that is here rather than in the guest daemon.
+    //
+    // Best-effort for the same reason gvproxy is: a broker that will not start
+    // costs a box its credential lanes, not its boot. The endpoint variables
+    // are simply absent, and `min session credentials` reports the lanes as
+    // unavailable.
+    let _broker = match credlane::server::control_socket_path() {
+        Ok(control_socket) => {
+            let config = credlane::server::BrokerConfig::new(control_socket);
+            match std::env::current_exe() {
+                Ok(daemon) => {
+                    match credlane::server::BrokerProcess::spawn(&daemon, &config).await {
+                        Ok(broker) => Some(broker),
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to spawn the credential broker");
+                            None
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cannot locate this binary to spawn the broker");
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "no runtime dir for the broker control socket");
+            None
+        }
+    };
+
     // R2.5: record whether the data volume image pre-exists this boot, before
     // the VMM child provisions it — a later boot failure is fatal for a
     // pre-existing image (may hold session data) and recoverable for a blank

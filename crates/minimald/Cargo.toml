@@ -35,6 +35,9 @@ chrono.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 constcat.workspace = true
+# The credential broker `minimald broker` runs on a native-Linux host (DM2),
+# where this daemon is the process that owns the machine's gvproxy switch.
+credlane.workspace = true
 fd-lock.workspace = true
 futures.workspace = true
 size.workspace = true

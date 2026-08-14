@@ -654,6 +654,7 @@ mod tests {
     async fn spawn_broker(lanes: Vec<Lane>, scope: &[&str]) -> (SocketAddr, Token) {
         let mut store = TokenStore::new();
         let (token, _) = store.mint(
+            sessions::SessionId::nil(),
             scope.iter().map(|name| (*name).to_owned()),
             Instant::now(),
             TTL,

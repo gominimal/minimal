@@ -60,6 +60,29 @@ enum Command {
     /// Hidden VMM child subcommand — spawned by `boot`, not for direct use.
     #[command(name = "__krun-vmm", hide = true)]
     KrunVmm,
+    /// Hidden credential-lane broker — spawned and supervised by this daemon,
+    /// not for direct use.
+    ///
+    /// A subcommand rather than a fifth binary: `release.yml` is frozen and
+    /// lists every shipped artifact explicitly, so a new Mach-O could not ship.
+    /// It belongs to `minvmd` because the broker must run wherever gvproxy
+    /// does — the switch NATs its host alias to that machine's loopback.
+    #[command(name = credlane::server::SUBCOMMAND, hide = true)]
+    Broker(BrokerArgs),
+}
+
+/// Where the broker child listens. Both values are passed explicitly by the
+/// supervisor so parent and child cannot derive two different sockets; the
+/// defaults exist for a hand-run broker.
+#[derive(Debug, clap::Args)]
+struct BrokerArgs {
+    /// Control socket to bind (default: the path `min` derives).
+    #[arg(long)]
+    control_socket: Option<std::path::PathBuf>,
+
+    /// Box-facing loopback port.
+    #[arg(long, default_value_t = credlane::server::DEFAULT_PORT)]
+    port: u16,
 }
 
 #[derive(Subcommand)]
@@ -120,7 +143,26 @@ fn main() -> Result<()> {
         },
         Command::Stop => minvmd::cmd::stop::run(),
         Command::KrunVmm => minvmd::cmd::vmm_child::run(),
+        Command::Broker(args) => run_broker(args),
     }
+}
+
+/// Runs the credential broker in the foreground until a listener fails.
+///
+/// Its own multi-threaded runtime: the broker proxies streams for however many
+/// boxes hold lanes, and the rest of `minvmd`'s commands are synchronous.
+fn run_broker(args: BrokerArgs) -> Result<()> {
+    let control_socket = match args.control_socket {
+        Some(path) => path,
+        None => credlane::control_socket_path().context("resolving the broker control socket")?,
+    };
+    let config = credlane::BrokerConfig::new(control_socket).with_port(args.port);
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building the broker runtime")?
+        .block_on(credlane::server::run(config))
+        .context("running the credential broker")
 }
 
 /// Install the tracing subscriber. Foreground processes log to stdout;
@@ -176,5 +218,41 @@ mod tests {
     fn start_is_an_alias_for_run() {
         let cli = Cli::try_parse_from(["minvmd", "start"]).expect("`start` should parse as `run`");
         assert!(matches!(cli.command, Command::Run { .. }));
+    }
+
+    /// The exact argv `credlane::server::BrokerProcess` spawns. The supervisor
+    /// lives in another crate, so nothing but this test stops the two halves of
+    /// that contract from drifting apart.
+    #[test]
+    fn the_broker_subcommand_parses_what_its_supervisor_spawns() {
+        let cli = Cli::try_parse_from([
+            "minvmd",
+            credlane::server::SUBCOMMAND,
+            "--control-socket",
+            "/run/user/1000/minimal/credlane.sock",
+            "--port",
+            "7656",
+        ])
+        .expect("the supervisor's argv must parse");
+        let Command::Broker(args) = cli.command else {
+            panic!("expected the broker subcommand")
+        };
+        assert_eq!(
+            args.control_socket.as_deref(),
+            Some(std::path::Path::new("/run/user/1000/minimal/credlane.sock"))
+        );
+        assert_eq!(args.port, 7656);
+    }
+
+    /// Run bare, the broker lands on the port a box is handed by
+    /// `BrokerEndpoint`, and on the socket `min` will connect to.
+    #[test]
+    fn a_bare_broker_takes_the_shared_defaults() {
+        let cli = Cli::try_parse_from(["minvmd", credlane::server::SUBCOMMAND]).unwrap();
+        let Command::Broker(args) = cli.command else {
+            panic!("expected the broker subcommand")
+        };
+        assert!(args.control_socket.is_none());
+        assert_eq!(args.port, credlane::server::DEFAULT_PORT);
     }
 }

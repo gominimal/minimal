@@ -17,6 +17,9 @@ libkrun = []
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+# The credential broker `minvmd broker` runs: it must live wherever gvproxy
+# does, and on the microVM platforms that is this daemon's host.
+credlane.workspace = true
 clap_complete.workspace = true
 fd-lock.workspace = true
 libc.workspace = true

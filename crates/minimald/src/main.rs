@@ -150,6 +150,28 @@ enum Command {
     /// power launching a process in existing namespaces.
     #[command(name = minimald::nsenter::SUBCOMMAND, hide = true)]
     Nsenter(minimald::nsenter::ShimArgs),
+    /// Internal: run the credential-lane broker, host-side.
+    ///
+    /// A subcommand rather than a fifth binary: `release.yml` is frozen and
+    /// lists every shipped artifact explicitly. Native Linux (DM2) only — see
+    /// [`run_broker`] for why a guest-side broker is a boundary error, not a
+    /// missing feature.
+    #[command(name = credlane::server::SUBCOMMAND, hide = true)]
+    Broker(BrokerArgs),
+}
+
+/// Where the broker child listens. Both values are passed explicitly by the
+/// supervisor so parent and child cannot derive two different sockets; the
+/// defaults exist for a hand-run broker.
+#[derive(Debug, Args)]
+pub struct BrokerArgs {
+    /// Control socket to bind (default: the path `min` derives).
+    #[arg(long)]
+    control_socket: Option<std::path::PathBuf>,
+
+    /// Box-facing loopback port.
+    #[arg(long, default_value_t = credlane::server::DEFAULT_PORT)]
+    port: u16,
 }
 
 /// The arguments for the completions subcommand.
@@ -410,6 +432,40 @@ fn spawn_detached(cli: &Cli) -> Result<(), MainError> {
     }
 }
 
+/// Runs the credential-lane broker in the foreground until a listener fails.
+///
+/// Native-Linux hosts only (DM2). Inside the microVM this daemon is guest-side
+/// — the state [`Config::in_microvm`] records, set from `--vsock` — and a
+/// guest-side broker would be the boundary error the design rejects twice
+/// over: it would hold host-resolved credentials behind the VM wall, and its
+/// control socket, a host filesystem path, would be unreachable to the client
+/// that must register and revoke over it. On the microVM platforms `minvmd`
+/// owns the broker instead.
+///
+/// Logs to stdout, which the supervisor inherits: a detached daemon's stdout is
+/// `/dev/null`, so a broker under one is silent until it is given a log file of
+/// its own (its parent's is already owned by another appender).
+async fn run_broker(args: BrokerArgs) -> Result<(), MainError> {
+    if is_minimal_microvm() {
+        return Err(MainError::Other(
+            "`minimald broker` runs host-side only; this daemon is the microVM's init, where the \
+             broker's control socket (a host path) is unreachable. Run `minvmd broker` on the host."
+                .to_string(),
+        ));
+    }
+    let _logger = DaemonLogger::install(LogMode::Console)?;
+
+    let control_socket = match args.control_socket {
+        Some(path) => path,
+        None => credlane::control_socket_path()
+            .map_err(|e| MainError::IO(e, "resolving the broker control socket"))?,
+    };
+    let config = credlane::BrokerConfig::new(control_socket).with_port(args.port);
+    credlane::server::run(config)
+        .await
+        .map_err(|e| MainError::IO(e, "running the credential broker"))
+}
+
 /// Whether some process holds an exclusive advisory lock on `path`.
 /// Read-only probe: a missing file means no holder.
 fn lock_held(path: &std::path::Path) -> std::io::Result<bool> {
@@ -481,6 +537,7 @@ async fn async_main() -> Result<(), MainError> {
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
             return Ok(());
         }
+        Command::Broker(args) => return run_broker(args).await,
         _ => cli,
     };
 
@@ -1041,5 +1098,31 @@ mod tests {
         assert!(!is_microvm_init(1, Some(OsStr::new("/usr/bin/minimald"))));
         assert!(!is_microvm_init(1, Some(OsStr::new("minimald"))));
         assert!(!is_microvm_init(1, None));
+    }
+
+    /// The exact argv `credlane::server::BrokerProcess` spawns. The supervisor
+    /// lives in another crate, so nothing but this test stops the two halves of
+    /// that contract from drifting apart.
+    #[test]
+    fn the_broker_subcommand_parses_what_its_supervisor_spawns() {
+        use clap::Parser as _;
+
+        let cli = super::Cli::try_parse_from([
+            "minimald",
+            credlane::server::SUBCOMMAND,
+            "--control-socket",
+            "/run/user/1000/minimal/credlane.sock",
+            "--port",
+            "7656",
+        ])
+        .expect("the supervisor's argv must parse");
+        let super::Command::Broker(args) = cli.command else {
+            panic!("expected the broker subcommand")
+        };
+        assert_eq!(
+            args.control_socket.as_deref(),
+            Some(std::path::Path::new("/run/user/1000/minimal/credlane.sock"))
+        );
+        assert_eq!(args.port, credlane::server::DEFAULT_PORT);
     }
 }

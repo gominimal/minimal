@@ -1213,7 +1213,10 @@ name = "credlane"
 version = "0.0.1"
 dependencies = [
  "blake3",
+ "dirs",
  "hex",
+ "libc",
+ "paths",
  "rand 0.10.2",
  "rustls",
  "rustls-platform-verifier",
@@ -4024,6 +4027,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "credlane",
  "diagnostics",
  "dirs",
  "indicatif",
@@ -4044,12 +4048,14 @@ dependencies = [
  "serde_json_lenient",
  "sessions",
  "tempfile",
+ "thiserror 2.0.19",
  "tokio",
  "tokio-stream",
  "toml",
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "url",
  "version",
 ]
 
@@ -4126,6 +4132,7 @@ dependencies = [
  "clap_complete",
  "common",
  "constcat",
+ "credlane",
  "decode",
  "diagnostics",
  "fd-lock",
@@ -4205,6 +4212,7 @@ dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
+ "credlane",
  "fd-lock",
  "libc",
  "minimald-rpc",
@@ -8056,6 +8064,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]

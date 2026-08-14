@@ -774,6 +774,31 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
             }
         }
     }
+
+    // The credential broker, native-host only. In a microVM this daemon is
+    // guest-side, and a broker there would hold host-resolved credentials
+    // behind the VM wall on a control socket the client cannot reach — the
+    // host's `minvmd` owns it on those platforms instead.
+    //
+    // Run in-process rather than as a supervised child the way `minvmd` does
+    // it: on this path the daemon already *is* the host, so there is no
+    // boundary to cross, and the other host listeners above are spawned the
+    // same way.
+    if !in_microvm {
+        match credlane::server::control_socket_path() {
+            Ok(control_socket) => {
+                let config = credlane::server::BrokerConfig::new(control_socket);
+                tokio::spawn(async move {
+                    if let Err(error) = credlane::server::run(config).await {
+                        tracing::error!(%error, "credential broker exited");
+                    }
+                });
+            }
+            Err(error) => {
+                tracing::warn!(%error, "no runtime dir for the broker control socket");
+            }
+        }
+    }
 }
 
 /// Upper bound on the best-effort host-loopback publish in

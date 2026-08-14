@@ -14,6 +14,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sessions::SessionId;
 
 use crate::lane::Secret;
 
@@ -60,9 +61,10 @@ impl fmt::Debug for Token {
 /// An opaque handle to one registration, returned alongside the token it
 /// scopes and used to revoke it.
 ///
-/// Registrations are keyed by this rather than by session id: the client
-/// registers before the session exists, so no session id is available at mint
-/// time.
+/// Registrations are keyed by this rather than by session id: two sessions may
+/// hold the same lane name with different credentials, and a session-keyed
+/// store would let one reach the other's. The session id is carried alongside
+/// (see [`TokenStore::revoke_session`]) rather than in its place.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RegistrationHandle(String);
@@ -79,9 +81,10 @@ impl fmt::Display for RegistrationHandle {
     }
 }
 
-/// One registration: the digest of a token, the lanes it may reach, and when
-/// it dies.
+/// One registration: the digest of a token, the lanes it may reach, the
+/// session it was made for, and when it dies.
 struct Registration {
+    session: SessionId,
     digest: blake3::Hash,
     lanes: BTreeSet<String>,
     expires_at: Instant,
@@ -100,13 +103,16 @@ impl TokenStore {
         Self::default()
     }
 
-    /// Mints a token scoped to `lanes`, expiring `ttl` after `now`.
+    /// Mints a token for `session`, scoped to `lanes` and expiring `ttl` after
+    /// `now`.
     ///
     /// The token is returned once and never stored; the store keeps only its
-    /// digest. The handle is the caller's only later reference to it.
+    /// digest. The handle is the caller's primary later reference to it;
+    /// `session` is the one a teardown that holds no handle has.
     #[must_use]
     pub fn mint(
         &mut self,
+        session: SessionId,
         lanes: impl IntoIterator<Item = String>,
         now: Instant,
         ttl: Duration,
@@ -116,6 +122,7 @@ impl TokenStore {
         self.registrations.insert(
             handle.clone(),
             Registration {
+                session,
                 digest: blake3::hash(token.expose().as_bytes()),
                 lanes: lanes.into_iter().collect(),
                 expires_at: now + ttl,
@@ -129,6 +136,24 @@ impl TokenStore {
     /// owns the handle, never surfaced to a box.
     pub fn revoke(&mut self, handle: &RegistrationHandle) -> bool {
         self.registrations.remove(handle).is_some()
+    }
+
+    /// Drops every registration made for `session`, yielding the handles that
+    /// were live so the caller can drop whatever it keyed on them.
+    ///
+    /// The session is found by scanning rather than through a second map keyed
+    /// by it: the store holds one entry per live activation, and a
+    /// denormalised index would be a second source of truth every
+    /// handle-revoke had to remember to update.
+    pub fn revoke_session(&mut self, session: SessionId) -> Vec<RegistrationHandle> {
+        let doomed: Vec<_> = self
+            .registrations
+            .iter()
+            .filter(|(_, reg)| reg.session == session)
+            .map(|(handle, _)| handle.clone())
+            .collect();
+        self.registrations.retain(|_, reg| reg.session != session);
+        doomed
     }
 
     /// Authorises `presented` for `lane`, yielding the registration it belongs
@@ -172,11 +197,17 @@ mod tests {
         names.iter().map(|n| (*n).to_string()).collect()
     }
 
+    /// A distinct session id per `n`, so a test can say which session a
+    /// registration was made for without writing a UUID out by hand.
+    fn session(n: u8) -> SessionId {
+        SessionId::parse_str(&format!("00000000-0000-0000-0000-0000000000{n:02}")).unwrap()
+    }
+
     #[test]
     fn a_fresh_token_authorises_a_lane_in_its_scope() {
         let now = Instant::now();
         let mut store = TokenStore::new();
-        let (token, handle) = store.mint(lanes(&["anthropic", "github-mcp"]), now, TTL);
+        let (token, handle) = store.mint(session(1), lanes(&["anthropic", "github-mcp"]), now, TTL);
 
         assert_eq!(
             store.authorize(token.expose(), "github-mcp", now),
@@ -188,7 +219,7 @@ mod tests {
     fn a_lane_outside_the_scope_is_refused_exactly_as_an_unknown_token_is() {
         let now = Instant::now();
         let mut store = TokenStore::new();
-        let (token, _) = store.mint(lanes(&["anthropic"]), now, TTL);
+        let (token, _) = store.mint(session(1), lanes(&["anthropic"]), now, TTL);
 
         let out_of_scope = store.authorize(token.expose(), "github-mcp", now);
         let unknown = store.authorize("deadbeef", "github-mcp", now);
@@ -200,7 +231,7 @@ mod tests {
     fn an_expired_token_is_refused() {
         let now = Instant::now();
         let mut store = TokenStore::new();
-        let (token, _) = store.mint(lanes(&["anthropic"]), now, TTL);
+        let (token, _) = store.mint(session(1), lanes(&["anthropic"]), now, TTL);
 
         assert!(
             store
@@ -218,7 +249,7 @@ mod tests {
     fn a_revoked_handle_refuses_its_token() {
         let now = Instant::now();
         let mut store = TokenStore::new();
-        let (token, handle) = store.mint(lanes(&["anthropic"]), now, TTL);
+        let (token, handle) = store.mint(session(1), lanes(&["anthropic"]), now, TTL);
 
         assert!(store.revoke(&handle));
         assert_eq!(
@@ -235,8 +266,8 @@ mod tests {
     fn revoking_one_registration_leaves_the_others_alone() {
         let now = Instant::now();
         let mut store = TokenStore::new();
-        let (kept, _) = store.mint(lanes(&["anthropic"]), now, TTL);
-        let (_, doomed) = store.mint(lanes(&["anthropic"]), now, TTL);
+        let (kept, _) = store.mint(session(1), lanes(&["anthropic"]), now, TTL);
+        let (_, doomed) = store.mint(session(1), lanes(&["anthropic"]), now, TTL);
 
         store.revoke(&doomed);
         assert!(store.authorize(kept.expose(), "anthropic", now).is_ok());
@@ -246,8 +277,8 @@ mod tests {
     fn two_mints_produce_different_tokens_and_handles() {
         let now = Instant::now();
         let mut store = TokenStore::new();
-        let (first, first_handle) = store.mint(lanes(&["anthropic"]), now, TTL);
-        let (second, second_handle) = store.mint(lanes(&["anthropic"]), now, TTL);
+        let (first, first_handle) = store.mint(session(1), lanes(&["anthropic"]), now, TTL);
+        let (second, second_handle) = store.mint(session(1), lanes(&["anthropic"]), now, TTL);
 
         assert_ne!(first.expose(), second.expose());
         assert_ne!(first_handle, second_handle);
@@ -258,8 +289,8 @@ mod tests {
     fn one_token_does_not_authorise_another_registrations_lane() {
         let now = Instant::now();
         let mut store = TokenStore::new();
-        let (sink, _) = store.mint(lanes(&["sink"]), now, TTL);
-        let (_, _mcp) = store.mint(lanes(&["github-mcp"]), now, TTL);
+        let (sink, _) = store.mint(session(1), lanes(&["sink"]), now, TTL);
+        let (_, _mcp) = store.mint(session(2), lanes(&["github-mcp"]), now, TTL);
 
         assert_eq!(
             store.authorize(sink.expose(), "github-mcp", now),
@@ -267,9 +298,62 @@ mod tests {
         );
     }
 
+    /// R3.4: `min session destroy` runs in a process that never held the
+    /// handle, so the session id is the only name it has for the registration.
+    #[test]
+    fn revoking_a_session_refuses_its_token_exactly_as_an_unknown_one_is_refused() {
+        let now = Instant::now();
+        let mut store = TokenStore::new();
+        let (token, handle) = store.mint(session(1), lanes(&["anthropic"]), now, TTL);
+
+        assert_eq!(store.revoke_session(session(1)), vec![handle]);
+        assert_eq!(
+            store.authorize(token.expose(), "anthropic", now),
+            store.authorize("deadbeef", "anthropic", now),
+        );
+        assert_eq!(
+            store.authorize(token.expose(), "anthropic", now),
+            Err(Refused)
+        );
+    }
+
+    #[test]
+    fn revoking_one_session_leaves_another_sessions_registration_working() {
+        let now = Instant::now();
+        let mut store = TokenStore::new();
+        let (kept, _) = store.mint(session(1), lanes(&["anthropic"]), now, TTL);
+        let (doomed, _) = store.mint(session(2), lanes(&["anthropic"]), now, TTL);
+
+        assert_eq!(store.revoke_session(session(2)).len(), 1);
+        assert!(store.authorize(kept.expose(), "anthropic", now).is_ok());
+        assert!(store.authorize(doomed.expose(), "anthropic", now).is_err());
+    }
+
+    /// A session with no lane never registers, and every destroy calls this.
+    #[test]
+    fn revoking_a_session_that_never_registered_is_a_no_op() {
+        let mut store = TokenStore::new();
+        assert!(store.revoke_session(session(9)).is_empty());
+    }
+
+    /// One session may register more than once — an activation retried, or a
+    /// second lane set — and a destroy must leave none of them live.
+    #[test]
+    fn revoking_a_session_drops_every_registration_it_made() {
+        let now = Instant::now();
+        let mut store = TokenStore::new();
+        let (first, _) = store.mint(session(1), lanes(&["anthropic"]), now, TTL);
+        let (second, _) = store.mint(session(1), lanes(&["github-mcp"]), now, TTL);
+
+        assert_eq!(store.revoke_session(session(1)).len(), 2);
+        assert!(store.authorize(first.expose(), "anthropic", now).is_err());
+        assert!(store.authorize(second.expose(), "github-mcp", now).is_err());
+    }
+
     #[test]
     fn debugging_a_token_does_not_print_it() {
-        let (token, _) = TokenStore::new().mint(lanes(&["anthropic"]), Instant::now(), TTL);
+        let (token, _) =
+            TokenStore::new().mint(session(1), lanes(&["anthropic"]), Instant::now(), TTL);
         let rendered = format!("{token:?}");
         assert!(!rendered.contains(token.expose()), "{rendered}");
     }
