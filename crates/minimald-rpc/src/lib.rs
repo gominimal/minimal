@@ -401,10 +401,38 @@ impl OneshotSshRpc for ConfigureLoadout {
 pub struct FinalizeSession;
 
 /// The request for a [`FinalizeSession`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FinalizeSessionRequest {
     /// The session to finalize.
     pub session_id: SessionId,
+    /// The bearer token the box presents to the credential broker, when
+    /// the client registered any lane. It rides *this* RPC rather than
+    /// the create one because the client can only register once the
+    /// policy gate has decided which lanes exist, which is after the
+    /// session is created.
+    ///
+    /// Wire-only, and load-bearing that it stays so: the daemon holds it
+    /// in the session actor's memory and it reaches neither `record.json`
+    /// nor `composition.json`, both of which are written world-readable.
+    /// `serde(default)` keeps a client that predates the field able to
+    /// finalize.
+    #[serde(default)]
+    pub credential_token: Option<String>,
+}
+
+/// Redacts the token: this type is the one wire request that carries a
+/// bearer credential, and a derived `Debug` would put it in any log line
+/// that formats a request.
+impl std::fmt::Debug for FinalizeSessionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FinalizeSessionRequest")
+            .field("session_id", &self.session_id)
+            .field(
+                "credential_token",
+                &self.credential_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// The response for a [`FinalizeSession`] RPC.
@@ -663,6 +691,33 @@ impl OneshotSshRpc for GetSessionHooks {
     /// setup order (project first, then loadouts). Teardown order is the
     /// reverse; the caller renders whichever it needs.
     type Response = Errorable<Vec<sessions::wire::primitives::WireProvenancedHook>>;
+}
+
+/// An RPC to list the credential lanes composed into a session, and
+/// where each was declared.
+///
+/// Served from the session's persisted composition snapshot, the same
+/// way [`GetSessionHooks`] is: it answers after a daemon restart and for
+/// a session nobody is attached to. The snapshot holds only the lanes
+/// that survived the user-policy gate — no descriptor on this path ever
+/// carries a credential value.
+pub struct GetSessionCredentials;
+
+/// Request for the [`GetSessionCredentials`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GetSessionCredentialsRequest {
+    Name(String),
+    Id(SessionId),
+}
+
+impl OneshotSshRpc for GetSessionCredentials {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionCredentials");
+    type Request<'a> = GetSessionCredentialsRequest;
+    /// Each lane paired with the loadout or project that declared it.
+    /// Lane, bound upstream, header, and source only — no field on this
+    /// path can hold a credential value.
+    type Response = Errorable<Vec<sessions::wire::primitives::WireCredentialLane>>;
 }
 
 /// An RPC for a process inside a PTask to request a dynamic ingress port
@@ -996,6 +1051,30 @@ mod tests {
             }
             Errorable::Err { error } => panic!("a success decoded as an error: {error}"),
         }
+    }
+
+    /// A client that predates the credential lane sends `session_id` alone;
+    /// it must still finalize, with no token rather than a decode failure.
+    #[test]
+    fn a_finalize_request_without_a_token_still_decodes() {
+        let raw = serde_json_lenient::json!({
+            "session_id": "00000000-0000-0000-0000-000000000001",
+        });
+        let req: FinalizeSessionRequest = serde_json_lenient::from_value(raw).expect("deserialize");
+        assert_eq!(req.credential_token, None);
+    }
+
+    /// The token is the one bearer credential on this wire; a `Debug` that
+    /// prints it puts it in every log line that formats the request.
+    #[test]
+    fn a_finalize_request_never_debug_prints_its_token() {
+        let req = FinalizeSessionRequest {
+            session_id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            credential_token: Some("tok-live-hunter2".into()),
+        };
+        let rendered = format!("{req:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("redacted"), "{rendered}");
     }
 
     /// An empty request body must decode with the documented defaults so a

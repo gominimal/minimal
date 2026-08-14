@@ -330,6 +330,10 @@ async fn serve_submit_verdict(
 /// under `<workspace>/patches/`; a missing marker (client crashed
 /// mid-upload, or skipped the patches upload entirely) surfaces
 /// as `Errorable::Err`. Idempotent on already-Active sessions.
+///
+/// Also the delivery point for the credential-broker token: it is handed
+/// straight to the session actor, which keeps it in memory for the
+/// launches it mints and writes it nowhere.
 async fn serve_finalize_session(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
@@ -346,7 +350,7 @@ async fn serve_finalize_session(
                     error: format!("no session with ID `{}`", req.session_id.as_ref()),
                 });
             };
-            Ok(match h.finalize().await {
+            Ok(match h.finalize(req.credential_token).await {
                 Ok(activate_hooks) => Errorable::Ok(FinalizeSessionResponse { activate_hooks }),
                 Err(e) => Errorable::Err {
                     error: e.to_string(),
@@ -603,6 +607,59 @@ async fn serve_get_session_hooks(
                 })
                 .unwrap_or_default();
             Ok(Errorable::Ok(hooks))
+        })
+        .await
+}
+
+/// `GetSessionCredentials`: the credential lanes composed into a session,
+/// each with the loadout or project that declared it.
+///
+/// Read from the persisted composition snapshot, mirroring
+/// `serve_get_session_hooks`: it answers for a session with no running
+/// host and survives a daemon restart. A session whose snapshot is
+/// missing reports an empty list rather than failing.
+async fn serve_get_session_credentials(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    minimald_rpc::GetSessionCredentials
+        .handle_channel(c, async |req| {
+            let mngr = s.sessions_manager().await;
+            let predicate = match req {
+                minimald_rpc::GetSessionCredentialsRequest::Id(id) => SessionKeyPredicate::Id(id),
+                minimald_rpc::GetSessionCredentialsRequest::Name(name) => {
+                    SessionKeyPredicate::Name(name)
+                }
+            };
+            // Same "no such session" vs "nothing recorded" split as hooks:
+            // the record lookup answers the former, the composition read
+            // the latter.
+            if mngr
+                .get_record(predicate.clone())
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?
+                .is_none()
+            {
+                return Ok(Errorable::Err {
+                    error: "no session found".to_string(),
+                });
+            }
+            // Read-only: goes to the store rather than the actor, so
+            // listing a stopped session's lanes does not start it.
+            let composition = mngr
+                .get_composition(predicate)
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            let credentials = composition
+                .map(|c| {
+                    c.credentials()
+                        .iter()
+                        .cloned()
+                        .map(Into::into)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Ok(Errorable::Ok(credentials))
         })
         .await
 }
@@ -1496,6 +1553,7 @@ pub async fn handle_ssh_rpc(
         | AbortSession::NAME
         | GetSessionPolicy::NAME
         | minimald_rpc::GetSessionHooks::NAME
+        | minimald_rpc::GetSessionCredentials::NAME
         | SessionDelta::NAME
         | GetSessionScreen::NAME
         | GetMeshStatus::NAME
@@ -1580,6 +1638,9 @@ pub async fn handle_ssh_rpc(
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
         minimald_rpc::GetSessionHooks::NAME => serve!(serve_get_session_hooks(s, channel)),
+        minimald_rpc::GetSessionCredentials::NAME => {
+            serve!(serve_get_session_credentials(s, channel))
+        }
         SessionDelta::NAME => serve!(serve_session_delta(s, channel)),
         GetSessionScreen::NAME => serve!(serve_get_session_screen(s, channel)),
         GetMeshStatus::NAME => serve!(serve_get_mesh_status(s, channel)),
@@ -1614,7 +1675,8 @@ pub async fn handle_ssh_rpc(
 #[cfg(test)]
 mod tests {
     use minimald_rpc::{
-        CreateSession, CreateSessionRequest, DestroySessionRequest, EgressPolicy, GetSessionPolicy,
+        CreateSession, CreateSessionRequest, DestroySessionRequest, EgressPolicy,
+        GetSessionCredentials, GetSessionCredentialsRequest, GetSessionPolicy,
         GetSessionPolicyRequest, RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest,
         ShutdownResponse,
     };
@@ -2454,6 +2516,33 @@ mod tests {
         // The configured ingress was `None`, and the read reflects that rather
         // than the old hardcoded `Some(IngressPolicy::default())`.
         assert_eq!(policy.ingress, None);
+    }
+
+    #[tokio::test]
+    async fn get_session_credentials_reports_no_such_session() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let resp = client
+            .call::<GetSessionCredentials>(&GetSessionCredentialsRequest::Id(SessionId::nil()))
+            .await;
+        assert_eq!(resp.err().as_deref(), Some("no session found"));
+    }
+
+    /// Mirrors `serve_get_session_hooks`'s "no snapshot" behaviour: a
+    /// session that exists but declared no credential lanes reports an
+    /// empty list rather than an error.
+    #[tokio::test]
+    async fn get_session_credentials_is_empty_for_a_session_without_lanes() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let lanes = client
+            .call::<GetSessionCredentials>(&GetSessionCredentialsRequest::Id(session_id))
+            .await
+            .unwrap();
+        assert!(lanes.is_empty());
     }
 
     #[tokio::test]

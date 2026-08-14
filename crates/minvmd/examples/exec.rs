@@ -264,7 +264,10 @@ async fn run_session_exec(
             .await
             .map_err(|e| format!("request_subsystem: {e}"))?;
 
-        let req = FinalizeSessionRequest { session_id };
+        let req = FinalizeSessionRequest {
+            session_id,
+            credential_token: None,
+        };
         let body =
             serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
 

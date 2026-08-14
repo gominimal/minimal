@@ -1524,12 +1524,21 @@ fn session_baseline_env(
 /// launcher `baseline` (session identity + orientation banner), the
 /// client-forwarded `inherited` locale/timezone, then the `composition` vars
 /// (which may override both lower layers), then the `connection` facts
-/// (which override everything — sshd-style). Later inserts win on a shared key.
+/// (which override everything — sshd-style), and finally the `credential`
+/// lane variables. Later inserts win on a shared key.
+///
+/// Credentials sit on top rather than in the baseline, and the ordering is
+/// a security property rather than a taste: nothing in this tree reserves
+/// the `MINIMAL_` prefix against the user var lane, so a loadout declaring
+/// `MINIMAL_CREDENTIAL_ENDPOINT_ANTHROPIC` from a lower layer would
+/// silently point the box's requests — token attached — at whatever host
+/// it named.
 fn layer_session_env(
     baseline: Vec<(String, String)>,
     inherited: Vec<(String, String)>,
     composition: Vec<(String, String)>,
     connection: Vec<(String, String)>,
+    credential: Vec<(String, String)>,
 ) -> std::collections::HashMap<String, String> {
     let mut env = std::collections::HashMap::new();
     for (k, v) in baseline
@@ -1537,10 +1546,56 @@ fn layer_session_env(
         .chain(inherited)
         .chain(composition)
         .chain(connection)
+        .chain(credential)
     {
         env.insert(k, v);
     }
     env
+}
+
+/// Prefix of the per-lane endpoint variable. One variable per lane,
+/// because the box's software needs a distinct base URL per lane
+/// (`ANTHROPIC_BASE_URL` for one, an MCP server URL for another).
+const CREDENTIAL_ENDPOINT_PREFIX: &str = "MINIMAL_CREDENTIAL_ENDPOINT_";
+
+/// The one token variable. One per session, not per lane: the token's
+/// scope *is* the set of lanes it was minted for.
+const CREDENTIAL_TOKEN_VAR: &str = "MINIMAL_CREDENTIAL_TOKEN";
+
+/// The credential-lane layer of [`layer_session_env`]: an endpoint
+/// variable per composed lane, plus the session's token.
+///
+/// Every part is required. A box with no composed lane, one whose
+/// activation minted no token, and one whose network mode leaves the
+/// broker unreachable (`NoNet`, hence no `endpoint`) each get *nothing* —
+/// never an empty variable, which reads as a configured endpoint to the
+/// software that finds it and fails far from the cause.
+fn credential_env(
+    lanes: &[sessions::core::compose::SessionCredential],
+    endpoint: Option<credlane::BrokerEndpoint>,
+    token: Option<&str>,
+) -> Vec<(String, String)> {
+    let (Some(endpoint), Some(token)) = (endpoint, token) else {
+        return Vec::new();
+    };
+    if lanes.is_empty() {
+        return Vec::new();
+    }
+    lanes
+        .iter()
+        .map(|c| {
+            let lane = c.lane().lane();
+            let suffix = sessions::core::primitives::credential_env_suffix(lane);
+            (
+                format!("{CREDENTIAL_ENDPOINT_PREFIX}{suffix}"),
+                endpoint.lane_url(lane),
+            )
+        })
+        .chain(std::iter::once((
+            CREDENTIAL_TOKEN_VAR.to_string(),
+            token.to_string(),
+        )))
+        .collect()
 }
 
 /// The real [`SessionLauncher`]: evaluates a minimal context into a graph,
@@ -1562,6 +1617,11 @@ pub(crate) struct SandboxLauncher {
     /// Composition to merge into the launcher's baseline packages and
     /// vars. Patches and lifecycle hooks are ignored today.
     pub(crate) composition: Option<std::sync::Arc<sessions::core::compose::Composition>>,
+    /// The bearer token for this session's credential lanes, delivered on
+    /// `FinalizeSession` and held only in the session actor's memory.
+    /// `None` when the activation registered no lane, which leaves the box
+    /// with no credential variables at all.
+    pub(crate) credential_token: Option<String>,
     /// Weak handle back to the owning session actor, for  `min` commands
     /// (e.g. `min build`) to drive session side-ops.
     pub(crate) session: crate::session::WeakSessionHandle,
@@ -1701,6 +1761,7 @@ impl SessionLauncher for SandboxLauncher {
         // the sandbox env below.
         let session_name = name.clone();
         let composition = self.composition;
+        let credential_token = self.credential_token;
         let attach_env = self.attach_env;
         let session = self.session;
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
@@ -1830,11 +1891,33 @@ impl SessionLauncher for SandboxLauncher {
             .as_ref()
             .map(|c| c.orientation().loadouts_display.as_str())
             .filter(|d| !d.is_empty());
+        // Where this box reaches the broker. The switch's transport is the
+        // same fact `Config::in_microvm` sets — a host shuttle exists only
+        // for a guest-side daemon, whose broker is out on the host — and
+        // its subnet is the one gvproxy NATs the host alias from.
+        let broker_endpoint = {
+            let switch = net_switch.lock().await;
+            let location = match switch.transport() {
+                crate::net::SwitchTransport::HostShuttle { .. } => credlane::BoxLocation::MicroVm,
+                crate::net::SwitchTransport::LocalSpawn => credlane::BoxLocation::NativeHost,
+            };
+            credlane::BrokerEndpoint::derive(
+                location,
+                network_mode,
+                switch.subnet(),
+                credlane::server::DEFAULT_PORT,
+            )
+        };
         let env_vars = layer_session_env(
             session_baseline_env(&name, loadouts_display),
             attach_env.inherited,
             composition_vars,
             attach_env.connection,
+            credential_env(
+                composition.as_ref().map_or(&[], |c| c.credentials()),
+                broker_endpoint,
+                credential_token.as_deref(),
+            ),
         );
         // Log every item that will (or would) end up in the session,
         // tagged with its provenance. Patches and lifecycle hooks are
@@ -2723,6 +2806,7 @@ mod tests {
             ],
             // connection: authoritative TERM.
             vec![sv("TERM", "xterm-256color")],
+            vec![],
         );
 
         assert_eq!(env.get("LANG").map(String::as_str), Some("fr_FR.UTF-8")); // composition > inherited > baseline
@@ -2746,6 +2830,7 @@ mod tests {
     fn layer_session_env_seeds_baseline_banner() {
         let env = layer_session_env(
             session_baseline_env("api-server-4f2a", Some("default (built-in)")),
+            vec![],
             vec![],
             vec![],
             vec![],
@@ -2788,7 +2873,13 @@ mod tests {
     /// render, each correct for its surface.
     #[test]
     fn baseline_env_omits_loadouts_var_when_display_unknown() {
-        let env = layer_session_env(session_baseline_env("box-1", None), vec![], vec![], vec![]);
+        let env = layer_session_env(
+            session_baseline_env("box-1", None),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
         assert!(!env.contains_key("MINIMAL_LOADOUTS"));
         assert!(env.contains_key("MINIMAL_SESSION_NAME"));
     }
@@ -2807,6 +2898,7 @@ mod tests {
                 r#"eval "$MY_MOTD""#.to_string(),
             )],
             vec![],
+            vec![],
         );
 
         assert_eq!(
@@ -2821,6 +2913,130 @@ mod tests {
             env.get("MINIMAL_LOADOUTS").map(String::as_str),
             Some("helix, fish")
         );
+    }
+
+    /// A lane as it reaches the launcher: post-gate, upstream bound.
+    fn lane(name: &str) -> sessions::core::compose::SessionCredential {
+        sessions::wire::primitives::WireCredentialLane {
+            lane: name.to_owned(),
+            upstream: "https://api.example/".to_owned(),
+            header: "Authorization".to_owned(),
+            source: sessions::wire::primitives::WireSource::UserLoadout {
+                name: "dev".to_owned(),
+            },
+        }
+        .into()
+    }
+
+    /// The endpoint a microVM box in `mode` is handed, derived exactly as
+    /// the launcher derives it.
+    fn broker_endpoint(mode: sessions::NetworkMode) -> Option<credlane::BrokerEndpoint> {
+        credlane::BrokerEndpoint::derive(
+            credlane::BoxLocation::MicroVm,
+            mode,
+            switch::SwitchSubnet::default(),
+            credlane::server::DEFAULT_PORT,
+        )
+    }
+
+    /// One endpoint per composed lane and one token for all of them. The
+    /// variable's name carries the mangled suffix (`-` → `_`, upcased)
+    /// while its value keeps the lane's real name as the selector the
+    /// broker resolves.
+    #[test]
+    fn two_lanes_yield_two_endpoints_and_one_token() {
+        let env = layer_session_env(
+            session_baseline_env("box-1", None),
+            vec![],
+            vec![],
+            vec![],
+            credential_env(
+                &[lane("anthropic"), lane("github-mcp")],
+                broker_endpoint(sessions::NetworkMode::HostNet),
+                Some("tok-live-hunter2"),
+            ),
+        );
+
+        let anthropic = &env["MINIMAL_CREDENTIAL_ENDPOINT_ANTHROPIC"];
+        let mcp = &env["MINIMAL_CREDENTIAL_ENDPOINT_GITHUB_MCP"];
+        assert!(anthropic.ends_with("/anthropic"), "{anthropic}");
+        assert!(mcp.ends_with("/github-mcp"), "{mcp}");
+        assert_ne!(anthropic, mcp);
+        assert_eq!(env["MINIMAL_CREDENTIAL_TOKEN"], "tok-live-hunter2");
+        assert_eq!(
+            env.keys()
+                .filter(|k| k.starts_with("MINIMAL_CREDENTIAL_"))
+                .count(),
+            3,
+            "two endpoints and one token, nothing else"
+        );
+    }
+
+    /// The shadowing property. Nothing reserves the `MINIMAL_` prefix
+    /// against the user var lane, so a loadout is free to declare these
+    /// names — and if the credential layer sat any lower, the box would
+    /// send its token to whatever host that loadout named.
+    #[test]
+    fn a_composed_var_cannot_shadow_the_credential_layer() {
+        let sv = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let env = layer_session_env(
+            session_baseline_env("box-1", None),
+            vec![sv("MINIMAL_CREDENTIAL_TOKEN", "inherited-impostor")],
+            vec![
+                sv("MINIMAL_CREDENTIAL_TOKEN", "composed-impostor"),
+                sv(
+                    "MINIMAL_CREDENTIAL_ENDPOINT_ANTHROPIC",
+                    "http://attacker.example/anthropic",
+                ),
+            ],
+            vec![sv("MINIMAL_CREDENTIAL_TOKEN", "connection-impostor")],
+            credential_env(
+                &[lane("anthropic")],
+                broker_endpoint(sessions::NetworkMode::HostNet),
+                Some("tok-live-hunter2"),
+            ),
+        );
+
+        assert_eq!(env["MINIMAL_CREDENTIAL_TOKEN"], "tok-live-hunter2");
+        assert!(
+            !env["MINIMAL_CREDENTIAL_ENDPOINT_ANTHROPIC"].contains("attacker"),
+            "a composed endpoint must not win: {}",
+            env["MINIMAL_CREDENTIAL_ENDPOINT_ANTHROPIC"]
+        );
+    }
+
+    /// An empty netns reaches no broker, so a `NoNet` box is handed
+    /// nothing rather than a URL it cannot dial.
+    #[test]
+    fn a_no_net_session_gets_no_credential_variables() {
+        let vars = credential_env(
+            &[lane("anthropic")],
+            broker_endpoint(sessions::NetworkMode::NoNet),
+            Some("tok-live-hunter2"),
+        );
+        assert!(vars.is_empty(), "{vars:?}");
+    }
+
+    #[test]
+    fn a_session_with_no_lanes_gets_no_credential_variables() {
+        let vars = credential_env(
+            &[],
+            broker_endpoint(sessions::NetworkMode::HostNet),
+            Some("tok-live-hunter2"),
+        );
+        assert!(vars.is_empty(), "not even a bare token: {vars:?}");
+    }
+
+    /// A finalize that carried no token leaves the lanes unusable, so the
+    /// endpoints are not published either.
+    #[test]
+    fn a_session_finalized_without_a_token_gets_no_credential_variables() {
+        let vars = credential_env(
+            &[lane("anthropic")],
+            broker_endpoint(sessions::NetworkMode::HostNet),
+            None,
+        );
+        assert!(vars.is_empty(), "{vars:?}");
     }
 
     #[test]

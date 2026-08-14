@@ -1952,7 +1952,10 @@ mod tests {
             // empty-composition shortcut past the marker check and
             // promotes the record to `Active` in one call.
             match client
-                .call::<FinalizeSession>(&FinalizeSessionRequest { session_id })
+                .call::<FinalizeSession>(&FinalizeSessionRequest {
+                    session_id,
+                    credential_token: None,
+                })
                 .await
             {
                 minimald_rpc::Errorable::Ok(_) => {}

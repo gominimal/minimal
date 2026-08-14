@@ -499,7 +499,13 @@ enum SessionMessage {
     /// patches-ready marker under `<workspace>/patches/`. Idempotent
     /// on an already-`Active` session; refused with `InvalidInput`
     /// on `Pending` (configure the loadout first).
-    Finalize(oneshot::Sender<Result<Vec<minimald_rpc::RanHook>, std::io::Error>>),
+    ///
+    /// Carries the credential-broker token the client minted for this
+    /// session's lanes, if any; see [`Session::credential_token`].
+    Finalize(
+        Option<String>,
+        oneshot::Sender<Result<Vec<minimald_rpc::RanHook>, std::io::Error>>,
+    ),
     /// Run this session's `on_detach` hooks, sent by a binding that has
     /// left a session which outlives it. Answered when they have run (or
     /// been skipped), so a departing binding can await them.
@@ -619,6 +625,22 @@ pub struct Session {
     /// we spawns (e.g. build [`SideOp`]s) so they can reach back into
     /// the session.
     weak_self: WeakSessionHandle,
+
+    /// The bearer token the box presents to the credential broker,
+    /// delivered on `FinalizeSession` and handed to every launch this
+    /// actor mints afterwards.
+    ///
+    /// In memory only, for the actor's lifetime. It deliberately does not
+    /// ride `SessionConfig` (whose every field `build_record` copies onto
+    /// the `Record`) or the `Composition`: both `record.json` and
+    /// `composition.json` are written world-readable, and a token that
+    /// outlives the daemon in a 0644 file is no longer a capability that
+    /// dies with the box.
+    ///
+    /// Read only by the production `session_launcher` (`cfg(not(test))`),
+    /// as with [`Self::net_switch`].
+    #[cfg_attr(test, allow(dead_code))]
+    credential_token: Option<String>,
 }
 
 impl Session {
@@ -653,6 +675,7 @@ impl Session {
             hook_scripts_upload_lock: Arc::new(Mutex::new(())),
             manager,
             weak_self,
+            credential_token: None,
             #[cfg(target_os = "linux")]
             hostnames,
         }
@@ -898,8 +921,8 @@ impl Session {
                 let (verdict, r) = *msg;
                 let _ = r.send(self.handle_verdict(verdict).await);
             }
-            SessionMessage::Finalize(r) => {
-                let _ = r.send(self.finalize().await);
+            SessionMessage::Finalize(credential_token, r) => {
+                let _ = r.send(self.finalize(credential_token).await);
             }
             SessionMessage::Abort(r) => match &self.inner {
                 // Abort is Draft-only: delete the record, then stop. The
@@ -1190,7 +1213,20 @@ impl Session {
     /// with `WrongState`; refuses `Materializing` sessions without
     /// a patches-ready marker with a "patches upload never
     /// finished" fault.
-    async fn finalize(&mut self) -> Result<Vec<minimald_rpc::RanHook>, std::io::Error> {
+    ///
+    /// `credential_token` is stored before anything else runs: the
+    /// activation-hook launch below is a launch like any other, and a
+    /// hook that reaches an upstream through a lane needs the same
+    /// endpoint variables the attach shell gets.
+    async fn finalize(
+        &mut self,
+        credential_token: Option<String>,
+    ) -> Result<Vec<minimald_rpc::RanHook>, std::io::Error> {
+        // A retry that carries no token must not drop the one the
+        // attempt before it delivered.
+        if credential_token.is_some() {
+            self.credential_token = credential_token;
+        }
         let record = self.record.record().await?;
         match record.status {
             SessionStatus::Active => {
@@ -1619,7 +1655,11 @@ impl Session {
             // to exist: `finalize` skips the check, `materialize`
             // iterates zero patches, and the record is written as
             // `Active`.
-            self.finalize().await.map_err(AttachError::LoadoutFailed)?;
+            // No token: this shortcut composes an empty contribution, so
+            // it has no credential lane to serve either.
+            self.finalize(None)
+                .await
+                .map_err(AttachError::LoadoutFailed)?;
         }
 
         // Attach is gated on `Active` — a Materializing session has
@@ -2000,6 +2040,7 @@ impl Session {
             net_switch: Arc::clone(&self.net_switch),
             ingress,
             composition: self.composition(),
+            credential_token: self.credential_token.clone(),
             // A weak handle so in-sandbox `min build` can drive session
             // side-ops without keeping the actor alive past teardown.
             session: session.downgrade(),
@@ -2403,11 +2444,18 @@ impl SessionHandle {
     /// patches-ready marker having been written by a completed
     /// `WorkspacePatchesTarZst` upload. Idempotent on already-Active
     /// sessions. See [`Session::finalize`] for the state-machine
-    /// contract.
-    pub(crate) async fn finalize(&self) -> Result<Vec<minimald_rpc::RanHook>, std::io::Error> {
+    /// contract, and [`Session::credential_token`] for what the token
+    /// the client mints for its approved lanes is used for.
+    pub(crate) async fn finalize(
+        &self,
+        credential_token: Option<String>,
+    ) -> Result<Vec<minimald_rpc::RanHook>, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
-        let _ = self.0.send(SessionMessage::Finalize(send)).await;
+        let _ = self
+            .0
+            .send(SessionMessage::Finalize(credential_token, send))
+            .await;
         recv.await.unwrap_or_else(|_| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -3679,7 +3727,10 @@ mod tests {
                 .unwrap(),
         );
         match client
-            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+            .call::<FinalizeSession>(&FinalizeSessionRequest {
+                session_id: id,
+                credential_token: None,
+            })
             .await
         {
             Errorable::Ok(_) => id,
@@ -3772,6 +3823,68 @@ mod tests {
         )));
     }
 
+    /// The credential token is wire-only: the actor keeps it in memory and
+    /// writes it nowhere. `record.json` and `composition.json` are both
+    /// created world-readable, so a token that reached either would sit in
+    /// a file any user on the machine can read for as long as the session
+    /// exists — while the capability it names is supposed to die with the
+    /// box.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_finalize_token_is_persisted_nowhere() {
+        use crate::test_harness::{create_session_req, unwrap_ready};
+        use minimald_rpc::{
+            ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+            FinalizeSessionRequest,
+        };
+        const TOKEN: &str = "tok-live-hunter2";
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = client
+            .call::<CreateSession>(&create_session_req("wire-only-token", "/uwu"))
+            .await
+            .unwrap()
+            .id;
+        unwrap_ready(
+            client
+                .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                    session_id: id,
+                    contribution: Default::default(),
+                })
+                .await
+                .unwrap(),
+        );
+        match client
+            .call::<FinalizeSession>(&FinalizeSessionRequest {
+                session_id: id,
+                credential_token: Some(TOKEN.to_string()),
+            })
+            .await
+        {
+            Errorable::Ok(_) => {}
+            Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+        }
+
+        let state_dir = server.state.minimal_state_dir().await;
+        let files_containing = |needle: &str| -> Vec<String> {
+            walkdir::WalkDir::new(state_dir.as_utf8_path().as_std_path())
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_type().is_file())
+                .filter(|e| std::fs::read_to_string(e.path()).is_ok_and(|b| b.contains(needle)))
+                .map(|e| e.path().display().to_string())
+                .collect()
+        };
+        // The session name proves the walk reaches the files that would
+        // carry a leaked token: it is on the record this finalize wrote.
+        assert!(
+            !files_containing("wire-only-token").is_empty(),
+            "the walk found no persisted session state to check"
+        );
+        let carriers = files_containing(TOKEN);
+        assert!(carriers.is_empty(), "the token was written to {carriers:?}");
+    }
+
     /// Activation runs `on_activate`, and the session it hands back is
     /// attachable.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3837,7 +3950,10 @@ mod tests {
         );
 
         let error = match client
-            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+            .call::<FinalizeSession>(&FinalizeSessionRequest {
+                session_id: id,
+                credential_token: None,
+            })
             .await
         {
             Errorable::Err { error } => error,

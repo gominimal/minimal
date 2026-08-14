@@ -320,6 +320,9 @@ pub async fn activate(
         match client
             .oneshot_rpc::<minimald_rpc::FinalizeSession>(minimald_rpc::FinalizeSessionRequest {
                 session_id: id,
+                // This flow refuses anything that needs gating (above), so
+                // no lane was ever registered and there is no token.
+                credential_token: None,
             })
             .await
             .context("FinalizeSession RPC failed")?

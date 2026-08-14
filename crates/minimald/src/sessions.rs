@@ -1085,7 +1085,7 @@ pub(crate) mod tests {
             .expect("configuring an empty loadout should succeed");
         assert!(response.is_none(), "an empty loadout should finalize");
         handle
-            .finalize()
+            .finalize(None)
             .await
             .expect("finalize should succeed for a patchless composition");
         id
@@ -1816,7 +1816,10 @@ pub(crate) mod tests {
             .expect("a project-only loadout gates nothing");
         // The composition carries packages but no patches, so finalize skips
         // the patches marker and the record lands `Active`.
-        handle.finalize().await.expect("finalize should succeed");
+        handle
+            .finalize(None)
+            .await
+            .expect("finalize should succeed");
         id
     }
 
