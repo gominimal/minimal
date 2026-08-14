@@ -125,15 +125,32 @@ alias NATs to `127.0.0.1` *of the machine running gvproxy*
 loopback is what makes the address resolve. Placement and reachability are one
 fact.
 
-A new `credlane` library crate holds the broker; `minvmd` and `minimald` each own
-its lifetime where they are host-side, `minimald` gating on `!in_microvm` — the
-same predicate `start_host_proxies` uses to choose its bind address
-(`crates/minimald/src/server.rs:696-777`).
+A new `credlane` library crate holds the broker; `minvmd` and `minimald` each
+spawn and supervise it where they are host-side, `minimald` gating on
+`!in_microvm` — the same predicate `start_host_proxies` uses to choose its bind
+address (`crates/minimald/src/server.rs`).
 
-### It is not a fifth binary
+### A process of its own, but not a fifth binary
 
-The broker ships as a **subcommand of the daemon that already runs host-side** —
+The broker is **always a separate process**, on every deployment model, and it
+ships as a **subcommand of the daemon that already runs host-side** —
 `minvmd broker` and `minimald broker` — with the logic in a shared crate.
+
+> **Changed from the original design.** The first draft ran it as an in-process
+> task inside `minimald` on native Linux, on the reasoning that the daemon there
+> already *is* the host, so there was no boundary to cross. That traded away the
+> property that matters most: the broker is the one listener holding plaintext
+> credentials, and an address space of its own means nothing else in the daemon
+> can read them. It also gave the two deployment models different restart paths
+> for the same component. It is now the same supervised child everywhere.
+>
+> Making it a child on that path exposed an orphan bug that had been latent on
+> the `minvmd` path all along: `kill_on_drop` only fires when Rust runs the
+> destructor, so a *signalled* supervisor — the ordinary way a daemon ends —
+> left the broker holding `:7656` and the control socket, failing every later
+> boot. `PR_SET_PDEATHSIG` closes it on Linux for both supervisors, including
+> under `SIGKILL` where no destructor could run; macOS keeps `scripts/reap-vms.sh`
+> as its backstop, the same answer the tree already gives for a stranded gvproxy.
 
 The reason is distribution surface, not the release workflow. A fifth binary
 would need: a `cargo build` + rename + `upload-artifact` triple per platform in
@@ -152,9 +169,11 @@ and therefore a fifth binary was impossible. That overstated it: the freeze is
 CODEOWNER review, not a prohibition, so the workflow edit is a cost to weigh
 rather than a wall. The conclusion is unchanged, but it rests on the costs above.
 
-This also departs from the "sibling of `gvproxy-min`" shape deliberately.
-`gvproxy-min` is a vendored upstream binary that is *downloaded*
-(`scripts/fetch-gvproxy.sh`), not precedent for shipping a fifth first-party one.
+So the broker is a sibling of `gvproxy-min` in the sense that matters — its own
+process, spawned and supervised beside it, on the same loopback — without being
+one in the sense that costs: `gvproxy-min` is a vendored upstream binary that is
+*downloaded* (`scripts/fetch-gvproxy.sh`), not precedent for shipping a fifth
+first-party one.
 
 ### The address the box uses
 
@@ -863,6 +882,25 @@ exactly as for hooks.
 
 ## Known gaps
 
+- **The broker owns an HTTP/1.1 parser, and that is the largest risk surface
+  here.** `crates/credlane/src/proxy.rs` hand-parses the request head, mirroring
+  `minimald`'s `net/proxy.rs`, and every request-smuggling class it does not
+  anticipate is ours. Two alternatives were weighed and rejected for now.
+  **Envoy** replaces the easy half and not the hard one: per-session capability
+  tokens, host-side secret resolution and the policy-gate integration have no
+  Envoy concept, so injection would run through a Lua/Wasm filter or `ext_authz`
+  calling back into a Rust service we still write, with lanes being dynamic
+  per session it would need generated config hot-reloaded over xDS — a control
+  plane, which is more moving parts than the in-memory table, not fewer — and it
+  costs a ~100 MB per-platform C++ binary to sign and ship next to gvproxy's
+  ~15 MB. **`hyper`** is the cheaper answer and remains open: it is already in
+  `Cargo.lock` via `reqwest` and `tonic`, so it adds no distributed artifact, and
+  it would delete both the parser and the `Connection: close` handshake-per-call
+  penalty the hand-rolled path needs. It was not taken in this pass because it
+  would make the workspace's "no HTTP server library in any crate's
+  `[dependencies]`" property no longer true, which is a call worth making
+  deliberately rather than midway through a feature. The `Connector` and
+  `LaneTable` traits are what keep the swap contained to one module.
 - **A lane is transport, not a facade — and that is a real reduction in
   granularity.** The mechanism this replaces could expose `POST /sink` as one
   operation and build the upstream request itself; a lane hands the box an

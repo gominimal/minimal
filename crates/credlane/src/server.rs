@@ -241,6 +241,14 @@ pub enum RegisterError {
         /// The offending lane.
         lane: String,
     },
+    /// A declared `inject.also` header the broker could never attach.
+    #[error("lane {lane}: the inject.also header {header} cannot be attached")]
+    Extra {
+        /// The offending lane.
+        lane: String,
+        /// The header that cannot be attached.
+        header: String,
+    },
 }
 
 /// The broker's live registrations: the token store plus the lanes each
@@ -302,6 +310,15 @@ impl Broker {
                     return Err(RegisterError::Upstream {
                         lane: reg.lane,
                         scheme: reg.upstream.scheme().to_owned(),
+                    });
+                }
+                // Rejected here rather than left to surface as an opaque
+                // per-request refusal: a lane that can never carry a request is
+                // a registration error, and the client can say so at gate time.
+                if let Some(header) = proxy::unattachable_header(&reg.inject) {
+                    return Err(RegisterError::Extra {
+                        header: header.to_owned(),
+                        lane: reg.lane,
                     });
                 }
                 Ok((
@@ -1181,6 +1198,45 @@ mod tests {
 
         let response: Response = serde_json_lenient::from_str(&line).unwrap();
         assert!(matches!(response, Response::Failed { .. }), "{response:?}");
+    }
+
+    /// A declaration is checked against the `sessions` constant and a request
+    /// against this crate's, because the dependency runs one way and neither
+    /// crate can name the other's. If they drift, `sessions` starts guarding a
+    /// header the broker no longer removes.
+    #[test]
+    fn both_crates_name_the_same_token_header() {
+        assert_eq!(
+            proxy::TOKEN_HEADER,
+            sessions::core::primitives::CREDENTIAL_TOKEN_HEADER
+        );
+    }
+
+    #[test]
+    fn a_lane_whose_extra_header_could_never_be_attached_is_refused_at_registration() {
+        let broker = Broker::new(Duration::from_mins(1));
+        for also in [
+            // Would forge a second header line.
+            ("X-Evil", "yes\r\nX-Injected: true"),
+            // Not a header name at all.
+            ("X Evil", "yes"),
+            // Claims a header the broker writes itself, so the upstream would
+            // be handed two and left to choose.
+            ("x-api-key", "box-chosen"),
+            (proxy::TOKEN_HEADER, "box-chosen"),
+        ] {
+            let registration = LaneRegistration {
+                lane: "anthropic".to_owned(),
+                upstream: Url::parse("https://api.anthropic.com/v1/").unwrap(),
+                inject: Inject::new("x-api-key", "").with_also([also]),
+                secret: Secret::new("sk-live-hunter2"),
+                methods: Vec::new(),
+            };
+            let err = broker
+                .register(SessionId::nil(), [registration])
+                .expect_err("{also:?} must not register");
+            assert!(matches!(err, RegisterError::Extra { .. }), "{err:?}");
+        }
     }
 
     #[tokio::test]

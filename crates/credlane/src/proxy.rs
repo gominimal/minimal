@@ -33,7 +33,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use url::Url;
 
-use crate::lane::Lane;
+use crate::lane::{Inject, Lane};
 use crate::token::Refused;
 
 /// The header a box presents its token in.
@@ -451,6 +451,22 @@ fn is_header_name(name: &str) -> bool {
     !name.is_empty() && is_visible(name) && !name.contains(':')
 }
 
+/// The first `inject.also` header that could not be attached, if any: one whose
+/// name or value is outside the grammar, or that claims a header the broker
+/// controls and would therefore be written twice.
+///
+/// Shared by registration and by [`rewrite`] so a declaration cannot be
+/// accepted at registration and then refuse every request it is used on.
+pub(crate) fn unattachable_header(inject: &Inject) -> Option<&str> {
+    inject.also().iter().find_map(|(name, value)| {
+        let attachable = is_header_name(name)
+            && is_field_value(value)
+            && !name.eq_ignore_ascii_case(inject.header())
+            && !name.eq_ignore_ascii_case(TOKEN_HEADER);
+        (!attachable).then_some(&**name)
+    })
+}
+
 /// Whether `value` can be a field value: no control byte but tab, so it cannot
 /// end the line it is written on.
 fn is_field_value(value: &str) -> bool {
@@ -641,19 +657,19 @@ fn rewrite(head: &Head<'_>, lane: &Lane, target: &str) -> Result<String, Refused
         }
     }
     push_header(&mut out, injected, &value);
+    // Validated where the declaration is parsed and again at registration;
+    // re-checked here because this is the process the box cannot reach, and the
+    // one that would do the forging.
+    if let Some(header) = unattachable_header(inject) {
+        tracing::warn!(
+            component = COMPONENT,
+            lane = %lane.name(),
+            %header,
+            "an inject.also header cannot be attached and the request is refused"
+        );
+        return Err(Refused);
+    }
     for (name, value) in inject.also() {
-        // Both halves are validated where the declaration is parsed; re-checked
-        // here because this is the process the box cannot reach, and the one
-        // that would do the forging.
-        if !is_header_name(name) || !is_field_value(value) {
-            tracing::warn!(
-                component = COMPONENT,
-                lane = %lane.name(),
-                header = %name,
-                "an inject.also header cannot be attached and the request is refused"
-            );
-            return Err(Refused);
-        }
         push_header(&mut out, name, value);
     }
     // Not merely stripping the inbound `Connection`: HTTP/1.1 is persistent by
