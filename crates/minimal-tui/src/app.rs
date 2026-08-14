@@ -538,6 +538,13 @@ fn update_key(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
             model.filter.editing = true;
             Vec::new()
         }
+        // Esc clears an applied filter (the footer advertises this) but
+        // does nothing when no filter is set, so it stays a safe no-op.
+        (KeyCode::Esc, _) if !model.filter.input.is_empty() => {
+            model.filter = FilterState::default();
+            model.clamp_cursor();
+            Vec::new()
+        }
         (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
             model.cursor = model.cursor.saturating_sub(1);
             on_focus_change(model)
@@ -1257,6 +1264,26 @@ mod tests {
         assert!(!model.filter.editing);
         assert!(model.filter.input.is_empty());
         assert_eq!(model.visible_rows().len(), 5);
+    }
+
+    #[test]
+    fn esc_clears_an_applied_filter_and_is_otherwise_a_no_op() {
+        let mut model = two_providers();
+        // Apply a filter, then leave the editing mode (Enter keeps input).
+        update(&mut model, key(KeyCode::Char('/')));
+        for c in "bench".chars() {
+            update(&mut model, key(KeyCode::Char(c)));
+        }
+        update(&mut model, key(KeyCode::Enter));
+        assert!(!model.filter.editing);
+        assert_eq!(model.filter.input, "bench");
+        // Esc clears the applied filter...
+        update(&mut model, key(KeyCode::Esc));
+        assert!(model.filter.input.is_empty());
+        // ...and a second Esc does not quit or otherwise change state.
+        update(&mut model, key(KeyCode::Esc));
+        assert!(!model.quit);
+        assert!(model.action.is_none());
     }
 
     #[test]

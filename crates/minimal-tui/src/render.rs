@@ -671,13 +671,32 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
         }
         None => {
             // Key hints flush left; the transient status line flush right.
-            frame.render_widget(
-                Paragraph::new(Line::styled(
+            // An applied filter trades the hints for its own segment: the
+            // active filter must be visible, and the two together would
+            // clip on a narrow terminal.
+            let gray = Style::default().fg(Color::Gray);
+            let line = match model.filter.input.as_str() {
+                "" => Line::styled(
                     " ↑↓ move · / filter · enter attach · d destroy · r rename · n new · q quit ",
-                    Style::default().fg(Color::Gray),
-                )),
-                area,
-            );
+                    gray,
+                ),
+                input => {
+                    let total: usize = model.providers.iter().map(|p| p.sessions.len()).sum();
+                    let matched = model
+                        .providers
+                        .iter()
+                        .flat_map(|p| p.sessions.iter())
+                        .filter(|e| crate::filter::session_match(input, e).is_some())
+                        .count();
+                    Line::styled(
+                        format!(
+                            " filter: {input} · {matched} of {total} sessions · esc clears · ↑↓ move · enter attach · q quit "
+                        ),
+                        gray,
+                    )
+                }
+            };
+            frame.render_widget(Paragraph::new(line), area);
             if let Some(status) = &model.status {
                 let style = if status.starts_with("error:") {
                     Style::default().fg(Color::Red)
