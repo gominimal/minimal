@@ -308,9 +308,11 @@ exist as a first-class thing. Instead the sequence runs entirely host-side,
 between two host processes:
 
 1. The client gates the lanes and resolves each bound value (host-side).
-2. The client registers `{session name, lane set, resolved values}` with the
-   broker over the broker's control UDS, and receives a token.
-3. The client sends the token to the daemon in the create RPC.
+2. The client registers `{lane set, bound upstreams, resolved values}` with the
+   broker over the broker's control UDS, and receives a token and a handle.
+3. The client sends the token to the daemon on **`FinalizeSession`** — not on
+   the create RPC, which happens before the gate has decided which lanes exist
+   at all, and so before there is anything to register.
 4. The daemon injects the endpoint vars into the box.
 
 - **Material.** 32 bytes from `rand::random()` — `rand` 0.10 is a ChaCha CSPRNG
@@ -335,10 +337,13 @@ between two host processes:
   excluded from `build_record`.
 - **Scope.** A set of lane names. One box reaching an MCP server and another
   reaching a sink cannot reach each other's upstream.
-- **Keyed by a registration handle, not a session id.** The client registers
-  *before* the session exists — it needs the token to put in the create request —
-  so no session id is available at mint time. The broker returns an opaque
-  handle alongside the token; the client keeps it and uses it to revoke.
+- **Keyed by an opaque registration handle, and indexed by session id.** The
+  handle is the primary key, so two sessions holding the same lane name with
+  different credentials never reach each other's. But registration happens at
+  *gate* time, after `CreateSession`, so the session id **is** known — and
+  indexing by it is what lets a later, separate `min session destroy`
+  invocation revoke at all. The activating process holds the handle and exits;
+  without the index, revocation would require persisting the handle to disk.
 - **TTL.** An absolute expiry, so an abandoned session leaves no live token.
 - **Revoke.** From the **client**, over the control UDS, on `min session
   destroy`. Revocation cannot be driven from `ManagerMessage::DeleteSession`
@@ -579,10 +584,13 @@ Two honest limits:
   it to no file: it is a wire-only field on the create request, excluded from
   `build_record` (`crates/minimald/src/sessions.rs:67-82`, which today copies
   every `SessionConfig` field onto the `Record`).
-- **R3.4**: The client revokes by handle over the control UDS on `min session
-  destroy`. Daemon-side teardown paths do not revoke — `minimald` is guest-side
-  on DM1/3/4 and cannot reach a host filesystem socket — and are bounded by the
-  R3.2 expiry. A test asserts a revoked handle's token is refused.
+- **R3.4**: The client revokes over the control UDS: by handle on an activation
+  failure it is still holding, and **by session id** from `min session destroy`,
+  which is a separate invocation with no handle. Daemon-side teardown paths do
+  not revoke — `minimald` is guest-side on DM1/3/4 and cannot reach a host
+  filesystem socket — and are bounded by the R3.2 expiry. Tests assert that a
+  revoked handle's token is refused, and that destroying a session refuses its
+  token afterwards.
 - **R3.5**: Unknown lane, out-of-scope lane, malformed selector, and
   missing/expired token produce one identical refusal, and the credential is not
   read from its resolver in any of those cases.
