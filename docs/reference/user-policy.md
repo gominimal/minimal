@@ -17,27 +17,35 @@ choice on every activation. The allow list does not apply to values specified in
 loadouts, only the ignore and deny lists do.
 
 The policy is enforced **only on the client**, inside `min`, never on the
-daemon (see [Sessions](../concepts/sessions.md)). It gates three domains:
+daemon (see [Sessions](../concepts/sessions.md)). It gates four domains:
 
 - **Variables** — matched by variable **name**.
 - **Patches** — matched by the **source file paths** a patch enumerates on
   the host (the patch's `dest` is never matched).
 - **Lifecycle hooks** — matched by the **project root path** that declared
   them.
+- **Credentials** — matched by the **project root path** that declared them,
+  the same key `[hooks]` uses.
 
 The first two exist to stop a project pulling *your data* into a session. The
-third exists for a different reason: a [lifecycle
+other two exist for different reasons. A [lifecycle
 hook](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points) is
 arbitrary code the project asks to run inside your session, so the risk is
 execution rather than disclosure. A project must be allow-listed before any
-hook it declares will run. Hooks declared in your own loadouts are not gated —
-they are your files already.
+hook it declares will run. A [credential lane](../guide/credentials.md) is
+different again: the project cannot name the upstream or the secret at all —
+your own binding owns both — so the risk is *access*, not disclosure or
+execution. The gate is path-keyed rather than lane-name-keyed for the same
+reason as hooks: the question is whether you trust this project with your
+credentials at all, not whether you trust it with this one name. Hooks and
+credentials declared in your own loadouts are not gated — they are your files
+already.
 
 Packages are effectively out of scope. A package cannot supply file
 patches, nor environment variables that carry host data (values inherited from
-your shell), nor lifecycle hooks; because packages cannot transfer host data
-into a session or ask to execute code, the policy's protective purpose does not
-apply to them.
+your shell), nor lifecycle hooks, nor credential lanes; because packages cannot
+transfer host data into a session or ask to execute code, the policy's
+protective purpose does not apply to them.
 
 ## Where the policy lives
 
@@ -73,12 +81,13 @@ ignore = ["**/.DS_Store"]
 
 ## Schema
 
-The file has three optional sections, `[vars]`, `[patches]`, and `[hooks]`.
-Each holds three optional keys — `allow`, `deny`, and `ignore` — and each key
-is a list of glob patterns. Every key defaults to empty, so any section or key
-may be omitted; an empty file is a valid empty policy.
+The file has four optional sections, `[vars]`, `[patches]`, `[hooks]`, and
+`[credentials]`. Each holds three optional keys — `allow`, `deny`, and
+`ignore` — and each key is a list of glob patterns. Every key defaults to
+empty, so any section or key may be omitted; an empty file is a valid empty
+policy.
 
-Each of the nine lists accepts either a single bare string or a list of
+Each of the twelve lists accepts either a single bare string or a list of
 strings:
 
 ```toml
@@ -178,10 +187,41 @@ allow = ["~/work/**"]
 deny  = ["/tmp/**"]
 ```
 
+### `[credentials]` — Credential-lane rules
+
+Patterns match the **project root path** that declared the lane — the same
+key `[hooks]` matches on, and for the same reason: a lane from a project you
+have not vetted should not inherit a decision made about a different project.
+A credential lane never carries the upstream or the secret itself (both come
+from your own [binding file](../guide/credentials.md#binding-a-lane)), so this
+section decides *whose* project may use a bound lane at all, not which lane.
+
+| Key | Matches project roots whose… |
+|-----|------------------------------|
+| `allow` | credential lanes may be used |
+| `deny` | credential lanes may never be used, and whose presence fails the activation |
+| `ignore` | credential lanes are silently dropped without prompting |
+
+A lane declared in one of your own loadouts auto-allows, the same as a
+loadout-origin variable or patch. A lane a package declares is **denied
+outright** — packages cannot hold credential lanes at all.
+
+Patterns expand the same way hook patterns do (`~/`, `$NAME`, `${NAME}`), and
+a project matching nothing here is **undecided**, not allowed: it reaches the
+prompt, and under `--no-prompt` it fails the activation with a snippet naming
+the project and the lane.
+
+```toml
+[credentials]
+allow = ["~/work/**"]
+deny  = ["/tmp/**"]
+```
+
 ## How a contribution is decided
 
-Every variable, every patch source, and every project that declares lifecycle
-hooks is categorized against the relevant section in a fixed precedence:
+Every variable, every patch source, every project that declares lifecycle
+hooks, and every project that declares credential lanes is categorized against
+the relevant section in a fixed precedence:
 
 1. **`deny`** — if it matches, the composition fails. Deny takes precedence
    over every other rule, including `ignore`: an item matched by both `deny`
@@ -202,10 +242,10 @@ on it:
 - **Non-user-origin** items must match an `allow` pattern to pass cleanly. If
   none matches, the item is **undecided** and routes to an interactive prompt
   (or aborts under `--no-prompt`; see below). In practice the non-user
-  contributor is the **project**: it can contribute both gated patches and
-  gated variables. A package can only reach this step with a static-valued
-  variable — its patches and host-inherited variables are dropped before the
-  gate.
+  contributor is the **project**: it can contribute gated patches, gated
+  variables, and gated credential lanes. A package can only reach this step
+  with a static-valued variable — its patches, host-inherited variables, and
+  credential lanes are dropped before the gate.
 
 Composing several loadouts does not compose policy — the policy is a single
 file about what you let *other* sources contribute, kept separate from what

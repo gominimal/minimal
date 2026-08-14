@@ -171,7 +171,43 @@ The field shapes and composition semantics (conflicts, policy gating) are the
 same as loadouts; see the [loadout reference](./loadouts.md) for the exact
 rules.
 
+#### `[session.credentials.<name>]` - Outbound credential lanes {#credentials}
 
+Declares that this project wants a named credential lane: a box-side endpoint
+an agent can call to reach a credentialed upstream API, without the credential
+itself ever entering the box. See the [credentials guide](../guide/credentials.md)
+for the full walkthrough.
+
+```toml
+[session.credentials.anthropic]
+inject = { header = "x-api-key" }
+
+[session.credentials.github-mcp]
+inject = { header = "Authorization", prefix = "Bearer " }
+```
+
+| Field | Description |
+|-------|-------------|
+| `inject.header` | The HTTP header the broker injects the resolved credential into on the upstream leg. |
+| `inject.prefix` | Optional. Text prepended to the value before injection, e.g. `"Bearer "`. Defaults to empty. |
+
+**The project declares only the lane's shape.** It never names the upstream
+host and never holds a secret: the lane name (`anthropic`, `github-mcp`) is
+just a key. The upstream URL and the secret's source are supplied separately,
+per developer, in that developer's own [user-scope credentials
+binding](../guide/credentials.md#binding-a-lane) — kept out of the project
+tree and out of git. A project cannot redirect a lane's destination, because
+it has no field to put one in.
+
+Lane names must match `^[a-z0-9][a-z0-9-]*$`. Every declared lane is gated
+against your [user policy](./user-policy.md#credentials) before it takes
+effect: an unbound or unapproved lane fails activation rather than silently
+granting nothing.
+
+Unknown keys under `[session.credentials.<name>]` or its `inject` table are a
+parse error — unlike other sections, there is no `extra` catch-all here, so
+that pasting a raw secret into this table can never be silently accepted and
+re-emitted.
 
 ### `[tasks.*]` - Run tasks, scripts, & dev tooling {#tasks}
 

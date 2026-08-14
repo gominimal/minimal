@@ -1,0 +1,158 @@
+---
+description: Give an agent in a session an outbound credential to a real API without the credential ever entering the box.
+---
+
+# Giving an agent a credential
+
+An agent in a [session](./dev-shell.md) that must call a credentialed API —
+Anthropic's own API, an MCP server behind a token — has no safe way to hold
+that credential directly: anything you pass into the box as an environment
+variable or a patched file is visible to every process running there, and to
+`env`, `printenv`, and `/proc` for the lifetime of the session.
+
+A **credential lane** solves this differently: the box gets a scoped,
+revocable token and a local endpoint to call, and a broker running on your
+host resolves the real credential and attaches it to the outbound request.
+The value itself never crosses into the box.
+
+## What a lane is
+
+A lane has two halves, declared in two different places:
+
+- **The project** declares that it wants a lane, and how the credential
+  should be injected into the request — a header name and an optional prefix.
+  It never says which upstream the lane reaches or where the secret comes
+  from.
+- **You** bind the lane name to an upstream URL and a secret source, once, in
+  your own user-scope configuration.
+
+Splitting it this way is the whole point: a project can ask for a credential
+by name, but it cannot tell your machine where to send it or what to send.
+Only your binding does that.
+
+## Declaring a lane in the project
+
+In `minimal.toml`, under `[session.credentials.<name>]`:
+
+```toml
+[session.credentials.anthropic]
+inject = { header = "x-api-key" }
+```
+
+`<name>` is the lane name an agent's tooling will reference (via the
+environment variable described below). `inject.header` is the HTTP header the
+credential is attached under on the request to the real upstream; an optional
+`inject.prefix` is prepended to the value, useful for `Authorization: Bearer
+<token>` shapes:
+
+```toml
+[session.credentials.github-mcp]
+inject = { header = "Authorization", prefix = "Bearer " }
+```
+
+See the [`minimal.toml` reference](../reference/minimal-dot-toml.md#credentials)
+for the full field list.
+
+## Binding a lane {#binding-a-lane}
+
+The project's declaration is inert until you bind the lane name to an actual
+upstream and secret, in your own user-scope credentials file — outside the
+project tree, never committed to git:
+
+```
+~/.config/minimal/credentials.toml
+```
+
+```toml
+[anthropic]
+upstream = "https://api.anthropic.com"
+source   = { env = "ANTHROPIC_API_KEY" }
+
+[github-mcp]
+upstream = "https://api.githubcopilot.com/mcp/"
+source   = { file = "~/.secrets/github-mcp-token" }
+```
+
+`upstream` must be `https://` — a plain `http://` upstream is rejected, since
+it would put your secret on the wire in cleartext. `source` names where the
+value resolves from on your machine: `{ env = "VAR" }` reads a variable from
+your own shell environment at activation time; `{ file = "path" }` reads a
+host file (a symlinked path component is refused, the same as a patch
+source).
+
+A lane name that appears in a project's `minimal.toml` but has no matching
+entry in your `credentials.toml` fails activation, naming the lane and the
+binding file it expected.
+
+## Approving a lane
+
+Like [patches and hooks](../reference/user-policy.md), a project-declared
+lane is gated by your [user policy](../reference/user-policy.md#credentials)
+before it can be used, matched against `[credentials]` by the project's root
+path — the same key `[hooks]` uses, because the question is whether you trust
+*this project* with your credentials at all, not whether you trust it with
+this one lane name.
+
+A project matching nothing in your policy is undecided, not allowed: `min
+session activate` prompts you before anything runs, showing the lane name,
+the **bound** upstream, and the injected header — never the credential's
+value. Choose to allow it once, allow it permanently, or deny it, the same
+choices offered for any other gated contribution. Under
+[`--no-prompt`](../reference/cli-min.md#global-flags) an undecided lane fails
+activation with a ready-to-paste policy snippet instead of prompting.
+
+A lane declared in one of your own [loadouts](../reference/loadouts.md)
+auto-allows — it's your own configuration already. A lane a package declares
+is denied outright; packages cannot hold credential lanes.
+
+## What the box sees
+
+Once a lane is approved, the session carries two environment variables per
+lane instead of a credential:
+
+| Variable | Value |
+|---|---|
+| `MINIMAL_CREDENTIAL_ENDPOINT_<LANE>` | The local broker endpoint for this lane, e.g. `http://100.64.255.254:<port>/anthropic`. |
+| `MINIMAL_CREDENTIAL_TOKEN` | A bearer token scoping this box to the lanes it was granted. |
+
+`<LANE>` is the lane name upcased with `-` replaced by `_` — `anthropic`
+becomes `ANTHROPIC`, `github-mcp` becomes `GITHUB_MCP`. Point the agent's
+tooling at the endpoint variable instead of the upstream's real base URL
+(`ANTHROPIC_BASE_URL=$MINIMAL_CREDENTIAL_ENDPOINT_ANTHROPIC`, for example),
+and send `MINIMAL_CREDENTIAL_TOKEN` as `X-Minimal-Credential-Token` on each
+request. A request through the lane reaches the real upstream with the real
+credential attached; a request to the upstream directly, without the token,
+does not.
+
+Nothing else appears in the box. The credential's value is never in `env`,
+never in a patched file, and never written to the session's on-disk
+composition — only the endpoint and a token that is meaningless outside this
+session.
+
+## Reviewing a session's lanes
+
+`min session credentials <session>` lists every lane an active session holds:
+the lane name, its bound upstream, the header it injects into, where it was
+declared, and whether the broker still considers it live. It never shows a
+value, at any verbosity or with `--json`.
+
+## Revoking access
+
+A lane's token lives only as long as the session that requested it: destroying
+the session (`min session destroy`) revokes it. There is also an absolute
+expiry, so an abandoned session's access does not outlive the session
+indefinitely even if the client that created it never runs the revoke.
+
+## Why the project can't redirect your credential
+
+The security property this design relies on is narrow and worth stating
+plainly: **the binding, not the project, owns the destination.** A project's
+`[session.credentials.<name>]` block has no field for an upstream URL — it
+can only ask for a lane by name and describe how to inject the header. If a
+project could also say where the lane goes, an already-allowed project could
+quietly repoint a bound lane's *name* at an attacker-controlled host and
+receive your real credential in plaintext, with no additional prompt, because
+your policy allow-lists the project path, not the lane's destination. Because
+the upstream comes only from your own binding file, the worst a malicious
+project can do is ask for a lane name you've already bound, and get exactly
+the upstream you bound it to.
