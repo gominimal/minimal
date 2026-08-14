@@ -2831,8 +2831,22 @@ async fn cmd_session_hooks(global: &GlobalArgs, args: HooksArgs) -> Result<(), a
     Ok(())
 }
 
+/// One lane's composition record plus the broker state this run observed.
+///
+/// Flattened, so every field a `--json` consumer already read stays exactly
+/// where it was: broker state is not part of the composition — it is a fact
+/// about this moment — and does not belong on the wire type the daemon
+/// persists.
+#[derive(serde::Serialize)]
+struct CredentialRow<'a> {
+    #[serde(flatten)]
+    lane: &'a sessions::wire::primitives::WireCredentialLane,
+    broker: credentials::LaneState,
+}
+
 /// `min session credentials`: list the credential lanes composed into a
-/// session, with the loadout or project that declared each.
+/// session, with the loadout or project that declared each and whether the
+/// broker still holds a live registration for it.
 ///
 /// Shows what a box may actually reach, not what was asked for: the
 /// daemon answers from the composition, which holds only the lanes that
@@ -2846,10 +2860,13 @@ async fn cmd_session_credentials(
     ensure_daemon(global)?;
     let mut client = connect_daemon(global).await?;
 
+    // Resolved to an id before anything else: `SESSION` may be a name, and the
+    // broker keys its registrations by session id and knows no names.
+    let record = resolve_session(&mut client, &args.session).await?;
+
     use minimald_rpc::{GetSessionCredentials, GetSessionCredentialsRequest};
-    let lookup: GetSessionCredentialsRequest = SessionLookup::parse(&args.session).into();
     let resp = client
-        .oneshot_rpc::<GetSessionCredentials>(lookup)
+        .oneshot_rpc::<GetSessionCredentials>(GetSessionCredentialsRequest::Id(record.id))
         .await
         .context("GetSessionCredentials RPC failed")?;
 
@@ -2858,42 +2875,97 @@ async fn cmd_session_credentials(
         minimald_rpc::Errorable::Err { error } => bail!("{error}"),
     };
 
+    // One query for the whole session, and none at all when there is nothing
+    // to report on: a session with no lane must not need a broker to be
+    // running. `None` is "no broker answered", never "no lanes are live".
+    let live = if lanes.is_empty() {
+        None
+    } else {
+        credentials::live_lanes(record.id).await
+    };
+    let rows: Vec<CredentialRow<'_>> = lanes
+        .iter()
+        .map(|lane| CredentialRow {
+            lane,
+            broker: credentials::LaneState::of(live.as_ref(), &lane.lane),
+        })
+        .collect();
+
     if args.json {
         println!(
             "{}",
-            serde_json_lenient::to_string(&lanes).context("Failed to serialize credentials")?
+            serde_json_lenient::to_string(&rows).context("Failed to serialize credentials")?
         );
         return Ok(());
     }
 
-    if lanes.is_empty() {
+    if rows.is_empty() {
         println!("No credential lanes are composed into this session.");
         return Ok(());
     }
 
     // Sized to content, not fixed: an upstream is a whole URL, and a column
     // narrower than one runs the next column's values into it.
-    let rows: Vec<(&str, &str, &str, String)> = lanes
+    let cells: Vec<(&str, &str, &str, String, credentials::LaneState)> = rows
         .iter()
-        .map(|l| {
+        .map(|r| {
             (
-                l.lane.as_str(),
-                l.header.as_str(),
-                l.upstream.as_str(),
-                render_hook_source(&l.source),
+                r.lane.lane.as_str(),
+                r.lane.header.as_str(),
+                r.lane.upstream.as_str(),
+                render_hook_source(&r.lane.source),
+                r.broker,
             )
         })
         .collect();
-    let lane_w = rows.iter().map(|r| r.0.len()).chain([4]).max().unwrap_or(4);
-    let header_w = rows.iter().map(|r| r.1.len()).chain([6]).max().unwrap_or(6);
-    let upstream_w = rows.iter().map(|r| r.2.len()).chain([8]).max().unwrap_or(8);
+    let lane_w = cells
+        .iter()
+        .map(|r| r.0.len())
+        .chain([4])
+        .max()
+        .unwrap_or(4);
+    let header_w = cells
+        .iter()
+        .map(|r| r.1.len())
+        .chain([6])
+        .max()
+        .unwrap_or(6);
+    let upstream_w = cells
+        .iter()
+        .map(|r| r.2.len())
+        .chain([8])
+        .max()
+        .unwrap_or(8);
+    let source_w = cells
+        .iter()
+        .map(|r| r.3.len())
+        .chain([6])
+        .max()
+        .unwrap_or(6);
 
     println!(
-        "{:<lane_w$}  {:<header_w$}  {:<upstream_w$}  SOURCE",
-        "LANE", "HEADER", "UPSTREAM"
+        "{:<lane_w$}  {:<header_w$}  {:<upstream_w$}  {:<source_w$}  BROKER",
+        "LANE", "HEADER", "UPSTREAM", "SOURCE"
     );
-    for (name, header, upstream, source) in &rows {
-        println!("{name:<lane_w$}  {header:<header_w$}  {upstream:<upstream_w$}  {source}");
+    for (name, header, upstream, source, broker) in &cells {
+        println!(
+            "{name:<lane_w$}  {header:<header_w$}  {upstream:<upstream_w$}  \
+             {source:<source_w$}  {broker}"
+        );
+    }
+
+    // Said in words because the consequence is not obvious from one column:
+    // the broker's registrations are in memory and die with its supervisor
+    // while the session survives, and nothing re-registers them. Without this
+    // the box meets the same fact as a 401 inside an agent.
+    if cells.iter().any(|r| r.4 == credentials::LaneState::Dead) {
+        println!(
+            "\nA `dead` lane has no live broker registration — the broker restarted, or the \
+             session's lanes were revoked. Nothing re-registers them; create the session again \
+             to bind them afresh."
+        );
+    } else if cells.iter().any(|r| r.4 == credentials::LaneState::Unknown) {
+        println!("\nBroker state is `unknown`: no credential broker answered on this host.");
     }
     Ok(())
 }

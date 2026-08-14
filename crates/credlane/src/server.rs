@@ -21,7 +21,7 @@
 //!
 //! See `docs/specs/12-spec-credential-lane/12-spec-credential-lane.md`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::{DirBuilderExt as _, FileTypeExt as _, PermissionsExt as _};
@@ -171,6 +171,18 @@ pub enum Request {
         /// The session whose registrations to drop.
         session_id: SessionId,
     },
+    /// Asks which of a session's lanes the broker still holds live
+    /// registrations for (R7.1).
+    ///
+    /// A read: the only verb here that changes nothing. It exists because
+    /// broker state is in memory and dies with its supervisor while sessions
+    /// survive, so after a daemon or VM restart every lane of a live session
+    /// is dead — and without asking, the box discovers that as a `401` deep
+    /// inside an agent.
+    SessionLanes {
+        /// The session to report on.
+        session_id: SessionId,
+    },
 }
 
 /// A control response.
@@ -197,6 +209,19 @@ pub enum Response {
     SessionRevoked {
         /// How many live registrations the session had.
         live: usize,
+    },
+    /// The lanes the named session still has live registrations for. Empty is
+    /// the ordinary answer for a session that never registered one, and for
+    /// every session after the broker restarted.
+    ///
+    /// Names only, and only for the session the caller named: whoever can open
+    /// this socket can already register and revoke that session's lanes, so
+    /// this enumerates nothing they could not already see. As with the two
+    /// above, a control-path answer never surfaced to a box.
+    SessionLanes {
+        /// The live lane names, deduplicated across the session's
+        /// registrations.
+        live: BTreeSet<String>,
     },
     /// The request was rejected. Control-path only: unlike the box-facing
     /// path's single refusal, this says what was wrong, because the caller is
@@ -343,6 +368,24 @@ impl Broker {
         let mut state = self.lock();
         state.lanes.remove(handle);
         state.tokens.revoke(handle)
+    }
+
+    /// The lanes `session_id` still has live registrations for.
+    ///
+    /// Answers exactly what [`LaneTable::resolve`] would: a lane counts as live
+    /// only when some unexpired registration of this session both scopes a
+    /// token to it and still holds it in the lane table. Anything looser would
+    /// report a lane live that the very next request refuses.
+    #[must_use]
+    pub fn session_lanes(&self, session_id: SessionId) -> BTreeSet<String> {
+        let state = self.lock();
+        state
+            .tokens
+            .live_handles(session_id, Instant::now())
+            .iter()
+            .filter_map(|handle| state.lanes.get(handle))
+            .flat_map(|lanes| lanes.keys().cloned())
+            .collect()
     }
 
     /// Drops every registration `session_id` made, and their lanes. Returns
@@ -567,6 +610,18 @@ async fn handle_control(mut stream: UnixStream, broker: &Broker) -> io::Result<(
                 "revoked a session's registrations"
             );
             Response::SessionRevoked { live }
+        }
+        Ok(Request::SessionLanes { session_id }) => {
+            let live = broker.session_lanes(session_id);
+            // Count only: the lane names are the answer, and this log is read
+            // on a host where the session's own client already prints them.
+            tracing::debug!(
+                component = COMPONENT,
+                %session_id,
+                live = live.len(),
+                "reported a session's live lanes"
+            );
+            Response::SessionLanes { live }
         }
         // The body may carry credential values, so the log says nothing about
         // what arrived beyond the parse error itself.
@@ -1141,6 +1196,139 @@ mod tests {
             matches!(response, Response::SessionRevoked { live: 0 }),
             "{response:?}"
         );
+    }
+
+    /// Asks the control socket for a session's live lanes, as `min` does.
+    async fn session_lanes(path: &Path, session_id: SessionId) -> BTreeSet<String> {
+        match call(path, &Request::SessionLanes { session_id })
+            .await
+            .unwrap()
+        {
+            Response::SessionLanes { live } => live,
+            other => panic!("expected a lane listing, got {other:?}"),
+        }
+    }
+
+    /// R7.1: the state the table renders is per lane, not per session, because
+    /// a registration can be partially live — one lane revoked out from under
+    /// a session that still holds another.
+    #[tokio::test]
+    async fn a_live_registration_reports_the_lane_names_it_serves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, _broker) = control_server(tmp.path());
+
+        register_one(
+            &path,
+            session(1),
+            &registration("anthropic", "https://api.anthropic.com/v1/"),
+        )
+        .await;
+        register_one(
+            &path,
+            session(1),
+            &registration("github-mcp", "https://api.github.com/mcp/"),
+        )
+        .await;
+        register_one(
+            &path,
+            session(2),
+            &registration("gist-sink", "https://api.github.com/gists"),
+        )
+        .await;
+
+        assert_eq!(
+            session_lanes(&path, session(1)).await,
+            BTreeSet::from(["anthropic".to_owned(), "github-mcp".to_owned()]),
+            "one session's answer must name that session's lanes and no others"
+        );
+    }
+
+    /// The state a restart leaves behind, reached here by the one path a test
+    /// can drive deterministically: a revoked registration serves nothing, and
+    /// must report nothing rather than the names it used to hold.
+    #[tokio::test]
+    async fn a_revoked_registration_reports_no_live_lanes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, _broker) = control_server(tmp.path());
+
+        register_one(
+            &path,
+            session(1),
+            &registration("anthropic", "https://api.anthropic.com/v1/"),
+        )
+        .await;
+        assert!(!session_lanes(&path, session(1)).await.is_empty());
+
+        call(
+            &path,
+            &Request::RevokeSession {
+                session_id: session(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(session_lanes(&path, session(1)).await.is_empty());
+    }
+
+    /// Most sessions never register a lane, and `min session credentials` is
+    /// run against them like any other; an error there would be noise.
+    #[tokio::test]
+    async fn asking_about_a_session_that_never_registered_answers_rather_than_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, _broker) = control_server(tmp.path());
+        assert!(session_lanes(&path, session(7)).await.is_empty());
+    }
+
+    /// R2.2a for the one verb that reads state back out: it is a *control*
+    /// verb, and the box-facing listener's entire vocabulary is
+    /// [`LaneTable::resolve`]. Even a box holding a valid token gets the single
+    /// refusal, never a lane listing.
+    #[tokio::test]
+    async fn the_box_facing_listener_answers_a_lane_listing_request_with_its_one_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (path, broker) = control_server(tmp.path());
+        let token = register_one(
+            &path,
+            session(1),
+            &registration("anthropic", "https://api.anthropic.com/v1/"),
+        )
+        .await;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(proxy::serve(
+            listener,
+            Arc::clone(&broker),
+            Arc::new(TlsUpstream::new().unwrap()),
+        ));
+
+        let control = serde_json_lenient::to_string(&Request::SessionLanes {
+            session_id: session(1),
+        })
+        .unwrap();
+        for probe in [
+            // The control framing, spoken verbatim at the box-facing port.
+            format!("{control}\n"),
+            // And the same request as the best-formed HTTP a box could wrap it
+            // in, carrying a token the broker really minted.
+            format!(
+                "POST /t/{}/ HTTP/1.1\r\nHost: broker\r\nContent-Length: {}\r\n\r\n{control}",
+                token.expose(),
+                control.len(),
+            ),
+        ] {
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            client.write_all(probe.as_bytes()).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut answer = String::new();
+            client.read_to_string(&mut answer).await.unwrap();
+
+            assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
+            assert!(
+                !answer.contains("anthropic"),
+                "the box-facing path must not name a lane: {answer}"
+            );
+        }
     }
 
     #[tokio::test]

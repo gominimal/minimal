@@ -156,6 +156,21 @@ impl TokenStore {
         doomed
     }
 
+    /// The handles of `session`'s registrations that have not expired.
+    ///
+    /// The read-only twin of [`Self::revoke_session`]: the same scan, scoped
+    /// the same way, dropping nothing. Expiry is applied here because an
+    /// expired registration authorises nothing — reporting it live would tell
+    /// an operator a lane works when the next request refuses it.
+    #[must_use]
+    pub fn live_handles(&self, session: SessionId, now: Instant) -> Vec<RegistrationHandle> {
+        self.registrations
+            .iter()
+            .filter(|(_, reg)| reg.session == session && now < reg.expires_at)
+            .map(|(handle, _)| handle.clone())
+            .collect()
+    }
+
     /// Authorises `presented` for `lane`, yielding the registration it belongs
     /// to so the caller can resolve the lane against its own table.
     ///
@@ -348,6 +363,35 @@ mod tests {
         assert_eq!(store.revoke_session(session(1)).len(), 2);
         assert!(store.authorize(first.expose(), "anthropic", now).is_err());
         assert!(store.authorize(second.expose(), "github-mcp", now).is_err());
+    }
+
+    /// R7.1: an expired registration serves nothing, so it must not be
+    /// reported as live either — a token past its TTL is exactly the state
+    /// `min session credentials` exists to surface before a box hits a 401.
+    #[test]
+    fn an_expired_registration_is_no_longer_one_of_its_sessions_live_handles() {
+        let now = Instant::now();
+        let mut store = TokenStore::new();
+        let (_, handle) = store.mint(session(1), lanes(&["anthropic"]), now, TTL);
+
+        assert_eq!(store.live_handles(session(1), now), vec![handle]);
+        assert!(store.live_handles(session(1), now + TTL).is_empty());
+    }
+
+    #[test]
+    fn live_handles_names_only_the_handles_of_the_session_it_was_asked_about() {
+        let now = Instant::now();
+        let mut store = TokenStore::new();
+        let (_, first) = store.mint(session(1), lanes(&["anthropic"]), now, TTL);
+        let (_, second) = store.mint(session(1), lanes(&["github-mcp"]), now, TTL);
+        let _other = store.mint(session(2), lanes(&["anthropic"]), now, TTL);
+
+        let mut live = store.live_handles(session(1), now);
+        live.sort_by_key(ToString::to_string);
+        let mut expected = vec![first, second];
+        expected.sort_by_key(ToString::to_string);
+        assert_eq!(live, expected);
+        assert!(store.live_handles(session(9), now).is_empty());
     }
 
     #[test]

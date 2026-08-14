@@ -205,9 +205,17 @@ session.
 ## Reviewing a session's lanes
 
 `min session credentials <session>` lists every lane an active session holds:
-the lane name, the header it injects into, its bound upstream, and where it
-was declared. `--json` adds the lane's `inject.also` headers and its
-`endpoint_var`. It never shows a value, at any verbosity or with `--json`.
+the lane name, the header it injects into, its bound upstream, where it was
+declared, and whether the broker still holds a live registration for it.
+`--json` adds the lane's `inject.also` headers and its `endpoint_var`. It never
+shows a value, at any verbosity or with `--json`.
+
+The last column reads `live` when the broker holds the lane and a request on it
+would be served, `dead` when the broker answered and holds nothing for it, and
+`unknown` when no broker answered at all. `dead` is what you see after the
+daemon or the VM restarts: the broker's registrations live only in its memory
+and die with it, while the session itself survives. Nothing re-registers them —
+create the session again to get live lanes back.
 
 ## Revoking access
 

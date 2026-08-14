@@ -168,17 +168,25 @@ min session credentials <SESSION> [--json]
 
 Lists the [credential lanes](../guide/credentials.md) composed into `SESSION`
 (a UUID or session name), with the bound upstream, the header the broker
-injects into, and the loadout or project that declared each lane. There is no
-value column, at any width: the composition descriptor this reads from has no
-field that can hold a credential value, and neither does this listing.
+injects into, the loadout or project that declared each lane, and its `BROKER`
+state. There is no value column, at any width: the composition descriptor this
+reads from has no field that can hold a credential value, and neither does this
+listing.
+
+`BROKER` is `live` when the broker still holds a registration for the lane,
+`dead` when the broker answered and holds none, and `unknown` when no broker
+answered on this host. A restarted daemon or VM leaves every lane `dead`: the
+registrations are in the broker's memory and die with it while the session
+survives, and nothing re-registers them.
 
 This shows what a box can actually reach, not what was asked for: the daemon
 answers from the session's composition, which holds only the lanes that
 survived your [user policy](./user-policy.md). A project whose credential
 lanes you never allow-listed lists nothing.
 
-Answered from the persisted composition, so it works after a daemon restart
-and for a session nobody is attached to.
+Answered from the persisted composition, so the lane list works after a daemon
+restart and for a session nobody is attached to; the `BROKER` column is the one
+part read live, from the broker's owner-only control socket.
 
 ### `stop`
 

@@ -762,8 +762,16 @@ for a lane outside the token's scope is refused identically to an unknown lane.
 ### Unit 7: review surface
 
 - **R7.1**: `min session credentials <SESSION> [--json]` renders lane, bound
-  upstream, injected header, declaring source, and live/absent broker state.
+  upstream, injected header, declaring source, and per-lane broker state —
+  `live` when the broker still holds a registration for it, `dead` when the
+  broker answered and holds none, `unknown` when no broker answered at all.
   Never a value.
+- **R7.1a**: Broker state is read over the **control socket** and nowhere else:
+  a `session_lanes` request naming one session, answered with that session's
+  live lane names. The box-facing listener's whole vocabulary stays
+  `LaneTable::resolve`, so a box cannot ask this question. The answer carries
+  names only, and only for the session the caller named — whoever can open the
+  control socket can already register and revoke that session's lanes.
 - **R7.2**: The policy prompt shows lane, bound upstream, and header before
   approval.
 
@@ -943,10 +951,13 @@ exactly as for hooks.
   control verb on the switch-facing listener the guest daemon can already reach —
   is the follow-up.
 - **Broker state is in memory and dies with its supervisor, but sessions
-  survive.** A restarted VM or daemon leaves every live lane dead; `min session
-  credentials` reports it (R7.1) but nothing re-registers automatically, and a
-  re-attach after a restart has no token. A re-registration path is the obvious
-  follow-up and is deliberately not designed here.
+  survive.** A restarted VM or daemon leaves every live lane dead. `min session
+  credentials` now says so — the lane's `BROKER` column reads `dead`, with a
+  note that nothing re-registers it (R7.1) — so the state is visible before a
+  box meets it as a `401`, but *reporting* is all it does. Nothing re-registers
+  automatically, and a re-attach after a restart has no token; recreating the
+  session is the only way back to a live lane. A re-registration path is the
+  obvious follow-up and is deliberately not designed here.
 - **Package-declared credentials.** `class = 'Credential` stays dropped on both
   paths. Teaching the extractor to emit a lane — so a package can say "I need an
   Anthropic credential" without saying where plaintext lands — is the natural

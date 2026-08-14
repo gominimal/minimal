@@ -419,9 +419,9 @@ impl Registration {
         {
             Response::Revoked { .. } => Ok(()),
             Response::Failed { error } => Err(Error::Refused(error)),
-            Response::Registered { .. } | Response::SessionRevoked { .. } => {
-                Err(Error::Protocol("a registration"))
-            }
+            Response::Registered { .. }
+            | Response::SessionRevoked { .. }
+            | Response::SessionLanes { .. } => Err(Error::Protocol("a registration")),
         }
     }
 }
@@ -451,8 +451,98 @@ pub async fn revoke_session(session: SessionId) -> Result<usize, Error> {
     {
         Response::SessionRevoked { live } => Ok(live),
         Response::Failed { error } => Err(Error::Refused(error)),
-        Response::Registered { .. } | Response::Revoked { .. } => {
+        Response::Registered { .. } | Response::Revoked { .. } | Response::SessionLanes { .. } => {
             Err(Error::Protocol("a single-registration answer"))
+        }
+    }
+}
+
+/// One composed lane's broker state, as `min session credentials` renders it
+/// (R7.1).
+///
+/// Three states, not two: a broker that cannot be reached knows nothing about
+/// any lane, which is a different fact from a broker that answered and holds no
+/// registration. Collapsing them would render every lane on a host with no
+/// broker as dead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneState {
+    /// The broker holds a live registration for the lane; a box's request on it
+    /// would resolve.
+    Live,
+    /// The broker answered and holds none. Broker state is in memory and dies
+    /// with its supervisor while sessions survive, so this is what a daemon or
+    /// VM restart leaves behind — as well as what a revoke does.
+    Dead,
+    /// No broker answered, so nothing is known. The broker is best-effort: its
+    /// supervisor warns and continues if it will not start, and on the
+    /// host-side deployment models the control socket may simply not exist.
+    Unknown,
+}
+
+impl LaneState {
+    /// Where `lane` stands against the answer [`live_lanes`] returned.
+    #[must_use]
+    pub fn of(live: Option<&HashSet<String>>, lane: &str) -> Self {
+        match live {
+            Some(live) if live.contains(lane) => Self::Live,
+            Some(_) => Self::Dead,
+            None => Self::Unknown,
+        }
+    }
+
+    /// The word the table and `--json` both render, so the two cannot drift.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Dead => "dead",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for LaneState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl serde::Serialize for LaneState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// The lanes the broker still holds live registrations for, or `None` when no
+/// broker answered.
+///
+/// Deliberately infallible. Every way this can fail — no control socket, no
+/// broker listening, a broker that answered something else — means the same
+/// thing to a caller that is only reporting: nothing is known. Returning an
+/// error instead would fail a read-only command on the ordinary case of a host
+/// that never started a broker, and returning an empty set would report every
+/// lane dead on it.
+pub async fn live_lanes(session: SessionId) -> Option<HashSet<String>> {
+    let socket = credlane::control_socket_path().ok()?;
+    match credlane::server::call(
+        &socket,
+        &Request::SessionLanes {
+            session_id: session,
+        },
+    )
+    .await
+    {
+        Ok(Response::SessionLanes { live }) => Some(live.into_iter().collect()),
+        Ok(other) => {
+            tracing::debug!(
+                ?other,
+                "the credential broker answered a lane listing with something else"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::debug!(%error, "no credential broker answered; lane state is unknown");
+            None
         }
     }
 }
@@ -517,9 +607,9 @@ pub async fn register_approved(
             }))
         }
         Response::Failed { error } => Err(Error::Refused(error)),
-        Response::Revoked { .. } | Response::SessionRevoked { .. } => {
-            Err(Error::Protocol("a revocation"))
-        }
+        Response::Revoked { .. }
+        | Response::SessionRevoked { .. }
+        | Response::SessionLanes { .. } => Err(Error::Protocol("a revocation")),
     }
 }
 
@@ -992,5 +1082,73 @@ mod tests {
             assert_eq!(revoke_session(session(9)).await.unwrap(), 0);
         })
         .await;
+    }
+
+    /// R7.1: the lane a box can actually reach reports live, and one the same
+    /// session never registered reports dead rather than sharing its fate.
+    #[tokio::test]
+    async fn a_lane_the_broker_still_holds_reports_live_and_an_unregistered_one_reports_dead() {
+        with_broker(|_broker| async move {
+            let _registration = register_lane(session(1), "anthropic", "KEY_A", "sk-live").await;
+
+            let live = live_lanes(session(1)).await;
+            assert_eq!(LaneState::of(live.as_ref(), "anthropic"), LaneState::Live);
+            assert_eq!(LaneState::of(live.as_ref(), "github-mcp"), LaneState::Dead);
+        })
+        .await;
+    }
+
+    /// The state a restarted daemon or VM leaves behind — its registrations
+    /// died with it while the session lived on — reached here by the one path
+    /// a test can drive deterministically.
+    #[tokio::test]
+    async fn a_lane_whose_registration_is_gone_reports_dead_while_another_sessions_stays_live() {
+        with_broker(|_broker| async move {
+            let _doomed = register_lane(session(1), "anthropic", "KEY_A", "sk-doomed").await;
+            let _kept = register_lane(session(2), "anthropic", "KEY_B", "sk-kept").await;
+            assert_eq!(revoke_session(session(1)).await.unwrap(), 1);
+
+            let doomed = live_lanes(session(1)).await;
+            assert_eq!(LaneState::of(doomed.as_ref(), "anthropic"), LaneState::Dead);
+            let kept = live_lanes(session(2)).await;
+            assert_eq!(LaneState::of(kept.as_ref(), "anthropic"), LaneState::Live);
+        })
+        .await;
+    }
+
+    /// The broker is best-effort — its supervisor warns and continues if it
+    /// will not start — so a host with none is ordinary, and must render as
+    /// "nothing is known" rather than failing the command or claiming every
+    /// lane is dead.
+    #[tokio::test]
+    async fn an_absent_broker_leaves_a_lane_unknown_rather_than_dead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = ENV_LOCK.lock().await;
+        // SAFETY: the lock serializes this against every other test reading the
+        // variable, and it is restored before returning. The directory is real
+        // but empty, so the control socket resolves and simply is not there.
+        unsafe { std::env::set_var(credlane::server::RUNTIME_DIR_ENV, tmp.path()) };
+
+        let live = live_lanes(session(1)).await;
+        assert!(live.is_none(), "an absent broker answers nothing");
+        assert_eq!(
+            LaneState::of(live.as_ref(), "anthropic"),
+            LaneState::Unknown
+        );
+
+        // SAFETY: as above — still under `_guard`.
+        unsafe { std::env::remove_var(credlane::server::RUNTIME_DIR_ENV) };
+    }
+
+    /// The table and `--json` must not drift into two vocabularies for one
+    /// state; the JSON form is the string the column shows.
+    #[test]
+    fn a_lane_state_serializes_as_the_word_the_table_prints() {
+        for state in [LaneState::Live, LaneState::Dead, LaneState::Unknown] {
+            assert_eq!(
+                serde_json_lenient::to_string(&state).unwrap(),
+                format!("\"{}\"", state.as_str())
+            );
+        }
     }
 }
