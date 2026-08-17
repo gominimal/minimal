@@ -337,6 +337,10 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // Same first-class orientation field as an activate: a `--keep`
     // task session is attachable later, and its banner should orient
     // too.
+    // Size the later `FinalizeSession` deadline to the composition's
+    // `on_activate` hook timeouts, read while the loadouts are still in hand.
+    let finalize_hook_budget = crate::loadouts::activate_hook_budget(&active, &utf8_path, true);
+
     let (contribution, user_policy) =
         crate::loadouts::compose_user_contribution(active, user_policy, compose_options, true)?;
 
@@ -512,8 +516,14 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 
     collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
     collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
-    if let Err(e) =
-        crate::upload_and_finalize(&mut client, id, &collected_patches, &hook_scripts).await
+    if let Err(e) = crate::upload_and_finalize(
+        &mut client,
+        id,
+        &collected_patches,
+        &hook_scripts,
+        finalize_hook_budget,
+    )
+    .await
     {
         crate::best_effort_destroy(&mut client, id).await;
         return Err(e);

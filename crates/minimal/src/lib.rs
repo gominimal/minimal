@@ -1627,11 +1627,17 @@ async fn best_effort_destroy(client: &mut client::Client, session_id: sessions::
 /// upload's ready-marker: a session must not become attachable while
 /// either its patches or its hook scripts are still missing from the
 /// daemon.
+///
+/// `hook_budget` is the summed declared timeout of the composition's
+/// `on_activate` hooks, which the daemon runs inside `FinalizeSession`;
+/// the call's deadline is extended by it so a hook declaring more than the
+/// base RPC timeout is not cut short.
 async fn upload_and_finalize(
     client: &mut client::Client,
     session_id: sessions::SessionId,
     patches: &[(std::path::PathBuf, paths::SandboxRelPath)],
     hook_scripts: &[sessions::client::hookscripts::StagedScript],
+    hook_budget: std::time::Duration,
 ) -> Result<(), anyhow::Error> {
     client
         .upload_patches(session_id, patches)
@@ -1645,7 +1651,10 @@ async fn upload_and_finalize(
 
     use minimald_rpc::{FinalizeSession, FinalizeSessionRequest};
     let resp = client
-        .oneshot_rpc::<FinalizeSession>(FinalizeSessionRequest { session_id })
+        .oneshot_rpc_with_hook_budget::<FinalizeSession>(
+            FinalizeSessionRequest { session_id },
+            hook_budget,
+        )
         .await
         .context("FinalizeSession RPC failed")?;
     match resp {
@@ -1932,6 +1941,11 @@ async fn activate_session(
     if !args.no_hooks {
         loadouts::check_project_hooks(&utf8_path)?;
     }
+
+    // The daemon runs the composition's `on_activate` hooks inside
+    // `FinalizeSession`; size that call's deadline to their summed declared
+    // timeouts, computed here while the loadouts are still in hand.
+    let finalize_hook_budget = loadouts::activate_hook_budget(&active, &utf8_path, !args.no_hooks);
 
     let (contribution, user_policy) =
         loadouts::compose_user_contribution(active, user_policy, compose_options, !args.no_hooks)?;
@@ -2227,7 +2241,15 @@ async fn activate_session(
     // are exact matches (same source), so collapsing is safe.
     collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
     collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
-    if let Err(e) = upload_and_finalize(&mut client, id, &collected_patches, &hook_scripts).await {
+    if let Err(e) = upload_and_finalize(
+        &mut client,
+        id,
+        &collected_patches,
+        &hook_scripts,
+        finalize_hook_budget,
+    )
+    .await
+    {
         // Best-effort teardown: the session is stuck in
         // Materializing on the daemon. Destroy it so the operator's
         // `min ls` doesn't fill with half-finalized sessions.
