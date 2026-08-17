@@ -593,6 +593,89 @@ pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `struct fstrim_range` as `FITRIM` takes it: the byte range to discard and
+/// the minimum extent worth discarding. The kernel writes back `len` with the
+/// number of bytes it actually discarded, which is the only report of what a
+/// trim reclaimed.
+///
+/// `start` and `minlen` are read by the kernel through the pointer we hand it,
+/// which rustc cannot see — hence the `dead_code` waiver rather than a shape
+/// that omits them. The struct's layout *is* the contract; dropping a field
+/// would change the `FITRIM` request code below and the kernel's decode of it.
+#[repr(C)]
+#[allow(dead_code)]
+struct FstrimRange {
+    start: u64,
+    len: u64,
+    minlen: u64,
+}
+
+/// `FITRIM`, encoded as `_IOWR('X', 121, struct fstrim_range)`.
+///
+/// Computed rather than hardcoded so the derivation is auditable: the
+/// asm-generic `_IOC` layout is `dir << 30 | size << 16 | type << 8 | nr`,
+/// with `_IOWR`'s direction being read|write = 3. Every Linux target this
+/// daemon is built for (x86_64, aarch64) uses that layout; the four
+/// architectures that don't (mips, powerpc, sparc, alpha) are not targets.
+///
+/// Typed `u32` and cast at the call site: glibc's `ioctl` takes the request as
+/// `c_ulong` and musl's as `c_int`, and this daemon is built against both (the
+/// guest initramfs is static musl).
+const FITRIM: u32 =
+    (3 << 30) | ((size_of::<FstrimRange>() as u32) << 16) | ((b'X' as u32) << 8) | 121;
+
+/// Discard the free blocks of the filesystem mounted at `mountpoint`, returning
+/// the bytes the kernel reports having discarded.
+///
+/// This is the half of steady-state maintenance that reaches the *host*.
+/// Deleting files inside the guest frees ext4 blocks but writes nothing to the
+/// backing image, which is mounted without `discard`
+/// ([`mount_state_volume`]) and so is a high-water mark of every block ever
+/// written. `FITRIM` issues virtio UNMAP for the freed extents, which libkrun's
+/// virtio-blk turns into a hole-punch on the host image. Without it a sweep
+/// reclaims nothing the user can see.
+///
+/// `syncfs(2)` runs first: freshly-deleted extents are not free until the
+/// journal commits, so trimming straight after a sweep otherwise reports far
+/// less than the sweep released.
+///
+/// Safe to run on a live filesystem — `FITRIM` is the online-discard ioctl —
+/// but it takes ext4's block-group locks as it walks, so callers schedule it
+/// against idle time rather than contending with a build. The daemon's caller
+/// is the `maintenance` actor, which runs it behind the cache clean.
+///
+/// Blocking, and unbounded: the walk is proportional to the filesystem, not to
+/// what the clean freed. Callers on an async runtime owe it a blocking thread.
+pub fn trim_state_volume(mountpoint: &str) -> std::io::Result<u64> {
+    use std::os::fd::AsRawFd;
+
+    let dir = std::fs::File::open(mountpoint)?;
+    // SAFETY: `syncfs(2)` on a valid open fd; blocks until dirty pages and
+    // journal entries of the containing filesystem reach the block device, so
+    // the extents this sweep just freed are actually free before we walk them.
+    if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // `len: u64::MAX` asks for the whole device; the kernel clamps it to the
+    // filesystem size. `minlen: 0` takes the driver's own granularity rather
+    // than imposing one — the point here is to return as much as the backing
+    // image can reclaim, not to skip small extents.
+    let mut range = FstrimRange {
+        start: 0,
+        len: u64::MAX,
+        minlen: 0,
+    };
+    // SAFETY: `FITRIM` on a valid open fd for a mounted filesystem, with a
+    // pointer to a live, correctly-shaped `fstrim_range` the kernel both reads
+    // and writes back through.
+    if unsafe { libc::ioctl(dir.as_raw_fd(), FITRIM as _, &raw mut range) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // The kernel overwrites `len` with the bytes it discarded.
+    Ok(range.len)
+}
+
 /// Take the microVM down, by resetting it. Does not return on success: the
 /// guest resets, and libkrun's VMM exits with it. On failure it returns the
 /// `reboot(2)` error.
@@ -1197,6 +1280,17 @@ fn mount_if_absent(target: &str, source: &str, fstype: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The derivation in [`FITRIM`] must land on the number the kernel
+    /// actually decodes. `0xc018_5879` is the value every asm-generic Linux
+    /// arch has for `_IOWR('X', 121, struct fstrim_range)`; if the struct ever
+    /// changed shape the size field would move and the ioctl would be a
+    /// different, unrelated request.
+    #[test]
+    fn the_fitrim_request_code_matches_the_kernels() {
+        assert_eq!(size_of::<FstrimRange>(), 24, "three u64s, no padding");
+        assert_eq!(FITRIM, 0xc018_5879);
+    }
 
     /// Small drift is left alone: the host sends every 60s, and stepping the
     /// clock for sub-threshold noise would rewrite it on every update.
