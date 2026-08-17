@@ -24,5 +24,10 @@ walkdir.workspace = true
 indoc.workspace = true
 tempfile.workspace = true
 
+[lints.rust]
+# `cfg(kani)` gates the proof harnesses in core/policy.rs; declare it so
+# stable rustc's unexpected_cfgs lint accepts the attribute.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

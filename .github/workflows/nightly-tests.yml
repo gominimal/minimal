@@ -363,6 +363,36 @@ jobs:
           shared-key: nightly-canary
           save-if: "false"
 
+  kani-canary:
+    # The Kani-version canary: run the proof suite (scripts/kani.sh, the exact
+    # invocation the ci-kani PR lane runs) against the LATEST kani-verifier
+    # instead of the lane's exact 0.67.0 pin. Catches solver/output drift ahead
+    # of a pin bump, and signals when Kani ships a bundled toolchain >= the
+    # workspace rust-version floor — the moment kani.sh's scratch-copy MSRV
+    # workaround gets deleted. Non-blocking (the pin is the gate), so a Kani
+    # release cannot trip `notify`; read failures in the run itself.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          # Own cache class, and never write: latest-Kani artifacts must not
+          # poison the pinned lane's `kani` cache class (this scheduled run is
+          # on main, where the default save-if would be true).
+          shared-key: kani-canary
+          save-if: "false"
+      - name: Install latest Kani (unpinned on purpose)
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+          cargo kani --version
+      - name: Run proofs (latest Kani)
+        run: ./scripts/kani.sh
+
   macos-e2e:
     # macOS/HVF VM smoke nightly — closes the docs/ci-strategy.md §9 "both
     # platforms" row (the Linux/KVM soak above is the other half). Reuses the

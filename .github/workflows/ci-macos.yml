@@ -210,7 +210,30 @@ jobs:
         # RUN_MACOS_CI is the kill-switch repo variable for taking the mini
         # offline; a skipped e2e reads as `skipped`, which the aggregator
         # treats as pass.
-        if: ${{ vars.RUN_MACOS_CI != 'false' && (github.event_name != 'pull_request' || needs.changes.outputs.macos == 'true') }}
+        #
+        # FORK GUARD — the head-repo check is load-bearing SECURITY, not a
+        # filter. This repo is PUBLIC and this job runs on a self-hosted
+        # runner: a physical Mac mini on a home network, reused across jobs
+        # rather than torn down. Without this condition, anyone can open a PR
+        # from a fork and execute arbitrary code on that machine — GitHub's own
+        # docs say not to pair self-hosted runners with public repos for
+        # exactly this reason. `permissions: contents: read` and using no
+        # secrets limit what a run can STEAL; they do nothing about what it can
+        # RUN, or what it can leave behind on a persistent host.
+        #
+        # Deliberately expressed here rather than relying on the repo's
+        # "require approval for fork PRs" setting: that setting exempts anyone
+        # with a previously-merged PR, is invisible in review, and silently
+        # reverts to the org default. This line is versioned, reviewable, and
+        # fails closed.
+        #
+        # Fork PRs get `skipped`, which the ci-macos-success aggregator counts
+        # as pass, so this does not wedge the required check.
+        if: >-
+            ${{ vars.RUN_MACOS_CI != 'false'
+            && (github.event_name != 'pull_request'
+                || (needs.changes.outputs.macos == 'true'
+                    && github.event.pull_request.head.repo.full_name == github.repository)) }}
         needs: [changes, artifacts, unit]
         runs-on: [self-hosted, macOS, ARM64]
         timeout-minutes: 30

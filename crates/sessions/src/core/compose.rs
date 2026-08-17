@@ -2852,6 +2852,48 @@ mod tests {
             assert!(matches!(err, ComposeError::Denied { .. }), "got: {err:?}");
         }
 
+        /// Mirror of the test above: the LINK path is denied while the
+        /// TARGET it resolves to is allowed. This is the sole live-fire
+        /// coverage of the link-path arm of the dual check at
+        /// `policy.rs` `check()` — mutation testing (Kani PR #1217
+        /// review) showed that deleting that arm passes the whole suite
+        /// AND all lattice proofs: the proofs discharge the combine
+        /// algebra, not the wiring that feeds it.
+        #[cfg(unix)]
+        #[test]
+        fn symlink_link_denied_wins_over_allowed_target() {
+            let tmp = tempfile::tempdir().unwrap();
+            let canonical = std::fs::canonicalize(tmp.path()).unwrap();
+            let root = Utf8Path::from_path(&canonical).unwrap().to_path_buf();
+            let allowed_dir = root.join("allowed_dir");
+            let denied_dir = root.join("denied_dir");
+            std::fs::create_dir_all(allowed_dir.as_std_path()).unwrap();
+            std::fs::create_dir_all(denied_dir.as_std_path()).unwrap();
+            let target_file = allowed_dir.join("innocent");
+            std::fs::write(target_file.as_std_path(), "fine").unwrap();
+            let link_file = denied_dir.join("route");
+            symlink(target_file.as_std_path(), link_file.as_std_path());
+
+            let patch = Patch::new(
+                format!("{denied_dir}/**"),
+                PatchDest::try_new("etc").unwrap(),
+            );
+            let pp = ProvenancedPatch::new(patch, project_source());
+            let policy = PatchesPolicy::empty().with_deny([format!("{denied_dir}/**")]);
+            let err = gate_patches(
+                vec![pp],
+                policy,
+                Some(&PassThroughHook),
+                ComposeOptions {
+                    follow_symlinks: true,
+                },
+                &[],
+                None,
+            )
+            .unwrap_err();
+            assert!(matches!(err, ComposeError::Denied { .. }), "got: {err:?}");
+        }
+
         #[cfg(unix)]
         #[test]
         fn follow_symlinks_on_normal_file_uses_target_only() {
