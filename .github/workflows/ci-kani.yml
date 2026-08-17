@@ -51,11 +51,16 @@ jobs:
                       kani:
                         - "crates/rcache/**"
                         - "crates/sessions/**"
+                        # In the current proof closure: the rcache record
+                        # harnesses construct SpecHash::from_bytes and
+                        # serialize via as_bytes. Direct spec-hash codec
+                        # proofs are #1109 set #6 (hash-epoch work).
                         - "crates/common/src/spec_hash.rs"
                         - ".github/workflows/ci-kani.yml"
                         - "justfile"
                         - "Cargo.toml"
                         - "Cargo.lock"
+                        - "scripts/kani.sh"
 
     kani:
         needs: [changes]
