@@ -251,3 +251,113 @@ mod tests {
         assert_eq!(a.sha256(&h(3)), Some([0x33; 32]));
     }
 }
+
+/// Kani proof harnesses for the untrusted-bytes record codec
+/// (gominimal/minimal#1109, harness set 1).
+///
+/// `index.shisha` bytes come from storage the signed-index design (#86)
+/// exists *because* we don't trust — bucket, CDN, or mirror. These
+/// harnesses prove, for **every** input within the stated bounds (not a
+/// fuzzer's sample of them), that the 68-byte record codec — the layer
+/// that actually touches hostile bytes — is safe and lossless:
+///
+///   * decoding an arbitrary record, at any truncation, never panics
+///     and never reads out of bounds — `read_wire_kv` returns `Ok` or
+///     `Err`, only;
+///   * a nonzero `flags` field always surfaces as `Err` (the format's
+///     sole forward-compat hook actually fires), and it fires *before*
+///     the sha256 bytes are consumed;
+///   * encode→decode round-trips every record exactly, emitting
+///     precisely [`WIRE_RECORD_LEN`] bytes with zero flags — so
+///     serialized output can never trip the flags gate.
+///
+/// **Deliberately record-level, not file-level.** `IndexFile` composes
+/// this codec through a `BTreeMap`, and symbolic 32-byte keys inside
+/// std collections are a classic bounded-model-checking blow-up (the
+/// first cut of these harnesses OOM'd CBMC); std's `BTreeMap` is also
+/// not our proof obligation. The division of labor: Kani proves the
+/// codec **totally**, the `index_file` fuzz/unit coverage samples the
+/// file-level composition (`from_reader`, `merge`, canonical ordering
+/// — see the `#[cfg(test)]` module and the rcache fuzz target).
+///
+/// No `blake3` stubbing is needed: nothing here ever invokes the
+/// compression function — `SpecHash`/`blake3::Hash` act purely as an
+/// inert `[u8; 32]` wrapper.
+///
+/// Run: `cargo kani -p rcache` (or `just kani`, or `scripts/kani.sh`).
+/// Kani pinned at 0.67.0 in CI — older releases give spurious failures
+/// on arrays > 64 elements (kani#2416/#4408), and one wire record is
+/// 68 bytes.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    use std::io::Cursor;
+
+    const RECORD: usize = WIRE_RECORD_LEN as usize;
+
+    /// Decoding an arbitrary record at any truncation never panics,
+    /// and succeeds IFF the input is one full record with zero flags —
+    /// stated as an iff so neither arm can silently become unreachable
+    /// (a one-sided `Ok =>` postcondition still "verifies" when a
+    /// changed reader makes `Ok` impossible; mutation-tested). On
+    /// success exactly the whole record was consumed — the property
+    /// the callers' `len % 68 == 0` arithmetic silently relies on.
+    #[kani::proof]
+    fn read_record_never_panics() {
+        let bytes: [u8; RECORD] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= RECORD);
+        let mut cur = Cursor::new(&bytes[..len]);
+        let res = read_wire_kv(&mut cur);
+        let full_and_zero_flags =
+            len == RECORD && bytes[32] == 0 && bytes[33] == 0 && bytes[34] == 0 && bytes[35] == 0;
+        assert_eq!(res.is_ok(), full_and_zero_flags);
+        if res.is_ok() {
+            assert_eq!(cur.position(), WIRE_RECORD_LEN);
+        }
+    }
+
+    /// The flags forward-compat gate always fires: any record whose 4
+    /// flag bytes are not all zero fails to decode — and fails at the
+    /// flags field (position 36), before the sha256 bytes are consumed.
+    #[kani::proof]
+    fn nonzero_flags_always_rejected() {
+        let bytes: [u8; RECORD] = kani::any();
+        kani::assume(bytes[32] != 0 || bytes[33] != 0 || bytes[34] != 0 || bytes[35] != 0);
+        let mut cur = Cursor::new(&bytes[..]);
+        assert!(read_wire_kv(&mut cur).is_err());
+        assert_eq!(cur.position(), 36);
+    }
+
+    /// Encode→decode round-trips every record exactly, and the encoded
+    /// form is exactly one 68-byte record with zero flags — so output
+    /// this code writes can never trip the flags gate on read-back.
+    #[kani::proof]
+    fn record_roundtrip_is_exact() {
+        let key: [u8; 32] = kani::any();
+        let sha256: [u8; 32] = kani::any();
+        let k = SpecHash::from_bytes(key);
+        let v = IndexEntry { sha256 };
+
+        let mut out = Vec::new();
+        write_wire_kv(&mut out, &k, &v).expect("Vec write is infallible");
+        // Pin the exact field OFFSETS, not just round-trip equality: a
+        // wire-layout permutation both sides agree on (key and sha256
+        // swapped, say) round-trips fine but breaks every other reader
+        // of index.shisha. Mutation-tested.
+        assert_eq!(out.len(), RECORD);
+        assert_eq!(&out[0..32], &key[..]);
+        assert_eq!(&out[32..36], &[0u8; 4]);
+        assert_eq!(&out[36..68], &sha256[..]);
+
+        let (k2, v2) =
+            read_wire_kv(&mut Cursor::new(&out[..])).expect("own serialization always decodes");
+        // Compare key BYTES, not `SpecHash == SpecHash`: blake3's
+        // `PartialEq` is a constant-time comparison whose
+        // optimization-barrier internals are opaque to the model
+        // checker and yield a spurious counterexample. Byte equality
+        // is the property under proof anyway.
+        assert_eq!(k2.as_bytes(), k.as_bytes());
+        assert_eq!(v2, v);
+    }
+}

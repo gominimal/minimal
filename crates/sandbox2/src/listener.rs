@@ -102,6 +102,8 @@ impl<C: Channel> Drop for Listener<C> {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        std::fs::remove_file(&self.socket_path).unwrap();
+        if let Err(e) = std::fs::remove_file(&self.socket_path) {
+            tracing::warn!("listener socket cleanup failed: {}", e);
+        }
     }
 }
