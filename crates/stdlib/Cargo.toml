@@ -1,6 +1,6 @@
 [package]
 name = "stdlib"
-version = "0.0.19"
+version = "0.0.20"
 rust-version.workspace = true
 license.workspace = true
 edition.workspace = true

@@ -10,7 +10,7 @@ use mfile::{EnvPatches, EnvVarValue, PatchSetting, Upstream};
 use nickel_lang_core::eval::value::{NickelValue, RecordData};
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::position::TermPos;
-use nickel_lang_core::term::IndexMap;
+use nickel_lang_core::term::{IndexMap, RuntimeContract};
 use nickel_lang_core::{
     eval::{Closure, cache::CacheImpl},
     program::Program,
@@ -33,6 +33,8 @@ mod decl_tests;
 pub use decl_tests::Test;
 mod stacks;
 pub use stacks::{PackageMatcherPredicate, Stack, StackMatcher};
+mod container;
+pub use container::{Container, ExposedPort, Proto};
 
 // Increment for any big change to the format of build specs / stacks, so that hash
 // keys get invalidated.
@@ -71,6 +73,7 @@ pub struct Layer {
     pub top_levels: Vec<generational_arena::Index>,
 
     pub stacks: HashMap<String, Stack>,
+    pub containers: HashMap<String, Container>,
 
     read_ids: HashMap<u64, generational_arena::Index>,
 }
@@ -172,6 +175,7 @@ impl Layer {
             read_ids: HashMap::with_capacity(512),
 
             stacks: HashMap::with_capacity(32),
+            containers: HashMap::with_capacity(32),
         };
 
         // The top-level of the nickel tree can either evaluate to:
@@ -204,6 +208,18 @@ impl Layer {
                                     .collect::<Result<Vec<_>, Error>>()?
                                     .into_iter()
                                     .map(|p| (p.name.clone(), p)),
+                            );
+                        }
+                    };
+                    if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("containers")) {
+                        let rt = eval_if_closure(&rt, &mut program)?;
+                        if let Some(a) = rt.as_array() {
+                            layer.containers = HashMap::from_iter(
+                                a.iter()
+                                    .map(|c| layer.ingest_container(c, &mut program))
+                                    .collect::<Result<Vec<_>, Error>>()?
+                                    .into_iter()
+                                    .map(|c| (c.name.clone(), c)),
                             );
                         }
                     };
@@ -262,6 +278,14 @@ impl Layer {
         program: &mut Program<CacheImpl>,
     ) -> Result<Stack, Error> {
         Stack::from_term(rt, program)
+    }
+
+    fn ingest_container(
+        &mut self,
+        rt: &NickelValue,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<Container, Error> {
+        Container::from_term(rt, program)
     }
 }
 
@@ -325,6 +349,7 @@ pub enum ObjTy {
     Upstream,
     Test,
     Stack,
+    Container,
 }
 
 pub(crate) fn read_ty(val: &NickelValue, program: &mut Program<CacheImpl>) -> Result<ObjTy, Error> {
@@ -496,14 +521,27 @@ pub(crate) fn env_vars_from_term(
 }
 
 pub(crate) fn packages_array_from_term(
+    field: &'static str,
     rt: &NickelValue,
     program: &mut Program<CacheImpl>,
 ) -> Result<Vec<String>, Error> {
     let packages_rt = eval_if_closure(rt, program)?;
 
     if let Some(a) = packages_rt.as_array() {
+        // Element contracts are pending on the array; without applying them a
+        // non-string entry reaches `String::deserialize` and panics.
+        let pending = a.iter_pending_contracts().cloned().collect::<Vec<_>>();
         a.iter()
-            .map(|input| Ok(String::deserialize(eval_if_closure(input, program)?).unwrap()))
+            .map(|input| {
+                let input = RuntimeContract::apply_all(
+                    input.clone(),
+                    pending.iter().cloned(),
+                    input.pos_idx(),
+                );
+                let input = eval_if_closure(&input, program)?;
+                String::deserialize(input)
+                    .map_err(|_| Error::Other(format!("`{field}` must be a list of package names")))
+            })
             .collect::<Result<Vec<_>, Error>>()
     } else {
         todo!("handle packages value being non-array {:?}", packages_rt);
@@ -840,7 +878,7 @@ mod tests {
         let layer = Layer::new_for_test(
             indoc! {
                 "
-                let {layer, stack, BuildSpec, ..} = import \"minimal.ncl\" in
+                let {layer, stack, container, BuildSpec, ..} = import \"minimal.ncl\" in
 
                 layer {
                   builds = [
@@ -861,6 +899,16 @@ mod tests {
                         },
 
                         build_cmd = [\"uwu\", \"build\"],
+                    }
+                  ],
+
+                  containers = [
+                    container {
+                        name = \"owo\",
+                        packages = [\"glibc\", \"nginx\"],
+
+                        entrypoint = \"/usr/bin/nginx\",
+                        exposed_ports = [{ port = 80 }],
                     }
                   ],
                 }
@@ -894,6 +942,19 @@ mod tests {
                 build_cmds: Some(vec![vec!["uwu".to_string(), "build".to_string()]]),
                 matches_project_if_any: None,
                 matches_project_priority: 0,
+            }),
+        );
+        assert_eq!(
+            layer.containers.get("owo"),
+            Some(&Container {
+                name: "owo".to_string(),
+                packages: vec!["glibc".to_string(), "nginx".to_string()],
+                entrypoint: Some(vec!["/usr/bin/nginx".to_string()]),
+                exposed_ports: vec![ExposedPort {
+                    proto: Proto::Tcp,
+                    port: 80
+                }],
+                ..Default::default()
             }),
         );
     }
