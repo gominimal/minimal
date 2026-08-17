@@ -223,8 +223,8 @@ per-kind summary of what it contributes:
 
 ```
   NAME   DESCRIPTION                     CONTRIBUTES
-* dev    helix + zellij with my dotfiles 2 pkg / 2 var / 2 patch / 1 hook
-  extra                                  1 pkg / 0 var / 0 patch / 0 hook
+* dev    helix + zellij with my dotfiles 2 pkg / 1 var / 2 patch
+  extra                                  1 pkg / 0 var / 0 patch
 
 * default (from `[loadouts].default_loadouts`)
 ```
