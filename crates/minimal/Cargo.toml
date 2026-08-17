@@ -45,7 +45,6 @@ camino.workspace = true
 chrono.workspace = true
 diagnostics.workspace = true
 dirs.workspace = true
-indicatif.workspace = true
 nix.workspace = true
 mctx.workspace = true
 mfile.workspace = true
