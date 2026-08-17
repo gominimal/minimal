@@ -134,6 +134,100 @@ impl DeltaSource {
     }
 }
 
+/// Current [`WireBaseline`] format version. A reader that finds any other
+/// version treats the sidecar as unparseable and falls back to a fresh arm.
+const WIRE_BASELINE_VERSION: u32 = 1;
+
+/// On-disk form of a session's arm result: the `delta-baseline.json`
+/// sidecar the session actor persists at first arm and reloads after a
+/// daemon restart, so the shell-exit prompt keeps diffing against the
+/// activation-time snapshot instead of re-walking an already-modified
+/// tree.
+///
+/// The workspace root is deliberately not part of the payload: the loader
+/// rebinds the snapshot to the session's current workspace path, so a
+/// relocated state dir cannot resurrect a stale absolute path.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WireBaseline {
+    version: u32,
+    /// One row per baseline entry, or `None` for an arm that yielded no
+    /// baseline (the walk timed out). Persisting that outcome keeps
+    /// change detection disabled across restarts — the alternative,
+    /// re-arming after a restart, would snapshot a tree the session has
+    /// already modified and misreport it as clean.
+    baseline: Option<Vec<WireSigRow>>,
+}
+
+/// One `(path, signature)` baseline row. A list of rows rather than a
+/// map, so the payload never rides on JSON object-key encoding of
+/// arbitrary paths.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WireSigRow {
+    path: PathBuf,
+    len: u64,
+    mtime: Option<SystemTime>,
+    digest: Option<blake3::Hash>,
+}
+
+/// Serializes an arm result for the sidecar; `None` records a failed arm
+/// verbatim. Errors only on a snapshot JSON cannot represent (a non-UTF-8
+/// path) — persistence is best-effort, and the caller logs and continues
+/// with the in-memory baseline.
+pub(crate) fn to_sidecar_bytes(
+    delta: Option<&Arc<DeltaSource>>,
+) -> Result<Vec<u8>, std::io::Error> {
+    let baseline = delta.map(|d| {
+        d.baseline
+            .iter()
+            .map(|(path, sig)| WireSigRow {
+                path: path.clone(),
+                len: sig.len,
+                mtime: sig.mtime,
+                digest: sig.digest,
+            })
+            .collect()
+    });
+    serde_json_lenient::to_vec(&WireBaseline {
+        version: WIRE_BASELINE_VERSION,
+        baseline,
+    })
+    .map_err(|e| std::io::Error::other(format!("serializing delta baseline: {e}")))
+}
+
+/// Parses a sidecar payload back into an arm result, rebinding the
+/// snapshot to `root`. `Ok(None)` reproduces a persisted failed arm;
+/// `Err` means the payload is unreadable (corrupt, or a future version)
+/// and the caller should fall back to arming afresh.
+pub(crate) fn from_sidecar_bytes(
+    bytes: &[u8],
+    root: PathBuf,
+) -> Result<Option<Arc<DeltaSource>>, std::io::Error> {
+    let wire: WireBaseline = serde_json_lenient::from_slice(bytes)
+        .map_err(|e| std::io::Error::other(format!("parsing delta baseline: {e}")))?;
+    if wire.version != WIRE_BASELINE_VERSION {
+        return Err(std::io::Error::other(format!(
+            "unknown delta baseline version {}",
+            wire.version
+        )));
+    }
+    Ok(wire.baseline.map(|rows| {
+        let baseline = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.path,
+                    Sig {
+                        len: row.len,
+                        mtime: row.mtime,
+                        digest: row.digest,
+                    },
+                )
+            })
+            .collect();
+        Arc::new(DeltaSource { root, baseline })
+    }))
+}
+
 /// Assesses what a destroy of the workspace at `root` would permanently
 /// lose, for the `SessionDelta` RPC.
 ///
@@ -704,5 +798,62 @@ mod tests {
         );
         // Nothing behind the links was walked.
         assert!(!snap.keys().any(|p| p.to_string_lossy().contains("secret")));
+    }
+
+    /// The sidecar round-trip is behavior-preserving: a reloaded baseline
+    /// detects the same changes the original would have — including a
+    /// same-length, mtime-preserving edit, which only survives if the
+    /// content digests came back intact.
+    #[test]
+    fn sidecar_round_trip_preserves_change_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "kept.txt", "same");
+        write(root, "edited.txt", "v1");
+
+        let source = Arc::new(DeltaSource {
+            root: root.to_path_buf(),
+            baseline: snapshot(root).unwrap(),
+        });
+        let bytes = to_sidecar_bytes(Some(&source)).unwrap();
+        let loaded = from_sidecar_bytes(&bytes, root.to_path_buf())
+            .unwrap()
+            .expect("an armed baseline must reload as armed");
+
+        // A same-length edit with the original mtime restored: only the
+        // digest can tell, so this proves digests survived the round-trip.
+        let edited = root.join("edited.txt");
+        let mtime = std::fs::metadata(&edited).unwrap().modified().unwrap();
+        std::fs::write(&edited, "v2").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&edited)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        write(root, "added.txt", "new");
+
+        assert_eq!(
+            diff(&loaded.baseline, &snapshot(root).unwrap()),
+            vec!["A added.txt".to_string(), "M edited.txt".to_string()],
+        );
+    }
+
+    /// A persisted failed arm reloads as a failed arm, and unreadable
+    /// payloads — corrupt bytes or an unknown format version — error so
+    /// the caller can fall back to arming afresh.
+    #[test]
+    fn sidecar_reproduces_failed_arms_and_rejects_unreadable_payloads() {
+        let bytes = to_sidecar_bytes(None).unwrap();
+        assert!(
+            from_sidecar_bytes(&bytes, PathBuf::from("/w"))
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(from_sidecar_bytes(b"not json", PathBuf::from("/w")).is_err());
+        assert!(
+            from_sidecar_bytes(br#"{"version":999,"baseline":null}"#, PathBuf::from("/w")).is_err()
+        );
     }
 }
