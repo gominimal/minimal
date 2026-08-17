@@ -267,6 +267,37 @@ impl Client {
     where
         <R as OneshotSshRpc>::Response: serde::de::DeserializeOwned,
     {
+        self.oneshot_rpc_within::<R>(request, RPC_TIMEOUT).await
+    }
+
+    /// Issue a oneshot RPC whose deadline is [`RPC_TIMEOUT`] plus
+    /// `hook_budget`, for `FinalizeSession`: it runs the composition's
+    /// `on_activate` hooks inside the single round-trip, and those hooks run
+    /// sequentially and without an aggregate budget on the daemon, so the
+    /// call can legitimately take as long as the summed declared hook
+    /// timeouts. The client knows that sum before the call; the base
+    /// [`RPC_TIMEOUT`] still covers the non-hook finalize work (the sandbox
+    /// build), so a zero budget behaves exactly like [`Self::oneshot_rpc`].
+    pub async fn oneshot_rpc_with_hook_budget<R: OneshotSshRpc>(
+        &mut self,
+        request: R::Request<'_>,
+        hook_budget: Duration,
+    ) -> Result<R::Response, anyhow::Error>
+    where
+        <R as OneshotSshRpc>::Response: serde::de::DeserializeOwned,
+    {
+        self.oneshot_rpc_within::<R>(request, RPC_TIMEOUT + hook_budget)
+            .await
+    }
+
+    async fn oneshot_rpc_within<R: OneshotSshRpc>(
+        &mut self,
+        request: R::Request<'_>,
+        timeout: Duration,
+    ) -> Result<R::Response, anyhow::Error>
+    where
+        <R as OneshotSshRpc>::Response: serde::de::DeserializeOwned,
+    {
         let rpc = async {
             let mut channel = self
                 .handle
@@ -317,9 +348,9 @@ impl Client {
                 .with_context(|| format!("decode response for {}", R::NAME))
         };
 
-        tokio::time::timeout(RPC_TIMEOUT, rpc)
+        tokio::time::timeout(timeout, rpc)
             .await
-            .map_err(|_| anyhow::anyhow!("{} RPC timed out after {RPC_TIMEOUT:?}", R::NAME))?
+            .map_err(|_| anyhow::anyhow!("{} RPC timed out after {timeout:?}", R::NAME))?
     }
 
     /// Open a session channel and issue an `exec` request for `command`,

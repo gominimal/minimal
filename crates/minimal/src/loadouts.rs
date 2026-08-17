@@ -5,6 +5,7 @@
 
 use anyhow::{Context as _, bail};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::config::{read_client_config, resolve_minimal_config_dir};
 use crate::{GlobalArgs, LoadoutListArgs};
@@ -322,6 +323,47 @@ pub(crate) fn check_project_hooks(project_root: &camino::Utf8Path) -> Result<(),
     };
     stage_external_scripts(&provenanced, &anchors).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
+}
+
+/// The wall-clock the daemon may spend running `on_activate` hooks inside a
+/// single `FinalizeSession`: the summed declared timeouts of every
+/// activation hook the client can see — the active loadouts' plus the
+/// project's. Setup hooks run sequentially and without an aggregate budget
+/// on the daemon, so this sum bounds the round-trip, and it is known before
+/// the call — which is what lets the `FinalizeSession` deadline be sized to
+/// it so a hook declaring more than the base oneshot timeout can still
+/// finish.
+///
+/// Zero when hooks are disabled or nothing declares an `on_activate`. The
+/// project's `minimal.toml` is read the same way [`check_project_hooks`]
+/// reads it; an unreadable or session-less file contributes nothing.
+pub(crate) fn activate_hook_budget(
+    active: &ActiveLoadouts,
+    project_root: &camino::Utf8Path,
+    hooks_enabled: bool,
+) -> Duration {
+    if !hooks_enabled {
+        return Duration::ZERO;
+    }
+    let loadout: Duration = active
+        .loadouts
+        .iter()
+        .flat_map(|l| l.lifecycle_hooks())
+        .filter_map(|h| h.on_activate())
+        .map(|s| s.timeout())
+        .sum();
+    let project: Duration = mfile::File::from_dir(project_root.as_std_path())
+        .ok()
+        .and_then(|f| f.session)
+        .map(|s| {
+            s.lifecycle_hooks
+                .iter()
+                .filter_map(|h| h.on_activate())
+                .map(|hs| hs.timeout())
+                .sum::<Duration>()
+        })
+        .unwrap_or(Duration::ZERO);
+    loadout + project
 }
 
 /// Compose the resolved [`ActiveLoadouts`] into a
@@ -707,6 +749,41 @@ on_activate = { type = "inline", value = "echo activated" }
         assert_eq!(wire.vars.len(), 1);
         // The orientation rides as a first-class field, never a var.
         assert_eq!(wire.orientation.loadouts_display, "dev");
+    }
+
+    /// A loadout `on_activate` declaring more than the base oneshot RPC
+    /// timeout yields a finalize budget equal to its declared timeout, so
+    /// the `FinalizeSession` deadline (base + budget) clears the point at
+    /// which such a hook was previously cut off. `--no-hooks` zeroes it.
+    #[test]
+    fn activate_hook_budget_reflects_declared_on_activate_timeout() {
+        let loadout: sessions::core::loadout::Loadout = toml::from_str(
+            r#"
+name = "slow"
+
+[[lifecycle_hooks]]
+on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
+"#,
+        )
+        .expect("loadout parses");
+        let active = ActiveLoadouts {
+            loadouts: vec![loadout],
+            builtin_default: false,
+        };
+        // A tempdir with no minimal.toml: the project side contributes
+        // nothing, isolating the loadout hook's declared timeout.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = camino::Utf8Path::from_path(tmp.path()).unwrap();
+
+        assert_eq!(
+            activate_hook_budget(&active, root, true),
+            Duration::from_secs(90),
+        );
+        assert_eq!(
+            activate_hook_budget(&active, root, false),
+            Duration::ZERO,
+            "--no-hooks contributes no budget",
+        );
     }
 
     /// The built-in `default` loadout parses (guarding the `expect` in
