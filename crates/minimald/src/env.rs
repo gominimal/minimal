@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use futures::StreamExt as _;
 use graph::{BuildSpecRef, Graph, SetupForPackages, Transitives};
 use mctx::{AddDepMode, Context, Error};
 use mfile::{EnvPatches, EnvVarValue};
@@ -709,7 +710,32 @@ impl SessionChannel {
                 new_graph.top_levels.push(*bsr);
             }
         }
-        if let Err(e) = self.ctx.build_graph(&new_graph, false, None).await {
+        // Stream build progress back to the client while the graph builds: a
+        // first-time `min add` fetches and extracts its packages right here,
+        // and previously drew nothing while the bytes downloaded. Rendered
+        // through the same `BuildRenderer` as `min build`, so both read
+        // identically; a fully-cached add emits no events and stays quiet.
+        let (log_tx, mut log_rx) = futures::channel::mpsc::unbounded();
+        let build = async {
+            // Reduce the `!Send` error (`mctx::Error` holds nickel `Rc`s) to a
+            // string in the same poll it appears, so `join!` never buffers it
+            // across the render side's awaits — this future runs on the
+            // spawned (`Send`) channel actor.
+            match self.ctx.build_graph(&new_graph, false, Some(log_tx)).await {
+                Ok(()) => None,
+                Err(e) => Some(e.to_string()),
+            }
+        };
+        let render = async {
+            let mut renderer = orchestrator::BuildRenderer::new(false);
+            while let Some(event) = log_rx.next().await {
+                if let Some(line) = renderer.render(event) {
+                    let _ = writeln!(stream, "msg:{}", line.text);
+                }
+            }
+        };
+        let (build_err, ()) = tokio::join!(build, render);
+        if let Some(e) = build_err {
             let _ = writeln!(stream, "error: {e}");
             return;
         }
