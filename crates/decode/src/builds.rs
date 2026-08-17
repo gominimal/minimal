@@ -448,6 +448,7 @@ impl BuildDep {
             | ObjTy::OutputData
             | ObjTy::Profile
             | ObjTy::Stack
+            | ObjTy::Container
             | ObjTy::Layer
             | ObjTy::Test => Err(Error::UnexpectedObject {
                 files: program.files(),

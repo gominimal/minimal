@@ -353,13 +353,18 @@ impl Stack {
                         }
                         "build_packages" => {
                             if let Some(packages_rt) = field.value.as_ref() {
-                                build_packages = Some(packages_array_from_term(packages_rt, program)?);
+                                build_packages =
+                                    Some(packages_array_from_term("build_packages", packages_rt, program)?);
                             }
                             Ok(())
                         }
                         "runtime_packages" => {
                             if let Some(packages_rt) = field.value.as_ref() {
-                                runtime_packages = Some(packages_array_from_term(packages_rt, program)?);
+                                runtime_packages = Some(packages_array_from_term(
+                                    "runtime_packages",
+                                    packages_rt,
+                                    program,
+                                )?);
                             }
                             Ok(())
                         }
@@ -646,6 +651,31 @@ mod tests {
                 ..Default::default()
             }
         )
+    }
+
+    #[test]
+    fn non_string_package_entry_errors() {
+        // Must be an error, not a panic: the array's element contract is
+        // pending until applied.
+        for field in ["build_packages", "runtime_packages"] {
+            let src = format!(
+                "let {{stack, ..}} = import \"minimal.ncl\" in\n\
+                 stack {{ name = \"s\", build_cmd = \"x\", {field} = [1] }}"
+            );
+            let (term, mut program, _origin, _target) =
+                Loader::new(src, None, &LoadOptions::for_test())
+                    .unwrap()
+                    .finish()
+                    .unwrap();
+
+            let err = Stack::from_term(&term, &mut program)
+                .err()
+                .unwrap_or_else(|| panic!("expected `{field} = [1]` to be rejected"));
+            assert!(
+                format!("{err:?}").contains("Nickel") || matches!(err, Error::Other(_)),
+                "unexpected error for `{field}`: {err:?}"
+            );
+        }
     }
 
     #[test]
