@@ -4005,7 +4005,6 @@ dependencies = [
  "clap_complete",
  "diagnostics",
  "dirs",
- "indicatif",
  "inquire",
  "mctx",
  "mfile",
