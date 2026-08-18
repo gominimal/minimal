@@ -478,7 +478,7 @@ enum SessionMessage {
     /// Resize the running host's terminal to `sz` without attaching
     /// (`min dash`'s `SetSessionScreenSize`). A session with no live host
     /// is a no-op; the ack is sent either way.
-    SetHostScreenSize(WinSize, oneshot::Sender<()>),
+    SetHostScreenSize(WinSize, oneshot::Sender<std::io::Result<()>>),
     /// Compose a `Draft` session's loadout from the project config and the
     /// client's wire contribution. `None` finalizes the session (`Active`);
     /// `Some(response)` parks it in `Draft` awaiting a verdict. Refused with
@@ -882,16 +882,15 @@ impl Session {
                 });
             }
             SessionMessage::SetHostScreenSize(sz, r) => {
-                // Best-effort by contract: a session with no live host has
-                // nothing to resize, and a dead host is a no-op rather than an
-                // error — the caller (the TUI's preview) ignores failures.
-                if let SessionInner::Active {
-                    host: Some((h, _)), ..
-                } = &self.inner
-                {
-                    let _ = h.set_screen_size(sz).await;
-                }
-                let _ = r.send(());
+                // A session with no live host has nothing to resize (a no-op);
+                // a live host reports whether its PTY accepted the resize.
+                let res = match &self.inner {
+                    SessionInner::Active {
+                        host: Some((h, _)), ..
+                    } => h.set_screen_size(sz).await,
+                    _ => Ok(()),
+                };
+                let _ = r.send(res);
             }
             SessionMessage::ConfigureLoadout(contribution, r) => {
                 // Honour what the user chose at `min session activate`.
@@ -2315,15 +2314,20 @@ impl SessionHandle {
 
     /// Resizes the running session's terminal to `sz` without attaching
     /// (`min dash`'s `SetSessionScreenSize`). A session with no live host is a
-    /// no-op; a dead actor is likewise, since the resize is best-effort.
-    pub async fn set_screen_size(&self, sz: WinSize) {
+    /// no-op; a dead actor reads as an error.
+    pub async fn set_screen_size(&self, sz: WinSize) -> std::io::Result<()> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
             .0
             .send(SessionMessage::SetHostScreenSize(sz, send))
             .await;
-        let _ = recv.await;
+        recv.await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "session actor is dead",
+            ))
+        })
     }
 
     /// Runs this session's `on_detach` hooks, awaiting them so a departing

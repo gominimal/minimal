@@ -946,7 +946,7 @@ enum Message {
     /// Resize the PTY and parser screen to `sz` without attaching, so a
     /// preview consumer (`min dash`) can match the session's terminal to its
     /// pane. The ack is sent once the size is applied.
-    SetScreenSize(WinSize, oneshot::Sender<()>),
+    SetScreenSize(WinSize, oneshot::Sender<io::Result<()>>),
 
     SetTitleCallback(String),
     VisualBellCallback,
@@ -1197,13 +1197,20 @@ impl HostHandle {
 
     /// Resize the session's PTY and parser screen to `sz` without attaching
     /// (the TUI's Preview pane matching its size to the session's terminal).
-    /// A dead host reads as `Err(())`, matching [`Self::get_attrs`].
-    pub async fn set_screen_size(&self, sz: WinSize) -> Result<(), ()> {
+    /// Reports a PTY resize the kernel refused; a dead host reads as
+    /// [`io::ErrorKind::BrokenPipe`], matching [`Self::get_attrs`]'s dead-host
+    /// error.
+    pub async fn set_screen_size(&self, sz: WinSize) -> io::Result<()> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         match self.sender.send(Message::SetScreenSize(sz, send)).await {
-            Ok(()) => recv.await.map_err(|_| ()),
-            Err(SendError(Message::SetScreenSize(_, _))) => Err(()),
+            Ok(()) => recv
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "session host is dead"))?,
+            Err(SendError(Message::SetScreenSize(_, _))) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session host is dead",
+            )),
             Err(e) => unreachable!("{:?}", e),
         }
     }
@@ -2472,8 +2479,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                         let _ = s.send(self.screen_snapshot());
                     }
                     Message::SetScreenSize(sz, r) => {
-                        self.set_size(sz);
-                        let _ = r.send(());
+                        let _ = r.send(self.set_size(sz));
                     }
                     Message::CommandInSession {
                         program,
@@ -2561,10 +2567,10 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                         };
                     }
                     StdinMsg::TerminalUpdate(sz) => {
-                        self.set_size(WinSize::from(&sz));
+                        self.set_size_best_effort(WinSize::from(&sz));
                     },
                     StdinMsg::WindowChange{ col_width, row_height, pix_height, pix_width } => {
-                        self.set_size(WinSize {
+                        self.set_size_best_effort(WinSize {
                             rows: row_height as u16,
                             cols: col_width as u16,
                             xpixel: pix_width as u16,
@@ -2638,20 +2644,29 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             let _ = old_join_hnd.await;
         }
 
-        self.set_size(sz);
+        self.set_size_best_effort(sz);
 
         // After the binding is installed and sized, so a hook writing to
         // the terminal reaches the client that just attached.
         self.run_hooks_for(crate::hooks::HookEvent::Attach).await;
     }
-    fn set_size(&mut self, sz: WinSize) {
-        // If the terminal size changed, reconfigure the pty.
+    fn set_size(&mut self, sz: WinSize) -> io::Result<()> {
+        // If the terminal size changed, reconfigure the pty. The parser and
+        // `self.sz` only follow a resize the PTY actually accepted, so a
+        // refused resize cannot desync the snapshot from the terminal.
         if sz != self.sz {
-            if let Err(e) = set_winsize(self.master.as_raw_fd(), sz) {
-                tracing::warn!(error = %e, "set_winsize failed, ignoring");
-            }
+            set_winsize(self.master.as_raw_fd(), sz)?;
             self.parser.screen_mut().set_size(sz.rows, sz.cols);
             self.sz = sz;
+        }
+        Ok(())
+    }
+
+    /// Best-effort resize for callers with no result channel (interactive
+    /// stdin resize events): log and drop a `set_winsize` failure.
+    fn set_size_best_effort(&mut self, sz: WinSize) {
+        if let Err(e) = self.set_size(sz) {
+            tracing::warn!(error = %e, "set_winsize failed, ignoring");
         }
     }
 

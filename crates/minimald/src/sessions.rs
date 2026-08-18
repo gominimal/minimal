@@ -507,7 +507,7 @@ impl Manager {
                     };
                     // A session with no live host has nothing to resize.
                     if let Some(h) = self.running.get(&id) {
-                        h.set_screen_size(sz).await;
+                        h.set_screen_size(sz).await?;
                     }
                     Ok::<(), SessionsError>(())
                 })
