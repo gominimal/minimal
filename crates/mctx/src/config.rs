@@ -42,6 +42,18 @@ impl std::error::Error for ConfigError {
 /// bucket. A bare name (no scheme) is treated as a GCS bucket.
 pub const DEFAULT_REMOTE_CACHE_BUCKET: &str = "minimal-staging-cache";
 
+/// Default *read* location: the R2 mirror on the product domain. Cache
+/// reads are immutable, content-addressed, and sha256-verified
+/// client-side, and R2 charges no egress — where the same reads from
+/// the GCS bucket are billed internet egress for every consumer
+/// outside GCP. Writers never use this (writes require the `gs://`
+/// bucket above). An explicitly configured location or the
+/// `MINIMAL_REMOTE_CACHE_URL` env var both take precedence: in-cloud
+/// readers (res-servers) pin `gs://` explicitly for free same-region
+/// reads, and pointing the env var at `gs://minimal-staging-cache` is
+/// the escape hatch back to direct GCS.
+pub const DEFAULT_REMOTE_CACHE_READ_URL: &str = "https://cache.minimal.dev/";
+
 /// Parses a remote-cache location string into (a) the resolved [`AnyUrl`] a
 /// reader fetches from and (b) the GCS bucket name a *writer* would use
 /// (`None` for an HTTPS mirror — you can't write to a read mirror). Accepted:
@@ -180,6 +192,7 @@ impl ConfigBuilder {
     /// Constructs a config object using the given builder.
     pub fn build(self) -> Result<Config, ConfigError> {
         // The one configured cache location (default: the shared GCS bucket).
+        let explicitly_configured = self.remote_cache_url.is_some();
         let remote_cache_url = self
             .remote_cache_url
             .unwrap_or_else(|| DEFAULT_REMOTE_CACHE_BUCKET.to_string());
@@ -187,13 +200,28 @@ impl ConfigBuilder {
         // when it's an HTTPS mirror -> writes error, since you can't write to a
         // read mirror). This also validates the configured value.
         let (_, remote_cache_write_bucket) = parse_remote_cache_url(&remote_cache_url)?;
-        // Reads honour the `MINIMAL_REMOTE_CACHE_URL` env override (for read-only
-        // consumers pointing at an R2 mirror to avoid GCS egress); otherwise the
-        // configured location.
-        let read_raw = std::env::var("MINIMAL_REMOTE_CACHE_URL")
+        // Read-side resolution, in precedence order: the
+        // `MINIMAL_REMOTE_CACHE_URL` env override, then an explicitly
+        // configured location, then the R2 mirror default. Only callers
+        // that configured nothing get the mirror — an explicit
+        // `with_remote_cache_url` (e.g. res-servers pinning `gs://` for
+        // free same-region reads) is honoured for reads AND writes.
+        let env_override = std::env::var("MINIMAL_REMOTE_CACHE_URL")
             .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| remote_cache_url.clone());
+            .filter(|s| !s.trim().is_empty());
+        let (read_raw, read_source) = match (env_override, explicitly_configured) {
+            (Some(url), _) => (url, "env-override"),
+            (None, true) => (remote_cache_url.clone(), "configured"),
+            (None, false) => (
+                DEFAULT_REMOTE_CACHE_READ_URL.to_string(),
+                "default-r2-mirror",
+            ),
+        };
+        // One line of visibility: which source reads use. Selection was
+        // previously silent, which made "is this client actually on the
+        // mirror?" unanswerable from logs (it took GCS access-log
+        // forensics to attribute egress).
+        tracing::info!(url = %read_raw, source = read_source, "remote cache read location");
         let (remote_cache_read, _) = parse_remote_cache_url(&read_raw)?;
 
         Ok(Config {
@@ -415,6 +443,29 @@ mod tests {
             cfg.remote_cache_write_bucket(),
             Some(DEFAULT_REMOTE_CACHE_BUCKET)
         );
+    }
+
+    #[test]
+    fn default_reader_is_the_r2_mirror_writer_stays_gcs() {
+        // The R2-default flip: an unconfigured builder reads from the
+        // mirror but still derives its write bucket from the GCS
+        // default — the read default must never leak into the writer.
+        let cfg = ConfigBuilder::new().build().unwrap();
+        assert_eq!(
+            cfg.remote_cache_write_bucket(),
+            Some(DEFAULT_REMOTE_CACHE_BUCKET)
+        );
+        // Same env guard as the sibling tests.
+        if std::env::var("MINIMAL_REMOTE_CACHE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .is_none()
+        {
+            assert!(
+                matches!(cfg.remote_cache_url(), AnyUrl::Https(_)),
+                "unconfigured reader should default to the R2 mirror"
+            );
+        }
     }
 
     #[test]
