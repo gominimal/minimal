@@ -15,7 +15,7 @@ A Minimal package is available anywhere it is called for:
  - A package declared on a [task](../reference/tasks.md) will always be installed in the environment the task runs.
  - A package declared as an input to a [build spec](../reference/build-specs.md) will always be present in the build sandbox.
  - A package declared on a [stack](./stacks.md) will always be present in the tasks and builds that use the stack.
- - A package declared on a [profile](./profiles.md) will always be present in the tasks that use the profile.
+ - A package declared on a [session](./sessions.md) will always be present in that session.
 
 
 ## Defining packages {#definition}

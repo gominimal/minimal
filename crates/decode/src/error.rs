@@ -57,6 +57,12 @@ pub enum Error {
         needed_by: String,
         current_version: String,
     },
+    /// An attribute value was nested deeper than the supported limit.
+    ///
+    /// Construction is depth-capped at the trust boundary: unbounded nesting
+    /// would otherwise abort the process with an uncatchable stack overflow
+    /// during evaluation instead of surfacing a recoverable error.
+    AttrTooDeep { max_depth: usize },
 }
 
 impl Error {
@@ -116,6 +122,11 @@ impl fmt::Display for Error {
                 f,
                 "stdlib out of date: need={},got={},needed_by={}",
                 need_version, current_version, needed_by
+            ),
+            Error::AttrTooDeep { max_depth } => write!(
+                f,
+                "attribute value nested too deeply: exceeds the maximum depth of {}",
+                max_depth
             ),
         }
     }
@@ -299,6 +310,12 @@ impl Error {
                 writeln!(writer).unwrap();
                 writeln!(writer, "help: try updating your Minimal installation").unwrap();
             }
+            Error::AttrTooDeep { max_depth } => writeln!(
+                writer,
+                "Error: attribute value nested too deeply (maximum depth is {})",
+                max_depth
+            )
+            .unwrap(),
         }
     }
 
