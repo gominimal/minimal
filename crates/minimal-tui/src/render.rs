@@ -29,6 +29,11 @@ pub fn view(model: &mut Model, frame: &mut Frame) {
 
 /// Truncate `s` to at most `w` display columns, appending `…` when cut.
 fn truncate(s: &str, w: usize) -> String {
+    // w == 0 must yield the empty string: the ellipsis alone is one column
+    // and would overflow a zero-width allocation.
+    if w == 0 {
+        return String::new();
+    }
     if UnicodeWidthStr::width(s) <= w {
         return s.to_string();
     }
@@ -777,6 +782,17 @@ mod tests {
         assert_eq!(style.fg, Some(Color::Indexed(1)));
         assert!(style.add_modifier.contains(Modifier::BOLD));
         assert!(style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn truncation_respects_a_zero_width_budget() {
+        assert_eq!(truncate("abc", 0), "");
+        assert_eq!(truncate("", 0), "");
+        // Width 1 has room for the ellipsis itself when the input is cut.
+        assert_eq!(truncate("abc", 1), "…");
+        // pad_truncate inherits the zero-width guard instead of overflowing.
+        assert_eq!(pad_truncate("abc", 0), "");
+        assert_eq!(pad_truncate("", 3), "   ");
     }
 
     #[test]
