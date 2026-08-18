@@ -696,17 +696,25 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
                     )
                 }
             };
-            frame.render_widget(Paragraph::new(line), area);
-            if let Some(status) = &model.status {
+            let status_line = model.status.as_ref().map(|status| {
                 let style = if status.starts_with("error:") {
                     Style::default().fg(Color::Red)
                 } else {
                     Style::default().fg(Color::Cyan)
                 };
+                Line::styled(format!("{status} "), style)
+            });
+            // Reserve the right edge for the status so it can't overdraw
+            // the hints or the filter segment.
+            let status_width = status_line.as_ref().map_or(0, |l| l.width() as u16);
+            let [line_area, status_area] =
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(status_width)])
+                    .areas(area);
+            frame.render_widget(Paragraph::new(line), line_area);
+            if let Some(status_line) = status_line {
                 frame.render_widget(
-                    Paragraph::new(Line::styled(format!("{status} "), style))
-                        .alignment(Alignment::Right),
-                    area,
+                    Paragraph::new(status_line).alignment(Alignment::Right),
+                    status_area,
                 );
             }
         }

@@ -105,6 +105,20 @@ fn filtered() {
 }
 
 #[test]
+fn filtered_with_status() {
+    // The status reserves the footer's right edge; it must not overdraw
+    // the filter segment's controls.
+    let mut model = fixed_model(vec![
+        provider("host", vec![entry(1, Some("api-staging"), "/src/api")]),
+        provider("vm", vec![entry(3, Some("bench"), "/src/bench")]),
+    ]);
+    model.filter.input = "bench".to_string();
+    model.clamp_cursor();
+    model.status = Some("refreshed".to_string());
+    insta::assert_snapshot!(render(&mut model));
+}
+
+#[test]
 fn preview_section_with_screen_snapshot() {
     let mut model = fixed_model(vec![provider(
         "host",
