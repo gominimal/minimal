@@ -253,6 +253,40 @@ fn sidebar_and_info_show_git_context() {
     );
 }
 
+/// A branch name longer than the sidebar truncates with `…` instead of
+/// pushing the network label and activity indicator off the right edge.
+#[test]
+fn sidebar_truncates_a_long_branch() {
+    let mut model = fixed_model(vec![provider(
+        "host",
+        vec![entry_with_git(1, "api", "/src/api", false)],
+    )]);
+    let long_branch = format!("feature/{}", "x".repeat(120));
+    model.providers[0].sessions[0].git.as_mut().unwrap().branch = long_branch;
+    model.details.insert(
+        SessionKey {
+            provider: "host".to_string(),
+            id: id(1),
+        },
+        Detail {
+            record: Some(record(Some("api"), NetworkMode::OwnIp)),
+            policy: None,
+        },
+    );
+    let rendered = render(&mut model);
+    let row = rendered
+        .lines()
+        .find(|l| l.contains('⎇'))
+        .unwrap_or_else(|| panic!("branch row missing:\n{rendered}"));
+    assert!(row.contains('…'), "branch must be truncated: {row}");
+    assert!(
+        !row.contains(&"x".repeat(20)),
+        "full branch must not fit: {row}"
+    );
+    // The right-aligned cells survive truncation.
+    assert!(row.contains("OwnIp"), "network label clipped: {row}");
+}
+
 /// A session with fresh stdout renders its activity spinner in the sidebar
 /// (TestBackend text, not a stored snapshot — the glyph is what matters).
 #[test]

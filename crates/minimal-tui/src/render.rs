@@ -27,13 +27,10 @@ pub fn view(model: &mut Model, frame: &mut Frame) {
     render_footer(model, frame, footer);
 }
 
-/// Truncate `s` to at most `w` display columns (appending `…` when cut), or
-/// pad it with trailing spaces to exactly `w`. Widths are terminal display
-/// widths, so CJK/emoji session names don't misalign the sidebar.
-fn pad_truncate(s: &str, w: usize) -> String {
-    let width = UnicodeWidthStr::width(s);
-    if width <= w {
-        return format!("{s}{}", " ".repeat(w - width));
+/// Truncate `s` to at most `w` display columns, appending `…` when cut.
+fn truncate(s: &str, w: usize) -> String {
+    if UnicodeWidthStr::width(s) <= w {
+        return s.to_string();
     }
     let budget = w.saturating_sub(1);
     let mut used = 0;
@@ -48,6 +45,15 @@ fn pad_truncate(s: &str, w: usize) -> String {
         })
         .collect();
     format!("{cut}…")
+}
+
+/// Truncate `s` to at most `w` display columns (appending `…` when cut), or
+/// pad it with trailing spaces to exactly `w`. Widths are terminal display
+/// widths, so CJK/emoji session names don't misalign the sidebar.
+fn pad_truncate(s: &str, w: usize) -> String {
+    let out = truncate(s, w);
+    let pad = w.saturating_sub(UnicodeWidthStr::width(out.as_str()));
+    format!("{out}{}", " ".repeat(pad))
 }
 
 fn render_sidebar(model: &mut Model, frame: &mut Frame, area: Rect) {
@@ -147,13 +153,20 @@ fn render_sidebar(model: &mut Model, frame: &mut Frame, area: Rect) {
                 let marker = if selected { "▸ " } else { "  " };
                 // Branch segment (` ⎇ feature` + two-space gutter) only
                 // when the daemon answered git info; skipping it entirely
-                // keeps the no-git layout byte-identical to before.
+                // keeps the no-git layout byte-identical to before. Cap it
+                // to whatever the row can spare after the right-aligned
+                // network/indicator block, so a long branch name truncates
+                // instead of pushing those cells off the right edge.
+                let right = format!("{net} {indicator:>2}");
+                let max_branch_width =
+                    inner_width.saturating_sub(UnicodeWidthStr::width(right.as_str()) + 2);
                 let branch = entry
                     .git
                     .as_ref()
                     .map(|g| format!(" ⎇ {}", g.branch))
+                    .filter(|_| max_branch_width > UnicodeWidthStr::width(" ⎇ "))
+                    .map(|b| truncate(&b, max_branch_width))
                     .unwrap_or_default();
-                let right = format!("{net} {indicator:>2}");
                 let right_w = UnicodeWidthStr::width(right.as_str())
                     + if branch.is_empty() {
                         0
