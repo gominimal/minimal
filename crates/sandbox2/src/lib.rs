@@ -16,13 +16,18 @@ pub use config::NetworkMode;
 pub mod network;
 pub use network::{AttachFuture, HostNet, NetGuard, Network, NetworkError, NoNet};
 use std::fs::{self, Permissions};
-use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::io::Read;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 pub mod error;
-use crate::config::{Invocation, WdSetup};
+#[cfg(target_os = "linux")]
+use crate::config::Invocation;
+use crate::config::WdSetup;
+#[cfg(target_os = "linux")]
 use crate::error::ExecutionError;
 pub use error::Error;
 /// Re-export so downstream crates (e.g. `mctx`) can use the command type
@@ -71,6 +76,7 @@ pub const SESSION_HOME: &str = "home";
 #[derive(Debug)]
 pub struct Sandbox<C: Channel = ()> {
     pub(crate) base_dir: PathBuf,
+    #[cfg(target_os = "linux")]
     pub(crate) state_dir: PathBuf,
     pub(crate) config: Config,
 
@@ -315,6 +321,7 @@ impl<C: Channel> Sandbox<C> {
 
         Ok(Self {
             base_dir,
+            #[cfg(target_os = "linux")]
             state_dir,
             config,
             keep_dir: false,
@@ -324,15 +331,18 @@ impl<C: Channel> Sandbox<C> {
         })
     }
 
+    #[cfg(target_os = "linux")]
     fn needs_lib64_symlink(&self) -> Result<bool, Error> {
         let lib64_p = self.rootfs().join("lib64");
         Ok(!fs::exists(&lib64_p)
             .map_err(|e| Error::IO("checking for lib64 directory", lib64_p, e))?)
     }
+    #[cfg(target_os = "linux")]
     fn needs_lib_symlink(&self) -> Result<bool, Error> {
         let lib_p = self.rootfs().join("lib");
         Ok(!fs::exists(&lib_p).map_err(|e| Error::IO("checking for lib directory", lib_p, e))?)
     }
+    #[cfg(target_os = "linux")]
     fn needs_bin_symlink(&self) -> Result<bool, Error> {
         let bin_p = self.rootfs().join("bin");
         Ok(!fs::exists(&bin_p).map_err(|e| Error::IO("checking for bin directory", bin_p, e))?)
@@ -1192,6 +1202,7 @@ fn locked_mount_flags(path: &Path) -> hakoniwa::MountOptions {
 /// by capability or seccomp policy — but with the fail-closed contract above a
 /// false positive surfaces as a spawn error, never as a silent loss of
 /// isolation.
+#[cfg(target_os = "linux")]
 fn network_namespaces_available() -> bool {
     std::fs::read_to_string("/proc/sys/user/max_net_namespaces")
         .ok()
@@ -1459,6 +1470,7 @@ mod tests {
     /// as `base_dir/state`. The caller relies on this to bind-mount `/state`
     /// into the container at the correct host path.
     #[test]
+    #[cfg(target_os = "linux")]
     fn sandbox_new_derives_state_dir_from_base() {
         let (_tmp, base) = make_base_with_synth();
         let config = Config::new("test-state-default");
@@ -1474,6 +1486,7 @@ mod tests {
     /// `Sandbox::new` must store that path verbatim so the container bind-mounts
     /// the caller's chosen directory rather than an auto-generated one.
     #[test]
+    #[cfg(target_os = "linux")]
     fn sandbox_new_honours_explicit_state_dir() {
         let (_tmp, base) = make_base_with_synth();
         let state_tmp = tempfile::TempDir::new().unwrap();

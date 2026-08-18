@@ -24,11 +24,32 @@ impl Default for AttrValue {
     }
 }
 
+/// Maximum nesting depth accepted when constructing an [AttrValue].
+///
+/// Nickel evaluation forces one level of nesting per recursive call, so an
+/// unbounded config aborts the process with a stack overflow during evaluation
+/// before any error can be returned. Capping construction at the trust boundary
+/// turns hostile or accidental deep nesting into a recoverable error.
+const MAX_ATTR_DEPTH: usize = 128;
+
 impl AttrValue {
     pub(crate) fn from_term(
         rt: &NickelValue,
         program: &mut Program<CacheImpl>,
     ) -> Result<Option<Self>, Error> {
+        Self::from_term_at(rt, program, 0)
+    }
+
+    fn from_term_at(
+        rt: &NickelValue,
+        program: &mut Program<CacheImpl>,
+        depth: usize,
+    ) -> Result<Option<Self>, Error> {
+        if depth > MAX_ATTR_DEPTH {
+            return Err(Error::AttrTooDeep {
+                max_depth: MAX_ATTR_DEPTH,
+            });
+        }
         let rt = eval_if_closure(rt, program)?;
 
         if let Some(s) = rt.as_string() {
@@ -59,7 +80,7 @@ impl AttrValue {
                             val.pos_idx(),
                         );
 
-                        if let Some(value) = AttrValue::from_term(&val, program)? {
+                        if let Some(value) = Self::from_term_at(&val, program, depth + 1)? {
                             map.insert(ident_and_loc.label().to_string(), value);
                         }
                     }
@@ -70,7 +91,7 @@ impl AttrValue {
         if let Some(a) = rt.as_array() {
             return Ok(Some(Self::List(
                 a.iter()
-                    .map(|e| AttrValue::from_term(e, program))
+                    .map(|e| Self::from_term_at(e, program, depth + 1))
                     .collect::<Result<Vec<_>, Error>>()?
                     .into_iter()
                     .flatten()
@@ -89,7 +110,9 @@ impl AttrValue {
         if let Some(ev) = rt.as_enum_variant() {
             return Ok(Some(Self::EnumVariant(
                 ev.tag.into_label(),
-                Box::new(AttrValue::from_term(&ev.arg.clone().unwrap(), program)?.unwrap()),
+                Box::new(
+                    Self::from_term_at(&ev.arg.clone().unwrap(), program, depth + 1)?.unwrap(),
+                ),
             )));
         }
 
@@ -228,6 +251,38 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert!(matches!(&list[0], AttrValue::String(a, _) if a == "a"));
         assert!(matches!(&list[1], AttrValue::String(a, _) if a == "b"));
+    }
+
+    /// Config that nests attribute values past the cap must surface a
+    /// structured [`Error::AttrTooDeep`] rather than aborting the process with a
+    /// stack overflow. Evaluation forces one level per nested list, so the
+    /// assertion runs on a thread with a large stack to guarantee the cap is
+    /// reached and reported before any overflow could occur.
+    #[test]
+    fn nesting_past_cap_errors_instead_of_overflowing() {
+        let depth = MAX_ATTR_DEPTH + 32;
+        let spec = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+
+        // `Error` carries non-`Send` Nickel types, so match inside the worker
+        // and hand back only a `Send` verdict string.
+        let outcome: Result<(), String> = std::thread::Builder::new()
+            .stack_size(128 * 1024 * 1024)
+            .spawn(move || {
+                let (term, mut program, _origin, _target) =
+                    Loader::new(spec, None, &LoadOptions::for_test())
+                        .unwrap()
+                        .finish()
+                        .unwrap();
+                match AttrValue::from_term(&term, &mut program) {
+                    Err(Error::AttrTooDeep { .. }) => Ok(()),
+                    other => Err(format!("expected Error::AttrTooDeep, got {other:?}")),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        outcome.expect("nesting past the cap should return a structured error");
     }
 
     #[test]

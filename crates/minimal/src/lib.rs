@@ -1627,11 +1627,17 @@ async fn best_effort_destroy(client: &mut client::Client, session_id: sessions::
 /// upload's ready-marker: a session must not become attachable while
 /// either its patches or its hook scripts are still missing from the
 /// daemon.
+///
+/// `hook_budget` is the summed declared timeout of the composition's
+/// `on_activate` hooks, which the daemon runs inside `FinalizeSession`;
+/// the call's deadline is extended by it so a hook declaring more than the
+/// base RPC timeout is not cut short.
 async fn upload_and_finalize(
     client: &mut client::Client,
     session_id: sessions::SessionId,
     patches: &[(std::path::PathBuf, paths::SandboxRelPath)],
     hook_scripts: &[sessions::client::hookscripts::StagedScript],
+    hook_budget: std::time::Duration,
 ) -> Result<(), anyhow::Error> {
     client
         .upload_patches(session_id, patches)
@@ -1645,7 +1651,10 @@ async fn upload_and_finalize(
 
     use minimald_rpc::{FinalizeSession, FinalizeSessionRequest};
     let resp = client
-        .oneshot_rpc::<FinalizeSession>(FinalizeSessionRequest { session_id })
+        .oneshot_rpc_with_hook_budget::<FinalizeSession>(
+            FinalizeSessionRequest { session_id },
+            hook_budget,
+        )
         .await
         .context("FinalizeSession RPC failed")?;
     match resp {
@@ -1809,6 +1818,23 @@ fn resolve_upload_root(dir: &camino::Utf8Path) -> Result<camino::Utf8PathBuf, an
     }
 }
 
+/// Counts the lifecycle hooks declared in the project's `[session]` block
+/// at `root`. Zero when there is no mfile there, no `[session]` block, or
+/// the block declares none.
+///
+/// The project's hooks reach the daemon only inside the workspace tree
+/// upload — the daemon composes them from the uploaded `minimal.toml` — so
+/// this count is exactly what a skipped upload would silently discard. A
+/// malformed mfile is already rejected by [`resolve_upload_root`] before
+/// this runs, so any load error here can only mean "no readable hooks to
+/// lose" and maps to zero rather than a second failure surface.
+fn project_lifecycle_hook_count(root: &camino::Utf8Path) -> usize {
+    match mfile::File::from_dir(root.as_std_path()) {
+        Ok(file) => file.session.map_or(0, |s| s.lifecycle_hooks.len()),
+        Err(_) => 0,
+    }
+}
+
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
     activate_session(global, args, true).await
@@ -1915,6 +1941,11 @@ async fn activate_session(
     if !args.no_hooks {
         loadouts::check_project_hooks(&utf8_path)?;
     }
+
+    // The daemon runs the composition's `on_activate` hooks inside
+    // `FinalizeSession`; size that call's deadline to their summed declared
+    // timeouts, computed here while the loadouts are still in hand.
+    let finalize_hook_budget = loadouts::activate_hook_budget(&active, &utf8_path, !args.no_hooks);
 
     let (contribution, user_policy) =
         loadouts::compose_user_contribution(active, user_policy, compose_options, !args.no_hooks)?;
@@ -2028,6 +2059,24 @@ async fn activate_session(
             ) {
                 file_upload::UploadGate::Upload => true,
                 file_upload::UploadGate::SkipHeadless => {
+                    // Skipping the upload means the project's minimal.toml
+                    // never reaches the daemon, so any lifecycle hooks it
+                    // declares are discarded and never run. Refuse loudly
+                    // instead of exiting 0 on a session silently missing
+                    // them; the caller can force the upload or opt out on
+                    // purpose.
+                    let dropped_hooks = project_lifecycle_hook_count(&upload_root);
+                    if dropped_hooks > 0 {
+                        bail!(
+                            "{upload_root} is not a version control repository root, so its \
+                             file upload is being skipped — but its {name} declares \
+                             {dropped_hooks} lifecycle hook(s) that reach the session only \
+                             through that upload. They would be silently dropped and never \
+                             run. Pass `--sync tarball` to upload the project (hooks \
+                             included), or `--sync none` to start without them deliberately.",
+                            name = mfile::MFILE_NAME,
+                        );
+                    }
                     eprintln!(
                         "warning: {upload_root} is not a version control repository root; \
                          skipping file upload (pass --sync tarball to upload anyway)"
@@ -2192,7 +2241,15 @@ async fn activate_session(
     // are exact matches (same source), so collapsing is safe.
     collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
     collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
-    if let Err(e) = upload_and_finalize(&mut client, id, &collected_patches, &hook_scripts).await {
+    if let Err(e) = upload_and_finalize(
+        &mut client,
+        id,
+        &collected_patches,
+        &hook_scripts,
+        finalize_hook_budget,
+    )
+    .await
+    {
         // Best-effort teardown: the session is stuck in
         // Materializing on the daemon. Destroy it so the operator's
         // `min ls` doesn't fill with half-finalized sessions.
@@ -4295,6 +4352,33 @@ mod tests {
         std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
         let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
         assert!(resolve_upload_root(path).is_err());
+    }
+
+    /// A project outside a VCS root that declares lifecycle hooks must be
+    /// detected as hook-carrying, so the headless activation path refuses
+    /// rather than silently dropping the hooks with the skipped tree
+    /// upload. A project with no `[session]` hooks reports zero and keeps
+    /// the quiet skip-and-warn behaviour.
+    #[test]
+    fn project_lifecycle_hook_count_detects_declared_hooks() {
+        let with_hook = tempfile::tempdir().unwrap();
+        std::fs::write(
+            with_hook.path().join(mfile::MFILE_NAME),
+            "[[session.lifecycle_hooks]]\n\
+             on_activate = { type = \"inline\", value = \"echo hi\" }\n",
+        )
+        .unwrap();
+        let root = camino::Utf8Path::from_path(with_hook.path()).expect("temp path is UTF-8");
+        assert_eq!(project_lifecycle_hook_count(root), 1);
+
+        let no_hook = tempfile::tempdir().unwrap();
+        std::fs::write(
+            no_hook.path().join(mfile::MFILE_NAME),
+            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+        )
+        .unwrap();
+        let root = camino::Utf8Path::from_path(no_hook.path()).expect("temp path is UTF-8");
+        assert_eq!(project_lifecycle_hook_count(root), 0);
     }
 
     /// On a VM target the daemon is the guest's pid-1, so an accepted shutdown

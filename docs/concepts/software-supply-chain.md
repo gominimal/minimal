@@ -46,7 +46,7 @@ For readers familiar with Nix/Nixpkgs, package build-specs are similar to Nix de
 
 ## Everything is (composable) configuration
 
-In addition to declaring packages, each software supply chain layer also declares [stacks](./stacks.md) and [profiles](./profiles.md). Each layer inherits the definitions from the layers above it and adds its own on top; defining the same name twice is an error, with one exception: a profile may extend an upstream profile via `from_profile`. Your codebase can use packages from the public registry while defining its own stacks or profiles, and an organization's internal registry can add private packages on top of the public one.
+In addition to declaring packages, each software supply chain layer also declares [stacks](./stacks.md). Each layer inherits the definitions from the layers above it and adds its own on top; defining the same name twice is an error. Your codebase can use packages from the public registry while defining its own stacks, and an organization's internal registry can add private packages on top of the public one.
 
 This composability means you can:
 
