@@ -459,7 +459,14 @@ a typo (`[loadout]` for `[loadouts]`) fails loudly.
 
 The detach chord is configurable. The leader key (the chord that enters
 command mode) and its command-mode subcommand keys live under a
-`[session-keys]` section in the same `config.toml`:
+`[session-keys]` section in the same `config.toml`.
+
+`[session-keys]` is client configuration, not a loadout: unlike everything a
+loadout composes, it is never baked into the session on activation. It is
+read fresh on every attach and negotiated per SSH channel, so each client —
+and each machine attaching to a session it didn't create — brings its own
+chord. The section is documented here only because that is where
+`config.toml` is described.
 
 ```toml
 [session-keys]
@@ -477,6 +484,13 @@ forward = "ctrl-]"
 | `bell_on_leader` | `false` | Ring the terminal bell (BEL `0x07`) on entering command mode. The terminal renders it per its own bell config; minimal picks no modality |
 | `subcommands.detach` | `d` | The command-mode key that detaches the channel |
 | `subcommands.forward` | `ctrl-]` | The command-mode key that verbatim-forwards a leader byte down the PTY (for nested sessions). Defaults to the resolved `leader`, so a double-press forwards |
+
+Key names take one of two forms: `ctrl-<glyph>`, where the glyph is a single
+ASCII character in `@`..`~` (so `ctrl-2` and `ctrl-?` are rejected), or a
+single printable ASCII glyph such as `d`. Only `ctrl-` is configurable;
+`alt-`, `shift-`, `meta-`, and `super-` are rejected. The `ctrl-` prefix is
+case-insensitive and `ctrl-` letters normalise to lowercase, since `Ctrl+a`
+and `Ctrl+A` send the same control code. Plain glyphs are case-sensitive.
 
 The leader is negotiated with the daemon per attach channel — sent as env
 vars alongside `MINIMAL_SESSION_ID` — so two clients with different configs on
