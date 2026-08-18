@@ -2207,6 +2207,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         sz: WinSize,
         channel: Option<Channel<Msg>>,
         control: Option<SessionControl>,
+        delta: Option<Arc<DeltaSource>>,
         archives_dir: std::path::PathBuf,
         session_id: sessions::SessionId,
         composition: Option<Arc<sessions::core::compose::Composition>>,
@@ -2222,6 +2223,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             sz,
             channel,
             control,
+            delta,
             archives_dir,
             session_id,
             composition,
@@ -2243,6 +2245,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         sz: WinSize,
         channel: Option<Channel<Msg>>,
         control: Option<SessionControl>,
+        delta: Option<Arc<DeltaSource>>,
         archives_dir: std::path::PathBuf,
         session_id: sessions::SessionId,
         composition: Option<Arc<sessions::core::compose::Composition>>,
@@ -2250,13 +2253,15 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     where
         L: SessionLauncher<Process = P, Guard = G>,
     {
-        // Baseline the workspace before the process launches, so nothing the
-        // session writes can leak into the "since activation" reference point.
+        // The change-detection baseline (`delta`) is armed once per session and
+        // handed in, so a host rebuilt on reattach keeps the activation-time
+        // reference point rather than re-snapshotting an already-modified
+        // workspace. The root is still kept for the at-risk assessment, whose
+        // VCS mode needs the tree path even when no baseline could be armed.
         let workspace_root = paths.working.as_utf8_path().as_std_path().to_path_buf();
         // Kept before `launch` consumes `paths`.
         let hooks_dir = paths.hooks.clone();
         let workspace_dir = paths.working.clone();
-        let delta = DeltaSource::arm(workspace_root.clone()).await;
 
         // The launcher consumes `name`; the bindings need it too, to name the
         // archives the shell-exit prompt's save-then-delete lane writes.
@@ -2921,6 +2926,7 @@ mod tests {
             DEFAULT_SIZE,
             None,
             None,
+            None,
             std::env::temp_dir(),
             sessions::SessionId::nil(),
             None,
@@ -2990,6 +2996,7 @@ mod tests {
                 hooks: DaemonAbsPath::root(),
             },
             DEFAULT_SIZE,
+            None,
             None,
             None,
             std::env::temp_dir(),
@@ -3102,6 +3109,7 @@ mod tests {
             DEFAULT_SIZE,
             None,
             None,
+            None,
             std::env::temp_dir(),
             sessions::SessionId::nil(),
             None,
@@ -3150,6 +3158,7 @@ mod tests {
             "user".to_string(),
             test_paths(),
             DEFAULT_SIZE,
+            None,
             None,
             None,
             std::env::temp_dir(),
