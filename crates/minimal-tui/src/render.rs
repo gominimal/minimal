@@ -671,31 +671,16 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
         }
         None => {
             // Key hints flush left; the transient status line flush right.
-            // An applied filter trades the hints for its own segment: the
-            // active filter must be visible, and the two together would
-            // clip on a narrow terminal.
-            let gray = Style::default().fg(Color::Gray);
-            let line = match model.filter.input.as_str() {
-                "" => Line::styled(
-                    " ↑↓ move · / filter · enter attach · d destroy · r rename · n new · q quit ",
-                    gray,
-                ),
-                input => {
-                    let total: usize = model.providers.iter().map(|p| p.sessions.len()).sum();
-                    let matched = model
-                        .providers
-                        .iter()
-                        .flat_map(|p| p.sessions.iter())
-                        .filter(|e| crate::filter::session_match(input, e).is_some())
-                        .count();
-                    Line::styled(
-                        format!(
-                            " filter: {input} · {matched} of {total} sessions · esc clears · ↑↓ move · enter attach · q quit "
-                        ),
-                        gray,
-                    )
-                }
+            // An applied filter already shows its input in the sidebar's
+            // `/` line, so the footer only advertises how to drop it.
+            let hints = if model.filter.input.is_empty() {
+                " ↑↓ move · / filter · enter attach · d destroy · r rename · n new · q quit "
+                    .to_string()
+            } else {
+                " ↑↓ move · / filter · esc clear filter · enter attach · d destroy · r rename · n new · q quit "
+                    .to_string()
             };
+            let line = Line::styled(hints, Style::default().fg(Color::Gray));
             let status_line = model.status.as_ref().map(|status| {
                 let style = if status.starts_with("error:") {
                     Style::default().fg(Color::Red)
@@ -705,7 +690,7 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
                 Line::styled(format!("{status} "), style)
             });
             // Reserve the right edge for the status so it can't overdraw
-            // the hints or the filter segment.
+            // the hints.
             let status_width = status_line.as_ref().map_or(0, |l| l.width() as u16);
             let [line_area, status_area] =
                 Layout::horizontal([Constraint::Min(0), Constraint::Length(status_width)])

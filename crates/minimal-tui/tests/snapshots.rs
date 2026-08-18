@@ -107,7 +107,7 @@ fn filtered() {
 #[test]
 fn filtered_with_status() {
     // The status reserves the footer's right edge; it must not overdraw
-    // the filter segment's controls.
+    // the hints, long as they are with a filter applied.
     let mut model = fixed_model(vec![
         provider("host", vec![entry(1, Some("api-staging"), "/src/api")]),
         provider("vm", vec![entry(3, Some("bench"), "/src/bench")]),
@@ -116,10 +116,12 @@ fn filtered_with_status() {
     model.clamp_cursor();
     model.status = Some("refreshed".to_string());
     // Render with constrained width to exercise potential overlap between
-    // filter controls and status.
+    // the hints and the status.
     let backend = TestBackend::new(80, 30);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| render::view(&mut model, frame)).unwrap();
+    terminal
+        .draw(|frame| render::view(&mut model, frame))
+        .unwrap();
     insta::assert_snapshot!(format!("{}", terminal.backend()));
 }
 

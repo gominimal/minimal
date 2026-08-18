@@ -1,6 +1,5 @@
 ---
 source: crates/minimal-tui/tests/snapshots.rs
-assertion_line: 104
 expression: render(&mut model)
 ---
 "┌ sessions ────────────────────┐┌──────────────────────────────────────────────────────────────────┐"
@@ -32,4 +31,4 @@ expression: render(&mut model)
 "│                              ││                                                                  │"
 "│                              ││                                                                  │"
 "└──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘"
-" filter: bench · 1 of 2 sessions · esc clears · ↑↓ move · enter attach · q quit                     "
+" ↑↓ move · / filter · esc clear filter · enter attach · d destroy · r rename · n new · q quit       "
