@@ -4,24 +4,9 @@
 //! command, replacing itself) and the `min dash` TUI (which spawns it as a
 //! child while the TUI is suspended and resumes when ssh exits).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Context as _;
-
-/// Resolve the minimal config directory: `<config_dir>/minimal` when an
-/// override is given, else the platform default
-/// ([`paths::minimal_config_dir`]). The base under which `config.toml`,
-/// `loadouts/`, etc. live.
-pub fn minimal_config_dir(config_dir: Option<&Path>) -> PathBuf {
-    if let Some(dir) = config_dir {
-        dir.join("minimal")
-    } else {
-        paths::minimal_config_dir()
-            .as_utf8_path()
-            .as_std_path()
-            .to_path_buf()
-    }
-}
 
 /// Read and validate the session-key config, returning the resolved
 /// [`sessions::keys::SessionKeys`] to negotiate at attach. A missing config
@@ -35,7 +20,7 @@ pub fn minimal_config_dir(config_dir: Option<&Path>) -> PathBuf {
 pub fn resolve_session_keys(
     config_dir: Option<&Path>,
 ) -> Result<sessions::keys::SessionKeys, anyhow::Error> {
-    let cfg_path = minimal_config_dir(config_dir).join("config.toml");
+    let cfg_path = paths::minimal_config_dir_with_override(config_dir).join("config.toml");
     let cfg = sessions::client::config::read_config_or_default(&cfg_path)
         .map_err(|e| anyhow::anyhow!("reading session-keys config {cfg_path:?}: {e}"))?;
     cfg.session_keys

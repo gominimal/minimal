@@ -11,10 +11,10 @@ use crate::GlobalArgs;
 /// Resolve `<config>/minimal` on the platform's user config dir,
 /// or the `--config-dir` override if the caller passed one. The
 /// base for both the loadouts subdir and the client config file.
-/// Delegates to the `minimal-client` resolution the attach path
-/// uses, so the two can never drift.
+/// Delegates to `paths::minimal_config_dir_with_override`, which the
+/// attach path also uses, so every reader sees the same layout.
 pub fn resolve_minimal_config_dir(global: &GlobalArgs) -> PathBuf {
-    minimal_client::attach::minimal_config_dir(global.config_dir.as_deref())
+    paths::minimal_config_dir_with_override(global.config_dir.as_deref())
 }
 
 /// Read the client config once, so both loadout resolution and
