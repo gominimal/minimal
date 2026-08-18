@@ -624,8 +624,11 @@ pub struct CacheSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexSourceMode {
-    /// The upstream pin's per-commit index snapshot when it exists, falling
-    /// back to the global root index when it doesn't.
+    /// Per pinned chain link (upstream + each pinned sideload), the first
+    /// available of: the sealed per-commit *closure* (the curated, bounded
+    /// catalog), then the per-commit byte-copy snapshot, then — for the
+    /// upstream only — the global root index. Falls back to the root index
+    /// outright when there is no git upstream or no locked commit.
     Auto,
     /// The per-commit snapshot only; a missing snapshot is an error.
     Pinned,
@@ -679,6 +682,25 @@ pub enum CacheConfig {
         upstream: String,
         sideloads: Vec<String>,
     },
+    /// The `auto` chain: per pinned link, try the sealed closure first,
+    /// then the byte-copy snapshot; the upstream additionally falls back
+    /// to the root index (each hop logged — the byte-copy is the
+    /// UNCURATED copy of the root at publish time, so reading it should
+    /// leave a trace; see the 2026-08-17 dangling-index incident).
+    /// Sideload links that resolve nothing are skipped best-effort.
+    AutoChain {
+        upstream: ChainLink,
+        sideloads: Vec<ChainLink>,
+    },
+}
+
+/// One pinned chain link's candidate index objects, most-curated first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainLink {
+    /// `<repo>/<commit>.closure.shisha` — the sealed, bounded catalog.
+    pub closure: String,
+    /// `<repo>/<commit>.shisha` — the byte-copy of the root at publish.
+    pub snapshot: String,
 }
 
 /// Object key of the per-commit index snapshot for a repo + commit:
@@ -1154,7 +1176,42 @@ impl File {
 
         match (mode, snapshot) {
             (IndexSourceMode::Root, _) => Ok(CacheConfig::GlobalIndex),
-            (IndexSourceMode::Auto, Some(object)) => Ok(CacheConfig::CommitIndex { object }),
+            (IndexSourceMode::Auto, Some(_)) => {
+                // Pinned auto: the full per-link chain. `snapshot` above
+                // proves the upstream pin exists; rebuild both objects per
+                // link here (closure first — the curated catalog).
+                let u = self.upstream.as_ref().expect("pinned auto has an upstream");
+                let LinkConfig::Git {
+                    repo,
+                    locked_commit: Some(commit),
+                    ..
+                } = &u.link
+                else {
+                    unreachable!("snapshot presence implies a locked git upstream");
+                };
+                let sideloads = u
+                    .sideloads()
+                    .iter()
+                    .filter_map(|sl| match sl.link() {
+                        LinkConfig::Git {
+                            repo,
+                            locked_commit: Some(commit),
+                            ..
+                        } => Some(ChainLink {
+                            closure: commit_closure_object(repo, commit),
+                            snapshot: commit_index_object(repo, commit),
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+                Ok(CacheConfig::AutoChain {
+                    upstream: ChainLink {
+                        closure: commit_closure_object(repo, commit),
+                        snapshot: commit_index_object(repo, commit),
+                    },
+                    sideloads,
+                })
+            }
             (IndexSourceMode::Auto, None) => Ok(CacheConfig::GlobalIndex),
             (IndexSourceMode::Pinned, Some(object)) => Ok(CacheConfig::CommitIndexOnly { object }),
             (IndexSourceMode::Pinned, None) => Err(
@@ -1830,11 +1887,16 @@ mod tests {
         .unwrap();
         let object = format!("github.com/gominimal/pkgs/{SHA}.shisha");
 
-        // Default is auto: snapshot with fallback.
+        // Default is auto: the per-link chain — sealed closure first, then
+        // the byte-copy snapshot, then (upstream only) the root.
         assert_eq!(
             pinned.cache_config(None).unwrap(),
-            CacheConfig::CommitIndex {
-                object: object.clone()
+            CacheConfig::AutoChain {
+                upstream: ChainLink {
+                    closure: format!("github.com/gominimal/pkgs/{SHA}.closure.shisha"),
+                    snapshot: object.clone(),
+                },
+                sideloads: vec![],
             }
         );
         // Override wins over the (unset) file setting.
