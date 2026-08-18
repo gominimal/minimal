@@ -480,8 +480,29 @@ impl PtyOp {
     }
 }
 
-/// Messages from the binding (user terminal) to the shell process / host.
-enum StdinMsg {
+/// A message from the binding (user terminal) to the shell process / host.
+///
+/// Every message tags the generation of the [`Binding`] that sent it. The
+/// host bumps its active generation on every attach — before the superseded
+/// binding has shut down — and discards a queued message with a stale
+/// generation: input typed at the old channel predates the attach that
+/// installed the current session keys, so interpreting it would apply the
+/// new channel's chord (or its size) to the old channel's keystrokes.
+struct StdinMsg {
+    // The sender's binding generation; must equal the host's active
+    // generation to be honored.
+    generation: u64,
+    kind: StdinMsgKind,
+}
+
+impl StdinMsg {
+    /// Stamps `kind` as sent by a binding of `generation`.
+    fn new(generation: u64, kind: StdinMsgKind) -> Self {
+        Self { generation, kind }
+    }
+}
+
+enum StdinMsgKind {
     Bytes(bytes::Bytes),
     /// A binding left its mainloop for a reason that counts as a detach.
     TerminalUpdate(RequestedPty),
@@ -493,6 +514,22 @@ enum StdinMsg {
     },
 }
 
+/// Queues bytes for the PTY master, appended after the unwritten remainder
+/// of whatever is already queued: buffered bytes are strictly older in
+/// stream order than a freshly fed chunk, so replacing the buffer on top
+/// would drop forwarded keystrokes — e.g. one chunk `x`+`ESC` forwards `x`
+/// into the buffer and holds `ESC` as a split chord candidate, and a pty
+/// still unwritable at the idle-flush deadline would then overwrite that
+/// queued `x` with `ESC`.
+fn queue_stdin(buf: &mut Option<(bytes::Bytes, usize)>, bytes: Vec<u8>) {
+    let mut next = match buf.take() {
+        Some((pending, written)) => pending[written..].to_vec(),
+        None => Vec::with_capacity(bytes.len()),
+    };
+    next.extend_from_slice(&bytes);
+    *buf = Some((bytes::Bytes::from(next), 0));
+}
+
 /// A connection between a [`Host`] and an SSH channel.
 ///
 /// The [`Binding`] is owned by the spawned async task, but the
@@ -501,6 +538,10 @@ enum StdinMsg {
 struct Binding {
     /// The remote end of this binding.
     channel: Channel<Msg>,
+    /// Which host binding-generation this binding owns; stamped on every
+    /// [`StdinMsg`] it sends so the host can discard the queue once the
+    /// binding is superseded.
+    generation: u64,
     /// Channel the binding writes down to communicate stdin to the host.
     stdin_tx: mpsc::Sender<StdinMsg>,
     /// Channel the [`Host`] uses to communicate with this [`Binding`].
@@ -527,6 +568,7 @@ impl Binding {
     pub(crate) async fn spawn(
         channel: Channel<Msg>,
         stdin_tx: mpsc::Sender<StdinMsg>,
+        generation: u64,
         control: Option<SessionControl>,
         delta: Option<Arc<DeltaSource>>,
         name: String,
@@ -536,6 +578,7 @@ impl Binding {
 
         let binding = Self {
             channel,
+            generation,
             stdin_tx,
             receiver: rx,
             control,
@@ -583,7 +626,10 @@ impl Binding {
                     Some(msg) => {
                         match msg {
                             russh::ChannelMsg::Data{ data } => {
-                                let _ = self.stdin_tx.send(StdinMsg::Bytes(data)).await;
+                                let _ = self
+                                    .stdin_tx
+                                    .send(StdinMsg::new(self.generation, StdinMsgKind::Bytes(data)))
+                                    .await;
                             }
                             russh::ChannelMsg::RequestPty {
                                 want_reply: _,
@@ -594,12 +640,18 @@ impl Binding {
                                 pix_height,
                                 terminal_modes,
                             } => {
-                                let _ = self.stdin_tx.send(StdinMsg::TerminalUpdate(RequestedPty {
-                                    char_sizes: (col_width, row_height),
-                                    pixel_sizes: (pix_width, pix_height),
-                                    term: term.to_string(),
-                                    modes: terminal_modes.to_vec(),
-                                })).await;
+                                let _ = self
+                                    .stdin_tx
+                                    .send(StdinMsg::new(
+                                        self.generation,
+                                        StdinMsgKind::TerminalUpdate(RequestedPty {
+                                            char_sizes: (col_width, row_height),
+                                            pixel_sizes: (pix_width, pix_height),
+                                            term: term.to_string(),
+                                            modes: terminal_modes.to_vec(),
+                                        }),
+                                    ))
+                                    .await;
                             },
                             russh::ChannelMsg::WindowChange{
                                 col_width,
@@ -607,9 +659,15 @@ impl Binding {
                                 pix_width,
                                 pix_height,
                             } => {
-                                let _ = self.stdin_tx.send(StdinMsg::WindowChange{
-                                    col_width, row_height, pix_width, pix_height,
-                                }).await;
+                                let _ = self
+                                    .stdin_tx
+                                    .send(StdinMsg::new(
+                                        self.generation,
+                                        StdinMsgKind::WindowChange {
+                                            col_width, row_height, pix_width, pix_height,
+                                        },
+                                    ))
+                                    .await;
                             },
                             // Flow-control window updates fire on every
                             // burst of bytes forwarded through the
@@ -1496,6 +1554,12 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // Recieve-end for bytes coming from the remote - i.e. 'stdin' keystrokes.
     // We process this end.
     remote_rx: mpsc::Receiver<StdinMsg>,
+
+    // Monotonic identity of the currently active binding. Bumped by
+    // `attach()` before the new binding is spawned, so an [`StdinMsg`] whose
+    // generation lags this was queued by a superseded binding and gets
+    // discarded rather than interpreted under the new channel's session keys.
+    binding_generation: u64,
 
     // Temporary buffer for reading from the pty master (i.e. 'stdout').
     stdout_buf: Vec<u8>,
@@ -2912,6 +2976,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
 
             remote_tx,
             remote_rx,
+            binding_generation: 0,
             stdout_buf: vec![0u8; 8 * 1024],
             stdin_buf: None,
             net_guard,
@@ -3290,8 +3355,15 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             // we only consume new keystrokes if we have none waiting to be written to the pty, and
             // pending writes to the pty are serviced async by their own select arm (below).
             Some(msg) = self.remote_rx.recv(), if self.stdin_buf.is_none() => {
-                match msg {
-                    StdinMsg::Bytes(b) => {
+                // Discard input queued by the superseded binding: its bytes
+                // predate the attach that installed the current session keys,
+                // and matching them now would hand the old channel's
+                // keystrokes to the new channel's chord (or its size).
+                if msg.generation != self.binding_generation {
+                    return Ok(());
+                }
+                match msg.kind {
+                    StdinMsgKind::Bytes(b) => {
                         self.attrs.stdin_last = Some(SystemTime::now());
 
                         // Session-key chord matching over the stdin byte
@@ -3345,7 +3417,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                             }
                         }
                         if !forward.is_empty() {
-                            self.stdin_buf = Some((bytes::Bytes::from(forward), 0));
+                            queue_stdin(&mut self.stdin_buf, forward);
                         }
 
                         // Arm (or clear) the idle-flush timer: a chunk that
@@ -3358,10 +3430,10 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                             .has_pending()
                             .then(|| tokio::time::Instant::now() + CHORD_FLUSH_IDLE);
                     }
-                    StdinMsg::TerminalUpdate(sz) => {
+                    StdinMsgKind::TerminalUpdate(sz) => {
                         self.set_size(WinSize::from(&sz));
                     },
-                    StdinMsg::WindowChange{ col_width, row_height, pix_height, pix_width } => {
+                    StdinMsgKind::WindowChange{ col_width, row_height, pix_height, pix_width } => {
                         self.set_size(WinSize {
                             rows: row_height as u16,
                             cols: col_width as u16,
@@ -3416,9 +3488,13 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                 }
             } => {
                 self.chord_flush_deadline = None;
+                // Appended after anything already queued: forwarded input
+                // still waiting on an unwritable pty predates the candidate
+                // the flush releases, and replacing the buffer would drop it
+                // (see `queue_stdin`).
                 let flushed = self.chord_matcher.flush();
                 if !flushed.is_empty() {
-                    self.stdin_buf = Some((bytes::Bytes::from(flushed), 0));
+                    queue_stdin(&mut self.stdin_buf, flushed);
                 }
             }
 
@@ -3454,6 +3530,12 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         // deadline from the previous channel is stale.
         self.chord_flush_deadline = None;
 
+        // Bump before spawning the new binding: anything the superseded
+        // binding already queued into the shared stdin channel carries the
+        // old generation from here on, so the stdin arm drops it instead of
+        // interpreting those keystrokes under this channel's fresh keys.
+        self.binding_generation += 1;
+
         if !skip_flush {
             self.parser.screen_mut().set_size(sz.rows, sz.cols);
             let _ = channel
@@ -3464,6 +3546,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         let new_binding = Binding::spawn(
             channel,
             self.remote_tx.clone(),
+            self.binding_generation,
             self.control.clone(),
             self.delta.clone(),
             self.session_name.clone(),
@@ -3585,6 +3668,13 @@ mod tests {
         xpixel: 0,
         ypixel: 0,
     };
+
+    /// Wraps a chunk as a current-generation [`StdinMsg`] for the test
+    /// harness: hosts here never attach a binding, so the host's active
+    /// binding generation stays 0.
+    fn stdin_bytes(b: impl Into<bytes::Bytes>) -> StdinMsg {
+        StdinMsg::new(0, StdinMsgKind::Bytes(b.into()))
+    }
 
     /// Builds the `hakoniwa` account of a normal exit: the inner process
     /// reported its own status, so `exit_code` is `Some`.
@@ -3778,9 +3868,7 @@ mod tests {
         let task = tokio::spawn(host.mainloop());
 
         stdin
-            .send(StdinMsg::Bytes(bytes::Bytes::from(
-                format!("{MOCK_EXIT_LINE}\n").into_bytes(),
-            )))
+            .send(stdin_bytes(format!("{MOCK_EXIT_LINE}\n").into_bytes()))
             .await
             .expect("failed to send exit line");
         tokio::time::timeout(Duration::from_secs(10), task)
@@ -3863,15 +3951,13 @@ mod tests {
         let mut line = MOUSE_ON.to_vec();
         line.push(b'\n');
         stdin
-            .send(StdinMsg::Bytes(bytes::Bytes::from(line)))
+            .send(stdin_bytes(line))
             .await
             .expect("failed to send the mouse-enable line");
         await_forwarded(&mut rx, MOUSE_ON).await;
 
         stdin
-            .send(StdinMsg::Bytes(bytes::Bytes::from(
-                format!("{MOCK_EXIT_LINE}\n").into_bytes(),
-            )))
+            .send(stdin_bytes(format!("{MOCK_EXIT_LINE}\n").into_bytes()))
             .await
             .expect("failed to send exit line");
         tokio::time::timeout(Duration::from_secs(10), task)
@@ -4364,7 +4450,7 @@ mod tests {
         let title = "hello-title";
         let osc = format!("\x1b]0;{title}\x07\n");
         stdin
-            .send(StdinMsg::Bytes(bytes::Bytes::from(osc.into_bytes())))
+            .send(stdin_bytes(osc.into_bytes()))
             .await
             .expect("failed to send stdin");
 
@@ -4552,9 +4638,7 @@ mod tests {
 
         // Make the shell exit; the network must then be released.
         stdin
-            .send(StdinMsg::Bytes(bytes::Bytes::from(
-                format!("{MOCK_EXIT_LINE}\n").into_bytes(),
-            )))
+            .send(stdin_bytes(format!("{MOCK_EXIT_LINE}\n").into_bytes()))
             .await
             .expect("failed to send exit line");
         tokio::time::timeout(Duration::from_secs(10), task)
@@ -4604,11 +4688,11 @@ mod tests {
         // no-op on the channel — what matters is that neither byte reaches
         // the shell.)
         stdin
-            .send(StdinMsg::Bytes(bytes::Bytes::from(vec![0x1d])))
+            .send(stdin_bytes(vec![0x1d]))
             .await
             .expect("failed to send leader");
         stdin
-            .send(StdinMsg::Bytes(bytes::Bytes::from(b"d".to_vec())))
+            .send(stdin_bytes(b"d".to_vec()))
             .await
             .expect("failed to send detach key");
 
@@ -4616,7 +4700,7 @@ mod tests {
         // stamps stdout activity. (If the chord had been forwarded or had killed
         // the process, no echo would ever arrive.)
         stdin
-            .send(StdinMsg::Bytes(bytes::Bytes::from(b"ping\n".to_vec())))
+            .send(stdin_bytes(b"ping\n".to_vec()))
             .await
             .expect("failed to send line after detach");
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -4646,5 +4730,81 @@ mod tests {
             torn_down.load(std::sync::atomic::Ordering::SeqCst),
             "kill/destroy must release the network",
         );
+    }
+
+    /// The PTY write queue appends: bytes queued later land *after* anything
+    /// already buffered, so an idle chord-candidate flush can never overwrite
+    /// forwarded input still waiting on an unwritable pty.
+    #[test]
+    fn queue_stdin_appends_after_unwritten_remainder() {
+        // Two bytes of a queued chunk written; three still pending. The flush
+        // must not resurrect the written prefix or drop either remainder.
+        let mut buf = Some((bytes::Bytes::from_static(b"abcde"), 2));
+        queue_stdin(&mut buf, vec![0x1b]);
+        let (pending, written) = buf.as_ref().unwrap();
+        assert_eq!(*written, 0);
+        assert_eq!(&pending[..], b"cde\x1b");
+
+        // An empty queue takes the new bytes wholesale.
+        let mut buf = None;
+        queue_stdin(&mut buf, vec![0x1d, 0x64]);
+        let (pending, written) = buf.as_ref().unwrap();
+        assert_eq!(*written, 0);
+        assert_eq!(&pending[..], b"\x1d\x64");
+    }
+
+    /// Input stamped with a stale binding generation — what a superseded
+    /// binding left queued in the shared stdin channel — must never reach
+    /// the shell. (A real supersession attaches a new channel; here no
+    /// binding ever attaches, so the active generation stays 0 and a manual
+    /// generation-1 message stands in for the queued leftovers.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_binding_generation_input_is_discarded() {
+        let (host, _handle) = Host::build(
+            MockLauncher,
+            "test-session".to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+            None,
+            None,
+            None,
+            std::env::temp_dir(),
+            sessions::SessionId::nil(),
+            None,
+            ConnectionEnv::new(),
+        )
+        .await
+        .expect("failed to build host");
+        let stdin = host.remote_tx.clone();
+        let mut task = tokio::spawn(host.mainloop());
+
+        // The exit sentinel on a stale generation: if this reached the shell
+        // the mainloop would reap the process and the task would complete.
+        stdin
+            .send(StdinMsg::new(
+                1,
+                StdinMsgKind::Bytes(bytes::Bytes::from(
+                    format!("{MOCK_EXIT_LINE}\n").into_bytes(),
+                )),
+            ))
+            .await
+            .expect("failed to send stale stdin");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !task.is_finished(),
+            "stale-generation input must not reach the shell",
+        );
+
+        // The same bytes on the active generation must still go through.
+        stdin
+            .send(stdin_bytes(format!("{MOCK_EXIT_LINE}\n").into_bytes()))
+            .await
+            .expect("failed to send stdin");
+        tokio::time::timeout(Duration::from_secs(10), &mut task)
+            .await
+            .expect("mainloop should terminate after the shell exits")
+            .expect("host task should not panic during teardown")
+            .expect("mainloop should return the reaped exit status");
     }
 }
