@@ -942,6 +942,7 @@ impl ExpandedPatchesPolicy {
 /// ([`CheckOutcome`]) carries the item; this type doesn't, so it can
 /// be computed for the same item against multiple paths and combined.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 pub(crate) enum PathDecision {
     Allowed,
     Ignored,
@@ -1571,5 +1572,104 @@ mod tests {
                 .with_deny(VarNameGlobs::try_new(["SECRET_*"]).unwrap());
             assert_eq!(policy.vars(), &expected_vars);
         }
+    }
+}
+
+/// Kani proof harnesses for the [`PathDecision`] combination lattice
+/// (gominimal/minimal#1109, harness set 4).
+///
+/// The domain is a 4-variant `Copy` enum, so every proof here is
+/// **exhaustive** — Kani enumerates all 16 (or 64) input states with no
+/// unwind bound and no `kani::assume`. Together the laws prove the
+/// combine ALGEBRA: no permutation or regrouping of per-path decisions
+/// can downgrade a deny, and a decision folded in twice cannot change
+/// the outcome. They deliberately do NOT prove the WIRING that feeds
+/// the algebra — that a caller actually combines both paths' decisions
+/// — which is live-fire unit-test territory (see
+/// `symlink_link_denied_wins_over_allowed_target` and its mirror in
+/// `compose.rs`). Versus the existing truth-table tests, the proofs'
+/// marginal value is robustness to change: add a fifth variant and
+/// `kani::any()` covers it automatically, where a hand-written table
+/// silently under-covers.
+///
+/// `severity` below restates the doc's precedence — `Denied` >
+/// `Ignored` > `NeedsApproval` > `Allowed` — as an explicit rank so the
+/// single lemma `combine == max-by-severity` can be checked. It is
+/// deliberately NOT the enum's discriminant order: declaration order
+/// (`NeedsApproval` last, so numerically greatest) disagrees with
+/// precedence, which is exactly why [`PathDecision`] derives no `Ord`
+/// and why these proofs exist.
+///
+/// Run: `cargo kani -p sessions` (or `just kani`). Kani pinned at
+/// 0.67.0 in CI.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::PathDecision::{self, Allowed, Denied, Ignored, NeedsApproval};
+
+    /// The documented precedence, as an explicit rank (higher = more
+    /// restrictive). Must match the doc comment on [`PathDecision::combine`].
+    fn severity(d: PathDecision) -> u8 {
+        match d {
+            Allowed => 0,
+            NeedsApproval => 1,
+            Ignored => 2,
+            Denied => 3,
+        }
+    }
+
+    /// The one lemma that entails the whole lattice: `combine` is
+    /// exactly max-by-severity. Everything below follows from this,
+    /// but the named laws are kept as separate harnesses so a future
+    /// regression names the law it broke.
+    #[kani::proof]
+    fn combine_is_max_by_severity() {
+        let a: PathDecision = kani::any();
+        let b: PathDecision = kani::any();
+        let c = a.combine(b);
+        let expected = if severity(a) >= severity(b) { a } else { b };
+        assert_eq!(c, expected);
+    }
+
+    /// "Any deny on either path wins (security first)."
+    #[kani::proof]
+    fn denied_is_absorbing() {
+        let d: PathDecision = kani::any();
+        assert_eq!(d.combine(Denied), Denied);
+        assert_eq!(Denied.combine(d), Denied);
+    }
+
+    /// "Both must independently `Allowed` for the file to pass
+    /// cleanly": `Allowed` is the identity, so it can never mask a
+    /// stricter decision from the other path.
+    #[kani::proof]
+    fn allowed_is_identity() {
+        let d: PathDecision = kani::any();
+        assert_eq!(d.combine(Allowed), d);
+        assert_eq!(Allowed.combine(d), d);
+    }
+
+    /// Order of the two paths never matters.
+    #[kani::proof]
+    fn combine_is_commutative() {
+        let a: PathDecision = kani::any();
+        let b: PathDecision = kani::any();
+        assert_eq!(a.combine(b), b.combine(a));
+    }
+
+    /// Grouping never matters — folding a decision list in any tree
+    /// shape yields the same outcome.
+    #[kani::proof]
+    fn combine_is_associative() {
+        let a: PathDecision = kani::any();
+        let b: PathDecision = kani::any();
+        let c: PathDecision = kani::any();
+        assert_eq!(a.combine(b).combine(c), a.combine(b.combine(c)));
+    }
+
+    /// Seeing the same decision twice cannot change the outcome.
+    #[kani::proof]
+    fn combine_is_idempotent() {
+        let d: PathDecision = kani::any();
+        assert_eq!(d.combine(d), d);
     }
 }

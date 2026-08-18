@@ -69,7 +69,7 @@ jobs:
         # build-initramfs.sh cross-compiles the guest minimald to static musl;
         # install the prebuilt cross like the KVM lane so it never falls back
         # to `cargo install cross` from source inside this blocking job.
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
         with:
           tool: cross
       - name: Enable /dev/kvm access
@@ -259,7 +259,7 @@ jobs:
         # Both are prebuilt binaries in taiki-e's manifest (zizmor is Rust,
         # from zizmorcore/zizmor). actionlint is NOT — it runs from its
         # pinned official image below.
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
         with:
           tool: cargo-machete,zizmor
       - name: actionlint (workflow lint)
@@ -300,7 +300,7 @@ jobs:
         with:
           shared-key: msrv
       - name: Install cargo-hack
-        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
         with:
           tool: cargo-hack
       - name: cargo hack check --rust-version
@@ -362,6 +362,36 @@ jobs:
           # the shared pool the real lanes restore from).
           shared-key: nightly-canary
           save-if: "false"
+
+  kani-canary:
+    # The Kani-version canary: run the proof suite (scripts/kani.sh, the exact
+    # invocation the ci-kani PR lane runs) against the LATEST kani-verifier
+    # instead of the lane's exact 0.67.0 pin. Catches solver/output drift ahead
+    # of a pin bump, and signals when Kani ships a bundled toolchain >= the
+    # workspace rust-version floor — the moment kani.sh's scratch-copy MSRV
+    # workaround gets deleted. Non-blocking (the pin is the gate), so a Kani
+    # release cannot trip `notify`; read failures in the run itself.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          # Own cache class, and never write: latest-Kani artifacts must not
+          # poison the pinned lane's `kani` cache class (this scheduled run is
+          # on main, where the default save-if would be true).
+          shared-key: kani-canary
+          save-if: "false"
+      - name: Install latest Kani (unpinned on purpose)
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+          cargo kani --version
+      - name: Run proofs (latest Kani)
+        run: ./scripts/kani.sh
 
   macos-e2e:
     # macOS/HVF VM smoke nightly — closes the docs/ci-strategy.md §9 "both

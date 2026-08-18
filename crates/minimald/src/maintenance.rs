@@ -1,10 +1,18 @@
 //! Housekeeping the daemon runs on its own clock, with no client asking.
 //!
-//! Today that is one job: reclaiming the local cache. A long-lived daemon
-//! accumulates build artifacts nothing reads any more, plus the sandbox, task
-//! and temp directories of executions whose process is long gone. `mip cache
-//! clean` does this on demand for a project; here the same [`op::CleanCache`]
-//! runs for the daemon, with every live session's packages held back.
+//! The job is reclaiming the local cache. A long-lived daemon accumulates
+//! build artifacts nothing reads any more, plus the sandbox, task and temp
+//! directories of executions whose process is long gone. `mip cache clean`
+//! does this on demand for a project; here the same [`op::CleanCache`] runs
+//! for the daemon, with every live session's packages held back.
+//!
+//! In the microVM there is a second half to it. Unlinking files inside the
+//! guest returns blocks to ext4 and nothing else: the data volume is mounted
+//! without `discard`, so the host's backing image only ever grows, and a clean
+//! that reclaims gigabytes inside the VM reclaims nothing the user can see on
+//! their disk. So every clean that ran is followed by an `FITRIM`
+//! ([`guest::trim_state_volume`](crate::guest::trim_state_volume)), which is
+//! what actually punches the freed extents out of the image.
 //!
 //! Cleaning is an actor, not a bare timer, because there is more than one way
 //! to ask for one: the periodic tick, and anything that wants a clean *now*.
@@ -96,13 +104,25 @@ impl Maintenance {
                     None => break,
                     Some(MaintenanceMessage::CleanNow { older_than, events, responder }) => {
                         let older_than = older_than.unwrap_or(UNUSED_FOR);
-                        responder.handle(clean(&self.state, older_than, events)).await;
+                        let report = clean(&self.state, older_than, events).await;
+                        // The trim finishes before the caller is answered: a
+                        // reply means the whole reclaim is done, on the host's
+                        // disk as well as inside the guest. Answering early
+                        // would have `mip cache clean` return while the space
+                        // it reported is still not back, which is the one
+                        // question the caller is asking.
+                        if report.is_ok() {
+                            trim_state_volume_if_mounted(&self.state).await;
+                        }
+                        responder.handle(std::future::ready(report)).await;
                         next_tick = Instant::now() + CLEAN_INTERVAL;
                     }
                 },
                 () = tokio::time::sleep_until(next_tick) => {
                     // Nobody is waiting on this one; `clean` logged the outcome.
-                    let _ = clean(&self.state, UNUSED_FOR, None).await;
+                    if clean(&self.state, UNUSED_FOR, None).await.is_ok() {
+                        trim_state_volume_if_mounted(&self.state).await;
+                    }
                     next_tick = Instant::now() + CLEAN_INTERVAL;
                 }
             }
@@ -127,9 +147,12 @@ impl MaintenanceHandle {
     /// for a caller relaying it (the `CleanCache` RPC streams it to its
     /// client).
     ///
-    /// Queues behind a clean already in progress rather than starting a second
-    /// one, so this can take as long as a full clean plus the one ahead of it,
-    /// and `events` stays silent until this request's turn comes.
+    /// Returns only once the reclaim is complete end to end — including, in
+    /// the microVM, the `FITRIM` that returns the freed blocks to the host
+    /// image. Queues behind a clean already in progress rather than starting a
+    /// second one, so this can take as long as a full clean-and-trim plus the
+    /// one ahead of it, and `events` stays silent until this request's turn
+    /// comes (the trim reports to the log, not through `events`).
     /// `NotConnected` once the actor has stopped (shutdown).
     pub(crate) async fn clean_now(
         &self,
@@ -258,6 +281,56 @@ async fn clean(
         }
     }
 }
+
+/// Hand the blocks the clean just freed back to the host image — the trim half
+/// of the module doc. No-op unless the boot path actually mounted a data volume
+/// at the state dir, which in practice means the microVM: a native daemon's
+/// state dir is a directory on the user's own filesystem, not this daemon's to
+/// discard against.
+///
+/// Every failure is logged and swallowed. A trim reclaims space; it never
+/// affects correctness, and a daemon whose housekeeping cannot punch holes
+/// still has a correct cache. `Unsupported` is the ordinary case for a
+/// filesystem or block driver without discard (a native-Linux `minimald` run
+/// with a state volume, a virtio-blk without `discard` negotiated), and would
+/// otherwise warn every [`CLEAN_INTERVAL`] forever, so it logs at debug.
+///
+/// Deliberately unbounded, unlike the shutdown quiesce's 10 s ceiling. A
+/// requesting client does wait on this — [`MaintenanceHandle::clean_now`]
+/// replies only once the trim is done — but so does it wait on the clean
+/// itself, which is equally unbounded; a reclaim takes as long as the
+/// filesystem makes it take, and a deadline here would only report success
+/// over extents still undiscarded. It shares the shutdown hazard documented on
+/// [`clean`] — a trim in flight when the `Shutdown` RPC quiesces the volume is
+/// walking a filesystem being synced and unmounted — bounded the same way, by
+/// [`MaintenanceHandle::abort`] and the ext4 journal.
+#[cfg(target_os = "linux")]
+async fn trim_state_volume_if_mounted(state: &ServerStateHandle) {
+    if !state.state_volume_mounted().await {
+        return;
+    }
+    let mountpoint = state.minimal_state_dir().await;
+    // `FITRIM` walks the whole filesystem's block groups; like the clean
+    // itself, that belongs on the blocking pool.
+    let trim = tokio::task::spawn_blocking(move || {
+        crate::guest::trim_state_volume(mountpoint.as_utf8_path().as_str())
+    });
+    match trim.await {
+        Ok(Ok(discarded)) => {
+            tracing::info!(discarded_bytes = discarded, "state volume trimmed")
+        }
+        Ok(Err(error)) if error.kind() == ErrorKind::Unsupported => {
+            tracing::debug!(%error, "state volume does not support discard; not trimming")
+        }
+        Ok(Err(error)) => tracing::warn!(%error, "state volume trim failed; space not reclaimed"),
+        Err(error) => tracing::warn!(%error, "state volume trim panicked"),
+    }
+}
+
+/// Nothing to trim off a host that has no guest data volume — `minimald` only
+/// mounts one as the microVM's pid-1, and its `FITRIM` is Linux-only.
+#[cfg(not(target_os = "linux"))]
+async fn trim_state_volume_if_mounted(_state: &ServerStateHandle) {}
 
 /// Logs what the clean removed, one line per entry, until the sender drops,
 /// mirroring each event to `relay` if a caller asked for one. Best-effort on
