@@ -56,6 +56,15 @@ enum StoreMessage {
         std::sync::Arc<sessions::core::compose::Composition>,
         oneshot::Sender<Result<(), std::io::Error>>,
     ),
+    DeltaBaselineLoad(
+        DiskSessionKey,
+        oneshot::Sender<Result<Option<Vec<u8>>, std::io::Error>>,
+    ),
+    DeltaBaselineStore(
+        DiskSessionKey,
+        Vec<u8>,
+        oneshot::Sender<Result<(), std::io::Error>>,
+    ),
 }
 
 /// The session store actor. Mediates reading, writing, and enumerating
@@ -146,6 +155,12 @@ impl Store {
             }
             StoreMessage::CompositionStore(k, comp, r) => {
                 let _ = r.send(self.store.store_composition(&k, &comp));
+            }
+            StoreMessage::DeltaBaselineLoad(k, r) => {
+                let _ = r.send(self.store.load_delta_baseline(&k));
+            }
+            StoreMessage::DeltaBaselineStore(k, payload, r) => {
+                let _ = r.send(self.store.store_delta_baseline(&k, &payload));
             }
         }
     }
@@ -297,6 +312,39 @@ impl SessionRecordHandle {
             .send(StoreMessage::CompositionStore(
                 self.k.clone(),
                 std::sync::Arc::new(composition.clone()),
+                send,
+            ))
+            .await;
+        recv.await.expect("corresponding store is dead")
+    }
+
+    /// Loads the persisted workspace delta-baseline sidecar for this
+    /// session, if one exists. Returns `Ok(None)` when the sidecar is
+    /// absent (pre-sidecar session, or the baseline was never
+    /// persisted). The payload is opaque bytes; the session actor owns
+    /// its format.
+    pub async fn load_delta_baseline(&self) -> Result<Option<Vec<u8>>, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        let _ = self
+            .h
+            .sender
+            .send(StoreMessage::DeltaBaselineLoad(self.k.clone(), send))
+            .await;
+        recv.await.expect("corresponding store is dead")
+    }
+
+    /// Atomically persists the workspace delta-baseline sidecar for this
+    /// session (tmp + rename). Written once at first arm so a daemon
+    /// restart keeps the activation-time baseline instead of
+    /// re-snapshotting an already-modified workspace.
+    pub async fn store_delta_baseline(&self, payload: Vec<u8>) -> Result<(), std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        let _ = self
+            .h
+            .sender
+            .send(StoreMessage::DeltaBaselineStore(
+                self.k.clone(),
+                payload,
                 send,
             ))
             .await;
