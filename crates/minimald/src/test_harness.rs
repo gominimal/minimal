@@ -299,13 +299,25 @@ impl TestClient {
         &mut self,
         session_id: SessionId,
     ) -> russh::Channel<russh::client::Msg> {
+        self.open_shell_with_term(session_id, "xterm").await
+    }
+
+    /// [`Self::open_shell`], naming the terminal type the PTY request
+    /// carries. `TERM` is a per-connection fact the daemon applies on every
+    /// attach, so a test that cares which terminal is on the other end — or
+    /// that re-attaches from a different one — has to be able to say.
+    pub async fn open_shell_with_term(
+        &mut self,
+        session_id: SessionId,
+        term: &str,
+    ) -> russh::Channel<russh::client::Msg> {
         let channel = self.handle.channel_open_session().await.unwrap();
         channel
             .set_env(true, crate::MINIMAL_SESSION_ID_ENV, session_id.to_string())
             .await
             .unwrap();
         channel
-            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .request_pty(true, term, 80, 24, 0, 0, &[])
             .await
             .unwrap();
         channel.request_shell(true).await.unwrap();

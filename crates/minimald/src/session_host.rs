@@ -974,7 +974,10 @@ pub(crate) struct Launched<P, G> {
 /// Actor messages to a [`Host`].
 enum Message {
     Kill(bool),
-    Attach(Channel<Msg>, WinSize),
+    /// Bind a client channel to this host. The [`ConnectionEnv`] rides along
+    /// on every attach — not just the one that minted the host — because it
+    /// describes the terminal on the other end of *this* channel.
+    Attach(Channel<Msg>, WinSize, ConnectionEnv),
     GetAttrs(oneshot::Sender<HostAttrs>),
     /// Compute the workspace's at-risk report (VCS-exact when the tree is a
     /// git repository, the changed-since-activation delta otherwise) and
@@ -1139,14 +1142,24 @@ impl HostHandle {
             Err(_e) => Err(()), // closed
         }
     }
+    /// Binds `c` to this host, carrying the attaching terminal's facts.
+    ///
+    /// `connection` is applied on every attach, so a client attaching from a
+    /// different terminal than the one that minted the shell updates `TERM`
+    /// for everything the session spawns from here on. An empty map leaves the
+    /// last known facts in place rather than clearing them: a client whose own
+    /// `TERM` is unset (OpenSSH then sends an empty pty-req term string) has
+    /// nothing to say about the terminal, which is not the same as saying
+    /// there isn't one.
     pub async fn attach(
         &self,
         c: Channel<Msg>,
         sz: WinSize,
+        connection: ConnectionEnv,
     ) -> Result<(), (Channel<Msg>, WinSize)> {
-        match self.sender.send(Message::Attach(c, sz)).await {
+        match self.sender.send(Message::Attach(c, sz, connection)).await {
             Ok(()) => Ok(()),
-            Err(SendError(Message::Attach(c, sz))) => Err((c, sz)),
+            Err(SendError(Message::Attach(c, sz, _))) => Err((c, sz)),
             Err(e) => unreachable!("{:?}", e),
         }
     }
@@ -1358,6 +1371,17 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // prompt's save-then-delete lane can name its archive.
     session_name: String,
 
+    /// The attached terminal's facts as of the latest attach, layered over the
+    /// session's own environment for everything this host runs in the sandbox
+    /// (`command_in_session`) and republished into the session's home so the
+    /// already-running shell can pick them up at its next prompt.
+    connection_env: ConnectionEnv,
+
+    /// Daemon-side path of the session's home directory — the same directory
+    /// the sandbox mounts at [`SESSION_HOME_ROOT`]. Held so the per-attach
+    /// environment files can be written without entering the sandbox.
+    home_dir: paths::DaemonAbsPath,
+
     // Daemon-side directory the save-then-delete lane archives into, handed
     // to each binding alongside `delta`.
     archives_dir: std::path::PathBuf,
@@ -1386,6 +1410,97 @@ struct HookPlan {
     workspace: paths::DaemonAbsPath,
     output: crate::hooks::HookOutput,
 }
+
+/// Writes the session's per-attach environment files: `env` rendered into
+/// [`ATTACH_ENV_SH_REL`], [`ATTACH_ENV_FISH_REL`], and [`ATTACH_ENV_JSON_REL`]
+/// under the session's `home` directory.
+///
+/// This is how a fact about the *current* terminal reaches a shell that was
+/// spawned for a previous one — a process's `environ` cannot be rewritten from
+/// outside, so the value is published to a file the shell re-reads, at every
+/// prompt and before every command, through the hooks `crate::env` installs
+/// into the session rootfs. Written from the daemon's side of the session home
+/// rather than through the sandbox: it is the same directory, and it works
+/// before the session has anything running to inject into.
+///
+/// Best-effort. A failure here costs a stale `TERM` in the shell, which must
+/// never be allowed to refuse an attach.
+async fn write_connection_env(home: paths::DaemonAbsPath, env: ConnectionEnv) {
+    // Nothing to say: leave whatever the last attach published in place. An
+    // attach that carries no facts is a client that couldn't describe its
+    // terminal, not a client asserting there is no terminal.
+    if env.is_empty() {
+        return;
+    }
+
+    let dir = home.sub_path_unchecked(ATTACH_ENV_DIR_REL);
+    if let Err(e) = tokio::fs::create_dir_all(dir.as_str()).await {
+        tracing::warn!(error = %e, dir = %dir, "creating the per-attach env dir");
+        return;
+    }
+
+    let mut sh = String::from("# Written by minimald on attach; edits are lost.\n");
+    let mut fish = sh.clone();
+    for (k, v) in &env {
+        // Single quotes are the only quoting both shells read literally. POSIX
+        // has no escape inside them, so a quote is closed, escaped, and
+        // reopened; fish does take a backslash escape.
+        sh.push_str(&format!("export {k}='{}'\n", v.replace('\'', r"'\''")));
+        fish.push_str(&format!(
+            "set -gx {k} '{}'\n",
+            v.replace('\\', r"\\").replace('\'', r"\'")
+        ));
+    }
+
+    // The data form. Serialized rather than hand-rendered so the escaping is
+    // the serializer's problem; a failure here is not fatal to the others.
+    let json = match serde_json_lenient::to_string_pretty(&env) {
+        Ok(j) => Some(j),
+        Err(e) => {
+            tracing::warn!(error = %e, "rendering the per-attach env as JSON");
+            None
+        }
+    };
+
+    let files = [
+        (ATTACH_ENV_SH_REL, Some(sh)),
+        (ATTACH_ENV_FISH_REL, Some(fish)),
+        (ATTACH_ENV_JSON_REL, json),
+    ];
+    for (rel, body) in files {
+        let Some(body) = body else { continue };
+        let path = home.sub_path_unchecked(rel);
+
+        // Write a sibling and rename over the destination, rather than
+        // truncating in place. A shell reads these files constantly — bash's
+        // `DEBUG` trap sources one before every command — so an in-place
+        // rewrite has a window where a reader sees a truncated file, and half
+        // an `export TERM='xterm-256co` is a syntax error on the user's
+        // terminal. `rename(2)` is atomic within a directory, and the sibling
+        // is in the same one by construction.
+        let tmp = home.sub_path_unchecked(&format!(
+            "{rel}.{}.{}.tmp",
+            std::process::id(),
+            ATTACH_ENV_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        if let Err(e) = tokio::fs::write(tmp.as_str(), body).await {
+            tracing::warn!(error = %e, path = %tmp, "writing the per-attach env file");
+            // Nothing was published, so nothing is half-written — but the
+            // sibling may exist and must not accumulate.
+            let _ = tokio::fs::remove_file(tmp.as_str()).await;
+            continue;
+        }
+        if let Err(e) = tokio::fs::rename(tmp.as_str(), path.as_str()).await {
+            tracing::warn!(error = %e, path = %path, "publishing the per-attach env file");
+            let _ = tokio::fs::remove_file(tmp.as_str()).await;
+        }
+    }
+}
+
+/// Distinguishes the temporary files [`write_connection_env`] renames into
+/// place, so two attaches publishing at once cannot pick the same sibling and
+/// clobber each other's half-written file.
+static ATTACH_ENV_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Run a snapshotted plan, warning on any hook that failed.
 ///
@@ -1502,13 +1617,17 @@ impl SessionProcess for SandboxProcess {
 const BASELINE_PACKAGES: &[&str] = &["base", "coreutils", "socat"];
 
 /// Environment folded into a session shell at the launching attach, over and
-/// above the composition. Both halves are captured from the SSH channel that
-/// mints the shell (see [`crate::session::Session::attach`]); a re-attach to an
-/// already-running shell does not revisit them.
+/// above the composition. Both halves are captured from the SSH channel the
+/// attach arrives on (see [`crate::session::Session::attach`]).
 ///
 /// The two halves sit on opposite sides of the composition in precedence:
 /// `inherited` are defaults the composition may override, `connection` are
 /// authoritative facts that override the composition.
+///
+/// `inherited` is a launch-time fact: it describes the client that *created*
+/// the shell and cannot be revised without respawning it. `connection` is a
+/// per-attach fact — see [`ConnectionEnv`] — carried on every attach, not just
+/// the one that mints the host.
 ///
 /// The fields are read only by the real [`SandboxLauncher`] (`cfg(not(test))`);
 /// the mock launcher ignores them, so tolerate them being unread under `test`.
@@ -1528,12 +1647,86 @@ pub(crate) struct AttachEnv {
     pub(crate) connection: Vec<(String, String)>,
 }
 
+impl AttachEnv {
+    /// The connection half as a map, for merging into a session environment.
+    pub(crate) fn connection_env(&self) -> ConnectionEnv {
+        self.connection.iter().cloned().collect()
+    }
+}
+
+/// The facts that describe *the terminal currently attached*, as opposed to
+/// the session's own composed environment: `TERM` today.
+///
+/// Kept apart from [`AttachEnv`] because its lifetime is different. A session
+/// shell is spawned once and lives across many attaches, so its `environ` is
+/// frozen at launch — but `TERM` describes whichever terminal is on the other
+/// end *now*, and a client attaching from a different terminal than the one
+/// that minted the shell brings a different one. The host therefore keeps the
+/// latest and republishes it on every attach ([`Host::publish_connection_env`])
+/// rather than treating it as a launch-time constant.
+pub(crate) type ConnectionEnv = std::collections::BTreeMap<String, String>;
+
+/// Where the session home lives inside the sandbox.
+///
+/// Derived from the same `sandbox2` constant the sandbox mounts it from
+/// (`crate::env::HOME_ROOT` is the same value; this module cannot use that one
+/// because `env` is `cfg(not(test))` and these paths are asserted under test).
+const SESSION_HOME_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_HOME);
+
+/// Session-home-relative directory holding the per-attach environment files.
+const ATTACH_ENV_DIR_REL: &str = ".local/state/minimal";
+
+/// POSIX-shell form of the per-attach environment, sourced by the baseline
+/// [`BASELINE_PROMPT_COMMAND`] at every prompt.
+const ATTACH_ENV_SH_REL: &str = constcat::concat!(ATTACH_ENV_DIR_REL, "/attach-env.sh");
+
+/// fish form of the same file, read by the fish hook the daemon installs into
+/// the rootfs (`crate::env`). Written alongside the POSIX form because a
+/// session's shell is whatever the user runs, not only the bash the daemon
+/// spawns.
+const ATTACH_ENV_FISH_REL: &str = constcat::concat!(ATTACH_ENV_DIR_REL, "/attach-env.fish");
+
+/// The same facts as data rather than as a script, for a shell that would
+/// rather read them than evaluate them — nushell, today.
+///
+/// Nu cannot use either script form. `source` takes a *parse-time constant*
+/// path, so it can't be pointed at `$env.MINIMAL_ATTACH_ENV_JSON`; and a
+/// literal path that doesn't exist yet is a hard parse error, which would
+/// break the shell outright on a session that has published nothing. Its
+/// `load-env (open …)` reads this file instead, under a `path exists` guard.
+/// JSON also sidesteps a third set of quoting rules — the escaping is the
+/// serializer's problem, not this module's.
+///
+/// Every key here becomes an environment variable, so the file carries no
+/// metadata (not even the "generated" banner the script forms have).
+const ATTACH_ENV_JSON_REL: &str = constcat::concat!(ATTACH_ENV_DIR_REL, "/attach-env.json");
+
+/// In-sandbox absolute path of the POSIX per-attach environment file.
+pub(crate) const ATTACH_ENV_SH: &str = constcat::concat!(SESSION_HOME_ROOT, "/", ATTACH_ENV_SH_REL);
+
+/// In-sandbox absolute path of the fish per-attach environment file.
+pub(crate) const ATTACH_ENV_FISH: &str =
+    constcat::concat!(SESSION_HOME_ROOT, "/", ATTACH_ENV_FISH_REL);
+
+/// In-sandbox absolute path of the JSON per-attach environment file.
+pub(crate) const ATTACH_ENV_JSON: &str =
+    constcat::concat!(SESSION_HOME_ROOT, "/", ATTACH_ENV_JSON_REL);
+
+/// The baseline shell's per-prompt wiring, in two halves.
+///
 /// Trigger half of the launcher-baseline orientation banner: evaluates the
 /// [`BASELINE_MOTD`] payload at the first interactive prompt, then unsets
 /// both vars so the banner prints exactly once and never for
 /// non-interactive commands. Identical to the MOTD recipe the built-in
 /// `default` loadout ships and `docs/reference/loadouts.md` ("Vars in the
 /// attach shell") documents.
+///
+/// It carries nothing but the banner. The per-attach environment is refreshed
+/// by the shell hooks the daemon installs into the rootfs (`crate::env`),
+/// deliberately not from here: this variable is composed, so a loadout
+/// setting its own `PROMPT_COMMAND` would replace the refresh, and the MOTD
+/// recipe above would `unset` it — neither of which a session's `TERM` may
+/// depend on.
 const BASELINE_PROMPT_COMMAND: &str = r#"eval "$MINIMAL_MOTD"; unset PROMPT_COMMAND MINIMAL_MOTD"#;
 
 /// Absolute workspace root inside a session sandbox, `/workbench` by
@@ -1592,6 +1785,25 @@ fn session_baseline_env(
             BASELINE_PROMPT_COMMAND.to_string(),
         ),
         ("MINIMAL_MOTD".to_string(), BASELINE_MOTD.to_string()),
+        // Where the host republishes the attached terminal's facts. Named
+        // rather than hard-coded into the prompt command so a loadout that
+        // replaces `PROMPT_COMMAND` (or starts another shell) can still find
+        // the file; the fish form is offered for the same reason.
+        ("MINIMAL_ATTACH_ENV".to_string(), ATTACH_ENV_SH.to_string()),
+        (
+            "MINIMAL_ATTACH_ENV_FISH".to_string(),
+            ATTACH_ENV_FISH.to_string(),
+        ),
+        (
+            "MINIMAL_ATTACH_ENV_JSON".to_string(),
+            ATTACH_ENV_JSON.to_string(),
+        ),
+        // The POSIX fallback tier. `$ENV` is the only startup hook a plain
+        // `sh`, dash, ash, or ksh offers, and unlike the other four shells
+        // there is nothing in the rootfs they read on their own — so this one
+        // has to travel as a variable. It names a daemon-owned file; the file
+        // is what does the work.
+        ("ENV".to_string(), crate::env::ATTACH_ENV_POSIX.to_string()),
     ];
     if let Some(display) = loadouts_display {
         env.push(("MINIMAL_LOADOUTS".to_string(), display.to_string()));
@@ -1958,8 +2170,26 @@ impl SessionLauncher for SandboxLauncher {
             // The `bash` package installs to `/usr/bin/bash` (--prefix=/usr) and
             // the generic rootfs has no `/bin/bash`, so exec the absolute path
             // that exists rather than `/bin/bash` (which fails with ENOENT).
+            // `--rcfile` rather than `-l`: this build of bash has no
+            // `/etc/bash.bashrc`, so the daemon's per-attach environment hook
+            // has no shell-owned integration point to live in and must be
+            // named on the argv — and bash consults `--rcfile` only for an
+            // interactive *non-login* shell. Nothing is lost: `--noprofile`
+            // already suppressed every file `-l` would have read, so the
+            // session shell read nothing before this and still reads nothing
+            // but the daemon's own rc (a user `~/.bashrc` stays unread).
+            // `-i` is explicit rather than inferred from the pty.
             let mut command = env
-                .command(&container, "/usr/bin/bash", ["--noprofile", "-l"])
+                .command(
+                    &container,
+                    "/usr/bin/bash",
+                    [
+                        "--noprofile",
+                        "--rcfile",
+                        crate::env::ATTACH_ENV_BASH_RC,
+                        "-i",
+                    ],
+                )
                 .map_err(|e| io::Error::other(format!("build command: {e}")))?;
             command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
             command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
@@ -2184,8 +2414,13 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     {
         let environment = self.guard.command_environment();
         // `with_env` replaces rather than extends, so the merge happens
-        // here: session variables first, `extra_env` layered over them.
+        // here: session variables first, then the attached terminal's facts,
+        // then `extra_env`. The connection layer sits above the session's own
+        // variables for the same reason it does at launch — `TERM` describes
+        // the terminal, and the session's copy of it is only ever as fresh as
+        // the attach that spawned the shell.
         let mut vars = environment.vars;
+        vars.extend(self.connection_env.clone());
         vars.extend(extra_env);
         crate::nsenter::Injection::new(self.session_leader_pid()?, program, args)
             .with_cwd(environment.cwd)
@@ -2218,6 +2453,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     {
         let environment = self.guard.command_environment();
         let mut vars = environment.vars;
+        vars.extend(self.connection_env.clone());
         vars.extend(extra_env);
         let mut cmd = std::process::Command::new(program);
         cmd.args(args);
@@ -2290,6 +2526,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         archives_dir: std::path::PathBuf,
         session_id: sessions::SessionId,
         composition: Option<Arc<sessions::core::compose::Composition>>,
+        connection_env: ConnectionEnv,
     ) -> Result<(HostHandle, JoinHandle<Result<i32, std::io::Error>>), std::io::Error>
     where
         L: SessionLauncher<Process = P, Guard = G>,
@@ -2306,6 +2543,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             archives_dir,
             session_id,
             composition,
+            connection_env,
         )
         .await?;
         let task = tokio::spawn(host.mainloop());
@@ -2328,6 +2566,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         archives_dir: std::path::PathBuf,
         session_id: sessions::SessionId,
         composition: Option<Arc<sessions::core::compose::Composition>>,
+        connection_env: ConnectionEnv,
     ) -> Result<(Self, HostHandle), std::io::Error>
     where
         L: SessionLauncher<Process = P, Guard = G>,
@@ -2341,6 +2580,9 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         // Kept before `launch` consumes `paths`.
         let hooks_dir = paths.hooks.clone();
         let workspace_dir = paths.working.clone();
+        // Kept for `write_connection_env`, which rewrites the per-attach env
+        // (TERM included) into the session's home on every reattach.
+        let home_dir = paths.home.clone();
 
         // The launcher consumes `name`; the bindings need it too, to name the
         // archives the shell-exit prompt's save-then-delete lane writes.
@@ -2394,11 +2636,22 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             workspace_root,
             session_name,
             archives_dir,
+            connection_env,
+            home_dir,
             guard,
         };
 
         if let Some(channel) = channel {
-            host.attach(channel, sz, true).await;
+            // The launch already folded these facts into the shell's
+            // environment, so pass an empty map rather than re-applying them:
+            // `attach` treats empty as "nothing new to say" and publishes what
+            // the host already holds.
+            host.attach(channel, sz, true, ConnectionEnv::new()).await;
+        } else {
+            // No client to bind, so nothing calls `attach` — publish anyway,
+            // so a host minted headlessly still has the files in place before
+            // anything in the session looks for them.
+            host.publish_connection_env().await;
         }
 
         Ok((host, handle))
@@ -2594,8 +2847,8 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                         // `mainloop` reap via `wait()` and return.
                         return Err(());
                     }
-                    Message::Attach(channel, sz) => {
-                        self.attach(channel, sz, false).await;
+                    Message::Attach(channel, sz, connection) => {
+                        self.attach(channel, sz, false, connection).await;
                     }
                     Message::SetTitleCallback(title) => {
                         self.attrs.title = Some((title, SystemTime::now()));
@@ -2757,7 +3010,22 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         Ok(())
     }
 
-    async fn attach(&mut self, channel: Channel<Msg>, sz: WinSize, skip_flush: bool) {
+    async fn attach(
+        &mut self,
+        channel: Channel<Msg>,
+        sz: WinSize,
+        skip_flush: bool,
+        connection: ConnectionEnv,
+    ) {
+        // Before anything the client can see: the facts describe the terminal
+        // that is arriving, and the shell's first prompt after this should
+        // already read them. Empty means the client had nothing to say (see
+        // [`HostHandle::attach`]), so the previous facts stand.
+        if !connection.is_empty() {
+            self.connection_env = connection;
+        }
+        self.publish_connection_env().await;
+
         if !skip_flush {
             self.parser.screen_mut().set_size(sz.rows, sz.cols);
             let _ = channel
@@ -2790,6 +3058,17 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         // the terminal reaches the client that just attached.
         self.run_hooks_for(crate::hooks::HookEvent::Attach).await;
     }
+    /// Rewrites the session's per-attach environment files from
+    /// [`Self::connection_env`].
+    ///
+    /// Takes `&mut self` rather than `&self` deliberately: a `Host` holds a
+    /// non-`Sync` `dyn NetGuard`, so a `&Host` held across the write's await
+    /// would make the whole session future non-`Send` (the same constraint
+    /// [`HookPlan`] snapshots around).
+    async fn publish_connection_env(&mut self) {
+        write_connection_env(self.home_dir.clone(), self.connection_env.clone()).await;
+    }
+
     fn set_size(&mut self, sz: WinSize) {
         // If the terminal size changed, reconfigure the pty.
         if sz != self.sz {
@@ -2901,6 +3180,58 @@ mod tests {
         assert_eq!(env.len(), 5);
     }
 
+    /// The per-attach environment is written in each shell's own syntax, with
+    /// values quoted so a terminal name carrying shell metacharacters is
+    /// data rather than code, plus a JSON form for shells that read data
+    /// instead of evaluating a script. An empty map writes nothing at all: an
+    /// attach that carries no facts leaves the last known ones standing.
+    #[tokio::test]
+    async fn write_connection_env_renders_every_form() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = DaemonAbsPath::try_new(
+            camino::Utf8PathBuf::try_from(tmp.path().to_path_buf()).unwrap(),
+        )
+        .unwrap();
+        let sh = home.sub_path_unchecked(ATTACH_ENV_SH_REL);
+        let fish = home.sub_path_unchecked(ATTACH_ENV_FISH_REL);
+        let json = home.sub_path_unchecked(ATTACH_ENV_JSON_REL);
+
+        write_connection_env(home.clone(), ConnectionEnv::new()).await;
+        for path in [&sh, &json] {
+            assert!(
+                !std::fs::exists(path.as_str()).unwrap(),
+                "an empty attach has nothing to publish"
+            );
+        }
+
+        let env: ConnectionEnv = [
+            ("TERM".to_string(), "xterm-256color".to_string()),
+            ("ODD".to_string(), "it's \\ odd".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        write_connection_env(home, env).await;
+
+        let sh = std::fs::read_to_string(sh.as_str()).unwrap();
+        assert!(sh.contains("export TERM='xterm-256color'"), "{sh}");
+        // POSIX has no escape inside single quotes: close, escape, reopen.
+        assert!(sh.contains(r"export ODD='it'\''s \ odd'"), "{sh}");
+
+        let fish = std::fs::read_to_string(fish.as_str()).unwrap();
+        assert!(fish.contains("set -gx TERM 'xterm-256color'"), "{fish}");
+        // fish does take a backslash escape, and escapes the backslash too.
+        assert!(fish.contains(r"set -gx ODD 'it\'s \\ odd'"), "{fish}");
+
+        // The JSON form round-trips the values themselves rather than a
+        // rendering of them, and carries nothing but the variables — every
+        // key in it becomes one, so a "generated by" banner would too.
+        let json = std::fs::read_to_string(json.as_str()).unwrap();
+        let back: ConnectionEnv = serde_json_lenient::from_str(&json).expect("{json}");
+        assert_eq!(back.get("TERM").map(String::as_str), Some("xterm-256color"));
+        assert_eq!(back.get("ODD").map(String::as_str), Some("it's \\ odd"));
+        assert_eq!(back.len(), 2, "{json}");
+    }
+
     /// The launcher baseline seeds the session's identity plus the
     /// once-only orientation banner pair: the session name verbatim in
     /// `MINIMAL_SESSION_NAME`, the self-unsetting `PROMPT_COMMAND`
@@ -2932,6 +3263,36 @@ mod tests {
         let pc = env.get("PROMPT_COMMAND").expect("baseline PROMPT_COMMAND");
         assert!(pc.contains(r#"eval "$MINIMAL_MOTD""#));
         assert!(pc.contains("unset PROMPT_COMMAND MINIMAL_MOTD"));
+        // The banner and the per-attach environment are deliberately not
+        // wired together: this variable is composed, so a loadout could
+        // replace it (and the MOTD recipe unsets it outright). The refresh
+        // lives in the shell hooks `crate::env` installs into the rootfs.
+        assert!(
+            !pc.contains("MINIMAL_ATTACH_ENV"),
+            "the refresh must not ride on a composed variable: {pc}"
+        );
+
+        // The paths are still named in the environment, for anything
+        // scripting against them; the hooks themselves do not read these.
+        assert_eq!(
+            env.get("MINIMAL_ATTACH_ENV").map(String::as_str),
+            Some("/home/.local/state/minimal/attach-env.sh")
+        );
+        assert_eq!(
+            env.get("MINIMAL_ATTACH_ENV_FISH").map(String::as_str),
+            Some("/home/.local/state/minimal/attach-env.fish")
+        );
+        assert_eq!(
+            env.get("MINIMAL_ATTACH_ENV_JSON").map(String::as_str),
+            Some("/home/.local/state/minimal/attach-env.json")
+        );
+        // The POSIX tier's only startup hook. Unlike the other shells' hooks
+        // this one has to be a variable, because a plain `sh` reads nothing
+        // else — so the baseline names the daemon-owned file.
+        assert_eq!(
+            env.get("ENV").map(String::as_str),
+            Some("/usr/share/minimal/attach-env-posix.sh")
+        );
 
         let motd = env.get("MINIMAL_MOTD").expect("baseline MINIMAL_MOTD");
         assert!(motd.starts_with("[ -t 1 ]"), "banner must be TTY-gated");
@@ -3093,6 +3454,7 @@ mod tests {
             std::env::temp_dir(),
             sessions::SessionId::nil(),
             None,
+            ConnectionEnv::new(),
         )
         .await
         .expect("failed to build host");
@@ -3165,6 +3527,7 @@ mod tests {
             std::env::temp_dir(),
             sessions::SessionId::nil(),
             None,
+            ConnectionEnv::new(),
         )
         .await
         .expect("failed to build host");
@@ -3276,6 +3639,7 @@ mod tests {
             std::env::temp_dir(),
             sessions::SessionId::nil(),
             None,
+            ConnectionEnv::new(),
         )
         .await
         .expect("failed to build host");
@@ -3327,6 +3691,7 @@ mod tests {
             std::env::temp_dir(),
             sessions::SessionId::nil(),
             None,
+            ConnectionEnv::new(),
         )
         .await
         .expect("failed to build host");

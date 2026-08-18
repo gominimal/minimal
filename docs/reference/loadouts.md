@@ -141,7 +141,10 @@ MUXER = { inherit = true }               # inherit from the host env
 - `{ inherit = true }` passes the variable through from the environment of
   the `min` process on the host. If the host does not have it set, the
   variable is dropped from the session (with a warning) rather than failing
-  activation, so opportunistically inheriting things like `TERM` is safe.
+  activation, so opportunistically inheriting things like `COLORTERM` is
+  safe. `TERM` is not worth inheriting: the daemon sets it from the terminal
+  you attach from and keeps it current, above anything a loadout composes —
+  see [The attached terminal](#attached-terminal).
 - `{ inherit = true, default = "..." }` inherits, falling back to `default`
   when the host does not have the variable set.
 
@@ -443,10 +446,12 @@ file means an empty policy; a fresh install activates fine without it.
 ## Vars in the attach shell
 
 The interactive shell minted by [`min session attach`](./cli-min.md#session-attach) is
-`bash --noprofile -l`, a login shell that sources **no** startup files
-(not `/etc/profile`, `~/.bash_profile`, or `~/.bashrc`), so rc-file
-patches cannot influence it. Interactive setup travels through the
-environment instead, i.e. through `[vars]`:
+`bash --noprofile --rcfile <daemon rc> -i`. It sources **none** of your
+startup files (not `/etc/profile`, `~/.bash_profile`, or `~/.bashrc`), so
+rc-file patches cannot influence it — the only rc it reads is the daemon's
+own, which installs the [attached terminal](#attached-terminal) hook and
+nothing else. Interactive setup travels through the environment instead,
+i.e. through `[vars]`:
 
 - **Prompt**: the session launcher seeds a baseline environment
   (a stock `PS1`, plus the [orientation banner](#orientation-banner)
@@ -458,20 +463,110 @@ environment instead, i.e. through `[vars]`:
   to the launcher's defaults.
 - **Banner / MOTD**: bash evaluates `PROMPT_COMMAND` from the
   environment before the first interactive prompt, so a once-only banner
-  can ship as a payload var plus a self-unsetting trigger:
+  can ship as a payload var plus a trigger that clears its own payload:
 
   ```toml
   [vars]
-  PROMPT_COMMAND = 'eval "$MINIMAL_MOTD"; unset PROMPT_COMMAND MINIMAL_MOTD'
+  PROMPT_COMMAND = 'if [ -n "${MINIMAL_MOTD:-}" ]; then eval "$MINIMAL_MOTD"; unset MINIMAL_MOTD; fi; if [ -r "${MINIMAL_ATTACH_ENV:-}" ]; then . "$MINIMAL_ATTACH_ENV"; fi'
   MINIMAL_MOTD   = '''
   [ -t 1 ] && printf '%s\n' '' '  Welcome to the dev session.' ''
   '''
   ```
 
-  The trigger unsets both variables, so the banner prints exactly once
+  The trigger clears `MINIMAL_MOTD`, so the banner prints exactly once
   and never runs for non-interactive commands; the `[ -t 1 ]` guard keeps
   redirected output clean. Multi-line literal values survive composition
   intact.
+
+  Replacing `PROMPT_COMMAND` costs you nothing but the banner: the
+  [attached terminal's](#attached-terminal) `TERM` is refreshed by a hook
+  the daemon installs, not by this variable.
+
+### The attached terminal {#attached-terminal}
+
+A session shell is spawned once and outlives the terminals that attach to
+it, so `TERM` — a fact about *the terminal currently attached* — cannot
+live in its environment alone. The shell may have been minted for a
+different terminal, or for no terminal at all: a lifecycle hook or an exec
+brings the sandbox up the same way an attach does.
+
+**Nothing is required of a loadout or a project for this to work.** The
+daemon publishes the current terminal's facts on every attach, and installs
+the hook that re-reads them into every session rootfs, for every shell it
+supports. This is deliberately not carried by a `[vars]` entry: an
+environment variable is composed, so a loadout could replace it — and the
+MOTD recipe above unsets `PROMPT_COMMAND` outright — which would leave the
+session's `TERM` depending on whether an author knew to preserve it.
+
+The published files, rewritten on each attach (edits to them are lost):
+
+| Var | File | Read by |
+|---|---|---|
+| `MINIMAL_ATTACH_ENV` | `~/.local/state/minimal/attach-env.sh` | bash, zsh — POSIX `export TERM='…'` |
+| `MINIMAL_ATTACH_ENV_FISH` | `~/.local/state/minimal/attach-env.fish` | fish — `set -gx TERM '…'` |
+| `MINIMAL_ATTACH_ENV_JSON` | `~/.local/state/minimal/attach-env.json` | nushell — data, not a script |
+
+`ENV` is also set, to a daemon-owned file that sources the POSIX form at
+shell startup — see [Other POSIX shells](#attached-terminal-posix).
+
+The variables are there for anything you want to script against. The hooks
+themselves do not read them: each hard-codes the path, so a composition
+that happens to set a variable of that name cannot redirect the refresh.
+
+The hooks live at each shell's own vendor/system integration point, inside
+the rootfs rather than the session home — so a loadout patch cannot collide
+with one:
+
+| Shell | Hook location | At the prompt | Before a command |
+|---|---|---|---|
+| bash | the rc the session shell is started with (`--rcfile`) | — | `DEBUG` trap |
+| zsh | `/etc/zsh/zshrc` | `precmd` | `preexec` |
+| fish | `/usr/share/fish/vendor_conf.d/` | `fish_prompt` event | `fish_preexec` event |
+| nushell | `/usr/share/nushell/vendor/autoload/` | `pre_prompt` | `pre_execution` |
+
+Two hooks, because they answer different questions. The prompt one keeps a
+shell that is sitting idle current. The pre-execution one matters when you
+re-attach: the prompt on your screen was drawn *before* you detached, and
+it has already fired its prompt hook — so without a hook that runs before
+the command, the first thing you type at that restored prompt would still
+see the terminal you had last time, and only the *next* prompt would catch
+up. bash's `DEBUG` trap covers both cases on its own.
+
+bash uses a trap rather than `PROMPT_COMMAND` for the same reason the
+mechanism is not a var at all: `PROMPT_COMMAND` is composed, and the MOTD
+recipe unsets it. A trap is shell state, which nothing in a composition can
+reach.
+
+#### Other POSIX shells {#attached-terminal-posix}
+
+A plain `sh`, dash, the BusyBox or BSD ashes, ksh and mksh get a weaker
+guarantee, and the limit is POSIX's rather than ours. The one hook POSIX
+defines is `$ENV`: an interactive shell expands it and sources that file at
+**startup**. The daemon points `ENV` at a file of its own
+(`/usr/share/minimal/attach-env-posix.sh`) which sources the published
+POSIX form, so any such shell starts with the terminal that is current at
+that moment — including one started from a parent whose own value was
+stale.
+
+What these shells cannot do is *refresh*. POSIX has no per-prompt or
+per-command hook, and none can be built: `PS1` expansion cannot change the
+shell's own environment, because a command substitution runs in a subshell
+and `${var:=word}` assigns only when the variable is unset. So a `sh` you
+left running across a re-attach keeps the terminal it started with. Two
+ways out, either of which is a one-liner:
+
+```sh
+. "$MINIMAL_ATTACH_ENV"   # re-sync this shell
+exec sh                   # or just start a new one
+```
+
+ksh93 is the exception in this family — its `PS1.get` discipline function
+is a genuine per-prompt hook — but the daemon does not install one, so ksh93
+behaves like the rest here.
+
+Anything the daemon itself runs inside the session — an exec, a lifecycle
+hook — gets the current terminal's facts applied directly, above the
+composed vars, without any of this.
 
 ### Orientation banner {#orientation-banner}
 
@@ -509,4 +604,6 @@ cannot collide with either.
 Because the trigger lives in the baseline layer, a loadout that sets its
 own `PROMPT_COMMAND` replaces the banner cleanly — and can interpolate
 the same `$MINIMAL_*` vars in its own MOTD, as the built-in `default`
-loadout does for its orientation lines.
+loadout does for its orientation lines. It carries no obligation beyond
+the banner — the [attached terminal's](#attached-terminal) `TERM` is kept
+current by a daemon-installed shell hook that no composition can reach.
