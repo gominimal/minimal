@@ -1,0 +1,13 @@
+# ArgSchema grammar (crates/args/src/lib.rs): primitives + bracketed lists.
+p_string="string"
+p_number="number"
+p_boolean="boolean"
+p_bool="bool"
+br_open="["
+br_close="]"
+br_pair="[]"
+comma=", "
+quoted="\"v 1\""
+list="[a, b, \"c d\"]"
+nested="[[]]"
+empty_str="\"\""

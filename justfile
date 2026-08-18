@@ -263,6 +263,12 @@ msrv: (_need "cargo-hack" "cargo install cargo-hack --locked")
 miri:
     cargo +nightly miri test -p switch
 
+# Kani bounded-verification harnesses over the pure security cores
+# (rcache index_file parse, sessions PathDecision lattice). See
+# scripts/kani.sh for install + the 0.67.0 pin rationale. #1109.
+kani: (_need "cargo-kani" "cargo install --locked kani-verifier --version 0.67.0 && cargo kani setup")
+    ./scripts/kani.sh
+
 # Each `fuzz/` dir is its OWN workspace (so the nightly/sanitizer build can't
 # perturb the main one), which means no workspace-wide build ever compiles
 # them — they bitrot silently as the crates they target evolve. Plain `cargo
@@ -285,7 +291,15 @@ fuzz-check:
 #
 # Run one fuzz target: `just fuzz graph graph_from_bytes -max_total_time=60`.
 fuzz crate target *args: (_need "cargo-fuzz" "cargo install cargo-fuzz --locked")
-    cd crates/{{crate}} && cargo +nightly fuzz run {{target}} -- -rss_limit_mb=2048 {{args}}
+    #!/usr/bin/env sh
+    set -eu
+    cd crates/{{crate}}
+    # libFuzzer never loads a dictionary on its own — it has to be passed. Any
+    # target with a `fuzz/<target>.dict` gets it automatically; a dict only
+    # biases mutation, so a target without one is not an error.
+    dict=""
+    [ -f "fuzz/{{target}}.dict" ] && dict="-dict=fuzz/{{target}}.dict"
+    cargo +nightly fuzz run {{target}} -- -rss_limit_mb=2048 $dict {{args}}
 
 # Unit + in-process integration tests. CI: every lane's core-tests suite.
 test: _nextest

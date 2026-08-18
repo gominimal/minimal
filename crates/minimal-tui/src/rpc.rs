@@ -238,6 +238,9 @@ pub async fn rename(
 /// root isn't a VCS checkout — the CLI asks for confirmation there (#770),
 /// and a TUI form pre-filled with the current directory must not stream a
 /// home directory to the daemon on three Enters.
+///
+/// Loadout hooks that name an external script are dropped on the way — see
+/// [`without_external_hook_scripts`].
 pub async fn activate(
     sock: &Path,
     name: Option<String>,
@@ -253,6 +256,10 @@ pub async fn activate(
                 project_path: project_path.clone(),
                 network,
                 policy: SessionPolicy::default(),
+                // Same default as an activate with no flags: the dashboard
+                // has no `--no-hooks` of its own, and a session created here
+                // is attachable later like any other.
+                hooks_enabled: true,
                 attrs: Default::default(),
             },
         })
@@ -285,6 +292,14 @@ pub async fn activate(
             .upload_workspace_files_quiet(id, upload_root.as_std_path())
             .await
             .context("uploading project files")?;
+        // Drop hooks whose scripts live in a file. The dashboard has no
+        // hook-script upload — that staging lives in the `minimal` crate,
+        // which sits above this one — and the daemon refuses to finalize a
+        // session whose composition names a staged script that never
+        // arrived. Sending them would fail every dashboard activation for a
+        // user whose loadout happens to use an external hook. Inline hooks
+        // carry their body in the composition and are kept.
+        let contribution = without_external_hook_scripts(contribution);
         let configured = client
             .oneshot_rpc::<minimald_rpc::ConfigureLoadout>(minimald_rpc::ConfigureLoadoutRequest {
                 session_id: id,
@@ -347,6 +362,46 @@ fn resolve_upload_root(dir: &camino::Utf8Path) -> Result<camino::Utf8PathBuf, an
     }
 }
 
+/// Strip hooks whose scripts are files rather than inline bodies.
+///
+/// The daemon gates `FinalizeSession` on a marker the hook-script upload
+/// writes, and the dashboard has no such upload — the staging that produces
+/// it lives in the `minimal` crate, above this one. A composition naming a
+/// script that never arrives cannot finalize, so a user whose loadout uses
+/// an external hook could not create a session from the dashboard at all.
+///
+/// Dropping is the conservative half of that trade: an inline hook still
+/// runs, and an external one silently does not rather than failing the
+/// activation. A hook left with no scripts at all is removed entirely,
+/// since an empty one is not constructible.
+fn without_external_hook_scripts(
+    mut contribution: sessions::wire::request::WireContribution,
+) -> sessions::wire::request::WireContribution {
+    use sessions::wire::primitives::WireHookScript;
+    let is_inline =
+        |s: &Option<WireHookScript>| !matches!(s, Some(WireHookScript::External { .. }));
+    for ph in &mut contribution.lifecycle_hooks {
+        let h = &mut ph.hook;
+        for slot in [
+            &mut h.on_activate,
+            &mut h.on_destroy,
+            &mut h.on_attach,
+            &mut h.on_detach,
+        ] {
+            if !is_inline(slot) {
+                *slot = None;
+            }
+        }
+    }
+    contribution.lifecycle_hooks.retain(|ph| {
+        let h = &ph.hook;
+        h.on_activate.is_some()
+            || h.on_destroy.is_some()
+            || h.on_attach.is_some()
+            || h.on_detach.is_some()
+    });
+    contribution
+}
 #[cfg(test)]
 mod tests {
     use super::*;

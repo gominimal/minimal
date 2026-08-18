@@ -94,6 +94,18 @@ impl From<&RequestedPty> for WinSize {
 pub struct Pty {
     master: OwnedFd,
     slave: OwnedFd,
+    /// Filesystem path of the slave side (`/dev/pts/N`), captured at
+    /// open.
+    ///
+    /// Exists so a caller that needs the terminal *later* — a lifecycle
+    /// hook wanting a real tty for `[ -t 1 ]` and `tput` — can open a
+    /// short-lived descriptor and close it again, instead of retaining
+    /// a spare slave fd for the session's lifetime. Retaining one is
+    /// precisely the leak the `set_cloexec` comment below warns about:
+    /// while any slave fd stays open the master never sees EOF, so the
+    /// host never observes the shell exiting and the session is never
+    /// reaped.
+    slave_path: std::path::PathBuf,
 }
 
 impl Pty {
@@ -138,7 +150,39 @@ impl Pty {
         set_cloexec(master.as_raw_fd())?;
         set_cloexec(slave.as_raw_fd())?;
 
-        Ok(Self { master, slave })
+        // `ptsname_r`, not `ptsname`: the latter returns a pointer to a
+        // static buffer, which is not safe to call from a daemon that
+        // opens PTYs from more than one task.
+        let slave_path = {
+            let mut buf = [0 as libc::c_char; 128];
+            // SAFETY: `master` is a live PTY master fd; `buf` is a valid
+            // writable array of the length passed alongside it.
+            let ret = unsafe { libc::ptsname_r(master.as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
+            if ret != 0 {
+                return Err(io::Error::from_raw_os_error(ret));
+            }
+            // SAFETY: on success `ptsname_r` wrote a NUL-terminated
+            // string into `buf`.
+            let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+            std::path::PathBuf::from(
+                std::str::from_utf8(cstr.to_bytes())
+                    .map_err(|_| io::Error::other("pty slave path is not valid UTF-8"))?,
+            )
+        };
+
+        Ok(Self {
+            master,
+            slave,
+            slave_path,
+        })
+    }
+
+    /// Path of the slave side, for opening a short-lived terminal
+    /// descriptor after the pair has been wired to a process. See
+    /// [`Pty::slave_path`](Self::slave_path) on the struct for why this
+    /// is a path rather than a retained descriptor.
+    pub fn slave_path(&self) -> &std::path::Path {
+        &self.slave_path
     }
 
     /// Returns the raw file descriptor for the master side.
@@ -242,36 +286,40 @@ fn log_session_contents(
             "session content (patch: materialized into session home at FinalizeSession)",
         );
     }
-    // Session transition scripts are gated off for this release. A hook
-    // declared in a project `[session]` block is still accepted and
-    // composed into the session — it is disabled here, at the output
-    // layer, by suppressing the content-logging loop below (and it is
-    // never executed, as exec is deferred), rather than being refused at
-    // compose time. Restore the loop when the feature ships. (Hooks from
-    // loadouts are excluded earlier, before client-side composition — see
-    // `crates/minimal/src/loadouts.rs`.)
-    //
-    // for h in comp.lifecycle_hooks() {
-    //     let src = sessions::core::source::Provenanced::source(h);
-    //     let hook = h.hook();
-    //     [
-    //         ("on_activate", hook.on_activate()),
-    //         ("on_destroy", hook.on_destroy()),
-    //         ("on_failure", hook.on_failure()),
-    //     ]
-    //     .into_iter()
-    //     .filter_map(|(event, script)| script.map(|s| (event, s)))
-    //     .for_each(|(event, script)| {
-    //         let kind = match script {
-    //             sessions::core::lifecyclehook::HookScript::Inline(_) => "inline",
-    //             sessions::core::lifecyclehook::HookScript::External(_) => "external",
-    //         };
-    //         tracing::info!(
-    //             session = session_name,
-    //             ...
-    //         );
-    //     });
-    // }
+    // Hooks are logged in setup order (project first, then loadouts —
+    // see `Composition::lifecycle_hooks`), so the log reads in the
+    // order the transitions will fire. Execution is still deferred, so
+    // this records intent rather than an outcome; an operator
+    // inspecting a session should be able to see which scripts it
+    // carries and where each came from before any of them runs.
+    for h in comp.lifecycle_hooks() {
+        let src = sessions::core::source::Provenanced::source(h);
+        let hook = h.hook();
+        [
+            ("on_activate", hook.on_activate()),
+            ("on_destroy", hook.on_destroy()),
+            ("on_attach", hook.on_attach()),
+            ("on_detach", hook.on_detach()),
+        ]
+        .into_iter()
+        .filter_map(|(event, script)| script.map(|s| (event, s)))
+        .for_each(|(event, script)| {
+            let kind = match script.body() {
+                sessions::core::lifecyclehook::HookScriptBody::Inline(_) => "inline",
+                sessions::core::lifecyclehook::HookScriptBody::External(_) => "external",
+            };
+            tracing::info!(
+                session = session_name,
+                domain = "lifecycle_hook",
+                event,
+                kind,
+                timeout_secs = script.timeout().as_secs(),
+                description = hook.description().unwrap_or_default(),
+                source = ?src,
+                "session content (lifecycle hook: composed, not yet executed)",
+            );
+        });
+    }
 }
 
 /// Duplicate `fd` into a new close-on-exec `OwnedFd` via
@@ -334,6 +382,7 @@ enum BindingMsg {
 /// Messages from the binding (user terminal) to the shell process / host.
 enum StdinMsg {
     Bytes(bytes::Bytes),
+    /// A binding left its mainloop for a reason that counts as a detach.
     TerminalUpdate(RequestedPty),
     WindowChange {
         col_width: u32,
@@ -510,16 +559,52 @@ impl Binding {
 
         tracing::info!(reason = ?exit_reason, "binding leaving mainloop");
 
-        if exit_reason == MainloopExitReason::ProcessExited {
-            Self::shell_exit_prompt(
-                self.delta.as_ref(),
-                self.control.as_ref(),
-                &self.archives_dir,
-                &self.name,
-                rs.make_reader(),
-                &mut w,
-            )
-            .await;
+        // Whether the session outlives this binding, and so should run its
+        // `on_detach` hooks. `HostGone` leaves no session to detach from,
+        // and a shell exit resolved as "delete" flows into destruction,
+        // which runs its own hooks instead.
+        let session_outlives_us = match exit_reason {
+            MainloopExitReason::HostGone => false,
+            MainloopExitReason::ProcessExited => {
+                Self::shell_exit_prompt(
+                    self.delta.as_ref(),
+                    self.control.as_ref(),
+                    &self.archives_dir,
+                    &self.name,
+                    rs.make_reader(),
+                    &mut w,
+                )
+                .await
+                    == ExitDisposition::Kept
+            }
+            MainloopExitReason::Detach => true,
+            // NOT on supercede, however much it looks like a departure.
+            // `Host::attach` sends the teardown and then awaits this
+            // binding's join handle — from inside the host's own message
+            // loop — so anything here that needs the host deadlocks:
+            // `detached()` reaches the session actor, which reaches back
+            // into the host to build the hook's command, which is blocked
+            // waiting for us. The session is also still attached, just by
+            // someone else, so firing `on_detach` immediately before the
+            // new binding's `on_attach` would misdescribe what happened.
+            MainloopExitReason::Superceded => false,
+            // Not on daemon shutdown. Asking for detach hooks reaches the
+            // sessions manager, which brings a session's actor *up* from
+            // disk on demand and would mint a fresh sandbox to run them in
+            // — the opposite of what shutdown is doing, and a race against
+            // the teardown already in flight. The session is being
+            // suspended, not left: `on_detach` waits for the next real
+            // departure.
+            MainloopExitReason::Shutdown => false,
+        };
+
+        // Asked of the session actor rather than run here: a detach hook is
+        // not the departing shell's to run — on the shell-exit path that
+        // shell is already gone, which is what ended the sandbox — so the
+        // actor mints a host for it exactly as activation does. Awaited, so
+        // the hooks are not racing this binding's teardown.
+        if session_outlives_us && let Some(control) = self.control.as_ref() {
+            control.detached().await;
         }
 
         let _ = ws.eof().await;
@@ -577,7 +662,8 @@ impl Binding {
         name: &str,
         mut r: R,
         mut w: W,
-    ) where
+    ) -> ExitDisposition
+    where
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
     {
@@ -700,18 +786,36 @@ impl Binding {
             match control {
                 Some(control) => {
                     let _ = w.write_all(b"\r\nDeleting session...\r\n").await;
-                    if let Err(e) = control.destroy().await {
-                        tracing::warn!(error = %e, "session delete failed");
-                        let _ = w
-                            .write_all(format!("Failed to delete session: {e}\r\n").as_bytes())
-                            .await;
+                    match control.destroy().await {
+                        // Destroyed: its own hooks have run, and there is no
+                        // session left to detach from.
+                        Ok(()) => return ExitDisposition::Destroyed,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "session delete failed");
+                            let _ = w
+                                .write_all(format!("Failed to delete session: {e}\r\n").as_bytes())
+                                .await;
+                        }
                     }
                 }
                 // No manager wired (test harness): degrade to a detach.
                 None => tracing::warn!("delete selected but no session control available"),
             }
         }
+        // Every remaining path leaves the session standing: keep, cancel, a
+        // failed delete, or a delete with nothing wired to carry it out.
+        ExitDisposition::Kept
     }
+}
+
+/// What the shell-exit prompt settled on, which decides whether the session
+/// is still there to run `on_detach`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitDisposition {
+    /// The session survives the shell that exited.
+    Kept,
+    /// The session was torn down, running its `on_destroy` hooks on the way.
+    Destroyed,
 }
 
 /// A handle to a launched session process.
@@ -807,6 +911,9 @@ pub(crate) struct Launched<P, G> {
     /// down explicitly via [`sandbox2::NetGuard::teardown`] at session end.
     /// `None` for `HostNet`/`NoNet` and for the mock launcher.
     net_guard: Option<Box<dyn sandbox2::NetGuard>>,
+    /// Path of the session PTY's slave side, so hooks can open the
+    /// terminal briefly rather than the host retaining a descriptor.
+    tty_path: std::path::PathBuf,
 }
 
 /// Actor messages to a [`Host`].
@@ -825,6 +932,10 @@ enum Message {
     CommandInSession {
         program: std::ffi::OsString,
         args: Vec<std::ffi::OsString>,
+        /// Layered over the session's own variables, replacing on a
+        /// shared key. Empty for callers that want the session
+        /// environment verbatim.
+        extra_env: std::collections::BTreeMap<String, String>,
         reply: oneshot::Sender<Result<std::process::Command, crate::nsenter::NsenterError>>,
     },
 
@@ -1019,6 +1130,28 @@ impl HostHandle {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
+        self.command_in_session_env(program, args, std::collections::BTreeMap::new())
+            .await
+    }
+
+    /// [`Self::command_in_session`], with `extra_env` layered over the
+    /// session's own variables.
+    ///
+    /// Separate rather than an extra parameter on the common form
+    /// because [`crate::nsenter::Injection::with_env`] *replaces* the
+    /// environment outright — merging has to happen host-side, where
+    /// the session's variables live, and every caller that doesn't need
+    /// it should keep saying so by not passing anything.
+    pub async fn command_in_session_env<I, S>(
+        &self,
+        program: impl AsRef<std::ffi::OsStr>,
+        args: I,
+        extra_env: std::collections::BTreeMap<String, String>,
+    ) -> io::Result<std::process::Command>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
         let (reply, recv) = oneshot::channel();
         let message = Message::CommandInSession {
             program: program.as_ref().to_os_string(),
@@ -1026,6 +1159,7 @@ impl HostHandle {
                 .into_iter()
                 .map(|a| a.as_ref().to_os_string())
                 .collect(),
+            extra_env,
             reply,
         };
         let dead = || io::Error::other("session host stopped before the command could be built");
@@ -1135,6 +1269,20 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // thus the sandbox files) is dropped. `None` for `HostNet`/`NoNet` and tests.
     net_guard: Option<Box<dyn sandbox2::NetGuard>>,
 
+    /// Path of the session PTY's slave side. Attach and detach hooks
+    /// open it briefly so their stdout is a real terminal; the host
+    /// never holds a descriptor on it, because one open slave fd stops
+    /// the master from ever seeing EOF.
+    tty_path: std::path::PathBuf,
+    /// The composed hooks, so the attach and detach transitions can run
+    /// them. `None` for a host spawned without one (tests, and a
+    /// restart-orphaned actor).
+    composition: Option<Arc<sessions::core::compose::Composition>>,
+    /// Identity and paths a hook run needs.
+    session_id: sessions::SessionId,
+    hooks_dir: paths::DaemonAbsPath,
+    workspace_dir: paths::DaemonAbsPath,
+
     // Destroy capability handed to each binding this host spawns, so a
     // shell-exit "delete" can tear the whole session down. `None` for hosts
     // built without a manager (the test harness).
@@ -1166,6 +1314,51 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // down before the sandbox files backing its rootfs are removed. Also read,
     // via `SessionGuard`, for the session's current environment.
     guard: G,
+}
+
+/// An owned snapshot of everything a hook run needs.
+///
+/// Owned rather than borrowed because a `Host` holds a non-`Sync`
+/// `dyn NetGuard`: keeping a `&Host` alive across an await would make
+/// the whole session future non-`Send`.
+struct HookPlan {
+    event: crate::hooks::HookEvent,
+    commands: crate::hooks::InjectedCommands,
+    composition: Arc<sessions::core::compose::Composition>,
+    session_id: sessions::SessionId,
+    session_name: String,
+    hooks_dir: paths::DaemonAbsPath,
+    workspace: paths::DaemonAbsPath,
+    output: crate::hooks::HookOutput,
+}
+
+/// Run a snapshotted plan, warning on any hook that failed.
+///
+/// Never fatal: an attach must not be refused, and a detach must not be
+/// blocked, because a hook misbehaved.
+async fn run_hook_plan(plan: HookPlan) {
+    let ctx = crate::hooks::HookContext {
+        session_id: plan.session_id,
+        session_name: &plan.session_name,
+        composition: &plan.composition,
+        hooks_dir: plan.hooks_dir,
+        workspace: plan.workspace,
+    };
+    // No budget: the only event still routed through the host is
+    // `on_attach`, which runs on the user's terminal under a command
+    // they can interrupt. Teardown is budgeted where it runs, on the
+    // session actor.
+    for o in crate::hooks::run_hooks(&plan.commands, &ctx, plan.event, plan.output, None).await {
+        if o.failed() {
+            tracing::warn!(
+                session = plan.session_name,
+                event = o.event,
+                declared_by = %o.declared_by,
+                status = ?o.status,
+                "lifecycle hook failed",
+            );
+        }
+    }
 }
 
 /// A launched session process backed by a sandboxed [`hakoniwa::Child`].
@@ -1388,6 +1581,70 @@ pub(crate) struct SandboxLauncher {
 struct PhaseOneAttachGuard {
     switch: std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
     armed: bool,
+}
+
+/// Reaps a freshly-spawned sandbox process if the launch is abandoned
+/// before the process is handed off to a [`Launched`].
+///
+/// A [`hakoniwa::Child`] does not terminate when dropped, so anything
+/// that lets one go without killing it orphans the sandbox — a process
+/// still holding the session's rootfs after the session it belonged to
+/// is gone. The `Err` arms between the spawn and the handoff reap
+/// explicitly; this is what catches the third way out, a **cancelled**
+/// launch future. There is a real caller: a teardown transition bounds
+/// its launch with a timeout (`session::HOOK_LAUNCH_TIMEOUT`) and drops
+/// this future when it expires, which without the guard would strand a
+/// sandbox the destroy then tries to delete out from under.
+///
+/// Reaping is synchronous (`kill` + `wait` are not async), so unlike
+/// [`PhaseOneAttachGuard`] this needs no runtime to do its work in
+/// `Drop`.
+#[cfg(not(test))]
+struct SpawnedProcessGuard {
+    /// `None` once the process has been handed off — see
+    /// [`Self::release`].
+    process: Option<hakoniwa::Child>,
+}
+
+#[cfg(not(test))]
+impl SpawnedProcessGuard {
+    fn new(process: hakoniwa::Child) -> Self {
+        Self {
+            process: Some(process),
+        }
+    }
+
+    /// Borrow the guarded process, for the post-spawn wiring that still
+    /// needs it while the guard stays responsible for it.
+    fn get_mut(&mut self) -> &mut hakoniwa::Child {
+        self.process
+            .as_mut()
+            .expect("the process is taken only by `release`, which consumes the guard")
+    }
+
+    /// Hand the process off, disarming the guard.
+    fn release(mut self) -> hakoniwa::Child {
+        self.process
+            .take()
+            .expect("the process is taken only here, and this consumes the guard")
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for SpawnedProcessGuard {
+    fn drop(&mut self) {
+        let Some(mut process) = self.process.take() else {
+            return;
+        };
+        // `kill` and `wait` are independent: a process that already
+        // exited fails the kill with `ESRCH` but still needs reaping.
+        if let Err(e) = process.kill() {
+            tracing::warn!(error = %e, "killing sandbox process after an abandoned launch");
+        }
+        if let Err(e) = process.wait() {
+            tracing::warn!(error = %e, "reaping sandbox process after an abandoned launch");
+        }
+    }
 }
 
 #[cfg(not(test))]
@@ -1627,6 +1884,7 @@ impl SessionLauncher for SandboxLauncher {
                 .map_err(|e| io::Error::other(format!("build command: {e}")))?;
             command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
             command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
+            let tty_path = pty.slave_path().to_path_buf();
             let (master, slave) = pty.into_fds();
             command.stderr(hakoniwa::Stdio::from(slave));
 
@@ -1636,30 +1894,23 @@ impl SessionLauncher for SandboxLauncher {
             // `command`/`container` no longer borrow `env`, so it can be moved
             // into the host to keep its backing files alive.
             drop(container);
-            Ok::<_, io::Error>((env, master, process))
+            Ok::<_, io::Error>((env, master, process, tty_path))
         }
         .await;
 
-        let (env, master, mut process) = match build_and_spawn {
+        let (env, master, process, tty_path) = match build_and_spawn {
             // `attach_guard` (if armed) rolls the phase-1 attach back on this
-            // `Err` return when it drops.
+            // `Err` return when it drops. Nothing spawned, so there is no
+            // process to reap on this arm.
             Ok(parts) => parts,
             Err(e) => return Err(e),
         };
 
-        // Reap a sandbox process whose own-IP attach failed. A `hakoniwa::Child`
-        // does not terminate when dropped — it would orphan the sandbox process —
-        // so kill and reap it explicitly. `kill` and `wait` are independent: when
-        // `kill` fails with `ESRCH` because the process already exited during the
-        // attach window, the child still needs reaping, so `wait` runs regardless.
-        let reap = |process: &mut hakoniwa::Child| {
-            if let Err(kill_err) = process.kill() {
-                tracing::warn!(error = %kill_err, "killing sandbox process after OwnIp attach failure");
-            }
-            if let Err(wait_err) = process.wait() {
-                tracing::warn!(error = %wait_err, "reaping sandbox process after OwnIp attach failure");
-            }
-        };
+        // From here the process exists, so every way out of this function
+        // has to account for it — including the one no `return` covers, a
+        // cancelled future. `SpawnedProcessGuard` owns it until the
+        // handoff at the bottom; an `Err` return or a drop reaps it.
+        let mut process = SpawnedProcessGuard::new(process);
 
         // Phase 2 (post-spawn): wire the freshly-unshared netns onto the switch.
         // Native (DM2): hakoniwa already built + configured the tap in-namespace
@@ -1675,8 +1926,7 @@ impl SessionLauncher for SandboxLauncher {
                 // `Drop`, so it never closes it); a missing fd means the in-VM
                 // RustSlirp setup did not run — `attach_guard` rolls the phase-1
                 // attach back on the `Err` return.
-                let Some(raw) = process.rustslirp_tapfd else {
-                    reap(&mut process);
+                let Some(raw) = process.get_mut().rustslirp_tapfd else {
                     return Err(io::Error::other(
                         "own-IP sandbox produced no in-namespace tap fd",
                     ));
@@ -1704,12 +1954,10 @@ impl SessionLauncher for SandboxLauncher {
                         }
                         Some(Box::new(guard) as Box<dyn sandbox2::NetGuard>)
                     }
-                    // `complete_local_own_ip_attach` leaves rollback to
-                    // `attach_guard` (this `Err` return), so only reap the process.
-                    Err(e) => {
-                        reap(&mut process);
-                        return Err(io::Error::other(e));
-                    }
+                    // `complete_local_own_ip_attach` leaves the switch
+                    // rollback to `attach_guard` and the process to
+                    // `process`, both on this `Err` return.
+                    Err(e) => return Err(io::Error::other(e)),
                 }
             } else if matches!(network_mode, NetworkMode::OwnIp) {
                 let network = crate::net::gvproxy_network::GvproxyNetwork::new(
@@ -1717,12 +1965,9 @@ impl SessionLauncher for SandboxLauncher {
                     session_name,
                     ingress,
                 );
-                match network.attach(process.id()).await {
+                match network.attach(process.get_mut().id()).await {
                     Ok(guard) => Some(guard),
-                    Err(e) => {
-                        reap(&mut process);
-                        return Err(io::Error::other(e));
-                    }
+                    Err(e) => return Err(io::Error::other(e)),
                 }
             } else {
                 None
@@ -1730,9 +1975,10 @@ impl SessionLauncher for SandboxLauncher {
 
         Ok(Launched {
             master,
-            process: SandboxProcess(process),
+            process: SandboxProcess(process.release()),
             guard: env,
             net_guard,
+            tty_path,
         })
     }
 }
@@ -1799,6 +2045,7 @@ impl SessionLauncher for MockLauncher {
         command.arg("-c").arg(&script);
         command.stdin(std::process::Stdio::from(pty.dup_slave_fd()?));
         command.stdout(std::process::Stdio::from(pty.dup_slave_fd()?));
+        let tty_path = pty.slave_path().to_path_buf();
         let (master, slave) = pty.into_fds();
         command.stderr(std::process::Stdio::from(slave));
 
@@ -1809,6 +2056,7 @@ impl SessionLauncher for MockLauncher {
             process: MockProcess(process),
             guard: (),
             net_guard: None,
+            tty_path,
         })
     }
 }
@@ -1844,20 +2092,104 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     ///
     /// Fails if the shell's PID cannot be resolved or pinned; see
     /// [`Self::session_leader_pid`].
+    #[cfg(not(test))]
     pub(crate) fn command_in_session<I, S>(
         &self,
         program: impl AsRef<std::ffi::OsStr>,
         args: I,
+        extra_env: std::collections::BTreeMap<String, String>,
     ) -> Result<std::process::Command, crate::nsenter::NsenterError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
         let environment = self.guard.command_environment();
+        // `with_env` replaces rather than extends, so the merge happens
+        // here: session variables first, `extra_env` layered over them.
+        let mut vars = environment.vars;
+        vars.extend(extra_env);
         crate::nsenter::Injection::new(self.session_leader_pid()?, program, args)
             .with_cwd(environment.cwd)
-            .with_env(environment.vars)
+            .with_env(vars)
             .command()
+    }
+
+    /// Under test, build a plain host-side command instead of injecting into
+    /// a sandbox — the same swap [`MockLauncher`] makes for the launcher and
+    /// `()` makes for the guard.
+    ///
+    /// [`MockLauncher`]'s program is an un-sandboxed `/bin/sh` with no
+    /// children, so there is no container supervisor to resolve and
+    /// [`Self::session_leader_pid`] cannot succeed; a test reaching this
+    /// would only ever see `NoSessionLeader`. Running host-side instead
+    /// keeps everything above the injection under test — the session
+    /// environment, the script piping, output capture, outcome reporting,
+    /// and the actor wiring that decides *when* hooks run — while
+    /// [`crate::nsenter`]'s own tests cover the injection itself.
+    #[cfg(test)]
+    pub(crate) fn command_in_session<I, S>(
+        &self,
+        program: impl AsRef<std::ffi::OsStr>,
+        args: I,
+        extra_env: std::collections::BTreeMap<String, String>,
+    ) -> Result<std::process::Command, crate::nsenter::NsenterError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let environment = self.guard.command_environment();
+        let mut vars = environment.vars;
+        vars.extend(extra_env);
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        cmd.env_clear();
+        cmd.envs(vars);
+        // The mock guard reports no cwd, and an empty one would make every
+        // spawn fail; a real sandbox path wouldn't resolve host-side anyway,
+        // so only set what exists here.
+        if !environment.cwd.is_empty() && std::path::Path::new(&environment.cwd).is_dir() {
+            cmd.current_dir(&environment.cwd);
+        }
+        Ok(cmd)
+    }
+
+    /// Snapshot what a hook run needs, or `None` when there is nothing
+    /// to run or nothing to run it in.
+    fn hook_plan(&self, event: crate::hooks::HookEvent) -> Option<HookPlan> {
+        let composition = self.composition.clone()?;
+        let leader_pid = match self.session_leader_pid() {
+            Ok(pid) => pid,
+            Err(e) => {
+                tracing::debug!(
+                    event = event.as_str(),
+                    error = %e,
+                    "no session leader; skipping lifecycle hooks",
+                );
+                return None;
+            }
+        };
+        let environment = self.guard.command_environment();
+        Some(HookPlan {
+            event,
+            commands: crate::hooks::InjectedCommands {
+                leader_pid,
+                cwd: environment.cwd,
+                vars: environment.vars,
+            },
+            composition,
+            session_id: self.session_id,
+            session_name: self.session_name.clone(),
+            hooks_dir: self.hooks_dir.clone(),
+            workspace: self.workspace_dir.clone(),
+            output: crate::hooks::HookOutput::Tty(self.tty_path.clone()),
+        })
+    }
+
+    /// Snapshot a plan and run it, if there is anything to run.
+    async fn run_hooks_for(&mut self, event: crate::hooks::HookEvent) {
+        if let Some(plan) = self.hook_plan(event) {
+            run_hook_plan(plan).await;
+        }
     }
 
     /// Spawns a session host from the given launcher, wiring it to `channel` if
@@ -1875,7 +2207,10 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         sz: WinSize,
         channel: Option<Channel<Msg>>,
         control: Option<SessionControl>,
+        delta: Option<Arc<DeltaSource>>,
         archives_dir: std::path::PathBuf,
+        session_id: sessions::SessionId,
+        composition: Option<Arc<sessions::core::compose::Composition>>,
     ) -> Result<(HostHandle, JoinHandle<Result<i32, std::io::Error>>), std::io::Error>
     where
         L: SessionLauncher<Process = P, Guard = G>,
@@ -1888,7 +2223,10 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             sz,
             channel,
             control,
+            delta,
             archives_dir,
+            session_id,
+            composition,
         )
         .await?;
         let task = tokio::spawn(host.mainloop());
@@ -1907,15 +2245,23 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         sz: WinSize,
         channel: Option<Channel<Msg>>,
         control: Option<SessionControl>,
+        delta: Option<Arc<DeltaSource>>,
         archives_dir: std::path::PathBuf,
+        session_id: sessions::SessionId,
+        composition: Option<Arc<sessions::core::compose::Composition>>,
     ) -> Result<(Self, HostHandle), std::io::Error>
     where
         L: SessionLauncher<Process = P, Guard = G>,
     {
-        // Baseline the workspace before the process launches, so nothing the
-        // session writes can leak into the "since activation" reference point.
+        // The change-detection baseline (`delta`) is armed once per session and
+        // handed in, so a host rebuilt on reattach keeps the activation-time
+        // reference point rather than re-snapshotting an already-modified
+        // workspace. The root is still kept for the at-risk assessment, whose
+        // VCS mode needs the tree path even when no baseline could be armed.
         let workspace_root = paths.working.as_utf8_path().as_std_path().to_path_buf();
-        let delta = DeltaSource::arm(workspace_root.clone()).await;
+        // Kept before `launch` consumes `paths`.
+        let hooks_dir = paths.hooks.clone();
+        let workspace_dir = paths.working.clone();
 
         // The launcher consumes `name`; the bindings need it too, to name the
         // archives the shell-exit prompt's save-then-delete lane writes.
@@ -1925,6 +2271,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             process,
             guard,
             net_guard,
+            tty_path,
         } = launcher.launch(name, username, paths, sz).await?;
 
         let (sender, receiver) = mpsc::channel(8);
@@ -1958,6 +2305,11 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             stdout_buf: vec![0u8; 8 * 1024],
             stdin_buf: None,
             net_guard,
+            tty_path,
+            composition,
+            session_id,
+            hooks_dir,
+            workspace_dir,
             control,
             delta,
             workspace_root,
@@ -2109,9 +2461,10 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     Message::CommandInSession {
                         program,
                         args,
+                        extra_env,
                         reply,
                     } => {
-                        let _ = reply.send(self.command_in_session(program, args));
+                        let _ = reply.send(self.command_in_session(program, args, extra_env));
                     }
                     Message::GetAtRisk(s) => {
                         // Computed on a spawned task: the git commands and
@@ -2269,6 +2622,10 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         }
 
         self.set_size(sz);
+
+        // After the binding is installed and sized, so a hook writing to
+        // the terminal reaches the client that just attached.
+        self.run_hooks_for(crate::hooks::HookEvent::Attach).await;
     }
     fn set_size(&mut self, sz: WinSize) {
         // If the terminal size changed, reconfigure the pty.
@@ -2564,11 +2921,15 @@ mod tests {
                 cache: DaemonAbsPath::root(),
                 home: DaemonAbsPath::root(),
                 patches: DaemonAbsPath::root(),
+                hooks: DaemonAbsPath::root(),
             },
             DEFAULT_SIZE,
             None,
             None,
+            None,
             std::env::temp_dir(),
+            sessions::SessionId::nil(),
+            None,
         )
         .await
         .expect("failed to build host");
@@ -2632,11 +2993,15 @@ mod tests {
                 cache: DaemonAbsPath::root(),
                 home: DaemonAbsPath::root(),
                 patches: DaemonAbsPath::root(),
+                hooks: DaemonAbsPath::root(),
             },
             DEFAULT_SIZE,
             None,
             None,
+            None,
             std::env::temp_dir(),
+            sessions::SessionId::nil(),
+            None,
         )
         .await
         .expect("failed to build host");
@@ -2702,6 +3067,7 @@ mod tests {
             command.arg("-c").arg(&script);
             command.stdin(std::process::Stdio::from(pty.dup_slave_fd()?));
             command.stdout(std::process::Stdio::from(pty.dup_slave_fd()?));
+            let tty_path = pty.slave_path().to_path_buf();
             let (master, slave) = pty.into_fds();
             command.stderr(std::process::Stdio::from(slave));
             let process = command.spawn()?;
@@ -2709,6 +3075,7 @@ mod tests {
                 master,
                 process: MockProcess(process),
                 guard: (),
+                tty_path,
                 net_guard: Some(Box::new(RecordingNetGuard {
                     torn_down: self.torn_down,
                 })),
@@ -2722,6 +3089,7 @@ mod tests {
             cache: DaemonAbsPath::root(),
             home: DaemonAbsPath::root(),
             patches: DaemonAbsPath::root(),
+            hooks: DaemonAbsPath::root(),
         }
     }
 
@@ -2741,7 +3109,10 @@ mod tests {
             DEFAULT_SIZE,
             None,
             None,
+            None,
             std::env::temp_dir(),
+            sessions::SessionId::nil(),
+            None,
         )
         .await
         .expect("failed to build host");
@@ -2789,7 +3160,10 @@ mod tests {
             DEFAULT_SIZE,
             None,
             None,
+            None,
             std::env::temp_dir(),
+            sessions::SessionId::nil(),
+            None,
         )
         .await
         .expect("failed to build host");

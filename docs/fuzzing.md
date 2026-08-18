@@ -250,9 +250,19 @@ Ideas, roughly in value order, for follow-up on a beefy Linux box:
    | `minimald::net::wg` | `WgPublicKey::from_str` length-checks its `try_into`; `Ipv4Cidr` validates the prefix and special-cases `/0` in `mask()`. |
    | `minvmd::rpc_client` response decode | The defect there was a resource bound (an unbounded `read_to_end`), which a fuzzer cannot surface. Fixed with a cap instead. |
 
-4. **Cheap multipliers** — a libFuzzer dictionary (the JSON keys + tag bytes
-   `0x01`–`0x07`, `0xFF`), and a nightly CI fuzz job per target with a
-   persisted corpus.
+4. **Cheap multipliers** — a nightly CI fuzz job per target with a persisted
+   corpus. (Dictionaries are done: see below.)
+
+## Dictionaries
+
+A target with a `crates/<crate>/fuzz/<target>.dict` gets it passed as
+`-dict=` automatically by `just fuzz`. libFuzzer never loads one on its own,
+so a dict that is not wired up is a dead file — the naming convention is what
+wires it. Targets without one are unaffected; a dictionary only biases
+mutation towards tokens that mean something to the parser.
+
+Shipped so far: `arg_schema_parse`, `graph_from_bytes`, `jq_parse_json`,
+`mfile_from_toml`.
 
 Related: `minimal run mutants` mutation-tests `graph`'s wire decoder in the
 Linux sandbox; surviving mutants pinpoint untested encode/decode branches.

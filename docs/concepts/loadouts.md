@@ -115,14 +115,17 @@ that may not be present on every machine.
 
 ### Lifecycle hooks
 
-> **Coming soon.** Lifecycle hooks are not yet live: a hook declared in a
-> loadout is accepted, but the current release excludes it from composition
-> and nothing executes it. The declaration format below is what we expect to ship.
+Hooks run inside your session, with its packages, variables, files, and
+network. Your own loadouts' hooks run without ceremony; a *project's* hooks
+require you to allow-list that project in your
+[user policy](../reference/user-policy.md) first, because a hook is arbitrary
+code the project asked to run on your machine. `min session activate
+--no-hooks` turns them off for a session entirely.
 
 Hooks are scripts declared to run at session transition points: `on_activate`
-when the session comes up, `on_destroy` when it is torn down, and `on_failure`
-when activation fails. Declare them to warm a cache, fetch grammars, or clean
-up after a failed start:
+when the session comes up, `on_destroy` when it is torn down, `on_attach`
+when you connect to it, and `on_detach` when you disconnect. Declare them to
+warm a cache, fetch grammars, or clean up when you step away:
 
 ```toml
 [[lifecycle_hooks]]
@@ -220,8 +223,8 @@ per-kind summary of what it contributes:
 
 ```
   NAME   DESCRIPTION                     CONTRIBUTES
-* dev    helix + zellij with my dotfiles 2 pkg / 2 var / 2 patch / 1 hook
-  extra                                  1 pkg / 0 var / 0 patch / 0 hook
+* dev    helix + zellij with my dotfiles 2 pkg / 1 var / 2 patch
+  extra                                  1 pkg / 0 var / 0 patch
 
 * default (from `[loadouts].default_loadouts`)
 ```

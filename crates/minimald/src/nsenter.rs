@@ -219,6 +219,21 @@ pub enum NsenterError {
         source: std::io::Error,
     },
 
+    /// The shim path resolved to something that is no longer on disk. The
+    /// usual cause is a daemon whose own binary was replaced or deleted while
+    /// it was running: `current_exe()` reads `/proc/self/exe`, which the
+    /// kernel then reports as a dangling `<path> (deleted)`.
+    ///
+    /// Checked before the spawn because the `ENOENT` it would otherwise
+    /// produce names the *injected* program, sending whoever reads it looking
+    /// for a missing `bash` inside the session instead of a missing daemon
+    /// outside it.
+    #[error(
+        "the daemon's own executable is gone from {path:?} — it was replaced or deleted while \
+         the daemon was running (a rebuild, typically); restart minimald"
+    )]
+    ShimMissing { path: PathBuf },
+
     /// `setns(2)` failed. `EPERM` on an otherwise sound setup means one of: the
     /// caller is multi-threaded (which the user namespace forbids), the set
     /// includes a namespace the sandbox never unshared (see
@@ -413,6 +428,12 @@ impl Injection {
                 std::env::current_exe().map_err(|source| NsenterError::CurrentExe { source })?
             }
         };
+        // See [`NsenterError::ShimMissing`]: a path that has gone away since it
+        // was resolved is worth its own error, because the spawn's `ENOENT`
+        // blames the injected program for the daemon's problem.
+        if !shim.exists() {
+            return Err(NsenterError::ShimMissing { path: shim });
+        }
 
         let mut cmd = Command::new(shim);
         cmd.arg(SUBCOMMAND).arg("--pidfd").arg(PIDFD_FD.to_string());
@@ -631,8 +652,14 @@ mod tests {
     /// The production path: no shim is named per injection (only tests do
     /// that), so this resolution order is what keeps #1175 fixed. One test,
     /// because [`SHIM_EXE`] is process-wide and set once.
+    ///
+    /// Both stand-in shims are real files: a path that doesn't exist is now
+    /// [`NsenterError::ShimMissing`], which would mask the ordering under test.
     #[test]
     fn the_registered_shim_overrides_current_exe_and_yields_to_an_explicit_one() {
+        let registered_exe = tempfile::NamedTempFile::new().expect("a temp file to stand in");
+        let explicit_exe = tempfile::NamedTempFile::new().expect("a temp file to stand in");
+
         // A plain child shares all our namespaces, so nothing is joined and no
         // privilege is needed.
         let mut sleep = Command::new("/bin/sleep")
@@ -643,10 +670,10 @@ mod tests {
         let injection = || Injection::new(target, "/bin/true", Vec::<&str>::new());
 
         let unregistered = injection().command().map(|c| c.get_program().to_owned());
-        set_shim_exe("/run/minimald");
+        set_shim_exe(registered_exe.path());
         let registered = injection().command().map(|c| c.get_program().to_owned());
         let explicit = injection()
-            .with_shim("/usr/bin/minimald")
+            .with_shim(explicit_exe.path())
             .command()
             .map(|c| c.get_program().to_owned());
 
@@ -658,15 +685,42 @@ mod tests {
             "with nothing registered the daemon re-execs itself",
         );
         assert_eq!(
-            registered.expect("building the command"),
-            OsStr::new("/run/minimald"),
+            PathBuf::from(registered.expect("building the command")),
+            registered_exe.path(),
             "the registered shim replaces current_exe()",
         );
         assert_eq!(
-            explicit.expect("building the command"),
-            OsStr::new("/usr/bin/minimald"),
+            PathBuf::from(explicit.expect("building the command")),
+            explicit_exe.path(),
             "a per-injection shim still wins over the registration",
         );
+    }
+
+    /// A shim path that has gone away — the shape `current_exe()` takes after
+    /// the daemon's binary is replaced under it, which any rebuild of a running
+    /// daemon does — is reported as the daemon's problem. Spawning it instead
+    /// yields an `ENOENT` naming the injected program, which reads as a broken
+    /// session rather than a stale daemon.
+    #[test]
+    fn a_shim_that_is_no_longer_on_disk_is_named_as_the_failure() {
+        let missing = tempfile::NamedTempFile::new().expect("a temp file to stand in");
+        let path = missing.path().to_path_buf();
+        drop(missing); // Now a path that resolved a moment ago and no longer does.
+
+        let mut sleep = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawning /bin/sleep");
+        let built = Injection::new(sleep.id(), "/bin/true", Vec::<&str>::new())
+            .with_shim(&path)
+            .command();
+
+        let _ = sleep.kill();
+        let _ = sleep.wait();
+        let Err(NsenterError::ShimMissing { path: reported }) = built else {
+            panic!("expected ShimMissing, got {:?}", built.map(|_| "a command"));
+        };
+        assert_eq!(reported, path);
     }
 
     #[test]

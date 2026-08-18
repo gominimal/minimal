@@ -63,10 +63,10 @@ impl Composable for ProjectComposable {
             path: self.project_path,
         };
         // Session transition scripts declared in a project `[session]`
-        // block are accepted and composed like any other primitive; the
-        // feature is gated off for this release purely at the output and
-        // execution layers (see `crates/minimald/src/session_host.rs`),
-        // not by dropping them here.
+        // block are composed like any other primitive. Unlike a
+        // loadout's, they face the user's `[hooks]` policy before they
+        // will run — a project is not the user, and a hook is arbitrary
+        // code. That gate is the composer's; nothing is dropped here.
         contribute_primitives(
             &source,
             self.session.packages,

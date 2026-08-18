@@ -1,0 +1,107 @@
+name: CI (Kani proofs)
+
+# Kani bounded-verification harnesses over the pure security-load-bearing
+# cores (#1109): the rcache index_file untrusted-bytes parse path and the
+# sessions PathDecision combination lattice. ADVISORY lane: not in branch
+# protection's required contexts until the harnesses have soaked — flip by
+# adding `ci-kani-success` to the ruleset, no workflow change needed.
+#
+# ALWAYS-TRIGGERED, path-scoped INSIDE the workflow (same pattern as every
+# other lane — do NOT add trigger-level `paths:` here; a required context
+# skipped at trigger level wedges PRs as "Expected" forever).
+on:
+    push:
+        branches: ["main"]
+    pull_request:
+        branches: ["main"]
+    workflow_dispatch:
+
+env:
+    CARGO_TERM_COLOR: always
+    # Pin EXACTLY: 0.66.0 and earlier give spurious verification failures
+    # on arrays with more than 64 elements (kani#2416/#4408, fixed by the
+    # CBMC 6.8.0 upgrade in 0.67.0) — one index_file wire record is 68
+    # bytes, so an older cached Kani would fail proofs that are correct.
+    KANI_VERSION: 0.67.0
+
+concurrency:
+    group: ci-kani-${{ github.ref }}
+    cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+    contents: read
+    pull-requests: read
+
+jobs:
+    changes:
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        outputs:
+            kani: ${{ steps.filter.outputs.kani }}
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Detect changes to proved crates or this lane
+              id: filter
+              if: github.event_name == 'pull_request'
+              uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v3.0.2
+              with:
+                  filters: |
+                      kani:
+                        - "crates/rcache/**"
+                        - "crates/sessions/**"
+                        # In the current proof closure: the rcache record
+                        # harnesses construct SpecHash::from_bytes and
+                        # serialize via as_bytes. Direct spec-hash codec
+                        # proofs are #1109 set #6 (hash-epoch work).
+                        - "crates/common/src/spec_hash.rs"
+                        - ".github/workflows/ci-kani.yml"
+                        - "justfile"
+                        - "Cargo.toml"
+                        - "Cargo.lock"
+                        - "scripts/kani.sh"
+
+    kani:
+        needs: [changes]
+        if: github.event_name != 'pull_request' || needs.changes.outputs.kani == 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 60
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - uses: ./.github/actions/setup-rust
+              with:
+                  shared-key: kani
+            - name: Cache Kani install
+              id: kani-cache
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+              with:
+                  path: |
+                      ~/.cargo/bin/cargo-kani
+                      ~/.cargo/bin/kani
+                      ~/.kani
+                  key: kani-${{ env.KANI_VERSION }}-${{ runner.os }}
+            - name: Install Kani
+              if: steps.kani-cache.outputs.cache-hit != 'true'
+              run: |
+                  cargo install --locked kani-verifier --version "$KANI_VERSION"
+                  cargo kani setup
+            - name: Run proofs
+              run: ./scripts/kani.sh
+
+    # Lane aggregator, same shape as every other lane: branch protection
+    # keys on this job (once the lane is promoted from advisory), so
+    # adding/removing jobs above stays a workflow-only change. Skipped
+    # counts as pass; failure or cancellation of any needed job fails it.
+    ci-kani-success:
+        if: always()
+        needs: [changes, kani]
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        steps:
+            - name: Verify all gating jobs succeeded or were skipped
+              if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+              run: exit 1
+            - run: echo "Kani lane passed"

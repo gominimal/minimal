@@ -28,6 +28,17 @@ pub trait SessionObject: Sized + Send + Clone + 'static + std::fmt::Debug {
     /// materialize into the sandbox home. Each entry is stored
     /// under the patch's sandbox-home-relative destination path.
     fn patches_path(&self) -> DaemonAbsPath;
+    /// Directory the daemon stages the client-uploaded external
+    /// lifecycle-hook scripts into. Each entry is stored under the
+    /// path [`staged_script_path`] derives from its hook's source, so
+    /// the daemon can find a script again from the composition alone.
+    ///
+    /// Deliberately not under [`patches_path`](Self::patches_path):
+    /// the whole patch tree is copied into the sandbox home when the
+    /// session finalizes, and hook scripts are not dotfiles.
+    ///
+    /// [`staged_script_path`]: crate::core::lifecyclehook::staged_script_path
+    fn hooks_path(&self) -> DaemonAbsPath;
 }
 
 /// Describes the primary key a [`Loader`] uses to reference
@@ -172,6 +183,33 @@ pub trait Loader {
         key: &Self::Key,
         composition: &crate::core::compose::Composition,
     ) -> Result<(), std::io::Error>;
+
+    /// Loads the persisted workspace delta-baseline sidecar for the
+    /// session at `key`, if one exists. Returns `Ok(None)` when the
+    /// sidecar is absent (a session that predates it, or whose baseline
+    /// was never persisted).
+    ///
+    /// The payload is opaque bytes: the baseline's shape belongs to the
+    /// daemon's change-detection code, so this crate stores and returns
+    /// it verbatim rather than learning its schema.
+    ///
+    /// # Errors
+    ///
+    /// - `NotFound` if `key` is stale (same semantics as [`Self::save`]).
+    /// - I/O errors if the sidecar exists but cannot be read.
+    fn load_delta_baseline(&self, key: &Self::Key) -> Result<Option<Vec<u8>>, std::io::Error>;
+
+    /// Atomically persists the workspace delta-baseline sidecar for the
+    /// session at `key` (tmp + rename, same crash-safety as
+    /// [`Self::save`]). Written once at first arm so a daemon restart
+    /// can keep reporting changes against the activation-time baseline
+    /// instead of re-snapshotting an already-modified workspace.
+    ///
+    /// # Errors
+    ///
+    /// - `NotFound` if `key` is stale (same semantics as [`Self::save`]).
+    /// - I/O errors if the sidecar cannot be written.
+    fn store_delta_baseline(&self, key: &Self::Key, payload: &[u8]) -> Result<(), std::io::Error>;
 }
 
 /// The concrete key used to identify sessions from [`DiskLoader`].
@@ -228,6 +266,9 @@ impl SessionObject for DiskSession {
     }
     fn patches_path(&self) -> DaemonAbsPath {
         sub_path!(self.root_path(), "patches")
+    }
+    fn hooks_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root_path(), "hooks")
     }
 }
 
@@ -1002,6 +1043,42 @@ impl Loader for DiskLoader {
 
         Ok(())
     }
+
+    fn load_delta_baseline(&self, key: &Self::Key) -> Result<Option<Vec<u8>>, std::io::Error> {
+        let short = self.live_short(key)?;
+        let path = self
+            .minimal_dir
+            .as_utf8_path()
+            .join("sessions")
+            .join(&short)
+            .join("delta-baseline.json");
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn store_delta_baseline(&self, key: &Self::Key, payload: &[u8]) -> Result<(), std::io::Error> {
+        let short = self.live_short(key)?;
+        let session_dir = self
+            .minimal_dir
+            .as_utf8_path()
+            .join("sessions")
+            .join(&short);
+        std::fs::create_dir_all(&session_dir)?;
+        let dest = session_dir.join("delta-baseline.json");
+        let tmp = session_dir.join("delta-baseline.json.tmp");
+
+        std::fs::write(&tmp, payload)?;
+
+        #[cfg(target_os = "linux")]
+        common::renameat2::renameat2_cwd(tmp.as_std_path(), dest.as_std_path(), 0)?;
+        #[cfg(not(target_os = "linux"))]
+        std::fs::rename(&tmp, &dest)?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1036,6 +1113,10 @@ mod tests {
                 None,
             ),
             status: SessionStatus::default(),
+            // Deliberately the non-default (`--no-hooks`): `true` is the
+            // serde default, so a fixture using it would round-trip
+            // green even if the field were dropped on write.
+            hooks_enabled: false,
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),
@@ -1061,6 +1142,11 @@ mod tests {
         // is the authoritative source the GetSessionPolicy RPC reads back.
         assert_eq!(got.record().network, input.network);
         assert_eq!(got.record().policy, input.policy);
+        // Likewise `--no-hooks`: the attach, detach, and destroy
+        // transitions read this back off disk, long after the flag that
+        // set it is gone.
+        assert_eq!(got.record().hooks_enabled, input.hooks_enabled);
+        assert!(!got.record().hooks_enabled);
 
         // Check find_by_id as well.
         assert_eq!(
@@ -2028,5 +2114,52 @@ mod tests {
         );
         assert_eq!(loader.find_by_id(key_a.id()).unwrap(), None);
         assert_eq!(loader.find_by_id(key_b.id()).unwrap(), None);
+    }
+
+    /// The delta-baseline sidecar is absent until stored, then round-trips
+    /// its payload verbatim — the bytes are opaque to the store, so what
+    /// went in must come out untouched.
+    #[test]
+    fn delta_baseline_sidecar_round_trips_and_is_absent_until_stored() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+
+        assert_eq!(loader.load_delta_baseline(&key).unwrap(), None);
+
+        let payload = br#"{"version":1,"baseline":null}"#;
+        loader.store_delta_baseline(&key, payload).unwrap();
+        assert_eq!(
+            loader.load_delta_baseline(&key).unwrap().as_deref(),
+            Some(payload.as_slice())
+        );
+
+        // A rewrite replaces the payload; the sidecar holds one baseline.
+        let payload2 = br#"{"version":1,"baseline":[]}"#;
+        loader.store_delta_baseline(&key, payload2).unwrap();
+        assert_eq!(
+            loader.load_delta_baseline(&key).unwrap().as_deref(),
+            Some(payload2.as_slice())
+        );
+    }
+
+    /// A stale key — one whose session has been deleted — is `NotFound` on
+    /// both sidecar operations, matching `save`'s semantics: neither call
+    /// may touch a directory the index no longer owns.
+    #[test]
+    fn delta_baseline_sidecar_rejects_a_stale_key() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        loader.delete(&key).unwrap();
+
+        assert_eq!(
+            loader.load_delta_baseline(&key).unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            loader.store_delta_baseline(&key, b"{}").unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
     }
 }

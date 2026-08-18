@@ -90,6 +90,34 @@ pub enum WirePatchVerdict {
     },
 }
 
+/// The client's decision about one pending lifecycle hook.
+///
+/// Unlike a var or patch verdict this carries no value back: the daemon
+/// already holds the hook, and the client is answering only "may this
+/// run". `Denied` aborts the activation, matching the other domains —
+/// a project-declared hook the user explicitly refused must not leave a
+/// session that silently differs from what the project asked for.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireHookVerdict {
+    /// User policy or prompt approved this hook; it composes in.
+    Approved {
+        /// Matches the corresponding `WirePendingHook::id`.
+        id: PendingId,
+    },
+    /// User policy or prompt refused this hook.
+    Denied {
+        /// Matches the corresponding `WirePendingHook::id`.
+        id: PendingId,
+    },
+    /// User policy's `ignore` rule matched; drop it without failing
+    /// the activation.
+    Ignored {
+        /// Matches the corresponding `WirePendingHook::id`.
+        id: PendingId,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

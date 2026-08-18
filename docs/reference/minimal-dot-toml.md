@@ -160,8 +160,12 @@ on_activate = { type = "inline", value = "cargo check --workspace >/dev/null 2>&
   `dest` is relative to the session user's home directory; `source` resolves
   on the host, typically inside the repo.
 - **`lifecycle_hooks`**: Scripts declared for session transition points
-  (`on_activate`, `on_destroy`, `on_failure`). Composed and recorded today;
-  execution is not yet wired up in the current release.
+  (`on_activate`, `on_destroy`, `on_attach`, `on_detach`), run inside the
+  session under POSIX `sh` — or under whatever a leading shebang names, for
+  a hook you would rather write in fish or Python. A project's hooks require
+  the developer to allow-list the project in their
+  [user policy](./user-policy.md) before they will run — a hook is arbitrary
+  code, so the developer must opt in.
 
 The field shapes and composition semantics (conflicts, policy gating) are the
 same as loadouts; see the [loadout reference](./loadouts.md) for the exact

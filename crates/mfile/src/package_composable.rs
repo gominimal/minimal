@@ -28,13 +28,13 @@
 //! route them through a separate path. `read_only` is discarded
 //! (no meaning under copy semantics). `class = 'State` entries
 //! flow through unchanged as regular patches, gate-able via
-//! [`PatchPolicy`].
+//! [`PatchesPolicy`].
 //!
 //! [`Composable`]: sessions::core::compose::Composable
 //! [`Source::Package`]: sessions::core::source::Source::Package
 //! [`ProjectComposable`]: crate::ProjectComposable
 //! [`Patch`]: sessions::core::primitives::Patch
-//! [`PatchPolicy`]: sessions::core::policy::PatchPolicy
+//! [`PatchesPolicy`]: sessions::core::policy::PatchesPolicy
 
 use sessions::core::compose::{Composable, Contribution, Error};
 use sessions::core::primitives::{Patch, PatchDest, ResolvedVar, VarValue};

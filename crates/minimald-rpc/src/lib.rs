@@ -279,9 +279,24 @@ pub struct SessionConfig {
     /// Per-session networking policy (egress + ingress).
     #[serde(default)]
     pub policy: SessionPolicy,
+    /// Whether the session runs the lifecycle hooks composed into it.
+    /// Cleared by `min session activate --no-hooks`, and persisted onto
+    /// the session record so the later attach/detach/destroy
+    /// transitions — which run from processes that never saw the
+    /// activating command — honour the same choice. Defaults to `true`
+    /// so a client that predates the field gets hooks, not silence.
+    #[serde(default = "default_hooks_enabled")]
+    pub hooks_enabled: bool,
     /// Free-form attributes (typed by the caller).
     #[serde(default)]
     pub attrs: std::collections::BTreeMap<String, String>,
+}
+
+/// Serde default for [`SessionConfig::hooks_enabled`]. See
+/// [`sessions::Record::hooks_enabled`] for why this cannot be a bare
+/// `#[serde(default)]`.
+fn default_hooks_enabled() -> bool {
+    true
 }
 
 /// The request for a [`CreateSession`] RPC.
@@ -392,9 +407,36 @@ pub struct FinalizeSessionRequest {
     pub session_id: SessionId,
 }
 
-/// The response for a [`FinalizeSession`] RPC — a unit-shaped ack.
+/// The response for a [`FinalizeSession`] RPC.
+///
+/// Carries what the session's `on_activate` hooks did, so the client can
+/// report it: a hook that ran is otherwise invisible to the user, since
+/// activation is headless and its output goes to the daemon log. A
+/// *failing* activate hook fails the whole RPC instead, so anything
+/// listed here succeeded.
+/// `deny_unknown_fields` is load-bearing, not tidiness. [`Errorable`] is
+/// `#[serde(untagged)]`, so it tries `Ok(S)` first and takes it if it
+/// parses — and a struct whose every field is optional parses from *any*
+/// object, including `{"error": "..."}`. Without this, every failed
+/// finalize would decode as a successful one with no hooks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FinalizeSessionResponse {
+    /// One entry per `on_activate` hook that ran, in the order they ran.
+    /// Serde-defaulted so a daemon that predates the field still answers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activate_hooks: Vec<RanHook>,
+}
+
+/// One hook that ran, as reported back to the client.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FinalizeSessionResponse;
+pub struct RanHook {
+    /// Where it was declared, e.g. ``user loadout `dev` ``.
+    pub declared_by: String,
+    /// The hook's own description, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
 
 impl OneshotSshRpc for FinalizeSession {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "FinalizeSession");
@@ -594,6 +636,33 @@ impl OneshotSshRpc for GetSessionPolicy {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionPolicy");
     type Request<'a> = GetSessionPolicyRequest;
     type Response = Errorable<SessionPolicy>;
+}
+
+/// An RPC to list the lifecycle hooks composed into a session, and where
+/// each was declared.
+///
+/// Served from the session's persisted composition snapshot rather than
+/// live state, so it answers after a daemon restart and for a session
+/// nobody is attached to. The snapshot holds only the hooks that
+/// survived the user-policy gate, so what this returns is what will
+/// actually run — not what the loadouts and project asked for.
+pub struct GetSessionHooks;
+
+/// Request for the [`GetSessionHooks`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GetSessionHooksRequest {
+    Name(String),
+    Id(SessionId),
+}
+
+impl OneshotSshRpc for GetSessionHooks {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionHooks");
+    type Request<'a> = GetSessionHooksRequest;
+    /// Each hook paired with the loadout or project that declared it, in
+    /// setup order (project first, then loadouts). Teardown order is the
+    /// reverse; the caller renders whichever it needs.
+    type Response = Errorable<Vec<sessions::wire::primitives::WireProvenancedHook>>;
 }
 
 /// An RPC for a process inside a PTask to request a dynamic ingress port
@@ -890,6 +959,45 @@ mod tests {
     use super::*;
     use sessions::wire::request::{ContributionResponse, WireContribution};
 
+    /// A failed finalize must decode as an error, not as a success with
+    /// nothing in it.
+    ///
+    /// [`Errorable`] is `#[serde(untagged)]`, so it takes `Ok(S)` if `S`
+    /// parses at all — and a response whose fields are all optional
+    /// parses from any object, an error payload included. Adding
+    /// `activate_hooks` reopened exactly that hole, and the symptom is
+    /// silent: every activation, including a failing one, reads as
+    /// successful. `deny_unknown_fields` is what closes it, and this is
+    /// what keeps it closed.
+    #[test]
+    fn a_finalize_error_does_not_decode_as_a_successful_finalize() {
+        let err: Errorable<FinalizeSessionResponse> =
+            serde_json_lenient::from_str(r#"{"error":"activation hook failed"}"#)
+                .expect("an error payload must decode");
+        match err {
+            Errorable::Err { error } => assert!(error.contains("activation hook failed")),
+            Errorable::Ok(ok) => {
+                panic!("an error decoded as success: {ok:?}")
+            }
+        }
+
+        // The success shapes still decode: with hooks, and without.
+        let bare: Errorable<FinalizeSessionResponse> =
+            serde_json_lenient::from_str("{}").expect("an empty success must decode");
+        assert_eq!(bare, Errorable::Ok(FinalizeSessionResponse::default()));
+        let with_hooks: Errorable<FinalizeSessionResponse> = serde_json_lenient::from_str(
+            r#"{"activate_hooks":[{"declared_by":"user loadout `dev`"}]}"#,
+        )
+        .expect("a populated success must decode");
+        match with_hooks {
+            Errorable::Ok(ok) => {
+                assert_eq!(ok.activate_hooks.len(), 1);
+                assert_eq!(ok.activate_hooks[0].declared_by, "user loadout `dev`");
+            }
+            Errorable::Err { error } => panic!("a success decoded as an error: {error}"),
+        }
+    }
+
     /// An empty request body must decode with the documented defaults so a
     /// bare `{}` probe (or an older client) still gets a full bundle.
     #[test]
@@ -1079,12 +1187,31 @@ mod tests {
                 project_path: paths::HostAbsPath::try_new("/home/u/proj").unwrap(),
                 network: NetworkMode::OwnIp,
                 policy: SessionPolicy::default(),
+                // The non-default (`--no-hooks`): `true` is the serde
+                // default, so a fixture using it would round-trip green
+                // even if the field never reached the wire.
+                hooks_enabled: false,
                 attrs: [("color".to_string(), "blue".to_string())]
                     .into_iter()
                     .collect(),
             },
         };
         assert_eq!(round_trip(&req), req);
+    }
+
+    /// A `SessionConfig` from a client that predates `hooks_enabled`
+    /// deserializes with hooks **on**. A bare `#[serde(default)]` would
+    /// give `false` and silently disable hooks for every older client.
+    #[test]
+    fn session_config_predating_hooks_enabled_defaults_to_on() {
+        let json = r#"{
+            "name": "s",
+            "project_path": "/p",
+            "network": "host_net",
+            "attrs": {}
+        }"#;
+        let c: SessionConfig = serde_json_lenient::from_str(json).expect("legacy config must load");
+        assert!(c.hooks_enabled);
     }
 
     #[test]

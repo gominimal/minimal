@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use sessions::core::decision::ItemDecision;
 use sessions::core::hooks::{HookResult, PolicyHooks, Unapproved};
-use sessions::core::policy::{PatchPolicy, VarNameGlobs, VarsPolicy};
+use sessions::core::policy::{HooksPolicy, PatchesPolicy, VarNameGlobs, VarsPolicy};
 use sessions::core::source::Source;
 
 /// One choice a user makes at a prompt. Names carry both intent
@@ -174,7 +174,9 @@ pub struct InteractivePrompt {
     /// cell. Extracted by [`Self::into_final_policy`].
     vars_policy: RefCell<VarsPolicy>,
     /// Same shape as `vars_policy`, for the patches side.
-    patches_policy: RefCell<PatchPolicy>,
+    patches_policy: RefCell<PatchesPolicy>,
+    /// Same shape again, for the lifecycle-hooks side.
+    hooks_policy: RefCell<HooksPolicy>,
 }
 
 impl InteractivePrompt {
@@ -184,12 +186,13 @@ impl InteractivePrompt {
     /// composer.
     #[must_use]
     pub fn new(policy_path: &Path, initial: sessions::core::policy::UserPolicy) -> Self {
-        let (vars, patches) = initial.into_parts();
+        let (vars, patches, hooks) = initial.into_parts();
         Self {
             prompter: Box::new(InquirePrompter),
             can_persist: is_writable(policy_path),
             vars_policy: RefCell::new(vars),
             patches_policy: RefCell::new(patches),
+            hooks_policy: RefCell::new(hooks),
         }
     }
 
@@ -204,6 +207,7 @@ impl InteractivePrompt {
         sessions::core::policy::UserPolicy::empty()
             .with_vars(self.vars_policy.into_inner())
             .with_patches(self.patches_policy.into_inner())
+            .with_hooks(self.hooks_policy.into_inner())
     }
 
     /// Test seam: injectable prompter + explicit `can_persist`.
@@ -214,7 +218,8 @@ impl InteractivePrompt {
             prompter,
             can_persist,
             vars_policy: RefCell::new(VarsPolicy::empty()),
-            patches_policy: RefCell::new(PatchPolicy::empty()),
+            patches_policy: RefCell::new(PatchesPolicy::empty()),
+            hooks_policy: RefCell::new(HooksPolicy::empty()),
         }
     }
 
@@ -340,9 +345,9 @@ impl PolicyHooks for InteractivePrompt {
 
     fn on_patch_unapproved(
         &self,
-        _policy: PatchPolicy,
+        _policy: PatchesPolicy,
         items: &[Unapproved<'_, camino::Utf8Path>],
-    ) -> HookResult<PatchPolicy> {
+    ) -> HookResult<PatchesPolicy> {
         let choices = self.choices();
         let mut decisions = Vec::with_capacity(items.len());
         let mut policy_touched = false;
@@ -361,6 +366,42 @@ impl PolicyHooks for InteractivePrompt {
             match apply_patch_choice(&mut policy, path.as_str(), choice, &mut policy_touched) {
                 PatchStep::Decision(d) => decisions.push(d),
                 PatchStep::Abort => return HookResult::Abort,
+            }
+        }
+        if policy_touched {
+            HookResult::decided_with_policy(decisions, policy.clone())
+        } else {
+            HookResult::decided(decisions)
+        }
+    }
+
+    fn on_hook_unapproved(
+        &self,
+        _policy: HooksPolicy,
+        items: &[Unapproved<'_, camino::Utf8Path>],
+    ) -> HookResult<HooksPolicy> {
+        let choices = self.choices();
+        let mut decisions = Vec::with_capacity(items.len());
+        let mut policy_touched = false;
+        let mut policy = self.hooks_policy.borrow_mut();
+        for item in items {
+            let root = item.item();
+            // Worded to say what approval actually grants. The other
+            // two domains move data; this one runs code, and a prompt
+            // that read like "wants to use lifecycle hooks" would
+            // understate what the user is agreeing to.
+            let msg = format!(
+                "The project at `{}` wants to run its own scripts inside the session \
+                 (lifecycle hooks). This executes arbitrary code from that project.",
+                root.as_str()
+            );
+            let choice = match self.prompter.ask(&msg, choices) {
+                Ok(c) => c,
+                Err(_) => return HookResult::Abort,
+            };
+            match apply_hook_choice(&mut policy, root.as_str(), choice, &mut policy_touched) {
+                HookStep::Decision(d) => decisions.push(d),
+                HookStep::Abort => return HookResult::Abort,
             }
         }
         if policy_touched {
@@ -468,7 +509,7 @@ fn apply_var_choice(
 /// absolute path the walker produced. Fancier pattern editing
 /// (glob-ification, `~/` conversion) is a future feature.
 fn apply_patch_choice(
-    policy: &mut PatchPolicy,
+    policy: &mut PatchesPolicy,
     path: &str,
     choice: UserChoice,
     touched: &mut bool,
@@ -491,6 +532,86 @@ fn apply_patch_choice(
             *policy = append_patch_pattern(policy.clone(), PatchBucket::Deny, path);
             *touched = true;
             PatchStep::Abort
+        }
+    }
+}
+
+/// Outcome of applying a hooks-side [`UserChoice`]. Same shape as
+/// [`VarStep`] and [`PatchStep`].
+enum HookStep {
+    Decision(ItemDecision),
+    Abort,
+}
+
+/// Apply one [`UserChoice`] to the hooks policy for a project root.
+///
+/// The permanent variants record the project root verbatim, so
+/// approving once covers every hook that project declares now and
+/// later. That is the intended grain: the user is trusting the
+/// project, not auditing individual scripts, and a per-script rule
+/// would silently lapse the moment the project added another.
+fn apply_hook_choice(
+    policy: &mut HooksPolicy,
+    root: &str,
+    choice: UserChoice,
+    touched: &mut bool,
+) -> HookStep {
+    match choice {
+        UserChoice::AllowOnce => HookStep::Decision(ItemDecision::AllowOnce),
+        UserChoice::IgnoreOnce => HookStep::Decision(ItemDecision::IgnoreOnce),
+        UserChoice::AllowPermanent => {
+            *policy = append_hook_pattern(policy.clone(), HookBucket::Allow, root);
+            *touched = true;
+            HookStep::Decision(ItemDecision::UseRule)
+        }
+        UserChoice::IgnorePermanent => {
+            *policy = append_hook_pattern(policy.clone(), HookBucket::Ignore, root);
+            *touched = true;
+            HookStep::Decision(ItemDecision::UseRule)
+        }
+        UserChoice::Abort => HookStep::Abort,
+        UserChoice::DenyPermanent => {
+            *policy = append_hook_pattern(policy.clone(), HookBucket::Deny, root);
+            *touched = true;
+            HookStep::Abort
+        }
+    }
+}
+
+enum HookBucket {
+    Allow,
+    Deny,
+    Ignore,
+}
+
+/// Append `root` as a pattern into the requested hooks-policy bucket.
+fn append_hook_pattern(policy: HooksPolicy, bucket: HookBucket, root: &str) -> HooksPolicy {
+    // Stored as a literal, not as the pattern it would otherwise be
+    // read as. The user picked one project at the prompt; a raw path
+    // containing glob metacharacters would either match its siblings
+    // too — approving code execution nobody was asked about — or match
+    // nothing, leaving a rule that silently never fires. See
+    // [`literal_policy_pattern`].
+    let root = sessions::core::expansion::literal_policy_pattern(root);
+    let extend = |existing: &[String]| -> Vec<String> {
+        existing
+            .iter()
+            .cloned()
+            .chain(std::iter::once(root.clone()))
+            .collect()
+    };
+    match bucket {
+        HookBucket::Allow => {
+            let p = extend(policy.allow());
+            policy.with_allow(p)
+        }
+        HookBucket::Deny => {
+            let p = extend(policy.deny());
+            policy.with_deny(p)
+        }
+        HookBucket::Ignore => {
+            let p = extend(policy.ignore());
+            policy.with_ignore(p)
         }
     }
 }
@@ -538,7 +659,12 @@ fn append_var_pattern(policy: &mut VarsPolicy, bucket: VarBucket, name: &str) ->
     }
 }
 
-fn append_patch_pattern(policy: PatchPolicy, bucket: PatchBucket, path: &str) -> PatchPolicy {
+fn append_patch_pattern(policy: PatchesPolicy, bucket: PatchBucket, path: &str) -> PatchesPolicy {
+    // Same literal-not-pattern reasoning as `append_hook_pattern`. A
+    // patch moves data rather than running it, so the stakes are lower
+    // — but a rule that silently never matches is the same bug either
+    // way, and the user picked one file.
+    let path = &sessions::core::expansion::literal_policy_pattern(path);
     match bucket {
         PatchBucket::Allow => {
             let patterns: Vec<String> = policy
@@ -595,6 +721,7 @@ pub struct NoPromptHook {
 pub struct UnapprovedSummary {
     vars: Vec<String>,
     patches: Vec<String>,
+    hooks: Vec<String>,
 }
 
 impl UnapprovedSummary {
@@ -626,6 +753,15 @@ impl UnapprovedSummary {
             patches.insert("allow", toml_edit::value(allow));
             doc.insert("patches", toml_edit::Item::Table(patches));
         }
+        if !self.hooks.is_empty() {
+            let mut hooks = toml_edit::Table::new();
+            let mut allow = toml_edit::Array::new();
+            for root in &self.hooks {
+                allow.push(root.as_str());
+            }
+            hooks.insert("allow", toml_edit::value(allow));
+            doc.insert("hooks", toml_edit::Item::Table(hooks));
+        }
         doc.to_string()
     }
 
@@ -633,7 +769,7 @@ impl UnapprovedSummary {
     /// would require approval").
     #[must_use]
     pub fn count(&self) -> usize {
-        self.vars.len() + self.patches.len()
+        self.vars.len() + self.patches.len() + self.hooks.len()
     }
 }
 
@@ -694,12 +830,28 @@ impl PolicyHooks for NoPromptHook {
 
     fn on_patch_unapproved(
         &self,
-        _policy: PatchPolicy,
+        _policy: PatchesPolicy,
         items: &[Unapproved<'_, camino::Utf8Path>],
-    ) -> HookResult<PatchPolicy> {
+    ) -> HookResult<PatchesPolicy> {
         let mut seen = self.seen.borrow_mut();
         for item in items {
             insert_unique(&mut seen.patches, item.item().as_str().to_owned());
+        }
+        HookResult::decided(vec![ItemDecision::AllowOnce; items.len()])
+    }
+
+    /// Records each project whose hooks would need approval and
+    /// fake-approves, exactly as the other two domains do — the caller
+    /// checks `into_summary().count()` and aborts before any verdict
+    /// reaches the daemon, so this never grants execution.
+    fn on_hook_unapproved(
+        &self,
+        _policy: HooksPolicy,
+        items: &[Unapproved<'_, camino::Utf8Path>],
+    ) -> HookResult<HooksPolicy> {
+        let mut seen = self.seen.borrow_mut();
+        for item in items {
+            insert_unique(&mut seen.hooks, item.item().as_str().to_owned());
         }
         HookResult::decided(vec![ItemDecision::AllowOnce; items.len()])
     }
@@ -817,8 +969,8 @@ impl Drop for RemoveOnDrop<'_> {
     }
 }
 
-/// Upsert the six rule arrays (`vars.allow/deny/ignore`,
-/// `patches.allow/deny/ignore`) from `policy` into `doc`, replacing
+/// Upsert the nine rule arrays (`vars`, `patches`, and `hooks`, each
+/// with `allow`/`deny`/`ignore`) from `policy` into `doc`, replacing
 /// each in place while leaving surrounding structure, comments, and
 /// unrelated keys intact. Empty arrays are removed rather than
 /// written as `[]` so a minimal policy doesn't render bloated
@@ -837,12 +989,18 @@ fn merge_policy_into_document(
     upsert_string_array(doc, "patches", "deny", patches.deny());
     upsert_string_array(doc, "patches", "ignore", patches.ignore());
 
-    // Drop `[vars]` / `[patches]` sections that end up empty. Keeps
-    // the file minimal after a rule the user hand-added gets emptied
-    // by some future policy operation (defensive — today's flow only
-    // appends, never removes).
+    let hooks = policy.hooks();
+    upsert_string_array(doc, "hooks", "allow", hooks.allow());
+    upsert_string_array(doc, "hooks", "deny", hooks.deny());
+    upsert_string_array(doc, "hooks", "ignore", hooks.ignore());
+
+    // Drop sections that end up empty. Keeps the file minimal after a
+    // rule the user hand-added gets emptied by some future policy
+    // operation (defensive — today's flow only appends, never
+    // removes).
     remove_empty_section(doc, "vars");
     remove_empty_section(doc, "patches");
+    remove_empty_section(doc, "hooks");
 }
 
 fn upsert_string_array(
@@ -951,6 +1109,37 @@ mod tests {
 
     fn scripted(answers: Vec<UserChoice>, can_persist: bool) -> InteractivePrompt {
         InteractivePrompt::with_prompter(Box::new(ScriptedPrompter::new(answers)), can_persist)
+    }
+
+    /// "Allow permanent" on a project whose path contains glob
+    /// metacharacters must store something that means *that* project.
+    /// Stored raw, `/tmp/build*` would grant every sibling `build…`
+    /// project the right to run code in the user's sessions — an
+    /// approval nobody was asked for. Asserted here as well as on the
+    /// expander so the escaping cannot be dropped at the call site.
+    #[test]
+    fn allowing_a_project_with_glob_chars_stores_a_literal_not_a_pattern() {
+        let policy = append_hook_pattern(HooksPolicy::empty(), HookBucket::Allow, "/tmp/build*");
+        let stored = policy.allow();
+        assert_eq!(stored.len(), 1);
+        assert_ne!(
+            stored[0], "/tmp/build*",
+            "the raw path would be read back as a wildcard",
+        );
+
+        // What matters is the behaviour after expansion, not the spelling.
+        let vars: [sessions::core::primitives::ResolvedVar; 0] = [];
+        let fs =
+            sessions::core::expansion::expand_policy_pattern(&stored[0], vars.as_slice(), None)
+                .expect("the stored entry should expand");
+        assert!(
+            fs.is_match("/tmp/build*"),
+            "should match the project itself"
+        );
+        assert!(
+            !fs.is_match("/tmp/build-someone-elses-project"),
+            "should not reach another project",
+        );
     }
 
     // ---- UserChoice option filtering ----
@@ -1096,7 +1285,7 @@ mod tests {
         let source = package_source("go");
         let path = camino::Utf8Path::new("/home/u/.config/go/env");
         let items = [Unapproved::new(path, &source)];
-        let out = hook.on_patch_unapproved(PatchPolicy::empty(), &items);
+        let out = hook.on_patch_unapproved(PatchesPolicy::empty(), &items);
         match out {
             HookResult::Decided {
                 decisions,
@@ -1166,11 +1355,79 @@ mod tests {
         let path = camino::Utf8Path::new("/etc/foo");
         let patch_items = [Unapproved::new(path, &source)];
         let _ =
-            hook.on_patch_unapproved(sessions::core::policy::PatchPolicy::empty(), &patch_items);
+            hook.on_patch_unapproved(sessions::core::policy::PatchesPolicy::empty(), &patch_items);
 
         let summary = hook.into_summary();
         assert_eq!(summary.vars, vec!["DIAGRAM", "GOCACHE", "LOG_LEVEL"]);
         assert_eq!(summary.patches, vec!["/etc/foo"]);
+    }
+
+    /// `--no-prompt` records the projects whose hooks would need
+    /// approval and renders them into the `[hooks]` section of the
+    /// pasteable snippet.
+    ///
+    /// Without this the snippet would tell an operator how to unblock
+    /// the vars and patches but stay silent about the hooks, so the
+    /// activation would fail again on the next run for a reason the
+    /// error never mentioned.
+    #[test]
+    fn no_prompt_hook_collects_projects_and_renders_hooks_section() {
+        let hook = NoPromptHook::new();
+        let source = project_source();
+        let root = camino::Utf8Path::new("/repo");
+
+        let items = [Unapproved::new(root, &source)];
+        let _ = hook.on_hook_unapproved(HooksPolicy::empty(), &items);
+        // A second batch naming the same project must not duplicate.
+        let _ = hook.on_hook_unapproved(HooksPolicy::empty(), &items);
+
+        let summary = hook.into_summary();
+        assert_eq!(summary.hooks, vec!["/repo"]);
+        assert_eq!(summary.count(), 1);
+
+        let snippet = summary.as_toml_snippet();
+        assert!(snippet.contains("[hooks]"), "got: {snippet}");
+        assert!(snippet.contains("\"/repo\""), "got: {snippet}");
+        // The snippet must parse — it is meant to be pasted verbatim.
+        let parsed: sessions::core::policy::UserPolicy =
+            toml::from_str(&snippet).expect("snippet must be valid user_policy.toml");
+        assert_eq!(parsed.hooks().allow(), &["/repo".to_string()]);
+    }
+
+    /// A project the user permanently allows lands in the hooks
+    /// policy's `allow` list, so the next activation of that project
+    /// runs its hooks without asking again.
+    #[test]
+    fn allow_permanent_appends_project_to_hooks_allow() {
+        let mut policy = HooksPolicy::empty();
+        let mut touched = false;
+        let step = apply_hook_choice(
+            &mut policy,
+            "/repo",
+            UserChoice::AllowPermanent,
+            &mut touched,
+        );
+        assert!(matches!(step, HookStep::Decision(ItemDecision::UseRule)));
+        assert!(touched);
+        assert_eq!(policy.allow(), &["/repo".to_string()]);
+        assert!(policy.deny().is_empty());
+    }
+
+    /// A permanent denial records the rule *and* aborts, matching the
+    /// patch domain: the user is saying "never" and "not now" at once.
+    #[test]
+    fn deny_permanent_records_rule_and_aborts() {
+        let mut policy = HooksPolicy::empty();
+        let mut touched = false;
+        let step = apply_hook_choice(
+            &mut policy,
+            "/repo",
+            UserChoice::DenyPermanent,
+            &mut touched,
+        );
+        assert!(matches!(step, HookStep::Abort));
+        assert!(touched);
+        assert_eq!(policy.deny(), &["/repo".to_string()]);
     }
 
     /// The TOML snippet builder groups by domain, quotes correctly,

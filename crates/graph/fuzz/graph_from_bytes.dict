@@ -1,0 +1,32 @@
+# graph wire format (crates/graph/src/wire.rs): tagged records, JSON payloads.
+# Tags
+tag_header="\x01"
+tag_build_spec="\x02"
+tag_local_file="\x03"
+tag_top_levels="\x04"
+tag_profile="\x05"
+tag_stack="\x06"
+tag_supply_chain="\x07"
+tag_footer="\xff"
+# JSON structure
+obj_open="{\""
+kv_sep="\":"
+comma_key=",\""
+arr="[]"
+null="null"
+true="true"
+false="false"
+# Record vocabulary seen in wire payloads
+k_pkg="\"pkg\""
+k_top="\"top\""
+k_shared="\"shared\""
+k_lib="\"lib\""
+k_main="\"main\""
+k_default_file_mode="\"default_file_mode\""
+k_name="\"name\""
+k_version="\"version\""
+k_hash="\"hash\""
+k_path="\"path\""
+# Length-field stress (little-endian extremes)
+len_ff="\xff\xff\xff\xff"
+len_hi="\x00\x00\x00\x80"

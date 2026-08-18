@@ -5,6 +5,7 @@
 
 use anyhow::{Context as _, bail};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::config::{read_client_config, resolve_minimal_config_dir};
 use crate::{GlobalArgs, LoadoutListArgs};
@@ -196,6 +197,175 @@ pub(crate) fn compose_options_from_config(
         .with_follow_symlinks(cfg.loadouts.follow_symlinks)
 }
 
+/// Resolve and validate every external hook script the active loadouts
+/// declare, ready to upload.
+///
+/// Run before the daemon connection is opened so a mistyped script path
+/// fails on this machine, naming the file, instead of surfacing after a
+/// session already exists on the daemon.
+///
+/// Only *loadout* scripts are staged here. A project's external scripts
+/// live in the project tree, which the daemon already has from the
+/// workspace upload, so it resolves those itself —
+/// [`check_project_hooks`] validates them without staging them.
+///
+/// Returns an empty list when hooks are disabled — `--no-hooks` means
+/// nothing is staged, uploaded, or run.
+pub(crate) fn stage_loadout_hook_scripts(
+    active: &ActiveLoadouts,
+    global: &GlobalArgs,
+    project_root: &camino::Utf8Path,
+    hooks_enabled: bool,
+) -> Result<Vec<sessions::client::hookscripts::StagedScript>, anyhow::Error> {
+    use sessions::client::hookscripts::{ScriptAnchors, stage_external_scripts};
+    use sessions::core::source::{ProvenancedHook, Source};
+
+    if !hooks_enabled {
+        return Ok(Vec::new());
+    }
+    let loadouts_dir =
+        camino::Utf8PathBuf::from_path_buf(resolve_minimal_config_dir(global).join("loadouts"))
+            .map_err(|p| {
+                anyhow::anyhow!("loadouts directory is not valid UTF-8: {}", p.display())
+            })?;
+
+    let hooks: Vec<ProvenancedHook> = active
+        .loadouts
+        .iter()
+        .flat_map(|l| {
+            let source = Source::UserLoadout {
+                name: l.name().as_ref().to_owned(),
+            };
+            l.lifecycle_hooks()
+                .iter()
+                .map(move |h| ProvenancedHook::new(h.clone(), source.clone()))
+        })
+        .collect();
+
+    let anchors = ScriptAnchors {
+        loadouts_dir,
+        project_root: project_root.to_owned(),
+    };
+    stage_external_scripts(&hooks, &anchors).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Validate the hooks a project declares, before a session exists.
+///
+/// The daemon composes these from the uploaded mfile, so nothing here is
+/// staged or sent — but every reason a hook would fail later is knowable
+/// now, on the machine that owns the file:
+///
+/// - an **external** script that is missing, is not a regular file, or
+///   traverses a symlink. The daemon would surface this only when the
+///   hook ran, which for `on_destroy` is at teardown, long after the
+///   mistake.
+/// - an **inline** script that is empty, which can only ever be a typo:
+///   it declares a transition and then does nothing at it.
+///
+/// A project with no mfile, or one that does not parse, is not this
+/// function's problem — the activation has its own handling for both, and
+/// duplicating it here would report the same fault twice.
+pub(crate) fn check_project_hooks(project_root: &camino::Utf8Path) -> Result<(), anyhow::Error> {
+    use sessions::client::hookscripts::{ScriptAnchors, stage_external_scripts};
+    use sessions::core::lifecyclehook::{HookScript, HookScriptBody};
+    use sessions::core::source::{ProvenancedHook, Source};
+
+    let Ok(mfile) = mfile::File::from_dir(project_root.as_std_path()) else {
+        return Ok(());
+    };
+    let Some(session) = mfile.session.as_ref() else {
+        return Ok(());
+    };
+    let hooks = &session.lifecycle_hooks;
+    if hooks.is_empty() {
+        return Ok(());
+    }
+
+    for hook in hooks {
+        let scripts = [
+            ("on_activate", hook.on_activate()),
+            ("on_destroy", hook.on_destroy()),
+            ("on_attach", hook.on_attach()),
+            ("on_detach", hook.on_detach()),
+        ];
+        for (event, script) in scripts {
+            let Some(HookScriptBody::Inline(body)) = script.map(HookScript::body) else {
+                continue;
+            };
+            if body.trim().is_empty() {
+                anyhow::bail!(
+                    "the project's `{event}` lifecycle hook has an empty inline script \
+                     (in {}/minimal.toml)",
+                    project_root,
+                );
+            }
+        }
+    }
+
+    // Resolved against the project root, the same anchor the daemon uses.
+    // The loadouts dir is irrelevant here and is never consulted, since
+    // every hook is tagged `Project`.
+    let provenanced: Vec<ProvenancedHook> = hooks
+        .iter()
+        .map(|h| {
+            ProvenancedHook::new(
+                h.clone(),
+                Source::Project {
+                    path: paths::HostPath::try_new(project_root.as_str())
+                        .expect("an activation's project path is a valid host path"),
+                },
+            )
+        })
+        .collect();
+    let anchors = ScriptAnchors {
+        loadouts_dir: project_root.to_owned(),
+        project_root: project_root.to_owned(),
+    };
+    stage_external_scripts(&provenanced, &anchors).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+/// The wall-clock the daemon may spend running `on_activate` hooks inside a
+/// single `FinalizeSession`: the summed declared timeouts of every
+/// activation hook the client can see — the active loadouts' plus the
+/// project's. Setup hooks run sequentially and without an aggregate budget
+/// on the daemon, so this sum bounds the round-trip, and it is known before
+/// the call — which is what lets the `FinalizeSession` deadline be sized to
+/// it so a hook declaring more than the base oneshot timeout can still
+/// finish.
+///
+/// Zero when hooks are disabled or nothing declares an `on_activate`. The
+/// project's `minimal.toml` is read the same way [`check_project_hooks`]
+/// reads it; an unreadable or session-less file contributes nothing.
+pub(crate) fn activate_hook_budget(
+    active: &ActiveLoadouts,
+    project_root: &camino::Utf8Path,
+    hooks_enabled: bool,
+) -> Duration {
+    if !hooks_enabled {
+        return Duration::ZERO;
+    }
+    let loadout: Duration = active
+        .loadouts
+        .iter()
+        .flat_map(|l| l.lifecycle_hooks())
+        .filter_map(|h| h.on_activate())
+        .map(|s| s.timeout())
+        .sum();
+    let project: Duration = mfile::File::from_dir(project_root.as_std_path())
+        .ok()
+        .and_then(|f| f.session)
+        .map(|s| {
+            s.lifecycle_hooks
+                .iter()
+                .filter_map(|h| h.on_activate())
+                .map(|hs| hs.timeout())
+                .sum::<Duration>()
+        })
+        .unwrap_or(Duration::ZERO);
+    loadout + project
+}
+
 /// Compose the resolved [`ActiveLoadouts`] into a
 /// [`sessions::wire::request::WireContribution`] under the user's
 /// [`UserPolicy`] loaded from `user_policy.toml`. User-origin items
@@ -217,6 +387,7 @@ pub(crate) fn compose_user_contribution(
     active: ActiveLoadouts,
     policy: sessions::core::policy::UserPolicy,
     options: sessions::core::compose::ComposeOptions,
+    hooks_enabled: bool,
 ) -> Result<
     (
         sessions::wire::request::WireContribution,
@@ -225,16 +396,21 @@ pub(crate) fn compose_user_contribution(
     anyhow::Error,
 > {
     let loadouts_display = loadout_display_list(&active);
-    // Session transition scripts declared in a loadout are not available
-    // in this release, so they are silently excluded here — before the
-    // loadouts reach the composer — rather than after composition. This
-    // keeps a declared hook from participating in composition at all.
-    // Drop the `without_lifecycle_hooks` map when the feature ships.
-    let loadouts: Vec<_> = active
-        .loadouts
-        .into_iter()
-        .map(sessions::core::loadout::Loadout::without_lifecycle_hooks)
-        .collect();
+    // `--no-hooks` strips the loadouts' transition scripts here, before
+    // they reach the composer, rather than filtering them out after
+    // composition: a hook the user opted out of then never participates
+    // in composition, never rides the wire, and has no script staged for
+    // it. The daemon applies the same flag to the project's hooks, and
+    // the session record carries it for the later transitions.
+    let loadouts: Vec<_> = if hooks_enabled {
+        active.loadouts
+    } else {
+        active
+            .loadouts
+            .into_iter()
+            .map(sessions::core::loadout::Loadout::without_lifecycle_hooks)
+            .collect()
+    };
 
     let mut composer = sessions::client::composer::UserComposer::new()
         .with_orientation(sessions::core::compose::Orientation { loadouts_display });
@@ -525,13 +701,16 @@ mod tests {
         );
     }
 
-    /// A loadout that declares a session transition script still composes
-    /// cleanly: the hook is excluded before composition (see
-    /// [`compose_user_contribution`]), so it neither errors nor lands in
-    /// the wire contribution, while the loadout's other items compose
-    /// normally.
+    /// A loadout that declares a session transition script contributes
+    /// it, alongside its other items.
+    ///
+    /// This inverts what the test asserted while hooks were gated off:
+    /// the hook used to be stripped unconditionally before composition,
+    /// and now rides the contribution unless `--no-hooks` is given (see
+    /// [`no_hooks_strips_loadout_hooks_from_the_contribution`] for the
+    /// opt-out direction).
     #[test]
-    fn loadout_lifecycle_hook_is_excluded_without_affecting_composition() {
+    fn loadout_lifecycle_hook_composes_alongside_other_items() {
         let loadout: sessions::core::loadout::Loadout = toml::from_str(
             r#"
 name = "dev"
@@ -555,19 +734,56 @@ on_activate = { type = "inline", value = "echo activated" }
             },
             sessions::core::policy::UserPolicy::empty(),
             sessions::core::compose::ComposeOptions::default(),
+            true,
         )
-        .expect("composition succeeds despite the declared hook");
+        .expect("composition succeeds with the declared hook");
 
-        // The declared hook is silently excluded...
-        assert!(
-            wire.lifecycle_hooks.is_empty(),
-            "declared lifecycle hook must be excluded from the contribution"
+        // The declared hook rides the contribution...
+        assert_eq!(
+            wire.lifecycle_hooks.len(),
+            1,
+            "declared lifecycle hook must reach the contribution"
         );
         // ...while the loadout's other items compose normally.
         assert_eq!(wire.requested_packages.len(), 1);
         assert_eq!(wire.vars.len(), 1);
         // The orientation rides as a first-class field, never a var.
         assert_eq!(wire.orientation.loadouts_display, "dev");
+    }
+
+    /// A loadout `on_activate` declaring more than the base oneshot RPC
+    /// timeout yields a finalize budget equal to its declared timeout, so
+    /// the `FinalizeSession` deadline (base + budget) clears the point at
+    /// which such a hook was previously cut off. `--no-hooks` zeroes it.
+    #[test]
+    fn activate_hook_budget_reflects_declared_on_activate_timeout() {
+        let loadout: sessions::core::loadout::Loadout = toml::from_str(
+            r#"
+name = "slow"
+
+[[lifecycle_hooks]]
+on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
+"#,
+        )
+        .expect("loadout parses");
+        let active = ActiveLoadouts {
+            loadouts: vec![loadout],
+            builtin_default: false,
+        };
+        // A tempdir with no minimal.toml: the project side contributes
+        // nothing, isolating the loadout hook's declared timeout.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = camino::Utf8Path::from_path(tmp.path()).unwrap();
+
+        assert_eq!(
+            activate_hook_budget(&active, root, true),
+            Duration::from_secs(90),
+        );
+        assert_eq!(
+            activate_hook_budget(&active, root, false),
+            Duration::ZERO,
+            "--no-hooks contributes no budget",
+        );
     }
 
     /// The built-in `default` loadout parses (guarding the `expect` in
@@ -648,6 +864,7 @@ on_activate = { type = "inline", value = "echo activated" }
             },
             sessions::core::policy::UserPolicy::empty(),
             sessions::core::compose::ComposeOptions::default(),
+            true,
         )
         .expect("empty composition succeeds");
         assert_eq!(wire.orientation.loadouts_display, "default (built-in)");
@@ -743,5 +960,42 @@ on_activate = { type = "inline", value = "echo activated" }
             no_input: false,
         };
         assert!(cmd_loadout_list(args, &global).is_err());
+    }
+
+    /// A loadout carrying a hook contributes it when hooks are on and
+    /// contributes nothing when `--no-hooks` turns them off.
+    ///
+    /// The off case is the one that matters: the hook must be absent
+    /// from the *wire contribution*, not merely skipped at run time, so
+    /// that a hook the user opted out of is never shipped to the daemon
+    /// and never has a script staged for it.
+    #[test]
+    fn no_hooks_strips_loadout_hooks_from_the_contribution() {
+        use sessions::core::lifecyclehook::{HookScript, LifecycleHook};
+        use sessions::core::loadout::{Loadout, LoadoutName};
+
+        let build = |hooks_enabled: bool| {
+            let loadout = Loadout::new(LoadoutName::try_new("dev").unwrap()).with_lifecycle_hook(
+                LifecycleHook::builder()
+                    .with_on_activate(HookScript::inline("echo hi"))
+                    .build()
+                    .unwrap(),
+            );
+            let active = ActiveLoadouts {
+                loadouts: vec![loadout],
+                builtin_default: false,
+            };
+            let (contribution, _) = compose_user_contribution(
+                active,
+                sessions::core::policy::UserPolicy::empty(),
+                sessions::core::compose::ComposeOptions::default(),
+                hooks_enabled,
+            )
+            .expect("composing a hook-only loadout");
+            contribution.lifecycle_hooks.len()
+        };
+
+        assert_eq!(build(true), 1, "hooks on: the loadout's hook composes in");
+        assert_eq!(build(false), 0, "--no-hooks: nothing reaches the wire");
     }
 }

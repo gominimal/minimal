@@ -319,6 +319,14 @@ pub enum SessionStatus {
     Active,
 }
 
+/// Default for [`Record::hooks_enabled`] (and for the matching field on
+/// `minimald_rpc::SessionConfig`): hooks are on unless the user opted
+/// out. A bare `#[serde(default)]` would give `false`, silently
+/// disabling hooks on every record written before the field existed.
+fn hooks_enabled_default() -> bool {
+    true
+}
+
 /// Deserialize a session name, collapsing an empty string to `None`.
 ///
 /// An empty-string name could reach storage before the rename/activate
@@ -370,6 +378,19 @@ pub struct Record {
     /// always finalized at create time.
     #[serde(default)]
     pub status: SessionStatus,
+
+    /// Whether this session runs the lifecycle hooks composed into it.
+    /// Cleared by `min session activate --no-hooks`.
+    ///
+    /// Persisted on the record rather than applied only to the
+    /// composition because the attach, detach, and destroy transitions
+    /// fire from processes that never saw the activating command line —
+    /// a later `min session attach` has no other way to know the user
+    /// opted out. Defaults to `true` for records that predate the field;
+    /// hooks have never executed, so no existing session gains
+    /// behaviour from that default.
+    #[serde(default = "hooks_enabled_default")]
+    pub hooks_enabled: bool,
 
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
@@ -487,8 +508,43 @@ mod tests {
             network,
             policy,
             status: SessionStatus::default(),
+            hooks_enabled: true,
             attrs: BTreeMap::new(),
         }
+    }
+
+    /// A record written before `hooks_enabled` existed loads with hooks
+    /// **on**. A bare `#[serde(default)]` would yield `false` and
+    /// silently disable hooks for every pre-existing session — the kind
+    /// of regression that looks like "hooks just don't work" rather
+    /// than an error.
+    #[test]
+    fn record_predating_hooks_enabled_defaults_to_on() {
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": null,
+            "username": null,
+            "project_path": "/p",
+            "attrs": {}
+        }"#;
+        let r: Record = serde_json_lenient::from_str(json).expect("legacy record must still load");
+        assert!(r.hooks_enabled);
+    }
+
+    /// An explicit `false` survives deserialization rather than being
+    /// overwritten by the default.
+    #[test]
+    fn record_honours_explicit_hooks_disabled() {
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": null,
+            "username": null,
+            "project_path": "/p",
+            "hooks_enabled": false,
+            "attrs": {}
+        }"#;
+        let r: Record = serde_json_lenient::from_str(json).expect("record must load");
+        assert!(!r.hooks_enabled);
     }
 
     #[test]

@@ -83,6 +83,7 @@ ADD_TOOL_MARKER="jq-1"
 SEED_DIR=""
 SEEDED_MFILE=""
 TASK_SEED_DIR="" # seeded by the `min task run` proof below; removed on teardown
+HOOK_SEED_DIR="" # seeded by the lifecycle-hooks proof below; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -197,6 +198,7 @@ teardown() {
   [ -n "$SEED_DIR" ] && rm -rf "$SEED_DIR"
   [ -n "$SEEDED_MFILE" ] && rm -f "$SEEDED_MFILE"
   [ -n "$TASK_SEED_DIR" ] && rm -rf "$TASK_SEED_DIR"
+  [ -n "$HOOK_SEED_DIR" ] && rm -rf "$HOOK_SEED_DIR"
   # And the state dir — which is NOT just metadata. On a VM lane it holds the
   # provider's per-VM writable data volume
   # (`minimal/providers/local-minvmd0/data-vol.raw`), a sparse image whose HOST
@@ -455,6 +457,343 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Lifecycle-hooks proofs. These are the only coverage of hook execution that
+# goes through the real nsenter injection: the unit tests substitute a
+# host-side command builder for it, so a break in the injection, in the
+# script upload, or in the client/daemon round trip would not show up there.
+#
+# Seeded projects of their own, like the task-run proof, because the shared
+# seed declares no hooks.
+if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
+  # Every fixture below is a project, and a project's hooks only run once the
+  # user has allow-listed it. Written up front so nothing has to be answered
+  # interactively — and note this is only writable in advance because the
+  # policy stores the project path as the CLIENT knows it. A daemon that
+  # stamped its own per-session workspace copy would make this unmatchable,
+  # which is what `hooks_gate_refuses_without_an_allow_entry` below pins from
+  # the other side.
+  hook_allow() {
+    mkdir -p "$XDG_CONFIG_HOME/minimal"
+    printf '[hooks]\nallow = ["%s"]\n' "$1" > "$XDG_CONFIG_HOME/minimal/user_policy.toml"
+  }
+  # `mktemp -d`, then resolve it. macOS's /tmp is a symlink to /private/tmp,
+  # and `min session activate .` reports the project by its RESOLVED path —
+  # so an allow entry written against the unresolved one names a project the
+  # daemon never sees, and the activation fails the gate on that lane only.
+  # Every hooks fixture goes through here so the path in the policy and the
+  # path in the record are the same string on every host.
+  hook_mktemp() {
+    local dir
+    dir="$(mktemp -d "$1")" || return 1
+    (cd "$dir" && pwd -P)
+  }
+  # The `[upstream]` stanza every fixture needs, plus the shell stack.
+  hook_seed_preamble() {
+    awk '
+      /^\[upstream\]/            { grab = 1; print; next }
+      grab && (/^$/ || /^\[/)    { exit }
+      grab                       { print }
+    ' "$ROOT/.minimal/minimal.toml"
+    printf '\n[stack]\nuse = "shell"\n'
+  }
+  # Grep the daemon's file log. The only way to observe a hook whose session
+  # is gone by the time you could look (`on_destroy`), and the reason those
+  # fixtures exit non-zero: RUST_LOG is `warn` here, so the INFO "hook ran"
+  # record is not emitted, but the WARN "hook failed" record is — and it
+  # carries the hook's captured output, which is the evidence.
+  hook_log_has() {
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+      -exec grep -l -- "$1" {} + 2>/dev/null | head -n1
+  }
+  # Whether that log is on THIS host. On a VM lane minimald runs inside the
+  # guest and writes to a guest tmpfs (`/run/minimal`), which no host path
+  # reaches — the host's log dir holds only `minvmd.log`. So the assertions
+  # that read a hook's captured output are native-only.
+  #
+  # What is NOT skipped anywhere: that the destroy still completed. That half
+  # of the contract ("a failing teardown hook must not block the teardown")
+  # is asserted off `min ls` on every lane, and `on_detach` — the other
+  # headless teardown hook — is proved on every lane too, by a marker read
+  # back through the session rather than out of a log.
+  hook_log_readable() { [ -z "$E2E_VM" ]; }
+
+  # -- A. The four transitions, one session ---------------------------------
+  # One fixture and one activation covering activate → attach → detach →
+  # destroy. Separate activations would be separate package installs for no
+  # extra coverage.
+  echo "::group::lifecycle hooks: the four transitions"
+  HOOK_SEED_DIR="$(hook_mktemp /tmp/mnlh.XXXXXX)"
+  # shellcheck disable=SC2016 # `$MINIMAL_HOOK_EVENT` and `$0` must reach the
+  # TOML *unexpanded*: they are for the hook's own shell to expand inside the
+  # session, and expanding them here would write this script's values instead
+  # — which is exactly what these assertions are checking did not happen.
+  {
+    hook_seed_preamble
+    # No shebang on the first hook: proves the POSIX-`sh` default.
+    # `$MINIMAL_HOOK_EVENT` proves the metadata env reaches the hook.
+    printf '\n[[session.lifecycle_hooks]]\n'
+    printf 'description = "e2e transition markers"\n'
+    printf 'on_activate = { type = "inline", value = "echo HOOK_OK $MINIMAL_HOOK_EVENT > /home/hook-activate" }\n'
+    printf 'on_attach   = { type = "inline", value = "echo HOOK_ATTACH_OK" }\n'
+    printf 'on_detach   = { type = "inline", value = "echo HOOK_OK $MINIMAL_HOOK_EVENT > /home/hook-detach" }\n'
+    # Non-zero on purpose: makes the daemon log the run at WARN *with its
+    # output*, which is the only evidence that outlives the session — and
+    # asserts the contract that a failing teardown hook still tears down.
+    printf 'on_destroy  = { type = "inline", value = "echo HOOK_DESTROY_OK; exit 3" }\n'
+    # A second hook, dispatched by shebang rather than the default, writing
+    # the interpreter it actually ran under.
+    printf '\n[[session.lifecycle_hooks]]\n'
+    printf 'description = "e2e shebang dispatch"\n'
+    printf 'on_activate = { type = "inline", value = "#!/usr/bin/bash\\necho $0 > /home/hook-shebang\\n" }\n'
+  } > "$HOOK_SEED_DIR/minimal.toml"
+  mkdir "$HOOK_SEED_DIR/.git"
+  hook_allow "$HOOK_SEED_DIR"
+
+  hook_sid="$(cd "$HOOK_SEED_DIR" && mnl session activate . --no-prompt 2>"$WORK/hooks-activate.err")" || {
+    echo "::error::'min session activate' with project hooks failed"
+    echo "--- stderr ---"; cat "$WORK/hooks-activate.err" 2>/dev/null || true
+    fail
+  }
+
+  # on_activate. Read back from INSIDE the session, so this asserts the hook
+  # ran in the session's namespaces rather than anywhere on the host.
+  hook_out="$(mnl session exec "$hook_sid" 'cat /home/hook-activate' 2>"$WORK/hooks-read.err")" || {
+    echo "::error::could not read the activate hook's marker from the session"
+    echo "--- stderr ---"; cat "$WORK/hooks-read.err" 2>/dev/null || true
+    fail
+  }
+  if [[ "$hook_out" != *"HOOK_OK on_activate"* ]]; then
+    echo "::error::on_activate hook did not run in the session (marker: '$hook_out')"
+    echo "--- activate stderr ---"; cat "$WORK/hooks-activate.err" 2>/dev/null || true
+    fail
+  fi
+
+  # Shebang dispatch: the second hook ran under the interpreter it named, not
+  # the default. Resolved against the SESSION's filesystem, which is the part
+  # no unit test can reach.
+  sheb_out="$(mnl session exec "$hook_sid" 'cat /home/hook-shebang' 2>/dev/null)"
+  if [[ "$sheb_out" != *bash* ]]; then
+    echo "::error::shebang hook did not run under the interpreter it named (\$0: '$sheb_out')"
+    fail
+  fi
+  echo "on_activate + shebang dispatch OK"
+
+  # on_attach and on_detach, over a REAL pty — `on_attach` writes to the
+  # terminal you are attached to, and a detach is by definition something a
+  # non-interactive caller cannot perform. Answer the exit prompt with `keep`
+  # (Enter, the first option) so leaving the shell is a detach rather than a
+  # destroy.
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  attach_out="$(E2E_PTY_COMMANDS='cat /home/hook-activate
+exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+    min ${E2E_MINIMAL_ARGS:-} session attach "$hook_sid" \
+    2>"$WORK/hooks-attach.err")" || {
+    echo "::error::pty attach for the hooks proof failed"
+    echo "--- transcript ---"; printf '%s\n' "$attach_out"
+    echo "--- stderr ---"; cat "$WORK/hooks-attach.err" 2>/dev/null || true
+    fail
+  }
+  # `on_attach` runs on the attached terminal, so its output is in the
+  # transcript. Glob, not grep — same SIGPIPE-under-pipefail reasoning as the
+  # sandbox proof's marker checks.
+  if [[ "$attach_out" != *HOOK_ATTACH_OK* ]]; then
+    echo "::error::on_attach hook output did not reach the attached terminal"
+    echo "--- transcript ---"; printf '%s\n' "$attach_out"
+    fail
+  fi
+  # Keeping at the exit prompt is a detach, and the session must survive it.
+  if ! mnl ls --raw 2>/dev/null | grep -q -- "$hook_sid"; then
+    echo "::error::session gone after answering the exit prompt with 'keep'"
+    fail
+  fi
+  # `on_detach` is headless (the terminal it would have used is the thing
+  # that just left), so its marker is read back the same way as activate's.
+  # Reported by the departing binding rather than by anything we called, so
+  # it lands shortly after the attach returns.
+  detached=""
+  for _ in $(seq 1 40); do
+    if mnl session exec "$hook_sid" 'cat /home/hook-detach' 2>/dev/null | grep -q HOOK_OK; then
+      detached=1; break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$detached" ]; then
+    echo "::error::on_detach hook did not run after the attach ended"
+    echo "--- transcript ---"; printf '%s\n' "$attach_out"
+    fail
+  fi
+  echo "on_attach (on the terminal) + on_detach (headless, after leaving) OK"
+
+  # on_destroy. The session's filesystem goes with it, so the evidence is the
+  # daemon log — and the failing hook must not have blocked the teardown.
+  mnl session destroy --force "$hook_sid" >/dev/null 2>&1 \
+    || { echo "::error::could not destroy the hooks session $hook_sid"; fail; }
+  if hook_log_readable; then
+    destroy_log=""
+    for _ in $(seq 1 40); do
+      destroy_log="$(hook_log_has HOOK_DESTROY_OK)"
+      [ -n "$destroy_log" ] && break
+      sleep 0.25
+    done
+    if [ -z "$destroy_log" ]; then
+      echo "::error::on_destroy hook left no record in the daemon log"
+      echo "--- log dir ---"; ls -la "$XDG_STATE_HOME/minimal/logs" 2>/dev/null || true
+      fail
+    fi
+    echo "on_destroy OK (ran, output captured, and a non-zero exit still destroyed)"
+  else
+    echo "on_destroy: output check skipped (guest-side daemon log)"
+  fi
+  # Lane-agnostic half: a failing teardown hook must not keep the session.
+  if mnl ls --raw 2>/dev/null | grep -q -- "$hook_sid"; then
+    echo "::error::a failing on_destroy hook blocked the teardown"
+    fail
+  fi
+  rm -rf "$HOOK_SEED_DIR"; HOOK_SEED_DIR=""
+  echo "::endgroup::"
+
+  # -- B. External hook scripts ---------------------------------------------
+  # The longest untested chain in the feature: the client resolves the path
+  # against its anchor, refuses a symlink at any component, tars it up; the
+  # daemon unpacks it under the session's hooks dir with its own per-entry
+  # validation; and at run time the daemon re-derives the same staged path
+  # from the hook's source and reads it. Every piece has unit coverage;
+  # nothing covered the wire between them.
+  echo "::group::lifecycle hooks: external scripts"
+  HOOK_SEED_DIR="$(hook_mktemp /tmp/mnlx.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[[session.lifecycle_hooks]]\n'
+    printf 'description = "e2e external script"\n'
+    printf 'on_activate = { type = "external", value = "hooks/setup.sh" }\n'
+  } > "$HOOK_SEED_DIR/minimal.toml"
+  mkdir "$HOOK_SEED_DIR/.git" "$HOOK_SEED_DIR/hooks"
+  printf '#!/usr/bin/bash\necho HOOK_EXTERNAL_OK > /home/hook-external\n' \
+    > "$HOOK_SEED_DIR/hooks/setup.sh"
+  chmod +x "$HOOK_SEED_DIR/hooks/setup.sh"
+  hook_allow "$HOOK_SEED_DIR"
+
+  ext_sid="$(cd "$HOOK_SEED_DIR" && mnl session activate . --no-prompt 2>"$WORK/hooks-ext.err")" || {
+    echo "::error::activation with an external hook script failed"
+    echo "--- stderr ---"; cat "$WORK/hooks-ext.err" 2>/dev/null || true
+    fail
+  }
+  ext_out="$(mnl session exec "$ext_sid" 'cat /home/hook-external' 2>/dev/null)"
+  if [[ "$ext_out" != *HOOK_EXTERNAL_OK* ]]; then
+    echo "::error::external hook script did not run (marker: '$ext_out')"
+    echo "--- activate stderr ---"; cat "$WORK/hooks-ext.err" 2>/dev/null || true
+    fail
+  fi
+  mnl session destroy --force "$ext_sid" >/dev/null 2>&1 || true
+  rm -rf "$HOOK_SEED_DIR"; HOOK_SEED_DIR=""
+  echo "external hook script proof OK (staged, uploaded, resolved, ran)"
+  echo "::endgroup::"
+
+  # -- C. The refusals ------------------------------------------------------
+  # Three ways hooks must NOT run, each spanning the client/daemon boundary.
+  echo "::group::lifecycle hooks: refusals"
+  HOOK_SEED_DIR="$(hook_mktemp /tmp/mnlr.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[[session.lifecycle_hooks]]\n'
+    printf 'description = "e2e refusal fixture"\n'
+    printf 'on_activate = { type = "inline", value = "echo HOOK_REFUSAL_MARKER > /home/hook-refusal; exit 9" }\n'
+  } > "$HOOK_SEED_DIR/minimal.toml"
+  mkdir "$HOOK_SEED_DIR/.git"
+
+  # C1: no allow entry + --no-prompt. The consent boundary for arbitrary code
+  # execution: it must refuse, and the error must carry a snippet the user
+  # can act on. Asserting the snippet's CONTENT is what catches a regression
+  # to an unmatchable project path.
+  rm -f "$XDG_CONFIG_HOME/minimal/user_policy.toml"
+  if (cd "$HOOK_SEED_DIR" && mnl session activate . --no-prompt >/dev/null 2>"$WORK/hooks-gate.err"); then
+    echo "::error::activation with un-allow-listed project hooks should have refused"
+    fail
+  fi
+  if ! grep -q "hooks" "$WORK/hooks-gate.err" || ! grep -qF -- "$HOOK_SEED_DIR" "$WORK/hooks-gate.err"; then
+    echo "::error::the hooks refusal does not name the project in an actionable snippet"
+    echo "--- stderr ---"; cat "$WORK/hooks-gate.err" 2>/dev/null || true
+    fail
+  fi
+  echo "gate refuses an un-allow-listed project, naming it OK"
+
+  # C2: a failing on_activate fails the ACTIVATION — the session must not
+  # come up, and the error must name the hook and what it printed.
+  hook_allow "$HOOK_SEED_DIR"
+  if (cd "$HOOK_SEED_DIR" && mnl session activate . --no-prompt >/dev/null 2>"$WORK/hooks-failact.err"); then
+    echo "::error::activation should have failed on a failing on_activate hook"
+    fail
+  fi
+  if ! grep -qi "hook" "$WORK/hooks-failact.err"; then
+    echo "::error::the failed-activation error does not mention the hook"
+    echo "--- stderr ---"; cat "$WORK/hooks-failact.err" 2>/dev/null || true
+    fail
+  fi
+  echo "a failing on_activate aborts the activation OK"
+
+  # C3: --no-hooks. Both ends honour it (the client strips its loadouts'
+  # before sending, the daemon strips the project's), so the same fixture
+  # that just failed the activation must now come up clean.
+  nohooks_sid="$(cd "$HOOK_SEED_DIR" && mnl session activate . --no-prompt --no-hooks 2>"$WORK/hooks-nohooks.err")" || {
+    echo "::error::'--no-hooks' activation failed"
+    echo "--- stderr ---"; cat "$WORK/hooks-nohooks.err" 2>/dev/null || true
+    fail
+  }
+  if mnl session exec "$nohooks_sid" 'cat /home/hook-refusal' >/dev/null 2>&1; then
+    echo "::error::'--no-hooks' session ran its project's on_activate hook anyway"
+    fail
+  fi
+  # And the composition records that it has none, rather than carrying hooks
+  # every later transition has to remember to skip.
+  nohooks_list="$(mnl session hooks "$nohooks_sid" 2>/dev/null)"
+  if [[ "$nohooks_list" != *"No lifecycle hooks"* ]]; then
+    echo "::error::'--no-hooks' session still lists composed hooks: $nohooks_list"
+    fail
+  fi
+  mnl session destroy --force "$nohooks_sid" >/dev/null 2>&1 || true
+  echo "--no-hooks suppresses execution and composition OK"
+  rm -rf "$HOOK_SEED_DIR"; HOOK_SEED_DIR=""
+  rm -f "$XDG_CONFIG_HOME/minimal/user_policy.toml"
+  echo "::endgroup::"
+
+  # -- Loadout-declared hooks ------------------------------------------------
+  # A different path from everything above: composed on the CLIENT, ungated
+  # (they are the user's own file, not a project's), and staged under a
+  # different prefix. XDG_CONFIG_HOME is hermetic here, so the loadout only
+  # exists for this block.
+  echo "::group::lifecycle hooks: loadout-declared"
+  mkdir -p "$XDG_CONFIG_HOME/minimal/loadouts"
+  cat > "$XDG_CONFIG_HOME/minimal/loadouts/hookdev.toml" <<'LOADOUT'
+name = "hookdev"
+description = "e2e loadout hooks"
+
+[[lifecycle_hooks]]
+on_activate = { type = "inline", value = "echo HOOK_LOADOUT_OK > /home/hook-loadout" }
+LOADOUT
+  HOOK_SEED_DIR="$(hook_mktemp /tmp/mnll.XXXXXX)"
+  hook_seed_preamble > "$HOOK_SEED_DIR/minimal.toml"
+  mkdir "$HOOK_SEED_DIR/.git"
+
+  # No `[hooks] allow` written: a loadout's hooks face no policy gate, and
+  # --no-prompt proves it — a gate would fail the activation here.
+  lo_sid="$(cd "$HOOK_SEED_DIR" && mnl session activate . --no-prompt --loadout hookdev 2>"$WORK/hooks-loadout.err")" || {
+    echo "::error::activation with a loadout-declared hook failed"
+    echo "--- stderr ---"; cat "$WORK/hooks-loadout.err" 2>/dev/null || true
+    fail
+  }
+  lo_out="$(mnl session exec "$lo_sid" 'cat /home/hook-loadout' 2>/dev/null)"
+  if [[ "$lo_out" != *HOOK_LOADOUT_OK* ]]; then
+    echo "::error::loadout-declared hook did not run (marker: '$lo_out')"
+    echo "--- activate stderr ---"; cat "$WORK/hooks-loadout.err" 2>/dev/null || true
+    fail
+  fi
+  mnl session destroy --force "$lo_sid" >/dev/null 2>&1 || true
+  rm -rf "$HOOK_SEED_DIR"; HOOK_SEED_DIR=""
+  rm -f "$XDG_CONFIG_HOME/minimal/loadouts/hookdev.toml"
+  echo "loadout-declared hooks proof OK (ran, ungated)"
+  echo "::endgroup::"
+fi
+# ---------------------------------------------------------------------------
 # Session-sandbox proof (every lane). Everything above proves the lifecycle;
 # this forks a real sandbox and proves the in-sandbox `min add`. A session is
 # interactive by design, so we drive it like a real user through a REAL pty
@@ -536,6 +875,33 @@ if mnl ls --raw 2>/dev/null | grep -Fqx "$sid"; then
   fail
 fi
 
+# ---------------------------------------------------------------------------
+# Lifecycle hooks across a daemon restart. Staged around the stop/respawn
+# proof below rather than as its own block, because the restart is the point:
+# a session's hooks live in a composition snapshot on disk, and a daemon that
+# has never composed this session has to reconstruct them from it. Activated
+# here, asserted after the respawn.
+HOOK_RESTART_SID=""
+if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
+  HOOK_SEED_DIR="$(hook_mktemp /tmp/mnlp2.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[[session.lifecycle_hooks]]\n'
+    printf 'description = "e2e restart survivor"\n'
+    # Non-zero for the same reason as the transitions fixture: the WARN
+    # record is what carries the output past the session's own lifetime.
+    printf 'on_destroy = { type = "inline", value = "echo HOOK_RESTART_OK; exit 3" }\n'
+  } > "$HOOK_SEED_DIR/minimal.toml"
+  mkdir "$HOOK_SEED_DIR/.git"
+  hook_allow "$HOOK_SEED_DIR"
+  HOOK_RESTART_SID="$(cd "$HOOK_SEED_DIR" && mnl session activate . --no-prompt 2>"$WORK/hooks-restart.err")" || {
+    echo "::error::activation for the hooks-restart proof failed"
+    echo "--- stderr ---"; cat "$WORK/hooks-restart.err" 2>/dev/null || true
+    fail
+  }
+  rm -f "$XDG_CONFIG_HOME/minimal/user_policy.toml"
+fi
+
 # Shut the daemon down; it must not survive.
 # Keep stderr: discarding it leaves a failing stop indistinguishable from every
 # other one, and this assertion's error text is the whole diagnosis.
@@ -569,5 +935,43 @@ fi
 # half of #730.
 mnl ls >/dev/null 2>&1 \
   || { echo "::error::'minimal ls' after 'minimal stop' did not restart the daemon"; fail; }
+
+# The hooks staged before the stop must have survived it. This daemon never
+# composed that session — it is reading the snapshot off disk — so both halves
+# are worth asserting: that it can still SAY what the hooks are, and that it
+# can still RUN one.
+if [ -n "$HOOK_RESTART_SID" ]; then
+  echo "::group::lifecycle hooks: survive a daemon restart"
+  restart_list="$(mnl session hooks "$HOOK_RESTART_SID" 2>"$WORK/hooks-restart-list.err")"
+  if [[ "$restart_list" != *on_destroy* ]]; then
+    echo "::error::hooks did not survive the daemon restart: $restart_list"
+    echo "--- stderr ---"; cat "$WORK/hooks-restart-list.err" 2>/dev/null || true
+    fail
+  fi
+  mnl session destroy --force "$HOOK_RESTART_SID" >/dev/null 2>&1 \
+    || { echo "::error::could not destroy the hooks-restart session"; fail; }
+  # Same lane split as the transitions block: the hook's output is only
+  # readable where the daemon logs to this host. The listing above already
+  # proved the snapshot survived on every lane.
+  if hook_log_readable; then
+    restart_log=""
+    for _ in $(seq 1 40); do
+      restart_log="$(hook_log_has HOOK_RESTART_OK)"
+      [ -n "$restart_log" ] && break
+      sleep 0.25
+    done
+    if [ -z "$restart_log" ]; then
+      echo "::error::on_destroy did not run for a session composed by a previous daemon"
+      fail
+    fi
+  fi
+  if mnl ls --raw 2>/dev/null | grep -q -- "$HOOK_RESTART_SID"; then
+    echo "::error::the hooks-restart session survived its destroy"
+    fail
+  fi
+  rm -rf "$HOOK_SEED_DIR"; HOOK_SEED_DIR=""
+  echo "hooks survive a daemon restart OK (listed, and still executable)"
+  echo "::endgroup::"
+fi
 
 echo "session e2e OK"

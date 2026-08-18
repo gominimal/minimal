@@ -46,7 +46,21 @@ impl TestServer {
     /// Spins up a fresh server backed by an empty tempdir. The tempdir
     /// lives as long as the [`TestServer`].
     pub async fn new() -> Self {
-        let temp = TempDir::new().unwrap();
+        Self::new_in(TempDir::new().unwrap()).await
+    }
+
+    /// Tears this server down (dropping its actor handles) and hands back
+    /// its state dir, so a follow-up [`TestServer::new_in`] can boot a
+    /// "restarted daemon" against the same on-disk state.
+    pub fn into_state_dir(self) -> TempDir {
+        self._temp
+    }
+
+    /// Spins up a server backed by `temp`, which may already hold a
+    /// previous server's state — the daemon-restart path: a test hands
+    /// one server's [`Self::into_state_dir`] to a second server to prove
+    /// per-session state survives a restart.
+    pub async fn new_in(temp: TempDir) -> Self {
         let path = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let state_dir = DaemonAbsPath::try_new(path.clone()).unwrap();
         let cache_dir = DaemonAbsPath::try_new(path).unwrap();
@@ -413,6 +427,7 @@ pub fn create_session_req(name: &str, project: &str) -> minimald_rpc::CreateSess
             project_path: paths::HostAbsPath::try_new(project).unwrap(),
             network: sessions::NetworkMode::default(),
             policy: Default::default(),
+            hooks_enabled: true,
             attrs: Default::default(),
         },
     }

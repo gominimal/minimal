@@ -265,6 +265,7 @@ async fn activate_creates_session() {
         ingress: vec![],
         loadout: vec![],
         no_loadouts: false,
+        no_hooks: false,
         no_prompt: false,
         attach: false,
     };
@@ -307,6 +308,7 @@ async fn activate_uploads_project_files() {
         ingress: vec![],
         loadout: vec![],
         no_loadouts: false,
+        no_hooks: false,
         no_prompt: false,
         attach: false,
     };
@@ -388,6 +390,7 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
         ingress: vec![],
         loadout: vec![],
         no_loadouts: false,
+        no_hooks: false,
         no_prompt: false,
         attach: false,
     };
@@ -726,6 +729,7 @@ async fn create_pending_session(daemon: &common::TestDaemon, name: &str) -> Sess
         project_path: paths::HostAbsPath::try_new(project_path).unwrap(),
         network: sessions::NetworkMode::NoNet,
         policy: Default::default(),
+        hooks_enabled: true,
         attrs: Default::default(),
     };
 
@@ -776,6 +780,7 @@ async fn create_session_at(
         project_path,
         network: sessions::NetworkMode::NoNet,
         policy: Default::default(),
+        hooks_enabled: true,
         attrs: Default::default(),
     };
 

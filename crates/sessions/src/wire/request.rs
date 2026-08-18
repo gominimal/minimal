@@ -10,16 +10,26 @@
 //! 3. Client → daemon: [`ContributionVerdict`] with per-item decisions.
 
 use super::errors::WireError;
-use super::policy::{WirePatchVerdict, WireVarVerdict};
+use super::policy::{WireHookVerdict, WirePatchVerdict, WireVarVerdict};
 use super::primitives::{
-    WireOrientation, WirePackageRef, WirePendingPatch, WirePendingVar, WireProvenancedHook,
-    WireSessionPatch, WireSessionVar,
+    WireOrientation, WirePackageRef, WirePendingHook, WirePendingPatch, WirePendingVar,
+    WireProvenancedHook, WireSessionPatch, WireSessionVar,
 };
 use crate::SessionId;
 
 /// Snapshot format version for [`WireComposition`]. Bumped when the
 /// on-disk shape changes in a way older daemons can't tolerate.
-const COMPOSITION_SNAPSHOT_VERSION: u32 = 1;
+///
+/// - **1** — lifecycle hooks carried `on_failure` and no `description`
+///   or per-script `timeout`.
+/// - **2** — hooks carry `description`, `on_attach`, `on_detach`, and a
+///   per-script `timeout_secs`; `on_failure` is gone.
+pub const COMPOSITION_SNAPSHOT_VERSION: u32 = 2;
+
+/// Version assumed for a sidecar with no `version` field. Those were
+/// written before the field existed, which is by definition version 1 —
+/// so this must not track [`COMPOSITION_SNAPSHOT_VERSION`].
+const LEGACY_COMPOSITION_SNAPSHOT_VERSION: u32 = 1;
 
 /// The client's composed contribution, wire-shaped: var values
 /// resolved, patch sources expanded to concrete files, every item
@@ -50,13 +60,13 @@ pub struct WireContribution {
 /// same wire primitives used for the live RPC flow
 /// ([`WireContribution`], [`ContributionResponse`]). A `version` field
 /// gates the on-disk shape so a future format can evolve without
-/// ambiguity; the current and only version is
-/// [`COMPOSITION_SNAPSHOT_VERSION`] (1).
+/// ambiguity; the current one is [`COMPOSITION_SNAPSHOT_VERSION`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WireComposition {
     /// Snapshot format version. Defaults to
-    /// [`COMPOSITION_SNAPSHOT_VERSION`] so sidecars written by daemons
-    /// that predate the field deserialize cleanly.
+    /// [`LEGACY_COMPOSITION_SNAPSHOT_VERSION`] — a sidecar without the
+    /// field was written before it existed, which is version 1 by
+    /// definition, not whatever the current writer emits.
     #[serde(default = "default_composition_version")]
     pub version: u32,
     /// Variables that survived the policy gate.
@@ -76,7 +86,7 @@ pub struct WireComposition {
 }
 
 fn default_composition_version() -> u32 {
-    COMPOSITION_SNAPSHOT_VERSION
+    LEGACY_COMPOSITION_SNAPSHOT_VERSION
 }
 
 impl From<&crate::core::compose::Composition> for WireComposition {
@@ -110,8 +120,10 @@ pub struct ContributionResponse {
     pub vars: Vec<WirePendingVar>,
     /// Pending patches awaiting policy + prompt.
     pub patches: Vec<WirePendingPatch>,
-    /// Lifecycle hooks (no policy applies; pass through to client).
-    pub lifecycle_hooks: Vec<WireProvenancedHook>,
+    /// Lifecycle hooks awaiting the hooks-policy gate. Project-declared
+    /// hooks only — a loadout's are the user's own and never reach the
+    /// daemon-side pending set.
+    pub lifecycle_hooks: Vec<WirePendingHook>,
 }
 
 /// Client → Daemon: per-item verdicts on the [`ContributionResponse`]'s
@@ -124,6 +136,12 @@ pub struct ContributionVerdict {
     pub vars: Vec<WireVarVerdict>,
     /// One verdict per pending patch.
     pub patches: Vec<WirePatchVerdict>,
+    /// One verdict per pending lifecycle hook. Serde-defaulted so a
+    /// verdict from a client that predates the hooks gate deserializes;
+    /// the daemon treats a hook with no verdict as refused, so an old
+    /// client can never accidentally approve one by omission.
+    #[serde(default)]
+    pub lifecycle_hooks: Vec<WireHookVerdict>,
 }
 
 /// Daemon's reply to a `SubmitVerdict`: composition finalized (the
@@ -217,8 +235,26 @@ mod tests {
                 id: PendingId::new(2),
                 host_path: paths::HostAbsPath::try_new("/etc/secret").unwrap(),
             }],
+            lifecycle_hooks: vec![WireHookVerdict::Approved {
+                id: PendingId::new(3),
+            }],
         };
         assert_eq!(round_trip(&v), v);
+    }
+
+    /// A verdict from a client that predates the hooks gate carries no
+    /// `lifecycle_hooks` key at all. It must deserialize to an empty
+    /// list — which the daemon treats as "approve nothing" — rather
+    /// than failing the message.
+    #[test]
+    fn contribution_verdict_without_hook_field_deserializes_empty() {
+        let json = format!(
+            r#"{{"session_id":"{}","vars":[],"patches":[]}}"#,
+            session_id()
+        );
+        let v: ContributionVerdict =
+            serde_json_lenient::from_str(&json).expect("legacy verdict must load");
+        assert!(v.lifecycle_hooks.is_empty());
     }
 
     #[test]
@@ -270,12 +306,49 @@ mod tests {
 
     #[test]
     fn composition_snapshot_defaults_version_to_one() {
-        // A sidecar written without the `version` field (e.g. by a
-        // hypothetical future writer that omits it) should default to
-        // version 1, not 0.
+        // A sidecar written without the `version` field predates the
+        // field, so it is version 1 — not 0, and not whatever the
+        // current writer emits.
         let json = r#"{"vars":[],"patches":[],"packages":[],"lifecycle_hooks":[]}"#;
         let c: WireComposition = serde_json_lenient::from_str(json).unwrap();
-        assert_eq!(c.version, COMPOSITION_SNAPSHOT_VERSION);
+        assert_eq!(c.version, LEGACY_COMPOSITION_SNAPSHOT_VERSION);
+        assert_ne!(c.version, COMPOSITION_SNAPSHOT_VERSION);
+    }
+
+    /// A v1 sidecar — `on_failure` present, no `description` or
+    /// `timeout_secs` — still loads. Its `on_failure` is dropped and the
+    /// remaining scripts take the default timeout.
+    #[test]
+    fn v1_snapshot_with_on_failure_still_loads() {
+        let json = r#"{
+            "version": 1,
+            "vars": [], "patches": [], "packages": [],
+            "lifecycle_hooks": [{
+                "hook": {
+                    "on_activate": {"kind": "inline", "body": "echo hi"},
+                    "on_failure":  {"kind": "inline", "body": "old"}
+                },
+                "source": {"kind": "user_loadout", "name": "dev"}
+            }]
+        }"#;
+        let c: WireComposition =
+            serde_json_lenient::from_str(json).expect("v1 snapshot must still load");
+        assert_eq!(c.version, 1);
+        let hook = &c.lifecycle_hooks[0].hook;
+        assert!(hook.on_activate.is_some());
+        assert!(hook.description.is_none());
+    }
+
+    /// The writer stamps the current version, so a freshly written
+    /// snapshot is distinguishable on read from a legacy one that
+    /// omitted the field entirely.
+    #[test]
+    fn written_snapshot_carries_current_version() {
+        let composition =
+            crate::core::compose::Composition::from_daemon_passthrough(Vec::new(), Vec::new());
+        let wire = WireComposition::from(&composition);
+        assert_eq!(wire.version, COMPOSITION_SNAPSHOT_VERSION);
+        assert_ne!(wire.version, LEGACY_COMPOSITION_SNAPSHOT_VERSION);
     }
 
     /// Payloads written before the `orientation` field existed
