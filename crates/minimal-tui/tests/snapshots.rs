@@ -115,7 +115,12 @@ fn filtered_with_status() {
     model.filter.input = "bench".to_string();
     model.clamp_cursor();
     model.status = Some("refreshed".to_string());
-    insta::assert_snapshot!(render(&mut model));
+    // Render with constrained width to exercise potential overlap between
+    // filter controls and status.
+    let backend = TestBackend::new(80, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render::view(&mut model, frame)).unwrap();
+    insta::assert_snapshot!(format!("{}", terminal.backend()));
 }
 
 #[test]
