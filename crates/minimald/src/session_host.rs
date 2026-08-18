@@ -951,11 +951,11 @@ enum Message {
 /// Renders a vt100 cell color into the string form the
 /// [`minimald_rpc::ScreenCell`] wire type uses: `"idx:<n>"` for an ANSI-256
 /// palette index, `"#rrggbb"` for truecolor, `None` for the terminal default.
-fn wire_color(color: vt100_ctt::Color) -> Option<String> {
+fn wire_color(color: vt100::Color) -> Option<String> {
     match color {
-        vt100_ctt::Color::Default => None,
-        vt100_ctt::Color::Idx(n) => Some(format!("idx:{n}")),
-        vt100_ctt::Color::Rgb(r, g, b) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
+        vt100::Color::Default => None,
+        vt100::Color::Idx(n) => Some(format!("idx:{n}")),
+        vt100::Color::Rgb(r, g, b) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
     }
 }
 
@@ -963,7 +963,7 @@ fn wire_color(color: vt100_ctt::Color) -> Option<String> {
 /// type. Wide-glyph continuation cells are dropped rather than emitted as
 /// spaces: consumers flatten cells into width-aware text, so a placeholder
 /// cell would add a phantom column per wide glyph and skew the row.
-fn screen_to_snapshot(screen: &vt100_ctt::Screen) -> minimald_rpc::ScreenSnapshot {
+fn screen_to_snapshot(screen: &vt100::Screen) -> minimald_rpc::ScreenSnapshot {
     use minimald_rpc::{ScreenCell, ScreenRow, ScreenSnapshot};
     let (rows, cols) = screen.size();
     let lines = (0..rows)
@@ -1014,14 +1014,14 @@ fn screen_to_snapshot(screen: &vt100_ctt::Screen) -> minimald_rpc::ScreenSnapsho
 
 /// Handles callback events from the terminal parser, transmitting them to the host.
 struct ParserEventHandler(WeakHostHandle);
-impl vt100_ctt::Callbacks for ParserEventHandler {
-    fn set_window_title(&mut self, _: &mut vt100_ctt::Screen, title: &[u8]) {
+impl vt100::Callbacks for ParserEventHandler {
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.0.set_title_cb(title);
     }
-    fn audible_bell(&mut self, _: &mut vt100_ctt::Screen) {
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
         self.0.audible_bell_cb();
     }
-    fn visual_bell(&mut self, _: &mut vt100_ctt::Screen) {
+    fn visual_bell(&mut self, _: &mut vt100::Screen) {
         self.0.visual_bell_cb();
     }
 }
@@ -1241,7 +1241,7 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     /// The last-set pty terminal size.
     sz: WinSize,
     /// In-memory representation of the terminal state.
-    parser: vt100_ctt::Parser<ParserEventHandler>,
+    parser: vt100::Parser<ParserEventHandler>,
     /// The session process.
     process: P,
     /// The master-side fd of the Pty.
@@ -2272,7 +2272,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         let (sender, receiver) = mpsc::channel(8);
         let handle = HostHandle { sender };
 
-        let parser = vt100_ctt::Parser::new_with_callbacks(
+        let parser = vt100::Parser::new_with_callbacks(
             sz.rows,
             sz.cols,
             0,
@@ -2637,7 +2637,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     /// to a normal state on detach.
     fn unwind_codes(&self) -> Vec<u8> {
         let live = self.parser.screen();
-        let clean = vt100_ctt::Parser::new(live.size().0, live.size().1, 0)
+        let clean = vt100::Parser::new(live.size().0, live.size().1, 0)
             .screen()
             .clone();
 
@@ -2836,11 +2836,23 @@ mod tests {
     /// the flattened row keeps the terminal's display width.
     #[test]
     fn screen_snapshot_drops_wide_continuation_cells() {
-        let mut parser = vt100_ctt::Parser::new(2, 10, 0);
+        let mut parser = vt100::Parser::new(2, 10, 0);
         parser.process("abあcd".as_bytes());
         let snapshot = screen_to_snapshot(parser.screen());
         let text: String = snapshot.lines[0].cells.iter().map(|c| c.ch).collect();
         assert_eq!(text.trim_end(), "abあcd");
+    }
+
+    #[test]
+    fn hvp_positions_like_cup() {
+        // btop positions exclusively with HVP (`f`); it must behave like CUP
+        // (gominimal/minimal#1197). Guards the gominimal/vt100-rust fork's
+        // patch against being dropped.
+        let mut parser = vt100::Parser::new(5, 10, 0);
+        parser.process("\u{1b}[3;7fX\u{1b}[fY".as_bytes());
+        assert_eq!(parser.screen().cell(2, 6).unwrap().contents(), "X");
+        assert_eq!(parser.screen().cell(0, 0).unwrap().contents(), "Y");
+        assert_eq!(parser.screen().cursor_position(), (0, 1));
     }
 
     #[test]
