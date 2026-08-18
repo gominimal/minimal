@@ -359,6 +359,9 @@ fn render_info(model: &Model, key: &SessionKey, frame: &mut Frame, area: Rect) {
             false => root,
         }
     });
+    // The branch repeats in the Info column at full fidelity, where the
+    // sidebar's tight truncation budget may have clipped it.
+    let branch = entry.and_then(|e| e.git.as_ref()).map(|g| g.branch.clone());
     let left = [
         ("project", project),
         ("user", user),
@@ -369,11 +372,14 @@ fn render_info(model: &Model, key: &SessionKey, frame: &mut Frame, area: Rect) {
         .and_then(|d| d.record.as_ref())
         .map(|r| format!("{:?}", r.network))
         .unwrap_or_else(|| "?".to_string());
-    // The Info section is four rows tall; the branch rides in the sidebar
-    // row, so only the repo root joins the right column here.
+    // The Info section is four rows tall: runtime facts first, then the
+    // git context fills the right column's spare rows.
     let mut right = vec![("net", net), ("idle", idle_text(model, key))];
     if let Some(repo) = repo {
         right.push(("repo", repo));
+    }
+    if let Some(branch) = branch {
+        right.push(("branch", branch));
     }
 
     // Left column takes half the pane; the right column starts after a
@@ -392,7 +398,9 @@ fn render_info(model: &Model, key: &SessionKey, frame: &mut Frame, area: Rect) {
             }
             if let Some((label, value)) = right.get(i) {
                 spans.push(Span::raw("  "));
-                spans.push(Span::styled(pad_truncate(label, 6), dim));
+                // Eight-wide to match the left column: the six-wide gutter
+                // left the six-char "branch" label flush against its value.
+                spans.push(Span::styled(pad_truncate(label, 8), dim));
                 spans.push(Span::raw(value.clone()));
             }
             Line::from(spans)

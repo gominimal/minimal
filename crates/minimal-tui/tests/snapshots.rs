@@ -251,6 +251,35 @@ fn sidebar_and_info_show_git_context() {
         !info_row.contains("worktree"),
         "plain repo must not be tagged: {info_row}"
     );
+    // The branch repeats in the Info section at full fidelity, alongside
+    // the repo root it came from in the sidebar.
+    let branch_row = rendered
+        .lines()
+        .find(|l| l.contains("branch"))
+        .expect("branch row in info section");
+    assert!(
+        branch_row.contains("main"),
+        "branch name missing: {branch_row}"
+    );
+}
+
+/// A session with no git info renders neither a repo nor a branch row,
+/// keeping the Info column layout byte-identical to pre-git renders.
+#[test]
+fn info_section_omits_git_rows_without_git_info() {
+    let mut model = fixed_model(vec![provider(
+        "host",
+        vec![entry(1, Some("plain"), "/src/plain")],
+    )]);
+    let rendered = render(&mut model);
+    assert!(
+        !rendered.lines().any(|l| l.contains("repo")),
+        "repo row leaked into a no-git render:\n{rendered}"
+    );
+    assert!(
+        !rendered.lines().any(|l| l.contains("branch")),
+        "branch row leaked into a no-git render:\n{rendered}"
+    );
 }
 
 /// A branch name longer than the sidebar truncates with `…` instead of
