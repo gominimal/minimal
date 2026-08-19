@@ -30,8 +30,10 @@
 //! [vars]
 //! EDITOR    = "hx"
 //! VISUAL    = "hx"
-//! TERM      = { inherit = true, default = "xterm-256color" }
 //! COLORTERM = { inherit = true }
+//! # `TERM` is deliberately absent: the daemon sets it from the terminal
+//! # each attach arrives on and keeps it current, above anything composed
+//! # here (`docs/reference/loadouts.md`, "The attached terminal").
 //!
 //! # Warm helix's tree-sitter grammar cache the first time the session
 //! # comes up. Best-effort; failures don't tank activation.
