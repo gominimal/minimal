@@ -33,11 +33,14 @@ consistency with Minimal's state and cache dirs. The global
 
 The filename stem **is** the loadout's identifier:
 
-- It must match the `name` field declared inside the file, or loading fails
-  with a `NameMismatch` error naming both the file stem and the declared
-  `name`.
+- Nothing inside the file names it, so renaming the file renames the
+  loadout.
 - Names are trimmed and must be non-empty, with no `/`, `\`, or NUL
   characters.
+- A file that still carries the old `name` field loads anyway, with a
+  warning that the field is no longer required. If the declared name
+  disagrees with the filename, the warning says so and the filename wins;
+  the declared name is discarded.
 
 The directory is not created automatically; create it and drop
 `<name>.toml` files there to get started.
@@ -48,7 +51,6 @@ A loadout that brings in the helix editor and zellij multiplexer, wired up
 with the user's dotfiles:
 
 ```toml
-name        = "dev"
 description = "helix + zellij with my dotfiles"
 packages    = ["helix", "zellij"]
 
@@ -81,11 +83,16 @@ Saved as `<config>/minimal/loadouts/dev.toml`, this is applied with
 
 ### `name` - The loadout's identifier
 
-_Required_
+_Not a field. Comes from the filename_
 
-Must match the filename stem. Shown in selection and error messages.
+A loadout is identified by its filename stem — `dev.toml` is the loadout
+`dev` — which is what selection and error messages show.
+
+The field itself is obsolete. A file that still declares one loads with a
+warning that it is no longer required, and the filename is used regardless:
 
 ```toml
+# Delete this line; the file is already named `dev.toml`.
 name = "dev"
 ```
 
