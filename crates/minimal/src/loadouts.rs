@@ -907,7 +907,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         std::fs::create_dir_all(&loadouts).unwrap();
         std::fs::write(
             loadouts.join("default.toml"),
-            "name = \"default\"\ndescription = \"user override\"\n",
+            "description = \"user override\"\n",
         )
         .unwrap();
         let cfg = sessions::client::config::Config::default();
@@ -947,8 +947,8 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         let tmp = tempfile::tempdir().unwrap();
         let loadouts = tmp.path().join("loadouts");
         std::fs::create_dir_all(&loadouts).unwrap();
-        // Valid TOML but missing the required `name` field → parse failure.
-        std::fs::write(loadouts.join("broken.toml"), "x = 1\n").unwrap();
+        // Valid TOML, wrong schema: `packages` is a list → parse failure.
+        std::fs::write(loadouts.join("broken.toml"), "packages = 1\n").unwrap();
         let args = LoadoutListArgs {
             dir: Some(loadouts),
         };

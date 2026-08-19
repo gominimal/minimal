@@ -62,7 +62,7 @@ fn fake_config_dir() -> tempfile::TempDir {
     .unwrap();
     std::fs::write(
         root.join("loadouts/dev.toml"),
-        "name = \"dev\"\npackages = [\"ripgrep\"]\n\n[vars]\nGITHUB_TOKEN = \"canary-secret-value\"\n",
+        "packages = [\"ripgrep\"]\n\n[vars]\nGITHUB_TOKEN = \"canary-secret-value\"\n",
     )
     .unwrap();
     dir

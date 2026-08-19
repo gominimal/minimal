@@ -764,7 +764,6 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   echo "::group::lifecycle hooks: loadout-declared"
   mkdir -p "$XDG_CONFIG_HOME/minimal/loadouts"
   cat > "$XDG_CONFIG_HOME/minimal/loadouts/hookdev.toml" <<'LOADOUT'
-name = "hookdev"
 description = "e2e loadout hooks"
 
 [[lifecycle_hooks]]
