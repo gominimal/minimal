@@ -56,9 +56,9 @@ directories. The global `--config-dir` flag overrides the base directory when
 you need a non-default location.
 
 The filename stem is the loadout's identifier. A file named `dev.toml`
-defines the loadout `dev`, and its `name` field inside the file must match
-that stem. The directory is not created for you: make it and drop
-`<name>.toml` files in to get started.
+defines the loadout `dev` — nothing inside the file names it, so renaming
+the file renames the loadout. The directory is not created for you: make it
+and drop `<name>.toml` files in to get started.
 
 ## What a loadout carries
 
@@ -140,7 +140,6 @@ Putting the pieces together, a loadout that sets up the helix editor and the
 zellij multiplexer with your dotfiles looks like this:
 
 ```toml
-name        = "dev"
 description = "helix + zellij with my dotfiles"
 packages    = ["helix", "zellij"]
 
@@ -223,8 +222,8 @@ per-kind summary of what it contributes:
 
 ```
   NAME   DESCRIPTION                     CONTRIBUTES
-* dev    helix + zellij with my dotfiles 2 pkg / 2 var / 2 patch / 1 hook
-  extra                                  1 pkg / 0 var / 0 patch / 0 hook
+* dev    helix + zellij with my dotfiles 2 pkg / 1 var / 2 patch
+  extra                                  1 pkg / 0 var / 0 patch
 
 * default (from `[loadouts].default_loadouts`)
 ```
@@ -238,7 +237,7 @@ loadouts directory other than the default.
 ## Where to go next
 
 - The [loadout reference](../reference/loadouts.md) has the full TOML schema
-  for every field (`name`, `packages`, `[vars]`, `patches`,
+  for every field (`description`, `packages`, `[vars]`, `patches`,
   `[[lifecycle_hooks]]`, and the rest), the client config keys, and the exact
   composition and conflict rules.
 - [Sessions](./sessions.md) explains the session model that loadouts layer

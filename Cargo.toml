@@ -63,6 +63,13 @@ opt-level = 1
 lto = false
 codegen-units = 16
 
+# Keep debug info lean for third-party dependencies. Full DWARF on every
+# transitive rlib bloats `target/debug` into the tens of GB (this workspace
+# alone accumulated ~160GB of deps). Line tables are enough for backtraces and
+# gdb line numbers; workspace crates keep full debug info for local debugging.
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
 [workspace.dependencies]
 anyhow = "1.0"
 arbitrary = "1"

@@ -50,9 +50,9 @@ use crate::core::primitives::{LenientVarEntry, Patch, Patches, StrictVarName, Va
 /// separators and NUL bytes.
 ///
 /// Names appear in user-facing contexts (selection menus, error
-/// messages) and may be used as filesystem-key fragments by the loader,
-/// so they're constrained at construction time rather than at point of
-/// use.
+/// messages) and are the filename stems the loader reads loadouts
+/// from, so they're constrained at construction time rather than at
+/// point of use.
 #[nutype(
     sanitize(trim),
     validate(not_empty, predicate = |s: &str| !s.contains(['/', '\\', '\0'])),
@@ -63,10 +63,25 @@ use crate::core::primitives::{LenientVarEntry, Patch, Patches, StrictVarName, Va
 )]
 pub struct LoadoutName(String);
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct Loadout {
-    /// Identifier — user-facing, used in selection and error messages.
-    name: LoadoutName,
+/// A loadout file's contents, with its identity not yet resolved.
+///
+/// A loadout is named after the file it lives in, never after
+/// anything written inside it: [`read_loadout_file`] pairs the parsed
+/// contents with the filename stem via [`LoadoutFile::into_loadout`].
+///
+/// The `name` key is still accepted so files written when it *was* the
+/// identifier keep parsing. It is exposed through
+/// [`LoadoutFile::declared_name`] only so the loader can warn that the
+/// field is no longer required; it never becomes the identifier, and a
+/// declared name that disagrees with the filename is discarded.
+///
+/// [`read_loadout_file`]: crate::client::disk::read_loadout_file
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct LoadoutFile {
+    /// The vestigial `name` field. See the type docs: read for
+    /// warnings, never for identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<LoadoutName>,
     /// Free-form description, shown alongside the name in user-facing
     /// contexts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,6 +110,61 @@ pub struct Loadout {
     follow_symlinks: Option<bool>,
 }
 
+impl LoadoutFile {
+    /// The `name` field declared inside the file, if it still carries
+    /// one. Not the loadout's identity — see the type docs.
+    #[must_use]
+    pub fn declared_name(&self) -> Option<&LoadoutName> {
+        self.name.as_ref()
+    }
+
+    /// Resolve identity: pair these contents with `name`, the stem of
+    /// the file they were read from. Any declared `name` is discarded.
+    #[must_use]
+    pub fn into_loadout(self, name: LoadoutName) -> Loadout {
+        Loadout { name, file: self }
+    }
+}
+
+/// A loadout: a file's contents plus the identity taken from its
+/// filename.
+#[derive(Clone, Debug)]
+pub struct Loadout {
+    /// Identifier — user-facing, used in selection and error messages.
+    /// Assigned by the loader from the filename stem, so it is
+    /// authoritative over any `name` the file itself declared.
+    name: LoadoutName,
+    /// Everything the file declared.
+    file: LoadoutFile,
+}
+
+/// Serializing a [`Loadout`] emits the resolved name in the `name`
+/// field, so the output round-trips back through [`Loadout`]'s own
+/// [`Deserialize`](serde::Deserialize) impl.
+impl serde::Serialize for Loadout {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut file = self.file.clone();
+        file.name = Some(self.name.clone());
+        file.serialize(serializer)
+    }
+}
+
+/// Deserializing a [`Loadout`] *does* require a `name` field: this is
+/// the path for loadouts defined in-repo (the `min` CLI's built-in
+/// `default`) and in tests, where there is no file to take a name
+/// from. Loadouts read from disk go through [`LoadoutFile`] instead
+/// and are named after their file.
+impl<'de> serde::Deserialize<'de> for Loadout {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let file = LoadoutFile::deserialize(deserializer)?;
+        let name = file
+            .name
+            .clone()
+            .ok_or_else(|| serde::de::Error::missing_field("name"))?;
+        Ok(file.into_loadout(name))
+    }
+}
+
 impl Loadout {
     /// Construct a loadout with a pre-validated name. Build it up via
     /// the additive `with_*` methods:
@@ -111,25 +181,14 @@ impl Loadout {
     /// ```
     #[must_use]
     pub fn new(name: LoadoutName) -> Self {
-        Self {
-            name,
-            description: None,
-            packages: Vec::new(),
-            vars: BTreeMap::new(),
-            vars_lenient: Vec::new(),
-            patches: Patches::empty(),
-            lifecycle_hooks: Vec::new(),
-            follow_symlinks: None,
-        }
+        LoadoutFile::default().into_loadout(name)
     }
 
     /// Set a free-form description.
     #[must_use]
-    pub fn with_description(self, description: impl Into<String>) -> Self {
-        Self {
-            description: Some(description.into()),
-            ..self
-        }
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.file.description = Some(description.into());
+        self
     }
 
     /// The loadout's identifier.
@@ -141,14 +200,14 @@ impl Loadout {
     /// The loadout's free-form description, if any.
     #[must_use]
     pub fn description(&self) -> Option<&str> {
-        self.description.as_deref()
+        self.file.description.as_deref()
     }
 
     /// Append a package dependency.
     #[must_use]
     pub fn with_package(self, package: impl Into<String>) -> Self {
         let mut new = self;
-        new.packages.push(package.into());
+        new.file.packages.push(package.into());
         new
     }
 
@@ -158,7 +217,7 @@ impl Loadout {
     #[must_use]
     pub fn with_var(self, name: StrictVarName, value: VarValue) -> Self {
         let mut new = self;
-        new.vars.insert(name, value);
+        new.file.vars.insert(name, value);
         new
     }
 
@@ -166,14 +225,14 @@ impl Loadout {
     #[must_use]
     pub fn with_var_lenient(self, entry: LenientVarEntry) -> Self {
         let mut new = self;
-        new.vars_lenient.push(entry);
+        new.file.vars_lenient.push(entry);
         new
     }
 
     /// Append a patch.
     #[must_use]
     pub fn with_patch(mut self, patch: Patch) -> Self {
-        self.patches.push(patch);
+        self.file.patches.push(patch);
         self
     }
 
@@ -181,7 +240,7 @@ impl Loadout {
     #[must_use]
     pub fn with_lifecycle_hook(self, hook: LifecycleHook) -> Self {
         let mut new = self;
-        new.lifecycle_hooks.push(hook);
+        new.file.lifecycle_hooks.push(hook);
         new
     }
 
@@ -196,7 +255,7 @@ impl Loadout {
     /// never saw the original command line.
     #[must_use]
     pub fn without_lifecycle_hooks(mut self) -> Self {
-        self.lifecycle_hooks.clear();
+        self.file.lifecycle_hooks.clear();
         self
     }
 
@@ -204,7 +263,7 @@ impl Loadout {
     /// this loadout's patches.
     #[must_use]
     pub fn with_follow_symlinks(mut self, v: bool) -> Self {
-        self.follow_symlinks = Some(v);
+        self.file.follow_symlinks = Some(v);
         self
     }
 
@@ -215,25 +274,25 @@ impl Loadout {
     /// [`ComposeOptions::follow_symlinks`]: crate::core::compose::ComposeOptions::follow_symlinks
     #[must_use]
     pub fn follow_symlinks(&self) -> Option<bool> {
-        self.follow_symlinks
+        self.file.follow_symlinks
     }
 
     /// Packages this loadout requires.
     #[must_use]
     pub fn packages(&self) -> &[String] {
-        &self.packages
+        &self.file.packages
     }
 
     /// Variables with POSIX-shaped names (raw wire-form accessor).
     #[must_use]
     pub fn vars(&self) -> &BTreeMap<StrictVarName, VarValue> {
-        &self.vars
+        &self.file.vars
     }
 
     /// Variables with Linux-permissive names (raw wire-form accessor).
     #[must_use]
     pub fn vars_lenient(&self) -> &[LenientVarEntry] {
-        &self.vars_lenient
+        &self.file.vars_lenient
     }
 
     /// Iterate over every variable this loadout declares — strict and
@@ -249,10 +308,12 @@ impl Loadout {
     /// the underlying [`BTreeMap`]), then lenient (in declaration order).
     pub fn all_vars(&self) -> impl Iterator<Item = (VarName, &VarValue)> {
         let strict = self
+            .file
             .vars
             .iter()
             .map(|(n, v)| (VarName::Strict(n.clone()), v));
         let lenient = self
+            .file
             .vars_lenient
             .iter()
             .map(|e| (VarName::Lenient(e.name().clone()), e.value()));
@@ -262,13 +323,13 @@ impl Loadout {
     /// Patches contributed by this loadout.
     #[must_use]
     pub fn patches(&self) -> &Patches {
-        &self.patches
+        &self.file.patches
     }
 
     /// Lifecycle hooks attached to this loadout.
     #[must_use]
     pub fn lifecycle_hooks(&self) -> &[LifecycleHook] {
-        &self.lifecycle_hooks
+        &self.file.lifecycle_hooks
     }
 }
 
@@ -312,7 +373,7 @@ impl crate::core::compose::Composable for Loadout {
         // shouldn't fail activation just because the host doesn't
         // set them.
         let mut contribution = crate::core::compose::Contribution::new();
-        for (name, value) in self.vars {
+        for (name, value) in self.file.vars {
             if let Some(resolved) =
                 resolve_var_declaration(&loadout_name, name.as_ref(), value, env)?
             {
@@ -327,7 +388,7 @@ impl crate::core::compose::Composable for Loadout {
                 ));
             }
         }
-        for entry in self.vars_lenient {
+        for entry in self.file.vars_lenient {
             let (name, value) = entry.into_parts();
             if let Some(resolved) =
                 resolve_var_declaration(&loadout_name, name.as_ref(), value, env)?
@@ -350,11 +411,11 @@ impl crate::core::compose::Composable for Loadout {
         // helper's var loop is a no-op.
         let mut rest = crate::core::compose::contribute_primitives(
             &source,
-            self.packages,
+            self.file.packages,
             std::collections::BTreeMap::new(),
             Vec::new(),
-            self.patches,
-            self.lifecycle_hooks,
+            self.file.patches,
+            self.file.lifecycle_hooks,
             env,
         )?;
         contribution.merge(std::mem::take(&mut rest)).ok();
@@ -364,7 +425,7 @@ impl crate::core::compose::Composable for Loadout {
         // inherit `ComposeOptions::follow_symlinks` at expand time.
         // `Some(v)` overrides the default for this loadout's patches
         // specifically.
-        if let Some(follow) = self.follow_symlinks {
+        if let Some(follow) = self.file.follow_symlinks {
             contribution.set_follow_symlinks_on_patches(Some(follow));
         }
         Ok(contribution)
@@ -543,6 +604,37 @@ mod tests {
         let collected: Vec<_> = l.all_vars().collect();
         assert!(matches!(collected[0].0, VarName::Strict(_)));
         assert!(matches!(collected[1].0, VarName::Lenient(_)));
+    }
+
+    /// A loadout file carries no identity of its own: it parses
+    /// without a `name` field, and takes the name it is given.
+    #[test]
+    fn loadout_file_takes_the_name_it_is_given() {
+        let file: LoadoutFile = toml::from_str(r#"packages = ["helix"]"#).unwrap();
+        assert_eq!(file.declared_name(), None);
+        let l = file.into_loadout(LoadoutName::try_new("dev").unwrap());
+        assert_eq!(l.name().as_ref(), "dev");
+        assert_eq!(l.packages(), &["helix"]);
+    }
+
+    /// A file that still declares a `name` parses — the field is
+    /// readable so the loader can warn about it — but the name it
+    /// declares loses to the one `into_loadout` assigns.
+    #[test]
+    fn declared_name_is_readable_but_never_wins() {
+        let file: LoadoutFile = toml::from_str(r#"name = "stale""#).unwrap();
+        assert_eq!(file.declared_name().unwrap().as_ref(), "stale");
+        let l = file.into_loadout(LoadoutName::try_new("dev").unwrap());
+        assert_eq!(l.name().as_ref(), "dev");
+    }
+
+    /// `Loadout`'s own `Deserialize` — the in-repo path, with no file
+    /// to be named after — still requires the `name` field.
+    #[test]
+    fn loadout_deserialize_requires_a_name() {
+        let err = toml::from_str::<Loadout>(r#"packages = ["helix"]"#)
+            .expect_err("a nameless Loadout has no identity");
+        assert!(err.to_string().contains("name"), "got: {err}");
     }
 
     #[test]
