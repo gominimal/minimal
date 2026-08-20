@@ -651,6 +651,34 @@ pub struct Session {
     /// we spawns (e.g. build [`SideOp`]s) so they can reach back into
     /// the session.
     weak_self: WeakSessionHandle,
+
+    /// What brought the currently held host up, which decides whether an
+    /// interactive attach may respawn it. See [`HostOrigin`].
+    host_origin: HostOrigin,
+}
+
+/// Why a session host was launched.
+///
+/// The sandbox and the interactive shell are one spawn — the shell *is* the
+/// sandbox's session leader — so a launch that only wanted the sandbox still
+/// creates the shell a user may later attach to, and that shell's `environ`
+/// is fixed for its lifetime. This records which case a live host is in, so
+/// an attach can tell "the shell was made for a terminal" from "the shell was
+/// made for a hook, and no terminal has ever described itself to it".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostOrigin {
+    /// Minted by an attach, from a client with a PTY. Its environment already
+    /// describes a terminal.
+    Interactive,
+    /// Minted by [`Session::launch_host_for_hooks`] to run lifecycle hooks.
+    /// Nothing of the user's runs in it: activation hooks have completed by
+    /// the time an attach can arrive, so the shell is safe to replace.
+    Hooks,
+    /// Minted by [`Session::ensure_host`] to serve an exec. The command is
+    /// live inside that sandbox, so replacing the shell would kill it — this
+    /// one is never respawned, and the attaching terminal's facts reach it
+    /// through the per-attach environment instead.
+    Exec,
 }
 
 impl Session {
@@ -686,6 +714,10 @@ impl Session {
             hook_scripts_upload_lock: Arc::new(Mutex::new(())),
             manager,
             weak_self,
+            // No host yet; the first launch sets this. `Interactive` is the
+            // conservative default — it is the one value that never licenses
+            // a respawn.
+            host_origin: HostOrigin::Interactive,
             #[cfg(target_os = "linux")]
             hostnames,
         }
@@ -1577,10 +1609,25 @@ impl Session {
         let attach_env = {
             let inherited = inherited_session_env(&config.env_vars);
             let mut connection = Vec::new();
-            if let Some(pty) = config.pty.as_ref()
-                && !pty.term.is_empty()
-            {
-                connection.push(("TERM".to_string(), pty.term.clone()));
+            match config.pty.as_ref().map(|pty| pty.term.as_str()) {
+                Some(term) if !term.is_empty() => {
+                    tracing::info!(term, "attach carries a terminal");
+                    connection.push(("TERM".to_string(), term.to_string()));
+                }
+                // The client had nothing to say about its terminal — OpenSSH
+                // sends an empty pty-req term string when its own `TERM` is
+                // unset. The session keeps whatever the last attach published,
+                // which is right (an absent value is not an assertion that
+                // there is no terminal) but indistinguishable from "nothing
+                // changed" unless it is said out loud. Logged because the
+                // silence here has already cost one debugging session: the
+                // symptom is a session whose `TERM` never follows the client,
+                // and this line is the difference between reading it off and
+                // guessing at it.
+                _ => tracing::info!(
+                    "attach carries no terminal (client sent an empty pty-req term); \
+                     keeping the last published TERM"
+                ),
             }
             session_host::AttachEnv {
                 inherited,
@@ -1671,6 +1718,31 @@ impl Session {
             }
         }
 
+        // A host minted to run hooks has an environment that describes no
+        // terminal, because there was none — and the shell's `environ` cannot
+        // be revised in place. Nothing of the user's is running in it (the
+        // activation hooks it was launched for have completed by the time an
+        // attach can arrive), so replace it with one minted for the terminal
+        // that is actually here. An `Exec`-minted host is deliberately not
+        // replaced: a command is live inside that sandbox, and killing it to
+        // improve `TERM` is a bad trade. That case rides on the per-attach
+        // environment the host republishes instead.
+        let respawn_for_terminal =
+            self.host_origin == HostOrigin::Hooks && !attach_env.connection.is_empty();
+        if respawn_for_terminal
+            && let SessionInner::Active {
+                host: slot @ Some(_),
+                ..
+            } = &mut self.inner
+        {
+            tracing::info!(
+                "replacing the hook-launched session shell with one minted for the attaching terminal"
+            );
+            let (handle, join) = slot.take().expect("matched on Some");
+            let _ = handle.kill(false).await;
+            let _ = join.await;
+        }
+
         let host = match &mut self.inner {
             // Awaiting a verdict: a client is mid create flow, and composing
             // over it here would discard the items it is still gating.
@@ -1683,7 +1755,10 @@ impl Session {
                     .await
             }
             Some((h, _)) => {
-                match h.attach(channel, sz).await {
+                // Every attach carries the connection facts, not just the one
+                // that mints the shell: `TERM` describes whichever terminal is
+                // on the other end of *this* channel.
+                match h.attach(channel, sz, attach_env.connection_env()).await {
                     Ok(()) => Ok(()),
                     Err((channel, sz)) => {
                         // session host is dead
@@ -1716,6 +1791,11 @@ impl Session {
     ) -> Result<(Option<Channel<Msg>>, LaunchedHost), AttachError> {
         let record = self.record.record().await.unwrap();
         let paths = self.paths().await;
+        // Kept before the launcher consumes `attach_env`: the launch folds
+        // these into the shell's environment, and the host keeps them so it
+        // can layer them onto everything it later runs in the session and
+        // republish them for the shell to re-read.
+        let connection_env = attach_env.connection_env();
         let launcher = self
             .session_launcher(session_hnd, &record, attach_env, phase)
             .await?;
@@ -1755,6 +1835,7 @@ impl Session {
             // The host runs attach and detach itself: it owns the terminal
             // they write to and the process whose namespaces they join.
             self.composition(),
+            connection_env,
         ));
 
         let (channel, spawned) = match progress {
@@ -1859,6 +1940,13 @@ impl Session {
             SessionInner::Active { .. } => None,
         };
         if let Some(host) = running {
+            // Same claim as the launch below, for a host this call did not
+            // mint: an exec is about to run in this sandbox, so a later
+            // attach must not replace the shell out from under it. Without
+            // this, a host minted for lifecycle hooks stays `Hooks` through
+            // every exec that reuses it, and the first interactive attach
+            // would respawn it — killing a command that is still running.
+            self.host_origin = HostOrigin::Exec;
             return Ok(host);
         }
 
@@ -1878,6 +1966,9 @@ impl Session {
             unreachable!("ensure_host returns early on a Draft session");
         };
         *slot = Some(launched);
+        // Minted for an exec: a command is about to run in this sandbox, so a
+        // later attach must not replace it. See [`HostOrigin::Exec`].
+        self.host_origin = HostOrigin::Exec;
         Ok(host)
     }
 
@@ -1906,15 +1997,26 @@ impl Session {
         // the host died in the window between launch and attach; surface it as
         // a spawn failure rather than leaving a dead, channel-less host — which
         // is why the host is stored only once it is bound.
-        launched.0.attach(channel, sz).await.map_err(|_| {
-            AttachError::SpawnFailed(std::io::Error::other(
-                "session host exited before its channel could attach",
-            ))
-        })?;
+        //
+        // The launch already folded this attach's connection facts into the
+        // shell's environment, so nothing new is passed here: the host holds
+        // them, and an empty map means "no revision", not "no terminal".
+        launched
+            .0
+            .attach(channel, sz, session_host::ConnectionEnv::new())
+            .await
+            .map_err(|_| {
+                AttachError::SpawnFailed(std::io::Error::other(
+                    "session host exited before its channel could attach",
+                ))
+            })?;
         let SessionInner::Active { host, .. } = &mut self.inner else {
             unreachable!("mint_session_host is only reachable from the Active state");
         };
         *host = Some(launched);
+        // Minted by an attach: its environment describes the terminal that is
+        // here, so nothing may replace it out from under that client.
+        self.host_origin = HostOrigin::Interactive;
         Ok(())
     }
 
@@ -2053,6 +2155,10 @@ impl Session {
             unreachable!("a headless hook launch only reaches here from the Active state");
         };
         *host = Some(launched);
+        // Minted for hooks, with no terminal to describe: an interactive
+        // attach may replace this shell rather than inherit its blank `TERM`.
+        // See [`HostOrigin::Hooks`].
+        self.host_origin = HostOrigin::Hooks;
         Ok(())
     }
 
@@ -4032,6 +4138,149 @@ mod tests {
             record_status(&mut client, session_id).await,
             Some(sessions::SessionStatus::Active),
             "a session whose activate hook succeeded should be attachable",
+        );
+    }
+
+    /// The POSIX form of the per-attach environment the host republishes into
+    /// the session's home. Empty when nothing has been published yet.
+    async fn published_attach_env(server: &TestServer, session_id: SessionId) -> String {
+        let paths = session_paths(server, session_id).await;
+        let path = paths
+            .home
+            .sub_path_unchecked(".local/state/minimal/attach-env.sh");
+        tokio::fs::read_to_string(path.as_str())
+            .await
+            .unwrap_or_default()
+    }
+
+    /// An attach publishes the terminal it arrived from, so the session shell
+    /// can pick it up at its next prompt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_publishes_the_terminal_it_arrived_from() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        let mut channel = client
+            .open_shell_with_term(session_id, "xterm-256color")
+            .await;
+        await_echo(&mut channel).await;
+
+        let published = published_attach_env(&server, session_id).await;
+        assert!(
+            published.contains("export TERM='xterm-256color'"),
+            "the attaching terminal should be published; got: {published:?}"
+        );
+    }
+
+    /// `TERM` is a per-attach fact, not a per-shell one: a client attaching
+    /// from a different terminal than the one that minted the shell gets its
+    /// own terminal described, not the previous client's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reattaching_from_another_terminal_republishes_term() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        let mut first = client.open_shell_with_term(session_id, "xterm").await;
+        await_echo(&mut first).await;
+        assert!(
+            published_attach_env(&server, session_id)
+                .await
+                .contains("export TERM='xterm'")
+        );
+
+        // Same session, same shell — a different terminal.
+        let mut second = client.open_shell_with_term(session_id, "wezterm").await;
+        await_echo(&mut second).await;
+
+        let published = published_attach_env(&server, session_id).await;
+        assert!(
+            published.contains("export TERM='wezterm'"),
+            "a re-attach must republish, not keep the minting terminal's TERM; \
+             got: {published:?}"
+        );
+    }
+
+    /// A client that says nothing about its terminal — OpenSSH sends an empty
+    /// pty-req term string when its own `TERM` is unset — leaves the last
+    /// published value standing rather than clearing it. An absent value is
+    /// not an assertion that there is no terminal, and a session that had a
+    /// good `TERM` must not lose it to a client that could not describe one.
+    ///
+    /// This is the case `Session::attach` logs, because on the wire it looks
+    /// exactly like "nothing changed".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_attach_with_no_terminal_keeps_the_last_published_one() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        let mut first = client.open_shell_with_term(session_id, "wezterm").await;
+        await_echo(&mut first).await;
+        assert!(
+            published_attach_env(&server, session_id)
+                .await
+                .contains("export TERM='wezterm'")
+        );
+
+        // Same session, a client with no terminal to declare.
+        let mut second = client.open_shell_with_term(session_id, "").await;
+        await_echo(&mut second).await;
+
+        let published = published_attach_env(&server, session_id).await;
+        assert!(
+            published.contains("export TERM='wezterm'"),
+            "an attach with no terminal must not clear the last one; got: {published:?}"
+        );
+    }
+
+    /// Regression: a session shell minted headlessly — by the activation
+    /// hooks, with no terminal anywhere in the picture — used to keep that
+    /// terminal-less environment for the session's whole life, because
+    /// `TERM` was applied only when the shell was *minted* and every later
+    /// attach reused the shell. A session whose loadout declared an
+    /// `on_activate` hook therefore ran with no `TERM` at all, and `less`
+    /// in it fell back to ncurses' generic `unknown` entry
+    /// (`'unknown': I need something more specific.`).
+    ///
+    /// The attaching terminal must win over a shell that was minted without
+    /// one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hook_launched_shell_takes_the_attaching_terminals_term() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("activated");
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = session_with_hook(
+            &mut client,
+            "hook-then-attach",
+            sessions::wire::primitives::WireLifecycleHook {
+                on_activate: Some(inline(marker_body(&marker))),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            marker.exists(),
+            "the activate hook should have brought a host up headlessly"
+        );
+        assert!(
+            published_attach_env(&server, session_id).await.is_empty(),
+            "a headless launch has no terminal to describe"
+        );
+
+        let mut channel = client
+            .open_shell_with_term(session_id, "xterm-256color")
+            .await;
+        await_echo(&mut channel).await;
+
+        let published = published_attach_env(&server, session_id).await;
+        assert!(
+            published.contains("export TERM='xterm-256color'"),
+            "a hook-launched shell must still take the attaching terminal's \
+             TERM; got: {published:?}"
         );
     }
 

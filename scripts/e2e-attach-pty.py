@@ -22,6 +22,11 @@ to fire `on_detach`):
   E2E_PTY_ANSWER    how to answer the session-exit prompt: `delete` (the
                     default, what the sandbox proof needs) or `keep`, which
                     leaves the session alive — a detach.
+  E2E_PTY_DETACH    set to leave via the ctrl-w detach chord once the command
+                    stream goes quiet, instead of ending it with `exit`. The
+                    session's SHELL then survives, which is what a test of
+                    re-attaching to a still-running shell needs: `exit` ends
+                    that shell, and the next attach mints a new one.
 
 Prints the full captured terminal output on stdout. Exits 0 iff the attach
 process exited 0.
@@ -59,6 +64,7 @@ EXIT_PROMPT = b"would you like to do with this session"  # SHELL_EXIT_PROMPT, lo
 # bare Enter keeps the session (a detach), and Down+Enter selects "Delete".
 PROMPT_KEYS = {"delete": b"\x1b[B\r", "keep": b"\r"}
 answer = os.environ.get("E2E_PTY_ANSWER", "delete")
+DETACH = os.environ.get("E2E_PTY_DETACH") is not None
 if answer not in PROMPT_KEYS:
     sys.stderr.write(f"e2e-attach-pty: unknown E2E_PTY_ANSWER {answer!r}\n")
     sys.exit(2)
@@ -91,11 +97,22 @@ try:
     time.sleep(1.5)
     os.write(fd, ("\n".join(commands) + "\n").encode())
 
+    quiet = 0
+    detached = False
     while time.monotonic() < DEADLINE:
         chunk = drain_ready(1.0)
         if chunk is None:
             break  # EOF / closed
         buf.extend(chunk)
+        quiet = 0 if chunk else quiet + 1
+        # The detach chord has to arrive as a WRITE OF ITS OWN: the daemon
+        # matches a *bare* ctrl-w (`b.len() == 1 && b[0] == 0x17`), so the same
+        # byte inside the command stream is not a detach — it reaches the shell,
+        # where readline eats it as delete-previous-word. Sent once the stream
+        # goes quiet, so the commands have run first.
+        if DETACH and not detached and quiet >= 2:
+            os.write(fd, b"\x17")
+            detached = True
         if not answered and EXIT_PROMPT in bytes(buf).lower():
             os.write(fd, PROMPT_ANSWER_KEY)  # answer the prompt like a user
             answered = True
