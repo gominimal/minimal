@@ -17,6 +17,12 @@ on:
     workflow_dispatch:
 
 env:
+    # Route package-cache reads through the R2 mirror. min binaries built
+    # from branches predating minimal#1234 default the reader to gs:// and
+    # bill GCS internet egress from the GHA runners (25-36 GB/day measured
+    # 2026-08-18/19, gcs_access_logs). Harmless in jobs that never read the
+    # package cache; the mutable index.shisha is edge-bypassed to live GCS.
+    MINIMAL_REMOTE_CACHE_URL: https://cache.minimal.dev/
     CARGO_TERM_COLOR: always
     # Pin EXACTLY: 0.66.0 and earlier give spurious verification failures
     # on arrays with more than 64 elements (kani#2416/#4408, fixed by the
