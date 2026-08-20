@@ -274,6 +274,20 @@ impl RemoteCache<AnyBackend> {
                 )
                 .await;
             }
+            mfile::CacheConfig::AutoChain {
+                upstream,
+                sideloads,
+            } => {
+                return Self::new_any_auto_chain(
+                    url,
+                    gcs_storage,
+                    index_dir,
+                    ot,
+                    upstream,
+                    sideloads,
+                )
+                .await;
+            }
         };
         if let IndexSource::Snapshot { object } = &source {
             tracing::debug!("cache index: per-commit snapshot {object}");
@@ -358,6 +372,116 @@ impl RemoteCache<AnyBackend> {
         tracing::debug!(
             "cache index: closure union ready, {} entries",
             rc.index.len()
+        );
+        Ok(rc)
+    }
+
+    /// The `auto` chain (mfile::CacheConfig::AutoChain): per pinned link,
+    /// first-available of sealed closure → byte-copy snapshot, with the
+    /// upstream additionally falling back to the root index. Every
+    /// downgrade WARNS: the closure is the curated catalog; the byte-copy
+    /// is an uncurated copy of the root at publish time (dangling or
+    /// non-sealed entries live there — see the 2026-08-17 incident), and
+    /// the root is the mutable global. Chosen sources log at info so
+    /// "which catalog did this client read" is answerable from any log.
+    async fn new_any_auto_chain(
+        url: AnyUrl,
+        gcs_storage: Option<Storage>,
+        index_dir: Option<PathBuf>,
+        ot: Option<OpTracker>,
+        upstream: &mfile::ChainLink,
+        sideloads: &[mfile::ChainLink],
+    ) -> Result<Self, Error<AnyRespError>> {
+        let fetch = |object: String| {
+            Self::new_any(
+                url.clone(),
+                gcs_storage.clone(),
+                index_dir.clone(),
+                ot.clone(),
+                IndexSource::Snapshot { object },
+            )
+        };
+
+        // Upstream: closure → byte-copy → root.
+        let (mut rc, upstream_source) = match fetch(upstream.closure.clone()).await {
+            Ok(rc) => (rc, "closure"),
+            Err(Error::SnapshotMissing { object }) => {
+                tracing::warn!(
+                    "auto chain: sealed closure {object} not published; \
+                     falling back to the byte-copy snapshot (the uncurated \
+                     copy of the root at publish time)"
+                );
+                match fetch(upstream.snapshot.clone()).await {
+                    Ok(rc) => (rc, "byte-copy"),
+                    Err(Error::SnapshotMissing { object }) => {
+                        tracing::warn!(
+                            "auto chain: byte-copy snapshot {object} not \
+                             published either; falling back to the root index"
+                        );
+                        (
+                            Self::new_any(
+                                url.clone(),
+                                gcs_storage.clone(),
+                                index_dir.clone(),
+                                ot.clone(),
+                                IndexSource::Root,
+                            )
+                            .await?,
+                            "root",
+                        )
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Sideloads: closure → byte-copy → skip (their specs resolve
+        // locally, exactly as an absent sideload closure does today).
+        let mut side_hits = 0usize;
+        let mut side_skipped = 0usize;
+        for link in sideloads {
+            let side = match fetch(link.closure.clone()).await {
+                Ok(s) => Some(s),
+                Err(Error::SnapshotMissing { .. }) => match fetch(link.snapshot.clone()).await {
+                    Ok(s) => {
+                        tracing::warn!(
+                            "auto chain: sideload closure {} not published; \
+                             using its byte-copy snapshot",
+                            link.closure
+                        );
+                        Some(s)
+                    }
+                    Err(Error::SnapshotMissing { .. }) => {
+                        tracing::info!(
+                            "auto chain: sideload {} publishes no index; \
+                             its specs resolve locally",
+                            link.closure
+                        );
+                        side_skipped += 1;
+                        None
+                    }
+                    Err(e) => return Err(e),
+                },
+                Err(e) => return Err(e),
+            };
+            if let Some(s) = side {
+                side_hits += 1;
+                let conflicts = rc.index.merge(s.index);
+                if conflicts > 0 {
+                    tracing::warn!(
+                        "auto chain: {conflicts} conflicting entries merging {}",
+                        link.closure
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            upstream = upstream_source,
+            sideloads_merged = side_hits,
+            sideloads_skipped = side_skipped,
+            entries = rc.index.len(),
+            "cache index: auto chain ready"
         );
         Ok(rc)
     }
@@ -1072,6 +1196,97 @@ mod tests {
         // Upstream entries resolve; the sideload's specs simply miss (and
         // would build locally), exactly as they do today.
         assert_eq!(rc.sha256(&spec_a), Some([0xA1; 32]));
+        assert_eq!(rc.sha256(&SpecHash::from_bytes([0x0B; 32])), None);
+    }
+
+    #[tokio::test]
+    async fn auto_chain_prefers_the_sealed_closure() {
+        const CLOSURE: &str = "github.com/gominimal/pkgs/aaaa.closure.shisha";
+        const SNAP: &str = "github.com/gominimal/pkgs/aaaa.shisha";
+        let spec = SpecHash::from_bytes([0x0A; 32]);
+        // BOTH exist with different content: the closure must win.
+        let base = serve_objects(vec![
+            (CLOSURE.to_string(), index_bytes_for(&spec, [0xC1; 32])),
+            (SNAP.to_string(), index_bytes_for(&spec, [0xB1; 32])),
+        ]);
+        let config = mfile::CacheConfig::AutoChain {
+            upstream: mfile::ChainLink {
+                closure: CLOSURE.to_string(),
+                snapshot: SNAP.to_string(),
+            },
+            sideloads: vec![],
+        };
+        let rc = RemoteCache::new_any_configured(https_url(&base), None, None, None, &config)
+            .await
+            .unwrap();
+        assert_eq!(rc.sha256(&spec), Some([0xC1; 32]));
+    }
+
+    #[tokio::test]
+    async fn auto_chain_falls_back_to_byte_copy_when_closure_missing() {
+        const CLOSURE: &str = "github.com/gominimal/pkgs/aaaa.closure.shisha";
+        const SNAP: &str = "github.com/gominimal/pkgs/aaaa.shisha";
+        let spec = SpecHash::from_bytes([0x0A; 32]);
+        let base = serve_objects(vec![(SNAP.to_string(), index_bytes_for(&spec, [0xB1; 32]))]);
+        let config = mfile::CacheConfig::AutoChain {
+            upstream: mfile::ChainLink {
+                closure: CLOSURE.to_string(),
+                snapshot: SNAP.to_string(),
+            },
+            sideloads: vec![],
+        };
+        let rc = RemoteCache::new_any_configured(https_url(&base), None, None, None, &config)
+            .await
+            .unwrap();
+        assert_eq!(rc.sha256(&spec), Some([0xB1; 32]));
+    }
+
+    #[tokio::test]
+    async fn auto_chain_falls_back_to_root_when_both_missing() {
+        const CLOSURE: &str = "github.com/gominimal/pkgs/aaaa.closure.shisha";
+        const SNAP: &str = "github.com/gominimal/pkgs/aaaa.shisha";
+        let spec = SpecHash::from_bytes([0x0A; 32]);
+        // Only the ROOT index exists — pre-snapshot-era pin, exactly the
+        // 2026-08-17 incident shape (JK's July-9 pin).
+        let base = serve_index(Some(index_bytes_for(&spec, [0xD1; 32])));
+        let config = mfile::CacheConfig::AutoChain {
+            upstream: mfile::ChainLink {
+                closure: CLOSURE.to_string(),
+                snapshot: SNAP.to_string(),
+            },
+            sideloads: vec![],
+        };
+        let rc = RemoteCache::new_any_configured(https_url(&base), None, None, None, &config)
+            .await
+            .unwrap();
+        assert_eq!(rc.sha256(&spec), Some([0xD1; 32]));
+    }
+
+    #[tokio::test]
+    async fn auto_chain_skips_sideload_with_no_published_index() {
+        const CLOSURE: &str = "github.com/gominimal/pkgs/aaaa.closure.shisha";
+        const SNAP: &str = "github.com/gominimal/pkgs/aaaa.shisha";
+        const SIDE_CLOSURE: &str = "github.com/acme/extra/bbbb.closure.shisha";
+        const SIDE_SNAP: &str = "github.com/acme/extra/bbbb.shisha";
+        let spec = SpecHash::from_bytes([0x0A; 32]);
+        let base = serve_objects(vec![(
+            CLOSURE.to_string(),
+            index_bytes_for(&spec, [0xC1; 32]),
+        )]);
+        let config = mfile::CacheConfig::AutoChain {
+            upstream: mfile::ChainLink {
+                closure: CLOSURE.to_string(),
+                snapshot: SNAP.to_string(),
+            },
+            sideloads: vec![mfile::ChainLink {
+                closure: SIDE_CLOSURE.to_string(),
+                snapshot: SIDE_SNAP.to_string(),
+            }],
+        };
+        let rc = RemoteCache::new_any_configured(https_url(&base), None, None, None, &config)
+            .await
+            .unwrap();
+        assert_eq!(rc.sha256(&spec), Some([0xC1; 32]));
         assert_eq!(rc.sha256(&SpecHash::from_bytes([0x0B; 32])), None);
     }
 
