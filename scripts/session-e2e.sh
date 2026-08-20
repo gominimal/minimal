@@ -583,9 +583,31 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   # non-interactive caller cannot perform. Answer the exit prompt with `keep`
   # (Enter, the first option) so leaving the shell is a detach rather than a
   # destroy.
+  #
+  # This attach also proves `TERM`, and this is the only place in the lane
+  # that can: the session's shell was minted HEADLESSLY, by the activation
+  # hooks above, with no terminal in the picture — the exact shape that used
+  # to leave a session with no `TERM` at all for its whole life (every later
+  # attach reused that shell), so `less` in it fell back to ncurses' generic
+  # `unknown` entry. A pinned `TERM` on the driver makes the assertion below
+  # exact whatever the lane's own terminal is; the unit tests cover the
+  # decision, but only a real sandbox proves the value reaches a real bash.
   # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  # Leave a mark IN the shell — a plain shell variable, never exported, so it
+  # lives in that process and nowhere else. The re-attach below reads it back.
+  # Deliberately not `$$`: the session shell is pid 1 of its own namespace, so
+  # a replacement shell would report pid 1 too and the check would be vacuous.
+  # Leaves by the ctrl-w detach chord (`E2E_PTY_DETACH`), NOT by `exit`.
+  # `exit` ends the session's shell, and the "re-attach" below would then land
+  # on a freshly minted one — which would still report the new terminal (a new
+  # shell takes `TERM` from its launch env) while proving nothing about
+  # re-attaching. Detaching leaves the shell running, which is what the mark
+  # above is read back out of.
+  # shellcheck disable=SC2016 # `$TERM` must reach the SESSION's shell unexpanded.
   attach_out="$(E2E_PTY_COMMANDS='cat /home/hook-activate
-exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+echo TERM_INSHELL=$TERM
+__e2e_same_shell=yes' \
+    E2E_PTY_DETACH=1 TERM=xterm-256color python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     min ${E2E_MINIMAL_ARGS:-} session attach "$hook_sid" \
     2>"$WORK/hooks-attach.err")" || {
     echo "::error::pty attach for the hooks proof failed"
@@ -598,6 +620,16 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   # sandbox proof's marker checks.
   if [[ "$attach_out" != *HOOK_ATTACH_OK* ]]; then
     echo "::error::on_attach hook output did not reach the attached terminal"
+    echo "--- transcript ---"; printf '%s\n' "$attach_out"
+    fail
+  fi
+  # The attaching terminal must be what the shell reports, even though this
+  # shell was minted for hooks rather than for a terminal. Matching the FULL
+  # `TERM_INSHELL=<value>` is what makes this real: the pty echoes the typed
+  # `echo TERM_INSHELL=$TERM` verbatim (the shell expands it only on the
+  # output side), so an empty or stale `TERM` cannot satisfy it.
+  if [[ "$attach_out" != *"TERM_INSHELL=xterm-256color"* ]]; then
+    echo "::error::the attached terminal's TERM did not reach the session shell"
     echo "--- transcript ---"; printf '%s\n' "$attach_out"
     fail
   fi
@@ -623,6 +655,43 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     fail
   fi
   echo "on_attach (on the terminal) + on_detach (headless, after leaving) OK"
+  echo "TERM reached the hook-launched shell from the attaching terminal OK"
+
+  # Re-attach to the SAME (still-running) shell from a terminal that calls
+  # itself something else. `TERM` is a per-attach fact, so the shell must now
+  # report the new one: the value is not fixed when the shell is minted, and
+  # the daemon-installed hook re-reads it. This is the case a user hits by
+  # attaching from a second machine or emulator.
+  #
+  # The in-shell mark is asserted alongside it, because `TERM` alone cannot
+  # tell the two explanations apart: a daemon that *replaced* the shell would
+  # also report the new terminal, while silently destroying everything the
+  # session was running. Only the original process still holds that variable.
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  # shellcheck disable=SC2016 # `$TERM` must reach the SESSION's shell unexpanded.
+  reattach_out="$(E2E_PTY_COMMANDS='echo TERM_INSHELL=$TERM
+echo SHELLMARK=[$__e2e_same_shell]
+exit' E2E_PTY_ANSWER=keep TERM=vt220 python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+    min ${E2E_MINIMAL_ARGS:-} session attach "$hook_sid" \
+    2>"$WORK/hooks-reattach.err")" || {
+    echo "::error::pty re-attach for the TERM proof failed"
+    echo "--- transcript ---"; printf '%s\n' "$reattach_out"
+    echo "--- stderr ---"; cat "$WORK/hooks-reattach.err" 2>/dev/null || true
+    fail
+  }
+  if [[ "$reattach_out" != *"TERM_INSHELL=vt220"* ]]; then
+    echo "::error::re-attaching from a different terminal did not update TERM"
+    echo "--- transcript ---"; printf '%s\n' "$reattach_out"
+    fail
+  fi
+  # `SHELLMARK=[yes]` can only come from the shell that ran the assignment;
+  # a replacement prints `SHELLMARK=[]`, which is why the brackets are there.
+  if [[ "$reattach_out" != *"SHELLMARK=[yes]"* ]]; then
+    echo "::error::the re-attach did not land on the same shell (its state was gone)"
+    echo "--- transcript ---"; printf '%s\n' "$reattach_out"
+    fail
+  fi
+  echo "re-attach from a different terminal updated TERM in the same shell OK"
 
   # on_destroy. The session's filesystem goes with it, so the evidence is the
   # daemon log — and the failing hook must not have blocked the teardown.

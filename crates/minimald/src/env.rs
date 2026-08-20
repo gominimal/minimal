@@ -50,6 +50,120 @@ use tokio::task::{JoinHandle, spawn_blocking};
 /// The min helper script installed at `/usr/bin/min` inside the sandbox.
 const MIN_SCRIPT: &str = include_str!("env_min_helper.sh");
 
+/// Marks a hook file as ours, so a rootfs that already carries one (zsh's
+/// global rc is a file its own package may ship) is appended to once rather
+/// than repeatedly.
+const ATTACH_ENV_HOOK_MARKER: &str = "minimal: per-attach environment";
+
+/// Directory and file name of the bash rc the session shell is started with
+/// (`--rcfile`). Not a shell-owned integration point like the others — this
+/// build of bash has no `/etc/bash.bashrc` — so the daemon names it on the
+/// shell's own argv; see [`install_attach_env_hooks`].
+const ATTACH_ENV_BASH_RC_DIR: &str = "usr/share/minimal";
+const ATTACH_ENV_BASH_RC_NAME: &str = "attach-env.bash";
+
+/// In-sandbox absolute path of that rc, for the shell's argv.
+///
+/// Read only by the real launcher (`cfg(not(test))`); the mock launcher runs
+/// its own program, so tolerate it being unread under `test`.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) const ATTACH_ENV_BASH_RC: &str =
+    constcat::concat!("/", ATTACH_ENV_BASH_RC_DIR, "/", ATTACH_ENV_BASH_RC_NAME);
+
+/// File name of the POSIX fallback, installed beside the bash rc.
+const ATTACH_ENV_POSIX_NAME: &str = "attach-env-posix.sh";
+
+/// In-sandbox absolute path of the POSIX fallback, named by `$ENV`.
+///
+/// `$ENV` is the one hook POSIX defines: an interactive shell expands it and
+/// sources that file at startup. dash, the BusyBox and BSD ashes, ksh, and
+/// mksh all honour it (bash only in POSIX mode, which is why bash has its own
+/// rc instead).
+///
+/// It buys startup, not refresh: POSIX has no per-prompt or per-command hook,
+/// and none can be synthesized — `PS1` expansion cannot mutate the shell's own
+/// environment, since a command substitution runs in a subshell and
+/// `${var:=word}` assigns only when the variable is unset. So a POSIX shell
+/// gets the terminal that was current when it started, and a long-lived one
+/// re-syncs by sourcing `$MINIMAL_ATTACH_ENV` itself. Documented in
+/// `docs/reference/loadouts.md`.
+pub(crate) const ATTACH_ENV_POSIX: &str =
+    constcat::concat!("/", ATTACH_ENV_BASH_RC_DIR, "/", ATTACH_ENV_POSIX_NAME);
+
+/// POSIX shells: no function, no hook, no trap — just read the published
+/// file, if it is there. Sourced once, at shell startup, via `$ENV`.
+///
+/// Deliberately silent and side-effect free: `$ENV` is read by every
+/// interactive POSIX shell in the session (and by some ksh builds for
+/// non-interactive ones too), so anything that printed or failed here would
+/// surface in places that have nothing to do with a terminal.
+const ATTACH_ENV_HOOK_POSIX: &str = constcat::concat!(
+    "# ",
+    ATTACH_ENV_HOOK_MARKER,
+    "\n[ -r ",
+    crate::session_host::ATTACH_ENV_SH,
+    " ] && . ",
+    crate::session_host::ATTACH_ENV_SH,
+    "\n: \n",
+);
+
+/// bash: a `DEBUG` trap rather than `PROMPT_COMMAND`.
+///
+/// `PROMPT_COMMAND` is an environment variable, so a composed one replaces
+/// ours and the MOTD recipe this project documented for years ends in
+/// `unset PROMPT_COMMAND` — either would silently stop the refresh. A trap is
+/// shell state, not environment, so nothing a loadout sets can reach it.
+const ATTACH_ENV_HOOK_BASH: &str = constcat::concat!(
+    "# ",
+    ATTACH_ENV_HOOK_MARKER,
+    "\n__minimal_attach_env() {\n    [ -r ",
+    crate::session_host::ATTACH_ENV_SH,
+    " ] && . ",
+    crate::session_host::ATTACH_ENV_SH,
+    "\n    return 0\n}\ntrap '__minimal_attach_env' DEBUG\n",
+);
+
+/// zsh: `precmd`, its per-prompt hook. Installed into the global rc, so it
+/// runs before any user `~/.zshrc`, which cannot unset a hook it never saw.
+const ATTACH_ENV_HOOK_ZSH: &str = constcat::concat!(
+    "# ",
+    ATTACH_ENV_HOOK_MARKER,
+    "\nautoload -Uz add-zsh-hook\n__minimal_attach_env() {\n    [ -r ",
+    crate::session_host::ATTACH_ENV_SH,
+    " ] && . ",
+    crate::session_host::ATTACH_ENV_SH,
+    "\n}\nadd-zsh-hook precmd __minimal_attach_env\nadd-zsh-hook preexec __minimal_attach_env\n",
+);
+
+/// fish: its own syntax, from `vendor_conf.d` — the directory fish reserves
+/// for exactly this kind of integration.
+const ATTACH_ENV_HOOK_FISH: &str = constcat::concat!(
+    "# ",
+    ATTACH_ENV_HOOK_MARKER,
+    "\nfunction __minimal_attach_env --on-event fish_prompt\n    test -r ",
+    crate::session_host::ATTACH_ENV_FISH,
+    "\n    and source ",
+    crate::session_host::ATTACH_ENV_FISH,
+    "\nend\nfunction __minimal_attach_env_preexec --on-event fish_preexec\n    test -r ",
+    crate::session_host::ATTACH_ENV_FISH,
+    "\n    and source ",
+    crate::session_host::ATTACH_ENV_FISH,
+    "\nend\n",
+);
+
+/// nushell: the JSON form, from a vendor autoload dir. Nu cannot `source` a
+/// path it does not know at parse time, and a literal path that is missing is
+/// a parse error rather than a skipped file, so it reads data instead.
+const ATTACH_ENV_HOOK_NU: &str = constcat::concat!(
+    "# ",
+    ATTACH_ENV_HOOK_MARKER,
+    "\n$env.config.hooks.pre_prompt ++= [{||\n    let p = \"",
+    crate::session_host::ATTACH_ENV_JSON,
+    "\"\n    if ($p | path exists) { load-env (open $p) }\n}]\n$env.config.hooks.pre_execution ++= [{||\n    let p = \"",
+    crate::session_host::ATTACH_ENV_JSON,
+    "\"\n    if ($p | path exists) { load-env (open $p) }\n}]\n",
+);
+
 /// Where the session's workspace appears *inside* the sandbox. The daemon sees
 /// the same directory at [`SessionChannel::working`], so this is the prefix
 /// that translates a path typed in the sandbox into one the daemon can write.
@@ -497,13 +611,84 @@ fn sandbox_err_to_io(e: sandbox2::Error) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
-/// Installs the `min` helper script and the `etc` directory into a rootfs.
+/// Installs the `min` helper script and the `etc` directory into a rootfs,
+/// along with the per-attach environment hooks ([`install_attach_env_hooks`]).
 fn install_min_helpers(rootfs: &Path) -> std::io::Result<()> {
     let usr_bin = rootfs.join("usr").join("bin");
     std::fs::create_dir_all(&usr_bin)?;
     std::fs::write(usr_bin.join("min"), MIN_SCRIPT)?;
     std::fs::set_permissions(usr_bin.join("min"), Permissions::from_mode(0o0755))?;
     std::fs::create_dir_all(rootfs.join("etc"))?;
+    install_attach_env_hooks(rootfs)?;
+    Ok(())
+}
+
+/// Installs the shell hooks that re-read the per-attach environment (`TERM`)
+/// into a rootfs.
+///
+/// These live in the *rootfs*, at each shell's own vendor/system integration
+/// point, for two reasons. They are outside the session home, which is where
+/// loadout patches land — so nothing a loadout does can collide with them or
+/// remove them. And they are installed by the daemon for every session, so no
+/// loadout or project author has to know the mechanism exists, which a
+/// composed `PROMPT_COMMAND` recipe would have required.
+///
+/// One file per shell because there is no shell-agnostic hook: each names its
+/// own events. Each installs *two* — one at the prompt and one before a
+/// command runs — because they answer different questions. The prompt hook
+/// keeps a shell that is sitting idle current; the pre-execution hook is what
+/// makes the very first command typed at a prompt drawn *before* the attach
+/// see the new terminal, rather than the value that was in force when that
+/// prompt was drawn. bash needs only the `DEBUG` trap, which already fires
+/// before every command. bash is missing here on purpose — this build has no
+/// `/etc/bash.bashrc`, so the session shell is pointed at
+/// [`ATTACH_ENV_BASH_RC`] with `--rcfile` instead (which also keeps the
+/// session from reading a user `~/.bashrc` it never read before).
+///
+/// Every hook hard-codes the file path rather than reading
+/// `$MINIMAL_ATTACH_ENV`: the variable is a convenience for anyone scripting
+/// against this, and a session whose composition happened to set it must not
+/// be able to break the refresh.
+fn install_attach_env_hooks(rootfs: &Path) -> std::io::Result<()> {
+    // (integration dir, file name, contents)
+    let hooks: [(&Path, &str, &str); 5] = [
+        (
+            Path::new(ATTACH_ENV_BASH_RC_DIR),
+            ATTACH_ENV_BASH_RC_NAME,
+            ATTACH_ENV_HOOK_BASH,
+        ),
+        (
+            Path::new(ATTACH_ENV_BASH_RC_DIR),
+            ATTACH_ENV_POSIX_NAME,
+            ATTACH_ENV_HOOK_POSIX,
+        ),
+        (Path::new("etc/zsh"), "zshrc", ATTACH_ENV_HOOK_ZSH),
+        (
+            Path::new("usr/share/fish/vendor_conf.d"),
+            "00-minimal-attach-env.fish",
+            ATTACH_ENV_HOOK_FISH,
+        ),
+        (
+            Path::new("usr/share/nushell/vendor/autoload"),
+            "00-minimal-attach-env.nu",
+            ATTACH_ENV_HOOK_NU,
+        ),
+    ];
+
+    for (dir, name, body) in hooks {
+        let dir = rootfs.join(dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(name);
+        // zsh's global rc is a file its own package may ship, so append rather
+        // than overwrite; the others are namespaced files nothing else owns.
+        // Appending is safe on a fresh rootfs and idempotent per launch, since
+        // each session composes its rootfs anew.
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if existing.contains(ATTACH_ENV_HOOK_MARKER) {
+            continue;
+        }
+        std::fs::write(&path, format!("{existing}{body}"))?;
+    }
     Ok(())
 }
 
@@ -1504,6 +1689,98 @@ impl tokio::io::AsyncWrite for StreamWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every session rootfs carries the per-attach environment hook for every
+    /// shell we support, at that shell's own vendor/system integration point
+    /// — installed by the daemon, so no loadout or project author has to know
+    /// the mechanism exists, and outside the session home, so no loadout
+    /// patch can collide with one.
+    #[test]
+    fn every_session_rootfs_carries_the_attach_env_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+
+        // (path in the rootfs, a fragment only that shell's hook contains)
+        // Two hooks per shell, and the pre-execution one is the load-bearing
+        // half: the first command typed at a prompt drawn *before* the attach
+        // must already see the new terminal, which a prompt-only hook cannot
+        // do (that prompt already fired). bash's `DEBUG` trap covers both.
+        let expected = [
+            (
+                "usr/share/minimal/attach-env.bash",
+                "trap '__minimal_attach_env' DEBUG",
+            ),
+            ("etc/zsh/zshrc", "add-zsh-hook precmd __minimal_attach_env"),
+            ("etc/zsh/zshrc", "add-zsh-hook preexec __minimal_attach_env"),
+            (
+                "usr/share/fish/vendor_conf.d/00-minimal-attach-env.fish",
+                "--on-event fish_prompt",
+            ),
+            (
+                "usr/share/fish/vendor_conf.d/00-minimal-attach-env.fish",
+                "--on-event fish_preexec",
+            ),
+            (
+                "usr/share/nushell/vendor/autoload/00-minimal-attach-env.nu",
+                "$env.config.hooks.pre_prompt",
+            ),
+            (
+                "usr/share/nushell/vendor/autoload/00-minimal-attach-env.nu",
+                "$env.config.hooks.pre_execution",
+            ),
+            // The POSIX tier sources the file outright: `$ENV` fires once, at
+            // startup, and POSIX has no hook to refresh from afterwards.
+            (
+                "usr/share/minimal/attach-env-posix.sh",
+                "/home/.local/state/minimal/attach-env.sh",
+            ),
+        ];
+        for (rel, fragment) in expected {
+            let body = std::fs::read_to_string(rootfs.join(rel))
+                .unwrap_or_else(|e| panic!("{rel} should be installed: {e}"));
+            assert!(body.contains(fragment), "{rel} is missing its hook: {body}");
+            // Each reads the published file by absolute path rather than
+            // through `$MINIMAL_ATTACH_ENV`, so a composed variable of that
+            // name cannot redirect or break the refresh.
+            assert!(
+                body.contains(crate::session_host::ATTACH_ENV_SH)
+                    || body.contains(crate::session_host::ATTACH_ENV_FISH)
+                    || body.contains(crate::session_host::ATTACH_ENV_JSON),
+                "{rel} should hard-code the published path: {body}"
+            );
+            assert!(
+                !body.contains("$MINIMAL_ATTACH_ENV"),
+                "{rel} must not depend on a composed variable: {body}"
+            );
+        }
+    }
+
+    /// A rootfs whose own packages ship a global zsh rc keeps it: the hook is
+    /// appended, and appending is idempotent across launches.
+    #[test]
+    fn installing_hooks_appends_to_a_shipped_zshrc_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        std::fs::create_dir_all(rootfs.join("etc/zsh")).unwrap();
+        std::fs::write(
+            rootfs.join("etc/zsh/zshrc"),
+            "# shipped by the zsh package\n",
+        )
+        .unwrap();
+
+        install_min_helpers(rootfs).unwrap();
+        install_min_helpers(rootfs).unwrap();
+
+        let body = std::fs::read_to_string(rootfs.join("etc/zsh/zshrc")).unwrap();
+        assert!(body.contains("# shipped by the zsh package"), "{body}");
+        assert_eq!(
+            body.matches("add-zsh-hook precmd __minimal_attach_env")
+                .count(),
+            1,
+            "the hook should be appended exactly once: {body}"
+        );
+    }
     use camino::Utf8PathBuf;
     use mctx::ConfigBuilder;
     use std::io::{BufRead, BufReader};
