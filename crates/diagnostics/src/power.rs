@@ -34,15 +34,17 @@ const JOURNAL_LINES_MAX: &str = "5000";
 /// are listed so a reader can see whether this host panics repeatedly.
 const PANIC_REPORTS_LISTED: usize = 10;
 
-/// Opening lines excerpted from the newest panic report. Enough to carry the
-/// `panic(cpu N caller …)` string and the top of the backtrace — which name
-/// the panicking subsystem — and no more: a whole crash log is a dump of the
-/// user's machine state, not evidence anyone asked to share.
-const PANIC_EXCERPT_LINES: usize = 40;
-
-/// Byte ceiling on the excerpt read, applied before the line cap so a report
-/// written as one enormous line cannot pull the whole file into the bundle.
+/// Bytes of the newest report's head searched for the panic string. A report
+/// carries it either as its opening line or as a field of the JSON header
+/// that precedes the backtrace, so the sentence always sits inside the first
+/// few KiB; the cap is what keeps a report written as one enormous line from
+/// being pulled into memory whole.
 const PANIC_EXCERPT_BYTES: u64 = 8 * 1024;
+
+/// Bytes kept of the panic string itself. The `panic(cpu N caller …): …`
+/// sentence names the failing subsystem in far less than this; the cap bounds
+/// a report whose string runs on.
+const PANIC_STRING_MAX_BYTES: usize = 512;
 
 /// The last [`POWER_EVENTS_MAX`] of `events` — the whole slice when it is
 /// shorter. The full pmset/journal log runs to megabytes; only the tail of the
@@ -234,16 +236,18 @@ const fn panic_report_dir() -> Option<&'static str> {
 }
 
 /// `<dest>/panic.txt`: the newest kernel panic reports by name, plus the
-/// opening lines of the newest.
+/// panic string of the newest.
 ///
 /// A hard reboot leaves the *why* in a panic report, and "was it us?" is
-/// answered by the subsystem the panic string names. The capture carries
-/// enough to read that and no more — a whole panic log is a dump of the user's
-/// machine state, not evidence anyone offered to share.
+/// answered by the subsystem the panic string names. The capture carries that
+/// sentence and no more — see [`report_panic_string`] for why the rest of a
+/// crash log does not travel.
 ///
-/// Best-effort throughout: a missing directory and an empty one are both
-/// recorded as data. Where the platform has no panic reports at all, the entry
-/// is a manifest skip rather than an error.
+/// Best-effort throughout, and every outcome is accounted for: an empty
+/// directory is recorded as data ("no panic reports"), an absent or unlistable
+/// one as a manifest skip naming the reason, and a platform with no panic
+/// reports at all as a skip too. Nothing here reports *not having looked* as
+/// an answer.
 pub async fn panic_report<W: BundleSink>(
     w: &mut BundleWriter<W>,
     dest: &str,
@@ -253,16 +257,37 @@ pub async fn panic_report<W: BundleSink>(
         w.skip(path, "kernel panic reports are a macOS facility");
         return Ok(());
     };
-    let text = panic_report_text(Path::new(dir)).await;
-    w.add_bytes(&path, text.as_bytes(), Redaction::None).await
+    match panic_report_text(Path::new(dir)).await {
+        Ok(text) => w.add_bytes(&path, text.as_bytes(), Redaction::Keys).await,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            w.skip(path, format!("no {dir} — this host keeps no panic reports"));
+            Ok(())
+        }
+        // "Nothing panicked" and "we were not allowed to look" are opposite
+        // answers to the one question this collector exists to settle, so the
+        // errno travels rather than collapsing into "(no panic reports)".
+        // Not hypothetical: `/Library/Logs/DiagnosticReports` is
+        // TCC-protected, so `min bug` from a terminal without Full Disk
+        // Access is denied here on a Mac that panicked minutes ago.
+        Err(e) => {
+            w.skip(
+                path,
+                format!("{dir} unreadable ({e}) — whether this host panicked is unknown"),
+            );
+            Ok(())
+        }
+    }
 }
 
-/// The panic-report capture for `dir`. Parameterized by directory so the
-/// mechanic is exercisable without the real system location.
-async fn panic_report_text(dir: &Path) -> String {
-    let reports =
-        crate::logs::newest_matching(dir, PANIC_REPORTS_LISTED, |name| name.ends_with(".panic"))
-            .await;
+/// The panic-report capture for `dir`, or the error that made the directory
+/// unlistable — which the caller must be able to tell from an empty one.
+/// Parameterized by directory so the mechanic is exercisable without the real
+/// system location.
+async fn panic_report_text(dir: &Path) -> std::io::Result<String> {
+    let reports = crate::logs::try_newest_matching(dir, PANIC_REPORTS_LISTED, |name| {
+        name.ends_with(".panic")
+    })
+    .await?;
     let mut text = String::new();
     let _ = writeln!(
         text,
@@ -273,28 +298,48 @@ async fn panic_report_text(dir: &Path) -> String {
         let _ = writeln!(text, "{}", report.display());
     }
     let Some(newest) = reports.first() else {
+        // Reached only when the directory *was* read: absence of reports is a
+        // fact about the host, not the shrug of a failed read.
         let _ = writeln!(text, "(no panic reports)");
-        return text;
+        return Ok(text);
     };
     let _ = writeln!(
         text,
-        "\n=== {} (first {PANIC_EXCERPT_LINES} lines) ===",
+        "\n=== {} (panic string only; report header and backtrace withheld) ===",
         newest.display()
     );
-    match report_excerpt(newest).await {
-        Ok(excerpt) => text.push_str(&excerpt),
+    match report_panic_string(newest).await {
+        Ok(Some(panic_string)) => {
+            let _ = writeln!(text, "{panic_string}");
+        }
+        Ok(None) => {
+            let _ = writeln!(
+                text,
+                "(no panic string in the first {PANIC_EXCERPT_BYTES} bytes)"
+            );
+        }
         Err(e) => {
             let _ = writeln!(text, "(unreadable: {e:#})");
         }
     }
-    text
+    Ok(text)
 }
 
-/// The opening lines of a panic report, read no-follow and capped at both
-/// [`PANIC_EXCERPT_BYTES`] and [`PANIC_EXCERPT_LINES`]. A panic report opens
-/// with its JSON metadata header and the `panic(cpu N caller …)` string, so
-/// the front of the file is exactly the identifying part.
-async fn report_excerpt(path: &Path) -> Result<String, anyhow::Error> {
+/// The panic string of the report at `path`: the one sentence naming the
+/// failing subsystem, read no-follow out of the first [`PANIC_EXCERPT_BYTES`]
+/// and capped at [`PANIC_STRING_MAX_BYTES`].
+///
+/// Deliberately *not* the head of the file. A `.panic` report is OS- and
+/// third-party-authored text whose contents this project does not control,
+/// and the parts around the panic string are the parts we have no business
+/// shipping: the metadata header carries a device-stable identifier
+/// (`crashReporterKey`, the incident id) and the hardware model, and the
+/// backtrace names every kext loaded at the time — an inventory of the user's
+/// security, VPN, and virtualization software. None of that answers "was it
+/// us?"; the panic string does. So the string alone travels, and it travels
+/// through the same fail-closed sensitive-token scrub every other flattened
+/// free-text line in a bundle goes through.
+async fn report_panic_string(path: &Path) -> Result<Option<String>, anyhow::Error> {
     use tokio::io::AsyncReadExt as _;
 
     let (file, _) = open_regular_nofollow(path).await?;
@@ -303,13 +348,52 @@ async fn report_excerpt(path: &Path) -> Result<String, anyhow::Error> {
         .read_to_end(&mut head)
         .await
         .with_context(|| format!("reading {}", path.display()))?;
-    Ok(String::from_utf8_lossy(&head)
-        .lines()
-        .take(PANIC_EXCERPT_LINES)
-        .fold(String::new(), |mut acc, line| {
-            let _ = writeln!(acc, "{}", line.trim_end());
-            acc
-        }))
+    Ok(panic_string(&String::from_utf8_lossy(&head)))
+}
+
+/// The panic string carried by a report's head, in either shape the OS
+/// writes it: a plain-text report opens with the `panic(cpu N caller …)`
+/// sentence itself, while a modern one carries it as the `panicString` field
+/// of a JSON header, where an escaped newline separates the sentence from the
+/// backtrace that follows it. Everything else in the head is dropped on the
+/// floor; what survives is truncated and scrubbed.
+fn panic_string(head: &str) -> Option<String> {
+    let raw = head.lines().find_map(|line| {
+        let line = line.trim_start();
+        if line.starts_with("panic(") {
+            return Some(line);
+        }
+        let (_, rest) = line.split_once("\"panicString\"")?;
+        let value = rest.trim_start().strip_prefix(':')?.trim_start();
+        let value = value.strip_prefix('"').unwrap_or(value);
+        // Past the first escaped newline lie the backtrace and the kext list.
+        Some(
+            value
+                .split("\\n")
+                .next()
+                .unwrap_or(value)
+                .trim_end_matches('"'),
+        )
+    })?;
+    let raw = raw.trim_end();
+    let kept = clamp_bytes(raw, PANIC_STRING_MAX_BYTES);
+    let mut out = crate::procs::scrub_flattened(kept);
+    if kept.len() < raw.len() {
+        out.push_str(" (truncated)");
+    }
+    Some(out)
+}
+
+/// `s` cut to at most `max` bytes, on a character boundary.
+fn clamp_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 #[cfg(test)]
@@ -385,15 +469,32 @@ mod tests {
         );
     }
 
+    /// A `.panic` report shaped like a modern one: a JSON metadata header
+    /// carrying the device-stable identifiers, the panic string, and then the
+    /// backtrace with its kext inventory.
+    fn panic_report_file(tag: &str) -> String {
+        format!(
+            "{{\"bug_type\":\"210\",\"os_version\":\"macOS 26.1\",\
+             \"incident_id\":\"1A2B3C4D-DEAD-BEEF-0000-000000000001\",\
+             \"crashReporterKey\":\"a1b2c3d4e5f60718293a4b5c6d7e8f9012345678\"}}\n\
+             {{\n\
+             \"build\" : \"Darwin Kernel Version 26.1.0\",\n\
+             \"product\" : \"MacBookPro18,3\",\n\
+             \"crashReporterKey\" : \"a1b2c3d4e5f60718293a4b5c6d7e8f9012345678\",\n\
+             \"panicString\" : \"panic(cpu 4 caller 0xfffffe001): Kernel data abort {tag}\\n\
+             Debugger message: panic\\nKernel Extensions in backtrace:\\n\
+             com.vendorvpn.tunnel(1.2)\\ncom.othervendor.security(3.4)\",\n\
+             \"panicFlags\" : \"0x0\"\n\
+             }}\n"
+        )
+    }
+
     #[tokio::test]
-    async fn panic_capture_names_the_newest_report_and_excerpts_its_head() {
+    async fn panic_capture_names_the_newest_report_and_quotes_its_panic_string() {
         let dir = tempfile::TempDir::new().unwrap();
-        let body: String = (0..PANIC_EXCERPT_LINES * 2)
-            .map(|i| format!("backtrace line {i}\n"))
-            .collect();
         for (name, age_secs) in [("Kernel-old.panic", 600), ("Kernel-new.panic", 0)] {
             let path = dir.path().join(name);
-            std::fs::write(&path, format!("panic(cpu 4 caller 0x0): {name}\n{body}")).unwrap();
+            std::fs::write(&path, panic_report_file(name)).unwrap();
             std::fs::File::options()
                 .write(true)
                 .open(&path)
@@ -403,7 +504,7 @@ mod tests {
         }
         std::fs::write(dir.path().join("other.ips"), "not a panic").unwrap();
 
-        let text = panic_report_text(dir.path()).await;
+        let text = panic_report_text(dir.path()).await.expect("readable dir");
         assert!(text.contains("Kernel-new.panic"), "{text}");
         assert!(text.contains("Kernel-old.panic"), "both are listed: {text}");
         assert!(
@@ -411,30 +512,103 @@ mod tests {
             "only *.panic is listed: {text}"
         );
         assert!(
-            text.contains("panic(cpu 4 caller 0x0): Kernel-new.panic"),
-            "the newest report is the one excerpted: {text}"
+            text.contains("panic(cpu 4 caller 0xfffffe001): Kernel data abort Kernel-new.panic"),
+            "the newest report's panic string is what the capture is for: {text}"
         );
+    }
+
+    /// The panic string is the *only* part of a third-party crash report the
+    /// bundle is entitled to. The report's metadata header identifies the
+    /// device (`crashReporterKey`, incident id) and its model, and the
+    /// backtrace is an inventory of the user's installed kexts — neither
+    /// answers "was it us?", so neither may ride along.
+    #[tokio::test]
+    async fn panic_capture_withholds_the_report_header_and_backtrace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("Kernel-new.panic"),
+            panic_report_file("Kernel-new.panic"),
+        )
+        .unwrap();
+
+        let text = panic_report_text(dir.path()).await.expect("readable dir");
+        for leaked in [
+            "crashReporterKey",
+            "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+            "1A2B3C4D-DEAD-BEEF-0000-000000000001",
+            "MacBookPro18,3",
+            "com.vendorvpn.tunnel",
+            "com.othervendor.security",
+            "Kernel Extensions in backtrace",
+        ] {
+            assert!(
+                !text.contains(leaked),
+                "{leaked:?} is not ours to ship: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn panic_string_is_capped_and_scrubbed() {
+        let long = format!("panic(cpu 0 caller 0x1): {}", "x".repeat(4096));
+        let capped = panic_string(&long).expect("a panic string is found");
         assert!(
-            // The panic string takes the first of the capped lines, so the
-            // last backtrace line kept is two short of the cap.
-            !text.contains(&format!("backtrace line {}", PANIC_EXCERPT_LINES - 1)),
-            "the excerpt stops at the line cap: {text}"
+            capped.len() <= PANIC_STRING_MAX_BYTES + " (truncated)".len(),
+            "capped at {PANIC_STRING_MAX_BYTES} bytes: {} bytes",
+            capped.len()
+        );
+        assert!(capped.ends_with(" (truncated)"), "{capped}");
+
+        let secret = panic_string("panic(cpu 0 caller 0x1): api_key=hunter2 boom")
+            .expect("a panic string is found");
+        assert!(
+            !secret.contains("hunter2"),
+            "sensitive tokens are scrubbed fail-closed: {secret}"
+        );
+
+        // A plain-text (pre-JSON) report opens with the sentence itself.
+        assert_eq!(
+            panic_string("panic(cpu 1 caller 0x2): Kernel trap\nbacktrace 0x0\n").as_deref(),
+            Some("panic(cpu 1 caller 0x2): Kernel trap"),
+            "the backtrace stays behind"
         );
     }
 
     #[tokio::test]
     async fn a_host_with_no_panic_reports_records_that_as_data() {
         let dir = tempfile::TempDir::new().unwrap();
-        let text = panic_report_text(dir.path()).await;
+        let text = panic_report_text(dir.path()).await.expect("readable dir");
         assert!(
             text.contains("(no panic reports)"),
             "absence is data, not an error"
         );
+    }
 
-        let missing = panic_report_text(Path::new("/nonexistent/diag-panics")).await;
-        assert!(
-            missing.contains("(no panic reports)"),
-            "so is a missing directory"
+    /// #1222 turns on this distinction: on a TCC-restricted Mac the panic
+    /// directory is unreadable, and answering "(no panic reports)" there would
+    /// tell a triager the machine did not panic when nobody looked. The
+    /// unlistable directory must come back as an error so the collector can
+    /// record a skip instead.
+    #[tokio::test]
+    async fn an_unreadable_panic_directory_is_never_reported_as_no_panics() {
+        let missing = panic_report_text(Path::new("/nonexistent/diag-panics"))
+            .await
+            .expect_err("a missing directory is not an answer");
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+
+        // A non-directory stands in for the permission-denied case: the read
+        // fails with something other than `NotFound`, which is the shape a
+        // TCC-protected directory has.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let not_a_dir = tmp.path().join("DiagnosticReports");
+        std::fs::write(&not_a_dir, "").unwrap();
+        let err = panic_report_text(&not_a_dir)
+            .await
+            .expect_err("an unlistable directory is not an answer");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "unreadable stays distinguishable from absent: {err}"
         );
     }
 }
