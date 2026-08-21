@@ -369,14 +369,80 @@ fn set_winsize(fd: RawFd, size: WinSize) -> io::Result<()> {
 enum BindingMsg {
     Stdin(Vec<u8>),
     /// The session process ended, so the binding should tear down and raise the
-    /// shell-exit prompt. Carries the pty error when teardown was triggered by
-    /// an *unexpected* master read/write failure (surfaced to the user); `None`
-    /// when the process was reaped cleanly or the master reported the expected
-    /// `EIO`-on-exit.
-    TeardownDueToProcessExit(Option<std::io::Error>),
+    /// shell-exit prompt. See [`TeardownCause`] for what the binding surfaces.
+    TeardownDueToProcessExit(TeardownCause),
     TeardownDueToSuperceded(Vec<u8>),
     TeardownDueToDetach(Vec<u8>),
     TeardownDueToDaemonShutdown(Vec<u8>),
+}
+
+/// The `errno` every exiting shell produces: the last slave fd closes and the
+/// master reports `EIO`. Expected, and therefore never surfaced on its own —
+/// see [`TeardownCause::notices`].
+const EIO_ON_EXIT: i32 = libc::EIO;
+
+/// Whether a pty-master failure means the shell is already gone, and so
+/// whether the host can afford to block on the reap before telling the binding
+/// why it is going away.
+///
+/// `EIO` is the last slave fd closing: the shell is dead or dying, `wait`
+/// returns at once, and it carries the one fact that separates an exit from a
+/// kill — worth the wait.
+///
+/// Every other failure (a retryable `EINTR` the read loop treats as fatal, an
+/// io-reactor readiness error) can leave a perfectly live process behind.
+/// Blocking on `wait` there would hold the user's teardown hostage to a shell
+/// that may never exit, turning an error-plus-prompt into a silent hang — the
+/// exact failure this whole path exists to make visible.
+fn shell_is_already_gone(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(EIO_ON_EXIT)
+}
+
+/// Why a host is tearing its attached binding down, assembled *after* the
+/// process has been reaped so that both halves are known at once.
+///
+/// The two are independent, and neither alone is enough to tell the user what
+/// happened: the pty error says how the host found out, the exit reason says
+/// what actually became of their shell.
+#[derive(Debug)]
+struct TeardownCause {
+    /// The master read/write failure that unwound the host, when one did.
+    /// `None` when the loop's reap won the race and the pty never reported
+    /// anything. The expected `EIO`-on-exit is carried here but not shown.
+    pty_err: Option<std::io::Error>,
+    /// How the process ended, once reaped. `None` only if the reap failed.
+    exit: Option<ExitReason>,
+}
+
+impl TeardownCause {
+    /// What to tell the user, above the shell-exit prompt, before it renders.
+    ///
+    /// Empty for the expected case — a shell that exited under its own control,
+    /// whose death reached the host as [`EIO_ON_EXIT`] — because
+    /// [`SHELL_EXIT_PROMPT`] already speaks for it. Non-empty only when the
+    /// prompt alone would misrepresent what happened, which it does in two
+    /// independent ways:
+    ///
+    /// - the master failed for some reason *other* than the shell exiting, so
+    ///   the session ended without the shell necessarily having died;
+    /// - the shell did not exit under its own control. This arrives as that
+    ///   same expected `EIO`, so the prompt's "Session shell process exited"
+    ///   is indistinguishable from the user having typed `exit` — the one case
+    ///   where a killed session silently impersonates a clean one.
+    fn notices(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(e) = self
+            .pty_err
+            .as_ref()
+            .filter(|e| e.raw_os_error() != Some(EIO_ON_EXIT))
+        {
+            out.push(format!("Error reading stdout: {e}"));
+        }
+        if let Some(r) = self.exit.as_ref().filter(|r| r.is_abnormal()) {
+            out.push(format!("Session ended abnormally: {}", r.reason));
+        }
+        out
+    }
 }
 
 /// Which pty-master operation produced the error that tore a host down.
@@ -562,28 +628,29 @@ impl Binding {
                         BindingMsg::Stdin(b) => {
                             let _ = w.write_all(&b).await;
                         },
-                        BindingMsg::TeardownDueToProcessExit(err) => {
-                            // Surface only a genuine, unexpected master error; the
-                            // expected `EIO`-on-exit (os error 5) and clean reaps
-                            // stay silent — the shell-exit prompt speaks for them.
-                            //
-                            // Logged either way, and with `shown` recording
-                            // whether the user was told: a suppressed EIO is
-                            // indistinguishable from a clean exit on their
-                            // terminal, so the log is the only place the
-                            // difference survives.
-                            let errno = err.as_ref().and_then(std::io::Error::raw_os_error);
-                            let shown = errno.is_some_and(|n| n != 5);
+                        BindingMsg::TeardownDueToProcessExit(cause) => {
+                            // `shown` records whether the user was told
+                            // anything beyond the prompt itself: a suppressed
+                            // notice leaves no other trace, and the expected
+                            // case is deliberately silent.
+                            let notices = cause.notices();
+                            let errno = cause.pty_err.as_ref().and_then(std::io::Error::raw_os_error);
                             tracing::info!(
-                                cause = if err.is_some() { "pty-error" } else { "process-reaped" },
+                                cause = if cause.pty_err.is_some() { "pty-error" } else { "process-reaped" },
                                 ?errno,
-                                shown,
+                                abnormal = cause.exit.as_ref().is_some_and(ExitReason::is_abnormal),
+                                exit_reason = cause.exit.as_ref().map_or("", |r| r.reason.as_str()),
+                                exit_code = ?cause.exit.as_ref().map(|r| r.code),
+                                shown = !notices.is_empty(),
                                 "raising the shell-exit prompt",
                             );
-                            if let Some(e) = err
-                                && e.raw_os_error() != Some(5)
-                            {
-                                let _ = w.write_all(format!("Error reading stdout: {e}\n").as_bytes()).await;
+                            // `\r\n`: the remote terminal is in raw mode, so a
+                            // bare newline stair-steps off the right margin.
+                            if !notices.is_empty() {
+                                let _ = w.write_all(b"\r\n").await;
+                                for notice in &notices {
+                                    let _ = w.write_all(format!("{notice}\r\n").as_bytes()).await;
+                                }
                             }
                             break MainloopExitReason::ProcessExited;
                         }
@@ -873,11 +940,45 @@ enum ExitDisposition {
     Destroyed,
 }
 
+/// How a session process ended, as `hakoniwa` accounts for it.
+///
+/// Kept alongside the portable exit code because the code alone cannot say
+/// whether a session *ended* or was *killed*: a clean `exit 0` and a SIGKILL
+/// both close every slave fd, both surface on the master as the same `EIO`,
+/// and both otherwise raise the same silent shell-exit prompt. This is what
+/// separates them, in the log and on the user's terminal.
+#[derive(Debug, Clone)]
+pub(crate) struct ExitReason {
+    /// `hakoniwa`'s portable code: the inner process's own status when it
+    /// exited normally, or `125` when the container itself failed or was
+    /// signalled.
+    pub(crate) code: i32,
+    /// `Some(status)` when the inner process exited on its own, `None` when it
+    /// was signalled or the container failed out from under it — the
+    /// discriminator behind [`Self::is_abnormal`].
+    pub(crate) exit_code: Option<i32>,
+    /// `hakoniwa`'s human account, e.g. `container received signal SIGKILL` or
+    /// `process(/usr/bin/bash) exited with code 0`. Shown to the user verbatim
+    /// when the end was abnormal.
+    pub(crate) reason: String,
+}
+
+impl ExitReason {
+    /// Whether the process failed to exit under its own control — signalled,
+    /// or the container failed. Exactly `hakoniwa`'s `exit_code: None`, which
+    /// it sets both on its `received signal` path and on the `new_failure`
+    /// path behind a container-level SIGKILL.
+    pub(crate) fn is_abnormal(&self) -> bool {
+        self.exit_code.is_none()
+    }
+}
+
 /// A handle to a launched session process.
 ///
 /// Abstracts the process the [`Host`] supervises so its runtime loop can be
-/// driven against a real sandboxed process or a test double. The unused
-/// `hakoniwa::ExitStatus` payload is reduced to a portable exit code.
+/// driven against a real sandboxed process or a test double. `try_wait` and
+/// `wait` reduce the `hakoniwa::ExitStatus` payload to a portable exit code;
+/// [`Self::exit_reason`] carries the part of it that has to reach the user.
 pub(crate) trait SessionProcess: Send + 'static {
     /// Returns the PID of hakoniwa's container supervisor — **not** the PID of
     /// the shell it exec'd.
@@ -894,6 +995,14 @@ pub(crate) trait SessionProcess: Send + 'static {
     fn wait(&mut self) -> io::Result<i32>;
     /// Sends a kill signal to the process.
     fn kill(&mut self) -> io::Result<()>;
+    /// `hakoniwa`'s account of how the process ended, available once
+    /// [`Self::try_wait`] has returned `Some` or [`Self::wait`] has returned.
+    ///
+    /// `None` before the reap, and for the test double, which has no abnormal
+    /// end to model — so the default keeps every mock impl untouched.
+    fn exit_reason(&self) -> Option<ExitReason> {
+        None
+    }
 }
 
 /// Opens a PTY of the requested size, launches the session process
@@ -1009,11 +1118,11 @@ enum Message {
 /// Renders a vt100 cell color into the string form the
 /// [`minimald_rpc::ScreenCell`] wire type uses: `"idx:<n>"` for an ANSI-256
 /// palette index, `"#rrggbb"` for truecolor, `None` for the terminal default.
-fn wire_color(color: vt100_ctt::Color) -> Option<String> {
+fn wire_color(color: vt100::Color) -> Option<String> {
     match color {
-        vt100_ctt::Color::Default => None,
-        vt100_ctt::Color::Idx(n) => Some(format!("idx:{n}")),
-        vt100_ctt::Color::Rgb(r, g, b) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
+        vt100::Color::Default => None,
+        vt100::Color::Idx(n) => Some(format!("idx:{n}")),
+        vt100::Color::Rgb(r, g, b) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
     }
 }
 
@@ -1021,7 +1130,7 @@ fn wire_color(color: vt100_ctt::Color) -> Option<String> {
 /// type. Wide-glyph continuation cells are dropped rather than emitted as
 /// spaces: consumers flatten cells into width-aware text, so a placeholder
 /// cell would add a phantom column per wide glyph and skew the row.
-fn screen_to_snapshot(screen: &vt100_ctt::Screen) -> minimald_rpc::ScreenSnapshot {
+fn screen_to_snapshot(screen: &vt100::Screen) -> minimald_rpc::ScreenSnapshot {
     use minimald_rpc::{ScreenCell, ScreenRow, ScreenSnapshot};
     let (rows, cols) = screen.size();
     let lines = (0..rows)
@@ -1072,14 +1181,14 @@ fn screen_to_snapshot(screen: &vt100_ctt::Screen) -> minimald_rpc::ScreenSnapsho
 
 /// Handles callback events from the terminal parser, transmitting them to the host.
 struct ParserEventHandler(WeakHostHandle);
-impl vt100_ctt::Callbacks for ParserEventHandler {
-    fn set_window_title(&mut self, _: &mut vt100_ctt::Screen, title: &[u8]) {
+impl vt100::Callbacks for ParserEventHandler {
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
         self.0.set_title_cb(title);
     }
-    fn audible_bell(&mut self, _: &mut vt100_ctt::Screen) {
+    fn audible_bell(&mut self, _: &mut vt100::Screen) {
         self.0.audible_bell_cb();
     }
-    fn visual_bell(&mut self, _: &mut vt100_ctt::Screen) {
+    fn visual_bell(&mut self, _: &mut vt100::Screen) {
         self.0.visual_bell_cb();
     }
 }
@@ -1309,9 +1418,18 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     /// The last-set pty terminal size.
     sz: WinSize,
     /// In-memory representation of the terminal state.
-    parser: vt100_ctt::Parser<ParserEventHandler>,
+    parser: vt100::Parser<ParserEventHandler>,
     /// The session process.
     process: P,
+    /// The pty-master failure that unwound the host, held from the moment
+    /// [`Host::step`] hit it until [`Host::mainloop`] has reaped the process.
+    ///
+    /// The binding cannot be told why it is going away until both are known —
+    /// the error says how the host noticed, the reap says what became of the
+    /// shell — and the reap is the slower of the two. Set only by a pty
+    /// failure, never by a deliberate kill, which is what keeps a destroy from
+    /// raising a shell-exit prompt.
+    pending_pty_err: Option<std::io::Error>,
     /// The master-side fd of the Pty.
     master: AsyncFd<std::fs::File>,
     /// Various attributes about the running terminal.
@@ -1533,78 +1651,86 @@ async fn run_hook_plan(plan: HookPlan) {
 
 /// A launched session process backed by a sandboxed [`hakoniwa::Child`].
 #[cfg(not(test))]
-pub(crate) struct SandboxProcess(hakoniwa::Child);
+pub(crate) struct SandboxProcess {
+    child: hakoniwa::Child,
+    /// `hakoniwa`'s account of the exit, captured at the reap. `hakoniwa`
+    /// caches the status itself but only ever hands it back through a
+    /// `wait`/`try_wait` call, so the host would otherwise have no way to ask
+    /// *why* after the fact — which is exactly when it needs to know, since
+    /// the binding is told to tear down after the reap.
+    exit: Option<ExitReason>,
+}
+
+#[cfg(not(test))]
+impl SandboxProcess {
+    /// Logs `hakoniwa`'s account of an observed exit and caches it for
+    /// [`SessionProcess::exit_reason`], returning the portable code.
+    ///
+    /// Logs on every exit, not just the non-zero ones, and exactly once per
+    /// session: `hakoniwa` caches the status, so a `wait` following a
+    /// `try_wait` that already saw it would otherwise log the same death
+    /// twice.
+    fn record_exit(&mut self, s: hakoniwa::ExitStatus) -> i32 {
+        let code = s.code;
+        if self.exit.is_none() {
+            if s.code != 0 {
+                tracing::warn!(
+                    code = s.code,
+                    exit_code = ?s.exit_code,
+                    reason = %s.reason,
+                    "DIAG hakoniwa container/process exited non-zero"
+                );
+            } else {
+                tracing::info!(
+                    code = s.code,
+                    exit_code = ?s.exit_code,
+                    reason = %s.reason,
+                    "hakoniwa container/process exited"
+                );
+            }
+            self.exit = Some(ExitReason {
+                code: s.code,
+                exit_code: s.exit_code,
+                reason: s.reason,
+            });
+        }
+        code
+    }
+}
 
 #[cfg(not(test))]
 impl SessionProcess for SandboxProcess {
     fn container_pid(&self) -> u32 {
-        self.0.id()
+        self.child.id()
     }
 
     fn try_wait(&mut self) -> io::Result<Option<i32>> {
-        self.0
+        let status = self
+            .child
             .try_wait()
-            .map(|status| {
-                status.map(|s| {
-                    // Logged on every observed exit, not just the non-zero
-                    // ones. `reason` is hakoniwa's account of *how* the process
-                    // ended — a clean `exit 0` from a Ctrl-D and a SIGKILL both
-                    // reach the user as the same silent shell-exit prompt, and
-                    // this field is what separates them. Runs once per session:
-                    // the host loop polls `try_wait` continuously but only ever
-                    // gets `Some` on the reap.
-                    if s.code != 0 {
-                        tracing::warn!(
-                            code = s.code,
-                            exit_code = ?s.exit_code,
-                            reason = %s.reason,
-                            "DIAG hakoniwa container/process exited non-zero"
-                        );
-                    } else {
-                        tracing::info!(
-                            code = s.code,
-                            exit_code = ?s.exit_code,
-                            reason = %s.reason,
-                            "hakoniwa container/process exited"
-                        );
-                    }
-                    s.code
-                })
-            })
-            .map_err(|e| io::Error::other(format!("wait failed: {e}")))
+            .map_err(|e| io::Error::other(format!("wait failed: {e}")))?;
+        Ok(status.map(|s| self.record_exit(s)))
     }
 
     fn wait(&mut self) -> io::Result<i32> {
-        self.0
+        // The blocking reap the pty/step error path takes — in practice the
+        // one that fires, since the master's `EIO` beats the loop's `try_wait`
+        // poll to every ordinary exit.
+        let s = self
+            .child
             .wait()
-            .map(|s| {
-                // Same reasoning as `try_wait`: this is the blocking reap the
-                // pty/step error path takes, so it is the one that fires when a
-                // session ends *without* the process having exited on its own.
-                if s.code != 0 {
-                    tracing::warn!(
-                        code = s.code,
-                        exit_code = ?s.exit_code,
-                        reason = %s.reason,
-                        "DIAG hakoniwa container/process exited non-zero"
-                    );
-                } else {
-                    tracing::info!(
-                        code = s.code,
-                        exit_code = ?s.exit_code,
-                        reason = %s.reason,
-                        "hakoniwa container/process exited"
-                    );
-                }
-                s.code
-            })
-            .map_err(|e| io::Error::other(format!("wait failed: {e}")))
+            .map_err(|e| io::Error::other(format!("wait failed: {e}")))?;
+        Ok(self.record_exit(s))
     }
 
     fn kill(&mut self) -> io::Result<()> {
-        self.0
+        self.child
             .kill()
             .map_err(|e| io::Error::other(format!("kill failed: {e}")))
+    }
+
+    fn exit_reason(&self) -> Option<ExitReason> {
+        self.exit.clone()
     }
 }
 
@@ -2284,7 +2410,10 @@ impl SessionLauncher for SandboxLauncher {
 
         Ok(Launched {
             master,
-            process: SandboxProcess(process.release()),
+            process: SandboxProcess {
+                child: process.release(),
+                exit: None,
+            },
             guard: env,
             net_guard,
             tty_path,
@@ -2294,24 +2423,65 @@ impl SessionLauncher for SandboxLauncher {
 
 /// A launched session process backed by a plain host [`std::process::Child`].
 #[cfg(test)]
-pub(crate) struct MockProcess(std::process::Child);
+pub(crate) struct MockProcess {
+    child: std::process::Child,
+    /// Mirrors [`SandboxProcess`]'s cache so a test can drive the same
+    /// reap-then-notify path a real session takes.
+    exit: Option<ExitReason>,
+}
+
+#[cfg(test)]
+impl MockProcess {
+    /// Translates a plain process status into the shape `hakoniwa` reports, so
+    /// the host cannot tell a mock reap from a sandboxed one: a signalled
+    /// process has no exit code of its own and carries the container's 125.
+    ///
+    /// Returns the portable code unchanged from what this mock always
+    /// returned, so the reap value every existing test asserts on is
+    /// untouched.
+    fn record_exit(&mut self, s: std::process::ExitStatus) -> i32 {
+        use std::os::unix::process::ExitStatusExt;
+        let code = s.code().unwrap_or(-1);
+        if self.exit.is_none() {
+            self.exit = Some(match s.signal() {
+                Some(sig) => ExitReason {
+                    code: 125,
+                    exit_code: None,
+                    reason: format!("process(mock) received signal {sig}"),
+                },
+                None => ExitReason {
+                    code,
+                    exit_code: Some(code),
+                    reason: format!("process(mock) exited with code {code}"),
+                },
+            });
+        }
+        code
+    }
+}
 
 #[cfg(test)]
 impl SessionProcess for MockProcess {
     fn container_pid(&self) -> u32 {
-        self.0.id()
+        self.child.id()
     }
 
     fn try_wait(&mut self) -> io::Result<Option<i32>> {
-        Ok(self.0.try_wait()?.map(|s| s.code().unwrap_or(-1)))
+        let status = self.child.try_wait()?;
+        Ok(status.map(|s| self.record_exit(s)))
     }
 
     fn wait(&mut self) -> io::Result<i32> {
-        Ok(self.0.wait()?.code().unwrap_or(-1))
+        let s = self.child.wait()?;
+        Ok(self.record_exit(s))
     }
 
     fn kill(&mut self) -> io::Result<()> {
-        self.0.kill()
+        self.child.kill()
+    }
+
+    fn exit_reason(&self) -> Option<ExitReason> {
+        self.exit.clone()
     }
 }
 
@@ -2362,7 +2532,10 @@ impl SessionLauncher for MockLauncher {
 
         Ok(Launched {
             master,
-            process: MockProcess(process),
+            process: MockProcess {
+                child: process,
+                exit: None,
+            },
             guard: (),
             net_guard: None,
             tty_path,
@@ -2598,7 +2771,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         let (sender, receiver) = mpsc::channel(8);
         let handle = HostHandle { sender };
 
-        let parser = vt100_ctt::Parser::new_with_callbacks(
+        let parser = vt100::Parser::new_with_callbacks(
             sz.rows,
             sz.cols,
             0,
@@ -2618,6 +2791,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             sz,
             parser,
             process,
+            pending_pty_err: None,
             master,
             attrs: HostAttrs::default(),
 
@@ -2661,13 +2835,19 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         let result = loop {
             match self.process.try_wait() {
                 Ok(Some(exit_code)) => {
-                    // `try_wait` already logs the richer hakoniwa diagnostics
-                    // (signal, reason); this is the host's own account, at info
-                    // because it is the moment a live session stops being one.
+                    // This is the host's own account, at info because it is the
+                    // moment a live session stops being one. `try_wait` logged
+                    // the same hakoniwa reason already, but from the process
+                    // handle, which has no span and so names no session —
+                    // repeat it here, where it is attributable, for the same
+                    // reason the pty/step path does.
+                    let exit = self.process.exit_reason();
                     tracing::info!(
                         session_id = %self.session_id,
                         session = %self.session_name,
                         exit_code,
+                        abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
+                        exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
                         "session process exited; reaped by the host loop",
                     );
                     // The process was reaped here before the pty surfaced its
@@ -2676,8 +2856,20 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     // the session down); otherwise the binding only observes the
                     // host drop and silently detaches. Without this the prompt is
                     // lost whenever `try_wait` wins the race against the master's
-                    // `EIO` — a flaky detach under CPU load.
-                    self.notify_remote_process_exit();
+                    // `EIO`.
+                    //
+                    // The race is structurally one-sided: `step` parks in a
+                    // `select!` on the master read, and a dying process closes
+                    // every slave fd, so the `EIO` normally lands before this
+                    // poll comes round again — which makes this the safety net
+                    // rather than the common path. It still has to hold: a
+                    // `step` that wakes for some other reason first can reach
+                    // here, and then this is the only thing that raises a
+                    // prompt at all.
+                    self.notify_remote_teardown(TeardownCause {
+                        pty_err: None,
+                        exit,
+                    });
                     break Ok(exit_code);
                 }
                 Ok(None) => {}
@@ -2696,15 +2888,51 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             }
 
             if self.step().await.is_err() {
+                // Everything here is gated on a stashed pty error, so a
+                // deliberate kill stays silent: `Message::Kill` also returns
+                // `Err` from `step`, but a destroy or a daemon shutdown either
+                // wants no prompt at all or has already sent its own teardown.
+                let mut pending = self.pending_pty_err.take();
+
+                // Notify *before* the reap when the process may still be
+                // running, because `wait` below is unbounded — see
+                // `shell_is_already_gone`. Nothing is lost by going early: a
+                // live process has no exit reason to report yet.
+                if let Some(e) = pending.take_if(|e| !shell_is_already_gone(e)) {
+                    self.notify_remote_teardown(TeardownCause {
+                        pty_err: Some(e),
+                        exit: None,
+                    });
+                }
+
                 let code = self.process.wait();
+                let exit = self.process.exit_reason();
                 // The pty/step arm that got here already logged the errno; this
                 // records what reaping the process then yielded.
+                //
+                // Carries the reason as well as the code because this is the
+                // only session-attributed line a *detached* death produces:
+                // hakoniwa's own account is logged from the process handle,
+                // which has no span and so names no session, and the binding's
+                // prompt line never happens with nothing attached.
                 tracing::warn!(
                     session_id = %self.session_id,
                     session = %self.session_name,
                     ?code,
+                    abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
+                    exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
                     "session process reaped after pty/step error",
                 );
+
+                // Otherwise notify *after* it, which is the whole point: only
+                // the reap can say whether that shell exited or was killed, and
+                // on the `EIO` path it costs a few milliseconds.
+                if let Some(e) = pending {
+                    self.notify_remote_teardown(TeardownCause {
+                        pty_err: Some(e),
+                        exit,
+                    });
+                }
                 break code;
             }
         };
@@ -2719,27 +2947,23 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         result
     }
 
-    /// Notifies the attached binding (if any) that the pty master has errored,
-    /// so it can tear the ssh channel down.
+    /// Logs a pty-master failure and stashes it for [`Self::mainloop`] to hand
+    /// to the binding once the process has been reaped.
     ///
     /// Used on any pty read/write failure — in practice the process dying closes
     /// every slave fd, so the master reports `EIO`; this is the signal to unwind
-    /// the host. The binding suppresses the (expected) `EIO` text on its end.
+    /// the host.
     ///
-    /// The notice is sent best-effort with `try_send`, never awaited: the
-    /// binding drains this queue in the same `select!` as its (potentially
-    /// blocking) write to the ssh remote, so awaiting a full queue could wedge
-    /// teardown behind a stuck remote. If the queue is full the notice is
-    /// dropped — the host returns regardless, and dropping its sender closes the
-    /// binding on its next turn.
-    async fn notify_remote_pty_err(&mut self, op: PtyOp, e: std::io::Error) {
+    /// Deliberately does *not* notify the binding itself. The error alone
+    /// cannot say whether the shell exited or was killed — both arrive as the
+    /// same `EIO` — so the notice waits for the reap, which is the only thing
+    /// that can tell them apart.
+    fn record_pty_err(&mut self, op: PtyOp, e: std::io::Error) {
         // `errno` and `kind` are logged as their own fields, not left inside the
         // rendered message: this is the one line that says whether a session
         // died of the expected EIO-on-exit (5), of an `EINTR` (4) that the read
         // loop treated as fatal rather than retrying, or of something else
-        // entirely. The binding suppresses the EIO text on its end, so without
-        // this the user sees an unexplained shell-exit prompt and the log says
-        // nothing more than "pty master error".
+        // entirely.
         tracing::warn!(
             session_id = %self.session_id,
             session = %self.session_name,
@@ -2750,47 +2974,41 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             attached = self.remote.is_some(),
             "pty master error; tearing down host",
         );
-        if let Some((tx, _hnd)) = self.remote.as_mut()
-            && let Err(send_err) = tx.try_send(BindingMsg::TeardownDueToProcessExit(Some(e)))
-        {
-            // The binding never learns why it is going away, so it falls
-            // through to `HostGone` and detaches silently without a prompt —
-            // which is exactly the "my session just disappeared" report, and is
-            // otherwise invisible.
-            tracing::warn!(
-                session_id = %self.session_id,
-                error = %send_err,
-                "could not hand the pty error to the binding; no shell-exit prompt will render",
-            );
-        }
+        self.pending_pty_err = Some(e);
     }
 
-    /// Notifies the attached binding that the session process has been reaped,
-    /// so it tears down and raises the shell-exit prompt. Unlike
-    /// [`Self::notify_remote_pty_err`] there is no error to surface — the process
-    /// simply exited, and the pty may never report the death (the reap can win
-    /// the race against the master's `EIO`).
+    /// Notifies the attached binding that the session is going away, so it
+    /// tears down and raises the shell-exit prompt.
     ///
-    /// Best-effort `try_send` for the same reason as `notify_remote_pty_err`: the
-    /// notice is never awaited, so a full queue can't wedge teardown. The message
-    /// stays buffered even as this host drops, and an mpsc receiver drains its
-    /// buffer before observing the closed sender — so the binding sees the exit
-    /// before it would fall through to `HostGone`.
-    fn notify_remote_process_exit(&mut self) {
+    /// Called once the process has been reaped, from either route into
+    /// teardown: the loop's own `try_wait` (no pty error) or a pty failure
+    /// stashed by [`Self::record_pty_err`].
+    ///
+    /// The notice is sent best-effort with `try_send`, never awaited: the
+    /// binding drains this queue in the same `select!` as its (potentially
+    /// blocking) write to the ssh remote, so awaiting a full queue could wedge
+    /// teardown behind a stuck remote. If the queue is full the notice is
+    /// dropped — the host returns regardless, and dropping its sender closes the
+    /// binding on its next turn. The message stays buffered even as this host
+    /// drops, and an mpsc receiver drains its buffer before observing the closed
+    /// sender, so the binding sees the teardown before falling through to
+    /// `HostGone`.
+    fn notify_remote_teardown(&mut self, cause: TeardownCause) {
         match self.remote.as_mut() {
-            Some((tx, _hnd)) => match tx.try_send(BindingMsg::TeardownDueToProcessExit(None)) {
+            Some((tx, _hnd)) => match tx.try_send(BindingMsg::TeardownDueToProcessExit(cause)) {
                 Ok(()) => tracing::debug!(
                     session_id = %self.session_id,
-                    "handed the process exit to the attached binding",
+                    "handed the teardown cause to the attached binding",
                 ),
-                // The documented best-effort drop, made visible: the prompt is
-                // lost and the binding detaches silently on `HostGone`. Same
-                // user-visible shape as a healthy detach, so it has to be
-                // distinguishable in the log.
+                // The documented best-effort drop, made visible: the binding
+                // never learns why it is going away, so it falls through to
+                // `HostGone` and detaches silently without a prompt — which is
+                // exactly the "my session just disappeared" report, and has the
+                // same user-visible shape as a healthy detach.
                 Err(e) => tracing::warn!(
                     session_id = %self.session_id,
                     error = %e,
-                    "could not hand the process exit to the binding; \
+                    "could not hand the teardown to the binding; \
                      no shell-exit prompt will render",
                 ),
             },
@@ -2897,7 +3115,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     Err(e) => {
                         // The io reactor failed to report readiness; the master
                         // is unusable, so unwind rather than panic.
-                        self.notify_remote_pty_err(PtyOp::Readable, e).await;
+                        self.record_pty_err(PtyOp::Readable, e);
                         return Err(());
                     }
                 };
@@ -2923,7 +3141,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     // The errno is on the log line so a spurious teardown can
                     // be told apart from the genuine EIO-on-exit.
                     Ok(Err(e)) => {
-                        self.notify_remote_pty_err(PtyOp::Read, e).await;
+                        self.record_pty_err(PtyOp::Read, e);
                         return Err(());
                     },
                     Err(_would_block) => {},
@@ -2979,7 +3197,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     Err(e) => {
                         // The io reactor failed to report writability; the master
                         // is unusable, so unwind rather than panic.
-                        self.notify_remote_pty_err(PtyOp::Writable, e).await;
+                        self.record_pty_err(PtyOp::Writable, e);
                         return Err(());
                     }
                 };
@@ -2998,7 +3216,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     // host down so it gets reaped, instead of panicking and
                     // leaking the process as a zombie.
                     Ok(Err(e)) => {
-                        self.notify_remote_pty_err(PtyOp::Write, e).await;
+                        self.record_pty_err(PtyOp::Write, e);
                         return Err(());
                     }
                     Err(_would_block) => {},
@@ -3084,7 +3302,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     /// to a normal state on detach.
     fn unwind_codes(&self) -> Vec<u8> {
         let live = self.parser.screen();
-        let clean = vt100_ctt::Parser::new(live.size().0, live.size().1, 0)
+        let clean = vt100::Parser::new(live.size().0, live.size().1, 0)
             .screen()
             .clone();
 
@@ -3148,6 +3366,262 @@ mod tests {
         xpixel: 0,
         ypixel: 0,
     };
+
+    /// Builds the `hakoniwa` account of a normal exit: the inner process
+    /// reported its own status, so `exit_code` is `Some`.
+    fn exited(code: i32) -> ExitReason {
+        ExitReason {
+            code,
+            exit_code: Some(code),
+            reason: format!("process(/usr/bin/bash) exited with code {code}"),
+        }
+    }
+
+    /// Builds the account of a death `hakoniwa` attributes to a signal. Its
+    /// `new_failure` path leaves `exit_code` `None` and stamps code 125 —
+    /// the shape a container-level SIGKILL arrives in.
+    fn signalled(reason: &str) -> ExitReason {
+        ExitReason {
+            code: 125,
+            exit_code: None,
+            reason: reason.to_string(),
+        }
+    }
+
+    fn eio() -> Option<std::io::Error> {
+        Some(std::io::Error::from_raw_os_error(EIO_ON_EXIT))
+    }
+
+    /// The expected teardown, and the reason the prompt is silent by default:
+    /// a shell the user exited closes the last slave fd, the master reports
+    /// `EIO`, and the prompt alone tells the whole story.
+    #[test]
+    fn a_clean_exit_says_nothing_beyond_the_prompt() {
+        let cause = TeardownCause {
+            pty_err: eio(),
+            exit: Some(exited(0)),
+        };
+        assert!(
+            cause.notices().is_empty(),
+            "a clean exit must stay silent: {:?}",
+            cause.notices(),
+        );
+    }
+
+    /// The regression this all exists for. A SIGKILLed container reaches the
+    /// binding as the *same* `EIO` a clean exit does, so before the exit
+    /// reason was carried through it rendered the identical silent prompt —
+    /// a killed session impersonating one the user ended.
+    #[test]
+    fn a_signalled_container_is_named_not_silently_passed_off_as_an_exit() {
+        let cause = TeardownCause {
+            pty_err: eio(),
+            exit: Some(signalled("container received signal SIGKILL")),
+        };
+        assert_eq!(
+            cause.notices(),
+            vec!["Session ended abnormally: container received signal SIGKILL"],
+            "a signalled container must say so, despite the expected EIO",
+        );
+    }
+
+    /// A non-zero *exit* is still the shell exiting under its own control —
+    /// `exit 1` is not an anomaly, and must not be dressed up as one.
+    #[test]
+    fn a_non_zero_exit_is_still_a_normal_exit() {
+        let cause = TeardownCause {
+            pty_err: eio(),
+            exit: Some(exited(1)),
+        };
+        assert!(
+            cause.notices().is_empty(),
+            "a non-zero exit is not abnormal: {:?}",
+            cause.notices(),
+        );
+    }
+
+    /// A master error that is *not* the expected on-exit `EIO` means the
+    /// session ended without the shell necessarily having died — surfaced as
+    /// before this change.
+    #[test]
+    fn an_unexpected_master_error_is_surfaced() {
+        let cause = TeardownCause {
+            pty_err: Some(std::io::Error::from_raw_os_error(libc::EINTR)),
+            exit: Some(exited(0)),
+        };
+        let notices = cause.notices();
+        assert_eq!(notices.len(), 1, "expected one notice: {notices:?}");
+        assert!(
+            notices[0].starts_with("Error reading stdout:"),
+            "got: {notices:?}",
+        );
+    }
+
+    /// The two notices are independent: an unexpected master error and an
+    /// abnormal end are different facts and both get said.
+    #[test]
+    fn both_halves_are_reported_together() {
+        let cause = TeardownCause {
+            pty_err: Some(std::io::Error::from_raw_os_error(libc::EINTR)),
+            exit: Some(signalled("process(/usr/bin/bash) received signal SIGSEGV")),
+        };
+        let notices = cause.notices();
+        assert_eq!(notices.len(), 2, "expected both notices: {notices:?}");
+        assert!(notices[0].starts_with("Error reading stdout:"));
+        assert_eq!(
+            notices[1],
+            "Session ended abnormally: process(/usr/bin/bash) received signal SIGSEGV",
+        );
+    }
+
+    /// The reap failed, so there is no account of the end. The pty error still
+    /// governs, and an expected `EIO` still stays silent rather than inventing
+    /// an anomaly from missing information.
+    #[test]
+    fn a_missing_exit_reason_falls_back_to_the_pty_error() {
+        let cause = TeardownCause {
+            pty_err: eio(),
+            exit: None,
+        };
+        assert!(
+            cause.notices().is_empty(),
+            "an unknown end is not evidence of an abnormal one: {:?}",
+            cause.notices(),
+        );
+    }
+
+    /// Which pty failures the host may block on before notifying the binding.
+    /// Only `EIO` promises a reap that returns; blocking on anything else
+    /// risks waiting on a live shell, so the user has to be told first.
+    #[test]
+    fn only_eio_promises_the_shell_is_already_gone() {
+        assert!(
+            shell_is_already_gone(&std::io::Error::from_raw_os_error(EIO_ON_EXIT)),
+            "EIO is the last slave fd closing — the shell is gone",
+        );
+        for errno in [libc::EINTR, libc::EBADF, libc::ENXIO] {
+            assert!(
+                !shell_is_already_gone(&std::io::Error::from_raw_os_error(errno)),
+                "errno {errno} can leave a live process; the host must not block on the reap",
+            );
+        }
+    }
+
+    /// Wires a channel into a host's binding slot and hands back the receiving
+    /// end, so a test can see exactly what the host tells an attached binding.
+    /// The join handle is a stand-in — nothing under test awaits it.
+    fn watch_binding<P: SessionProcess, G: SessionGuard>(
+        host: &mut Host<P, G>,
+    ) -> mpsc::Receiver<BindingMsg> {
+        let (tx, rx) = mpsc::channel(16);
+        host.remote = Some((tx, tokio::spawn(async {})));
+        rx
+    }
+
+    /// Drains the binding's queue and returns the teardown it was handed, if
+    /// any. Stdout traffic is noise here — the shell echoes its own prompt.
+    fn teardown_from(rx: &mut mpsc::Receiver<BindingMsg>) -> Option<TeardownCause> {
+        std::iter::from_fn(|| rx.try_recv().ok()).find_map(|msg| match msg {
+            BindingMsg::TeardownDueToProcessExit(cause) => Some(cause),
+            _ => None,
+        })
+    }
+
+    /// The reorder this change turns on: the binding is told why it is going
+    /// away only *after* the process has been reaped, so the notice can carry
+    /// the reap's account of the end. An exit reason on the message is proof
+    /// of the ordering — notifying from `step`, as this used to, could not
+    /// have supplied one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shell_exit_reaches_the_binding_with_the_reaped_exit_reason() {
+        let (mut host, _handle) = Host::build(
+            MockLauncher,
+            "test-session".to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+            None,
+            None,
+            None,
+            std::env::temp_dir(),
+            sessions::SessionId::nil(),
+            None,
+            ConnectionEnv::new(),
+        )
+        .await
+        .expect("failed to build host");
+        let mut rx = watch_binding(&mut host);
+        let stdin = host.remote_tx.clone();
+        let task = tokio::spawn(host.mainloop());
+
+        stdin
+            .send(StdinMsg::Bytes(bytes::Bytes::from(
+                format!("{MOCK_EXIT_LINE}\n").into_bytes(),
+            )))
+            .await
+            .expect("failed to send exit line");
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("mainloop should terminate after the shell exits")
+            .expect("host task should not panic during teardown")
+            .expect("mainloop should return the reaped exit status");
+
+        let cause = teardown_from(&mut rx).expect("the binding must be told the shell exited");
+        assert!(
+            cause.notices().is_empty(),
+            "a clean exit stays silent: {:?}",
+            cause.notices(),
+        );
+        let exit = cause
+            .exit
+            .as_ref()
+            .expect("the teardown must carry the reap's account of the end");
+        assert!(
+            !exit.is_abnormal(),
+            "a shell that exited on its own is not abnormal: {exit:?}",
+        );
+    }
+
+    /// A deliberate kill must not raise a shell-exit prompt: the caller already
+    /// decided the session's fate. `Message::Kill` returns `Err` from `step`
+    /// exactly as a pty failure does, so only the absence of a stashed pty
+    /// error keeps the two apart — an invariant a refactor could quietly drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_kill_tells_the_binding_nothing() {
+        let (mut host, handle) = Host::build(
+            MockLauncher,
+            "test-session".to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+            None,
+            None,
+            None,
+            std::env::temp_dir(),
+            sessions::SessionId::nil(),
+            None,
+            ConnectionEnv::new(),
+        )
+        .await
+        .expect("failed to build host");
+        let mut rx = watch_binding(&mut host);
+        let task = tokio::spawn(host.mainloop());
+
+        handle
+            .kill(false)
+            .await
+            .expect("kill should reach the host");
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("host mainloop should terminate after kill")
+            .expect("host task should not panic during teardown")
+            .expect("mainloop should return the reaped exit status");
+
+        assert!(
+            teardown_from(&mut rx).is_none(),
+            "a kill is not a shell exit and must raise no prompt",
+        );
+    }
 
     /// Precedence: the launcher `baseline` sits below the client-forwarded
     /// `inherited`, which sits below the composition, which sits below the
@@ -3365,11 +3839,23 @@ mod tests {
     /// the flattened row keeps the terminal's display width.
     #[test]
     fn screen_snapshot_drops_wide_continuation_cells() {
-        let mut parser = vt100_ctt::Parser::new(2, 10, 0);
+        let mut parser = vt100::Parser::new(2, 10, 0);
         parser.process("abあcd".as_bytes());
         let snapshot = screen_to_snapshot(parser.screen());
         let text: String = snapshot.lines[0].cells.iter().map(|c| c.ch).collect();
         assert_eq!(text.trim_end(), "abあcd");
+    }
+
+    #[test]
+    fn hvp_positions_like_cup() {
+        // btop positions exclusively with HVP (`f`); it must behave like CUP
+        // (gominimal/minimal#1197). Guards the gominimal/vt100-rust fork's
+        // patch against being dropped.
+        let mut parser = vt100::Parser::new(5, 10, 0);
+        parser.process("\u{1b}[3;7fX\u{1b}[fY".as_bytes());
+        assert_eq!(parser.screen().cell(2, 6).unwrap().contents(), "X");
+        assert_eq!(parser.screen().cell(0, 0).unwrap().contents(), "Y");
+        assert_eq!(parser.screen().cursor_position(), (0, 1));
     }
 
     #[test]
@@ -3599,7 +4085,10 @@ mod tests {
             let process = command.spawn()?;
             Ok(Launched {
                 master,
-                process: MockProcess(process),
+                process: MockProcess {
+                    child: process,
+                    exit: None,
+                },
                 guard: (),
                 tty_path,
                 net_guard: Some(Box::new(RecordingNetGuard {
