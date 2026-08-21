@@ -10,6 +10,7 @@
     "loadouts.md",
     "user-policy.md",
     "build-specs.md",
+    "reproducibility.md",
     "stack-specs.md",
     "sandbox-operations.md",
     "linux-host-setup.md"

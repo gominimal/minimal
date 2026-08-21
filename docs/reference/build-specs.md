@@ -62,6 +62,8 @@ build_spec {
 ```
 
 Each package also has a `build.sh` script adjacent to `build.ncl` that performs the actual compilation.
+That script is responsible for making the build byte-reproducible; see
+[build reproducibility](./reproducibility.md) for the per-toolchain determinism flags it needs.
 
 More examples are maintained in the [Minimal Public Package Registry](https://github.com/gominimal/pkgs/tree/main/packages).
 
