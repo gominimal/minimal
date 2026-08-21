@@ -24,42 +24,75 @@ the [`minimal.toml`](./minimal-dot-toml.md) file at its base. The directory can 
 Here is a simplified build spec for `jq`, based on the [Minimal Public Package Registry](https://github.com/gominimal/pkgs/tree/main/packages):
 
 ```ncl
-let { build_spec, .. } = import "minimal.ncl" in
-build_spec {
+let { standaloneTest, Attrs, BuildSpec, Local, OutputBin, OutputData, OutputLib, Source, Test, .. } = import "minimal.ncl" in
+let base = import "../base/build.ncl" in
+let glibc = import "../glibc/build.ncl" in
+let make = import "../make/build.ncl" in
+let toolchain = import "../toolchain/build.ncl" in
+
+let version = "1.8.1" in
+{
   name = "jq",
 
   build_deps = [
-    { src = { url = "https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-1.8.1.tar.gz", sha256 = "..." } },
-    { pkg = "make" },
-    { pkg = "gcc" },
-    { pkg = "glibc" },
+    { file = "build.sh" } | Local,
+    {
+      url = "https://github.com/jqlang/jq/releases/download/jq-%{version}/jq-%{version}.tar.gz",
+      sha256 = "5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5",
+      extract = true,
+    } | Source,
+    base,
+    make,
+    toolchain,
   ],
 
   runtime_deps = [
-    { pkg = "glibc" },
+    glibc,
   ],
 
-  cmd = ["./build.sh"],
+  cmd = "./build.sh",
+  build_args = {
+    include version,
+  },
 
   outputs = {
-    bin = { glob = "usr/bin/*" },
-    lib = { glob = "usr/lib/*" },
-    man = { glob = "usr/share/man/**" },
+    jq = { glob = "usr/bin/jq" } | OutputBin,
+    libjq = { glob = "usr/lib/libjq.{so*,a}" } | OutputLib,
+    mans = { glob = "usr/share/man/**" } | OutputData,
   },
 
   tests = {
-    smoketest = { cmd = ["jq", "--version"] },
-    basic = { cmd = [
-      "/bin/bash", "-c",
-      "echo '{\"name\": \"minimal\"}' | jq -r '.name' | grep -q minimal"
-    ]},
+    smoketest = standaloneTest "/bin/jq --version",
+
+    basic =
+      {
+        class = 'Standalone,
+        test_deps = [base],
+        cmds = [
+          ["/bin/bash", "-c", "echo '{\"name\":\"minimal\"}' | jq -r '.name' | grep -q minimal"],
+        ],
+      } | Test,
   },
 
-  attrs = {
-    upstream_version = "1.8.1",
-  },
-}
+  attrs =
+    {
+      upstream_version = version,
+      license_spdx = "MIT",
+      source_provenance = {
+        category = 'GithubRepo,
+        owner = "jqlang",
+        repo = "jq",
+      },
+    } | Attrs,
+} | BuildSpec
 ```
+
+Note the shapes this uses, because they are load-bearing:
+
+ * The spec is a plain record with the `BuildSpec` contract applied at the end (`} | BuildSpec`). The stdlib also exports `build`, so `build { ... }` is an equivalent spelling.
+ * A dependency on another package is a Nickel import of that package's `build.ncl`, used directly in the array. Source archives and adjacent files are records carrying the `Source` and `Local` contracts.
+ * Outputs and tests carry their own contracts (`OutputBin`, `OutputLib`, `OutputData`, `Test`); `standaloneTest` is a shorthand that builds a `Standalone` test from a single command string.
+ * Binding `version` once and forwarding it through `build_args` keeps a version bump to a single edit, since `build.sh` reads it as `$MINIMAL_ARG_VERSION`.
 
 Each package also has a `build.sh` script adjacent to `build.ncl` that performs the actual compilation.
 That script is responsible for making the build byte-reproducible; see
@@ -79,7 +112,8 @@ embedded standard library, in
 | `name` | String | Declares the name of the package.   May only contain alphanumeric characters, dashes, and underscores.  Must match the name of the containing directory. |
 | `build_deps` | Array&lt;BuildDep> | A list of dependencies that are needed at build time. This may be:<br>- Other packages<br>- `Subset`s of other packages<br>- `Source` objects<br>- `Local` objects |
 | `runtime_deps` | Array&lt;RuntimeDep> | A list of dependencies that are needed both at build time, and wherever the package is needed. These may be:<br>- Other packages<br>- Subsets of other packages |
-| `cmd`, `cmds` | Array&lt;String> or Array&lt;Array&lt;String>> | The command that is invoked to build the package.  This is either an array of arguments, or an array of commands, each of which is an array of arguments. |
+| `cmd` | String or Array&lt;String> | The command that is invoked to build the package, either as a single string or as an array of arguments. |
+| `cmds` | Array&lt;String or Array&lt;String>> | Several commands, run in order, each in either of the `cmd` forms. |
 | `build_args` | Map&lt;String, String> | A list of arguments to be passed to the build command.  These are made available to the build commands as environment variables.  eg: `build_args.abc = "def"` would be available as the environment variable `MINIMAL_ARG_ABC` with the value `def`. |
 | `outputs` | Map&lt;String, Output> | The named set of output files that are captured from a build. If no files match a named output, it's a build error.   |
 | `attrs` | Attrs | The typed set of metadata attached to a given package. |
