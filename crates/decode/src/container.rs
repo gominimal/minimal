@@ -8,24 +8,27 @@ use nickel_lang_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, ObjTy, eval_if_closure, packages_array_from_term, record_data_from_val};
+use crate::{
+    Error, ObjTy, deserialize_field, eval_if_closure, packages_array_from_term,
+    record_data_from_val,
+};
 
 /// The transport protocol of an [ExposedPort].
 ///
 /// OCI recognises only `tcp` and `udp`, and spells them lowercase in the
 /// `ExposedPorts` keys of the image config.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Proto {
+pub enum ExposedPortProto {
     #[default]
     Tcp,
     Udp,
 }
 
-impl std::fmt::Display for Proto {
+impl std::fmt::Display for ExposedPortProto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Proto::Tcp => write!(f, "tcp"),
-            Proto::Udp => write!(f, "udp"),
+            ExposedPortProto::Tcp => write!(f, "tcp"),
+            ExposedPortProto::Udp => write!(f, "udp"),
         }
     }
 }
@@ -43,12 +46,7 @@ fn argv_from_term(
     let rt = eval_if_closure(rt, program)?;
 
     let argv = if let Some(s) = rt.as_string() {
-        shlex::split(s.as_ref()).ok_or_else(|| {
-            Error::Other(format!(
-                "container `{field}` is not a valid shell word list: {:?}",
-                s.as_ref()
-            ))
-        })?
+        crate::shell_split(&format!("container `{field}`"), s.as_ref())?
     } else if let Some(a) = rt.as_array() {
         // `CmdSpec` is an `any_of`, so its element contract does not fire on
         // its own: without the element check here a non-string argv entry
@@ -61,18 +59,21 @@ fn argv_from_term(
                     pending.iter().cloned(),
                     elem.pos_idx(),
                 );
-                let elem = eval_if_closure(&elem, program)?;
-                String::deserialize(elem).map_err(|_| {
-                    Error::Other(format!("container `{field}` must be a list of strings"))
-                })
+                deserialize_field(
+                    format!("container `{field}` entry"),
+                    "a string",
+                    &elem,
+                    program,
+                )
             })
             .collect::<Result<Vec<_>, Error>>()?
     } else {
-        todo!(
-            "error for `{}` field being non-string & non-array, got {:?}",
-            field,
-            rt
-        );
+        return Err(Error::unexpected_type(
+            format!("container `{field}`"),
+            "a string or an array of strings",
+            &rt,
+            program,
+        ));
     };
 
     if argv.is_empty() {
@@ -89,7 +90,7 @@ fn argv_from_term(
 pub struct ExposedPort {
     /// The protocol the port speaks. Defaults to TCP, matching the OCI
     /// bare-port form.
-    pub proto: Proto,
+    pub proto: ExposedPortProto,
     /// The port number, always within 1-65535.
     pub port: u16,
 }
@@ -102,7 +103,7 @@ impl ExposedPort {
     ) -> Result<Self, Error> {
         let rt = eval_if_closure(rt, program)?;
 
-        let mut proto: Option<Proto> = None;
+        let mut proto: Option<ExposedPortProto> = None;
         let mut port: Option<u16> = None;
 
         if let Some(r) = record_data_from_val(&rt) {
@@ -123,7 +124,7 @@ impl ExposedPort {
                     match ident_and_loc.label() {
                         "proto" => {
                             let p_rt = eval_if_closure(field_rt, program)?;
-                            proto = Some(Proto::deserialize(p_rt).map_err(|_| {
+                            proto = Some(ExposedPortProto::deserialize(p_rt).map_err(|_| {
                                 Error::Other(
                                     "container port `proto` must be 'Tcp or 'Udp".to_string(),
                                 )
@@ -150,7 +151,12 @@ impl ExposedPort {
                     }
                 })?;
         } else {
-            todo!("unexpected term for exposed_ports entry: {:?}", rt);
+            return Err(Error::unexpected_type(
+                "container `exposed_ports` entry",
+                "a record with `port` and optional `proto` fields",
+                &rt,
+                program,
+            ));
         }
 
         // A bare port is TCP in the OCI `ExposedPorts` form.
@@ -172,7 +178,10 @@ impl ExposedPort {
 }
 
 /// Parses a nickel tree representing a map of `String` to `String`.
+///
+/// `what` names the field being read, for the error when it is not a record.
 fn string_map_from_term(
+    what: &'static str,
     rt: &NickelValue,
     program: &mut Program<CacheImpl>,
 ) -> Result<IndexMap<String, String>, Error> {
@@ -180,21 +189,30 @@ fn string_map_from_term(
     if let Some(r) = record_data_from_val(&rt) {
         r.fields
             .iter()
+            // A field can carry an annotation and no value (`FOO | String`),
+            // which declares the name without setting anything.
+            .filter_map(|(ident_and_loc, field)| Some((ident_and_loc, field.value.as_ref()?)))
             .map(
-                |(ident_and_loc, field)| -> Result<(String, String), Error> {
+                |(ident_and_loc, value)| -> Result<(String, String), Error> {
                     Ok((
                         ident_and_loc.label().to_string(),
-                        String::deserialize(eval_if_closure(
-                            field.value.as_ref().unwrap(),
+                        deserialize_field(
+                            format!("{what} entry `{}`", ident_and_loc.label()),
+                            "a string",
+                            value,
                             program,
-                        )?)
-                        .unwrap(),
+                        )?,
                     ))
                 },
             )
             .collect::<Result<IndexMap<_, _>, Error>>()
     } else {
-        todo!("unexpected term for string map: {:?}", rt)
+        Err(Error::unexpected_type(
+            what,
+            "a record of strings",
+            &rt,
+            program,
+        ))
     }
 }
 
@@ -278,15 +296,21 @@ impl Container {
 
                     match ident_and_loc.label() {
                         "ty" => {
-                            ty = Some(
-                                ObjTy::deserialize(eval_if_closure(field_rt, program)?).unwrap(),
-                            );
+                            ty = Some(deserialize_field(
+                                "container `ty` annotation",
+                                "a known object type",
+                                field_rt,
+                                program,
+                            )?);
                             Ok(())
                         }
                         "name" => {
-                            name = Some(
-                                String::deserialize(eval_if_closure(field_rt, program)?).unwrap(),
-                            );
+                            name = Some(deserialize_field(
+                                "container `name`",
+                                "a string",
+                                field_rt,
+                                program,
+                            )?);
                             Ok(())
                         }
                         "packages" => {
@@ -303,19 +327,29 @@ impl Container {
                             Ok(())
                         }
                         "arch" => {
-                            arch = Some(
-                                Arch::deserialize(eval_if_closure(field_rt, program)?).unwrap(),
-                            );
+                            arch = Some(deserialize_field(
+                                "container `arch`",
+                                "a known architecture",
+                                field_rt,
+                                program,
+                            )?);
                             Ok(())
                         }
                         "working_dir" => {
-                            working_dir = Some(
-                                String::deserialize(eval_if_closure(field_rt, program)?).unwrap(),
-                            );
+                            working_dir = Some(deserialize_field(
+                                "container `working_dir`",
+                                "a string",
+                                field_rt,
+                                program,
+                            )?);
                             Ok(())
                         }
                         "env_vars" => {
-                            env_vars = Some(string_map_from_term(field_rt, program)?);
+                            env_vars = Some(string_map_from_term(
+                                "container `env_vars`",
+                                field_rt,
+                                program,
+                            )?);
                             Ok(())
                         }
                         "exposed_ports" => {
@@ -338,10 +372,12 @@ impl Container {
                                         .collect::<Result<Vec<_>, Error>>()?,
                                 );
                             } else {
-                                todo!(
-                                    "handle exposed_ports value being non-array {:?}",
-                                    field.value
-                                );
+                                return Err(Error::unexpected_type(
+                                    "container `exposed_ports`",
+                                    "an array of ports",
+                                    &ports_rt,
+                                    program,
+                                ));
                             }
 
                             Ok(())
@@ -361,35 +397,58 @@ impl Container {
                                                 pending.iter().cloned(),
                                                 v.pos_idx(),
                                             );
-                                            Ok(String::deserialize(eval_if_closure(&v, program)?)
-                                                .unwrap())
+                                            deserialize_field(
+                                                "container `volumes` entry",
+                                                "a string",
+                                                &v,
+                                                program,
+                                            )
                                         })
                                         .collect::<Result<Vec<_>, Error>>()?,
                                 );
                             } else {
-                                todo!("handle volumes value being non-array {:?}", field.value);
+                                return Err(Error::unexpected_type(
+                                    "container `volumes`",
+                                    "an array of strings",
+                                    &volumes_rt,
+                                    program,
+                                ));
                             }
 
                             Ok(())
                         }
                         "user" => {
-                            user = Some(
-                                String::deserialize(eval_if_closure(field_rt, program)?).unwrap(),
-                            );
+                            user = Some(deserialize_field(
+                                "container `user`",
+                                "a string",
+                                field_rt,
+                                program,
+                            )?);
                             Ok(())
                         }
                         "stop_signal" => {
-                            stop_signal = Some(
-                                String::deserialize(eval_if_closure(field_rt, program)?).unwrap(),
-                            );
+                            stop_signal = Some(deserialize_field(
+                                "container `stop_signal`",
+                                "a string",
+                                field_rt,
+                                program,
+                            )?);
                             Ok(())
                         }
                         "labels" => {
-                            labels = Some(string_map_from_term(field_rt, program)?);
+                            labels = Some(string_map_from_term(
+                                "container `labels`",
+                                field_rt,
+                                program,
+                            )?);
                             Ok(())
                         }
                         "config" => {
-                            config = Some(string_map_from_term(field_rt, program)?);
+                            config = Some(string_map_from_term(
+                                "container `config`",
+                                field_rt,
+                                program,
+                            )?);
                             Ok(())
                         }
                         _ => Ok(()),
@@ -848,12 +907,12 @@ mod tests {
         assert_eq!(
             c.exposed_ports,
             vec![ExposedPort {
-                proto: Proto::Tcp,
+                proto: ExposedPortProto::Tcp,
                 port: 8080
             }]
         );
-        assert_eq!(Proto::Tcp.to_string(), "tcp");
-        assert_eq!(Proto::Udp.to_string(), "udp");
+        assert_eq!(ExposedPortProto::Tcp.to_string(), "tcp");
+        assert_eq!(ExposedPortProto::Udp.to_string(), "udp");
 
         // A string argv is word-split into exec form; quoting is honoured.
         let c = parse_body(&format!(
@@ -947,11 +1006,11 @@ mod tests {
                 env_vars: IndexMap::from_iter([("PORT".to_string(), "8080".to_string())]),
                 exposed_ports: vec![
                     ExposedPort {
-                        proto: Proto::Tcp,
+                        proto: ExposedPortProto::Tcp,
                         port: 80
                     },
                     ExposedPort {
-                        proto: Proto::Udp,
+                        proto: ExposedPortProto::Udp,
                         port: 443
                     },
                 ],

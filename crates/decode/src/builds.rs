@@ -1,6 +1,6 @@
 //! Build specification objects.
 
-use crate::{Error, ObjTy, attrs::AttrValue, eval_if_closure, read_ty};
+use crate::{Error, ObjTy, attrs::AttrValue, deserialize_field, eval_if_closure, read_ty};
 use crate::{StrPos, cmds_from_cmd_term, cmds_from_cmds_term};
 use common::Target;
 use nickel_lang_core::eval::value::NickelValue;
@@ -74,7 +74,7 @@ impl BuildRef {
 
                 let name =
                     if let Ok(Some(n_rt)) = record.get_value_with_ctrs(&LocIdent::new("name")) {
-                        String::deserialize(eval_if_closure(&n_rt, program)?).unwrap()
+                        deserialize_field("upstream `name`", "a string", &n_rt, program)?
                     } else {
                         return Err(Error::MissingField {
                             files: program.files(),
@@ -109,7 +109,7 @@ impl BuildRef {
 
                 let name =
                     if let Ok(Some(n_rt)) = record.get_value_with_ctrs(&LocIdent::new("name")) {
-                        String::deserialize(eval_if_closure(&n_rt, program)?).unwrap()
+                        deserialize_field("builder `name`", "a string", &n_rt, program)?
                     } else {
                         return Err(Error::MissingField {
                             files: program.files(),
@@ -178,7 +178,7 @@ impl SourceInput {
                         "file" => {
                             if let Some(rt) = field.value.as_ref() {
                                 filename = Some((
-                                    String::deserialize(eval_if_closure(rt, program)?).unwrap(),
+                                    deserialize_field("source `file`", "a string", rt, program)?,
                                     field
                                         .value
                                         .as_ref()
@@ -193,7 +193,7 @@ impl SourceInput {
                         "url" => {
                             if let Some(rt) = field.value.as_ref() {
                                 url = Some((
-                                    String::deserialize(eval_if_closure(rt, program)?).unwrap(),
+                                    deserialize_field("source `url`", "a string", rt, program)?,
                                     Some(rt.pos(program.pos_table())),
                                 ));
                             }
@@ -202,7 +202,7 @@ impl SourceInput {
                         "sha256" => {
                             if let Some(rt) = field.value.as_ref() {
                                 sha256 = Some((
-                                    String::deserialize(eval_if_closure(rt, program)?).unwrap(),
+                                    deserialize_field("source `sha256`", "a string", rt, program)?,
                                     Some(rt.pos(program.pos_table())),
                                 ));
                             }
@@ -210,17 +210,23 @@ impl SourceInput {
                         }
                         "extract" => {
                             if let Some(ext_rt) = field.value.as_ref() {
-                                extract = Some(
-                                    bool::deserialize(eval_if_closure(ext_rt, program)?).unwrap(),
-                                );
+                                extract = Some(deserialize_field(
+                                    "source `extract`",
+                                    "a boolean",
+                                    ext_rt,
+                                    program,
+                                )?);
                             }
                             Ok(())
                         }
                         "strip_prefix" => {
                             if let Some(st_rt) = field.value.as_ref() {
-                                strip_prefix = Some(
-                                    String::deserialize(eval_if_closure(st_rt, program)?).unwrap(),
-                                );
+                                strip_prefix = Some(deserialize_field(
+                                    "source `strip_prefix`",
+                                    "a string",
+                                    st_rt,
+                                    program,
+                                )?);
                             }
                             Ok(())
                         }
@@ -344,18 +350,22 @@ impl SubsetInput {
                                         outputs = Some(
                                             a.iter()
                                                 .map(|input| {
-                                                    Ok(String::deserialize(eval_if_closure(
-                                                        input, program,
-                                                    )?)
-                                                    .unwrap())
+                                                    deserialize_field(
+                                                        "subset input `outputs` entry",
+                                                        "a string",
+                                                        input,
+                                                        program,
+                                                    )
                                                 })
                                                 .collect::<Result<SmallVec<_>, Error>>()?,
                                         );
                                     } else {
-                                        todo!(
-                                            "handle outputs value being non-array {:?}",
-                                            field.value
-                                        );
+                                        return Err(Error::unexpected_type(
+                                            "subset input `outputs`",
+                                            "an array of output names",
+                                            &outputs_val,
+                                            program,
+                                        ));
                                     }
                                 }
                             }
@@ -471,11 +481,12 @@ impl BuildDep {
                     match ident_and_loc.label() {
                         "file" => {
                             file = Some((
-                                String::deserialize(eval_if_closure(
+                                deserialize_field(
+                                    "local `file`",
+                                    "a string",
                                     field.value.as_ref().unwrap(),
                                     program,
-                                )?)
-                                .unwrap(),
+                                )?,
                                 field
                                     .value
                                     .as_ref()
@@ -574,33 +585,44 @@ impl BuildOutput {
                 .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
                     match ident_and_loc.label() {
                         "glob" => {
-                            glob = Some(
-                                String::deserialize(eval_if_closure(
-                                    field.value.as_ref().unwrap(),
-                                    program,
-                                )?)
-                                .unwrap(),
-                            );
+                            glob = Some(deserialize_field(
+                                "output `glob`",
+                                "a string",
+                                field.value.as_ref().unwrap(),
+                                program,
+                            )?);
                             Ok(())
                         }
                         "allow_executable" => {
                             if let Some(rt) = field.value.as_ref() {
-                                allow_executable =
-                                    Some(bool::deserialize(eval_if_closure(rt, program)?).unwrap());
+                                allow_executable = Some(deserialize_field(
+                                    "output `allow_executable`",
+                                    "a boolean",
+                                    rt,
+                                    program,
+                                )?);
                             }
                             Ok(())
                         }
                         "allow_data" => {
                             if let Some(rt) = field.value.as_ref() {
-                                allow_data =
-                                    Some(bool::deserialize(eval_if_closure(rt, program)?).unwrap());
+                                allow_data = Some(deserialize_field(
+                                    "output `allow_data`",
+                                    "a boolean",
+                                    rt,
+                                    program,
+                                )?);
                             }
                             Ok(())
                         }
                         "allow_missing_interpreter" => {
                             if let Some(rt) = field.value.as_ref() {
-                                allow_missing_interpreter =
-                                    Some(bool::deserialize(eval_if_closure(rt, program)?).unwrap());
+                                allow_missing_interpreter = Some(deserialize_field(
+                                    "output `allow_missing_interpreter`",
+                                    "a boolean",
+                                    rt,
+                                    program,
+                                )?);
                             }
                             Ok(())
                         }
@@ -770,57 +792,54 @@ impl BuildDecl {
                 .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
                     match ident_and_loc.label() {
                         "ty" => {
-                            ty = Some(
-                                ObjTy::deserialize(eval_if_closure(
-                                    field.value.as_ref().unwrap(),
-                                    program,
-                                )?)
-                                .unwrap(),
-                            );
+                            ty = Some(deserialize_field(
+                                "builder `ty` annotation",
+                                "a known object type",
+                                field.value.as_ref().unwrap(),
+                                program,
+                            )?);
                             Ok(())
                         }
                         "name" => {
-                            name = Some(
-                                String::deserialize(eval_if_closure(
-                                    field.value.as_ref().unwrap(),
-                                    program,
-                                )?)
-                                .unwrap(),
-                            );
+                            name = Some(deserialize_field(
+                                "builder `name`",
+                                "a string",
+                                field.value.as_ref().unwrap(),
+                                program,
+                            )?);
                             Ok(())
                         }
                         "prebuilt" => {
                             if let Some(rt) = field.value.as_ref() {
-                            prebuilt = Some(
-                                bool::deserialize(eval_if_closure(
-                                    rt,
-                                    program,
-                                )?)
-                                .unwrap(),
-                            );
+                            prebuilt = Some(deserialize_field(
+                                "builder `prebuilt`",
+                                "a boolean",
+                                rt,
+                                program,
+                            )?);
                             }
                             Ok(())
                         }
                         "cmd" => {
                             if let Some(rt) = field.value.as_ref() {
-                                cmds = Some(cmds_from_cmd_term(rt, program)?);
+                                cmds = Some(cmds_from_cmd_term("builder `cmd`", rt, program)?);
                             };
                             Ok(())
                         }
                         "cmds" => {
                             if let Some(rt) = field.value.as_ref() {
-                                cmds = Some(cmds_from_cmds_term(rt, program)?);
+                                cmds = Some(cmds_from_cmds_term("builder `cmds`", rt, program)?);
                             };
                             Ok(())
                         }
                         "target" => {
                             if let Some(target_rt) = field.value.as_ref() {
-                                let target_str =
-                                    String::deserialize(eval_if_closure(
-                                        target_rt,
-                                        program,
-                                    )?)
-                                    .unwrap();
+                                let target_str: String = deserialize_field(
+                                    "builder `target`",
+                                    "a string",
+                                    target_rt,
+                                    program,
+                                )?;
                                 match target_str.parse::<Target>() {
                                     Ok(t) => {
                                         target = Some(t);
@@ -854,11 +873,15 @@ impl BuildDecl {
 
                                             Ok((
                                                 ident_and_loc.label().to_string(),
-                                                String::deserialize(eval_if_closure(
+                                                deserialize_field(
+                                                    format!(
+                                                        "builder `build_args.{}`",
+                                                        ident_and_loc.label()
+                                                    ),
+                                                    "a string",
                                                     field.value.as_ref().unwrap(),
                                                     program,
-                                                )?)
-                                                .unwrap(),
+                                                )?,
                                             ))
                                         },
                                     ).collect::<Result<IndexMap<_, _>, Error>>()?
@@ -866,7 +889,12 @@ impl BuildDecl {
                                 } else if crate::is_record(&build_args_rt) {
                                     build_args = Some(Default::default());
                                 } else {
-                                    todo!("unexpected term for build_args");
+                                    return Err(Error::unexpected_type(
+                                        "builder `build_args`",
+                                        "a record of strings",
+                                        &build_args_rt,
+                                        program,
+                                    ));
                                 }
                             }
 
@@ -890,7 +918,12 @@ impl BuildDecl {
                                         .collect::<Result<SmallVec<_>, Error>>()?,
                                 );
                             } else {
-                                todo!("handle build_deps value being non-array {:?}", field.value);
+                                return Err(Error::unexpected_type(
+                                    "builder `build_deps`",
+                                    "an array of build dependencies",
+                                    &build_deps_rt,
+                                    program,
+                                ));
                             };
                             Ok(())
                         }
@@ -910,10 +943,12 @@ impl BuildDecl {
                                                 .collect::<Result<SmallVec<_>, Error>>()?,
                                         );
                                     } else {
-                                        todo!(
-                                            "handle runtime_deps value being non-array {:?}",
-                                            field.value
-                                        );
+                                        return Err(Error::unexpected_type(
+                                            "builder `runtime_deps`",
+                                            "an array of runtime dependencies",
+                                            &runtime_deps_val,
+                                            program,
+                                        ));
                                     }
                                 }
                             }
@@ -947,7 +982,12 @@ impl BuildDecl {
                                 // Empty record - no outputs
                                 outputs = Some(Default::default());
                             } else {
-                                todo!("handle value being non-dict {:?}", field.value);
+                                return Err(Error::unexpected_type(
+                                    "builder `outputs`",
+                                    "a record of outputs",
+                                    &outputs_rt,
+                                    program,
+                                ));
                             };
                             Ok(())
                         }
@@ -994,7 +1034,12 @@ impl BuildDecl {
                                 } else if crate::is_record(&attrs_rt) {
                                     attrs = Some(Default::default());
                                 } else {
-                                    todo!("unexpected term for attrs: {:?}", attrs_rt);
+                                    return Err(Error::unexpected_type(
+                                        "builder `attrs`",
+                                        "a record of attributes",
+                                        &attrs_rt,
+                                        program,
+                                    ));
                                 }
                             }
 
@@ -1027,7 +1072,12 @@ impl BuildDecl {
                                 } else if crate::is_record(&needs_rt) {
                                     needs = Some(Default::default());
                                 } else {
-                                    todo!("unexpected term for needs: {:?}", needs_rt);
+                                    return Err(Error::unexpected_type(
+                                        "builder `needs`",
+                                        "a record of attributes",
+                                        &needs_rt,
+                                        program,
+                                    ));
                                 }
                             }
 
@@ -1056,7 +1106,12 @@ impl BuildDecl {
                                         // Empty record - no tests
                                         tests = Some(Default::default());
                                     } else {
-                                        todo!("handle value being non-dict {:?}", field.value);
+                                        return Err(Error::unexpected_type(
+                                            "builder `tests`",
+                                            "a record of tests",
+                                            &tests_rt,
+                                            program,
+                                        ));
                                     };
                                 }
                             Ok(())

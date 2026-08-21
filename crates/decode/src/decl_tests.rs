@@ -46,19 +46,25 @@ impl Test {
                                     if let Some(tag) = rt.as_enum_tag() {
                                         is_build_test = tag.label() == "Build";
                                     } else {
-                                        todo!("class enum err: {:?}", rt)
+                                        return Err(Error::unexpected_type(
+                                            "test `class`",
+                                            "an enum tag",
+                                            &rt,
+                                            program,
+                                        ));
                                     }
                                     Ok(())
                                 }
                                 "cmd" => {
                                     if let Some(rt) = field.value.as_ref() {
-                                        cmds = Some(cmds_from_cmd_term(rt, program)?);
+                                        cmds = Some(cmds_from_cmd_term("test `cmd`", rt, program)?);
                                     };
                                     Ok(())
                                 }
                                 "cmds" => {
                                     if let Some(rt) = field.value.as_ref() {
-                                        cmds = Some(cmds_from_cmds_term(rt, program)?);
+                                        cmds =
+                                            Some(cmds_from_cmds_term("test `cmds`", rt, program)?);
                                     };
                                     Ok(())
                                 }
@@ -78,10 +84,12 @@ impl Test {
                                                         .collect::<Result<SmallVec<_>, Error>>()?,
                                                 );
                                             } else {
-                                                todo!(
-                                                    "handle test_deps value being non-array {:?}",
-                                                    field.value
-                                                );
+                                                return Err(Error::unexpected_type(
+                                                    "test `test_deps`",
+                                                    "an array of build references",
+                                                    &test_deps_val,
+                                                    program,
+                                                ));
                                             }
                                         }
                                     }

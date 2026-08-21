@@ -12,7 +12,7 @@ use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Error, ObjTy, cmds_from_cmd_term, env_vars_from_term, eval_if_closure,
+    Error, ObjTy, cmds_from_cmd_term, deserialize_field, env_vars_from_term, eval_if_closure,
     packages_array_from_term, record_data_from_val,
 };
 
@@ -64,15 +64,22 @@ impl PackageMatcherPredicate {
                                         |(ident_and_loc, field)| -> Result<(String, String), Error> {
                                             Ok((
                                                 ident_and_loc.label().to_string(),
-                                                String::deserialize(eval_if_closure(
+                                                deserialize_field(
+                                                    format!("stack matcher `file_regexes.{}`", ident_and_loc.label()),
+                                                    "a string",
                                                     field.value.as_ref().unwrap(),
                                                     program,
-                                                )?).unwrap(),
+                                                )?,
                                             ))
                                         },
                                     ).collect::<Result<IndexMap<_, _>, Error>>()?);
                                 } else {
-                                    todo!("unexpected term for file_regexes: {:?}", rt);
+                                    return Err(Error::unexpected_type(
+                                        "stack matcher `file_regexes`",
+                                        "a record of strings",
+                                        &rt,
+                                        program,
+                                    ));
                                 }
 
                             Ok(())
@@ -84,15 +91,22 @@ impl PackageMatcherPredicate {
                                         |(ident_and_loc, field)| -> Result<(String, String), Error> {
                                             Ok((
                                                 ident_and_loc.label().to_string(),
-                                                String::deserialize(eval_if_closure(
+                                                deserialize_field(
+                                                    format!("stack matcher `file_predicates.{}`", ident_and_loc.label()),
+                                                    "a string",
                                                     field.value.as_ref().unwrap(),
                                                     program,
-                                                )?).unwrap(),
+                                                )?,
                                             ))
                                         },
                                     ).collect::<Result<IndexMap<_, _>, Error>>()?);
                                 } else {
-                                    todo!("unexpected term for file_predicates: {:?}", rt);
+                                    return Err(Error::unexpected_type(
+                                        "stack matcher `file_predicates`",
+                                        "a record of strings",
+                                        &rt,
+                                        program,
+                                    ));
                                 }
 
                             Ok(())
@@ -113,7 +127,10 @@ impl PackageMatcherPredicate {
 }
 
 /// Parses a nickel tree representing a map of `String` to `Vec<PackageMatcherPredicate>`.
+///
+/// `what` names the field being read, for the errors when it is the wrong shape.
 fn package_map_from_term(
+    what: &'static str,
     rt: &NickelValue,
     program: &mut Program<CacheImpl>,
 ) -> Result<IndexMap<String, Vec<PackageMatcherPredicate>>, Error> {
@@ -129,10 +146,12 @@ fn package_map_from_term(
                             .map(|input| PackageMatcherPredicate::from_term(input, program))
                             .collect::<Result<Vec<_>, Error>>()?
                     } else {
-                        todo!(
-                            "handle build_package_if_any value being non-array {:?}",
-                            field.value
-                        )
+                        return Err(Error::unexpected_type(
+                            format!("{what} entry `{}`", ident_and_loc.label()),
+                            "an array of package matchers",
+                            &a_rt,
+                            program,
+                        ));
                     };
 
                     Ok((ident_and_loc.label().to_string(), pred))
@@ -140,7 +159,12 @@ fn package_map_from_term(
             )
             .collect::<Result<IndexMap<_, _>, Error>>()
     } else {
-        todo!("unexpected term for build_package_if_any: {:?}", rt)
+        Err(Error::unexpected_type(
+            what,
+            "a record of package matchers",
+            &rt,
+            program,
+        ))
     }
 }
 
@@ -241,11 +265,19 @@ impl StackMatcher {
 
                         match ident_and_loc.label() {
                             "build_package_if_any" => {
-                                build_package_matchers = package_map_from_term(&rt, program)?;
+                                build_package_matchers = package_map_from_term(
+                                    "stack `build_package_if_any`",
+                                    &rt,
+                                    program,
+                                )?;
                                 Ok(())
                             }
                             "runtime_package_if_any" => {
-                                runtime_package_matchers = package_map_from_term(&rt, program)?;
+                                runtime_package_matchers = package_map_from_term(
+                                    "stack `runtime_package_if_any`",
+                                    &rt,
+                                    program,
+                                )?;
                                 Ok(())
                             }
                             _ => Ok(()),
@@ -318,23 +350,21 @@ impl Stack {
                 .try_for_each(|(ident_and_loc, field)| -> Result<(), Error> {
                     match ident_and_loc.label() {
                         "ty" => {
-                            ty = Some(
-                                ObjTy::deserialize(eval_if_closure(
-                                    field.value.as_ref().unwrap(),
-                                    program,
-                                )?)
-                                .unwrap(),
-                            );
+                            ty = Some(deserialize_field(
+                                "stack `ty` annotation",
+                                "a known object type",
+                                field.value.as_ref().unwrap(),
+                                program,
+                            )?);
                             Ok(())
                         }
                         "name" => {
-                            name = Some(
-                                String::deserialize(eval_if_closure(
-                                    field.value.as_ref().unwrap(),
-                                    program,
-                                )?)
-                                .unwrap(),
-                            );
+                            name = Some(deserialize_field(
+                                "stack `name`",
+                                "a string",
+                                field.value.as_ref().unwrap(),
+                                program,
+                            )?);
                             Ok(())
                         }
 
@@ -345,7 +375,12 @@ impl Stack {
                                 if let Some(r) = record_data_from_val(&ev_rt) {
                                     build_env_vars = Some(env_vars_from_term(r, program)?);
                                 } else {
-                                    todo!("unexpected term for build_env_vars: {:?}", ev_rt);
+                                    return Err(Error::unexpected_type(
+                                        "stack `build_env_vars`",
+                                        "a record of strings",
+                                        &ev_rt,
+                                        program,
+                                    ));
                                 }
                             }
 
@@ -353,8 +388,11 @@ impl Stack {
                         }
                         "build_packages" => {
                             if let Some(packages_rt) = field.value.as_ref() {
-                                build_packages =
-                                    Some(packages_array_from_term("build_packages", packages_rt, program)?);
+                                build_packages = Some(packages_array_from_term(
+                                    "build_packages",
+                                    packages_rt,
+                                    program,
+                                )?);
                             }
                             Ok(())
                         }
@@ -370,7 +408,8 @@ impl Stack {
                         }
                         "build_cmd" => {
                             if let Some(rt) = field.value.as_ref() {
-                                build_cmds = Some(cmds_from_cmd_term(rt, program)?);
+                                build_cmds =
+                                    Some(cmds_from_cmd_term("stack `build_cmd`", rt, program)?);
                             };
                             Ok(())
                         }
@@ -378,20 +417,30 @@ impl Stack {
                             if let Some(rt) = field.value.as_ref() {
                                 let rt = eval_if_closure(rt, program)?;
                                 if let Some(s) = rt.as_string() {
-                                    build_cmds_cmd = Some(
-                                        shlex::split(s.as_ref()).unwrap(),
-                                    );
+                                    build_cmds_cmd = Some(crate::shell_split(
+                                        "stack `build_cmds_cmd`",
+                                        s.as_ref(),
+                                    )?);
                                 } else if let Some(a) = rt.as_array() {
                                     build_cmds_cmd = Some(
                                         a.iter()
-                                            .map(|rt| eval_if_closure(rt, program))
-                                            .collect::<Result<Vec<_>, _>>()?
-                                            .into_iter()
-                                            .map(|rt| String::deserialize(rt).unwrap())
-                                            .collect(),
+                                            .map(|rt| {
+                                                deserialize_field(
+                                                    "stack `build_cmds_cmd` entry",
+                                                    "a string",
+                                                    rt,
+                                                    program,
+                                                )
+                                            })
+                                            .collect::<Result<Vec<_>, Error>>()?,
                                     );
                                 } else {
-                                    todo!("error for 'build_cmds_cmd' field being non-string & non-array, got {:?}", rt);
+                                    return Err(Error::unexpected_type(
+                                        "stack `build_cmds_cmd`",
+                                        "a string or an array of strings",
+                                        &rt,
+                                        program,
+                                    ));
                                 }
                                 Ok(())
                             } else {
@@ -406,7 +455,8 @@ impl Stack {
                                     matches_project_if_any = Some(
                                         a.iter()
                                             .map(|m| {
-                                                let pending = a.iter_pending_contracts()
+                                                let pending = a
+                                                    .iter_pending_contracts()
                                                     .cloned()
                                                     .collect::<Vec<_>>();
                                                 let rt = RuntimeContract::apply_all(
@@ -415,18 +465,20 @@ impl Stack {
                                                     m.pos_idx(),
                                                 );
 
-                                                StackMatcher::from_term(&eval_if_closure(
-                                                    &rt,
+                                                StackMatcher::from_term(
+                                                    &eval_if_closure(&rt, program)?,
                                                     program,
-                                                )?, program)
+                                                )
                                             })
                                             .collect::<Result<Vec<_>, Error>>()?,
                                     );
                                 } else {
-                                    todo!(
-                                        "handle matches_project_if_any value being non-array {:?}",
-                                        field.value
-                                    );
+                                    return Err(Error::unexpected_type(
+                                        "stack `matches_project_if_any`",
+                                        "an array of stack matchers",
+                                        &matchers_rt,
+                                        program,
+                                    ));
                                 }
                             }
 
@@ -434,9 +486,13 @@ impl Stack {
                         }
                         "matches_project_priority" => {
                             if let Some(matchers_rt) = field.value.as_ref() {
-                                let matchers_rt =
-                                    eval_if_closure(matchers_rt, program)?;
-                                matches_project_priority = Some(i32::deserialize(matchers_rt).unwrap());
+                                let matchers_rt = eval_if_closure(matchers_rt, program)?;
+                                matches_project_priority = Some(deserialize_field(
+                                    "stack `matches_project_priority`",
+                                    "a whole number",
+                                    &matchers_rt,
+                                    program,
+                                )?);
                             }
 
                             Ok(())
@@ -651,6 +707,34 @@ mod tests {
                 ..Default::default()
             }
         )
+    }
+
+    /// A field can be annotated without being given a value
+    /// (`FOO | String`), which declares the name and sets nothing. Reading one
+    /// must skip it rather than unwrap its absent value.
+    #[test]
+    fn annotation_only_env_var_is_skipped() {
+        let src = "let {stack, ..} = import \"minimal.ncl\" in\n\
+                   stack { name = \"s\", build_cmd = \"x\",\n\
+                   build_env_vars = { SET = \"1\", DECLARED | String } }"
+            .to_string();
+        let (term, mut program, _origin, _target) =
+            Loader::new(src, None, &LoadOptions::for_test())
+                .unwrap()
+                .finish()
+                .unwrap();
+
+        let stack = Stack::from_term(&term, &mut program).expect("stack should decode");
+        assert!(
+            stack.build_env_vars.contains_key("SET"),
+            "expected the set var to survive: {:?}",
+            stack.build_env_vars
+        );
+        assert!(
+            !stack.build_env_vars.contains_key("DECLARED"),
+            "expected the annotation-only var to be skipped: {:?}",
+            stack.build_env_vars
+        );
     }
 
     #[test]
