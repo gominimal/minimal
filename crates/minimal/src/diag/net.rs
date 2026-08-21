@@ -111,6 +111,9 @@ pub async fn probe_socket(sock_path: &Path) -> (SocketProbe, Option<crate::clien
     }
 
     let t = Instant::now();
+    // Deliberately not version-gated: a support bundle has to describe the
+    // daemon that is actually running, and a skew is one of the faults it is
+    // collected to reveal — refusing to probe would erase the evidence.
     let mut client = match crate::client::Client::connect(sock_path).await {
         Ok(client) => {
             probe.handshake = Stage::run(t, Ok(()));

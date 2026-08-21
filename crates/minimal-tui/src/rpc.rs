@@ -87,6 +87,11 @@ pub async fn discover(minimal_dir: Option<&Path>) -> Vec<Provider> {
         if !sock.exists() {
             continue;
         }
+        // Deliberately not version-gated: the dashboard is read-only until the
+        // user acts, it renders each provider's version in the sidebar, and a
+        // skewed daemon is precisely when an operator needs to see (and be able
+        // to destroy) the sessions on it. The one multi-step mutation the TUI
+        // drives, `activate`, gates on its own connection instead.
         match Client::connect(&sock).await {
             Ok(client) => providers.push(Provider {
                 label,
@@ -112,6 +117,8 @@ pub async fn connect_missing(providers: &mut Vec<Provider>, minimal_dir: Option<
         if !sock.exists() {
             continue;
         }
+        // Deliberately not version-gated, for the same reason as `discover`:
+        // a provider that reappears mid-run must still be listable.
         match tokio::time::timeout(CONNECT_TIMEOUT, Client::connect(&sock)).await {
             Ok(Ok(client)) => {
                 tracing::info!(provider = label, "provider connected");
@@ -249,6 +256,11 @@ pub async fn activate(
     contribution: sessions::wire::request::WireContribution,
 ) -> Result<SessionId, anyhow::Error> {
     let mut client = Client::connect(sock).await?;
+    // The dashboard's own copy of the create/upload/configure/finalize
+    // sequence, so it needs the same gate `min session activate` gets: on a
+    // skewed pair `FinalizeSession` fails after the record exists, and the
+    // abort below then destroys the session the user just created (#1251).
+    minimal_client::ensure_version_match(&mut client).await?;
     let id = match client
         .oneshot_rpc::<CreateSession>(CreateSessionRequest {
             config: SessionConfig {
@@ -456,5 +468,44 @@ mod tests {
         std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
         let path = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
         assert!(resolve_upload_root(&path).is_err());
+    }
+}
+
+#[cfg(test)]
+mod version_gate_tests {
+    /// The dashboard opens three daemon connections, and #1251's gate reached
+    /// none of them. Only `activate` runs a multi-step mutation, so only it is
+    /// gated; the two discovery connections stay open on purpose and must say
+    /// so, since a reader who finds an ungated connect has no other way to tell
+    /// an audited decision from an oversight.
+    #[test]
+    fn only_the_activation_path_is_version_gated() {
+        // Concatenated so this scanner does not match itself.
+        const NEEDLE: &str = concat!("Client", "::connect(");
+        let src = include_str!("rpc.rs");
+
+        let mut gated = 0;
+        let mut explained = 0;
+        for (i, line) in src.lines().enumerate() {
+            if !line.contains(NEEDLE) {
+                continue;
+            }
+            // The classification is always within a few lines of the connect:
+            // the gate call just after it, or the rationale comment just before.
+            let window: Vec<&str> = src.lines().skip(i.saturating_sub(8)).take(20).collect();
+            let text = window.join("\n");
+            if text.contains("ensure_version_match") {
+                gated += 1;
+            } else if text.contains("not version-gated") {
+                explained += 1;
+            } else {
+                panic!("unclassified daemon connection at rpc.rs:{}", i + 1);
+            }
+        }
+        assert_eq!(
+            (gated, explained),
+            (1, 2),
+            "the connection inventory changed"
+        );
     }
 }

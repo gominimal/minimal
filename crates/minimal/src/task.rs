@@ -191,6 +191,9 @@ fn arm_task_run_interrupt(
         // without that race a second interrupt would be silently swallowed.
         const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let destroy = async {
+            // Deliberately not version-gated: this is the recovery half of a
+            // task run, and a cleanup blocked by a skew is exactly the orphaned
+            // session the gate exists to prevent.
             if let Ok(sock) = sock
                 && let Ok(mut client) = crate::client::Client::connect(&sock).await
             {

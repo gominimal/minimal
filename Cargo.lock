@@ -4050,6 +4050,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "version",
 ]
 
 [[package]]

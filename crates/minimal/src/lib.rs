@@ -21,6 +21,10 @@ pub mod config;
 pub mod diag;
 pub mod dirs;
 use minimal_client::file_upload;
+// The version gate lives in `minimal-client`, next to the transport it guards,
+// so the dashboard's activation path (`minimal-tui`, which cannot depend on
+// this crate) gates on the same wording and the same override.
+use minimal_client::ensure_version_match;
 pub mod git_remote;
 pub mod loadouts;
 pub mod prompt;
@@ -1131,55 +1135,6 @@ async fn connect_daemon_unchecked(global: &GlobalArgs) -> Result<client::Client,
         .context("Failed to connect to minimald")
 }
 
-/// Set to a non-empty value to downgrade the version gate to a warning.
-/// Escape hatch for deliberate skew (bisecting a daemon regression against a
-/// known-good CLI); named in the gate's error so anyone who hits it finds it.
-const SKEW_OVERRIDE_VAR: &str = "MINIMAL_ALLOW_VERSION_SKEW";
-
-/// Refuse to drive a daemon built from a different tree than this CLI.
-///
-/// The RPC surface is versioned by nothing but the two binaries agreeing, and
-/// several response types are `#[serde(deny_unknown_fields)]` on purpose (see
-/// `FinalizeSessionResponse` in `minimald-rpc` for why that guard is
-/// load-bearing). A skewed pair therefore doesn't fail at connect time — it
-/// fails *mid-activation*, at `FinalizeSession`, after the session already
-/// exists on the daemon, and the activation's own cleanup then destroys it. To
-/// the operator every session is created and vanishes at once (#1251).
-///
-/// Failing here costs one extra round trip and turns that into a diagnosis.
-async fn ensure_version_match(client: &mut client::Client) -> Result<(), anyhow::Error> {
-    use minimald_rpc::GetVersion;
-    let daemon = client
-        .oneshot_rpc::<GetVersion>(())
-        .await
-        .context("GetVersion RPC failed")?;
-
-    let Some(message) = version_skew_message(version::VERSION, &daemon.version) else {
-        return Ok(());
-    };
-    if std::env::var_os(SKEW_OVERRIDE_VAR).is_some_and(|v| !v.is_empty()) {
-        eprintln!("warning: {message}");
-        return Ok(());
-    }
-    bail!("{message}");
-}
-
-/// The operator-facing account of a CLI/daemon version skew, or `None` when
-/// the two builds match. Split out from [`ensure_version_match`] so the
-/// wording is testable without a daemon.
-fn version_skew_message(cli: &str, daemon: &str) -> Option<String> {
-    (cli != daemon).then(|| {
-        format!(
-            "This CLI is minimal {cli}, but the running minimald is {daemon}. \
-             The two speak the same RPCs only when built together, so continuing \
-             would fail partway through and tear down whatever it had created. \
-             Restart the daemon on the new build: run `min stop`, then re-run this \
-             command (the daemon is started again automatically). \
-             Set {SKEW_OVERRIDE_VAR}=1 to proceed anyway."
-        )
-    })
-}
-
 /// A session reference parsed from a CLI string: either a UUID or a name.
 /// Used to build the typed request enums both `GetSessionRecord` and
 /// `GetSessionPolicy` expect.
@@ -1782,6 +1737,9 @@ fn arm_activation_interrupt(
             return;
         }
         eprintln!("\nAborting activation; cleaning up session {session_id}…");
+        // Deliberately not version-gated: this is the cleanup half of an
+        // activation the gate already cleared, and a cleanup that refuses to
+        // run is the orphaned session #1251 is about.
         if let Ok(sock) = sock
             && let Ok(mut client) = client::Client::connect(&sock).await
         {
@@ -2367,6 +2325,10 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
     let mut client = client::Client::connect(&sock)
         .await
         .context("Failed to connect to minimald")?;
+    // Connects directly rather than through `connect_daemon` (it needs `sock`
+    // for the ssh hand-off), so the gate is applied by hand — with no session
+    // named, this path creates one, and a skewed activation is #1251 exactly.
+    ensure_version_match(&mut client).await?;
 
     let (id, name) = match args.session {
         Some(ref s) => {
@@ -2404,6 +2366,10 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
     let mut client = client::Client::connect(&sock)
         .await
         .context("Failed to connect to minimald")?;
+    // Gated by hand for the same reason as `cmd_attach`: this hands off into a
+    // live session (the daemon mints the exec channel and runs the attach
+    // hooks around it), which is not something to drive on a skewed pair.
+    ensure_version_match(&mut client).await?;
 
     let r = resolve_session(&mut client, &args.session).await?;
     tracing::info!(
@@ -2632,6 +2598,10 @@ pub async fn cmd_session_setup_zed(
     let mut daemon_client = client::Client::connect(&sock)
         .await
         .context("Failed to connect to minimald")?;
+    // Gated: the record read here is baked into Zed's settings.json and
+    // outlives the command, so it must not be sourced from a daemon the
+    // operator is about to restart onto another build.
+    ensure_version_match(&mut daemon_client).await?;
     let record = resolve_session(&mut daemon_client, &args.session).await?;
 
     // Pin the socket explicitly rather than leaning on `min proxy`'s own
@@ -3390,6 +3360,10 @@ pub async fn cmd_ssh_forward(
     let mut daemon_client = client::Client::connect(&sock)
         .await
         .context("Failed to connect to minimald")?;
+    // Gated: like `cmd_attach`, this hands off into a live session — the
+    // forward's server-side auth gate is keyed on wire types both builds have
+    // to agree on.
+    ensure_version_match(&mut daemon_client).await?;
 
     let record = resolve_session(&mut daemon_client, &args.session).await?;
 
@@ -3734,6 +3708,9 @@ pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         }
     };
 
+    // Deliberately not version-gated: reporting the two versions is how an
+    // operator sees a skew at all, so this must answer on a skewed pair rather
+    // than refuse — and the gate's own check is this very RPC.
     let mut client = match client::Client::connect(&sock).await {
         Ok(c) => c,
         Err(e) => {
@@ -3797,7 +3774,7 @@ mod tests {
     /// destroyed the session it had just created.
     #[test]
     fn version_skew_is_reported_with_both_builds_and_a_recovery() {
-        let msg = version_skew_message("0.6.0", "0.5.0-dev.12.g86ce5c3a")
+        let msg = client::version_skew_message("0.6.0", "0.5.0-dev.12.g86ce5c3a")
             .expect("differing builds are a skew");
         assert!(msg.contains("0.6.0"), "missing the CLI version: {msg}");
         assert!(
@@ -3806,16 +3783,120 @@ mod tests {
         );
         assert!(msg.contains("min stop"), "missing the recovery: {msg}");
         assert!(
-            msg.contains(SKEW_OVERRIDE_VAR),
+            msg.contains(client::SKEW_OVERRIDE_VAR),
             "missing the override: {msg}"
         );
+    }
+
+    /// Every direct daemon connection in this crate is either version-gated or
+    /// deliberately not, and this test is where that decision is recorded.
+    ///
+    /// #1251 shipped the gate but wired it to two call sites; the rest reached
+    /// activations and live-session hand-offs ungated. A new connection is easy
+    /// to add and easy to forget, so the inventory is asserted rather than
+    /// documented: adding, removing, or un-gating one fails here and forces the
+    /// same judgement — can this path leave daemon state half-built (gate it),
+    /// or must it work *because* the pair is skewed (leave it, with a comment
+    /// saying why)?
+    #[test]
+    fn every_daemon_connection_is_classified() {
+        assert_eq!(
+            connect_site_inventory(env!("CARGO_MANIFEST_DIR")),
+            [
+                "diag/net.rs::probe_socket = ungated",
+                "lib.rs::arm_activation_interrupt = ungated",
+                "lib.rs::cmd_attach = gated",
+                "lib.rs::cmd_bare = gated",
+                "lib.rs::cmd_exec = gated",
+                "lib.rs::cmd_session_setup_zed = gated",
+                "lib.rs::cmd_ssh_forward = gated",
+                "lib.rs::cmd_version = ungated",
+                "lib.rs::connect_daemon_unchecked = ungated",
+                "task.rs::arm_task_run_interrupt = ungated",
+            ]
+        );
+    }
+
+    /// Attributes every direct `Client` connection under `<crate>/src` to the
+    /// function that opens it, and reports whether that function also applies
+    /// the version gate. Source-level on purpose: the alternative is a live
+    /// daemon per call site.
+    fn connect_site_inventory(manifest_dir: &str) -> Vec<String> {
+        // Built by concatenation so this scanner does not match itself.
+        const NEEDLE: &str = concat!("Client", "::connect(");
+        let src = std::path::Path::new(manifest_dir).join("src");
+
+        let mut files = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("crate src must be readable") {
+                let path = entry.expect("readable dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+
+        let is_fn_decl = |line: &str| {
+            let t = line.trim_start();
+            let t = t
+                .strip_prefix("pub(crate) ")
+                .or_else(|| t.strip_prefix("pub "))
+                .unwrap_or(t);
+            let t = t.strip_prefix("async ").unwrap_or(t);
+            t.strip_prefix("fn ")
+                .map(|rest| rest.split(['(', '<']).next().unwrap_or("").to_string())
+        };
+
+        let mut sites = Vec::new();
+        for path in files {
+            let text = std::fs::read_to_string(&path).expect("source file must be readable");
+            let lines: Vec<&str> = text.lines().collect();
+            let decls: Vec<(usize, String)> = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(i, l)| is_fn_decl(l).map(|n| (i, n)))
+                .collect();
+            let rel = path
+                .strip_prefix(&src)
+                .expect("scanned under src")
+                .to_string_lossy()
+                .into_owned();
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains(NEEDLE) {
+                    continue;
+                }
+                let (start, name) = decls
+                    .iter()
+                    .rev()
+                    .find(|(d, _)| *d < i)
+                    .cloned()
+                    .unwrap_or((0, "<top level>".to_string()));
+                let end = decls
+                    .iter()
+                    .find(|(d, _)| *d > start)
+                    .map_or(lines.len(), |(d, _)| *d);
+                let gated = lines[start..end]
+                    .iter()
+                    .any(|l| l.contains("ensure_version_match"));
+                sites.push(format!(
+                    "{rel}::{name} = {}",
+                    if gated { "gated" } else { "ungated" }
+                ));
+            }
+        }
+        sites.sort();
+        sites
     }
 
     /// Matching builds are the overwhelmingly common case and must cost the
     /// operator nothing.
     #[test]
     fn matching_versions_are_not_a_skew() {
-        assert!(version_skew_message(version::VERSION, version::VERSION).is_none());
+        assert!(client::version_skew_message(version::VERSION, version::VERSION).is_none());
     }
 
     /// The `Cli` command tree must stay well-formed: a malformed clap

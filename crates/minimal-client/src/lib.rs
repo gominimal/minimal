@@ -902,6 +902,60 @@ fn decode_context(rpc: &str, body: &[u8]) -> String {
     format!("decode response for {rpc} (daemon replied: {excerpt})")
 }
 
+/// Set to a non-empty value to downgrade the version gate to a warning.
+/// Escape hatch for deliberate skew (bisecting a daemon regression against a
+/// known-good CLI); named in the gate's error so anyone who hits it finds it.
+pub const SKEW_OVERRIDE_VAR: &str = "MINIMAL_ALLOW_VERSION_SKEW";
+
+/// Refuse to drive a daemon built from a different tree than this CLI.
+///
+/// The RPC surface is versioned by nothing but the two binaries agreeing, and
+/// several response types are `#[serde(deny_unknown_fields)]` on purpose (see
+/// `FinalizeSessionResponse` in `minimald-rpc` for why that guard is
+/// load-bearing). A skewed pair therefore doesn't fail at connect time — it
+/// fails *mid-activation*, at `FinalizeSession`, after the session already
+/// exists on the daemon, and the activation's own cleanup then destroys it. To
+/// the operator every session is created and vanishes at once (#1251).
+///
+/// Failing here costs one extra round trip and turns that into a diagnosis.
+///
+/// Lives in this crate, not in `minimal`, because the dashboard activates
+/// sessions too: `min dash` drives the same create/upload/configure/finalize
+/// sequence from `minimal-tui`, which cannot depend on the CLI crate. One
+/// definition means one wording and one override for both front ends.
+pub async fn ensure_version_match(client: &mut Client) -> Result<(), anyhow::Error> {
+    use minimald_rpc::GetVersion;
+    let daemon = client
+        .oneshot_rpc::<GetVersion>(())
+        .await
+        .context("GetVersion RPC failed")?;
+
+    let Some(message) = version_skew_message(version::VERSION, &daemon.version) else {
+        return Ok(());
+    };
+    if std::env::var_os(SKEW_OVERRIDE_VAR).is_some_and(|v| !v.is_empty()) {
+        eprintln!("warning: {message}");
+        return Ok(());
+    }
+    anyhow::bail!("{message}");
+}
+
+/// The operator-facing account of a CLI/daemon version skew, or `None` when
+/// the two builds match. Split out from [`ensure_version_match`] so the
+/// wording is testable without a daemon.
+pub fn version_skew_message(cli: &str, daemon: &str) -> Option<String> {
+    (cli != daemon).then(|| {
+        format!(
+            "This CLI is minimal {cli}, but the running minimald is {daemon}. \
+             The two speak the same RPCs only when built together, so continuing \
+             would fail partway through and tear down whatever it had created. \
+             Restart the daemon on the new build: run `min stop`, then re-run this \
+             command (the daemon is started again automatically). \
+             Set {SKEW_OVERRIDE_VAR}=1 to proceed anyway."
+        )
+    })
+}
+
 /// The provider kind the CLI should talk to, given `--provider`.
 ///
 /// The native minimald and minvmd backends now occupy distinct provider dirs,
