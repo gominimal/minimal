@@ -137,12 +137,18 @@ export KBUILD_BUILD_HOST=minimal
 
 Those three cover the timestamp, user and host only. Two further inputs bite in practice:
 
-- **Build paths.** For an out-of-tree build, remap them in the assembler flags as well as
-  the compiler flags, or the source directory ends up in the debug info:
-  `export KCFLAGS="-ffile-prefix-map=$(pwd)=/builddir"` and the same value in `KAFLAGS`.
-- **Module signing.** With `CONFIG_MODULE_SIG_ALL=y`, Kbuild generates a throwaway signing
-  key when none is configured, so every module's signature differs between builds. Point
-  `CONFIG_MODULE_SIG_KEY` at a stable key you supply, or turn the option off.
+- **Build paths.** An out-of-tree build can put absolute filenames in the debug info.
+  Remap them in the assembler flags as well as the compiler flags, so `.S` files are
+  covered alongside `.c`:
+  `export KCFLAGS="-fdebug-prefix-map=$(pwd)=/builddir"` and the same value in `KAFLAGS`.
+- **Module signing.** With `CONFIG_MODULE_SIG_ALL` enabled, Kbuild generates a fresh
+  temporary key per build, so every module signature differs. The simplest fix is to
+  disable it; signing reproducibly means treating a persistent key as a source input and
+  attaching detached signatures in a second pass.
+
+The kernel documents its own remaining cases — `CONFIG_RANDSTRUCT`'s seed, `CONFIG_IKHEADERS`
+timestamps, and the module-signing workflow above — in
+[Reproducible builds](https://docs.kernel.org/kbuild/reproducible-builds.html).
 
 ### Builds that stamp their own wall-clock time
 
