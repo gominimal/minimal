@@ -3,7 +3,7 @@
 
 use chrono::Utc;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -64,20 +64,36 @@ fn pad_truncate(s: &str, w: usize) -> String {
 fn render_sidebar(model: &mut Model, frame: &mut Frame, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .padding(ratatui::widgets::Padding::horizontal(1))
-        .title(Span::styled(
-            " sessions ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        .padding(ratatui::widgets::Padding::horizontal(1));
     let inner = block.inner(area);
     let inner_width = inner.width as usize;
     frame.render_widget(block, area);
 
-    // The filter line and its separator pin to the top, per the spec's
-    // layout mock (dim while the filter isn't being edited); the session
-    // list scrolls beneath them.
-    let [filter_area, list_area] =
-        Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(inner);
+    // The centered logo and its separator pin to the top, with the filter
+    // line and its own separator beneath per the spec's layout mock (dim
+    // while the filter isn't being edited); the session list scrolls
+    // underneath.
+    let [logo_area, filter_area, list_area] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Min(1),
+    ])
+    .areas(inner);
+    // The logo uses Legacy Computing diagonal blocks (U+1FB40..U+1FB5F) for
+    // cleaner slanted stripes; those codepoints are missing from some
+    // terminal fonts. If that turns out to hurt in practice, the Geometric
+    // Shapes fallback (renders almost everywhere) is "▃◥◣◥◣ M I N I M A L".
+    let logo_lines = vec![
+        Line::styled(
+            "▃🭕🭏🭕🭏 M I N I M A L",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::styled("─".repeat(inner_width), Style::default().fg(Color::Gray)),
+    ];
+    frame.render_widget(
+        Paragraph::new(logo_lines).alignment(Alignment::Center),
+        logo_area,
+    );
     let filter_style = if model.filter.editing {
         Style::default()
     } else {
