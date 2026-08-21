@@ -3,8 +3,8 @@ source: crates/minimal-tui/tests/snapshots.rs
 expression: render(&mut model)
 ---
 "┌──────────────────────────────┐┌ api-staging · 00000000 ──────────────────────────────────────────┐"
-"│      ▃◥◣◥◣ M I N I M A L     ││ project /src/api                  net   ?                        │"
-"│ ──────────────────────────── ││ user    ?                         idle  -                        │"
+"│      ▃🭕🭏🭕🭏 M I N I M A L     ││ project /src/api                  net     ?                      │"
+"│ ──────────────────────────── ││ user    ?                         idle    -                      │"
 "│ /                            ││ title   -                                                        │"
 "│ ──────────────────────────── ││ bells   -                                                        │"
 "│ ▼ host  v0.1              ●  ││ ─ Policy ─────────────────────────────────────────────────────── │"
