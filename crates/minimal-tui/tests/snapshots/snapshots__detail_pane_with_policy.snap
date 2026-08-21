@@ -1,10 +1,10 @@
 ---
 source: crates/minimal-tui/tests/snapshots.rs
-expression: render(&model)
+expression: render(&mut model)
 ---
 "┌ sessions ────────────────────┐┌ api-staging · 00000000 ──────────────────────────────────────────┐"
-"│ /                            ││ project /src/api                  net   OwnIp                    │"
-"│ ──────────────────────────── ││ user    chroma                    idle  -                        │"
+"│ /                            ││ project /src/api                  net     OwnIp                  │"
+"│ ──────────────────────────── ││ user    chroma                    idle    -                      │"
 "│ ▼ host  v0.1              ●  ││ title   -                                                        │"
 "│   ▸ api-staging     OwnIp    ││ bells   -                                                        │"
 "│                              ││ ─ Policy ─────────────────────────────────────────────────────── │"

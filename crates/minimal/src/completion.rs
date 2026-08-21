@@ -215,6 +215,7 @@ mod tests {
             name: name.map(str::to_string),
             project_path: None,
             status: Default::default(),
+            git: None,
             attrs: None,
         }
     }
