@@ -316,6 +316,7 @@ mod tests {
             name: None,
             project_path: Some(HostAbsPath::try_new(path).unwrap()),
             status,
+            git: None,
             attrs: None,
         }
     }
@@ -328,6 +329,7 @@ mod tests {
             name: None,
             project_path: None,
             status,
+            git: None,
             attrs: None,
         }
     }

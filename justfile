@@ -309,6 +309,11 @@ test: _nextest
 doctest:
     cargo test {{scope}} --doc --locked
 
+# Regenerate the minimal-tui insta snapshots after an intentional render change;
+# `just test` fails until these are updated. Review the diff, then `just test` to verify.
+test-snap-update:
+    INSTA_UPDATE=always cargo test -p minimal-tui --test snapshots --locked
+
 # The old `cargo test -- --include-ignored` pre-PR surface; the env-gated
 # VM/netns harnesses self-skip here (`just test-vm` runs those for real).
 #

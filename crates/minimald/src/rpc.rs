@@ -116,18 +116,25 @@ async fn serve_list_sessions(
                 .await
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             let mngr = s.sessions_manager().await;
+            let infos = mngr
+                .list()
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             Ok(ListSessionsResponse {
                 resource_pool,
-                sessions: mngr
-                    .list()
-                    .await
-                    .map_err(|e| ConnectionError::Internal(e.to_string()))?
-                    .into_iter()
-                    .map(|i| ListSessionsEntry {
+                // The git probes run in parallel across sessions: each is
+                // one small process under a deadline, and serializing them
+                // would multiply the latency of every list call.
+                sessions: futures::future::join_all(infos.into_iter().map(|i| async move {
+                    let git = probe_git_info(i.project_path.as_utf8_path().as_std_path())
+                        .await
+                        .map(Box::new);
+                    ListSessionsEntry {
                         id: i.id,
                         name: i.name,
                         project_path: Some(i.project_path),
                         status: i.status,
+                        git,
                         attrs: i.attrs.map(|a| minimald_rpc::RunningSessionAttrs {
                             last_stdout: a.stdout_last.map(|i| i.into()),
                             last_stdin: a.stdin_last.map(|i| i.into()),
@@ -144,11 +151,61 @@ async fn serve_list_sessions(
                                 last: t.into(),
                             }),
                         }),
-                    })
-                    .collect(),
+                    }
+                }))
+                .await,
             })
         })
         .await
+}
+
+/// Per-probe deadline for the `git rev-parse` calls
+/// [`serve_list_sessions`] runs: a list response must stay fast even when
+/// a session's project sits on a wedged filesystem.
+const GIT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Probes the git context of `path` for [`minimald_rpc::GitInfo`]: one
+/// `rev-parse` invocation answers the branch, the toplevel, and the git
+/// directory. `--absolute-git-dir` (not `--git-dir`) keeps the worktree
+/// comparison exact — the relative form prints `.git` when `path` is the
+/// toplevel. Anything but a clean success — not a repo, no git binary, a
+/// timeout — yields `None`.
+async fn probe_git_info(path: &std::path::Path) -> Option<minimald_rpc::GitInfo> {
+    let out = tokio::time::timeout(
+        GIT_PROBE_TIMEOUT,
+        tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args([
+                "rev-parse",
+                "--abbrev-ref",
+                "HEAD",
+                "--show-toplevel",
+                "--absolute-git-dir",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut lines = text.lines();
+    let (branch, toplevel, git_dir) = match (lines.next(), lines.next(), lines.next(), lines.next())
+    {
+        (Some(branch), Some(toplevel), Some(git_dir), None) => (branch, toplevel, git_dir),
+        _ => return None,
+    };
+    Some(minimald_rpc::GitInfo {
+        branch: branch.to_string(),
+        repo_root: toplevel.to_string(),
+        is_worktree: git_dir != format!("{toplevel}/.git"),
+    })
 }
 
 fn detect_resource_pool() -> Option<ResourcePool> {
@@ -2413,6 +2470,8 @@ mod tests {
                 // A freshly-created session that hasn't been configured yet
                 // sits in `Pending` until `ConfigureLoadout` promotes it.
                 status: sessions::SessionStatus::Pending,
+                // /uwu is not a git repository, so the probe yields nothing.
+                git: None,
                 attrs: None,
             }]
         );
@@ -2454,6 +2513,100 @@ mod tests {
         // The configured ingress was `None`, and the read reflects that rather
         // than the old hardcoded `Some(IngressPolicy::default())`.
         assert_eq!(policy.ingress, None);
+    }
+
+    /// `ListSessions` answers each session's git context: branch and
+    /// toplevel for a plain repo, the worktree flag for a linked
+    /// worktree, and `None` for a non-repo project. Follows
+    /// `session_delta`'s fixture; skipped where no git binary exists.
+    #[tokio::test]
+    async fn list_sessions_reports_git_info_per_session() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: no git binary in this environment");
+            return;
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["commit", "--allow-empty", "-m", "initial"]);
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_path = wt_parent.path().join("wt");
+        git(&[
+            "worktree",
+            "add",
+            "-b",
+            "feature",
+            wt_path.to_str().unwrap(),
+        ]);
+        let plain = tempfile::tempdir().unwrap();
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        for (name, path) in [
+            ("repo-s", repo.path()),
+            ("wt-s", wt_path.as_path()),
+            ("plain-s", plain.path()),
+        ] {
+            crate::test_harness::create_configured_session(
+                &mut client,
+                name,
+                path.to_str().unwrap(),
+            )
+            .await;
+        }
+
+        let list = client.call::<ListSessions>(&()).await;
+        let by_name = |n: &str| {
+            list.sessions
+                .iter()
+                .find(|s| s.name.as_deref() == Some(n))
+                .unwrap_or_else(|| panic!("session {n} missing from list"))
+        };
+
+        // `--show-toplevel` canonicalizes; tempdir paths may pass through
+        // symlinks (/var → /private/var on macOS).
+        let repo_root = std::fs::canonicalize(repo.path()).unwrap();
+        let repo_s = by_name("repo-s")
+            .git
+            .clone()
+            .expect("repo-s must have git info");
+        assert_eq!(repo_s.branch, "main");
+        assert_eq!(std::fs::canonicalize(&repo_s.repo_root).unwrap(), repo_root,);
+        assert!(!repo_s.is_worktree);
+
+        let wt_s = by_name("wt-s")
+            .git
+            .clone()
+            .expect("wt-s must have git info");
+        assert_eq!(wt_s.branch, "feature");
+        assert!(wt_s.is_worktree, "linked worktree must be flagged");
+
+        assert_eq!(by_name("plain-s").git, None, "non-repo must probe to None");
     }
 
     #[tokio::test]

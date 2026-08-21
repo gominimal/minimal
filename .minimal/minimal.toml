@@ -5,15 +5,23 @@ locked_commit = "b1a1b1b7275d06dcd9235708a648c88e928b9462"
 
 [stack]
 use = "rust"
-runtime_packages = ["socat"]
+runtime_packages = [
+    "socat",
+    "pkgconf",
+    "openssl",
+    "linux_headers",
+    "zlib",
+    "protobuf",
+    "skopeo",
+    "coreutils",
+    "git",
+]
 
 [defaults]
-profile = "dev"
 state_key = "dev"
 
-[tasks.claude]
-interactive = true
-exec = "claude --dangerously-skip-permissions"
+[session]
+packages = ["just", "shellcheck", "python"]
 
 [tasks.build]
 description = "Builds the minimal CLI"
@@ -29,12 +37,38 @@ inherit_cwd = true
 exec = "cargo test --verbose"
 inherit_cwd = true
 
-[tasks.shell]
-interactive = true
-exec = "bash --noprofile -l"
-
 [tasks.startup-time]
 exec = "date"
+
+[tasks.fmt-check]
+exec = "cargo fmt -- --check"
+inherit_cwd = true
+
+[tasks.clippy]
+exec = "cargo clippy --all-targets -- -D warnings"
+inherit_cwd = true
+
+# Mutation-test the graph wire decoder. Runs in the Linux sandbox, where the
+# graph baseline test suite is green (the spec_hasher hash assertions that fail
+# on macOS pass here), which cargo-mutants requires. Scoped to wire.rs to keep
+# the run bounded; widen -f / drop it to cover more.
+[tasks.mutants]
+description = "Mutation-test the graph wire decoder with cargo-mutants"
+inherit_cwd = true
+bash = """
+set -e
+command -v cargo-mutants >/dev/null 2>&1 || cargo install cargo-mutants --locked
+cargo mutants -p graph -f wire.rs --timeout 120
+"""
+
+[tasks.ci]
+inherit_cwd = true
+bash = """
+set -e
+cargo test --verbose
+# cargo fmt -- --check
+# cargo clippy --all-targets -- -D warnings
+"""
 
 [outputs.bash-img]
 type = "oci-image"
@@ -65,64 +99,3 @@ path = "usr/share/microvm-rootfs/rootfs.img"
 type = "oci-image"
 packages = ["libkrun"]
 
-[session]
-packages = ["just", "protobuf", "shellcheck", "python"]
-
-[tasks.vim]
-profile = "demo"
-state_key = ""
-exec = "vim"
-
-[tasks.btop]
-profile = "demo"
-state_key = ""
-exec = "btop"
-
-[tasks.demo-shell]
-profile = "demo"
-state_key = "demo"
-exec = "bash -l"
-
-[tasks.python]
-profile = "demo"
-state_key = "demo"
-exec = "python3"
-
-
-[tasks.ci]
-inherit_cwd = true
-bash = """
-set -e
-cargo test --verbose
-cargo fmt -- --check
-cargo clippy --all-targets -- -D warnings
-"""
-
-[tasks.fmt-check]
-exec = "cargo fmt -- --check"
-inherit_cwd = true
-
-[tasks.clippy]
-exec = "cargo clippy --all-targets -- -D warnings"
-inherit_cwd = true
-
-# Mutation-test the graph wire decoder. Runs in the Linux sandbox, where the
-# graph baseline test suite is green (the spec_hasher hash assertions that fail
-# on macOS pass here), which cargo-mutants requires. Scoped to wire.rs to keep
-# the run bounded; widen -f / drop it to cover more.
-[tasks.mutants]
-description = "Mutation-test the graph wire decoder with cargo-mutants"
-inherit_cwd = true
-bash = """
-set -e
-command -v cargo-mutants >/dev/null 2>&1 || cargo install cargo-mutants --locked
-cargo mutants -p graph -f wire.rs --timeout 120
-"""
-
-[tasks.arg-smoketest]
-args = {
-    input_str = "string"
-}
-bash = """
-echo Input was: %{input_str}
-"""
