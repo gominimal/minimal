@@ -538,6 +538,15 @@ fn update_key(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
             model.filter.editing = true;
             Vec::new()
         }
+        // Esc clears an applied filter (the footer advertises this) but
+        // does nothing when no filter is set, so it stays a safe no-op.
+        // Clearing restores rows ahead of the cursor, so the session under
+        // it can change: refresh focus like any other cursor change.
+        (KeyCode::Esc, _) if !model.filter.input.is_empty() => {
+            model.filter = FilterState::default();
+            model.clamp_cursor();
+            on_focus_change(model)
+        }
         (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
             model.cursor = model.cursor.saturating_sub(1);
             on_focus_change(model)
@@ -1258,6 +1267,40 @@ mod tests {
         assert!(!model.filter.editing);
         assert!(model.filter.input.is_empty());
         assert_eq!(model.visible_rows().len(), 5);
+    }
+
+    #[test]
+    fn esc_clears_an_applied_filter_and_is_otherwise_a_no_op() {
+        let mut model = two_providers();
+        // Apply a filter, then leave the editing mode (Enter keeps input).
+        update(&mut model, key(KeyCode::Char('/')));
+        for c in "bench".chars() {
+            update(&mut model, key(KeyCode::Char(c)));
+        }
+        update(&mut model, key(KeyCode::Enter));
+        assert!(!model.filter.editing);
+        assert_eq!(model.filter.input, "bench");
+        // Focus "bench": the only session row left by the filter (both
+        // provider headers stay visible, so it sits at row 2).
+        update(&mut model, key(KeyCode::Down));
+        update(&mut model, key(KeyCode::Down));
+        assert_eq!(model.focused(), Some(skey("vm", 3)));
+        // Esc clears the applied filter...
+        let effects = update(&mut model, key(KeyCode::Esc));
+        assert!(model.filter.input.is_empty());
+        // ...restoring the host sessions ahead of "bench", so its row index
+        // shifts and the focus lands on the session now under the cursor and
+        // refreshes (detail fetched, bells acknowledged).
+        assert_eq!(model.focused(), Some(skey("host", 2)));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchDetail(k) if *k == skey("host", 2)))
+        );
+        // ...and a second Esc does not quit or otherwise change state.
+        update(&mut model, key(KeyCode::Esc));
+        assert!(!model.quit);
+        assert!(model.action.is_none());
     }
 
     #[test]

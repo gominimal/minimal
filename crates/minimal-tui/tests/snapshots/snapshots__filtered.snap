@@ -31,4 +31,4 @@ expression: render(&mut model)
 "│                              ││                                                                  │"
 "│                              ││                                                                  │"
 "└──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘"
-" ↑↓ move · / filter · enter attach · d destroy · r rename · n new · q quit                          "
+" ↑↓ move · / filter · esc clear filter · enter attach · d destroy · r rename · n new · q quit       "

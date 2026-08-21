@@ -748,23 +748,35 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
         }
         None => {
             // Key hints flush left; the transient status line flush right.
-            frame.render_widget(
-                Paragraph::new(Line::styled(
-                    " ↑↓ move · / filter · enter attach · d destroy · r rename · n new · q quit ",
-                    Style::default().fg(Color::Gray),
-                )),
-                area,
-            );
-            if let Some(status) = &model.status {
+            // An applied filter already shows its input in the sidebar's
+            // `/` line, so the footer only advertises how to drop it.
+            let hints = if model.filter.input.is_empty() {
+                " ↑↓ move · / filter · enter attach · d destroy · r rename · n new · q quit "
+                    .to_string()
+            } else {
+                " ↑↓ move · / filter · esc clear filter · enter attach · d destroy · r rename · n new · q quit "
+                    .to_string()
+            };
+            let line = Line::styled(hints, Style::default().fg(Color::Gray));
+            let status_line = model.status.as_ref().map(|status| {
                 let style = if status.starts_with("error:") {
                     Style::default().fg(Color::Red)
                 } else {
                     Style::default().fg(Color::Cyan)
                 };
+                Line::styled(format!("{status} "), style)
+            });
+            // Reserve the right edge for the status so it can't overdraw
+            // the hints.
+            let status_width = status_line.as_ref().map_or(0, |l| l.width() as u16);
+            let [line_area, status_area] =
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(status_width)])
+                    .areas(area);
+            frame.render_widget(Paragraph::new(line), line_area);
+            if let Some(status_line) = status_line {
                 frame.render_widget(
-                    Paragraph::new(Line::styled(format!("{status} "), style))
-                        .alignment(Alignment::Right),
-                    area,
+                    Paragraph::new(status_line).alignment(Alignment::Right),
+                    status_area,
                 );
             }
         }
