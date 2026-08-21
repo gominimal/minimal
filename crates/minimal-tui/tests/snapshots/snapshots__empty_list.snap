@@ -1,13 +1,13 @@
 ---
 source: crates/minimal-tui/tests/snapshots.rs
-expression: "render(&fixed_model(vec![]))"
+expression: "render(&mut fixed_model(vec![]))"
 ---
-"┌ sessions ────────────────────┐┌──────────────────────────────────────────────────────────────────┐"
-"│ /                            ││ no session selected                                              │"
+"┌──────────────────────────────┐┌──────────────────────────────────────────────────────────────────┐"
+"│      ▃◥◣◥◣ M I N I M A L     ││ no session selected                                              │"
+"│ ──────────────────────────── ││                                                                  │"
+"│ /                            ││                                                                  │"
 "│ ──────────────────────────── ││                                                                  │"
 "│ no sessions (n to create)    ││                                                                  │"
-"│                              ││                                                                  │"
-"│                              ││                                                                  │"
 "│                              ││                                                                  │"
 "│                              ││                                                                  │"
 "│                              ││                                                                  │"
