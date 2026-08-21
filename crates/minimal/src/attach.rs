@@ -12,10 +12,75 @@
 //! owns its own raw-mode handling and fuzzy-filters by default.
 
 use std::fmt;
-use std::io::IsTerminal as _;
+use std::io::{IsTerminal as _, Write as _};
 
 use anyhow::Context as _;
 use minimald_rpc::ListSessionsEntry;
+
+/// The escape sequences that put a terminal back into the state a shell
+/// expects, whatever the session left it in: mouse reporting and its encodings
+/// off, bracketed paste off, application cursor keys and keypad off, off the
+/// alternate screen, cursor visible, drawing attributes and focus reporting
+/// reset.
+///
+/// The same set `minimald` computes per session as its unwind codes, minus the
+/// "only if currently set" narrowing — a client has no screen model to diff
+/// against, and every sequence here is a no-op against a terminal that was
+/// never in that mode.
+const TERMINAL_UNWIND: &[u8] = concat!(
+    // mouse reporting: press, press/release, button-motion, any-motion
+    "\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l",
+    // mouse encodings: utf-8, SGR, urxvt
+    "\x1b[?1005l\x1b[?1006l\x1b[?1015l",
+    // bracketed paste, application cursor keys, application keypad
+    "\x1b[?2004l\x1b[?1l\x1b>",
+    // leave the alternate screen, unhide the cursor
+    "\x1b[?1049l\x1b[?25h",
+    // blind: reset drawing attributes ('SGR') and focus reporting
+    "\x1b[m\x1b[?1004l",
+)
+.as_bytes();
+
+/// Restores the terminal on drop, unconditionally, around an attach.
+///
+/// `minimald` sends unwind codes with every teardown it initiates, but the
+/// client cannot assume it will hear them: a daemon predating #1210 sends none
+/// when the session process dies, and a transport that drops mid-session sends
+/// nothing at all. By then this process is the only thing left that can still
+/// reach the tty — ssh restores termios but knows nothing of the DEC private
+/// modes the remote app set — so it writes the sequences itself on the way
+/// out, and a session that died with mouse reporting on cannot leave the
+/// user's shell spraying escape sequences whenever the mouse moves.
+///
+/// Writing them after a well-behaved teardown is harmless: the sequences are
+/// idempotent, and the daemon has already written the same ones.
+pub(crate) struct TerminalUnwind {
+    /// Whether there is a terminal to write to at all. A redirected stdout
+    /// gets nothing — the bytes would be data in whatever captured it, and a
+    /// pipe has no modes to restore.
+    armed: bool,
+}
+
+impl TerminalUnwind {
+    pub(crate) fn arm() -> Self {
+        Self {
+            armed: std::io::stdout().is_terminal(),
+        }
+    }
+}
+
+impl Drop for TerminalUnwind {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Best-effort: this runs on the way out of an attach, and a terminal
+        // that cannot be written to is already beyond repair.
+        let mut out = std::io::stdout();
+        let _ = out.write_all(TERMINAL_UNWIND);
+        let _ = out.flush();
+    }
+}
 
 /// The current working directory as a host path, respecting the `--repo-dir`
 /// (`-C`) override. The result is canonicalized so it compares equal to a
@@ -334,6 +399,33 @@ mod tests {
 
     fn cwd(path: &str) -> HostAbsPath {
         HostAbsPath::try_new(path).unwrap()
+    }
+
+    /// Every sequence the guard writes has to be a "put it back" form. The
+    /// client has no screen model to diff against, so it writes the whole set
+    /// blind and must never be able to put a terminal *into* a mode it was not
+    /// already in: `l` on every DEC private mode but the cursor, and the
+    /// keypad *reset* `ESC >`, never the set `ESC =`.
+    #[test]
+    fn terminal_unwind_only_ever_disables() {
+        let seq = std::str::from_utf8(TERMINAL_UNWIND).expect("the unwind codes are ASCII");
+        for tail in seq.split("\x1b[?").skip(1) {
+            // A DEC private mode ends at its final byte, the first letter.
+            let end = tail
+                .find(char::is_alphabetic)
+                .expect("a DEC private mode has a final byte");
+            let mode = &tail[..=end];
+            assert!(
+                // `25h` unhides the cursor: the safe direction of that one.
+                mode.ends_with('l') || mode == "25h",
+                "the unwind turns something on: {mode:?} in {seq:?}",
+            );
+        }
+        assert!(!seq.contains("\x1b="), "application keypad set: {seq:?}");
+        // The modes the reported terminal corruption is actually about (#1210).
+        for mouse in ["\x1b[?1000l", "\x1b[?1002l", "\x1b[?1003l"] {
+            assert!(seq.contains(mouse), "missing {mouse:?} in {seq:?}");
+        }
     }
 
     #[test]

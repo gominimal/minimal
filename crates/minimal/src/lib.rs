@@ -2471,11 +2471,43 @@ async fn session_via_ssh(
     // forever (#953). Fail fast instead of hanging.
     if command.is_empty() {
         ensure_interactive_attach_tty(std::io::stdin().is_terminal())?;
+
+        // The interactive path waits on ssh rather than `exec()`ing it, so this
+        // process outlives the attach by the moment it takes to put the
+        // terminal back. `minimald` sends unwind codes with every teardown it
+        // initiates, but the client cannot count on hearing them — a daemon
+        // predating #1210 sends none when the session process dies, and a
+        // dropped transport sends nothing at all — and once ssh is gone this is
+        // the only process left that can still reach the tty. `min dash`
+        // already runs the same command as a child while it is suspended.
+        let code = {
+            let _unwind = attach::TerminalUnwind::arm();
+            let status = tokio::process::Command::from(ssh)
+                .status()
+                .await
+                .context("failed to run ssh")?;
+            exit_code_of(status)
+        };
+        // Terminate with ssh's own status, exactly as the `exec()` this
+        // replaced did: `min` has nothing of its own left to say after an
+        // attach, and the guard above has already run.
+        std::process::exit(code);
     }
 
     let err = ssh.exec();
     // exec() only returns on failure
     bail!("failed to exec ssh: {err}");
+}
+
+/// A child's exit status as this process's exit code, following the shell's
+/// `128 + signal` convention for a signalled child. Reproduces what `exec()`
+/// gave for free: the client's status *is* ssh's.
+fn exit_code_of(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt as _;
+    status
+        .code()
+        .or_else(|| status.signal().map(|s| 128 + s))
+        .unwrap_or(1)
 }
 
 /// Print the effective networking policy for a session as JSON.
@@ -3666,6 +3698,21 @@ mod tests {
             "expected an actionable non-TTY error, got: {err}"
         );
         ensure_interactive_attach_tty(true).expect("a real terminal must pass the guard");
+    }
+
+    /// The interactive attach no longer `exec()`s ssh — it waits on it so the
+    /// terminal can be put back afterwards (#1210) — so the status ssh reports
+    /// has to become this process's own, signalled children included.
+    #[test]
+    fn ssh_status_becomes_the_clients_exit_code() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        assert_eq!(exit_code_of(std::process::ExitStatus::from_raw(0)), 0);
+        // wait(2) encoding: the exit code sits in the high byte.
+        assert_eq!(exit_code_of(std::process::ExitStatus::from_raw(3 << 8)), 3);
+        // A signalled child reports no code of its own; the shell's 128 + n.
+        // 9 is SIGKILL, in the low bits where wait(2) puts the signal.
+        assert_eq!(exit_code_of(std::process::ExitStatus::from_raw(9)), 137);
     }
 
     /// The `Cli` command tree must stay well-formed: a malformed clap

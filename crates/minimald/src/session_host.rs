@@ -370,7 +370,15 @@ enum BindingMsg {
     Stdin(Vec<u8>),
     /// The session process ended, so the binding should tear down and raise the
     /// shell-exit prompt. See [`TeardownCause`] for what the binding surfaces.
-    TeardownDueToProcessExit(TeardownCause),
+    ///
+    /// Carries unwind codes like every other teardown. The notices and the
+    /// shell-exit prompt are written into the terminal the dead process left
+    /// behind, so without them both render through its mouse and keypad modes
+    /// — and the user's own shell inherits them afterwards (#1210).
+    TeardownDueToProcessExit {
+        cause: TeardownCause,
+        unwind_codes: Vec<u8>,
+    },
     TeardownDueToSuperceded(Vec<u8>),
     TeardownDueToDetach(Vec<u8>),
     TeardownDueToDaemonShutdown(Vec<u8>),
@@ -628,7 +636,12 @@ impl Binding {
                         BindingMsg::Stdin(b) => {
                             let _ = w.write_all(&b).await;
                         },
-                        BindingMsg::TeardownDueToProcessExit(cause) => {
+                        BindingMsg::TeardownDueToProcessExit { cause, unwind_codes } => {
+                            // Before the notices below and before the
+                            // shell-exit prompt further down: both render into
+                            // the terminal the session process just left, and
+                            // it may well have left mouse reporting on (#1210).
+                            let _ = w.write_all(&unwind_codes).await;
                             // `shown` records whether the user was told
                             // anything beyond the prompt itself: a suppressed
                             // notice leaves no other trace, and the expected
@@ -2994,8 +3007,15 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     /// sender, so the binding sees the teardown before falling through to
     /// `HostGone`.
     fn notify_remote_teardown(&mut self, cause: TeardownCause) {
+        // Read off the screen before the binding slot is borrowed: the binding
+        // has no view of this host's parser, so the codes that undo whatever
+        // input modes the process left behind have to travel with the message.
+        let unwind_codes = self.unwind_codes();
         match self.remote.as_mut() {
-            Some((tx, _hnd)) => match tx.try_send(BindingMsg::TeardownDueToProcessExit(cause)) {
+            Some((tx, _hnd)) => match tx.try_send(BindingMsg::TeardownDueToProcessExit {
+                cause,
+                unwind_codes,
+            }) {
                 Ok(()) => tracing::debug!(
                     session_id = %self.session_id,
                     "handed the teardown cause to the attached binding",
@@ -3518,11 +3538,15 @@ mod tests {
         rx
     }
 
-    /// Drains the binding's queue and returns the teardown it was handed, if
-    /// any. Stdout traffic is noise here — the shell echoes its own prompt.
-    fn teardown_from(rx: &mut mpsc::Receiver<BindingMsg>) -> Option<TeardownCause> {
+    /// Drains the binding's queue and returns the teardown it was handed — the
+    /// cause together with the unwind codes that travel with it — if any.
+    /// Stdout traffic is noise here — the shell echoes its own prompt.
+    fn teardown_from(rx: &mut mpsc::Receiver<BindingMsg>) -> Option<(TeardownCause, Vec<u8>)> {
         std::iter::from_fn(|| rx.try_recv().ok()).find_map(|msg| match msg {
-            BindingMsg::TeardownDueToProcessExit(cause) => Some(cause),
+            BindingMsg::TeardownDueToProcessExit {
+                cause,
+                unwind_codes,
+            } => Some((cause, unwind_codes)),
             _ => None,
         })
     }
@@ -3566,7 +3590,7 @@ mod tests {
             .expect("host task should not panic during teardown")
             .expect("mainloop should return the reaped exit status");
 
-        let cause = teardown_from(&mut rx).expect("the binding must be told the shell exited");
+        let (cause, _) = teardown_from(&mut rx).expect("the binding must be told the shell exited");
         assert!(
             cause.notices().is_empty(),
             "a clean exit stays silent: {:?}",
@@ -3579,6 +3603,89 @@ mod tests {
         assert!(
             !exit.is_abnormal(),
             "a shell that exited on its own is not abnormal: {exit:?}",
+        );
+    }
+
+    /// Reads forwarded stdout off the binding channel until `needle` shows up.
+    /// The host feeds its parser from the same read it forwards, and in that
+    /// order, so seeing the bytes here proves the screen has already absorbed
+    /// them — which is what keeps the assertion below off a race with the mock
+    /// shell's echo.
+    async fn await_forwarded(rx: &mut mpsc::Receiver<BindingMsg>, needle: &[u8]) {
+        let mut seen: Vec<u8> = Vec::new();
+        let wait = async {
+            while let Some(msg) = rx.recv().await {
+                if let BindingMsg::Stdin(b) = msg {
+                    seen.extend_from_slice(&b);
+                    if seen.windows(needle.len()).any(|w| w == needle) {
+                        return;
+                    }
+                }
+            }
+            panic!("the binding channel closed before the session echoed {needle:?}");
+        };
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for the session to echo {needle:?}"));
+    }
+
+    /// #1210: a process that dies while a full-screen app still has mouse
+    /// reporting on must hand the binding the codes that turn it back off. The
+    /// exit notices and the shell-exit prompt render into that same terminal,
+    /// and the user keeps it after answering — so this teardown has to carry
+    /// the unwind exactly as detach, supercede, and shutdown do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shell_exit_hands_the_binding_the_codes_that_leave_mouse_mode() {
+        let (mut host, _handle) = Host::build(
+            MockLauncher,
+            "test-session".to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+            None,
+            None,
+            None,
+            std::env::temp_dir(),
+            sessions::SessionId::nil(),
+            None,
+            ConnectionEnv::new(),
+        )
+        .await
+        .expect("failed to build host");
+        let mut rx = watch_binding(&mut host);
+        let stdin = host.remote_tx.clone();
+        let task = tokio::spawn(host.mainloop());
+
+        // The mock shell echoes every line back, which is how a test drives the
+        // host's screen into the state a full-screen app leaves behind: here,
+        // any-motion mouse tracking left on.
+        const MOUSE_ON: &[u8] = b"\x1b[?1003h";
+        const MOUSE_OFF: &[u8] = b"\x1b[?1003l";
+        let mut line = MOUSE_ON.to_vec();
+        line.push(b'\n');
+        stdin
+            .send(StdinMsg::Bytes(bytes::Bytes::from(line)))
+            .await
+            .expect("failed to send the mouse-enable line");
+        await_forwarded(&mut rx, MOUSE_ON).await;
+
+        stdin
+            .send(StdinMsg::Bytes(bytes::Bytes::from(
+                format!("{MOCK_EXIT_LINE}\n").into_bytes(),
+            )))
+            .await
+            .expect("failed to send exit line");
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("mainloop should terminate after the shell exits")
+            .expect("host task should not panic during teardown")
+            .expect("mainloop should return the reaped exit status");
+
+        let (_, unwind) =
+            teardown_from(&mut rx).expect("the binding must be told the shell exited");
+        assert!(
+            unwind.windows(MOUSE_OFF.len()).any(|w| w == MOUSE_OFF),
+            "the teardown must leave mouse mode: {unwind:?}",
         );
     }
 
