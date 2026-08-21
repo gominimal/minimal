@@ -15,17 +15,25 @@ use std::time::SystemTime;
 /// that need to distinguish "no log dir" from "no matches" check the
 /// directory first.
 pub async fn newest_rotated(dir: &Path, prefix: &str, limit: usize) -> Vec<PathBuf> {
+    newest_matching(dir, limit, |name| name.starts_with(prefix)).await
+}
+
+/// The newest `limit` files in `dir` whose names satisfy `keep`, newest
+/// first — the general form of [`newest_rotated`] for selections that are not
+/// prefix-shaped (crash reports picked out by their `.panic` extension).
+/// Same ordering and same missing-dir behavior.
+pub async fn newest_matching(
+    dir: &Path,
+    limit: usize,
+    keep: impl Fn(&str) -> bool,
+) -> Vec<PathBuf> {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return Vec::new();
     };
     let mut matches: Vec<(SystemTime, PathBuf)> = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(prefix))
-        {
+        if path.file_name().and_then(|n| n.to_str()).is_some_and(&keep) {
             let mtime = entry
                 .metadata()
                 .await

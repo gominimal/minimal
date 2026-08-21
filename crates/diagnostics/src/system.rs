@@ -24,6 +24,11 @@ pub struct SystemInfo {
     pub kernel: Option<String>,
     pub hostname: Option<String>,
     pub ncpu: Option<usize>,
+    /// Total physical memory. A bundle records what a session asked the VM
+    /// for; without the host's own number that figure cannot be judged
+    /// oversized, and "the machine died under a 24 GiB allocation" stays a
+    /// guess.
+    pub mem_total_bytes: Option<u64>,
     pub euid: u32,
     #[cfg(target_os = "linux")]
     pub kvm: KvmInfo,
@@ -65,12 +70,40 @@ pub async fn system_info(disk_paths: &[&Path]) -> SystemInfo {
         kernel,
         hostname,
         ncpu: std::thread::available_parallelism().map(usize::from).ok(),
+        mem_total_bytes: mem_total_bytes().await,
         // SAFETY: geteuid has no failure modes or preconditions.
         euid: unsafe { libc::geteuid() },
         #[cfg(target_os = "linux")]
         kvm: kvm_info(),
         disks: disk_paths.iter().map(|p| disk_info(p)).collect(),
     }
+}
+
+/// Total physical memory in bytes, from `hw.memsize`.
+#[cfg(target_os = "macos")]
+async fn mem_total_bytes() -> Option<u64> {
+    crate::first_stdout_line("sysctl", &["-n", "hw.memsize"], FACT_TIMEOUT)
+        .await?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Total physical memory in bytes, from `/proc/meminfo`'s `MemTotal:` (which
+/// counts kibibytes). `None` anywhere `/proc` isn't the answer — best-effort,
+/// like every other probe here.
+#[cfg(not(target_os = "macos"))]
+async fn mem_total_bytes() -> Option<u64> {
+    tokio::fs::read_to_string("/proc/meminfo")
+        .await
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()
+        .map(|kib| kib * 1024)
 }
 
 fn disk_info(path: &Path) -> DiskInfo {
@@ -155,5 +188,14 @@ mod tests {
         );
         let json = serde_json_lenient::to_value(&info).unwrap();
         assert!(json["euid"].is_u64());
+        // A VM sizing recorded elsewhere in the bundle is only judgeable
+        // against the host's own memory, so the probe has to land where the
+        // platform can answer it.
+        assert!(info.mem_total_bytes.is_none_or(|bytes| bytes > 0));
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(
+            info.mem_total_bytes.is_some(),
+            "linux and macOS both report total memory"
+        );
     }
 }
