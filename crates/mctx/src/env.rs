@@ -560,6 +560,16 @@ pub fn interpolate_task_strings(
     .map_err(Error::Other)
 }
 
+/// Names whoever put a patch path into the environment: the package that
+/// declared it, or — for a path that arrived through the task's own `patch`
+/// table rather than a package attribute — the task itself.
+fn declared_by(packages: &HashMap<String, String>, declared: &str, task: &str) -> String {
+    match packages.get(declared) {
+        Some(p) => format!("package `{p}`"),
+        None => format!("task `{task}`"),
+    }
+}
+
 /// A successfully-configured runtime environment.
 pub struct Env<'a> {
     sandbox: sandbox2::Sandbox<EnvChannel<'a>>,
@@ -581,6 +591,7 @@ impl<'a> Env<'a> {
 
         let SetupForPackages {
             fs_mappings: mut patch,
+            fs_mapping_packages,
             needs_dns,
             needs_internet,
             state_dirs,
@@ -611,8 +622,36 @@ impl<'a> Env<'a> {
             );
         }
 
+        // `~/`-rooted patch paths expand against this environment's home. It
+        // is the ambient one here: the sandbox mirrors host paths one-for-one
+        // (`WdSetup::BoundDir`) and sandbox2 synthesizes the same home into
+        // the sandbox's passwd. A home that can't hold the file — notably `/`,
+        // which is what `minimald` sees as pid 1 in the guest — is refused
+        // with the package named, rather than landing the file at the root of
+        // a read-only rootfs (#1204).
+        let home = std::env::home_dir();
+        let fs_mappings = patch.to_fs_mappings(home.as_deref()).map_err(|e| {
+            Error::Other(anyhow::anyhow!(
+                "{e} (declared by {})",
+                declared_by(&fs_mapping_packages, &e.declared, args.name)
+            ))
+        })?;
+        // Expanded path → the declaration behind it. sandbox2 only ever sees
+        // the expanded form, so its "create mapped file" failures name a path
+        // nobody wrote down; this puts the package and its `~/`-rooted
+        // declaration back into the message.
+        let declarations: HashMap<String, &String> = fs_mapping_packages
+            .keys()
+            .filter_map(|declared| {
+                Some((
+                    EnvPatches::expand_home(declared, home.as_deref()).ok()?,
+                    declared,
+                ))
+            })
+            .collect();
+
         let mut config = sandbox2::config::Config::new(args.name)
-            .with_wd(args.cwd.clone(), false, patch.into())
+            .with_wd(args.cwd.clone(), false, fs_mappings)
             .with_rootfs(
                 args.transitives
                     .keys()
@@ -660,7 +699,23 @@ impl<'a> Env<'a> {
                     daemon_id,
                 },
             )
-            .await?;
+            .await
+            .map_err(|e| {
+                // Sandbox setup creates every mapped file it doesn't find. If
+                // that failed on a path we mapped in, say whose declaration it
+                // was — "create mapped file /.claude.json: EROFS" on its own
+                // sends nobody anywhere useful (#1204).
+                let sandbox2::Error::IO(_, path, _) = &e else {
+                    return e.into();
+                };
+                match path.to_str().and_then(|p| declarations.get(p)) {
+                    Some(declared) => Error::Other(anyhow::anyhow!(
+                        "{e}; mapped in by {}, which declares it as `{declared}`",
+                        declared_by(&fs_mapping_packages, declared, args.name)
+                    )),
+                    None => e.into(),
+                }
+            })?;
         for want_dir in state_dirs {
             std::fs::create_dir_all(args.state_base_dir.join(&want_dir)).map_err(|e| {
                 Error::IO("creating state dir", args.state_base_dir.join(want_dir), e)
@@ -843,6 +898,25 @@ mod tests {
     use sandbox2::Channel;
     use std::io::{BufRead, BufReader};
     use tempfile::tempdir;
+
+    /// A patch path a package declared is attributed to that package; one
+    /// that only the task's own `patch` table names falls back to the task.
+    /// The attribution is what makes a failure to map `~/.claude.json`
+    /// actionable — the path alone doesn't say who asked for it (#1204).
+    #[test]
+    fn declared_by_names_the_package_then_the_task() {
+        let packages =
+            HashMap::from_iter([("~/.claude.json".to_string(), "claude-code".to_string())]);
+        assert_eq!(
+            declared_by(&packages, "~/.claude.json", "test"),
+            "package `claude-code`"
+        );
+        assert_eq!(
+            declared_by(&packages, "~/.npmrc", "test"),
+            "task `test`",
+            "a path no package declared came from the task's own patch table"
+        );
+    }
 
     /// Helper: build a Context and Graph from the fakerepo test data,
     /// matching the pattern used in lib.rs tests.

@@ -20,6 +20,11 @@
 
 use std::sync::Arc;
 
+// The string form of the nickel enum tag `'Credential`, shared with the
+// package-attribute path in `graph` so both filters key off one definition.
+// That constant carries the schema-stability note; the regression guard on
+// this side is `credential_class_fs_mappings_are_filtered_out` below.
+use graph::CREDENTIAL_CLASS_TAG;
 use paths::DaemonAbsPath;
 use sessions::{
     SessionId,
@@ -96,23 +101,6 @@ fn extract_state_wiring(b: &graph::BuildSpec) -> Result<Vec<mfile::StateWiring>,
         })
         .collect()
 }
-
-/// The string form of the nickel enum tag `'Credential` as it
-/// appears after `decode`'s AttrValue conversion. Compared as a
-/// plain string at runtime in [`extract_fs_mappings`], so if
-/// `decode::AttrValue::EnumTag` ever changes its rendering
-/// (angle-brackets, hash prefix, etc.) the check here silently
-/// stops matching — credential mappings would then flow through
-/// unfiltered.
-///
-/// The actual regression guard is the
-/// `credential_class_fs_mappings_are_filtered_out` test in this
-/// module, which asserts a `'Credential`-tagged mapping is dropped.
-/// If `decode`'s enum-tag rendering changes, that test will fail
-/// and this constant is where to update.
-// TODO(schema-stability): keep in sync with `decode::AttrValue::EnumTag`
-// rendering.
-const CREDENTIAL_CLASS_TAG: &str = "Credential";
 
 fn extract_fs_mappings(b: &graph::BuildSpec) -> Vec<mfile::PackageFsMapping> {
     // TODO(secrets): `class = 'Credential` mappings are filtered

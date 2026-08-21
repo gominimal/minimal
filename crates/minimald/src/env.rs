@@ -439,6 +439,7 @@ impl Env {
         let (legacy_state_dirs, mut pkg_env_vars) = if args.include_package_attr_wiring {
             let SetupForPackages {
                 fs_mappings: _,
+                fs_mapping_packages: _,
                 needs_dns: _,
                 needs_internet: _,
                 state_dirs,
