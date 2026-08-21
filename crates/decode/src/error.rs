@@ -2,8 +2,11 @@
 
 use crate::ObjTy;
 use nickel_lang_core::error::Error as NclError;
+use nickel_lang_core::eval::cache::CacheImpl;
+use nickel_lang_core::eval::value::NickelValue;
 use nickel_lang_core::files::Files;
 use nickel_lang_core::position::TermPos;
+use nickel_lang_core::program::Program;
 use std::fmt;
 
 /// Errors that can occur when decoding nickel layers.
@@ -33,6 +36,23 @@ pub enum Error {
         got: ObjTy,
         want: ObjTy,
         pos: TermPos,
+    },
+    /// A value in the Nickel tree had a shape the decoder cannot read there.
+    ///
+    /// Nickel's own contracts do not catch every one of these: an `any_of`
+    /// contract does not fire on its element, and some fields are read
+    /// without a contract at all. The decoder re-checks the shape itself and
+    /// reports the offending value's position with this.
+    UnexpectedType {
+        files: Files,
+        pos: TermPos,
+        /// What was being read, e.g. ``container `cmd` ``.
+        what: String,
+        /// The shape(s) accepted there, e.g. "a string or an array of strings".
+        want: &'static str,
+        /// Nickel's class for the value actually found, absent when the value
+        /// is not in evaluated form.
+        got: Option<&'static str>,
     },
     /// An object which was expected to be a build-spec was missing annotation
     /// with a unique ID (see [crate::load::Loader]).
@@ -70,6 +90,26 @@ impl Error {
     pub fn other<S: Into<String>>(msg: S) -> Self {
         Error::Other(msg.into())
     }
+
+    /// Creates an [Error::UnexpectedType] for a value read out of a Nickel
+    /// tree, taking its position and class from the value itself.
+    ///
+    /// `val` must already be evaluated (see [crate::eval_if_closure]);
+    /// an unevaluated one has no class to report.
+    pub(crate) fn unexpected_type<S: Into<String>>(
+        what: S,
+        want: &'static str,
+        val: &NickelValue,
+        program: &Program<CacheImpl>,
+    ) -> Self {
+        Error::UnexpectedType {
+            files: program.files(),
+            pos: val.pos(program.pos_table()),
+            what: what.into(),
+            want,
+            got: val.type_of(),
+        }
+    }
 }
 
 impl From<std::io::Error> for Error {
@@ -96,6 +136,20 @@ impl fmt::Display for Error {
                 f,
                 "missing field {} on object {:?} defined at {:?}",
                 field, obj, pos
+            ),
+            Error::UnexpectedType {
+                pos,
+                what,
+                want,
+                got,
+                ..
+            } => write!(
+                f,
+                "unexpected type for {} at {:?}: expected {}, got {}",
+                what,
+                pos,
+                want,
+                got.unwrap_or("an unevaluated term")
             ),
             Error::MissingID(_files, pos) => {
                 write!(f, "missing build-spec ID on object defined at {:?}", pos)
@@ -229,6 +283,34 @@ impl Error {
                     "unexpected record: found {:?} when looking for {:?}",
                     got, want
                 ));
+                let diagnostic = if let Some(pos) = pos.into_opt() {
+                    diagnostic.with_label(primary(&pos))
+                } else {
+                    diagnostic
+                };
+
+                report_with(
+                    writer,
+                    &mut files,
+                    diagnostic,
+                    nickel_lang_core::error::report::ErrorFormat::Text,
+                );
+            }
+            Error::UnexpectedType {
+                files,
+                pos,
+                what,
+                want,
+                got,
+            } => {
+                let mut files = files.clone();
+                let diagnostic = Diagnostic::error()
+                    .with_message(format!("unexpected type for {}", what))
+                    .with_note(format!(
+                        "expected {}, got {}",
+                        want,
+                        got.unwrap_or("an unevaluated term")
+                    ));
                 let diagnostic = if let Some(pos) = pos.into_opt() {
                     diagnostic.with_label(primary(&pos))
                 } else {
@@ -443,6 +525,30 @@ mod tests {
         );
         assert!(out.contains("Source"), "expected 'Source' in: {out:?}");
         assert!(out.contains("Builder"), "expected 'Builder' in: {out:?}");
+    }
+
+    #[test]
+    fn unexpected_type_contains_what_and_shapes() {
+        let e = Error::UnexpectedType {
+            files: Files::default(),
+            pos: TermPos::None,
+            what: "container `cmd`".into(),
+            want: "a string or an array of strings",
+            got: Some("Record"),
+        };
+        let out = capture(&e);
+        assert!(
+            out.contains("unexpected type for container `cmd`"),
+            "expected the headline in: {out:?}"
+        );
+        assert!(
+            out.contains("a string or an array of strings"),
+            "expected the wanted shape in: {out:?}"
+        );
+        assert!(
+            out.contains("Record"),
+            "expected the found class in: {out:?}"
+        );
     }
 
     #[test]
