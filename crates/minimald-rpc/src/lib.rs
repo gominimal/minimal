@@ -147,7 +147,31 @@ pub struct ListSessionsEntry {
     /// field so an older server still deserializes cleanly.
     #[serde(default)]
     pub status: sessions::SessionStatus,
+    /// Git context for the project path, probed at list time. `None` on
+    /// responses from daemons that predate this field, and whenever the
+    /// probe fails: not a repo, no git binary, or a timeout (a VM guest
+    /// without git lands here too). Boxed so the (usually `None`) field
+    /// stays small in the enums that wrap [`ListSessionsEntry`].
+    #[serde(default)]
+    pub git: Option<Box<GitInfo>>,
     pub attrs: Option<RunningSessionAttrs>,
+}
+
+/// The git state of a session's project path, as of the last
+/// [`ListSessions`] response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitInfo {
+    /// `git rev-parse --abbrev-ref HEAD` — the branch name, or `HEAD` when
+    /// detached.
+    pub branch: String,
+    /// `git rev-parse --show-toplevel` — the working-tree root. For a
+    /// linked worktree this is the worktree's root, not the main repo's.
+    /// On the listing daemon's own filesystem (the guest's for a VM
+    /// daemon).
+    pub repo_root: String,
+    /// The checkout is a linked worktree (or submodule): its git directory
+    /// lives outside `<toplevel>/.git`.
+    pub is_worktree: bool,
 }
 
 /// Resources shared by every session managed by a minimald instance.
@@ -1298,5 +1322,47 @@ mod tests {
         assert_eq!(round_trip(&resp), resp);
         let json = serde_json_lenient::to_string(&resp).unwrap();
         assert!(json.contains(r#""kind":"pending""#), "got: {json}");
+    }
+
+    /// Back-compat both directions: a daemon that predates `git` omits the
+    /// field and decodes to `None`; an extra field in the payload is
+    /// accepted (no `deny_unknown_fields`), so a new daemon still serves
+    /// old clients.
+    #[test]
+    fn list_sessions_entry_decodes_with_and_without_git() {
+        let bare = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": "api",
+            "project_path": "/src/api",
+            "status": "active",
+            "attrs": null
+        }"#;
+        let without: ListSessionsEntry =
+            serde_json_lenient::from_str(bare).expect("pre-git payload");
+        assert_eq!(without.git, None);
+
+        let with_git = serde_json_lenient::json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": "api",
+            "project_path": "/src/api",
+            "status": "active",
+            "git": {
+                "branch": "main",
+                "repo_root": "/src/api",
+                "is_worktree": true
+            },
+            "attrs": null
+        });
+        let with: ListSessionsEntry =
+            serde_json_lenient::from_value(with_git).expect("post-git payload");
+        assert_eq!(
+            with.git,
+            Some(Box::new(GitInfo {
+                branch: "main".to_string(),
+                repo_root: "/src/api".to_string(),
+                is_worktree: true,
+            }))
+        );
+        assert_eq!(round_trip(&with), with);
     }
 }

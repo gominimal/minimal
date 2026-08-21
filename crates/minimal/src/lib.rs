@@ -3690,6 +3690,7 @@ mod tests {
             name: name.map(str::to_owned),
             project_path: path.map(|p| paths::HostAbsPath::try_new(p).unwrap()),
             status,
+            git: None,
             attrs: None,
         }
     }
