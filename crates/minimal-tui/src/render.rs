@@ -79,6 +79,11 @@ fn render_sidebar(model: &mut Model, frame: &mut Frame, area: Rect) {
         Constraint::Min(1),
     ])
     .areas(inner);
+    // Candidate logo with cleaner slanted stripes: "▂🭕🭏🭕🭏 M I N I M A L"
+    // (Legacy Computing diagonal blocks, U+1FB40..U+1FB5F). Held back for
+    // now: those codepoints are missing from many terminal fonts, whereas
+    // the Geometric Shapes triangles below (U+25E2..U+25E5) render almost
+    // everywhere.
     let logo_lines = vec![
         Line::styled(
             "▃◥◣◥◣ M I N I M A L",
