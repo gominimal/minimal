@@ -4302,7 +4302,9 @@ mod tests {
         let Some(home) = std::env::home_dir() else {
             return; // no HOME: no walk boundary to anchor the test to
         };
-        let dir = tempfile::tempdir_in(&home).unwrap();
+        let Ok(dir) = tempfile::tempdir_in(&home) else {
+            return; // can't create temp dir in HOME, such as on a read only file system  
+        };
         let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
         assert_eq!(resolve_upload_root(path).unwrap(), path);
     }
