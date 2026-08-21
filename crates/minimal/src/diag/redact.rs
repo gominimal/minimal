@@ -7,7 +7,22 @@
 
 /// Env vars whose *values* are safe and useful to include verbatim. Everything
 /// else is reported by name only.
-const ENV_VALUE_ALLOWLIST_EXACT: &[&str] = &["RUST_LOG", "HOME", "SHELL", "TERM", "PATH"];
+///
+/// `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`, and `COLORTERM` join `TERM` because
+/// a rendering complaint (#950) is answered by the emulator, not the termcap
+/// name: Terminal.app, iTerm2, and Ghostty disagree about wide glyphs and
+/// truecolor while all reporting `xterm-256color`. Each names a program, never
+/// the user or their work.
+const ENV_VALUE_ALLOWLIST_EXACT: &[&str] = &[
+    "RUST_LOG",
+    "HOME",
+    "SHELL",
+    "TERM",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "COLORTERM",
+    "PATH",
+];
 const ENV_VALUE_ALLOWLIST_PREFIXES: &[&str] = &["XDG_", "MINIMAL_", "MINVMD_", "MINIMALD_"];
 
 /// Returns true when the named env var's value may be captured verbatim.
@@ -35,6 +50,10 @@ mod tests {
             "MINIMALD_DETACHED",
             "HOME",
             "PATH",
+            "TERM",
+            "TERM_PROGRAM",
+            "TERM_PROGRAM_VERSION",
+            "COLORTERM",
         ] {
             assert!(is_env_value_allowlisted(name), "{name} should be allowed");
         }
@@ -48,6 +67,15 @@ mod tests {
             "MINVMD_PASSWORD",
             "MINIMALIST_THING",
         ] {
+            assert!(!is_env_value_allowlisted(name), "{name} must not be");
+        }
+    }
+
+    /// The terminal-identity names are an exact-match widening, not a `TERM`
+    /// prefix: a var that merely starts with the same letters stays masked.
+    #[test]
+    fn terminal_identity_is_allowlisted_by_name_not_by_prefix() {
+        for name in ["TERMINAL_EMULATOR", "TERM_SESSION_ID", "TERM_TOKEN"] {
             assert!(!is_env_value_allowlisted(name), "{name} must not be");
         }
     }

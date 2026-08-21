@@ -207,13 +207,21 @@ system facts, log tails, redacted config, and state listings, plus a
 broken install still yields a valid archive that explains what is
 missing.
 
+Because sessions are interactive, the bundle also records the terminal
+`bug` itself ran on (`host/terminal.json`): whether stdin, stdout, and
+stderr are ttys — the same condition `attach` gates on, so a run under a
+pipe or CI is distinguishable from a real terminal — and, for each that
+is, its device and its `TIOCGWINSZ` rows/columns, which is what makes a
+garbled TUI or wrong wrapping diagnosable.
+
 Diagnosing a wedged system must not change it: `bug` mutates no state and
 never starts a daemon; it works even when none are running.
 
 Secret-shaped values (env vars, tokens) are redacted before they enter
 the archive: only a small allowlist of env names (`RUST_LOG`, `HOME`,
-`SHELL`, `TERM`, `PATH`, and the `XDG_*` / `MINIMAL_*` / `MINVMD_*` /
-`MINIMALD_*` prefixes) have values captured verbatim (a sensitive-shaped
+`SHELL`, `TERM`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`, `COLORTERM`,
+`PATH`, and the `XDG_*` / `MINIMAL_*` / `MINVMD_*` / `MINIMALD_*`
+prefixes) have values captured verbatim (a sensitive-shaped
 name always loses to the allowlist), and every other env var is reported
 by name only. Session and project file contents are never included, only
 name/size listings. Review the archive before sharing.
