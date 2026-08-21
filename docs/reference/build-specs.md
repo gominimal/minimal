@@ -38,7 +38,7 @@ let version = "1.8.1" in
     { file = "build.sh" } | Local,
     {
       url = "https://github.com/jqlang/jq/releases/download/jq-%{version}/jq-%{version}.tar.gz",
-      sha256 = "5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5",
+      sha256 = "2be64e7129cecb11d5906290eba10af694fb9e3e7f9fc208a311dc33ca837eb0",
       extract = true,
     } | Source,
     base,

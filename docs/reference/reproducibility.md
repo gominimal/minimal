@@ -21,8 +21,17 @@ For background and the full taxonomy of non-determinism in software builds, see
 ## What the sandbox already provides
 
 Package builds run in a hermetic, isolated [sandbox](../concepts/sandboxing.md) so the
-machine running the build cannot leak into its result. Among the fixed environment the
-sandbox sets for every build are two variables that most build systems honour:
+machine running the build cannot leak into its result. The one thing the sandbox shares
+with the outside world is network access, and only when a dependency calls for it — so a
+build that reaches the network is reproducible only to the extent that what it fetches is
+pinned. `Source` entries are pinned for you, because Minimal verifies them against the
+`sha256` in the spec. Anything a build resolves for itself over the network — Go modules,
+cargo crates, npm packages, all of which require an explicit
+[`needs`](./build-specs.md) declaration — is an unpinned build input unless a committed
+lockfile pins it.
+
+Among the fixed environment the sandbox sets for every build are two variables that most
+build systems honour:
 
 | Variable | Value | Effect |
 |---|---|---|
@@ -45,17 +54,23 @@ invocation, drop the linker's random build ID, and make `ar` write deterministic
 archives:
 
 ```bash
-export CFLAGS="-ffile-prefix-map=$(pwd)=/builddir -gno-record-gcc-switches"
-export CXXFLAGS="$CFLAGS"
-export LDFLAGS="-Wl,--build-id=none"
+export CFLAGS="${CFLAGS:-} -ffile-prefix-map=$(pwd)=/builddir -gno-record-gcc-switches"
+export CXXFLAGS="${CXXFLAGS:-} -ffile-prefix-map=$(pwd)=/builddir -gno-record-gcc-switches"
+export LDFLAGS="${LDFLAGS:-} -Wl,--build-id=none"
 export ARFLAGS=Drc
 ```
 
-Append these to whatever optimisation flags the package already uses rather than
-replacing them.
+Note the `${CFLAGS:-}` form: these determinism flags must be *added* to whatever
+optimisation flags the package already sets, not substituted for them.
 
-With autotools, also pass `--enable-deterministic-archives` to `./configure`, and delete
-libtool archives after install — they embed absolute paths:
+If you are building a package that ships its own `ar`/`ranlib` — binutils, or a
+cross-binutils — also pass `--enable-deterministic-archives` to `./configure`, which makes
+the tools it installs default to deterministic archives. It is a binutils configure
+option, not general autotools determinism advice: other packages ignore it with an
+`unrecognized options` warning, so `ARFLAGS=Drc` above is what actually does the work for
+them.
+
+With autotools, delete libtool archives after install — they embed absolute paths:
 
 ```bash
 find "$OUTPUT_DIR" -name '*.la' -delete
@@ -63,30 +78,52 @@ find "$OUTPUT_DIR" -name '*.la' -delete
 
 ### Go
 
-Pass `-trimpath` and clear the build ID on every `go build` and `go install`:
+Pass `-trimpath`, clear the build ID, and turn off VCS stamping on every `go build` and
+`go install`:
 
 ```bash
-go build -trimpath -ldflags "-buildid=" -o "$OUTPUT_DIR/usr/bin/my-tool" .
+go build -trimpath -buildvcs=false -ldflags "-buildid=" -o "$OUTPUT_DIR/usr/bin/my-tool" .
 ```
 
-If the source tree contains a `.git` directory, add `-buildvcs=false` so the commit
-metadata Go would otherwise stamp into the binary does not vary with the checkout.
+Set all three unconditionally. Go's default is `-buildvcs=auto`, which stamps commit
+metadata whenever the main package, its module, and the working directory sit in the same
+repository — and Go searches parent directories for that repository root, so it is not
+enough to observe that the extracted source tree has no `.git` of its own. Passing
+`-buildvcs=false` removes the question. Setting it once for the whole script works too:
+
+```bash
+export GOFLAGS="-trimpath -buildvcs=false"
+```
 
 ### Rust
 
 Remap both the build directory and the cargo registry path:
 
 ```bash
-export RUSTFLAGS="--remap-path-prefix=$(pwd)=/builddir --remap-path-prefix=$HOME/.cargo=/cargo"
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$(pwd)=/builddir --remap-path-prefix=$HOME/.cargo=/cargo"
 ```
 
+As with the C flags above, append rather than overwrite — a package that needs
+`-C linker=gcc` still needs it after this line.
+
 If two builds still differ in `.text` or `.rodata`, the remaining variation is usually
-parallel codegen or a randomly seeded constant. Add:
+parallel codegen. Pin it:
 
 ```bash
 export RUSTFLAGS="$RUSTFLAGS -C codegen-units=1"
+```
+
+If the crate graph pulls in [`const-random`](https://github.com/tkaitchuck/constrandom)
+(commonly by way of `ahash`), it seeds a constant at compile time from system randomness,
+which differs on every build. That crate reads its seed from the environment, so pin it
+as well:
+
+```bash
 export CONST_RANDOM_SEED=0
 ```
+
+This is that crate's own variable, not a `rustc` or Cargo setting — setting it does
+nothing for a dependency tree that does not use `const-random`.
 
 ### Linux kernel
 
@@ -97,6 +134,15 @@ export KBUILD_BUILD_TIMESTAMP=@0
 export KBUILD_BUILD_USER=builder
 export KBUILD_BUILD_HOST=minimal
 ```
+
+Those three cover the timestamp, user and host only. Two further inputs bite in practice:
+
+- **Build paths.** For an out-of-tree build, remap them in the assembler flags as well as
+  the compiler flags, or the source directory ends up in the debug info:
+  `export KCFLAGS="-ffile-prefix-map=$(pwd)=/builddir"` and the same value in `KAFLAGS`.
+- **Module signing.** With `CONFIG_MODULE_SIG_ALL=y`, Kbuild generates a throwaway signing
+  key when none is configured, so every module's signature differs between builds. Point
+  `CONFIG_MODULE_SIG_KEY` at a stable key you supply, or turn the option off.
 
 ### Builds that stamp their own wall-clock time
 
@@ -112,7 +158,19 @@ set the build-time variable to empty so the time is omitted entirely.
 ## Verifying
 
 Build the package twice and compare the two `$OUTPUT_DIR` trees. They must be
-byte-for-byte identical:
+byte-for-byte identical.
+
+Force both runs to actually build. By default a build is served from the binary cache
+when a matching artifact exists, so a plain second `mip package build` can hand back the
+first run's artifact and the comparison proves nothing:
+
+```bash
+mip --no-cache --no-fetch package build <name> --rebuild
+```
+
+[`--no-cache`](./cli-mip.md) ignores locally-available artifacts, `--no-fetch` stops
+Minimal fetching them from the remote cache, and `--rebuild` builds the named packages
+even when they are already available. Keep the tree each run produces, then compare them:
 
 ```bash
 diff -r first-output/ second-output/
@@ -125,11 +183,15 @@ When they differ, the diff names the cause. Common signatures and their fixes:
 | An embedded date or time string | Build stamps the wall clock | Pin the generator's own date variable |
 | An absolute path under the build directory | Path baked into debug info or an `.la` file | `-ffile-prefix-map` / `--remap-path-prefix`; delete `*.la` |
 | A differing `.note.gnu.build-id` section | Linker-generated random build ID | `LDFLAGS="-Wl,--build-id=none"` |
-| Differing member order or timestamps in a `.a` | Non-deterministic `ar` | `ARFLAGS=Drc`, `--enable-deterministic-archives` |
-| Varying uid/gid or mtime on extracted files | Archive extraction preserved the archive's own ownership | Extract with `tar -xof` |
+| Differing member order or timestamps in a `.a` | Non-deterministic `ar` | `ARFLAGS=Drc` |
+| Varying uid/gid on extracted files | Extraction restored the archive's recorded ownership | Extract with `tar -xof` |
+| Varying mtime on installed files | A step stamped the wall clock onto files it wrote | Normalise explicitly, e.g. `find "$OUTPUT_DIR" -exec touch -hd @"$SOURCE_DATE_EPOCH" {} +` |
 
-For that last case, `mip check`'s build-script audit also flags plain `tar -xf` in a
-build script and directs you to `tar -xof`.
+`mip check`'s build-script audit flags plain `tar -xf` and directs you to `tar -xof`. Note
+what that fixes and what it does not: `-o` is `--no-same-owner`, so it only settles
+ownership. Extraction still restores each member's recorded mtime — which is itself fine,
+because those timestamps are fixed by the archive's content. Wall-clock mtimes come from
+build steps that write files, which is why the two rows above have different fixes.
 
 ## See also
 
