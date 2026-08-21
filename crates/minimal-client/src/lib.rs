@@ -345,7 +345,7 @@ impl Client {
             }
 
             serde_json_lenient::from_slice(&resp_buf)
-                .with_context(|| format!("decode response for {}", R::NAME))
+                .with_context(|| decode_context(R::NAME, &resp_buf))
         };
 
         tokio::time::timeout(timeout, rpc)
@@ -877,6 +877,31 @@ fn append_daemon_error(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(&data[..room.min(data.len())]);
 }
 
+/// How much of an undecodable reply the decode error quotes. Generous enough
+/// for any oneshot response the daemon actually sends, bounded so a
+/// pathological body can't become the whole error message.
+const DECODE_EXCERPT_MAX: usize = 1024;
+
+/// Context for a response that wouldn't decode, quoting the daemon's reply
+/// verbatim.
+///
+/// The body has to be in the message because serde's own error usually can't
+/// name the fault: every `Errorable<T>` response is `#[serde(untagged)]`, and
+/// an untagged enum discards its per-variant errors in favour of "data did
+/// not match any variant". So when a CLI meets a daemon of another build —
+/// the skew a `deny_unknown_fields` response type exists to catch — the error
+/// says only that nothing matched, and a bug report can't say which field
+/// tripped the guard (#1251). Quoting the reply makes that diagnosable
+/// without a live repro.
+fn decode_context(rpc: &str, body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let excerpt = match text.char_indices().nth(DECODE_EXCERPT_MAX) {
+        Some((cut, _)) => format!("{}… ({} bytes total)", &text[..cut], body.len()),
+        None => text.into_owned(),
+    };
+    format!("decode response for {rpc} (daemon replied: {excerpt})")
+}
+
 /// The provider kind the CLI should talk to, given `--provider`.
 ///
 /// The native minimald and minvmd backends now occupy distinct provider dirs,
@@ -971,6 +996,45 @@ mod tests {
             super::append_daemon_error(&mut buf, &chunk);
         }
         assert_eq!(buf.len(), super::DAEMON_ERROR_MAX);
+    }
+
+    /// A daemon of another build answering `FinalizeSession` in a shape this
+    /// CLI's wire types reject must produce an error that names the offending
+    /// field. `Errorable` is untagged, so serde alone only says "no variant
+    /// matched" — the reply itself is what makes the skew diagnosable (#1251).
+    #[test]
+    fn decode_errors_quote_the_daemon_reply() {
+        use anyhow::Context as _;
+
+        let body = br#"{"activate_hooks":[],"finalized_at":"2026-08-21T00:00:00Z"}"#;
+        let err = serde_json_lenient::from_slice::<
+            minimald_rpc::Errorable<minimald_rpc::FinalizeSessionResponse>,
+        >(body)
+        .with_context(|| super::decode_context("FinalizeSession", body))
+        .unwrap_err();
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("finalized_at"),
+            "the reply must be quoted so the tripping field is identifiable, got: {rendered}"
+        );
+    }
+
+    /// A pathological body is quoted, but bounded — the excerpt must not
+    /// become the whole error message.
+    #[test]
+    fn decode_context_bounds_the_excerpt() {
+        let body = vec![b'x'; 8 * 1024];
+        let msg = super::decode_context("Whatever", &body);
+        assert!(
+            msg.len() < body.len(),
+            "excerpt was not bounded: {}",
+            msg.len()
+        );
+        assert!(
+            msg.contains("8192 bytes total"),
+            "missing the full size: {msg}"
+        );
     }
 
     #[test]

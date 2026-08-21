@@ -941,6 +941,10 @@ async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     let mut client = client::Client::connect(&sock)
         .await
         .context("Failed to connect to minimald")?;
+    // Connects directly rather than through `connect_daemon` (it needs `sock`
+    // for the attach hand-off), so the gate is applied by hand — this path can
+    // end in an activation just as `min session activate` does.
+    ensure_version_match(&mut client).await?;
 
     match resolve_smart_attach(&mut client, global).await? {
         SmartAttach::Attach(entry) => {
@@ -1104,14 +1108,76 @@ fn display_with_home_tilde(path: &camino::Utf8Path, home: Option<&camino::Utf8Pa
     }
 }
 
-/// Connect to the daemon, resolving the socket path from global args.
+/// Connect to the daemon, resolving the socket path from global args, and
+/// refuse to proceed against a daemon of a different build
+/// ([`ensure_version_match`]).
 pub async fn connect_daemon(global: &GlobalArgs) -> Result<client::Client, anyhow::Error> {
+    let mut client = connect_daemon_unchecked(global).await?;
+    ensure_version_match(&mut client).await?;
+    Ok(client)
+}
+
+/// [`connect_daemon`] without the version gate.
+///
+/// For the commands that must keep working *because* the pair is skewed —
+/// `min stop` is the recovery the gate's own message prescribes, so gating it
+/// would leave the operator with no way out.
+async fn connect_daemon_unchecked(global: &GlobalArgs) -> Result<client::Client, anyhow::Error> {
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
         .context("Failed to resolve daemon socket path")?;
 
     client::Client::connect(&sock)
         .await
         .context("Failed to connect to minimald")
+}
+
+/// Set to a non-empty value to downgrade the version gate to a warning.
+/// Escape hatch for deliberate skew (bisecting a daemon regression against a
+/// known-good CLI); named in the gate's error so anyone who hits it finds it.
+const SKEW_OVERRIDE_VAR: &str = "MINIMAL_ALLOW_VERSION_SKEW";
+
+/// Refuse to drive a daemon built from a different tree than this CLI.
+///
+/// The RPC surface is versioned by nothing but the two binaries agreeing, and
+/// several response types are `#[serde(deny_unknown_fields)]` on purpose (see
+/// `FinalizeSessionResponse` in `minimald-rpc` for why that guard is
+/// load-bearing). A skewed pair therefore doesn't fail at connect time — it
+/// fails *mid-activation*, at `FinalizeSession`, after the session already
+/// exists on the daemon, and the activation's own cleanup then destroys it. To
+/// the operator every session is created and vanishes at once (#1251).
+///
+/// Failing here costs one extra round trip and turns that into a diagnosis.
+async fn ensure_version_match(client: &mut client::Client) -> Result<(), anyhow::Error> {
+    use minimald_rpc::GetVersion;
+    let daemon = client
+        .oneshot_rpc::<GetVersion>(())
+        .await
+        .context("GetVersion RPC failed")?;
+
+    let Some(message) = version_skew_message(version::VERSION, &daemon.version) else {
+        return Ok(());
+    };
+    if std::env::var_os(SKEW_OVERRIDE_VAR).is_some_and(|v| !v.is_empty()) {
+        eprintln!("warning: {message}");
+        return Ok(());
+    }
+    bail!("{message}");
+}
+
+/// The operator-facing account of a CLI/daemon version skew, or `None` when
+/// the two builds match. Split out from [`ensure_version_match`] so the
+/// wording is testable without a daemon.
+fn version_skew_message(cli: &str, daemon: &str) -> Option<String> {
+    (cli != daemon).then(|| {
+        format!(
+            "This CLI is minimal {cli}, but the running minimald is {daemon}. \
+             The two speak the same RPCs only when built together, so continuing \
+             would fail partway through and tear down whatever it had created. \
+             Restart the daemon on the new build: run `min stop`, then re-run this \
+             command (the daemon is started again automatically). \
+             Set {SKEW_OVERRIDE_VAR}=1 to proceed anyway."
+        )
+    })
 }
 
 /// A session reference parsed from a CLI string: either a UUID or a name.
@@ -3148,7 +3214,9 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
     // Racy by nature: the daemon may go down between the probe and this connect
     // (or `--provider` may point the probe and the client at different backends),
     // so a connect failure is still a real error, not something to swallow.
-    let mut client = connect_daemon(global).await?;
+    // Unchecked: stopping a version-skewed daemon is exactly what the version
+    // gate tells the operator to do, so this command must never be gated by it.
+    let mut client = connect_daemon_unchecked(global).await?;
 
     use minimald_rpc::{Shutdown, ShutdownRequest};
     let resp = client
@@ -3721,6 +3789,33 @@ mod tests {
         // A signalled child reports no code of its own; the shell's 128 + n.
         // 9 is SIGKILL, in the low bits where wait(2) puts the signal.
         assert_eq!(exit_code_of(std::process::ExitStatus::from_raw(9)), 137);
+    }
+
+    /// A CLI upgraded past its daemon must be refused up front, naming both
+    /// builds and the recovery. Before #1251 the skew surfaced only at
+    /// `FinalizeSession`, by which point the activation's cleanup had already
+    /// destroyed the session it had just created.
+    #[test]
+    fn version_skew_is_reported_with_both_builds_and_a_recovery() {
+        let msg = version_skew_message("0.6.0", "0.5.0-dev.12.g86ce5c3a")
+            .expect("differing builds are a skew");
+        assert!(msg.contains("0.6.0"), "missing the CLI version: {msg}");
+        assert!(
+            msg.contains("0.5.0-dev.12.g86ce5c3a"),
+            "missing the daemon version: {msg}"
+        );
+        assert!(msg.contains("min stop"), "missing the recovery: {msg}");
+        assert!(
+            msg.contains(SKEW_OVERRIDE_VAR),
+            "missing the override: {msg}"
+        );
+    }
+
+    /// Matching builds are the overwhelmingly common case and must cost the
+    /// operator nothing.
+    #[test]
+    fn matching_versions_are_not_a_skew() {
+        assert!(version_skew_message(version::VERSION, version::VERSION).is_none());
     }
 
     /// The `Cli` command tree must stay well-formed: a malformed clap
