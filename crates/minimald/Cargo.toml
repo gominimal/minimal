@@ -51,7 +51,7 @@ tempfile.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 zstd.workspace = true
-vt100-ctt.workspace = true
+vt100.workspace = true
 walkdir.workspace = true
 
 tokio.workspace = true
