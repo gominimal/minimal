@@ -852,4 +852,110 @@ mod tests {
         // Width 10: 1 + 3 + 1 rows.
         assert_eq!(wrapped_height(&lines, 10), 5);
     }
+
+    fn sid(n: u128) -> sessions::SessionId {
+        sessions::SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012x}")).unwrap()
+    }
+
+    fn sess_entry(n: u128, name: &str) -> minimald_rpc::ListSessionsEntry {
+        minimald_rpc::ListSessionsEntry {
+            id: sid(n),
+            name: Some(name.to_string()),
+            project_path: Some(paths::HostAbsPath::try_new("/src/x").unwrap()),
+            status: sessions::SessionStatus::Active,
+            git: None,
+            attrs: None,
+        }
+    }
+
+    fn provider_view(
+        label: &str,
+        collapsed: bool,
+        sessions: Vec<minimald_rpc::ListSessionsEntry>,
+    ) -> crate::app::ProviderView {
+        crate::app::ProviderView {
+            label: label.to_string(),
+            version: "0.1".to_string(),
+            collapsed,
+            reachable: true,
+            sessions,
+        }
+    }
+
+    fn sidebar_model(providers: Vec<crate::app::ProviderView>) -> Model {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let mut model = Model::new(now);
+        model.providers = providers;
+        model
+    }
+
+    /// Render just the sidebar into a `TestBackend` and return its text.
+    fn draw_sidebar(model: &mut Model, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_sidebar(model, frame, area);
+            })
+            .unwrap();
+        format!("{}", terminal.backend())
+    }
+
+    /// With more sessions than the list pane can show, rendering pushes the
+    /// scroll offset down so a bottom cursor stays in view, and resets it to
+    /// zero once the cursor returns to the top.
+    #[test]
+    fn render_sidebar_scrolls_to_keep_the_cursor_visible() {
+        let sessions = (0..30)
+            .map(|n| sess_entry(n, &format!("s{n:02}")))
+            .collect();
+        let mut model = sidebar_model(vec![provider_view("host", false, sessions)]);
+        // Rows: one header + 30 sessions; a short pane can't show them all.
+        model.cursor = model.visible_rows().len() - 1;
+        draw_sidebar(&mut model, 40, 16);
+        // The offset advanced (list scrolled) and never sits below the
+        // cursor's row, so the cursor is drawn.
+        assert!(model.scroll > 0, "bottom cursor must scroll the list");
+        assert!(model.scroll <= model.cursor);
+        // Back at the top, the offset resets.
+        model.cursor = 0;
+        draw_sidebar(&mut model, 40, 16);
+        assert_eq!(model.scroll, 0);
+    }
+
+    /// While the `/` filter is being edited, its line shows the typed text
+    /// followed by the cursor bar; a dimmed line without the bar means "not
+    /// editing", so the bar is the observable edit state.
+    #[test]
+    fn render_sidebar_shows_the_filter_edit_cursor_while_editing() {
+        let mut model = sidebar_model(vec![provider_view(
+            "host",
+            false,
+            vec![sess_entry(1, "api")],
+        )]);
+        model.filter.editing = true;
+        model.filter.input = "web".to_string();
+        let out = draw_sidebar(&mut model, 40, 12);
+        assert!(out.contains("web▏"), "filter edit cursor missing:\n{out}");
+    }
+
+    /// A collapsed provider renders its `▸` arrow and drops its session rows
+    /// from the sidebar entirely.
+    #[test]
+    fn render_sidebar_collapses_a_provider_hiding_its_sessions() {
+        let mut model = sidebar_model(vec![provider_view(
+            "host",
+            true,
+            vec![sess_entry(1, "hidden-sess")],
+        )]);
+        let out = draw_sidebar(&mut model, 40, 12);
+        assert!(out.contains('▸'), "collapsed arrow missing:\n{out}");
+        assert!(
+            !out.contains("hidden-sess"),
+            "collapsed session leaked:\n{out}"
+        );
+    }
 }
