@@ -168,6 +168,92 @@ async fn the_invoking_terminal_is_described() {
     }
 }
 
+/// A project laid out under `.minimal/`.
+fn fake_project() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config = dir.path().join(".minimal");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("minimal.toml"),
+        "[tasks.build]\nexec = \"true\"\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// Runs `min bug` against `repo_dir` and returns the unpacked bundle.
+async fn bundle_for_project(repo_dir: Option<&Path>) -> BTreeMap<String, Vec<u8>> {
+    let state = tempfile::TempDir::new().unwrap();
+    let config = tempfile::TempDir::new().unwrap();
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let out = out_dir.path().join("diag.tar.zst");
+    let mut args = global_args(state.path(), config.path());
+    args.repo_dir = repo_dir.map(Path::to_path_buf);
+    cmd_bug(&args, bug_args(&out)).await.unwrap();
+    unpack(&out).await
+}
+
+/// #1211: a bundle has to say which project it came from. Without it, two
+/// bundles from one machine and two checkouts read identically and the report
+/// lands on the wrong project. The identity is in the manifest — the first
+/// file a reader opens — as well as in the bundle.
+#[tokio::test]
+async fn the_bundle_names_the_project_it_came_from() {
+    let project = fake_project();
+    let files = bundle_for_project(Some(project.path())).await;
+
+    let manifest: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
+    let scope = &manifest["project"];
+    assert_eq!(
+        scope["state"], "identified",
+        "unattributable bundle: {scope}"
+    );
+    assert_eq!(
+        scope["name"],
+        project.path().file_name().unwrap().to_str().unwrap()
+    );
+    assert_eq!(scope["config"], ".minimal/minimal.toml");
+
+    let report: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&files, "project/project.json").expect("project.json"))
+            .unwrap();
+    assert_eq!(report["name"], scope["name"], "the two must not disagree");
+    assert_eq!(report["root"], scope["root"]);
+}
+
+/// `min bug` is run from wherever the user is standing. Outside a project,
+/// the manifest records that as a finding with a reason, rather than leaving
+/// the reader to guess which project the bundle belongs to.
+#[tokio::test]
+async fn a_bundle_collected_outside_a_project_says_so() {
+    let elsewhere = tempfile::TempDir::new().unwrap();
+    let files = bundle_for_project(Some(elsewhere.path())).await;
+
+    let manifest: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
+    let scope = &manifest["project"];
+    assert_eq!(scope["state"], "unknown");
+    assert!(
+        scope["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains(mfile::MFILE_NAME)),
+        "the absence must be explainable: {scope}"
+    );
+    assert!(find(&files, "project/project.json").is_none());
+
+    let skipped: Vec<&str> = manifest["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["what"].as_str().unwrap())
+        .collect();
+    assert!(
+        skipped.contains(&"project/project.json"),
+        "project/project.json absent without a reason"
+    );
+}
+
 #[tokio::test]
 async fn planted_secrets_never_reach_the_bundle() {
     let state = tempfile::TempDir::new().unwrap();

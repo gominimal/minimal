@@ -215,6 +215,21 @@ is, its device and its `TIOCGWINSZ` geometry (rows, columns, and the
 `xpixel`/`ypixel` size emulators report), which is what makes a garbled
 TUI or wrong wrapping diagnosable.
 
+The bundle is scoped to a project, so it can be attributed to one. Every
+other collector describes a machine, and a machine hosts many projects:
+two bundles taken on one host from two checkouts otherwise read
+identically. `manifest.json` therefore opens with the project's name,
+root, and which config file defines it (`minimal.toml` or
+`.minimal/minimal.toml`), repeated in `project/project.json` along with
+the directory `bug` was actually run from. Run outside a project, the
+manifest records that as a finding with its reason rather than falling
+silent.
+
+Only the project's identity is recorded there — its name, its root, its
+config file's relative path, and where `bug` ran from. No configuration
+*values*; the redacted config is collected separately, under the
+allowlist policy below.
+
 Diagnosing a wedged system must not change it: `bug` mutates no state and
 never starts a daemon; it works even when none are running.
 
