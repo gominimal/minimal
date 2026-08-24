@@ -105,7 +105,7 @@ jobs:
         # free on a fresh GitHub-hosted Ubuntu runner. `remove_tool_cache:
         # true` reclaims /opt/hostedtoolcache (~14 GB); the dtolnay step below
         # reinstalls the Rust toolchain we actually need.
-        uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 # v3
+        uses: endersonmenezes/free-disk-space@2a22f8c59cae9cddae7194b33e6b92d023b2b4b8 # v4.0.0
         with:
           remove_android: true
           remove_dotnet: true
@@ -143,7 +143,7 @@ jobs:
         run: rustup target add x86_64-unknown-linux-musl
 
       - name: Install cross + nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: cross,nextest
 
@@ -263,7 +263,7 @@ jobs:
           persist-credentials: false
 
       - name: Install nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: nextest
 
