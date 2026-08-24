@@ -99,6 +99,43 @@ impl OneshotSshRpc for GetVersion {
     type Response = GetVersionResponse;
 }
 
+/// Set to a non-empty value to downgrade the version gate to a warning.
+/// Escape hatch for deliberate skew (bisecting a daemon regression against a
+/// known-good CLI); named in [`version_skew_message`] so anyone who hits the
+/// gate finds it.
+pub const SKEW_OVERRIDE_VAR: &str = "MINIMAL_ALLOW_VERSION_SKEW";
+
+/// How [`version_skew_message`] names a daemon whose reply carried no
+/// `daemon_version` at all.
+///
+/// Every RPC that the gated paths piggyback on reports the daemon's build
+/// (see [`CreateSessionResponse::daemon_version`]). A reply without one comes
+/// from a daemon built before that field existed — which is itself proof that
+/// it is not this build, so it is a skew, not an unknown.
+pub const UNVERSIONED_DAEMON: &str = "an older build that does not report its version";
+
+/// The operator-facing account of a CLI/daemon version skew, or `None` when
+/// the two builds match.
+///
+/// Lives in the wire crate because *both* ends produce it: the client when a
+/// reply reports a build it did not expect, and the daemon when it refuses a
+/// create whose [`CreateSessionRequest::must_match_version`] does not name it.
+/// One definition means the operator reads the same sentence whichever side
+/// caught the skew.
+#[must_use]
+pub fn version_skew_message(cli: &str, daemon: &str) -> Option<String> {
+    (cli != daemon).then(|| {
+        format!(
+            "This CLI is minimal {cli}, but the running minimald is {daemon}. \
+             The two speak the same RPCs only when built together, so continuing \
+             would fail partway through and tear down whatever it had created. \
+             Restart the daemon on the new build: run `min stop`, then re-run this \
+             command (the daemon is started again automatically). \
+             Set {SKEW_OVERRIDE_VAR}=1 to proceed anyway."
+        )
+    })
+}
+
 /// An RPC to list sessions managed by this minimald.
 pub struct ListSessions;
 
@@ -189,6 +226,12 @@ pub struct ListSessionsResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_pool: Option<ResourcePool>,
     pub sessions: Vec<ListSessionsEntry>,
+    /// The build this daemon runs, so a client can assert the pair matches
+    /// without spending a round trip on [`GetVersion`]. `None` from a daemon
+    /// that predates the field — see [`UNVERSIONED_DAEMON`] for why that is a
+    /// skew rather than an unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
 }
 
 impl OneshotSshRpc for ListSessions {
@@ -217,6 +260,12 @@ pub enum GetSessionRecordRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetSessionRecordResponse {
     pub record: Option<sessions::Record>,
+    /// The build this daemon runs, so a client can assert the pair matches
+    /// without spending a round trip on [`GetVersion`]. `None` from a daemon
+    /// that predates the field — see [`UNVERSIONED_DAEMON`] for why that is a
+    /// skew rather than an unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
 }
 
 impl OneshotSshRpc for GetSessionRecord {
@@ -328,6 +377,25 @@ fn default_hooks_enabled() -> bool {
 pub struct CreateSessionRequest {
     /// Out-of-band session config.
     pub config: SessionConfig,
+    /// The build the caller expects the daemon to be. When set, the daemon
+    /// compares it against its own version and fails the RPC with
+    /// [`version_skew_message`] *before allocating anything*, so a skewed pair
+    /// cannot leave a half-built session behind (#1251). `None` asserts
+    /// nothing and behaves exactly as this RPC always has — which is what a
+    /// client sends when the operator set [`SKEW_OVERRIDE_VAR`], since a
+    /// daemon-side refusal is not something a client-side override could
+    /// downgrade to a warning.
+    ///
+    /// Carried here rather than checked by a preceding [`GetVersion`] because
+    /// this is the first RPC of the activation path, and that path must not
+    /// pay a round trip for a check the create can make itself.
+    ///
+    /// A daemon that predates this field ignores it —
+    /// [`CreateSessionRequest`] is not `deny_unknown_fields`, deliberately, so
+    /// that older clients keep working — and is caught instead by the
+    /// [`CreateSessionResponse::daemon_version`] it fails to echo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub must_match_version: Option<String>,
 }
 
 /// The response for a [`CreateSession`] RPC: the allocated session.
@@ -339,6 +407,12 @@ pub struct CreateSessionRequest {
 pub struct CreateSessionResponse {
     /// Daemon-assigned session id.
     pub id: SessionId,
+    /// The build this daemon runs, so a client can assert the pair matches
+    /// without spending a round trip on [`GetVersion`]. `None` from a daemon
+    /// that predates the field — see [`UNVERSIONED_DAEMON`] for why that is a
+    /// skew rather than an unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -1219,8 +1293,59 @@ mod tests {
                     .into_iter()
                     .collect(),
             },
+            must_match_version: Some("0.6.0".into()),
         };
         assert_eq!(round_trip(&req), req);
+    }
+
+    /// A client that predates `must_match_version` sends no such field, and
+    /// the daemon must read that as "assert nothing" rather than fail to
+    /// decode the request. `CreateSessionRequest` is deliberately *not*
+    /// `deny_unknown_fields`, which is the same property read the other way:
+    /// a daemon that predates the field ignores it instead of rejecting the
+    /// create outright.
+    #[test]
+    fn create_session_request_predating_must_match_version_asserts_nothing() {
+        let json = r#"{"config":{
+            "name": "s",
+            "project_path": "/p",
+            "network": "host_net",
+            "attrs": {}
+        }}"#;
+        let req: CreateSessionRequest =
+            serde_json_lenient::from_str(json).expect("legacy request must load");
+        assert!(req.must_match_version.is_none());
+
+        // And the forward direction: an old daemon's serde ignores the new
+        // field rather than refusing the request.
+        let with_field = r#"{"config":{
+            "name": "s",
+            "project_path": "/p",
+            "network": "host_net",
+            "attrs": {}
+        },"must_match_version":"0.6.0"}"#;
+        let req: CreateSessionRequest =
+            serde_json_lenient::from_str(with_field).expect("the new field must decode");
+        assert_eq!(req.must_match_version.as_deref(), Some("0.6.0"));
+    }
+
+    /// The skew wording names both builds, the recovery, and the override —
+    /// and says nothing at all when the two builds agree.
+    #[test]
+    fn version_skew_message_names_both_builds_the_recovery_and_the_override() {
+        assert!(version_skew_message("0.6.0", "0.6.0").is_none());
+        let msg = version_skew_message("0.6.0", "0.5.0-dev.12.g86ce5c3a")
+            .expect("differing builds are a skew");
+        assert!(msg.contains("0.6.0"), "missing the CLI version: {msg}");
+        assert!(
+            msg.contains("0.5.0-dev.12.g86ce5c3a"),
+            "missing the daemon version: {msg}"
+        );
+        assert!(msg.contains("min stop"), "missing the recovery: {msg}");
+        assert!(
+            msg.contains(SKEW_OVERRIDE_VAR),
+            "missing the override: {msg}"
+        );
     }
 
     /// A `SessionConfig` from a client that predates `hooks_enabled`
@@ -1242,8 +1367,31 @@ mod tests {
     fn create_session_response_round_trips() {
         let resp = CreateSessionResponse {
             id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            daemon_version: Some("0.6.0".into()),
         };
         assert_eq!(round_trip(&resp), resp);
+    }
+
+    /// The reply a daemon that predates `daemon_version` sends must still
+    /// decode — with `None`, which is what tells the client it is talking to
+    /// a build older than the handshake and therefore a skewed one.
+    #[test]
+    fn create_session_response_predating_daemon_version_decodes_as_absent() {
+        let resp: Errorable<CreateSessionResponse> =
+            serde_json_lenient::from_str(r#"{"id":"00000000-0000-0000-0000-000000000001"}"#)
+                .expect("a legacy reply must decode");
+        assert!(resp.unwrap().daemon_version.is_none());
+    }
+
+    /// Same for the two read RPCs the attach/exec paths gate on.
+    #[test]
+    fn read_responses_predating_daemon_version_decode_as_absent() {
+        let listed: ListSessionsResponse =
+            serde_json_lenient::from_str(r#"{"sessions":[]}"#).expect("deserialize");
+        assert!(listed.daemon_version.is_none());
+        let record: GetSessionRecordResponse =
+            serde_json_lenient::from_str(r#"{"record":null}"#).expect("deserialize");
+        assert!(record.daemon_version.is_none());
     }
 
     #[test]

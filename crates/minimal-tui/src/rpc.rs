@@ -260,8 +260,11 @@ pub async fn activate(
     // sequence, so it needs the same gate `min session activate` gets: on a
     // skewed pair `FinalizeSession` fails after the record exists, and the
     // abort below then destroys the session the user just created (#1251).
-    minimal_client::ensure_version_match(&mut client).await?;
-    let id = match client
+    // The gate is the `must_match_version` on the create below and the version
+    // the reply echoes back — not a `GetVersion` ahead of them. Activation is
+    // the one path where an extra round trip is felt, and the create can carry
+    // the check for free.
+    let created = match client
         .oneshot_rpc::<CreateSession>(CreateSessionRequest {
             config: SessionConfig {
                 name,
@@ -274,13 +277,23 @@ pub async fn activate(
                 hooks_enabled: true,
                 attrs: Default::default(),
             },
+            // A daemon of another build refuses this before it allocates
+            // anything; `None` under the skew override, which is how an
+            // operator still gets through.
+            must_match_version: minimal_client::version_assertion(),
         })
         .await
         .context("CreateSession RPC failed")?
     {
-        Errorable::Ok(resp) => resp.id,
+        Errorable::Ok(resp) => resp,
         Errorable::Err { error } => return Err(anyhow::anyhow!(error)),
     };
+    // A daemon that predates the field ignored the assertion and echoes no
+    // version; that silence is itself the skew. Refuse now — before the
+    // upload and the finalize — leaving an unfinalized record the daemon
+    // reaps when this connection drops.
+    minimal_client::ensure_version_reported(created.daemon_version.as_deref())?;
+    let id = created.id;
 
     let flow = async {
         // The upload-root walk and VCS-root stat are blocking filesystem
@@ -478,34 +491,126 @@ mod version_gate_tests {
     /// gated; the two discovery connections stay open on purpose and must say
     /// so, since a reader who finds an ungated connect has no other way to tell
     /// an audited decision from an oversight.
+    ///
+    /// Asserted as an inventory rather than a count, so adding, removing, or
+    /// reclassifying a connection fails here and forces the same judgement.
     #[test]
     fn only_the_activation_path_is_version_gated() {
+        assert_eq!(
+            connect_site_inventory(),
+            [
+                "activate = gated",
+                "connect_missing = ungated (explained)",
+                "discover = ungated (explained)",
+            ]
+        );
+    }
+
+    /// The dashboard's activation must not spend a round trip on the version
+    /// either. Its gate is the assertion on the `CreateSession` it was already
+    /// sending plus the build the reply echoes back — never a `GetVersion`
+    /// ahead of them.
+    ///
+    /// `refresh` still calls `GetVersion`, and must: the sidebar renders each
+    /// provider's build. That is a display fetch on the idle loop, not a gate
+    /// on the create path.
+    #[test]
+    fn the_dashboard_activation_makes_no_version_round_trip() {
+        let body = function_code("activate").expect("rpc.rs no longer defines activate");
+        for round_trip in ["GetVersion", "ensure_version_match"] {
+            assert!(
+                !body.contains(round_trip),
+                "activate reintroduced a version round trip ({round_trip})"
+            );
+        }
+        assert!(
+            body.contains("must_match_version"),
+            "activate no longer asserts its build on the create"
+        );
+        assert!(
+            body.contains("ensure_version_reported"),
+            "activate no longer checks the build the create echoed back"
+        );
+        assert!(
+            function_code("refresh").is_some_and(|f| f.contains("GetVersion")),
+            "the sidebar still needs each provider's version"
+        );
+    }
+
+    /// Every free-function declaration in this file, as `(line index, name)`.
+    fn fn_decls(lines: &[&str]) -> Vec<(usize, String)> {
+        lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                let t = l.trim_start();
+                let t = t.strip_prefix("pub ").unwrap_or(t);
+                let t = t.strip_prefix("async ").unwrap_or(t);
+                t.strip_prefix("fn ")
+                    .map(|rest| (i, rest.split(['(', '<']).next().unwrap_or("").to_string()))
+            })
+            .collect()
+    }
+
+    /// The named function's code, comments dropped — the rationale prose names
+    /// the very mechanisms the scanners look for.
+    fn function_code(name: &str) -> Option<String> {
+        let src = include_str!("rpc.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let decls = fn_decls(&lines);
+        let at = decls.iter().position(|(_, n)| n == name)?;
+        let to = decls.get(at + 1).map_or(lines.len(), |(d, _)| *d);
+        Some(
+            lines[decls[at].0..to]
+                .iter()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    /// Attributes every direct `Client` connection in this file to the
+    /// function that opens it, and reports how it is classified: gated by the
+    /// assertion it carries on its own first RPC, or deliberately ungated with
+    /// a comment saying why. An unclassified connection fails the test.
+    fn connect_site_inventory() -> Vec<String> {
         // Concatenated so this scanner does not match itself.
         const NEEDLE: &str = concat!("Client", "::connect(");
         let src = include_str!("rpc.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let decls = fn_decls(&lines);
 
-        let mut gated = 0;
-        let mut explained = 0;
-        for (i, line) in src.lines().enumerate() {
+        let mut sites = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
             if !line.contains(NEEDLE) {
                 continue;
             }
-            // The classification is always within a few lines of the connect:
-            // the gate call just after it, or the rationale comment just before.
-            let window: Vec<&str> = src.lines().skip(i.saturating_sub(8)).take(20).collect();
-            let text = window.join("\n");
-            if text.contains("ensure_version_match") {
-                gated += 1;
-            } else if text.contains("not version-gated") {
-                explained += 1;
-            } else {
-                panic!("unclassified daemon connection at rpc.rs:{}", i + 1);
-            }
+            let (start, name) = decls
+                .iter()
+                .rev()
+                .find(|(d, _)| *d < i)
+                .cloned()
+                .unwrap_or((0, "<top level>".to_string()));
+            let end = decls
+                .iter()
+                .find(|(d, _)| *d > start)
+                .map_or(lines.len(), |(d, _)| *d);
+            let body = &lines[start..end];
+            let gated = body.iter().any(|l| {
+                l.contains("must_match_version")
+                    || l.contains("ensure_version_reported")
+                    || l.contains("ensure_version_match")
+            });
+            let explained = body.iter().any(|l| l.contains("not version-gated"));
+            let label = match (gated, explained) {
+                (true, _) => "gated",
+                (false, true) => "ungated (explained)",
+                (false, false) => panic!("unclassified daemon connection in {name}"),
+            };
+            sites.push(format!("{name} = {label}"));
         }
-        assert_eq!(
-            (gated, explained),
-            (1, 2),
-            "the connection inventory changed"
-        );
+        sites.sort();
+        sites
     }
 }

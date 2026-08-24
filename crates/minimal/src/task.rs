@@ -355,7 +355,10 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         std::env::home_dir().as_deref(),
     );
 
-    let mut client = crate::connect_daemon(global).await?;
+    // Not `connect_daemon`: like `min session activate`, this creates a session
+    // and the version gate rides on that `CreateSession` rather than on a
+    // `GetVersion` ahead of it.
+    let mut client = crate::connect_daemon_unchecked(global).await?;
 
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
@@ -368,6 +371,9 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         let resp = client
             .oneshot_rpc::<CreateSession>(CreateSessionRequest {
                 config: config.clone(),
+                // Refused by a daemon of another build before it allocates
+                // anything; `None` under the skew override.
+                must_match_version: minimal_client::version_assertion(),
             })
             .await
             .context("CreateSession RPC failed")?;
@@ -383,6 +389,10 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
             }
         }
     };
+    // A daemon too old to know the field ignored it and echoes no version;
+    // that silence is the skew. Caught here, before the upload and the
+    // finalize, with the record still unfinalized and reapable.
+    minimal_client::ensure_version_reported(created.daemon_version.as_deref())?;
     let id = created.id;
     let session_name = config
         .name

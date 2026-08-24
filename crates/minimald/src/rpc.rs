@@ -30,6 +30,11 @@ use crate::{
     sessions::SessionKeyPredicate,
 };
 
+/// This daemon's build, reported on every reply a version-gated client path
+/// piggybacks its check on. One name for it so the assertion in
+/// `serve_create_session` and the versions echoed to clients cannot drift.
+const OWN_VERSION: &str = version::VERSION;
+
 /// Server-side serving glue for [`OneshotSshRpc`]s.
 ///
 /// The wire contract (names, request/response schemas) lives in the
@@ -121,6 +126,7 @@ async fn serve_list_sessions(
                 .await
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             Ok(ListSessionsResponse {
+                daemon_version: Some(OWN_VERSION.to_string()),
                 resource_pool,
                 // The git probes run in parallel across sessions: each is
                 // one small process under a deadline, and serializing them
@@ -233,6 +239,7 @@ async fn serve_get_session_record(
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
             Ok(GetSessionRecordResponse {
+                daemon_version: Some(OWN_VERSION.to_string()),
                 record: mngr
                     .get_record(match req {
                         GetSessionRecordRequest::Id(id) => SessionKeyPredicate::Id(id),
@@ -261,6 +268,18 @@ async fn serve_create_session(
 ) -> Result<(), ConnectionError> {
     CreateSession
         .handle_channel(c, async |req| {
+            // The version gate, made by the RPC the activation path was
+            // already sending rather than by a `GetVersion` ahead of it
+            // (#1251). Checked here, before the manager allocates anything,
+            // because the failure this closes is precisely a session that
+            // exists and then gets torn down by its own caller's cleanup:
+            // refusing after `create_session` would reproduce it.
+            if let Some(asserted) = req.must_match_version.as_deref()
+                && let Some(message) = minimald_rpc::version_skew_message(asserted, OWN_VERSION)
+            {
+                return Ok(Errorable::Err { error: message });
+            }
+
             let mngr = s.sessions_manager().await;
             // Read the name off the config before it is handed to the
             // manager: the success record below needs it, and the reply
@@ -279,7 +298,10 @@ async fn serve_create_session(
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
                         "session created"
                     );
-                    Errorable::Ok(minimald_rpc::CreateSessionResponse { id })
+                    Errorable::Ok(minimald_rpc::CreateSessionResponse {
+                        id,
+                        daemon_version: Some(OWN_VERSION.to_string()),
+                    })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
                     error: "A session with that name already exists".to_string(),
@@ -2477,6 +2499,91 @@ mod tests {
         );
     }
 
+    /// The version gate, made by the RPC the activation path already sends
+    /// rather than by a `GetVersion` ahead of it (#1251).
+    ///
+    /// A matching assertion is invisible; a differing one fails the call with
+    /// the skew message *and leaves nothing behind* — which is the whole
+    /// point, since the failure this closes is a session that exists and is
+    /// then destroyed by its own caller's cleanup. An absent assertion (an
+    /// older client) behaves exactly as this RPC always did.
+    #[tokio::test]
+    async fn create_session_refuses_a_version_skew_before_allocating_anything() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let mut skewed = req("skewed", "/uwu");
+        skewed.must_match_version = Some("0.0.0-not-this-build".to_string());
+        let refused = client.call::<CreateSession>(&skewed).await;
+        let error = refused.err().expect("a skewed create must be refused");
+        assert!(
+            error.contains("0.0.0-not-this-build") && error.contains(OWN_VERSION),
+            "the refusal must name both builds, got: {error}"
+        );
+        assert!(error.contains("min stop"), "missing the recovery: {error}");
+        assert!(
+            error.contains(minimald_rpc::SKEW_OVERRIDE_VAR),
+            "missing the override: {error}"
+        );
+        assert!(
+            client.call::<ListSessions>(&()).await.sessions.is_empty(),
+            "a refused create must not have allocated a session"
+        );
+
+        // The matching assertion goes through, and the reply names the build
+        // that honoured it — the half of the handshake that catches a daemon
+        // too old to have looked at `must_match_version` at all.
+        let mut matching = req("matching", "/uwu");
+        matching.must_match_version = Some(OWN_VERSION.to_string());
+        let created = client
+            .call::<CreateSession>(&matching)
+            .await
+            .ok()
+            .expect("a matching assertion must be accepted");
+        assert_eq!(created.daemon_version.as_deref(), Some(OWN_VERSION));
+
+        // And a client that asserts nothing — an older one, or one running
+        // under the skew override — is unaffected.
+        let created = client
+            .call::<CreateSession>(&req("unasserted", "/uwu"))
+            .await
+            .ok()
+            .expect("an unasserted create must behave as it always has");
+        assert_eq!(created.daemon_version.as_deref(), Some(OWN_VERSION));
+    }
+
+    /// The two read RPCs the attach / exec / setup-zed / ssh-forward paths
+    /// gate on must report the daemon's build, or those paths have nothing to
+    /// assert against and would have to spend a `GetVersion` to find out.
+    #[tokio::test]
+    async fn the_read_rpcs_report_the_daemon_build() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let id = client
+            .call::<CreateSession>(&req("my session", "/uwu"))
+            .await
+            .unwrap()
+            .id;
+
+        assert_eq!(
+            client
+                .call::<ListSessions>(&())
+                .await
+                .daemon_version
+                .as_deref(),
+            Some(OWN_VERSION)
+        );
+        assert_eq!(
+            client
+                .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(id))
+                .await
+                .daemon_version
+                .as_deref(),
+            Some(OWN_VERSION)
+        );
+    }
+
     #[tokio::test]
     async fn get_session_policy_returns_the_policy_configured_at_launch() {
         // R2.6: GetSessionPolicy reads the live per-session policy from the
@@ -2500,6 +2607,7 @@ mod tests {
                     hooks_enabled: true,
                     attrs: Default::default(),
                 },
+                must_match_version: None,
             })
             .await
             .unwrap()
@@ -2700,6 +2808,7 @@ mod tests {
                     hooks_enabled: true,
                     attrs: Default::default(),
                 },
+                must_match_version: None,
             })
             .await;
         assert_eq!(
