@@ -1066,8 +1066,14 @@ Unit 8's dual-format rework, sequenced after Unit 6.
   governed by the no-interpolated-values tracing standard; full argv is
   recorded only for marker-matched minimal-family processes — a concurrent
   unrelated process's command line is never captured (`comm` only) — and is
-  scrubbed of sensitive `key=value` tokens (R5.2, R6.2). Residual risk is
-  handled by two nets: the CLI's explicit review-before-sharing notice
+  scrubbed of sensitive `key=value` tokens (R5.2, R6.2). One free-text
+  surface is *not* ours to bound this way — the host's kernel panic report —
+  and is admitted only as a single bounded extract: the
+  `panic(cpu N caller …)` string alone, truncated and token-scrubbed. The
+  report's metadata header (device-stable `crashReporterKey`/incident id,
+  hardware model) and its backtrace (an inventory of the user's loaded kexts)
+  are withheld; the collector never copies a crash report's head verbatim.
+  Residual risk is handled by two nets: the CLI's explicit review-before-sharing notice
   (R2.9) and the team-side explorer's `audit` secret-pattern scan (Unit 8
   prior art).
 - **The collector must not be a read gadget.** Every content read on both

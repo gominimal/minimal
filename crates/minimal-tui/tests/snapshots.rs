@@ -19,8 +19,26 @@ fn entry(n: u128, name: Option<&str>, project: &str) -> minimald_rpc::ListSessio
         name: name.map(str::to_owned),
         project_path: Some(paths::HostAbsPath::try_new(project).unwrap()),
         status: sessions::SessionStatus::Active,
+        git: None,
         attrs: None,
     }
+}
+
+/// An entry backed by a git repository: branch in the sidebar row, repo
+/// root in the detail Info section.
+fn entry_with_git(
+    n: u128,
+    name: &str,
+    project: &str,
+    worktree: bool,
+) -> minimald_rpc::ListSessionsEntry {
+    let mut e = entry(n, Some(name), project);
+    e.git = Some(Box::new(minimald_rpc::GitInfo {
+        branch: "main".to_string(),
+        repo_root: project.to_string(),
+        is_worktree: worktree,
+    }));
+    e
 }
 
 fn provider(label: &str, sessions: Vec<minimald_rpc::ListSessionsEntry>) -> ProviderData {
@@ -102,6 +120,27 @@ fn filtered() {
     model.filter.input = "bench".to_string();
     model.clamp_cursor();
     insta::assert_snapshot!(render(&mut model));
+}
+
+#[test]
+fn filtered_with_status() {
+    // The status reserves the footer's right edge; it must not overdraw
+    // the hints, long as they are with a filter applied.
+    let mut model = fixed_model(vec![
+        provider("host", vec![entry(1, Some("api-staging"), "/src/api")]),
+        provider("vm", vec![entry(3, Some("bench"), "/src/bench")]),
+    ]);
+    model.filter.input = "bench".to_string();
+    model.clamp_cursor();
+    model.status = Some("refreshed".to_string());
+    // Render with constrained width to exercise potential overlap between
+    // the hints and the status.
+    let backend = TestBackend::new(80, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| render::view(&mut model, frame))
+        .unwrap();
+    insta::assert_snapshot!(format!("{}", terminal.backend()));
 }
 
 #[test]
@@ -188,6 +227,114 @@ fn detail_pane_with_policy() {
     // Focus the session.
     model.cursor = 1;
     insta::assert_snapshot!(render(&mut model));
+}
+
+/// Git info from the list RPC renders: the branch in the sidebar row
+/// (TestBackend text — the glyph is what matters) and the repo root,
+/// tagged as a worktree, in the detail Info section.
+#[test]
+fn sidebar_and_info_show_git_context() {
+    let mut model = fixed_model(vec![provider(
+        "host",
+        vec![
+            entry_with_git(1, "api-staging", "/src/api", false),
+            entry_with_git(2, "web-wt", "/src/web-wt", true),
+        ],
+    )]);
+    let rendered = render(&mut model);
+    let api_row = rendered
+        .lines()
+        .find(|l| l.contains("api-staging"))
+        .expect("session row");
+    assert!(api_row.contains('⎇'), "branch glyph missing: {api_row}");
+    assert!(api_row.contains("main"), "branch name missing: {api_row}");
+
+    // Focus the worktree session: its repo root and the worktree tag
+    // appear in the right column of the Info section.
+    model.cursor = 2;
+    let rendered = render(&mut model);
+    assert!(
+        rendered.contains("/src/web-wt (worktree)"),
+        "worktree-tagged repo root missing:\n{rendered}"
+    );
+    // A plain repo root renders without the tag.
+    model.cursor = 1;
+    let rendered = render(&mut model);
+    let info_row = rendered
+        .lines()
+        .find(|l| l.contains("repo"))
+        .expect("repo row in info section");
+    assert!(
+        info_row.contains("/src/api"),
+        "repo root missing: {info_row}"
+    );
+    assert!(
+        !info_row.contains("worktree"),
+        "plain repo must not be tagged: {info_row}"
+    );
+    // The branch repeats in the Info section at full fidelity, alongside
+    // the repo root it came from in the sidebar.
+    let branch_row = rendered
+        .lines()
+        .find(|l| l.contains("branch"))
+        .expect("branch row in info section");
+    assert!(
+        branch_row.contains("main"),
+        "branch name missing: {branch_row}"
+    );
+}
+
+/// A session with no git info renders neither a repo nor a branch row,
+/// keeping the Info column layout byte-identical to pre-git renders.
+#[test]
+fn info_section_omits_git_rows_without_git_info() {
+    let mut model = fixed_model(vec![provider(
+        "host",
+        vec![entry(1, Some("plain"), "/src/plain")],
+    )]);
+    let rendered = render(&mut model);
+    assert!(
+        !rendered.lines().any(|l| l.contains("repo")),
+        "repo row leaked into a no-git render:\n{rendered}"
+    );
+    assert!(
+        !rendered.lines().any(|l| l.contains("branch")),
+        "branch row leaked into a no-git render:\n{rendered}"
+    );
+}
+
+/// A branch name longer than the sidebar truncates with `…` instead of
+/// pushing the network label and activity indicator off the right edge.
+#[test]
+fn sidebar_truncates_a_long_branch() {
+    let mut model = fixed_model(vec![provider(
+        "host",
+        vec![entry_with_git(1, "api", "/src/api", false)],
+    )]);
+    let long_branch = format!("feature/{}", "x".repeat(120));
+    model.providers[0].sessions[0].git.as_mut().unwrap().branch = long_branch;
+    model.details.insert(
+        SessionKey {
+            provider: "host".to_string(),
+            id: id(1),
+        },
+        Detail {
+            record: Some(record(Some("api"), NetworkMode::OwnIp)),
+            policy: None,
+        },
+    );
+    let rendered = render(&mut model);
+    let row = rendered
+        .lines()
+        .find(|l| l.contains('⎇'))
+        .unwrap_or_else(|| panic!("branch row missing:\n{rendered}"));
+    assert!(row.contains('…'), "branch must be truncated: {row}");
+    assert!(
+        !row.contains(&"x".repeat(20)),
+        "full branch must not fit: {row}"
+    );
+    // The right-aligned cells survive truncation.
+    assert!(row.contains("OwnIp"), "network label clipped: {row}");
 }
 
 /// A session with fresh stdout renders its activity spinner in the sidebar

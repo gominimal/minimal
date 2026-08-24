@@ -137,27 +137,6 @@ fn build_dir_rows(dirs: &DirsLookup) -> Vec<DirRow> {
         rows.push(mesh_row());
     }
     rows.extend([
-        (
-            "Config",
-            "mTLS client cert",
-            Some(dirs.config.join("client.pem")),
-            None,
-        )
-            .into_row(),
-        (
-            "Config",
-            "mTLS client key",
-            Some(dirs.config.join("client.key")),
-            None,
-        )
-            .into_row(),
-        (
-            "Config",
-            "mTLS CA cert",
-            Some(dirs.config.join("ca.pem")),
-            None,
-        )
-            .into_row(),
         ("State", "State dir", Some(dirs.state.clone()), None).into_row(),
         ("State", "Sessions", Some(dirs.state.join("sessions")), None).into_row(),
         (
@@ -330,21 +309,6 @@ mod tests {
                 "Config",
                 "Loadouts dir",
                 "/home/u/.config/minimal/loadouts".to_string(),
-            ),
-            (
-                "Config",
-                "mTLS client cert",
-                "/home/u/.config/minimal/client.pem".to_string(),
-            ),
-            (
-                "Config",
-                "mTLS client key",
-                "/home/u/.config/minimal/client.key".to_string(),
-            ),
-            (
-                "Config",
-                "mTLS CA cert",
-                "/home/u/.config/minimal/ca.pem".to_string(),
             ),
             (
                 "State",

@@ -1,9 +1,11 @@
 ---
 source: crates/minimal-tui/tests/snapshots.rs
-expression: render(&model)
+expression: render(&mut model)
 ---
-"┌ sessions ────────────────────┐┌──────────────────────────────────────────────────────────────────┐"
-"│ / bench                      ││ no session selected                                              │"
+"┌──────────────────────────────┐┌──────────────────────────────────────────────────────────────────┐"
+"│      ▃🭕🭏🭕🭏 M I N I M A L     ││ no session selected                                              │"
+"│ ──────────────────────────── ││                                                                  │"
+"│ / bench                      ││                                                                  │"
 "│ ──────────────────────────── ││                                                                  │"
 "│ ▼ host  v0.1              ●  ││                                                                  │"
 "│ ▼ vm  v0.1                ●  ││                                                                  │"
@@ -28,7 +30,5 @@ expression: render(&model)
 "│                              ││                                                                  │"
 "│                              ││                                                                  │"
 "│                              ││                                                                  │"
-"│                              ││                                                                  │"
-"│                              ││                                                                  │"
 "└──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘"
-" ↑↓ move · / filter · enter attach · d destroy · r rename · n new · q quit                          "
+" ↑↓ move · / filter · esc clear filter · enter attach · d destroy · r rename · n new · q quit       "

@@ -137,6 +137,11 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
         diagnostics::net::routes(&mut w, "host")
     );
     collect_step!(w, "host.power", diagnostics::power::power(&mut w, "host"));
+    collect_step!(
+        w,
+        "host.panic-report",
+        diagnostics::power::panic_report(&mut w, "host")
+    );
     collect_step!(w, "config", collect::config(&mut w, &paths));
     collect_step!(w, "state", collect::state(&mut w, &paths));
     // Log prefixes that matched nothing on the host come back rather than

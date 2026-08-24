@@ -3,7 +3,7 @@
 
 use chrono::Utc;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -27,13 +27,15 @@ pub fn view(model: &mut Model, frame: &mut Frame) {
     render_footer(model, frame, footer);
 }
 
-/// Truncate `s` to at most `w` display columns (appending `…` when cut), or
-/// pad it with trailing spaces to exactly `w`. Widths are terminal display
-/// widths, so CJK/emoji session names don't misalign the sidebar.
-fn pad_truncate(s: &str, w: usize) -> String {
-    let width = UnicodeWidthStr::width(s);
-    if width <= w {
-        return format!("{s}{}", " ".repeat(w - width));
+/// Truncate `s` to at most `w` display columns, appending `…` when cut.
+fn truncate(s: &str, w: usize) -> String {
+    // w == 0 must yield the empty string: the ellipsis alone is one column
+    // and would overflow a zero-width allocation.
+    if w == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(s) <= w {
+        return s.to_string();
     }
     let budget = w.saturating_sub(1);
     let mut used = 0;
@@ -50,23 +52,48 @@ fn pad_truncate(s: &str, w: usize) -> String {
     format!("{cut}…")
 }
 
+/// Truncate `s` to at most `w` display columns (appending `…` when cut), or
+/// pad it with trailing spaces to exactly `w`. Widths are terminal display
+/// widths, so CJK/emoji session names don't misalign the sidebar.
+fn pad_truncate(s: &str, w: usize) -> String {
+    let out = truncate(s, w);
+    let pad = w.saturating_sub(UnicodeWidthStr::width(out.as_str()));
+    format!("{out}{}", " ".repeat(pad))
+}
+
 fn render_sidebar(model: &mut Model, frame: &mut Frame, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .padding(ratatui::widgets::Padding::horizontal(1))
-        .title(Span::styled(
-            " sessions ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        .padding(ratatui::widgets::Padding::horizontal(1));
     let inner = block.inner(area);
     let inner_width = inner.width as usize;
     frame.render_widget(block, area);
 
-    // The filter line and its separator pin to the top, per the spec's
-    // layout mock (dim while the filter isn't being edited); the session
-    // list scrolls beneath them.
-    let [filter_area, list_area] =
-        Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(inner);
+    // The centered logo and its separator pin to the top, with the filter
+    // line and its own separator beneath per the spec's layout mock (dim
+    // while the filter isn't being edited); the session list scrolls
+    // underneath.
+    let [logo_area, filter_area, list_area] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Min(1),
+    ])
+    .areas(inner);
+    // The logo uses Legacy Computing diagonal blocks (U+1FB40..U+1FB5F) for
+    // cleaner slanted stripes; those codepoints are missing from some
+    // terminal fonts. If that turns out to hurt in practice, the Geometric
+    // Shapes fallback (renders almost everywhere) is "▃◥◣◥◣ M I N I M A L".
+    let logo_lines = vec![
+        Line::styled(
+            "▃🭕🭏🭕🭏 M I N I M A L",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::styled("─".repeat(inner_width), Style::default().fg(Color::Gray)),
+    ];
+    frame.render_widget(
+        Paragraph::new(logo_lines).alignment(Alignment::Center),
+        logo_area,
+    );
     let filter_style = if model.filter.editing {
         Style::default()
     } else {
@@ -145,8 +172,28 @@ fn render_sidebar(model: &mut Model, frame: &mut Frame, area: Rect) {
                 // and the terminal swallows the indicator cell at the right
                 // edge (this was the "no activity indicator" bug).
                 let marker = if selected { "▸ " } else { "  " };
+                // Branch segment (` ⎇ feature` + two-space gutter) only
+                // when the daemon answered git info; skipping it entirely
+                // keeps the no-git layout byte-identical to before. Cap it
+                // to whatever the row can spare after the right-aligned
+                // network/indicator block, so a long branch name truncates
+                // instead of pushing those cells off the right edge.
                 let right = format!("{net} {indicator:>2}");
-                let right_w = UnicodeWidthStr::width(right.as_str());
+                let max_branch_width =
+                    inner_width.saturating_sub(UnicodeWidthStr::width(right.as_str()) + 2);
+                let branch = entry
+                    .git
+                    .as_ref()
+                    .map(|g| format!(" ⎇ {}", g.branch))
+                    .filter(|_| max_branch_width > UnicodeWidthStr::width(" ⎇ "))
+                    .map(|b| truncate(&b, max_branch_width))
+                    .unwrap_or_default();
+                let right_w = UnicodeWidthStr::width(right.as_str())
+                    + if branch.is_empty() {
+                        0
+                    } else {
+                        UnicodeWidthStr::width(branch.as_str()) + 2
+                    };
                 let left = pad_truncate(
                     &format!("  {marker}{name}"),
                     inner_width.saturating_sub(right_w),
@@ -154,21 +201,28 @@ fn render_sidebar(model: &mut Model, frame: &mut Frame, area: Rect) {
                 let gap = inner_width
                     .saturating_sub(UnicodeWidthStr::width(left.as_str()))
                     .saturating_sub(right_w);
-                Line::from(vec![
-                    Span::styled(
-                        format!("{left}{}", " ".repeat(gap)),
-                        if selected {
-                            Style::default().add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default()
-                        },
-                    ),
-                    Span::styled(net.to_string(), Style::default().fg(Color::Gray)),
-                    Span::styled(
-                        format!(" {indicator:>2}"),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                ])
+                let name_span = Span::styled(
+                    format!("{left}{}", " ".repeat(gap)),
+                    if selected {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                );
+                let mut spans = vec![name_span];
+                if !branch.is_empty() {
+                    spans.push(Span::styled(branch, Style::default().fg(Color::Gray)));
+                    spans.push(Span::raw("  "));
+                }
+                spans.push(Span::styled(
+                    net.to_string(),
+                    Style::default().fg(Color::Gray),
+                ));
+                spans.push(Span::styled(
+                    format!(" {indicator:>2}"),
+                    Style::default().fg(Color::Yellow),
+                ));
+                Line::from(spans)
             }
         };
         lines.push(line);
@@ -311,6 +365,19 @@ fn render_info(model: &Model, key: &SessionKey, frame: &mut Frame, area: Rect) {
         .and_then(|a| a.title.as_ref())
         .map(|t| t.value.clone())
         .unwrap_or_else(|| "-".to_string());
+    // The repo's toplevel, tagged when the project lives in a linked
+    // worktree (its .git lives in the main repo). Absent entirely for
+    // non-repo projects so their layout doesn't shift.
+    let repo = entry.and_then(|e| e.git.as_ref()).map(|g| {
+        let root = shorten_home(&g.repo_root);
+        match g.is_worktree {
+            true => format!("{root} (worktree)"),
+            false => root,
+        }
+    });
+    // The branch repeats in the Info column at full fidelity, where the
+    // sidebar's tight truncation budget may have clipped it.
+    let branch = entry.and_then(|e| e.git.as_ref()).map(|g| g.branch.clone());
     let left = [
         ("project", project),
         ("user", user),
@@ -321,7 +388,15 @@ fn render_info(model: &Model, key: &SessionKey, frame: &mut Frame, area: Rect) {
         .and_then(|d| d.record.as_ref())
         .map(|r| format!("{:?}", r.network))
         .unwrap_or_else(|| "?".to_string());
-    let right = [("net", net), ("idle", idle_text(model, key))];
+    // The Info section is four rows tall: runtime facts first, then the
+    // git context fills the right column's spare rows.
+    let mut right = vec![("net", net), ("idle", idle_text(model, key))];
+    if let Some(repo) = repo {
+        right.push(("repo", repo));
+    }
+    if let Some(branch) = branch {
+        right.push(("branch", branch));
+    }
 
     // Left column takes half the pane; the right column starts after a
     // two-space gutter. Labels are dim in both columns.
@@ -339,7 +414,9 @@ fn render_info(model: &Model, key: &SessionKey, frame: &mut Frame, area: Rect) {
             }
             if let Some((label, value)) = right.get(i) {
                 spans.push(Span::raw("  "));
-                spans.push(Span::styled(pad_truncate(label, 6), dim));
+                // Eight-wide to match the left column: the six-wide gutter
+                // left the six-char "branch" label flush against its value.
+                spans.push(Span::styled(pad_truncate(label, 8), dim));
                 spans.push(Span::raw(value.clone()));
             }
             Line::from(spans)
@@ -671,23 +748,35 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
         }
         None => {
             // Key hints flush left; the transient status line flush right.
-            frame.render_widget(
-                Paragraph::new(Line::styled(
-                    " ↑↓ move · / filter · enter attach · d destroy · r rename · n new · q quit ",
-                    Style::default().fg(Color::Gray),
-                )),
-                area,
-            );
-            if let Some(status) = &model.status {
+            // An applied filter already shows its input in the sidebar's
+            // `/` line, so the footer only advertises how to drop it.
+            let hints = if model.filter.input.is_empty() {
+                " ↑↓ move · / filter · enter attach · d destroy · r rename · n new · q quit "
+                    .to_string()
+            } else {
+                " ↑↓ move · / filter · esc clear filter · enter attach · d destroy · r rename · n new · q quit "
+                    .to_string()
+            };
+            let line = Line::styled(hints, Style::default().fg(Color::Gray));
+            let status_line = model.status.as_ref().map(|status| {
                 let style = if status.starts_with("error:") {
                     Style::default().fg(Color::Red)
                 } else {
                     Style::default().fg(Color::Cyan)
                 };
+                Line::styled(format!("{status} "), style)
+            });
+            // Reserve the right edge for the status so it can't overdraw
+            // the hints.
+            let status_width = status_line.as_ref().map_or(0, |l| l.width() as u16);
+            let [line_area, status_area] =
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(status_width)])
+                    .areas(area);
+            frame.render_widget(Paragraph::new(line), line_area);
+            if let Some(status_line) = status_line {
                 frame.render_widget(
-                    Paragraph::new(Line::styled(format!("{status} "), style))
-                        .alignment(Alignment::Right),
-                    area,
+                    Paragraph::new(status_line).alignment(Alignment::Right),
+                    status_area,
                 );
             }
         }
@@ -729,6 +818,17 @@ mod tests {
         assert_eq!(style.fg, Some(Color::Indexed(1)));
         assert!(style.add_modifier.contains(Modifier::BOLD));
         assert!(style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn truncation_respects_a_zero_width_budget() {
+        assert_eq!(truncate("abc", 0), "");
+        assert_eq!(truncate("", 0), "");
+        // Width 1 has room for the ellipsis itself when the input is cut.
+        assert_eq!(truncate("abc", 1), "…");
+        // pad_truncate inherits the zero-width guard instead of overflowing.
+        assert_eq!(pad_truncate("abc", 0), "");
+        assert_eq!(pad_truncate("", 3), "   ");
     }
 
     #[test]
