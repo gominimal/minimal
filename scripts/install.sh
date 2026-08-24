@@ -41,6 +41,11 @@
 
 set -eu
 
+# The entire executable body lives in main(), invoked as the very last line, so
+# a truncated `curl … | sh` download fails to parse instead of executing a
+# partial, syntactically-valid prefix of the script.
+main() {
+
 # --- Configuration ---------------------------------------------------------
 
 # Bucket root. Hardcoded, overridable for staging/tests. Must be HTTPS: the
@@ -1226,3 +1231,6 @@ say "  $mark ${b}min$rst                               ${dim}build the sandbox a
 say ""
 say "  ${dim}docs.minimal.dev   $sep   discord.com/invite/qgX8sm6X7G$rst"
 say ""
+}
+
+main "$@"
