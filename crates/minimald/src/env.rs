@@ -1159,6 +1159,12 @@ impl SessionChannel {
                     Some(&task.patch),
                     Some(&task.vars),
                     task.packages.clone(),
+                    // The session's own home, not the daemon's. `minimald` is
+                    // pid 1 with `HOME=/` inside the guest, so the ambient
+                    // home would expand a package's `~/.claude.json` onto the
+                    // read-only rootfs (#1204); the session has a real,
+                    // writable home and this channel already holds it.
+                    mctx::PatchHome::Session(self.home.clone()),
                 )
                 .await?;
 

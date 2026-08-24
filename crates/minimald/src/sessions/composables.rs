@@ -20,11 +20,13 @@
 
 use std::sync::Arc;
 
-// The string form of the nickel enum tag `'Credential`, shared with the
-// package-attribute path in `graph` so both filters key off one definition.
-// That constant carries the schema-stability note; the regression guard on
-// this side is `credential_class_fs_mappings_are_filtered_out` below.
-use graph::CREDENTIAL_CLASS_TAG;
+// The env-mapping attrs are decoded into `graph`'s typed representation
+// rather than read out of `AttrValue` here, so this path and the
+// package-attribute path in `graph::SetupForPackages` classify an entry
+// through one definition instead of two string comparisons. The regression
+// guard on this side is `credential_class_fs_mappings_are_filtered_out`
+// below.
+use graph::{EnvFsMapping, EnvMappingClass, EnvMappingKind};
 use paths::DaemonAbsPath;
 use sessions::{
     SessionId,
@@ -36,8 +38,8 @@ use sessions::{
 /// The runtime-env attrs a package can declare on
 /// `BuildSpec.attrs`. See
 /// [`extract_package_attrs`] for the extraction rules — in
-/// particular, `class = 'Credential` mappings are silently dropped
-/// pending the future secrets strategy.
+/// particular, `class = 'Credential` mappings are dropped (with a
+/// warn naming the package) pending the future secrets strategy.
 #[derive(Debug)]
 struct PackageAttrs {
     state_wiring: Vec<mfile::StateWiring>,
@@ -52,13 +54,14 @@ struct PackageAttrs {
 /// into domain-typed pieces for [`mfile::PackageComposable`].
 ///
 /// Credential-class mappings are dropped (see `TODO(secrets)`);
-/// `read_only` is ignored (minimal is copy-based). Malformed
-/// entries are silently skipped — the nickel schema is the
-/// authority on shape.
+/// `read_only` is ignored (minimal is copy-based). An entry that
+/// doesn't decode is an error, not a skip: this extractor feeds a
+/// credential filter, so an entry nobody can classify must never
+/// reach the session.
 fn extract_package_attrs(b: &graph::BuildSpec) -> Result<PackageAttrs, std::io::Error> {
     Ok(PackageAttrs {
         state_wiring: extract_state_wiring(b)?,
-        fs_mappings: extract_fs_mappings(b),
+        fs_mappings: extract_fs_mappings(b)?,
     })
 }
 
@@ -102,7 +105,9 @@ fn extract_state_wiring(b: &graph::BuildSpec) -> Result<Vec<mfile::StateWiring>,
         .collect()
 }
 
-fn extract_fs_mappings(b: &graph::BuildSpec) -> Vec<mfile::PackageFsMapping> {
+fn extract_fs_mappings(
+    b: &graph::BuildSpec,
+) -> Result<Vec<mfile::PackageFsMapping>, std::io::Error> {
     // TODO(secrets): `class = 'Credential` mappings are filtered
     // out here rather than routed through a separate secrets
     // channel. When the secrets strategy lands, teach this
@@ -113,78 +118,57 @@ fn extract_fs_mappings(b: &graph::BuildSpec) -> Vec<mfile::PackageFsMapping> {
     // [`mfile::PackageComposable::contribute`]; here we just tag the
     // variant so that logic can distinguish them from single-file
     // mappings.
-    ["env_dir_mappings", "env_file_mappings"]
-        .iter()
-        .flat_map(|attr| {
-            let is_dir = *attr == "env_dir_mappings";
-            b.attrs
-                .get(*attr)
-                .into_iter()
-                .flat_map(|v| attr_entries(v).into_iter())
-                .filter_map(move |entry| {
-                    let m = entry.as_map()?;
-                    // Normalize the path: trim trailing slashes so a
-                    // package declaration like `~/.claude/` gives the
-                    // same mapping as `~/.claude`, and reject the
-                    // pathological cases (empty, or a bare `/`) so a
-                    // walker rooted at filesystem root can never
-                    // reach the client.
-                    let path = m.get("path")?.as_string()?.trim_end_matches('/').to_owned();
-                    if path.is_empty() {
-                        tracing::warn!(
-                            package = %b.name,
-                            attr = %attr,
-                            "dropping fs mapping with empty or root path; the walker \
-                             would otherwise be rooted at the filesystem root",
-                        );
-                        return None;
-                    }
-                    // The two filters differ in what they do with the entry:
-                    // - Credential-class drops the entry entirely (with a
-                    //   warn naming the package + path).
-                    // - read_only=true keeps the entry (the mapping still
-                    //   reaches the sandbox) but warns that the flag was
-                    //   ignored, since minimal is copy-based and there's
-                    //   no read-only enforcement to apply.
-                    // Both warn so an operator reading daemon logs sees
-                    // exactly which package's mapping had its declared
-                    // intent altered.
-                    //
-                    // Missing/malformed `class` still returns silently —
-                    // that's a nickel-schema violation on the package side
-                    // and the extractor isn't the right layer to surface
-                    // it.
-                    if m.get("class")
-                        .and_then(|c| c.as_string())
-                        .map(String::as_str)
-                        == Some(CREDENTIAL_CLASS_TAG)
-                    {
-                        tracing::warn!(
-                            package = %b.name,
-                            path = %path,
-                            "dropping Credential-class fs mapping from session composition; \
-                             the secrets strategy is deferred, so credentials do not reach the \
-                             session sandbox via the composition path",
-                        );
-                        return None;
-                    }
-                    if m.get("read_only").and_then(|c| c.as_bool()).copied() == Some(true) {
-                        tracing::warn!(
-                            package = %b.name,
-                            path = %path,
-                            "ignoring `read_only = true` on fs mapping; minimal is copy-based \
-                             and the resulting sandbox file is writable regardless of the \
-                             package author's declared intent",
-                        );
-                    }
-                    Some(if is_dir {
-                        mfile::PackageFsMapping::Dir { path }
-                    } else {
-                        mfile::PackageFsMapping::File { path }
-                    })
-                })
-        })
-        .collect()
+    let mut out = Vec::new();
+    for mapping in EnvFsMapping::decode_all(b)? {
+        // Normalize the path: trim trailing slashes so a package
+        // declaration like `~/.claude/` gives the same mapping as
+        // `~/.claude`, and reject the pathological cases (empty, or
+        // a bare `/`) so a walker rooted at filesystem root can
+        // never reach the client.
+        let path = mapping.path.trim_end_matches('/').to_owned();
+        if path.is_empty() {
+            tracing::warn!(
+                package = %b.name,
+                attr = %mapping.kind.attr(),
+                "dropping fs mapping with empty or root path; the walker \
+                 would otherwise be rooted at the filesystem root",
+            );
+            continue;
+        }
+        // The two filters differ in what they do with the entry:
+        // - Credential-class drops the entry entirely (with a warn
+        //   naming the package + path).
+        // - read_only=true keeps the entry (the mapping still
+        //   reaches the sandbox) but warns that the flag was
+        //   ignored, since minimal is copy-based and there's no
+        //   read-only enforcement to apply.
+        // Both warn so an operator reading daemon logs sees exactly
+        // which package's mapping had its declared intent altered.
+        if mapping.class == EnvMappingClass::Credential {
+            tracing::warn!(
+                package = %b.name,
+                path = %path,
+                "dropping Credential-class fs mapping from session composition; \
+                 the secrets strategy is deferred, so credentials do not reach the \
+                 session sandbox via the composition path",
+            );
+            continue;
+        }
+        if mapping.read_only {
+            tracing::warn!(
+                package = %b.name,
+                path = %path,
+                "ignoring `read_only = true` on fs mapping; minimal is copy-based \
+                 and the resulting sandbox file is writable regardless of the \
+                 package author's declared intent",
+            );
+        }
+        out.push(match mapping.kind {
+            EnvMappingKind::Dir => mfile::PackageFsMapping::Dir { path },
+            EnvMappingKind::File => mfile::PackageFsMapping::File { path },
+        });
+    }
+    Ok(out)
 }
 
 /// Normalize the list-or-single-map wire shape into a slice of
@@ -725,6 +709,51 @@ mod tests {
             vec![mfile::PackageFsMapping::Dir {
                 path: "~/.claude".to_string(),
             }],
+        );
+    }
+
+    /// The other half of the credential filter: an entry this build
+    /// cannot classify fails the whole extraction rather than
+    /// reaching the composer as an ordinary mapping.
+    ///
+    /// This is the hazard the shared typed decode exists to close.
+    /// While both extractors compared `class` to the string
+    /// `"Credential"`, anything that didn't match — an entry with no
+    /// class, or a `decode::AttrValue` that rendered enum tags some
+    /// other way — was treated as "not a credential" and staged into
+    /// the session. Now it is an error naming the package to go and
+    /// fix.
+    #[test]
+    fn an_unclassifiable_fs_mapping_fails_extraction() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+                {
+                    name = \"claude-code\",
+                    build_deps = [],
+                    cmd = \"\",
+                    attrs = {
+                        env_file_mappings = [{ read_only = false, path = \"~/.claude.json\" }],
+                    },
+                } | BuildSpec
+                "
+            }
+            .to_string(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+        let g = graph::Graph::new().ingest(layer).unwrap();
+        let bs = g.get(g.by_name("claude-code").unwrap()).unwrap();
+
+        let err = extract_package_attrs(bs)
+            .expect_err("an entry with no class must not reach the composer");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("claude-code") && err.to_string().contains("class"),
+            "the error must name the package and the offending field, got {err}"
         );
     }
 

@@ -3,6 +3,7 @@ use std::{
     path::PathBuf,
 };
 
+use crate::env_mapping::{EnvFsMapping, EnvMappingClass, EnvMappingKind};
 use crate::{BuildSpecRef, Graph};
 use decode::AttrValue;
 use mfile::EnvPatches;
@@ -30,64 +31,6 @@ pub struct SetupForPackages {
     pub fs_mapping_packages: HashMap<String, String>,
 }
 
-/// The string form of the nickel enum tag `'Credential` as it appears after
-/// `decode`'s AttrValue conversion. Compared as a plain string at runtime, so
-/// if `decode::AttrValue`'s enum-tag rendering ever changes (angle-brackets,
-/// hash prefix, etc.) the checks here and in `minimald`'s session-composition
-/// extractor silently stop matching, and credential mappings flow through
-/// unfiltered.
-///
-/// The regression guards are `fs_mappings_drop_credential_class` in this
-/// module and `credential_class_fs_mappings_are_filtered_out` in
-/// `minimald::sessions::composables`; if the rendering changes, both fail and
-/// this constant is where to update.
-// TODO(schema-stability): keep in sync with `decode::AttrValue::EnumTag`
-// rendering.
-pub const CREDENTIAL_CLASS_TAG: &str = "Credential";
-
-/// Reads one `env_dir_mappings` / `env_file_mappings` entry into its declared
-/// path and patch setting, dropping `class = 'Credential` entries.
-///
-/// TODO(secrets): credential-class mappings are dropped rather than routed
-/// through a separate secrets channel, matching what the session-composition
-/// path already does in `minimald`'s `extract_fs_mappings`. Until the secrets
-/// strategy lands they simply aren't seen by the sandbox — which is also what
-/// keeps a task running inside the guest from trying to mount host
-/// credentials that aren't there (#1204).
-fn read_mapping(
-    package: &str,
-    attr: &'static str,
-    entry: &AttrValue,
-) -> Option<(String, mfile::PatchSetting)> {
-    use mfile::PatchSetting;
-
-    let entry = entry.as_map().unwrap();
-    let path = entry.get("path").unwrap().as_string().unwrap().clone();
-    if entry
-        .get("class")
-        .and_then(|c| c.as_string())
-        .map(String::as_str)
-        == Some(CREDENTIAL_CLASS_TAG)
-    {
-        tracing::warn!(
-            package = %package,
-            attr = %attr,
-            path = %path,
-            "dropping Credential-class fs mapping; the secrets strategy is deferred, so \
-             credentials do not reach the sandbox through package attributes",
-        );
-        return None;
-    }
-    Some((
-        path,
-        if *entry.get("read_only").unwrap().as_bool().unwrap() {
-            PatchSetting::ReadOnly
-        } else {
-            PatchSetting::ReadWrite
-        },
-    ))
-}
-
 impl SetupForPackages {
     /// Computes environment settings that need to be applied to an environment containing the
     /// given packages.
@@ -108,25 +51,36 @@ impl SetupForPackages {
 
         for dep in i.into_iter() {
             let b = g.get(dep).unwrap();
-            if let Some(dirs) = b.attrs.get("env_dir_mappings") {
-                for mapping in dirs.as_list().unwrap() {
-                    if let Some((path, setting)) =
-                        read_mapping(&b.name, "env_dir_mappings", mapping)
-                    {
-                        fs_mapping_packages.insert(path.clone(), b.name.clone());
-                        patch.dir.insert(path, setting);
-                    }
+            for mapping in EnvFsMapping::decode_all(b)? {
+                // TODO(secrets): credential-class mappings are dropped rather
+                // than routed through a separate secrets channel, matching
+                // what the session-composition path already does in
+                // `minimald`'s `extract_fs_mappings`. Until the secrets
+                // strategy lands they simply aren't seen by the sandbox —
+                // which is also what keeps a task running inside the guest
+                // from trying to mount host credentials that aren't there
+                // (#1204).
+                if mapping.class == EnvMappingClass::Credential {
+                    tracing::warn!(
+                        package = %b.name,
+                        attr = %mapping.kind.attr(),
+                        path = %mapping.path,
+                        "dropping Credential-class fs mapping; the secrets strategy is \
+                         deferred, so credentials do not reach the sandbox through package \
+                         attributes",
+                    );
+                    continue;
                 }
-            }
-            if let Some(files) = b.attrs.get("env_file_mappings") {
-                for mapping in files.as_list().unwrap() {
-                    if let Some((path, setting)) =
-                        read_mapping(&b.name, "env_file_mappings", mapping)
-                    {
-                        fs_mapping_packages.insert(path.clone(), b.name.clone());
-                        patch.file.insert(path, setting);
-                    }
-                }
+                let setting = if mapping.read_only {
+                    mfile::PatchSetting::ReadOnly
+                } else {
+                    mfile::PatchSetting::ReadWrite
+                };
+                fs_mapping_packages.insert(mapping.path.clone(), b.name.clone());
+                match mapping.kind {
+                    EnvMappingKind::Dir => patch.dir.insert(mapping.path, setting),
+                    EnvMappingKind::File => patch.file.insert(mapping.path, setting),
+                };
             }
             if let Some(wiring) = b.attrs.get("env_state_wiring") {
                 let mut apply_wiring = |entry: &AttrValue| -> Result<(), std::io::Error> {
@@ -239,6 +193,51 @@ mod tests {
                 )]),
             }
         )
+    }
+
+    /// An entry the typed decode can't classify stops the whole setup with
+    /// an error naming the package, rather than reaching the sandbox as an
+    /// unclassified — and therefore unfiltered — mapping. This is what the
+    /// old `class` string comparison could not do: it answered "not
+    /// `Credential`" for anything it didn't recognise and let the mapping
+    /// through.
+    #[test]
+    fn an_unclassifiable_mapping_fails_the_whole_setup() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+            let {BuildSpec, ..} = import \"minimal.ncl\" in
+
+            let
+                b1 = {
+                    name = \"b1\",
+                    build_deps = [],
+                    cmd = \"\",
+                    attrs = {
+                        env_file_mappings = [{ read_only = false, path = \"~/.claude.json\" }],
+                    },
+                } | BuildSpec,
+            in
+            [b1]
+            "
+            }
+            .to_string(),
+        )
+        // Nickel's own `class | [| 'Credential, 'State |]` contract does not
+        // catch this: a record contract's undefined field is lazy, so an
+        // entry that simply omits `class` evaluates cleanly and arrives here
+        // unclassified. That is precisely the case the old string comparison
+        // waved through.
+        .expect("nickel accepts an entry that omits `class`");
+        let g = Graph::new().ingest(layer).unwrap();
+
+        let err = SetupForPackages::build(&g, [g.by_name("b1").unwrap()])
+            .expect_err("an entry with no class must not decode");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("b1") && err.to_string().contains("class"),
+            "the error must name the package and the offending field, got {err}"
+        );
     }
 
     #[test]

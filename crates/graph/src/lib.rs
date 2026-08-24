@@ -180,8 +180,13 @@ pub use builds::{
     SubsetInput,
 };
 
+mod env_mapping;
+pub use env_mapping::{
+    EnvFsMapping, EnvMappingClass, EnvMappingError, EnvMappingErrorKind, EnvMappingKind,
+};
+
 mod env_setup;
-pub use env_setup::{CREDENTIAL_CLASS_TAG, SetupForPackages};
+pub use env_setup::SetupForPackages;
 
 // Re-exported so downstream crates can inspect the `Stack` a
 // `Graph::stack(name)` lookup returns without pulling in `decode`

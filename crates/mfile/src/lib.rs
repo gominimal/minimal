@@ -303,8 +303,9 @@ impl EnvPatches {
     /// usable home is an error here rather than a write into `/`.
     ///
     /// Mappings come back in a deterministic order — directories then files,
-    /// each sorted by declared path — so a caller reporting the first
-    /// failure names the same entry every run.
+    /// each sorted by declared path — so the sandbox applies them the same
+    /// way every run and a caller reporting the first failure names the same
+    /// entry every run.
     pub fn to_fs_mappings(
         &self,
         home: Option<&Path>,
@@ -340,17 +341,39 @@ impl EnvPatches {
         };
         let home = match home {
             None => HomeUnusable::Unset,
-            Some(h) => match h.to_str() {
-                Some(s) if h.is_absolute() && s != "/" => {
-                    return Ok(format!("{}/{stripped}", s.trim_end_matches('/')));
-                }
-                _ => HomeUnusable::NotAHome(h.to_path_buf()),
+            Some(h) => match Self::usable_home(h) {
+                // UTF-8 by construction — `usable_home` only returns a path
+                // it has already round-tripped through `to_str`.
+                Some(h) => return Ok(format!("{}/{stripped}", h.to_str().unwrap())),
+                None => HomeUnusable::NotAHome(h.to_path_buf()),
             },
         };
         Err(PatchHomeError {
             declared: path.to_string(),
             home,
         })
+    }
+
+    /// Normalizes `home` and hands it back only if it is somewhere a
+    /// patched-in file could actually live: absolute, valid UTF-8, and naming
+    /// at least one directory below `/`.
+    ///
+    /// The test is on normalized [`Component`]s rather than the literal
+    /// string. `/`, `//` and `/.` all denote the filesystem root, so a
+    /// string-exact `home != "/"` check passes the latter two straight
+    /// through and reconstitutes the very `/.claude.json` this guard exists
+    /// to prevent (#1204). Normalizing also collapses duplicate separators
+    /// and trailing `/` and `/.` segments, so `/home/dev/`, `/home//dev` and
+    /// `/home/dev/.` all expand identically.
+    fn usable_home(home: &Path) -> Option<PathBuf> {
+        if !home.is_absolute() {
+            return None;
+        }
+        let normalized: PathBuf = home.components().collect();
+        let names_a_directory = normalized
+            .components()
+            .any(|c| matches!(c, Component::Normal(_)));
+        (names_a_directory && normalized.to_str().is_some()).then_some(normalized)
     }
 }
 
@@ -1600,6 +1623,67 @@ mod tests {
         assert!(
             err.to_string().contains("~/.claude.json"),
             "the error must name the unexpanded path, got {err}"
+        );
+    }
+
+    /// Every spelling of the filesystem root is refused, not just the literal
+    /// `"/"`. A string-exact guard let `//` and `/.` through — both are
+    /// absolute, both compare unequal to `"/"`, and both then expanded
+    /// `~/.claude.json` right back to `/.claude.json`, reproducing #1204 with
+    /// a `HOME` a shell or a `WORKDIR /` image could plausibly set.
+    #[test]
+    fn to_fs_mappings_refuses_every_spelling_of_root() {
+        let patches = EnvPatches {
+            file: [("~/.claude.json".to_string(), PatchSetting::ReadWrite)].into(),
+            ..Default::default()
+        };
+
+        for home in ["//", "/.", "///", "/./."] {
+            assert_eq!(
+                patches
+                    .to_fs_mappings(Some(Path::new(home)))
+                    .unwrap_err()
+                    .home,
+                HomeUnusable::NotAHome(PathBuf::from(home)),
+                "`HOME={home}` names the filesystem root and must be refused"
+            );
+        }
+    }
+
+    /// A home that does name a directory expands the same however it is
+    /// spelled: trailing separators, doubled separators and `.` segments are
+    /// normalized away rather than passed into the mapping.
+    #[test]
+    fn to_fs_mappings_normalizes_the_home_it_expands_against() {
+        let patches = EnvPatches {
+            file: [("~/.claude.json".to_string(), PatchSetting::ReadWrite)].into(),
+            ..Default::default()
+        };
+
+        for home in ["/home/dev", "/home/dev/", "/home//dev", "/home/./dev/."] {
+            let mappings = patches.to_fs_mappings(Some(Path::new(home))).unwrap();
+            assert_eq!(
+                mappings[0].host_path, "/home/dev/.claude.json",
+                "`HOME={home}` should expand like `/home/dev`"
+            );
+        }
+    }
+
+    /// A relative `HOME` is no home either — expanding against it would make
+    /// the mapping depend on whatever directory the daemon happens to be in.
+    #[test]
+    fn to_fs_mappings_refuses_a_relative_home() {
+        let patches = EnvPatches {
+            file: [("~/.claude.json".to_string(), PatchSetting::ReadWrite)].into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            patches
+                .to_fs_mappings(Some(Path::new("home/dev")))
+                .unwrap_err()
+                .home,
+            HomeUnusable::NotAHome(PathBuf::from("home/dev")),
         );
     }
 
