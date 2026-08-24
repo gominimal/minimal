@@ -13,6 +13,7 @@ pub mod client;
 pub mod core;
 pub mod daemon;
 pub mod store;
+pub mod terminal;
 pub mod wire;
 
 /// The network isolation mode for a `PTask` (session).
