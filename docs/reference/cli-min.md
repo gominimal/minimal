@@ -211,8 +211,9 @@ Because sessions are interactive, the bundle also records the terminal
 `bug` itself ran on (`host/terminal.json`): whether stdin, stdout, and
 stderr are ttys — the same condition `attach` gates on, so a run under a
 pipe or CI is distinguishable from a real terminal — and, for each that
-is, its device and its `TIOCGWINSZ` rows/columns, which is what makes a
-garbled TUI or wrong wrapping diagnosable.
+is, its device and its `TIOCGWINSZ` geometry (rows, columns, and the
+`xpixel`/`ypixel` size emulators report), which is what makes a garbled
+TUI or wrong wrapping diagnosable.
 
 Diagnosing a wedged system must not change it: `bug` mutates no state and
 never starts a daemon; it works even when none are running.

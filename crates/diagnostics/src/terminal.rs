@@ -79,16 +79,27 @@ fn stream_info(fd: RawFd) -> StreamInfo {
 }
 
 /// The tty device path behind `fd`, `None` when it cannot be resolved.
+///
+/// `ttyname_r`, not `ttyname`: the latter answers out of a buffer that glibc
+/// and musl both make a *process-wide* static, so two threads probing at once
+/// can each be handed the other's device. Collectors run sequentially today,
+/// but a probe that is only correct because of its caller's scheduling is a
+/// trap for the next one. The `_r` form writes into a caller-owned buffer and
+/// is safe unconditionally.
 fn device_name(fd: RawFd) -> Option<String> {
-    // SAFETY: ttyname returns a pointer into a static buffer valid until the
-    // next ttyname call on this thread; it is copied into an owned String
-    // before this thread can make another.
-    let name = unsafe { libc::ttyname(fd) };
-    if name.is_null() {
+    // POSIX puts TTY_NAME_MAX at 32; 256 is headroom for any /dev/pts/N a
+    // kernel cares to invent. ERANGE (too small) reads as "unresolved", which
+    // is what every other failure here does too.
+    let mut buf = [0 as libc::c_char; 256];
+    // SAFETY: `buf` is a valid writable buffer of exactly the length passed;
+    // on success ttyname_r writes a NUL-terminated string within it.
+    let rc = unsafe { libc::ttyname_r(fd, buf.as_mut_ptr(), buf.len()) };
+    if rc != 0 {
         return None;
     }
-    // SAFETY: a non-null ttyname result is a NUL-terminated C string.
-    unsafe { CStr::from_ptr(name) }
+    // SAFETY: ttyname_r reported success, so `buf` holds a NUL-terminated
+    // string no longer than itself.
+    unsafe { CStr::from_ptr(buf.as_ptr()) }
         .to_str()
         .ok()
         .map(str::to_owned)
@@ -161,6 +172,36 @@ mod tests {
 
         assert!(!info.tty);
         assert!(info.device.is_none() && info.size.is_none());
+    }
+
+    /// The device lookup is reentrant. `ttyname` would answer all of these
+    /// threads out of one process-wide buffer, so a probe could return a
+    /// terminal it never looked at; `ttyname_r` gives each caller its own.
+    #[test]
+    fn concurrent_device_lookups_do_not_collide() {
+        // Held open for the whole test: /dev/pts numbers are recycled on
+        // close, so only simultaneously-live ptys are guaranteed to differ.
+        let ptys: Vec<(OwnedFd, OwnedFd)> = (0..8).map(|_| open_pty(24, 80)).collect();
+        let probe =
+            |slave: &OwnedFd| device_name(slave.as_raw_fd()).expect("a pty names its device");
+
+        // The uncontended answers, taken one at a time.
+        let expected: Vec<String> = ptys.iter().map(|(_, slave)| probe(slave)).collect();
+
+        let concurrent: Vec<String> = std::thread::scope(|s| {
+            let handles: Vec<_> = ptys
+                .iter()
+                .map(|(_, slave)| s.spawn(move || probe(slave)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        // Contention changes nothing. Under `ttyname` these would smear into
+        // whichever name the shared static held when each thread read it.
+        assert_eq!(
+            concurrent, expected,
+            "a probe returned another pty's device"
+        );
     }
 
     #[test]
