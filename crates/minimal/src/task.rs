@@ -656,4 +656,40 @@ mod tests {
         );
         assert!(err.downcast_ref::<TaskExit>().is_none());
     }
+
+    /// `cmd_task_run` rejects a task the project's minimal.toml does not
+    /// declare *before* it ever touches the daemon: the declared-task guard
+    /// runs on the resolved project path ahead of `ensure_daemon`, so an
+    /// undeclared name errors client-side — naming the unknown task and the
+    /// declared list — with no session created and no daemon required. This
+    /// pins the entry-path contract of the command itself; the daemon-backed
+    /// run/finalize legs need a live daemon and are covered by the session
+    /// e2e, not a unit test.
+    #[tokio::test]
+    async fn cmd_task_run_rejects_an_undeclared_task_client_side() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            b"[tasks.build]\necho = 'x'\n",
+        )
+        .unwrap();
+
+        let global = GlobalArgs {
+            repo_dir: Some(project.path().to_path_buf()),
+            no_input: true,
+            ..Default::default()
+        };
+        let args = TaskRunArgs {
+            task: "deploy".into(),
+            path: None,
+            keep: false,
+        };
+
+        let err = cmd_task_run(&global, args)
+            .await
+            .expect_err("an undeclared task must be rejected before the daemon");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown task 'deploy'"), "got: {msg}");
+        assert!(msg.contains("declared tasks: build"), "got: {msg}");
+    }
 }
