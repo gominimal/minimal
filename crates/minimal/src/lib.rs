@@ -2475,19 +2475,27 @@ async fn session_via_ssh(
         // The interactive path waits on ssh rather than `exec()`ing it, so this
         // process outlives the attach by the moment it takes to put the
         // terminal back. `minimald` sends unwind codes with every teardown it
-        // initiates, but the client cannot count on hearing them — a daemon
-        // predating #1210 sends none when the session process dies, and a
-        // dropped transport sends nothing at all — and once ssh is gone this is
-        // the only process left that can still reach the tty. `min dash`
-        // already runs the same command as a child while it is suspended.
-        let code = {
-            let _unwind = attach::TerminalUnwind::arm();
-            let status = tokio::process::Command::from(ssh)
-                .status()
-                .await
-                .context("failed to run ssh")?;
-            exit_code_of(status)
+        // initiates, but a transport that drops mid-session sends nothing at
+        // all, and once ssh is gone this is the only process left that can
+        // still reach the tty. So the guard stays armed for the duration and
+        // is stood down only once ssh's exit proves the daemon was alive and
+        // speaking — see `attach::client_must_unwind`. `min dash` already runs
+        // the same command as a child while it is suspended.
+        let mut unwind = attach::TerminalUnwind::arm();
+        let status = match tokio::process::Command::from(ssh).status().await {
+            Ok(status) => status,
+            Err(e) => {
+                // ssh never ran, so nothing of ours reached the terminal and
+                // there is nothing to put back.
+                unwind.disarm();
+                return Err(e).context("failed to run ssh");
+            }
         };
+        if !attach::client_must_unwind(&status) {
+            unwind.disarm();
+        }
+        let code = exit_code_of(status);
+        drop(unwind);
         // Terminate with ssh's own status, exactly as the `exec()` this
         // replaced did: `min` has nothing of its own left to say after an
         // attach, and the guard above has already run.

@@ -3320,7 +3320,16 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
 
     /// Computes terminal escape sequences to return the outer terminal
     /// to a normal state on detach.
+    ///
+    /// Deliberately *narrow*: the host has a screen model, so it emits only
+    /// what this session actually turned on. That matters most for
+    /// [`LEAVE_ALT_SCREEN`](sessions::terminal::LEAVE_ALT_SCREEN), which is
+    /// not inert against a terminal that never left the normal buffer — see
+    /// its docs. The `min` client's blind fallback exists only for the case
+    /// where these bytes cannot reach the tty at all.
     fn unwind_codes(&self) -> Vec<u8> {
+        use sessions::terminal as term;
+
         let live = self.parser.screen();
         let clean = vt100_ctt::Parser::new(live.size().0, live.size().1, 0)
             .screen()
@@ -3330,17 +3339,17 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         let mut out = clean.input_mode_diff(live);
         // disable alternate screen
         if live.alternate_screen() {
-            out.extend_from_slice(b"\x1b[?1049l");
+            out.extend_from_slice(term::LEAVE_ALT_SCREEN.as_bytes());
         }
         // disable hidden cursor
         if live.hide_cursor() {
-            out.extend_from_slice(b"\x1b[?25h");
+            out.extend_from_slice(term::SHOW_CURSOR.as_bytes());
         }
 
         // blind: reset text colors etc ('SGR')
-        out.extend_from_slice(b"\x1b[m");
+        out.extend_from_slice(term::SGR_RESET.as_bytes());
         // blind: disable focus reporting
-        out.extend_from_slice(b"\x1b[?1004l");
+        out.extend_from_slice(term::FOCUS_REPORTING_OFF.as_bytes());
         out
     }
 }
@@ -3686,6 +3695,54 @@ mod tests {
         assert!(
             unwind.windows(MOUSE_OFF.len()).any(|w| w == MOUSE_OFF),
             "the teardown must leave mouse mode: {unwind:?}",
+        );
+    }
+
+    /// The host's unwind codes are deliberately *narrow*: it has a screen
+    /// model, so it emits only the modes this session actually set. That is
+    /// the whole reason the daemon-side set is better than the `min` client's
+    /// blind fallback, and it is what keeps `\x1b[?1049l` — the one sequence
+    /// that is not inert against a terminal on the normal buffer — off the
+    /// wire for a session that never left it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unwind_codes_narrow_to_what_the_screen_actually_set() {
+        let (host, _handle) = Host::build(
+            MockLauncher,
+            "test-session".to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+            None,
+            None,
+            None,
+            std::env::temp_dir(),
+            sessions::SessionId::nil(),
+            None,
+            ConnectionEnv::new(),
+        )
+        .await
+        .expect("failed to build host");
+
+        // A pristine screen: no alternate buffer, no hidden cursor, no input
+        // modes to diff. Only the two unconditional resets may appear.
+        let codes = host.unwind_codes();
+        let rendered = String::from_utf8_lossy(&codes).into_owned();
+        assert!(
+            !rendered.contains(sessions::terminal::LEAVE_ALT_SCREEN),
+            "rmcup must not be sent for a session that never left the normal buffer: {rendered:?}",
+        );
+        assert!(
+            !rendered.contains(sessions::terminal::SHOW_CURSOR),
+            "the cursor was never hidden, so nothing should unhide it: {rendered:?}",
+        );
+        assert_eq!(
+            rendered,
+            format!(
+                "{}{}",
+                sessions::terminal::SGR_RESET,
+                sessions::terminal::FOCUS_REPORTING_OFF
+            ),
+            "a clean screen unwinds to the two blind resets and nothing else",
         );
     }
 

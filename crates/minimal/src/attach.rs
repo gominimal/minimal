@@ -23,41 +23,95 @@ use minimald_rpc::ListSessionsEntry;
 /// alternate screen, cursor visible, drawing attributes and focus reporting
 /// reset.
 ///
-/// The same set `minimald` computes per session as its unwind codes, minus the
-/// "only if currently set" narrowing — a client has no screen model to diff
-/// against, and every sequence here is a no-op against a terminal that was
-/// never in that mode.
-const TERMINAL_UNWIND: &[u8] = concat!(
+/// The same vocabulary `minimald` draws its per-session unwind codes from
+/// (both sides name the sequences out of [`sessions::terminal`], so neither
+/// can drift), but without the "only if currently set" narrowing: a client has
+/// no screen model to diff against, so it can only write the lot.
+///
+/// Writing the lot is *not* free. Every sequence here bar one is inert against
+/// a terminal that was never in that mode; the exception is
+/// [`LEAVE_ALT_SCREEN`](sessions::terminal::LEAVE_ALT_SCREEN), which on
+/// xterm-family terminals performs a `DECRC`-style cursor restore even from
+/// the normal buffer, so a gratuitous one can jump the cursor to a stale saved
+/// position and have the shell prompt redraw over existing content. That is
+/// precisely why [`TerminalUnwind`] writes this only when the daemon
+/// demonstrably could not have spoken for itself, rather than on every attach.
+const TERMINAL_UNWIND: &[&str] = &[
     // mouse reporting: press, press/release, button-motion, any-motion
-    "\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l",
+    sessions::terminal::MOUSE_X10_OFF,
+    sessions::terminal::MOUSE_PRESS_RELEASE_OFF,
+    sessions::terminal::MOUSE_BUTTON_MOTION_OFF,
+    sessions::terminal::MOUSE_ANY_MOTION_OFF,
     // mouse encodings: utf-8, SGR, urxvt
-    "\x1b[?1005l\x1b[?1006l\x1b[?1015l",
+    sessions::terminal::MOUSE_ENCODING_UTF8_OFF,
+    sessions::terminal::MOUSE_ENCODING_SGR_OFF,
+    sessions::terminal::MOUSE_ENCODING_URXVT_OFF,
     // bracketed paste, application cursor keys, application keypad
-    "\x1b[?2004l\x1b[?1l\x1b>",
+    sessions::terminal::BRACKETED_PASTE_OFF,
+    sessions::terminal::APPLICATION_CURSOR_KEYS_OFF,
+    sessions::terminal::APPLICATION_KEYPAD_OFF,
     // leave the alternate screen, unhide the cursor
-    "\x1b[?1049l\x1b[?25h",
-    // blind: reset drawing attributes ('SGR') and focus reporting
-    "\x1b[m\x1b[?1004l",
-)
-.as_bytes();
+    sessions::terminal::LEAVE_ALT_SCREEN,
+    sessions::terminal::SHOW_CURSOR,
+    // reset drawing attributes ('SGR') and focus reporting
+    sessions::terminal::SGR_RESET,
+    sessions::terminal::FOCUS_REPORTING_OFF,
+];
 
-/// Restores the terminal on drop, unconditionally, around an attach.
+/// [`TERMINAL_UNWIND`] as the byte string that goes to the tty.
+fn terminal_unwind_bytes() -> Vec<u8> {
+    TERMINAL_UNWIND.concat().into_bytes()
+}
+
+/// Whether the client has to unwind the terminal itself, given how `ssh`
+/// exited.
 ///
-/// `minimald` sends unwind codes with every teardown it initiates, but the
-/// client cannot assume it will hear them: a daemon predating #1210 sends none
-/// when the session process dies, and a transport that drops mid-session sends
-/// nothing at all. By then this process is the only thing left that can still
-/// reach the tty — ssh restores termios but knows nothing of the DEC private
-/// modes the remote app set — so it writes the sequences itself on the way
-/// out, and a session that died with mouse reporting on cannot leave the
-/// user's shell spraying escape sequences whenever the mouse moves.
+/// `minimald` sends unwind codes with every teardown it initiates, and they
+/// are the *narrow*, screen-aware set — strictly better than anything this
+/// side can compute. So the client writes its blind set only when the daemon
+/// demonstrably could not have been heard: a transport that dropped
+/// mid-session sends nothing at all, and by then this process is the only
+/// thing left that can still reach the tty (ssh restores termios but knows
+/// nothing of the DEC private modes the remote app set).
 ///
-/// Writing them after a well-behaved teardown is harmless: the sequences are
-/// idempotent, and the daemon has already written the same ones.
+/// `ssh` reports its own connection failures as exit status 255; a death by
+/// signal is abnormal by construction. Everything else — including the session
+/// process's own non-zero status passing through — means ssh talked to a live
+/// daemon right to the end, so the daemon's own codes have already landed and
+/// this side must stay quiet.
+///
+/// The one ambiguity is honest and unavoidable: a session process that itself
+/// exits 255 is indistinguishable, from out here, from an ssh transport
+/// failure, so it earns a redundant blind unwind. Harmless but for the
+/// [`LEAVE_ALT_SCREEN`](sessions::terminal::LEAVE_ALT_SCREEN) caveat on
+/// [`TERMINAL_UNWIND`].
+///
+/// Pure in its input so both branches are unit-testable without spawning ssh.
+pub(crate) fn client_must_unwind(status: &std::process::ExitStatus) -> bool {
+    /// `ssh`'s own "the connection failed" status.
+    const SSH_TRANSPORT_FAILURE: i32 = 255;
+
+    match status.code() {
+        Some(code) => code == SSH_TRANSPORT_FAILURE,
+        // No exit code at all: ssh died by signal, so it never got to relay a
+        // teardown even if the daemon sent one.
+        None => true,
+    }
+}
+
+/// Restores the terminal on drop, around an attach.
+///
+/// Armed while ssh runs so that a panic or a signal on the way out still puts
+/// the terminal back — a session that died with mouse reporting on cannot be
+/// allowed to leave the user's shell spraying escape sequences whenever the
+/// mouse moves. Once ssh has exited normally the daemon is known to have
+/// spoken for itself, and the caller [`disarm`](Self::disarm)s: see
+/// [`client_must_unwind`] for why writing anyway is not free.
 pub(crate) struct TerminalUnwind {
-    /// Whether there is a terminal to write to at all. A redirected stdout
-    /// gets nothing — the bytes would be data in whatever captured it, and a
-    /// pipe has no modes to restore.
+    /// Whether the guard still owes the terminal anything on drop. Starts as
+    /// "is there a terminal to write to at all" — a redirected stdout gets
+    /// nothing, since the bytes would be data in whatever captured it and a
+    /// pipe has no modes to restore — and is cleared by [`Self::disarm`].
     armed: bool,
 }
 
@@ -66,6 +120,14 @@ impl TerminalUnwind {
         Self {
             armed: std::io::stdout().is_terminal(),
         }
+    }
+
+    /// Stand the guard down: drop will write nothing.
+    ///
+    /// Called once the teardown is known to have gone through the daemon,
+    /// which has already sent its own — narrower, screen-aware — codes.
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
@@ -77,7 +139,7 @@ impl Drop for TerminalUnwind {
         // Best-effort: this runs on the way out of an attach, and a terminal
         // that cannot be written to is already beyond repair.
         let mut out = std::io::stdout();
-        let _ = out.write_all(TERMINAL_UNWIND);
+        let _ = out.write_all(&terminal_unwind_bytes());
         let _ = out.flush();
     }
 }
@@ -408,7 +470,8 @@ mod tests {
     /// keypad *reset* `ESC >`, never the set `ESC =`.
     #[test]
     fn terminal_unwind_only_ever_disables() {
-        let seq = std::str::from_utf8(TERMINAL_UNWIND).expect("the unwind codes are ASCII");
+        let bytes = terminal_unwind_bytes();
+        let seq = std::str::from_utf8(&bytes).expect("the unwind codes are ASCII");
         for tail in seq.split("\x1b[?").skip(1) {
             // A DEC private mode ends at its final byte, the first letter.
             let end = tail
@@ -425,6 +488,75 @@ mod tests {
         // The modes the reported terminal corruption is actually about (#1210).
         for mouse in ["\x1b[?1000l", "\x1b[?1002l", "\x1b[?1003l"] {
             assert!(seq.contains(mouse), "missing {mouse:?} in {seq:?}");
+        }
+    }
+
+    /// The unwind set is now assembled from named constants in `sessions`,
+    /// shared with the daemon. Naming them cannot be allowed to change what
+    /// goes on the wire, so this pins the exact byte string the guard emitted
+    /// before the constants existed: edit a constant and this test says so.
+    #[test]
+    fn the_shared_constants_compose_the_unwind_byte_for_byte() {
+        const EXPECTED: &[u8] = concat!(
+            // mouse reporting: press, press/release, button-motion, any-motion
+            "\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l",
+            // mouse encodings: utf-8, SGR, urxvt
+            "\x1b[?1005l\x1b[?1006l\x1b[?1015l",
+            // bracketed paste, application cursor keys, application keypad
+            "\x1b[?2004l\x1b[?1l\x1b>",
+            // leave the alternate screen, unhide the cursor
+            "\x1b[?1049l\x1b[?25h",
+            // reset drawing attributes ('SGR') and focus reporting
+            "\x1b[m\x1b[?1004l",
+        )
+        .as_bytes();
+
+        assert_eq!(
+            terminal_unwind_bytes(),
+            EXPECTED,
+            "the shared constants no longer compose the unwind the client emits",
+        );
+    }
+
+    /// The blind fallback must stay silent after a clean teardown: the daemon
+    /// has already sent its narrow, screen-aware codes, and re-sending
+    /// `\x1b[?1049l` on top of them can jump the cursor. It must still fire
+    /// when ssh could not have relayed anything.
+    #[test]
+    fn only_an_abnormal_ssh_exit_arms_the_blind_unwind() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        // A normal exit — the session process spoke through a live daemon.
+        for code in [0, 1, 2, 130, 254] {
+            let status = std::process::ExitStatus::from_raw(code << 8);
+            assert!(
+                !client_must_unwind(&status),
+                "exit code {code} must not arm the blind unwind",
+            );
+        }
+
+        // ssh's own "the connection failed".
+        let transport_failure = std::process::ExitStatus::from_raw(255 << 8);
+        assert!(
+            client_must_unwind(&transport_failure),
+            "ssh's 255 must arm the blind unwind",
+        );
+
+        // Death by signal: ssh never got to relay a teardown. The raw wait
+        // status of a signalled child is the bare signal number.
+        const SIGHUP: i32 = 1;
+        const SIGKILL: i32 = 9;
+        const SIGTERM: i32 = 15;
+        for signal in [SIGHUP, SIGKILL, SIGTERM] {
+            let status = std::process::ExitStatus::from_raw(signal);
+            assert!(
+                status.code().is_none(),
+                "the fixture must be a signal death, not an exit status",
+            );
+            assert!(
+                client_must_unwind(&status),
+                "a death by signal {signal} must arm the blind unwind",
+            );
         }
     }
 
