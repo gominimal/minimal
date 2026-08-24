@@ -343,6 +343,20 @@ async fn incident_collectors_land_and_mask_macs() {
         );
     }
 
+    // The panic-report capture is macOS-only: everywhere else the bundle
+    // still accounts for it, as a skip rather than a silent absence.
+    let manifest: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
+    let panic_skipped = manifest["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["what"].as_str().unwrap().ends_with("panic.txt"));
+    assert!(
+        find(&files, "host/panic.txt").is_some() || panic_skipped,
+        "panic reports are either captured or recorded as skipped"
+    );
+
     // R5.1: no full MAC survives in the interfaces capture — every one is
     // masked to its OUI, so a 17-char `xx:xx:xx:xx:xx:xx` token never appears.
     let interfaces = String::from_utf8_lossy(find(&files, "host/net/interfaces.txt").unwrap());
