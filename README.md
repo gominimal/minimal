@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="docs/public/readme-banner.webp" alt="Minimal — build software you can trust" width="880">
-</p>
-
 <h1 align="center">Minimal</h1>
 
 <p align="center"><strong>Build Software You Can Trust</strong><br>Isolated, reproducible development sandboxes and a secure package manager that give your whole team identical environments, while keeping AI agents off the laptop.</p>
