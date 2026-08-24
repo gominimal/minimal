@@ -276,8 +276,45 @@ impl LayerCache for () {
     }
 }
 
+/// Schema version of the on-disk layer-cache entries. Bump this for any change to
+/// the serialized shape of [Layer], so entries written by one build are never
+/// handed to another build's deserializer.
+//
+// Version 1: `Layer` as of the removal of profiles support.
+const CACHE_FORMAT_VERSION: u32 = 1;
+
 /// A layer cache which serializes layers in the given directory.
 pub struct LayerCacheDir(pub PathBuf);
+
+impl LayerCacheDir {
+    /// Path of the cache entry for `lo`, under the [CACHE_FORMAT_VERSION] namespace.
+    fn entry_path(&self, lo: &LoadOptions) -> PathBuf {
+        self.0
+            .join(format!("v{CACHE_FORMAT_VERSION}"))
+            .join(lo.input_hash().to_hex().as_ref())
+    }
+}
+
+/// How much of a poisoned layer-cache entry to quote into the warning that precedes
+/// deleting it.
+const ENTRY_HEAD_BYTES: usize = 200;
+
+/// Renders the head of a layer-cache entry for a diagnostic, escaped so it stays on one
+/// log line. Truncated to [ENTRY_HEAD_BYTES], which is plenty: an entry we cannot parse
+/// is almost always JSON from another build's schema, and its first field names say so.
+fn entry_head(bytes: &[u8]) -> String {
+    let head = &bytes[..bytes.len().min(ENTRY_HEAD_BYTES)];
+    match std::str::from_utf8(head) {
+        Ok(s) => format!("{s:?}"),
+        // A multi-byte char cut in half by the truncation is not corruption: quote the
+        // valid prefix rather than writing the whole entry off as binary.
+        Err(e) if e.valid_up_to() > 0 => {
+            let valid = std::str::from_utf8(&head[..e.valid_up_to()]).expect("valid prefix");
+            format!("{valid:?}")
+        }
+        Err(_) => "<not valid UTF-8>".to_string(),
+    }
+}
 
 impl LayerCache for LayerCacheDir {
     type Error = ();
@@ -288,9 +325,16 @@ impl LayerCache for LayerCacheDir {
             return Ok(());
         }
 
-        let p = self.0.join(lo.input_hash().to_hex().as_ref());
+        let p = self.entry_path(&lo);
         if std::fs::exists(&p).unwrap_or(false) {
             return Ok(());
+        }
+
+        // Only the cache root is created for us; the version namespace under it is ours to make.
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                tracing::warn!("LayerCacheDir::insert failed to create dir: {}", e);
+            })?;
         }
 
         let f = std::fs::OpenOptions::new()
@@ -309,13 +353,32 @@ impl LayerCache for LayerCacheDir {
         Ok(())
     }
     fn get(&mut self, lo: &LoadOptions) -> Result<Option<Layer>, Self::Error> {
-        let p = self.0.join(lo.input_hash().to_hex().as_ref());
+        let p = self.entry_path(lo);
 
-        if let Ok(f) = std::fs::File::open(&p) {
-            let layer: Layer = serde_json_lenient::from_reader(f).map_err(|e| {
-                tracing::warn!("LayerCacheDir::get failed to deserialize: {}", e);
-                std::fs::remove_file(&p).ok(); // best effort, delete broken file
-            })?;
+        if let Ok(bytes) = std::fs::read(&p) {
+            // An entry we can't parse is a miss, not a failure: drop it and let the
+            // caller re-evaluate from source. Propagating here would fail the whole
+            // graph load over a single poisoned file.
+            let layer: Layer = match serde_json_lenient::from_slice(&bytes) {
+                Ok(layer) => layer,
+                Err(e) => {
+                    // The entry is about to be unlinked, so this warning is the only
+                    // record that will survive it. Say which file, which cache key, how
+                    // big it was, and what it actually held -- the head of the JSON is
+                    // what tells you which build's schema wrote it.
+                    tracing::warn!(
+                        "LayerCacheDir::get failed to deserialize {} (input_hash {}, {} bytes): {}; \
+                         discarding the entry, the layer will be re-evaluated from source. Head: {}",
+                        p.display(),
+                        lo.input_hash().to_hex(),
+                        bytes.len(),
+                        e,
+                        entry_head(&bytes),
+                    );
+                    std::fs::remove_file(&p).ok(); // best effort, delete broken file
+                    return Ok(None);
+                }
+            };
 
             // Local BuildDeps point to the file they represent by path, typically a VCS checkout.
             // As a quick correctness check, spot-check a few local files to make sure the path
@@ -839,6 +902,163 @@ mod tests {
                 middle_repo.as_spec_origin().unwrap(),
             ],
         )
+    }
+
+    /// Collects every file below `dir`, recursively.
+    fn files_under(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                out.extend(files_under(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn poisoned_layer_cache_entry_is_a_miss() {
+        let apex = TempDir::new().unwrap();
+        std::fs::create_dir_all(apex.path().join("packages").join("top")).unwrap();
+        std::fs::write(
+            apex.path().join("packages").join("top").join("build.ncl"),
+            indoc! {
+            "
+            let {build, ..} = import \"minimal.ncl\" in
+
+            build {
+                name = \"top\",
+                build_deps = [],
+                cmd = \"\",
+            }"
+            },
+        )
+        .unwrap();
+        let apex_repo = LinkConfig::Git {
+            repo: "git@fakehub.com:minimal/apex.git".to_string(),
+            locked_commit: Some("abc123".to_string()),
+            branch: None,
+        };
+        let mut sp = SourceProviderFake(HashMap::from_iter([(apex_repo.clone(), apex)]));
+
+        let cache_dir = TempDir::new().unwrap();
+        let mut lc = LayerCacheDir(cache_dir.path().to_path_buf());
+
+        let load = |sp: &mut SourceProviderFake, lc: &mut LayerCacheDir| {
+            Graph::new_from_chain(
+                sp,
+                lc,
+                apex_repo.clone(),
+                LoadOptions::for_test().minimal_lib_path,
+                Target::default(),
+            )
+        };
+
+        // Warm the cache.
+        let graph = load(&mut sp, &mut lc).unwrap();
+        assert_eq!(
+            graph
+                .builds
+                .iter()
+                .map(|(_, b)| &b.name)
+                .collect::<Vec<_>>(),
+            vec!["top"]
+        );
+
+        // Poison every entry, as a build whose `Layer` schema no longer matches would.
+        let entries = files_under(cache_dir.path());
+        assert!(
+            !entries.is_empty(),
+            "expected the load to populate the cache"
+        );
+        for e in &entries {
+            std::fs::write(e, "{\"not\": \"a layer\"}").unwrap();
+        }
+
+        // The poisoned entries are a miss, not an error: the layers are re-evaluated
+        // from source and the graph comes out whole.
+        let graph = load(&mut sp, &mut lc).unwrap();
+        assert_eq!(
+            graph
+                .builds
+                .iter()
+                .map(|(_, b)| &b.name)
+                .collect::<Vec<_>>(),
+            vec!["top"]
+        );
+
+        // ...and the broken entries were dropped and rewritten, so the next load hits.
+        for e in files_under(cache_dir.path()) {
+            let f = std::fs::File::open(&e).unwrap();
+            serde_json_lenient::from_reader::<_, Layer>(f)
+                .unwrap_or_else(|e| panic!("cache entry not re-written: {e}"));
+        }
+    }
+
+    /// A poisoned entry is deleted, not set aside: a `.corrupt` sidecar would grow the
+    /// cache by one file per poisoned key with nothing to ever collect it, and the
+    /// schema-change failure this guards against poisons every key at once. The warning
+    /// carries the evidence instead, which [entry_head] is the interesting half of.
+    #[test]
+    fn poisoned_layer_cache_entry_is_deleted_leaving_nothing_behind() {
+        let cache_dir = TempDir::new().unwrap();
+        let mut lc = LayerCacheDir(cache_dir.path().to_path_buf());
+
+        let lo = LoadOptions {
+            // Only `SpecOrigin::Repo` entries are cached at all.
+            from: SpecOrigin::Repo(Repo::Git {
+                url: "git@fakehub.com:minimal/apex.git".to_string(),
+                rev: "abc123".to_string(),
+                tracking: None,
+            }),
+            ..LoadOptions::for_test()
+        };
+
+        let entry = lc.entry_path(&lo);
+        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::fs::write(&entry, "{\"not\": \"a layer\"}").unwrap();
+
+        // Unparseable is a miss, not an error.
+        assert!(lc.get(&lo).unwrap().is_none());
+
+        // The entry is gone, and nothing was left in its place -- no sidecar, no
+        // rename-aside -- so a repeatedly poisoned cache cannot grow without bound.
+        assert!(!entry.exists(), "poisoned entry should have been deleted");
+        assert_eq!(
+            files_under(cache_dir.path()),
+            Vec::<PathBuf>::new(),
+            "nothing should be left behind for the poisoned entry"
+        );
+
+        // A missing entry is still just a miss.
+        assert!(lc.get(&lo).unwrap().is_none());
+    }
+
+    #[test]
+    fn entry_head_quotes_content_for_the_warning() {
+        // The common case: JSON from another build's schema, quoted and escaped so a
+        // newline in the entry cannot break the log line.
+        assert_eq!(
+            entry_head(b"{\"profiles\": {},\n \"builds\": {}}"),
+            r#""{\"profiles\": {},\n \"builds\": {}}""#
+        );
+
+        // Long entries are truncated to the head.
+        let long = vec![b'a'; ENTRY_HEAD_BYTES * 2];
+        assert_eq!(entry_head(&long).len(), ENTRY_HEAD_BYTES + 2); // + the quotes
+
+        // Truncation landing mid-char keeps the valid prefix rather than giving up.
+        let mut split = vec![b'a'; ENTRY_HEAD_BYTES - 1];
+        split.extend_from_slice("\u{00e9}".as_bytes());
+        assert_eq!(
+            entry_head(&split),
+            format!("{:?}", "a".repeat(ENTRY_HEAD_BYTES - 1))
+        );
+
+        // Genuinely binary content is reported as such, not mangled.
+        assert_eq!(entry_head(&[0xff, 0xfe, 0xfd]), "<not valid UTF-8>");
     }
 
     #[test]
