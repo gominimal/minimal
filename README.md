@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/public/minimal-mark-light.svg">
+    <img src="docs/public/minimal-mark-dark.svg" alt="Minimal logo" width="120">
+  </picture>
+</p>
+
 <h1 align="center">Minimal</h1>
 
 <p align="center"><strong>Build Software You Can Trust</strong><br>Isolated, reproducible development sandboxes and a secure package manager that give your whole team identical environments, while keeping AI agents off the laptop.</p>
