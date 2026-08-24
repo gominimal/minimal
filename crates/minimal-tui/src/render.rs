@@ -915,11 +915,14 @@ mod tests {
         let mut model = sidebar_model(vec![provider_view("host", false, sessions)]);
         // Rows: one header + 30 sessions; a short pane can't show them all.
         model.cursor = model.visible_rows().len() - 1;
-        draw_sidebar(&mut model, 40, 16);
+        let out = draw_sidebar(&mut model, 40, 16);
         // The offset advanced (list scrolled) and never sits below the
         // cursor's row, so the cursor is drawn.
         assert!(model.scroll > 0, "bottom cursor must scroll the list");
         assert!(model.scroll <= model.cursor);
+        // The scroll math is only correct if the selected last session is
+        // actually inside the viewport: assert its rendered marker row shows.
+        assert!(out.contains("▸ s29"), "bottom cursor not in view:\n{out}");
         // Back at the top, the offset resets.
         model.cursor = 0;
         draw_sidebar(&mut model, 40, 16);
