@@ -42,6 +42,56 @@ let source_provenance_gitlab = {
     repo | String | doc "The project (repository) name.",
 }
 in
+# --- security-patch revision ledger (inbox#511) -------------------------
+# These contracts fail CLOSED on malformed entries: a blank or misshapen
+# `cve` / `origin` / `sha256` / `upstream_commit` refuses to parse rather
+# than producing an SBOM row that quietly asserts nothing.
+let CveId = std.contract.custom (fun _label value =>
+    if std.typeof value == 'String && std.string.is_match m%"^CVE-[0-9]{4}-[0-9]{4,}$"% value then
+        'Ok value
+    else
+        'Error { message = "expected a CVE id of the form CVE-YYYY-NNNN…" }
+)
+in
+let Sha256Hex = std.contract.custom (fun _label value =>
+    if std.typeof value == 'String && std.string.is_match m%"^[0-9a-f]{64}$"% value then
+        'Ok value
+    else
+        'Error { message = "expected a lowercase 64-char sha256 hex digest" }
+)
+in
+let CommitHex = std.contract.custom (fun _label value =>
+    if std.typeof value == 'String && std.string.is_match m%"^[0-9a-f]{7,40}$"% value then
+        'Ok value
+    else
+        'Error { message = "expected an abbreviated or full lowercase commit hash (7-40 hex chars)" }
+)
+in
+let NonBlankString = std.contract.custom (fun _label value =>
+    if std.typeof value == 'String && std.string.length (std.string.trim value) > 0 then
+        'Ok value
+    else
+        'Error { message = "expected a non-blank string" }
+)
+in
+let security_patch_entry = {
+    file
+        | NonBlankString
+        | doc "The patch file name as it appears in this spec's build_deps (a Local input).",
+    cve
+        | CveId
+        | doc "The CVE this patch remediates. One entry per CVE, even when one file fixes several — the ledger is what feeds go by.",
+    sha256
+        | Sha256Hex
+        | doc "sha256 of the patch file contents, pinning what was actually applied.",
+    origin
+        | NonBlankString
+        | doc "Where the fix came from: the upstream advisory, MR, or mailing-list URL a reviewer can follow.",
+    upstream_commit
+        | CommitHex
+        | doc "The upstream commit this patch was cherry-picked from (ancestry-verifiable).",
+}
+in
 let PURL = std.contract.custom (fun _label value =>
     if std.typeof value != 'String then
         'Error { message = "PURLs must be a string" }
@@ -55,7 +105,38 @@ in
     upstream_version = {
         name = "upstream version",
         desc = "The software version as declared by the upstream.",
-        validate = String,
+        # INVARIANT (inbox#511): upstream_version is the advisory-matching
+        # key and must be upstream's label verbatim — it NEVER carries our
+        # `-rN` security-revision suffix. Vulnerability feeds and `pkgmgr
+        # check` compare against this field; an `-rN` here would silently
+        # break CVE matching for the package. Our revision lives in the
+        # `revision` attr and is rendered into published version strings
+        # (SBOM/OpenVEX/secdb) at the publish boundary only.
+        validate = std.contract.custom (fun _label value =>
+            if std.typeof value != 'String then
+                'Error { message = "upstream_version must be a string" }
+            else if std.string.is_match m%"-r[0-9]+$"% value then
+                'Error {
+                    message = "upstream_version must be upstream's label verbatim — it never carries our -rN revision suffix (that lives in the `revision` attr; see gominimal/inbox#511)",
+                }
+            else
+                'Ok value
+        ),
+    },
+    revision = {
+        name = "security patch revision",
+        desc = "Counts security patch-sets applied on top of upstream_version. 0 (or absent) = pristine upstream. Owned by pkgmgr — never hand-edited — and resets to 0 on any upstream version bump. Rendered as `-rN` into published version strings (SBOM, OpenVEX, secdb) by the publish-boundary helper.",
+        validate = std.contract.custom (fun _label value =>
+            if std.typeof value == 'Number && value >= 0 && value == std.number.floor value then
+                'Ok value
+            else
+                'Error { message = "revision must be a non-negative integer" }
+        ),
+    },
+    patches = {
+        name = "security patch ledger",
+        desc = "Typed record of every security patch applied beyond upstream_version: which CVE, from which upstream commit, via which advisory, with the patch file's digest. This ledger — not the patch files — is what qualified_version() and the vulnerability feeds consume, so entries are contract-enforced: a blank cve or origin refuses to parse.",
+        validate = Array security_patch_entry,
     },
     repology_project = {
         name = "repology project name",
