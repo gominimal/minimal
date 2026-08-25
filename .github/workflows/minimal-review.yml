@@ -449,13 +449,22 @@ jobs:
             *PLACEHOLDER*) echo "review: broker unreachable from the box (tried \${BROKER_CANDIDATES})" >&2; exit 67 ;;
           esac
           timeout ${AGENT_TIMEOUT_SECONDS} claude -p --dangerously-skip-permissions < .review/review-prompt.md > .review/agent-log.txt 2> .review/agent-err.txt || echo 'review: agent exited non-zero' >&2
+          # An ephemeral task's filesystem does not come back, so stdout
+          # carries the findings and stderr is the only other channel out.
+          # Push the logs through it rather than expecting to read them later.
+          {
+            echo "--- agent-log (tail) ---"; tail -c 2000 .review/agent-log.txt 2>/dev/null
+            echo "--- agent-err (tail) ---"; tail -c 2000 .review/agent-err.txt 2>/dev/null
+            echo "--- build attempts ---";   cat .review/build-attempts.log 2>/dev/null
+          } >&2
+
           if ! test -s .review/findings.json; then
-            # Exhausted quota is not a broken reviewer, and it must not look
-            # like one: a red X on every PR during a rate-limit crunch reads as
-            # "this tool is unreliable", which costs more trust than the missed
-            # review does. 75 is EX_TEMPFAIL — try again later.
-            if grep -qiE '\(429\)|rate.?limit|too many requests' .review/agent-log.txt .review/agent-err.txt 2>/dev/null; then
-              echo 'review: rate-limited upstream; no review produced' >&2
+            # Anything upstream and transient — quota, gateway, overload —
+            # means "no review this time", not "the reviewer is broken". A red
+            # X for someone else's 502 costs more trust than the missed review.
+            if grep -qiE '\((429|500|502|503|504|529)\)|rate.?limit|too many requests|overloaded|api error|connection error' \
+                 .review/agent-log.txt .review/agent-err.txt 2>/dev/null; then
+              echo 'review: upstream unavailable; no review produced' >&2
               tail -n 5 .review/agent-log.txt >&2
               exit 75
             fi
@@ -493,7 +502,7 @@ jobs:
           cp "$RUN_DIR/task-stderr.txt" "$RUN_DIR/agent-diagnostics.txt" 2>/dev/null || true
 
           if [ "$rc" -eq 75 ]; then
-            echo "::warning::minimal-review was rate-limited upstream and produced no review for this commit. Push again, or re-run this job, once capacity frees up."
+            echo "::warning::minimal-review got no usable response from upstream and produced no review for this commit. Re-run this job, or push again, once it recovers."
             echo "status=rate_limited" >> "$GITHUB_OUTPUT"
             tail -n 20 "$RUN_DIR/task-stderr.txt" || true
             exit 0
