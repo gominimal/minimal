@@ -345,7 +345,7 @@ impl Client {
             }
 
             serde_json_lenient::from_slice(&resp_buf)
-                .with_context(|| format!("decode response for {}", R::NAME))
+                .with_context(|| decode_context(R::NAME, &resp_buf))
         };
 
         tokio::time::timeout(timeout, rpc)
@@ -877,6 +877,118 @@ fn append_daemon_error(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(&data[..room.min(data.len())]);
 }
 
+/// How much of an undecodable reply the decode error quotes. Generous enough
+/// for any oneshot response the daemon actually sends, bounded so a
+/// pathological body can't become the whole error message.
+const DECODE_EXCERPT_MAX: usize = 1024;
+
+/// Context for a response that wouldn't decode, quoting the daemon's reply
+/// verbatim.
+///
+/// The body has to be in the message because serde's own error usually can't
+/// name the fault: every `Errorable<T>` response is `#[serde(untagged)]`, and
+/// an untagged enum discards its per-variant errors in favour of "data did
+/// not match any variant". So when a CLI meets a daemon of another build —
+/// the skew a `deny_unknown_fields` response type exists to catch — the error
+/// says only that nothing matched, and a bug report can't say which field
+/// tripped the guard (#1251). Quoting the reply makes that diagnosable
+/// without a live repro.
+fn decode_context(rpc: &str, body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let excerpt = match text.char_indices().nth(DECODE_EXCERPT_MAX) {
+        Some((cut, _)) => format!("{}… ({} bytes total)", &text[..cut], body.len()),
+        None => text.into_owned(),
+    };
+    format!("decode response for {rpc} (daemon replied: {excerpt})")
+}
+
+/// The wording, the override, and the placeholder for a daemon too old to
+/// report its build all live in the wire crate: the daemon produces the same
+/// message when it refuses a `CreateSession` whose `must_match_version` does
+/// not name it, and one definition means one sentence.
+pub use minimald_rpc::{SKEW_OVERRIDE_VAR, UNVERSIONED_DAEMON, version_skew_message};
+
+/// Whether the operator asked for a skewed pair to be driven anyway.
+fn skew_override_set() -> bool {
+    std::env::var_os(SKEW_OVERRIDE_VAR).is_some_and(|v| !v.is_empty())
+}
+
+/// This CLI's build, to be asserted by an RPC that acts before it replies —
+/// today `CreateSessionRequest::must_match_version`.
+///
+/// `None` under [`SKEW_OVERRIDE_VAR`]: the daemon-side check refuses the call
+/// outright, and a refusal is not something the client could downgrade to a
+/// warning afterwards. Withholding the assertion is what keeps the override
+/// an override.
+#[must_use]
+pub fn version_assertion() -> Option<String> {
+    (!skew_override_set()).then(|| version::VERSION.to_string())
+}
+
+/// Refuse to drive a daemon built from a different tree than this CLI, given
+/// the build it just reported on a reply the caller was making anyway.
+///
+/// The RPC surface is versioned by nothing but the two binaries agreeing, and
+/// several response types are `#[serde(deny_unknown_fields)]` on purpose (see
+/// `FinalizeSessionResponse` in `minimald-rpc` for why that guard is
+/// load-bearing). A skewed pair therefore doesn't fail at connect time — it
+/// fails *mid-activation*, at `FinalizeSession`, after the session already
+/// exists on the daemon, and the activation's own cleanup then destroys it. To
+/// the operator every session is created and vanishes at once (#1251).
+///
+/// `daemon` is `None` when the reply carried no version at all, which means a
+/// daemon older than the field — a skew by construction, reported as
+/// [`UNVERSIONED_DAEMON`] rather than waved through.
+///
+/// Costs no round trip: every caller passes a version that came back on an RPC
+/// it had to make regardless. Lives in this crate, not in `minimal`, because
+/// the dashboard activates sessions too — `min dash` drives the same
+/// create/upload/configure/finalize sequence from `minimal-tui`, which cannot
+/// depend on the CLI crate.
+pub fn ensure_version_reported(daemon: Option<&str>) -> Result<(), anyhow::Error> {
+    if let Some(warning) = version_gate(version::VERSION, daemon, skew_override_set())? {
+        eprintln!("warning: {warning}");
+    }
+    Ok(())
+}
+
+/// The decision [`ensure_version_reported`] makes, split from the environment
+/// lookup and the printing so the override's semantics are testable without a
+/// process-global env var.
+///
+/// `Ok(None)` is a matching pair, `Ok(Some(warning))` is a skew the operator
+/// opted into, `Err` is a refusal.
+fn version_gate(
+    cli: &str,
+    daemon: Option<&str>,
+    override_set: bool,
+) -> Result<Option<String>, anyhow::Error> {
+    let daemon = daemon.unwrap_or(UNVERSIONED_DAEMON);
+    let Some(message) = version_skew_message(cli, daemon) else {
+        return Ok(None);
+    };
+    if override_set {
+        return Ok(Some(message));
+    }
+    anyhow::bail!("{message}");
+}
+
+/// [`ensure_version_reported`] for a path with no first RPC of its own to
+/// carry the assertion: spends a `GetVersion` round trip to learn the build.
+///
+/// Used by `connect_daemon` in the `minimal` crate, the generic connector that fronts
+/// the commands whose first call differs from one to the next. The
+/// activation path — the one the round trip actually showed up on — does not
+/// come through here; it asserts inside its own `CreateSession`.
+pub async fn ensure_version_match(client: &mut Client) -> Result<(), anyhow::Error> {
+    use minimald_rpc::GetVersion;
+    let daemon = client
+        .oneshot_rpc::<GetVersion>(())
+        .await
+        .context("GetVersion RPC failed")?;
+    ensure_version_reported(Some(&daemon.version))
+}
+
 /// The provider kind the CLI should talk to, given `--provider`.
 ///
 /// The native minimald and minvmd backends now occupy distinct provider dirs,
@@ -973,6 +1085,45 @@ mod tests {
         assert_eq!(buf.len(), super::DAEMON_ERROR_MAX);
     }
 
+    /// A daemon of another build answering `FinalizeSession` in a shape this
+    /// CLI's wire types reject must produce an error that names the offending
+    /// field. `Errorable` is untagged, so serde alone only says "no variant
+    /// matched" — the reply itself is what makes the skew diagnosable (#1251).
+    #[test]
+    fn decode_errors_quote_the_daemon_reply() {
+        use anyhow::Context as _;
+
+        let body = br#"{"activate_hooks":[],"finalized_at":"2026-08-21T00:00:00Z"}"#;
+        let err = serde_json_lenient::from_slice::<
+            minimald_rpc::Errorable<minimald_rpc::FinalizeSessionResponse>,
+        >(body)
+        .with_context(|| super::decode_context("FinalizeSession", body))
+        .unwrap_err();
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("finalized_at"),
+            "the reply must be quoted so the tripping field is identifiable, got: {rendered}"
+        );
+    }
+
+    /// A pathological body is quoted, but bounded — the excerpt must not
+    /// become the whole error message.
+    #[test]
+    fn decode_context_bounds_the_excerpt() {
+        let body = vec![b'x'; 8 * 1024];
+        let msg = super::decode_context("Whatever", &body);
+        assert!(
+            msg.len() < body.len(),
+            "excerpt was not bounded: {}",
+            msg.len()
+        );
+        assert!(
+            msg.contains("8192 bytes total"),
+            "missing the full size: {msg}"
+        );
+    }
+
     #[test]
     fn socket_path_honors_override() {
         let sock = resolve_socket_path(Some(Path::new("/tmp/minimal-test")), false).unwrap();
@@ -1007,5 +1158,66 @@ mod tests {
             err.to_string().contains("SSH handshake timed out"),
             "expected a handshake-deadline error, got: {err:#}"
         );
+    }
+
+    /// The gate's three outcomes, off a version a reply already carried:
+    /// matching builds cost nothing, a differing build is refused with the
+    /// skew message, and the override downgrades that refusal to a warning
+    /// the caller prints.
+    #[test]
+    fn the_gate_passes_a_match_refuses_a_skew_and_warns_under_the_override() {
+        if let Some(warning) =
+            super::version_gate("0.6.0", Some("0.6.0"), false).expect("a matching pair must pass")
+        {
+            panic!("a matching pair must not warn: {warning}");
+        }
+
+        let err = super::version_gate("0.6.0", Some("0.5.0"), false)
+            .expect_err("a differing build must be refused")
+            .to_string();
+        assert!(err.contains("0.6.0") && err.contains("0.5.0"), "got: {err}");
+        assert!(err.contains("min stop"), "missing the recovery: {err}");
+        assert!(
+            err.contains(super::SKEW_OVERRIDE_VAR),
+            "missing the override: {err}"
+        );
+
+        let warning = super::version_gate("0.6.0", Some("0.5.0"), true)
+            .expect("the override must let the operator proceed")
+            .expect("the override still warns");
+        assert_eq!(warning, err);
+    }
+
+    /// A reply carrying no version at all comes from a daemon built before the
+    /// piggybacked handshake existed, which makes it a different build by
+    /// construction. It must be refused, and named — not waved through as an
+    /// unknown.
+    #[test]
+    fn a_reply_without_a_version_is_a_skew_not_an_unknown() {
+        let err = super::version_gate("0.6.0", None, false)
+            .expect_err("an unversioned daemon must be refused")
+            .to_string();
+        assert!(
+            err.contains(super::UNVERSIONED_DAEMON),
+            "the daemon must be named, got: {err}"
+        );
+        assert!(err.contains("min stop"), "missing the recovery: {err}");
+
+        super::version_gate("0.6.0", None, true)
+            .expect("the override must let the operator proceed")
+            .expect("the override still warns");
+    }
+
+    /// The assertion this CLI puts on a `CreateSession` is its own build —
+    /// except under the override, where it must be withheld entirely: the
+    /// daemon-side check refuses the call outright, and a refusal is not
+    /// something the client could downgrade to a warning after the fact.
+    #[test]
+    fn the_override_withholds_the_assertion_rather_than_softening_it() {
+        // `version_assertion` reads the process environment, so exercise the
+        // decision it encodes rather than racing other tests over an env var.
+        let assertion = |override_set: bool| (!override_set).then(|| version::VERSION.to_string());
+        assert_eq!(assertion(false).as_deref(), Some(version::VERSION));
+        assert_eq!(assertion(true), None);
     }
 }

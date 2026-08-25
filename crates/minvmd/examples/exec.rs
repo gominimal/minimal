@@ -174,6 +174,9 @@ async fn run_session_exec(
                 hooks_enabled: true,
                 attrs: Default::default(),
             },
+            // The guest daemon is built from this same tree by the harness, so
+            // there is no skew to assert against; the gate has its own tests.
+            must_match_version: None,
         };
         let body =
             serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
