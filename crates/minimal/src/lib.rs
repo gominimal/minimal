@@ -1793,7 +1793,14 @@ fn offer_mfile_scaffold(
             .build()
             .map_err(|e| anyhow::anyhow!("{e}"))?
     };
-    run_init_flow(config, false, false)
+    // stderr, unlike `cmd_init`: this scaffold runs inside `min activate`,
+    // whose stdout is reserved for the bare session id that scripted callers
+    // read (`id=$(min activate)`). A result line on stdout here would land
+    // ahead of that id and corrupt the capture.
+    if let Some(line) = run_init_flow(config, false, false)?.result_line() {
+        eprintln!("{line}");
+    }
+    Ok(())
 }
 
 /// Resolves the directory whose tree should be uploaded as the session
@@ -3477,6 +3484,31 @@ pub fn build_config(global: &GlobalArgs) -> Result<mctx::Config, mctx::Error> {
     Ok(builder.build()?)
 }
 
+/// What [`run_init_flow`] did. Returned rather than printed because the two
+/// callers publish it on different streams: `min init` puts the line on
+/// stdout — it is that command's whole scriptable result — while
+/// `min activate`'s scaffold offer keeps it on stderr, where stdout carries
+/// only the session id (see [`activate_session`]).
+enum InitOutcome {
+    /// The operator declined the confirmation; nothing was written.
+    Declined,
+    /// A `minimal.toml` was created at this path.
+    Created(std::path::PathBuf),
+    /// An existing `minimal.toml` at this path was overwritten.
+    Updated(std::path::PathBuf),
+}
+
+impl InitOutcome {
+    /// The one-line result to report, or `None` when nothing was written.
+    fn result_line(&self) -> Option<String> {
+        match self {
+            Self::Declined => None,
+            Self::Created(path) => Some(format!("Created {}", path.display())),
+            Self::Updated(path) => Some(format!("Updated {}", path.display())),
+        }
+    }
+}
+
 /// Run the init flow for a given config: detect the project's stack,
 /// generate a `minimal.toml`, show the plan, prompt for confirmation,
 /// and write the file. Shared by `cmd_init` and the `cmd_activate`
@@ -3485,7 +3517,7 @@ fn run_init_flow(
     config: mctx::Config,
     skip_confirm: bool,
     force: bool,
-) -> Result<(), anyhow::Error> {
+) -> Result<InitOutcome, anyhow::Error> {
     use op::ProjectOp as _;
     let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| anyhow::anyhow!("{e}"))?;
     let plan = op::InitProject
@@ -3513,26 +3545,31 @@ fn run_init_flow(
         eprintln!();
         if !confirm("Continue?", true)? {
             eprintln!("Aborted.");
-            return Ok(());
+            return Ok(InitOutcome::Declined);
         }
     }
 
     std::fs::write(&plan.toml_path, &plan.content)
         .with_context(|| format!("writing {}", plan.toml_path.display()))?;
 
-    println!(
-        "{} {}",
-        if exists { "Updated" } else { "Created" },
-        plan.toml_path.display()
-    );
-
-    Ok(())
+    Ok(if exists {
+        InitOutcome::Updated(plan.toml_path)
+    } else {
+        InitOutcome::Created(plan.toml_path)
+    })
 }
 
 /// Initialize a `minimal.toml` based on the source tree.
 pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::Error> {
     let config = build_config(global)?;
-    run_init_flow(config, args.yes, args.force).map_err(mctx::Error::Other)
+    let outcome = run_init_flow(config, args.yes, args.force).map_err(mctx::Error::Other)?;
+    // stdout: the result line is `min init`'s scriptable output, so it
+    // survives `min init > audit.log` while the preview and prompt above
+    // stay on stderr.
+    if let Some(line) = outcome.result_line() {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 /// Add packages as dependencies to the project's `minimal.toml`.
