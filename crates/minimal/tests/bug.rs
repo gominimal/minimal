@@ -214,12 +214,26 @@ async fn the_bundle_names_the_project_it_came_from() {
         project.path().file_name().unwrap().to_str().unwrap()
     );
     assert_eq!(scope["config"], ".minimal/minimal.toml");
+    // Agreement between the two outputs is not enough on its own: both could
+    // name the same wrong directory. Pin the values themselves.
+    assert_eq!(
+        Path::new(scope["root"].as_str().expect("a root")),
+        std::fs::canonicalize(project.path()).unwrap()
+    );
 
     let report: serde_json_lenient::Value =
         serde_json_lenient::from_slice(find(&files, "project/project.json").expect("project.json"))
             .unwrap();
     assert_eq!(report["name"], scope["name"], "the two must not disagree");
     assert_eq!(report["root"], scope["root"]);
+    assert_eq!(report["config"], scope["config"]);
+    // The field that separates "minimal read no config" from "minimal read the
+    // config one level up", so it has to be the directory the command really
+    // ran from — not the project root it resolved to.
+    assert_eq!(
+        Path::new(report["invoked_from"].as_str().expect("an invocation dir")),
+        std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap()
+    );
 }
 
 /// `ProjectIdentity::root` is documented as an absolute path on the producing
@@ -245,6 +259,47 @@ async fn the_recorded_project_root_is_resolved_not_echoed() {
         std::fs::canonicalize(project.path()).unwrap(),
         "the root must name the project directory itself"
     );
+}
+
+/// R2.11: a malformed config is reported as malformed, without quoting the
+/// line it choked on — because that line is a line of the user's config, and
+/// a TOML parse error prints it verbatim. A bundle gets shared; a secret on
+/// the offending line would ride along in the manifest header, outside every
+/// redaction policy the collectors apply, and in the one field a reader is
+/// guaranteed to look at.
+#[tokio::test]
+async fn a_malformed_config_is_reported_without_quoting_it() {
+    let project = tempfile::TempDir::new().unwrap();
+    let config = project.path().join(".minimal");
+    std::fs::create_dir_all(&config).unwrap();
+    // Invalid TOML with the secret on the very line the parser rejects, so
+    // any error text that quotes its context carries the secret with it.
+    std::fs::write(
+        config.join("minimal.toml"),
+        "[tasks.build]\ntoken = \"canary-secret-value\" this is not toml\n",
+    )
+    .unwrap();
+
+    let files = bundle_for_project(Some(project.path())).await;
+    let manifest: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
+    let scope = &manifest["project"];
+
+    assert_eq!(scope["state"], "unknown", "unparseable is not identified");
+    let reason = scope["reason"].as_str().expect("a reason");
+    assert!(
+        reason.contains("not valid TOML"),
+        "malformed must be reported as malformed: {reason}"
+    );
+
+    // The whole point: the fact of the malformation travels, its contents do
+    // not — anywhere in the bundle, manifest and skip reasons included.
+    for (path, contents) in &files {
+        assert!(
+            !String::from_utf8_lossy(contents).contains("canary-secret-value"),
+            "a rejected config line leaked into {path}"
+        );
+    }
 }
 
 /// `min bug` is run from wherever the user is standing. Outside a project,

@@ -442,7 +442,10 @@ paths, and the archive layout.
    `a_bundle_collected_outside_a_project_says_so` — the scope is `unknown`
    with a reason and the entry is a skip, never a silent absence; and
    `the_recorded_project_root_is_resolved_not_echoed` — the root is resolved
-   against the filesystem rather than echoed from `--repo-dir`. Covers R2.11.
+   against the filesystem rather than echoed from `--repo-dir`; and
+   `a_malformed_config_is_reported_without_quoting_it` — a secret planted on
+   the line the TOML parser rejects reaches no file in the bundle, the
+   manifest's own reason included. Covers R2.11.
 
 ---
 
