@@ -1,0 +1,43 @@
+# minimal-review policy for gominimal/minimal — the tuning week.
+#
+# Install to `.minimal/review/policy.toml` in gominimal/minimal. Committed in
+# the repo under review on purpose: what the bot is allowed to do should be
+# visible and changeable by the people it reviews, not buried in a workflow.
+# Absent this file the library falls back to DEFAULT_POLICY, which is the same
+# shape — this exists so the week's settings are auditable rather than implied.
+
+[actions]
+comment = true
+
+# OFF, and this is the setting most likely to be turned on by mistake.
+# Thread resolution is one of the two signals the grading harness reads: a
+# thread resolved without a matching code change is a dismissal, and resolved
+# with one is an address. A bot that resolves its own threads destroys the
+# measurement it exists to produce. Leave this false for the whole week.
+resolve_own_threads = false
+
+# Both off: survey D2 had 3 of 5 saying the bot should never block a merge, and
+# D3 had 4 of 5 asking for shadow first. Blocking is also unreachable in code —
+# request_changes requires host-attested evidence (a pinned Literal[True] in
+# the policy model) and no probe runner exists yet — but stating it here means
+# the intent is legible without reading the models.
+approve = false
+request_changes = false
+
+[thresholds]
+# Three, not five. Survey D1's modal answer for "useless comments before I mute
+# it" was 3, and D4 favoured fewer high-confidence findings over coverage.
+# The prompt carries the same number; they must not drift apart.
+max_inline_findings = 3
+
+# Findings below this are dropped by the validator, not merely ranked down.
+# Raise it if the week's false-positive rate runs above the ~10% effective
+# ceiling that governs whether a reviewer survives contact with a team.
+min_confidence = 0.5
+
+[budget]
+# A wall-clock ceiling per probe. Much less load-bearing since building was
+# forbidden: the golden set ran three PRs in 874 s total with zero build
+# attempts, against 2046 s when compiling was allowed.
+probe_wall_clock_seconds = 300
+max_probes_per_persona = 3

@@ -18,6 +18,7 @@
 //! - [`kmsg`] — the kernel ring buffer, read without `dmesg`
 //! - [`disk`] — filesystem capacity probes
 //! - [`system`] — host identity/capability probe (OS, kernel, KVM, disks)
+//! - [`terminal`] — the tty state and window size of the invoking terminal
 //!
 //! The split with the app crates is mechanics vs. policy: the *how* lives
 //! here; the *what* — which paths, which log prefixes, which env names are
@@ -41,6 +42,8 @@ pub mod procs;
 pub mod redact;
 #[cfg(unix)]
 pub mod system;
+#[cfg(unix)]
+pub mod terminal;
 
 /// Per-collector deadline. Generous enough for a slow disk, small enough that
 /// one wedged collector cannot stall a whole bundle — and a wedged host is
@@ -90,3 +93,5 @@ pub use logs::{newest_matching, newest_rotated, try_newest_matching};
 pub use manifest::{CollectedEntry, CollectorError, Manifest, Redaction, SkippedEntry};
 #[cfg(unix)]
 pub use system::{DiskInfo, SystemInfo, system_info};
+#[cfg(unix)]
+pub use terminal::{StreamInfo, TerminalInfo, WinSize, terminal_info};
