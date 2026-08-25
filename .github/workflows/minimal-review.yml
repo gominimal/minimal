@@ -490,7 +490,7 @@ jobs:
           {
             echo "--- agent-log (tail) ---"; tail -c 2000 .review/agent-log.txt 2>/dev/null
             echo "--- agent-err (tail) ---"; tail -c 2000 .review/agent-err.txt 2>/dev/null
-            echo "--- build attempts ---";   cat .review/build-attempts.log 2>/dev/null
+            echo "--- build attempts ---"; tail -c 2000 .review/build-attempts.log 2>/dev/null
           } >&2
 
           if ! test -s .review/findings.json; then
