@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use camino::Utf8PathBuf;
 use paths::DaemonAbsPath;
-use russh::keys::ssh_key;
+use russh::keys::PublicKeyOrCertificate;
 use sessions::SessionId;
 use tempfile::TempDir;
 use tokio::net::{UnixListener, UnixStream};
@@ -419,7 +419,7 @@ struct TestClientHandler;
 impl russh::client::Handler for TestClientHandler {
     type Error = russh::Error;
 
-    async fn check_server_key(&mut self, _: &ssh_key::PublicKey) -> Result<bool, Self::Error> {
+    async fn check_server_key(&mut self, _: &PublicKeyOrCertificate) -> Result<bool, Self::Error> {
         // Tests run against an ephemeral key we just generated, so
         // there is nothing to check.
         Ok(true)

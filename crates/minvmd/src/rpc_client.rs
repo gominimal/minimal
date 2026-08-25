@@ -32,7 +32,7 @@ impl russh::client::Handler for AnyHostKey {
 
     async fn check_server_key(
         &mut self,
-        _key: &russh::keys::ssh_key::PublicKey,
+        _key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
