@@ -180,6 +180,11 @@ pub use builds::{
     SubsetInput,
 };
 
+mod env_mapping;
+pub use env_mapping::{
+    EnvFsMapping, EnvMappingClass, EnvMappingError, EnvMappingErrorKind, EnvMappingKind,
+};
+
 mod env_setup;
 pub use env_setup::SetupForPackages;
 
