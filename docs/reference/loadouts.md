@@ -397,14 +397,19 @@ a typo (`[loadout]` for `[loadouts]`) fails loudly.
 directory, one row per file:
 
 ```
-  NAME               DESCRIPTION                       CONTRIBUTES
-* dev                helix + zellij with my dotfiles   2 pkg / 4 var / 5 patch
-  extra                                                1 pkg / 0 var / 0 patch
-  default (built-in) orientation banner and shaped prompt  0 pkg / 3 var / 0 patch
+  NAME                DESCRIPTION                           CONTRIBUTES
+* dev                 helix + zellij with my dotfiles       2 pkg / 4 var / 5 patch
+  extra                                                     1 pkg / 0 var / 0 patch
+  default (built-in)  orientation banner and shaped prompt  0 pkg / 3 var / 0 patch
 
   default (built-in) applied when no loadouts are configured
+
 * default (from `[loadouts].default_loadouts`)
 ```
+
+The two trailing lines are the legend `min loadout list` prints below the
+table: the first appears only when the built-in `default` is shown, the
+second only when `default_loadouts` is non-empty.
 
 - Loadouts named in `default_loadouts` are marked with a leading `*`.
 - The [built-in `default` loadout](#built-in-default-loadout) is listed as a
