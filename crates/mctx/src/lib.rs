@@ -33,7 +33,7 @@ pub use mfile_search_strategy::MFileSearchStrategy;
 mod project_setup;
 pub use project_setup::ProjectSetup;
 
-pub use env::{Env, interpolate_task_strings};
+pub use env::{Env, PatchHome, interpolate_task_strings};
 use tokio::sync::Semaphore;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
 
@@ -852,6 +852,7 @@ impl Context {
         patches: Option<&'a EnvPatches>,
         env_vars: Option<&'a HashMap<String, EnvVarValue>>,
         packages: S,
+        home: PatchHome,
     ) -> Result<env::Env<'a>, Error> {
         self.make_env_with_network(
             name,
@@ -862,6 +863,7 @@ impl Context {
             env_vars,
             packages,
             sandbox2::NetworkMode::HostNet,
+            home,
         )
         .await
     }
@@ -870,6 +872,10 @@ impl Context {
     /// [`sandbox2::NetworkMode`], so callers (e.g. the minimald task-exec path)
     /// can give a task the same network isolation as its session rather than
     /// always `HostNet`.
+    ///
+    /// `home` is the directory `~/`-rooted patch paths expand against; see
+    /// [`PatchHome`] for why every caller states it rather than letting
+    /// the conversion read the ambient one.
     #[allow(clippy::too_many_arguments)]
     pub async fn make_env_with_network<'a, S: PackageSelection>(
         &'a mut self,
@@ -881,6 +887,7 @@ impl Context {
         env_vars: Option<&'a HashMap<String, EnvVarValue>>,
         packages: S,
         network_mode: sandbox2::NetworkMode,
+        home: PatchHome,
     ) -> Result<env::Env<'a>, Error> {
         let mfile = self.minimal_file();
 
@@ -951,6 +958,7 @@ impl Context {
                 transitives: transitive_deps,
                 cwd: wd,
                 patches,
+                home,
                 env_vars,
                 hostname: Some(name.to_string()),
                 override_network_mode: Some(network_mode),
@@ -1441,6 +1449,7 @@ mod tests {
                     Some(&task_smoketest.patch),
                     Some(&task_smoketest.vars),
                     task_smoketest.packages,
+                    PatchHome::Ambient,
                 )
                 .await
                 .unwrap();
@@ -1616,6 +1625,7 @@ mod tests {
                     Some(&task.patch),
                     Some(&task.vars),
                     task.packages.clone(),
+                    PatchHome::Ambient,
                 )
                 .await
                 .unwrap();
