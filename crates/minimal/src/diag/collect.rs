@@ -45,6 +45,17 @@ pub async fn system(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
         .await
 }
 
+// ── host/terminal.json ───────────────────────────────────────────────────────
+
+/// The terminal `min bug` itself ran on. Interactive rendering complaints
+/// (#950) cannot be judged without it, and it costs three ioctls.
+pub async fn terminal(w: &mut BundleWriter) -> Result<(), anyhow::Error> {
+    let info = diagnostics::terminal_info();
+    let json = serde_json_lenient::to_vec_pretty(&info).context("serializing terminal info")?;
+    w.add_bytes("host/terminal.json", &json, Redaction::None)
+        .await
+}
+
 // ── host/env.json ────────────────────────────────────────────────────────────
 
 pub async fn env(w: &mut BundleWriter) -> Result<(), anyhow::Error> {

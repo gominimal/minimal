@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="docs/public/readme-banner.webp" alt="Minimal — build software you can trust" width="880">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/public/minimal-mark-light.svg">
+    <img src="docs/public/minimal-mark-dark.svg" alt="Minimal logo" width="120">
+  </picture>
 </p>
 
 <h1 align="center">Minimal</h1>

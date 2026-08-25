@@ -346,14 +346,20 @@ paths, and the archive layout.
   in the manifest, per R1.3.)
 - **R2.4**: `host/env.json` shall enumerate via `std::env::vars_os` (never
   `vars` — panics on non-UTF-8), record allowlisted values verbatim
-  (`RUST_LOG`, `HOME`, `SHELL`, `TERM`, `PATH`; prefixes `XDG_`, `MINIMAL_`,
+  (`RUST_LOG`, `HOME`, `SHELL`, `TERM`, `TERM_PROGRAM`,
+  `TERM_PROGRAM_VERSION`, `COLORTERM`, `PATH`; prefixes `XDG_`, `MINIMAL_`,
   `MINVMD_`, `MINIMALD_`), and mask everything else to `<redacted:len=N>`.
   The allowlist grants candidacy, not exemption: an allowlisted name that
   trips the R1.5 sensitive-key policy (e.g. `MINIMAL_TOKEN`,
   `MINIMALD_SECRET`) is masked regardless. `HOME` and `PATH` are recorded
   deliberately — install-layout questions dominate field triage — and their
   user-identifying paths are covered by the review-before-sharing notice
-  (R2.9).
+  (R2.9). The three terminal names beyond `TERM` are matched **exactly, not
+  as a `TERM` prefix**: each names an emulator program, whereas
+  `TERM_SESSION_ID` and any `TERM`-prefixed token would not. Locale (`LANG`,
+  `LC_*`) is deliberately **not** allowlisted — it carries weakly
+  identifying country/language signal, and unmasking it is a policy call for
+  a human rather than a consequence of a collector change.
 - **R2.5**: Config files (`config.toml`, `user_policy.toml`, loadouts) shall
   be bundled through the TOML redaction walker; unparseable TOML is withheld
   with a manifest note, never shipped raw. Every content read — config
@@ -376,6 +382,23 @@ paths, and the archive layout.
   `min dirs` unchanged).
 - **R2.9**: The final output shall print the archive path, entry and error
   counts, and a review-before-sharing notice.
+- **R2.10**: `host/terminal.json` shall record the terminal the bundle's
+  producer was invoked on (`diagnostics::terminal_info`): for each of stdin,
+  stdout, and stderr, whether it is a tty, and for those that are, the tty
+  device path and the `TIOCGWINSZ` geometry (`rows`, `cols`, `xpixel`,
+  `ypixel`). Sessions are interactive, so the tty flag is the same
+  precondition `attach` and the prompts gate on — it separates a pipe, a
+  script, or CI from a real terminal — and the geometry is what makes a
+  garbled TUI or wrong wrapping judgeable. The entry is unconditional: "not
+  a terminal" is a finding, not an absence. Every field is best-effort per
+  R2.3's discipline — a stream that is not a tty reports `null` device and
+  size, and a tty whose ioctl fails reports a `null` size rather than an
+  error. Device lookup shall use `ttyname_r`; `ttyname` answers from a
+  process-wide static buffer on both glibc and musl and is unsafe to reach
+  concurrently. The capture describes the terminal the *bundle* ran on,
+  which is the one that rendered wrong only when the user reports from the
+  same window; that caveat is inherent and is why the field sits beside the
+  other host facts rather than being presented as the incident's terminal.
 
 **Proof Artifacts:**
 
@@ -387,6 +410,11 @@ paths, and the archive layout.
    archive — covers R2.4, R2.5.
 3. **CLI:** `min bug` on a dev box; inspect manifest counts and `host/`
    entries — covers R2.3, R2.7-R2.9.
+4. **Test:** `the_invoking_terminal_is_described` — `host/terminal.json` is
+   present and every standard stream is probed; a tty carries a well-formed
+   size, a pipe carries neither device nor size. Paired with the `diagnostics`
+   unit tests, which point the probe at a real pty of known dimensions and at
+   a pipe — covers R2.10.
 
 ---
 
@@ -1105,6 +1133,7 @@ Unit 8's dual-format rework, sequenced after Unit 6.
 | 2 | R2.1, R2.2, R2.6 | Test | `bug_without_daemon_still_produces_a_bundle` (Linux lane) |
 | 2 | R2.4, R2.5 | Test | planted secret → `<redacted:len=N>`, never verbatim |
 | 2 | R2.3, R2.7-R2.9 | CLI | `min bug` on dev box; manifest counts, `host/` entries |
+| 2 | R2.10 | Test | `the_invoking_terminal_is_described`; `cargo test -p diagnostics terminal` — pty of known size, pipe reports nothing |
 | 3 | R3.2-R3.4 | CLI (gate) | idle attach + `minvmd stop` → clean ext4 journal; `boot.log` in provider dir, `minimald.log*` on volume next boot |
 | 3 | R3.4 | Test | release runs exactly once, before quiesce returns |
 | 3 | R3.6 | Test | size-threshold rotation + retention pruning |

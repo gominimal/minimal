@@ -107,6 +107,7 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
     // ── Host-side collectors: independent, each failure becomes a
     // manifest error rather than aborting the run.
     collect_step!(w, "host.system", collect::system(&mut w, &paths));
+    collect_step!(w, "host.terminal", collect::terminal(&mut w));
     collect_step!(w, "host.env", collect::env(&mut w));
     collect_step!(w, "host.dirs", dirs_report(&mut w, global));
     // Incident collectors: the wedged-system captures. The mechanics live in
