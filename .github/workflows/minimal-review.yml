@@ -118,6 +118,26 @@ jobs:
           path: reviewer
           persist-credentials: false
 
+      # workflow_dispatch skips the job-level fork guard, because there is no
+      # pull_request payload to read head.repo from. Without this it would
+      # resolve refs/pull/<n>/head for ANY number given — including a fork's —
+      # and run the agent over untrusted code in a sandbox that can reach the
+      # broker. Dispatch requires write access, but "trusted to trigger" is not
+      # "meant to review anything".
+      - name: Refuse a fork PR on dispatch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.inputs.pr }}
+        run: |
+          set -euo pipefail
+          head_repo="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.head.repo.full_name // ""')"
+          if [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
+            echo "::error::PR #$PR_NUMBER has its head in '${head_repo:-<deleted>}', not $GITHUB_REPOSITORY. Fork review is out of scope."
+            exit 1
+          fi
+          echo "PR #$PR_NUMBER is same-repo"
+
       # `ref` is load-bearing: the default checkout for a pull_request event is
       # the MERGE commit, a tree that exists in no branch. Every finding anchor
       # would silently point at line numbers the PR does not have.
@@ -135,7 +155,8 @@ jobs:
           # foundry reviews itself with its own PR's staging code, because a
           # module added on a branch does not exist on main yet. Keyed on the
           # repository name so no other repo can opt in by adding review/.
-          # The GATE is chosen separately and never comes from the PR.
+          # The GATE is chosen separately and never comes from the PR, and
+          # neither does the policy that sets its thresholds.
           REVIEWER="$GITHUB_WORKSPACE/reviewer/review"
           if [ "$GITHUB_REPOSITORY" = "gominimal/foundry" ] && [ -d "$GITHUB_WORKSPACE/pr/review/contract" ]; then
             REVIEWER="$GITHUB_WORKSPACE/pr/review"
@@ -185,6 +206,20 @@ jobs:
             BASE_TIP="refs/remotes/origin/${BASE_REF}"
           fi
           BASE_SHA="$(git merge-base "$BASE_TIP" HEAD)"
+
+          # The policy sets the confidence floor and the inline cap — it governs
+          # the gate, so it cannot come from the branch being gated. Taken from
+          # the merge base: still this repo's own committed policy, but the
+          # version that was already reviewed and merged, so a PR cannot raise
+          # min_confidence or set max_inline_findings to 0 and silence itself.
+          # A policy change takes effect for the PRs after it, not for itself.
+          # Absent is fine — every reader falls back to the built-in defaults.
+          if git show "$BASE_SHA:.minimal/review/policy.toml" > "$RUN_DIR/policy.toml" 2>/dev/null; then
+            echo "policy: from base ${BASE_SHA:0:12}"
+          else
+            rm -f "$RUN_DIR/policy.toml"
+            echo "policy: none at base; using built-in defaults"
+          fi
 
           if [ -e .review ]; then
             echo "::error::the repo already has a .review path; the reviewer stages its inputs there"
@@ -287,7 +322,7 @@ jobs:
           # agent spends its budget on findings the validator then drops.
           "$STAGING_PY" -m contract.prompt \
             "$REVIEWER/contract/review-prompt.md" \
-            --policy "$GITHUB_WORKSPACE/pr/.minimal/review/policy.toml" \
+            --policy "$RUN_DIR/policy.toml" \
             -o "$GITHUB_WORKSPACE/pr/.review/review-prompt.md"
 
           # Repo map: what exists in this codebase and what it is for. Every
@@ -528,7 +563,7 @@ jobs:
             --diff "$RUN_DIR/pr.diff" \
             --head-sha "$HEAD_SHA" \
             --pr "$PR_NUMBER" \
-            --policy "$GITHUB_WORKSPACE/pr/.minimal/review/policy.toml" \
+            --policy "$RUN_DIR/policy.toml" \
             | tee "$RUN_DIR/validation.txt"
 
       # validate -> decide -> render, through the library's one entry point.
@@ -548,7 +583,7 @@ jobs:
           from contract.policy import load_policy
 
           run_dir = os.environ["RUN_DIR"]
-          policy = load_policy(os.path.join(os.environ["GITHUB_WORKSPACE"], "pr/.minimal/review/policy.toml"))
+          policy = load_policy(os.path.join(os.environ["RUN_DIR"], "policy.toml"))
 
           with open(f"{run_dir}/findings.json", encoding="utf-8") as fh:
               doc = ReviewDocument.parse_v0_or_v1(json.load(fh))
