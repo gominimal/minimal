@@ -3520,7 +3520,7 @@ fn run_init_flow(
     std::fs::write(&plan.toml_path, &plan.content)
         .with_context(|| format!("writing {}", plan.toml_path.display()))?;
 
-    eprintln!(
+    println!(
         "{} {}",
         if exists { "Updated" } else { "Created" },
         plan.toml_path.display()
