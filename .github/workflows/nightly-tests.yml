@@ -55,7 +55,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - name: Free Disk Space
-        uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 # v3
+        uses: endersonmenezes/free-disk-space@2a22f8c59cae9cddae7194b33e6b92d023b2b4b8 # v4.0.0
         with:
           remove_android: true
           remove_dotnet: true
@@ -77,7 +77,7 @@ jobs:
         # build-initramfs.sh cross-compiles the guest minimald to static musl;
         # install the prebuilt cross like the KVM lane so it never falls back
         # to `cargo install cross` from source inside this blocking job.
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: cross
       - name: Enable /dev/kvm access
@@ -267,7 +267,7 @@ jobs:
         # Both are prebuilt binaries in taiki-e's manifest (zizmor is Rust,
         # from zizmorcore/zizmor). actionlint is NOT — it runs from its
         # pinned official image below.
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: cargo-machete,zizmor
       - name: actionlint (workflow lint)
@@ -308,7 +308,7 @@ jobs:
         with:
           shared-key: msrv
       - name: Install cargo-hack
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
         with:
           tool: cargo-hack
       - name: cargo hack check --rust-version

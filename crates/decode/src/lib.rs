@@ -10,7 +10,7 @@ use mfile::{EnvPatches, EnvVarValue, PatchSetting, Upstream};
 use nickel_lang_core::eval::value::{NickelValue, RecordData};
 use nickel_lang_core::identifier::LocIdent;
 use nickel_lang_core::position::TermPos;
-use nickel_lang_core::term::IndexMap;
+use nickel_lang_core::term::{IndexMap, RuntimeContract};
 use nickel_lang_core::{
     eval::{Closure, cache::CacheImpl},
     program::Program,
@@ -33,6 +33,8 @@ mod decl_tests;
 pub use decl_tests::Test;
 mod stacks;
 pub use stacks::{PackageMatcherPredicate, Stack, StackMatcher};
+mod container;
+pub use container::{Container, ExposedPort, ExposedPortProto};
 
 // Increment for any big change to the format of build specs / stacks, so that hash
 // keys get invalidated.
@@ -71,6 +73,7 @@ pub struct Layer {
     pub top_levels: Vec<generational_arena::Index>,
 
     pub stacks: HashMap<String, Stack>,
+    pub containers: HashMap<String, Container>,
 
     read_ids: HashMap<u64, generational_arena::Index>,
 }
@@ -172,6 +175,7 @@ impl Layer {
             read_ids: HashMap::with_capacity(512),
 
             stacks: HashMap::with_capacity(32),
+            containers: HashMap::with_capacity(32),
         };
 
         // The top-level of the nickel tree can either evaluate to:
@@ -204,6 +208,18 @@ impl Layer {
                                     .collect::<Result<Vec<_>, Error>>()?
                                     .into_iter()
                                     .map(|p| (p.name.clone(), p)),
+                            );
+                        }
+                    };
+                    if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("containers")) {
+                        let rt = eval_if_closure(&rt, &mut program)?;
+                        if let Some(a) = rt.as_array() {
+                            layer.containers = HashMap::from_iter(
+                                a.iter()
+                                    .map(|c| layer.ingest_container(c, &mut program))
+                                    .collect::<Result<Vec<_>, Error>>()?
+                                    .into_iter()
+                                    .map(|c| (c.name.clone(), c)),
                             );
                         }
                     };
@@ -262,6 +278,14 @@ impl Layer {
         program: &mut Program<CacheImpl>,
     ) -> Result<Stack, Error> {
         Stack::from_term(rt, program)
+    }
+
+    fn ingest_container(
+        &mut self,
+        rt: &NickelValue,
+        program: &mut Program<CacheImpl>,
+    ) -> Result<Container, Error> {
+        Container::from_term(rt, program)
     }
 }
 
@@ -325,6 +349,7 @@ pub enum ObjTy {
     Upstream,
     Test,
     Stack,
+    Container,
 }
 
 pub(crate) fn read_ty(val: &NickelValue, program: &mut Program<CacheImpl>) -> Result<ObjTy, Error> {
@@ -334,8 +359,7 @@ pub(crate) fn read_ty(val: &NickelValue, program: &mut Program<CacheImpl>) -> Re
         .into_opt()
         .expect("read_ty: expected non-empty record");
     if let Ok(Some(rt)) = record.get_value_with_ctrs(&LocIdent::new("ty")) {
-        let rt = eval_if_closure(&rt, program)?;
-        Ok(ObjTy::deserialize(rt).unwrap())
+        deserialize_field("`ty` annotation", "a known object type", &rt, program)
     } else {
         Err(Error::MissingTy(
             program.files(),
@@ -362,6 +386,33 @@ pub(crate) fn eval_if_closure(
     }
 }
 
+/// Word-splits the shell form of a command field into exec form.
+///
+/// There is no shell downstream to hand an unbalanced quote to, so a string
+/// that does not lex is an error rather than a silently dropped word.
+pub(crate) fn shell_split(what: &str, s: &str) -> Result<Vec<String>, Error> {
+    shlex::split(s)
+        .ok_or_else(|| Error::Other(format!("{what} is not a valid shell word list: {s:?}")))
+}
+
+/// Evaluates a field's value and deserializes it into `T`.
+///
+/// The shape of most fields is pinned by a contract in `minimal.ncl`, but not
+/// all of them are: `Dyn`-annotated fields, elements under an `any_of`, and
+/// fields read before their contract is applied all arrive here unchecked. So
+/// a failure is a wrong-shaped value rather than a decoder bug, and it is
+/// reported as one — `what` names the field and `want` its shape, as in
+/// [Error::unexpected_type].
+pub(crate) fn deserialize_field<T: serde::de::DeserializeOwned, S: Into<String>>(
+    what: S,
+    want: &'static str,
+    val: &NickelValue,
+    program: &mut Program<CacheImpl>,
+) -> Result<T, Error> {
+    let val = eval_if_closure(val, program)?;
+    T::deserialize(val.clone()).map_err(|_| Error::unexpected_type(what, want, &val, program))
+}
+
 pub(crate) fn record_data_from_val(
     val: &NickelValue,
 ) -> Option<&nickel_lang_core::term::record::RecordData> {
@@ -383,8 +434,14 @@ pub(crate) fn patches_from_term(
     let mut dirs: Option<HashMap<String, PatchSetting>> = None;
     let mut files: Option<HashMap<String, PatchSetting>> = None;
 
-    let r = record_data_from_val(&patch_rt)
-        .unwrap_or_else(|| panic!("unexpected term for patches: {:?}", patch_rt));
+    let Some(r) = record_data_from_val(&patch_rt) else {
+        return Err(Error::unexpected_type(
+            "`patches`",
+            "a record with `dir`/`dirs` and `file`/`files` fields",
+            &patch_rt,
+            program,
+        ));
+    };
 
     r.fields
         .iter()
@@ -393,8 +450,14 @@ pub(crate) fn patches_from_term(
                 "dir" | "dirs" => {
                     let dir_rt = eval_if_closure(field.value.as_ref().unwrap(), program)?;
 
-                    let r = record_data_from_val(&dir_rt)
-                        .unwrap_or_else(|| panic!("unexpected term for dir: {:?}", dir_rt));
+                    let Some(r) = record_data_from_val(&dir_rt) else {
+                        return Err(Error::unexpected_type(
+                            format!("patch `{}`", ident_and_loc.label()),
+                            "a record of patch settings",
+                            &dir_rt,
+                            program,
+                        ));
+                    };
                     if dirs.is_some() {
                         todo!("error for both 'dirs' and 'dir' set");
                     }
@@ -403,11 +466,12 @@ pub(crate) fn patches_from_term(
                             .iter()
                             .map(
                                 |(ident_and_loc, field)| -> Result<(String, PatchSetting), Error> {
-                                    let val = String::deserialize(eval_if_closure(
+                                    let val: String = deserialize_field(
+                                        format!("patch `dir.{}`", ident_and_loc.label()),
+                                        "a string",
                                         field.value.as_ref().unwrap(),
                                         program,
-                                    )?)
-                                    .unwrap();
+                                    )?;
                                     Ok((
                                         ident_and_loc.label().to_string(),
                                         match val.as_str() {
@@ -429,8 +493,14 @@ pub(crate) fn patches_from_term(
                 "file" | "files" => {
                     let file_rt = eval_if_closure(field.value.as_ref().unwrap(), program)?;
 
-                    let r = record_data_from_val(&file_rt)
-                        .unwrap_or_else(|| panic!("unexpected term for file: {:?}", file_rt));
+                    let Some(r) = record_data_from_val(&file_rt) else {
+                        return Err(Error::unexpected_type(
+                            format!("patch `{}`", ident_and_loc.label()),
+                            "a record of patch settings",
+                            &file_rt,
+                            program,
+                        ));
+                    };
                     if files.is_some() {
                         todo!("error for both 'file' and 'files' set");
                     }
@@ -439,11 +509,12 @@ pub(crate) fn patches_from_term(
                             .iter()
                             .map(
                                 |(ident_and_loc, field)| -> Result<(String, PatchSetting), Error> {
-                                    let val = String::deserialize(eval_if_closure(
+                                    let val: String = deserialize_field(
+                                        format!("patch `file.{}`", ident_and_loc.label()),
+                                        "a string",
                                         field.value.as_ref().unwrap(),
                                         program,
-                                    )?)
-                                    .unwrap();
+                                    )?;
                                     Ok((
                                         ident_and_loc.label().to_string(),
                                         match val.as_str() {
@@ -478,17 +549,19 @@ pub(crate) fn env_vars_from_term(
 ) -> Result<IndexMap<String, EnvVarValue>, Error> {
     r.fields
         .iter()
+        // A field can carry an annotation and no value (`FOO | String`), which
+        // declares the name without setting anything.
+        .filter_map(|(ident_and_loc, field)| Some((ident_and_loc, field.value.as_ref()?)))
         .map(
-            |(ident_and_loc, field)| -> Result<(String, EnvVarValue), Error> {
+            |(ident_and_loc, value)| -> Result<(String, EnvVarValue), Error> {
                 Ok((
                     ident_and_loc.label().to_string(),
-                    EnvVarValue::Value(
-                        String::deserialize(eval_if_closure(
-                            field.value.as_ref().unwrap(),
-                            program,
-                        )?)
-                        .unwrap(),
-                    ),
+                    EnvVarValue::Value(deserialize_field(
+                        format!("env var `{}`", ident_and_loc.label()),
+                        "a string",
+                        value,
+                        program,
+                    )?),
                 ))
             },
         )
@@ -496,45 +569,71 @@ pub(crate) fn env_vars_from_term(
 }
 
 pub(crate) fn packages_array_from_term(
+    field: &'static str,
     rt: &NickelValue,
     program: &mut Program<CacheImpl>,
 ) -> Result<Vec<String>, Error> {
     let packages_rt = eval_if_closure(rt, program)?;
 
     if let Some(a) = packages_rt.as_array() {
+        // Element contracts are pending on the array; without applying them a
+        // non-string entry reaches `String::deserialize` and panics.
+        let pending = a.iter_pending_contracts().cloned().collect::<Vec<_>>();
         a.iter()
-            .map(|input| Ok(String::deserialize(eval_if_closure(input, program)?).unwrap()))
+            .map(|input| {
+                let input = RuntimeContract::apply_all(
+                    input.clone(),
+                    pending.iter().cloned(),
+                    input.pos_idx(),
+                );
+                let input = eval_if_closure(&input, program)?;
+                String::deserialize(input)
+                    .map_err(|_| Error::Other(format!("`{field}` must be a list of package names")))
+            })
             .collect::<Result<Vec<_>, Error>>()
     } else {
-        todo!("handle packages value being non-array {:?}", packages_rt);
+        Err(Error::unexpected_type(
+            format!("`{field}`"),
+            "an array of package names",
+            &packages_rt,
+            program,
+        ))
     }
 }
 
+/// Parses a nickel tree representing a single command, in shell or exec form.
+///
+/// `what` names the field being read, for the error when it is neither.
 pub(crate) fn cmds_from_cmd_term(
+    what: &str,
     rt: &NickelValue,
     program: &mut Program<CacheImpl>,
 ) -> Result<Vec<Vec<String>>, Error> {
     let rt = eval_if_closure(rt, program)?;
     if let Some(s) = rt.as_string() {
-        Ok(vec![shlex::split(s.as_ref()).unwrap()])
+        Ok(vec![shell_split(what, s.as_ref())?])
     } else if let Some(a) = rt.as_array() {
         Ok(vec![
             a.iter()
-                .map(|rt| eval_if_closure(rt, program))
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .map(|rt| String::deserialize(rt).unwrap())
-                .collect(),
+                .map(|rt| deserialize_field(format!("{what} entry"), "a string", rt, program))
+                .collect::<Result<Vec<_>, Error>>()?,
         ])
     } else {
-        todo!(
-            "error for 'cmd' field being non-string & non-array, got {:?}",
-            rt
-        );
+        Err(Error::unexpected_type(
+            what,
+            "a string or an array of strings",
+            &rt,
+            program,
+        ))
     }
 }
 
+/// Parses a nickel tree representing a list of commands, each in shell or exec
+/// form.
+///
+/// `what` names the field being read, for the errors when it is not.
 pub(crate) fn cmds_from_cmds_term(
+    what: &str,
     rt: &NickelValue,
     program: &mut Program<CacheImpl>,
 ) -> Result<Vec<Vec<String>>, Error> {
@@ -547,24 +646,30 @@ pub(crate) fn cmds_from_cmds_term(
                 if let Some(a) = rt.as_array() {
                     Ok::<_, Error>(
                         a.iter()
-                            .map(|rt| eval_if_closure(rt, program))
-                            .collect::<Result<Vec<_>, _>>()?
-                            .into_iter()
-                            .map(|rt| String::deserialize(rt).unwrap())
-                            .collect(),
+                            .map(|rt| {
+                                deserialize_field(format!("{what} entry"), "a string", rt, program)
+                            })
+                            .collect::<Result<Vec<_>, Error>>()?,
                     )
                 } else if let Some(s) = rt.as_string() {
-                    Ok::<_, Error>(shlex::split(s.as_ref()).unwrap())
+                    Ok::<_, Error>(shell_split(&format!("{what} entry"), s.as_ref())?)
                 } else {
-                    todo!(
-                        "error for 'cmds' field being non-array & non-string, got {:?}",
-                        rt
-                    );
+                    Err(Error::unexpected_type(
+                        format!("{what} entry"),
+                        "a string or an array of strings",
+                        &rt,
+                        program,
+                    ))
                 }
             })
             .collect::<Result<Vec<_>, _>>()?)
     } else {
-        todo!("error for 'cmds' field being non-array, got {:?}", rt);
+        Err(Error::unexpected_type(
+            what,
+            "an array of commands",
+            &rt,
+            program,
+        ))
     }
 }
 
@@ -579,6 +684,98 @@ mod tests {
     use indoc::indoc;
     use mfile::EnvVarValue;
     use nickel_lang_core::term::IndexMap;
+
+    /// A field whose value is the wrong shape must decode to an error, not
+    /// abort the process. Nickel's contracts catch most of these first, but
+    /// the fields below are annotated loosely enough that the value reaches
+    /// the decoder as-is — where it used to hit a `todo!()`.
+    #[test]
+    fn wrong_shaped_field_errors_rather_than_panicking() {
+        // (offending field, what the diagnostic must name it, wanted shape)
+        let cases = [
+            (
+                "build_deps = 1",
+                "builder `build_deps`",
+                "an array of build dependencies",
+            ),
+            (
+                "runtime_deps = 1",
+                "builder `runtime_deps`",
+                "an array of runtime dependencies",
+            ),
+            (
+                "build_args = 1",
+                "builder `build_args`",
+                "a record of strings",
+            ),
+            ("attrs = 1", "builder `attrs`", "a record of attributes"),
+            ("needs = 1", "builder `needs`", "a record of attributes"),
+            ("tests = 1", "builder `tests`", "a record of tests"),
+            ("cmds = 1", "builder `cmds`", "an array of commands"),
+            (
+                "cmds = [1]",
+                "builder `cmds` entry",
+                "a string or an array of strings",
+            ),
+            // Values the contracts let through, which used to reach a
+            // `deserialize(..).unwrap()`.
+            (
+                "build_args = { a = 1 }",
+                "builder `build_args.a`",
+                "a string",
+            ),
+            ("cmds = [[1]]", "builder `cmds` entry", "a string"),
+            ("target = 1", "builder `target`", "a string"),
+            ("prebuilt = 1", "builder `prebuilt`", "a boolean"),
+        ];
+
+        for (body, what, want) in cases {
+            // `build_deps` is required, so it is in the fixture unless the
+            // case is the one supplying it.
+            let base = if body.starts_with("build_deps") {
+                "name = \"n\", cmd = \"x\""
+            } else {
+                "name = \"n\", cmd = \"x\", build_deps = []"
+            };
+            let src = format!(
+                "let {{BuildSpec, ..}} = import \"minimal.ncl\" in\n\
+                 {{ {base}, {body} }} | BuildSpec"
+            );
+            let err = crate::Layer::new_for_test(src)
+                .err()
+                .unwrap_or_else(|| panic!("expected `{body}` to be rejected"));
+
+            let Error::UnexpectedType { pos, .. } = &err else {
+                panic!("expected Error::UnexpectedType for `{body}`, got {err:?}");
+            };
+            assert!(
+                pos.into_opt().is_some(),
+                "expected `{body}` to carry the offending value's position, got {pos:?}"
+            );
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains(what) && msg.contains(want) && msg.contains("Number"),
+                "unexpected message for `{body}`: {msg}"
+            );
+        }
+    }
+
+    /// An unbalanced quote in a shell-form command has no shell downstream to
+    /// receive it, and used to panic in `shlex::split(..).unwrap()`.
+    #[test]
+    fn unbalanced_quote_in_cmd_errors_rather_than_panicking() {
+        let src = "let {BuildSpec, ..} = import \"minimal.ncl\" in\n\
+                   { name = \"n\", build_deps = [], cmd = \"echo '\" } | BuildSpec"
+            .to_string();
+        let err =
+            crate::Layer::new_for_test(src).expect_err("an unbalanced quote should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("builder `cmd`") && msg.contains("not a valid shell word list"),
+            "unexpected message: {msg}"
+        );
+    }
 
     #[test]
     fn simple_buildspec() {
@@ -840,7 +1037,7 @@ mod tests {
         let layer = Layer::new_for_test(
             indoc! {
                 "
-                let {layer, stack, BuildSpec, ..} = import \"minimal.ncl\" in
+                let {layer, stack, container, BuildSpec, ..} = import \"minimal.ncl\" in
 
                 layer {
                   builds = [
@@ -861,6 +1058,16 @@ mod tests {
                         },
 
                         build_cmd = [\"uwu\", \"build\"],
+                    }
+                  ],
+
+                  containers = [
+                    container {
+                        name = \"owo\",
+                        packages = [\"glibc\", \"nginx\"],
+
+                        entrypoint = \"/usr/bin/nginx\",
+                        exposed_ports = [{ port = 80 }],
                     }
                   ],
                 }
@@ -894,6 +1101,19 @@ mod tests {
                 build_cmds: Some(vec![vec!["uwu".to_string(), "build".to_string()]]),
                 matches_project_if_any: None,
                 matches_project_priority: 0,
+            }),
+        );
+        assert_eq!(
+            layer.containers.get("owo"),
+            Some(&Container {
+                name: "owo".to_string(),
+                packages: vec!["glibc".to_string(), "nginx".to_string()],
+                entrypoint: Some(vec!["/usr/bin/nginx".to_string()]),
+                exposed_ports: vec![ExposedPort {
+                    proto: ExposedPortProto::Tcp,
+                    port: 80
+                }],
+                ..Default::default()
             }),
         );
     }

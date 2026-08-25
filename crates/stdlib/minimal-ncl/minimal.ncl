@@ -1,4 +1,4 @@
-let Tys = [| 'Builder, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Subset, 'Profile, 'Layer, 'Upstream, 'Test, 'Stack |]
+let Tys = [| 'Builder, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Subset, 'Profile, 'Layer, 'Upstream, 'Test, 'Stack, 'Container |]
 in
 let attrs_schema = import "attr_classes.ncl" in
 let needs_schema = import "need_classes.ncl" in
@@ -6,6 +6,81 @@ let CmdSpec = std.contract.any_of [
   String,
   Array String,
 ] in
+# Builds a contract that accepts strings matching `regex`, blaming with `msg`.
+let StringMatching = fun regex msg =>
+  std.contract.custom (fun label value =>
+    if !(std.is_string value) then
+      'Error { message = "expected a string" }
+    else if std.string.is_match regex value then
+      'Ok value
+    else
+      'Error { message = "%{msg}: got `%{value}`" }
+  ) in
+# A container image name, following the registry reference grammar: lowercase
+# alphanumerics separated by `.`, `_`, or `-`, in `/`-separated path
+# components. Registries reject uppercase, so this does too.
+let ImageName = StringMatching
+  "^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$"
+  "not a valid image name: use lowercase alphanumerics separated by `.`, `_`, `-`, or `/`"
+in
+# A clean absolute path: no relative form, no trailing or repeated `/`, no
+# `.`/`..` components. A bare `/` is allowed.
+let AbsolutePath =
+  std.contract.custom (fun label value =>
+    if !(std.is_string value) then
+      'Error { message = "expected a string path" }
+    else if value == "/" then
+      'Ok value
+    else if !(std.string.is_match "^(/[^/]+)+$" value) then
+      'Error {
+        message = "must be an absolute path with no trailing or repeated `/`: got `%{value}`"
+      }
+    else if std.string.is_match "(^|/)[.][.]?(/|$)" value then
+      'Error {
+        message = "must not contain `.` or `..` path components: got `%{value}`"
+      }
+    else
+      'Ok value
+  ) in
+# The user processes run as, in OCI form: `user`, `uid`, `user:group`,
+# `uid:gid`, `uid:group`, or `user:gid`.
+#
+# Prefer numeric ids. A *named* user must resolve through `/etc/passwd` inside
+# the image, which a package-assembled rootfs usually lacks, and Kubernetes
+# `runAsNonRoot` requires a numeric uid.
+let UserSpec = StringMatching
+  "^([0-9]+|[A-Za-z_][A-Za-z0-9_.-]*)(:([0-9]+|[A-Za-z_][A-Za-z0-9_.-]*))?$"
+  "not a valid user: expected `user`, `uid`, `user:group`, or `uid:gid`"
+in
+# A signal name, e.g. `SIGTERM` or `SIGRTMIN+3`.
+let StopSignal = StringMatching
+  "^SIG[A-Z0-9]+([+-][0-9]+)?$"
+  "not a valid signal name: expected the `SIGTERM` form"
+in
+# Environment variables baked into an image. Names must be POSIX portable
+# (`[A-Za-z_][A-Za-z0-9_]*`), because runtimes join these into `KEY=VALUE`
+# strings and split on the first `=`.
+let EnvVars = std.contract.custom (fun label record_value =>
+    if !(std.is_record record_value) then
+      'Error { message = "not a record" }
+    else
+      record_value
+      |> std.record.to_array
+      |> std.array.try_fold_left
+        (fun acc { field, value } =>
+          if !(std.string.is_match "^[A-Za-z_][A-Za-z0-9_]*$" field) then
+            'Error { message = "`%{field}` is not a valid environment variable name" }
+          else if !(std.is_string value) then
+            'Error { message = "environment variable `%{field}` must be a string" }
+          else
+            'Ok acc
+        )
+        null
+      |> match {
+        'Ok _ => 'Ok record_value,
+        'Error e => 'Error e,
+      }
+  ) in
 {
     BuildSpec | doc "A minimal build spec, defining inputs to the build as well as outputs which carry build artifacts downstream" = {
         ty | Tys = 'Builder,
@@ -203,6 +278,7 @@ let CmdSpec = std.contract.any_of [
         builds | Array BuildSpec,
         profiles | Array Dyn, # Profiles were removed 2026-08-06.
         stacks | Array Stack,
+        containers | Array Container,
     },
     layer | Dyn -> Layer | doc "Constructs a layer." =
         fun spec => spec | Layer,
@@ -272,4 +348,41 @@ let CmdSpec = std.contract.any_of [
         os | [| 'Linux, 'MacOS |],
         arch | [| 'Amd64, 'Arm64 |],
     },
+
+    Container | doc "A declared container image." = {
+        ty | Tys = 'Container,
+        name
+            | ImageName,
+        packages
+            | Array String,
+
+        # OCI has no shell form: a string is word-split into exec form, so an
+        # unbalanced quote is an error rather than something the shell sees.
+        entrypoint | CmdSpec | optional,
+        cmd | CmdSpec | optional,
+        # Must match the architecture the packages were built for, or the
+        # image pulls cleanly and then fails with `exec format error`.
+        arch | [| 'Amd64, 'Arm64 |] | optional,
+        working_dir | AbsolutePath | optional,
+
+        env_vars
+            | EnvVars | optional,
+
+        # Element contracts can only refer to builtins (see the note above
+        # `AbsolutePath`), so the port range, the volume paths, and the
+        # set semantics of both are checked by the decoder.
+        exposed_ports
+            | Array { port | Number, proto | [| 'Tcp, 'Udp |] | default = 'Tcp } | optional,
+        volumes
+            | Array String | optional,
+        user | UserSpec | optional,
+        stop_signal | StopSignal | optional,
+
+        labels
+            | {_ : String} | optional,
+        config
+            | {_ : String} | optional,
+    },
+    container | Dyn -> Container | doc "Constructs a container image." =
+        fun spec => spec | Container,
 }

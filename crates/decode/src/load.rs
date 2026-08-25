@@ -315,6 +315,26 @@ impl Loader {
         }
         src.push_str("\t],\n");
 
+        src.push_str("\tcontainers = [\n");
+        match std::fs::read_dir(layer_dir.as_ref().join("containers")) {
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(e.into());
+                }
+            }
+            Ok(d) => {
+                for e in d {
+                    let e = e?;
+                    if e.file_type()?.is_dir() {
+                        src.push_str("  import \"");
+                        src.push_str(e.path().to_str().unwrap());
+                        src.push_str("/spec.ncl\",\n");
+                    }
+                }
+            }
+        }
+        src.push_str("\t],\n");
+
         src.push('}');
 
         Self::new(src, args, opts)
@@ -587,6 +607,7 @@ mod tests {
         std::fs::create_dir(temp_dir.path().join("packages")).unwrap();
         std::fs::create_dir(temp_dir.path().join("profiles")).unwrap();
         std::fs::create_dir(temp_dir.path().join("stacks")).unwrap();
+        std::fs::create_dir(temp_dir.path().join("containers")).unwrap();
 
         // Create multiple packages
         for pkg_name in &["package-a", "package-b", "package-c"] {
@@ -639,6 +660,23 @@ mod tests {
         )
         .unwrap();
 
+        // Make a container called web
+        let container_dir = temp_dir.path().join("containers").join("web");
+        std::fs::create_dir(&container_dir).unwrap();
+        std::fs::write(
+            container_dir.join("spec.ncl"),
+            indoc! {
+            "
+            let {container, ..} = import \"minimal.ncl\" in
+            container {
+        		name = \"web\",
+        		packages = [\"glibc\"],
+        	}
+			"
+            },
+        )
+        .unwrap();
+
         let sr = Loader::new_with_all_pkgs(temp_dir.path(), None, &LoadOptions::for_test());
         // So we can see the actual error when the test fails
         if let Some(e) = sr.as_ref().err().iter().next() {
@@ -670,6 +708,16 @@ mod tests {
             )
             .unwrap();
             assert!(stacks_val.as_array().map(|a| a.len()).unwrap_or(0) == 1,);
+
+            // Check a field 'containers' was an array with one object
+            let containers_val = eval_if_closure(
+                &rd.get_value_with_ctrs(&LocIdent::new("containers"))
+                    .unwrap()
+                    .unwrap(),
+                &mut sr.p,
+            )
+            .unwrap();
+            assert!(containers_val.as_array().map(|a| a.len()).unwrap_or(0) == 1,);
         }
     }
 }

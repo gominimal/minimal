@@ -116,7 +116,12 @@ impl AttrValue {
             )));
         }
 
-        todo!("error for unexpected attribute value type: {:?}", rt)
+        Err(Error::unexpected_type(
+            "attribute value",
+            "a string, number, boolean, record, array, or enum",
+            &rt,
+            program,
+        ))
     }
 
     /// Returns the inner list, if this [AttrValue] is the list variant.
