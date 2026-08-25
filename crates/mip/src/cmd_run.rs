@@ -256,6 +256,9 @@ pub async fn run_task(
             Some(&task.patch),
             Some(&task.vars),
             task.packages.clone(),
+            // `mip` runs on the user's own host, where the sandbox mirrors
+            // host paths, so `~` means the invoking user's home.
+            mctx::PatchHome::Ambient,
         )
         .await?;
 

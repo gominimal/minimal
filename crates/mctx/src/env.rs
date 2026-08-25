@@ -363,6 +363,11 @@ impl EnvChannel<'_> {
                     Some(&task.patch),
                     Some(&task.vars),
                     task.packages.clone(),
+                    // A nested `min task` inside a bound-dir sandbox: paths
+                    // are mirrored one-for-one and sandbox2 gave this process
+                    // the outer environment's `HOME`, so the ambient home is
+                    // the outer home, which is the one `~/` meant all along.
+                    PatchHome::Ambient,
                 )
                 .await?;
 
@@ -512,6 +517,9 @@ pub struct EnvArgs<'a> {
     pub cwd: PathBuf,
     /// Any additional pinhole bind mounts / file mappings.
     pub patches: Option<&'a EnvPatches>,
+    /// The home directory `~/`-rooted patch paths expand against, and that
+    /// the sandbox reports as `$HOME`.
+    pub home: PatchHome,
 
     /// Environment variables to set.
     pub env_vars: Option<&'a HashMap<String, EnvVarValue>>,
@@ -560,6 +568,62 @@ pub fn interpolate_task_strings(
     .map_err(Error::Other)
 }
 
+/// Names whoever put a patch path into the environment: the package that
+/// declared it, or — for a path that arrived through the task's own `patch`
+/// table rather than a package attribute — the task itself.
+fn declared_by(packages: &HashMap<String, String>, declared: &str, task: &str) -> String {
+    match packages.get(declared) {
+        Some(p) => format!("package `{p}`"),
+        None => format!("task `{task}`"),
+    }
+}
+
+/// The home directory this environment's `~/`-rooted patch paths expand
+/// against, and that its sandbox reports as `$HOME`.
+///
+/// A patch path such as `~/.claude.json` has to name a real directory on the
+/// filesystem the sandbox is assembled on. Reading the *ambient* home is
+/// right in exactly one of the two situations this type distinguishes, so the
+/// choice is made at the call site rather than silently deep in the
+/// conversion: `minimald` is pid 1 inside the guest with `HOME=/`, and
+/// expanding against that put package-declared files at the root of a
+/// read-only rootfs, failing with `EROFS` (#1204).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PatchHome {
+    /// The home of the process building the environment (`$HOME`).
+    ///
+    /// The right answer for `mip` run by a developer: the sandbox mirrors
+    /// host paths one-for-one (`WdSetup::BoundDir`), so the home a package
+    /// means by `~` *is* the invoking user's, and sandbox2 synthesizes the
+    /// same home into the sandbox's passwd. An unset `HOME` leaves no home at
+    /// all, which is an error for a `~/`-rooted mapping and fine for anything
+    /// else.
+    #[default]
+    Ambient,
+    /// The home directory of the `minimald` session this environment belongs
+    /// to, in the daemon's filesystem view.
+    ///
+    /// [`Daemon`]-realm because that is the filesystem the daemon assembles
+    /// the sandbox on, and because it is the realm the session already tracks
+    /// its home in (`SessionPaths::home`, `minimald::env::EnvArgs::home`) —
+    /// so it arrives here without a conversion that could launder the realm.
+    ///
+    /// [`Daemon`]: paths::Daemon
+    Session(paths::DaemonAbsPath),
+}
+
+impl PatchHome {
+    /// The directory to expand `~/` against, or `None` when there is no home
+    /// to be had (an [`Ambient`](Self::Ambient) home with `HOME` unset).
+    #[must_use]
+    pub fn resolve(&self) -> Option<PathBuf> {
+        match self {
+            Self::Ambient => std::env::home_dir(),
+            Self::Session(home) => Some(home.as_utf8_path().as_std_path().to_path_buf()),
+        }
+    }
+}
+
 /// A successfully-configured runtime environment.
 pub struct Env<'a> {
     sandbox: sandbox2::Sandbox<EnvChannel<'a>>,
@@ -581,6 +645,7 @@ impl<'a> Env<'a> {
 
         let SetupForPackages {
             fs_mappings: mut patch,
+            fs_mapping_packages,
             needs_dns,
             needs_internet,
             state_dirs,
@@ -611,8 +676,37 @@ impl<'a> Env<'a> {
             );
         }
 
+        // `~/`-rooted patch paths expand against the home the caller named
+        // (see [`PatchHome`]), and the same home goes on to the sandbox as
+        // `$HOME` so a mapped-in `~/.claude.json` lands where the process
+        // will look for it. A home that can't hold the file — notably `/`,
+        // which is what `minimald` sees as pid 1 in the guest with no session
+        // to borrow a home from — is refused with the package named, rather
+        // than landing the file at the root of a read-only rootfs (#1204).
+        let home = args.home.resolve();
+        let fs_mappings = patch.to_fs_mappings(home.as_deref()).map_err(|e| {
+            Error::Other(anyhow::anyhow!(
+                "{e} (declared by {})",
+                declared_by(&fs_mapping_packages, &e.declared, args.name)
+            ))
+        })?;
+        // Expanded path → the declaration behind it. sandbox2 only ever sees
+        // the expanded form, so its "create mapped file" failures name a path
+        // nobody wrote down; this puts the package and its `~/`-rooted
+        // declaration back into the message.
+        let declarations: HashMap<String, &String> = fs_mapping_packages
+            .keys()
+            .filter_map(|declared| {
+                Some((
+                    EnvPatches::expand_home(declared, home.as_deref()).ok()?,
+                    declared,
+                ))
+            })
+            .collect();
+
         let mut config = sandbox2::config::Config::new(args.name)
-            .with_wd(args.cwd.clone(), false, patch.into())
+            .with_wd(args.cwd.clone(), false, fs_mappings)
+            .with_home(home.clone())
             .with_rootfs(
                 args.transitives
                     .keys()
@@ -660,7 +754,23 @@ impl<'a> Env<'a> {
                     daemon_id,
                 },
             )
-            .await?;
+            .await
+            .map_err(|e| {
+                // Sandbox setup creates every mapped file it doesn't find. If
+                // that failed on a path we mapped in, say whose declaration it
+                // was — "create mapped file /.claude.json: EROFS" on its own
+                // sends nobody anywhere useful (#1204).
+                let sandbox2::Error::IO(_, path, _) = &e else {
+                    return e.into();
+                };
+                match path.to_str().and_then(|p| declarations.get(p)) {
+                    Some(declared) => Error::Other(anyhow::anyhow!(
+                        "{e}; mapped in by {}, which declares it as `{declared}`",
+                        declared_by(&fs_mapping_packages, declared, args.name)
+                    )),
+                    None => e.into(),
+                }
+            })?;
         for want_dir in state_dirs {
             std::fs::create_dir_all(args.state_base_dir.join(&want_dir)).map_err(|e| {
                 Error::IO("creating state dir", args.state_base_dir.join(want_dir), e)
@@ -843,6 +953,54 @@ mod tests {
     use sandbox2::Channel;
     use std::io::{BufRead, BufReader};
     use tempfile::tempdir;
+
+    /// The guest case (#1204). A task running in a `minimald` session
+    /// expands `~/` against the session's own home — a real, writable
+    /// directory — where the daemon's ambient home is `/` (it is pid 1 in the
+    /// guest) and expanding against that produced `/.claude.json` on a
+    /// read-only rootfs. Both halves are asserted here: the session home
+    /// resolves and expands, and `/` is still refused for the case where
+    /// there is no session home to borrow.
+    #[test]
+    fn a_session_home_expands_where_the_ambient_one_is_refused() {
+        let patches = EnvPatches {
+            file: [("~/.claude.json".to_string(), mfile::PatchSetting::ReadWrite)].into(),
+            ..Default::default()
+        };
+
+        let session = PatchHome::Session(
+            paths::DaemonAbsPath::try_new("/var/lib/minimal/sessions/s1/home").unwrap(),
+        );
+        let home = session.resolve().expect("a session always has a home");
+        assert_eq!(
+            patches.to_fs_mappings(Some(&home)).unwrap()[0].host_path,
+            "/var/lib/minimal/sessions/s1/home/.claude.json",
+        );
+
+        assert!(
+            patches.to_fs_mappings(Some(Path::new("/"))).is_err(),
+            "a pid-1 daemon with no session home to offer must still refuse `/`"
+        );
+    }
+
+    /// A patch path a package declared is attributed to that package; one
+    /// that only the task's own `patch` table names falls back to the task.
+    /// The attribution is what makes a failure to map `~/.claude.json`
+    /// actionable — the path alone doesn't say who asked for it (#1204).
+    #[test]
+    fn declared_by_names_the_package_then_the_task() {
+        let packages =
+            HashMap::from_iter([("~/.claude.json".to_string(), "claude-code".to_string())]);
+        assert_eq!(
+            declared_by(&packages, "~/.claude.json", "test"),
+            "package `claude-code`"
+        );
+        assert_eq!(
+            declared_by(&packages, "~/.npmrc", "test"),
+            "task `test`",
+            "a path no package declared came from the task's own patch table"
+        );
+    }
 
     /// Helper: build a Context and Graph from the fakerepo test data,
     /// matching the pattern used in lib.rs tests.
