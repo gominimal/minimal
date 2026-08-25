@@ -24,7 +24,10 @@ const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// russh client handler that accepts any host key. The daemon generates a
 /// fresh host key on every boot and the connection is a local UDS (the
-/// libkrun vsock bridge), so TOFU trust is acceptable.
+/// libkrun vsock bridge), so TOFU trust is acceptable. russh 0.63 widened the
+/// callback to `PublicKeyOrCertificate`; both variants are accepted on that
+/// same rationale — the guest daemon never presents a host certificate, and
+/// nothing here is verified either way.
 struct AnyHostKey;
 
 impl russh::client::Handler for AnyHostKey {
