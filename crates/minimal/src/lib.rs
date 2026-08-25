@@ -21,6 +21,13 @@ pub mod config;
 pub mod diag;
 pub mod dirs;
 use minimal_client::file_upload;
+// The version gate lives in `minimal-client`, next to the transport it guards,
+// so the dashboard's activation path (`minimal-tui`, which cannot depend on
+// this crate) gates on the same wording and the same override.
+// `ensure_version_reported` asserts a build a reply already carried;
+// `ensure_version_match` is the round-trip form, for paths with no first RPC
+// of their own to carry it.
+use minimal_client::{ensure_version_match, ensure_version_reported, version_assertion};
 pub mod git_remote;
 pub mod loadouts;
 pub mod prompt;
@@ -941,8 +948,14 @@ async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     let mut client = client::Client::connect(&sock)
         .await
         .context("Failed to connect to minimald")?;
+    // Connects directly rather than through `connect_daemon` (it needs `sock`
+    // for the attach hand-off), so the gate is applied by hand — this path can
+    // end in an activation just as `min session activate` does. It rides on the
+    // `ListSessions` this path had to send anyway; nothing here spends a round
+    // trip on the version alone.
+    let listed = list_sessions_version_gated(&mut client).await?;
 
-    match resolve_smart_attach(&mut client, global).await? {
+    match resolve_smart_attach(&listed.sessions, global)? {
         SmartAttach::Attach(entry) => {
             tracing::info!(
                 session_id = %entry.id,
@@ -1104,8 +1117,32 @@ fn display_with_home_tilde(path: &camino::Utf8Path, home: Option<&camino::Utf8Pa
     }
 }
 
-/// Connect to the daemon, resolving the socket path from global args.
+/// Connect to the daemon, resolving the socket path from global args, and
+/// refuse to proceed against a daemon of a different build
+/// ([`ensure_version_match`]).
+///
+/// Costs a `GetVersion` round trip, which is why the paths that care — the
+/// activation, and the attach/exec hand-offs — do not come through here: they
+/// fold the assertion into the RPC they were already sending. This stays the
+/// safe default for the rest, whose first call differs from one command to the
+/// next and none of which is hot.
 pub async fn connect_daemon(global: &GlobalArgs) -> Result<client::Client, anyhow::Error> {
+    let mut client = connect_daemon_unchecked(global).await?;
+    ensure_version_match(&mut client).await?;
+    Ok(client)
+}
+
+/// [`connect_daemon`] without the `GetVersion` gate.
+///
+/// Two kinds of caller. The commands that must keep working *because* the pair
+/// is skewed — `min stop` is the recovery the gate's own message prescribes, so
+/// gating it would leave the operator with no way out. And the activation path,
+/// which *is* gated, just not from here: its `CreateSession` carries the
+/// assertion itself, so routing it through [`connect_daemon`] would only add
+/// the round trip this connector exists to skip.
+pub(crate) async fn connect_daemon_unchecked(
+    global: &GlobalArgs,
+) -> Result<client::Client, anyhow::Error> {
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
         .context("Failed to resolve daemon socket path")?;
 
@@ -1169,16 +1206,64 @@ async fn resolve_session(
     client: &mut client::Client,
     session: &str,
 ) -> Result<sessions::Record, anyhow::Error> {
+    let resp = get_session_record(client, session).await?;
+    named_record(resp.record, session)
+}
+
+/// [`resolve_session`] for the paths that must refuse a version-skewed daemon:
+/// the same lookup, with the build it reports asserted before the record is
+/// used for anything.
+///
+/// The lookup is the first RPC `min session attach`, `min session exec`,
+/// `min session setup-zed`, and `min ssh-forward` make, so the gate rides on
+/// its reply rather than on a `GetVersion` sent ahead of it — an activation
+/// must not pay a round trip for a check the calls it already makes can carry
+/// (#1251). Ordered so the skew is reported ahead of a "no session found":
+/// against the wrong daemon, the name is the less useful of the two answers.
+async fn resolve_session_version_gated(
+    client: &mut client::Client,
+    session: &str,
+) -> Result<sessions::Record, anyhow::Error> {
+    let resp = get_session_record(client, session).await?;
+    ensure_version_reported(resp.daemon_version.as_deref())?;
+    named_record(resp.record, session)
+}
+
+/// The `GetSessionRecord` round trip both resolvers share.
+async fn get_session_record(
+    client: &mut client::Client,
+    session: &str,
+) -> Result<minimald_rpc::GetSessionRecordResponse, anyhow::Error> {
     use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
     let lookup: GetSessionRecordRequest = SessionLookup::parse(session).into();
-    let resp = client
+    client
         .oneshot_rpc::<GetSessionRecord>(lookup)
         .await
-        .context("GetSessionRecord RPC failed")?;
-    match resp.record {
-        Some(r) => Ok(r),
-        None => bail!("No session found matching '{session}'"),
-    }
+        .context("GetSessionRecord RPC failed")
+}
+
+/// Unwrap a looked-up record, naming what was asked for when nothing matched.
+fn named_record(
+    record: Option<sessions::Record>,
+    session: &str,
+) -> Result<sessions::Record, anyhow::Error> {
+    record.ok_or_else(|| anyhow::anyhow!("No session found matching '{session}'"))
+}
+
+/// `ListSessions` with the daemon's build asserted off the same reply, for the
+/// paths that go on to attach or activate. See
+/// [`resolve_session_version_gated`] for why the gate rides here rather than on
+/// a `GetVersion` of its own.
+async fn list_sessions_version_gated(
+    client: &mut client::Client,
+) -> Result<minimald_rpc::ListSessionsResponse, anyhow::Error> {
+    use minimald_rpc::ListSessions;
+    let resp = client
+        .oneshot_rpc::<ListSessions>(())
+        .await
+        .context("ListSessions RPC failed")?;
+    ensure_version_reported(resp.daemon_version.as_deref())?;
+    Ok(resp)
 }
 
 /// Bidirectionally pipe stdio to a daemon UDS socket.
@@ -1716,6 +1801,9 @@ fn arm_activation_interrupt(
             return;
         }
         eprintln!("\nAborting activation; cleaning up session {session_id}…");
+        // Deliberately not version-gated: this is the cleanup half of an
+        // activation the gate already cleared, and a cleanup that refuses to
+        // run is the orphaned session #1251 is about.
         if let Ok(sock) = sock
             && let Ok(mut client) = client::Client::connect(&sock).await
         {
@@ -1975,7 +2063,11 @@ async fn activate_session(
             file_upload::is_empty_or_home(root.as_std_path(), std::env::home_dir().as_deref())
         });
 
-    let mut client = connect_daemon(global).await?;
+    // Deliberately not `connect_daemon`: this path's version gate travels on
+    // the `CreateSession` below rather than on a `GetVersion` sent ahead of it.
+    // Activation is the hot path #1251's gate landed on, and it must not pay a
+    // round trip for a check its own first RPC can make.
+    let mut client = connect_daemon_unchecked(global).await?;
 
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
@@ -1991,6 +2083,11 @@ async fn activate_session(
         let resp = client
             .oneshot_rpc::<CreateSession>(CreateSessionRequest {
                 config: config.clone(),
+                // The version gate: a daemon of another build refuses this
+                // call outright, before it has allocated anything to tear
+                // down. `None` under the skew override, which is what lets an
+                // operator proceed.
+                must_match_version: version_assertion(),
             })
             .await
             .context("CreateSession RPC failed")?;
@@ -2006,6 +2103,13 @@ async fn activate_session(
             }
         }
     };
+    // The other half of the gate: a daemon old enough to predate
+    // `must_match_version` ignored the assertion instead of answering it, and
+    // says so by echoing no version at all. Being older than the field is
+    // itself proof of a skew, so refuse here — still before the upload, the
+    // loadout, and the finalize that #1251 died at, and with the session left
+    // unfinalized for the daemon to reap when this connection drops.
+    ensure_version_reported(created.daemon_version.as_deref())?;
     let id = created.id;
 
     // From here the session exists on the daemon in an unfinalized state.
@@ -2301,13 +2405,20 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
     let mut client = client::Client::connect(&sock)
         .await
         .context("Failed to connect to minimald")?;
-
+    // Connects directly rather than through `connect_daemon` (it needs `sock`
+    // for the ssh hand-off), so the gate is applied by hand — with no session
+    // named, this path creates one, and a skewed activation is #1251 exactly.
+    // Both arms below gate on the build the daemon reports on the lookup they
+    // were already making, so the gate costs no round trip of its own.
     let (id, name) = match args.session {
         Some(ref s) => {
-            let r = resolve_session(&mut client, s).await?;
+            let r = resolve_session_version_gated(&mut client, s).await?;
             (r.id, r.name)
         }
-        None => match resolve_smart_attach(&mut client, global).await? {
+        None => match resolve_smart_attach(
+            &list_sessions_version_gated(&mut client).await?.sessions,
+            global,
+        )? {
             SmartAttach::Attach(entry) => (entry.id, entry.name),
             SmartAttach::CreateForCwd => return activate_new_for_attach(global).await,
             SmartAttach::NoSessions => {
@@ -2338,8 +2449,11 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
     let mut client = client::Client::connect(&sock)
         .await
         .context("Failed to connect to minimald")?;
-
-    let r = resolve_session(&mut client, &args.session).await?;
+    // Gated by hand for the same reason as `cmd_attach`: this hands off into a
+    // live session (the daemon mints the exec channel and runs the attach
+    // hooks around it), which is not something to drive on a skewed pair. The
+    // gate rides on the lookup's reply — no `GetVersion` ahead of it.
+    let r = resolve_session_version_gated(&mut client, &args.session).await?;
     tracing::info!(
         session_id = %r.id,
         session_name = ?r.name,
@@ -2350,24 +2464,22 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
 }
 
 /// Resolve a session to attach to when the user supplied no explicit session
-/// reference. Lists sessions, matches against the current working directory,
-/// and either attaches directly (unambiguous), opens the interactive picker
-/// (ambiguous), or errors (ambiguous but non-interactive).
+/// reference. Matches an already-fetched session list against the current
+/// working directory, and either attaches directly (unambiguous), opens the
+/// interactive picker (ambiguous), or errors (ambiguous but non-interactive).
+///
+/// Takes the list rather than fetching it so its two callers can assert the
+/// daemon's build off the `ListSessions` reply — before the picker blocks on a
+/// human, not after.
 ///
 /// Returns [`SmartAttach::NoSessions`] when no sessions exist at all, which
 /// `min session attach` reports as an error pointing at `min session activate`.
-async fn resolve_smart_attach(
-    client: &mut client::Client,
+fn resolve_smart_attach(
+    sessions: &[minimald_rpc::ListSessionsEntry],
     global: &GlobalArgs,
 ) -> Result<SmartAttach, anyhow::Error> {
-    use minimald_rpc::ListSessions;
-
-    let resp = client
-        .oneshot_rpc::<ListSessions>(())
-        .await
-        .context("ListSessions RPC failed")?;
     let cwd = attach::cwd_host_path(global)?;
-    match attach::resolve_for_attach(&resp.sessions, &cwd) {
+    match attach::resolve_for_attach(sessions, &cwd) {
         attach::SmartResolve::NoSessions => Ok(SmartAttach::NoSessions),
         attach::SmartResolve::Attach(entry) => {
             // Unambiguous auto-resolve: the operator never chose this session,
@@ -2566,7 +2678,11 @@ pub async fn cmd_session_setup_zed(
     let mut daemon_client = client::Client::connect(&sock)
         .await
         .context("Failed to connect to minimald")?;
-    let record = resolve_session(&mut daemon_client, &args.session).await?;
+    // Gated: the record read here is baked into Zed's settings.json and
+    // outlives the command, so it must not be sourced from a daemon the
+    // operator is about to restart onto another build. The daemon names its
+    // build on the lookup's own reply.
+    let record = resolve_session_version_gated(&mut daemon_client, &args.session).await?;
 
     // Pin the socket explicitly rather than leaning on `min proxy`'s own
     // resolution: Zed launches the ProxyCommand from its own environment, which
@@ -3148,7 +3264,9 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
     // Racy by nature: the daemon may go down between the probe and this connect
     // (or `--provider` may point the probe and the client at different backends),
     // so a connect failure is still a real error, not something to swallow.
-    let mut client = connect_daemon(global).await?;
+    // Unchecked: stopping a version-skewed daemon is exactly what the version
+    // gate tells the operator to do, so this command must never be gated by it.
+    let mut client = connect_daemon_unchecked(global).await?;
 
     use minimald_rpc::{Shutdown, ShutdownRequest};
     let resp = client
@@ -3322,8 +3440,10 @@ pub async fn cmd_ssh_forward(
     let mut daemon_client = client::Client::connect(&sock)
         .await
         .context("Failed to connect to minimald")?;
-
-    let record = resolve_session(&mut daemon_client, &args.session).await?;
+    // Gated: like `cmd_attach`, this hands off into a live session — the
+    // forward's server-side auth gate is keyed on wire types both builds have
+    // to agree on. Asserted off the lookup this command already makes.
+    let record = resolve_session_version_gated(&mut daemon_client, &args.session).await?;
 
     // Validate the forward spec format: local:remote_host:remote_port.
     // We accept either `local_port:host:port` (3 components, last two joined by
@@ -3666,6 +3786,9 @@ pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         }
     };
 
+    // Deliberately not version-gated: reporting the two versions is how an
+    // operator sees a skew at all, so this must answer on a skewed pair rather
+    // than refuse — and the gate's own check is this very RPC.
     let mut client = match client::Client::connect(&sock).await {
         Ok(c) => c,
         Err(e) => {
@@ -3721,6 +3844,263 @@ mod tests {
         // A signalled child reports no code of its own; the shell's 128 + n.
         // 9 is SIGKILL, in the low bits where wait(2) puts the signal.
         assert_eq!(exit_code_of(std::process::ExitStatus::from_raw(9)), 137);
+    }
+
+    /// A CLI upgraded past its daemon must be refused up front, naming both
+    /// builds and the recovery. Before #1251 the skew surfaced only at
+    /// `FinalizeSession`, by which point the activation's cleanup had already
+    /// destroyed the session it had just created.
+    #[test]
+    fn version_skew_is_reported_with_both_builds_and_a_recovery() {
+        let msg = client::version_skew_message("0.6.0", "0.5.0-dev.12.g86ce5c3a")
+            .expect("differing builds are a skew");
+        assert!(msg.contains("0.6.0"), "missing the CLI version: {msg}");
+        assert!(
+            msg.contains("0.5.0-dev.12.g86ce5c3a"),
+            "missing the daemon version: {msg}"
+        );
+        assert!(msg.contains("min stop"), "missing the recovery: {msg}");
+        assert!(
+            msg.contains(client::SKEW_OVERRIDE_VAR),
+            "missing the override: {msg}"
+        );
+    }
+
+    /// Every direct daemon connection in this crate is either version-gated or
+    /// deliberately not, and this test is where that decision is recorded.
+    ///
+    /// #1251 shipped the gate but wired it to two call sites; the rest reached
+    /// activations and live-session hand-offs ungated. A new connection is easy
+    /// to add and easy to forget, so the inventory is asserted rather than
+    /// documented: adding, removing, or un-gating one fails here and forces the
+    /// same judgement — can this path leave daemon state half-built (gate it),
+    /// or must it work *because* the pair is skewed (leave it, with a comment
+    /// saying why)?
+    #[test]
+    fn every_daemon_connection_is_classified() {
+        assert_eq!(
+            connect_site_inventory(env!("CARGO_MANIFEST_DIR")),
+            [
+                "diag/net.rs::probe_socket = ungated",
+                "lib.rs::arm_activation_interrupt = ungated",
+                "lib.rs::cmd_attach = gated",
+                "lib.rs::cmd_bare = gated",
+                "lib.rs::cmd_exec = gated",
+                "lib.rs::cmd_session_setup_zed = gated",
+                "lib.rs::cmd_ssh_forward = gated",
+                "lib.rs::cmd_version = ungated",
+                "lib.rs::connect_daemon_unchecked = ungated",
+                "task.rs::arm_task_run_interrupt = ungated",
+            ]
+        );
+    }
+
+    /// Every `CreateSession` this crate sends states, in the request itself,
+    /// whether it asserts the daemon's build.
+    ///
+    /// The struct field makes omitting the decision a compile error; this
+    /// makes answering it "no" a visible one. Both session-creating paths
+    /// assert — they are the ones #1251 is about — and the inventory is what
+    /// stops a third from quietly passing `None`.
+    #[test]
+    fn every_create_session_asserts_the_daemon_build() {
+        assert_eq!(
+            create_site_inventory(env!("CARGO_MANIFEST_DIR")),
+            [
+                "lib.rs::activate_session = asserts",
+                "task.rs::cmd_task_run = asserts",
+            ]
+        );
+    }
+
+    /// The activation path must not spend a round trip on the version.
+    ///
+    /// That was the cost of #1251's first fix: a `GetVersion` ahead of the
+    /// create, on the one path where an extra RTT is felt. The check now rides
+    /// on the `CreateSession` the path was already sending, so the marks of
+    /// the old mechanism — `GetVersion`, `ensure_version_match`, or the
+    /// `connect_daemon` that issues it — must be absent from both creators,
+    /// and the marks of the new one present.
+    #[test]
+    fn the_activation_path_makes_no_version_round_trip() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for (file, func) in [
+            ("src/lib.rs", "activate_session"),
+            ("src/task.rs", "cmd_task_run"),
+        ] {
+            let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
+            let body = function_body(&text, func)
+                .unwrap_or_else(|| panic!("{file} no longer defines {func}"));
+            for round_trip in ["GetVersion", "ensure_version_match", "connect_daemon("] {
+                assert!(
+                    !body.contains(round_trip),
+                    "{func} reintroduced a version round trip ({round_trip})"
+                );
+            }
+            assert!(
+                body.contains("must_match_version"),
+                "{func} no longer asserts its build on the create"
+            );
+            assert!(
+                body.contains("ensure_version_reported"),
+                "{func} no longer checks the build the create echoed back"
+            );
+        }
+    }
+
+    /// The code of the named free function, from its `fn` line to the next
+    /// one, with comment lines dropped — the prose here talks *about* the
+    /// mechanisms the caller is scanning for, and a rationale comment naming
+    /// `GetVersion` must not read as a call to it.
+    fn function_body(text: &str, name: &str) -> Option<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let decls = fn_decl_lines(&lines);
+        let start = decls.iter().position(|(_, n)| n == name)?;
+        let from = decls[start].0;
+        let to = decls.get(start + 1).map_or(lines.len(), |(d, _)| *d);
+        Some(
+            lines[from..to]
+                .iter()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    /// Every free-function declaration in `lines`, as `(line index, name)`.
+    fn fn_decl_lines(lines: &[&str]) -> Vec<(usize, String)> {
+        lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                let t = l.trim_start();
+                let t = t
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| t.strip_prefix("pub "))
+                    .unwrap_or(t);
+                let t = t.strip_prefix("async ").unwrap_or(t);
+                t.strip_prefix("fn ")
+                    .map(|rest| (i, rest.split(['(', '<']).next().unwrap_or("").to_string()))
+            })
+            .collect()
+    }
+
+    /// Every `.rs` file under `<crate>/src`, sorted.
+    fn crate_sources(manifest_dir: &str) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+        let src = std::path::Path::new(manifest_dir).join("src");
+        let mut files = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("crate src must be readable") {
+                let path = entry.expect("readable dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        (src, files)
+    }
+
+    /// Attributes every line matching `needle` under `<crate>/src` to the
+    /// function containing it, labelling that function by whether its body
+    /// carries one of `markers`.
+    fn source_inventory(
+        manifest_dir: &str,
+        needle: &str,
+        markers: &[&str],
+        labels: (&str, &str),
+    ) -> Vec<String> {
+        let (src, files) = crate_sources(manifest_dir);
+        let mut sites = Vec::new();
+        for path in files {
+            let text = std::fs::read_to_string(&path).expect("source file must be readable");
+            let lines: Vec<&str> = text.lines().collect();
+            let decls = fn_decl_lines(&lines);
+            let rel = path
+                .strip_prefix(&src)
+                .expect("scanned under src")
+                .to_string_lossy()
+                .into_owned();
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains(needle) {
+                    continue;
+                }
+                let (start, name) = decls
+                    .iter()
+                    .rev()
+                    .find(|(d, _)| *d < i)
+                    .cloned()
+                    .unwrap_or((0, "<top level>".to_string()));
+                let end = decls
+                    .iter()
+                    .find(|(d, _)| *d > start)
+                    .map_or(lines.len(), |(d, _)| *d);
+                let marked = lines[start..end]
+                    .iter()
+                    .any(|l| markers.iter().any(|m| l.contains(m)));
+                sites.push(format!(
+                    "{rel}::{name} = {}",
+                    if marked { labels.0 } else { labels.1 }
+                ));
+            }
+        }
+        sites.sort();
+        sites
+    }
+
+    /// Attributes every `CreateSessionRequest` construction under
+    /// `<crate>/src` to its function, and reports whether it asserts this
+    /// build.
+    fn create_site_inventory(manifest_dir: &str) -> Vec<String> {
+        // Built by concatenation so this scanner does not match itself.
+        const NEEDLE: &str = concat!("CreateSession", "Request {");
+        source_inventory(
+            manifest_dir,
+            NEEDLE,
+            &[
+                "must_match_version: version_assertion()",
+                "must_match_version: minimal_client::version_assertion()",
+            ],
+            ("asserts", "asserts nothing"),
+        )
+    }
+
+    /// Attributes every direct `Client` connection under `<crate>/src` to the
+    /// function that opens it, and reports whether that function also applies
+    /// the version gate. Source-level on purpose: the alternative is a live
+    /// daemon per call site.
+    ///
+    /// A path counts as gated whichever way it gets its answer: the
+    /// `GetVersion` round trip (`ensure_version_match`), a build a reply it was
+    /// already making carried (`ensure_version_reported`, directly or through a
+    /// `*_version_gated` lookup helper), or the assertion it puts on its own
+    /// `CreateSession`. What the inventory records is that the decision was
+    /// made, not which mechanism made it.
+    fn connect_site_inventory(manifest_dir: &str) -> Vec<String> {
+        // Built by concatenation so this scanner does not match itself.
+        const NEEDLE: &str = concat!("Client", "::connect(");
+        source_inventory(
+            manifest_dir,
+            NEEDLE,
+            &[
+                "ensure_version_match",
+                "ensure_version_reported",
+                "_version_gated(",
+                "must_match_version",
+            ],
+            ("gated", "ungated"),
+        )
+    }
+
+    /// Matching builds are the overwhelmingly common case and must cost the
+    /// operator nothing.
+    #[test]
+    fn matching_versions_are_not_a_skew() {
+        assert!(client::version_skew_message(version::VERSION, version::VERSION).is_none());
     }
 
     /// The `Cli` command tree must stay well-formed: a malformed clap

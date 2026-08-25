@@ -42,6 +42,7 @@ async fn version_succeeds_without_daemon() {
 #[test]
 fn ls_shows_shared_resource_pool() {
     let resp = ListSessionsResponse {
+        daemon_version: None,
         resource_pool: Some(ResourcePool {
             cpu_cores: 8,
             memory_bytes: 16 * 1024 * 1024 * 1024,
@@ -76,6 +77,7 @@ fn ls_shows_shared_resource_pool() {
 #[test]
 fn ls_table_exposes_project_path_and_status() {
     let resp = ListSessionsResponse {
+        daemon_version: None,
         resource_pool: None,
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
@@ -740,7 +742,10 @@ async fn create_pending_session(daemon: &common::TestDaemon, name: &str) -> Sess
         CreateSessionRequest,
     };
     let id = client
-        .call::<CreateSession>(&CreateSessionRequest { config })
+        .call::<CreateSession>(&CreateSessionRequest {
+            config,
+            must_match_version: None,
+        })
         .await
         .unwrap()
         .id;
@@ -791,7 +796,10 @@ async fn create_session_at(
         FinalizeSession, FinalizeSessionRequest,
     };
     let id = match client
-        .call::<CreateSession>(&CreateSessionRequest { config })
+        .call::<CreateSession>(&CreateSessionRequest {
+            config,
+            must_match_version: None,
+        })
         .await
     {
         minimald_rpc::Errorable::Ok(r) => r.id,

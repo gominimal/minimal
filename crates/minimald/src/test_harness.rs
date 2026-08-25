@@ -442,6 +442,9 @@ pub fn create_session_req(name: &str, project: &str) -> minimald_rpc::CreateSess
             hooks_enabled: true,
             attrs: Default::default(),
         },
+        // No assertion: the harness's client *is* this daemon's build, and
+        // the version gate has its own tests.
+        must_match_version: None,
     }
 }
 
