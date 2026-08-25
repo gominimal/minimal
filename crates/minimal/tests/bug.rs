@@ -127,6 +127,47 @@ async fn bug_without_daemon_still_produces_a_bundle() {
     );
 }
 
+/// R2.10: the bundle describes the terminal `min bug` ran on. A rendering
+/// complaint is unjudgeable without it (#950), so the entry is unconditional
+/// — under `cargo test` the streams are pipes, and "not a terminal" is
+/// exactly the finding that separates a CI run from a real session.
+#[tokio::test]
+async fn the_invoking_terminal_is_described() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config = tempfile::TempDir::new().unwrap();
+    let out_dir = tempfile::TempDir::new().unwrap();
+    let out = out_dir.path().join("diag.tar.zst");
+    cmd_bug(&global_args(state.path(), config.path()), bug_args(&out))
+        .await
+        .unwrap();
+
+    let files = unpack(&out).await;
+    let terminal: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&files, "host/terminal.json").expect("terminal.json"))
+            .unwrap();
+
+    for name in ["stdin", "stdout", "stderr"] {
+        let stream = &terminal[name];
+        let tty = stream["tty"].as_bool().expect("tty is probed as a bool");
+        if tty {
+            // A terminal reports the size that explains its wrapping — but a
+            // failed `TIOCGWINSZ` is a null size, not a broken bundle, and the
+            // probe is specified best-effort. Demand well-formedness, not
+            // presence.
+            let size = &stream["size"];
+            assert!(
+                size.is_null() || (size["rows"].is_u64() && size["cols"].is_u64()),
+                "a terminal's size is either absent or complete: {stream}"
+            );
+        } else {
+            assert!(
+                stream["size"].is_null() && stream["device"].is_null(),
+                "a pipe has no size or device to report: {stream}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn planted_secrets_never_reach_the_bundle() {
     let state = tempfile::TempDir::new().unwrap();

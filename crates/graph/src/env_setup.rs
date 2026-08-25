@@ -3,6 +3,7 @@ use std::{
     path::PathBuf,
 };
 
+use crate::env_mapping::{EnvFsMapping, EnvMappingClass, EnvMappingKind};
 use crate::{BuildSpecRef, Graph};
 use decode::AttrValue;
 use mfile::EnvPatches;
@@ -21,6 +22,13 @@ pub struct SetupForPackages {
     pub needs_internet: bool,
     /// The filesystem mappings accumulated from `env_file_mappings` and `env_dir_mappings` attrs.
     pub fs_mappings: EnvPatches,
+    /// Which package contributed each entry of `fs_mappings`, keyed by the
+    /// path exactly as the package declared it (`~/`-rooted paths are not
+    /// expanded here). Last writer wins, matching `fs_mappings` itself.
+    ///
+    /// Consumed when a mapping can't be honoured, so the error can name the
+    /// package to go and look at rather than only the path it landed on.
+    pub fs_mapping_packages: HashMap<String, String>,
 }
 
 impl SetupForPackages {
@@ -36,38 +44,43 @@ impl SetupForPackages {
         i: I,
     ) -> Result<SetupForPackages, std::io::Error> {
         let mut patch = EnvPatches::default();
+        let mut fs_mapping_packages: HashMap<String, String> = Default::default();
         let (mut needs_dns, mut needs_internet) = (false, false);
         let mut env_vars: HashMap<String, String> = Default::default();
         let mut state_dirs = HashSet::default();
 
-        use mfile::PatchSetting;
         for dep in i.into_iter() {
             let b = g.get(dep).unwrap();
-            if let Some(dirs) = b.attrs.get("env_dir_mappings") {
-                for mapping in dirs.as_list().unwrap() {
-                    let mapping = mapping.as_map().unwrap();
-                    patch.dir.insert(
-                        mapping.get("path").unwrap().as_string().unwrap().clone(),
-                        if *mapping.get("read_only").unwrap().as_bool().unwrap() {
-                            PatchSetting::ReadOnly
-                        } else {
-                            PatchSetting::ReadWrite
-                        },
+            for mapping in EnvFsMapping::decode_all(b)? {
+                // TODO(secrets): credential-class mappings are dropped rather
+                // than routed through a separate secrets channel, matching
+                // what the session-composition path already does in
+                // `minimald`'s `extract_fs_mappings`. Until the secrets
+                // strategy lands they simply aren't seen by the sandbox —
+                // which is also what keeps a task running inside the guest
+                // from trying to mount host credentials that aren't there
+                // (#1204).
+                if mapping.class == EnvMappingClass::Credential {
+                    tracing::warn!(
+                        package = %b.name,
+                        attr = %mapping.kind.attr(),
+                        path = %mapping.path,
+                        "dropping Credential-class fs mapping; the secrets strategy is \
+                         deferred, so credentials do not reach the sandbox through package \
+                         attributes",
                     );
+                    continue;
                 }
-            }
-            if let Some(dirs) = b.attrs.get("env_file_mappings") {
-                for mapping in dirs.as_list().unwrap() {
-                    let mapping = mapping.as_map().unwrap();
-                    patch.file.insert(
-                        mapping.get("path").unwrap().as_string().unwrap().clone(),
-                        if *mapping.get("read_only").unwrap().as_bool().unwrap() {
-                            PatchSetting::ReadOnly
-                        } else {
-                            PatchSetting::ReadWrite
-                        },
-                    );
-                }
+                let setting = if mapping.read_only {
+                    mfile::PatchSetting::ReadOnly
+                } else {
+                    mfile::PatchSetting::ReadWrite
+                };
+                fs_mapping_packages.insert(mapping.path.clone(), b.name.clone());
+                match mapping.kind {
+                    EnvMappingKind::Dir => patch.dir.insert(mapping.path, setting),
+                    EnvMappingKind::File => patch.file.insert(mapping.path, setting),
+                };
             }
             if let Some(wiring) = b.attrs.get("env_state_wiring") {
                 let mut apply_wiring = |entry: &AttrValue| -> Result<(), std::io::Error> {
@@ -102,6 +115,7 @@ impl SetupForPackages {
         Ok(SetupForPackages {
             env_vars,
             fs_mappings: patch,
+            fs_mapping_packages,
             state_dirs,
             needs_dns,
             needs_internet,
@@ -116,8 +130,14 @@ mod tests {
     use indoc::indoc;
     use mfile::PatchSetting;
 
+    /// `class = 'Credential` mappings are dropped here, matching what the
+    /// session-composition path (`minimald`'s `extract_fs_mappings`) already
+    /// did; `class = 'State` ones survive and remember the package that
+    /// declared them. Regression guard for #1204, where a credential file a
+    /// package declared as `~/.claude.json` reached a guest task's sandbox
+    /// and was created at `/` on a read-only rootfs.
     #[test]
-    fn fs_mappings() {
+    fn fs_mappings_drop_credential_class() {
         let layer = Layer::new_for_test(
             indoc! {
                 "
@@ -165,13 +185,59 @@ mod tests {
                 state_dirs: Default::default(),
                 fs_mappings: EnvPatches {
                     dir: HashMap::from_iter([("~/.claude".to_string(), PatchSetting::ReadWrite)]),
-                    file: HashMap::from_iter([(
-                        "~/.claude.json".to_string(),
-                        PatchSetting::ReadWrite
-                    )])
+                    file: HashMap::new(),
                 },
+                fs_mapping_packages: HashMap::from_iter([(
+                    "~/.claude".to_string(),
+                    "b1".to_string()
+                )]),
             }
         )
+    }
+
+    /// An entry the typed decode can't classify stops the whole setup with
+    /// an error naming the package, rather than reaching the sandbox as an
+    /// unclassified — and therefore unfiltered — mapping. This is what the
+    /// old `class` string comparison could not do: it answered "not
+    /// `Credential`" for anything it didn't recognise and let the mapping
+    /// through.
+    #[test]
+    fn an_unclassifiable_mapping_fails_the_whole_setup() {
+        let layer = Layer::new_for_test(
+            indoc! {
+                "
+            let {BuildSpec, ..} = import \"minimal.ncl\" in
+
+            let
+                b1 = {
+                    name = \"b1\",
+                    build_deps = [],
+                    cmd = \"\",
+                    attrs = {
+                        env_file_mappings = [{ read_only = false, path = \"~/.claude.json\" }],
+                    },
+                } | BuildSpec,
+            in
+            [b1]
+            "
+            }
+            .to_string(),
+        )
+        // Nickel's own `class | [| 'Credential, 'State |]` contract does not
+        // catch this: a record contract's undefined field is lazy, so an
+        // entry that simply omits `class` evaluates cleanly and arrives here
+        // unclassified. That is precisely the case the old string comparison
+        // waved through.
+        .expect("nickel accepts an entry that omits `class`");
+        let g = Graph::new().ingest(layer).unwrap();
+
+        let err = SetupForPackages::build(&g, [g.by_name("b1").unwrap()])
+            .expect_err("an entry with no class must not decode");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("b1") && err.to_string().contains("class"),
+            "the error must name the package and the offending field, got {err}"
+        );
     }
 
     #[test]
@@ -222,6 +288,7 @@ mod tests {
                 needs_internet: true,
                 state_dirs: Default::default(),
                 fs_mappings: Default::default(),
+                fs_mapping_packages: Default::default(),
             }
         )
     }
@@ -270,6 +337,7 @@ mod tests {
                 needs_internet: false,
                 state_dirs: HashSet::from_iter(["gocache".to_string(), "gomodcache".to_string()]),
                 fs_mappings: Default::default(),
+                fs_mapping_packages: Default::default(),
             }
         )
     }
