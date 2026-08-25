@@ -466,6 +466,43 @@ impl fmt::Debug for WorkspaceBaseline {
     }
 }
 
+/// Deadline for a read-only probe of a session's host — the terminal
+/// attributes and the screen snapshot.
+///
+/// Spawning those probes off the session actor (see
+/// [`Session::handle_message`]) keeps the *actor* responsive, but says
+/// nothing about the spawned task: against a host that never answers, an
+/// unbounded probe outlives every caller that gave up on it. Nor does it
+/// stay parked in the same place:
+/// [`HOST_MAILBOX_CAPACITY`](crate::session_host::HOST_MAILBOX_CAPACITY)
+/// messages in, a wedged host's mailbox is full and the probe blocks in
+/// `send` rather than `recv` — still forever, and still one stranded task
+/// per poll. `min dash` polls the focused session's screen on every refresh
+/// tick, which makes that leak unbounded in the one case the bound exists
+/// for.
+///
+/// So the probe is bounded here too, not only at its callers: a task that
+/// cannot answer within the deadline ends, and the caller reads the same
+/// `None` a session with no running host already reports.
+///
+/// [`crate::sessions::Manager`] bounds these probes again on its own
+/// mainloop. That is not redundant — this deadline covers a wedged *host*,
+/// and the manager's covers a wedged *session actor*, which can be parked in
+/// an inline `EnsureHost`, `Attach`, or `ConfigureLoadout` and never reach
+/// the spawn at all.
+pub(crate) const HOST_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Awaits a host probe under [`HOST_PROBE_TIMEOUT`], collapsing both a
+/// missed deadline and a dead host to `None`.
+pub(crate) async fn probe_host<T>(
+    probe: impl std::future::Future<Output = Result<T, ()>>,
+) -> Option<T> {
+    tokio::time::timeout(HOST_PROBE_TIMEOUT, probe)
+        .await
+        .ok()?
+        .ok()
+}
+
 /// The PTY size a host minted with nothing attached starts at. A client that
 /// attaches later resizes it; until then only an unattached shell sees it.
 const UNATTACHED_WIN_SIZE: WinSize = WinSize {
@@ -919,9 +956,14 @@ impl Session {
                     // mid-teardown, and awaiting it from here parks this
                     // actor — which the manager awaits in turn, from its own
                     // mainloop, where a park costs every session RPC.
+                    //
+                    // Bounded *inside* the task: dropping the caller's
+                    // receiver does not cancel a spawned future, so an
+                    // unbounded probe would strand one task per poll against
+                    // a host that never answers.
                     let h = h.clone();
                     tokio::spawn(async move {
-                        let _ = r.send(h.get_attrs().await.ok());
+                        let _ = r.send(probe_host(h.get_attrs()).await);
                     });
                 }
                 _ => {
@@ -948,10 +990,11 @@ impl Session {
                 SessionInner::Active {
                     host: Some((h, _)), ..
                 } => {
-                    // Off-actor for the same reason as `GetHostAttrs`.
+                    // Off-actor and bounded for the same reasons as
+                    // `GetHostAttrs`.
                     let h = h.clone();
                     tokio::spawn(async move {
-                        let _ = r.send(h.get_screen().await.ok());
+                        let _ = r.send(probe_host(h.get_screen()).await);
                     });
                 }
                 _ => {
@@ -2813,7 +2856,61 @@ mod tests {
 
     use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
 
+    use crate::session_host::{HOST_MAILBOX_CAPACITY, HostHandle};
     use crate::test_harness::{TestClient, TestServer, create_configured_session};
+
+    /// Far longer than [`super::HOST_PROBE_TIMEOUT`], so under a paused
+    /// clock the probe's own deadline is always the one that fires first.
+    /// Reaching *this* one means the probe had no deadline at all.
+    const GIVE_UP: Duration = Duration::from_secs(600);
+
+    /// A probe of a host that never answers has to end on its own deadline.
+    ///
+    /// The session actor forwards `GetHostAttrs`/`GetHostScreen` to a spawned
+    /// task so the actor stays responsive, but nothing cancels that task:
+    /// dropping the caller's receiver does not stop a spawned future. Left
+    /// unbounded, every poll of a wedged host stranded one task forever — and
+    /// `min dash` polls the focused session on every refresh tick, so the
+    /// leak is unbounded in exactly the case the timeout exists for.
+    ///
+    /// Probes well past the mailbox capacity, which covers both places the
+    /// probe can park: the first `HOST_MAILBOX_CAPACITY` block awaiting a
+    /// reply that never comes, and the rest block trying to queue at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_of_a_wedged_host_ends_instead_of_stranding_its_task() {
+        // Holding the mailbox is what makes the host wedged: messages are
+        // accepted and none is ever answered.
+        let (host, _mailbox) = HostHandle::wedged();
+        let alive_before = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+
+        let probes: Vec<_> = (0..3 * HOST_MAILBOX_CAPACITY)
+            .map(|_| {
+                let host = host.clone();
+                tokio::spawn(async move { super::probe_host(host.get_attrs()).await })
+            })
+            .collect();
+
+        for (i, probe) in probes.into_iter().enumerate() {
+            let attrs = tokio::time::timeout(GIVE_UP, probe)
+                .await
+                .unwrap_or_else(|_| panic!("probe {i} never finished: the await is unbounded"))
+                .expect("the probe task should not panic");
+            assert!(
+                attrs.is_none(),
+                "probe {i} of a host that never answers should report no attrs",
+            );
+        }
+
+        assert_eq!(
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks(),
+            alive_before,
+            "every probe task should be gone, not merely abandoned",
+        );
+    }
 
     /// The `AcceptEnv` allowlist keeps locale + timezone vars and drops
     /// everything else — critically the control-plane vars, which must never
