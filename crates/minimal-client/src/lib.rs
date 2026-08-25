@@ -161,7 +161,10 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 /// russh client handler that accepts any ephemeral host key.
 ///
 /// The daemon generates a fresh host key on every boot. Since we connect over
-/// a local UDS (not the network), TOFU trust is acceptable here.
+/// a local UDS (not the network), TOFU trust is acceptable here. russh 0.63
+/// widened the callback to `PublicKeyOrCertificate`; both variants are accepted
+/// on that same rationale — minimald never presents a host certificate, and
+/// nothing here is verified either way.
 struct MinimalClientHandler;
 
 impl russh::client::Handler for MinimalClientHandler {
@@ -169,7 +172,7 @@ impl russh::client::Handler for MinimalClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _key: &russh::keys::ssh_key::PublicKey,
+        _key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }

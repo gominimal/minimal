@@ -148,7 +148,7 @@ prost = "0.14"
 prost-build = "0.14"
 prost-types = "0.14"
 resolv-conf = "0.7"
-russh = { version = "0.62", default-features = false, features = ["aws-lc-rs", "flate2"] }
+russh = { version = "0.63", default-features = false, features = ["aws-lc-rs", "flate2"] }
 russh-sftp = "2.4"
 serde_json_lenient = { version = "0.2" }
 serial_test = "4"
