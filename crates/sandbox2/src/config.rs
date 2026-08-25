@@ -203,6 +203,16 @@ pub struct Config {
     pub hostname: Option<String>,
     /// The username to set in the environment, if any. Defaults to `build`.
     pub username: Option<String>,
+    /// The home directory to give the sandboxed process — both `$HOME` and
+    /// the synthesized passwd entry — under the [`WdSetup::BoundDir`] layout.
+    /// The other two layouts own their home outright (`/state/home` for
+    /// `Isolated`, `/home` for `Session`) and ignore this.
+    ///
+    /// `None` falls back to the ambient `$HOME` of the process building the
+    /// sandbox, which is the right answer for `mip` on a developer's host and
+    /// the wrong one under `minimald`, where the daemon is pid 1 in the guest
+    /// with `HOME=/` and has a real session home to offer instead (#1204).
+    pub home: Option<PathBuf>,
 
     /// Globally/initially-set environment variables.
     pub env_vars: HashMap<String, String>,
@@ -234,6 +244,30 @@ pub struct Invocation {
 }
 
 impl Config {
+    /// The home directory a command in this sandbox sees, as an absolute path
+    /// inside the sandbox. One definition, used for both `$HOME` and the
+    /// synthesized passwd entry so the two can never disagree.
+    ///
+    /// `Isolated` and `Session` own their home outright. `BoundDir` mirrors
+    /// host paths one-for-one, so its home is a host path too: the
+    /// caller-supplied [`Config::home`] when there is one, else the ambient
+    /// `$HOME`. `/state/home` is the last resort for a process with no `$HOME`
+    /// at all.
+    #[must_use]
+    pub fn sandbox_home(&self) -> String {
+        match &self.wd {
+            WdSetup::Isolated { .. } => "/state/home".to_string(),
+            WdSetup::Session { .. } => format!("/{}", crate::SESSION_HOME),
+            WdSetup::BoundDir { .. } => self
+                .home
+                .as_deref()
+                .and_then(Path::to_str)
+                .map(String::from)
+                .or_else(|| std::env::var("HOME").ok())
+                .unwrap_or_else(|| "/state/home".to_string()),
+        }
+    }
+
     /// The working directory a command in this sandbox starts in, as an
     /// absolute path inside the sandbox — `/workbench` for a session (unless
     /// the name is overridden), `/build` for a task.
@@ -303,14 +337,7 @@ impl Config {
         set("XDG_CACHE_HOME", "/state/cache");
         set("XDG_RUNTIME_DIR", "/run");
 
-        match &self.wd {
-            WdSetup::Isolated { .. } => set("HOME", "/state/home"),
-            WdSetup::Session { .. } => set("HOME", "/home"),
-            WdSetup::BoundDir { .. } => match std::env::var("HOME") {
-                Ok(h) => set("HOME", &h),
-                Err(_) => set("HOME", "/state/home"),
-            },
-        }
+        set("HOME", &self.sandbox_home());
 
         if let WdSetup::Isolated { .. } = self.wd {
             set("OUTPUT_DIR", "/build/output");
@@ -358,6 +385,7 @@ impl Config {
             env_vars: HashMap::with_capacity(12),
             hostname: None,
             username: None,
+            home: None,
             keep_dirs: false,
             rootfs: BTreeSet::new(),
             state_dir: None,
@@ -479,6 +507,13 @@ impl Config {
     /// Configures the username to use in the sandbox.
     pub fn with_username<S: Into<String>>(mut self, username: S) -> Self {
         self.username = Some(username.into());
+        self
+    }
+    /// Configures the home directory to give the sandboxed process under the
+    /// [`WdSetup::BoundDir`] layout, in place of the ambient `$HOME`. See
+    /// [`Config::home`]; `None` restores the ambient fallback.
+    pub fn with_home<P: Into<PathBuf>>(mut self, home: Option<P>) -> Self {
+        self.home = home.map(Into::into);
         self
     }
 
@@ -635,13 +670,7 @@ impl Config {
             common::synth_dns_config(&sd)
                 .map_err(|e| Error::IO("synthesizing DNS configuration", sd.clone(), e))?;
         }
-        let home = match &self.wd {
-            WdSetup::Isolated { .. } => "/state/home".to_string(),
-            WdSetup::BoundDir { .. } => std::env::home_dir()
-                .and_then(|p| p.to_str().map(String::from))
-                .unwrap_or_else(|| "/state/home".to_string()),
-            WdSetup::Session { .. } => "/home".to_string(),
-        };
+        let home = self.sandbox_home();
         match &self.username {
             Some(n) => common::synth_user_group_config(&sd, n, &home),
             None => common::synth_user_group_config(&sd, "build", &home),
@@ -710,5 +739,33 @@ mod tests {
         assert_eq!(env.get("SOURCE_DATE_EPOCH").map(String::as_str), Some("0"));
         assert_eq!(env.get("LC_ALL").map(String::as_str), Some("en_US.utf8"));
         assert_eq!(env.get("PS1"), None);
+    }
+
+    /// A bound-dir sandbox mirrors host paths, so its home is a host path —
+    /// the caller's when one is given. `minimald` gives the session's home
+    /// here because its own ambient `$HOME` is `/` in the guest, which is not
+    /// a directory anything can be patched into (#1204).
+    #[test]
+    fn a_bound_dir_sandbox_takes_the_home_it_is_given() {
+        let config = Config::new("test")
+            .with_wd("/workbench", false, Vec::new())
+            .with_home(Some("/var/lib/minimal/sessions/s1/home"));
+
+        assert_eq!(config.sandbox_home(), "/var/lib/minimal/sessions/s1/home");
+        assert_eq!(
+            config.command_env().get("HOME").map(String::as_str),
+            Some("/var/lib/minimal/sessions/s1/home"),
+        );
+    }
+
+    /// The other two layouts own their home outright, so an override is
+    /// ignored rather than silently relocating a session's `/home`.
+    #[test]
+    fn only_the_bound_dir_layout_takes_a_home_override() {
+        let session = session_config().with_home(Some("/elsewhere"));
+        assert_eq!(session.sandbox_home(), "/home");
+
+        let build = Config::new("test").with_home(Some("/elsewhere"));
+        assert_eq!(build.sandbox_home(), "/state/home");
     }
 }

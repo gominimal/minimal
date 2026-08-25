@@ -187,6 +187,11 @@ async fn task_producer(
             // so any future mode also takes the safe HostNet default.
             _ => sandbox2::NetworkMode::HostNet,
         };
+        // A task's `~/` resolves against the session's home, the same
+        // directory the interactive session sees at `/home`. The daemon's own
+        // ambient home is `/` inside the guest, and expanding against that
+        // dropped package-declared files onto the read-only rootfs (#1204).
+        let session_home = session.paths().await?.home;
         let mut env = ctx
             .make_env_with_network(
                 &exec.task,
@@ -197,6 +202,7 @@ async fn task_producer(
                 Some(&task.vars),
                 task.packages.clone(),
                 network_mode,
+                mctx::PatchHome::Session(session_home),
             )
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;

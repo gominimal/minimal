@@ -114,7 +114,7 @@ jobs:
               # pre-installed Rust toolchain on ubuntu-latest lives in
               # `~/.rustup` + `~/.cargo`, not `/opt/hostedtoolcache`, so
               # `rustup target add` below still resolves.
-              uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 # v3
+              uses: endersonmenezes/free-disk-space@2a22f8c59cae9cddae7194b33e6b92d023b2b4b8 # v4.0.0
               with:
                   remove_android: true
                   remove_dotnet: true
@@ -262,7 +262,7 @@ jobs:
               #
               # Runs BEFORE checkout: the action copies a `bc` binary into its
               # working dir, which dirty's the checkout.
-              uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 # v3
+              uses: endersonmenezes/free-disk-space@2a22f8c59cae9cddae7194b33e6b92d023b2b4b8 # v4.0.0
               with:
                   remove_android: true
                   remove_dotnet: true

@@ -104,7 +104,7 @@ jobs:
               # GitHub-hosted Ubuntu runner. `remove_tool_cache: true`
               # reclaims /opt/hostedtoolcache (~14 GB); the dtolnay Toolchain
               # step below reinstalls the Rust toolchain we actually need.
-              uses: endersonmenezes/free-disk-space@7901478139cff6e9d44df5972fd8ab8fcade4db1 # v3
+              uses: endersonmenezes/free-disk-space@2a22f8c59cae9cddae7194b33e6b92d023b2b4b8 # v4.0.0
               with:
                   remove_android: true
                   remove_dotnet: true
@@ -150,7 +150,7 @@ jobs:
                   arch: aarch64
                   channel: unstable
             - name: Install cross
-              uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+              uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
               with:
                   tool: cross
             - name: Build guest initramfs (minimald as /init)
@@ -268,7 +268,7 @@ jobs:
                   name: mac-testbed
                   path: ${{ runner.temp }}/testbed
             - name: Install nextest
-              uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+              uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
               with:
                   tool: nextest
             - name: Unpack testbed + resolve paths
@@ -469,7 +469,7 @@ jobs:
             - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Install nextest
-              uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2
+              uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
               with:
                   tool: nextest
             - name: Clippy (minvmd)
