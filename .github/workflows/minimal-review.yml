@@ -460,7 +460,20 @@ jobs:
             *PLACEHOLDER*) echo "review: broker unreachable from the box (tried \${BROKER_CANDIDATES})" >&2; exit 67 ;;
           esac
           timeout ${AGENT_TIMEOUT_SECONDS} .review/bin/claude -p --dangerously-skip-permissions < .review/review-prompt.md > .review/agent-log.txt 2> .review/agent-err.txt || echo 'review: agent exited non-zero' >&2
-          test -s .review/findings.json || { echo 'review: agent produced no .review/findings.json' >&2; tail -n 40 .review/agent-err.txt >&2; exit 65; }
+          if ! test -s .review/findings.json; then
+            # Exhausted quota is not a broken reviewer, and it must not look
+            # like one: a red X on every PR during a rate-limit crunch reads as
+            # "this tool is unreliable", which costs more trust than the missed
+            # review does. 75 is EX_TEMPFAIL — try again later.
+            if grep -qiE '\(429\)|rate.?limit|too many requests' .review/agent-log.txt .review/agent-err.txt 2>/dev/null; then
+              echo 'review: rate-limited upstream; no review produced' >&2
+              tail -n 5 .review/agent-log.txt >&2
+              exit 75
+            fi
+            echo 'review: agent produced no .review/findings.json' >&2
+            tail -n 40 .review/agent-err.txt >&2
+            exit 65
+          fi
           cat .review/findings.json
           '''
           TOML
@@ -502,16 +515,24 @@ jobs:
           min session exec "$SID" cat .review/agent-log.txt > "$RUN_DIR/agent-log.txt" 2>/dev/null || true
           min session exec "$SID" cat .review/agent-err.txt > "$RUN_DIR/agent-err.txt" 2>/dev/null || true
 
+          if [ "$rc" -eq 75 ]; then
+            echo "::warning::minimal-review was rate-limited upstream and produced no review for this commit. Push again, or re-run this job, once capacity frees up."
+            echo "status=rate_limited" >> "$GITHUB_OUTPUT"
+            tail -n 20 "$RUN_DIR/task-stderr.txt" || true
+            exit 0
+          fi
           if [ "$rc" -ne 0 ]; then
             echo "::error::review task exited $rc"
             tail -n 40 "$RUN_DIR/task-stderr.txt" || true
             exit "$rc"
           fi
+          echo "status=ok" >> "$GITHUB_OUTPUT"
 
       # Model output is data. It validates against minimal-review/v1, the diff
       # and the policy, or it is dropped with a reason — nothing here repairs a
       # malformed document.
       - name: Validate the findings document
+        if: steps.agent.outputs.status == 'ok'
         env:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
@@ -532,6 +553,7 @@ jobs:
       # while fingerprints are unset. Harmless while nothing was posted; a
       # silently missing comment once it is.
       - name: Compose the review
+        if: steps.agent.outputs.status == 'ok'
         env:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
@@ -584,6 +606,7 @@ jobs:
       # merely switched off. Idempotent — a re-run finds its own sticky marker
       # for this head SHA and declines to post a second time.
       - name: Post the review
+        if: steps.agent.outputs.status == 'ok'
         env:
           GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
