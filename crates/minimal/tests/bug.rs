@@ -222,6 +222,31 @@ async fn the_bundle_names_the_project_it_came_from() {
     assert_eq!(report["root"], scope["root"]);
 }
 
+/// `ProjectIdentity::root` is documented as an absolute path on the producing
+/// host, and a bundle is read on a different machine than it was made on — so
+/// whatever `--repo-dir` was typed, the recorded root has to be resolved, not
+/// echoed. A path threaded through `..` stands in for the general case: the
+/// resolver accepts it, and it would otherwise be written down verbatim.
+#[tokio::test]
+async fn the_recorded_project_root_is_resolved_not_echoed() {
+    let project = fake_project();
+    let detour = project.path().join(".minimal").join("..");
+    let files = bundle_for_project(Some(&detour)).await;
+
+    let manifest: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
+    let root = manifest["project"]["root"].as_str().expect("a root");
+    assert!(
+        !root.contains(".."),
+        "the root must be resolved, not echoed back: {root}"
+    );
+    assert_eq!(
+        Path::new(root),
+        std::fs::canonicalize(project.path()).unwrap(),
+        "the root must name the project directory itself"
+    );
+}
+
 /// `min bug` is run from wherever the user is standing. Outside a project,
 /// the manifest records that as a finding with a reason, rather than leaving
 /// the reader to guess which project the bundle belongs to.

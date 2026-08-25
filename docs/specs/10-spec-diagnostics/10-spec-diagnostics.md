@@ -413,7 +413,10 @@ paths, and the archive layout.
   outside a project is a **finding, not an error** — the scope records
   `unknown` with a reason and the entry becomes a manifest skip, since
   `min bug` is run from wherever the user is standing. Identity only: name,
-  root, and the config file's relative path. No configuration *values* enter
+  root, and the config file's relative path. The root shall be resolved
+  against the filesystem rather than echoed back from `--repo-dir`: it is
+  recorded as an absolute path on the producing host, and a bundle is read
+  somewhere the caller's relative path means nothing. No configuration *values* enter
   here; the config itself is collected under R2.5's redaction. A malformed
   config is reported as malformed without quoting the offending line, which
   would be a line of the user's configuration. `SCHEMA_VERSION` stays at 1:
@@ -435,10 +438,11 @@ paths, and the archive layout.
    unit tests, which point the probe at a real pty of known dimensions and at
    a pipe — covers R2.10.
 5. **Test:** `the_bundle_names_the_project_it_came_from` — the manifest and
-   `project/project.json` agree on the identity; and
+   `project/project.json` agree on the identity;
    `a_bundle_collected_outside_a_project_says_so` — the scope is `unknown`
-   with a reason and the entry is a skip, never a silent absence. Covers
-   R2.11.
+   with a reason and the entry is a skip, never a silent absence; and
+   `the_recorded_project_root_is_resolved_not_echoed` — the root is resolved
+   against the filesystem rather than echoed from `--repo-dir`. Covers R2.11.
 
 ---
 

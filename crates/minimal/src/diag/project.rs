@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use serde::Serialize;
 
 use diagnostics::{BundleWriter, ProjectIdentity, ProjectScope, Redaction};
@@ -32,7 +33,25 @@ pub async fn project(
     cwd: &Path,
     repo_dir: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
-    let project = match resolve(cwd, repo_dir) {
+    // `resolve` is a synchronous walk of the filesystem — a `std::fs::read`
+    // per ancestor — so it goes on a blocking thread, the same discipline the
+    // rest of the diagnostics collectors keep (`diagnostics::listing`,
+    // `diagnostics::kmsg`). A wedged filesystem must strand a blocking thread,
+    // never the worker whose `collect_step!` timeout is the failsafe: this
+    // collector runs before its own first `await`, so a blocked resolver on
+    // the runtime would outlast the deadline meant to catch it.
+    let (cwd_owned, repo_owned) = (cwd.to_path_buf(), repo_dir.map(Path::to_path_buf));
+    let (resolved, invoked_from) = tokio::task::spawn_blocking(move || {
+        // The cwd is resolved on this thread too, for the same reason:
+        // `canonicalize` is one more filesystem call, and the point of the
+        // thread is that none of them run on the worker.
+        let invoked_from = absolute(&cwd_owned);
+        (resolve(&cwd_owned, repo_owned.as_deref()), invoked_from)
+    })
+    .await
+    .context("project worker")?;
+
+    let project = match resolved {
         Ok(project) => project,
         Err(reason) => {
             w.set_project(ProjectScope::Unknown {
@@ -44,7 +63,7 @@ pub async fn project(
     };
 
     let root = project.root.display().to_string();
-    let invoked_from = cwd.display().to_string();
+    let invoked_from = invoked_from.display().to_string();
     w.set_project(ProjectScope::Identified(ProjectIdentity::new(
         &project.name,
         &root,
@@ -83,6 +102,17 @@ struct ProjectReport<'a> {
     invoked_from: &'a str,
 }
 
+/// The path resolved against the filesystem, or left exactly as given when it
+/// cannot be.
+///
+/// Falling back rather than failing keeps the diagnostic honest: a
+/// `--repo-dir` that does not exist is the "no project here" finding below,
+/// reported against the path the user actually typed, not a collector error
+/// about `canonicalize`.
+fn absolute(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Resolves the project, or the reason there is none to resolve.
 ///
 /// Uses the same resolver the rest of the CLI loads config with, and honors
@@ -91,12 +121,26 @@ struct ProjectReport<'a> {
 fn resolve(cwd: &Path, repo_dir: Option<&Path>) -> Result<Project, String> {
     // `--repo-dir` names the root outright; without it, `min` walks up from
     // the cwd to the nearest config, so the bundle must too.
+    //
+    // Either input can be relative — `--repo-dir ../other-checkout` verbatim,
+    // and `cwd` when `current_dir()` failed and the caller fell back to `"."`
+    // — so both are made absolute first. `ProjectIdentity::root` is
+    // documented as an absolute path on the producing host, and a relative
+    // one means nothing to a reader on a different machine. The established
+    // step for a `--repo-dir` about to be treated as a root: `attach.rs`,
+    // `cmd_activate`, and `cmd_task_run` all canonicalize the same way.
     let (found, searched) = match repo_dir {
-        Some(dir) => (mfile::File::from_dir(dir), format!("in {}", dir.display())),
-        None => (
-            mfile::File::from_dir_recursive(cwd),
-            format!("at or above {}", cwd.display()),
-        ),
+        Some(dir) => {
+            let dir = absolute(dir);
+            (mfile::File::from_dir(&dir), format!("in {}", dir.display()))
+        }
+        None => {
+            let cwd = absolute(cwd);
+            (
+                mfile::File::from_dir_recursive(&cwd),
+                format!("at or above {}", cwd.display()),
+            )
+        }
     };
     let file = found.map_err(|e| {
         let name = mfile::MFILE_NAME;
