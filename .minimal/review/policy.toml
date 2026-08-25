@@ -27,7 +27,8 @@ request_changes = false
 [thresholds]
 # Three, not five. Survey D1's modal answer for "useless comments before I mute
 # it" was 3, and D4 favoured fewer high-confidence findings over coverage.
-# The prompt carries the same number; they must not drift apart.
+# The prompt is rendered from this value at stage time, so changing it here
+# changes both what the agent is told and what the validator enforces.
 max_inline_findings = 3
 
 # Findings below this are dropped by the validator, not merely ranked down.

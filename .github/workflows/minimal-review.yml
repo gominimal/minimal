@@ -2,8 +2,8 @@ name: minimal-review
 
 # Phase 1b — the review is POSTED. "Shadow" now means the action layer is inert,
 # not that the comment is invisible: the reviewer speaks, and cannot change the
-# PR's state. Three independent things hold that line, and all three would have
-# to be undone deliberately:
+# PR's state. Four independent things hold that line, and all four would have to
+# be undone deliberately:
 #
 #   * `permissions:` grants pull-requests: write and nothing else. `contents`
 #     stays read, so the reviewer cannot push, commit or move a branch.
@@ -188,7 +188,6 @@ jobs:
                changed_files: ($files | split("\n") | map(select(length > 0)))
              }' > .review/pr.json
 
-          cp "$GITHUB_WORKSPACE/reviewer/review/contract/review-prompt.md" .review/review-prompt.md
           cp "$GITHUB_WORKSPACE/reviewer/review/contract/stage-claude.sh" .review/stage-claude.sh
           chmod +x .review/stage-claude.sh
 
@@ -234,6 +233,15 @@ jobs:
           # cannot drift.
           "$RUNNER_TEMP/venv/bin/python" -m contract.models --emit-schema \
             > "$GITHUB_WORKSPACE/pr/.review/minimal-review.v1.schema.json"
+
+          # The prompt is a template; this repo's policy.toml is the source of
+          # the numbers in it. Stating "at most 3 findings" in the prompt while
+          # policy.toml holds max_inline_findings gives one rule two owners,
+          # and the prompt's copy is the one nobody remembers to change.
+          "$RUNNER_TEMP/venv/bin/python" -m contract.prompt \
+            "$GITHUB_WORKSPACE/reviewer/review/contract/review-prompt.md" \
+            --policy "$GITHUB_WORKSPACE/pr/.minimal/review/policy.toml" \
+            -o "$GITHUB_WORKSPACE/pr/.review/review-prompt.md"
 
           # Repo map: what exists in this codebase and what it is for. Every
           # workspace crate with its //! intent line, plus the public surface of
