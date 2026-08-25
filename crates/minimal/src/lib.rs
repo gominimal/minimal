@@ -1202,17 +1202,43 @@ pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyho
         .await
         .with_context(|| format!("connect to {}", socket_path))?;
 
+    proxy_bridge(stream, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+/// Bridge proxy stdio to the daemon socket until either side closes.
+///
+/// The socket half (`from_sock`) reaching EOF means the daemon has torn the
+/// socket down; returning then — instead of waiting on stdin, which the
+/// driving `ssh` holds open indefinitely — is what keeps the proxy from
+/// lingering against a dead socket. When stdin closes first, its write half
+/// is shut down and any remaining daemon output is drained before exit.
+async fn proxy_bridge<I, O>(
+    stream: tokio::net::UnixStream,
+    mut stdin: I,
+    mut stdout: O,
+) -> Result<(), anyhow::Error>
+where
+    I: tokio::io::AsyncRead + Unpin,
+    O: tokio::io::AsyncWrite + Unpin,
+{
     let (mut rx, mut tx) = stream.into_split();
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
 
     let to_sock = async {
         tokio::io::copy(&mut stdin, &mut tx).await?;
         tx.shutdown().await
     };
     let from_sock = tokio::io::copy(&mut rx, &mut stdout);
+    tokio::pin!(from_sock);
 
-    tokio::try_join!(to_sock, from_sock).context("proxy")?;
+    tokio::select! {
+        res = &mut from_sock => {
+            res.context("proxy")?;
+        }
+        res = to_sock => {
+            res.context("proxy")?;
+            from_sock.await.context("proxy")?;
+        }
+    }
     Ok(())
 }
 
@@ -4572,5 +4598,39 @@ mod tests {
         cmd_stop(&global, StopArgs { force: false })
             .await
             .expect("an already-stopped daemon is the goal state, not an error");
+    }
+
+    /// A `min proxy` bridge must not outlive the daemon socket: when the daemon
+    /// tears the connection down, the proxy exits even though its stdin — held
+    /// open by the driving `ssh` — never closes. Otherwise the proxy, and the
+    /// `ssh` process feeding it, orphan against a dead socket.
+    #[tokio::test]
+    async fn proxy_exits_when_the_daemon_closes_the_socket() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("proxy.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+
+        // Stand in for the daemon: accept the proxy's connection, then drop it,
+        // the way `min stop` tears the socket down under a live proxy.
+        tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.unwrap();
+            drop(conn);
+        });
+
+        let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+
+        // Stdin that stays open with no data, the way `ssh` holds it; the other
+        // duplex half must outlive the bridge so the reader never sees EOF.
+        let (client_stdin, _ssh_stdin) = tokio::io::duplex(64);
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            proxy_bridge(stream, client_stdin, tokio::io::sink()),
+        )
+        .await
+        .expect("proxy must exit once the socket closes, not hang on open stdin")
+        .expect("a bridge that ends on a closed socket is not an error");
     }
 }
