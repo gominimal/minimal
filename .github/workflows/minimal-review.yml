@@ -54,6 +54,23 @@ env:
   # the userns backend (no /dev/kvm), where the sandbox shares the host netns.
   HOST_ALIAS: ${{ vars.MINIMAL_REVIEW_HOST_ALIAS || '100.64.255.254' }}
   BROKER_PORT: "8901"
+  # Sonnet for the review itself. The work is bounded — read a diff, run some
+  # searches, write structured JSON — and the run is repeated on every push,
+  # so the cheaper model is the one that can actually be afforded at this
+  # repo's volume. Override per repo if a harder reviewer is wanted.
+  REVIEW_MODEL: ${{ vars.MINIMAL_REVIEW_MODEL || 'claude-sonnet-5' }}
+  # Release channel for the Minimal CLI. `nightly` is how you pick up a fix
+  # before it reaches a stable release — switch the repo variable rather than
+  # editing this file, so the change is one click and shows up in the audit log.
+  MINIMAL_CHANNEL: ${{ vars.MINIMAL_CHANNEL || 'stable' }}
+  # Quiet window before anything expensive runs. See the step for why.
+  QUIET_SECONDS: ${{ vars.MINIMAL_REVIEW_QUIET_SECONDS || '90' }}
+  # Probe budget. Far less load-bearing since building was forbidden: the same
+  # three golden PRs took 874 s in total without a compiler against 2046 s with
+  # one, and the slowest single review fell from 1145 s to 410 s. Kept as a
+  # backstop against an agent that loops rather than as the latency control it
+  # used to be.
+  AGENT_TIMEOUT_SECONDS: "1500"
   # Probe budget. Far less load-bearing since building was forbidden: the same
   # three golden PRs took 874 s in total without a compiler against 2046 s with
   # one, and the slowest single review fell from 1145 s to 410 s. Kept as a
@@ -97,6 +114,36 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
+      # Debounce, placed before anything is spent rather than after.
+      #
+      # `concurrency: cancel-in-progress` already collapses a burst, but it
+      # cancels whatever is running — including an agent halfway through a
+      # review, whose tokens are then gone for nothing. This repo is 70-100%
+      # agent-authored by the team's own estimate, and agents push in bursts,
+      # so that was the common case rather than the rare one.
+      #
+      # Sitting still for a minute first moves the cancellation window ahead of
+      # the expensive part: a second push during the wait cancels this run
+      # having spent nothing. If the head moved without cancelling us — a
+      # dispatch, or a race — we notice and stand down, because a newer run is
+      # already handling it.
+      - name: Quiet window
+        id: quiet
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          echo "waiting ${QUIET_SECONDS}s before spending anything on ${EVENT_HEAD:0:8}"
+          sleep "$QUIET_SECONDS"
+          current="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)"
+          if [ "$current" != "$EVENT_HEAD" ]; then
+            echo "::notice::head moved to ${current:0:8} during the quiet window; standing down so the newer run reviews it"
+            echo "status=stale" >> "$GITHUB_OUTPUT"
+          fi
+
       # One short-lived App token for both private repos this job reads:
       # gominimal/foundry (the reviewer) and gominimal/broker (credentials).
       # This job's GITHUB_TOKEN is scoped to gominimal/minimal alone, so a
@@ -301,7 +348,7 @@ jobs:
       - name: Install Minimal
         run: |
           set -euo pipefail
-          curl -fsSL https://go.minimal.dev/stable | sh
+          curl -fsSL "https://go.minimal.dev/${MINIMAL_CHANNEL}" | sh
           for d in "$HOME/.local/bin" "$HOME/.minimal/bin" /usr/local/bin; do
             if [ -d "$d" ]; then echo "$d" >> "$GITHUB_PATH"; fi
           done
@@ -428,6 +475,7 @@ jobs:
           env_vars.BROKER_CANDIDATES = "${HOST_ALIAS} 127.0.0.1"
           env_vars.BROKER_PORT_IN_BOX = "${BROKER_PORT}"
           env_vars.ANTHROPIC_AUTH_TOKEN = "brokered-no-secret-here"
+          env_vars.ANTHROPIC_MODEL = "${REVIEW_MODEL}"
           bash = '''
           set -eu
           test -x .review/bin/claude || { echo 'review: staged claude missing — stage-claude.sh did not run' >&2; exit 66; }
@@ -485,6 +533,7 @@ jobs:
 
       - name: Mint a session and run the review
         id: agent
+        if: steps.quiet.outputs.status != 'stale' 
         working-directory: pr
         run: |
           set -euo pipefail
