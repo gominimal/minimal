@@ -64,15 +64,36 @@ env:
 
 jobs:
   review:
-    # Fork guard. Forks get no secrets, so the broker would start keyless and
-    # the agent would burn 177 s in silent client-side retry before failing
-    # (spike O23). Fork-PR review is deliberately Phase 3, after egress
-    # enforcement lands. workflow_dispatch is exempt: it already requires write
-    # access on this repo.
+    # Who may cause a review to run. Two separate questions, and the fork
+    # guard only answered the first.
+    #
+    # 1. Fork PRs get no secrets, so the broker would start keyless and the
+    #    agent would burn 177 s in silent client-side retry before failing
+    #    (spike O23). Fork review is deliberately Phase 3, after egress
+    #    enforcement lands.
+    # 2. Who the author is. `head.repo.full_name == github.repository` already
+    #    implies push access, so an outside contributor cannot reach this
+    #    today — but "has push access" is wider than "is one of us", and an
+    #    outside collaborator granted write would otherwise be able to spend
+    #    review budget. author_association makes the intent explicit rather
+    #    than a side effect of where the branch lives.
+    #
+    # The Bot clause is load-bearing, not a convenience. Measured over the last
+    # 100 PRs on gominimal/minimal: every human is MEMBER, and both bots —
+    # gominimal-aw-bot and dependabot — are CONTRIBUTOR, which is 39% of all
+    # PRs. Gating on MEMBER alone would silently stop reviewing every
+    # dependency bump, i.e. exactly the supply-chain PRs the team rated
+    # highest. Only an installed App can open a same-repo PR, so combined with
+    # the fork guard this cannot be reached by an outsider.
+    #
+    # workflow_dispatch is exempt: triggering it already requires write access.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
-       github.event.pull_request.draft != true)
+       github.event.pull_request.draft != true &&
+       (github.event.pull_request.user.type == 'Bot' ||
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                 github.event.pull_request.author_association)))
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
