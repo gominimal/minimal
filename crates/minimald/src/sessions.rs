@@ -300,6 +300,19 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
     Ok(())
 }
 
+/// Per-session deadline for the host-attributes probe that
+/// [`ManagerMessage::List`] makes.
+///
+/// The probe crosses two more actor mailboxes — the session actor, then its
+/// host — either of which can legitimately be mid-operation. The manager's
+/// mainloop is serial and is the single entry point for *every* session RPC,
+/// so it must never wait on one of them without a bound: a session that could
+/// not answer once wedged `min ls`, `min session ...` and even `Shutdown`
+/// daemon-wide until the daemon was killed. A session that misses the
+/// deadline is listed without its `attrs`, which is what a session with no
+/// running host already reports.
+const ATTRS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl Manager {
     /// The async task which handles interactions with the
     /// manager.
@@ -420,21 +433,36 @@ impl Manager {
         match msg {
             // Lists all sessions.
             ManagerMessage::List(r) => {
-                r.handle(async {
-                    let mut out = Vec::with_capacity(32);
-                    for handle in self.store.handles().await? {
-                        let record = handle.record().await?;
-                        out.push(SessionInfo {
-                            id: record.id,
-                            name: record.name.clone(),
-                            project_path: record.project_path.clone(),
-                            status: record.status,
-                            attrs: match self.running.get(&record.id) {
-                                Some(h) => h.get_attrs().await,
-                                None => None,
-                            },
-                        });
+                let running = &self.running;
+                let store = &self.store;
+                r.handle(async move {
+                    let mut records = Vec::with_capacity(32);
+                    for handle in store.handles().await? {
+                        records.push(handle.record().await?);
                     }
+                    // The attrs probes run in parallel and each under
+                    // `ATTRS_PROBE_TIMEOUT`, so one unresponsive session
+                    // costs its own `attrs` rather than the mainloop.
+                    // Serially they would also cost N deadlines instead of
+                    // one, which the mainloop pays on behalf of every
+                    // queued RPC.
+                    let out =
+                        futures::future::join_all(records.into_iter().map(|record| async move {
+                            let attrs = match running.get(&record.id) {
+                                Some(h) => tokio::time::timeout(ATTRS_PROBE_TIMEOUT, h.get_attrs())
+                                    .await
+                                    .unwrap_or(None),
+                                None => None,
+                            };
+                            SessionInfo {
+                                id: record.id,
+                                name: record.name.clone(),
+                                project_path: record.project_path.clone(),
+                                status: record.status,
+                                attrs,
+                            }
+                        }))
+                        .await;
                     Ok(out)
                 })
                 .await;

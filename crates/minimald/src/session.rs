@@ -910,14 +910,24 @@ impl Session {
             SessionMessage::EnsureHost(r, session_hnd, conn_username) => {
                 let _ = r.send(self.ensure_host(session_hnd, conn_username).await);
             }
-            SessionMessage::GetHostAttrs(r) => {
-                let _ = r.send(match &self.inner {
-                    SessionInner::Active {
-                        host: Some((h, _)), ..
-                    } => h.get_attrs().await.ok(),
-                    _ => None,
-                });
-            }
+            SessionMessage::GetHostAttrs(r) => match &self.inner {
+                SessionInner::Active {
+                    host: Some((h, _)), ..
+                } => {
+                    // Forwarded off-actor for the same reason as
+                    // `GetWorkspaceDelta`: the host loop can be mid-attach or
+                    // mid-teardown, and awaiting it from here parks this
+                    // actor — which the manager awaits in turn, from its own
+                    // mainloop, where a park costs every session RPC.
+                    let h = h.clone();
+                    tokio::spawn(async move {
+                        let _ = r.send(h.get_attrs().await.ok());
+                    });
+                }
+                _ => {
+                    let _ = r.send(None);
+                }
+            },
             SessionMessage::GetWorkspaceDelta(r) => match &self.inner {
                 SessionInner::Active {
                     host: Some((h, _)), ..
@@ -934,14 +944,20 @@ impl Session {
                     let _ = r.send(minimald_rpc::SessionDeltaResponse::Unavailable);
                 }
             },
-            SessionMessage::GetHostScreen(r) => {
-                let _ = r.send(match &self.inner {
-                    SessionInner::Active {
-                        host: Some((h, _)), ..
-                    } => h.get_screen().await.ok(),
-                    _ => None,
-                });
-            }
+            SessionMessage::GetHostScreen(r) => match &self.inner {
+                SessionInner::Active {
+                    host: Some((h, _)), ..
+                } => {
+                    // Off-actor for the same reason as `GetHostAttrs`.
+                    let h = h.clone();
+                    tokio::spawn(async move {
+                        let _ = r.send(h.get_screen().await.ok());
+                    });
+                }
+                _ => {
+                    let _ = r.send(None);
+                }
+            },
             SessionMessage::ConfigureLoadout(contribution, r) => {
                 // Honour what the user chose at `min session activate`.
                 let hooks_enabled = match self.record.record().await {

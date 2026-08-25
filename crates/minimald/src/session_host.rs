@@ -1344,12 +1344,15 @@ impl HostHandle {
         recv.await.map_err(|_| dead())?.map_err(io::Error::other)
     }
 
-    /// Returns the terminal attributes.
+    /// Returns the terminal attributes. A host that goes away between the
+    /// send and the reply reads as `Err(())` rather than a panic: the loop
+    /// can drop a queued responder on its way out, and that is a teardown
+    /// race, not a bug in the caller.
     pub async fn get_attrs(&self) -> Result<HostAttrs, ()> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         match self.sender.send(Message::GetAttrs(send)).await {
-            Ok(()) => Ok(recv.await.expect("host died")),
+            Ok(()) => recv.await.map_err(|_| ()),
             Err(SendError(Message::GetAttrs(_))) => Err(()),
             Err(e) => unreachable!("{:?}", e),
         }
