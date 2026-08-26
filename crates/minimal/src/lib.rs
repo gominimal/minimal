@@ -1778,6 +1778,12 @@ async fn upload_and_finalize(
                     Some(d) => eprintln!("Ran activation hook from {}: {d}", hook.declared_by),
                     None => eprintln!("Ran activation hook from {}", hook.declared_by),
                 }
+                // The description is an author-supplied label; what the
+                // hook actually said is its captured output. Echo it to
+                // stderr — stdout is reserved for the bare session id.
+                if !hook.output.is_empty() {
+                    eprintln!("{}", hook.output.trim_end());
+                }
             }
             Ok(())
         }

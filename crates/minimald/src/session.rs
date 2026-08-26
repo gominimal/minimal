@@ -1446,6 +1446,7 @@ impl Session {
                     ran.extend(outcomes.iter().map(|o| minimald_rpc::RanHook {
                         declared_by: o.declared_by.clone(),
                         description: o.description.clone(),
+                        output: o.output.clone(),
                     }));
                 }
 

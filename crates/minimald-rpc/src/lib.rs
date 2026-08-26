@@ -534,6 +534,11 @@ pub struct RanHook {
     /// The hook's own description, when it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Tail of the hook's captured stdout and stderr, when it wrote
+    /// any. Serde-defaulted so a daemon that predates the field still
+    /// answers.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output: String,
 }
 
 impl OneshotSshRpc for FinalizeSession {
@@ -1092,6 +1097,38 @@ mod tests {
                 assert_eq!(ok.activate_hooks.len(), 1);
                 assert_eq!(ok.activate_hooks[0].declared_by, "user loadout `dev`");
             }
+            Errorable::Err { error } => panic!("a success decoded as an error: {error}"),
+        }
+    }
+
+    /// A hook's captured output must cross the wire, so the client can
+    /// show what the hook said rather than only its author-supplied
+    /// description.
+    #[test]
+    fn a_ran_hook_carries_its_captured_output() {
+        let resp = FinalizeSessionResponse {
+            activate_hooks: vec![RanHook {
+                declared_by: "user loadout `dev`".to_string(),
+                description: Some("emit to stdout and stderr".to_string()),
+                output: "HOOK_STDOUT_VISIBLE\nHOOK_STDERR_VISIBLE\n".to_string(),
+            }],
+        };
+        let wire = serde_json_lenient::to_string(&resp).expect("must serialize");
+        let back: FinalizeSessionResponse =
+            serde_json_lenient::from_str(&wire).expect("must decode");
+        assert_eq!(back, resp);
+        assert_eq!(
+            back.activate_hooks[0].output,
+            "HOOK_STDOUT_VISIBLE\nHOOK_STDERR_VISIBLE\n"
+        );
+
+        // A daemon predating the field still decodes, with empty output.
+        let old: Errorable<FinalizeSessionResponse> = serde_json_lenient::from_str(
+            r#"{"activate_hooks":[{"declared_by":"user loadout `dev`"}]}"#,
+        )
+        .expect("a field-less hook must decode");
+        match old {
+            Errorable::Ok(ok) => assert!(ok.activate_hooks[0].output.is_empty()),
             Errorable::Err { error } => panic!("a success decoded as an error: {error}"),
         }
     }
