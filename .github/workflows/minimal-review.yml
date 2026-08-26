@@ -272,9 +272,29 @@ jobs:
           fi
           mkdir .review
 
+          # The diff is the reviewer's primary input, and until here the PR
+          # still chose how it was rendered. `$GIT_DIR/info/attributes` outranks
+          # every .gitattributes in the tree — the root one and any nested one —
+          # and `!diff` (Unspecified) restores git's own content-based binary
+          # detection. Without it a PR commits `*.rs -diff` and its own source
+          # renders as "Binary files a/x and b/x differ": no hunks, so no
+          # finding on those paths can anchor and every one is dropped.
+          # `--text` is the wrong tool for this — it would also inline a real
+          # binary's raw bytes into pr.diff, which nothing here caps. A genuine
+          # binary still reads as binary below, which is correct: it is
+          # unreviewable either way.
+          attrs="$(git rev-parse --git-path info/attributes)"
+          mkdir -p "$(dirname "$attrs")"
+          printf '* !diff\n' > "$attrs"
+
           # The three-dot diff, which is what GitHub shows as "Files changed".
-          git diff --no-color --no-ext-diff "$BASE_SHA" HEAD > .review/pr.diff
-          git diff --name-only "$BASE_SHA" HEAD > "$RUN_DIR/changed-files.txt"
+          # core.quotePath=false so a non-ASCII path is written as itself rather
+          # than C-quoted to "b/caf\303\251.rs", which no finding's `path` can
+          # match — the validator would drop every finding on that file as
+          # unanchored. git still quotes a path holding a `"` or a `\`; the
+          # validator unquotes those.
+          git -c core.quotePath=false diff --no-color --no-ext-diff "$BASE_SHA" HEAD > .review/pr.diff
+          git -c core.quotePath=false diff --name-only "$BASE_SHA" HEAD > "$RUN_DIR/changed-files.txt"
 
           # PR title and body are attacker-controlled text. They reach the agent
           # as JSON data and never pass through a shell: jq reads the event
@@ -498,7 +518,12 @@ jobs:
           # A base, not an endpoint: the broker appends the client's own
           # `/v1/messages` to it. `/api/v1` here produced `/api/v1/v1/messages`
           # and a 404 on every call.
-          BROKER_ANTHROPIC_UPSTREAM: ${{ secrets.MINIMAL_REVIEW_KEY != '' && 'https://openrouter.ai/api' || '' }}
+          # The fallback is broker.py's own default written out in full, not ''.
+          # An Actions expression evaluating to '' is still exported as a
+          # present-but-empty variable, so `os.environ.get(..., default)` in the
+          # broker never sees the default: the upstream becomes a bare path and
+          # the first request dies unframed.
+          BROKER_ANTHROPIC_UPSTREAM: ${{ secrets.MINIMAL_REVIEW_KEY != '' && 'https://openrouter.ai/api' || 'https://api.anthropic.com' }}
           BROKER_PORT: ${{ env.BROKER_PORT }}
         run: |
           set -euo pipefail
