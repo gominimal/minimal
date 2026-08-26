@@ -40,13 +40,19 @@ env:
   # the userns backend (no /dev/kvm), where the sandbox shares the host netns.
   HOST_ALIAS: ${{ vars.MINIMAL_REVIEW_HOST_ALIAS || '100.64.255.254' }}
   BROKER_PORT: "8901"
-  REVIEW_MODEL: ${{ vars.MINIMAL_REVIEW_MODEL || 'claude-sonnet-5' }}
+  # Sonnet either way, but the id is vendor-shaped: bare through Anthropic,
+  # namespaced through OpenRouter. An explicit MINIMAL_REVIEW_MODEL wins.
+  REVIEW_MODEL: ${{ vars.MINIMAL_REVIEW_MODEL || (secrets.MINIMAL_REVIEW_KEY != '' && 'anthropic/claude-sonnet-5' || 'claude-sonnet-5') }}
   # Release channel for the Minimal CLI. `nightly` is how you pick up a fix
   # before it reaches a stable release — switch the repo variable rather than
   # editing this file, so the change is one click and shows up in the audit log.
   # unstable: `min task run` with claude-code in the task's packages needs
   # bff10a70 (#1262). Move to stable once that ships stable.
   MINIMAL_CHANNEL: ${{ vars.MINIMAL_CHANNEL || 'unstable' }}
+  # The declared task the reviewer injects and runs. Overridable because a
+  # repo may already have its own [tasks.review] — webapp does — and the
+  # injector refuses to shadow it rather than silently replacing it.
+  REVIEW_TASK: ${{ vars.MINIMAL_REVIEW_TASK || 'review' }}
   QUIET_SECONDS: ${{ vars.MINIMAL_REVIEW_QUIET_SECONDS || '90' }}
   # Backstop against an agent that loops.
   AGENT_TIMEOUT_SECONDS: "1500"
@@ -94,8 +100,7 @@ jobs:
       # One App token for both private repos this job reads: gominimal/foundry
       # (the reviewer) and gominimal/broker (credentials). This job's
       # GITHUB_TOKEN is scoped to this repo alone, so a plain cross-repo
-      # checkout gets "Repository not found". Minted first: the next step needs
-      # it.
+      # checkout gets "Repository not found". Minted first: the next step needs it.
       - name: Mint a token for the private reviewer and broker repos
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
@@ -394,7 +399,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: gominimal/broker
-          ref: e1d3188c7ca99135a7062145a7ad448aa8a1cda6
+          ref: e6e0c29b74a4fd93258ec028325a97fc3ab639a8
           token: ${{ steps.app-token.outputs.token }}
           path: broker
           persist-credentials: false
@@ -402,11 +407,21 @@ jobs:
       - name: Start the credential broker and preflight it
         env:
           CLAUDE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Host-side only. The sandbox never sees this — it gets a placeholder
+          # and the broker's URL, which is the whole reason the broker exists.
+          MINIMAL_REVIEW_KEY: ${{ secrets.MINIMAL_REVIEW_KEY }}
+          # A base, not an endpoint: the broker appends the client's own
+          # `/v1/messages` to it. `/api/v1` here produced `/api/v1/v1/messages`
+          # and a 404 on every call.
+          BROKER_ANTHROPIC_UPSTREAM: ${{ secrets.MINIMAL_REVIEW_KEY != '' && 'https://openrouter.ai/api' || '' }}
           BROKER_PORT: ${{ env.BROKER_PORT }}
         run: |
           set -euo pipefail
-          if [ -z "${CLAUDE_OAUTH_TOKEN:-}" ]; then
-            echo "::error::secrets.CLAUDE_CODE_OAUTH_TOKEN is unset — the broker would start keyless"
+          # Either credential will do. This guard predated MINIMAL_REVIEW_KEY
+          # and still demanded a Claude subscription token, so an OpenRouter-only
+          # deployment — which is a supported configuration — could not start.
+          if [ -z "${CLAUDE_OAUTH_TOKEN:-}" ] && [ -z "${MINIMAL_REVIEW_KEY:-}" ]; then
+            echo "::error::neither secrets.MINIMAL_REVIEW_KEY nor secrets.CLAUDE_CODE_OAUTH_TOKEN is set — the broker would start keyless"
             exit 1
           fi
           nohup python3 "$GITHUB_WORKSPACE/broker/broker.py" > "$RUN_DIR/broker.log" 2>&1 &
@@ -420,8 +435,8 @@ jobs:
           echo "$health" | tee "$RUN_DIR/broker-health.json"
           # Fail fast: a keyless broker makes the agent retry in silence until
           # its timeout.
-          if ! echo "$health" | grep -q '"claude_oauth_loaded": true'; then
-            echo "::error::broker holds no Claude credential — aborting before minting a session"
+          if ! echo "$health" | grep -qE '"(claude_oauth_loaded|openrouter_loaded)": true'; then
+            echo "::error::broker holds no model credential — aborting before minting a session"
             exit 1
           fi
 
@@ -435,14 +450,14 @@ jobs:
             echo "::error::no minimal.toml — run 'min init' in this repo and commit the result (a pinned [upstream] is required)"
             exit 1
           fi
-          if grep -q '^\[tasks\.review\]' "$CFG"; then
-            echo "::error::$CFG already declares [tasks.review]; refusing to shadow the repo's own task"
+          if grep -q "^\[tasks\.${REVIEW_TASK}\]" "$CFG"; then
+            echo "::error::$CFG already declares [tasks.${REVIEW_TASK}]; refusing to shadow the repo's own task. Set the repo variable MINIMAL_REVIEW_TASK to a name it does not use."
             exit 1
           fi
 
           cat >> "$CFG" <<TOML
 
-          [tasks.review]
+          [tasks.${REVIEW_TASK}]
           description = "minimal-review: review the PR staged under .review/"
           inherit_cwd = true
           # ripgrep/ast-grep are how the reviewer verifies structurally now that
@@ -526,7 +541,7 @@ jobs:
           # it down. The task's stdout IS the data contract — it ends with
           # `cat .review/findings.json` and nothing else may print there.
           T0=$(date +%s)
-          min task run review > "$RUN_DIR/findings.json" 2> "$RUN_DIR/task-stderr.txt"
+          min task run "$REVIEW_TASK" > "$RUN_DIR/findings.json" 2> "$RUN_DIR/task-stderr.txt"
           rc=$?
           elapsed=$(( $(date +%s) - T0 ))
           echo "elapsed_seconds=$elapsed" >> "$GITHUB_OUTPUT"
@@ -538,7 +553,7 @@ jobs:
 
           if [ "$rc" -eq 75 ]; then
             echo "::warning::minimal-review got no usable response from upstream and produced no review for this commit. Re-run this job, or push again, once it recovers."
-            echo "status=rate_limited" >> "$GITHUB_OUTPUT"
+            echo "status=upstream_unavailable" >> "$GITHUB_OUTPUT"
             tail -n 20 "$RUN_DIR/task-stderr.txt" || true
             exit 0
           fi
@@ -586,7 +601,24 @@ jobs:
           policy = load_policy(os.path.join(os.environ["RUN_DIR"], "policy.toml"))
 
           with open(f"{run_dir}/findings.json", encoding="utf-8") as fh:
-              doc = ReviewDocument.parse_v0_or_v1(json.load(fh))
+              # The gate comes from the default branch while this workflow
+              # comes from the PR head, so the workflow can be newer than the
+              # library it calls. That is not a transient state to code around
+              # once — it is permanent, and every gate-API change passes
+              # through it on the way in. Ask what the installed gate accepts
+              # rather than assuming, so a PR that adds a parameter still gets
+              # reviewed by the older gate instead of dying on a TypeError.
+              import inspect
+
+              raw = json.load(fh)
+              accepted = inspect.signature(ReviewDocument.parse_v0_or_v1).parameters
+              host_known = {
+                  "pr": int(os.environ["PR_NUMBER"]),
+                  "head_sha": os.environ["HEAD_SHA"],
+              }
+              doc = ReviewDocument.parse_v0_or_v1(
+                  raw, **{k: v for k, v in host_known.items() if k in accepted}
+              )
           with open(f"{run_dir}/pr.diff", encoding="utf-8") as fh:
               diff = fh.read()
 
@@ -661,7 +693,7 @@ jobs:
             success) headline="review posted to PR #${PR_NUMBER:-?}"; detail="The review below was posted." ;;
             failure) headline="posting FAILED for PR #${PR_NUMBER:-?}"; detail="The review below was rendered but not posted — see the failing step." ;;
             *)       case "${AGENT_STATUS:-none}" in
-                       rate_limited) headline="rate-limited — no review for PR #${PR_NUMBER:-?}"; detail="No review was produced; nothing was posted." ;;
+                       upstream_unavailable) headline="upstream unavailable — no review for PR #${PR_NUMBER:-?}"; detail="Upstream returned nothing usable — quota, gateway or overload. No review was produced and nothing was posted." ;;
                        *)            headline="no review posted to PR #${PR_NUMBER:-?}"; detail="Nothing was posted." ;;
                      esac ;;
           esac
