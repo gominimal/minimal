@@ -192,9 +192,12 @@ impl ConfigBuilder {
     /// Constructs a config object using the given builder.
     pub fn build(self) -> Result<Config, ConfigError> {
         // The one configured cache location (default: the shared GCS bucket).
-        let explicitly_configured = self.remote_cache_url.is_some();
-        let remote_cache_url = self
-            .remote_cache_url
+        // The raw `Option` is retained on `Config` so `into_builder` can
+        // round-trip "unconfigured" faithfully as `None`.
+        let configured_cache_url = self.remote_cache_url;
+        let explicitly_configured = configured_cache_url.is_some();
+        let remote_cache_url = configured_cache_url
+            .clone()
             .unwrap_or_else(|| DEFAULT_REMOTE_CACHE_BUCKET.to_string());
         // The writer always uses the configured location's GCS bucket (`None`
         // when it's an HTTPS mirror -> writes error, since you can't write to a
@@ -249,7 +252,7 @@ impl ConfigBuilder {
             repo_dir: self.repo_dir,
             vcs_manager: self.vcs_manager,
             ot: self.ot,
-            remote_cache_url,
+            remote_cache_url: configured_cache_url,
             remote_cache_read,
             remote_cache_write_bucket,
         })
@@ -272,7 +275,7 @@ impl Config {
             repo_dir: self.repo_dir,
             vcs_manager: self.vcs_manager,
             ot: self.ot,
-            remote_cache_url: Some(self.remote_cache_url),
+            remote_cache_url: self.remote_cache_url,
         }
     }
 }
@@ -306,8 +309,10 @@ pub struct Config {
     /// The [OpTracker] to use instead of the root.
     pub(crate) ot: Option<OpTracker>,
     /// The one configured cache location (raw), retained for round-tripping via
-    /// [Self::into_builder]. See [ConfigBuilder::with_remote_cache_url].
-    remote_cache_url: String,
+    /// [Self::into_builder]. `None` when nothing was configured, so the rebuild
+    /// re-applies the read default instead of pinning the materialized bucket.
+    /// See [ConfigBuilder::with_remote_cache_url].
+    remote_cache_url: Option<String>,
     /// The resolved location the *reader* fetches from (GCS bucket or HTTPS
     /// mirror), honouring the `MINIMAL_REMOTE_CACHE_URL` env override.
     remote_cache_read: AnyUrl,
@@ -466,6 +471,26 @@ mod tests {
                 "unconfigured reader should default to the R2 mirror"
             );
         }
+    }
+
+    #[test]
+    fn round_trip_through_into_builder_preserves_read_default() {
+        // An unconfigured config reads from the R2 mirror; round-tripping it
+        // through into_builder().build() must not flip reads back to GCS.
+        if std::env::var("MINIMAL_REMOTE_CACHE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .is_some()
+        {
+            return;
+        }
+        let fresh = ConfigBuilder::new().build().unwrap();
+        assert!(matches!(fresh.remote_cache_url(), AnyUrl::Https(_)));
+        let round_tripped = fresh.into_builder().build().unwrap();
+        assert!(
+            matches!(round_tripped.remote_cache_url(), AnyUrl::Https(_)),
+            "round-tripped config should still read from the R2 mirror"
+        );
     }
 
     #[test]
