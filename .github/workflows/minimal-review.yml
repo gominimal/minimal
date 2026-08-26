@@ -122,6 +122,7 @@ jobs:
       # GITHUB_TOKEN is scoped to this repo alone, so a plain cross-repo
       # checkout gets "Repository not found". Minted first: the next step needs it.
       - name: Mint a token for the private reviewer and broker repos
+        if: steps.quiet.outputs.status != 'stale'
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
@@ -135,6 +136,7 @@ jobs:
       # it is reviewed by, and the reviewer upgrades in one place for every repo
       # that installs it.
       - name: Check out the reviewer (gominimal/foundry@main)
+        if: steps.quiet.outputs.status != 'stale'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: gominimal/foundry
@@ -153,23 +155,32 @@ jobs:
       # broker. Dispatch requires write access, but "trusted to trigger" is not
       # "meant to review anything".
       - name: Refuse a fork PR on dispatch
+        id: dispatch_pr
         if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.inputs.pr }}
         run: |
           set -euo pipefail
-          head_repo="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.head.repo.full_name // ""')"
+          pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
+          head_repo="$(printf '%s' "$pr" | jq -r '.head.repo.full_name // ""')"
           if [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
             echo "::error::PR #$PR_NUMBER has its head in '${head_repo:-<deleted>}', not $GITHUB_REPOSITORY. Fork review is out of scope."
             exit 1
           fi
-          echo "PR #$PR_NUMBER is same-repo"
+          # The same response carries the base. Without this the dispatch path
+          # falls back to the default branch, so a PR targeting a release branch
+          # or stacked on another PR gets a diff containing commits it never
+          # introduced — and every anchor lands on code it did not change.
+          printf '%s' "$pr" | jq -r '"base_ref=" + .base.ref' >> "$GITHUB_OUTPUT"
+          printf '%s' "$pr" | jq -r '"base_sha=" + .base.sha' >> "$GITHUB_OUTPUT"
+          echo "PR #$PR_NUMBER is same-repo, base $(printf '%s' "$pr" | jq -r .base.ref)"
 
       # `ref` is load-bearing: the default checkout for a pull_request event is
       # the MERGE commit, a tree that exists in no branch. Every finding anchor
       # would silently point at line numbers the PR does not have.
       - name: Check out the tree under review (PR HEAD, not the merge commit)
+        if: steps.quiet.outputs.status != 'stale'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || format('refs/pull/{0}/head', github.event.inputs.pr) }}
@@ -178,6 +189,7 @@ jobs:
           persist-credentials: false
 
       - name: Choose which reviewer to run
+        if: steps.quiet.outputs.status != 'stale'
         run: |
           set -euo pipefail
           # foundry reviews itself with its own PR's staging code, because a
@@ -194,14 +206,15 @@ jobs:
           echo "reviewer: $REVIEWER"
 
       - name: Resolve the PR and stage the reviewer's inputs
+        if: steps.quiet.outputs.status != 'stale'
         id: pr
         working-directory: pr
         env:
           EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
           INPUT_PR_NUMBER: ${{ github.event.inputs.pr }}
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref || steps.dispatch_pr.outputs.base_ref }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha || steps.dispatch_pr.outputs.base_sha }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -236,14 +249,18 @@ jobs:
           BASE_SHA="$(git merge-base "$BASE_TIP" HEAD)"
 
           # The policy sets the confidence floor and the inline cap — it governs
-          # the gate, so it cannot come from the branch being gated. Taken from
-          # the merge base: still this repo's own committed policy, but the
-          # version that was already reviewed and merged, so a PR cannot raise
-          # min_confidence or set max_inline_findings to 0 and silence itself.
+          # the gate, so it cannot come from the branch being gated. Taken from the
+          # base branch TIP, not the merge base. Both keep the anti-tamper
+          # property — neither is PR-controlled — but the merge base is the
+          # newest commit the branch already shares, so a PR cut before the
+          # policy was added or last tightened keeps reading the old version, or
+          # none at all and the permissive built-in defaults, for its whole life.
+          # Silently, and for reasons unrelated to anything it changed.
           # A policy change takes effect for the PRs after it, not for itself.
           # Absent is fine — every reader falls back to the built-in defaults.
-          if git show "$BASE_SHA:.minimal/review/policy.toml" > "$RUN_DIR/policy.toml" 2>/dev/null; then
-            echo "policy: from base ${BASE_SHA:0:12}"
+          POLICY_SHA="$(git rev-parse "$BASE_TIP")"
+          if git show "$POLICY_SHA:.minimal/review/policy.toml" > "$RUN_DIR/policy.toml" 2>/dev/null; then
+            echo "policy: from base tip ${POLICY_SHA:0:12}"
           else
             rm -f "$RUN_DIR/policy.toml"
             echo "policy: none at base; using built-in defaults"
@@ -283,15 +300,37 @@ jobs:
           # Findings already dismissed. Always from the default branch, never
           # $REVIEWER: a PR must not choose what its own reviewer stays silent
           # about. Absent is a valid empty state.
-          if [ -f "$GITHUB_WORKSPACE/reviewer/review/learnings/minimal.md" ]; then
-            cp "$GITHUB_WORKSPACE/reviewer/review/learnings/minimal.md" .review/learnings.md
+          # Derived from the repo, not a hardcoded name. Every other repo-scoped
+          # read in this file keys off $GITHUB_REPOSITORY; this one named
+          # `minimal.md` literally, so in a workflow explicitly meant to be
+          # installed everywhere, each repo would load minimal's dismissals
+          # instead of its own — silently defeating the one mechanism that stops
+          # the reviewer repeating a finding a team already rejected.
+          LEARNINGS="$GITHUB_WORKSPACE/reviewer/review/learnings/${GITHUB_REPOSITORY##*/}.md"
+          if [ -f "$LEARNINGS" ]; then
+            cp "$LEARNINGS" .review/learnings.md
+            echo "learnings: $(wc -l < .review/learnings.md) lines from ${GITHUB_REPOSITORY##*/}.md"
           else
             printf '# Dismissed findings\n\n_None recorded yet._\n' > .review/learnings.md
+            echo "learnings: none recorded for ${GITHUB_REPOSITORY##*/}"
           fi
 
           # No-build shims; the task prepends this directory to PATH.
           mkdir -p .review/nobuild
-          for tool in cargo rustc cargo-clippy cargo-nextest; do
+          # The union, not the language this repo happens to be. A Rust-only
+          # blocklist on an Astro/Node repo left `pnpm build` wide open — the
+          # guard read as enforcement while enforcing nothing. Deriving the list
+          # from the detected repo map would work too, and would be one more
+          # thing to get wrong per language; the reviewer must not build
+          # anything, so the union states that directly.
+          # `node` is deliberately absent. It is an interpreter, not a build
+          # driver — npm/pnpm/yarn/npx already stop `pnpm build` — and shimming
+          # it risks breaking the agent's own runtime if claude-code launches
+          # through `#!/usr/bin/env node`. Blocking the reviewer is a worse
+          # outcome than a build already stopped three other ways.
+          for tool in cargo rustc cargo-clippy cargo-nextest \
+                      npm pnpm yarn npx \
+                      go make cmake; do
             cat > ".review/nobuild/$tool" <<'STUB'
           #!/bin/sh
           echo "$(date -u +%H:%M:%S) $(basename "$0") $*" >> "$PWD/.review/build-attempts.log"
@@ -310,6 +349,7 @@ jobs:
           echo "PR #$PR_NUMBER  head=$HEAD_SHA  base=$BASE_SHA  $(wc -l < .review/pr.diff) diff lines"
 
       - name: Install the review library and stage the generated schema
+        if: steps.quiet.outputs.status != 'stale'
         id: lib
         env:
           LOGFIRE_TOKEN: ${{ secrets.LOGFIRE_TOKEN }}
@@ -405,6 +445,7 @@ jobs:
              "$GITHUB_WORKSPACE/pr/.review/learnings.md" "$RUN_DIR/" 2>/dev/null || true
 
       - name: Install Minimal
+        if: steps.quiet.outputs.status != 'stale'
         run: |
           set -euo pipefail
           curl -fsSL "https://go.minimal.dev/${MINIMAL_CHANNEL}" | sh
@@ -417,9 +458,11 @@ jobs:
       # package build dies with write("/proc/self/uid_map") => Operation not
       # permitted. Same line gominimal/minimal's own ci-linux-native.yml uses.
       - name: Enable unprivileged user namespaces
+        if: steps.quiet.outputs.status != 'stale'
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Report the isolation backend
+        if: steps.quiet.outputs.status != 'stale'
         run: |
           set -euo pipefail
           command -v min >/dev/null || { echo "::error::min is not on PATH after install"; exit 1; }
@@ -436,15 +479,17 @@ jobs:
       # an OAuth Bearer upstream, so no credential material reaches the sandbox:
       # the box gets a placeholder token and a base URL pointing back here.
       - name: Check out the credential broker (gominimal/broker)
+        if: steps.quiet.outputs.status != 'stale'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: gominimal/broker
-          ref: e6e0c29b74a4fd93258ec028325a97fc3ab639a8
+          ref: d4b53da036ed5fc8ab51accadfdea0d79d5fa055
           token: ${{ steps.app-token.outputs.token }}
           path: broker
           persist-credentials: false
 
       - name: Start the credential broker and preflight it
+        if: steps.quiet.outputs.status != 'stale'
         env:
           CLAUDE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # Host-side only. The sandbox never sees this — it gets a placeholder
@@ -475,12 +520,16 @@ jobs:
           echo "$health" | tee "$RUN_DIR/broker-health.json"
           # Fail fast: a keyless broker makes the agent retry in silence until
           # its timeout.
-          if ! echo "$health" | grep -qE '"(claude_oauth_loaded|openrouter_loaded)": true'; then
+          # jq, not grep: the pattern required a literal space after the colon,
+          # so a broker emitting the same document compactly would abort a run
+          # holding a perfectly good credential.
+          if ! printf '%s' "$health" | jq -e '[.. | objects | (.claude_oauth_loaded, .openrouter_loaded)] | any(. == true)' > /dev/null 2>&1; then
             echo "::error::broker holds no model credential — aborting before minting a session"
             exit 1
           fi
 
       - name: Inject the review task (runtime only — never committed)
+        if: steps.quiet.outputs.status != 'stale'
         working-directory: pr
         run: |
           set -euo pipefail
@@ -576,11 +625,16 @@ jobs:
           env_vars.ANTHROPIC_MODEL = "${REVIEW_MODEL}"
           bash = '''
           set -eu
-          command -v claude >/dev/null 2>&1 || { echo 'review: no claude on PATH' >&2; exit 66; }
-
           # The stack puts cargo on PATH whatever this task's packages say, so
           # no-build is enforced by these shims, which refuse and log attempts.
           export PATH="\$PWD/.review/nobuild:\$PATH"
+
+          # Probe AFTER the shims are armed, not before. Probing first tests an
+          # environment the agent never runs in: if a shim shadows something
+          # claude needs to start, the check passes and the agent then dies at
+          # exit 127 with nothing explaining why. Fail here, where it can say so.
+          command -v claude >/dev/null 2>&1 || { echo 'review: no claude on PATH (shims armed — one may be shadowing its launcher)' >&2; exit 66; }
+          claude --version >/dev/null 2>&1 || { echo 'review: claude is on PATH but will not start under the no-build shims' >&2; exit 66; }
 
           # Preflight the path the AGENT will use, not the one the host can
           # reach. The host-side /health check passes on 127.0.0.1 whatever the
