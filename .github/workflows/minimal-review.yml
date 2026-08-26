@@ -358,6 +358,14 @@ jobs:
             --policy "$RUN_DIR/policy.toml" \
             -o "$GITHUB_WORKSPACE/pr/.review/review-prompt.md"
 
+          # Keep a copy of what the agent was actually handed. The artifact
+          # collects $RUN_DIR, and the prompt is staged under pr/.review/, so
+          # "what did the agent read" was unanswerable after the fact. A run
+          # where the agent replied conversationally instead of reviewing cost a
+          # control experiment to diagnose, for want of this one file.
+          cp "$GITHUB_WORKSPACE/pr/.review/review-prompt.md" "$RUN_DIR/review-prompt.md"
+          echo "prompt: $(wc -c < "$RUN_DIR/review-prompt.md") bytes, sha256 $(sha256sum "$RUN_DIR/review-prompt.md" | cut -c1-16)"
+
           # Repo map: what exists in this codebase and what it is for. Every
           # workspace crate with its //! intent line, plus the public surface of
           # the crates this PR touches. ~17% of human review comments here are
@@ -597,7 +605,7 @@ jobs:
           # carries the findings and stderr is the only other channel out.
           # Push the logs through it rather than expecting to read them later.
           {
-            echo "--- agent-log (tail) ---"; tail -c 2000 .review/agent-log.txt 2>/dev/null
+            echo "--- agent-log (tail) ---"; tail -c 8000 .review/agent-log.txt 2>/dev/null
             echo "--- agent-err (tail) ---"; tail -c 2000 .review/agent-err.txt 2>/dev/null
             echo "--- build attempts ---"; tail -c 2000 .review/build-attempts.log 2>/dev/null
           } >&2
@@ -613,6 +621,19 @@ jobs:
               exit 75
             fi
             echo 'review: agent produced no .review/findings.json' >&2
+            # What the SANDBOX saw, so "it refused" and "it never got the
+            # inputs" stop looking identical in the log.
+            #
+            # Every expansion here is escaped. This heredoc is unquoted, so an
+            # unescaped $( ) runs on the runner at inject time and bakes the
+            # host's numbers into the task as a constant — which reports a
+            # 7386-byte prompt even when the box received nothing, i.e. it
+            # asserts exactly the fact this line exists to establish.
+            prompt_bytes=missing
+            diff_lines=missing
+            [ -f .review/review-prompt.md ] && prompt_bytes="\$(wc -c < .review/review-prompt.md)"
+            [ -f .review/pr.diff ] && diff_lines="\$(wc -l < .review/pr.diff)"
+            echo "review: inputs prompt=\${prompt_bytes} bytes, diff=\${diff_lines} lines" >&2
             tail -n 40 .review/agent-err.txt >&2
             exit 65
           fi
