@@ -18,11 +18,19 @@
 //!   is a hard error ([`ExpandError::UndefinedVar`]). Substitution
 //!   sources its values from the resolved-vars set the caller passes
 //!   in via [`VarLookup`].
-//!   **One narrow exception:** the *tilde prefix* (`~` / `~/...`)
-//!   accepts a `HOME` fallback from process env (threaded through
-//!   the `home_fallback` parameter), so `~/foo` works without the
-//!   loadout having to declare `HOME = { inherit = true }`. Explicit
-//!   `$HOME` and `${HOME}` references stay strict — no fallback.
+//!   **Two narrow exceptions**, both threaded in through [`Anchors`]
+//!   rather than read from the var set:
+//!   - the *tilde prefix* (`~` / `~/...`) accepts a `HOME` fallback
+//!     from process env, so `~/foo` works without the loadout having
+//!     to declare `HOME = { inherit = true }`. Explicit `$HOME` and
+//!     `${HOME}` references stay strict — no fallback.
+//!   - [`LOADOUT_ROOT`] resolves to the declaring loadout's own
+//!     directory. It is **reserved**: the name is intercepted before
+//!     the var lookup, so a loadout declaring a variable by that name
+//!     cannot shadow it here. Where no loadout declared the pattern —
+//!     a policy rule, a project's or a package's patch — referencing
+//!     it is [`ExpandError::LoadoutRootUnavailable`] rather than a
+//!     silently wrong path.
 //! - After substitution the result is **path-normalized**: redundant
 //!   slashes and `.` components are dropped. Any `..` component
 //!   produces [`ExpandError::PathTraversal`] — silent normalization
@@ -54,6 +62,59 @@ impl VarLookup for [ResolvedVar] {
         self.iter()
             .find(|v| v.name() == name)
             .map(ResolvedVar::value)
+    }
+}
+
+/// The reserved reference naming the declaring loadout's own
+/// directory — `<loadouts dir>/<loadout name>/`, beside the
+/// `<name>.toml` that declared the patch, and the same directory its
+/// external hook scripts resolve against.
+///
+/// Lets a loadout ship the files it patches in next to itself
+/// (`source = "$LOADOUT_ROOT/config.toml"`) instead of hard-coding an
+/// absolute path into the user's config directory, which breaks the
+/// moment that directory moves.
+pub const LOADOUT_ROOT: &str = "LOADOUT_ROOT";
+
+/// The substitutions that do not come from the session's resolved
+/// variables: the tilde prefix's `HOME` fallback, and the declaring
+/// loadout's [`LOADOUT_ROOT`].
+///
+/// Both are properties of *who declared the pattern* rather than of the
+/// session, so neither can be looked up in the var set. A `None` field
+/// means "this pattern has no such anchor" — referencing it is then an
+/// error, never a silent empty string.
+///
+/// `#[non_exhaustive]`: a future anchor is a new field, and callers
+/// build these through the constructors below rather than by literal —
+/// the same treatment [`ComposeOptions`](crate::core::compose::ComposeOptions)
+/// gets for the same reason.
+#[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
+pub struct Anchors<'a> {
+    /// `HOME` for the `~` / `~/…` prefix, when the vars don't carry one.
+    pub home: Option<&'a str>,
+    /// The declaring loadout's directory, for [`LOADOUT_ROOT`]. `None`
+    /// for anything a loadout didn't declare.
+    pub loadout_root: Option<&'a str>,
+}
+
+impl<'a> Anchors<'a> {
+    /// Anchors carrying only a `HOME` fallback — the shape every
+    /// non-loadout caller wants.
+    #[must_use]
+    pub fn home(home: Option<&'a str>) -> Self {
+        Self {
+            home,
+            loadout_root: None,
+        }
+    }
+
+    /// Add the declaring loadout's directory.
+    #[must_use]
+    pub fn with_loadout_root(mut self, loadout_root: Option<&'a str>) -> Self {
+        self.loadout_root = loadout_root;
+        self
     }
 }
 
@@ -108,6 +169,17 @@ pub enum ExpandError {
          use `$HOME/...` or an explicit path"
     )]
     UnsupportedTildeUser { pattern: String },
+
+    /// A pattern referenced [`LOADOUT_ROOT`] with no loadout to anchor
+    /// it to — a user-policy rule, or a patch a project or package
+    /// declared. There is no sensible fallback: every candidate
+    /// directory would belong to some *other* declarer, so the
+    /// reference is refused rather than resolved to the wrong tree.
+    #[error(
+        "pattern `{pattern}` references `$LOADOUT_ROOT`, which only resolves in \
+         patch sources declared by a loadout"
+    )]
+    LoadoutRootUnavailable { pattern: String },
 }
 
 /// Expand `raw` against `resolved_vars` and parse the result as a
@@ -115,9 +187,10 @@ pub enum ExpandError {
 /// to the walker. The result must be absolute so the walker has a
 /// concrete starting point.
 ///
-/// `home_fallback` applies only to the `~` / `~/…` prefix when
+/// [`Anchors::home`] applies only to the `~` / `~/…` prefix when
 /// `HOME` isn't in `resolved_vars`. Explicit `$HOME` / `${HOME}`
-/// references stay strict.
+/// references stay strict. [`Anchors::loadout_root`] backs
+/// [`LOADOUT_ROOT`]; pass `None` for a pattern no loadout declared.
 ///
 /// See [`expand_policy_pattern`] for the matcher-side variant that
 /// drops the "must be absolute" requirement — policy patterns are
@@ -135,9 +208,9 @@ pub enum ExpandError {
 pub fn expand_source(
     raw: &str,
     resolved_vars: &(impl VarLookup + ?Sized),
-    home_fallback: Option<&str>,
+    anchors: Anchors<'_>,
 ) -> Result<FileSet, ExpandError> {
-    expand_pattern(raw, resolved_vars, home_fallback, RequireAbsolute::Yes)
+    expand_pattern(raw, resolved_vars, anchors, RequireAbsolute::Yes)
 }
 
 /// Expand `raw` against `resolved_vars` and parse the result as a
@@ -149,6 +222,10 @@ pub fn expand_source(
 /// `**/*.pem` is a legitimate matcher for "any `.pem` at any depth"
 /// and doesn't need to point at a walk root.
 ///
+/// A policy rule belongs to the user, not to any one loadout, so no
+/// [`Anchors::loadout_root`] is available here: a rule referencing
+/// [`LOADOUT_ROOT`] is [`ExpandError::LoadoutRootUnavailable`].
+///
 /// # Errors
 ///
 /// See [`ExpandError`]. [`ExpandError::NotAbsolute`] cannot be
@@ -158,7 +235,12 @@ pub fn expand_policy_pattern(
     resolved_vars: &(impl VarLookup + ?Sized),
     home_fallback: Option<&str>,
 ) -> Result<FileSet, ExpandError> {
-    expand_pattern(raw, resolved_vars, home_fallback, RequireAbsolute::No)
+    expand_pattern(
+        raw,
+        resolved_vars,
+        Anchors::home(home_fallback),
+        RequireAbsolute::No,
+    )
 }
 
 /// Whether the expander enforces "result must be absolute." Kept
@@ -173,7 +255,7 @@ enum RequireAbsolute {
 fn expand_pattern(
     raw: &str,
     resolved_vars: &(impl VarLookup + ?Sized),
-    home_fallback: Option<&str>,
+    anchors: Anchors<'_>,
     require_absolute: RequireAbsolute,
 ) -> Result<FileSet, ExpandError> {
     let mut out = String::with_capacity(raw.len());
@@ -185,7 +267,7 @@ fn expand_pattern(
     if bytes.first() == Some(&b'~') && bytes.get(1).is_none_or(|&c| c == b'/') {
         let home = resolved_vars
             .lookup("HOME")
-            .or(home_fallback)
+            .or(anchors.home)
             .ok_or_else(|| ExpandError::UndefinedVar {
                 name: "HOME".into(),
             })?;
@@ -211,11 +293,23 @@ fn expand_pattern(
                 continue;
             }
             let (name, consumed) = parse_var_ref(bytes, i)?;
-            let value = resolved_vars
-                .lookup(name)
-                .ok_or_else(|| ExpandError::UndefinedVar {
-                    name: name.to_owned(),
-                })?;
+            // `LOADOUT_ROOT` is reserved: resolved from the anchors and
+            // never from the var set, so a loadout that also declares a
+            // variable by that name (for the session's env, say) can't
+            // redirect its own patch sources by accident.
+            let value = if name == LOADOUT_ROOT {
+                anchors
+                    .loadout_root
+                    .ok_or_else(|| ExpandError::LoadoutRootUnavailable {
+                        pattern: raw.to_owned(),
+                    })?
+            } else {
+                resolved_vars
+                    .lookup(name)
+                    .ok_or_else(|| ExpandError::UndefinedVar {
+                        name: name.to_owned(),
+                    })?
+            };
             escape_glob_metas(value, &mut out);
             i += consumed;
             continue;
@@ -426,8 +520,9 @@ mod tests {
 
     fn expand(raw: &str, vars: &[ResolvedVar]) -> Result<String, ExpandError> {
         // Tests default to no env fallback so existing assertions
-        // about "no resolved HOME → error" stay deterministic.
-        expand_source(raw, vars, None).map(|fs| fs.pattern().to_owned())
+        // about "no resolved HOME → error" stay deterministic, and to no
+        // loadout root so `$LOADOUT_ROOT` assertions are opt-in.
+        expand_source(raw, vars, Anchors::default()).map(|fs| fs.pattern().to_owned())
     }
 
     fn expand_with_env_home(
@@ -435,7 +530,21 @@ mod tests {
         vars: &[ResolvedVar],
         home_fallback: &str,
     ) -> Result<String, ExpandError> {
-        expand_source(raw, vars, Some(home_fallback)).map(|fs| fs.pattern().to_owned())
+        expand_source(raw, vars, Anchors::home(Some(home_fallback)))
+            .map(|fs| fs.pattern().to_owned())
+    }
+
+    fn expand_in_loadout(
+        raw: &str,
+        vars: &[ResolvedVar],
+        loadout_root: &str,
+    ) -> Result<String, ExpandError> {
+        expand_source(
+            raw,
+            vars,
+            Anchors::default().with_loadout_root(Some(loadout_root)),
+        )
+        .map(|fs| fs.pattern().to_owned())
     }
 
     // ---- happy paths ----
@@ -898,6 +1007,101 @@ mod tests {
     fn policy_pattern_still_rejects_parent_traversal() {
         let vars: [ResolvedVar; 0] = [];
         let err = expand_policy_pattern("a/../b/*.pem", vars.as_slice(), None).unwrap_err();
+        assert!(
+            matches!(err, ExpandError::PathTraversal { .. }),
+            "got: {err:?}",
+        );
+    }
+
+    // ---- $LOADOUT_ROOT ----
+
+    /// The reference resolves to the anchor the caller supplied, in
+    /// both spellings, and composes with the rest of the pattern —
+    /// including globs, which is how a loadout patches in a whole
+    /// directory it ships.
+    #[test]
+    fn loadout_root_substitutes_the_anchor() {
+        let vars: [ResolvedVar; 0] = [];
+        let root = "/home/u/.config/minimal/loadouts/dev";
+        for raw in ["$LOADOUT_ROOT/config.toml", "${LOADOUT_ROOT}/config.toml"] {
+            assert_eq!(
+                expand_in_loadout(raw, vars.as_slice(), root).unwrap(),
+                "/home/u/.config/minimal/loadouts/dev/config.toml",
+                "raw: {raw}",
+            );
+        }
+        assert_eq!(
+            expand_in_loadout("$LOADOUT_ROOT/nvim/**/*.lua", vars.as_slice(), root).unwrap(),
+            "/home/u/.config/minimal/loadouts/dev/nvim/**/*.lua",
+        );
+    }
+
+    /// The anchor is a value, not a prefix rule: it substitutes
+    /// wherever it appears, the same way `$VAR` does.
+    #[test]
+    fn loadout_root_substitutes_mid_pattern() {
+        let vars = [sv("SUB", "themes")];
+        assert_eq!(
+            expand_in_loadout("$LOADOUT_ROOT/$SUB/*.toml", vars.as_slice(), "/l/dev").unwrap(),
+            "/l/dev/themes/*.toml",
+        );
+    }
+
+    /// Glob metacharacters in the anchor are escaped like any other
+    /// substituted value. A config directory under a home named `u[1]`
+    /// would otherwise truncate the walk root at the `[` and match a
+    /// far wider tree than the loadout asked for.
+    #[test]
+    fn loadout_root_escapes_glob_metas() {
+        let vars: [ResolvedVar; 0] = [];
+        let pat =
+            expand_in_loadout("$LOADOUT_ROOT/conf", vars.as_slice(), "/home/u[1]/l/dev").unwrap();
+        assert_eq!(pat, "/home/u[[]1[]]/l/dev/conf");
+    }
+
+    /// The name is reserved: it resolves from the anchor even when a
+    /// variable of the same name is in scope, so a loadout that exports
+    /// `LOADOUT_ROOT` into its session env can't redirect its own patch
+    /// sources by accident.
+    #[test]
+    fn loadout_root_is_not_shadowed_by_a_var_of_the_same_name() {
+        let vars = [sv("LOADOUT_ROOT", "/somewhere/else")];
+        assert_eq!(
+            expand_in_loadout("$LOADOUT_ROOT/conf", vars.as_slice(), "/l/dev").unwrap(),
+            "/l/dev/conf",
+        );
+    }
+
+    /// With no loadout to anchor against — a policy rule, or a patch a
+    /// project or package declared — the reference is refused. The
+    /// alternative, falling back to the var set, would silently resolve
+    /// to whatever a loadout happened to export.
+    #[test]
+    fn loadout_root_without_an_anchor_is_an_error() {
+        let vars = [sv("LOADOUT_ROOT", "/somewhere/else")];
+        let err = expand("$LOADOUT_ROOT/conf", &vars).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ExpandError::LoadoutRootUnavailable { ref pattern } if pattern == "$LOADOUT_ROOT/conf"
+            ),
+            "got: {err:?}",
+        );
+
+        let err = expand_policy_pattern("$LOADOUT_ROOT/**", vars.as_slice(), None).unwrap_err();
+        assert!(
+            matches!(err, ExpandError::LoadoutRootUnavailable { .. }),
+            "policy rules belong to the user, not a loadout; got: {err:?}",
+        );
+    }
+
+    /// `..` is still rejected on both sides of the substitution — the
+    /// anchor is not an escape hatch out of the traversal check.
+    #[test]
+    fn loadout_root_still_rejects_parent_traversal() {
+        let vars: [ResolvedVar; 0] = [];
+        let err =
+            expand_in_loadout("$LOADOUT_ROOT/../other/x", vars.as_slice(), "/l/dev").unwrap_err();
         assert!(
             matches!(err, ExpandError::PathTraversal { .. }),
             "got: {err:?}",
