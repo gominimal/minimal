@@ -491,6 +491,43 @@ mod tests {
             matches!(round_tripped.remote_cache_url(), AnyUrl::Https(_)),
             "round-tripped config should still read from the R2 mirror"
         );
+        // The writer is unaffected: it still derives from the GCS default.
+        assert_eq!(
+            round_tripped.remote_cache_write_bucket(),
+            Some(DEFAULT_REMOTE_CACHE_BUCKET)
+        );
+    }
+
+    #[test]
+    fn round_trip_through_into_builder_preserves_explicit_url() {
+        // The mirror image of the read-default case: keeping "unconfigured" as
+        // `None` must not also drop a location that *was* configured. Without
+        // this, deleting `Config::remote_cache_url` outright would still pass
+        // the read-default test while silently reverting every explicitly
+        // pinned reader (e.g. res-servers on `gs://`) to the R2 mirror.
+        let round_tripped = ConfigBuilder::new()
+            .with_remote_cache_url("gs://my-bucket".into())
+            .build()
+            .unwrap()
+            .into_builder()
+            .build()
+            .unwrap();
+        assert_eq!(round_tripped.remote_cache_write_bucket(), Some("my-bucket"));
+        // Same env guard as the sibling tests: a non-empty
+        // MINIMAL_REMOTE_CACHE_URL would override the reader.
+        if std::env::var("MINIMAL_REMOTE_CACHE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .is_none()
+        {
+            assert!(
+                matches!(
+                    round_tripped.remote_cache_url(),
+                    AnyUrl::Gcs(g) if g.bucket == "projects/_/buckets/my-bucket"
+                ),
+                "an explicitly configured reader must survive the round-trip"
+            );
+        }
     }
 
     #[test]
