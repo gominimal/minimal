@@ -84,6 +84,7 @@ SEED_DIR=""
 SEEDED_MFILE=""
 TASK_SEED_DIR="" # seeded by the `min task run` proof below; removed on teardown
 HOOK_SEED_DIR="" # seeded by the lifecycle-hooks proof below; removed on teardown
+PATCH_SRC_DIR="" # patch sources for the patch-modes proof; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -199,6 +200,7 @@ teardown() {
   [ -n "$SEEDED_MFILE" ] && rm -f "$SEEDED_MFILE"
   [ -n "$TASK_SEED_DIR" ] && rm -rf "$TASK_SEED_DIR"
   [ -n "$HOOK_SEED_DIR" ] && rm -rf "$HOOK_SEED_DIR"
+  [ -n "$PATCH_SRC_DIR" ] && rm -rf "$PATCH_SRC_DIR"
   # And the state dir — which is NOT just metadata. On a VM lane it holds the
   # provider's per-VM writable data volume
   # (`minimal/providers/local-minvmd0/data-vol.raw`), a sparse image whose HOST
@@ -859,6 +861,64 @@ LOADOUT
   rm -rf "$HOOK_SEED_DIR"; HOOK_SEED_DIR=""
   rm -f "$XDG_CONFIG_HOME/minimal/loadouts/hookdev.toml"
   echo "loadout-declared hooks proof OK (ran, ungated)"
+  echo "::endgroup::"
+
+  # -- Patch file modes ------------------------------------------------------
+  # A patch's permission bits cross three hops, and each has unit coverage of
+  # its own end only: the client stamps the source's mode on the tar header,
+  # the daemon applies it when unpacking into `<workspace>/patches/`, and the
+  # copy into the session home carries it the rest of the way. A bit dropped
+  # anywhere in there makes a patched script silently unrunnable, which is
+  # only observable from inside a real session — so it is asserted by RUNNING
+  # the patched script, not just by reading its mode back.
+  echo "::group::patch file modes"
+  PATCH_SRC_DIR="$(hook_mktemp /tmp/mnlpm.XXXXXX)"
+  # `/usr/bin/bash`, like the external-hook fixture above: it is the
+  # interpreter every lane's session is known to have.
+  printf '#!/usr/bin/bash\necho PATCHED_TOOL_OK\n' > "$PATCH_SRC_DIR/tool.sh"
+  chmod 755 "$PATCH_SRC_DIR/tool.sh"
+  printf 'token = "hunter2"\n' > "$PATCH_SRC_DIR/secret.toml"
+  chmod 600 "$PATCH_SRC_DIR/secret.toml"
+  mkdir -p "$XDG_CONFIG_HOME/minimal/loadouts"
+  {
+    printf 'description = "e2e patch modes"\n\n'
+    printf 'patches = [\n'
+    printf '  { dest = "bin/tool.sh", source = "%s/tool.sh" },\n' "$PATCH_SRC_DIR"
+    printf '  { dest = "secret.toml", source = "%s/secret.toml" },\n' "$PATCH_SRC_DIR"
+    printf ']\n'
+  } > "$XDG_CONFIG_HOME/minimal/loadouts/patchmode.toml"
+  HOOK_SEED_DIR="$(hook_mktemp /tmp/mnlpp.XXXXXX)"
+  hook_seed_preamble > "$HOOK_SEED_DIR/minimal.toml"
+  mkdir "$HOOK_SEED_DIR/.git"
+
+  pm_sid="$(cd "$HOOK_SEED_DIR" && mnl session activate . --no-prompt --loadout patchmode 2>"$WORK/patch-modes.err")" || {
+    echo "::error::activation with a patch-carrying loadout failed"
+    echo "--- stderr ---"; cat "$WORK/patch-modes.err" 2>/dev/null || true
+    fail
+  }
+  # `ls -l` rather than `stat -c %a`: portable across whatever the shell stack
+  # ships. The leading mode string is the assertion; a trailing ACL/SELinux
+  # marker would not disturb a substring match.
+  pm_out="$(mnl session exec "$pm_sid" \
+    'ls -l /home/bin/tool.sh /home/secret.toml; /home/bin/tool.sh' 2>/dev/null)"
+  if [[ "$pm_out" != *"-rwxr-xr-x"* ]]; then
+    echo "::error::patched script lost its 0755 mode: '$pm_out'"
+    echo "--- activate stderr ---"; cat "$WORK/patch-modes.err" 2>/dev/null || true
+    fail
+  fi
+  if [[ "$pm_out" != *"-rw-------"* ]]; then
+    echo "::error::patched secret did not keep its 0600 mode: '$pm_out'"
+    fail
+  fi
+  if [[ "$pm_out" != *PATCHED_TOOL_OK* ]]; then
+    echo "::error::patched script was not runnable in the session: '$pm_out'"
+    fail
+  fi
+  mnl session destroy --force "$pm_sid" >/dev/null 2>&1 || true
+  rm -rf "$HOOK_SEED_DIR"; HOOK_SEED_DIR=""
+  rm -rf "$PATCH_SRC_DIR"; PATCH_SRC_DIR=""
+  rm -f "$XDG_CONFIG_HOME/minimal/loadouts/patchmode.toml"
+  echo "patch file modes proof OK (0755 runs, 0600 stays private)"
   echo "::endgroup::"
 fi
 # ---------------------------------------------------------------------------
