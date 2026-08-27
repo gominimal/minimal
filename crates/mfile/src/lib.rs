@@ -1039,7 +1039,7 @@ impl File {
         }
         if let Some(p) = &self.defaults.profile {
             tracing::warn!(
-                "[defaults]profile = \"{p}\" defined, but profiles were removed in 0.5.1; move its packages to [session] packages"
+                "[defaults]profile = \"{p}\" defined, but profiles were removed in 0.5.1; move its packages to each task's [tasks.<name>] packages (or [stack] build_packages / runtime_packages, which apply to every task)"
             );
         }
         if let Some(stack) = &self.stack
