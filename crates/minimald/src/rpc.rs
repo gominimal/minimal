@@ -1151,6 +1151,12 @@ struct UnpackTarget {
 /// but the client is untrusted, so the same checks run again here —
 /// a peer writing raw tar bytes bypasses every client-side layer.
 ///
+/// Each entry's **permission bits** are reproduced on disk, masked to
+/// the standard nine. That is what carries a patched script's exec bit
+/// and a patched secret's `0600` into the session; ownership is not
+/// carried at all — every file here belongs to the daemon, and the
+/// sandbox's user namespace maps that to the session user.
+///
 /// On success, drops `target.marker` under `target.dir`. The write
 /// order matters: the marker only appears once every entry is on disk,
 /// which is what lets `FinalizeSession` treat its presence as proof
@@ -1296,6 +1302,20 @@ async fn unpack_tar_zst_into(target: UnpackTarget, c: &mut RuChannel<Msg>) -> Re
                 ));
             }
             let entry_size = entry.header().size().unwrap_or(0);
+            // The entry's permission bits, which the write below
+            // reproduces on disk: a patched script has to stay
+            // executable and a patched secret has to stay unreadable
+            // to anyone else, and neither survives a hardcoded mode.
+            //
+            // Masked to the standard nine. setuid/setgid/sticky are
+            // dropped rather than honoured — this header came off the
+            // wire, so the daemon is not in a position to trust it with
+            // a privilege bit, and `async_tar::Archive::unpack` (which
+            // unpacks the workspace tree a few functions up) applies
+            // exactly the same `& 0o777` for the same reason. A header
+            // whose mode field doesn't parse falls back to 0o644, the
+            // mode every entry landed as before this was read at all.
+            let mode = entry.header().mode().unwrap_or(0o644) & 0o777;
             // Per-entry cap: refuses forged headers that would push
             // `Vec::with_capacity` into an allocation panic or OOM
             // (allocator abort → whole daemon down) before we ever
@@ -1344,17 +1364,49 @@ async fn unpack_tar_zst_into(target: UnpackTarget, c: &mut RuChannel<Msg>) -> Re
             let dest = staging_dir.join(&entry_path);
             let path_display = entry_path.display().to_string();
             inflight.spawn(async move {
+                // `tokio::fs::OpenOptions::mode` is inherent on unix,
+                // so no `OpenOptionsExt` import is needed for it.
+                use std::os::unix::fs::PermissionsExt as _;
+                use tokio::io::AsyncWriteExt as _;
+
                 if let Some(parent) = dest.parent() {
                     tokio::fs::create_dir_all(parent)
                         .await
                         .map_err(|e| format!("creating parent dir for `{path_display}`: {e}"))?;
                 }
-                tokio::fs::write(&dest, &body)
+                // Create *with* the mode rather than writing and then
+                // widening: `.mode()` is masked by the daemon's umask,
+                // so the file is never briefly more permissive than the
+                // entry asked for. The explicit `set_permissions` below
+                // then takes it the rest of the way, since that same
+                // umask would otherwise quietly clear bits the entry
+                // does ask for.
+                let mut file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(mode)
+                    .open(&dest)
+                    .await
+                    .map_err(|e| format!("creating `{path_display}`: {e}"))?;
+                file.write_all(&body)
                     .await
                     .map_err(|e| format!("writing `{path_display}`: {e}"))?;
+                // A `tokio::fs::File` completes its writes in the
+                // background; dropping one unflushed truncates it
+                // silently.
+                file.flush()
+                    .await
+                    .map_err(|e| format!("flushing `{path_display}`: {e}"))?;
+                // Through the handle, not the path: the mode lands on
+                // the file we just wrote rather than on whatever a
+                // concurrent unpack may have swapped in at that path.
+                file.set_permissions(std::fs::Permissions::from_mode(mode))
+                    .await
+                    .map_err(|e| format!("setting mode on `{path_display}`: {e}"))?;
                 // Explicit drop keeps the permit alive across the
-                // fs::write so the byte budget only frees up after
-                // the buffer is genuinely gone.
+                // write so the byte budget only frees up after the
+                // buffer is genuinely gone.
                 drop(body);
                 drop(permit);
                 Ok::<_, String>(())
@@ -1986,6 +2038,92 @@ mod tests {
                 .await
                 .unwrap(),
             "patches-ready marker must be written on successful unpack",
+        );
+    }
+
+    /// Build a tar+zstd archive whose entries carry the modes given,
+    /// rather than `tar_zst`'s uniform `0o644` — the shape the patches
+    /// uploader produces once it stopped flattening the source's mode.
+    async fn tar_zst_with_modes(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let mut tar = async_tar::Builder::new(Vec::new());
+        for (path, contents, mode) in entries {
+            let mut header = async_tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(*mode);
+            tar.append_data(&mut header, path, *contents).await.unwrap();
+        }
+        let tar_bytes = tar.into_inner().await.unwrap();
+        let mut encoder = async_compression::tokio::write::ZstdEncoder::new(Vec::new());
+        encoder.write_all(&tar_bytes).await.unwrap();
+        encoder.shutdown().await.unwrap();
+        encoder.into_inner()
+    }
+
+    /// An entry's permission bits reach the staged file, so a patched
+    /// script stays executable and a patched secret stays private. The
+    /// `0o600` case is the one that proves the mode is applied
+    /// explicitly rather than left to the daemon's umask, which would
+    /// have produced `0o644` from the same header.
+    ///
+    /// setuid is masked off: the header arrives over the wire, so a
+    /// peer must not be able to ask the daemon to create a setuid file
+    /// in a session's tree. (`async_tar::Archive::unpack`, which
+    /// handles the workspace stream, drops it for the same reason.)
+    #[tokio::test]
+    async fn stream_workspace_patches_preserves_entry_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let payload = tar_zst_with_modes(&[
+            (".local/bin/tool", b"#!/bin/sh\necho hi\n", 0o755),
+            (".config/secret.toml", b"token = 'hunter2'\n", 0o600),
+            (".local/bin/suid", b"#!/bin/sh\n", 0o4755),
+        ])
+        .await;
+
+        let channel = client
+            .open_subsystem(
+                STREAM_WORKSPACE_PATCHES,
+                &[(MINIMAL_SESSION_ID_ENV, &session_id.to_string())],
+            )
+            .await;
+        let mut stream = channel.into_stream();
+        stream.write_all(&payload).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut trailing = Vec::new();
+        stream.read_to_end(&mut trailing).await.unwrap();
+
+        let mngr = server.state.sessions_manager().await;
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("session should be retrievable");
+        let paths = handle.paths().await.unwrap();
+        let patches = paths.patches.as_utf8_path();
+
+        let mode_of = async |rel: &str| {
+            tokio::fs::metadata(patches.join(rel))
+                .await
+                .unwrap_or_else(|e| panic!("staged patch `{rel}` should exist: {e}"))
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+
+        assert_eq!(mode_of(".local/bin/tool").await, 0o755, "exec bit survives");
+        assert_eq!(
+            mode_of(".config/secret.toml").await,
+            0o600,
+            "a private mode is applied exactly, not widened by the umask",
+        );
+        assert_eq!(
+            mode_of(".local/bin/suid").await,
+            0o755,
+            "setuid is masked off, the rest of the mode is kept",
         );
     }
 
