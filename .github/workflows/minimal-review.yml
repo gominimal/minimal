@@ -773,6 +773,13 @@ jobs:
         if: always()
         run: |
           set -uo pipefail
+          # $RUN_DIR is created by the staging step, which does not run when the
+          # quiet window stands the job down, nor when an earlier step aborts.
+          # Every redirect below then fails on a missing directory — including
+          # the `|| echo '{}'` fallback — so an always() step dies and the job
+          # goes red. That is the failure guarding those steps was meant to
+          # prevent, relocated one step further on.
+          mkdir -p "$RUN_DIR"
           curl -fsS -m 5 "http://127.0.0.1:${BROKER_PORT}/health" \
             > "$RUN_DIR/broker-usage.json" 2>/dev/null \
             || echo '{}' > "$RUN_DIR/broker-usage.json"
