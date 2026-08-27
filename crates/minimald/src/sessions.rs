@@ -300,6 +300,23 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
     Ok(())
 }
 
+/// Per-session deadline for the host probes this manager makes — the
+/// attributes [`ManagerMessage::List`] reports, and the screen snapshot
+/// [`ManagerMessage::GetScreen`] answers with.
+///
+/// A probe crosses two more actor mailboxes — the session actor, then its
+/// host — either of which can legitimately be mid-operation. The manager's
+/// mainloop is serial and is the single entry point for *every* session RPC,
+/// so it must never wait on one of them without a bound: a session that could
+/// not answer once wedged `min ls`, `min session ...` and even `Shutdown`
+/// daemon-wide until the daemon was killed. A session that misses the
+/// deadline reports no `attrs` / no screen, which is what a session with no
+/// running host already reports.
+///
+/// Aliases the session actor's bound on the same probes rather than picking
+/// its own number, so the two hops cannot drift apart.
+const HOST_PROBE_TIMEOUT: std::time::Duration = crate::session::HOST_PROBE_TIMEOUT;
+
 impl Manager {
     /// The async task which handles interactions with the
     /// manager.
@@ -420,21 +437,36 @@ impl Manager {
         match msg {
             // Lists all sessions.
             ManagerMessage::List(r) => {
-                r.handle(async {
-                    let mut out = Vec::with_capacity(32);
-                    for handle in self.store.handles().await? {
-                        let record = handle.record().await?;
-                        out.push(SessionInfo {
-                            id: record.id,
-                            name: record.name.clone(),
-                            project_path: record.project_path.clone(),
-                            status: record.status,
-                            attrs: match self.running.get(&record.id) {
-                                Some(h) => h.get_attrs().await,
-                                None => None,
-                            },
-                        });
+                let running = &self.running;
+                let store = &self.store;
+                r.handle(async move {
+                    let mut records = Vec::with_capacity(32);
+                    for handle in store.handles().await? {
+                        records.push(handle.record().await?);
                     }
+                    // The attrs probes run in parallel and each under
+                    // `HOST_PROBE_TIMEOUT`, so one unresponsive session
+                    // costs its own `attrs` rather than the mainloop.
+                    // Serially they would also cost N deadlines instead of
+                    // one, which the mainloop pays on behalf of every
+                    // queued RPC.
+                    let out =
+                        futures::future::join_all(records.into_iter().map(|record| async move {
+                            let attrs = match running.get(&record.id) {
+                                Some(h) => tokio::time::timeout(HOST_PROBE_TIMEOUT, h.get_attrs())
+                                    .await
+                                    .unwrap_or(None),
+                                None => None,
+                            };
+                            SessionInfo {
+                                id: record.id,
+                                name: record.name.clone(),
+                                project_path: record.project_path.clone(),
+                                status: record.status,
+                                attrs,
+                            }
+                        }))
+                        .await;
                     Ok(out)
                 })
                 .await;
@@ -472,7 +504,19 @@ impl Manager {
             // actor. A name resolves through the store to its id, then the
             // `running` map answers only for live actors.
             ManagerMessage::GetScreen(pred, r) => {
-                r.handle(async {
+                // Resolving the predicate to a live actor stays on the
+                // mainloop: the store's handlers are all synchronous, so
+                // that hop cannot park. The probe does not stay — it
+                // crosses the session actor and then its host, either of
+                // which can be mid-attach or mid-teardown, and this loop
+                // is the single entry point for every session RPC.
+                //
+                // `min dash` polls this for the focused session on every
+                // refresh tick, so leaving it inline meant one wedged host
+                // froze `List`, `GetRecord`, `CreateSession` and `Shutdown`
+                // daemon-wide — the same failure `List` was just fixed for,
+                // reached through `GetSessionScreen` instead.
+                let resolved = async {
                     let id = match pred {
                         SessionKeyPredicate::Id(id) => id,
                         SessionKeyPredicate::Name(name) => {
@@ -482,12 +526,27 @@ impl Manager {
                             }
                         }
                     };
-                    Ok::<_, SessionsError>(match self.running.get(&id) {
-                        Some(h) => h.get_screen().await,
-                        None => None,
-                    })
-                })
+                    Ok::<_, SessionsError>(self.running.get(&id).cloned())
+                }
                 .await;
+                match resolved {
+                    // Spawned *and* bounded: spawning alone would only move
+                    // the hang off this loop and onto a task nothing reaps,
+                    // leaving the client on an unanswered oneshot.
+                    Ok(Some(h)) => {
+                        tokio::spawn(async move {
+                            r.handle(async move {
+                                Ok(tokio::time::timeout(HOST_PROBE_TIMEOUT, h.get_screen())
+                                    .await
+                                    .unwrap_or(None))
+                            })
+                            .await;
+                        });
+                    }
+                    // Unknown session, or known but not running: answered
+                    // here, since neither touches a host.
+                    other => r.handle(async move { other.map(|_| None) }).await,
+                }
             }
             // Create a session: allocate the record (as `Pending`) and spawn
             // the session actor. Composing the loadout and promoting the
@@ -1118,6 +1177,55 @@ pub(crate) mod tests {
     /// A [`DaemonAbsPath`] for a test directory.
     fn daemon_abs(p: &std::path::Path) -> DaemonAbsPath {
         DaemonAbsPath::try_new(p.to_str().unwrap()).unwrap()
+    }
+
+    /// `GetScreen` answers every resolution outcome, by id and by name.
+    ///
+    /// Worth pinning because the probe no longer runs on the manager's
+    /// mainloop: it is spawned, so the responder travels into a task and a
+    /// mis-wired arm would leave the caller on a oneshot that is never sent
+    /// rather than failing loudly. A live session with no host takes the
+    /// spawned path, which is what proves that wiring delivers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_screen_answers_whether_or_not_a_session_resolves() {
+        let (_state, _cache, mngr) = manager().await;
+
+        // Nothing created yet: neither predicate resolves.
+        assert!(
+            mngr.get_screen(SessionKeyPredicate::Id(SessionId::nil()))
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown id should answer None, not hang or error"
+        );
+        assert!(
+            mngr.get_screen(SessionKeyPredicate::Name("nonesuch".to_string()))
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown name should answer None, not hang or error"
+        );
+
+        // A live actor that never launched a host: resolves, so the probe
+        // is spawned, and the session reports no screen.
+        let id = create_active_session(&mngr).await;
+        assert!(
+            mngr.get_screen(SessionKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .is_none(),
+            "a session with no running host should answer None"
+        );
+        assert!(
+            mngr.get_screen(SessionKeyPredicate::Name("doomed".to_string()))
+                .await
+                .unwrap()
+                .is_none(),
+            "resolving by name should reach the same session"
+        );
+
+        // The mainloop is still serving after all of it.
+        assert_eq!(mngr.list().await.unwrap().len(), 1);
     }
 
     /// Destroying a known-but-not-running session removes its record so it no

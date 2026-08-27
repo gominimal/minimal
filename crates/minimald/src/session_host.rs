@@ -1245,10 +1245,45 @@ impl WeakHostHandle {
     }
 }
 
+/// How many messages the host's mailbox holds before senders block.
+///
+/// Small on purpose — the loop is expected to drain it promptly. It matters
+/// to callers only when the loop is *not* draining: a wedged host fills this
+/// in a handful of polls, after which a probe blocks in `send` rather than
+/// `recv`. Both need a deadline; see
+/// [`HOST_PROBE_TIMEOUT`](crate::session::HOST_PROBE_TIMEOUT).
+pub(crate) const HOST_MAILBOX_CAPACITY: usize = 8;
+
 /// The handle to the session host - the running process.
 #[derive(Debug, Clone)]
 pub struct HostHandle {
     sender: mpsc::Sender<Message>,
+}
+
+/// The mailbox of a [`HostHandle::wedged`] host, opaque so [`Message`] stays
+/// private to this module.
+///
+/// Holding one is the whole point: an undrained mailbox is what makes the
+/// host wedged. Dropping it turns the same handle into a *dead* host
+/// instead, which is a different case and answers immediately.
+#[cfg(test)]
+pub(crate) struct WedgedMailbox(
+    // Never read — held only so the channel stays open and undrained.
+    #[allow(dead_code)] mpsc::Receiver<Message>,
+);
+
+#[cfg(test)]
+impl HostHandle {
+    /// A handle to a host that accepts messages and never answers one,
+    /// modelling a loop parked mid-attach or mid-teardown.
+    ///
+    /// Faithful where it counts — the mailbox is the production size, so a
+    /// test can queue past it and exercise the `send`-blocks case as well as
+    /// the `recv`-blocks one.
+    pub(crate) fn wedged() -> (Self, WedgedMailbox) {
+        let (sender, receiver) = mpsc::channel(HOST_MAILBOX_CAPACITY);
+        (Self { sender }, WedgedMailbox(receiver))
+    }
 }
 
 impl HostHandle {
@@ -1357,12 +1392,15 @@ impl HostHandle {
         recv.await.map_err(|_| dead())?.map_err(io::Error::other)
     }
 
-    /// Returns the terminal attributes.
+    /// Returns the terminal attributes. A host that goes away between the
+    /// send and the reply reads as `Err(())` rather than a panic: the loop
+    /// can drop a queued responder on its way out, and that is a teardown
+    /// race, not a bug in the caller.
     pub async fn get_attrs(&self) -> Result<HostAttrs, ()> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         match self.sender.send(Message::GetAttrs(send)).await {
-            Ok(()) => Ok(recv.await.expect("host died")),
+            Ok(()) => recv.await.map_err(|_| ()),
             Err(SendError(Message::GetAttrs(_))) => Err(()),
             Err(e) => unreachable!("{:?}", e),
         }
@@ -2781,7 +2819,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             tty_path,
         } = launcher.launch(name, username, paths, sz).await?;
 
-        let (sender, receiver) = mpsc::channel(8);
+        let (sender, receiver) = mpsc::channel(HOST_MAILBOX_CAPACITY);
         let handle = HostHandle { sender };
 
         let parser = vt100::Parser::new_with_callbacks(
