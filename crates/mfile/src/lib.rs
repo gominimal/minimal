@@ -1038,7 +1038,9 @@ impl File {
             was_unknown_fields = true;
         }
         if let Some(p) = &self.defaults.profile {
-            tracing::warn!("[defaults]profile = \"{p}\" defined, profiles were removed in 0.5.1");
+            tracing::warn!(
+                "[defaults]profile = \"{p}\" defined, but profiles were removed in 0.5.1; move its packages to [session] packages"
+            );
         }
         if let Some(stack) = &self.stack
             && !stack.extra.is_empty()
@@ -1072,7 +1074,7 @@ impl File {
             }
             if let Some(p) = &task.profile {
                 tracing::warn!(
-                    "[tasks.{task_name}]profile = \"{p}\" defined, profiles were removed in 0.5.1"
+                    "[tasks.{task_name}]profile = \"{p}\" defined, but profiles were removed in 0.5.1; move its packages to [tasks.{task_name}] packages"
                 );
             }
         }
