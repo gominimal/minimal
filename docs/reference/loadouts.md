@@ -207,6 +207,19 @@ By default the walker does not follow symlinks while enumerating glob
 matches; see [`follow_symlinks`](#follow_symlinks) and the
 [client config](#client-config).
 
+**Permissions** carry across. A patched file lands with the source file's
+own permission bits, so a script stays executable and a `0600` key stays
+readable only by you. Two qualifications:
+
+- Preservation is exact, which cuts both ways: a read-only source (a
+  `0444` file, or a dotfile symlinked into a read-only store) lands
+  read-only, and editing it in the session takes a `chmod` first.
+- `setuid`, `setgid`, and the sticky bit are dropped; the nine standard
+  permission bits are what survives.
+
+Ownership is not carried and cannot be: every file in the session belongs
+to the session user, whatever it was owned by on your host.
+
 ### `[[lifecycle_hooks]]` - Scripts at session transition points
 
 _Optional_

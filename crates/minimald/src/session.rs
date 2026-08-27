@@ -44,6 +44,13 @@ use tokio::task::JoinHandle;
 /// checked the patches-ready marker, so a missing file at this
 /// point is a bug (the marker was written but the file it should
 /// have gated on didn't land).
+///
+/// The copy is `fs::copy` specifically because it carries the source's
+/// permission bits across, which is the last link in the chain that
+/// keeps a patched script executable in the session (the unpacker set
+/// those bits on the staged file from the tar header). A hand-rolled
+/// read-then-write here would silently flatten every patch to the
+/// daemon's umask default.
 async fn materialize_patches_into_home(
     patches_dir: &DaemonAbsPath,
     home_dir: &DaemonAbsPath,
@@ -4716,5 +4723,84 @@ mod tests {
             "destroy ran a hook declared for another transition"
         );
         assert!(!record_exists(&mut client, session_id).await);
+    }
+
+    /// The staged patch's permission bits reach the session home. This
+    /// is the last hop of the chain that keeps a patched script
+    /// executable — the uploader puts the source's mode on the tar
+    /// header, the unpacker applies it to the staged file, and this
+    /// copy has to carry it the rest of the way.
+    ///
+    /// Pins the `fs::copy` in [`super::materialize_patches_into_home`]:
+    /// a hand-rolled read-then-write there would pass this test's
+    /// content assertions while silently flattening every mode.
+    #[tokio::test]
+    async fn materializing_patches_carries_their_modes_into_the_home() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use paths::{DaemonAbsPath, HostAbsPath, SandboxRelPath};
+        use sessions::core::compose::Composition;
+        use sessions::wire::primitives::{WireResolvedPatch, WireSessionPatch, WireSource};
+        use sessions::wire::request::{COMPOSITION_SNAPSHOT_VERSION, WireComposition};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = camino::Utf8Path::from_path(tmp.path()).unwrap();
+        let patches_dir = root.join("patches");
+        let home_dir = root.join("home");
+        std::fs::create_dir_all(patches_dir.join(".local/bin").as_std_path()).unwrap();
+        std::fs::create_dir_all(home_dir.as_std_path()).unwrap();
+
+        // Two staged patches: one executable, one private. Modes are set
+        // on the staged files the way the unpacker sets them.
+        let staged = [(".local/bin/tool", 0o755), (".config/secret.toml", 0o600)];
+        for (rel, mode) in staged {
+            let path = patches_dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap().as_std_path()).unwrap();
+            std::fs::write(path.as_std_path(), b"x").unwrap();
+            std::fs::set_permissions(path.as_std_path(), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+
+        let composition = Composition::try_from(WireComposition {
+            version: COMPOSITION_SNAPSHOT_VERSION,
+            vars: Vec::new(),
+            patches: staged
+                .iter()
+                .map(|(rel, _)| WireSessionPatch {
+                    patch: WireResolvedPatch {
+                        // The host path is not read here — the copy
+                        // sources from the staged tree, keyed by
+                        // destination — but the wire type requires one.
+                        host_path: HostAbsPath::try_new(patches_dir.join(rel)).unwrap(),
+                        destination: SandboxRelPath::try_new(*rel).unwrap(),
+                    },
+                    source: WireSource::UserLoadout {
+                        name: "dev".to_string(),
+                    },
+                })
+                .collect(),
+            packages: Vec::new(),
+            lifecycle_hooks: Vec::new(),
+            orientation: Default::default(),
+        })
+        .expect("a patch-only composition converts back");
+
+        super::materialize_patches_into_home(
+            &DaemonAbsPath::try_new(patches_dir.clone()).unwrap(),
+            &DaemonAbsPath::try_new(home_dir.clone()).unwrap(),
+            &composition,
+        )
+        .await
+        .expect("materializing staged patches");
+
+        for (rel, mode) in staged {
+            let meta = std::fs::metadata(home_dir.join(rel).as_std_path())
+                .unwrap_or_else(|e| panic!("`{rel}` should have landed in the home: {e}"));
+            assert_eq!(
+                meta.permissions().mode() & 0o7777,
+                mode,
+                "`{rel}` lost its mode on the way into the session home",
+            );
+        }
     }
 }

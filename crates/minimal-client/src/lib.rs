@@ -494,9 +494,16 @@ impl Client {
     /// share a destination with different sources, so any duplicates
     /// here are exact matches and safe to collapse.
     ///
-    /// The archive is streamed with `follow_symlinks: true` and
-    /// `mode_override: Some(0o644)` so a `/nix/store/…` link source
-    /// lands as a writable copy inside the sandbox.
+    /// The archive is streamed with `follow_symlinks: true`, so a
+    /// `/nix/store/…` link source is copied by value rather than
+    /// arriving as a link into a store the sandbox doesn't have.
+    ///
+    /// Each entry carries **the source file's own permission bits**.
+    /// The exec bit is the reason — a script patched into the session
+    /// has to still be runnable — but preservation is exact, so a
+    /// read-only source (a store path, a `0400` secret) lands read-only
+    /// and takes a `chmod` to edit in the box. The daemon masks off
+    /// setuid/setgid/sticky on unpack.
     ///
     /// [`Composition`]: sessions::core::compose::Composition
     pub async fn upload_patches(
@@ -543,9 +550,10 @@ impl Client {
                                     .add_file(
                                         host_path,
                                         dest.as_str(),
-                                        crate::file_upload::AddFileOptions {
-                                            mode_override: Some(0o644),
-                                        },
+                                        // Default options: the source's own
+                                        // mode rides the tar header. See the
+                                        // method docs.
+                                        crate::file_upload::AddFileOptions::default(),
                                     )
                                     .await
                                     .with_context(|| {
