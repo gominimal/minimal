@@ -168,6 +168,12 @@ pub struct ServerState {
     /// macOS, which is the platform the failure was reported from.
     proxy_unavailable: Option<String>,
 
+    /// Why the mTLS reverse proxy is not serving, if it is not. Kept apart
+    /// from [`Self::proxy_unavailable`] so a client is not told its hostnames
+    /// are broken when only TLS termination is. Never set without the
+    /// `networking-proxy` feature, where there is no such proxy to lose.
+    mtls_unavailable: Option<String>,
+
     /// The daemon's TLS certificate authority, used by the HTTPS proxy and the
     /// `IssueClientCert` RPC. Generated once on daemon startup and held for the
     /// daemon's lifetime; clients must call `minimal login` again after a
@@ -256,6 +262,7 @@ impl ServerState {
             log_release,
             host_key: None,
             proxy_unavailable: None,
+            mtls_unavailable: None,
             #[cfg(feature = "networking-proxy")]
             cert_authority,
             #[cfg(feature = "networking-wg")]
@@ -318,6 +325,17 @@ impl ServerStateHandle {
     /// Why hostname routing is unavailable, or `None` if the proxy is up.
     pub(crate) async fn proxy_unavailable(&self) -> Option<String> {
         self.0.lock().await.proxy_unavailable.clone()
+    }
+
+    /// Records why the mTLS reverse proxy is not serving.
+    #[cfg_attr(not(feature = "networking-proxy"), expect(dead_code))]
+    pub(crate) async fn set_mtls_unavailable(&self, reason: String) {
+        self.0.lock().await.mtls_unavailable = Some(reason);
+    }
+
+    /// Why the mTLS reverse proxy is not serving, or `None` if it is.
+    pub(crate) async fn mtls_unavailable(&self) -> Option<String> {
+        self.0.lock().await.mtls_unavailable.clone()
     }
 
     /// Returns the daemon-scoped mctx state.
@@ -782,10 +800,15 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
     // B8 mTLS reverse proxy (:7655), under the networking-proxy feature.
     #[cfg(feature = "networking-proxy")]
     {
+        // Three ways this ends with nothing serving on :7655, and all three
+        // were silent: the TLS config failing to build, the bind failing, and
+        // the publish failing. The daemon carries on in every case, so only a
+        // reported reason distinguishes "no mTLS proxy configured" from "the
+        // mTLS proxy is broken".
         let https_addr = SocketAddr::new(bind_base, proxy::HTTPS_PROXY_PORT);
         match state.cert_authority().await.build_server_config() {
             Ok(tls_config) => {
-                if proxy::bind_listener(https_addr)
+                let bound = proxy::bind_listener(https_addr)
                     .await
                     .map(|listener| {
                         let router = Router::new(registry.clone());
@@ -797,18 +820,34 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
                             }
                         })
                     })
-                    .is_some()
-                    && in_microvm
-                {
-                    let _ = expose_proxy_on_host(
+                    .is_some();
+
+                if !bound {
+                    state
+                        .set_mtls_unavailable(format!(
+                            "the daemon could not bind {https_addr}; another process is \
+                             holding it. Check with: lsof -nP -iTCP:{} -sTCP:LISTEN",
+                            proxy::HTTPS_PROXY_PORT
+                        ))
+                        .await;
+                } else if in_microvm
+                    && let Some(reason) = expose_proxy_on_host(
                         crate::net::DEFAULT_SUBNET.daemon_ip(),
                         proxy::HTTPS_PROXY_PORT,
                     )
-                    .await;
+                    .await
+                {
+                    state.set_mtls_unavailable(reason).await;
                 }
             }
             Err(error) => {
                 tracing::warn!(%error, "could not build TLS config for the mTLS reverse proxy");
+                state
+                    .set_mtls_unavailable(format!(
+                        "the daemon could not build a TLS config for the mTLS reverse \
+                         proxy: {error}"
+                    ))
+                    .await;
             }
         }
     }

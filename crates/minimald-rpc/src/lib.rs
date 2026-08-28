@@ -243,6 +243,18 @@ pub struct ListSessionsResponse {
     /// daemon log, and the user is at a terminal watching curl fail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname_routing_unavailable: Option<String>,
+    /// Why the mTLS reverse proxy (`:7655`) is not serving, when it is not.
+    ///
+    /// Separate from [`Self::hostname_routing_unavailable`] because they are
+    /// different services with different consumers: losing `:7654` costs every
+    /// session its hostname, losing `:7655` costs whatever terminates TLS
+    /// against it. Reporting them through one field would tell a user their
+    /// hostnames are broken when they are not.
+    ///
+    /// Always `None` from a daemon built without the `networking-proxy`
+    /// feature, which is the default — there is no proxy to be unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtls_proxy_unavailable: Option<String>,
 }
 
 impl OneshotSshRpc for ListSessions {
@@ -1398,11 +1410,11 @@ mod tests {
     /// client that read it that way would warn on every session it lists.
     #[test]
     fn responses_predating_hostname_routing_field_decode_as_absent() {
-        let list: ListSessionsResponse = serde_json_lenient::from_str(
-            r#"{"sessions":[],"daemon_version":"0.5.0"}"#,
-        )
-        .expect("a pre-field ListSessions reply must still decode");
+        let list: ListSessionsResponse =
+            serde_json_lenient::from_str(r#"{"sessions":[],"daemon_version":"0.5.0"}"#)
+                .expect("a pre-field ListSessions reply must still decode");
         assert!(list.hostname_routing_unavailable.is_none());
+        assert!(list.mtls_proxy_unavailable.is_none());
 
         let create: Errorable<CreateSessionResponse> = serde_json_lenient::from_str(
             r#"{"id":"00000000-0000-0000-0000-000000000001","daemon_version":"0.5.0"}"#,
@@ -1422,6 +1434,7 @@ mod tests {
         let resp = ListSessionsResponse {
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: None,
+            mtls_proxy_unavailable: None,
             resource_pool: None,
             sessions: vec![],
         };
@@ -1430,14 +1443,17 @@ mod tests {
             !json.contains("hostname_routing_unavailable"),
             "healthy reply should omit the field, got {json}"
         );
+        assert!(
+            !json.contains("mtls_proxy_unavailable"),
+            "healthy reply should omit the mTLS field too, got {json}"
+        );
 
         let down = ListSessionsResponse {
             hostname_routing_unavailable: Some("port 7654 is held".into()),
             ..resp
         };
         let json = serde_json_lenient::to_string(&down).expect("serializes");
-        let back: ListSessionsResponse =
-            serde_json_lenient::from_str(&json).expect("round trips");
+        let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
         assert_eq!(
             back.hostname_routing_unavailable.as_deref(),
             Some("port 7654 is held")

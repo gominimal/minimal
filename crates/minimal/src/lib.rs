@@ -1429,6 +1429,9 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // is exactly what will go on using hostnames that no longer resolve — and
     // stdout stays clean for the parser either way.
     warn_if_hostname_routing_down(resp.hostname_routing_unavailable.as_deref());
+    if let Some(reason) = resp.mtls_proxy_unavailable.as_deref() {
+        eprintln!("warning: the mTLS reverse proxy is not serving: {reason}");
+    }
     format_ls(&mut std::io::stdout(), &args, &resp)?;
     Ok(())
 }
