@@ -85,7 +85,10 @@ macro_rules! collect_step {
 pub use bundle::{
     BundleSink, BundleWriter, LOG_TAIL_CAP, MAX_LOG_TAIL_BYTES, open_regular_nofollow,
 };
-pub use capture::{Capture, CaptureError, command_capture, command_stdout, first_stdout_line};
+pub use capture::{
+    Capture, CaptureError, command_capture, command_capture_capped, command_stdout,
+    first_stdout_line,
+};
 #[cfg(unix)]
 pub use disk::{DiskUsage, disk_usage};
 pub use listing::{Listing, listing};
