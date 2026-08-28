@@ -3811,11 +3811,11 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
                 graph.top_levels.clone(),
                 mctx::AddDepMode::SessionPackages,
             )?;
-            // The host-side add only edits `minimal.toml`; unlike the
+            // The host-side add updates `minimal.toml`; unlike the
             // in-session helper it does not install into a running session.
             // Qualify the success line so it is not read as a live install.
             eprintln!(
-                "Note: this edited minimal.toml only — a running session is \
+                "Note: this updated minimal.toml; a running session is \
                  not modified. The package will be present in sessions \
                  activated after this change; to add it to an already-running \
                  session, run `min add --session` from inside that session."
