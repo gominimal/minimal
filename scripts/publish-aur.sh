@@ -185,4 +185,3 @@ esac
 git push origin HEAD:master
 
 echo "publish-aur: pushed minimal-bin $PKGVER to $remote_url"
-o "publish-aur: pushed minimal-bin $PKGVER to $remote_url"
