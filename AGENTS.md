@@ -218,6 +218,10 @@ proves, `nightly` ships.
   [docs/commit-conventions.md](docs/commit-conventions.md).
 - **Rust standards**:
   [docs/rust-coding-standards.md](docs/rust-coding-standards.md).
+- **Specs**: work carrying `kind:epic` gets one, at
+  `docs/specs/NN-spec-<slug>/NN-spec-<slug>.md`. Start from
+  [docs/specs/TEMPLATE.md](docs/specs/TEMPLATE.md); requirements are written as
+  EARS and the format is decided in gominimal/foundry.
 - **`.github/workflows/` is frozen** and CODEOWNER-gated. Do not edit it.
   Extend CI coverage through convention-discovered tests, `scripts/`, and the
   `justfile`, per the test-extension contract in
