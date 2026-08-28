@@ -165,6 +165,8 @@ jobs:
             id-token: "write"
             # verify-nightly-provenance.sh lists nightly workflow runs.
             actions: "read"
+        outputs:
+            version: ${{ steps.promote.outputs.sha }}
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
@@ -261,8 +263,47 @@ jobs:
                   if [ "$DRY_RUN" = "true" ]; then
                     echo "[dry-run] would dispatch reference-docs-promoted to gominimal/webapp for ${SHA}"
                   else
-                    gh api repos/gominimal/webapp/dispatches \
-                      -f event_type=reference-docs-promoted \
-                      -F "client_payload[sha]=${SHA}"
-                    echo "Dispatched reference-docs-promoted to gominimal/webapp for ${SHA}"
+                     gh api repos/gominimal/webapp/dispatches \
+                       -f event_type=reference-docs-promoted \
+                       -F "client_payload[sha]=${SHA}"
+                     echo "Dispatched reference-docs-promoted to gominimal/webapp for ${SHA}"
+                   fi
+
+    publish-aur:
+        # The AUR package tracks promoted semver releases (its PKGBUILD is
+        # keyed on versions/<semver>/ in the bucket), so only stable
+        # promotions publish, and only when the promoted sha is exactly a
+        # semver-tagged commit. A stable promotion of an untagged staged sha
+        # skips the publish with a notice.
+        needs: promote
+        if: ${{ inputs.target == 'stable' }}
+        runs-on: ubuntu-latest
+        container: archlinux:base-devel
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+                  # Full history + tags: the semver resolution below matches
+                  # the promoted sha against the v* tags.
+                  fetch-depth: 0
+            - name: Install curl
+              # base-devel carries git and makepkg but not the curl CLI the
+              # script uses to fetch versioned artifacts from the public bucket.
+              run: pacman -Sy --noconfirm --needed curl
+            - name: Resolve the promoted sha to a semver tag
+              id: semver
+              env:
+                  SHA: ${{ needs.promote.outputs.version }}
+              run: |
+                  tag="$(git describe --tags --exact-match --match 'v[0-9]*' "$SHA" 2>/dev/null || true)"
+                  if [ -z "$tag" ]; then
+                      echo "::notice::promoted sha $SHA is not a semver-tagged commit — skipping the AUR publish"
                   fi
+                  echo "semver=${tag#v}" >> "$GITHUB_OUTPUT"
+            - name: Publish minimal-bin to the AUR
+              if: ${{ steps.semver.outputs.semver != '' }}
+              env:
+                  PKGVER: ${{ steps.semver.outputs.semver }}
+                  AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+              run: scripts/publish-aur.sh

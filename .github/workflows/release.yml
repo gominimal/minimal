@@ -90,6 +90,43 @@ jobs:
                   [ "$fail" -eq 0 ] && echo "all five required checks are green on $sha"
                   exit "$fail"
 
+    assert-version:
+        # Fail the run before the expensive builds when the tag being released
+        # does not match the workspace `package.version`. crates/version/build.rs
+        # derives versions from `git describe` and falls back to package.version
+        # only when no `v*` tag is reachable (e.g. a source tarball with no
+        # .git) — a stale package.version would make such a build report the
+        # wrong -V. Tag pushes are the only flow with a semver tag to assert;
+        # the dispatch and nightly (release-<sha>) flows have none and skip.
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Assert package.version matches the tag
+              env:
+                  REF_TYPE: ${{ github.ref_type }}
+                  REF_NAME: ${{ github.ref_name }}
+              run: |
+                  set -euo pipefail
+                  if [ "$REF_TYPE" != "tag" ]; then
+                    echo "::notice::not a tag push (ref $REF_NAME) — no version tag to assert"
+                    exit 0
+                  fi
+                  # Tags are vX.Y.Z; package.version is X.Y.Z.
+                  tag_version="${REF_NAME#v}"
+                  package_version="$(sed -n 's/^package\.version[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' Cargo.toml | head -n 1)"
+                  if [ -z "$package_version" ]; then
+                    echo "::error::could not extract package.version from Cargo.toml"
+                    exit 1
+                  fi
+                  if [ "$package_version" != "$tag_version" ]; then
+                    echo "::error::releasing $REF_NAME but package.version is $package_version — they must match (crates/version/build.rs falls back to package.version when no v* git tag is reachable, e.g. in a source tarball). Bump package.version in Cargo.toml before tagging, or retag."
+                    exit 1
+                  fi
+                  echo "package.version ($package_version) matches tag $REF_NAME"
+
     build-release-linux-amd64:
         runs-on: ubuntu-latest
         # 90m, matching arm64. The build step below links the three binaries one
@@ -99,6 +136,7 @@ jobs:
         # shape fits; a cap only bounds a hang, and an early finish bills for the
         # time actually used.
         timeout-minutes: 90
+        needs: [assert-version]
         # `CARGO_TARGET_<TRIPLE>_LINKER` is the documented env equivalent of the
         # `[target.<triple>] linker` config key (triple uppercased, dashes to
         # underscores). Set here rather than appended to `.cargo/config.toml` so
@@ -143,23 +181,27 @@ jobs:
               with:
                   shared-key: release-amd64
                   save-if: ${{ github.ref == 'refs/heads/main' }}
+            - name: Build static libkrun (musl)
+              # Staged BEFORE the build: scripts/dist-build.sh links minvmd
+              # against this prefix, so LIBKRUN_PREFIX must be exported first.
+              # Static libkrun.a from the vendored pin, so minvmd JOINS the
+              # static-musl build instead of being the one binary that can't.
+              # build.rs reads the .a there, selects a static link and records
+              # no rpath. libkrunfw is not involved — minvmd supplies its own
+              # kernel, and a static musl binary cannot dlopen one anyway.
+              # See gominimal/minimal#1065.
+              uses: ./.github/actions/build-libkrun-static-linux
+              with:
+                  target: x86_64-unknown-linux-musl
             - name: Build static release binaries
-              # One invocation per package, not one combined build.
-              # `[profile.release]` is fat LTO with codegen-units = 1, so a
-              # combined build lets cargo schedule all three final LTO links
-              # concurrently at -j4. That peak is what got the arm64 job
-              # SIGTERMed (exit 143) immediately after its last workspace crate
-              # compiled; this job has the same profile on a runner with the same
-              # 16 GB, so it was clearing the ceiling on headroom rather than by
-              # design. Sequential invocations share dependency artifacts through
-              # the same target/ dir, so the cost is three graph resolutions, not
-              # three builds — while the LTO links run one at a time. Do not
-              # recollapse these without cutting the release profile's link-time
-              # memory first.
-              run: |
-                  cargo build --release --locked --target x86_64-unknown-linux-musl --package mip
-                  cargo build --release --locked --target x86_64-unknown-linux-musl --package minimal
-                  cargo build --release --locked --target x86_64-unknown-linux-musl --package minimald
+              # THE build entrypoint (scripts/dist-build.sh), shared with
+              # downstream packaging so CI builds == downstream builds: one
+              # cargo invocation per package so the fat-LTO links run one at a
+              # time (recollapsing them is what SIGTERMed the arm64 job, exit
+              # 143), and minvmd last, demanding the static libkrun the step
+              # above staged so a stub build can never ship. See the script's
+              # header for the full rationale and its env knobs.
+              run: scripts/dist-build.sh x86_64-unknown-linux-musl
             - name: Rename binaries with platform suffix
               # download-artifact merge-multiple flattens every artifact into one
               # directory using each file's basename, so the uploaded files must
@@ -170,6 +212,7 @@ jobs:
                   mv mip mip-linux-amd64
                   mv min minimal-linux-amd64
                   mv minimald minimald-linux-amd64
+                  mv minvmd minvmd-linux-amd64
             - name: Upload binary (mip)
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
@@ -188,32 +231,6 @@ jobs:
                   name: minimald-linux-amd64
                   path: target/x86_64-unknown-linux-musl/release/minimald-linux-amd64
                   retention-days: 7
-            - name: Build static libkrun (musl)
-              # Static libkrun.a from the vendored pin, so minvmd JOINS the
-              # static-musl build instead of being the one binary that can't.
-              # Publishes LIBKRUN_PREFIX; build.rs reads the .a there, selects a
-              # static link and records no rpath. libkrunfw is not involved —
-              # minvmd supplies its own kernel, and a static musl binary cannot
-              # dlopen one anyway. See gominimal/minimal#1065.
-              uses: ./.github/actions/build-libkrun-static-linux
-              with:
-                  target: x86_64-unknown-linux-musl
-            - name: Build static minvmd binary
-              # Same musl target as the three above, and self-contained for the
-              # same reason: nothing to resolve at load time, no lib/ sibling, no
-              # glibc floor. Its own cargo invocation so the fat-LTO link does
-              # not overlap theirs (see the build step above).
-              #
-              # MINVMD_REQUIRE_LIBKRUN=static: without it, a build.rs that fails
-              # to find libkrun quietly emits a runtime-bailing STUB that
-              # compiles and links perfectly well. That default keeps stock
-              # Linux CI green, but here it would ship. Demanding the static
-              # link turns the regression into a build error naming the prefix.
-              env:
-                  MINVMD_REQUIRE_LIBKRUN: static
-              run: |
-                  cargo build --release --locked --target x86_64-unknown-linux-musl -p minvmd --bin minvmd
-                  mv target/x86_64-unknown-linux-musl/release/minvmd target/x86_64-unknown-linux-musl/release/minvmd-linux-amd64
             - name: Verify minvmd is static and links libkrun
               # Both halves matter and neither is implied by a successful build:
               # a stub minvmd (build.rs found no libkrun) also compiles and
@@ -251,6 +268,7 @@ jobs:
     build-release-linux-arm64:
         runs-on: ubuntu-26.04-arm
         timeout-minutes: 90
+        needs: [assert-version]
         # See the amd64 job: cargo's env equivalent of `[target.<triple>]
         # linker`, so the build leaves the checkout untouched.
         env:
@@ -289,15 +307,22 @@ jobs:
               with:
                   shared-key: release-arm64
                   save-if: ${{ github.ref == 'refs/heads/main' }}
+            - name: Build static libkrun (musl)
+              # See the amd64 job: staged before the build, because
+              # scripts/dist-build.sh links minvmd against this prefix. arm64
+              # had no minvmd artifact at all before this — the dynamic build
+              # needed a native glibc host per arch, and only amd64 got one. A
+              # static musl build has no such constraint, so the two Linux
+              # arches finally ship the same set of binaries.
+              uses: ./.github/actions/build-libkrun-static-linux
+              with:
+                  target: aarch64-unknown-linux-musl
             - name: Build static release binaries
-              # See the amd64 job: one invocation per package so the fat-LTO
-              # links run one at a time. Recollapsing them into a single build is
-              # what got this job SIGTERMed (exit 143) on the 16 GB runner, right
-              # after the last workspace crate compiled.
-              run: |
-                  cargo build --release --locked --target aarch64-unknown-linux-musl --package mip
-                  cargo build --release --locked --target aarch64-unknown-linux-musl --package minimal
-                  cargo build --release --locked --target aarch64-unknown-linux-musl --package minimald
+              # See the amd64 job: the shared entrypoint (scripts/dist-build.sh),
+              # one cargo invocation per package so the fat-LTO links run one
+              # at a time — recollapsing them is what got this job SIGTERMed
+              # (exit 143) on the 16 GB runner.
+              run: scripts/dist-build.sh aarch64-unknown-linux-musl
             - name: Rename binaries with platform suffix
               # Platform-suffixed so download-artifact's merge-multiple basename
               # flatten does not collide with the amd64 build.
@@ -306,6 +331,7 @@ jobs:
                   mv min minimal-linux-arm64
                   mv mip mip-linux-arm64
                   mv minimald minimald-linux-arm64
+                  mv minvmd minvmd-linux-arm64
             - name: Upload binary (minimal)
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
@@ -324,21 +350,6 @@ jobs:
                   name: minimald-linux-arm64
                   path: target/aarch64-unknown-linux-musl/release/minimald-linux-arm64
                   retention-days: 7
-            - name: Build static libkrun (musl)
-              # See the amd64 job. arm64 had no minvmd artifact at all before
-              # this — the dynamic build needed a native glibc host per arch, and
-              # only amd64 got one. A static musl build has no such constraint,
-              # so the two Linux arches finally ship the same set of binaries.
-              uses: ./.github/actions/build-libkrun-static-linux
-              with:
-                  target: aarch64-unknown-linux-musl
-            - name: Build static minvmd binary
-              # See the amd64 job for MINVMD_REQUIRE_LIBKRUN.
-              env:
-                  MINVMD_REQUIRE_LIBKRUN: static
-              run: |
-                  cargo build --release --locked --target aarch64-unknown-linux-musl -p minvmd --bin minvmd
-                  mv target/aarch64-unknown-linux-musl/release/minvmd target/aarch64-unknown-linux-musl/release/minvmd-linux-arm64
             - name: Verify minvmd is static and links libkrun
               # See the amd64 job: a stub minvmd builds and links cleanly too, so
               # neither half of this is implied by the build succeeding.
@@ -372,6 +383,7 @@ jobs:
         # needs it.
         runs-on: [self-hosted, macOS, ARM64]
         timeout-minutes: 45
+        needs: [assert-version]
         if: vars.RUN_MACOS_CI != 'false'
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -752,6 +764,7 @@ jobs:
         needs:
             [
                 verify-ci,
+                assert-version,
                 build-release-linux-amd64,
                 build-release-linux-arm64,
                 build-release-macos-arm64,
@@ -906,6 +919,32 @@ jobs:
                     --artifacts-dir artifacts \
                     --version "$SHORT_SHA" \
                     --bucket gs://minimal-one
+            - name: Also stage under the semver tag
+              # Downstream packaging (the AUR PKGBUILD, brew formula, and nfpm
+              # renders) fetches from versions/<semver>/ — only tag pushes
+              # carry a semver. Same inert row layout as the sha-keyed upload
+              # above; the channel pointers still key off the sha row.
+              if: ${{ github.ref_type == 'tag' }}
+              env:
+                  SEMVER: ${{ github.ref_name }}
+              run: |
+                  scripts/stage-release.sh \
+                    --artifacts-dir artifacts \
+                    --version "${SEMVER#v}" \
+                    --bucket gs://minimal-one
+            - name: Build distro packages and stage versions/<semver>/pkg/
+              # .deb/.rpm/.apk from the just-staged semver row via the pinned
+              # nfpm. The apt/dnf/apk repo trees the infra repo builds on
+              # promote consume this row; nothing else reads it.
+              if: ${{ github.ref_type == 'tag' }}
+              env:
+                  SEMVER: ${{ github.ref_name }}
+              run: |
+                  PKGVER="${SEMVER#v}" scripts/package-nfpm.sh
+                  gcloud storage cp \
+                    --cache-control="public, max-age=31536000, immutable" \
+                    dist/*.deb dist/*.rpm dist/*.apk \
+                    "gs://minimal-one/versions/${SEMVER#v}/pkg/"
             - name: Stage the installer script into the versioned folder
               # Keep a version-pinned copy of the curl|sh installer next to the
               # components it reads, so each version's install path is immutable
@@ -930,3 +969,27 @@ jobs:
                     --channel unstable \
                     --version "$SHORT_SHA" \
                     --bucket gs://minimal-one
+
+    publish-brew:
+        # The brew tap tracks the GitHub Release assets directly (Homebrew has
+        # no channel concept), so it publishes on tag push — unlike the AUR,
+        # which waits for the stable promote (promote.yml's publish-aur job).
+        # The tap repo must exist and BREW_TAP_TOKEN (a fine-grained PAT with
+        # write access to it) must be set (user actions).
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        needs: [release]
+        if: ${{ github.ref_type == 'tag' && !inputs.dry_run }}
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Publish minimal to gominimal/homebrew-minimal
+              env:
+                  PKGVER: ${{ github.ref_name }}
+                  BREW_TAP_REPO: https://github.com/gominimal/homebrew-minimal.git
+                  GITHUB_TOKEN: ${{ secrets.BREW_TAP_TOKEN }}
+              run: |
+                  PKGVER="${PKGVER#v}" scripts/publish-brew.sh
