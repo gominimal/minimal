@@ -11,6 +11,7 @@
 //! because the collectors that need this filter for the newest lines) and the
 //! dropped-byte count rides back on the [`Capture`].
 
+use std::collections::VecDeque;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
@@ -74,9 +75,15 @@ const DEFAULT_CAPTURE_CAP: usize = 8 * 1024 * 1024;
 /// of dropped bytes is kept so the caller can record the truncation. The
 /// collectors that need this (kernel-journal and `pmset -g log` scrapers)
 /// filter for the *newest* lines, so the tail is the half worth keeping.
+///
+/// The buffer is a [`VecDeque`] so eviction is front-popping a ring, not
+/// `Vec::drain(..excess)` (which memmoves the whole retained tail on every
+/// chunk once the cap is reached — near-quadratic against a large steady
+/// stream). Bytes materialize into a `Vec` once, when the [`Capture`] is
+/// built.
 struct Tail {
     cap: usize,
-    buf: Vec<u8>,
+    buf: VecDeque<u8>,
     dropped: u64,
 }
 
@@ -84,13 +91,13 @@ impl Tail {
     fn new(cap: usize) -> Self {
         Self {
             cap,
-            buf: Vec::new(),
+            buf: VecDeque::new(),
             dropped: 0,
         }
     }
 
     fn extend(&mut self, bytes: &[u8]) {
-        self.buf.extend_from_slice(bytes);
+        self.buf.extend(bytes);
         if self.buf.len() > self.cap {
             let excess = self.buf.len() - self.cap;
             self.buf.drain(..excess);
@@ -158,8 +165,8 @@ pub async fn command_capture_capped(
                     cmd: cmd.to_string(),
                     timeout,
                     partial: Capture {
-                        stdout: stdout.buf,
-                        stderr: stderr.buf,
+                        stdout: Vec::from(stdout.buf),
+                        stderr: Vec::from(stderr.buf),
                         stdout_dropped: stdout.dropped,
                         stderr_dropped: stderr.dropped,
                         status: None,
@@ -180,8 +187,8 @@ pub async fn command_capture_capped(
         }
     };
     Ok(Capture {
-        stdout: stdout.buf,
-        stderr: stderr.buf,
+        stdout: Vec::from(stdout.buf),
+        stderr: Vec::from(stderr.buf),
         stdout_dropped: stdout.dropped,
         stderr_dropped: stderr.dropped,
         status: Some(status),
@@ -277,6 +284,29 @@ mod tests {
             "kept the newest bytes"
         );
         assert_eq!(cap.stdout_dropped, 900, "reported the discarded bytes");
+    }
+
+    #[tokio::test]
+    async fn size_cap_bounds_a_large_multi_read_stream_to_the_tail() {
+        // 200 KB of a 10-byte repeating block streamed through the 8 KiB read
+        // loop and capped at 5000: many reads, many front evictions, yet the
+        // result is exactly the last 5000 bytes with the rest counted as
+        // dropped. Exercises the eviction path across chunk boundaries, not
+        // just a single over-cap write.
+        let cap = command_capture_capped(
+            "sh",
+            &["-c", "printf '0123456789%.0s' $(seq 1 20000)"],
+            Duration::from_secs(10),
+            5000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cap.stdout,
+            b"0123456789".repeat(500),
+            "kept the newest bytes"
+        );
+        assert_eq!(cap.stdout_dropped, 195_000, "reported the discarded bytes");
     }
 
     #[tokio::test]
