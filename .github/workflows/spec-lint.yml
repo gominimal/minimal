@@ -1,0 +1,206 @@
+# INSTALLED FILE — the source of record is gominimal/foundry:spec/deploy/spec-lint.yml.
+#
+# Copy it verbatim into `.github/workflows/spec-lint.yml` in every repo that
+# holds specs. foundry's spec-drift.yml fails when an installed copy and this
+# file disagree.
+#
+# Only this file travels. spec_lint.py stays in foundry and is checked out at
+# run time, for the same two reasons the reviewer works that way: a PR here
+# cannot rewrite the checker that reads it, and the checker upgrades in one
+# place for every repo that installs it. A copied script would need a second
+# drift check and would be a third instance of the defect foundry has already
+# shipped twice — a value written literally in a place where the set has since
+# changed.
+name: spec-lint
+
+on:
+  pull_request:
+    paths:
+      - "docs/specs/**"
+      # Itself, so a change to this workflow is exercised by this workflow.
+      # Without it the install PR would ship a job that has never run, and the
+      # first spec PR after it would be the first execution.
+      - ".github/workflows/spec-lint.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: spec-lint-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  spec-lint:
+    # Fork PRs get no secrets, so the App token that reads the private linter
+    # cannot be minted and there is nothing to run. Skipped, not refused: an
+    # advisory comment is not worth a red X, and the reviewer's hard refusal
+    # exists because it reaches a credentialled sandbox. This reaches a regex.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    # The only way this job reports failure. Every step below is
+    # continue-on-error, so nothing else can turn a finding — or a broken
+    # checkout — into a red check. The lint itself is sub-second; the budget is
+    # the two checkouts.
+    timeout-minutes: 10
+    steps:
+      # Every step in this job carries continue-on-error. Decision 9 is that
+      # the lint never blocks a merge, and a job that goes red when a step
+      # fails has reversed that decision no matter what the template says. The
+      # promise is a property of the job, not a flag on the script.
+      - name: Check out the tree under review
+        id: pr_tree
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The default for a pull_request event is the merge commit, a tree in
+          # no branch. Findings would anchor to line numbers the PR does not
+          # have.
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          persist-credentials: false
+
+      - name: Mint a token for the private linter
+        id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ vars.AW_BOT_APP_ID }}
+          private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
+          owner: gominimal
+          repositories: foundry
+
+      - name: Check out the linter (gominimal/foundry@main)
+        id: linter
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: gominimal/foundry
+          # A standalone copy cannot pin a foundry commit: job.workflow_sha
+          # names a commit in THIS repo. The default branch is the only pin
+          # available, so the comment records the sha it actually resolved to.
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+          path: linter
+          persist-credentials: false
+          sparse-checkout: spec
+
+      - name: Lint the specs this PR touches
+        id: lint
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+
+          # Changed files come from the API, not from git: a shallow checkout of
+          # the head sha has no base to diff against, and deepening it to find
+          # one costs more than one request.
+          #
+          # Touched specs only. The format is not backfilled onto the specs that
+          # predate it, so a PR editing one spec must not be told about findings
+          # in eleven it did not write. Renames arrive as added; deletions are
+          # dropped, since a file that is gone cannot be linted.
+          mapfile -t changed < <(
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate \
+              --jq '.[] | select(.status != "removed") | .filename' 2>/dev/null || true
+          )
+
+          # A spec directory holds one spec and any number of supporting
+          # documents beside it — `architecture.md` in five of them today.
+          # Those are not specs, and linting them reports every required section
+          # as missing on a file nobody claimed was a spec. The convention that
+          # separates them is the filename: `<slug>/<slug>.md` is the spec.
+          files=()
+          for f in ${changed+"${changed[@]}"}; do
+            case "$f" in
+              docs/specs/TEMPLATE.md)
+                files+=("$f") ;;
+              docs/specs/*/*.md)
+                dir="${f%/*}"
+                [ "${f##*/}" = "${dir##*/}.md" ] && files+=("$f") ;;
+            esac
+          done
+          # A PR that changes this workflow and no spec would otherwise prove
+          # nothing: the token, the checkout and the linter would all go
+          # unexercised until someone else's spec PR ran them. Lint the
+          # template instead — it is a real spec-shaped document, it lives at a
+          # known path, and it is expected to come back clean.
+          if [ ${#files[@]} -eq 0 ] && [ -f pr/docs/specs/TEMPLATE.md ] \
+             && printf '%s\n' ${changed+"${changed[@]}"} \
+                | grep -qxF '.github/workflows/spec-lint.yml'; then
+            echo "this PR changes the workflow itself; linting the template as a self-test"
+            files=(docs/specs/TEMPLATE.md)
+          fi
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no spec files changed"
+            echo "state=quiet" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf 'linting %d file(s):\n' "${#files[@]}"
+          printf '  %s\n' "${files[@]}"
+
+          if [ ! -f linter/spec/spec_lint.py ]; then
+            echo "::warning::the linter could not be checked out of gominimal/foundry; no comment this run"
+            echo "state=quiet" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sha="$(git -C linter rev-parse HEAD 2>/dev/null || echo unknown)"
+
+          # --repo-root . from inside the PR tree, so `verify:` and `proof:`
+          # targets resolve and findings read `docs/specs/...` rather than
+          # `pr/docs/specs/...`.
+          ( cd pr && python3 "$GITHUB_WORKSPACE/linter/spec/spec_lint.py" \
+              --repo-root . --format markdown "${files[@]}" ) > /tmp/lint.md 2>/tmp/lint.err
+          if [ ! -s /tmp/lint.md ]; then
+            echo "::warning::the linter produced no output"
+            sed -n '1,40p' /tmp/lint.err
+            echo "state=quiet" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cat /tmp/lint.md
+
+          {
+            echo "<!-- spec-lint -->"
+            cat /tmp/lint.md
+            echo
+            echo "_Advisory, and never a merge gate. Linter: \`gominimal/foundry@${sha:0:8}\`, spec format: [How Minimal Writes Specs](https://docs.google.com/document/d/185oh7_PHVMsR2yiKOmX_pq3eUSERMRULawE8UBSZSIw/edit)._"
+          } > /tmp/comment.md
+
+          if grep -q '^No findings' /tmp/lint.md; then
+            echo "state=clean" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=findings" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post the findings
+        continue-on-error: true
+        if: steps.lint.outputs.state == 'findings' || steps.lint.outputs.state == 'clean'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          STATE: ${{ steps.lint.outputs.state }}
+        run: |
+          set -uo pipefail
+
+          # One comment, edited in place. A PR that pushes six times should
+          # carry one current comment, not six historical ones.
+          existing="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate \
+            --jq 'map(select(.body | startswith("<!-- spec-lint -->"))) | .[0].id // empty' 2>/dev/null || true)"
+
+          # A clean run never opens a comment — the absence of one is the
+          # result. It does update a comment that already exists, because the
+          # author fixed what it named and should see that.
+          if [ "$STATE" = "clean" ] && [ -z "$existing" ]; then
+            echo "clean, and no comment to update"
+            exit 0
+          fi
+
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" \
+              -F body=@/tmp/comment.md >/dev/null && echo "updated comment $existing"
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+              -F body=@/tmp/comment.md >/dev/null && echo "posted a comment"
+          fi
