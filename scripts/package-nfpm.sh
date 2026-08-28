@@ -94,8 +94,8 @@ printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?
 
 BUCKET_URL="${MINIMAL_BUCKET_URL:-https://storage.googleapis.com/minimal-one}"
 
-# nfpm.yaml's maintainer field env-expands this; placeholder default.
-MAINTAINER="${MAINTAINER:-minimal <noreply@minimal.dev>}"
+# nfpm.yaml's maintainer field env-expands this.
+MAINTAINER="${MAINTAINER:-minimal <security@minimal.dev>}"
 export MAINTAINER
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

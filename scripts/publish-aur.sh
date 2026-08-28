@@ -22,9 +22,8 @@
 #   MINIMAL_BUCKET_URL  Public base URL of the installer bucket
 #                       (default: https://storage.googleapis.com/minimal-one)
 #   MAINTAINER          PKGBUILD maintainer line. Defaults below to the
-#                       noreply placeholder until an official contact exists;
-#                       set this to override. Personal addresses are not
-#                       checked into this repo.
+#                       project contact; set this to override. Personal
+#                       addresses are not checked into this repo.
 #
 # Credentials (env/ssh-agent only — never hardcoded or echoed here):
 #   - an ssh-agent holding the bot's AUR key (SSH_AUTH_SOCK set), or
@@ -64,8 +63,8 @@ done
 
 [ -n "${PKGVER:-}" ] || die "PKGVER is required (the promoted semver, without the v prefix)"
 
-# The PKGBUILD maintainer line; placeholder until an official contact exists.
-MAINTAINER="${MAINTAINER:-minimal <noreply@minimal.dev>}"
+# The PKGBUILD maintainer line.
+MAINTAINER="${MAINTAINER:-minimal <security@minimal.dev>}"
 export MAINTAINER
 case "$PKGVER" in
     v*) die "PKGVER must not carry the v prefix: '$PKGVER' (use ${PKGVER#v})" ;;
