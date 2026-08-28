@@ -1128,6 +1128,28 @@ fn entry_handle(entry: &minimald_rpc::ListSessionsEntry) -> String {
     }
 }
 
+/// Warn when the daemon already tracks a session for `target`.
+///
+/// Activating a path that already has a session mints a second, independent
+/// one; bare `min` from that directory is then ambiguous between them. The
+/// activation still proceeds — this only surfaces the foot-gun the caller
+/// would otherwise hit silently, and points at `attach` as the way to reuse
+/// the existing session. Pure, so the message is unit-testable.
+fn duplicate_session_warning(
+    entries: &[minimald_rpc::ListSessionsEntry],
+    target: &paths::HostAbsPath,
+) -> Option<String> {
+    let existing = entries
+        .iter()
+        .find(|e| e.project_path.as_ref() == Some(target))?;
+    let handle = entry_handle(existing);
+    Some(format!(
+        "warning: a session already exists for this path ({handle}); activating \
+         creates a second one, leaving bare `min` here ambiguous between them. \
+         To reuse it instead: min session attach {handle}"
+    ))
+}
+
 /// Abbreviate a home-prefixed path to `~`/`~/...` for display; any other
 /// path renders absolute, unchanged.
 fn display_with_home_tilde(path: &camino::Utf8Path, home: Option<&camino::Utf8Path>) -> String {
@@ -2122,6 +2144,18 @@ async fn activate_session(
     // Activation is the hot path #1251's gate landed on, and it must not pay a
     // round trip for a check its own first RPC can make.
     let mut client = connect_daemon_unchecked(global).await?;
+
+    // Warn before minting a second session for a path that already has one:
+    // the duplicate leaves bare `min` from this directory ambiguous between
+    // them. Advisory only — activation still proceeds — and it folds onto a
+    // `ListSessions` reply, which also carries the daemon-build assertion the
+    // `CreateSession` below would otherwise be first to make.
+    let existing_sessions = list_sessions_version_gated(&mut client).await?;
+    if let Some(warning) =
+        duplicate_session_warning(&existing_sessions.sessions, &config.project_path)
+    {
+        eprintln!("{warning}");
+    }
 
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
@@ -4275,6 +4309,34 @@ mod tests {
              Next:\n\
              \x20 min session attach --command 'min task run <task>' web\n\
              \x20 min ls --json\n"
+        );
+    }
+
+    /// A session already tracked for the target path warns with that
+    /// session's handle and the `attach` reuse hint; a path with no session
+    /// stays silent.
+    #[test]
+    fn duplicate_session_warning_flags_only_a_matching_path() {
+        let entries = vec![twin_entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            Some("/w"),
+            sessions::SessionStatus::Active,
+        )];
+
+        let taken = paths::HostAbsPath::try_new("/w").unwrap();
+        let warning = duplicate_session_warning(&entries, &taken)
+            .expect("a session on the target path must warn");
+        assert!(warning.contains("web"), "warning names the existing handle");
+        assert!(
+            warning.contains("min session attach web"),
+            "warning points at attach for reuse"
+        );
+
+        let free = paths::HostAbsPath::try_new("/elsewhere").unwrap();
+        assert!(
+            duplicate_session_warning(&entries, &free).is_none(),
+            "an untaken path does not warn"
         );
     }
 
