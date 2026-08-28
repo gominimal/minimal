@@ -627,7 +627,7 @@ pub struct DestroyArgs {
 
 #[derive(Debug, Args)]
 pub struct StopArgs {
-    /// Force shutdown even if a session is mid-create or has a running host
+    /// Force shutdown even if a session is mid-create or still holds a host handle (even a dead one)
     #[arg(long, short, default_value_t = false)]
     pub force: bool,
 }
