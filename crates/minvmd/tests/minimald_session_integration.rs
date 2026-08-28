@@ -7,7 +7,7 @@
 //! `minimald_exec_over_bridge` drives a real russh client over a `UnixStream`
 //! to the bridge UDS: it authenticates, creates a session (`CreateSession` RPC
 //! over an SSH subsystem), uploads a task-only `minimal.toml` into the session
-//! workspace over SFTP, runs `min run echo_ok` in that session, and asserts the
+//! workspace over SFTP, runs the `echo_ok` task in that session, and asserts the
 //! stdout + exit status that come back — proving the full path host UDS →
 //! libkrun bridge → guest vsock → minimald SSH (`run_on_vsock`, direct, no socat
 //! relay) → session task exec. The `echo` task is serviced without a package
@@ -167,16 +167,18 @@ async fn minimald_exec_over_bridge() {
     let guest = Guest::boot();
     let sentinel = "MINIMALD_SESSION_OK";
     // A task-only `minimal.toml` uploaded into the session workspace over
-    // SFTP. `min run echo_ok` is serviced straight from this declaration —
-    // no `[upstream]`, package graph, or sandbox — so the guest needs no
-    // network and nothing baked into the rootfs beyond minimald itself.
+    // SFTP. The task is named on the wire as a `min://task/run` request and is
+    // serviced straight from this declaration — no `[upstream]`, package graph,
+    // or sandbox — so the guest needs no network and nothing baked into the
+    // rootfs beyond minimald itself.
     let mfile = format!("[tasks.echo_ok]\necho = \"{sentinel}\"\n");
 
     // Retry the whole session to absorb the post-READY startup race.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let mut result = Err("not attempted".to_string());
     for attempt in 1..=6 {
-        result = run_session_exec(&guest.sock_path, Some(&mfile), "min run echo_ok").await;
+        let task = minimald_rpc::exec::ExecRequest::TaskRun("echo_ok".to_string()).encode();
+        result = run_session_exec(&guest.sock_path, Some(&mfile), &task).await;
         if result.is_ok() {
             break;
         }
