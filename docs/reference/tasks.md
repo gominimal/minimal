@@ -116,6 +116,26 @@ declare the variable with the value `{ inherit = true }`:
 env_vars.TOKEN = { inherit = true }
 ```
 
+The parent process is the shell you run `min task run` in: the value is read
+on the client, at the moment you invoke the task, and carried to the session —
+the same way `[session.vars]` resolves at activation. So exporting the variable
+in your shell is enough, and the daemon's own environment is never consulted.
+
+A variable declared `inherit` but not set in that shell is an error, reported
+before the task's session is created:
+
+```console
+$ min task run deploy
+error: task 'deploy' declares `env_vars.TOKEN = { inherit = true }`, but TOKEN
+is not set in this shell; export it before running the task
+```
+
+This applies to `min task run` on the host. Running a declared task from
+*inside* a session (`min run <task>`) has no invoking client to read from, and
+an inherited variable there is still resolved against the daemon's
+environment — so prefer an explicit value for tasks meant to be run from
+inside a box.
+
 
 ### `interactive` - TUI apps and shells
 

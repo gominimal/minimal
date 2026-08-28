@@ -86,6 +86,16 @@ pub trait Process: Send + 'static {
 pub struct TaskExec {
     pub task: String,
     pub args: Option<args::ArgsSet>,
+    /// The task's `env_vars`, already resolved against the invoking shell
+    /// by the client and carried on the channel environment (see
+    /// [`minimald_rpc::taskenv`]). Applied over the task's own
+    /// declarations, so an `inherit` entry never reaches the daemon-side
+    /// `std::env::var` that cannot see the user's `export` (#585).
+    ///
+    /// Empty when the client sent none — an older `min`, or any caller
+    /// other than `min task run` — in which case resolution falls back to
+    /// the daemon-side path exactly as before.
+    pub env: BTreeMap<String, String>,
 }
 
 impl Exec for TaskExec {
@@ -166,10 +176,21 @@ async fn task_producer(
         .await
         .map_err(io::Error::other)?;
         let graph = graph_result.map_err(io::Error::other)?;
-        let (task, mut graph) = ctx
+        let (mut task, mut graph) = ctx
             .task(graph, &exec.task)
             .map_err(|e| io::Error::other(e.to_string()))?
             .ok_or_else(|| io::Error::other(format!("No such task: {}", exec.task)))?;
+        // Values the client resolved against the invoking shell win over the
+        // task's own declarations. That is what turns `{ inherit = true }`
+        // into something the daemon can apply: resolving it here would read
+        // *this* process's environment, which the user's `export` never
+        // reaches (#585). An entry the client did not send keeps whatever
+        // the task declared, so the daemon-side path still serves in-box
+        // `min run` and older clients.
+        for (name, value) in &exec.env {
+            task.vars
+                .insert(name.clone(), mfile::EnvVarValue::Value(value.clone()));
+        }
         // A task inherits its session's network isolation, through the same
         // sandbox2 `Network` seam the interactive session uses, rather than the
         // old hardcoded `HostNet` (which leaked host egress to a no-net
@@ -913,6 +934,12 @@ pub(crate) async fn handle_exec(
     }
     .to_string();
 
+    // A task's `env_vars`, resolved by the client against the invoking shell
+    // and carried on the channel environment (#585). Empty for every form
+    // but `min task run`, and empty from a client that predates it — in
+    // which case the task path resolves them the old way.
+    let task_env = minimald_rpc::taskenv::from_channel_env(&config.env_vars);
+
     let mut c = rem.split(' ');
     match c.next() {
         None => {
@@ -939,7 +966,11 @@ pub(crate) async fn handle_exec(
                     serv,
                     session: session_handle,
                     channel_id: id,
-                    exec: TaskExec { args: None, task },
+                    exec: TaskExec {
+                        args: None,
+                        task,
+                        env: task_env,
+                    },
                 };
                 exec_task.run(channel).await;
             });
@@ -969,7 +1000,11 @@ pub(crate) async fn handle_exec(
                     serv,
                     session: session_handle,
                     channel_id: id,
-                    exec: TaskExec { args: None, task },
+                    exec: TaskExec {
+                        args: None,
+                        task,
+                        env: task_env,
+                    },
                 };
                 exec_task.run(channel).await;
             });

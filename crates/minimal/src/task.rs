@@ -80,11 +80,15 @@ fn run_alias_message(task: Option<&str>) -> String {
     )
 }
 
-/// Verify `task` is declared in the project's `minimal.toml`, walking up
-/// from `dir` like the activate config discovery does. Errors name the fix:
-/// untrimmed name → the whitespace rejection; no config → `min init`;
-/// unknown task → the declared list.
-fn check_task_declared(dir: &camino::Utf8Path, task: &str) -> Result<(), anyhow::Error> {
+/// Look up `task` in the project's `minimal.toml`, walking up from `dir`
+/// like the activate config discovery does, and return its declaration.
+/// Errors name the fix: untrimmed name → the whitespace rejection; no
+/// config → `min init`; unknown task → the declared list.
+///
+/// The declaration comes back rather than being discarded because the
+/// client needs its `env_vars` to resolve them here — see
+/// [`resolve_task_env`].
+fn declared_task(dir: &camino::Utf8Path, task: &str) -> Result<mfile::Task, anyhow::Error> {
     // Rejected before any lookup: the daemon trims the task name out of the
     // exec command string, so a name with leading/trailing whitespace can
     // never round-trip into the box — even if minimal.toml declares it.
@@ -103,10 +107,47 @@ fn check_task_declared(dir: &camino::Utf8Path, task: &str) -> Result<(), anyhow:
             name = mfile::MFILE_NAME,
         ),
     };
-    if file.task(task).is_none() {
-        bail!(unknown_task_message(&file, task));
+    match file.task(task) {
+        Some(t) => Ok(t),
+        None => bail!(unknown_task_message(&file, task)),
     }
-    Ok(())
+}
+
+/// Resolve a task's declared `env_vars` against the invoking shell, so the
+/// values reach the daemon already resolved.
+///
+/// `{ inherit = true }` means "take this from the invoking process", and
+/// the only process that can honour it is this one. The daemon runs
+/// elsewhere — on macOS, inside the microVM — so its `std::env::var` reads
+/// the daemon's own environment, which the user's `export` never reaches
+/// (#585). `[session.vars]` has always resolved here, at activation, which
+/// is exactly why the two behaved differently in the same project.
+///
+/// Literal values are carried too, not just inherited ones: the daemon
+/// applies one consistent set rather than resolving half of them itself.
+///
+/// A variable that is declared `inherit` but unset is refused here, naming
+/// the task and the variable, instead of surfacing as the daemon's
+/// `failed to spawn process` after a session has already been built.
+fn resolve_task_env(
+    task: &mfile::Task,
+    task_name: &str,
+    env: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<std::collections::BTreeMap<String, String>, anyhow::Error> {
+    let mut resolved = std::collections::BTreeMap::new();
+    for (name, value) in &task.vars {
+        let value = match value {
+            mfile::EnvVarValue::Value(v) => v.clone(),
+            mfile::EnvVarValue::Inherit => env(name).map_err(|_| {
+                anyhow::anyhow!(
+                    "task '{task_name}' declares `env_vars.{name} = {{ inherit = true }}`, \
+                     but {name} is not set in this shell; export it before running the task"
+                )
+            })?,
+        };
+        resolved.insert(name.clone(), value);
+    }
+    Ok(resolved)
 }
 
 /// The whitespace rejection body: the name is debug-quoted so the offending
@@ -301,7 +342,13 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // The task must be declared before anything touches the daemon: a typo'd
     // name fails instantly, listing what IS declared, without a session ever
     // existing.
-    check_task_declared(&utf8_path, &args.task)?;
+    let declared = declared_task(&utf8_path, &args.task)?;
+
+    // Resolve the task's `env_vars` here, against this shell, and carry the
+    // values to the daemon on the exec channel (#585). Done alongside the
+    // declared-task check, before `ensure_daemon`, so an unset inherited
+    // variable also fails with no session built.
+    let task_env = resolve_task_env(&declared, &args.task, |k| std::env::var(k))?;
 
     crate::ensure_daemon(global)?;
 
@@ -550,7 +597,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     eprintln!("Running task {} in session {session_name}...", args.task);
 
     let outcome = match client
-        .open_session_exec_channel(id, &format!("min task run {}", args.task))
+        .open_session_exec_channel(id, &format!("min task run {}", args.task), &task_env)
         .await
     {
         Ok(channel) => bridge_exec(channel).await,
@@ -635,7 +682,7 @@ mod tests {
         // The rejection fires before the minimal.toml discovery: a path
         // that has no config still yields the whitespace error, not the
         // no-config one.
-        let err = check_task_declared(camino::Utf8Path::new("/nonexistent-task-test"), "build ")
+        let err = declared_task(camino::Utf8Path::new("/nonexistent-task-test"), "build ")
             .expect_err("an untrimmed name must be rejected");
         assert!(err.to_string().contains("whitespace"), "got: {err}");
     }
@@ -668,6 +715,82 @@ mod tests {
             "got: {err}"
         );
         assert!(err.downcast_ref::<TaskExit>().is_none());
+    }
+
+    /// Build a task declaration from TOML, for the env-resolution tests.
+    fn task_from_toml(toml: &str) -> mfile::Task {
+        mfile::File::from_toml_bytes(toml.as_bytes())
+            .unwrap()
+            .task("t")
+            .expect("the fixture declares task `t`")
+    }
+
+    /// The heart of #585: `{ inherit = true }` resolves against the
+    /// *invoking shell*, not the daemon. The resolver is handed the
+    /// client's env and must read the value from it, so what travels to
+    /// the daemon is a concrete value rather than an instruction the
+    /// daemon would carry out against its own environment.
+    #[test]
+    fn inherit_resolves_against_the_supplied_client_env() {
+        let task = task_from_toml(
+            "[tasks.t]\nenv_vars.ZZ_TASK_TOKEN = { inherit = true }\nexec = 'true'\n",
+        );
+
+        let out = resolve_task_env(&task, "t", |k| {
+            assert_eq!(k, "ZZ_TASK_TOKEN");
+            Ok("task-value-123".to_string())
+        })
+        .expect("an exported variable resolves");
+
+        assert_eq!(
+            out.get("ZZ_TASK_TOKEN").map(String::as_str),
+            Some("task-value-123")
+        );
+    }
+
+    /// A declared-but-unset inherited variable fails client-side, naming
+    /// the task and the variable, rather than reaching the daemon and
+    /// surfacing as `failed to spawn process` once a session already
+    /// exists.
+    #[test]
+    fn an_unset_inherited_var_fails_client_side_naming_the_fix() {
+        let task = task_from_toml(
+            "[tasks.t]\nenv_vars.ZZ_TASK_TOKEN = { inherit = true }\nexec = 'true'\n",
+        );
+
+        let err = resolve_task_env(&task, "t", |_| Err(std::env::VarError::NotPresent))
+            .expect_err("an unset inherited variable must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("task 't'"), "names the task: {msg}");
+        assert!(msg.contains("ZZ_TASK_TOKEN"), "names the variable: {msg}");
+        assert!(msg.contains("export it"), "names the fix: {msg}");
+    }
+
+    /// Literal values are carried alongside inherited ones, so the daemon
+    /// applies one consistent set instead of resolving half of them
+    /// itself. An empty inherited value is a value, not an absence.
+    #[test]
+    fn literals_are_carried_and_empty_inherited_values_survive() {
+        let task = task_from_toml(
+            "[tasks.t]\nenv_vars.LITERAL = 'fixed'\nenv_vars.EMPTY = { inherit = true }\nexec = 'true'\n",
+        );
+
+        let out = resolve_task_env(&task, "t", |_| Ok(String::new())).expect("resolves");
+        assert_eq!(out.get("LITERAL").map(String::as_str), Some("fixed"));
+        assert_eq!(out.get("EMPTY").map(String::as_str), Some(""));
+    }
+
+    /// A task declaring no `env_vars` sends nothing, which is the signal
+    /// the daemon reads as "resolve this the old way" — so the change is
+    /// inert for every task that does not inherit.
+    #[test]
+    fn a_task_without_env_vars_resolves_to_nothing() {
+        let task = task_from_toml("[tasks.t]\nexec = 'true'\n");
+        let out = resolve_task_env(&task, "t", |_| {
+            panic!("no variable should be looked up");
+        })
+        .expect("resolves");
+        assert!(out.is_empty());
     }
 
     /// `cmd_task_run` rejects a task the project's minimal.toml does not
