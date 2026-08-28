@@ -158,7 +158,9 @@ on_activate = { type = "inline", value = "cargo check --workspace >/dev/null 2>&
   `default = "..."` for a fallback when it is unset).
 - **`patches`**: `{ source, dest }` rows copying files into the session.
   `dest` is relative to the session user's home directory; `source` resolves
-  on the host, typically inside the repo.
+  on the host, typically inside the repo. The one expansion a loadout has
+  and a project does not is `$LOADOUT_ROOT`, which names a loadout's own
+  directory; referencing it here fails the activation.
 - **`lifecycle_hooks`**: Scripts declared for session transition points
   (`on_activate`, `on_destroy`, `on_attach`, `on_detach`), run inside the
   session under POSIX `sh` — or under whatever a leading shebang names, for

@@ -307,7 +307,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 
     let config = minimald_rpc::SessionConfig {
         name: Some(task_session_name(&args.task, &crate::random_hex4())),
-        project_path: abs_path,
+        project_path: abs_path.clone(),
         network: sessions::NetworkMode::HostNet,
         policy: sessions::SessionPolicy::default(),
         // Same default as an activate with no flags, matching the
@@ -334,8 +334,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     }
     // Same pre-daemon staging as an activate, so a broken hook script
     // path fails here rather than after the ephemeral session exists.
-    let hook_scripts =
-        crate::loadouts::stage_loadout_hook_scripts(&active, global, &utf8_path, true)?;
+    let hook_scripts = crate::loadouts::stage_loadout_hook_scripts(&active, &abs_path, true)?;
 
     // Same first-class orientation field as an activate: a `--keep`
     // task session is attachable later, and its banner should orient

@@ -6,7 +6,10 @@
 //! `dest` paths are inside the sandbox; `source` paths are on the
 //! host. Leading `~` in `source` expands at gate time against the
 //! host home; leading `~` in `dest` expands inside the sandbox at
-//! runtime.
+//! runtime. `$LOADOUT_ROOT` in a `source` expands to this loadout's
+//! own directory — `<loadouts dir>/<name>/`, beside the file — for
+//! files shipped with the loadout rather than kept in the user's
+//! dotfiles (see [`expansion::LOADOUT_ROOT`]).
 //!
 //! ```toml
 //! packages = ["helix", "zellij"]
@@ -25,6 +28,10 @@
 //!       source = "~/dotfiles/zellij/config.kdl" },
 //!     { dest = "~/.config/zellij/layouts/",
 //!       source = { base = "~/dotfiles/zellij/layouts", patterns = ["**/*.kdl"] } },
+//!
+//!     # This loadout's own file, shipped beside it in `<name>/`.
+//!     { dest = "~/.config/helix/ignore",
+//!       source = "$LOADOUT_ROOT/helix-ignore" },
 //! ]
 //!
 //! [vars]
@@ -40,6 +47,8 @@
 //! [[lifecycle_hooks]]
 //! on_activate = { type = "inline", value = "hx --grammar fetch >/dev/null 2>&1 || true" }
 //! ```
+//!
+//! [`expansion::LOADOUT_ROOT`]: crate::core::expansion::LOADOUT_ROOT
 
 use std::collections::BTreeMap;
 

@@ -187,6 +187,9 @@ so list entries only make sense with per-entry dests or glob entries):
   references (including `$HOME`) resolve against the session's
   already-resolved variables (declared in `[vars]`); referencing an
   undefined name is an error. `$$` is a literal `$`.
+- `$LOADOUT_ROOT` expands to the loadout's own directory, for files you
+  ship beside the loadout itself — see
+  [`$LOADOUT_ROOT`](#loadout_root) below.
 - After expansion the path must be absolute; anchor home-relative sources
   with `~/`.
 - Glob patterns must have a literal directory prefix to walk from:
@@ -220,7 +223,53 @@ readable only by you. Two qualifications:
 Ownership is not carried and cannot be: every file in the session belongs
 to the session user, whatever it was owned by on your host.
 
-### `[[lifecycle_hooks]]` - Scripts at session transition points
+#### `$LOADOUT_ROOT` - Files shipped with the loadout {#loadout_root}
+
+Not every file a loadout patches in belongs in your dotfiles. For the ones
+that exist only to serve this loadout, keep them beside it and name them
+with `$LOADOUT_ROOT`, which expands to a directory named after the loadout
+next to its `.toml` -- the same directory its
+[external hook scripts](#lifecycle_hooks) resolve against:
+
+```
+<config>/minimal/loadouts/
+├── dev.toml
+└── dev/
+    ├── config.toml
+    └── themes/
+        └── nord.toml
+```
+
+```toml
+patches = [
+    { dest = ".config/helix/config.toml", source = "$LOADOUT_ROOT/config.toml" },
+    { dest = ".config/helix/themes/",     source = "$LOADOUT_ROOT/themes/**/*.toml" },
+]
+```
+
+It resolves against the loadouts directory actually in use, so a
+`--config-dir` or `$XDG_CONFIG_HOME` that moves your config takes the
+loadout's files with it -- which a hard-coded `~/.config/minimal/loadouts/dev/`
+would not.
+
+Details worth knowing:
+
+- The reference is **only** available in the `source` of a patch a loadout
+  declared. In a [user policy](./user-policy.md) pattern, or in a patch a
+  project declared, it fails the activation rather than resolving to some
+  other declarer's directory. `dest` is a path inside the session, so it has
+  no use for it either.
+- The name is **reserved** here: a loadout that also declares a
+  `LOADOUT_ROOT` variable still patches from its own directory. The variable
+  reaches the session normally -- only patch sources ignore it.
+- `$LOADOUT_ROOT` alone names a directory, and a patch source matches files,
+  so it patches in nothing. Write `$LOADOUT_ROOT/**/*` to take the whole
+  tree.
+- The directory is optional. A loadout that never references it does not
+  need one, and -- like any other source -- a path that isn't there is
+  skipped with a warning rather than failing the activation.
+
+### `[[lifecycle_hooks]]` - Scripts at session transition points {#lifecycle_hooks}
 
 _Optional_
 
@@ -274,6 +323,9 @@ live in `dev/`:
     ├── activate.sh
     └── teardown.sh
 ```
+
+This is the same directory [`$LOADOUT_ROOT`](#loadout_root) names, so a
+loadout's scripts and the files it patches in live together.
 
 A script must resolve to a regular file inside that directory. Symlinks are
 rejected rather than followed, at every path component — a symlink is the one

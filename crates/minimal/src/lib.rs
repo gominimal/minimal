@@ -2041,7 +2041,7 @@ async fn activate_session(
     // connection context; the client doesn't send it.
     let config = minimald_rpc::SessionConfig {
         name: Some(session_name),
-        project_path: abs_path,
+        project_path: abs_path.clone(),
         network: args.network.into(),
         policy,
         hooks_enabled: !args.no_hooks,
@@ -2072,8 +2072,7 @@ async fn activate_session(
     // touches the daemon: a mistyped path, a symlinked script, or a
     // missing loadout script directory should fail here, on this
     // machine, rather than after a session exists on the daemon.
-    let hook_scripts =
-        loadouts::stage_loadout_hook_scripts(&active, global, &utf8_path, !args.no_hooks)?;
+    let hook_scripts = loadouts::stage_loadout_hook_scripts(&active, &abs_path, !args.no_hooks)?;
 
     // Same idea for the *project's* hooks, which the daemon composes from
     // the uploaded mfile and which therefore never pass through the
@@ -2081,7 +2080,7 @@ async fn activate_session(
     // its own scripts — but the checks a staging pass would have made are
     // still worth making on this machine, before a session exists.
     if !args.no_hooks {
-        loadouts::check_project_hooks(&utf8_path)?;
+        loadouts::check_project_hooks(&abs_path)?;
     }
 
     // The daemon runs the composition's `on_activate` hooks inside

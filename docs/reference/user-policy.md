@@ -128,6 +128,9 @@ the session's already-resolved variables at activation:
 - A leading `~/` expands to the host home directory.
 - `$NAME` / `${NAME}` references (including `$HOME`) resolve against the
   session vars; referencing an undefined name fails the activation.
+- `$LOADOUT_ROOT` is **not** available: a policy is yours, not any one
+  loadout's, so there is no loadout for it to name. Referencing it fails the
+  activation. Write the path out, or match with a glob.
 
 Unlike loadout patch **sources**, a policy pattern need not be absolute — it is
 a matcher, not a walk seed, so a bare `**/*.pem` matches any `.pem` path at any
