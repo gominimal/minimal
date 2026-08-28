@@ -2202,17 +2202,19 @@ async fn activate_session(
                 eprintln!("Uploading from project root {upload_root} (resolved from {utf8_path})");
             }
             // Guard against accidentally uploading a non-VCS directory
-            // (e.g. `~`). A VCS root uploads unconditionally. For a non-VCS
-            // root an interactive caller gets the confirm (default No); a
-            // headless caller (CI, pipes, agents, `--no-prompt`,
-            // `--no-input`) can't be asked, so it skips the upload with a
-            // warning rather than silently shipping a directory nobody
-            // confirmed — `--sync tarball` (via `sync_explicit`) is the
+            // (e.g. `~`). A VCS root, or a directory carrying a
+            // `minimal.toml` (a declared project), uploads unconditionally.
+            // For an undeclared non-VCS root an interactive caller gets the
+            // confirm (default No); a headless caller (CI, pipes, agents,
+            // `--no-prompt`, `--no-input`) can't be asked, so it skips the
+            // upload with a warning rather than silently shipping a directory
+            // nobody confirmed — `--sync tarball` (via `sync_explicit`) is the
             // escape hatch that force-uploads it anyway (#770).
             let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
             let should_upload = match file_upload::upload_gate(
                 file_upload::is_vcs_root(upload_root.as_std_path()),
                 sync_explicit,
+                project_has_mfile(&upload_root),
                 headless,
             ) {
                 file_upload::UploadGate::Upload => true,
@@ -2236,8 +2238,8 @@ async fn activate_session(
                         );
                     }
                     eprintln!(
-                        "warning: {upload_root} is not a version control repository root; \
-                         skipping file upload (pass --sync tarball to upload anyway)"
+                        "{}",
+                        file_upload::skipped_upload_warning(upload_root.as_std_path())
                     );
                     false
                 }
