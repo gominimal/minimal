@@ -971,6 +971,88 @@ LOADOUT
   rm -f "$XDG_CONFIG_HOME/minimal/loadouts/patchmode.toml"
   echo "patch file modes proof OK (0755 runs, 0600 stays private)"
   echo "::endgroup::"
+
+  # -- The session shell -----------------------------------------------------
+  # A loadout's `SHELL` picks the shell the attach mints, when the session has
+  # it installed. Only an interactive attach can show this: `min session exec`
+  # runs `bash -c` through nsenter and never touches the session shell, so it
+  # would pass no matter what got spawned. Both cases below need no extra
+  # package — `sh` is a symlink the `bash` package ships, and `zsh` is the
+  # not-installed case precisely because nothing pulls it in.
+  #
+  # `$0` is the assertion, not `$SHELL`: it is the shell's own argv[0], so it
+  # reports the process that is actually running rather than a variable the
+  # daemon also sets. Wrapped in `printf` so the marker appears only in the
+  # OUTPUT — the pty echoes what we type, and a bare `echo` of the marker would
+  # match its own echo.
+  echo "::group::session shell from a loadout's SHELL"
+  mkdir -p "$XDG_CONFIG_HOME/minimal/loadouts"
+  printf 'description = "e2e session shell"\n\n[vars]\nSHELL = "/usr/bin/sh"\n' \
+    > "$XDG_CONFIG_HOME/minimal/loadouts/shelldev.toml"
+  # Not installed in this session, so this one must fall back to bash and say
+  # so on the terminal.
+  printf 'description = "e2e missing shell"\n\n[vars]\nSHELL = "/usr/bin/zsh"\n' \
+    > "$XDG_CONFIG_HOME/minimal/loadouts/shellmissing.toml"
+  HOOK_SEED_DIR="$(hook_mktemp /tmp/mnlsh.XXXXXX)"
+  hook_seed_preamble > "$HOOK_SEED_DIR/minimal.toml"
+  mkdir "$HOOK_SEED_DIR/.git"
+
+  sh_sid="$(cd "$HOOK_SEED_DIR" && mnl session activate . --no-prompt --loadout shelldev 2>"$WORK/shell-sh.err")" || {
+    echo "::error::activation with a SHELL-carrying loadout failed"
+    echo "--- stderr ---"; cat "$WORK/shell-sh.err" 2>/dev/null || true
+    fail
+  }
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  # shellcheck disable=SC2016 # `$0` must reach the SESSION's shell unexpanded.
+  sh_out="$(E2E_PTY_COMMANDS='printf "SESSION_SHELL_IS[%s]\n" "$0"
+exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+    min ${E2E_MINIMAL_ARGS:-} session attach "$sh_sid" \
+    2>"$WORK/shell-sh-attach.err")" || {
+    echo "::error::pty attach for the session-shell proof failed"
+    echo "--- transcript ---"; printf '%s\n' "$sh_out"
+    echo "--- stderr ---"; cat "$WORK/shell-sh-attach.err" 2>/dev/null || true
+    fail
+  }
+  if [[ "$sh_out" != *"SESSION_SHELL_IS[/usr/bin/sh]"* ]]; then
+    echo "::error::loadout SHELL=/usr/bin/sh did not become the session shell"
+    echo "--- transcript ---"; printf '%s\n' "$sh_out"
+    fail
+  fi
+  echo "declared shell OK (SHELL=/usr/bin/sh started sh, not bash)"
+
+  # The fallback: a shell that isn't installed leaves bash running AND tells
+  # the user why, on the terminal, before the first prompt.
+  miss_sid="$(cd "$HOOK_SEED_DIR" && mnl session activate . --no-prompt --loadout shellmissing 2>"$WORK/shell-missing.err")" || {
+    echo "::error::activation with an uninstalled SHELL failed"
+    echo "--- stderr ---"; cat "$WORK/shell-missing.err" 2>/dev/null || true
+    fail
+  }
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  # shellcheck disable=SC2016 # `$0` must reach the SESSION's shell unexpanded.
+  miss_out="$(E2E_PTY_COMMANDS='printf "SESSION_SHELL_IS[%s]\n" "$0"
+exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+    min ${E2E_MINIMAL_ARGS:-} session attach "$miss_sid" \
+    2>"$WORK/shell-missing-attach.err")" || {
+    echo "::error::pty attach for the shell-fallback proof failed"
+    echo "--- transcript ---"; printf '%s\n' "$miss_out"
+    echo "--- stderr ---"; cat "$WORK/shell-missing-attach.err" 2>/dev/null || true
+    fail
+  }
+  if [[ "$miss_out" != *"SESSION_SHELL_IS[/usr/bin/bash]"* ]]; then
+    echo "::error::an uninstalled SHELL did not fall back to bash"
+    echo "--- transcript ---"; printf '%s\n' "$miss_out"
+    fail
+  fi
+  if [[ "$miss_out" != *"min add --session zsh"* ]]; then
+    echo "::error::the fallback notice did not reach the terminal"
+    echo "--- transcript ---"; printf '%s\n' "$miss_out"
+    fail
+  fi
+  rm -rf "$HOOK_SEED_DIR"; HOOK_SEED_DIR=""
+  rm -f "$XDG_CONFIG_HOME/minimal/loadouts/shelldev.toml"
+  rm -f "$XDG_CONFIG_HOME/minimal/loadouts/shellmissing.toml"
+  echo "shell fallback proof OK (bash started, notice names the package)"
+  echo "::endgroup::"
 fi
 # ---------------------------------------------------------------------------
 # Session-sandbox proof (every lane). Everything above proves the lifecycle;
