@@ -152,6 +152,27 @@ minimal-cli:
 minimald-build:
     cargo build -p minimald --features {{features}} --locked
 
+# THE single build entrypoint for a shippable build: the four release binaries
+# for a target triple, built exactly the way release.yml's build jobs build
+# them (they call this same script), plus completions from the built `min`.
+# Per-package invocations (fat-LTO links serialize), FEATURES for the guest
+# minimald, and the fail-loud static-libkrun requirement for minvmd live in
+# scripts/dist-build.sh — read its header for the LIBKRUN_PREFIX /
+# COMPLETIONS_DIR / FEATURES env knobs.
+#
+# Build the shippable binaries + completions for a target triple (e.g. just dist-build x86_64-unknown-linux-musl).
+dist-build target:
+    scripts/dist-build.sh {{target}}
+
+# Build the .deb/.rpm/.apk packages for a staged semver release from the
+# installer bucket via the pinned nfpm (fetched + sha256-verified by the
+# script). Packages land in dist/. Apt/dnf/apk repo-tree hosting lives in the
+# infra repo, not here.
+#
+# Package a staged semver's Linux artifacts, e.g. `just pkg-nfpm 0.5.3`.
+pkg-nfpm pkgver:
+    PKGVER={{pkgver}} scripts/package-nfpm.sh
+
 # ── run & inspect ────────────────────────────────────────────────────────────
 
 # Run the dev-built `min` CLI, args forwarded (e.g. `just min loadout list`).
