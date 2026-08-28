@@ -304,6 +304,7 @@ async fn serve_create_session(
                         id,
                         daemon_version: Some(OWN_VERSION.to_string()),
                         hostname_routing_unavailable: s.proxy_unavailable().await,
+                        mtls_proxy_unavailable: s.mtls_unavailable().await,
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {

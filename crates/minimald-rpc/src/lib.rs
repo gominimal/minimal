@@ -444,6 +444,15 @@ pub struct CreateSessionResponse {
     /// looking healthy either way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname_routing_unavailable: Option<String>,
+    /// Why the mTLS reverse proxy is not serving, when it is not — see
+    /// [`ListSessionsResponse::mtls_proxy_unavailable`].
+    ///
+    /// Here for the same reason as the field above it: both proxies are
+    /// daemon-wide rather than session-scoped, so the thing that decides
+    /// whether activation should mention them is whether the person
+    /// activating is about to depend on one, and that is not ours to know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtls_proxy_unavailable: Option<String>,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -1400,6 +1409,7 @@ mod tests {
             id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
             daemon_version: Some("0.6.0".into()),
             hostname_routing_unavailable: None,
+            mtls_proxy_unavailable: None,
         };
         assert_eq!(round_trip(&resp), resp);
     }
@@ -1421,7 +1431,10 @@ mod tests {
         )
         .expect("a pre-field CreateSession reply must still decode");
         match create {
-            Errorable::Ok(c) => assert!(c.hostname_routing_unavailable.is_none()),
+            Errorable::Ok(c) => {
+                assert!(c.hostname_routing_unavailable.is_none());
+                assert!(c.mtls_proxy_unavailable.is_none());
+            }
             Errorable::Err { error } => panic!("expected Ok, got {error}"),
         }
     }

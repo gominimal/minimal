@@ -1429,9 +1429,7 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // is exactly what will go on using hostnames that no longer resolve — and
     // stdout stays clean for the parser either way.
     warn_if_hostname_routing_down(resp.hostname_routing_unavailable.as_deref());
-    if let Some(reason) = resp.mtls_proxy_unavailable.as_deref() {
-        eprintln!("warning: the mTLS reverse proxy is not serving: {reason}");
-    }
+    warn_if_mtls_proxy_down(resp.mtls_proxy_unavailable.as_deref());
     format_ls(&mut std::io::stdout(), &args, &resp)?;
     Ok(())
 }
@@ -1445,6 +1443,17 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
 fn warn_if_hostname_routing_down(reason: Option<&str>) {
     if let Some(reason) = reason {
         eprintln!("warning: session hostnames will not route: {reason}");
+    }
+}
+
+/// Tells the user the mTLS reverse proxy is not serving, and why.
+///
+/// Kept separate from [`warn_if_hostname_routing_down`] so the two faults read
+/// as what they are: hostnames failing to resolve and TLS termination being
+/// absent are different problems with different fixes.
+fn warn_if_mtls_proxy_down(reason: Option<&str>) {
+    if let Some(reason) = reason {
+        eprintln!("warning: the mTLS reverse proxy is not serving: {reason}");
     }
 }
 
@@ -2185,6 +2194,7 @@ async fn activate_session(
     // unfinalized for the daemon to reap when this connection drops.
     ensure_version_reported(created.daemon_version.as_deref())?;
     warn_if_hostname_routing_down(created.hostname_routing_unavailable.as_deref());
+    warn_if_mtls_proxy_down(created.mtls_proxy_unavailable.as_deref());
     let id = created.id;
 
     // From here the session exists on the daemon in an unfinalized state.
