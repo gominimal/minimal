@@ -1143,11 +1143,32 @@ fn duplicate_session_warning(
         .iter()
         .find(|e| e.project_path.as_ref() == Some(target))?;
     let handle = entry_handle(existing);
-    Some(format!(
+    let lead = format!(
         "warning: a session already exists for this path ({handle}); activating \
-         creates a second one, leaving bare `min` here ambiguous between them. \
-         To reuse it instead: min session attach {handle}"
-    ))
+         creates a second one, leaving bare `min` here ambiguous between them."
+    );
+    // Only point at `attach` for a session it will actually accept. Attach
+    // refuses anything not yet `Active` (see `sessions::SessionStatus`), so for
+    // a `Pending`/`Materializing` duplicate the reuse command would fail
+    // immediately — say to wait instead. When we do suggest it, use a key
+    // `SessionLookup::parse` can resolve: a name matches by name and the full id
+    // parses as a UUID, but the short unnamed handle would parse as a
+    // nonexistent name and the attach lookup would miss.
+    match existing.status {
+        sessions::SessionStatus::Active => {
+            let key = existing
+                .name
+                .clone()
+                .unwrap_or_else(|| existing.id.to_string());
+            Some(format!(
+                "{lead} To reuse it instead: min session attach {key}"
+            ))
+        }
+        _ => Some(format!(
+            "{lead} The existing session is still being created; wait for it to \
+             become active, then reuse it instead of creating a second."
+        )),
+    }
 }
 
 /// Abbreviate a home-prefixed path to `~`/`~/...` for display; any other
@@ -2147,12 +2168,15 @@ async fn activate_session(
 
     // Warn before minting a second session for a path that already has one:
     // the duplicate leaves bare `min` from this directory ambiguous between
-    // them. Advisory only — activation still proceeds — and it folds onto a
-    // `ListSessions` reply, which also carries the daemon-build assertion the
-    // `CreateSession` below would otherwise be first to make.
-    let existing_sessions = list_sessions_version_gated(&mut client).await?;
-    if let Some(warning) =
-        duplicate_session_warning(&existing_sessions.sessions, &config.project_path)
+    // them. Advisory only — a listing failure (ordinary transport or
+    // daemon-side error) must not block activation, so the error is swallowed
+    // and the duplicate check skipped. The hard version gate is unaffected:
+    // `CreateSession` below carries its own `must_match_version`, so a
+    // version-skewed daemon is still refused there even when this enumeration
+    // is skipped.
+    if let Ok(existing_sessions) = list_sessions_version_gated(&mut client).await
+        && let Some(warning) =
+            duplicate_session_warning(&existing_sessions.sessions, &config.project_path)
     {
         eprintln!("{warning}");
     }
@@ -4337,6 +4361,54 @@ mod tests {
         assert!(
             duplicate_session_warning(&entries, &free).is_none(),
             "an untaken path does not warn"
+        );
+    }
+
+    /// An unnamed existing session must still be reusable: the reuse hint must
+    /// carry the full id, which `SessionLookup::parse` resolves back to an id.
+    /// The short unnamed handle would parse as a nonexistent name, so the attach
+    /// lookup would miss.
+    #[test]
+    fn duplicate_session_warning_reuses_unnamed_session_by_id() {
+        let id = "019f5d0f-0a99-78b1-9165-0809440f0052";
+        let entries = vec![twin_entry(
+            id,
+            None,
+            Some("/w"),
+            sessions::SessionStatus::Active,
+        )];
+
+        let taken = paths::HostAbsPath::try_new("/w").unwrap();
+        let warning = duplicate_session_warning(&entries, &taken)
+            .expect("a session on the target path must warn");
+        assert!(
+            warning.contains(&format!("min session attach {id}")),
+            "unnamed reuse hint carries the full id, got: {warning}"
+        );
+        // The id the hint prints must resolve through the attach lookup path.
+        assert!(
+            matches!(SessionLookup::parse(id), SessionLookup::Id(_)),
+            "the full id resolves as an id, not a name"
+        );
+    }
+
+    /// Attach refuses a `Materializing` session, so the warning must not point
+    /// at it; the duplicate is still flagged, just without an attach hint.
+    #[test]
+    fn duplicate_session_warning_skips_attach_for_materializing() {
+        let entries = vec![twin_entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            Some("/w"),
+            sessions::SessionStatus::Materializing,
+        )];
+
+        let taken = paths::HostAbsPath::try_new("/w").unwrap();
+        let warning = duplicate_session_warning(&entries, &taken)
+            .expect("a session on the target path must warn");
+        assert!(
+            !warning.contains("min session attach"),
+            "no attach hint for a non-attachable session, got: {warning}"
         );
     }
 
