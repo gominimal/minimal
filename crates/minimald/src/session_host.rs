@@ -2304,6 +2304,20 @@ impl SessionLauncher for SandboxLauncher {
             composition_vars,
             attach_env.connection,
         );
+        // Which shell this attach starts is decided from the composed
+        // `SHELL` (see `crate::session_shell`). Read before `env_vars`
+        // moves into the env build; the rootfs it has to be checked
+        // against doesn't exist until that build has run.
+        let requested_shell = env_vars.get("SHELL").cloned();
+        // Whether anything composed a prompt. `sandbox2` sets a
+        // bash-syntax `PS1` as the session default, which a shell that
+        // doesn't speak those escapes prints literally — so a non-bash
+        // shell gets its own (see `ShellChoice::prompt`), but only when
+        // the user hasn't asked for a specific prompt themselves.
+        let composed_prompt = env_vars.contains_key("PS1");
+        // For the log line on the fallback path, which fires after
+        // `name` has moved into `EnvArgs`.
+        let session_label = name.clone();
         // Log every item that will (or would) end up in the session,
         // tagged with its provenance. Patches and lifecycle hooks are
         // included even though the launcher can't act on them yet —
@@ -2344,30 +2358,52 @@ impl SessionLauncher for SandboxLauncher {
             container.set_session_leader();
 
             let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
-            // The `bash` package installs to `/usr/bin/bash` (--prefix=/usr) and
-            // the generic rootfs has no `/bin/bash`, so exec the absolute path
-            // that exists rather than `/bin/bash` (which fails with ENOENT).
-            // `--rcfile` rather than `-l`: this build of bash has no
-            // `/etc/bash.bashrc`, so the daemon's per-attach environment hook
-            // has no shell-owned integration point to live in and must be
-            // named on the argv — and bash consults `--rcfile` only for an
-            // interactive *non-login* shell. Nothing is lost: `--noprofile`
-            // already suppressed every file `-l` would have read, so the
-            // session shell read nothing before this and still reads nothing
-            // but the daemon's own rc (a user `~/.bashrc` stays unread).
-            // `-i` is explicit rather than inferred from the pty.
+            // The shell, and the argv it needs to reach the daemon's
+            // per-attach environment hook. Every program path here is
+            // absolute (`/usr/bin/<shell>`): packages install with
+            // `--prefix=/usr` and the generic rootfs has no `/bin`, so a
+            // bare name or a `/bin/…` path would fail with ENOENT.
+            let shell = crate::session_shell::resolve(requested_shell.as_deref(), &env.rootfs());
+            if let Some(notice) = &shell.fallback {
+                tracing::warn!(
+                    session = %session_label,
+                    requested = requested_shell.as_deref().unwrap_or_default(),
+                    "{notice}",
+                );
+                // Onto the pty's *slave* — that is the shell's stdout, so
+                // the line reaches the attached terminal ahead of the
+                // first prompt. Writing to the master would feed it to
+                // the shell as input instead. Best-effort: a session that
+                // comes up must not fail over a notice, and the log above
+                // has already recorded it. CRLF because this is a raw
+                // terminal write, not a line through the shell.
+                let written = pty.dup_slave_fd().and_then(|fd| {
+                    use std::io::Write as _;
+                    std::fs::File::from(fd).write_all(format!("minimal: {notice}\r\n").as_bytes())
+                });
+                if let Err(e) = written {
+                    tracing::debug!(error = %e, "could not print the shell notice to the terminal");
+                }
+            }
             let mut command = env
-                .command(
-                    &container,
-                    "/usr/bin/bash",
-                    [
-                        "--noprofile",
-                        "--rcfile",
-                        crate::env::ATTACH_ENV_BASH_RC,
-                        "-i",
-                    ],
-                )
+                .command(&container, &shell.program, shell.args.iter().copied())
                 .map_err(|e| io::Error::other(format!("build command: {e}")))?;
+            // Name the shell that is actually running. The composed
+            // value is a path on the machine the loadout was authored on
+            // (`/opt/homebrew/bin/fish`), which resolves to nothing
+            // in-session, and on the fallback path it names a shell that
+            // isn't the one at this prompt.
+            command.env("SHELL", &shell.program);
+            // The session default `PS1` is bash's, so a shell with its
+            // own prompt grammar needs the equivalent in that grammar —
+            // handed the bash one, zsh renders `\[\033[…\]\u@\h` as
+            // literal text. Skipped when the composition set `PS1`: that
+            // is the user's own prompt, in whatever syntax they meant.
+            if let Some(prompt) = shell.prompt
+                && !composed_prompt
+            {
+                command.env("PS1", prompt);
+            }
             command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
             command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
             let tty_path = pty.slave_path().to_path_buf();
@@ -3854,6 +3890,36 @@ mod tests {
         assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color")); // connection > composition
         assert_eq!(env.get("EDITOR").map(String::as_str), Some("hx")); // composition-only survives
         assert_eq!(env.len(), 5);
+    }
+
+    /// A composed `SHELL` reaches the layered map, which is the input
+    /// the launcher hands [`crate::session_shell::resolve`] to pick the
+    /// shell it spawns. Nothing else sets the key — the sandbox's
+    /// `/usr/bin/bash` default lives a layer below this, inside
+    /// `sandbox2`'s `command_env` — so its absence here is exactly the
+    /// "no shell was asked for" case that keeps bash the default.
+    #[test]
+    fn a_composed_shell_reaches_the_layered_env() {
+        let sv = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let without = layer_session_env(
+            session_baseline_env("box-1", None),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            without.get("SHELL"),
+            None,
+            "nothing but a composition may name the session's shell",
+        );
+
+        let with = layer_session_env(
+            session_baseline_env("box-1", None),
+            Vec::new(),
+            vec![sv("SHELL", "/usr/bin/fish")],
+            Vec::new(),
+        );
+        assert_eq!(with.get("SHELL").map(String::as_str), Some("/usr/bin/fish"));
     }
 
     /// The per-attach environment is written in each shell's own syntax, with
