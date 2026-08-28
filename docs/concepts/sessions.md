@@ -241,6 +241,35 @@ hosts; a **sandbox** is the isolated execution context composed from a package
 closure; and a **task** is a declared command that runs in such a sandbox. Your
 project config and loadouts decide what goes into all three.
 
+## Reaching the host from inside a session
+
+A session is isolated from the machine you launched it on, but it can still
+reach services listening on that machine — a database on `5432`, a dev server on
+`3000`, a secrets broker on a loopback port. The address to use is
+**`host.min.internal`**.
+
+```sh
+curl http://host.min.internal:3000/
+psql -h host.min.internal -p 5432
+```
+
+Use the name, never a literal address. The address behind it is not one value:
+it depends on which provider hosts the session and on the session's network
+mode, because those decide which network namespace the session's processes live
+in.
+
+| Provider | `--network` | Resolves to |
+|---|---|---|
+| `local-minvmd` (the only provider on macOS) | `host-net` (default) | the switch host alias — the session is inside a microVM, and the host is off-VM |
+| `local-minimald` (Linux default) | `host-net` (default) | `127.0.0.1` — the session shares the host's own network namespace |
+| either | `own-ip` | the switch host alias — the session has its own namespace behind the gvproxy switch |
+| either | `no-net` | nothing. A `no-net` session has no path to the host, so the name does not resolve |
+
+Minimal resolves the right address when the session's sandbox is composed and
+publishes it in the sandbox's `/etc/hosts`. Nothing inside the session needs to
+know which case it is in, and the underlying addresses can change without
+breaking anything written against the name.
+
 ## See also
 
 - [`min` command reference](../reference/cli-min.md) for every command and flag.

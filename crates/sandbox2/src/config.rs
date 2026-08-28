@@ -198,6 +198,16 @@ pub struct Config {
     /// (which does not) — so DNS is not tied to the presence of tap params.
     /// `None` keeps the host-derived resolver.
     pub own_ip_dns: Option<std::net::Ipv4Addr>,
+    /// The address that reaches the provider's host from inside this sandbox,
+    /// published in `/etc/hosts` as [`crate::hosts::HOST_ALIAS_NAME`].
+    ///
+    /// Provider- and mode-dependent (`127.0.0.1` for a host-net sandbox on a
+    /// native daemon, the gvproxy host alias in a microVM or on own-IP), so the
+    /// caller resolves it and passes the answer down; see
+    /// `minimald::net::host_alias_target`. `None` writes no `/etc/hosts` at all,
+    /// which is the right answer for a `NoNet` sandbox (the host is unreachable)
+    /// and for build sandboxes, which have no provider host to name.
+    pub host_alias: Option<std::net::Ipv4Addr>,
 
     /// The hostname to set in the environment, if any.
     pub hostname: Option<String>,
@@ -382,6 +392,7 @@ impl Config {
             network: None,
             own_ip_tap: None,
             own_ip_dns: None,
+            host_alias: None,
             env_vars: HashMap::with_capacity(12),
             hostname: None,
             username: None,
@@ -497,6 +508,14 @@ impl Config {
     /// resolver. `None` keeps the host-derived resolver.
     pub fn with_own_ip_dns(mut self, dns: Option<std::net::Ipv4Addr>) -> Self {
         self.own_ip_dns = dns;
+        self
+    }
+    /// Sets the address `host.min.internal` resolves to inside this sandbox —
+    /// the provider host as seen from *this* namespace. `None` (the default)
+    /// writes no `/etc/hosts`, leaving the name unresolvable, which is what a
+    /// `NoNet` sandbox and a build sandbox both want.
+    pub fn with_host_alias(mut self, host_alias: Option<std::net::Ipv4Addr>) -> Self {
+        self.host_alias = host_alias;
         self
     }
     /// Sets whether DNS should be configured.

@@ -197,6 +197,7 @@ pub struct EnvArgs {
     network_mode: NetworkMode,
     own_ip_tap: Option<sandbox2::config::OwnIpTap>,
     own_ip_dns: Option<std::net::Ipv4Addr>,
+    host_alias: Option<std::net::Ipv4Addr>,
     /// Weak handle to the owning session actor, wired into the command channel
     /// so in-sandbox `min` commands can drive session side-ops (e.g. builds).
     /// Every session env has one — this `Env` is always session-scoped.
@@ -235,6 +236,7 @@ impl EnvArgs {
             network_mode: NetworkMode::HostNet,
             own_ip_tap: None,
             own_ip_dns: None,
+            host_alias: None,
             session,
             include_package_attr_wiring: true,
         }
@@ -327,6 +329,16 @@ impl EnvArgs {
     #[must_use]
     pub fn with_own_ip_dns(mut self, dns: Option<std::net::Ipv4Addr>) -> Self {
         self.own_ip_dns = dns;
+        self
+    }
+
+    /// Sets the address the session's `/etc/hosts` publishes as
+    /// [`crate::net::HOST_ALIAS_NAME`] — the provider host as reachable from
+    /// this session's namespace. Resolved by
+    /// [`crate::net::host_alias_target`]; `None` publishes no name.
+    #[must_use]
+    pub fn with_host_alias(mut self, host_alias: Option<std::net::Ipv4Addr>) -> Self {
+        self.host_alias = host_alias;
         self
     }
 }
@@ -501,6 +513,9 @@ impl Env {
             // vsock-shuttle path. DNS is set on every own-IP sandbox.
             .with_own_ip_tap(args.own_ip_tap)
             .with_own_ip_dns(args.own_ip_dns)
+            // `host.min.internal` → whatever reaches the provider host from this
+            // session's namespace; `None` for `NoNet`, which has no such address.
+            .with_host_alias(args.host_alias)
             .with_hostname(args.name.clone())
             .with_daemon_id(ctx.daemon_id().unwrap()) // Always set under minimald
             .with_username(args.username.unwrap_or_else(|| "user".to_string()));
