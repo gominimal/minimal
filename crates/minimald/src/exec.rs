@@ -842,14 +842,16 @@ where
 ///
 /// Accepted forms are:
 ///  * `git-receive-pack min://<session ID>` - handles a git receive-pack, routing
-///    with the trailing session ID
-///  * `min task run <task>` (canonical) or `min run <task>` (legacy alias) -
-///    runs a task, routed via a `MINIMAL_SESSION_ID` env var that must be set
-///    on the channel by the client
-///  * `min package build <args>` - builds package(s), routed via a
-///    `MINIMAL_SESSION_ID` env var that must be set on the channel by the client
-///  * `min check <args>` - lints the session's `minimal.toml`, packages,
-///    profiles, and stacks, routed the same way as `min package build`
+///    with the trailing session ID. Matched before the vocabulary below, and
+///    not part of it: git speaks the pack protocol, not exec requests.
+///  * a [`minimald_rpc::exec::ExecRequest`], which is where the rest of the
+///    vocabulary is defined. The daemon-serviced forms — `min://task/run`,
+///    `min://package/build` and `min://check` — are each routed via a
+///    `MINIMAL_SESSION_ID` env var that must be set on the channel by the
+///    client. `min://shell` and `min://argv` are handed to the session.
+///  * anything else: a shell command for the session. Nothing about a
+///    command's text routes it, so a session command can never be mistaken
+///    for one of the daemon's own (gominimal/inbox#558).
 pub(crate) async fn handle_exec(
     argv: &[u8],
     serv: ServerStateHandle,

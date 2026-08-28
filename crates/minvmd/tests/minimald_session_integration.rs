@@ -188,9 +188,15 @@ async fn minimald_exec_over_bridge() {
 
     let (stdout, exit) = result.unwrap_or_else(|e| panic!("minimald_session_integration: {e}"));
     eprintln!("minimald_session_integration: exec stdout={stdout:?} exit={exit:?}");
-    assert!(
-        stdout.trim() == sentinel,
-        "expected stdout {sentinel:?}, got {stdout:?}"
+    // Exact, not trimmed: the task's output is the whole of stdout, and the
+    // in-process twin (`minimald::exec` `exec_runs_echo_task`) asserts the same
+    // bytes. A trimming compare would swallow anything that leaked in
+    // alongside it — including the leading blank line the old
+    // argv-through-a-shell bug produced (gominimal/inbox#558).
+    assert_eq!(
+        stdout,
+        format!("{sentinel}\n"),
+        "expected stdout {sentinel:?} and nothing else, got {stdout:?}"
     );
     assert_eq!(exit, Some(0), "expected exit status 0, got {exit:?}");
 }
