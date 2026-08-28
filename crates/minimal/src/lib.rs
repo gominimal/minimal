@@ -1782,7 +1782,10 @@ async fn upload_and_finalize(
                 // hook actually said is its captured output. Echo it to
                 // stderr — stdout is reserved for the bare session id.
                 if !hook.output.is_empty() {
-                    eprintln!("{}", hook.output.trim_end());
+                    eprint!("{}", hook.output);
+                    if !hook.output.ends_with('\n') {
+                        eprintln!();
+                    }
                 }
             }
             Ok(())
