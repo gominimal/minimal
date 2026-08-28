@@ -13,6 +13,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sessions::SessionId;
 
+pub mod exec;
 pub mod trace;
 
 pub use sessions::{EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy};

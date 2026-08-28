@@ -232,9 +232,10 @@ test run, a linter) that executes in a freshly composed sandbox built from the
 packages that task needs. If a needed package is not present, Minimal builds it
 or fetches it from a remote cache first. Loadouts contribute to the session's
 interactive shell only, never to tasks, so your personal tooling cannot
-influence a task's deterministic execution. Running `min session exec <session> min run
-<task>` is the non-interactive way to trigger a declared task against a
-session.
+influence a task's deterministic execution. Running `min task run <task>` is
+the non-interactive way to trigger a declared task; `min session run <session>
+<task>` runs one against a session you already have, rather than composing a
+task session of its own.
 
 The through-line: a **session** is the durable, named environment a provider
 hosts; a **sandbox** is the isolated execution context composed from a package

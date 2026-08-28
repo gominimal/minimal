@@ -339,6 +339,32 @@ if [ "$rc" -ne 7 ]; then
   echo "::error::'min session exec \"exit 7\"' exited $rc (expected the command's 7)"
   fail
 fi
+# A multi-word argv must reach the session with the quoting the local shell
+# already removed. ssh has no argv on the wire — it joins its trailing
+# arguments with spaces and the far side reshells the result — so passing them
+# through word by word let `sh -c` take LINE1 as its `$0`, so it never printed.
+# The client now sends a `min://argv` request carrying the words as data
+# (gominimal/inbox#558).
+argv_out="$(mnl session exec "$sid" sh -c 'echo LINE1; echo LINE2' 2>"$WORK/exec-argv.err")" || {
+  echo "::error::'min session exec $sid sh -c ...' failed"
+  echo "--- stderr ---"; cat "$WORK/exec-argv.err" 2>/dev/null || true
+  fail
+}
+if [ "$argv_out" != "$(printf 'LINE1\nLINE2')" ]; then
+  echo "::error::multi-word argv lost its quoting: expected 'LINE1/LINE2', got '$argv_out'"
+  fail
+fi
+# A command that merely looks like one of the daemon's own belongs to the
+# session. The daemon used to claim every string starting with `min ` and refuse
+# what it did not recognise, which made the session's own `min` unreachable
+# through exec; only the `min://` scheme addresses the daemon now.
+lookalike_err="$WORK/exec-lookalike.err"
+mnl session exec "$sid" 'min --version' >"$WORK/exec-lookalike.out" 2>"$lookalike_err"
+if grep -q "unsupported command" "$lookalike_err"; then
+  echo "::error::the daemon hijacked a session command instead of routing it"
+  echo "--- stderr ---"; cat "$lookalike_err"
+  fail
+fi
 echo "session exec proof OK"
 echo "::endgroup::"
 
@@ -421,6 +447,31 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     mnl ls 2>&1 || true
     fail
   fi
+  # `min session run <session> <task>` runs a declared task against a session
+  # that already exists, rather than composing one of its own. It reaches the
+  # daemon as a named `min://task/run` form, so nothing about the task's name
+  # is inferred from the text — the routing a bare string used to decide by
+  # prefix-sniffing (gominimal/inbox#558).
+  sr_out="$(mnl session run "$kept" e2e-echo 2>"$WORK/session-run.err")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::'min session run $kept e2e-echo' exited $rc (expected 0)"
+    echo "--- stderr ---"; cat "$WORK/session-run.err" 2>/dev/null || true
+    fail
+  fi
+  if [[ "$sr_out" != *TASK_RUN_E2E_OK* ]]; then
+    echo "::error::'min session run' did not stream the task's output, got '$sr_out'"
+    fail
+  fi
+  # The task's exit code is the client's, as it is for `min task run`.
+  mnl session run "$kept" e2e-fail >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -ne 7 ]; then
+    echo "::error::'min session run $kept e2e-fail' exited $rc (expected 7)"
+    fail
+  fi
+  echo "session run proof OK (task in an existing session, exit relay 7 → 7)"
+
   # The destroy dirty gate: the kept session's task process has exited, so
   # no host is running and its at-risk state is unknowable — the gate must
   # refuse a headless (no TTY) destroy without --force, naming the escape
