@@ -232,11 +232,11 @@ pub struct EnvPatches {
     /// The list of directories to be patched into the environment. Keys are expected to be path strings,
     /// either absolute paths are starting with the prefix `~/` to be rooted in the users home directory.
     #[serde(default, alias = "dirs")]
-    pub dir: HashMap<String, PatchSetting>,
+    pub dir: BTreeMap<String, PatchSetting>,
     /// The list of files to be patched into the environment. Keys are expected to be path strings,
     /// either absolute paths are starting with the prefix `~/` to be rooted in the users home directory.
     #[serde(default, alias = "files")]
-    pub file: HashMap<String, PatchSetting>,
+    pub file: BTreeMap<String, PatchSetting>,
 }
 
 /// Why a `~/`-rooted patch path had no home directory to expand against.
@@ -312,8 +312,6 @@ impl EnvPatches {
     ) -> Result<Vec<common::FsMapping>, PatchHomeError> {
         let mut mappings = Vec::with_capacity(self.dir.len() + self.file.len());
         for (is_file, entries) in [(false, &self.dir), (true, &self.file)] {
-            let mut entries: Vec<_> = entries.iter().collect();
-            entries.sort_by_key(|(path, _)| *path);
             for (path, settings) in entries {
                 mappings.push(common::FsMapping {
                     host_path: Self::expand_home(path, home)?,
@@ -1422,7 +1420,7 @@ mod tests {
                         vars: HashMap::new(),
                         patch: EnvPatches {
                             dir: [("~/.claude".to_string(), PatchSetting::ReadWrite)].into(),
-                            file: HashMap::new()
+                            file: BTreeMap::new()
                         },
                         packages: vec!["base".to_string(), "go".to_string()],
                         action: TaskAction::exec_from_str("go test ./..."),
@@ -1545,7 +1543,7 @@ mod tests {
         })
         .unwrap();
         let other = EnvPatches {
-            dir: HashMap::from_iter([
+            dir: BTreeMap::from_iter([
                 ("~/.claude".to_string(), PatchSetting::ReadOnly),
                 ("other".to_string(), PatchSetting::ReadOnly),
             ]),
@@ -1563,7 +1561,7 @@ mod tests {
                     ("other".to_string(), PatchSetting::ReadOnly),
                 ]
                 .into(),
-                file: HashMap::new()
+                file: BTreeMap::new()
             }
         );
     }
@@ -1716,6 +1714,42 @@ mod tests {
                 .expect("absolute paths need no home")
                 .len(),
             1
+        );
+    }
+
+    /// Two [`EnvPatches`] holding the same entries inserted in opposite
+    /// orders lower to the same mapping sequence and serialize identically:
+    /// the order comes off the sorted map, not off insertion, so the sandbox
+    /// setup and any serialized patch table are stable from run to run.
+    #[test]
+    fn to_fs_mappings_and_serialization_are_insertion_order_independent() {
+        let mut forward = EnvPatches::default();
+        for k in ["~/a", "~/b", "~/c"] {
+            forward.dir.insert(k.to_string(), PatchSetting::ReadOnly);
+        }
+        for k in ["/x", "/y", "/z"] {
+            forward.file.insert(k.to_string(), PatchSetting::ReadWrite);
+        }
+
+        let mut reverse = EnvPatches::default();
+        for k in ["~/c", "~/b", "~/a"] {
+            reverse.dir.insert(k.to_string(), PatchSetting::ReadOnly);
+        }
+        for k in ["/z", "/y", "/x"] {
+            reverse.file.insert(k.to_string(), PatchSetting::ReadWrite);
+        }
+
+        let seq = |p: &EnvPatches| {
+            p.to_fs_mappings(Some(Path::new("/home/dev")))
+                .unwrap()
+                .into_iter()
+                .map(|m| m.host_path)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(seq(&forward), seq(&reverse));
+        assert_eq!(
+            toml::to_string(&forward).unwrap(),
+            toml::to_string(&reverse).unwrap()
         );
     }
 
