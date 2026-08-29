@@ -1128,6 +1128,60 @@ fn entry_handle(entry: &minimald_rpc::ListSessionsEntry) -> String {
     }
 }
 
+/// Warn when the daemon already tracks a session for `target`.
+///
+/// Activating a path that already has a session mints a second, independent
+/// one; bare `min` from that directory is then ambiguous between them. The
+/// activation still proceeds — this only surfaces the foot-gun the caller
+/// would otherwise hit silently, and points at `attach` as the way to reuse
+/// the existing session. Pure, so the message is unit-testable.
+fn duplicate_session_warning(
+    entries: &[minimald_rpc::ListSessionsEntry],
+    target: &paths::HostAbsPath,
+) -> Option<String> {
+    // When several sessions track the same path, prefer an `Active` one: it is
+    // the only status `attach` accepts, so recommending it (rather than the
+    // first match, which may be `Pending`/`Materializing`) points the user at a
+    // session they can actually reuse. Fall back to the first match when none is
+    // active, so the "still being created; wait" guidance still fires.
+    let existing = entries
+        .iter()
+        .filter(|e| e.project_path.as_ref() == Some(target))
+        .find(|e| e.status == sessions::SessionStatus::Active)
+        .or_else(|| {
+            entries
+                .iter()
+                .find(|e| e.project_path.as_ref() == Some(target))
+        })?;
+    let handle = entry_handle(existing);
+    let lead = format!(
+        "warning: a session already exists for this path ({handle}); activating \
+         creates a second one, leaving bare `min` here ambiguous between them."
+    );
+    // Only point at `attach` for a session it will actually accept. Attach
+    // refuses anything not yet `Active` (see `sessions::SessionStatus`), so for
+    // a `Pending`/`Materializing` duplicate the reuse command would fail
+    // immediately — say to wait instead. When we do suggest it, use a key
+    // `SessionLookup::parse` can resolve: a name matches by name and the full id
+    // parses as a UUID, but the short unnamed handle would parse as a
+    // nonexistent name and the attach lookup would miss.
+    match existing.status {
+        sessions::SessionStatus::Active => {
+            let key = existing
+                .name
+                .clone()
+                .unwrap_or_else(|| existing.id.to_string());
+            Some(format!(
+                "{lead} To reuse it instead: min session attach {key}"
+            ))
+        }
+        _ => Some(format!(
+            "{lead} The existing session is still being created; wait for it to \
+             become active, then reuse it instead of creating a second."
+        )),
+    }
+}
+
 /// Abbreviate a home-prefixed path to `~`/`~/...` for display; any other
 /// path renders absolute, unchanged.
 fn display_with_home_tilde(path: &camino::Utf8Path, home: Option<&camino::Utf8Path>) -> String {
@@ -2121,6 +2175,45 @@ async fn activate_session(
     // Activation is the hot path #1251's gate landed on, and it must not pay a
     // round trip for a check its own first RPC can make.
     let mut client = connect_daemon_unchecked(global).await?;
+
+    // Warn before minting a second session for a path that already has one:
+    // the duplicate leaves bare `min` from this directory ambiguous between
+    // them. Advisory only — a listing failure (ordinary transport or
+    // daemon-side error) must not block activation, so the duplicate check is
+    // skipped on error. But `oneshot_rpc` reuses one `russh` handle, and a
+    // transport-level listing failure can close the shared connection, which
+    // would then break the `CreateSession` channel below; so on any listing
+    // error, reconnect before creation. A benign daemon-side error leaves the
+    // old connection usable and the reconnect is merely a no-op cost on the
+    // rare failure path — the happy path still pays no extra round trip. The
+    // hard version gate is unaffected: `CreateSession` below carries its own
+    // `must_match_version`, so a version-skewed daemon is still refused there
+    // even when this enumeration is skipped.
+    match list_sessions_version_gated(&mut client).await {
+        Ok(existing_sessions) => {
+            if let Some(warning) =
+                duplicate_session_warning(&existing_sessions.sessions, &config.project_path)
+            {
+                eprintln!("{warning}");
+            }
+        }
+        Err(_) => {
+            // The listing failed. A transport-level closure can leave the
+            // shared `russh` handle unusable, which would then break the
+            // `CreateSession` channel below, so try to reconnect. But a
+            // daemon-side listing error closes only the RPC channel and leaves
+            // the SSH connection intact — so if the reconnect itself fails,
+            // keep the original client and let `CreateSession` proceed on it
+            // rather than aborting activation outright. `CreateSession` carries
+            // its own hard version gate and surfaces a clear error if the
+            // connection really is dead, so retaining the original client can
+            // only help the daemon-side-error case and never regresses the
+            // transport-closure case.
+            if let Ok(reconnected) = connect_daemon_unchecked(global).await {
+                client = reconnected;
+            }
+        }
+    }
 
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
@@ -4274,6 +4367,117 @@ mod tests {
              Next:\n\
              \x20 min session attach --command 'min task run <task>' web\n\
              \x20 min ls --json\n"
+        );
+    }
+
+    /// A session already tracked for the target path warns with that
+    /// session's handle and the `attach` reuse hint; a path with no session
+    /// stays silent.
+    #[test]
+    fn duplicate_session_warning_flags_only_a_matching_path() {
+        let entries = vec![twin_entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            Some("/w"),
+            sessions::SessionStatus::Active,
+        )];
+
+        let taken = paths::HostAbsPath::try_new("/w").unwrap();
+        let warning = duplicate_session_warning(&entries, &taken)
+            .expect("a session on the target path must warn");
+        assert!(warning.contains("web"), "warning names the existing handle");
+        assert!(
+            warning.contains("min session attach web"),
+            "warning points at attach for reuse"
+        );
+
+        let free = paths::HostAbsPath::try_new("/elsewhere").unwrap();
+        assert!(
+            duplicate_session_warning(&entries, &free).is_none(),
+            "an untaken path does not warn"
+        );
+    }
+
+    /// An unnamed existing session must still be reusable: the reuse hint must
+    /// carry the full id, which `SessionLookup::parse` resolves back to an id.
+    /// The short unnamed handle would parse as a nonexistent name, so the attach
+    /// lookup would miss.
+    #[test]
+    fn duplicate_session_warning_reuses_unnamed_session_by_id() {
+        let id = "019f5d0f-0a99-78b1-9165-0809440f0052";
+        let entries = vec![twin_entry(
+            id,
+            None,
+            Some("/w"),
+            sessions::SessionStatus::Active,
+        )];
+
+        let taken = paths::HostAbsPath::try_new("/w").unwrap();
+        let warning = duplicate_session_warning(&entries, &taken)
+            .expect("a session on the target path must warn");
+        assert!(
+            warning.contains(&format!("min session attach {id}")),
+            "unnamed reuse hint carries the full id, got: {warning}"
+        );
+        // The id the hint prints must resolve through the attach lookup path.
+        assert!(
+            matches!(SessionLookup::parse(id), SessionLookup::Id(_)),
+            "the full id resolves as an id, not a name"
+        );
+    }
+
+    /// Attach refuses a `Materializing` session, so the warning must not point
+    /// at it; the duplicate is still flagged, just without an attach hint.
+    #[test]
+    fn duplicate_session_warning_skips_attach_for_materializing() {
+        let entries = vec![twin_entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            Some("/w"),
+            sessions::SessionStatus::Materializing,
+        )];
+
+        let taken = paths::HostAbsPath::try_new("/w").unwrap();
+        let warning = duplicate_session_warning(&entries, &taken)
+            .expect("a session on the target path must warn");
+        assert!(
+            !warning.contains("min session attach"),
+            "no attach hint for a non-attachable session, got: {warning}"
+        );
+    }
+
+    /// When several sessions track the target path with mixed statuses, the
+    /// warning must recommend the `Active` one — the only status `attach`
+    /// accepts — even when a non-active match sorts first in the listing.
+    #[test]
+    fn duplicate_session_warning_prefers_active_over_pending_match() {
+        let pending_id = "019f5d0f-0a99-78b1-9165-0809440f0052";
+        let active_id = "019f5d0f-0a99-78b1-9165-0809440f0053";
+        let entries = vec![
+            twin_entry(
+                pending_id,
+                Some("mzing"),
+                Some("/w"),
+                sessions::SessionStatus::Materializing,
+            ),
+            twin_entry(
+                active_id,
+                Some("live"),
+                Some("/w"),
+                sessions::SessionStatus::Active,
+            ),
+        ];
+
+        let taken = paths::HostAbsPath::try_new("/w").unwrap();
+        let warning = duplicate_session_warning(&entries, &taken)
+            .expect("a session on the target path must warn");
+        assert!(
+            warning.contains("min session attach live"),
+            "warning points at the active match for reuse, got: {warning}"
+        );
+        assert!(
+            !warning.contains("still being created"),
+            "an attachable active match must not print the wait guidance, got: {warning}"
         );
     }
 
