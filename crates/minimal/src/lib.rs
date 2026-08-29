@@ -1478,8 +1478,37 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
         .await
         .context("ListSessions RPC failed")?;
 
+    // On stderr, and outside `format_ls`: every output mode should carry a
+    // fault this severe — `--raw` most of all, since a script parsing bare ids
+    // is exactly what will go on using hostnames that no longer resolve — and
+    // stdout stays clean for the parser either way.
+    warn_if_hostname_routing_down(resp.hostname_routing_unavailable.as_deref());
+    warn_if_mtls_proxy_down(resp.mtls_proxy_unavailable.as_deref());
     format_ls(&mut std::io::stdout(), &args, &resp)?;
     Ok(())
+}
+
+/// Tells the user that `<name>.local.min.internal` will not resolve, and why.
+///
+/// The daemon keeps serving without its host-side proxy, so nothing else the
+/// user sees is different: sessions activate, exec works, the list prints. The
+/// only other trace is a `warn!` in the daemon log, which is not where someone
+/// watching curl fail is looking (gominimal/inbox#560).
+fn warn_if_hostname_routing_down(reason: Option<&str>) {
+    if let Some(reason) = reason {
+        eprintln!("warning: session hostnames will not route: {reason}");
+    }
+}
+
+/// Tells the user the mTLS reverse proxy is not serving, and why.
+///
+/// Kept separate from [`warn_if_hostname_routing_down`] so the two faults read
+/// as what they are: hostnames failing to resolve and TLS termination being
+/// absent are different problems with different fixes.
+fn warn_if_mtls_proxy_down(reason: Option<&str>) {
+    if let Some(reason) = reason {
+        eprintln!("warning: the mTLS reverse proxy is not serving: {reason}");
+    }
 }
 
 /// Format the session list for the given output mode. Split from
@@ -2269,6 +2298,8 @@ async fn activate_session(
     // loadout, and the finalize that #1251 died at, and with the session left
     // unfinalized for the daemon to reap when this connection drops.
     ensure_version_reported(created.daemon_version.as_deref())?;
+    warn_if_hostname_routing_down(created.hostname_routing_unavailable.as_deref());
+    warn_if_mtls_proxy_down(created.mtls_proxy_unavailable.as_deref());
     let id = created.id;
 
     // From here the session exists on the daemon in an unfinalized state.

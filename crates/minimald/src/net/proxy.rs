@@ -148,9 +148,12 @@ fn split_authority(authority: &str) -> (&str, Option<u16>) {
 /// supersedes the former systemd-resolved probe (R3.4).
 ///
 /// The returned listener is the caller's to either serve (via [`serve`]) or
-/// drop. The success event therefore reports the address as `reachable` rather
-/// than `listening`: binding proves the address is free, but a caller that drops
-/// the listener (the current startup check does) is not yet accepting requests.
+/// drop. The success event reports the address as `reachable` rather than
+/// `listening` because binding only proves the address was free — a caller that
+/// drops the listener is not accepting requests. The daemon startup path does
+/// serve it (see `server::start_host_proxies`); this said otherwise, and reading
+/// it as a bind-and-drop probe is what made gominimal/inbox#560 look like a
+/// false alarm on macOS.
 pub async fn bind_listener(addr: SocketAddr) -> Option<TcpListener> {
     match TcpListener::bind(addr).await {
         Ok(listener) => {

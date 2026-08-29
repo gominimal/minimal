@@ -43,6 +43,8 @@ async fn version_succeeds_without_daemon() {
 fn ls_shows_shared_resource_pool() {
     let resp = ListSessionsResponse {
         daemon_version: None,
+        hostname_routing_unavailable: None,
+        mtls_proxy_unavailable: None,
         resource_pool: Some(ResourcePool {
             cpu_cores: 8,
             memory_bytes: 16 * 1024 * 1024 * 1024,
@@ -78,6 +80,8 @@ fn ls_shows_shared_resource_pool() {
 fn ls_table_exposes_project_path_and_status() {
     let resp = ListSessionsResponse {
         daemon_version: None,
+        hostname_routing_unavailable: None,
+        mtls_proxy_unavailable: None,
         resource_pool: None,
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
