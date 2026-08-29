@@ -2199,7 +2199,20 @@ async fn activate_session(
             }
         }
         Err(_) => {
-            client = connect_daemon_unchecked(global).await?;
+            // The listing failed. A transport-level closure can leave the
+            // shared `russh` handle unusable, which would then break the
+            // `CreateSession` channel below, so try to reconnect. But a
+            // daemon-side listing error closes only the RPC channel and leaves
+            // the SSH connection intact — so if the reconnect itself fails,
+            // keep the original client and let `CreateSession` proceed on it
+            // rather than aborting activation outright. `CreateSession` carries
+            // its own hard version gate and surfaces a clear error if the
+            // connection really is dead, so retaining the original client can
+            // only help the daemon-side-error case and never regresses the
+            // transport-closure case.
+            if let Ok(reconnected) = connect_daemon_unchecked(global).await {
+                client = reconnected;
+            }
         }
     }
 
