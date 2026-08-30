@@ -122,7 +122,8 @@ the same way `[session.vars]` resolves at activation. So exporting the variable
 in your shell is enough, and the daemon's own environment is never consulted.
 
 A variable declared `inherit` but not set in that shell is an error, reported
-before the task's session is created:
+before the task's session is created — unless your policy ignores the name, in
+which case it is dropped rather than looked up ([below](#policy)):
 
 ```console
 $ min task run deploy
@@ -136,6 +137,7 @@ an inherited variable there is still resolved against the daemon's
 environment — so prefer an explicit value for tasks meant to be run from
 inside a box.
 
+<a id="policy"></a>
 Every name a task declares — inherited or literal — is checked against the
 `[vars]` section of your `user_policy.toml` before its value is read:
 
