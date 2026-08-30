@@ -131,11 +131,16 @@ error: task 'deploy' declares `env_vars.TOKEN = { inherit = true }`, but TOKEN
 is not set in this shell; export it before running the task
 ```
 
-This applies to `min task run` on the host. Running a declared task from
-*inside* a session (`min run <task>`) has no invoking client to read from, and
-an inherited variable there is still resolved against the daemon's
-environment — so prefer an explicit value for tasks meant to be run from
-inside a box.
+This applies to `min task run`. Two other ways of running a declared task
+still resolve `inherit` against the daemon's environment:
+
+- `min run <task>`, from *inside* a session, has no invoking client to read
+  from.
+- `min session run <session> <task>` runs against a session you already have,
+  over the attach transport, which forwards only `MINIMAL_SESSION_ID` and your
+  locale.
+
+So prefer an explicit value for tasks meant to be run either of those ways.
 
 <a id="policy"></a>
 Every name a task declares — inherited or literal — is checked against the
