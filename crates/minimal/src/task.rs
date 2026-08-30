@@ -144,14 +144,20 @@ fn declared_task(dir: &camino::Utf8Path, task: &str) -> Result<mfile::Task, anyh
 /// which for an `inherit` entry means the daemon resolving it against its
 /// own environment, exactly what the user asked not to happen.
 ///
-/// [`TaskEnv::drop`]: minimald_rpc::taskenv::TaskEnv::drop
-///
 /// The `allow` step is deliberately not applied. A task's `env_vars` are
 /// declared in the project's own `minimal.toml` and requested by name on
 /// the command line, and there is no prompt on this path — routing them
 /// through `allow` would hard-fail every scripted `min task run` until each
 /// name were allowlisted, which is the case this resolution exists to
 /// unblock. `deny` and `ignore` have no prompt leg, so they apply cleanly.
+///
+/// An echo task resolves to nothing at all, whatever it declares. The daemon
+/// answers one straight from the declaration and returns before it builds an
+/// environment (`crates/minimald/src/exec.rs`), so its `env_vars` are read by
+/// no one. Resolving them would fail a run that works today over a variable
+/// the task has no use for, and deny one over a name it never sees.
+///
+/// [`TaskEnv::drop`]: minimald_rpc::taskenv::TaskEnv::drop
 fn resolve_task_env(
     task: &mfile::Task,
     task_name: &str,
@@ -160,6 +166,9 @@ fn resolve_task_env(
     env: impl Fn(&str) -> Result<String, std::env::VarError>,
 ) -> Result<minimald_rpc::taskenv::TaskEnv, anyhow::Error> {
     let mut resolved = minimald_rpc::taskenv::TaskEnv::default();
+    if task.action.as_echo().is_some() {
+        return Ok(resolved);
+    }
     for (name, value) in &task.vars {
         // Deny wins over ignore, matching `VarsPolicy::check`: a
         // would-be rejection must not be hidden behind an ignore glob.
@@ -987,6 +996,27 @@ mod tests {
             Some("task-value-123")
         );
         assert!(out.drop.is_empty());
+    }
+
+    /// An echo task's `env_vars` are read by nobody: the daemon answers it
+    /// from the declaration and returns before it builds an environment. So
+    /// an unset `inherit` on one must not fail the run — it ran fine before
+    /// client-side resolution existed — and a denied name on one must not
+    /// either, since the task never sees it.
+    #[test]
+    fn an_echo_task_resolves_to_nothing_whatever_it_declares() {
+        let task = task_from_toml(
+            "[tasks.t]\naction = 'echo hi'\nenv_vars.UNSET = { inherit = true }\n\
+             env_vars.AWS_KEY = 'literal'\n",
+        );
+        let policy = no_vars_policy().try_with_deny(["AWS_*"]).unwrap();
+
+        let out = resolve_task_env(&task, "t", &policy, &policy_path_fixture(), |_| {
+            panic!("an echo task looks nothing up");
+        })
+        .expect("an echo task neither resolves nor denies");
+
+        assert!(out.is_empty(), "nothing to send: {out:?}");
     }
 
     /// `cmd_task_run` rejects a task the project's minimal.toml does not
