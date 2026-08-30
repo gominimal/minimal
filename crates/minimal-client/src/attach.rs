@@ -52,7 +52,12 @@ pub fn host_key_opts(known_hosts: &Path) -> [String; 2] {
 /// Build the `ssh` command that attaches to session `id` via the daemon
 /// socket at `sock`.
 ///
-/// The interactive path (`command: None`) forces a PTY with `-tt` — the
+/// `wire` is an already-encoded [`minimald_rpc::exec`] request, or `None` for
+/// the interactive shell. Callers name their own form — [`remote_command`] for
+/// a user's argv, [`minimald_rpc::exec::ExecRequest::TaskRun`] for a task — so
+/// this function never has to guess what a caller meant.
+///
+/// The interactive path (`wire: None`) forces a PTY with `-tt` — the
 /// daemon's shell_request handler mints the PTY-backed session shell, and
 /// ssh handles termios/PTY management. The caller decides how to run the
 /// command: `min session attach` `exec()`s it, `min dash` spawns it as a
@@ -60,7 +65,7 @@ pub fn host_key_opts(known_hosts: &Path) -> [String; 2] {
 pub fn attach_command(
     sock: &Path,
     id: sessions::SessionId,
-    command: &[String],
+    wire: Option<&str>,
 ) -> Result<std::process::Command, anyhow::Error> {
     // ProxyCommand points at our own `proxy` subcommand so we don't
     // depend on socat or nc being installed.
@@ -113,7 +118,7 @@ pub fn attach_command(
     // remote PTY, yet the interactive shell reading it never sees an EOF from a
     // redirected local stdin (`< /dev/null`, a pipe), so the command blocks
     // forever (#953). Callers must guarantee a terminal on stdin.
-    if command.is_empty() {
+    if wire.is_none() {
         ssh.arg("-tt");
     }
 
@@ -130,11 +135,43 @@ pub fn attach_command(
 
     // If a command was provided, pass it to ssh (non-interactive exec).
     // Otherwise, ssh opens an interactive shell via shell_request.
-    for cmd in command.iter() {
-        ssh.arg(cmd);
+    if let Some(wire) = wire {
+        ssh.arg(wire);
     }
 
     Ok(ssh)
+}
+
+/// The single command string to hand `ssh`, or `None` for the interactive
+/// shell.
+///
+/// ssh has no argv on the wire: it joins its trailing arguments with single
+/// spaces and the far side runs the result through a shell — so an argv passed
+/// through word by word is re-split by that shell, and every quote the *local*
+/// shell already removed is gone for good. `min session exec s sh -c 'echo A B'`
+/// arrived as `sh -c echo A B`, where `A` became `sh`'s `$0` and vanished from
+/// the output (gominimal/inbox#558 — fully qualified because the bare `#NNN`
+/// refs elsewhere in this tree point at this repo, and that one does not).
+///
+/// So the request is tagged instead ([`minimald_rpc::exec`]), and the arity
+/// picks the tag:
+///
+/// * One argument is a shell command, carried as-is — the `ssh host '...'` form
+///   the session e2e and the docs use (`min session exec s 'echo $PWD'`), where
+///   pipes, globs and `$PWD` are the point and must reach the session's shell.
+/// * Several arguments are an argv, carried as data. No shell reassembles them,
+///   so a word keeps its spaces and its metacharacters stay literal.
+///
+/// Arity is a default, not a limitation: both forms are nameable on the wire,
+/// so an explicit `--shell` / `--argv` flag could select one without changing
+/// the protocol.
+pub fn remote_command(command: &[String]) -> Option<String> {
+    use minimald_rpc::exec::ExecRequest;
+    match command {
+        [] => None,
+        [one] => Some(ExecRequest::Shell(one.clone()).encode()),
+        words => Some(ExecRequest::Argv(words.to_vec()).encode()),
+    }
 }
 
 #[cfg(test)]
@@ -145,7 +182,7 @@ mod tests {
     #[test]
     fn attach_command_targets_the_provider_alias() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), &[]).unwrap();
+        let cmd = attach_command(&sock, sessions::SessionId::nil(), None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -161,22 +198,74 @@ mod tests {
     #[test]
     fn attach_command_with_exec_has_no_forced_pty() {
         let sock = PathBuf::from("/tmp/x/providers/local-minvmd0/ssh.sock");
-        let cmd = attach_command(
-            &sock,
-            sessions::SessionId::nil(),
-            &["min".to_string(), "run".to_string(), "test".to_string()],
-        )
-        .unwrap();
+        let wire = remote_command(&["min".to_string(), "run".to_string(), "test".to_string()]);
+        let cmd = attach_command(&sock, sessions::SessionId::nil(), wire.as_deref()).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert!(!args.iter().any(|a| a == "-tt"));
+        // One trailing argument, not three: ssh would join a word-per-arg argv
+        // with spaces and let the far shell re-split it.
         assert_eq!(
-            args.into_iter().rev().take(3).rev().collect::<Vec<_>>(),
-            vec!["min".to_string(), "run".to_string(), "test".to_string()]
+            args.last().map(String::as_str),
+            Some(r#"min://argv ["min","run","test"]"#)
         );
     }
+
+    /// No command is the interactive shell: ssh gets no trailing argument at
+    /// all, and the daemon opens the session shell via `shell_request`.
+    #[test]
+    fn no_command_is_the_interactive_shell() {
+        assert_eq!(remote_command(&[]), None);
+    }
+
+    /// The `ssh host '...'` form the e2e and docs use: a lone argument is a
+    /// shell command, so `$PWD`, pipes and `;` still mean what they say when
+    /// the session's shell sees them.
+    #[test]
+    fn a_lone_argument_is_carried_as_a_shell_command() {
+        let wire = remote_command(&["echo EXEC_OK $PWD".to_string()]).unwrap();
+        assert_eq!(
+            minimald_rpc::exec::ExecRequest::parse(&wire),
+            Ok(minimald_rpc::exec::ExecRequest::Shell(
+                "echo EXEC_OK $PWD".to_string()
+            ))
+        );
+    }
+
+    /// The bug: `min session exec s sh -c 'echo A B C'`. ssh's join let the far
+    /// shell re-split the `-c` argument, so `A` was eaten as `sh`'s `$0` and
+    /// only `B C` printed. Carried as an argv, the words arrive as data and
+    /// `echo A B C` stays one argument.
+    #[test]
+    fn a_multi_word_argv_survives_as_data() {
+        let wire = remote_command(&["sh".to_string(), "-c".to_string(), "echo A B C".to_string()])
+            .unwrap();
+        assert_eq!(
+            minimald_rpc::exec::ExecRequest::parse(&wire),
+            Ok(minimald_rpc::exec::ExecRequest::Argv(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo A B C".to_string(),
+            ]))
+        );
+    }
+
+    /// A session command that merely looks like one of the daemon's own is the
+    /// session's: nothing about `min ...` is special on the wire any more, so
+    /// the session's `min` binary is reachable (gominimal/inbox#558).
+    #[test]
+    fn a_min_command_still_belongs_to_the_session() {
+        let wire = remote_command(&["min --version".to_string()]).unwrap();
+        assert_eq!(
+            minimald_rpc::exec::ExecRequest::parse(&wire),
+            Ok(minimald_rpc::exec::ExecRequest::Shell(
+                "min --version".to_string()
+            ))
+        );
+    }
+
     /// A VM-backed provider dir carries the guest's recorded host key, so
     /// attach must verify against it rather than waive the check.
     #[test]

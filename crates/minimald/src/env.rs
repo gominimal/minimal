@@ -560,6 +560,22 @@ impl Env {
         self.sandbox.new_container().map_err(sandbox_err_to_io)
     }
 
+    /// The assembled session rootfs on the daemon's filesystem.
+    ///
+    /// Exposed so the launcher can answer "is this shell installed in
+    /// this session" before it spawns one
+    /// ([`crate::session_shell::resolve`]) — the same question
+    /// [`install_min_helpers`] answers about directories it writes into.
+    /// Only meaningful once [`Env::build`] has returned: the rootfs is
+    /// what that assembles.
+    ///
+    /// Read only by the real `SandboxLauncher` (`cfg(not(test))`), which
+    /// the mock launcher stands in for under test.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn rootfs(&self) -> std::path::PathBuf {
+        self.sandbox.rootfs()
+    }
+
     /// Builds a command to run `program` inside the given container.
     pub fn command<I, S>(
         &mut self,

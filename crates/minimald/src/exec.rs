@@ -505,15 +505,41 @@ impl Exec for TokioExec {
     }
 }
 
+/// What to run inside the session, and whether a shell stands between the
+/// client's words and the process.
+#[derive(Debug, Clone)]
+pub enum SessionProgram {
+    /// A command line for the session's shell. The client wrote a shell
+    /// command, so quoting, globs, pipes and redirections are part of what it
+    /// means — matching what `ssh host '...'` does everywhere else.
+    Shell(String),
+    /// An argv to exec directly. Nothing re-splits these words, which is the
+    /// whole point: a shell in the middle would undo the quoting the client
+    /// already resolved. Guaranteed non-empty by
+    /// [`minimald_rpc::exec::ExecRequest::parse`].
+    Argv(Vec<String>),
+}
+
+impl SessionProgram {
+    /// The program and arguments to hand the session, resolving a shell
+    /// command into an explicit `bash -c` argv.
+    fn argv(self) -> (String, Vec<String>) {
+        match self {
+            Self::Shell(cmd) => (SESSION_SHELL.to_string(), vec!["-c".to_string(), cmd]),
+            Self::Argv(mut words) => {
+                // Non-empty by construction; `remove(0)` cannot panic.
+                let program = words.remove(0);
+                (program, words)
+            }
+        }
+    }
+}
+
 /// An [`Exec`] that runs a command *inside* the session's sandbox, joining the
 /// namespaces of the running session process.
-///
-/// `argv` is handed to the session's shell rather than split here, matching
-/// what `ssh host '...'` does everywhere else: the client wrote a shell command,
-/// and quoting, globs, pipes and redirections are part of what it means.
 #[derive(Debug, Clone)]
 pub struct SessionExec {
-    pub argv: String,
+    pub program: SessionProgram,
     /// The SSH username, needed only if the session has no host running and one
     /// has to be launched to service this request.
     pub conn_username: String,
@@ -536,9 +562,8 @@ impl Exec for SessionExec {
                 .ensure_host(self.conn_username)
                 .await
                 .map_err(|e| io::Error::other(format!("{e}")))?;
-            let command = host
-                .command_in_session(SESSION_SHELL, ["-c", &self.argv])
-                .await?;
+            let (program, args) = self.program.argv();
+            let command = host.command_in_session(&program, &args).await?;
 
             let mut command = Command::from(command);
             command
@@ -838,14 +863,16 @@ where
 ///
 /// Accepted forms are:
 ///  * `git-receive-pack min://<session ID>` - handles a git receive-pack, routing
-///    with the trailing session ID
-///  * `min task run <task>` (canonical) or `min run <task>` (legacy alias) -
-///    runs a task, routed via a `MINIMAL_SESSION_ID` env var that must be set
-///    on the channel by the client
-///  * `min package build <args>` - builds package(s), routed via a
-///    `MINIMAL_SESSION_ID` env var that must be set on the channel by the client
-///  * `min check <args>` - lints the session's `minimal.toml`, packages,
-///    profiles, and stacks, routed the same way as `min package build`
+///    with the trailing session ID. Matched before the vocabulary below, and
+///    not part of it: git speaks the pack protocol, not exec requests.
+///  * a [`minimald_rpc::exec::ExecRequest`], which is where the rest of the
+///    vocabulary is defined. The daemon-serviced forms — `min://task/run`,
+///    `min://package/build` and `min://check` — are each routed via a
+///    `MINIMAL_SESSION_ID` env var that must be set on the channel by the
+///    client. `min://shell` and `min://argv` are handed to the session.
+///  * anything else: a shell command for the session. Nothing about a
+///    command's text routes it, so a session command can never be mistaken
+///    for one of the daemon's own (gominimal/inbox#558).
 pub(crate) async fn handle_exec(
     argv: &[u8],
     serv: ServerStateHandle,
@@ -917,49 +944,62 @@ pub(crate) async fn handle_exec(
     // refused below.
     tracing::info!(%session_id, command = %argv, "exec request");
 
-    let rem = match argv.strip_prefix("min ") {
-        Some(c) => c,
-        // Not one of the daemon's own commands, so it is a command for the
-        // session: run it in the sandbox, the way `ssh host '<cmd>'` runs it on
-        // the host it names.
-        None => {
+    // Parsed, never sniffed. The vocabulary in `minimald_rpc::exec` is the only
+    // way to ask for one of the daemon's own forms, so a session command can no
+    // longer be mistaken for one — `min --version` names the session's `min`
+    // and reaches it, where the old `strip_prefix("min ")` claimed and refused
+    // it (gominimal/inbox#558).
+    let request = match minimald_rpc::exec::ExecRequest::parse(&argv) {
+        Ok(request) => request,
+        Err(e) => {
+            tracing::warn!(%session_id, error = %e, "execution request rejected");
+            // Accept-then-report, as the bad-flag path does: a bare
+            // `channel_failure` would reach the client as an opaque "exec
+            // request failed" with none of the detail the error carries.
+            session.channel_success(id)?;
+            spawn(async move {
+                reject_unsupported_exec(channel, e.to_string()).await;
+            });
+            return Ok(());
+        }
+    };
+
+    use minimald_rpc::exec::ExecRequest;
+    match request {
+        ExecRequest::Shell(_) | ExecRequest::Argv(_) => {
+            let program = match request {
+                ExecRequest::Shell(cmd) => SessionProgram::Shell(cmd),
+                ExecRequest::Argv(words) => SessionProgram::Argv(words),
+                _ => unreachable!("the match arm admits only Shell and Argv"),
+            };
             let span = exec_span(&config, session_id, &argv);
             session.channel_success(id)?;
             spawn(
-                run_in_session(serv, conn, session_handle, id, channel, argv, conn_username)
-                    .instrument(span),
+                run_in_session(
+                    serv,
+                    conn,
+                    session_handle,
+                    id,
+                    channel,
+                    program,
+                    conn_username,
+                )
+                .instrument(span),
             );
-            return Ok(());
         }
-    }
-    .to_string();
-
-    // A task's `env_vars`, resolved by the client against the invoking shell
-    // and carried on the channel environment (#585). Empty for every form
-    // but `min task run`, and empty from a client that predates it — in
-    // which case the task path resolves them the old way.
-    let task_env = minimald_rpc::taskenv::from_channel_env(&config.env_vars);
-
-    let mut c = rem.split(' ');
-    match c.next() {
-        None => {
-            tracing::warn!(%session_id, "execution request rejected: expected `min <sub command>`");
-            session.channel_failure(id)?;
-            return Ok(());
-        }
-        Some("run") => {
-            // `min run` with no task name would leave `strip_prefix("run ")`
-            // as `None` (and a trailing-space `min run ` as empty) — reject
-            // both before acking, rather than panicking on `.unwrap()`.
-            let task = rem.strip_prefix("run ").unwrap_or("").trim();
+        ExecRequest::TaskRun(task) => {
+            let task = task.trim().to_string();
             if task.is_empty() {
-                tracing::warn!(%session_id, "execution request rejected: expected `min run <task name>`");
+                tracing::warn!(%session_id, "execution request rejected: task/run names no task");
                 session.channel_failure(id)?;
                 return Ok(());
             }
-            let task = task.to_string();
+            // A task's `env_vars`, resolved by the client against the invoking
+            // shell and carried on the channel environment (#585). Empty from a
+            // client that predates it — in which case the task path resolves
+            // them the old way, daemon-side.
+            let task_env = minimald_rpc::taskenv::from_channel_env(&config.env_vars);
             session.channel_success(id)?;
-
             spawn(async move {
                 let exec_task = ExecTask {
                     conn,
@@ -975,91 +1015,36 @@ pub(crate) async fn handle_exec(
                 exec_task.run(channel).await;
             });
         }
-        Some("task") => {
-            // `min task run <task>` is the canonical spelling of the legacy
-            // bare `min run <task>`; `run` is its only sub-command. A bare
-            // `min task`, an unknown sub-command, or a prefix match like
-            // `min task runx` is refused before acking.
-            let rest = rem.strip_prefix("task").unwrap_or("").trim();
-            let task = rest
-                .strip_prefix("run")
-                .filter(|task| task.is_empty() || task.starts_with(' '))
-                .map(str::trim)
-                .unwrap_or("");
-            if task.is_empty() {
-                tracing::warn!(%session_id, "execution request rejected: expected `min task run <task name>`");
-                session.channel_failure(id)?;
-                return Ok(());
-            }
-            let task = task.to_string();
+        ExecRequest::PackageBuild(args) => {
             session.channel_success(id)?;
-
-            spawn(async move {
-                let exec_task = ExecTask {
-                    conn,
-                    serv,
-                    session: session_handle,
-                    channel_id: id,
-                    exec: TaskExec {
-                        args: None,
-                        task,
-                        env: task_env,
-                    },
-                };
-                exec_task.run(channel).await;
-            });
-        }
-        Some("package") => {
-            // `build` is the only `package` sub-command serviced here; a
-            // bare `min package`, an unknown sub-command, or a prefix match
-            // like `min package buildx` is refused before acking.
-            let rest = rem.strip_prefix("package").unwrap_or("").trim();
-            let Some(build_args) = rest
-                .strip_prefix("build")
-                .filter(|args| args.is_empty() || args.starts_with(' '))
-            else {
-                tracing::warn!(%session_id, "execution request rejected: expected `min package build [args...]`");
-                session.channel_failure(id)?;
-                return Ok(());
-            };
-            session.channel_success(id)?;
-            // Everything after the sub-command is the build's args
-            // (`--verbose` / `--rebuild` / package names).
-            let build_args = build_args.trim().to_string();
+            let build_args = args.trim().to_string();
             spawn(async move {
                 run_build_exec(session_handle, id, channel, build_args).await;
             });
         }
-        Some("check") => {
+        ExecRequest::Check(args) => {
             session.channel_success(id)?;
-            let check_args = rem.strip_prefix("check").unwrap_or("").trim().to_string();
+            let check_args = args.trim().to_string();
             spawn(async move {
                 run_check_exec(session_handle, id, channel, check_args).await;
             });
         }
-        Some(other) => {
-            tracing::warn!(%session_id, "execution request rejected: unexpected min sub-command `{other}`");
-            session.channel_success(id)?;
-            spawn(async move {
-                reject_unsupported_exec(channel, argv).await;
-            });
-        }
-    };
+    }
 
     Ok(())
 }
 
-/// Accepts the channel and reports an exec request that is not one of the
-/// accepted forms on the SSH stderr stream, then exits non-zero. A bare
-/// `channel_failure` would reach the client only as an opaque "exec request
-/// failed", so — mirroring the accept-then-report shape `run_check_exec` uses
-/// for a bad flag — this names the rejected command and lists what the daemon
-/// runs. The command is still refused; nothing is spawned.
-async fn reject_unsupported_exec(channel: Channel<Msg>, rejected: String) {
+/// Accepts the channel and reports an exec request the daemon cannot serve on
+/// the SSH stderr stream, then exits non-zero. A bare `channel_failure` would
+/// reach the client only as an opaque "exec request failed", so — mirroring the
+/// accept-then-report shape `run_check_exec` uses for a bad flag — this relays
+/// the parse error, which already names the form asked for and lists the ones
+/// this daemon serves. The command is still refused; nothing is spawned.
+async fn reject_unsupported_exec(channel: Channel<Msg>, reason: String) {
     let (_rs, ws) = channel.split();
     let mut e = ws.make_writer_ext(Some(1));
     let _ = e
-        .write_all(unsupported_command_message(&rejected).as_bytes())
+        .write_all(unsupported_command_message(&reason).as_bytes())
         .await;
     let _ = e.flush().await;
     let _ = ws.eof().await;
@@ -1067,13 +1052,11 @@ async fn reject_unsupported_exec(channel: Channel<Msg>, rejected: String) {
     let _ = ws.close().await; // needed to release the remote
 }
 
-/// The stderr copy for an exec request that is not an accepted form: names the
-/// rejected command and lists the forms the daemon services.
-fn unsupported_command_message(rejected: &str) -> String {
-    format!(
-        "minimald: unsupported command '{rejected}'; accepted: \
-         min run <task>, min package build [args...], min check [args...]\n"
-    )
+/// The stderr copy for an exec request the daemon cannot serve. The reason
+/// comes from [`minimald_rpc::exec::ExecParseError`], which already names the
+/// form that was asked for and the ones this daemon serves.
+fn unsupported_command_message(reason: &str) -> String {
+    format!("minimald: {reason}\n")
 }
 
 /// The tracing span an in-session exec runs under, mirroring the `rpc` span in
@@ -1124,7 +1107,7 @@ async fn run_in_session(
     session: SessionHandle,
     channel_id: ChannelId,
     channel: Channel<Msg>,
-    argv: String,
+    program: SessionProgram,
     conn_username: String,
 ) {
     let exec_task = ExecTask {
@@ -1133,7 +1116,7 @@ async fn run_in_session(
         session,
         channel_id,
         exec: SessionExec {
-            argv,
+            program,
             conn_username,
         },
     };
@@ -1869,6 +1852,8 @@ mod tests {
         //! and `handle_exec` request routing.
         use sessions::SessionId;
 
+        use minimald_rpc::exec::ExecRequest;
+
         use crate::MINIMAL_SESSION_ID_ENV;
         use crate::test_harness::{
             TestClient, TestServer, create_configured_session, create_session_req,
@@ -2006,11 +1991,11 @@ mod tests {
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    "min run echo_ok",
+                    &ExecRequest::TaskRun("echo_ok".to_string()).encode(),
                     &[],
                 )
                 .await
-                .expect("min run echo_ok should be accepted");
+                .expect("a task/run request should be accepted");
 
             assert_eq!(out.stdout, b"MINIMALD_SESSION_OK\n");
             assert_eq!(out.exit_status, Some(0));
@@ -2038,26 +2023,47 @@ mod tests {
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    "min task run some_task",
+                    &ExecRequest::TaskRun("some_task".to_string()).encode(),
                     &[],
                 )
                 .await;
             assert!(
                 accepted.is_ok(),
-                "`min task run <task>` must be accepted, got {accepted:?}",
+                "a task/run request naming a task must be accepted, got {accepted:?}",
             );
 
-            let rejected = client
+            // A task/run naming no task is refused before anything spawns, and
+            // there is nothing useful to stream, so it is a channel failure.
+            let empty = client
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    "min task runx",
+                    &ExecRequest::TaskRun(String::new()).encode(),
                     &[],
                 )
                 .await;
             assert!(
-                rejected.is_err(),
-                "`min task runx` is not `min task run <task>` and must be refused, got {rejected:?}",
+                empty.is_err(),
+                "a task/run naming no task must be refused, got {empty:?}",
+            );
+
+            // A near-miss tag is a form this daemon does not serve. It is not
+            // silently downgraded to a session shell command: the scheme was
+            // named, so the client asked for something specific.
+            let unknown = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    "min://task/runx some_task",
+                    &[],
+                )
+                .await
+                .expect("an unknown form is reported over the channel, not a channel failure");
+            assert_ne!(unknown.exit_status, Some(0));
+            assert!(
+                String::from_utf8_lossy(&unknown.stderr).contains("min://task/runx"),
+                "the refusal should name the form asked for, got {:?}",
+                String::from_utf8_lossy(&unknown.stderr),
             );
         }
 
@@ -2081,11 +2087,11 @@ mod tests {
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    "min check",
+                    &ExecRequest::Check(String::new()).encode(),
                     &[],
                 )
                 .await
-                .expect("min check should be accepted");
+                .expect("a check request should be accepted");
 
             assert_eq!(out.exit_status, Some(0));
             assert_eq!(
@@ -2115,7 +2121,7 @@ mod tests {
                 .exec(
                     &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
                     false,
-                    "min check --packags",
+                    &ExecRequest::Check("--packags".to_string()).encode(),
                     &[],
                 )
                 .await
@@ -2134,13 +2140,23 @@ mod tests {
             );
         }
 
-        /// `min check` takes its flags after the sub-command, so a prefix match
-        /// like `min checkx` must not be serviced as `min check`. A `min`
-        /// sub-command the daemon doesn't know is refused outright rather than
-        /// handed to the session — and refusing it means never running it, on
-        /// the daemon's filesystem least of all.
+        /// A command that merely *looks* like one of the daemon's own belongs
+        /// to the session, and reaches it.
+        ///
+        /// This is the contract that replaced prefix-sniffing: the daemon used
+        /// to claim every command starting with `min ` and refuse the ones it
+        /// did not recognise, which made a session's own `min` binary
+        /// unreachable through exec (gominimal/inbox#558). Now only the
+        /// `min://` scheme addresses the daemon, so `min checkx` is just a
+        /// command — routed to the session, and never run on the daemon's own
+        /// filesystem.
+        ///
+        /// The marker file pins the second half: had it run here, it would
+        /// exist. This harness launches a mock host with no sandbox to join, so
+        /// the command fails rather than running in-session; where it was
+        /// *sent* is what matters and what can be proved without a real sandbox.
         #[tokio::test]
-        async fn a_check_lookalike_is_not_serviced_as_check() {
+        async fn a_min_lookalike_goes_to_the_session_not_the_daemon() {
             let server = TestServer::new().await;
             let mut client = server.connect().await;
             let session_id = fresh_session(&mut client).await;
@@ -2166,12 +2182,80 @@ mod tests {
             assert_ne!(
                 out.exit_status,
                 Some(0),
-                "`min checkx` is not `min check` and must not succeed; stdout was {:?}",
+                "the mock harness has no sandbox to run in, so this cannot succeed; stdout was {:?}",
                 String::from_utf8_lossy(&out.stdout),
             );
+            // Routed, not refused: the old daemon answered this with an
+            // "unsupported command" refusal instead of handing it over.
+            let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(
-                String::from_utf8_lossy(&out.stderr).contains("min checkx"),
-                "the refusal should name the rejected command, got {:?}",
+                !stderr.contains("unsupported"),
+                "a `min` lookalike must be routed to the session, not refused, got {stderr:?}",
+            );
+        }
+
+        /// An argv reaches the session as words, not as a line for some shell
+        /// to re-split — the fix for gominimal/inbox#558. The mock harness has
+        /// no sandbox, so what is provable here is that the form is accepted
+        /// and routed to the session rather than refused or run on the daemon.
+        #[tokio::test]
+        async fn an_argv_form_is_accepted_and_routed_to_the_session() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let session_id = fresh_session(&mut client).await;
+            let session_str = session_id.to_string();
+            let marker = daemon_marker("argv");
+            let _ = std::fs::remove_file(&marker);
+
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &ExecRequest::Argv(vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!("printf pwned > {}", marker.display()),
+                    ])
+                    .encode(),
+                    &[],
+                )
+                .await
+                .expect("an argv request is serviced over the channel");
+
+            assert!(
+                !marker.exists(),
+                "an argv exec ran on the daemon's filesystem, creating {}",
+                marker.display(),
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                !stderr.contains("unsupported"),
+                "the argv form must be routed to the session, not refused, got {stderr:?}",
+            );
+        }
+
+        /// An argv naming no program is refused rather than guessed at.
+        #[tokio::test]
+        async fn an_empty_argv_is_refused() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let session_id = fresh_session(&mut client).await;
+            let session_str = session_id.to_string();
+
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    "min://argv []",
+                    &[],
+                )
+                .await
+                .expect("the refusal is reported over the channel");
+
+            assert_ne!(out.exit_status, Some(0));
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("names no program"),
+                "got {:?}",
                 String::from_utf8_lossy(&out.stderr),
             );
         }

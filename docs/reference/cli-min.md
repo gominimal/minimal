@@ -110,6 +110,58 @@ Attaches to an existing session, identified by UUID or session name. When
 working directory (or the only existing session) and opens an interactive
 picker if the choice is ambiguous (`--no-input` errors instead).
 
+### `session exec`
+
+```
+min session exec <SESSION> <COMMAND>...
+```
+
+Runs a command in an existing session, non-interactively, relaying its
+stdout, stderr and exit code.
+
+How `COMMAND` is read depends on how many arguments you give it:
+
+- **One argument is a shell command**, run by the session's shell with its
+  pipes, globs and `$VAR` intact — the `ssh host '<cmd>'` form.
+
+  ```
+  min session exec web 'echo $PWD'
+  ```
+
+- **Several arguments are an argv**, carried as data. No shell reassembles
+  them, so a word keeps its spaces and its metacharacters stay literal.
+
+  ```
+  min session exec web sh -c 'echo A B C'
+  ```
+
+The argv form matters because ssh has no argv on the wire — it joins its
+trailing arguments with single spaces and the far side reshells the result.
+Passing words through one by one would let the session's shell re-split them,
+which is how `sh -c 'echo A B C'` once lost its first word to `sh`'s `$0`.
+
+Nothing about a command's *text* routes it: a command is the session's however
+it happens to start, so the session's own `min` binary is reachable here. The
+daemon's own operations are named explicitly instead — see `session run`.
+
+### `session run`
+
+```
+min session run <SESSION> <TASK>
+```
+
+Runs a task declared in the session project's `minimal.toml`, in that session,
+relaying its output and exit code.
+
+This is the session-scoped counterpart to
+[`min task run <task>`](../guide/tasks.md), which composes a task session of
+its own. Use `session run` when you want the task to run against a session you
+already have.
+
+Because the task is named as a task rather than inferred from a command string,
+a task may share a name with a daemon subcommand or with a program on the
+session's `PATH`.
+
 ### `session destroy`
 
 ```
@@ -295,7 +347,8 @@ session arguments completable — `min session attach <TAB>` lists live session
 names, and `min session attach 019<TAB>` lists session IDs, neither of which
 exists at the time a static script would be written. Every argument documented
 as "UUID or session name" completes this way: `session attach`,
-`session destroy`, `session rename`, and `session policy`.
+`session exec`, `session run`, `session destroy`, `session rename`, and
+`session policy`.
 
 Session completion is best-effort by design. It never starts a daemon — with
 none running there is nothing to list, and booting a VM on a keystroke would be

@@ -371,15 +371,16 @@ impl Client {
     }
 
     /// Like [`Self::open_exec_channel`], but sets `MINIMAL_SESSION_ID` on the
-    /// channel before the exec request, the routing contract the daemon's
-    /// `min`-prefixed exec forms (`min task run <task>`, `min package build`,
-    /// `min check`) are served under.
+    /// channel before the exec request, the routing contract the daemon's own
+    /// exec forms ([`minimald_rpc::exec::ExecRequest::TaskRun`] and its
+    /// siblings) are served under.
     ///
     /// `task_env` carries a task's `env_vars` already resolved against the
     /// invoking shell, under
     /// [`TASK_ENV_PREFIX`](minimald_rpc::taskenv::TASK_ENV_PREFIX). Only
-    /// `min task run` has any to send; every other caller passes an empty
-    /// map and the daemon behaves exactly as before.
+    /// [`ExecRequest::TaskRun`](minimald_rpc::exec::ExecRequest::TaskRun) has
+    /// any to send; every other caller passes an empty map and the daemon
+    /// behaves exactly as before.
     pub async fn open_session_exec_channel(
         &mut self,
         session_id: sessions::SessionId,

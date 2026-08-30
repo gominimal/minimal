@@ -199,6 +199,12 @@ pub enum SessionCommand {
     Attach(AttachArgs),
     /// Execute a command in an existing session
     Exec(ExecArgs),
+    /// Run a declared task in an existing session
+    ///
+    /// The task runs in the named session's context, serviced by the daemon —
+    /// the counterpart to `min task run <task>`, which composes a task session
+    /// of its own instead of reusing one you already have.
+    Run(SessionRunArgs),
     /// Destroy (terminate) a session
     Destroy(DestroyArgs),
     /// Rename an existing session
@@ -261,8 +267,22 @@ pub struct ExecArgs {
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Command to execute in the session context
+    ///
+    /// A single argument is a shell command, run by the session's shell with
+    /// its pipes, globs and `$VAR` intact: `min session exec s 'echo $PWD'`.
+    /// Several arguments are an argv, quoted so the session sees exactly the
+    /// words you typed: `min session exec s sh -c 'echo A B'`.
     #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionRunArgs {
+    /// Session identifier (UUID or session name).
+    #[arg(add = completion::session_completer())]
+    pub session: String,
+    /// Name of a task declared in the session project's minimal.toml
+    pub task: String,
 }
 
 #[derive(Debug, Args)]
@@ -627,7 +647,7 @@ pub struct DestroyArgs {
 
 #[derive(Debug, Args)]
 pub struct StopArgs {
-    /// Force shutdown even if active sessions exist
+    /// Force shutdown even if a session is mid-create or still holds a host handle (even a dead one)
     #[arg(long, short, default_value_t = false)]
     pub force: bool,
 }
@@ -792,6 +812,7 @@ async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             SessionCommand::Activate(args) => cmd_activate(&cli.global_args, args).await,
             SessionCommand::Attach(args) => cmd_attach(&cli.global_args, args).await,
             SessionCommand::Exec(args) => cmd_exec(&cli.global_args, args).await,
+            SessionCommand::Run(args) => cmd_session_run(&cli.global_args, args).await,
             SessionCommand::Destroy(args) => cmd_destroy(&cli.global_args, args).await,
             SessionCommand::Rename(args) => cmd_rename(&cli.global_args, args).await,
             SessionCommand::Policy(args) => cmd_session_policy(&cli.global_args, args).await,
@@ -962,7 +983,7 @@ async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
                 session_name = ?entry.name,
                 "found session"
             );
-            session_via_ssh(&sock, entry.id, vec![]).await
+            session_via_ssh(&sock, entry.id, None).await
         }
         // Two ways to land on create-and-attach: no sessions exist at all
         // (first run), or the ambiguity picker's `+ Create a new session`
@@ -2466,7 +2487,7 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
         "found session"
     );
 
-    session_via_ssh(&sock, id, vec![]).await
+    session_via_ssh(&sock, id, None).await
 }
 
 /// Executes a command in an existing session.
@@ -2493,7 +2514,48 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
         "found session"
     );
 
-    session_via_ssh(&sock, r.id, args.command).await
+    session_via_ssh(
+        &sock,
+        r.id,
+        minimal_client::attach::remote_command(&args.command),
+    )
+    .await
+}
+
+/// Runs a task declared by the session's project, in that session.
+///
+/// The daemon services this itself rather than handing it to the session's
+/// shell, so the task composes against the session's context. Named on the wire
+/// as [`minimald_rpc::exec::ExecRequest::TaskRun`]; nothing is inferred from the
+/// text, which is what lets a task share a name with a program on `PATH`.
+pub async fn cmd_session_run(
+    global: &GlobalArgs,
+    args: SessionRunArgs,
+) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+        .context("Failed to resolve daemon socket path")?;
+
+    let mut client = client::Client::connect(&sock)
+        .await
+        .context("Failed to connect to minimald")?;
+    // Gated by hand for the same reason as `cmd_exec`: this hands off into a
+    // live session, which is not something to drive on a skewed pair.
+    let r = resolve_session_version_gated(&mut client, &args.session).await?;
+    tracing::info!(
+        session_id = %r.id,
+        session_name = ?r.name,
+        task = %args.task,
+        "found session"
+    );
+
+    session_via_ssh(
+        &sock,
+        r.id,
+        Some(minimald_rpc::exec::ExecRequest::TaskRun(args.task).encode()),
+    )
+    .await
 }
 
 /// Resolve a session to attach to when the user supplied no explicit session
@@ -2604,17 +2666,17 @@ fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), anyhow::Error
 async fn session_via_ssh(
     sock: &std::path::Path,
     id: sessions::SessionId,
-    command: Vec<String>,
+    wire: Option<String>,
 ) -> Result<(), anyhow::Error> {
     // The command itself lives in minimal-client, shared with the dash TUI's
     // suspend-attach-resume flow.
-    let mut ssh = minimal_client::attach::attach_command(sock, id, &command)?;
+    let mut ssh = minimal_client::attach::attach_command(sock, id, wire.as_deref())?;
 
     // `-tt` over a *non-terminal* stdin is a trap: ssh still forces the
     // remote PTY, yet the interactive shell reading it never sees an EOF from a
     // redirected local stdin (`< /dev/null`, a pipe), so the command blocks
     // forever (#953). Fail fast instead of hanging.
-    if command.is_empty() {
+    if wire.is_none() {
         ensure_interactive_attach_tty(std::io::stdin().is_terminal())?;
 
         // The interactive path waits on ssh rather than `exec()`ing it, so this
@@ -3949,6 +4011,7 @@ mod tests {
                 "lib.rs::cmd_attach = gated",
                 "lib.rs::cmd_bare = gated",
                 "lib.rs::cmd_exec = gated",
+                "lib.rs::cmd_session_run = gated",
                 "lib.rs::cmd_session_setup_zed = gated",
                 "lib.rs::cmd_ssh_forward = gated",
                 "lib.rs::cmd_version = ungated",
@@ -4671,6 +4734,40 @@ mod tests {
                 "1 file differs from activation (may include committed work):".to_string(),
                 "  A scratch.txt".to_string(),
             ]
+        );
+    }
+
+    /// `min session run <session> <task>` names both the session to run in and
+    /// the task to run, in that order — the session-scoped counterpart to
+    /// `min task run <task>`, which composes a session of its own.
+    #[test]
+    fn session_run_takes_a_session_then_a_task() {
+        let cli = Cli::try_parse_from(["min", "session", "run", "web", "build"]).unwrap();
+        let Some(Command::Session(SessionArgs {
+            command: SessionCommand::Run(a),
+        })) = cli.command
+        else {
+            panic!("expected a session run command");
+        };
+        assert_eq!(a.session, "web");
+        assert_eq!(a.task, "build");
+
+        // Both operands are required: a lone session names no task.
+        assert!(Cli::try_parse_from(["min", "session", "run", "web"]).is_err());
+        assert!(Cli::try_parse_from(["min", "session", "run"]).is_err());
+    }
+
+    /// The task reaches the daemon as a named form, so a task whose name
+    /// collides with a program on the session's `PATH` is still a task —
+    /// nothing is inferred from the text (gominimal/inbox#558).
+    #[test]
+    fn session_run_encodes_a_task_form_not_a_command() {
+        let wire = minimald_rpc::exec::ExecRequest::TaskRun("check".to_string()).encode();
+        assert_eq!(
+            minimald_rpc::exec::ExecRequest::parse(&wire),
+            Ok(minimald_rpc::exec::ExecRequest::TaskRun(
+                "check".to_string()
+            ))
         );
     }
 

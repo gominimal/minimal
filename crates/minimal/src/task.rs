@@ -597,7 +597,11 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     eprintln!("Running task {} in session {session_name}...", args.task);
 
     let outcome = match client
-        .open_session_exec_channel(id, &format!("min task run {}", args.task), &task_env)
+        .open_session_exec_channel(
+            id,
+            &minimald_rpc::exec::ExecRequest::TaskRun(args.task.clone()).encode(),
+            &task_env,
+        )
         .await
     {
         Ok(channel) => bridge_exec(channel).await,

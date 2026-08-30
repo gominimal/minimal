@@ -127,8 +127,8 @@ impl std::io::Write for DashLog {
 /// Whether the command's stdout is a data contract that tracing must not
 /// pollute, so its logs go to stderr instead. The `completions` handlers emit a
 /// shell shim on stdout, `session exec` carries only the exec'd
-/// command's output, and `task run` streams the task's stdout — a log line
-/// in any of them would be read as content. A bare `min` (no subcommand) is
+/// command's output, and `task run` / `session run` stream the task's stdout —
+/// a log line in any of them would be read as content. A bare `min` (no subcommand) is
 /// one too: its non-TTY twin promises an empty stdout to pipelines, and its
 /// interactive activate path prints only the session id there.
 fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
@@ -138,7 +138,8 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
             minimal::Command::CompleteSessionStr(_)
                 | minimal::Command::Completions(_)
                 | minimal::Command::Session(minimal::SessionArgs {
-                    command: minimal::SessionCommand::Exec(ExecArgs { .. }),
+                    command: minimal::SessionCommand::Exec(ExecArgs { .. })
+                        | minimal::SessionCommand::Run(_),
                 })
                 | minimal::Command::Task(minimal::TaskArgs {
                     command: minimal::TaskCommand::Run(_),
@@ -157,6 +158,19 @@ mod tests {
     #[test]
     fn bare_min_is_a_stdout_contract() {
         assert!(stdout_is_data_contract(&None));
+    }
+
+    /// `min session run` streams the task's stdout over the exec channel, so
+    /// tracing must route to stderr like the other stdout contracts.
+    #[test]
+    fn session_run_is_a_stdout_contract() {
+        let cmd = Some(Command::Session(minimal::SessionArgs {
+            command: minimal::SessionCommand::Run(minimal::SessionRunArgs {
+                session: "web".to_string(),
+                task: "build".to_string(),
+            }),
+        }));
+        assert!(stdout_is_data_contract(&cmd));
     }
 
     /// `min task run` streams the task's stdout, so tracing must route to
