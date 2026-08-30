@@ -1006,9 +1006,12 @@ mod tests {
     #[test]
     fn an_echo_task_resolves_to_nothing_whatever_it_declares() {
         let task = task_from_toml(
-            "[tasks.t]\naction = 'echo hi'\nenv_vars.UNSET = { inherit = true }\n\
+            "[tasks.t]\necho = 'hi'\nenv_vars.UNSET = { inherit = true }\n\
              env_vars.AWS_KEY = 'literal'\n",
         );
+        // Pinned: were the fixture to stop parsing as an echo task, every
+        // assertion below would still pass for the wrong reason.
+        assert_eq!(task.action.as_echo(), Some("hi"));
         let policy = no_vars_policy().try_with_deny(["AWS_*"]).unwrap();
 
         let out = resolve_task_env(&task, "t", &policy, &policy_path_fixture(), |_| {
