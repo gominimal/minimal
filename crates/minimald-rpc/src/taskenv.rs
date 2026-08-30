@@ -20,12 +20,26 @@
 //! its value, both verbatim, so nothing is escaped and any string a shell
 //! can export round-trips exactly.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Prefix marking a channel env var as one of a task's resolved
 /// `env_vars`. Client (`set_env`) and daemon (exec dispatch) both
 /// reference this constant — the name cannot skew.
 pub const TASK_ENV_PREFIX: &str = "MINIMAL_TASK_ENV_";
+
+/// Channel env var carrying the names the daemon must *remove* from the
+/// task's declarations, as a JSON array.
+///
+/// A resolved value can be sent as itself; a variable the client decided
+/// the task must not see cannot. Absence is not a signal — the daemon
+/// applies [`TASK_ENV_PREFIX`] entries by insertion, so a name the client
+/// simply omits keeps whatever `minimal.toml` declared and is resolved
+/// daemon-side. Dropping one therefore has to be said out loud.
+///
+/// Deliberately **not** under [`TASK_ENV_PREFIX`]: a name that started
+/// with it would be stripped by [`from_channel_env`] and delivered to the
+/// task as a variable called `DROP`.
+pub const TASK_ENV_DROP: &str = "MINIMAL_TASK_DROP";
 
 /// The channel env var name carrying task variable `name`.
 #[must_use]
@@ -47,6 +61,53 @@ pub fn from_channel_env(env_vars: &BTreeMap<String, String>) -> BTreeMap<String,
         .iter()
         .filter_map(|(k, v)| Some((k.strip_prefix(TASK_ENV_PREFIX)?.to_string(), v.clone())))
         .collect()
+}
+
+/// Encode the names the daemon must remove from the task's declarations,
+/// for [`TASK_ENV_DROP`]. JSON for the same reason argv words travel as
+/// JSON in [`crate::exec`]: an env var name is a TOML key and may hold
+/// anything, so no separator character is safe to assume.
+#[must_use]
+pub fn encode_drops(names: &BTreeSet<String>) -> String {
+    serde_json_lenient::to_string(names).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// The names a client asked the daemon to drop, from a channel's env map.
+///
+/// Absent, empty, or unparseable yields an empty set — a drop list is an
+/// instruction to remove something, and failing to understand one must
+/// never remove the wrong thing. An older client sends none, which leaves
+/// the task's declarations exactly as `minimal.toml` wrote them.
+#[must_use]
+pub fn drops_from_channel_env(env_vars: &BTreeMap<String, String>) -> BTreeSet<String> {
+    env_vars
+        .get(TASK_ENV_DROP)
+        .and_then(|raw| serde_json_lenient::from_str(raw).ok())
+        .unwrap_or_default()
+}
+
+/// A task's `env_vars` as the client resolved them: the values to apply,
+/// and the names to remove.
+///
+/// The two halves are disjoint by construction — a name is either resolved
+/// or dropped — and travel together because the daemon needs both to
+/// arrive at the set the task actually sees.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskEnv {
+    /// Values to apply over the task's own declarations.
+    pub set: BTreeMap<String, String>,
+    /// Names to remove from the task's declarations entirely.
+    pub drop: BTreeSet<String>,
+}
+
+impl TaskEnv {
+    /// `true` when there is nothing for the daemon to apply — the case for
+    /// every caller other than a task run, and for a task declaring no
+    /// `env_vars`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty() && self.drop.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -114,6 +175,59 @@ mod tests {
             out.get("MINIMAL_TASK_ENV_X").map(String::as_str),
             Some("inner")
         );
+    }
+
+    /// The drop list round-trips, and a name on it is not also a value:
+    /// the daemon reads the two halves from different channel vars.
+    #[test]
+    fn drop_list_round_trips() {
+        let drops: BTreeSet<String> = ["NOISY_DEBUG".to_string(), "OTHER".to_string()]
+            .into_iter()
+            .collect();
+        let mut channel = BTreeMap::new();
+        channel.insert(TASK_ENV_DROP.to_string(), encode_drops(&drops));
+
+        assert_eq!(drops_from_channel_env(&channel), drops);
+        // The drop carrier is not itself a task variable.
+        assert!(from_channel_env(&channel).is_empty());
+    }
+
+    /// `TASK_ENV_DROP` must not live under `TASK_ENV_PREFIX`, or
+    /// `from_channel_env` would strip the prefix and hand the task a
+    /// variable named `DROP` holding a JSON array.
+    #[test]
+    fn the_drop_carrier_is_not_under_the_value_prefix() {
+        assert!(!TASK_ENV_DROP.starts_with(TASK_ENV_PREFIX));
+    }
+
+    /// No drop list, an empty one, and a malformed one all mean "remove
+    /// nothing". Failing to parse an instruction to delete must never
+    /// delete the wrong thing, and an older client sends none at all.
+    #[test]
+    fn an_absent_or_unparseable_drop_list_removes_nothing() {
+        let mut absent = BTreeMap::new();
+        absent.insert("MINIMAL_SESSION_ID".to_string(), "an-id".to_string());
+        assert!(drops_from_channel_env(&absent).is_empty());
+
+        let mut empty = BTreeMap::new();
+        empty.insert(TASK_ENV_DROP.to_string(), encode_drops(&BTreeSet::new()));
+        assert!(drops_from_channel_env(&empty).is_empty());
+
+        let mut junk = BTreeMap::new();
+        junk.insert(TASK_ENV_DROP.to_string(), "not json".to_string());
+        assert!(drops_from_channel_env(&junk).is_empty());
+    }
+
+    /// A name needing no escaping in JSON and one that does both survive,
+    /// so a dropped name matches the declaration it must remove exactly.
+    #[test]
+    fn drop_names_survive_verbatim() {
+        let gnarly: BTreeSet<String> = ["PLAIN".to_string(), "with \"quote\" and \\".to_string()]
+            .into_iter()
+            .collect();
+        let mut channel = BTreeMap::new();
+        channel.insert(TASK_ENV_DROP.to_string(), encode_drops(&gnarly));
+        assert_eq!(drops_from_channel_env(&channel), gnarly);
     }
 
     /// An empty value is a real value, not an absence: `export X=` must

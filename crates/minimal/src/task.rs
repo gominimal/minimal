@@ -138,6 +138,14 @@ fn declared_task(dir: &camino::Utf8Path, task: &str) -> Result<mfile::Task, anyh
 /// read out of this shell and an ignored one does not have to be set at
 /// all.
 ///
+/// An ignored name goes into [`TaskEnv::drop`] rather than simply being
+/// left out. The daemon applies the resolved values by insertion, so a
+/// name it is not told about keeps whatever `minimal.toml` declared —
+/// which for an `inherit` entry means the daemon resolving it against its
+/// own environment, exactly what the user asked not to happen.
+///
+/// [`TaskEnv::drop`]: minimald_rpc::taskenv::TaskEnv::drop
+///
 /// The `allow` step is deliberately not applied. A task's `env_vars` are
 /// declared in the project's own `minimal.toml` and requested by name on
 /// the command line, and there is no prompt on this path — routing them
@@ -150,8 +158,8 @@ fn resolve_task_env(
     vars_policy: &sessions::core::policy::VarsPolicy,
     policy_path: &std::path::Path,
     env: impl Fn(&str) -> Result<String, std::env::VarError>,
-) -> Result<std::collections::BTreeMap<String, String>, anyhow::Error> {
-    let mut resolved = std::collections::BTreeMap::new();
+) -> Result<minimald_rpc::taskenv::TaskEnv, anyhow::Error> {
+    let mut resolved = minimald_rpc::taskenv::TaskEnv::default();
     for (name, value) in &task.vars {
         // Deny wins over ignore, matching `VarsPolicy::check`: a
         // would-be rejection must not be hidden behind an ignore glob.
@@ -159,6 +167,7 @@ fn resolve_task_env(
             bail!(denied_task_var_message(task_name, name, policy_path));
         }
         if vars_policy.ignore().is_match(name) {
+            resolved.drop.insert(name.clone());
             continue;
         }
         let value = match value {
@@ -170,7 +179,7 @@ fn resolve_task_env(
                 )
             })?,
         };
-        resolved.insert(name.clone(), value);
+        resolved.set.insert(name.clone(), value);
     }
     Ok(resolved)
 }
@@ -807,9 +816,10 @@ mod tests {
         .expect("an exported variable resolves");
 
         assert_eq!(
-            out.get("ZZ_TASK_TOKEN").map(String::as_str),
+            out.set.get("ZZ_TASK_TOKEN").map(String::as_str),
             Some("task-value-123")
         );
+        assert!(out.drop.is_empty());
     }
 
     /// A declared-but-unset inherited variable fails client-side, naming
@@ -853,8 +863,8 @@ mod tests {
             |_| Ok(String::new()),
         )
         .expect("resolves");
-        assert_eq!(out.get("LITERAL").map(String::as_str), Some("fixed"));
-        assert_eq!(out.get("EMPTY").map(String::as_str), Some(""));
+        assert_eq!(out.set.get("LITERAL").map(String::as_str), Some("fixed"));
+        assert_eq!(out.set.get("EMPTY").map(String::as_str), Some(""));
     }
 
     /// A task declaring no `env_vars` sends nothing, which is the signal
@@ -872,6 +882,7 @@ mod tests {
         )
         .expect("resolves");
         assert!(out.is_empty());
+        assert!(out.set.is_empty() && out.drop.is_empty());
     }
 
     /// A `deny` rule is the user's emergency stop, and it reaches a task's
@@ -939,9 +950,14 @@ mod tests {
         })
         .expect("an unset but ignored variable is not an error");
 
-        assert_eq!(out.get("KEPT").map(String::as_str), Some("kept-value"));
-        assert!(!out.contains_key("NOISY_DEBUG"));
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.set.get("KEPT").map(String::as_str), Some("kept-value"));
+        assert!(!out.set.contains_key("NOISY_DEBUG"));
+        assert_eq!(out.set.len(), 1);
+        // Named on the drop list, not merely absent: the daemon applies
+        // `set` by insertion, so a name it is not told about keeps the
+        // declaration `minimal.toml` made for it.
+        assert!(out.drop.contains("NOISY_DEBUG"));
+        assert_eq!(out.drop.len(), 1);
     }
 
     /// A name matching neither rule is carried through with no allow-list
@@ -967,9 +983,10 @@ mod tests {
         .expect("an unlisted name resolves without an allow entry");
 
         assert_eq!(
-            out.get("ZZ_TASK_TOKEN").map(String::as_str),
+            out.set.get("ZZ_TASK_TOKEN").map(String::as_str),
             Some("task-value-123")
         );
+        assert!(out.drop.is_empty());
     }
 
     /// `cmd_task_run` rejects a task the project's minimal.toml does not

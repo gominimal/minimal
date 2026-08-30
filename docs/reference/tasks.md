@@ -144,7 +144,9 @@ Every name a task declares — inherited or literal — is checked against the
 - a name matching **`deny`** fails the run, naming the rule's file. The value
   is never read out of your shell.
 - a name matching **`ignore`** is dropped silently and the task runs without
-  it; an ignored variable does not have to be set.
+  it; an ignored variable does not have to be set. The name is removed from
+  the task's declarations outright, so this holds for a literal value as much
+  as an inherited one.
 - anything else is carried through. `allow` is not consulted here — a task's
   `env_vars` come from the project's own `minimal.toml` and there is no prompt
   on this path, so requiring an allow-list entry would break scripted and CI
