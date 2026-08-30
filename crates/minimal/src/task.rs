@@ -129,13 +129,38 @@ fn declared_task(dir: &camino::Utf8Path, task: &str) -> Result<mfile::Task, anyh
 /// A variable that is declared `inherit` but unset is refused here, naming
 /// the task and the variable, instead of surfacing as the daemon's
 /// `failed to spawn process` after a session has already been built.
+///
+/// Every name is verified against the user's `[vars]` policy before it is
+/// resolved, in the same precedence the session composer uses: `deny`
+/// first, then `ignore`. `deny` is the user's emergency stop and fails the
+/// run naming the rule's file; `ignore` drops the variable silently. Both
+/// are checked *before* the lookup, so a denied name never has its value
+/// read out of this shell and an ignored one does not have to be set at
+/// all.
+///
+/// The `allow` step is deliberately not applied. A task's `env_vars` are
+/// declared in the project's own `minimal.toml` and requested by name on
+/// the command line, and there is no prompt on this path — routing them
+/// through `allow` would hard-fail every scripted `min task run` until each
+/// name were allowlisted, which is the case this resolution exists to
+/// unblock. `deny` and `ignore` have no prompt leg, so they apply cleanly.
 fn resolve_task_env(
     task: &mfile::Task,
     task_name: &str,
+    vars_policy: &sessions::core::policy::VarsPolicy,
+    policy_path: &std::path::Path,
     env: impl Fn(&str) -> Result<String, std::env::VarError>,
 ) -> Result<std::collections::BTreeMap<String, String>, anyhow::Error> {
     let mut resolved = std::collections::BTreeMap::new();
     for (name, value) in &task.vars {
+        // Deny wins over ignore, matching `VarsPolicy::check`: a
+        // would-be rejection must not be hidden behind an ignore glob.
+        if vars_policy.deny().is_match(name) {
+            bail!(denied_task_var_message(task_name, name, policy_path));
+        }
+        if vars_policy.ignore().is_match(name) {
+            continue;
+        }
         let value = match value {
             mfile::EnvVarValue::Value(v) => v.clone(),
             mfile::EnvVarValue::Inherit => env(name).map_err(|_| {
@@ -148,6 +173,18 @@ fn resolve_task_env(
         resolved.insert(name.clone(), value);
     }
     Ok(resolved)
+}
+
+/// The `[vars] deny` rejection body: names the task, the variable, and the
+/// file the rule lives in, so the fix is reachable without guessing where
+/// the policy is stored. Split out for unit tests.
+fn denied_task_var_message(task_name: &str, name: &str, policy_path: &std::path::Path) -> String {
+    format!(
+        "task '{task_name}' declares `env_vars.{name}`, but {name} is denied by \
+         `[vars] deny` in {path}; remove the declaration, or the deny rule if \
+         this task should see it",
+        path = policy_path.display(),
+    )
 }
 
 /// The whitespace rejection body: the name is debug-quoted so the offending
@@ -344,11 +381,23 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // existing.
     let declared = declared_task(&utf8_path, &args.task)?;
 
+    // Read before `ensure_daemon` because the env resolution below is
+    // gated on it: a malformed policy, or a variable the policy denies,
+    // must fail with no session built.
+    let policy_path = crate::config::user_policy_path(global);
+    let user_policy = crate::config::read_user_policy(global)?;
+
     // Resolve the task's `env_vars` here, against this shell, and carry the
     // values to the daemon on the exec channel (#585). Done alongside the
     // declared-task check, before `ensure_daemon`, so an unset inherited
     // variable also fails with no session built.
-    let task_env = resolve_task_env(&declared, &args.task, |k| std::env::var(k))?;
+    let task_env = resolve_task_env(
+        &declared,
+        &args.task,
+        user_policy.vars(),
+        &policy_path,
+        |k| std::env::var(k),
+    )?;
 
     crate::ensure_daemon(global)?;
 
@@ -369,8 +418,6 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // loadout flags — the config's `default_loadouts` apply. Resolved before
     // the daemon connection so a broken loadout fails loudly client-side.
     let cfg = crate::config::read_client_config(global)?;
-    let policy_path = crate::config::user_policy_path(global);
-    let user_policy = crate::config::read_user_policy(global)?;
     let initial_policy = user_policy.clone();
     let compose_options = crate::loadouts::compose_options_from_config(&cfg);
     let selection = crate::loadouts::LoadoutSelection::from_flags(&[], false);
@@ -721,6 +768,19 @@ mod tests {
         assert!(err.downcast_ref::<TaskExit>().is_none());
     }
 
+    /// The empty `[vars]` policy — a fresh install, where nothing is
+    /// denied or ignored. The default for the resolution tests that are
+    /// not about policy.
+    fn no_vars_policy() -> sessions::core::policy::VarsPolicy {
+        sessions::core::policy::VarsPolicy::empty()
+    }
+
+    /// Stand-in for the on-disk policy path, which only ever reaches the
+    /// error message.
+    fn policy_path_fixture() -> std::path::PathBuf {
+        std::path::PathBuf::from("/cfg/minimal/user_policy.toml")
+    }
+
     /// Build a task declaration from TOML, for the env-resolution tests.
     fn task_from_toml(toml: &str) -> mfile::Task {
         mfile::File::from_toml_bytes(toml.as_bytes())
@@ -740,7 +800,7 @@ mod tests {
             "[tasks.t]\nenv_vars.ZZ_TASK_TOKEN = { inherit = true }\nexec = 'true'\n",
         );
 
-        let out = resolve_task_env(&task, "t", |k| {
+        let out = resolve_task_env(&task, "t", &no_vars_policy(), &policy_path_fixture(), |k| {
             assert_eq!(k, "ZZ_TASK_TOKEN");
             Ok("task-value-123".to_string())
         })
@@ -762,8 +822,14 @@ mod tests {
             "[tasks.t]\nenv_vars.ZZ_TASK_TOKEN = { inherit = true }\nexec = 'true'\n",
         );
 
-        let err = resolve_task_env(&task, "t", |_| Err(std::env::VarError::NotPresent))
-            .expect_err("an unset inherited variable must be refused");
+        let err = resolve_task_env(
+            &task,
+            "t",
+            &no_vars_policy(),
+            &policy_path_fixture(),
+            |_| Err(std::env::VarError::NotPresent),
+        )
+        .expect_err("an unset inherited variable must be refused");
         let msg = err.to_string();
         assert!(msg.contains("task 't'"), "names the task: {msg}");
         assert!(msg.contains("ZZ_TASK_TOKEN"), "names the variable: {msg}");
@@ -779,7 +845,14 @@ mod tests {
             "[tasks.t]\nenv_vars.LITERAL = 'fixed'\nenv_vars.EMPTY = { inherit = true }\nexec = 'true'\n",
         );
 
-        let out = resolve_task_env(&task, "t", |_| Ok(String::new())).expect("resolves");
+        let out = resolve_task_env(
+            &task,
+            "t",
+            &no_vars_policy(),
+            &policy_path_fixture(),
+            |_| Ok(String::new()),
+        )
+        .expect("resolves");
         assert_eq!(out.get("LITERAL").map(String::as_str), Some("fixed"));
         assert_eq!(out.get("EMPTY").map(String::as_str), Some(""));
     }
@@ -790,11 +863,113 @@ mod tests {
     #[test]
     fn a_task_without_env_vars_resolves_to_nothing() {
         let task = task_from_toml("[tasks.t]\nexec = 'true'\n");
-        let out = resolve_task_env(&task, "t", |_| {
-            panic!("no variable should be looked up");
-        })
+        let out = resolve_task_env(
+            &task,
+            "t",
+            &no_vars_policy(),
+            &policy_path_fixture(),
+            |_| panic!("no variable should be looked up"),
+        )
         .expect("resolves");
         assert!(out.is_empty());
+    }
+
+    /// A `deny` rule is the user's emergency stop, and it reaches a task's
+    /// `env_vars` too: the run fails naming the task, the variable, and the
+    /// file the rule lives in, rather than shipping the value into the box.
+    #[test]
+    fn a_denied_var_fails_the_run_naming_the_policy_file() {
+        let task = task_from_toml(
+            "[tasks.t]\nenv_vars.AWS_SECRET_ACCESS_KEY = { inherit = true }\nexec = 'true'\n",
+        );
+        let policy = no_vars_policy().try_with_deny(["AWS_*"]).unwrap();
+
+        let err = resolve_task_env(&task, "t", &policy, &policy_path_fixture(), |_| {
+            panic!("a denied variable must never be read out of this shell");
+        })
+        .expect_err("a denied variable must fail the run");
+
+        let msg = err.to_string();
+        assert!(msg.contains("task 't'"), "names the task: {msg}");
+        assert!(
+            msg.contains("AWS_SECRET_ACCESS_KEY"),
+            "names the variable: {msg}"
+        );
+        assert!(msg.contains("[vars] deny"), "names the rule: {msg}");
+        assert!(
+            msg.contains("/cfg/minimal/user_policy.toml"),
+            "names the policy file: {msg}"
+        );
+    }
+
+    /// `deny` is checked before the lookup, and before `ignore`: a denied
+    /// literal has no shell value to read, and a name matching both rules
+    /// resolves as denied so a would-be rejection can't be hidden behind an
+    /// ignore glob — the same precedence `VarsPolicy::check` applies.
+    #[test]
+    fn deny_beats_ignore_and_applies_to_literals() {
+        let task = task_from_toml("[tasks.t]\nenv_vars.AWS_KEY = 'literal'\nexec = 'true'\n");
+        let policy = no_vars_policy()
+            .try_with_deny(["AWS_*"])
+            .unwrap()
+            .try_with_ignore(["AWS_*"])
+            .unwrap();
+
+        let err = resolve_task_env(&task, "t", &policy, &policy_path_fixture(), |_| {
+            panic!("no lookup happens for a literal");
+        })
+        .expect_err("deny must win over ignore");
+        assert!(err.to_string().contains("[vars] deny"));
+    }
+
+    /// `ignore` drops the variable silently and lets the task run — and it
+    /// is applied before the lookup, so an ignored `inherit` need not be
+    /// set at all. The unignored siblings are unaffected.
+    #[test]
+    fn an_ignored_var_is_dropped_without_being_looked_up() {
+        let task = task_from_toml(
+            "[tasks.t]\nenv_vars.NOISY_DEBUG = { inherit = true }\n\
+             env_vars.KEPT = { inherit = true }\nexec = 'true'\n",
+        );
+        let policy = no_vars_policy().try_with_ignore(["NOISY_*"]).unwrap();
+
+        let out = resolve_task_env(&task, "t", &policy, &policy_path_fixture(), |k| {
+            assert_eq!(k, "KEPT", "an ignored variable must not be looked up");
+            Ok("kept-value".to_string())
+        })
+        .expect("an unset but ignored variable is not an error");
+
+        assert_eq!(out.get("KEPT").map(String::as_str), Some("kept-value"));
+        assert!(!out.contains_key("NOISY_DEBUG"));
+        assert_eq!(out.len(), 1);
+    }
+
+    /// A name matching neither rule is carried through with no allow-list
+    /// entry and no prompt. This is the property that keeps scripted and CI
+    /// `min task run` working against a fresh install's empty policy — the
+    /// case client-side resolution exists to unblock — so the `allow` step
+    /// is deliberately not applied here.
+    #[test]
+    fn an_unlisted_var_needs_no_allow_entry() {
+        let task = task_from_toml(
+            "[tasks.t]\nenv_vars.ZZ_TASK_TOKEN = { inherit = true }\nexec = 'true'\n",
+        );
+        // Non-empty allow set that does NOT cover the name: under the
+        // composer's origin-aware rules this would prompt, and hard-fail in
+        // CI. Here it simply resolves.
+        let policy = no_vars_policy()
+            .try_with_allow(["SOMETHING_ELSE_*"])
+            .unwrap();
+
+        let out = resolve_task_env(&task, "t", &policy, &policy_path_fixture(), |_| {
+            Ok("task-value-123".to_string())
+        })
+        .expect("an unlisted name resolves without an allow entry");
+
+        assert_eq!(
+            out.get("ZZ_TASK_TOKEN").map(String::as_str),
+            Some("task-value-123")
+        );
     }
 
     /// `cmd_task_run` rejects a task the project's minimal.toml does not

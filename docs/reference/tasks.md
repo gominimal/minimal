@@ -136,6 +136,32 @@ an inherited variable there is still resolved against the daemon's
 environment — so prefer an explicit value for tasks meant to be run from
 inside a box.
 
+Every name a task declares — inherited or literal — is checked against the
+`[vars]` section of your `user_policy.toml` before its value is read:
+
+- a name matching **`deny`** fails the run, naming the rule's file. The value
+  is never read out of your shell.
+- a name matching **`ignore`** is dropped silently and the task runs without
+  it; an ignored variable does not have to be set.
+- anything else is carried through. `allow` is not consulted here — a task's
+  `env_vars` come from the project's own `minimal.toml` and there is no prompt
+  on this path, so requiring an allow-list entry would break scripted and CI
+  runs.
+
+```toml
+# user_policy.toml
+[vars]
+deny = ["AWS_*"]
+```
+
+```console
+$ min task run deploy
+error: task 'deploy' declares `env_vars.AWS_SECRET_ACCESS_KEY`, but
+AWS_SECRET_ACCESS_KEY is denied by `[vars] deny` in
+~/.config/minimal/user_policy.toml; remove the declaration, or the deny rule
+if this task should see it
+```
+
 
 ### `interactive` - TUI apps and shells
 
