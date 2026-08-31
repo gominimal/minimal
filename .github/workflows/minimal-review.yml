@@ -23,6 +23,11 @@ name: minimal-review
 on:
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
+  # `/review` in a PR comment. `created` only — editing an old comment to say
+  # `/review` should not start a run, and `edited` would let one comment start
+  # any number of them.
+  issue_comment:
+    types: [created]
   workflow_dispatch:
     inputs:
       pr:
@@ -34,9 +39,11 @@ permissions:
   pull-requests: write
 
 # Debounce `synchronize` bursts: three commits in ten seconds should produce one
-# review of the final head, not three of intermediate trees.
+# review of the final head, not three of intermediate trees. `issue.number` is
+# the comment path's PR: that payload has no `pull_request`, so without it every
+# comment forms its own group and runs beside the push review of the same PR.
 concurrency:
-  group: minimal-review-${{ github.event.pull_request.number || github.event.inputs.pr }}
+  group: minimal-review-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr }}
   cancel-in-progress: true
 
 env:
@@ -71,8 +78,23 @@ jobs:
     # dependabot are CONTRIBUTOR, not MEMBER, and gating them out would stop
     # reviewing every dependency bump. workflow_dispatch already requires
     # write access.
+    #
+    # `issue_comment` is the one path where the trigger is not the PR. It fires
+    # on issue comments too, and on a public install anyone at all can post one,
+    # so all four clauses are load-bearing: it must be a PR, the body must ask,
+    # and the person asking must be one of ours. No Bot clause here — a bot's
+    # comment starting a paid review is a loop nobody asked for.
+    #
+    # This gate is repeated in the caller, and that copy is the one that stops
+    # the job from starting. This one is the backstop: the caller's file can be
+    # edited by the PR under review, and this file cannot.
     if: >-
       github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       startsWith(github.event.comment.body, '/review') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                github.event.comment.author_association)) ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
        github.event.pull_request.draft != true &&
        (github.event.pull_request.user.type == 'Bot' ||
@@ -148,25 +170,56 @@ jobs:
           path: reviewer
           persist-credentials: false
 
-      # workflow_dispatch skips the job-level fork guard, because there is no
-      # pull_request payload to read head.repo from. Without this it would
-      # resolve refs/pull/<n>/head for ANY number given — including a fork's —
-      # and run the agent over untrusted code in a sandbox that can reach the
-      # broker. Dispatch requires write access, but "trusted to trigger" is not
-      # "meant to review anything".
-      - name: Refuse a fork PR on dispatch
+      # Neither number-carrying trigger has a pull_request payload, so the
+      # job-level fork guard cannot see head.repo and this step reads it from
+      # the API instead. Without it, refs/pull/<n>/head would resolve for ANY
+      # number given.
+      #
+      # The two triggers get different answers, and the difference is the whole
+      # point. A fork PR gets no secrets on `pull_request`, which is why the
+      # caller refuses it there — and why a member working from a fork has been
+      # getting no review at all (8 of the last 60 PRs on gominimal/minimal,
+      # all from one member with write access). `issue_comment` runs in THIS
+      # repo's context and does get secrets, so it is the one trigger that
+      # *can* review a fork. Dispatch requires write access, but "trusted to
+      # trigger" is not "meant to review anything"; a comment naming the PR is
+      # a per-run human authorisation, and that is what this accepts.
+      - name: Resolve the PR, and decide whether a fork may be reviewed
         id: dispatch_pr
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.inputs.pr }}
+          PR_NUMBER: ${{ github.event.inputs.pr || github.event.issue.number }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
           head_repo="$(printf '%s' "$pr" | jq -r '.head.repo.full_name // ""')"
           if [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
-            echo "::error::PR #$PR_NUMBER has its head in '${head_repo:-<deleted>}', not $GITHUB_REPOSITORY. Fork review is out of scope."
-            exit 1
+            if [ "$EVENT" != "issue_comment" ]; then
+              echo "::error::PR #$PR_NUMBER has its head in '${head_repo:-<deleted>}'. A fork is reviewed only when a member comments /review on it — that comment is the authorisation, and this trigger carries none."
+              exit 1
+            fi
+
+            # What the sandbox runs under still comes from the PR head, and on a
+            # fork that means from outside the org. Lifecycle hooks are stripped
+            # further down for exactly this reason, but minimal.toml also pins
+            # [upstream] — the repo and commit every package is built from — so
+            # editing it redirects the whole build at code of the author's
+            # choosing, and packages/ holds the build specs themselves.
+            #
+            # Refusing beats silently substituting the base config: a fork PR
+            # that changes how the project builds is precisely the PR a person
+            # should read before a machine does.
+            files="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename')"
+            risky="$(printf '%s\n' "$files" | grep -E '^(minimal\.toml|\.minimal/|packages/)' || true)"
+            if [ -n "$risky" ]; then
+              echo "::error::PR #$PR_NUMBER comes from a fork and changes what the sandbox builds and runs:"
+              printf '::error::  %s\n' $risky
+              echo "::error::Read it by hand, or land the build-config change from a branch in $GITHUB_REPOSITORY first."
+              exit 1
+            fi
+            echo "fork review authorised by comment: $head_repo (no build config touched)"
           fi
           # The same response carries the base. Without this the dispatch path
           # falls back to the default branch, so a PR targeting a release branch
@@ -183,7 +236,7 @@ jobs:
         if: steps.quiet.outputs.status != 'stale'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha || format('refs/pull/{0}/head', github.event.inputs.pr) }}
+          ref: ${{ github.event.pull_request.head.sha || format('refs/pull/{0}/head', github.event.inputs.pr || github.event.issue.number) }}
           fetch-depth: 0
           path: pr
           persist-credentials: false
@@ -211,7 +264,7 @@ jobs:
         working-directory: pr
         env:
           EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
-          INPUT_PR_NUMBER: ${{ github.event.inputs.pr }}
+          INPUT_PR_NUMBER: ${{ github.event.inputs.pr || github.event.issue.number }}
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EVENT_BASE_REF: ${{ github.event.pull_request.base.ref || steps.dispatch_pr.outputs.base_ref }}
           EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha || steps.dispatch_pr.outputs.base_sha }}
@@ -331,7 +384,14 @@ jobs:
             cp "$LEARNINGS" .review/learnings.md
             echo "learnings: $(wc -l < .review/learnings.md) lines from ${GITHUB_REPOSITORY##*/}.md"
           else
-            printf '# Dismissed findings\n\n_None recorded yet._\n' > .review/learnings.md
+            # The heading matches contract.learnings.render([], repo=...); the
+            # preamble it also emits does not, and deliberately — copying that
+            # prose into a shell printf is a second copy of it that will drift
+            # from the one in the library. What the agent needs from an empty
+            # store is that it is empty, and both forms say that. Only reachable
+            # for an install added before its store file was.
+            printf '# Dismissed findings — %s\n\n_None recorded yet._\n' \
+              "${GITHUB_REPOSITORY##*/}" > .review/learnings.md
             echo "learnings: none recorded for ${GITHUB_REPOSITORY##*/}"
           fi
 
@@ -503,7 +563,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: gominimal/broker
-          ref: d4b53da036ed5fc8ab51accadfdea0d79d5fa055
+          ref: 6743a61ef8324d81648047d0735684d26f2e2071
           token: ${{ steps.app-token.outputs.token }}
           path: broker
           persist-credentials: false
@@ -780,9 +840,26 @@ jobs:
           # goes red. That is the failure guarding those steps was meant to
           # prevent, relocated one step further on.
           mkdir -p "$RUN_DIR"
-          curl -fsS -m 5 "http://127.0.0.1:${BROKER_PORT}/health" \
-            > "$RUN_DIR/broker-usage.json" 2>/dev/null \
-            || echo '{}' > "$RUN_DIR/broker-usage.json"
+          # -m 10, not 5. /health shells out to `gh auth token`, and the broker
+          # documents HEALTH_PROBE_BUDGET = 5 as the *minimum* a client must
+          # allow; probing at exactly the budget files a slow broker as a
+          # missing one, and that answer is now recorded rather than discarded.
+          if curl -fsS -m 10 "http://127.0.0.1:${BROKER_PORT}/health" \
+               > "$RUN_DIR/broker-usage.json" 2>/dev/null; then
+            probe=ok
+          else
+            # The `{}` stays so the reader below has a document, but it is no
+            # longer the only evidence. On its own it cannot say whether the
+            # broker was gone or answered with zeroes, and the telemetry row
+            # then reports a missing token count as if it were a fact about
+            # cost. The probe result is what tells those apart.
+            probe=unreachable
+            echo '{}' > "$RUN_DIR/broker-usage.json"
+          fi
+          # A file, not a shell variable: the step that emits the row is not
+          # this one.
+          echo "$probe" > "$RUN_DIR/broker-probe.txt"
+          echo "broker probe: $probe"
           python3 -c "
           import json
           try:
@@ -853,10 +930,30 @@ jobs:
               # True because one generalist runs and it exited 0. This becomes a
               # real cross-persona check when a panel lands; it is the line that
               # would otherwise let an incomplete panel approve.
+              # Same version skew as parse_v0_or_v1 above, same guard: the gate
+              # is pip-installed from the default branch while this workflow
+              # comes from the PR head, so passing a parameter the installed
+              # gate has not got would kill the review with a TypeError instead
+              # of reviewing.
+              suppression = {}
+              if "learnings_dir" in inspect.signature(compose).parameters:
+                  # The reviewer checkout, pinned to job.workflow_sha — NOT the
+                  # copy staged under pr/.review/. That one lives in the
+                  # workspace the sandbox writes to, so reading it here would
+                  # let a PR choose what its own reviewer stays silent about.
+                  suppression = {
+                      "learnings_dir": os.path.join(
+                          os.environ["GITHUB_WORKSPACE"], "reviewer/review/learnings"
+                      ),
+                      # From the environment, never from the staged filename:
+                      # that copy is called learnings.md and has lost the repo.
+                      "repo": os.environ["GITHUB_REPOSITORY"].rsplit("/", 1)[-1],
+                  }
               outcome = compose(
                   doc, diff, os.environ["HEAD_SHA"], policy,
                   expected_pr=int(os.environ["PR_NUMBER"]),
                   personas_completed=True,
+                  **suppression,
               )
           except DocumentRejected as exc:
               raise SystemExit(f"::error::document rejected; nothing will be posted: {exc}")
@@ -865,6 +962,20 @@ jobs:
               json.dump(outcome.payload, fh, indent=2)
           with open(f"{run_dir}/payload.md", "w", encoding="utf-8") as fh:
               fh.write(outcome.payload["body"])
+
+          # The one field that says what the pipeline DECIDED, written where a
+          # later step can read it. Printing it below is for a human reading
+          # this job; the step log is not queryable and dies with the runner,
+          # which is why every telemetry row carried a null verdict.
+          #
+          # JSON rather than a step output: the reason is free prose from
+          # `decide`, and $GITHUB_OUTPUT is a line-oriented format that would
+          # need its own delimiter discipline to survive one.
+          with open(f"{run_dir}/verdict.json", "w", encoding="utf-8") as fh:
+              json.dump(
+                  {"verdict": outcome.verdict.value, "verdict_reason": outcome.reason},
+                  fh,
+              )
 
           print(f"{outcome.verdict.value}: {outcome.reason}")
           print(
@@ -905,6 +1016,16 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUN_DIR"
 
+          # Composed two steps ago, in another process. Absent whenever compose
+          # did not run at all — an empty string here, which the emitter reads
+          # as "no verdict was composed" rather than inventing one.
+          verdict=""
+          verdict_reason=""
+          if [ -s "$RUN_DIR/verdict.json" ]; then
+            verdict="$(jq -r '.verdict // ""' "$RUN_DIR/verdict.json")"
+            verdict_reason="$(jq -r '.verdict_reason // ""' "$RUN_DIR/verdict.json")"
+          fi
+
           jq -n \
             --arg pr "${PR_NUMBER:-}" --arg head "${HEAD_SHA:-}" --arg base "${BASE_SHA:-}" \
             --arg elapsed "${ELAPSED:-}" --arg alias "$HOST_ALIAS" \
@@ -914,10 +1035,13 @@ jobs:
             --arg posted "${POST_OUTCOME:-skipped}" \
             --arg upstream "${UPSTREAM:-anthropic}" \
             --arg repomap "${REPO_MAP:-absent}" \
+            --arg verdict "$verdict" \
+            --arg vreason "$verdict_reason" \
             '{pr: $pr, head_sha: $head, base_sha: $base, agent_seconds: $elapsed,
               host_alias: $alias, backend: $kvm, run_id: $run,
               agent_status: $astatus, posted: $posted,
-              upstream: $upstream, repo_map: $repomap}' \
+              upstream: $upstream, repo_map: $repomap,
+              verdict: $verdict, verdict_reason: $vreason}' \
             > "$RUN_DIR/run.json"
 
           # The audit record must say what actually happened.
@@ -961,6 +1085,7 @@ jobs:
             --findings   "$RUN_DIR/findings.json" \
             --validation "$RUN_DIR/validation.txt" \
             --usage      "$RUN_DIR/broker-usage.json" \
+            --usage-probe "$RUN_DIR/broker-probe.txt" \
             --repo       "$GITHUB_REPOSITORY" \
             --outcome    "${{ job.status }}" || true
 
