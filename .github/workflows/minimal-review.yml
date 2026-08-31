@@ -390,6 +390,18 @@ jobs:
           # PR title and body are attacker-controlled text. They reach the agent
           # as JSON data and never pass through a shell: jq reads the event
           # payload from disk, nothing is interpolated into this script.
+          #
+          # `.issue` sits between `.pull_request` and the literal below because an
+          # issue_comment payload carries the PR under `issue` and has no
+          # top-level `pull_request` key. Without it every /review-triggered run
+          # staged the string "(workflow_dispatch)" as the title and an empty
+          # body, and step 1 of the prompt is to read both for intent — so the
+          # agent opened the fork-review path knowing nothing about the PR.
+          #
+          # Explained HERE, not inside the jq program: that program is a single
+          # quoted shell string, so one apostrophe in a jq comment closes the
+          # quote and the whole thing dies as `jq: syntax error ... (Unix shell
+          # quoting issues?)`. Which is exactly how it shipped broken.
           jq -n \
             --slurpfile ev "$GITHUB_EVENT_PATH" \
             --argjson number "$PR_NUMBER" \
@@ -399,13 +411,6 @@ jobs:
             --rawfile files "$RUN_DIR/changed-files.txt" \
             '{
                number: $number,
-               # `.issue` before the literal: an issue_comment payload carries
-               # the PR under `issue`, with no top-level `pull_request` key.
-               # Without this every /review-triggered run staged the literal
-               # "(workflow_dispatch)" as the title and an empty body — and the
-               # prompt's step 1 is to read the title and body for intent, so
-               # the agent opened the fork-review path knowing nothing about
-               # what it was reviewing.
                title: ($ev[0].pull_request.title // $ev[0].issue.title // "(workflow_dispatch)"),
                body: ($ev[0].pull_request.body // $ev[0].issue.body // ""),
                head_sha: $head_sha,
