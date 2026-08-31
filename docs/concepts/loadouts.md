@@ -113,6 +113,20 @@ A source that does not exist on your host is skipped with a warning rather
 than failing activation, so you can opportunistically patch a dotfile tree
 that may not be present on every machine.
 
+For files that exist only to serve one loadout, keep them beside it instead
+and name them with `$LOADOUT_ROOT` — the directory next to the loadout file,
+named after the loadout, which is also where its hook scripts live:
+
+```toml
+patches = [
+    { dest = ".config/helix/config.toml", source = "$LOADOUT_ROOT/config.toml" },
+]
+```
+
+That makes the loadout and its files one movable unit, with no absolute path
+into your config directory to keep in sync. See the
+[reference](../reference/loadouts.md#loadout_root) for the rules.
+
 ### Lifecycle hooks
 
 Hooks run inside your session, with its packages, variables, files, and

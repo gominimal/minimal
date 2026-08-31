@@ -20,8 +20,8 @@
 //! land at the end.
 
 use crate::core::compose::{
-    ComposeError, ComposeOptions, HookDomain, PendingPatchFile, PendingVar, SessionVar,
-    expand_patch_sources,
+    ComposeError, ComposeOptions, HookDomain, PatchAnchors, PendingPatchFile, PendingVar,
+    SessionVar, expand_patch_sources,
 };
 use crate::core::decision::{CheckOutcome, Decision, ItemDecision};
 use crate::core::enumerate::enumerate_patch_files;
@@ -437,6 +437,11 @@ fn gate_pending_patches(
     }
     let home_fallback = env("HOME").ok();
     let home_fallback = home_fallback.as_deref();
+    // No loadouts directory: nothing on this path was declared by a
+    // loadout (the daemon only sends Package / Project items), so
+    // `$LOADOUT_ROOT` here is refused rather than anchored somewhere
+    // arbitrary.
+    let anchors = PatchAnchors::home(home_fallback);
 
     let mut expanded_policy = policy.expand_with(combined_vars, home_fallback)?;
 
@@ -447,7 +452,7 @@ fn gate_pending_patches(
         pending,
         &expanded_policy,
         combined_vars,
-        home_fallback,
+        anchors,
         options.follow_symlinks,
     )?;
     if unapproved.is_empty() {
@@ -483,7 +488,7 @@ fn enumerate_and_classify_patches(
     pending: Vec<WirePendingPatch>,
     policy: &ExpandedPatchesPolicy,
     combined_vars: &[SessionVar],
-    home_fallback: Option<&str>,
+    anchors: PatchAnchors<'_>,
     follow_symlinks: bool,
 ) -> Result<(Vec<WirePatchVerdict>, Vec<PendingPatchFile>), ComposeError> {
     let mut verdicts: Vec<WirePatchVerdict> = Vec::new();
@@ -505,8 +510,7 @@ fn enumerate_and_classify_patches(
         // `follow_symlinks: None`, which resolves to the compose
         // default at expand time.
         let pp = ProvenancedPatch::new(Patch::new(p.source_pattern, dest), provenance);
-        let expanded =
-            expand_patch_sources(vec![pp], combined_vars, home_fallback, follow_symlinks)?;
+        let expanded = expand_patch_sources(vec![pp], combined_vars, anchors, follow_symlinks)?;
         // Capture the walk root before `enumerate_patch_files`
         // consumes `expanded`. Needed for the synthetic Ignored
         // verdict emitted below when the walk yields zero files.

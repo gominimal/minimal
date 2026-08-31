@@ -1128,6 +1128,60 @@ fn entry_handle(entry: &minimald_rpc::ListSessionsEntry) -> String {
     }
 }
 
+/// Warn when the daemon already tracks a session for `target`.
+///
+/// Activating a path that already has a session mints a second, independent
+/// one; bare `min` from that directory is then ambiguous between them. The
+/// activation still proceeds — this only surfaces the foot-gun the caller
+/// would otherwise hit silently, and points at `attach` as the way to reuse
+/// the existing session. Pure, so the message is unit-testable.
+fn duplicate_session_warning(
+    entries: &[minimald_rpc::ListSessionsEntry],
+    target: &paths::HostAbsPath,
+) -> Option<String> {
+    // When several sessions track the same path, prefer an `Active` one: it is
+    // the only status `attach` accepts, so recommending it (rather than the
+    // first match, which may be `Pending`/`Materializing`) points the user at a
+    // session they can actually reuse. Fall back to the first match when none is
+    // active, so the "still being created; wait" guidance still fires.
+    let existing = entries
+        .iter()
+        .filter(|e| e.project_path.as_ref() == Some(target))
+        .find(|e| e.status == sessions::SessionStatus::Active)
+        .or_else(|| {
+            entries
+                .iter()
+                .find(|e| e.project_path.as_ref() == Some(target))
+        })?;
+    let handle = entry_handle(existing);
+    let lead = format!(
+        "warning: a session already exists for this path ({handle}); activating \
+         creates a second one, leaving bare `min` here ambiguous between them."
+    );
+    // Only point at `attach` for a session it will actually accept. Attach
+    // refuses anything not yet `Active` (see `sessions::SessionStatus`), so for
+    // a `Pending`/`Materializing` duplicate the reuse command would fail
+    // immediately — say to wait instead. When we do suggest it, use a key
+    // `SessionLookup::parse` can resolve: a name matches by name and the full id
+    // parses as a UUID, but the short unnamed handle would parse as a
+    // nonexistent name and the attach lookup would miss.
+    match existing.status {
+        sessions::SessionStatus::Active => {
+            let key = existing
+                .name
+                .clone()
+                .unwrap_or_else(|| existing.id.to_string());
+            Some(format!(
+                "{lead} To reuse it instead: min session attach {key}"
+            ))
+        }
+        _ => Some(format!(
+            "{lead} The existing session is still being created; wait for it to \
+             become active, then reuse it instead of creating a second."
+        )),
+    }
+}
+
 /// Abbreviate a home-prefixed path to `~`/`~/...` for display; any other
 /// path renders absolute, unchanged.
 fn display_with_home_tilde(path: &camino::Utf8Path, home: Option<&camino::Utf8Path>) -> String {
@@ -1424,8 +1478,37 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
         .await
         .context("ListSessions RPC failed")?;
 
+    // On stderr, and outside `format_ls`: every output mode should carry a
+    // fault this severe — `--raw` most of all, since a script parsing bare ids
+    // is exactly what will go on using hostnames that no longer resolve — and
+    // stdout stays clean for the parser either way.
+    warn_if_hostname_routing_down(resp.hostname_routing_unavailable.as_deref());
+    warn_if_mtls_proxy_down(resp.mtls_proxy_unavailable.as_deref());
     format_ls(&mut std::io::stdout(), &args, &resp)?;
     Ok(())
+}
+
+/// Tells the user that `<name>.local.min.internal` will not resolve, and why.
+///
+/// The daemon keeps serving without its host-side proxy, so nothing else the
+/// user sees is different: sessions activate, exec works, the list prints. The
+/// only other trace is a `warn!` in the daemon log, which is not where someone
+/// watching curl fail is looking (gominimal/inbox#560).
+fn warn_if_hostname_routing_down(reason: Option<&str>) {
+    if let Some(reason) = reason {
+        eprintln!("warning: session hostnames will not route: {reason}");
+    }
+}
+
+/// Tells the user the mTLS reverse proxy is not serving, and why.
+///
+/// Kept separate from [`warn_if_hostname_routing_down`] so the two faults read
+/// as what they are: hostnames failing to resolve and TLS termination being
+/// absent are different problems with different fixes.
+fn warn_if_mtls_proxy_down(reason: Option<&str>) {
+    if let Some(reason) = reason {
+        eprintln!("warning: the mTLS reverse proxy is not serving: {reason}");
+    }
 }
 
 /// Format the session list for the given output mode. Split from
@@ -1799,6 +1882,15 @@ async fn upload_and_finalize(
                     Some(d) => eprintln!("Ran activation hook from {}: {d}", hook.declared_by),
                     None => eprintln!("Ran activation hook from {}", hook.declared_by),
                 }
+                // The description is an author-supplied label; what the
+                // hook actually said is its captured output. Echo it to
+                // stderr — stdout is reserved for the bare session id.
+                if !hook.output.is_empty() {
+                    eprint!("{}", hook.output);
+                    if !hook.output.ends_with('\n') {
+                        eprintln!();
+                    }
+                }
             }
             Ok(())
         }
@@ -2009,10 +2101,6 @@ async fn activate_session(
     let abs_path =
         paths::HostAbsPath::try_new(utf8_path.clone()).context("Invalid project path")?;
 
-    if offer_scaffold {
-        offer_mfile_scaffold(&utf8_path, global)?;
-    }
-
     let mut port_mappings = Vec::with_capacity(args.ingress.len());
     for spec in &args.ingress {
         let mapping = parse_ingress_mapping(spec)?;
@@ -2041,7 +2129,7 @@ async fn activate_session(
     // connection context; the client doesn't send it.
     let config = minimald_rpc::SessionConfig {
         name: Some(session_name),
-        project_path: abs_path,
+        project_path: abs_path.clone(),
         network: args.network.into(),
         policy,
         hooks_enabled: !args.no_hooks,
@@ -2059,6 +2147,14 @@ async fn activate_session(
     let compose_options = loadouts::compose_options_from_config(&cfg);
     let selection = loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts);
     let active = loadouts::resolve_active_loadouts(selection, &cfg, global)?;
+
+    // Scaffold-offer a missing `minimal.toml` only after loadouts resolve:
+    // a bad `--loadout` must error before anything prints, so the user is
+    // never told the session is proceeding and then that it is not.
+    if offer_scaffold {
+        offer_mfile_scaffold(&utf8_path, global)?;
+    }
+
     if !active.loadouts.is_empty() {
         let names: Vec<&str> = active.loadouts.iter().map(|l| l.name().as_ref()).collect();
         eprintln!("Applying loadouts: {}", names.join(", "));
@@ -2072,8 +2168,7 @@ async fn activate_session(
     // touches the daemon: a mistyped path, a symlinked script, or a
     // missing loadout script directory should fail here, on this
     // machine, rather than after a session exists on the daemon.
-    let hook_scripts =
-        loadouts::stage_loadout_hook_scripts(&active, global, &utf8_path, !args.no_hooks)?;
+    let hook_scripts = loadouts::stage_loadout_hook_scripts(&active, &abs_path, !args.no_hooks)?;
 
     // Same idea for the *project's* hooks, which the daemon composes from
     // the uploaded mfile and which therefore never pass through the
@@ -2081,7 +2176,7 @@ async fn activate_session(
     // its own scripts — but the checks a staging pass would have made are
     // still worth making on this machine, before a session exists.
     if !args.no_hooks {
-        loadouts::check_project_hooks(&utf8_path)?;
+        loadouts::check_project_hooks(&abs_path)?;
     }
 
     // The daemon runs the composition's `on_activate` hooks inside
@@ -2122,6 +2217,45 @@ async fn activate_session(
     // Activation is the hot path #1251's gate landed on, and it must not pay a
     // round trip for a check its own first RPC can make.
     let mut client = connect_daemon_unchecked(global).await?;
+
+    // Warn before minting a second session for a path that already has one:
+    // the duplicate leaves bare `min` from this directory ambiguous between
+    // them. Advisory only — a listing failure (ordinary transport or
+    // daemon-side error) must not block activation, so the duplicate check is
+    // skipped on error. But `oneshot_rpc` reuses one `russh` handle, and a
+    // transport-level listing failure can close the shared connection, which
+    // would then break the `CreateSession` channel below; so on any listing
+    // error, reconnect before creation. A benign daemon-side error leaves the
+    // old connection usable and the reconnect is merely a no-op cost on the
+    // rare failure path — the happy path still pays no extra round trip. The
+    // hard version gate is unaffected: `CreateSession` below carries its own
+    // `must_match_version`, so a version-skewed daemon is still refused there
+    // even when this enumeration is skipped.
+    match list_sessions_version_gated(&mut client).await {
+        Ok(existing_sessions) => {
+            if let Some(warning) =
+                duplicate_session_warning(&existing_sessions.sessions, &config.project_path)
+            {
+                eprintln!("{warning}");
+            }
+        }
+        Err(_) => {
+            // The listing failed. A transport-level closure can leave the
+            // shared `russh` handle unusable, which would then break the
+            // `CreateSession` channel below, so try to reconnect. But a
+            // daemon-side listing error closes only the RPC channel and leaves
+            // the SSH connection intact — so if the reconnect itself fails,
+            // keep the original client and let `CreateSession` proceed on it
+            // rather than aborting activation outright. `CreateSession` carries
+            // its own hard version gate and surfaces a clear error if the
+            // connection really is dead, so retaining the original client can
+            // only help the daemon-side-error case and never regresses the
+            // transport-closure case.
+            if let Ok(reconnected) = connect_daemon_unchecked(global).await {
+                client = reconnected;
+            }
+        }
+    }
 
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
@@ -2164,6 +2298,8 @@ async fn activate_session(
     // loadout, and the finalize that #1251 died at, and with the session left
     // unfinalized for the daemon to reap when this connection drops.
     ensure_version_reported(created.daemon_version.as_deref())?;
+    warn_if_hostname_routing_down(created.hostname_routing_unavailable.as_deref());
+    warn_if_mtls_proxy_down(created.mtls_proxy_unavailable.as_deref());
     let id = created.id;
 
     // From here the session exists on the daemon in an unfinalized state.
@@ -2202,17 +2338,19 @@ async fn activate_session(
                 eprintln!("Uploading from project root {upload_root} (resolved from {utf8_path})");
             }
             // Guard against accidentally uploading a non-VCS directory
-            // (e.g. `~`). A VCS root uploads unconditionally. For a non-VCS
-            // root an interactive caller gets the confirm (default No); a
-            // headless caller (CI, pipes, agents, `--no-prompt`,
-            // `--no-input`) can't be asked, so it skips the upload with a
-            // warning rather than silently shipping a directory nobody
-            // confirmed — `--sync tarball` (via `sync_explicit`) is the
+            // (e.g. `~`). A VCS root, or a directory carrying a
+            // `minimal.toml` (a declared project), uploads unconditionally.
+            // For an undeclared non-VCS root an interactive caller gets the
+            // confirm (default No); a headless caller (CI, pipes, agents,
+            // `--no-prompt`, `--no-input`) can't be asked, so it skips the
+            // upload with a warning rather than silently shipping a directory
+            // nobody confirmed — `--sync tarball` (via `sync_explicit`) is the
             // escape hatch that force-uploads it anyway (#770).
             let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
             let should_upload = match file_upload::upload_gate(
                 file_upload::is_vcs_root(upload_root.as_std_path()),
                 sync_explicit,
+                project_has_mfile(&upload_root),
                 headless,
             ) {
                 file_upload::UploadGate::Upload => true,
@@ -2236,8 +2374,8 @@ async fn activate_session(
                         );
                     }
                     eprintln!(
-                        "warning: {upload_root} is not a version control repository root; \
-                         skipping file upload (pass --sync tarball to upload anyway)"
+                        "{}",
+                        file_upload::skipped_upload_warning(upload_root.as_std_path())
                     );
                     false
                 }
@@ -3805,11 +3943,22 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
             graph.top_levels.clone(),
             mctx::AddDepMode::TaskPackages { name: task },
         )?,
-        AddKind { session: true, .. } => ctx.add_deps(
-            &graph,
-            graph.top_levels.clone(),
-            mctx::AddDepMode::SessionPackages,
-        )?,
+        AddKind { session: true, .. } => {
+            ctx.add_deps(
+                &graph,
+                graph.top_levels.clone(),
+                mctx::AddDepMode::SessionPackages,
+            )?;
+            // The host-side add updates `minimal.toml`; unlike the
+            // in-session helper it does not install into a running session.
+            // Qualify the success line so it is not read as a live install.
+            eprintln!(
+                "Note: this updated minimal.toml; a running session is \
+                 not modified. The package will be present in sessions \
+                 activated after this change; to add it to an already-running \
+                 session, run `min add --session` from inside that session."
+            );
+        }
         _ => unreachable!(),
     }
 
@@ -4275,6 +4424,117 @@ mod tests {
              Next:\n\
              \x20 min session attach --command 'min task run <task>' web\n\
              \x20 min ls --json\n"
+        );
+    }
+
+    /// A session already tracked for the target path warns with that
+    /// session's handle and the `attach` reuse hint; a path with no session
+    /// stays silent.
+    #[test]
+    fn duplicate_session_warning_flags_only_a_matching_path() {
+        let entries = vec![twin_entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            Some("/w"),
+            sessions::SessionStatus::Active,
+        )];
+
+        let taken = paths::HostAbsPath::try_new("/w").unwrap();
+        let warning = duplicate_session_warning(&entries, &taken)
+            .expect("a session on the target path must warn");
+        assert!(warning.contains("web"), "warning names the existing handle");
+        assert!(
+            warning.contains("min session attach web"),
+            "warning points at attach for reuse"
+        );
+
+        let free = paths::HostAbsPath::try_new("/elsewhere").unwrap();
+        assert!(
+            duplicate_session_warning(&entries, &free).is_none(),
+            "an untaken path does not warn"
+        );
+    }
+
+    /// An unnamed existing session must still be reusable: the reuse hint must
+    /// carry the full id, which `SessionLookup::parse` resolves back to an id.
+    /// The short unnamed handle would parse as a nonexistent name, so the attach
+    /// lookup would miss.
+    #[test]
+    fn duplicate_session_warning_reuses_unnamed_session_by_id() {
+        let id = "019f5d0f-0a99-78b1-9165-0809440f0052";
+        let entries = vec![twin_entry(
+            id,
+            None,
+            Some("/w"),
+            sessions::SessionStatus::Active,
+        )];
+
+        let taken = paths::HostAbsPath::try_new("/w").unwrap();
+        let warning = duplicate_session_warning(&entries, &taken)
+            .expect("a session on the target path must warn");
+        assert!(
+            warning.contains(&format!("min session attach {id}")),
+            "unnamed reuse hint carries the full id, got: {warning}"
+        );
+        // The id the hint prints must resolve through the attach lookup path.
+        assert!(
+            matches!(SessionLookup::parse(id), SessionLookup::Id(_)),
+            "the full id resolves as an id, not a name"
+        );
+    }
+
+    /// Attach refuses a `Materializing` session, so the warning must not point
+    /// at it; the duplicate is still flagged, just without an attach hint.
+    #[test]
+    fn duplicate_session_warning_skips_attach_for_materializing() {
+        let entries = vec![twin_entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            Some("/w"),
+            sessions::SessionStatus::Materializing,
+        )];
+
+        let taken = paths::HostAbsPath::try_new("/w").unwrap();
+        let warning = duplicate_session_warning(&entries, &taken)
+            .expect("a session on the target path must warn");
+        assert!(
+            !warning.contains("min session attach"),
+            "no attach hint for a non-attachable session, got: {warning}"
+        );
+    }
+
+    /// When several sessions track the target path with mixed statuses, the
+    /// warning must recommend the `Active` one — the only status `attach`
+    /// accepts — even when a non-active match sorts first in the listing.
+    #[test]
+    fn duplicate_session_warning_prefers_active_over_pending_match() {
+        let pending_id = "019f5d0f-0a99-78b1-9165-0809440f0052";
+        let active_id = "019f5d0f-0a99-78b1-9165-0809440f0053";
+        let entries = vec![
+            twin_entry(
+                pending_id,
+                Some("mzing"),
+                Some("/w"),
+                sessions::SessionStatus::Materializing,
+            ),
+            twin_entry(
+                active_id,
+                Some("live"),
+                Some("/w"),
+                sessions::SessionStatus::Active,
+            ),
+        ];
+
+        let taken = paths::HostAbsPath::try_new("/w").unwrap();
+        let warning = duplicate_session_warning(&entries, &taken)
+            .expect("a session on the target path must warn");
+        assert!(
+            warning.contains("min session attach live"),
+            "warning points at the active match for reuse, got: {warning}"
+        );
+        assert!(
+            !warning.contains("still being created"),
+            "an attachable active match must not print the wait guidance, got: {warning}"
         );
     }
 

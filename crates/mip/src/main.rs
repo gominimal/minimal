@@ -5,6 +5,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use mctx::{ConfigBuilder, Context, Error};
 use std::io;
+use std::io::IsTerminal as _;
 use std::path::PathBuf;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -173,7 +174,11 @@ async fn main() -> Result<(), Error> {
     });
 
     tracing_subscriber::registry()
-        .with(fmt::layer().with_writer(ot::StdoutWriter::new))
+        .with(
+            fmt::layer()
+                .with_writer(ot::StderrWriter::new)
+                .with_ansi(io::stderr().is_terminal()),
+        )
         .with(filter)
         .init();
 

@@ -16,7 +16,7 @@ use nickel_lang_core::{
     program::Program,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 mod load;
@@ -431,8 +431,8 @@ pub(crate) fn patches_from_term(
 ) -> Result<EnvPatches, Error> {
     let patch_rt = eval_if_closure(rt, program)?;
 
-    let mut dirs: Option<HashMap<String, PatchSetting>> = None;
-    let mut files: Option<HashMap<String, PatchSetting>> = None;
+    let mut dirs: Option<BTreeMap<String, PatchSetting>> = None;
+    let mut files: Option<BTreeMap<String, PatchSetting>> = None;
 
     let Some(r) = record_data_from_val(&patch_rt) else {
         return Err(Error::unexpected_type(
@@ -486,7 +486,7 @@ pub(crate) fn patches_from_term(
                                     ))
                                 },
                             )
-                            .collect::<Result<HashMap<_, _>, Error>>()?,
+                            .collect::<Result<BTreeMap<_, _>, Error>>()?,
                     );
                     Ok(())
                 }
@@ -529,7 +529,7 @@ pub(crate) fn patches_from_term(
                                     ))
                                 },
                             )
-                            .collect::<Result<HashMap<_, _>, Error>>()?,
+                            .collect::<Result<BTreeMap<_, _>, Error>>()?,
                     );
                     Ok(())
                 }
