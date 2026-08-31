@@ -166,6 +166,12 @@ through, with the same precedence — `deny`, then `ignore`, then `allow` — an
 `allow` is required for the same reason: a project you have not read should
 not be able to name a variable and receive its value.
 
+An `echo` task is the one exception, and it is not a hole: its output comes
+straight from the declaration without an environment being built, so its
+`env_vars` are read by nobody. Nothing is looked up, so there is nothing to
+gate — an `echo` task never prompts, and never fails over a variable it has
+no use for.
+
 ```toml
 # user_policy.toml
 [vars]
