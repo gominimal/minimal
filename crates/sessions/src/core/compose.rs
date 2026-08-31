@@ -1594,8 +1594,16 @@ impl Provenanced for NameItem<'_> {
 /// one defeats the gate) call this directly.
 ///
 /// `hooks` is `None` for user-only composition — all items are expected
-/// to auto-decide. Any item that reaches the `NeedsApproval` branch with
-/// no hook surfaces as [`ComposeError::HookRequired`].
+/// to auto-decide.
+///
+/// # Errors
+///
+/// - [`ComposeError::HookRequired`] — an item needed approval and there
+///   was no hook to ask.
+/// - [`ComposeError::Aborted`] — the hook cancelled.
+/// - [`ComposeError::HookContract`] — the hook returned the wrong number
+///   of decisions, or answered `UseRule` for an item the policy still
+///   cannot decide.
 ///
 /// [`VarsPolicy::check`]: crate::core::policy::VarsPolicy::check
 pub fn gate_names(
@@ -1609,13 +1617,19 @@ pub fn gate_names(
         Decision::Denied(_) => NameVerdict::Denied,
     };
 
-    // Pass 1: categorize.
-    let mut verdicts: Vec<Option<NameVerdict>> = vec![None; items.len()];
+    // Pass 1: categorize. An undecided item is seeded `Denied` and
+    // queued; pass 3 overwrites every one of them. The placeholder is
+    // fail-closed on purpose — should a future edit ever leave one
+    // unwritten, the caller refuses it rather than carrying it.
+    let mut verdicts: Vec<NameVerdict> = Vec::with_capacity(items.len());
     let mut unapproved: Vec<usize> = Vec::new();
     for (i, (name, source)) in items.iter().enumerate() {
         match policy.check(name, NameItem { source }) {
-            CheckOutcome::Decided(d) => verdicts[i] = Some(verdict_of(&d)),
-            CheckOutcome::NeedsApproval(_) => unapproved.push(i),
+            CheckOutcome::Decided(d) => verdicts.push(verdict_of(&d)),
+            CheckOutcome::NeedsApproval(_) => {
+                unapproved.push(i);
+                verdicts.push(NameVerdict::Denied);
+            }
         }
     }
 
@@ -1640,7 +1654,7 @@ pub fn gate_names(
         // Pass 3: apply.
         for (&i, decision) in unapproved.iter().zip(decisions) {
             let (name, source) = items[i];
-            verdicts[i] = Some(match decision {
+            verdicts[i] = match decision {
                 ItemDecision::AllowOnce => NameVerdict::Allowed,
                 ItemDecision::IgnoreOnce => NameVerdict::Ignored,
                 ItemDecision::UseRule => match policy.check(name, NameItem { source }) {
@@ -1652,17 +1666,11 @@ pub fn gate_names(
                         ));
                     }
                 },
-            });
+            };
         }
     }
 
-    Ok((
-        verdicts
-            .into_iter()
-            .map(|v| v.expect("every index is assigned in pass 1 or pass 3"))
-            .collect(),
-        policy,
-    ))
+    Ok((verdicts, policy))
 }
 
 /// Drive the policy pass over a batch of vars.
