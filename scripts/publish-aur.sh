@@ -3,7 +3,7 @@
 # publish-aur.sh — clone the minimal-bin AUR repo, stamp the PKGBUILD, push.
 #
 # The monorepo is the source of truth for the AUR package; the AUR repo is
-# generated output. Each run shallow-clones a fresh copy, downloads the 11
+# generated output. Each run shallow-clones a fresh copy, downloads the 13
 # versioned artifacts from the installer bucket to compute their sha256s,
 # renders packaging/arch/PKGBUILD-bin.tmpl into PKGBUILD, copies the pacman
 # install hook, regenerates .SRCINFO, and commits + pushes.
@@ -11,14 +11,18 @@
 # Usage: scripts/publish-aur.sh [--dry-run]
 #
 # Env:
-#   PKGVER              Required. Promoted semver WITHOUT the v prefix
-#                       (X.Y.Z, optional -prerelease/+build tail). Artifacts
-#                       are fetched from <bucket>/versions/$PKGVER/ — the
-#                       same names the PKGBUILD's source arrays use. A bare
-#                       short SHA is rejected: the AUR package tracks
+#   PKGVER              Required. A RELEASED semver WITHOUT the v prefix
+#                       (X.Y.Z, optional +build tail). Artifacts are fetched
+#                       from <bucket>/versions/$PKGVER/ — the same names the
+#                       PKGBUILD's source arrays use. A bare short SHA is
+#                       rejected, and so is a prerelease (-rc.1 tail): pacman
+#                       forbids hyphens in pkgver, so an RC could never be
+#                       published here anyway. The AUR package tracks
 #                       promoted semver releases, not nightly builds.
 #   AUR_REPO_URL        git URL to clone/push
-#                       (default: ssh://aur@aur.archlinux.org/minimal-bin.git)
+#                       (default: ssh://aur@aur.archlinux.org/minimal-bin.git).
+#                       --dry-run without credentials falls back to the public
+#                       read-only https mirror so a rehearsal needs no key.
 #   MINIMAL_BUCKET_URL  Public base URL of the installer bucket
 #                       (default: https://storage.googleapis.com/minimal-one)
 #   MAINTAINER          PKGBUILD maintainer line. Defaults below to the
@@ -33,6 +37,8 @@
 #   key-management API: generate a dedicated keypair, put the public key on
 #   the account, store the private key in the CI secret AUR_SSH_PRIVATE_KEY,
 #   and keep the account password/recovery email in a shared vault.
+#   --dry-run does not push, so it does not need a key: without one it reads
+#   the public https mirror instead.
 #
 # --dry-run does everything up to the commit and prints the would-be diff.
 #
@@ -69,10 +75,18 @@ export MAINTAINER
 case "$PKGVER" in
     v*) die "PKGVER must not carry the v prefix: '$PKGVER' (use ${PKGVER#v})" ;;
 esac
-printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$' \
-    || die "PKGVER '$PKGVER' is not a semver X.Y.Z (optional -prerelease/+build)"
+# A release only: pacman's pkgver forbids hyphens, so a prerelease tail
+# (-rc.1) could never publish — reject it here with that named, instead of
+# letting makepkg's lint blame the template. A +build tail is a valid release
+# version and passes.
+printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$' \
+    || die "PKGVER '$PKGVER' is not a RELEASED semver X.Y.Z (optional +build; prereleases and shas are rejected: pacman's pkgver forbids hyphens)"
 
 AUR_REPO_URL="${AUR_REPO_URL:-ssh://aur@aur.archlinux.org/minimal-bin.git}"
+# The public read-only mirror. Same repo, no credentials — a --dry-run needs
+# to clone to produce its diff, and demanding the bot key for a rehearsal made
+# dry-runs unreachable outside CI.
+AUR_PUBLIC_URL="https://aur.archlinux.org/minimal-bin.git"
 BUCKET_URL="${MINIMAL_BUCKET_URL:-https://storage.googleapis.com/minimal-one}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -87,8 +101,9 @@ workdir="$(mktemp -d 2>/dev/null || mktemp -d -t publish-aur)"
 trap 'rm -rf "$workdir"' EXIT
 
 # artifact basename under versions/$PKGVER/ | env var holding its sha256.
-# Same order as the PKGBUILD's source arrays, so makepkg's positional
-# sha256sums stay aligned.
+# The variable names must match the @@SHA_*@@ tokens the template stamps; the
+# list order is irrelevant (each sha lands in its named variable, and the
+# PKGBUILD keeps its own source/checksum arrays aligned).
 ARTIFACTS=(
     "minimald.apparmor|SHA_APPARMOR"
     "minimald.apparmor-tunable|SHA_APPARMOR_TUNABLE"
@@ -97,10 +112,12 @@ ARTIFACTS=(
     "minimald-linux-amd64|SHA_MINIMALD_X86_64"
     "mip-linux-amd64|SHA_MIP_X86_64"
     "gvproxy-linux-amd64|SHA_GVPROXY_X86_64"
+    "minvmd-linux-amd64|SHA_MINVMD_X86_64"
     "minimal-linux-arm64|SHA_MIN_AARCH64"
     "minimald-linux-arm64|SHA_MINIMALD_AARCH64"
     "mip-linux-arm64|SHA_MIP_AARCH64"
     "gvproxy-linux-arm64|SHA_GVPROXY_AARCH64"
+    "minvmd-linux-arm64|SHA_MINVMD_AARCH64"
 )
 
 dist="$workdir/dist"
@@ -113,14 +130,19 @@ for entry in "${ARTIFACTS[@]}"; do
     printf -v "$var" '%s' "$(sha256sum "$dist/$name" | cut -d' ' -f1)"
 done
 
-# The renderer stamps from the environment.
-export PKGVER
+# The renderer stamps from the environment. BUCKET_URL is the token behind
+# the PKGBUILD's _bucket: a MINIMAL_BUCKET_URL override must change the source
+# URLs along with the checksums fetched from them, or the two diverge silently.
+export PKGVER BUCKET_URL
 export SHA_APPARMOR SHA_APPARMOR_TUNABLE SHA_APPARMOR_LOADER \
        SHA_MIN_X86_64 SHA_MINIMALD_X86_64 SHA_MIP_X86_64 SHA_GVPROXY_X86_64 \
-       SHA_MIN_AARCH64 SHA_MINIMALD_AARCH64 SHA_MIP_AARCH64 SHA_GVPROXY_AARCH64
+       SHA_MINVMD_X86_64 \
+       SHA_MIN_AARCH64 SHA_MINIMALD_AARCH64 SHA_MIP_AARCH64 SHA_GVPROXY_AARCH64 \
+       SHA_MINVMD_AARCH64
 
 # Credentials: an agent-loaded key first, else AUR_SSH_PRIVATE_KEY from the
-# environment. Never print the key material.
+# environment. Never print the key material. A dry run may proceed without
+# either by cloning the public mirror (it never pushes).
 keyfile=""
 if [ -n "${SSH_AUTH_SOCK:-}" ] && ssh-add -l >/dev/null 2>&1; then
     echo "publish-aur: using ssh-agent key"
@@ -129,6 +151,9 @@ elif [ -n "${AUR_SSH_PRIVATE_KEY:-}" ]; then
     printf '%s\n' "$AUR_SSH_PRIVATE_KEY" >"$keyfile"
     chmod 600 "$keyfile"
     echo "publish-aur: using AUR_SSH_PRIVATE_KEY"
+elif [ "$DRY_RUN" -eq 1 ]; then
+    echo "publish-aur: [dry-run] no credentials; cloning the public https mirror"
+    AUR_REPO_URL="$AUR_PUBLIC_URL"
 else
     die "no AUR credentials: load the bot's key into an ssh-agent, or set AUR_SSH_PRIVATE_KEY (see the header)"
 fi
@@ -145,9 +170,58 @@ git clone --depth 1 "$AUR_REPO_URL" "$workdir/aur" \
 "$RENDER" "$TEMPLATE" "$workdir/aur/PKGBUILD"
 cp "$INSTALL_HOOK" "$workdir/aur/minimal-bin.install"
 
+# makepkg --printsrcinfo refuses to run as root outright (its EUID == 0 guard
+# fires before the printsrcinfo early-return; FS#67158, Arch declined to
+# exempt it) — which is every container job. When root, run it as an
+# unprivileged user over a world-readable copy of the package files (the
+# workdir itself is 0700, so the copy must live outside it to be traversable).
+# Prints the .SRCINFO on stdout.
+generate_srcinfo() {
+    local dir="$1" rundir rc
+    # Unprivileged (a dev host, a non-root CI runner): makepkg runs directly.
+    if [ "$(id -u)" -ne 0 ]; then
+        (cd "$dir" && makepkg --printsrcinfo)
+        return
+    fi
+    rundir="$(mktemp -d "${TMPDIR:-/tmp}/srcinfo.XXXXXX")" || return 1
+    [ -n "$rundir" ] || return 1
+    cp "$dir/PKGBUILD" "$rundir/" || { rm -rf "$rundir"; return 1; }
+    if [ -f "$dir/minimal-bin.install" ]; then
+        cp "$dir/minimal-bin.install" "$rundir/" || { rm -rf "$rundir"; return 1; }
+    fi
+    chmod -R a+rX "$rundir"
+    # runuser (util-linux) is the purpose-built root form — no PAM auth path
+    # to trip over; su is the fallback.
+    if id nobody >/dev/null 2>&1; then
+        if command -v runuser >/dev/null 2>&1; then
+            HOME="$rundir" runuser -u nobody -- bash -c "cd '$rundir' && makepkg --printsrcinfo" </dev/null
+            rc=$?
+        elif command -v su >/dev/null 2>&1; then
+            HOME="$rundir" su -s /bin/bash nobody -c "cd '$rundir' && makepkg --printsrcinfo" </dev/null
+            rc=$?
+        else
+            echo "publish-aur: neither runuser nor su available to run makepkg as root's stand-in; skipping .SRCINFO" >&2
+            rc=1
+        fi
+    else
+        echo "publish-aur: no unprivileged user to run makepkg as root's stand-in; skipping .SRCINFO" >&2
+        rc=1
+    fi
+    rm -rf "$rundir"
+    return "$rc"
+}
+
 if command -v makepkg >/dev/null 2>&1; then
-    (cd "$workdir/aur" && makepkg --printsrcinfo > .SRCINFO) \
-        || die "makepkg --printsrcinfo failed — the rendered PKGBUILD is invalid"
+    # Write-then-rename: a failure must leave the cloned .SRCINFO intact, not
+    # truncated by the redirect that was supposed to overwrite it.
+    srcinfo_next="$workdir/.SRCINFO.next"
+    if generate_srcinfo "$workdir/aur" >"$srcinfo_next"; then
+        mv "$srcinfo_next" "$workdir/aur/.SRCINFO"
+        echo "publish-aur: regenerated .SRCINFO"
+    else
+        rm -f "$srcinfo_next"
+        die "makepkg --printsrcinfo failed — the rendered PKGBUILD is invalid"
+    fi
 else
     echo "publish-aur: makepkg not found; skipping .SRCINFO regeneration (run on an Arch host)" >&2
 fi
@@ -163,7 +237,10 @@ git add -A
 
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "publish-aur: [dry-run] diff that would be committed as 'Update to $PKGVER':"
-    git --no-pager diff --cached
+    # --no-ext-diff: the diff is machine-checked output for a human to review
+    # before a push; an ambient diff.external (difftastic et al.) would change
+    # its shape per runner config.
+    git --no-pager diff --cached --no-ext-diff
     echo "publish-aur: [dry-run] nothing committed, nothing pushed"
     exit 0
 fi

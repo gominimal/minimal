@@ -17,13 +17,12 @@
 # The scripts.* paths are NOT env-expanded by nfpm, so postinstall points at
 # the fixed .scratch location the driver materializes on every run.
 #
-# The file list mirrors the AUR package (aur/PKGBUILD) with one deliberate
-# addition: minvmd. The AUR package predates the static-musl minvmd build
-# (no AUR commit has ever shipped it); every staged versions/<version>/ row
-# does carry minvmd-linux-{amd64,arm64}, built with a static libkrun and
-# verified static in .github/workflows/release.yml, and the packaging plan's
-# Phase 3 file list names it. Closing the AUR-side gap is a separate AUR
-# phase.
+# The file list mirrors packaging/arch/PKGBUILD-bin.tmpl — same binaries, same
+# git-remote-min symlink, same AppArmor layout under /usr/share/minimal/ — and
+# both ship minvmd. Every staged versions/<version>/ row carries
+# minvmd-linux-{amd64,arm64}, built with a static libkrun and verified static
+# in .github/workflows/release.yml, so the Linux distro packages and the AUR
+# package agree on the VM-host binary without any extra runtime dependency.
 
 name: minimal
 version: ${PKGVER}

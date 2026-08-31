@@ -25,35 +25,42 @@ optdepends=(
     "fish: shell integration and completions"
 )
 install=minimal-bin.install
-_bucket="https://storage.googleapis.com/minimal-one"
+_bucket="@@BUCKET_URL@@"
 source=("${_bucket}/versions/${pkgver}/minimald.apparmor"
         "${_bucket}/versions/${pkgver}/minimald.apparmor-tunable"
         "${_bucket}/versions/${pkgver}/install-apparmor-profile.sh")
 source_x86_64=("min::${_bucket}/versions/${pkgver}/minimal-linux-amd64"
                "minimald::${_bucket}/versions/${pkgver}/minimald-linux-amd64"
                "mip::${_bucket}/versions/${pkgver}/mip-linux-amd64"
-               "gvproxy-min::${_bucket}/versions/${pkgver}/gvproxy-linux-amd64")
+               "gvproxy-min::${_bucket}/versions/${pkgver}/gvproxy-linux-amd64"
+               "minvmd::${_bucket}/versions/${pkgver}/minvmd-linux-amd64")
 source_aarch64=("min::${_bucket}/versions/${pkgver}/minimal-linux-arm64"
                 "minimald::${_bucket}/versions/${pkgver}/minimald-linux-arm64"
                 "mip::${_bucket}/versions/${pkgver}/mip-linux-arm64"
-                "gvproxy-min::${_bucket}/versions/${pkgver}/gvproxy-linux-arm64")
+                "gvproxy-min::${_bucket}/versions/${pkgver}/gvproxy-linux-arm64"
+                "minvmd::${_bucket}/versions/${pkgver}/minvmd-linux-arm64")
 sha256sums=('@@SHA_APPARMOR@@'
             '@@SHA_APPARMOR_TUNABLE@@'
             '@@SHA_APPARMOR_LOADER@@')
 sha256sums_x86_64=('@@SHA_MIN_X86_64@@'
                    '@@SHA_MINIMALD_X86_64@@'
                    '@@SHA_MIP_X86_64@@'
-                   '@@SHA_GVPROXY_X86_64@@')
+                   '@@SHA_GVPROXY_X86_64@@'
+                   '@@SHA_MINVMD_X86_64@@')
 sha256sums_aarch64=('@@SHA_MIN_AARCH64@@'
                     '@@SHA_MINIMALD_AARCH64@@'
                     '@@SHA_MIP_AARCH64@@'
-                    '@@SHA_GVPROXY_AARCH64@@')
+                    '@@SHA_GVPROXY_AARCH64@@'
+                    '@@SHA_MINVMD_AARCH64@@')
 
 package() {
-    # CLI, daemon, and helper binaries
+    # CLI, daemon, helper, and VM-host binaries. minvmd is self-contained:
+    # the shipped static-musl build links libkrun statically (no lib/ sibling,
+    # no dlopen), so the package needs no extra library, unlike macOS.
     install -Dm755 "${srcdir}/min" "${pkgdir}/usr/bin/min"
     install -Dm755 "${srcdir}/minimald" "${pkgdir}/usr/bin/minimald"
     install -Dm755 "${srcdir}/mip" "${pkgdir}/usr/bin/mip"
+    install -Dm755 "${srcdir}/minvmd" "${pkgdir}/usr/bin/minvmd"
     install -Dm755 "${srcdir}/gvproxy-min" "${pkgdir}/usr/bin/gvproxy-min"
 
     # git-remote-min is a symlink to min upstream
@@ -70,10 +77,15 @@ package() {
     # Upstream ships no pre-packaged completions; the binary generates them.
     # XDG overrides redirect its user-level target dirs into srcdir, and
     # ZDOTDIR keeps its compinit-dump cleanup off the build host's ~.
+    # BASH_COMPLETION_USER_DIR forces the bash write: `min` otherwise skips
+    # bash when it finds no bash-completion loader in the clean chroot, and
+    # the next install -Dm644 then aborts package() on the missing file —
+    # the same override scripts/dist-build.sh sets for its generation run.
     chmod +x "${srcdir}/min"
     XDG_DATA_HOME="${srcdir}/completions" \
     XDG_CONFIG_HOME="${srcdir}/completions" \
     ZDOTDIR="${srcdir}/zdotdir" \
+    BASH_COMPLETION_USER_DIR="${srcdir}/completions" \
         "${srcdir}/min" completions install --no-input \
             --minimal-dir "${srcdir}/minimal-cache" bash zsh fish
 
