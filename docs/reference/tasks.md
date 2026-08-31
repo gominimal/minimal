@@ -143,25 +143,37 @@ still resolve `inherit` against the daemon's environment:
 So prefer an explicit value for tasks meant to be run either of those ways.
 
 <a id="policy"></a>
-Every name a task declares — inherited or literal — is checked against the
-`[vars]` section of your `user_policy.toml` before its value is read:
+### Environment variables and your policy
 
-- a name matching **`deny`** fails the run, naming the rule's file. The value
-  is never read out of your shell.
-- a name matching **`ignore`** is dropped silently and the task runs without
-  it; an ignored variable does not have to be set. The name is removed from
-  the task's declarations outright, so this holds for a literal value as much
-  as an inherited one.
-- anything else is carried through. `allow` is not consulted here — a task's
-  `env_vars` come from the project's own `minimal.toml` and there is no prompt
-  on this path, so requiring an allow-list entry would break scripted and CI
-  runs.
+Resolving on the client means reading *your* shell. A project's
+`minimal.toml` naming `env_vars.AWS_SECRET_ACCESS_KEY = { inherit = true }` is
+that project asking for your credential, so every name a task declares —
+inherited or literal — is checked against the `[vars]` section of your
+`user_policy.toml` **before its value is read**:
+
+- a name matching **`deny`** fails the run, naming the rule's file.
+- a name matching **`ignore`** is dropped and the task runs without it. The
+  name is removed from the task's declarations outright, so this holds for a
+  literal value as much as an inherited one, and an ignored variable does not
+  have to be set.
+- a name matching **`allow`** is carried.
+- anything else is **not carried**. On a terminal you are asked, once per
+  name, and can record the answer as a rule; anywhere else the run stops and
+  prints the rules to add.
+
+This is the same gate `[session.vars]` from the same file has always passed
+through, with the same precedence — `deny`, then `ignore`, then `allow` — and
+`allow` is required for the same reason: a project you have not read should
+not be able to name a variable and receive its value.
 
 ```toml
 # user_policy.toml
 [vars]
-deny = ["AWS_*"]
+allow = ["ZZ_TASK_*", "RUST_*"]
+deny  = ["AWS_*"]
 ```
+
+A denied name:
 
 ```console
 $ min task run deploy
@@ -171,6 +183,20 @@ AWS_SECRET_ACCESS_KEY is denied by `[vars] deny` in
 if this task should see it
 ```
 
+An unlisted name in CI, where there is no one to ask:
+
+```console
+$ min task run deploy
+error: task 'deploy' declares 1 environment variable that your policy does not
+allow, and stdin/stderr is not a terminal.
+
+Add the following to ~/.config/minimal/user_policy.toml:
+
+[vars]
+allow = ["DEPLOY_TARGET"]
+
+Then re-run this command.
+```
 
 ### `interactive` - TUI apps and shells
 

@@ -130,56 +130,139 @@ fn declared_task(dir: &camino::Utf8Path, task: &str) -> Result<mfile::Task, anyh
 /// the task and the variable, instead of surfacing as the daemon's
 /// `failed to spawn process` after a session has already been built.
 ///
-/// Every name is verified against the user's `[vars]` policy before it is
-/// resolved, in the same precedence the session composer uses: `deny`
-/// first, then `ignore`. `deny` is the user's emergency stop and fails the
-/// run naming the rule's file; `ignore` drops the variable silently. Both
-/// are checked *before* the lookup, so a denied name never has its value
-/// read out of this shell and an ignored one does not have to be set at
-/// all.
+/// # Policy
 ///
-/// An ignored name goes into [`TaskEnv::drop`] rather than simply being
+/// Every name goes through [`VarsPolicy::check`] with
+/// [`Source::Project`] provenance, and the check happens *before* the
+/// lookup. That ordering is the security property: resolving here reads
+/// the user's own shell, so a `minimal.toml` naming
+/// `env_vars.AWS_SECRET_ACCESS_KEY = { inherit = true }` would otherwise
+/// hand a hostile project a real credential. A denied or unapproved name
+/// never has its value read at all.
+///
+/// The full check applies, `allow` included — a task's `env_vars` are
+/// declared by the project, and the project is exactly what the policy
+/// exists to constrain. `[session.vars]` from the same file has always
+/// been gated this way; a task's were the inconsistency.
+///
+/// - `deny` fails the run, naming the rule's file.
+/// - `ignore` drops the name.
+/// - `allow` carries it.
+/// - anything else is referred to `hooks`, which prompts on a terminal
+///   and refuses everywhere else.
+///
+/// A dropped name goes into [`TaskEnv::drop`] rather than simply being
 /// left out. The daemon applies the resolved values by insertion, so a
 /// name it is not told about keeps whatever `minimal.toml` declared —
 /// which for an `inherit` entry means the daemon resolving it against its
 /// own environment, exactly what the user asked not to happen.
 ///
-/// The `allow` step is deliberately not applied. A task's `env_vars` are
-/// declared in the project's own `minimal.toml` and requested by name on
-/// the command line, and there is no prompt on this path — routing them
-/// through `allow` would hard-fail every scripted `min task run` until each
-/// name were allowlisted, which is the case this resolution exists to
-/// unblock. `deny` and `ignore` have no prompt leg, so they apply cleanly.
-///
 /// An echo task resolves to nothing at all, whatever it declares. The daemon
 /// answers one straight from the declaration and returns before it builds an
 /// environment (`crates/minimald/src/exec.rs`), so its `env_vars` are read by
 /// no one. Resolving them would fail a run that works today over a variable
-/// the task has no use for, and deny one over a name it never sees.
+/// the task has no use for, and gate one over a name it never sees.
 ///
+/// [`VarsPolicy::check`]: sessions::core::policy::VarsPolicy::check
+/// [`Source::Project`]: sessions::core::source::Source::Project
 /// [`TaskEnv::drop`]: minimald_rpc::taskenv::TaskEnv::drop
 fn resolve_task_env(
     task: &mfile::Task,
     task_name: &str,
-    vars_policy: &sessions::core::policy::VarsPolicy,
+    vars_policy: sessions::core::policy::VarsPolicy,
     policy_path: &std::path::Path,
+    source: &sessions::core::source::Source,
+    hooks: &dyn sessions::core::hooks::PolicyHooks,
     env: impl Fn(&str) -> Result<String, std::env::VarError>,
 ) -> Result<minimald_rpc::taskenv::TaskEnv, anyhow::Error> {
+    use sessions::core::decision::{CheckOutcome, Decision, ItemDecision};
+    use sessions::core::hooks::{HookResult, Unapproved};
+
     let mut resolved = minimald_rpc::taskenv::TaskEnv::default();
     if task.action.as_echo().is_some() {
         return Ok(resolved);
     }
-    for (name, value) in &task.vars {
-        // Deny wins over ignore, matching `VarsPolicy::check`: a
-        // would-be rejection must not be hidden behind an ignore glob.
-        if vars_policy.deny().is_match(name) {
-            bail!(denied_task_var_message(task_name, name, policy_path));
+
+    // Names in a stable order: the prompt a user answers must not depend
+    // on `HashMap` iteration order, and neither must an error naming the
+    // first denial.
+    let mut names: Vec<&String> = task.vars.keys().collect();
+    names.sort_unstable();
+
+    // Pass 1: classify. What the policy can decide alone is decided;
+    // the rest queues for the hook.
+    let mut approved: Vec<&String> = Vec::new();
+    let mut pending: Vec<&String> = Vec::new();
+    for name in names {
+        match vars_policy.check(name.as_str(), TaskVar { source }) {
+            CheckOutcome::Decided(Decision::Denied(_)) => {
+                bail!(denied_task_var_message(task_name, name, policy_path))
+            }
+            CheckOutcome::Decided(Decision::Ignored) => {
+                resolved.drop.insert(name.clone());
+            }
+            CheckOutcome::Decided(Decision::Allowed(_)) => approved.push(name),
+            CheckOutcome::NeedsApproval(_) => pending.push(name),
         }
-        if vars_policy.ignore().is_match(name) {
-            resolved.drop.insert(name.clone());
-            continue;
+    }
+
+    // Pass 2: refer what is left to the hook — a prompt on a terminal, a
+    // collect-and-refuse anywhere else.
+    if !pending.is_empty() {
+        let view: Vec<Unapproved<'_, str>> = pending
+            .iter()
+            .map(|n| Unapproved::new(n.as_str(), source))
+            .collect();
+        let (decisions, policy) = match hooks.on_var_unapproved(vars_policy.clone(), &view) {
+            HookResult::Abort => bail!(
+                "aborted: task '{task_name}' declares environment variables that \
+                 {policy_path} does not allow",
+                policy_path = policy_path.display(),
+            ),
+            HookResult::Decided {
+                decisions,
+                updated_policy,
+            } => {
+                if decisions.len() != view.len() {
+                    bail!(
+                        "policy hook returned {got} decisions for {want} variables",
+                        got = decisions.len(),
+                        want = view.len(),
+                    );
+                }
+                (decisions, updated_policy.unwrap_or(vars_policy))
+            }
+        };
+
+        // Pass 3: apply. `UseRule` re-checks against the policy the hook
+        // handed back; it cannot legally come back undecided, since the
+        // hook is the last word.
+        for (name, decision) in pending.into_iter().zip(decisions) {
+            match decision {
+                ItemDecision::AllowOnce => approved.push(name),
+                ItemDecision::IgnoreOnce => {
+                    resolved.drop.insert(name.clone());
+                }
+                ItemDecision::UseRule => match policy.check(name.as_str(), TaskVar { source }) {
+                    CheckOutcome::Decided(Decision::Denied(_)) => {
+                        bail!(denied_task_var_message(task_name, name, policy_path))
+                    }
+                    CheckOutcome::Decided(Decision::Ignored) => {
+                        resolved.drop.insert(name.clone());
+                    }
+                    CheckOutcome::Decided(Decision::Allowed(_)) => approved.push(name),
+                    CheckOutcome::NeedsApproval(_) => bail!(
+                        "policy hook left `env_vars.{name}` undecided after \
+                             asking to re-check it against the policy"
+                    ),
+                },
+            }
         }
-        let value = match value {
+    }
+
+    // Only now is anything read out of this shell.
+    for name in approved {
+        let value = match &task.vars[name] {
             mfile::EnvVarValue::Value(v) => v.clone(),
             mfile::EnvVarValue::Inherit => env(name).map_err(|_| {
                 anyhow::anyhow!(
@@ -191,6 +274,24 @@ fn resolve_task_env(
         resolved.set.insert(name.clone(), value);
     }
     Ok(resolved)
+}
+
+/// A task's declared variable, carrying the provenance
+/// [`VarsPolicy::check`] gates on. A task's `env_vars` come from the
+/// project's `minimal.toml`, so the source is always
+/// [`Source::Project`] — never `UserLoadout`, which would auto-pass the
+/// `allow` step.
+///
+/// [`VarsPolicy::check`]: sessions::core::policy::VarsPolicy::check
+/// [`Source::Project`]: sessions::core::source::Source::Project
+struct TaskVar<'a> {
+    source: &'a sessions::core::source::Source,
+}
+
+impl sessions::core::source::Provenanced for TaskVar<'_> {
+    fn source(&self) -> &sessions::core::source::Source {
+        self.source
+    }
 }
 
 /// The `[vars] deny` rejection body: names the task, the variable, and the
@@ -400,7 +501,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     let declared = declared_task(&utf8_path, &args.task)?;
 
     // Read before `ensure_daemon` because the env resolution below is
-    // gated on it: a malformed policy, or a variable the policy denies,
+    // gated on it: a malformed policy, or a variable the policy refuses,
     // must fail with no session built.
     let policy_path = crate::config::user_policy_path(global);
     let user_policy = crate::config::read_user_policy(global)?;
@@ -409,13 +510,64 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // values to the daemon on the exec channel (#585). Done alongside the
     // declared-task check, before `ensure_daemon`, so an unset inherited
     // variable also fails with no session built.
-    let task_env = resolve_task_env(
-        &declared,
-        &args.task,
-        user_policy.vars(),
-        &policy_path,
-        |k| std::env::var(k),
-    )?;
+    //
+    // Gated against `[vars]` on the way, `allow` included. Resolving here
+    // reads the user's own shell, so the project naming a variable is the
+    // project asking for its value — the same two lanes as an activate: the
+    // interactive prompt on a real terminal, the collect-and-refuse
+    // `NoPromptHook` anywhere else.
+    let source = sessions::core::source::Source::Project {
+        path: paths::HostPath::try_new(utf8_path.clone()).context("Invalid project path")?,
+    };
+    let non_interactive = global.no_input || !crate::can_prompt_interactively();
+    let (task_env, user_policy) = if non_interactive {
+        let hooks = crate::prompt::NoPromptHook::new();
+        let task_env = resolve_task_env(
+            &declared,
+            &args.task,
+            user_policy.vars().clone(),
+            &policy_path,
+            &source,
+            &hooks,
+            |k| std::env::var(k),
+        );
+        let summary = hooks.into_summary();
+        if summary.count() > 0 {
+            let count = summary.count();
+            let snippet = summary.as_toml_snippet();
+            bail!(
+                "task '{task}' declares {count} environment variable{s} that your \
+                 policy does not allow, and stdin/stderr is not a terminal.\n\n\
+                 Add the following to {path}:\n\n{snippet}\n\
+                 Then re-run this command.",
+                task = args.task,
+                path = policy_path.display(),
+                s = if count == 1 { "" } else { "s" },
+            );
+        }
+        (task_env?, user_policy)
+    } else {
+        let hooks = crate::prompt::InteractivePrompt::new(&policy_path, user_policy.clone());
+        let task_env = resolve_task_env(
+            &declared,
+            &args.task,
+            user_policy.vars().clone(),
+            &policy_path,
+            &source,
+            &hooks,
+            |k| std::env::var(k),
+        );
+        // Persist before propagating a refusal: a rule the user chose to
+        // record is theirs whether or not this run goes on to fail.
+        let after = hooks.into_final_policy();
+        if after != user_policy {
+            match crate::prompt::save_user_policy(&policy_path, &after) {
+                Ok(()) => eprintln!("Updated {}", policy_path.display()),
+                Err(e) => eprintln!("warning: failed to update {}: {e}", policy_path.display()),
+            }
+        }
+        (task_env?, after)
+    };
 
     crate::ensure_daemon(global)?;
 
@@ -799,6 +951,84 @@ mod tests {
         std::path::PathBuf::from("/cfg/minimal/user_policy.toml")
     }
 
+    /// A policy that allows every name, for the resolution tests that are
+    /// not about gating. An empty policy would refer everything to the
+    /// hook, which is a different test.
+    fn allow_all() -> sessions::core::policy::VarsPolicy {
+        no_vars_policy().try_with_allow(["*"]).unwrap()
+    }
+
+    /// A task's `env_vars` always carry project provenance — the whole
+    /// point of the gate is that the project is what it constrains.
+    fn project_source() -> sessions::core::source::Source {
+        sessions::core::source::Source::Project {
+            path: paths::HostPath::try_new(camino::Utf8PathBuf::from("/home/dev/proj")).unwrap(),
+        }
+    }
+
+    /// A hook that answers every referred name the same way, recording
+    /// what it was asked about. Stands in for the interactive prompt.
+    struct ScriptedHook {
+        decision: sessions::core::decision::ItemDecision,
+        asked: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl ScriptedHook {
+        fn new(decision: sessions::core::decision::ItemDecision) -> Self {
+            Self {
+                decision,
+                asked: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.borrow().clone()
+        }
+    }
+
+    impl sessions::core::hooks::PolicyHooks for ScriptedHook {
+        fn on_var_unapproved(
+            &self,
+            _policy: sessions::core::policy::VarsPolicy,
+            items: &[sessions::core::hooks::Unapproved<'_, str>],
+        ) -> sessions::core::hooks::HookResult<sessions::core::policy::VarsPolicy> {
+            self.asked
+                .borrow_mut()
+                .extend(items.iter().map(|i| i.item().to_string()));
+            sessions::core::hooks::HookResult::decided(vec![self.decision; items.len()])
+        }
+
+        fn on_patch_unapproved(
+            &self,
+            _policy: sessions::core::policy::PatchesPolicy,
+            _items: &[sessions::core::hooks::Unapproved<'_, camino::Utf8Path>],
+        ) -> sessions::core::hooks::HookResult<sessions::core::policy::PatchesPolicy> {
+            unreachable!("task env resolution never gates patches")
+        }
+    }
+
+    /// A hook that refuses to be asked — for the cases where the policy
+    /// must decide on its own.
+    struct NeverAsked;
+
+    impl sessions::core::hooks::PolicyHooks for NeverAsked {
+        fn on_var_unapproved(
+            &self,
+            _policy: sessions::core::policy::VarsPolicy,
+            items: &[sessions::core::hooks::Unapproved<'_, str>],
+        ) -> sessions::core::hooks::HookResult<sessions::core::policy::VarsPolicy> {
+            panic!("the policy should have decided alone, was asked about {items:?}");
+        }
+
+        fn on_patch_unapproved(
+            &self,
+            _policy: sessions::core::policy::PatchesPolicy,
+            _items: &[sessions::core::hooks::Unapproved<'_, camino::Utf8Path>],
+        ) -> sessions::core::hooks::HookResult<sessions::core::policy::PatchesPolicy> {
+            unreachable!("task env resolution never gates patches")
+        }
+    }
+
     /// Build a task declaration from TOML, for the env-resolution tests.
     fn task_from_toml(toml: &str) -> mfile::Task {
         mfile::File::from_toml_bytes(toml.as_bytes())
@@ -818,10 +1048,18 @@ mod tests {
             "[tasks.t]\nenv_vars.ZZ_TASK_TOKEN = { inherit = true }\nexec = 'true'\n",
         );
 
-        let out = resolve_task_env(&task, "t", &no_vars_policy(), &policy_path_fixture(), |k| {
-            assert_eq!(k, "ZZ_TASK_TOKEN");
-            Ok("task-value-123".to_string())
-        })
+        let out = resolve_task_env(
+            &task,
+            "t",
+            allow_all(),
+            &policy_path_fixture(),
+            &project_source(),
+            &NeverAsked,
+            |k| {
+                assert_eq!(k, "ZZ_TASK_TOKEN");
+                Ok("task-value-123".to_string())
+            },
+        )
         .expect("an exported variable resolves");
 
         assert_eq!(
@@ -844,8 +1082,10 @@ mod tests {
         let err = resolve_task_env(
             &task,
             "t",
-            &no_vars_policy(),
+            allow_all(),
             &policy_path_fixture(),
+            &project_source(),
+            &NeverAsked,
             |_| Err(std::env::VarError::NotPresent),
         )
         .expect_err("an unset inherited variable must be refused");
@@ -867,8 +1107,10 @@ mod tests {
         let out = resolve_task_env(
             &task,
             "t",
-            &no_vars_policy(),
+            allow_all(),
             &policy_path_fixture(),
+            &project_source(),
+            &NeverAsked,
             |_| Ok(String::new()),
         )
         .expect("resolves");
@@ -885,8 +1127,10 @@ mod tests {
         let out = resolve_task_env(
             &task,
             "t",
-            &no_vars_policy(),
+            no_vars_policy(),
             &policy_path_fixture(),
+            &project_source(),
+            &NeverAsked,
             |_| panic!("no variable should be looked up"),
         )
         .expect("resolves");
@@ -904,9 +1148,15 @@ mod tests {
         );
         let policy = no_vars_policy().try_with_deny(["AWS_*"]).unwrap();
 
-        let err = resolve_task_env(&task, "t", &policy, &policy_path_fixture(), |_| {
-            panic!("a denied variable must never be read out of this shell");
-        })
+        let err = resolve_task_env(
+            &task,
+            "t",
+            policy,
+            &policy_path_fixture(),
+            &project_source(),
+            &NeverAsked,
+            |_| panic!("a denied variable must never be read out of this shell"),
+        )
         .expect_err("a denied variable must fail the run");
 
         let msg = err.to_string();
@@ -935,9 +1185,15 @@ mod tests {
             .try_with_ignore(["AWS_*"])
             .unwrap();
 
-        let err = resolve_task_env(&task, "t", &policy, &policy_path_fixture(), |_| {
-            panic!("no lookup happens for a literal");
-        })
+        let err = resolve_task_env(
+            &task,
+            "t",
+            policy,
+            &policy_path_fixture(),
+            &project_source(),
+            &NeverAsked,
+            |_| panic!("no lookup happens for a literal"),
+        )
         .expect_err("deny must win over ignore");
         assert!(err.to_string().contains("[vars] deny"));
     }
@@ -951,12 +1207,24 @@ mod tests {
             "[tasks.t]\nenv_vars.NOISY_DEBUG = { inherit = true }\n\
              env_vars.KEPT = { inherit = true }\nexec = 'true'\n",
         );
-        let policy = no_vars_policy().try_with_ignore(["NOISY_*"]).unwrap();
+        let policy = no_vars_policy()
+            .try_with_ignore(["NOISY_*"])
+            .unwrap()
+            .try_with_allow(["KEPT"])
+            .unwrap();
 
-        let out = resolve_task_env(&task, "t", &policy, &policy_path_fixture(), |k| {
-            assert_eq!(k, "KEPT", "an ignored variable must not be looked up");
-            Ok("kept-value".to_string())
-        })
+        let out = resolve_task_env(
+            &task,
+            "t",
+            policy,
+            &policy_path_fixture(),
+            &project_source(),
+            &NeverAsked,
+            |k| {
+                assert_eq!(k, "KEPT", "an ignored variable must not be looked up");
+                Ok("kept-value".to_string())
+            },
+        )
         .expect("an unset but ignored variable is not an error");
 
         assert_eq!(out.set.get("KEPT").map(String::as_str), Some("kept-value"));
@@ -969,33 +1237,96 @@ mod tests {
         assert_eq!(out.drop.len(), 1);
     }
 
-    /// A name matching neither rule is carried through with no allow-list
-    /// entry and no prompt. This is the property that keeps scripted and CI
-    /// `min task run` working against a fresh install's empty policy — the
-    /// case client-side resolution exists to unblock — so the `allow` step
-    /// is deliberately not applied here.
+    /// A name the policy cannot decide is referred to the hook rather than
+    /// carried. This is the mitigation: resolution reads the user's own
+    /// shell, so a `minimal.toml` naming a credential is the project asking
+    /// for that credential's value, and the project is what the policy
+    /// exists to constrain. `[session.vars]` from the same file has always
+    /// been gated this way.
     #[test]
-    fn an_unlisted_var_needs_no_allow_entry() {
+    fn an_unlisted_var_is_referred_to_the_hook_not_carried() {
         let task = task_from_toml(
-            "[tasks.t]\nenv_vars.ZZ_TASK_TOKEN = { inherit = true }\nexec = 'true'\n",
+            "[tasks.t]\nenv_vars.AWS_SECRET_ACCESS_KEY = { inherit = true }\nexec = 'true'\n",
         );
-        // Non-empty allow set that does NOT cover the name: under the
-        // composer's origin-aware rules this would prompt, and hard-fail in
-        // CI. Here it simply resolves.
+        // A non-empty allow set that does not cover the name.
         let policy = no_vars_policy()
             .try_with_allow(["SOMETHING_ELSE_*"])
             .unwrap();
+        let hooks = ScriptedHook::new(sessions::core::decision::ItemDecision::AllowOnce);
 
-        let out = resolve_task_env(&task, "t", &policy, &policy_path_fixture(), |_| {
-            Ok("task-value-123".to_string())
-        })
-        .expect("an unlisted name resolves without an allow entry");
+        let out = resolve_task_env(
+            &task,
+            "t",
+            policy,
+            &policy_path_fixture(),
+            &project_source(),
+            &hooks,
+            |_| Ok("secret".to_string()),
+        )
+        .expect("the hook allowed it");
 
         assert_eq!(
-            out.set.get("ZZ_TASK_TOKEN").map(String::as_str),
-            Some("task-value-123")
+            hooks.asked(),
+            vec!["AWS_SECRET_ACCESS_KEY".to_string()],
+            "the unlisted name must reach the hook",
         );
-        assert!(out.drop.is_empty());
+        assert_eq!(
+            out.set.get("AWS_SECRET_ACCESS_KEY").map(String::as_str),
+            Some("secret"),
+        );
+    }
+
+    /// The value of an unapproved name is never read out of the shell.
+    /// Order matters as much as the verdict: a gate that resolved first
+    /// and asked afterwards would already have the secret in hand.
+    #[test]
+    fn an_unapproved_var_is_never_read_from_the_shell() {
+        let task = task_from_toml(
+            "[tasks.t]\nenv_vars.AWS_SECRET_ACCESS_KEY = { inherit = true }\nexec = 'true'\n",
+        );
+        let hooks = ScriptedHook::new(sessions::core::decision::ItemDecision::IgnoreOnce);
+
+        let out = resolve_task_env(
+            &task,
+            "t",
+            no_vars_policy(),
+            &policy_path_fixture(),
+            &project_source(),
+            &hooks,
+            |_| panic!("an unapproved variable must never be read out of this shell"),
+        )
+        .expect("an ignored variable is not an error");
+
+        assert_eq!(hooks.asked(), vec!["AWS_SECRET_ACCESS_KEY".to_string()]);
+        assert!(out.set.is_empty());
+        // Dropped by name, so the daemon removes the declaration rather
+        // than resolving it against its own environment.
+        assert!(out.drop.contains("AWS_SECRET_ACCESS_KEY"));
+    }
+
+    /// An empty policy — a fresh install — refers every declared name.
+    /// Nothing is carried by default, which is what makes the allow list
+    /// a real control rather than an opt-in one.
+    #[test]
+    fn an_empty_policy_refers_every_name() {
+        let task = task_from_toml(
+            "[tasks.t]\nenv_vars.A = 'literal'\nenv_vars.B = { inherit = true }\nexec = 'true'\n",
+        );
+        let hooks = ScriptedHook::new(sessions::core::decision::ItemDecision::AllowOnce);
+
+        resolve_task_env(
+            &task,
+            "t",
+            no_vars_policy(),
+            &policy_path_fixture(),
+            &project_source(),
+            &hooks,
+            |_| Ok("v".to_string()),
+        )
+        .expect("the hook allowed both");
+
+        // Sorted, so the prompt order does not depend on HashMap iteration.
+        assert_eq!(hooks.asked(), vec!["A".to_string(), "B".to_string()]);
     }
 
     /// An echo task's `env_vars` are read by nobody: the daemon answers it
@@ -1014,9 +1345,15 @@ mod tests {
         assert_eq!(task.action.as_echo(), Some("hi"));
         let policy = no_vars_policy().try_with_deny(["AWS_*"]).unwrap();
 
-        let out = resolve_task_env(&task, "t", &policy, &policy_path_fixture(), |_| {
-            panic!("an echo task looks nothing up");
-        })
+        let out = resolve_task_env(
+            &task,
+            "t",
+            policy,
+            &policy_path_fixture(),
+            &project_source(),
+            &NeverAsked,
+            |_| panic!("an echo task looks nothing up"),
+        )
         .expect("an echo task neither resolves nor denies");
 
         assert!(out.is_empty(), "nothing to send: {out:?}");
