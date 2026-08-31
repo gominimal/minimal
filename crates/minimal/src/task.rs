@@ -175,88 +175,34 @@ fn resolve_task_env(
     hooks: &dyn sessions::core::hooks::PolicyHooks,
     env: impl Fn(&str) -> Result<String, std::env::VarError>,
 ) -> Result<minimald_rpc::taskenv::TaskEnv, anyhow::Error> {
-    use sessions::core::decision::{CheckOutcome, Decision, ItemDecision};
-    use sessions::core::hooks::{HookResult, Unapproved};
+    use sessions::core::compose::NameVerdict;
 
     let mut resolved = minimald_rpc::taskenv::TaskEnv::default();
     if task.action.as_echo().is_some() {
         return Ok(resolved);
     }
 
-    // Names in a stable order: the prompt a user answers must not depend
-    // on `HashMap` iteration order, and neither must an error naming the
-    // first denial.
-    let mut names: Vec<&String> = task.vars.keys().collect();
+    // Sorted: which variable a user is prompted about first, and which
+    // denial is reported, must not depend on `HashMap` iteration order.
+    let mut names: Vec<&str> = task.vars.keys().map(String::as_str).collect();
     names.sort_unstable();
 
-    // Pass 1: classify. What the policy can decide alone is decided;
-    // the rest queues for the hook.
-    let mut approved: Vec<&String> = Vec::new();
-    let mut pending: Vec<&String> = Vec::new();
-    for name in names {
-        match vars_policy.check(name.as_str(), TaskVar { source }) {
-            CheckOutcome::Decided(Decision::Denied(_)) => {
-                bail!(denied_task_var_message(task_name, name, policy_path))
-            }
-            CheckOutcome::Decided(Decision::Ignored) => {
-                resolved.drop.insert(name.clone());
-            }
-            CheckOutcome::Decided(Decision::Allowed(_)) => approved.push(name),
-            CheckOutcome::NeedsApproval(_) => pending.push(name),
-        }
-    }
+    // The gate is `sessions`' own — the same three passes the session
+    // composer runs, called with names alone so that no value is read
+    // before the policy has spoken.
+    let pairs: Vec<(&str, &sessions::core::source::Source)> =
+        names.iter().map(|n| (*n, source)).collect();
+    let (verdicts, _policy) = sessions::core::compose::gate_names(&pairs, vars_policy, Some(hooks))
+        .with_context(|| format!("gating `env_vars` for task '{task_name}'"))?;
 
-    // Pass 2: refer what is left to the hook — a prompt on a terminal, a
-    // collect-and-refuse anywhere else.
-    if !pending.is_empty() {
-        let view: Vec<Unapproved<'_, str>> = pending
-            .iter()
-            .map(|n| Unapproved::new(n.as_str(), source))
-            .collect();
-        let (decisions, policy) = match hooks.on_var_unapproved(vars_policy.clone(), &view) {
-            HookResult::Abort => bail!(
-                "aborted: task '{task_name}' declares environment variables that \
-                 {policy_path} does not allow",
-                policy_path = policy_path.display(),
-            ),
-            HookResult::Decided {
-                decisions,
-                updated_policy,
-            } => {
-                if decisions.len() != view.len() {
-                    bail!(
-                        "policy hook returned {got} decisions for {want} variables",
-                        got = decisions.len(),
-                        want = view.len(),
-                    );
-                }
-                (decisions, updated_policy.unwrap_or(vars_policy))
+    let mut approved: Vec<&str> = Vec::new();
+    for (name, verdict) in names.iter().zip(verdicts) {
+        match verdict {
+            NameVerdict::Allowed => approved.push(name),
+            NameVerdict::Ignored => {
+                resolved.drop.insert((*name).to_string());
             }
-        };
-
-        // Pass 3: apply. `UseRule` re-checks against the policy the hook
-        // handed back; it cannot legally come back undecided, since the
-        // hook is the last word.
-        for (name, decision) in pending.into_iter().zip(decisions) {
-            match decision {
-                ItemDecision::AllowOnce => approved.push(name),
-                ItemDecision::IgnoreOnce => {
-                    resolved.drop.insert(name.clone());
-                }
-                ItemDecision::UseRule => match policy.check(name.as_str(), TaskVar { source }) {
-                    CheckOutcome::Decided(Decision::Denied(_)) => {
-                        bail!(denied_task_var_message(task_name, name, policy_path))
-                    }
-                    CheckOutcome::Decided(Decision::Ignored) => {
-                        resolved.drop.insert(name.clone());
-                    }
-                    CheckOutcome::Decided(Decision::Allowed(_)) => approved.push(name),
-                    CheckOutcome::NeedsApproval(_) => bail!(
-                        "policy hook left `env_vars.{name}` undecided after \
-                             asking to re-check it against the policy"
-                    ),
-                },
-            }
+            NameVerdict::Denied => bail!(denied_task_var_message(task_name, name, policy_path)),
         }
     }
 
@@ -271,7 +217,7 @@ fn resolve_task_env(
                 )
             })?,
         };
-        resolved.set.insert(name.clone(), value);
+        resolved.set.insert(name.to_string(), value);
     }
     Ok(resolved)
 }
@@ -339,24 +285,6 @@ fn refused_vars_snippet(names: &[String]) -> String {
     vars.insert("allow", toml_edit::value(allow));
     doc.insert("vars", toml_edit::Item::Table(vars));
     doc.to_string()
-}
-
-/// A task's declared variable, carrying the provenance
-/// [`VarsPolicy::check`] gates on. A task's `env_vars` come from the
-/// project's `minimal.toml`, so the source is always
-/// [`Source::Project`] — never `UserLoadout`, which would auto-pass the
-/// `allow` step.
-///
-/// [`VarsPolicy::check`]: sessions::core::policy::VarsPolicy::check
-/// [`Source::Project`]: sessions::core::source::Source::Project
-struct TaskVar<'a> {
-    source: &'a sessions::core::source::Source,
-}
-
-impl sessions::core::source::Provenanced for TaskVar<'_> {
-    fn source(&self) -> &sessions::core::source::Source {
-        self.source
-    }
 }
 
 /// The `[vars] deny` rejection body: names the task, the variable, and the
@@ -1422,7 +1350,15 @@ mod tests {
         )
         .expect_err("a refusing hook must fail the run");
 
-        assert!(err.to_string().contains("aborted"), "{err}");
+        // `{:#}` renders the whole anyhow chain: the gate's abort now
+        // arrives wrapped in this call site's context, so the top-level
+        // message alone would not say why the run stopped.
+        let chain = format!("{err:#}");
+        assert!(chain.contains("aborted"), "{chain}");
+        assert!(
+            chain.contains("env_vars"),
+            "names the gate that failed: {chain}"
+        );
         assert_eq!(
             hooks.into_names(),
             vec!["AWS_SECRET_ACCESS_KEY".to_string(), "OTHER".to_string()],
