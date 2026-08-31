@@ -276,6 +276,71 @@ fn resolve_task_env(
     Ok(resolved)
 }
 
+/// The non-interactive lane's hook: records what the policy could not
+/// decide and then **refuses**.
+///
+/// [`NoPromptHook`](crate::prompt::NoPromptHook) cannot serve here. It
+/// fake-approves every unapproved item with `AllowOnce` so an activate's
+/// later hooks still fire and the operator's snippet lists every required
+/// edit — safe there, because that caller only ever submits a verdict and
+/// checks the summary before it does. This caller *reads values*, and an
+/// `AllowOnce` reaches the lookup: the name's value would come out of the
+/// user's shell before anyone checked the summary, which is the exact
+/// ordering the gate exists to prevent. Refusing keeps the read from
+/// happening at all; the caller formats the same snippet from `names`.
+#[derive(Default)]
+struct RefuseAndRecord {
+    names: std::cell::RefCell<Vec<String>>,
+}
+
+impl RefuseAndRecord {
+    fn into_names(self) -> Vec<String> {
+        self.names.into_inner()
+    }
+}
+
+impl sessions::core::hooks::PolicyHooks for RefuseAndRecord {
+    fn on_var_unapproved(
+        &self,
+        _policy: sessions::core::policy::VarsPolicy,
+        items: &[sessions::core::hooks::Unapproved<'_, str>],
+    ) -> sessions::core::hooks::HookResult<sessions::core::policy::VarsPolicy> {
+        let mut names = self.names.borrow_mut();
+        for item in items {
+            let name = item.item().to_owned();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        sessions::core::hooks::HookResult::Abort
+    }
+
+    fn on_patch_unapproved(
+        &self,
+        _policy: sessions::core::policy::PatchesPolicy,
+        _items: &[sessions::core::hooks::Unapproved<'_, camino::Utf8Path>],
+    ) -> sessions::core::hooks::HookResult<sessions::core::policy::PatchesPolicy> {
+        unreachable!("task env resolution never gates patches")
+    }
+}
+
+/// Format refused variable names as the `[vars] allow` snippet an
+/// operator can paste, mirroring
+/// [`UnapprovedSummary::as_toml_snippet`](crate::prompt::UnapprovedSummary::as_toml_snippet).
+/// Emitted through `toml_edit` so a name needing TOML escaping still
+/// produces a snippet that parses.
+fn refused_vars_snippet(names: &[String]) -> String {
+    let mut doc = toml_edit::DocumentMut::new();
+    let mut vars = toml_edit::Table::new();
+    let mut allow = toml_edit::Array::new();
+    for name in names {
+        allow.push(name.as_str());
+    }
+    vars.insert("allow", toml_edit::value(allow));
+    doc.insert("vars", toml_edit::Item::Table(vars));
+    doc.to_string()
+}
+
 /// A task's declared variable, carrying the provenance
 /// [`VarsPolicy::check`] gates on. A task's `env_vars` come from the
 /// project's `minimal.toml`, so the source is always
@@ -521,7 +586,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     };
     let non_interactive = global.no_input || !crate::can_prompt_interactively();
     let (task_env, user_policy) = if non_interactive {
-        let hooks = crate::prompt::NoPromptHook::new();
+        let hooks = RefuseAndRecord::default();
         let task_env = resolve_task_env(
             &declared,
             &args.task,
@@ -531,10 +596,12 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
             &hooks,
             |k| std::env::var(k),
         );
-        let summary = hooks.into_summary();
-        if summary.count() > 0 {
-            let count = summary.count();
-            let snippet = summary.as_toml_snippet();
+        // Checked before the result: the hook refused, so `task_env` is
+        // the abort error and the names are the useful half of it.
+        let refused = hooks.into_names();
+        if !refused.is_empty() {
+            let count = refused.len();
+            let snippet = refused_vars_snippet(&refused);
             bail!(
                 "task '{task}' declares {count} environment variable{s} that your \
                  policy does not allow, and stdin/stderr is not a terminal.\n\n\
@@ -1327,6 +1394,51 @@ mod tests {
 
         // Sorted, so the prompt order does not depend on HashMap iteration.
         assert_eq!(hooks.asked(), vec!["A".to_string(), "B".to_string()]);
+    }
+
+    /// The hook the non-interactive lane actually uses must refuse, not
+    /// fake-approve. `NoPromptHook` returns `AllowOnce` for everything so
+    /// an activate's later hooks still fire — harmless there, because that
+    /// caller only submits a verdict, and fatal here, because this one
+    /// reads values: the name's secret would leave the shell before anyone
+    /// looked at the summary. Drives the real `RefuseAndRecord`, which the
+    /// hand-rolled doubles above cannot stand in for.
+    #[test]
+    fn the_non_interactive_hook_refuses_before_anything_is_read() {
+        let task = task_from_toml(
+            "[tasks.t]\nenv_vars.AWS_SECRET_ACCESS_KEY = { inherit = true }\n\
+             env_vars.OTHER = { inherit = true }\nexec = 'true'\n",
+        );
+        let hooks = RefuseAndRecord::default();
+
+        let err = resolve_task_env(
+            &task,
+            "t",
+            no_vars_policy(),
+            &policy_path_fixture(),
+            &project_source(),
+            &hooks,
+            |_| panic!("no value may be read out of the shell on the refusing path"),
+        )
+        .expect_err("a refusing hook must fail the run");
+
+        assert!(err.to_string().contains("aborted"), "{err}");
+        assert_eq!(
+            hooks.into_names(),
+            vec!["AWS_SECRET_ACCESS_KEY".to_string(), "OTHER".to_string()],
+            "the refused names are what the caller's snippet is built from",
+        );
+    }
+
+    /// The refusal snippet is the `[vars] allow` block an operator pastes,
+    /// and stays valid TOML for a name that needs escaping.
+    #[test]
+    fn the_refusal_snippet_is_pasteable_toml() {
+        let snippet = refused_vars_snippet(&["DEPLOY_TARGET".to_string()]);
+        assert!(snippet.contains("[vars]"), "{snippet}");
+        assert!(snippet.contains("DEPLOY_TARGET"), "{snippet}");
+        let parsed: toml::Value = toml::from_str(&snippet).expect("snippet must parse");
+        assert!(parsed.get("vars").is_some());
     }
 
     /// An echo task's `env_vars` are read by nobody: the daemon answers it
