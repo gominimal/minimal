@@ -196,8 +196,20 @@ fn resolve_task_env(
     // before the policy has spoken.
     let pairs: Vec<(&str, &sessions::core::source::Source)> =
         names.iter().map(|n| (*n, source)).collect();
-    let (verdicts, _policy) = sessions::core::compose::gate_names(&pairs, vars_policy, Some(hooks))
-        .with_context(|| format!("gating `env_vars` for task '{task_name}'"))?;
+    let (verdicts, _policy) =
+        match sessions::core::compose::gate_names(&pairs, vars_policy, Some(hooks)) {
+            Ok(out) => out,
+            // The gate stops at the first denial and names it. Reported
+            // here rather than relayed, so the operator gets the task, the
+            // variable, and the file the rule lives in.
+            Err(sessions::core::compose::ComposeError::Denied { what, .. }) => {
+                bail!(denied_task_var_message(task_name, &what, policy_path))
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e))
+                    .with_context(|| format!("gating `env_vars` for task '{task_name}'"));
+            }
+        };
 
     let mut approved: Vec<&str> = Vec::new();
     for (name, verdict) in names.iter().zip(verdicts) {
@@ -206,7 +218,6 @@ fn resolve_task_env(
             NameVerdict::Ignored => {
                 resolved.drop.insert((*name).to_string());
             }
-            NameVerdict::Denied => bail!(denied_task_var_message(task_name, name, policy_path)),
         }
     }
 
@@ -1379,6 +1390,40 @@ mod tests {
         assert!(snippet.contains("DEPLOY_TARGET"), "{snippet}");
         let parsed: toml::Value = toml::from_str(&snippet).expect("snippet must parse");
         assert!(parsed.get("vars").is_some());
+    }
+
+    /// A denied name is reported even when an unlisted one sits beside
+    /// it. Without the short-circuit the hook answers for the unlisted
+    /// name first, and the non-interactive lane tells the operator to
+    /// allow-list that one — never mentioning the denial they would hit
+    /// on the very next run.
+    #[test]
+    fn a_denial_is_reported_even_beside_an_unlisted_name() {
+        let task = task_from_toml(
+            "[tasks.t]\nenv_vars.AWS_KEY = { inherit = true }\n\
+             env_vars.ZZ_UNLISTED = { inherit = true }\nexec = 'true'\n",
+        );
+        let policy = no_vars_policy().try_with_deny(["AWS_*"]).unwrap();
+        let hooks = RefuseAndRecord::default();
+
+        let err = resolve_task_env(
+            &task,
+            "t",
+            policy,
+            &policy_path_fixture(),
+            &project_source(),
+            &hooks,
+            |_| panic!("nothing is read out of the shell"),
+        )
+        .expect_err("the denial must fail the run");
+
+        let msg = err.to_string();
+        assert!(msg.contains("AWS_KEY"), "names the denied variable: {msg}");
+        assert!(msg.contains("[vars] deny"), "names the rule: {msg}");
+        assert!(
+            hooks.into_names().is_empty(),
+            "the hook must not be consulted once a name is denied",
+        );
     }
 
     /// An echo task's `env_vars` are read by nobody: the daemon answers it
