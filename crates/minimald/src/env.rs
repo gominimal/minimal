@@ -192,7 +192,7 @@ pub struct EnvArgs {
 
     packages: Vec<String>,
     patches: Option<EnvPatches>,
-    env_vars: Option<HashMap<String, EnvVarValue>>,
+    env_vars: Option<BTreeMap<String, EnvVarValue>>,
     ot: Option<OpTracker>,
     network_mode: NetworkMode,
     own_ip_tap: Option<sandbox2::config::OwnIpTap>,
@@ -271,7 +271,7 @@ impl EnvArgs {
 
     /// Sets environment variables to apply on top of the package-derived ones.
     #[must_use]
-    pub fn with_env_vars(mut self, env_vars: HashMap<String, EnvVarValue>) -> Self {
+    pub fn with_env_vars(mut self, env_vars: BTreeMap<String, EnvVarValue>) -> Self {
         self.env_vars = Some(env_vars);
         self
     }

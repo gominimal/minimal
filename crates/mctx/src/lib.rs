@@ -1,7 +1,7 @@
 //! Top-level API for minimal tooling.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -850,7 +850,7 @@ impl Context {
         wd: Option<PathBuf>,
         state_key: Option<&String>,
         patches: Option<&'a EnvPatches>,
-        env_vars: Option<&'a HashMap<String, EnvVarValue>>,
+        env_vars: Option<&'a BTreeMap<String, EnvVarValue>>,
         packages: S,
         home: PatchHome,
     ) -> Result<env::Env<'a>, Error> {
@@ -884,7 +884,7 @@ impl Context {
         wd: Option<PathBuf>,
         state_key: Option<&String>,
         patches: Option<&'a EnvPatches>,
-        env_vars: Option<&'a HashMap<String, EnvVarValue>>,
+        env_vars: Option<&'a BTreeMap<String, EnvVarValue>>,
         packages: S,
         network_mode: sandbox2::NetworkMode,
         home: PatchHome,

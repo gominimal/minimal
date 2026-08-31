@@ -1417,7 +1417,7 @@ mod tests {
                         state_key: Some("test".to_string()),
                         profile: None,
                         description: None,
-                        vars: HashMap::new(),
+                        vars: BTreeMap::new(),
                         patch: EnvPatches {
                             dir: [("~/.claude".to_string(), PatchSetting::ReadWrite)].into(),
                             file: BTreeMap::new()

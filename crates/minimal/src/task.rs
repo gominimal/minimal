@@ -182,14 +182,11 @@ fn resolve_task_env(
         return Ok(resolved);
     }
 
-    // Sorted: which variable a user is prompted about first, and which
-    // denial is reported, must not depend on `HashMap` iteration order.
-    //
-    // `sort_unstable` is not in tension with wanting a fixed order — it
-    // describes what happens to *equal* elements, and these are map keys,
-    // so there are none. The order it produces is fully determined.
-    let mut names: Vec<&str> = task.vars.keys().map(String::as_str).collect();
-    names.sort_unstable();
+    // Order comes off the map, which is a `BTreeMap` (#1319): which
+    // variable a user is prompted about first, and which denial is
+    // reported, are fixed by the declaration's own key order rather than
+    // by a sort here.
+    let names: Vec<&str> = task.vars.keys().map(String::as_str).collect();
 
     // The gate is `sessions`' own — the same three passes the session
     // composer runs, called with names alone so that no value is read

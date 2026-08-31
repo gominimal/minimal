@@ -522,7 +522,7 @@ pub struct EnvArgs<'a> {
     pub home: PatchHome,
 
     /// Environment variables to set.
-    pub env_vars: Option<&'a HashMap<String, EnvVarValue>>,
+    pub env_vars: Option<&'a BTreeMap<String, EnvVarValue>>,
     /// The hostname to set, if any.
     pub hostname: Option<String>,
 
