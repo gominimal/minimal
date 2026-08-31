@@ -17,6 +17,7 @@ pub mod server;
 mod session;
 mod session_delta;
 pub mod session_host;
+mod session_shell;
 pub mod session_sop;
 mod sessions;
 mod sftp;

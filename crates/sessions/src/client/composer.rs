@@ -2,8 +2,8 @@
 //! their policy, and emits a wire contribution to ship to the daemon.
 
 use crate::core::compose::{
-    Composable, ComposeError, ComposeOptions, Composition, Contribution, Error, StoredEnv,
-    compose_contribution, default_env,
+    Composable, ComposeError, ComposeOptions, Composition, Contribution, Error, PatchAnchors,
+    StoredEnv, compose_contribution, default_env,
 };
 use crate::core::loadout::Loadout;
 use crate::core::policy::UserPolicy;
@@ -30,6 +30,13 @@ pub struct UserComposer {
     ///
     /// [`Source::UserLoadout`]: crate::core::source::Source::UserLoadout
     seen_names: std::collections::HashSet<crate::core::loadout::LoadoutName>,
+    /// The directory the added loadouts were read from, set via
+    /// [`Self::with_loadouts_dir`]. Anchors `$LOADOUT_ROOT` in their
+    /// patch sources: loadout `dev` resolves it to `<dir>/dev`. Unset
+    /// means no loadout here can use the reference — the composer has
+    /// no way to guess which directory a loadout came from, and a wrong
+    /// guess would patch from the wrong tree.
+    loadouts_dir: Option<paths::HostAbsPath>,
     /// First-prompt orientation facts, set via
     /// [`Self::with_orientation`] and emitted on the composed
     /// [`WireContribution`] as a first-class field — control plane,
@@ -43,6 +50,7 @@ impl core::fmt::Debug for UserComposer {
         f.debug_struct("UserComposer")
             .field("contribution", &self.contribution)
             .field("seen_names", &self.seen_names)
+            .field("loadouts_dir", &self.loadouts_dir)
             .field("orientation", &self.orientation)
             .field("env", &"<closure>")
             .finish()
@@ -68,6 +76,7 @@ impl UserComposer {
         Self {
             contribution: Contribution::new(),
             seen_names: std::collections::HashSet::new(),
+            loadouts_dir: None,
             orientation: crate::core::compose::Orientation::default(),
             env: default_env(),
         }
@@ -78,6 +87,22 @@ impl UserComposer {
     #[must_use]
     pub fn with_env(mut self, env: StoredEnv) -> Self {
         self.env = env;
+        self
+    }
+
+    /// Set the directory the loadouts being added were read from, which
+    /// is what `$LOADOUT_ROOT` in their patch sources resolves against —
+    /// loadout `dev` gets `<dir>/dev`, the same directory its external
+    /// hook scripts resolve against.
+    ///
+    /// The caller sets this rather than the composer deriving it: which
+    /// directory is in play depends on how the CLI resolved its config
+    /// dir (`--config-dir`, `$XDG_CONFIG_HOME`, the platform default),
+    /// and only the caller knows that. Leaving it unset means loadouts
+    /// added here cannot use the reference at all.
+    #[must_use]
+    pub fn with_loadouts_dir(mut self, dir: paths::HostAbsPath) -> Self {
+        self.loadouts_dir = Some(dir);
         self
     }
 
@@ -156,14 +181,10 @@ impl UserComposer {
         // (this is the user's own process environment, so it's the
         // right HOME to use when the loadout doesn't declare one).
         let home_fallback = (*self.env)("HOME").ok();
-        let (composition, final_policy) = compose_contribution(
-            self.contribution,
-            &[],
-            policy,
-            None,
-            options,
-            home_fallback.as_deref(),
-        )?;
+        let anchors = PatchAnchors::home(home_fallback.as_deref())
+            .with_loadouts_dir(self.loadouts_dir.as_ref());
+        let (composition, final_policy) =
+            compose_contribution(self.contribution, &[], policy, None, options, anchors)?;
         Ok((
             composition_to_wire(composition, self.orientation),
             final_policy,

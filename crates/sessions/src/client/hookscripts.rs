@@ -80,28 +80,35 @@ pub enum StageError {
 }
 
 /// Where each kind of contributor's external scripts are anchored.
+///
+/// Both anchors are [`HostAbsPath`](paths::HostAbsPath): a script is
+/// read from the user's own filesystem, and it is resolved by walking
+/// down from the anchor, so an anchor that isn't a known-absolute host
+/// path would silently resolve against the process's working
+/// directory.
 #[derive(Debug, Clone)]
 pub struct ScriptAnchors {
     /// The user's loadouts directory. A loadout named `dev` anchors its
     /// scripts at `<loadouts_dir>/dev/`.
-    pub loadouts_dir: Utf8PathBuf,
+    pub loadouts_dir: paths::HostAbsPath,
     /// The project root, for hooks declared in `minimal.toml`.
-    pub project_root: Utf8PathBuf,
+    pub project_root: paths::HostAbsPath,
 }
 
 impl ScriptAnchors {
     /// The directory `source`'s scripts resolve against, or `None` for
     /// a source that cannot declare scripts.
     #[must_use]
-    pub fn for_source(&self, source: &Source) -> Option<Utf8PathBuf> {
+    pub fn for_source(&self, source: &Source) -> Option<paths::HostAbsPath> {
         match source {
-            // Same guard as `staged_script_path`, for the same reason:
-            // the name is joined into a path that is then read from, so
-            // it has to be a component that stays put. A name this
-            // rejects has no anchor, so its scripts never stage — and
-            // the daemon would refuse to read them anyway.
-            Source::UserLoadout { name } => crate::core::lifecyclehook::safe_path_component(name)
-                .then(|| self.loadouts_dir.join(name)),
+            // `Source::loadout_dir` applies the same guard
+            // `staged_script_path` does, for the same reason: the name is
+            // joined into a path that is then read from, so it has to be a
+            // component that stays put. A name it rejects has no anchor, so
+            // its scripts never stage — and the daemon would refuse to read
+            // them anyway. It is also what `$LOADOUT_ROOT` resolves to, so a
+            // loadout's scripts and its patch sources share one directory.
+            Source::UserLoadout { .. } => source.loadout_dir(&self.loadouts_dir),
             Source::Project { .. } => Some(self.project_root.clone()),
             Source::Package { .. } => None,
         }
@@ -188,12 +195,13 @@ fn external_staged_path(source: &Source, script: &HookScript) -> Option<Utf8Path
 /// [`ConfigRelPath`](paths::ConfigRelPath), which rejects both at
 /// construction.
 fn resolve_under_anchor(
-    anchor: &Utf8Path,
+    anchor: &paths::HostAbsPath,
     rel: &Utf8Path,
     source: &Source,
 ) -> Result<Utf8PathBuf, StageError> {
     let label = source.to_string();
     let script = rel.to_owned();
+    let anchor = anchor.as_utf8_path();
 
     // Absence and unreadability are different problems, told apart here the
     // same way the per-component walk below tells them apart: "no such
@@ -275,9 +283,11 @@ mod tests {
     use crate::core::lifecyclehook::LifecycleHook;
 
     fn anchors(root: &Utf8Path) -> ScriptAnchors {
+        // `root` is a tempdir, so both joins are absolute by
+        // construction.
         ScriptAnchors {
-            loadouts_dir: root.join("loadouts"),
-            project_root: root.join("proj"),
+            loadouts_dir: paths::HostAbsPath::try_new(root.join("loadouts")).unwrap(),
+            project_root: paths::HostAbsPath::try_new(root.join("proj")).unwrap(),
         }
     }
 

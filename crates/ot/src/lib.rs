@@ -13,7 +13,8 @@ use tokio::sync::watch;
 mod indicatif_shim;
 #[cfg(feature = "indicatif")]
 pub use indicatif_shim::{
-    IndicatifShim, StdoutWriter, global_progress, render_operations_while, render_to_stderr,
+    IndicatifShim, StderrWriter, StdoutWriter, global_progress, render_operations_while,
+    render_to_stderr,
 };
 
 #[derive(Debug, Clone)]

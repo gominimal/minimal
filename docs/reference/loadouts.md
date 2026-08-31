@@ -164,7 +164,7 @@ name  = "weird-thing"
 value = "x"
 ```
 
-### `patches` - Files copied from the host into the session
+### `patches` - Files copied from the host into the session {#patches}
 
 _Optional_
 
@@ -187,6 +187,9 @@ so list entries only make sense with per-entry dests or glob entries):
   references (including `$HOME`) resolve against the session's
   already-resolved variables (declared in `[vars]`); referencing an
   undefined name is an error. `$$` is a literal `$`.
+- `$LOADOUT_ROOT` expands to the loadout's own directory, for files you
+  ship beside the loadout itself — see
+  [`$LOADOUT_ROOT`](#loadout_root) below.
 - After expansion the path must be absolute; anchor home-relative sources
   with `~/`.
 - Glob patterns must have a literal directory prefix to walk from:
@@ -220,7 +223,53 @@ readable only by you. Two qualifications:
 Ownership is not carried and cannot be: every file in the session belongs
 to the session user, whatever it was owned by on your host.
 
-### `[[lifecycle_hooks]]` - Scripts at session transition points
+#### `$LOADOUT_ROOT` - Files shipped with the loadout {#loadout_root}
+
+Not every file a loadout patches in belongs in your dotfiles. For the ones
+that exist only to serve this loadout, keep them beside it and name them
+with `$LOADOUT_ROOT`, which expands to a directory named after the loadout
+next to its `.toml` -- the same directory its
+[external hook scripts](#lifecycle_hooks) resolve against:
+
+```
+<config>/minimal/loadouts/
+├── dev.toml
+└── dev/
+    ├── config.toml
+    └── themes/
+        └── nord.toml
+```
+
+```toml
+patches = [
+    { dest = ".config/helix/config.toml", source = "$LOADOUT_ROOT/config.toml" },
+    { dest = ".config/helix/themes/",     source = "$LOADOUT_ROOT/themes/**/*.toml" },
+]
+```
+
+It resolves against the loadouts directory actually in use, so a
+`--config-dir` or `$XDG_CONFIG_HOME` that moves your config takes the
+loadout's files with it -- which a hard-coded `~/.config/minimal/loadouts/dev/`
+would not.
+
+Details worth knowing:
+
+- The reference is **only** available in the `source` of a patch a loadout
+  declared. In a [user policy](./user-policy.md) pattern, or in a patch a
+  project declared, it fails the activation rather than resolving to some
+  other declarer's directory. `dest` is a path inside the session, so it has
+  no use for it either.
+- The name is **reserved** here: a loadout that also declares a
+  `LOADOUT_ROOT` variable still patches from its own directory. The variable
+  reaches the session normally -- only patch sources ignore it.
+- `$LOADOUT_ROOT` alone names a directory, and a patch source matches files,
+  so it patches in nothing. Write `$LOADOUT_ROOT/**/*` to take the whole
+  tree.
+- The directory is optional. A loadout that never references it does not
+  need one, and -- like any other source -- a path that isn't there is
+  skipped with a warning rather than failing the activation.
+
+### `[[lifecycle_hooks]]` - Scripts at session transition points {#lifecycle_hooks}
 
 _Optional_
 
@@ -274,6 +323,9 @@ live in `dev/`:
     ├── activate.sh
     └── teardown.sh
 ```
+
+This is the same directory [`$LOADOUT_ROOT`](#loadout_root) names, so a
+loadout's scripts and the files it patches in live together.
 
 A script must resolve to a regular file inside that directory. Symlinks are
 rejected rather than followed, at every path component — a symlink is the one
@@ -463,8 +515,10 @@ file means an empty policy; a fresh install activates fine without it.
 
 ## Vars in the attach shell
 
-The interactive shell minted by [`min session attach`](./cli-min.md#session-attach) is
-`bash --noprofile --rcfile <daemon rc> -i`. It sources **none** of your
+The interactive shell minted by [`min session attach`](./cli-min.md#session-attach)
+is bash unless a loadout says otherwise — see
+[`SHELL`](#session-shell) below. bash is started as
+`bash --noprofile --rcfile <daemon rc> -i`: it sources **none** of your
 startup files (not `/etc/profile`, `~/.bash_profile`, or `~/.bashrc`), so
 rc-file patches cannot influence it — the only rc it reads is the daemon's
 own, which installs the [attached terminal](#attached-terminal) hook and
@@ -499,6 +553,60 @@ i.e. through `[vars]`:
   Replacing `PROMPT_COMMAND` costs you nothing but the banner: the
   [attached terminal's](#attached-terminal) `TERM` is refreshed by a hook
   the daemon installs, not by this variable.
+
+### `SHELL` - Which shell an attach starts {#session-shell}
+
+Set `SHELL` in `[vars]` to be dropped into that shell instead of bash:
+
+```toml
+packages = ["fish"]
+
+[vars]
+SHELL = "/usr/bin/fish"
+```
+
+Only the file name is read, so a value carried over from your host
+(`/opt/homebrew/bin/fish`, a Nix store path) still works — the path
+itself names a filesystem the session does not have. Five shells are
+supported, each because the session can install it *and* the daemon ships
+it an [attached terminal](#attached-terminal) hook:
+
+| `SHELL` | Package to install |
+|---|---|
+| `bash` | `bash` (always present) |
+| `sh` | `bash` — it ships `sh` as a POSIX-mode symlink, so this needs nothing |
+| `zsh` | `zsh` |
+| `fish` | `fish` |
+| `nu` | `nushell` |
+
+Anything else starts bash and prints one line saying why. A shell from
+that table which the session hasn't installed is named along with the
+package that would supply it; a `SHELL` naming anything else is told
+which five shells there are to choose from. Nothing fails either way.
+
+This is the loadout's `SHELL`, not the `$SHELL` of the terminal you ran
+`min` from: a session is a declared environment, and the shell it hands
+you is part of the declaration.
+
+Three things worth knowing:
+
+- **bash is unchanged**, rc suppression included. Every other shell reads
+  its own startup files from the session home — which is where
+  [patches](#patches) land, so a patched-in `config.fish` or `.zshrc`
+  applies. That asymmetry is deliberate: bash's behaviour predates this
+  and stays as it was.
+- **The shell is chosen once**, at the attach that mints the session
+  shell, and that shell outlives later attaches. Changing `SHELL`
+  afterwards takes a new session.
+- **The stock prompt follows where it can.** The session default `PS1`
+  is written in bash's syntax, so zsh is given the same prompt in zsh's
+  syntax instead of printing `\u@\h` at you; fish and nushell build
+  their prompts from their own config and ignore `PS1` entirely. A `PS1`
+  you set in `[vars]` always wins, in whatever syntax you wrote it.
+- **The banner does not follow.** The orientation banner rides
+  `PROMPT_COMMAND`, which is bash's; a fish or nushell session simply
+  doesn't print it. `TERM` refresh *does* work in all five — that is what
+  the daemon's hooks are for.
 
 ### The attached terminal {#attached-terminal}
 

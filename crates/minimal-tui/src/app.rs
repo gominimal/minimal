@@ -1074,7 +1074,7 @@ fn attach_and_resume(
     id: SessionId,
     model: &mut Model,
 ) {
-    let result = minimal_client::attach::attach_command(sock, id, &[]).and_then(|mut cmd| {
+    let result = minimal_client::attach::attach_command(sock, id, None).and_then(|mut cmd| {
         terminal.suspend();
         let status = cmd.status();
         // A failed resume leaves the TUI unusable; report it over the

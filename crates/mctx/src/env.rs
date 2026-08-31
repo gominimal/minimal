@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::Permissions,
     io::Write,
     os::unix::{fs::PermissionsExt, net::UnixStream},
@@ -571,7 +571,7 @@ pub fn interpolate_task_strings(
 /// Names whoever put a patch path into the environment: the package that
 /// declared it, or — for a path that arrived through the task's own `patch`
 /// table rather than a package attribute — the task itself.
-fn declared_by(packages: &HashMap<String, String>, declared: &str, task: &str) -> String {
+fn declared_by(packages: &BTreeMap<String, String>, declared: &str, task: &str) -> String {
     match packages.get(declared) {
         Some(p) => format!("package `{p}`"),
         None => format!("task `{task}`"),
@@ -694,7 +694,7 @@ impl<'a> Env<'a> {
         // the expanded form, so its "create mapped file" failures name a path
         // nobody wrote down; this puts the package and its `~/`-rooted
         // declaration back into the message.
-        let declarations: HashMap<String, &String> = fs_mapping_packages
+        let declarations: BTreeMap<String, &String> = fs_mapping_packages
             .keys()
             .filter_map(|declared| {
                 Some((
@@ -990,7 +990,7 @@ mod tests {
     #[test]
     fn declared_by_names_the_package_then_the_task() {
         let packages =
-            HashMap::from_iter([("~/.claude.json".to_string(), "claude-code".to_string())]);
+            BTreeMap::from_iter([("~/.claude.json".to_string(), "claude-code".to_string())]);
         assert_eq!(
             declared_by(&packages, "~/.claude.json", "test"),
             "package `claude-code`"

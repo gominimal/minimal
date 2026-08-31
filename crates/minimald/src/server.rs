@@ -158,6 +158,22 @@ pub struct ServerState {
     /// Memoized SSH host key, after first successful load.
     host_key: Option<PrivateKey>,
 
+    /// Why the host-side egress proxy is not reachable, if it is not. Set by
+    /// [`start_host_proxies`] and read by the `ListSessions` RPC.
+    ///
+    /// Both failure paths land here, because they produce the same symptom
+    /// from different places: on DM2 the bind itself fails, and on DM1 the
+    /// bind succeeds inside the guest but publishing it on the host loopback
+    /// does not. A fix that surfaced only the first would stay silent on
+    /// macOS, which is the platform the failure was reported from.
+    proxy_unavailable: Option<String>,
+
+    /// Why the mTLS reverse proxy is not serving, if it is not. Kept apart
+    /// from [`Self::proxy_unavailable`] so a client is not told its hostnames
+    /// are broken when only TLS termination is. Never set without the
+    /// `networking-proxy` feature, where there is no such proxy to lose.
+    mtls_unavailable: Option<String>,
+
     /// The daemon's TLS certificate authority, used by the HTTPS proxy and the
     /// `IssueClientCert` RPC. Generated once on daemon startup and held for the
     /// daemon's lifetime; clients must call `minimal login` again after a
@@ -245,6 +261,8 @@ impl ServerState {
             shutdown: CancellationToken::new(),
             log_release,
             host_key: None,
+            proxy_unavailable: None,
+            mtls_unavailable: None,
             #[cfg(feature = "networking-proxy")]
             cert_authority,
             #[cfg(feature = "networking-wg")]
@@ -297,6 +315,27 @@ impl ServerStateHandle {
     /// Returns a handle to the sessions manager.
     pub async fn sessions_manager(&self) -> sessions::ManagerHandle {
         self.0.lock().await.sessions.clone()
+    }
+
+    /// Records why hostname routing is unavailable, so a client can be told.
+    pub(crate) async fn set_proxy_unavailable(&self, reason: String) {
+        self.0.lock().await.proxy_unavailable = Some(reason);
+    }
+
+    /// Why hostname routing is unavailable, or `None` if the proxy is up.
+    pub(crate) async fn proxy_unavailable(&self) -> Option<String> {
+        self.0.lock().await.proxy_unavailable.clone()
+    }
+
+    /// Records why the mTLS reverse proxy is not serving.
+    #[cfg_attr(not(feature = "networking-proxy"), expect(dead_code))]
+    pub(crate) async fn set_mtls_unavailable(&self, reason: String) {
+        self.0.lock().await.mtls_unavailable = Some(reason);
+    }
+
+    /// Why the mTLS reverse proxy is not serving, or `None` if it is.
+    pub(crate) async fn mtls_unavailable(&self) -> Option<String> {
+        self.0.lock().await.mtls_unavailable.clone()
     }
 
     /// Returns the daemon-scoped mctx state.
@@ -718,9 +757,12 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
         Ipv4Addr::LOCALHOST.into()
     };
 
-    // B5 egress/DNS proxy (:7654), always.
+    // B5 egress/DNS proxy (:7654), always. Both ways this can fail end with
+    // `<name>.local.min.internal` not routing, so both are recorded on the
+    // state where `ListSessions` can reach them — a daemon that keeps serving
+    // without its proxy looks identical to a healthy one otherwise.
     let egress_addr = SocketAddr::new(bind_base, proxy::EGRESS_PROXY_PORT);
-    if proxy::bind_listener(egress_addr)
+    let bound = proxy::bind_listener(egress_addr)
         .await
         .map(|listener| {
             let router = Router::new(registry.clone());
@@ -730,24 +772,43 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
                 }
             })
         })
-        .is_some()
-        && in_microvm
-    {
-        // Only publish a port whose listener actually bound.
-        expose_proxy_on_host(
+        .is_some();
+
+    if !bound {
+        // DM2: something else on the host holds the port.
+        state
+            .set_proxy_unavailable(format!(
+                "the daemon could not bind {egress_addr}; another process is \
+                 holding it. Check with: lsof -nP -iTCP:{} -sTCP:LISTEN",
+                proxy::EGRESS_PROXY_PORT
+            ))
+            .await;
+    } else if in_microvm {
+        // DM1: the guest bind cannot collide with a host process, so the
+        // failure moves to the publish instead. Only publish a port whose
+        // listener actually bound.
+        if let Some(reason) = expose_proxy_on_host(
             crate::net::DEFAULT_SUBNET.daemon_ip(),
             proxy::EGRESS_PROXY_PORT,
         )
-        .await;
+        .await
+        {
+            state.set_proxy_unavailable(reason).await;
+        }
     }
 
     // B8 mTLS reverse proxy (:7655), under the networking-proxy feature.
     #[cfg(feature = "networking-proxy")]
     {
+        // Three ways this ends with nothing serving on :7655, and all three
+        // were silent: the TLS config failing to build, the bind failing, and
+        // the publish failing. The daemon carries on in every case, so only a
+        // reported reason distinguishes "no mTLS proxy configured" from "the
+        // mTLS proxy is broken".
         let https_addr = SocketAddr::new(bind_base, proxy::HTTPS_PROXY_PORT);
         match state.cert_authority().await.build_server_config() {
             Ok(tls_config) => {
-                if proxy::bind_listener(https_addr)
+                let bound = proxy::bind_listener(https_addr)
                     .await
                     .map(|listener| {
                         let router = Router::new(registry.clone());
@@ -759,18 +820,34 @@ async fn start_host_proxies(state: &ServerStateHandle, in_microvm: bool) {
                             }
                         })
                     })
-                    .is_some()
-                    && in_microvm
-                {
-                    expose_proxy_on_host(
+                    .is_some();
+
+                if !bound {
+                    state
+                        .set_mtls_unavailable(format!(
+                            "the daemon could not bind {https_addr}; another process is \
+                             holding it. Check with: lsof -nP -iTCP:{} -sTCP:LISTEN",
+                            proxy::HTTPS_PROXY_PORT
+                        ))
+                        .await;
+                } else if in_microvm
+                    && let Some(reason) = expose_proxy_on_host(
                         crate::net::DEFAULT_SUBNET.daemon_ip(),
                         proxy::HTTPS_PROXY_PORT,
                     )
-                    .await;
+                    .await
+                {
+                    state.set_mtls_unavailable(reason).await;
                 }
             }
             Err(error) => {
                 tracing::warn!(%error, "could not build TLS config for the mTLS reverse proxy");
+                state
+                    .set_mtls_unavailable(format!(
+                        "the daemon could not build a TLS config for the mTLS reverse \
+                         proxy: {error}"
+                    ))
+                    .await;
             }
         }
     }
@@ -791,11 +868,15 @@ const HOST_EXPOSE_PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::fr
 
 /// Publishes a guest-side proxy bound on `daemon_ip:port` onto the macOS host's
 /// loopback (`127.0.0.1:port`) via the host gvproxy forwarder, reached over the
-/// vsock shuttle (DM1). Best-effort: warns and returns on failure, since the
-/// host gvproxy may be absent. Capped at [`HOST_EXPOSE_PUBLISH_TIMEOUT`] so it
-/// never stalls [`Server::run`]'s SSH accept loop.
+/// vsock shuttle (DM1). Best-effort in that it never fails the daemon, since
+/// the host gvproxy may be absent. Capped at [`HOST_EXPOSE_PUBLISH_TIMEOUT`] so
+/// it never stalls [`Server::run`]'s SSH accept loop.
+///
+/// Returns `Some(reason)` when the publish did not happen, so the caller can
+/// tell a client rather than leaving the loss in the daemon log — on DM1 this
+/// is the path a host process holding the port actually breaks.
 #[cfg(target_os = "linux")]
-async fn expose_proxy_on_host(daemon_ip: std::net::Ipv4Addr, port: u16) {
+async fn expose_proxy_on_host(daemon_ip: std::net::Ipv4Addr, port: u16) -> Option<String> {
     use crate::net::policy::{ControlChannel, ExposeRequest, post_json};
 
     let control = ControlChannel::Vsock {
@@ -813,17 +894,29 @@ async fn expose_proxy_on_host(daemon_ip: std::net::Ipv4Addr, port: u16) {
     )
     .await
     {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => tracing::warn!(
-            %port,
-            %error,
-            "could not publish host-side proxy on the host loopback via gvproxy forwarder"
-        ),
-        Err(_) => tracing::warn!(
-            %port,
-            timeout = ?HOST_EXPOSE_PUBLISH_TIMEOUT,
-            "host-side proxy publish did not complete in time; continuing (best-effort)"
-        ),
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                %port,
+                %error,
+                "could not publish host-side proxy on the host loopback via gvproxy forwarder"
+            );
+            Some(format!(
+                "the daemon could not publish port {port} on the host loopback \
+                 via the gvproxy forwarder: {error}"
+            ))
+        }
+        Err(_) => {
+            tracing::warn!(
+                %port,
+                timeout = ?HOST_EXPOSE_PUBLISH_TIMEOUT,
+                "host-side proxy publish did not complete in time; continuing (best-effort)"
+            );
+            Some(format!(
+                "publishing port {port} on the host loopback did not complete within \
+                 {HOST_EXPOSE_PUBLISH_TIMEOUT:?}"
+            ))
+        }
     }
 }
 

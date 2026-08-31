@@ -1376,6 +1376,68 @@ impl ComposeOptions {
     }
 }
 
+/// What a batch of patterns expands against, beyond the session's
+/// resolved variables: the `HOME` fallback for the `~` prefix, and the
+/// directory the user's loadouts were read from.
+///
+/// The compose-side counterpart to
+/// [`expansion::Anchors`](crate::core::expansion::Anchors), which is
+/// per-*pattern* and already resolved. This one is per-*batch* and
+/// still holds the loadouts directory rather than one loadout's
+/// subdirectory of it, because which subdirectory applies is a property
+/// of each patch's own [`Source`] —
+/// [`expand_patch_sources`] derives it per item.
+///
+/// The two fields travel together through the whole patch pipeline
+/// (`compose_contribution` → `gate_patches` → `expand_patch_sources`),
+/// so they ride as one value rather than as a pair of positional
+/// `Option`s that are easy to transpose.
+#[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
+pub(crate) struct PatchAnchors<'a> {
+    /// `HOME` for the `~` / `~/…` prefix, when the session's vars don't
+    /// carry one. Explicit `$HOME` references stay strict.
+    pub(crate) home: Option<&'a str>,
+    /// Where the user's loadout files were read from. `None` — the
+    /// daemon-response path, which sees no loadouts — means no patch in
+    /// the batch can resolve `$LOADOUT_ROOT`.
+    pub(crate) loadouts_dir: Option<&'a paths::HostAbsPath>,
+}
+
+impl<'a> PatchAnchors<'a> {
+    /// Anchors carrying only a `HOME` fallback — the shape every
+    /// caller that composes no loadouts wants.
+    #[must_use]
+    pub(crate) fn home(home: Option<&'a str>) -> Self {
+        Self {
+            home,
+            loadouts_dir: None,
+        }
+    }
+
+    /// Add the directory the loadouts in this batch were read from.
+    #[must_use]
+    pub(crate) fn with_loadouts_dir(
+        mut self,
+        loadouts_dir: Option<&'a paths::HostAbsPath>,
+    ) -> Self {
+        self.loadouts_dir = loadouts_dir;
+        self
+    }
+
+    /// The directory a patch declared by `provenance` anchors
+    /// `$LOADOUT_ROOT` at — its own loadout's, or `None` for a patch no
+    /// loadout declared (and for a batch with no loadouts directory).
+    ///
+    /// Returned owned rather than folded straight into an
+    /// [`Anchors`](crate::core::expansion::Anchors): those borrow their
+    /// anchor strings, so the directory has to outlive them at the call
+    /// site.
+    fn loadout_root(self, provenance: &Source) -> Option<paths::HostAbsPath> {
+        self.loadouts_dir.and_then(|d| provenance.loadout_dir(d))
+    }
+}
+
 // =====================================================================
 // Per-domain gating
 // =====================================================================
@@ -1589,6 +1651,14 @@ pub(crate) fn gate_vars(
 /// expansion would let some patches reach the walker with their
 /// references intact, which silently matches wrong paths.
 ///
+/// `anchors` carries the batch-wide `HOME` fallback and the directory
+/// the user's loadout files were read from; each patch a loadout
+/// declared expands `$LOADOUT_ROOT` against its own subdirectory of
+/// that (see [`PatchAnchors::loadout_root`]). A patch from a
+/// non-loadout source has no such anchor, so a `$LOADOUT_ROOT`
+/// reference there is an error rather than a path pointing at someone
+/// else's tree.
+///
 /// Per-patch `follow_symlinks` is resolved here: any `Some(v)` carried
 /// on the [`ProvenancedPatch`] wins; `None` inherits
 /// `default_follow_symlinks`. The resolved bool is stamped onto the
@@ -1597,15 +1667,18 @@ pub(crate) fn gate_vars(
 pub(crate) fn expand_patch_sources(
     patches: Vec<ProvenancedPatch>,
     gated_vars: &[SessionVar],
-    home_fallback: Option<&str>,
+    anchors: PatchAnchors<'_>,
     default_follow_symlinks: bool,
 ) -> Result<Vec<ExpandedProvenancedPatch>, ComposeError> {
     patches
         .into_iter()
         .map(|pp| {
             let (patch, provenance, follow_override) = pp.into_parts();
+            let loadout_root = anchors.loadout_root(&provenance);
+            let pattern_anchors = crate::core::expansion::Anchors::home(anchors.home)
+                .with_loadout_root(loadout_root.as_ref().map(paths::HostAbsPath::as_str));
             let source =
-                crate::core::expansion::expand_source(patch.source(), gated_vars, home_fallback)?;
+                crate::core::expansion::expand_source(patch.source(), gated_vars, pattern_anchors)?;
             let follow_symlinks = follow_override.unwrap_or(default_follow_symlinks);
             Ok(ExpandedProvenancedPatch {
                 source,
@@ -1620,13 +1693,15 @@ pub(crate) fn expand_patch_sources(
 /// Drive the policy pass over a batch of patches.
 ///
 /// `hooks` is `None` for user-only composition — see [`gate_vars`].
+/// `anchors` is what the patterns expand against — see
+/// [`expand_patch_sources`].
 pub(crate) fn gate_patches(
     items: Vec<ProvenancedPatch>,
     mut policy: PatchesPolicy,
     hooks: Option<&dyn PolicyHooks>,
     options: ComposeOptions,
     gated_vars: &[SessionVar],
-    home_fallback: Option<&str>,
+    anchors: PatchAnchors<'_>,
 ) -> Result<(Vec<SessionPatch>, PatchesPolicy), ComposeError> {
     let name_of = |pf: &PatchFile| pf.user_facing().as_str().to_owned();
     let source_of = |pf: PatchFile| pf.provenance;
@@ -1645,10 +1720,10 @@ pub(crate) fn gate_patches(
     // filesystem work happens. Otherwise a costly walk could complete
     // only to be discarded by a policy-expansion error the user has
     // no IO context for.
-    let mut expanded = policy.expand_with(gated_vars, home_fallback)?;
+    let mut expanded = policy.expand_with(gated_vars, anchors.home)?;
 
     let expanded_patches =
-        expand_patch_sources(items, gated_vars, home_fallback, options.follow_symlinks)?;
+        expand_patch_sources(items, gated_vars, anchors, options.follow_symlinks)?;
     let files = enumerate_patch_files(expanded_patches)?;
 
     // Pass 1: categorize per file.
@@ -1685,7 +1760,7 @@ pub(crate) fn gate_patches(
         let (decisions, new_policy, policy_updated) = prompt_patch_hook(hooks, policy, &view)?;
         policy = new_policy;
         if policy_updated {
-            expanded = policy.expand_with(gated_vars, home_fallback)?;
+            expanded = policy.expand_with(gated_vars, anchors.home)?;
         }
         // Pass 3: apply.
         for (pf, decision) in unapproved.into_iter().zip(decisions) {
@@ -1740,6 +1815,10 @@ pub(crate) fn gate_patches(
 /// needed hook prompts (when `hooks` is `Some`), runs patch expansion
 /// against the resolved vars, and assembles the final structure.
 ///
+/// `anchors` carries the `HOME` fallback and, for `$LOADOUT_ROOT`, the
+/// directory the loadouts were read from. Only the client composes
+/// loadouts, so the daemon side leaves that unset.
+///
 /// # Errors
 ///
 /// See [`ComposeError`].
@@ -1749,7 +1828,7 @@ pub(crate) fn compose_contribution(
     policy: UserPolicy,
     hooks: Option<&dyn PolicyHooks>,
     options: ComposeOptions,
-    home_fallback: Option<&str>,
+    anchors: PatchAnchors<'_>,
 ) -> Result<(Composition, UserPolicy), ComposeError> {
     let Contribution {
         vars,
@@ -1769,9 +1848,10 @@ pub(crate) fn compose_contribution(
     check_var_mismatches(gated_vars.iter(), |v| v.var().name(), |v| v.var().value())?;
     // Patch sources and policy patterns expand against the resolved
     // vars. Explicit `$VAR` references require an explicit
-    // `SessionVar` — no env fallback. The tilde prefix (`~/...`) is
-    // the one exception: it falls back to `home_fallback` if the
-    // loadout didn't declare a `HOME` var.
+    // `SessionVar` — no env fallback. The two exceptions come from
+    // `anchors` rather than the var set: the tilde prefix (`~/...`)
+    // falls back to its `home` if the loadout didn't declare a `HOME`
+    // var, and `$LOADOUT_ROOT` resolves under its `loadouts_dir`.
     //
     // `expansion_vars` carries pre-gated vars from an outer scope
     // (e.g. the client's wire contribution as seen by the daemon)
@@ -1789,7 +1869,7 @@ pub(crate) fn compose_contribution(
         hooks,
         options,
         &combined_for_lookup,
-        home_fallback,
+        anchors,
     )?;
     check_patch_mismatches(
         gated_patches.iter(),
@@ -2158,6 +2238,137 @@ mod tests {
     }
 
     // =================================================================
+    // `$LOADOUT_ROOT` anchoring
+    // =================================================================
+
+    /// Where a patch's `$LOADOUT_ROOT` resolves is decided per patch,
+    /// from the provenance it carries — not once for the whole batch.
+    mod loadout_root_anchoring {
+        use super::*;
+
+        fn loadouts_dir() -> paths::HostAbsPath {
+            paths::HostAbsPath::try_new("/cfg/minimal/loadouts").unwrap()
+        }
+
+        fn rooted_patch(loadout: &str) -> ProvenancedPatch {
+            ProvenancedPatch::new(
+                Patch::new(
+                    "$LOADOUT_ROOT/conf.toml",
+                    PatchDest::try_new("conf.toml").unwrap(),
+                ),
+                Source::UserLoadout {
+                    name: loadout.into(),
+                },
+            )
+        }
+
+        /// Two loadouts declaring the identical pattern resolve to
+        /// their own directories — this is what makes the reference
+        /// mean "beside *me*" rather than "in the loadouts directory".
+        #[test]
+        fn each_patch_anchors_at_its_own_loadouts_subdirectory() {
+            let dir = loadouts_dir();
+            let expanded = expand_patch_sources(
+                vec![rooted_patch("dev"), rooted_patch("ops")],
+                &[],
+                PatchAnchors::default().with_loadouts_dir(Some(&dir)),
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                expanded[0].source.pattern(),
+                "/cfg/minimal/loadouts/dev/conf.toml"
+            );
+            assert_eq!(
+                expanded[1].source.pattern(),
+                "/cfg/minimal/loadouts/ops/conf.toml"
+            );
+        }
+
+        /// A project's patch has no loadout to be beside, even when a
+        /// loadouts directory is in play for the same composition.
+        #[test]
+        fn a_non_loadout_patch_has_no_anchor() {
+            let pp = ProvenancedPatch::new(
+                Patch::new(
+                    "$LOADOUT_ROOT/conf.toml",
+                    PatchDest::try_new("conf.toml").unwrap(),
+                ),
+                project_source(),
+            );
+            // let-else rather than `unwrap_err`: the Ok side isn't
+            // `Debug`, and printing an expanded patch set adds nothing
+            // to the failure message anyway.
+            let Err(err) = expand_patch_sources(
+                vec![pp],
+                &[],
+                PatchAnchors::default().with_loadouts_dir(Some(&loadouts_dir())),
+                false,
+            ) else {
+                panic!("a project patch must not resolve `$LOADOUT_ROOT`");
+            };
+            assert!(
+                matches!(
+                    err,
+                    ComposeError::Expansion(
+                        crate::core::expansion::ExpandError::LoadoutRootUnavailable { .. }
+                    )
+                ),
+                "got: {err:?}",
+            );
+        }
+
+        /// A caller that never supplied a loadouts directory — the
+        /// daemon-response path — can't anchor a loadout patch either,
+        /// rather than guessing a directory.
+        #[test]
+        fn without_a_loadouts_dir_even_a_loadout_patch_has_no_anchor() {
+            let Err(err) = expand_patch_sources(
+                vec![rooted_patch("dev")],
+                &[],
+                PatchAnchors::default(),
+                false,
+            ) else {
+                panic!("no loadouts dir means no anchor to resolve against");
+            };
+            assert!(
+                matches!(
+                    err,
+                    ComposeError::Expansion(
+                        crate::core::expansion::ExpandError::LoadoutRootUnavailable { .. }
+                    )
+                ),
+                "got: {err:?}",
+            );
+        }
+
+        /// A loadout name that isn't a path component that stays put
+        /// gets no anchor: the name is joined into a path that is then
+        /// read from. `LoadoutName` already rejects these, but wire
+        /// provenance carries an unvetted string.
+        #[test]
+        fn a_name_that_is_not_a_path_component_gets_no_anchor() {
+            let Err(err) = expand_patch_sources(
+                vec![rooted_patch("..")],
+                &[],
+                PatchAnchors::default().with_loadouts_dir(Some(&loadouts_dir())),
+                false,
+            ) else {
+                panic!("`..` must not be joined into an anchor path");
+            };
+            assert!(
+                matches!(
+                    err,
+                    ComposeError::Expansion(
+                        crate::core::expansion::ExpandError::LoadoutRootUnavailable { .. }
+                    )
+                ),
+                "got: {err:?}",
+            );
+        }
+    }
+
+    // =================================================================
     // Vars gating
     // =================================================================
 
@@ -2347,7 +2558,7 @@ mod tests {
                 Some(&PanicHook),
                 ComposeOptions::default(),
                 &[],
-                None,
+                PatchAnchors::default(),
             )
             .unwrap();
             assert_eq!(resolved.len(), 1);
@@ -2365,7 +2576,7 @@ mod tests {
                 Some(&PassThroughHook),
                 ComposeOptions::default(),
                 &[],
-                None,
+                PatchAnchors::default(),
             )
             .unwrap();
             assert_eq!(resolved.len(), 1);
@@ -2383,7 +2594,7 @@ mod tests {
                 Some(&PassThroughHook),
                 ComposeOptions::default(),
                 &[],
-                None,
+                PatchAnchors::default(),
             )
             .unwrap_err();
             assert!(matches!(err, ComposeError::Denied { .. }), "got: {err:?}");
@@ -2402,7 +2613,7 @@ mod tests {
                 Some(&PanicHook),
                 ComposeOptions::default(),
                 &[],
-                None,
+                PatchAnchors::default(),
             )
             .unwrap_err();
             assert!(matches!(err, ComposeError::Denied { .. }), "got: {err:?}");
@@ -2419,7 +2630,7 @@ mod tests {
                 Some(&PanicHook),
                 ComposeOptions::default(),
                 &[],
-                None,
+                PatchAnchors::default(),
             )
             .unwrap();
             assert!(resolved.is_empty());
@@ -2455,7 +2666,7 @@ mod tests {
                 Some(&PanicHook),
                 ComposeOptions::default(),
                 &[],
-                None,
+                PatchAnchors::default(),
             )
             .unwrap();
             resolved.sort_by_key(|sp| sp.patch().destination().as_str().to_owned());
@@ -2485,7 +2696,7 @@ mod tests {
                 Some(&PanicHook),
                 ComposeOptions::default(),
                 &[],
-                None,
+                PatchAnchors::default(),
             )
             .expect("missing walk root should not error");
             assert!(
@@ -2522,7 +2733,7 @@ mod tests {
                 Some(&PanicHook),
                 ComposeOptions::default(),
                 &[],
-                None,
+                PatchAnchors::default(),
             )
             .expect("mixed batch should not error");
             let dests: Vec<&str> = patches
@@ -2543,7 +2754,7 @@ mod tests {
                 Some(&PanicHook),
                 ComposeOptions::default(),
                 &[],
-                None,
+                PatchAnchors::default(),
             )
             .unwrap_err();
             assert!(
@@ -2573,7 +2784,7 @@ mod tests {
                 Some(&PanicHook),
                 ComposeOptions::default(),
                 &vars,
-                None,
+                PatchAnchors::default(),
             )
             .unwrap();
             assert_eq!(resolved.len(), 1);
@@ -2605,7 +2816,7 @@ mod tests {
                 Some(&PassThroughHook),
                 ComposeOptions::default(),
                 &vars,
-                None,
+                PatchAnchors::default(),
             )
             .unwrap_err();
             assert!(matches!(err, ComposeError::Denied { .. }), "got: {err:?}");
@@ -2622,7 +2833,7 @@ mod tests {
                 Some(&PanicHook),
                 ComposeOptions::default(),
                 &[],
-                None,
+                PatchAnchors::default(),
             )
             .unwrap_err();
             assert!(
@@ -2649,7 +2860,7 @@ mod tests {
                 Some(&PanicHook),
                 ComposeOptions::default(),
                 &[],
-                None,
+                PatchAnchors::default(),
             )
             .unwrap_err();
             assert!(
@@ -2682,7 +2893,7 @@ mod tests {
                 Some(&PanicHook),
                 ComposeOptions::default(),
                 &vars,
-                None,
+                PatchAnchors::default(),
             )
             .unwrap();
 
@@ -2730,7 +2941,7 @@ mod tests {
                 Some(&TildeDenyAddingHook),
                 ComposeOptions::default(),
                 &vars,
-                None,
+                PatchAnchors::default(),
             )
             .unwrap_err();
             assert!(matches!(err, ComposeError::Denied { .. }), "got: {err:?}");
@@ -2768,7 +2979,7 @@ mod tests {
                 Some(&UnknownVarHook),
                 ComposeOptions::default(),
                 &[],
-                None,
+                PatchAnchors::default(),
             )
             .unwrap_err();
             assert!(
@@ -2811,7 +3022,7 @@ mod tests {
                     follow_symlinks: true,
                 },
                 &[],
-                None,
+                PatchAnchors::default(),
             )
             .unwrap();
             assert_eq!(resolved.len(), 1);
@@ -2846,7 +3057,7 @@ mod tests {
                     follow_symlinks: true,
                 },
                 &[],
-                None,
+                PatchAnchors::default(),
             )
             .unwrap_err();
             assert!(matches!(err, ComposeError::Denied { .. }), "got: {err:?}");
@@ -2888,7 +3099,7 @@ mod tests {
                     follow_symlinks: true,
                 },
                 &[],
-                None,
+                PatchAnchors::default(),
             )
             .unwrap_err();
             assert!(matches!(err, ComposeError::Denied { .. }), "got: {err:?}");
@@ -2915,7 +3126,7 @@ mod tests {
                     follow_symlinks: true,
                 },
                 &[],
-                None,
+                PatchAnchors::default(),
             )
             .unwrap();
             assert_eq!(resolved.len(), 1);
@@ -2952,7 +3163,7 @@ mod tests {
                 Some(&PanicHook),
                 ComposeOptions::default(),
                 &[],
-                None,
+                PatchAnchors::default(),
             )
             .unwrap();
             assert_eq!(resolved.len(), 1);
@@ -3819,7 +4030,7 @@ mod tests {
                 policy,
                 Some(&PanicHooks),
                 ComposeOptions::default(),
-                None,
+                PatchAnchors::default(),
             )
             .unwrap_err();
             assert!(
@@ -3862,7 +4073,7 @@ mod tests {
                 policy,
                 Some(&PanicHooks),
                 ComposeOptions::default(),
-                None,
+                PatchAnchors::default(),
             )
             .unwrap();
             assert!(

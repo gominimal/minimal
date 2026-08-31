@@ -1512,6 +1512,7 @@ impl Session {
                     ran.extend(outcomes.iter().map(|o| minimald_rpc::RanHook {
                         declared_by: o.declared_by.clone(),
                         description: o.description.clone(),
+                        output: o.output.clone(),
                     }));
                 }
 
@@ -4258,6 +4259,56 @@ mod tests {
             record_status(&mut client, session_id).await,
             Some(sessions::SessionStatus::Active),
             "a session whose activate hook succeeded should be attachable",
+        );
+    }
+
+    /// A successful activate hook's captured output must reach the client
+    /// over `FinalizeSession`, not just its author-supplied description.
+    /// The rpc-crate round-trip test proves `RanHook.output` serializes;
+    /// this proves the daemon actually populates it from the hook outcome,
+    /// which is what the CLI echoes as the hook's receipt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activate_hook_output_reaches_the_client() {
+        use crate::test_harness::{create_session_req, unwrap_ready};
+        use minimald_rpc::{
+            ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+            FinalizeSessionRequest,
+        };
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let id = client
+            .call::<CreateSession>(&create_session_req("activate-hook-output", "/uwu"))
+            .await
+            .unwrap()
+            .id;
+        unwrap_ready(
+            client
+                .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                    session_id: id,
+                    contribution: contribution_with_hook(
+                        sessions::wire::primitives::WireLifecycleHook {
+                            on_activate: Some(inline("echo HOOK_SAID_HELLO".to_string())),
+                            ..Default::default()
+                        },
+                    ),
+                })
+                .await
+                .unwrap(),
+        );
+
+        let ran = match client
+            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+            .await
+        {
+            Errorable::Ok(ok) => ok.activate_hooks,
+            Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+        };
+
+        assert!(
+            ran.iter().any(|h| h.output.contains("HOOK_SAID_HELLO")),
+            "the captured activate-hook output should reach the client; got: {ran:?}",
         );
     }
 
