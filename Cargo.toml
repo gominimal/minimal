@@ -49,7 +49,11 @@ package.rust-version = "1.95"
 # Shared base version for the workspace. This is the fallback the `version` crate
 # reports when no `v*` git tag is reachable; the real release version comes from
 # `git describe` at build time. See crates/version/build.rs.
-package.version = "0.5.3"
+# Must stay UNTIL the next tag lands: it is the version a no-.git build
+# (source tarball) reports, so leaving it at an already-shipped release makes
+# such a build report that release — exactly what release.yml's
+# assert-version job exists to catch. 0.5.4 until v0.5.4 is tagged.
+package.version = "0.5.4"
 
 [profile.release]
 strip = true
