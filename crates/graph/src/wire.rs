@@ -11,7 +11,7 @@
 //!        → TopLevels → Profile* → Stack* → SupplyChain → Footer
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -455,7 +455,7 @@ impl<R: Read> GraphReader<R> {
         let mut file_counter: usize = 0;
 
         let mut top_levels_raw: Vec<(usize, u64)> = Vec::new();
-        let mut stacks: HashMap<String, Stack> = HashMap::new();
+        let mut stacks: BTreeMap<String, Stack> = BTreeMap::new();
         let mut supply_chain: Vec<SpecOrigin> = Vec::new();
 
         // ── Body ──
@@ -921,7 +921,7 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
         let mut file_counter: usize = 0;
 
         let mut top_levels_raw: Vec<(usize, u64)> = Vec::new();
-        let mut stacks: HashMap<String, Stack> = HashMap::new();
+        let mut stacks: BTreeMap<String, Stack> = BTreeMap::new();
         let mut supply_chain: Vec<SpecOrigin> = Vec::new();
 
         loop {
