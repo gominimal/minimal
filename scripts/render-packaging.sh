@@ -9,15 +9,24 @@
 # semver, SHA_* for the artifact checksums, ...), so every satellite publish
 # shares one substitution rule instead of growing its own renderer.
 #
-# A token whose variable is unset, and any @@...@@ that survives the pass
-# (including malformed names), fails the run and is listed on stderr: a
-# half-stamped packaging file must never be committed or pushed.
+# A token whose variable is unset or empty, and any surviving "@@" — malformed
+# or not — fails the run and is listed on stderr: a half-stamped packaging file
+# must never be committed or pushed. Templates cannot carry a literal "@@";
+# that is the price of the guarantee above.
 #
 # Usage: scripts/render-packaging.sh <template-file> <output-file>
 #
-# Requires: bash, grep, sed, printenv.
+# Requires: bash 4+, grep, sed, printenv.
 
 set -euo pipefail
+
+# A replacement value containing `&` must reach the output literally. bash >=
+# 5.2's patsub_replacement expands a bare `&` in the replacement back to the
+# matched token, so `MAINTAINER="A & B"` would re-inject the token it just
+# replaced (and a token whose value ends in `&` loops forever). Turning the
+# option off restores the pre-5.2 literal behavior everywhere; on older bash
+# it is already the default (and unknown shopt names are errors).
+shopt -u patsub_replacement 2>/dev/null || true
 
 die() {
     printf 'render-packaging: %s\n' "$1" >&2
@@ -46,16 +55,22 @@ content="$(cat "$template"; printf x)"
 content="${content%x}"
 
 # One pass over the distinct well-formed tokens; the leftover check below
-# catches the malformed rest.
+# catches everything else — including tokens the well-formed scan skipped
+# (lowercase, embedded '@'), which the first version's `@@[^@]*@@` scan could
+# not span.
 while IFS= read -r token; do
     name="${token//@@/}"
-    if ! value="$(printenv "$name")"; then
-        die "token @@${name}@@ in $template: environment variable $name is not set"
+    # printenv exits 0 for a SET-BUT-EMPTY variable too, so its status alone
+    # cannot tell "unset, fail" from "empty, stamp it". An empty value is a
+    # caller bug either way: a checksum or version token that stamps as the
+    # empty string is a half-stamped file the leftover scan cannot see.
+    if ! value="$(printenv "$name")" || [ -z "$value" ]; then
+        die "token @@${name}@@ in $template: environment variable $name is unset or empty"
     fi
     content="${content//@@${name}@@/$value}"
 done < <(grep -oE '@@[A-Z0-9_]+@@' "$template" | sort -u)
 
-leftovers="$(printf '%s\n' "$content" | grep -oE '@@[^@]*@@' || true)"
+leftovers="$(printf '%s\n' "$content" | grep -nE '@@' || true)"
 if [ -n "$leftovers" ]; then
     printf 'render-packaging: refusing to write %s, unrendered token(s) remain:\n' "$output" >&2
     printf '%s\n' "$leftovers" >&2
