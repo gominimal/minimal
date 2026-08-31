@@ -244,7 +244,13 @@ jobs:
             risky="$(printf '%s\n' "$files" | grep -E '^(minimal\.toml|\.minimal/|packages/)' || true)"
             if [ -n "$risky" ]; then
               echo "::error::PR #$PR_NUMBER comes from a fork and changes what the sandbox builds and runs:"
-              printf '::error::  %s\n' $risky
+              # Quoted and piped, not expanded bare. These are filenames from
+              # a fork PR's diff — the one path built to admit untrusted content
+              # — and unquoted they take word-splitting and pathname expansion.
+              # Inert today only because this step runs before the PR tree is on
+              # disk, which is step ordering rather than anything this line
+              # asserts. A filename with a space also split across two lines.
+              printf '%s\n' "$risky" | sed 's/^/::error::  /'
               echo "::error::Read it by hand, or land the build-config change from a branch in $GITHUB_REPOSITORY first."
               exit 1
             fi
@@ -393,8 +399,15 @@ jobs:
             --rawfile files "$RUN_DIR/changed-files.txt" \
             '{
                number: $number,
-               title: ($ev[0].pull_request.title // "(workflow_dispatch)"),
-               body: ($ev[0].pull_request.body // ""),
+               # `.issue` before the literal: an issue_comment payload carries
+               # the PR under `issue`, with no top-level `pull_request` key.
+               # Without this every /review-triggered run staged the literal
+               # "(workflow_dispatch)" as the title and an empty body — and the
+               # prompt's step 1 is to read the title and body for intent, so
+               # the agent opened the fork-review path knowing nothing about
+               # what it was reviewing.
+               title: ($ev[0].pull_request.title // $ev[0].issue.title // "(workflow_dispatch)"),
+               body: ($ev[0].pull_request.body // $ev[0].issue.body // ""),
                head_sha: $head_sha,
                base_sha: $base_sha,
                base_ref: $base_ref,
