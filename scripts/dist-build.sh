@@ -37,7 +37,7 @@
 #                   build error (MINVMD_REQUIRE_LIBKRUN=1), never a stub.
 #   COMPLETIONS_DIR Where the generated completions are written (default:
 #                   .scratch/dist-completions). Generated only when the
-#                   target's arch runs on this host — a cross-built `min`
+#                   target's OS+arch runs on this host — a cross-built `min`
 #                   cannot execute to emit its own completions.
 #
 # Usage: scripts/dist-build.sh <target-triple>
@@ -127,16 +127,31 @@ case "$TARGET" in
         ;;
 esac
 
-# Completions from the built `min`, the technique aur/PKGBUILD uses: XDG
+# Completions from the built `min`, the technique packaging/arch/PKGBUILD-bin.tmpl
+# uses: XDG
 # overrides steer its user-level install targets into a scratch dir, and
 # ZDOTDIR keeps the zsh compinit-dump cleanup off this host's ~.
+#
+# The gate compares OS as well as arch: an arm64 macOS host matches an
+# aarch64-linux target on arch alone, and running that musl ELF is a hard
+# exec-format failure after the whole fat-LTO build — never try to run a
+# cross-built binary.
+case "$(uname -s)" in
+    Darwin) host_os=darwin ;;
+    *)      host_os=linux ;;
+esac
+case "$TARGET" in
+    *-linux-*) target_os=linux ;;
+    *-darwin)  target_os=darwin ;;
+    *)         target_os=unknown ;;
+esac
 case "$(uname -m)" in
     x86_64) HOST_ARCH=x86_64 ;;
     aarch64|arm64) HOST_ARCH=aarch64 ;;
     *) HOST_ARCH="$(uname -m)" ;;
 esac
-if [ "$HOST_ARCH" != "${TARGET%%-*}" ]; then
-    echo "dist-build: $TARGET does not run on this host ($HOST_ARCH); skipping completions (generate them on a $HOST_ARCH build)" >&2
+if [ "$host_os" != "$target_os" ] || [ "$HOST_ARCH" != "${TARGET%%-*}" ]; then
+    echo "dist-build: $TARGET does not run on this host ($host_os/$HOST_ARCH); skipping completions (generate them on a matching build)" >&2
 else
     # Own scratch: start clean so a failed generation can't masquerade as a
     # success behind files a previous run left behind.

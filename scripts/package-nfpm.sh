@@ -182,6 +182,33 @@ ARTIFACTS=(
     "gvproxy|gvproxy-min"
 )
 artifacts_root="$workdir/artifacts"
+
+# --- Verify before use -------------------------------------------------------
+# stage-release.sh writes versions/<pkgver>/components with one row per
+# artifact and its SHA-256 — the same manifest the curl|sh installer verifies
+# against, and the bucket's trust root. Every downloaded binary is checked
+# against it BEFORE anything chmods, executes, or packages it: a corrupted,
+# truncated, or wrongly-staged object must fail this job, not enter the
+# .deb/.rpm/.apk that users install.
+manifest_url="$BUCKET_URL/versions/$PKGVER/components"
+curl -fsSL --retry 3 -o "$workdir/components" "$manifest_url" \
+    || die "cannot download $manifest_url — is $PKGVER staged in the bucket? (see stage-release.sh)"
+
+declare -A manifest_sha=()
+while IFS= read -r row; do
+    case "$row" in '#'*) continue ;; esac
+    read -r -a cols <<<"$row"
+    # component os arch version sha256 kind dest src
+    [ "${#cols[@]}" -eq 8 ] || die "unexpected components row in $manifest_url: $row"
+    src="${cols[7]}"
+    case "$src" in
+        "versions/$PKGVER/"*) manifest_sha["${src##*/}"]="${cols[4]}" ;;
+        *) ;; # symlink rows and other versions' rows carry no artifact here
+    esac
+done <"$workdir/components"
+
+[ "${#manifest_sha[@]}" -gt 0 ] || die "no artifact rows for $PKGVER in the staged components manifest"
+
 for arch in amd64 arm64; do
     art_dir="$artifacts_root/$arch"
     mkdir -p "$art_dir"
@@ -190,6 +217,12 @@ for arch in amd64 arm64; do
         url="$BUCKET_URL/versions/$PKGVER/${staged}-linux-${arch}"
         curl -fsSL --retry 3 -o "$art_dir/$installed" "$url" \
             || die "cannot download $url — is $PKGVER staged in the bucket? (see stage-release.sh)"
+        want="${manifest_sha[${staged}-linux-${arch}]:-}"
+        [ -n "$want" ] \
+            || die "no digest for ${staged}-linux-${arch} in the staged components manifest — refusing to package an unverified artifact"
+        got="$(sha256_of "$art_dir/$installed")"
+        [ "$got" = "$want" ] \
+            || die "SHA-256 mismatch for ${staged}-linux-${arch}: got $got, the staged manifest says $want"
         chmod +x "$art_dir/$installed"
     done
 done
