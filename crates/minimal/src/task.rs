@@ -120,10 +120,9 @@ fn untrimmed_task_message(task: &str) -> String {
 }
 
 /// The unknown-task error body: names the task and lists what IS declared,
-/// sorted, so the fix is one copy-paste away. Split out for unit tests.
+/// in name order, so the fix is one copy-paste away. Split out for unit tests.
 fn unknown_task_message(file: &mfile::File, task: &str) -> String {
-    let mut names: Vec<&str> = file.iter_tasks().map(|(name, _)| name.as_str()).collect();
-    names.sort_unstable();
+    let names: Vec<&str> = file.iter_tasks().map(|(name, _)| name.as_str()).collect();
     if names.is_empty() {
         format!(
             "unknown task '{task}': {} declares no tasks",

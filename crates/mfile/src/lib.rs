@@ -865,7 +865,7 @@ pub struct File {
 
     /// Task definitions, invoked with `minimal run <task name>`.
     #[serde(default)]
-    pub tasks: HashMap<String, Task>,
+    pub tasks: BTreeMap<String, Task>,
     /// Output definitions.
     #[serde(default)]
     pub outputs: HashMap<String, Output>,
