@@ -11,16 +11,26 @@ class Minimal < Formula
   depends_on arch: :arm64
 
   # macOS VM support. minvmd links libkrun via @rpath/libkrun.1.dylib and
-  # carries an @loader_path/../lib rpath, so it resolves the library from this
-  # prefix's lib/ — where the slp/krun formula installs libkrun.1.dylib. That
-  # is the same bin/lib sibling layout the curl|sh installer drops (see
-  # scripts/rewrite-macos-linkage.sh), and the dependency matches the dev
-  # instruction `brew install slp/krun/libkrun`.
+  # carries an @loader_path/../lib rpath (scripts/rewrite-macos-linkage.sh
+  # retargets the release binary to exactly that shape), so it resolves the
+  # library from THIS prefix's lib/ — a Cellar prefix sibling of bin/, not the
+  # slp/krun formula's Cellar, which @loader_path can never reach. depends_on
+  # pulls the formula in and gives the dylib its runtime deps; the resource
+  # below installs the same trimmed dylib the installer drops (libkrun
+  # -macos-arm64.dylib from the release assets) under the load command's
+  # expected name, reproducing the installer's bin/lib sibling layout.
   depends_on "slp/krun/libkrun"
 
   resource "minvmd" do
     url "https://github.com/gominimal/minimal/releases/download/v@@VERSION@@/minvmd-macos-arm64"
     sha256 "@@SHA_MINVMD@@"
+  end
+
+  # The libkrun dylib minvmd loads. Basename MUST be libkrun.1.dylib: that is
+  # minvmd's @rpath load command (see scripts/stage-release.sh's darwin table).
+  resource "libkrun" do
+    url "https://github.com/gominimal/minimal/releases/download/v@@VERSION@@/libkrun-macos-arm64.dylib"
+    sha256 "@@SHA_LIBKRUN@@"
   end
 
   resource "gvproxy" do
@@ -31,8 +41,10 @@ class Minimal < Formula
   def install
     # The release asset minimal-macos-arm64 is the `min` binary (the bin
     # target of the `minimal` crate, named for the crate in the release);
-    # the installer installs it as `bin/min`.
-    (bin/"min").install "minimal-macos-arm64"
+    # the installer installs it as `bin/min`. The hash form renames on
+    # install: `bin.install "minimal-macos-arm64"` (no hash) would create a
+    # directory named min/ with the binary inside it.
+    bin.install "minimal-macos-arm64" => "min"
 
     # `git push min://<session>` resolves the min:// scheme to a
     # `git-remote-min` on PATH; `min` enters remote-helper mode from its
@@ -40,15 +52,18 @@ class Minimal < Formula
     # installer ships the same symlink with no separate artifact.
     ln_sf "min", bin/"git-remote-min"
 
-    # minvmd boots the guest microVM (libkrun comes from the slp/krun
-    # dependency above). The guest payload (kernel/rootfs/initramfs) is not
-    # in the formula: minvmd resolves it from the minimal data dir
-    # ($XDG_DATA_HOME/minimal, else ~/.local/share/minimal) — which the
-    # curl|sh install fills — or from the MINVMD_KERNEL_PATH /
-    # MINVMD_ROOTFS_PATH / MINVMD_INITRAMFS overrides; the release also
-    # publishes those arm64 artifacts.
-    resource("minvmd").stage do |staged|
-      (bin/"minvmd").install staged.staging/"minvmd-macos-arm64"
+    # minvmd boots the guest microVM; libkrun.1.dylib is staged into lib/
+    # below (the @loader_path/../lib rpath above resolves it there). The
+    # guest payload (kernel/rootfs/initramfs) is not in the formula: minvmd
+    # resolves it from the minimal data dir ($XDG_DATA_HOME/minimal, else
+    # ~/.local/share/minimal) — which the curl|sh install fills — or from the
+    # MINVMD_KERNEL_PATH / MINVMD_ROOTFS_PATH / MINVMD_INITRAMFS overrides;
+    # the release also publishes those arm64 artifacts.
+    #
+    # A staged resource block runs inside the staging directory, so the asset
+    # basename is a plain relative path (there is no Mktemp#staging).
+    resource("minvmd").stage do
+      bin.install "minvmd-macos-arm64" => "minvmd"
     end
 
     # gvproxy-min is the VM network switch for own-IP sessions, installed
@@ -56,8 +71,17 @@ class Minimal < Formula
     # `gvproxy`: podman/crc ship their own there). minvmd resolves it from
     # $MINIMAL_BIN/~/.local/bin or a system path, so on a brew-only host set
     # MINVMD_GVPROXY_BIN="$(brew --prefix minimal)/bin/gvproxy-min".
-    resource("gvproxy").stage do |staged|
-      (bin/"gvproxy-min").install staged.staging/"gvproxy-darwin-arm64"
+    resource("gvproxy").stage do
+      bin.install "gvproxy-darwin-arm64" => "gvproxy-min"
+    end
+
+    # The dylib goes into this prefix's lib/, the one directory minvmd's
+    # @loader_path/../lib rpath actually searches. (The slp/krun dependency
+    # installs its copy into ITS Cellar prefix, which @loader_path cannot
+    # reach; Homebrew's opt symlinks do not help either — dyld resolves
+    # @loader_path against the realpath of the installed binary.)
+    resource("libkrun").stage do
+      lib.install "libkrun-macos-arm64.dylib" => "libkrun.1.dylib"
     end
 
     # Completions: `min completions print <shell>` emits the shell's

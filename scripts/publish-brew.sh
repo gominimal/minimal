@@ -5,21 +5,28 @@
 #
 # The monorepo is the source of truth for the Homebrew formula; the tap repo
 # is generated output. Each run shallow-clones a fresh copy, downloads the
-# macOS arm64 assets from the GitHub Release v$PKGVER to compute their
-# sha256s, renders packaging/homebrew/minimal.rb.tmpl into Formula/minimal.rb,
-# and commits + pushes.
+# four macOS arm64 assets (min, minvmd, gvproxy, and the libkrun dylib) from
+# the GitHub Release v$PKGVER to compute their sha256s, renders
+# packaging/homebrew/minimal.rb.tmpl into Formula/minimal.rb, and commits +
+# pushes.
 #
 # Usage: scripts/publish-brew.sh [--dry-run]
 #
 # Env:
-#   PKGVER              Required. Promoted semver WITHOUT the v prefix
-#                       (X.Y.Z, optional -prerelease/+build tail). Assets are
-#                       fetched from the GitHub Release v$PKGVER of
-#                       gominimal/minimal. A bare short SHA is rejected: the
-#                       tap tracks promoted semver releases, not nightly
-#                       builds.
+#   PKGVER              Required. A RELEASED semver WITHOUT the v prefix
+#                       (X.Y.Z, optional +build tail). Assets are fetched from
+#                       the GitHub Release v$PKGVER of gominimal/minimal. A
+#                       bare short SHA is rejected: the tap tracks promoted
+#                       semver releases, not nightly builds. A prerelease
+#                       (-rc.1 tail) is rejected too: Homebrew has no
+#                       channels, so an RC would overwrite the only formula
+#                       for every user with no way to opt out.
 #   BREW_TAP_REPO       git URL to clone/push
 #                       (default: git@github.com:gominimal/homebrew-minimal.git)
+#   MINIMAL_RELEASE_URL Base URL the release assets are fetched from
+#                       (default: the GitHub Release download URL for
+#                       gominimal/minimal v$PKGVER). Overridable so a local
+#                       fixture can drive --dry-run without network access.
 #
 # Credentials (env/ssh-agent only — never hardcoded or echoed here):
 #   - an ssh-agent holding a key with push access to the tap (for the SSH
@@ -66,10 +73,14 @@ done
 case "$PKGVER" in
     v*) die "PKGVER must not carry the v prefix: '$PKGVER' (use ${PKGVER#v})" ;;
 esac
-printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$' \
-    || die "PKGVER '$PKGVER' is not a semver X.Y.Z (optional -prerelease/+build)"
+# A release only: no prerelease tail (Homebrew has no channels — an RC would
+# overwrite the one formula for every user), no bare sha. A +build tail is a
+# valid release version and passes.
+printf '%s\n' "$PKGVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$' \
+    || die "PKGVER '$PKGVER' is not a RELEASED semver X.Y.Z (optional +build; prereleases and shas are rejected: Homebrew has no channels)"
 
 BREW_TAP_REPO="${BREW_TAP_REPO:-git@github.com:gominimal/homebrew-minimal.git}"
+RELEASE_URL_BASE="${MINIMAL_RELEASE_URL:-https://github.com/gominimal/minimal/releases/download/v$PKGVER}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TEMPLATE="$ROOT/packaging/homebrew/minimal.rb.tmpl"
@@ -80,12 +91,12 @@ RENDER="$ROOT/scripts/render-packaging.sh"
 # One release asset per sha256 the Formula declares: the url asset plus each
 # resource. Same names as the GitHub Release (release.yml's release job
 # uploads the release artifacts flat, basenames unchanged).
-RELEASE_BASE="https://github.com/gominimal/minimal/releases/download/v$PKGVER"
 # asset basename | env var holding its sha256 (the template's @@TOKEN@@)
 ASSETS=(
     "minimal-macos-arm64|SHA256"
     "minvmd-macos-arm64|SHA_MINVMD"
     "gvproxy-darwin-arm64|SHA_GVPROXY"
+    "libkrun-macos-arm64.dylib|SHA_LIBKRUN"
 )
 
 workdir="$(mktemp -d 2>/dev/null || mktemp -d -t publish-brew)"
@@ -107,7 +118,7 @@ dist="$workdir/dist"
 mkdir -p "$dist"
 for entry in "${ASSETS[@]}"; do
     IFS='|' read -r name var <<<"$entry"
-    url="$RELEASE_BASE/$name"
+    url="$RELEASE_URL_BASE/$name"
     curl -fsSL --retry 3 -o "$dist/$name" "$url" \
         || die "cannot download $url — is v$PKGVER a GitHub Release of gominimal/minimal carrying the macOS arm64 assets?"
     printf -v "$var" '%s' "$(sha256_file "$dist/$name")"
@@ -117,7 +128,7 @@ done
 # token; PKGVER stays for error messages).
 export PKGVER
 export VERSION="$PKGVER"
-export SHA256 SHA_MINVMD SHA_GVPROXY
+export SHA256 SHA_MINVMD SHA_GVPROXY SHA_LIBKRUN
 
 # Never let git hang on an interactive https credential prompt.
 export GIT_TERMINAL_PROMPT=0
@@ -190,7 +201,9 @@ git add -A
 
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "publish-brew: [dry-run] diff that would be committed as 'minimal $PKGVER':"
-    git --no-pager diff --cached
+    # --no-ext-diff: machine-checked output, shape must not depend on the
+    # runner's git config (see publish-aur.sh).
+    git --no-pager diff --cached --no-ext-diff
     echo "publish-brew: [dry-run] nothing committed, nothing pushed"
     exit 0
 fi
