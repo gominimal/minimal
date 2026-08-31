@@ -184,6 +184,10 @@ fn resolve_task_env(
 
     // Sorted: which variable a user is prompted about first, and which
     // denial is reported, must not depend on `HashMap` iteration order.
+    //
+    // `sort_unstable` is not in tension with wanting a fixed order — it
+    // describes what happens to *equal* elements, and these are map keys,
+    // so there are none. The order it produces is fully determined.
     let mut names: Vec<&str> = task.vars.keys().map(String::as_str).collect();
     names.sort_unstable();
 

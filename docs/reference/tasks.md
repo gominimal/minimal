@@ -142,8 +142,7 @@ still resolve `inherit` against the daemon's environment:
 
 So prefer an explicit value for tasks meant to be run either of those ways.
 
-<a id="policy"></a>
-### Environment variables and your policy
+### Environment variables and your policy {#policy}
 
 Resolving on the client means reading *your* shell. A project's
 `minimal.toml` naming `env_vars.AWS_SECRET_ACCESS_KEY = { inherit = true }` is
