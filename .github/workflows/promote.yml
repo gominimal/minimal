@@ -194,23 +194,13 @@ jobs:
                   TARGET="$(printf '%s' "$INPUT_TARGET" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 
                   if [ -z "$SHA" ]; then
-                    echo "No SHA provided; finding the most recently staged version in gs://minimal-one..."
-                    # Each staged version has a versions/<sha>/components manifest;
-                    # sort those by creation time (col 2 of `ls -l`) and take the newest.
-                    # `|| true`: on an empty match `gcloud` errors and/or the
-                    # `grep -v` emits nothing (exit 1), which under `pipefail`
-                    # would abort via `set -e` before the emptiness check below.
-                    LATEST=$(gcloud storage ls -l "gs://minimal-one/versions/*/components" \
-                      | grep -v "^TOTAL:" \
-                      | sort -k2 \
-                      | tail -1 \
-                      | awk '{print $NF}' || true)
-                    if [ -z "$LATEST" ]; then
-                      echo "ERROR: no staged versions found under gs://minimal-one/versions/"
-                      exit 1
-                    fi
-                    # gs://minimal-one/versions/<sha>/components → <sha>
-                    SHA="$(basename "$(dirname "$LATEST")")"
+                    echo "No SHA provided; finding the most recently staged commit in gs://minimal-one..."
+                    # The lookup lives in scripts/latest-staged-version.sh
+                    # (tested by its _test.sh): it filters the rows to commit
+                    # shas, so the semver packaging rows a tag push stages
+                    # under versions/<semver>/ cannot hijack the default
+                    # target and fail the run after the approval gate.
+                    SHA="$(scripts/latest-staged-version.sh --bucket gs://minimal-one)"
                     echo "Latest staged SHA: ${SHA}"
                   fi
 
@@ -272,38 +262,98 @@ jobs:
     publish-aur:
         # The AUR package tracks promoted semver releases (its PKGBUILD is
         # keyed on versions/<semver>/ in the bucket), so only stable
-        # promotions publish, and only when the promoted sha is exactly a
-        # semver-tagged commit. A stable promotion of an untagged staged sha
-        # skips the publish with a notice.
+        # promotions publish, and only when the promoted sha resolves to a
+        # RELEASED tag (scripts/resolve-release-version.sh: the tag on the
+        # sha itself, else the newest released v* tag reachable from it —
+        # the nightly that gets promoted usually sits after the tag commit).
+        # A stable promotion of an untagged staged sha skips the publish with
+        # a notice. A rehearsal promotion (dry_run) publishes nothing
+        # anywhere: the gate below refuses to run it.
         needs: promote
-        if: ${{ inputs.target == 'stable' }}
+        if: ${{ inputs.target == 'stable' && !inputs.dry_run }}
         runs-on: ubuntu-latest
         container: archlinux:base-devel
         timeout-minutes: 30
+        permissions:
+            contents: read
         steps:
+            - name: Install git and openssh
+              # base-devel carries neither. Without git, actions/checkout
+              # falls back to a tarball download with no .git, and the semver
+              # resolution would have had nothing to resolve — a silent
+              # permanent skip that reported success. curl is already in the
+              # image (the publish script uses it to fetch versioned
+              # artifacts from the public bucket).
+              run: pacman -Syu --noconfirm --needed git openssh
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
-                  # Full history + tags: the semver resolution below matches
-                  # the promoted sha against the v* tags.
+                  # Full history + tags: the semver resolution matches the
+                  # promoted sha against the v* tags.
                   fetch-depth: 0
-            - name: Install curl
-              # base-devel carries git and makepkg but not the curl CLI the
-              # script uses to fetch versioned artifacts from the public bucket.
-              run: pacman -Sy --noconfirm --needed curl
-            - name: Resolve the promoted sha to a semver tag
+            - name: Resolve the promoted sha to a released semver
               id: semver
               env:
                   SHA: ${{ needs.promote.outputs.version }}
+              # scripts/resolve-release-version.sh contract: exit 0 prints
+              # the semver, exit 3 means no release applies (skip with its
+              # notice), anything else is a hard failure that fails the job.
               run: |
-                  tag="$(git describe --tags --exact-match --match 'v[0-9]*' "$SHA" 2>/dev/null || true)"
-                  if [ -z "$tag" ]; then
-                      echo "::notice::promoted sha $SHA is not a semver-tagged commit — skipping the AUR publish"
-                  fi
-                  echo "semver=${tag#v}" >> "$GITHUB_OUTPUT"
+                  semver=""
+                  rc=0
+                  out="$(scripts/resolve-release-version.sh --sha "$SHA")" || rc=$?
+                  case "$rc" in
+                    0) semver="$out" ;;
+                    3) echo "::notice::promoted sha $SHA has no released version to publish — skipping the AUR publish" ;;
+                    *) echo "::error::could not resolve the promoted sha $SHA to a released semver (see the error above)"; exit 1 ;;
+                  esac
+                  echo "semver=$semver" >> "$GITHUB_OUTPUT"
             - name: Publish minimal-bin to the AUR
               if: ${{ steps.semver.outputs.semver != '' }}
               env:
                   PKGVER: ${{ steps.semver.outputs.semver }}
                   AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
               run: scripts/publish-aur.sh
+
+    publish-brew:
+        # Same gate and resolution as publish-aur, and on purpose: Homebrew
+        # has no channels, so the tap is stable-only and publishes on the
+        # stable promote — NOT on tag push, where a release (or an RC tag)
+        # would overwrite the tap's only formula for every user with no way
+        # to opt out, bypassing the promotion gate. The tap repo must exist
+        # and BREW_TAP_TOKEN (a fine-grained PAT with write access to it)
+        # must be set (user actions).
+        needs: promote
+        if: ${{ inputs.target == 'stable' && !inputs.dry_run }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+                  # Full history + tags, same as publish-aur: the resolution
+                  # matches the promoted sha against the v* tags.
+                  fetch-depth: 0
+            - name: Resolve the promoted sha to a released semver
+              id: semver
+              env:
+                  SHA: ${{ needs.promote.outputs.version }}
+              run: |
+                  semver=""
+                  rc=0
+                  out="$(scripts/resolve-release-version.sh --sha "$SHA")" || rc=$?
+                  case "$rc" in
+                    0) semver="$out" ;;
+                    3) echo "::notice::promoted sha $SHA has no released version to publish — skipping the brew publish" ;;
+                    *) echo "::error::could not resolve the promoted sha $SHA to a released semver (see the error above)"; exit 1 ;;
+                  esac
+                  echo "semver=$semver" >> "$GITHUB_OUTPUT"
+            - name: Publish minimal to gominimal/homebrew-minimal
+              if: ${{ steps.semver.outputs.semver != '' }}
+              env:
+                  PKGVER: ${{ steps.semver.outputs.semver }}
+                  BREW_TAP_REPO: https://github.com/gominimal/homebrew-minimal.git
+                  GITHUB_TOKEN: ${{ secrets.BREW_TAP_TOKEN }}
+              run: scripts/publish-brew.sh
