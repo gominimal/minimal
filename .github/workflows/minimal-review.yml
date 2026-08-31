@@ -38,12 +38,15 @@ permissions:
   contents: read
   pull-requests: write
 
-# Debounce `synchronize` bursts: three commits in ten seconds should produce one
-# review of the final head, not three of intermediate trees. `issue.number` is
-# the comment path's PR: that payload has no `pull_request`, so without it every
-# comment forms its own group and runs beside the push review of the same PR.
+# `pull_request` runs group per PR so a burst of pushes produces one review of
+# the final head. `issue_comment` runs must NOT join that group: with
+# cancel-in-progress, sharing it means any comment on a PR kills the review
+# running for it — CodeRabbit posting its summary was enough, and it cancelled
+# the review of gominimal/foundry#46 nine seconds after the comment landed. So a
+# comment run is keyed by the comment, which cancels nothing and is cancelled by
+# nothing. Two `/review`s in a row both run, and each was explicitly asked for.
 concurrency:
-  group: minimal-review-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr }}
+  group: minimal-review-${{ github.event_name == 'issue_comment' && format('comment-{0}', github.event.comment.id) || github.event.pull_request.number || github.event.inputs.pr }}
   cancel-in-progress: true
 
 env:
@@ -196,6 +199,14 @@ jobs:
           set -euo pipefail
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
           head_repo="$(printf '%s' "$pr" | jq -r '.head.repo.full_name // ""')"
+          # Captured once, from this one response, and used for both the guard
+          # below and the checkout. Reading the head twice is the bug.
+          head_sha="$(printf '%s' "$pr" | jq -r '.head.sha // ""')"
+          base_sha="$(printf '%s' "$pr" | jq -r '.base.sha // ""')"
+          if [ -z "$head_sha" ]; then
+            echo "::error::PR #$PR_NUMBER has no head sha; refusing rather than resolving a mutable ref."
+            exit 1
+          fi
           if [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
             if [ "$EVENT" != "issue_comment" ]; then
               echo "::error::PR #$PR_NUMBER has its head in '${head_repo:-<deleted>}'. A fork is reviewed only when a member comments /review on it — that comment is the authorisation, and this trigger carries none."
@@ -212,7 +223,24 @@ jobs:
             # Refusing beats silently substituting the base config: a fork PR
             # that changes how the project builds is precisely the PR a person
             # should read before a machine does.
-            files="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename')"
+            # Against the captured SHA, not `pulls/<n>/files`. That endpoint
+            # answers for whatever the head is *when asked*, and the checkout
+            # below USED TO resolve `refs/pull/<n>/head`, a ref the fork author
+            # can move in between: the guard cleared one tree and the sandbox
+            # ran another. `compare/<base>...<head_sha>` names an immutable
+            # commit, and the checkout now reads that same SHA.
+            cmp="$(gh api "repos/$GITHUB_REPOSITORY/compare/$base_sha...$head_sha")"
+            files="$(printf '%s' "$cmp" | jq -r '.files[]?.filename')"
+            # `compare` caps `files` at 300 and does NOT paginate them —
+            # --paginate walks commits, not files. Past that cap the response
+            # is silently short, so a fork PR with 301 changed files could hide
+            # minimal.toml from this check and still be cleared. There is no
+            # truncation flag, so the cap itself is the signal, and a guard that
+            # cannot see the whole diff must not clear it.
+            if [ "$(printf '%s' "$cmp" | jq -r '.files | length')" -ge 300 ]; then
+              echo "::error::PR #$PR_NUMBER comes from a fork and changes 300+ files, which is the cap on what the compare API will list. This guard cannot prove the build config is untouched, so it refuses. Read it by hand."
+              exit 1
+            fi
             risky="$(printf '%s\n' "$files" | grep -E '^(minimal\.toml|\.minimal/|packages/)' || true)"
             if [ -n "$risky" ]; then
               echo "::error::PR #$PR_NUMBER comes from a fork and changes what the sandbox builds and runs:"
@@ -227,7 +255,10 @@ jobs:
           # or stacked on another PR gets a diff containing commits it never
           # introduced — and every anchor lands on code it did not change.
           printf '%s' "$pr" | jq -r '"base_ref=" + .base.ref' >> "$GITHUB_OUTPUT"
-          printf '%s' "$pr" | jq -r '"base_sha=" + .base.sha' >> "$GITHUB_OUTPUT"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          # The checkout uses this instead of refs/pull/<n>/head, so the tree
+          # reviewed is the tree the guard above cleared.
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
           echo "PR #$PR_NUMBER is same-repo, base $(printf '%s' "$pr" | jq -r .base.ref)"
 
       # `ref` is load-bearing: the default checkout for a pull_request event is
@@ -237,7 +268,7 @@ jobs:
         if: steps.quiet.outputs.status != 'stale'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha || format('refs/pull/{0}/head', github.event.inputs.pr || github.event.issue.number) }}
+          ref: ${{ github.event.pull_request.head.sha || steps.dispatch_pr.outputs.head_sha }}
           fetch-depth: 0
           path: pr
           persist-credentials: false
