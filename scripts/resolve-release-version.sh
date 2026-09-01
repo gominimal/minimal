@@ -87,9 +87,10 @@ skip() {
 
 # Tags pointing at the SHA itself, newest version first (--points-at takes
 # the next bare argument as its object, so every option precedes it).
-# Empty when none do.
+# Empty when none do; possibly several when a commit carries more than one
+# released tag — only the newest is resolved, so the output is one semver.
 exact="$(git_out tag --sort=-version:refname --format='%(refname:short)' \
-              --points-at "$SHA" | released_tag)"
+              --points-at "$SHA" | released_tag | sed -n '1p')"
 if [ -n "$exact" ]; then
     printf '%s\n' "${exact#v}"
     exit 0

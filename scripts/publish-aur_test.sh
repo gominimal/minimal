@@ -28,6 +28,10 @@ fi
 
 root="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-aurtest)"
 trap 'rm -rf "$root"' EXIT
+# Traversable by others: when this suite runs as root, the publisher's
+# runuser/su nobody stand-in must reach the makepkg stub on PATH (a mktemp
+# dir is 0700, which would hide it).
+chmod a+rx "$root"
 
 # --- fixtures -----------------------------------------------------------------
 
@@ -133,7 +137,7 @@ fi
 # Assert the checksums are the real digests of the fixture artifacts: every
 # 64-hex digest in the diff must be one of the fixture artifacts', and all 13
 # must be there.
-digests="$(for a in "${artifacts[@]}"; do sha256sum "$bucket/$a"; done | cut -d' ' -f1)"
+digests="$(for a in "${artifacts[@]}"; do sha256sum "$bucket/$a"; done | cut -d' ' -f1)"  # sha256sum: a stated requirement of the publisher
 stamped_ok=1
 count=0
 while IFS= read -r sha; do

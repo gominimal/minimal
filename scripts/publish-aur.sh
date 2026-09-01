@@ -191,13 +191,16 @@ generate_srcinfo() {
     fi
     chmod -R a+rX "$rundir"
     # runuser (util-linux) is the purpose-built root form — no PAM auth path
-    # to trip over; su is the fallback.
+    # to trip over; su is the fallback. Both rewrite HOME/PATH toward the
+    # target account (runuser also resets PATH to the login.defs default),
+    # so the payload re-exports the caller's PATH — where makepkg, and any
+    # harness stub shadowing it, live — and the scratch HOME explicitly.
     if id nobody >/dev/null 2>&1; then
         if command -v runuser >/dev/null 2>&1; then
-            HOME="$rundir" runuser -u nobody -- bash -c "cd '$rundir' && makepkg --printsrcinfo" </dev/null
+            runuser -u nobody -- bash -c "export PATH=\"$PATH\" HOME='$rundir'; cd '$rundir' && makepkg --printsrcinfo" </dev/null
             rc=$?
         elif command -v su >/dev/null 2>&1; then
-            HOME="$rundir" su -s /bin/bash nobody -c "cd '$rundir' && makepkg --printsrcinfo" </dev/null
+            su -s /bin/bash nobody -c "export PATH=\"$PATH\" HOME='$rundir'; cd '$rundir' && makepkg --printsrcinfo" </dev/null
             rc=$?
         else
             echo "publish-aur: neither runuser nor su available to run makepkg as root's stand-in; skipping .SRCINFO" >&2

@@ -89,14 +89,14 @@ resolve() {
 # --- fixture topology -------------------------------------------------------
 #
 # v0.5.3 ── v0.6.0-rc1 ── v0.6.0 ── (untagged head)
-#    └── exact-dual (v0.5.3 + v0.5.4 both on one commit)
+#    └── exact-dual (v0.5.4 + v0.5.2 both on one commit)
 commit base
 commit rel-053 v0.5.3;      tagged="$(sha_of HEAD)"
 commit post-053;            post053="$(sha_of HEAD)"
 commit rc-060 v0.6.0-rc1;   rc_sha="$(sha_of HEAD)"
 commit rel-060 v0.6.0
 commit head;                untagged="$(sha_of HEAD)"
-commit exact-dual v0.5.4;   dual="$(sha_of HEAD)"
+commit exact-dual v0.5.4 v0.5.2;   dual="$(sha_of HEAD)"
 push_all
 
 # --- the resolution contract ------------------------------------------------

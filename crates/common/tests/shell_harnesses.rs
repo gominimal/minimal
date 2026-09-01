@@ -16,7 +16,7 @@
 //! this runner only dispatches them and fails on a non-zero exit. `just
 //! test-shell` runs the same set locally.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn repo_root() -> PathBuf {
@@ -32,15 +32,28 @@ fn repo_root() -> PathBuf {
 fn all_script_test_harnesses_pass() {
     let scripts_dir = repo_root().join("scripts");
 
-    let mut harnesses: Vec<PathBuf> = std::fs::read_dir(&scripts_dir)
+    let mut harnesses = Vec::new();
+    for entry in std::fs::read_dir(&scripts_dir)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", scripts_dir.display()))
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with("_test.sh"))
-        })
-        .collect();
+    {
+        // An unreadable entry is a broken gate, not one harness fewer: fail
+        // loudly instead of silently passing a subset of the suite.
+        let path = entry
+            .unwrap_or_else(|e| {
+                panic!(
+                    "cannot enumerate an entry of {}: {e}",
+                    scripts_dir.display()
+                )
+            })
+            .path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with("_test.sh"))
+        {
+            harnesses.push(path);
+        }
+    }
     harnesses.sort();
 
     assert!(
@@ -51,7 +64,7 @@ fn all_script_test_harnesses_pass() {
     let mut failures = Vec::new();
     for harness in &harnesses {
         let name = harness.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-        let output = Command::new("bash")
+        let output = Command::new(declared_interpreter(harness))
             .arg(harness)
             .current_dir(repo_root())
             .output()
@@ -74,4 +87,25 @@ fn all_script_test_harnesses_pass() {
         "shell test harnesses failed:\n{}",
         failures.join("\n---\n")
     );
+}
+
+/// The harness's own declared interpreter, not a hardcoded bash:
+/// install_test.sh is a POSIX-sh harness (the shell-installer lane proves it
+/// under dash), and running it under bash would not test that contract.
+fn declared_interpreter(script: &Path) -> &'static str {
+    let first = std::fs::read_to_string(script)
+        .ok()
+        .and_then(|first| first.lines().next().map(str::to_owned))
+        .unwrap_or_default();
+    let bin = first
+        .strip_prefix("#!")
+        .unwrap_or("")
+        .split_whitespace()
+        .next_back()
+        .unwrap_or("");
+    if bin.rsplit('/').next_back() == Some("sh") {
+        "sh"
+    } else {
+        "bash"
+    }
 }

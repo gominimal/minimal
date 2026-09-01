@@ -11,8 +11,9 @@
 # nightly (release-<sha>) flows have none and skip.
 #
 # Usage: scripts/assert-release-version.sh [--tag v0.5.4] [--cargo-toml FILE]
-#   --tag         the ref being released (default: GITHUB_REF_NAME, or a fatal
-#                 error when neither is set)
+#   --tag         the ref being released (default: GITHUB_REF_NAME with
+#                 GITHUB_REF_TYPE; when neither carries a tag the script
+#                 asserts nothing and exits 0)
 #   --cargo-toml  Cargo.toml to read (default: <repo root>/Cargo.toml; the flag
 #                 exists so the harness can test against a fixture)
 #

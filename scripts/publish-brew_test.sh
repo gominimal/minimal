@@ -27,6 +27,16 @@ fi
 root="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-brewtest)"
 trap 'rm -rf "$root"' EXIT
 
+# The digest routine must match the publisher's (portable across
+# sha256sum/shasum/openssl — this harness also runs on hosts without
+# sha256sum), so it is extracted rather than copied: one definition.
+# shellcheck source=scripts/publish-brew.sh
+eval "$(sed -n '/^sha256_file()/,/^}/p' "$script")"
+[ "$(type -t sha256_file)" = "function" ] || {
+    echo "publish-brew_test: cannot extract sha256_file from publish-brew.sh" >&2
+    exit 1
+}
+
 # --- fixtures -----------------------------------------------------------------
 
 # The versioned release assets, each with distinct content so the sha256s
@@ -115,7 +125,7 @@ else
 fi
 
 # Every 64-hex digest in the diff must be one of the fixture assets'.
-digests="$(for a in "${assets[@]}"; do sha256sum "$release/$a"; done | cut -d' ' -f1)"
+digests="$(for a in "${assets[@]}"; do sha256_file "$release/$a"; done)"
 stamped_ok=1
 count=0
 while IFS= read -r sha; do
