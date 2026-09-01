@@ -261,42 +261,70 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
             )));
         }
 
-        let inputs = self.build_deps_mapped(build, opts, &build_op).await?;
-        let (rootfs, needs_dns, needs_internet) = self.rootfs_mapped(build, opts).await?;
-
-        let channel = ();
-
-        let mut config = sandbox2::config::Config::new(&build.name)
-            .with_isolated_wd(inputs.into_iter())
-            .with_rootfs(rootfs.into_iter())
-            .with_dns(needs_dns)
-            .with_disable_networking(!needs_dns && !needs_internet);
-        if let Some(a) = &build.build_args {
-            config = config.with_build_args(a.iter());
-        }
-        if let Some(w) = self.cpu_weight {
-            config = config.with_cpu_weight(w);
-        }
-        let mut sandbox = config.build(&opts.exec_base, channel).await?;
-        sandbox.keep_dir(true);
+        // MINIMAL_BUILD_RETRIES (default 0): re-run a FAILED build up to N extra
+        // times, each attempt in a FRESH sandbox (new process tree, new layout).
+        // Exists for the small class of seed-stage builds with known
+        // environment-sensitive nondeterminism (the mes-m2/mescc lottery
+        // compiling tcc.c: deterministic within one process tree, random
+        // across fresh ones) that cannot self-retry — the kaem executor has
+        // no loops and the rung's rootfs has no shell. Inputs are identical
+        // sha-pinned bytes on every attempt; retrying changes nothing but the
+        // process environment.
+        let max_attempts: usize = 1 + std::env::var("MINIMAL_BUILD_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0usize);
 
         info!("Building package: {}", build.name);
         let start = Instant::now();
-        sandbox
-            .run_with_cancel(
-                self.invocations(build)?
-                    .into_iter()
-                    .map(|(program, args)| sandbox2::config::Invocation {
-                        executable: program,
-                        args,
-                        envs: Default::default(),
-                    })
-                    .collect(),
-                self.stdout_writer.take(),
-                self.stderr_writer.take(),
-                self.cancel.clone(),
-            )
-            .await?;
+        let mut attempt = 0usize;
+        let mut sandbox = loop {
+            attempt += 1;
+            let inputs = self.build_deps_mapped(build, opts, &build_op).await?;
+            let (rootfs, needs_dns, needs_internet) = self.rootfs_mapped(build, opts).await?;
+
+            let channel = ();
+
+            let mut config = sandbox2::config::Config::new(&build.name)
+                .with_isolated_wd(inputs.into_iter())
+                .with_rootfs(rootfs.into_iter())
+                .with_dns(needs_dns)
+                .with_disable_networking(!needs_dns && !needs_internet);
+            if let Some(a) = &build.build_args {
+                config = config.with_build_args(a.iter());
+            }
+            if let Some(w) = self.cpu_weight {
+                config = config.with_cpu_weight(w);
+            }
+            let mut sandbox = config.build(&opts.exec_base, channel).await?;
+            sandbox.keep_dir(true);
+
+            let run_result = sandbox
+                .run_with_cancel(
+                    self.invocations(build)?
+                        .into_iter()
+                        .map(|(program, args)| sandbox2::config::Invocation {
+                            executable: program,
+                            args,
+                            envs: Default::default(),
+                        })
+                        .collect(),
+                    self.stdout_writer.take(),
+                    self.stderr_writer.take(),
+                    self.cancel.clone(),
+                )
+                .await;
+            match run_result {
+                Ok(()) => break sandbox,
+                Err(e) if attempt < max_attempts => {
+                    tracing::warn!(
+                        "build of {} failed (attempt {attempt}/{max_attempts}), retrying in a fresh sandbox: {e:?}",
+                        build.name
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
         let build_ms = Instant::now().duration_since(start).as_millis() as usize;
 
         let out_dir = opts
