@@ -84,14 +84,14 @@ jobs:
     #
     # `issue_comment` is the one path where the trigger is not the PR. It fires
     # on issue comments too, and on a public install anyone at all can post one,
-    # so all four clauses are load-bearing: it must be a PR, the body must ask,
+    # so all four clauses have to hold: it must be a PR, the body must ask,
     # and the person asking must be one of ours. No Bot clause here — a bot's
     # comment starting a paid review is a loop nobody asked for.
     #
     # This gate is repeated in the caller, and that copy is the one that stops
     # the job from starting. This one is the backstop: the caller's file can be
     # edited by the PR under review, and this file cannot.
-    # A double-quoted scalar, not `>-`, and that is load-bearing: in a folded
+    # A double-quoted scalar, not `>-`, and the difference matters: in a folded
     # block `\n` stays two characters, so the newline clause below would test
     # for a literal backslash-n and never match. YAML unescapes it here before
     # the expression engine sees it, and expression literals have no escapes
@@ -272,9 +272,10 @@ jobs:
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
           echo "PR #$PR_NUMBER is same-repo, base $(printf '%s' "$pr" | jq -r .base.ref)"
 
-      # `ref` is load-bearing: the default checkout for a pull_request event is
-      # the MERGE commit, a tree that exists in no branch. Every finding anchor
-      # would silently point at line numbers the PR does not have.
+      # `ref` decides what gets reviewed. The default checkout for a
+      # pull_request event is the MERGE commit, a tree that exists in no
+      # branch, and every finding anchor would silently point at line numbers
+      # the PR does not have.
       - name: Check out the tree under review (PR HEAD, not the merge commit)
         if: steps.quiet.outputs.status != 'stale'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
