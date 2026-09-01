@@ -91,19 +91,24 @@ jobs:
     # This gate is repeated in the caller, and that copy is the one that stops
     # the job from starting. This one is the backstop: the caller's file can be
     # edited by the PR under review, and this file cannot.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
+    # A double-quoted scalar, not `>-`, and that is load-bearing: in a folded
+    # block `\n` stays two characters, so the newline clause below would test
+    # for a literal backslash-n and never match. YAML unescapes it here before
+    # the expression engine sees it, and expression literals have no escapes
+    # of their own. The cost is that every " in the gate must be escaped.
+    if: "github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request != null &&
-       (github.event.comment.body == '/review' ||
-        startsWith(github.event.comment.body, '/review ')) &&
-       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
-                github.event.comment.author_association)) ||
+      github.event.issue.pull_request != null &&
+      (github.event.comment.body == '/review' ||
+      startsWith(github.event.comment.body, '/review ') ||
+      startsWith(github.event.comment.body, '/review\n')) &&
+      contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'),
+      github.event.comment.author_association)) ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
-       github.event.pull_request.draft != true &&
-       (github.event.pull_request.user.type == 'Bot' ||
-        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
-                 github.event.pull_request.author_association)))
+      github.event.pull_request.draft != true &&
+      (github.event.pull_request.user.type == 'Bot' ||
+      contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'),
+      github.event.pull_request.author_association)))"
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -834,6 +839,37 @@ jobs:
           # knows this repo's task schema.
           mip check
           cp "$CFG" "$RUN_DIR/injected-minimal.toml"
+
+          # Declare the task's own variables to the user policy, or `min` will
+          # not run it:
+          #
+          #   error: task 'review' declares 6 environment variables that your
+          #   policy does not allow, and stdin/stderr is not a terminal.
+          #
+          # It exits 1 in zero seconds, before the agent starts, so the run
+          # costs nothing and produces nothing. The gate is new — the reviewer
+          # tracks the `unstable` channel deliberately, and this is the bill
+          # for that.
+          #
+          # Read out of the config just injected rather than written by hand.
+          # The list is exactly what the task declares, so it cannot drift when
+          # the task gains a variable, and it grants nothing the task does not
+          # already ask for. A hand-kept copy would fail the same way, silently,
+          # the next time these two disagreed.
+          "$RUNNER_TEMP/venv/bin/python" - "$CFG" "$REVIEW_TASK" <<'PYPOLICY'
+          import os, pathlib, sys, tomllib
+
+          cfg, task = sys.argv[1], sys.argv[2]
+          with open(cfg, "rb") as fh:
+              declared = (tomllib.load(fh).get("tasks", {}).get(task, {})
+                          .get("env_vars") or {})
+          names = sorted(declared)
+          policy = pathlib.Path.home() / ".config" / "minimal" / "user_policy.toml"
+          policy.parent.mkdir(parents=True, exist_ok=True)
+          body = "[vars]\nallow = [" + ", ".join(f'"{n}"' for n in names) + "]\n"
+          policy.write_text(body)
+          print(f"policy: allowed {len(names)} task var(s): {', '.join(names)}")
+          PYPOLICY
 
       - name: Run the review
         id: agent
