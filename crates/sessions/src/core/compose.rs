@@ -1554,6 +1554,140 @@ pub(crate) fn apply_decision<T>(
     Ok(())
 }
 
+/// What the policy decided about one name.
+///
+/// The value-free half of [`Decision`]: a caller that has not resolved
+/// its values yet — or must not, until the policy has spoken — gets a
+/// verdict it can act on without handing anything to the gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameVerdict {
+    /// The policy permits this name.
+    Allowed,
+    /// Drop it silently.
+    Ignored,
+}
+
+/// A bare name's provenance, for [`VarsPolicy::check`]. Carries no
+/// value: [`gate_names`] exists precisely so a caller need not have one.
+struct NameItem<'a> {
+    source: &'a Source,
+}
+
+impl Provenanced for NameItem<'_> {
+    fn source(&self) -> &Source {
+        self.source
+    }
+}
+
+/// Drive the policy pass over a batch of `(name, source)` pairs and
+/// return one [`NameVerdict`] per input, in order, plus the policy as
+/// the hook may have amended it.
+///
+/// This is the gate itself — classify, refer what is undecided to
+/// `hooks`, apply what comes back — with values factored out.
+/// [`gate_vars`] is this function plus the value plumbing, and callers
+/// that must decide *before* reading a value (a task's `env_vars` are
+/// resolved out of the invoking user's shell, so reading an unapproved
+/// one defeats the gate) call this directly.
+///
+/// `hooks` is `None` for user-only composition — all items are expected
+/// to auto-decide.
+///
+/// # Errors
+///
+/// - [`ComposeError::Denied`] — a `deny` rule matched. Returned from the
+///   first denial found, before any hook is consulted, so a forbidden
+///   name is never preceded by a prompt about its neighbours.
+/// - [`ComposeError::HookRequired`] — an item needed approval and there
+///   was no hook to ask.
+/// - [`ComposeError::Aborted`] — the hook cancelled.
+/// - [`ComposeError::HookContract`] — the hook returned the wrong number
+///   of decisions, or answered `UseRule` for an item the policy still
+///   cannot decide.
+///
+/// [`VarsPolicy::check`]: crate::core::policy::VarsPolicy::check
+pub fn gate_names(
+    items: &[(&str, &Source)],
+    mut policy: VarsPolicy,
+    hooks: Option<&dyn PolicyHooks>,
+) -> Result<(Vec<NameVerdict>, VarsPolicy), ComposeError> {
+    // A denial ends the batch where it is found, before any hook runs.
+    // `deny` is the emergency stop: an operator who has forbidden a name
+    // should not first be prompted about its neighbours, approve one,
+    // have that rule written to `user_policy.toml`, and only then be told
+    // the composition was never going to succeed.
+    let denied = |name: &str, source: &Source| ComposeError::Denied {
+        what: name.to_owned(),
+        from: source.clone(),
+    };
+    let verdict_of = |d: &Decision<NameItem<'_>>| match d {
+        Decision::Allowed(_) => Some(NameVerdict::Allowed),
+        Decision::Ignored => Some(NameVerdict::Ignored),
+        Decision::Denied(_) => None,
+    };
+
+    // Pass 1: categorize. An undecided item is seeded `Ignored` and
+    // queued; pass 3 overwrites every one of them. The placeholder is
+    // fail-closed on purpose — should a future edit ever leave one
+    // unwritten, the caller drops the name rather than carrying it.
+    let mut verdicts: Vec<NameVerdict> = Vec::with_capacity(items.len());
+    let mut unapproved: Vec<usize> = Vec::new();
+    for (i, (name, source)) in items.iter().enumerate() {
+        match policy.check(name, NameItem { source }) {
+            CheckOutcome::Decided(d) => match verdict_of(&d) {
+                Some(v) => verdicts.push(v),
+                None => return Err(denied(name, source)),
+            },
+            CheckOutcome::NeedsApproval(_) => {
+                unapproved.push(i);
+                verdicts.push(NameVerdict::Ignored);
+            }
+        }
+    }
+
+    if !unapproved.is_empty() {
+        let Some(hooks) = hooks else {
+            let i = unapproved[0];
+            return Err(ComposeError::HookRequired {
+                what: items[i].0.to_owned(),
+                from: items[i].1.clone(),
+            });
+        };
+        // Pass 2: prompt.
+        let view: Vec<Unapproved<'_, str>> = unapproved
+            .iter()
+            .map(|&i| Unapproved {
+                item: items[i].0,
+                source: items[i].1,
+            })
+            .collect();
+        let (decisions, new_policy) = prompt_var_hook(hooks, policy, &view)?;
+        policy = new_policy;
+        // Pass 3: apply.
+        for (&i, decision) in unapproved.iter().zip(decisions) {
+            let (name, source) = items[i];
+            verdicts[i] = match decision {
+                ItemDecision::AllowOnce => NameVerdict::Allowed,
+                ItemDecision::IgnoreOnce => NameVerdict::Ignored,
+                ItemDecision::UseRule => match policy.check(name, NameItem { source }) {
+                    CheckOutcome::Decided(d) => match verdict_of(&d) {
+                        Some(v) => v,
+                        None => return Err(denied(name, source)),
+                    },
+                    CheckOutcome::NeedsApproval(_) => {
+                        return Err(ComposeError::use_rule_undecided(
+                            HookDomain::Var,
+                            format!("variable `{name}`"),
+                        ));
+                    }
+                },
+            };
+        }
+    }
+
+    Ok((verdicts, policy))
+}
+
 /// Drive the policy pass over a batch of vars.
 ///
 /// `hooks` is `None` for user-only composition — all items are
@@ -1561,78 +1695,45 @@ pub(crate) fn apply_decision<T>(
 /// branch with no hook surfaces as [`ComposeError::HookRequired`].
 pub(crate) fn gate_vars(
     items: Vec<ProvenancedVar>,
-    mut policy: VarsPolicy,
+    policy: VarsPolicy,
     hooks: Option<&dyn PolicyHooks>,
 ) -> Result<(Vec<SessionVar>, VarsPolicy), ComposeError> {
-    let name_of = |pv: &ProvenancedVar| pv.var().name().to_owned();
-    let source_of = |pv: ProvenancedVar| pv.into_parts().1;
+    // Vars whose value doesn't pull from the user's environment
+    // (hardcoded literals, or `inherit-with-default` that fell back to
+    // the default) aren't a data-leak vector, so the allow/deny/ignore
+    // rules don't apply — they never reach the gate. The policy exists
+    // to gate user data crossing into the sandbox; there's no user data
+    // here.
+    let gated: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, pv)| pv.var().carries_user_data())
+        .map(|(i, _)| i)
+        .collect();
 
-    // Pass 1: categorize.
-    let mut allowed: Vec<ProvenancedVar> = Vec::new();
-    let mut unapproved: Vec<ProvenancedVar> = Vec::new();
-    for pv in items {
-        // Vars whose value doesn't pull from the user's environment
-        // (hardcoded literals, or `inherit-with-default` that fell
-        // back to the default) aren't a data-leak vector, so the
-        // allow/deny/ignore rules don't apply — send straight to
-        // `allowed` without a policy check. The policy exists to
-        // gate user data crossing into the sandbox; there's no user
-        // data here.
-        if !pv.var().carries_user_data() {
-            allowed.push(pv);
-            continue;
-        }
-        let name = pv.var().name().to_owned();
-        match policy.check(&name, pv) {
-            CheckOutcome::Decided(d) => apply_decision(d, &mut allowed, name_of, source_of)?,
-            CheckOutcome::NeedsApproval(pv) => unapproved.push(pv),
-        }
-    }
-    if !unapproved.is_empty() {
-        let Some(hooks) = hooks else {
-            // Caller wired the user-only path but produced a
-            // non-user-origin item that the policy couldn't decide.
-            let pv = unapproved.into_iter().next().expect("non-empty");
-            let what = name_of(&pv);
-            return Err(ComposeError::HookRequired {
-                what,
-                from: source_of(pv),
-            });
-        };
-        // Pass 2: prompt.
-        let view: Vec<Unapproved<'_, str>> = unapproved
+    // Scoped so the borrows of `items` end before it is consumed below.
+    let (verdicts, policy) = {
+        let pairs: Vec<(&str, &Source)> = gated
             .iter()
-            .map(|pv| Unapproved {
-                item: pv.var().name(),
-                source: pv.source(),
-            })
+            .map(|&i| (items[i].var().name(), items[i].source()))
             .collect();
-        let (decisions, new_policy) = prompt_var_hook(hooks, policy, &view)?;
-        policy = new_policy;
-        // Pass 3: apply.
-        for (pv, decision) in unapproved.into_iter().zip(decisions) {
-            match decision {
-                ItemDecision::AllowOnce => allowed.push(pv),
-                // `IgnoreOnce` is the symmetric partner of `AllowOnce`:
-                // silently drop this item for this activation without
-                // adding a policy rule. Same downstream effect as a
-                // policy `ignore` match.
-                ItemDecision::IgnoreOnce => {}
-                ItemDecision::UseRule => {
-                    let name = pv.var().name().to_owned();
-                    match policy.check(&name, pv) {
-                        CheckOutcome::Decided(d) => {
-                            apply_decision(d, &mut allowed, name_of, source_of)?;
-                        }
-                        CheckOutcome::NeedsApproval(pv) => {
-                            return Err(ComposeError::use_rule_undecided(
-                                HookDomain::Var,
-                                format!("variable `{}`", pv.var().name()),
-                            ));
-                        }
-                    }
-                }
-            }
+        gate_names(&pairs, policy, hooks)?
+    };
+
+    let mut verdict_at: Vec<Option<NameVerdict>> = vec![None; items.len()];
+    for (&i, v) in gated.iter().zip(verdicts) {
+        verdict_at[i] = Some(v);
+    }
+
+    // Walked in input order, so the emitted list keeps the order the
+    // composer built it in — an ungated literal does not jump ahead of
+    // a gated var declared before it.
+    let mut allowed: Vec<ProvenancedVar> = Vec::with_capacity(items.len());
+    for (pv, verdict) in items.into_iter().zip(&verdict_at) {
+        match verdict {
+            // Never gated: skipped the policy entirely.
+            None | Some(NameVerdict::Allowed) => allowed.push(pv),
+            Some(NameVerdict::Ignored) => {}
         }
     }
 
@@ -2373,6 +2474,54 @@ mod tests {
     // =================================================================
 
     mod vars_gating {
+        /// A batch holding both a denied name and an merely-unapproved one
+        /// fails on the denial without the hook ever being consulted.
+        ///
+        /// `deny` is the emergency stop. Prompting about a neighbour first
+        /// wastes the answer — and can persist a rule to `user_policy.toml`
+        /// — for a composition that was never going to succeed. The
+        /// hook here panics if called, so the order is enforced rather
+        /// than described.
+        #[test]
+        fn a_denial_short_circuits_before_any_hook_runs() {
+            use super::super::{ComposeError, gate_names};
+            use crate::core::hooks::{HookResult, PolicyHooks, Unapproved};
+            use crate::core::policy::{PatchesPolicy, VarsPolicy};
+            use crate::core::source::Source;
+
+            struct NeverAsked;
+            impl PolicyHooks for NeverAsked {
+                fn on_var_unapproved(
+                    &self,
+                    _p: VarsPolicy,
+                    items: &[Unapproved<'_, str>],
+                ) -> HookResult<VarsPolicy> {
+                    panic!("a denial must stop the batch first; asked about {items:?}");
+                }
+                fn on_patch_unapproved(
+                    &self,
+                    _p: PatchesPolicy,
+                    _i: &[Unapproved<'_, camino::Utf8Path>],
+                ) -> HookResult<PatchesPolicy> {
+                    unreachable!()
+                }
+            }
+
+            let source = Source::Project {
+                path: paths::HostPath::try_new(camino::Utf8PathBuf::from("/p")).unwrap(),
+            };
+            let policy = VarsPolicy::empty().try_with_deny(["DENIED"]).unwrap();
+            // Sorted so the denied name is not simply first by luck.
+            let items = [("ALSO_UNLISTED", &source), ("DENIED", &source)];
+
+            let err = gate_names(&items, policy, Some(&NeverAsked))
+                .expect_err("a denied name must fail the batch");
+            assert!(
+                matches!(&err, ComposeError::Denied { what, .. } if what == "DENIED"),
+                "names the denied variable: {err:?}",
+            );
+        }
+
         use super::*;
 
         #[test]

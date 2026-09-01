@@ -366,25 +366,38 @@ impl Client {
         &mut self,
         command: &str,
     ) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
-        self.exec_channel(None, command).await
+        self.exec_channel(None, command, &minimald_rpc::taskenv::TaskEnv::default())
+            .await
     }
 
     /// Like [`Self::open_exec_channel`], but sets `MINIMAL_SESSION_ID` on the
     /// channel before the exec request, the routing contract the daemon's own
     /// exec forms ([`minimald_rpc::exec::ExecRequest::TaskRun`] and its
     /// siblings) are served under.
+    ///
+    /// `task_env` carries a task's `env_vars` already resolved against the
+    /// invoking shell: values under
+    /// [`TASK_ENV_PREFIX`](minimald_rpc::taskenv::TASK_ENV_PREFIX), and the
+    /// names to remove under
+    /// [`TASK_ENV_DROP`](minimald_rpc::taskenv::TASK_ENV_DROP). Only
+    /// [`ExecRequest::TaskRun`](minimald_rpc::exec::ExecRequest::TaskRun) has
+    /// any to send; every other caller passes an empty
+    /// [`TaskEnv`](minimald_rpc::taskenv::TaskEnv) and the daemon behaves
+    /// exactly as before.
     pub async fn open_session_exec_channel(
         &mut self,
         session_id: sessions::SessionId,
         command: &str,
+        task_env: &minimald_rpc::taskenv::TaskEnv,
     ) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
-        self.exec_channel(Some(session_id), command).await
+        self.exec_channel(Some(session_id), command, task_env).await
     }
 
     async fn exec_channel(
         &mut self,
         session_id: Option<sessions::SessionId>,
         command: &str,
+        task_env: &minimald_rpc::taskenv::TaskEnv,
     ) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
         let mut channel = self
             .handle
@@ -397,6 +410,29 @@ impl Client {
                 .set_env(true, "MINIMAL_SESSION_ID", id.to_string())
                 .await
                 .context("set MINIMAL_SESSION_ID env")?;
+        }
+        // Every env request must precede the exec request: the daemon folds
+        // them into the channel's pending config, which the exec dispatch
+        // then consumes.
+        for (name, value) in &task_env.set {
+            let wire = minimald_rpc::taskenv::wire_name(name);
+            channel
+                .set_env(true, wire.as_str(), value.as_str())
+                .await
+                .with_context(|| format!("set task env {name}"))?;
+        }
+        // Sent only when there is something to drop: an empty list and no
+        // list at all mean the same thing, and not sending one keeps the
+        // channel identical to what an older client produces.
+        if !task_env.drop.is_empty() {
+            channel
+                .set_env(
+                    true,
+                    minimald_rpc::taskenv::TASK_ENV_DROP,
+                    minimald_rpc::taskenv::encode_drops(&task_env.drop),
+                )
+                .await
+                .context("set task env drop list")?;
         }
         channel
             .exec(true, command)

@@ -19,6 +19,7 @@ validating constructor and keeps the inner value unconstructable elsewhere.
 - `Cow<'_, str>` for sometimes-owned, sometimes-borrowed values.
 - Builder pattern for types with more than a couple of fields or any optional config. Owned style: pub fn with_x(mut self, x: T) -> Self, never &mut self -> &mut Self.
 - Cloning discipline. .clone() is fine for Arc/Rc and small Copy-ish types; cloning a String/Vec/HashMap to dodge the borrow checker means restructure or borrow instead.
+- Ordered collections when iteration order escapes. `BTreeMap`/`BTreeSet` over `HashMap`/`HashSet` for anything whose iteration reaches a sandbox, a serialized artifact, a hash, a diagnostic, or a prompt — hash order varies run to run, so the same declarations otherwise produce different output. Keys in this codebase are almost always `String` or another `Ord` newtype, so ordering costs nothing. `HashMap` stays right for pure lookup that is never iterated. Fix it at the type, not with a `sort()` at the use site: the sort has to be repeated at every consumer and silently rots when one is added. Sorting is also no defence where a *later* sort is stable and the hash order is what it faithfully preserves.
 - Captured-identifier formatting. format!("{path}") over format!("{}", path).
 - Display for users, Debug for developers. Don't reuse one for the other.
 - Generics / impl Trait over dyn Trait. Reach for dyn only for heterogeneous collections or when monomorphization causes real code bloat.
