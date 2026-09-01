@@ -71,7 +71,7 @@ expect() {
 }
 
 run_dry() {
-    local ver="${1:-0.5.4}"
+    local ver="${1:?usage: run_dry <version>}"
     # No GITHUB_TOKEN, no SSH_AUTH_SOCK: the publisher must reach the dry-run
     # exit without any credential for a fixture (file://) remote. The release
     # base is version-keyed, so an unknown version finds no assets.
@@ -84,7 +84,7 @@ run_dry() {
 
 # --- the dry run --------------------------------------------------------------
 
-out="$(run_dry 2>&1)"
+out="$(run_dry 0.5.4 2>&1)"
 rc=$?
 
 if [ "$rc" -eq 0 ]; then ok "dry run succeeds without credentials"; else bad "dry run succeeds without credentials (rc=$rc; out: $out)"; fi

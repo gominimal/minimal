@@ -18,11 +18,15 @@ script="$here/resolve-release-version.sh"
 root="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-reshatest)"
 trap 'rm -rf "$root"' EXIT
 
+# Identity through the environment, not repo config: the fixture grows more
+# than one repository, and CI runners have no global git identity (an
+# un-configured `git commit` dies with "Author identity unknown").
+export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com
+export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
+
 repo="$root/repo"
 git init -q --bare "$repo/origin.git"
 git clone -q "$repo/origin.git" "$repo/work"
-git -C "$repo/work" config user.email test@example.com
-git -C "$repo/work" config user.name test
 
 # commit <message> [tag...] — one empty commit, optionally tagged at HEAD.
 commit() {
