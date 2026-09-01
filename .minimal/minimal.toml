@@ -1,7 +1,7 @@
 [upstream] # Source of software & tooling
 repo = "https://github.com/gominimal/pkgs"
 branch = "main"
-locked_commit = "0da02c7fe4cff292388c1b9ebd611feceabb22fe"
+locked_commit = "f8c060bcb3df6ddcbea4c61664621e226ab51245"
 
 [harness]
 use = "rust"
@@ -18,6 +18,8 @@ exec = "claude --dangerously-skip-permissions"
 description = "Builds the minimal CLI"
 exec = "cargo build --verbose"
 inherit_cwd = true
+# remote-proto's build.rs needs protoc (prost-build)
+packages = ["protobuf", "git"]
 
 [tasks.test]
 exec = "cargo test --verbose"

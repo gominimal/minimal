@@ -1,10 +1,16 @@
 use std::process::Command;
 fn main() {
-    let output = Command::new("git")
+    // Tolerate non-git contexts (sandboxed builds see a worktree whose gitfile
+    // points at an unreachable host path; release channels build from tarballs):
+    // fall back to "unknown" instead of panicking.
+    let git_hash = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
-        .unwrap();
-    let git_hash = String::from_utf8(output.stdout).unwrap();
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=GIT_HASH={}", git_hash);
 
     let is_clean = std::process::Command::new("git")
@@ -21,6 +27,6 @@ fn main() {
         "cargo:rustc-env=LONG_VERSION={} ({}{})",
         std::env::var("CARGO_PKG_VERSION").unwrap().as_str(),
         if is_clean { "" } else { "dirty " },
-        git_hash.strip_suffix("\n").unwrap(),
+        git_hash,
     );
 }

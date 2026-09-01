@@ -134,6 +134,14 @@ impl<C: Channel> Sandbox<C> {
         // still target lib64/ land in lib/ transparently.
         let usr_lib64 = rootfs.join("usr").join("lib64");
         if !fs::exists(&usr_lib64).unwrap_or(true) {
+            // A zero-dep package (e.g. a trust-config-hydrated seed carrier whose
+            // guard script is its only content) assembles an EMPTY rootfs — usr/
+            // does not exist yet and the bare symlink call dies with a confusing
+            // "I/O error ... No such file or directory" before the package's own
+            // build.sh can speak. Create the parent first; an empty usr/ in an
+            // empty rootfs is harmless.
+            let usr = rootfs.join("usr");
+            fs::create_dir_all(&usr).map_err(|e| Error::IO("create usr dir", usr, e))?;
             std::os::unix::fs::symlink("lib", &usr_lib64)
                 .map_err(|e| Error::IO("create usr/lib64 symlink", usr_lib64, e))?;
         }
