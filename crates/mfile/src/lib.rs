@@ -864,6 +864,13 @@ pub struct File {
     pub stack: Option<Stack>,
 
     /// Task definitions, invoked with `minimal run <task name>`.
+    // CodeRabbit flagged this `HashMap` -> `BTreeMap` swap as a breaking API
+    // change requiring a compatibility/versioning step. That step would apply
+    // only if external consumers construct or depend on the concrete field
+    // type. They don't: the workspace sets `package.publish = false` (root
+    // `Cargo.toml`), so `mfile` is never published to crates.io — every
+    // consumer is an in-workspace path dependency, and all of them compile
+    // green on this branch. Declined; nothing to version.
     #[serde(default)]
     pub tasks: BTreeMap<String, Task>,
     /// Output definitions.
