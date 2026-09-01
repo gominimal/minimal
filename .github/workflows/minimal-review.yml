@@ -76,11 +76,9 @@ env:
 
 jobs:
   review:
-    # Same-repo PRs only (forks get no secrets), from an org member or an
-    # installed App. The Bot clause matters: both gominimal-aw-bot and
-    # dependabot are CONTRIBUTOR, not MEMBER, and gating them out would stop
-    # reviewing every dependency bump. workflow_dispatch already requires
-    # write access.
+    # Same-repo PRs only — forks get no secrets, and the step below refuses
+    # them again where a PR cannot edit the check. workflow_dispatch already
+    # requires write access, so it needs no test of its own.
     #
     # `issue_comment` is the one path where the trigger is not the PR. It fires
     # on issue comments too, and on a public install anyone at all can post one,
@@ -91,6 +89,23 @@ jobs:
     # This gate is repeated in the caller, and that copy is the one that stops
     # the job from starting. This one is the backstop: the caller's file can be
     # edited by the PR under review, and this file cannot.
+    #
+    # The pull_request path tests no author at all, and that is deliberate.
+    # `author_association` is a visibility signal, not a permission one: it
+    # reports MEMBER only for a PUBLIC org member, and a private one comes back
+    # CONTRIBUTOR. gominimal/minimal#1313 skipped nine consecutive runs for that
+    # reason and was only ever reviewed by a hand-fired dispatch; four of
+    # thirteen org members were invisible to the reviewer the same way.
+    #
+    # Nothing is given up by dropping it. The head-repo test below already
+    # proves write access, because a branch cannot exist in this repo unless
+    # someone with write pushed it — checked against every same-repo PR author
+    # on gominimal/minimal, all of them write or admin, the only two exceptions
+    # being dependabot and gominimal-aw-bot, which is precisely what the Bot
+    # clause existed to rescue. Anyone who can push a branch here can already
+    # run arbitrary Actions in this repo, so the reviewer reaches nothing the
+    # branch did not already reach.
+    #
     # A double-quoted scalar, not `>-`, and the difference matters: in a folded
     # block `\n` stays two characters, so the newline clause below would test
     # for a literal backslash-n and never match. YAML unescapes it here before
@@ -105,10 +120,7 @@ jobs:
       contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'),
       github.event.comment.author_association)) ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.draft != true &&
-      (github.event.pull_request.user.type == 'Bot' ||
-      contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'),
-      github.event.pull_request.author_association)))"
+      github.event.pull_request.draft != true)"
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
