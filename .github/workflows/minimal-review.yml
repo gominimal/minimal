@@ -84,8 +84,8 @@ jobs:
     # A dependabot-triggered run cannot read Actions secrets — they live in the
     # separate Dependabot secrets store — so `secrets.AW_BOT_PRIVATE_KEY` is
     # empty and the token mint dies with "The 'private-key' input must be set to
-    # a non-empty string". Every dependabot run has failed that way: 12 of 12
-    # across webapp, pkgmgr-rs, minimal-supply-chain and minimal. The Bot clause
+    # a non-empty string". Every dependabot run has failed that way: 12 of 12,
+    # webapp 10 and pkgmgr-rs and minimal one each. The Bot clause
     # that used to admit them was added so dependency bumps would be reviewed,
     # and it has never once produced a review — only a red X on a PR nobody
     # wrote. Skipping is honest about that.
@@ -229,7 +229,8 @@ jobs:
       # mint, `continue-on-error` swallows that, the step falls back to
       # `github.token`, and the API call then fails too and lands in the
       # association fallback with a warning naming the scope. The first real run
-      # settles it — look for `has write on` in the log, or the warning.
+      # settles it — the step logs `has <permission> on`, so grep for `has ` and
+      # read what follows, or for the warning if it fell back.
       - name: Mint a read-only token for the author check
         id: author-token
         if: github.event_name != 'workflow_dispatch'
