@@ -145,6 +145,9 @@ RUST_LOG         = "info"
 CARGO_TERM_COLOR = "always"
 # Inherit from the developer's environment if set, else the default.
 DATABASE_URL     = { inherit = true, default = "postgres://localhost/dev" }
+# Inherit with no fallback: a developer who has not set this cannot
+# activate a session on this project.
+GITHUB_TOKEN     = { inherit = true }
 
 # Declared to warm the compile cache when a session comes up.
 [[session.lifecycle_hooks]]
@@ -154,8 +157,20 @@ on_activate = { type = "inline", value = "cargo check --workspace >/dev/null 2>&
 - **`packages`**: Packages brought into every session on this project,
   alongside whatever the developer's loadouts contribute.
 - **`vars`**: Environment variables. A string sets a fixed value;
-  `{ inherit = true }` passes the developer's own value through (add
-  `default = "..."` for a fallback when it is unset).
+  `{ inherit = true }` passes the developer's own value through. Here that
+  inheritance is **required**: if the developer's environment does not have
+  the variable set, activation fails rather than proceeding without it.
+
+  ```console
+  $ min session activate
+  error: Composition gating failed: could not resolve pending var
+  `GITHUB_TOKEN`: environment variable not found
+  ```
+
+  Adding `default = "..."` supplies a fallback and makes the variable
+  optional again. A loadout spells the bare form the same way but treats it
+  as optional — see
+  [Where `{ inherit = true }` differs](#inherit-divergence).
 - **`patches`**: `{ source, dest }` rows copying files into the session.
   `dest` is relative to the session user's home directory; `source` resolves
   on the host, typically inside the repo. The one expansion a loadout has
@@ -171,7 +186,29 @@ on_activate = { type = "inline", value = "cargo check --workspace >/dev/null 2>&
 
 The field shapes and composition semantics (conflicts, policy gating) are the
 same as loadouts; see the [loadout reference](./loadouts.md) for the exact
-rules.
+rules. Variable *resolution* is the exception: a bare `{ inherit = true }`
+that the host has not set fails activation here, where a loadout drops it
+with a warning, so the loadout page's rule for that one case does not carry
+over.
+
+#### Where `{ inherit = true }` differs {#inherit-divergence}
+
+Three surfaces accept `{ inherit = true }`, spelled identically on each.
+They agree that a variable the host *has* set is passed through, and they
+disagree about everything else:
+
+| Surface | Host variable unset | `default = "..."` |
+|---|---|---|
+| This file's `[session.vars]` (and `[[session.vars_lenient]]`) | Activation fails: `could not resolve pending var <NAME>` | Supported; the default is used |
+| A loadout's [`[vars]`](./loadouts.md#vars) and [`[[vars_lenient]]`](./loadouts.md#vars_lenient) | Dropped, with a warning on the terminal; activation continues | Supported; the default is used |
+| A task's [`env_vars`](./tasks.md#env_vars) | The run fails before the session is built | Rejected when the file is parsed — a task's `inherit` takes no `default` |
+
+Two things narrow the task row. An `echo` task never builds an environment,
+so it never reads — or fails over — an `env_vars` declaration. And
+`min run <task>` from inside a session, along with
+`min session run <session> <task>`, resolves `inherit` against the daemon's
+environment rather than your shell. Both are covered in
+[Tasks](./tasks.md#env_vars).
 
 
 

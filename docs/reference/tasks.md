@@ -95,7 +95,7 @@ state_key = "dev" # Cache build artifacts under 'dev'
 ```
 
 
-### `env_vars` - Environment variables to set
+### `env_vars` - Environment variables to set {#env_vars}
 
 _Optional. `env_vars` is an alias of the canonical `vars` key; both parse_
 

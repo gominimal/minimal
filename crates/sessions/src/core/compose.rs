@@ -606,10 +606,24 @@ pub trait Composable {
 /// against a single [`Source`], resolving each var against `env`.
 ///
 /// Shared by [`crate::core::loadout::Loadout`]'s and every project /
-/// package composable's `contribute` — the only per-source
-/// difference is the [`Source`] tag stamped on every produced item,
-/// so lifting the loop bodies into one helper prevents the impls
-/// from drifting when a new primitive lands.
+/// package composable's `contribute`, so lifting the loop bodies into
+/// one helper prevents the impls from drifting when a new primitive
+/// lands. For packages, patches, and hooks the only per-source
+/// difference is the [`Source`] tag stamped on every produced item.
+///
+/// **Vars are the exception.** [`Loadout::contribute`] passes empty
+/// maps for both var arguments and resolves its own vars through a
+/// private `resolve_var_declaration`, because a loadout treats a bare
+/// [`VarValue::Inherit`] the host hasn't set as a warn-and-drop.
+/// Everything that *does* route vars through here — project and
+/// package composables — gets [`ResolvedVar::resolve_with`]'s strict
+/// rule instead, where that same case is a hard error. Don't read
+/// this helper as the single definition of var semantics; it is the
+/// strict one of two.
+///
+/// [`Loadout::contribute`]: crate::core::loadout::Loadout::contribute
+/// [`VarValue::Inherit`]: crate::core::primitives::VarValue::Inherit
+/// [`ResolvedVar::resolve_with`]: crate::core::primitives::ResolvedVar::resolve_with
 ///
 /// Positional args over a named struct because wrapping five fields
 /// in a `Primitives`-shaped struct at every callsite (only to
