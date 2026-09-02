@@ -1183,8 +1183,17 @@ impl Session {
         // later never reaches the sandbox. Propagated, not logged — an
         // activation that hands back a session id must hand back a usable
         // session, and a box with no blueprint can't run anything.
-        self.scaffold_mfile_if_missing(&workspace_path)
-            .map_err(|e| std::io::Error::other(format!("scaffolding a default mfile: {e}")))?;
+        //
+        // Fenced: the scaffold resolves the default package repo over the
+        // network and runs inline on the session actor, so an unfenced call
+        // would pin a worker for the whole fetch. Flavor-guarded because
+        // `block_in_place` panics on a current-thread runtime.
+        let scaffold = || self.scaffold_mfile_if_missing(&workspace_path);
+        match tokio::runtime::Handle::current().runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(scaffold),
+            _ => scaffold(),
+        }
+        .map_err(|e| std::io::Error::other(format!("scaffolding a default mfile: {e}")))?;
 
         // Phase 1+2: resolve the project and drive the composer. Kept fully
         // synchronous — its non-`Send` intermediaries must not cross an
