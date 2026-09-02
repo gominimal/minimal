@@ -279,14 +279,19 @@ jobs:
           # two paragraphs up — and no equivalent audit was ever run for Apps.
           # Any other App gets the same lookup a human gets.
           #
-          # dependabot is refused here rather than waved through, and the arm is
-          # not dead code even though the caller's gate already excludes it. That
-          # gate lives in a file the PR under review can edit; this one does not.
-          # In a generated standalone copy the two sit in the same file and this
-          # arm is unreachable; in a stub caller it is not, and skipping the
-          # check there would send the run on to a token mint that cannot
-          # succeed. Saying why beats failing four steps later with
-          # "private-key must be set to a non-empty string".
+          # The dependabot arm is unreachable today and kept anyway. This job's
+          # own `if` excludes that login, and a called workflow's `if` is
+          # evaluated against the same triggering event as the caller's, so it
+          # holds no matter what a stale or PR-edited caller says — an earlier
+          # version of this comment argued the opposite and was wrong about the
+          # semantics.
+          #
+          # It stays because it is one line and it is the only place that names
+          # the cause. Drop the exclusion from either gate — which is exactly
+          # what someone wiring up Dependabot secrets would do first — and the
+          # run lands here. Refusing with a reason beats reaching a token mint
+          # that fails four steps later on "private-key must be set to a
+          # non-empty string".
           if [ "$AUTHOR_TYPE" = "Bot" ]; then
             if [ "${GITHUB_EVENT_NAME:-}" = "issue_comment" ]; then
               echo "::error::$AUTHOR is an App and a bot may not start a review by comment. Refusing."
