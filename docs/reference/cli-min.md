@@ -148,9 +148,10 @@ daemon's own operations are named explicitly instead — see `session run`.
 
 `session exec` returns when `COMMAND` itself exits, and relays output up to
 that point. A process the command backgrounds keeps running in the session,
-but anything it writes *after* the command has exited is not relayed — it is
-read and discarded, so the process is never killed by a broken pipe, but you
-will not see it.
+but what it writes *after* the command has exited is not yours to rely on: a
+short drain catches whatever was already in flight, and past that its output
+is read and discarded. Nothing it writes is ever lost to a broken pipe — the
+process is not killed — but you will not see it.
 
 ```
 min session exec web 'sleep 20 & echo STARTED'   # returns immediately
