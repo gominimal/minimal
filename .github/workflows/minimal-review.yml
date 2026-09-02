@@ -80,6 +80,21 @@ jobs:
     # them again where a PR cannot edit the check. workflow_dispatch already
     # requires write access, so it needs no test of its own.
     #
+    # dependabot is excluded, and that is a correction rather than a policy.
+    # A dependabot-triggered run cannot read Actions secrets — they live in the
+    # separate Dependabot secrets store — so `secrets.AW_BOT_PRIVATE_KEY` is
+    # empty and the token mint dies with "The 'private-key' input must be set to
+    # a non-empty string". Every dependabot run has failed that way: 12 of 12
+    # across webapp, pkgmgr-rs, minimal-supply-chain and minimal. The Bot clause
+    # that used to admit them was added so dependency bumps would be reviewed,
+    # and it has never once produced a review — only a red X on a PR nobody
+    # wrote. Skipping is honest about that. CodeRabbit raised it on
+    # gominimal/minimal-skills#17; the evidence is in the run history.
+    #
+    # To actually review bumps, add AW_BOT_PRIVATE_KEY and the rest to each
+    # repo's Dependabot secrets and drop this clause — deliberately, in a
+    # reviewed PR, having checked one runs green first.
+    #
     # `issue_comment` is the one path where the trigger is not the PR. It fires
     # on issue comments too, and on a public install anyone at all can post one,
     # so all four clauses have to hold: it must be a PR, the body must ask,
@@ -146,7 +161,8 @@ jobs:
       contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\",\"CONTRIBUTOR\"]'),
       github.event.comment.author_association)) ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.draft != true)"
+      github.event.pull_request.draft != true &&
+      github.event.pull_request.user.login != 'dependabot[bot]')"
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
