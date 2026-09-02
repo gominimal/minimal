@@ -4738,6 +4738,7 @@ dependencies = [
  "ot",
  "rayon",
  "sandbox2",
+ "serde",
  "serde_json_lenient",
  "sha2 0.11.0",
  "shlex",

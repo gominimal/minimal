@@ -19,6 +19,7 @@ globset.workspace = true
 walkdir.workspace = true
 oci-spec.workspace = true
 rayon.workspace = true
+serde.workspace = true
 serde_json_lenient.workspace = true
 sha2.workspace = true
 shlex.workspace = true

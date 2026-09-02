@@ -42,6 +42,8 @@ pub use subsets::SubsetBuild;
 mod cache_clean;
 pub use cache_clean::{CleanCache, CleanEvent, CleanReport, StaleKind};
 
+pub mod notices;
+pub use notices::{NoticeFile, SourceNotices};
 mod sources;
 pub use sources::{SourceFetcher, SourceLoad};
 mod specs;

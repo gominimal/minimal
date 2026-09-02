@@ -243,7 +243,7 @@ impl Cache<LocalDir> {
     pub fn at_dir<P: AsRef<Path>>(p: P) -> Result<Self, std::io::Error> {
         let fs = LocalDir::with_base(p)?;
 
-        for dir in &["temp", "meta", "alog"] {
+        for dir in &["temp", "meta", "alog", "notices"] {
             match fs.mkdir(dir) {
                 Ok(()) => Ok(()),
                 Err(e) => {
@@ -296,6 +296,12 @@ impl Cache<LocalDir> {
 
         let p = self.inner().fs.path().join(subpath);
         std::fs::remove_dir_all(p).map_err(CacheErr::from)
+    }
+
+    /// Where upstream attribution files captured from extracted sources
+    /// live: `<cache>/notices/<source-sha256>.json`.
+    pub fn notices_dir(&self) -> PathBuf {
+        self.inner().fs.path().join("notices")
     }
 
     /// Allocates a temporary directory in the same filesystem as the rest of the cache.
