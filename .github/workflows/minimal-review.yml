@@ -119,8 +119,11 @@ jobs:
     # reason and was only ever reviewed by a hand-fired dispatch; four of
     # thirteen org members were invisible to the reviewer the same way.
     #
-    # The author is tested by permission instead, in the first step below,
-    # where an API call is possible and an expression is not. An earlier draft
+    # The author is tested by permission instead, in the `Refuse a PR whose
+    # author lacks write` step below, where an API call is possible and an
+    # expression is not. Named rather than positioned: it was "the first step"
+    # until a step was added above it, which is the kind of claim a reader
+    # trusts without rechecking. An earlier draft
     # of this change leaned on the head-repo test alone, reasoning that a branch
     # cannot exist here unless someone with write pushed it. That is true and it
     # is not the same claim: opening a PR from a branch somebody else pushed
@@ -163,10 +166,66 @@ jobs:
           fi
           echo "caller: $CALLER ($EVENT)"
 
+      # Who wrote the PR, answered by permission rather than by visibility.
+      #
+      # The job-level `if` tests same-repo and non-draft and stops there, on the
+      # reasoning that a branch cannot exist in this repo unless someone with
+      # write pushed it. True, and not the same as "the author has write":
+      # opening a PR from a branch someone else pushed needs only read.
+      # `brandonweeks` has `read` on gominimal/minimal, is not an org member,
+      # and authored non-draft same-repo PRs #1 and #11. Found by CodeRabbit on
+      # gominimal/minimal#1338, against my claim that every same-repo author was
+      # write or admin — a claim drawn from `gh pr list --limit 200` on a repo
+      # with 881 same-repo PRs, so the two counterexamples were outside the
+      # sample. Full audit since: 2431 same-repo PRs across the fleet, one
+      # author below write.
+      #
+      # `author_association` cannot answer this. It reports MEMBER only for a
+      # PUBLIC org member, so it refused four of thirteen members here while
+      # admitting nobody it should have. Permission is the property that matters
+      # and the API states it directly.
+      #
+      # Falls back rather than fails closed. If the endpoint is unreadable with
+      # this token, refusing every PR would take the fleet down for a
+      # permissions detail, which is precisely how tonight started. The fallback
+      # is the association test — today's behaviour, no regression — with a
+      # warning naming the scope to fix. Not silent: a gate that quietly stopped
+      # checking is worse than one that never checked.
+      #
+      # It needs its own token. `github.token` carries this workflow's
+      # `permissions:` — contents: read, pull-requests: write — and the endpoint
+      # answers `403 Must have push access to view collaborator permission`
+      # without push, so the check would have fallen back on every single run
+      # and the gate would have been decorative. CodeRabbit flagged that on
+      # gominimal/foundry#69 before it ever ran. Raising the workflow's own
+      # ceiling was the wrong fix: that ceiling is the most the reviewer can
+      # ever hold in an install, and widening it to read collaborators widens it
+      # everywhere, permanently, for one lookup.
+      #
+      # So: a second App token, scoped to this one repo and to Administration
+      # read alone. It cannot write anything, cannot see another repo, and is
+      # gone when the step ends. The App-token step further down stays scoped to
+      # foundry and broker; the two are deliberately not merged, because that
+      # one is a checkout credential and this one is a gate.
+      - name: Mint a read-only token for the author check
+        id: author-token
+        if: github.event_name != 'workflow_dispatch'
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ vars.AW_BOT_APP_ID }}
+          private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
+          owner: gominimal
+          repositories: ${{ github.event.repository.name }}
+          permission-administration: read
+          permission-metadata: read
+
       - name: Refuse a PR whose author lacks write
         if: github.event_name != 'workflow_dispatch'
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Falls back to github.token if the mint above failed — which only
+          # moves the failure to the API call, where the fallback already is.
+          GH_TOKEN: ${{ steps.author-token.outputs.token || github.token }}
           CALLER: ${{ github.repository }}
           # On a comment run the person to check is the commenter, not the PR
           # author: `/review` is the thing being authorised. workflow_dispatch
@@ -176,40 +235,61 @@ jobs:
           ASSOCIATION: ${{ github.event_name == 'issue_comment' && github.event.comment.author_association || github.event.pull_request.author_association }}
         run: |
           set -uo pipefail
+          # "the PR author" is wrong on a comment run, where the subject is the
+          # commenter. Say which, because these messages are the whole
+          # explanation someone gets when a review does not appear.
+          if [ "${GITHUB_EVENT_NAME:-}" = "issue_comment" ]; then
+            WHO="commenter"
+          else
+            WHO="PR author"
+          fi
+
           # A Bot means opposite things on the two paths, so it cannot be one
           # rule. An App that OPENS a PR pushed its own branch and has no
-          # collaborator record to look up — dependabot and gominimal-aw-bot are
-          # both Bot and both CONTRIBUTOR, and refusing them stops every
+          # collaborator record to look up, and refusing dependabot stops every
           # dependency bump. An App that COMMENTS `/review` is a bot starting a
           # paid run, which is the loop nobody asked for; CodeRabbit alone
           # comments on most PRs here.
+          #
+          # Named, not typed. `user.type == 'Bot'` waived the check for the
+          # whole class of App accounts, which is the same unaudited "surely
+          # they must have write" reasoning `brandonweeks` disproved for humans
+          # two paragraphs up — and no equivalent audit was ever run for Apps.
+          # minimal-review made exactly that comparison on gominimal/foundry#69
+          # (medium, 0.65) and on gominimal/minimal#1338 (medium, 0.60, two
+          # personas). Any other App gets the same lookup a human gets.
           if [ "$AUTHOR_TYPE" = "Bot" ]; then
             if [ "${GITHUB_EVENT_NAME:-}" = "issue_comment" ]; then
               echo "::error::$AUTHOR is an App and a bot may not start a review by comment. Refusing."
               exit 1
             fi
-            echo "author $AUTHOR is an App; permission check does not apply"
-            exit 0
+            case "$AUTHOR" in
+              dependabot|dependabot\[bot\]|gominimal-aw-bot|gominimal-aw-bot\[bot\])
+                echo "author $AUTHOR is a known App with no collaborator record; permission check does not apply"
+                exit 0 ;;
+              *)
+                echo "$AUTHOR is an App, but not one of the two named here; checking its permission like any other author" ;;
+            esac
           fi
 
           if perm="$(gh api "repos/$CALLER/collaborators/$AUTHOR/permission" \
                        --jq .permission 2>/tmp/permerr)"; then
             case "$perm" in
               admin|maintain|write)
-                echo "author $AUTHOR has $perm on $CALLER" ;;
+                echo "$WHO $AUTHOR has $perm on $CALLER" ;;
               *)
-                echo "::error::PR author $AUTHOR has '$perm' on $CALLER, not write. The branch was pushed by someone else; opening a PR from it needs only read. Refusing before any credential is minted."
+                echo "::error::$WHO $AUTHOR has '$perm' on $CALLER, not write. Refusing before any credential is minted."
                 exit 1 ;;
             esac
             exit 0
           fi
 
-          echo "::warning::could not read repos/$CALLER/collaborators/$AUTHOR/permission ($(tr -d '\n' < /tmp/permerr | cut -c1-200)). Falling back to author_association, which cannot see a private org member. Grant this workflow's token the scope to read collaborator permissions and this stops being approximate."
+          echo "::warning::could not read repos/$CALLER/collaborators/$AUTHOR/permission ($(tr -d '\n' < /tmp/permerr | cut -c1-200)). Falling back to author_association, which reports a private org member as CONTRIBUTOR and will refuse them. Check that the aw-bot App is installed on $CALLER with Administration:read — the token minted for this step needs it."
           case "$ASSOCIATION" in
             OWNER|MEMBER|COLLABORATOR)
               echo "fallback: $AUTHOR is $ASSOCIATION" ;;
             *)
-              echo "::error::PR author $AUTHOR is $ASSOCIATION and the permission API was unreadable, so nothing here can confirm write access. Refusing."
+              echo "::error::$WHO $AUTHOR is $ASSOCIATION and the permission API was unreadable, so nothing here can confirm write access. Refusing."
               exit 1 ;;
           esac
 
