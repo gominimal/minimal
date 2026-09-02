@@ -815,6 +815,10 @@ fn fetch_focused(model: &Model) -> Vec<Effect> {
 pub struct DashOptions {
     /// `--minimal-dir` override; `None` uses the platform default state dir.
     pub minimal_dir: Option<PathBuf>,
+    /// `--config-dir` override; `None` uses the platform default config dir.
+    /// Resolved into session keys at attach so a dash-attach honors the
+    /// `[session-keys]` config just like `min session attach`.
+    pub config_dir: Option<PathBuf>,
     /// The loadout contribution the CLI composed at startup (default
     /// loadouts + user policy), re-sent with every create so `n` in dash
     /// matches `min session activate`. Composition needs the CLI crate's
@@ -893,7 +897,13 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                 Effect::Attach(key) => match providers.iter().find(|p| p.label == key.provider) {
                     Some(p) => {
                         let sock = p.sock.clone();
-                        attach_and_resume(&mut terminal, &sock, key.id, &mut model);
+                        attach_and_resume(
+                            &mut terminal,
+                            &sock,
+                            key.id,
+                            opts.config_dir.as_deref(),
+                            &mut model,
+                        );
                         inbox.push_back(Msg::Tick);
                     }
                     None => {
@@ -1067,23 +1077,34 @@ async fn exec_effect(
 }
 
 /// Suspend the TUI, attach to the session over ssh (blocking until the user
-/// detaches), then resume. The daemon recognizes `Ctrl-W` as detach.
+/// detaches), then resume. The session-key config is resolved from
+/// `config_dir` so the daemon adopts the user's detach/forward chord; a bad
+/// config is reported in the status bar rather than aborting the TUI.
 fn attach_and_resume(
     terminal: &mut TerminalGuard,
     sock: &std::path::Path,
     id: SessionId,
+    config_dir: Option<&std::path::Path>,
     model: &mut Model,
 ) {
-    let result = minimal_client::attach::attach_command(sock, id, None).and_then(|mut cmd| {
-        terminal.suspend();
-        let status = cmd.status();
-        // A failed resume leaves the TUI unusable; report it over the
-        // attach outcome.
-        terminal
-            .resume()
-            .context("restoring terminal after detach")?;
-        status.context("running ssh attach")
-    });
+    let session_keys = match minimal_client::attach::resolve_session_keys(config_dir) {
+        Ok(keys) => Some(keys),
+        Err(e) => {
+            model.status = Some(format!("error: {e:#}"));
+            return;
+        }
+    };
+    let result = minimal_client::attach::attach_command(sock, id, None, session_keys.as_ref())
+        .and_then(|mut cmd| {
+            terminal.suspend();
+            let status = cmd.status();
+            // A failed resume leaves the TUI unusable; report it over the
+            // attach outcome.
+            terminal
+                .resume()
+                .context("restoring terminal after detach")?;
+            status.context("running ssh attach")
+        });
     match result {
         Ok(status) => {
             model.status = Some(match status.code() {

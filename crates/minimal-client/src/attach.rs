@@ -8,6 +8,26 @@ use std::path::Path;
 
 use anyhow::Context as _;
 
+/// Read and validate the session-key config, returning the resolved
+/// [`sessions::keys::SessionKeys`] to negotiate at attach. A missing config
+/// file yields the shipped defaults; a present-but-invalid one (e.g. a
+/// termios-special leader) surfaces its error loudly so the user fixes the
+/// config rather than silently attaching with the wrong chord.
+///
+/// Only the interactive attach path needs the keys (non-interactive exec
+/// channels have no detach); callers pass `None` to [`attach_command`] for
+/// those.
+pub fn resolve_session_keys(
+    config_dir: Option<&Path>,
+) -> Result<sessions::keys::SessionKeys, anyhow::Error> {
+    let cfg_path = paths::minimal_config_dir_with_override(config_dir).join("config.toml");
+    let cfg = sessions::client::config::read_config_or_default(&cfg_path)
+        .map_err(|e| anyhow::anyhow!("reading session-keys config {cfg_path:?}: {e}"))?;
+    cfg.session_keys
+        .to_session_keys()
+        .map_err(|e| anyhow::anyhow!("invalid session-keys config: {e}"))
+}
+
 /// Shell-quote a string for safe interpolation into `sh -c`.
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
@@ -62,10 +82,17 @@ pub fn host_key_opts(known_hosts: &Path) -> [String; 2] {
 /// ssh handles termios/PTY management. The caller decides how to run the
 /// command: `min session attach` `exec()`s it, `min dash` spawns it as a
 /// child while suspended.
+///
+/// `session_keys` negotiates the configurable detach/forward chord per
+/// channel: when `Some`, each resolved key is sent as an env var (with a
+/// matching `SendEnv` option) the daemon reads back alongside
+/// `MINIMAL_SESSION_ID` and re-validates as a silent backstop. Pass `None`
+/// for non-interactive exec channels, which have no detach.
 pub fn attach_command(
     sock: &Path,
     id: sessions::SessionId,
     wire: Option<&str>,
+    session_keys: Option<&sessions::keys::SessionKeys>,
 ) -> Result<std::process::Command, anyhow::Error> {
     // ProxyCommand points at our own `proxy` subcommand so we don't
     // depend on socat or nc being installed.
@@ -87,7 +114,8 @@ pub fn attach_command(
     // full-path `min proxy …` that needs nothing but a POSIX `sh`, so force the
     // always-present `/bin/sh` rather than inherit the user's interactive shell.
     ssh.env("SHELL", "/bin/sh");
-    ssh.env("MINIMAL_SESSION_ID", id.to_string()).args([
+    ssh.env("MINIMAL_SESSION_ID", id.to_string());
+    ssh.args([
         "-o",
         "SendEnv=MINIMAL_SESSION_ID",
         // Forward the user's locale and timezone into the session, mirroring a
@@ -107,6 +135,37 @@ pub fn attach_command(
         "-o",
         &known_hosts_file,
     ]);
+    // Negotiate the session-key config per channel: send each resolved key
+    // as an env var the daemon reads back (alongside MINIMAL_SESSION_ID) and
+    // re-validates as a silent backstop. ssh's `SendEnv` forwards a var only
+    // when it's present in the child environment, so each `SendEnv` option is
+    // paired with its `env` set above. Only the interactive attach path sends
+    // these — exec/task channels pass `None`.
+    if let Some(keys) = session_keys {
+        ssh.env(sessions::keys::LEADER_ENV, keys.leader.as_config_str())
+            .env(
+                sessions::keys::DETACH_KEY_ENV,
+                keys.detach_key.as_config_str(),
+            )
+            .env(
+                sessions::keys::FORWARD_KEY_ENV,
+                keys.forward_key.as_config_str(),
+            )
+            .env(
+                sessions::keys::BELL_ENV,
+                if keys.bell_on_leader { "1" } else { "0" },
+            )
+            .args([
+                "-o",
+                &format!("SendEnv={}", sessions::keys::LEADER_ENV),
+                "-o",
+                &format!("SendEnv={}", sessions::keys::DETACH_KEY_ENV),
+                "-o",
+                &format!("SendEnv={}", sessions::keys::FORWARD_KEY_ENV),
+                "-o",
+                &format!("SendEnv={}", sessions::keys::BELL_ENV),
+            ]);
+    }
 
     // The interactive path opens the in-sandbox session shell via the daemon's
     // `shell_request`, which requires a PTY. Force one with `-tt` so ssh
@@ -182,7 +241,7 @@ mod tests {
     #[test]
     fn attach_command_targets_the_provider_alias() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None).unwrap();
+        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -199,7 +258,7 @@ mod tests {
     fn attach_command_with_exec_has_no_forced_pty() {
         let sock = PathBuf::from("/tmp/x/providers/local-minvmd0/ssh.sock");
         let wire = remote_command(&["min".to_string(), "run".to_string(), "test".to_string()]);
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), wire.as_deref()).unwrap();
+        let cmd = attach_command(&sock, sessions::SessionId::nil(), wire.as_deref(), None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -264,6 +323,104 @@ mod tests {
                 "min --version".to_string()
             ))
         );
+    }
+
+    /// The interactive attach path negotiates the session-key config: each
+    /// resolved key is set on the child env with a matching `SendEnv` option
+    /// so the daemon adopts the user's chord for that channel.
+    #[test]
+    fn attach_command_negotiates_session_keys_when_given() {
+        let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
+        let keys = sessions::keys::SessionKeys::default();
+        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, Some(&keys)).unwrap();
+
+        let env: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            env.get(sessions::keys::LEADER_ENV).map(String::as_str),
+            Some("ctrl-]")
+        );
+        assert_eq!(
+            env.get(sessions::keys::DETACH_KEY_ENV).map(String::as_str),
+            Some("d")
+        );
+        assert_eq!(
+            env.get(sessions::keys::FORWARD_KEY_ENV).map(String::as_str),
+            Some("ctrl-]")
+        );
+        assert_eq!(
+            env.get(sessions::keys::BELL_ENV).map(String::as_str),
+            Some("0")
+        );
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for name in [
+            sessions::keys::LEADER_ENV,
+            sessions::keys::DETACH_KEY_ENV,
+            sessions::keys::FORWARD_KEY_ENV,
+            sessions::keys::BELL_ENV,
+        ] {
+            assert!(
+                args.iter().any(|a| a == format!("SendEnv={name}").as_str()),
+                "missing SendEnv={name} in {args:?}",
+            );
+        }
+    }
+
+    /// Passing no session keys (`None`) sets no session-key env vars and asks
+    /// ssh to forward none: exec channels have no detach chord.
+    #[test]
+    fn attach_command_omits_session_keys_when_none() {
+        let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
+        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+
+        let env: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        for name in [
+            sessions::keys::LEADER_ENV,
+            sessions::keys::DETACH_KEY_ENV,
+            sessions::keys::FORWARD_KEY_ENV,
+            sessions::keys::BELL_ENV,
+        ] {
+            assert!(!env.contains_key(name), "{name} should not be set for exec");
+        }
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for name in [
+            sessions::keys::LEADER_ENV,
+            sessions::keys::DETACH_KEY_ENV,
+            sessions::keys::FORWARD_KEY_ENV,
+            sessions::keys::BELL_ENV,
+        ] {
+            assert!(
+                !args.iter().any(|a| a == format!("SendEnv={name}").as_str()),
+                "SendEnv={name} should not appear for exec in {args:?}",
+            );
+        }
     }
 
     /// A VM-backed provider dir carries the guest's recorded host key, so

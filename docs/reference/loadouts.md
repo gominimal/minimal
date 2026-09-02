@@ -455,6 +455,62 @@ follow_symlinks  = false
 A missing file is equivalent to the defaults; unknown keys are rejected so
 a typo (`[loadout]` for `[loadouts]`) fails loudly.
 
+### Session keys {#session-keys}
+
+The detach chord is configurable. The leader key (the chord that enters
+command mode) and its command-mode subcommand keys live under a
+`[session-keys]` section in the same `config.toml`.
+
+`[session-keys]` is client configuration, not a loadout: unlike everything a
+loadout composes, it is never baked into the session on activation. It is
+read fresh on every attach and negotiated per SSH channel, so each client —
+and each machine attaching to a session it didn't create — brings its own
+chord. The section is documented here only because that is where
+`config.toml` is described.
+
+```toml
+[session-keys]
+leader = "ctrl-]"
+bell_on_leader = false
+
+[session-keys.subcommands]
+detach = "d"
+forward = "ctrl-]"
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `leader` | `ctrl-]` | The chord that enters command mode, as a logical key name (`"ctrl-]"`, `"ctrl-^"`, `"d"`, …). Rejected loudly at load if termios-special (`ctrl-c`, `ctrl-w`, `ctrl-\`, … — consumed by the line discipline before the app) or wrapping-ambiguous (`ctrl-i` = TAB, `ctrl-m` = CR, …) |
+| `bell_on_leader` | `false` | Ring the terminal bell (BEL `0x07`) on entering command mode. The terminal renders it per its own bell config; minimal picks no modality |
+| `subcommands.detach` | `d` | The command-mode key that detaches the channel |
+| `subcommands.forward` | `ctrl-]` | The command-mode key that verbatim-forwards a leader byte down the PTY (for nested sessions). Defaults to the resolved `leader`, so a double-press forwards |
+
+Key names take one of two forms: `ctrl-<glyph>`, where the glyph is a single
+ASCII character in `@`..`~` (so `ctrl-2` and `ctrl-?` are rejected), or a
+single printable ASCII glyph such as `d`. Only `ctrl-` is configurable;
+`alt-`, `shift-`, `meta-`, and `super-` are rejected. The `ctrl-` prefix is
+case-insensitive and `ctrl-` letters normalise to lowercase, since `Ctrl+a`
+and `Ctrl+A` send the same control code. Plain glyphs are case-sensitive.
+
+The leader is negotiated with the daemon per attach channel — sent as env
+vars alongside `MINIMAL_SESSION_ID` — so two clients with different configs on
+the same session each get their own chord. The daemon re-validates the leader
+as a silent backstop: a chord it rejects is logged and only that field falls
+back to the default — your valid `detach`/`forward` remaps survive — never
+garbling the screen. As with `[loadouts]`, every field
+defaults and unknown keys are rejected, so an old config keeps parsing.
+
+Two caveats on that per-channel model:
+
+- **The banner's detach hint is mint-scoped.** The orientation banner prints
+  `MINIMAL_DETACH_HINT`, seeded from the channel that minted the shell. A
+  second client attaching with a remapped chord gets a *working* chord, but
+  the banner still advertises the minting channel's; trust your config over
+  the banner in that case.
+- **Bindings must not shadow each other.** A `detach` that equals the
+  `leader` or the `forward` key makes that other binding unreachable and is
+  rejected at load; the daemon's backstop reverts just the detach field.
+
 ## Listing loadouts
 
 [`min loadout list`](./cli-min.md#loadout-list-alias-ls) (alias:
@@ -701,7 +757,7 @@ attached session prints a two-line orientation banner:
 
 ```
 minimal · session api-server-4f2a · loadout default (built-in)
-detach: ctrl-w · no minimal.toml here — min init to add one
+detach: ctrl-] then d · no minimal.toml here — min init to add one
 ```
 
 The second line drops the `min init` pointer when the session workspace
