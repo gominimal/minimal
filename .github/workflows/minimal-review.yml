@@ -218,11 +218,27 @@ jobs:
       # ever hold in an install, and widening it to read collaborators widens it
       # everywhere, permanently, for one lookup.
       #
-      # So: a second App token, scoped to this one repo and to Administration
-      # read alone. It cannot write anything, cannot see another repo, and is
-      # gone when the step ends. The App-token step further down stays scoped to
-      # foundry and broker; the two are deliberately not merged, because that
-      # one is a checkout credential and this one is a gate.
+      # So: a second App token, scoped to this one repository and to Metadata
+      # read. It cannot write anything, cannot see another repo, and is gone when
+      # the step ends. The App-token step further down stays scoped to foundry
+      # and broker; the two are deliberately not merged, because that one is a
+      # checkout credential and this one is a gate.
+      #
+      # WHICH permission this endpoint wants is not settled, and this comment is
+      # not going to pretend otherwise. GitHub's REST reference lists it under
+      # Metadata; the endpoint's own page says "must have push access", which no
+      # read-only grant confers. Two reviewers read it two ways on this PR —
+      # CodeRabbit said Administration:read and Metadata:read establish nothing
+      # and it will 403; minimal-review said the docs put it under Metadata and
+      # that requesting an ungranted permission makes the mint itself fail.
+      # Both may be right. It cannot be settled from a text editor.
+      #
+      # So this asks for the least that could work, and every way it can go
+      # wrong degrades instead of breaking: an ungranted permission fails the
+      # mint, `continue-on-error` swallows that, the step falls back to
+      # `github.token`, and the API call then fails too and lands in the
+      # association fallback with a warning naming the scope. The first real run
+      # settles it — look for `has write on` in the log, or the warning.
       - name: Mint a read-only token for the author check
         id: author-token
         if: github.event_name != 'workflow_dispatch'
@@ -233,7 +249,6 @@ jobs:
           private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
           owner: gominimal
           repositories: ${{ github.event.repository.name }}
-          permission-administration: read
           permission-metadata: read
 
       - name: Refuse a PR whose author lacks write
