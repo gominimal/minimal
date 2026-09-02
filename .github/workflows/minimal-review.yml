@@ -104,10 +104,9 @@ jobs:
     #
     # CONTRIBUTOR is in the list, and it is not a widening to "anyone". A
     # private org member's comment carries CONTRIBUTOR, exactly as their PR
-    # does, so the narrower list reproduced the #1313 bug on the comment path —
-    # raised by minimal-review on gominimal/pkgmgr-rs#793 (high, 0.75), which
-    # correctly noted that a job-level `if` refusing them means the API check
-    # below never gets to run. A stranger with no commits here is NONE and is
+    # does, so the narrower list reproduced the #1313 bug on the comment path,
+    # and a job-level `if` that refuses them means the permission check below
+    # never runs at all. A stranger with no commits here is NONE and is
     # still refused for free. The set this admits is "has landed a commit in
     # this repo", and each one costs a runner start of about ten seconds before
     # the step below resolves their real permission and stops them — bounded,
@@ -119,9 +118,7 @@ jobs:
     # ones are twitchyliquid64's, who writes more review commentary on
     # gominimal/minimal than anyone. Matching only `/review\n` would have made
     # `/review` silently do nothing for exactly the person most likely to type
-    # it. `'/review\r'` covers CRLF and a lone CR both. Raised by minimal-review
-    # on gominimal/pkgmgr-rs#793 at 0.55 with two personas agreeing; it flagged
-    # the risk from a community thread and could not check the bodies itself.
+    # it. `'/review\r'` covers CRLF and a lone CR both.
     #
     # This gate is repeated in the caller, and that copy is the one that stops
     # the job from starting. This one is the backstop: the caller's file can be
@@ -189,12 +186,10 @@ jobs:
       # write pushed it. True, and not the same as "the author has write":
       # opening a PR from a branch someone else pushed needs only read.
       # `brandonweeks` has `read` on gominimal/minimal, is not an org member,
-      # and authored non-draft same-repo PRs #1 and #11. Found by CodeRabbit on
-      # gominimal/minimal#1338, against my claim that every same-repo author was
-      # write or admin — a claim drawn from `gh pr list --limit 200` on a repo
-      # with 881 same-repo PRs, so the two counterexamples were outside the
-      # sample. Full audit since: 2431 same-repo PRs across the fleet, one
-      # author below write.
+      # and authored non-draft same-repo PRs #1 and #11. An audit of all 2431
+      # same-repo PRs across the fleet finds exactly that one author below
+      # write — a count worth knowing, because an earlier check of the most
+      # recent 200 PRs on an 881-PR repo found none and read as proof.
       #
       # `author_association` cannot answer this. It reports MEMBER only for a
       # PUBLIC org member, so it refused four of thirteen members here while
@@ -212,8 +207,7 @@ jobs:
       # `permissions:` — contents: read, pull-requests: write — and the endpoint
       # answers `403 Must have push access to view collaborator permission`
       # without push, so the check would have fallen back on every single run
-      # and the gate would have been decorative. CodeRabbit flagged that on
-      # gominimal/foundry#69 before it ever ran. Raising the workflow's own
+      # and the gate would have been decorative. Raising the workflow's own
       # ceiling was the wrong fix: that ceiling is the most the reviewer can
       # ever hold in an install, and widening it to read collaborators widens it
       # everywhere, permanently, for one lookup.
@@ -227,11 +221,9 @@ jobs:
       # WHICH permission this endpoint wants is not settled, and this comment is
       # not going to pretend otherwise. GitHub's REST reference lists it under
       # Metadata; the endpoint's own page says "must have push access", which no
-      # read-only grant confers. Two reviewers read it two ways on this PR —
-      # CodeRabbit said Administration:read and Metadata:read establish nothing
-      # and it will 403; minimal-review said the docs put it under Metadata and
-      # that requesting an ungranted permission makes the mint itself fail.
-      # Both may be right. It cannot be settled from a text editor.
+      # read-only grant confers. Both readings are defensible, and requesting a
+      # permission the installation lacks makes the mint itself fail rather
+      # than the call. It cannot be settled from a text editor.
       #
       # So this asks for the least that could work, and every way it can go
       # wrong degrades instead of breaking: an ungranted permission fails the
@@ -285,20 +277,16 @@ jobs:
           # whole class of App accounts, which is the same unaudited "surely
           # they must have write" reasoning `brandonweeks` disproved for humans
           # two paragraphs up — and no equivalent audit was ever run for Apps.
-          # minimal-review made exactly that comparison on gominimal/foundry#69
-          # (medium, 0.65) and on gominimal/minimal#1338 (medium, 0.60, two
-          # personas). Any other App gets the same lookup a human gets.
+          # Any other App gets the same lookup a human gets.
           #
           # dependabot is refused here rather than waved through, and the arm is
           # not dead code even though the caller's gate already excludes it. That
           # gate lives in a file the PR under review can edit; this one does not.
-          # minimal-review called the arm unreachable on
-          # gominimal/minimal-skills#17 (low, 0.60) and was right for the
-          # standalone copies, where both live in the same file — but a stub
-          # caller with its clause removed would land here, and skipping the
-          # check would send it on to a token mint that cannot succeed. Saying
-          # why beats failing four steps later with "private-key must be
-          # non-empty".
+          # In a generated standalone copy the two sit in the same file and this
+          # arm is unreachable; in a stub caller it is not, and skipping the
+          # check there would send the run on to a token mint that cannot
+          # succeed. Saying why beats failing four steps later with
+          # "private-key must be set to a non-empty string".
           if [ "$AUTHOR_TYPE" = "Bot" ]; then
             if [ "${GITHUB_EVENT_NAME:-}" = "issue_comment" ]; then
               echo "::error::$AUTHOR is an App and a bot may not start a review by comment. Refusing."
