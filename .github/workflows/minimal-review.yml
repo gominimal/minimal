@@ -279,12 +279,10 @@ jobs:
           # two paragraphs up — and no equivalent audit was ever run for Apps.
           # Any other App gets the same lookup a human gets.
           #
-          # The dependabot arm is unreachable today and kept anyway. This job's
-          # own `if` excludes that login, and a called workflow's `if` is
-          # evaluated against the same triggering event as the caller's, so it
-          # holds no matter what a stale or PR-edited caller says — an earlier
-          # version of this comment argued the opposite and was wrong about the
-          # semantics.
+          # The dependabot arm is unreachable on the pull_request path and kept
+          # anyway. This job's own `if` excludes that login, and a called
+          # workflow's `if` is evaluated against the same triggering event as
+          # the caller's, so it holds whatever a stale or PR-edited caller says.
           #
           # It stays because it is one line and it is the only place that names
           # the cause. Drop the exclusion from either gate — which is exactly
@@ -292,6 +290,14 @@ jobs:
           # run lands here. Refusing with a reason beats reaching a token mint
           # that fails four steps later on "private-key must be set to a
           # non-empty string".
+          #
+          # `/review` on a dependabot PR is a different matter and deliberately
+          # allowed. That run is triggered by the commenter, not by dependabot,
+          # so it reads Actions secrets normally and the mint succeeds — which
+          # makes it the one way to get a dependency bump reviewed today. The
+          # check below authorises the commenter, which is the right subject:
+          # they are the one asking for the review, and the PR's own author is
+          # not in a position to spend anything.
           if [ "$AUTHOR_TYPE" = "Bot" ]; then
             if [ "${GITHUB_EVENT_NAME:-}" = "issue_comment" ]; then
               echo "::error::$AUTHOR is an App and a bot may not start a review by comment. Refusing."
