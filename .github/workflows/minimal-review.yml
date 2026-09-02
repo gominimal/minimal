@@ -84,7 +84,19 @@ jobs:
     # on issue comments too, and on a public install anyone at all can post one,
     # so all four clauses have to hold: it must be a PR, the body must ask,
     # and the person asking must be one of ours. No Bot clause here — a bot's
-    # comment starting a paid review is a loop nobody asked for.
+    # comment starting a paid review is a loop nobody asked for, and the step
+    # below refuses one by name.
+    #
+    # CONTRIBUTOR is in the list, and it is not a widening to "anyone". A
+    # private org member's comment carries CONTRIBUTOR, exactly as their PR
+    # does, so the narrower list reproduced the #1313 bug on the comment path —
+    # raised by minimal-review on gominimal/pkgmgr-rs#793 (high, 0.75), which
+    # correctly noted that a job-level `if` refusing them means the API check
+    # below never gets to run. A stranger with no commits here is NONE and is
+    # still refused for free. The set this admits is "has landed a commit in
+    # this repo", and each one costs a runner start of about ten seconds before
+    # the step below resolves their real permission and stops them — bounded,
+    # and ahead of the quiet window and the token mint.
     #
     # Both line endings, because GitHub does not normalise a comment body and
     # some clients send CRLF. Measured across 600 multi-line comments in this
@@ -128,7 +140,7 @@ jobs:
       startsWith(github.event.comment.body, '/review ') ||
       startsWith(github.event.comment.body, '/review\n') ||
       startsWith(github.event.comment.body, '/review\r')) &&
-      contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'),
+      contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\",\"CONTRIBUTOR\"]'),
       github.event.comment.author_association)) ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.draft != true)"
@@ -151,6 +163,58 @@ jobs:
           fi
           echo "caller: $CALLER ($EVENT)"
 
+      - name: Refuse a PR whose author lacks write
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CALLER: ${{ github.repository }}
+          # On a comment run the person to check is the commenter, not the PR
+          # author: `/review` is the thing being authorised. workflow_dispatch
+          # is excluded above — GitHub already requires write to fire one.
+          AUTHOR: ${{ github.event_name == 'issue_comment' && github.event.comment.user.login || github.event.pull_request.user.login }}
+          AUTHOR_TYPE: ${{ github.event_name == 'issue_comment' && github.event.comment.user.type || github.event.pull_request.user.type }}
+          ASSOCIATION: ${{ github.event_name == 'issue_comment' && github.event.comment.author_association || github.event.pull_request.author_association }}
+        run: |
+          set -uo pipefail
+          # A Bot means opposite things on the two paths, so it cannot be one
+          # rule. An App that OPENS a PR pushed its own branch and has no
+          # collaborator record to look up — dependabot and gominimal-aw-bot are
+          # both Bot and both CONTRIBUTOR, and refusing them stops every
+          # dependency bump. An App that COMMENTS `/review` is a bot starting a
+          # paid run, which is the loop nobody asked for; CodeRabbit alone
+          # comments on most PRs here.
+          if [ "$AUTHOR_TYPE" = "Bot" ]; then
+            if [ "${GITHUB_EVENT_NAME:-}" = "issue_comment" ]; then
+              echo "::error::$AUTHOR is an App and a bot may not start a review by comment. Refusing."
+              exit 1
+            fi
+            echo "author $AUTHOR is an App; permission check does not apply"
+            exit 0
+          fi
+
+          if perm="$(gh api "repos/$CALLER/collaborators/$AUTHOR/permission" \
+                       --jq .permission 2>/tmp/permerr)"; then
+            case "$perm" in
+              admin|maintain|write)
+                echo "author $AUTHOR has $perm on $CALLER" ;;
+              *)
+                echo "::error::PR author $AUTHOR has '$perm' on $CALLER, not write. The branch was pushed by someone else; opening a PR from it needs only read. Refusing before any credential is minted."
+                exit 1 ;;
+            esac
+            exit 0
+          fi
+
+          echo "::warning::could not read repos/$CALLER/collaborators/$AUTHOR/permission ($(tr -d '\n' < /tmp/permerr | cut -c1-200)). Falling back to author_association, which cannot see a private org member. Grant this workflow's token the scope to read collaborator permissions and this stops being approximate."
+          case "$ASSOCIATION" in
+            OWNER|MEMBER|COLLABORATOR)
+              echo "fallback: $AUTHOR is $ASSOCIATION" ;;
+            *)
+              echo "::error::PR author $AUTHOR is $ASSOCIATION and the permission API was unreadable, so nothing here can confirm write access. Refusing."
+              exit 1 ;;
+          esac
+
+      # Wait before spending anything, so a burst of pushes cancels this run
+      # before the agent starts rather than halfway through it.
       - name: Quiet window
         id: quiet
         if: github.event_name == 'pull_request'
