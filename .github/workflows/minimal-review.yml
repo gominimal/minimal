@@ -277,10 +277,9 @@ jobs:
 
           # A Bot means opposite things on the two paths, so it cannot be one
           # rule. An App that OPENS a PR pushed its own branch and has no
-          # collaborator record to look up, and refusing dependabot stops every
-          # dependency bump. An App that COMMENTS `/review` is a bot starting a
-          # paid run, which is the loop nobody asked for; CodeRabbit alone
-          # comments on most PRs here.
+          # collaborator record to look up. An App that COMMENTS `/review` is a
+          # bot starting a paid run, which is the loop nobody asked for;
+          # CodeRabbit alone comments on most PRs here.
           #
           # Named, not typed. `user.type == 'Bot'` waived the check for the
           # whole class of App accounts, which is the same unaudited "surely
@@ -289,17 +288,31 @@ jobs:
           # minimal-review made exactly that comparison on gominimal/foundry#69
           # (medium, 0.65) and on gominimal/minimal#1338 (medium, 0.60, two
           # personas). Any other App gets the same lookup a human gets.
+          #
+          # dependabot is refused here rather than waved through, and the arm is
+          # not dead code even though the caller's gate already excludes it. That
+          # gate lives in a file the PR under review can edit; this one does not.
+          # minimal-review called the arm unreachable on
+          # gominimal/minimal-skills#17 (low, 0.60) and was right for the
+          # standalone copies, where both live in the same file — but a stub
+          # caller with its clause removed would land here, and skipping the
+          # check would send it on to a token mint that cannot succeed. Saying
+          # why beats failing four steps later with "private-key must be
+          # non-empty".
           if [ "$AUTHOR_TYPE" = "Bot" ]; then
             if [ "${GITHUB_EVENT_NAME:-}" = "issue_comment" ]; then
               echo "::error::$AUTHOR is an App and a bot may not start a review by comment. Refusing."
               exit 1
             fi
             case "$AUTHOR" in
-              dependabot|dependabot\[bot\]|gominimal-aw-bot|gominimal-aw-bot\[bot\])
+              dependabot|dependabot\[bot\])
+                echo "::error::$AUTHOR cannot be reviewed: a dependabot run reads the Dependabot secret store, not Actions secrets, so the App token cannot be minted. Every such run has failed at that step. Put the secrets in this repo's Dependabot store and drop the exclusion from the caller's gate."
+                exit 1 ;;
+              gominimal-aw-bot|gominimal-aw-bot\[bot\])
                 echo "author $AUTHOR is a known App with no collaborator record; permission check does not apply"
                 exit 0 ;;
               *)
-                echo "$AUTHOR is an App, but not one of the two named here; checking its permission like any other author" ;;
+                echo "$AUTHOR is an App, but not one this file names; checking its permission like any other author" ;;
             esac
           fi
 
