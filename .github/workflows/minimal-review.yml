@@ -107,18 +107,14 @@ jobs:
     # reason and was only ever reviewed by a hand-fired dispatch; four of
     # thirteen org members were invisible to the reviewer the same way.
     #
-    # The head-repo test below carries almost all of it: a branch cannot exist
-    # in this repo unless someone with write pushed it. Checked against every
-    # same-repo PR author on gominimal/minimal — all write or admin, the only
-    # two exceptions being dependabot and gominimal-aw-bot, which is precisely
-    # what the Bot clause existed to rescue.
-    #
-    # Almost, not all. Someone with only read can open a PR from a branch
-    # somebody else pushed, and draw a review their own access would not have
-    # earned. That case is accepted, not overlooked: it has not occurred in 200
-    # PRs, the cost is one advisory comment, and anyone who can push a branch
-    # here can already run arbitrary Actions in this repo — so the reviewer
-    # reaches nothing the branch did not already reach.
+    # The author is tested by permission instead, in the first step below,
+    # where an API call is possible and an expression is not. An earlier draft
+    # of this change leaned on the head-repo test alone, reasoning that a branch
+    # cannot exist here unless someone with write pushed it. That is true and it
+    # is not the same claim: opening a PR from a branch somebody else pushed
+    # needs only read, and `brandonweeks` — `read`, not an org member — authored
+    # non-draft same-repo PRs #1 and #11 on gominimal/minimal. So the `if` is a
+    # cheap filter and the step is the test.
     #
     # A double-quoted scalar, not `>-`, and the difference matters: in a folded
     # block `\n` stays two characters, so the newline clause below would test
