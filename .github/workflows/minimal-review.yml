@@ -308,7 +308,10 @@ jobs:
                 echo "::error::$AUTHOR cannot be reviewed: a dependabot run reads the Dependabot secret store, not Actions secrets, so the App token cannot be minted. Every such run has failed at that step. Put the secrets in this repo's Dependabot store and drop the exclusion from the caller's gate."
                 exit 1 ;;
               gominimal-aw-bot|gominimal-aw-bot\[bot\])
-                echo "author $AUTHOR is a known App with no collaborator record; permission check does not apply"
+                # By name because there is nothing to look up: the permission
+                # endpoint answers `404 gominimal-aw-bot is not a user` for an
+                # App. A lookup-only rule would refuse every App there is.
+                echo "author $AUTHOR is a known App and has no collaborator record to check"
                 exit 0 ;;
               *)
                 echo "$AUTHOR is an App, but not one this file names; checking its permission like any other author" ;;
