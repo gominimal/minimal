@@ -86,6 +86,16 @@ jobs:
     # and the person asking must be one of ours. No Bot clause here — a bot's
     # comment starting a paid review is a loop nobody asked for.
     #
+    # Both line endings, because GitHub does not normalise a comment body and
+    # some clients send CRLF. Measured across 600 multi-line comments in this
+    # org: 43901 bare LF and 378 CRLF — rare, but not theoretical, and the CRLF
+    # ones are twitchyliquid64's, who writes more review commentary on
+    # gominimal/minimal than anyone. Matching only `/review\n` would have made
+    # `/review` silently do nothing for exactly the person most likely to type
+    # it. `'/review\r'` covers CRLF and a lone CR both. Raised by minimal-review
+    # on gominimal/pkgmgr-rs#793 at 0.55 with two personas agreeing; it flagged
+    # the risk from a community thread and could not check the bodies itself.
+    #
     # This gate is repeated in the caller, and that copy is the one that stops
     # the job from starting. This one is the backstop: the caller's file can be
     # edited by the PR under review, and this file cannot.
@@ -97,14 +107,18 @@ jobs:
     # reason and was only ever reviewed by a hand-fired dispatch; four of
     # thirteen org members were invisible to the reviewer the same way.
     #
-    # Nothing is given up by dropping it. The head-repo test below already
-    # proves write access, because a branch cannot exist in this repo unless
-    # someone with write pushed it — checked against every same-repo PR author
-    # on gominimal/minimal, all of them write or admin, the only two exceptions
-    # being dependabot and gominimal-aw-bot, which is precisely what the Bot
-    # clause existed to rescue. Anyone who can push a branch here can already
-    # run arbitrary Actions in this repo, so the reviewer reaches nothing the
-    # branch did not already reach.
+    # The head-repo test below carries almost all of it: a branch cannot exist
+    # in this repo unless someone with write pushed it. Checked against every
+    # same-repo PR author on gominimal/minimal — all write or admin, the only
+    # two exceptions being dependabot and gominimal-aw-bot, which is precisely
+    # what the Bot clause existed to rescue.
+    #
+    # Almost, not all. Someone with only read can open a PR from a branch
+    # somebody else pushed, and draw a review their own access would not have
+    # earned. That case is accepted, not overlooked: it has not occurred in 200
+    # PRs, the cost is one advisory comment, and anyone who can push a branch
+    # here can already run arbitrary Actions in this repo — so the reviewer
+    # reaches nothing the branch did not already reach.
     #
     # A double-quoted scalar, not `>-`, and the difference matters: in a folded
     # block `\n` stays two characters, so the newline clause below would test
@@ -116,7 +130,8 @@ jobs:
       github.event.issue.pull_request != null &&
       (github.event.comment.body == '/review' ||
       startsWith(github.event.comment.body, '/review ') ||
-      startsWith(github.event.comment.body, '/review\n')) &&
+      startsWith(github.event.comment.body, '/review\n') ||
+      startsWith(github.event.comment.body, '/review\r')) &&
       contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'),
       github.event.comment.author_association)) ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
