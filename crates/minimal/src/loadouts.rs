@@ -79,7 +79,7 @@ description = "orientation banner and shaped prompt"
 PROMPT_COMMAND = 'eval "$MINIMAL_MOTD"; unset PROMPT_COMMAND MINIMAL_MOTD'
 PS1 = 'minimal:\w\$ '
 MINIMAL_MOTD = '''
-[ -t 1 ] && { printf '\n     ████  ████▄\n  ▄▄▄ ▀███▄ ▀███▄\n  ▀███  ▀███  ▀███\n\n'; printf '  minimal · session %s · loadout %s\n  detach: ctrl-w' "${MINIMAL_SESSION_NAME:-unnamed}" "${MINIMAL_LOADOUTS:-default (built-in)}"; [ -f /workbench/minimal.toml ] || [ -f /workbench/.minimal/minimal.toml ] || printf ' · no minimal.toml here — min init to add one'; printf '\n\n  Add tools to this box:   min add --session <pkg>\n  Search the registry:     min search <query>\n\n'; }
+[ -t 1 ] && { printf '\n     ████  ████▄\n  ▄▄▄ ▀███▄ ▀███▄\n  ▀███  ▀███  ▀███\n\n'; printf '  minimal · session %s · loadout %s\n  detach: %s' "${MINIMAL_SESSION_NAME:-unnamed}" "${MINIMAL_LOADOUTS:-default (built-in)}" "${MINIMAL_DETACH_HINT:-ctrl-] then d}"; [ -f /workbench/minimal.toml ] || [ -f /workbench/.minimal/minimal.toml ] || printf ' · no minimal.toml here — min init to add one'; printf '\n\n  Add tools to this box:   min add --session <pkg>\n  Search the registry:     min search <query>\n\n'; }
 '''
 "#;
 
@@ -889,7 +889,8 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             !motd.contains("MINIMAL_BLUEPRINT"),
             "blueprint is a session-filesystem fact, not an env var"
         );
-        assert!(motd.contains("detach: ctrl-w"));
+        assert!(motd.contains("detach: %s"));
+        assert!(motd.contains("${MINIMAL_DETACH_HINT:-ctrl-] then d}"));
         assert!(motd.contains("min init"));
     }
 

@@ -15,6 +15,7 @@ use mctx::ConfigBuilder;
 use ot::OpTracker;
 use paths::DaemonAbsPath;
 use russh::{Channel, server::Msg};
+use sessions::keys::SessionKeys;
 use sessions::wire::request::ContributionResponse;
 use sessions::{
     Record, SessionStatus,
@@ -248,8 +249,11 @@ pub(crate) fn registry_name(record: &Record) -> String {
 /// The server-side `AcceptEnv` allowlist: locale and timezone vars a client is
 /// permitted to forward from its shell into the session (OpenSSH's default
 /// `AcceptEnv LANG LC_*`, plus `TZ`). Everything else the client set on the
-/// channel — e.g. `MINIMAL_SESSION_ID`, `TRACEPARENT` — is control plumbing and
-/// must not leak into the shell environment, so it is filtered out here.
+/// channel — e.g. `MINIMAL_SESSION_ID`, `TRACEPARENT`, and the session-key
+/// negotiation vars in `sessions::keys` (`LEADER_ENV`, `DETACH_KEY_ENV`,
+/// `FORWARD_KEY_ENV`, `BELL_ENV`) — is control plumbing read by the daemon's
+/// `shell_request` (and re-validated as a backstop) and must not leak into the
+/// shell environment, so it is filtered out here.
 fn inherited_session_env(
     channel_env: &std::collections::BTreeMap<String, String>,
 ) -> Vec<(String, String)> {
@@ -1665,14 +1669,21 @@ impl Session {
         // Capture the environment this attach contributes to the shell it may
         // mint: the locale/timezone vars the client forwarded (folded as
         // defaults below the composition) and the per-connection facts folded
-        // above it. Currently the only connection fact is `TERM`, from the
-        // client's PTY request.
+        // above it — `TERM` from the client's PTY request, and the banner's
+        // detach hint derived from the negotiated keys below.
         //
         // `SSH_TTY` and `SSH_CONNECTION`/`SSH_CLIENT` are intentionally omitted:
         // the session sandbox has no host `/dev/pts` and the transport is a
         // local Unix socket (no peer IP/port), so any value would name something
         // that doesn't exist in-session and would only mislead audit logs,
         // source-IP checks, or `$SSH_TTY` consumers.
+        // The negotiated session keys: the leader chord and detach/forward
+        // subcommand keys the client sent on this channel, re-validated here as
+        // a silent safety backstop (a bad chord falls back to the default,
+        // never garbling the screen). Per-channel: two clients with different
+        // configs on the same session each get their own chord.
+        let session_keys = SessionKeys::from_env(&config.env_vars).validated_or_default();
+
         let attach_env = {
             let inherited = inherited_session_env(&config.env_vars);
             let mut connection = Vec::new();
@@ -1696,6 +1707,20 @@ impl Session {
                      keeping the last published TERM"
                 ),
             }
+            // The orientation banner's detach hint: derived from the negotiated
+            // keys so a remapped leader/detach chord advertises itself. Seeded
+            // daemon-side (like MINIMAL_SESSION_NAME), never forwarded from the
+            // client — the client sends raw key names, the daemon builds the
+            // display string. The MOTD template interpolates this with a
+            // `${VAR:-fallback}` so an unset var (no negotiation) still renders.
+            connection.push((
+                "MINIMAL_DETACH_HINT".to_string(),
+                format!(
+                    "{} then {}",
+                    session_keys.leader.as_config_str(),
+                    session_keys.detach_key.as_config_str(),
+                ),
+            ));
             session_host::AttachEnv {
                 inherited,
                 connection,
@@ -1795,7 +1820,7 @@ impl Session {
         // improve `TERM` is a bad trade. That case rides on the per-attach
         // environment the host republishes instead.
         let respawn_for_terminal =
-            self.host_origin == HostOrigin::Hooks && !attach_env.connection.is_empty();
+            self.host_origin == HostOrigin::Hooks && attach_env.declares_terminal();
         if respawn_for_terminal
             && let SessionInner::Active {
                 host: slot @ Some(_),
@@ -1818,19 +1843,36 @@ impl Session {
         };
         match host {
             None => {
-                self.mint_session_host(session_hnd, conn_username, channel, sz, attach_env)
-                    .await
+                self.mint_session_host(
+                    session_hnd,
+                    conn_username,
+                    channel,
+                    sz,
+                    attach_env,
+                    session_keys,
+                )
+                .await
             }
             Some((h, _)) => {
                 // Every attach carries the connection facts, not just the one
                 // that mints the shell: `TERM` describes whichever terminal is
                 // on the other end of *this* channel.
-                match h.attach(channel, sz, attach_env.connection_env()).await {
+                match h
+                    .attach(channel, sz, attach_env.connection_env(), session_keys)
+                    .await
+                {
                     Ok(()) => Ok(()),
                     Err((channel, sz)) => {
                         // session host is dead
-                        self.mint_session_host(session_hnd, conn_username, channel, sz, attach_env)
-                            .await
+                        self.mint_session_host(
+                            session_hnd,
+                            conn_username,
+                            channel,
+                            sz,
+                            attach_env,
+                            session_keys,
+                        )
+                        .await
                     }
                 }
             }
@@ -2046,6 +2088,7 @@ impl Session {
         channel: Channel<Msg>,
         sz: WinSize,
         attach_env: session_host::AttachEnv,
+        session_keys: SessionKeys,
     ) -> Result<(), AttachError> {
         let progress = ChannelProgress::new(channel, self.tracker.clone(), (sz.cols, sz.rows));
         let (channel, launched) = self
@@ -2070,7 +2113,12 @@ impl Session {
         // them, and an empty map means "no revision", not "no terminal".
         launched
             .0
-            .attach(channel, sz, session_host::ConnectionEnv::new())
+            .attach(
+                channel,
+                sz,
+                session_host::ConnectionEnv::new(),
+                session_keys,
+            )
             .await
             .map_err(|_| {
                 AttachError::SpawnFailed(std::io::Error::other(
@@ -3841,12 +3889,13 @@ mod tests {
         );
     }
 
-    /// The ctrl-w detach chord (a single `0x17` byte) detaches the current
+    /// The detach chord (leader `ctrl-]` then `d`) detaches the current
     /// channel — sending a detach notice down it before it closes — without
     /// tearing the session down, so a later channel resumes it (the earlier
-    /// `got:hello` is flushed on reattach).
+    /// `got:hello` is flushed on reattach). The default keys apply because the
+    /// test's `open_shell` sends no session-key env vars.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ctrl_w_detaches_channel_then_session_resumes_on_reattach() {
+    async fn detach_chord_detaches_channel_then_session_resumes_on_reattach() {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
         let session_id = create_session(&mut client).await;
@@ -3872,9 +3921,12 @@ mod tests {
             }
         }
 
-        // Send the detach chord. The host writes a detach notice down the
-        // channel and then closes it.
-        first.data_bytes(vec![0x17]).await.unwrap();
+        // Send the detach chord as two separate chunks — the leader (0x1d)
+        // enters command mode (swallowed), then `d` detaches. (The streaming
+        // matcher also handles the two bytes coalesced into one chunk; split
+        // sends exercise the cross-chunk pending path instead.)
+        first.data_bytes(vec![0x1d]).await.unwrap();
+        first.data_bytes(vec![b'd']).await.unwrap();
         let mut detach_out = Vec::new();
         let mut first_closed = false;
         while let Ok(msg) = tokio::time::timeout(Duration::from_secs(5), first.wait()).await {
@@ -3889,7 +3941,7 @@ mod tests {
         }
         let detach_out = String::from_utf8_lossy(&detach_out);
         assert!(
-            detach_out.contains("Detaching due to ctrl-w."),
+            detach_out.contains("Detaching from session."),
             "expected a detach notice on the channel before it closed, got: {detach_out:?}",
         );
         assert!(first_closed, "channel should close after the detach chord");
@@ -3911,6 +3963,222 @@ mod tests {
         assert!(
             flushed.contains("got:hello"),
             "reattaching should flush prior terminal state, got: {flushed:?}",
+        );
+    }
+
+    /// A remapped leader (negotiated via env vars at attach) is honored: the
+    /// old default leader (`ctrl-]`, `0x1d`) no longer detaches — it forwards to
+    /// the shell — while the remapped leader (`ctrl-^`, `0x1e`) then the
+    /// remapped detach key (`x`) does. Proves the per-channel negotiation and
+    /// the dynamic matcher end-to-end through the real attach path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remapped_leader_detaches_old_leader_forwards() {
+        use sessions::keys::{DETACH_KEY_ENV, LEADER_ENV};
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        // Attach with a remapped leader (ctrl-^) and detach key (x).
+        let mut ch = client
+            .open_shell_with_keys(session_id, &[(LEADER_ENV, "ctrl-^"), (DETACH_KEY_ENV, "x")])
+            .await;
+
+        // The old default leader (0x1d, ctrl-]) must no longer detach: it
+        // forwards to the shell. Send it, then a normal line; the shell echoes
+        // both back, proving the channel survived (no detach fired).
+        ch.data_bytes(vec![0x1d]).await.unwrap();
+        ch.data_bytes(b"ping\n".to_vec()).await.unwrap();
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), ch.wait()).await {
+                Ok(Some(ChannelMsg::Data { data })) => {
+                    out.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&out).contains("got:") {
+                        break;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let out = String::from_utf8_lossy(&out);
+                    panic!(
+                        "channel closed after the old leader; it should have forwarded, got: {out:?}"
+                    );
+                }
+                Err(_) => panic!("timed out waiting for echo after the old leader"),
+            }
+        }
+
+        // The remapped leader (0x1e, ctrl-^) enters command mode (swallowed),
+        // then `x` detaches — sent as two separate chunks here to exercise the
+        // cross-chunk pending path; the coalesced form is covered by
+        // `reattach_renegotiates_the_chord_per_channel`.
+        ch.data_bytes(vec![0x1e]).await.unwrap();
+        ch.data_bytes(vec![b'x']).await.unwrap();
+        let mut detach_out = Vec::new();
+        let mut closed = false;
+        while let Ok(msg) = tokio::time::timeout(Duration::from_secs(5), ch.wait()).await {
+            match msg {
+                Some(ChannelMsg::Data { data }) => detach_out.extend_from_slice(&data),
+                Some(_) => {}
+                None => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        let detach_out = String::from_utf8_lossy(&detach_out);
+        assert!(
+            detach_out.contains("Detaching from session."),
+            "remapped chord should detach, got: {detach_out:?}",
+        );
+        assert!(
+            closed,
+            "channel should close after the remapped detach chord"
+        );
+    }
+
+    /// Drives `ch` until `needle` appears in its stdout (the mock echoes each
+    /// input line as `got:<line>`), panicking if the channel closes or stalls
+    /// first. Returns everything received anew.
+    async fn recv_until(ch: &mut russh::Channel<russh::client::Msg>, needle: &str) -> String {
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), ch.wait()).await {
+                Ok(Some(ChannelMsg::Data { data })) => {
+                    out.extend_from_slice(&data);
+                    let text = String::from_utf8_lossy(&out);
+                    if text.contains(needle) {
+                        return text.into_owned();
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("channel closed before {needle:?} appeared; got {out:?}"),
+                Err(_) => panic!("timed out waiting for {needle:?}; got {out:?}"),
+            }
+        }
+    }
+
+    /// Drains `ch` until it closes (e.g. after a detach chord), returning
+    /// everything received. Panics if the channel stays open.
+    async fn collect_to_close(ch: &mut russh::Channel<russh::client::Msg>) -> String {
+        let mut out = Vec::new();
+        while let Ok(msg) = tokio::time::timeout(Duration::from_secs(5), ch.wait()).await {
+            match msg {
+                Some(ChannelMsg::Data { data }) => out.extend_from_slice(&data),
+                Some(_) => {}
+                None => return String::from_utf8_lossy(&out).into_owned(),
+            }
+        }
+        panic!("channel did not close within the timeout; got {out:?}");
+    }
+
+    /// A client negotiating an unsafe leader (`ctrl-c`) hits the daemon's
+    /// silent backstop: the leader falls back to `ctrl-]` while the valid
+    /// detach remap (`x`) survives — the fallback is field-scoped, so the
+    /// effective chord is `ctrl-]` then `x`. The unsafe byte forwards as data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_leader_falls_back_to_default_chord() {
+        use sessions::keys::{DETACH_KEY_ENV, LEADER_ENV};
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        let mut ch = client
+            .open_shell_with_keys(session_id, &[(LEADER_ENV, "ctrl-c"), (DETACH_KEY_ENV, "x")])
+            .await;
+
+        // 0x03 must NOT enter command mode: it is data (the shell renders it
+        // `^C` and it never reaches the echoed line). If it had entered, the
+        // `x` below would be the detach subcommand and the channel would
+        // close; instead the mock echoes the line back.
+        ch.data_bytes(vec![0x03]).await.unwrap();
+        ch.data_bytes(b"xping\n".to_vec()).await.unwrap();
+        recv_until(&mut ch, "got:xping").await;
+
+        // The fallback chord — default leader, surviving detach remap — fires.
+        ch.data_bytes(vec![0x1d]).await.unwrap();
+        ch.data_bytes(b"x".to_vec()).await.unwrap();
+        let out = collect_to_close(&mut ch).await;
+        assert!(
+            out.contains("Detaching from session."),
+            "fallback leader + surviving detach remap should detach, got {out:?}"
+        );
+    }
+
+    /// Two channels on one session each get their own negotiated chord. The
+    /// first attach uses the defaults; the second negotiates `ctrl-^`/`x`,
+    /// finds its *own* old leader bytes (0x1d here) reduced to inert data,
+    /// and detaches via the remapped chord. Both chords are sent COALESCED —
+    // single SSH data messages exercising the streaming matcher's
+    // coalescing path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reattach_renegotiates_the_chord_per_channel() {
+        use sessions::keys::{DETACH_KEY_ENV, LEADER_ENV};
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        // First attach: defaults — detach via the coalesced `\x1dd` chord.
+        let mut first = client.open_shell(session_id).await;
+        first.data_bytes(b"boot\n".to_vec()).await.unwrap();
+        recv_until(&mut first, "got:boot").await;
+        first.data_bytes(b"\x1dd".to_vec()).await.unwrap();
+        let out = collect_to_close(&mut first).await;
+        assert!(
+            out.contains("Detaching from session."),
+            "coalesced default chord should detach, got {out:?}"
+        );
+
+        // Reattach with negotiated keys: the per-channel renegotiation.
+        let mut second = client
+            .open_shell_with_keys(session_id, &[(LEADER_ENV, "ctrl-^"), (DETACH_KEY_ENV, "x")])
+            .await;
+        // The old leader 0x1d is inert data on this channel: if it entered
+        // command mode, the `ping\n` below would be swallowed/mistaken; the
+        // mock echo proves it flowed as data instead.
+        second.data_bytes(vec![0x1d]).await.unwrap();
+        second.data_bytes(b"ping\n".to_vec()).await.unwrap();
+        recv_until(&mut second, "got:\u{1d}ping").await;
+        // The remapped chord, coalesced, detaches.
+        second.data_bytes(b"\x1ex".to_vec()).await.unwrap();
+        let out = collect_to_close(&mut second).await;
+        assert!(
+            out.contains("Detaching from session."),
+            "coalesced remapped chord should detach, got {out:?}"
+        );
+    }
+
+    /// An unbound subcommand key is swallowed and cancels command mode: the
+    /// key never reaches the shell, the line after forwards normally, and the
+    /// real chord still works afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unbound_subcommand_swallows_and_cancels_command_mode() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = create_session(&mut client).await;
+
+        let mut ch = client.open_shell(session_id).await;
+        ch.data_bytes(b"boot\n".to_vec()).await.unwrap();
+        recv_until(&mut ch, "got:boot").await;
+
+        // Leader enters command mode; `q` is unbound: swallowed, mode
+        // cancelled. The next line must arrive as plain `ping` — a leaked `q`
+        // would echo as `got:qping` and this would time out.
+        ch.data_bytes(vec![0x1d]).await.unwrap();
+        ch.data_bytes(b"q".to_vec()).await.unwrap();
+        ch.data_bytes(b"ping\n".to_vec()).await.unwrap();
+        recv_until(&mut ch, "got:ping").await;
+
+        // The real chord is unaffected by the cancelled attempt.
+        ch.data_bytes(vec![0x1d]).await.unwrap();
+        ch.data_bytes(b"d".to_vec()).await.unwrap();
+        let out = collect_to_close(&mut ch).await;
+        assert!(
+            out.contains("Detaching from session."),
+            "the chord should still detach after a cancelled command mode, got {out:?}"
         );
     }
 

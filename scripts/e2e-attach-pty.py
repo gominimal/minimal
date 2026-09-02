@@ -22,11 +22,12 @@ to fire `on_detach`):
   E2E_PTY_ANSWER    how to answer the session-exit prompt: `delete` (the
                     default, what the sandbox proof needs) or `keep`, which
                     leaves the session alive — a detach.
-  E2E_PTY_DETACH    set to leave via the ctrl-w detach chord once the command
-                    stream goes quiet, instead of ending it with `exit`. The
-                    session's SHELL then survives, which is what a test of
-                    re-attaching to a still-running shell needs: `exit` ends
-                    that shell, and the next attach mints a new one.
+  E2E_PTY_DETACH    set to leave via the session detach chord (the shipped
+                    default: `ctrl-]` then `d`) once the command stream goes
+                    quiet, instead of ending it with `exit`. The session's
+                    SHELL then survives, which is what a test of re-attaching
+                    to a still-running shell needs: `exit` ends that shell,
+                    and the next attach mints a new one.
 
 Prints the full captured terminal output on stdout. Exits 0 iff the attach
 process exited 0.
@@ -105,13 +106,18 @@ try:
             break  # EOF / closed
         buf.extend(chunk)
         quiet = 0 if chunk else quiet + 1
-        # The detach chord has to arrive as a WRITE OF ITS OWN: the daemon
-        # matches a *bare* ctrl-w (`b.len() == 1 && b[0] == 0x17`), so the same
-        # byte inside the command stream is not a detach — it reaches the shell,
-        # where readline eats it as delete-previous-word. Sent once the stream
-        # goes quiet, so the commands have run first.
+        # The detach chord has to arrive as a WRITE OF ITS OWN, sent once the
+        # command stream goes quiet — so the commands have run first and the
+        # chord can't be mistaken for their tail. It is the shipped default
+        # chord (leader `ctrl-]` = 0x1d, then the detach subcommand `d`), in a
+        # single coalesced chunk, which is exactly the shape the daemon's
+        # ChordMatcher accepts (sessions::keys matches chords across and within
+        # stdin chunks). An earlier era of this script sent a bare ctrl-w
+        # (0x17) here; that key retired as a detach, so a stale byte now just
+        # reaches the shell — where readline eats it as delete-previous-word
+        # and rings the bell — and the attach never ends.
         if DETACH and not detached and quiet >= 2:
-            os.write(fd, b"\x17")
+            os.write(fd, b"\x1dd")
             detached = True
         if not answered and EXIT_PROMPT in bytes(buf).lower():
             os.write(fd, PROMPT_ANSWER_KEY)  # answer the prompt like a user

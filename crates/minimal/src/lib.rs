@@ -983,7 +983,7 @@ async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
                 session_name = ?entry.name,
                 "found session"
             );
-            session_via_ssh(&sock, entry.id, None).await
+            session_via_ssh(&sock, entry.id, None, global.config_dir.as_deref()).await
         }
         // Two ways to land on create-and-attach: no sessions exist at all
         // (first run), or the ambiguity picker's `+ Create a new session`
@@ -1461,6 +1461,7 @@ pub async fn cmd_dash(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         loadouts::compose_user_contribution(active, user_policy, compose_options, true)?;
     minimal_tui::run(minimal_tui::DashOptions {
         minimal_dir: global.minimal_dir.clone(),
+        config_dir: global.config_dir.clone(),
         contribution,
     })
     .await
@@ -2625,7 +2626,7 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
         "found session"
     );
 
-    session_via_ssh(&sock, id, None).await
+    session_via_ssh(&sock, id, None, global.config_dir.as_deref()).await
 }
 
 /// Executes a command in an existing session.
@@ -2656,6 +2657,7 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
         &sock,
         r.id,
         minimal_client::attach::remote_command(&args.command),
+        None,
     )
     .await
 }
@@ -2692,6 +2694,7 @@ pub async fn cmd_session_run(
         &sock,
         r.id,
         Some(minimald_rpc::exec::ExecRequest::TaskRun(args.task).encode()),
+        None,
     )
     .await
 }
@@ -2801,14 +2804,28 @@ fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), anyhow::Error
 /// Split from [`cmd_attach`] so the activate-then-attach chain and the
 /// smart-resolution picker can attach without re-resolving an entry they
 /// already hold.
+///
+/// The interactive path (no `wire`) negotiates the configurable session
+/// keys from `config_dir` so the daemon adopts the user's detach/forward
+/// chord for that channel; the exec path (`wire` set) has no detach
+/// and sends none.
 async fn session_via_ssh(
     sock: &std::path::Path,
     id: sessions::SessionId,
     wire: Option<String>,
+    config_dir: Option<&std::path::Path>,
 ) -> Result<(), anyhow::Error> {
     // The command itself lives in minimal-client, shared with the dash TUI's
-    // suspend-attach-resume flow.
-    let mut ssh = minimal_client::attach::attach_command(sock, id, wire.as_deref())?;
+    // suspend-attach-resume flow. The interactive path resolves the
+    // session-key config from `config_dir` and forwards it per channel; the
+    // exec path has no detach and passes `None`.
+    let session_keys = if wire.is_none() {
+        Some(minimal_client::attach::resolve_session_keys(config_dir)?)
+    } else {
+        None
+    };
+    let mut ssh =
+        minimal_client::attach::attach_command(sock, id, wire.as_deref(), session_keys.as_ref())?;
 
     // `-tt` over a *non-terminal* stdin is a trap: ssh still forces the
     // remote PTY, yet the interactive shell reading it never sees an EOF from a
