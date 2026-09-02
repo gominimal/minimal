@@ -2069,6 +2069,20 @@ fn project_lifecycle_hook_count(root: &camino::Utf8Path) -> usize {
     }
 }
 
+/// The user-facing text for a session that could not be composed, by
+/// either route: a refused `ConfigureLoadout` or failed gating of what it
+/// sent back. The underlying error names an internal step the caller never
+/// asked for, so the directory leads and that text follows as the only
+/// diagnostic there is. Shared with `min task run` (`crate::task`), which
+/// creates a session through the same two steps.
+pub(crate) fn composition_failure_message(project_dir: &camino::Utf8Path, error: &str) -> String {
+    format!(
+        "Cannot start a session for {project_dir}: composing a session environment from \
+         that directory's project configuration failed, so no session was activated. Fix \
+         the configuration there, then re-run.\n\ncause: {error}"
+    )
+}
+
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
     activate_session(global, args, true).await
@@ -2432,8 +2446,10 @@ async fn activate_session(
         .context("ConfigureLoadout RPC failed")?;
     let configured = match configured {
         minimald_rpc::Errorable::Ok(r) => r,
+        // Bails before the `println!("{id}")` below: a session that cannot
+        // compose never puts an id on stdout for a script to capture.
         minimald_rpc::Errorable::Err { error } => {
-            bail!("ConfigureLoadout failed: {error}");
+            bail!(composition_failure_message(&utf8_path, &error));
         }
     };
     // The daemon may finalize immediately (`Ready`) or ask the
@@ -2464,7 +2480,11 @@ async fn activate_session(
                 Ok((verdict, _final_policy)) => verdict,
                 Err(e) => {
                     send_abort(&mut client, session_id).await;
-                    bail!("Composition gating failed: {e}");
+                    // The route an activation actually reaches today: the
+                    // daemon routes project config back for gating, so a
+                    // project it cannot compose surfaces here rather than as
+                    // the `Errorable::Err` above.
+                    bail!(composition_failure_message(&utf8_path, &e.to_string()));
                 }
             };
             let summary = hooks.into_summary();
@@ -5210,6 +5230,65 @@ mod tests {
         std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
         let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
         assert!(resolve_upload_root(path).is_err());
+    }
+
+    /// A refused composition is reported in the user's terms — the
+    /// directory the activation ran from — with the daemon's own text kept
+    /// as subordinate detail rather than as the headline (#581).
+    ///
+    /// The daemon error below is the one from the report: it names an
+    /// internal package server the caller never asked for and cannot reach.
+    #[test]
+    fn composition_failure_leads_with_the_directory_not_the_daemon_step() {
+        let daemon_error = "init of minimal context: other: git command 'fetch' failed \
+                            (exit status: 128): fatal: unable to access \
+                            'http://:8898/pkgs-local.git/': Failed to connect to server";
+        let msg =
+            composition_failure_message(camino::Utf8Path::new("/home/dev/myproject"), daemon_error);
+
+        let headline = msg.lines().next().expect("a first line");
+        assert!(
+            headline.contains("/home/dev/myproject"),
+            "the headline must name the directory: {msg}"
+        );
+        assert!(
+            !headline.contains("pkgs-local.git") && !headline.contains("ConfigureLoadout"),
+            "the headline must not lead with the internal step: {msg}"
+        );
+        assert!(
+            msg.contains(daemon_error),
+            "the daemon's error is the only diagnostic and must survive: {msg}"
+        );
+    }
+
+    /// Both session-creating paths report an uncomposable session through
+    /// the one helper, for both of the ways it can fail: the refused
+    /// `ConfigureLoadout` and the gating of what that RPC sent back.
+    /// Asserted rather than documented — the wording was already duplicated
+    /// across these two functions once, and re-typing either bail is one
+    /// copy-paste away.
+    #[test]
+    fn both_creators_share_the_composition_failure_message() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for (file, func) in [
+            ("src/lib.rs", "activate_session"),
+            ("src/task.rs", "cmd_task_run"),
+        ] {
+            let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
+            let body = function_body(&text, func)
+                .unwrap_or_else(|| panic!("{file} no longer defines {func}"));
+            assert_eq!(
+                body.matches("composition_failure_message").count(),
+                2,
+                "{func} must route both composition failures through the shared message"
+            );
+            for bare in ["ConfigureLoadout failed", "Composition gating failed"] {
+                assert!(
+                    !body.contains(bare),
+                    "{func} still names the internal step instead of the directory ({bare})"
+                );
+            }
+        }
     }
 
     /// A project outside a VCS root that declares lifecycle hooks must be

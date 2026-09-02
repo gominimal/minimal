@@ -735,8 +735,10 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         .context("ConfigureLoadout RPC failed")?;
     let configured = match configured {
         minimald_rpc::Errorable::Ok(r) => r,
+        // Same failure, same wording as an activate: the user knows the
+        // directory, not the daemon-side step that broke.
         minimald_rpc::Errorable::Err { error } => {
-            bail!("ConfigureLoadout failed: {error}");
+            bail!(crate::composition_failure_message(&utf8_path, &error));
         }
     };
 
@@ -754,7 +756,10 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
                     Ok((verdict, _final_policy)) => verdict,
                     Err(e) => {
                         crate::send_abort(&mut client, session_id).await;
-                        bail!("Composition gating failed: {e}");
+                        bail!(crate::composition_failure_message(
+                            &utf8_path,
+                            &e.to_string()
+                        ));
                     }
                 };
             let summary = hooks.into_summary();
