@@ -786,6 +786,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
                 user_policy,
                 compose_options,
                 &hooks,
+                &utf8_path,
             )
             .await;
             if let Ok((_, _, ref approved)) = result {

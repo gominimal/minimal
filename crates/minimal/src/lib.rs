@@ -1730,6 +1730,7 @@ async fn drive_pending_to_active(
     policy: sessions::core::policy::UserPolicy,
     options: sessions::core::compose::ComposeOptions,
     hooks: &dyn sessions::core::hooks::PolicyHooks,
+    project_dir: &camino::Utf8Path,
 ) -> Result<
     (
         sessions::SessionId,
@@ -1743,7 +1744,13 @@ async fn drive_pending_to_active(
         Ok(v) => v,
         Err(e) => {
             send_abort(client, session_id).await;
-            bail!("Composition gating failed: {e}");
+            // Declining at the prompt is not a broken project: only a
+            // genuine compose failure gets the directory-led message.
+            use sessions::core::compose::ComposeError;
+            match e {
+                ComposeError::Aborted | ComposeError::Denied { .. } => bail!("{e}"),
+                _ => bail!(composition_failure_message(project_dir, &e.to_string())),
+            }
         }
     };
     // Extract the approved-patch destinations before submit consumes
@@ -2518,6 +2525,7 @@ async fn activate_session(
                 user_policy,
                 compose_options,
                 &hooks,
+                &utf8_path,
             )
             .await;
             if let Ok((_, _, ref approved)) = result {
@@ -5261,26 +5269,28 @@ mod tests {
         );
     }
 
-    /// Both session-creating paths report an uncomposable session through
-    /// the one helper, for both of the ways it can fail: the refused
-    /// `ConfigureLoadout` and the gating of what that RPC sent back.
-    /// Asserted rather than documented — the wording was already duplicated
-    /// across these two functions once, and re-typing either bail is one
-    /// copy-paste away.
+    /// Every site that reports an uncomposable session goes through the one
+    /// helper: the refused `ConfigureLoadout` and the headless gating bail in
+    /// each creator, plus the interactive gating bail they share via
+    /// [`drive_pending_to_active`]. Asserted rather than documented — the
+    /// wording was already duplicated across the creators once, and the
+    /// interactive site was missed the first time precisely because it lives
+    /// in a third function.
     #[test]
     fn both_creators_share_the_composition_failure_message() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        for (file, func) in [
-            ("src/lib.rs", "activate_session"),
-            ("src/task.rs", "cmd_task_run"),
+        for (file, func, uses) in [
+            ("src/lib.rs", "activate_session", 2),
+            ("src/task.rs", "cmd_task_run", 2),
+            ("src/lib.rs", "drive_pending_to_active", 1),
         ] {
             let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
             let body = function_body(&text, func)
                 .unwrap_or_else(|| panic!("{file} no longer defines {func}"));
             assert_eq!(
                 body.matches("composition_failure_message").count(),
-                2,
-                "{func} must route both composition failures through the shared message"
+                uses,
+                "{func} must route its composition failures through the shared message"
             );
             for bare in ["ConfigureLoadout failed", "Composition gating failed"] {
                 assert!(
