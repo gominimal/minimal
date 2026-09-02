@@ -1177,13 +1177,14 @@ impl Session {
         let object = self.record.object().await?;
         let workspace_path = object.workspace_path();
 
-        // Deliberately no scaffold here: composing is not the moment to
-        // fabricate a project. `scaffold_default_mfile` resolves the default
-        // package repo's branch head over the network, and the default's
-        // packages reach the sandbox through the launcher's context (built
-        // from the workspace mfile) rather than through the composition —
-        // so paying for it here would buy nothing. A bare workspace composes
-        // to an empty loadout, and the scaffold lands at context-build time.
+        // Scaffold before composing, not after: the launcher's package set is
+        // its baseline unioned with the composition's packages (see the note
+        // on `SessionInner::Active::composition`), so a default written any
+        // later never reaches the sandbox. Propagated, not logged — an
+        // activation that hands back a session id must hand back a usable
+        // session, and a box with no blueprint can't run anything.
+        self.scaffold_mfile_if_missing(&workspace_path)
+            .map_err(|e| std::io::Error::other(format!("scaffolding a default mfile: {e}")))?;
 
         // Phase 1+2: resolve the project and drive the composer. Kept fully
         // synchronous — its non-`Send` intermediaries must not cross an
@@ -2367,6 +2368,10 @@ impl Session {
     /// session's workspace if it has none, so [`mctx::Context::new`] can
     /// succeed and the session gets a usable set of packages. A workspace
     /// that already holds an uploaded `minimal.toml` is left alone.
+    ///
+    /// Runs from [`Self::configure_loadout`], ahead of the composition that
+    /// decides the launcher's packages; [`Self::build_context`] repeats it as
+    /// an idempotent backstop for sessions brought up from disk.
     fn scaffold_mfile_if_missing(&self, wsp: &DaemonAbsPath) -> Result<(), String> {
         if wsp.as_utf8_path().join(mfile::MFILE_NAME).exists() {
             return Ok(());
@@ -2374,16 +2379,45 @@ impl Session {
         match mfile::File::from_dir(wsp.as_utf8_path()) {
             Ok(_) => Ok(()), // it exists
             Err(mfile::Error::NotFound) => {
-                let config = self.workspace_config(wsp)?;
-
-                use op::ProjectOp as _;
-                let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| e.to_string())?;
-                let plan = op::InitProject.run(&mut env).map_err(|e| e.to_string())?;
-
-                std::fs::write(&plan.toml_path, &plan.content).map_err(|e| e.to_string())
+                let (toml_path, content) = self.default_mfile_plan(wsp)?;
+                std::fs::write(&toml_path, &content).map_err(|e| e.to_string())
             }
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    /// The default `minimal.toml` [`Self::scaffold_mfile_if_missing`] writes:
+    /// `op::InitProject` detects the workspace's stack against the default
+    /// package repo, whose branch head it resolves over the network.
+    #[cfg(not(any(test, feature = "test-support")))]
+    fn default_mfile_plan(
+        &self,
+        wsp: &DaemonAbsPath,
+    ) -> Result<(std::path::PathBuf, String), String> {
+        let config = self.workspace_config(wsp)?;
+
+        use op::ProjectOp as _;
+        let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| e.to_string())?;
+        let plan = op::InitProject.run(&mut env).map_err(|e| e.to_string())?;
+
+        Ok((plan.toml_path, plan.content))
+    }
+
+    /// Under test, stand in for `op::InitProject`'s network round-trip: tests
+    /// run offline, and what they need from the scaffold is that it lands
+    /// before the composition — not what stack detection would have picked.
+    /// Same two packages `op::InitProject` falls back to when nothing matches.
+    #[cfg(any(test, feature = "test-support"))]
+    fn default_mfile_plan(
+        &self,
+        wsp: &DaemonAbsPath,
+    ) -> Result<(std::path::PathBuf, String), String> {
+        Ok((
+            wsp.as_utf8_path()
+                .join(mfile::MFILE_NAME)
+                .into_std_path_buf(),
+            "[session]\npackages = [\"base\", \"vim\"]\n".to_string(),
+        ))
     }
 
     /// Do the actual context construction: run [`mctx::Context::new`] against
@@ -2391,7 +2425,9 @@ impl Session {
     /// [`Self::context`].
     ///
     /// The workspace mfile it parses is either the client's uploaded one or
-    /// a default scaffolded here on the way past.
+    /// the default [`Self::configure_loadout`] scaffolded. The scaffold is
+    /// repeated here as a backstop — it early-returns when the mfile exists,
+    /// so it only fires for a session whose compose predates it.
     ///
     /// [`Config`]: mctx::Config
     async fn build_context(&self, scaffold_if_missing: bool) -> Result<mctx::Context, String> {
