@@ -132,15 +132,11 @@ jobs:
     #
     # The author is tested by permission instead, in the `Refuse a PR whose
     # author lacks write` step below, where an API call is possible and an
-    # expression is not. Named rather than positioned: it was "the first step"
-    # until a step was added above it, which is the kind of claim a reader
-    # trusts without rechecking. An earlier draft
-    # of this change leaned on the head-repo test alone, reasoning that a branch
-    # cannot exist here unless someone with write pushed it. That is true and it
-    # is not the same claim: opening a PR from a branch somebody else pushed
-    # needs only read, and `brandonweeks` — `read`, not an org member — authored
-    # non-draft same-repo PRs #1 and #11 on gominimal/minimal. So the `if` is a
-    # cheap filter and the step is the test.
+    # expression is not — that step carries the argument for why the head-repo
+    # test is not enough on its own. Named rather than positioned: it was "the
+    # first step" until a step was added above it, which is the kind of claim a
+    # reader trusts without rechecking. So the `if` is a cheap filter and the
+    # step is the test.
     #
     # A double-quoted scalar, not `>-`, and the difference matters: in a folded
     # block `\n` stays two characters, so the newline clause below would test
