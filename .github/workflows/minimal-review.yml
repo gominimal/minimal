@@ -88,8 +88,7 @@ jobs:
     # across webapp, pkgmgr-rs, minimal-supply-chain and minimal. The Bot clause
     # that used to admit them was added so dependency bumps would be reviewed,
     # and it has never once produced a review — only a red X on a PR nobody
-    # wrote. Skipping is honest about that. CodeRabbit raised it on
-    # gominimal/minimal-skills#17; the evidence is in the run history.
+    # wrote. Skipping is honest about that.
     #
     # To actually review bumps, add AW_BOT_PRIVATE_KEY and the rest to each
     # repo's Dependabot secrets and drop this clause — deliberately, in a
@@ -316,7 +315,7 @@ jobs:
             exit 0
           fi
 
-          echo "::warning::could not read repos/$CALLER/collaborators/$AUTHOR/permission ($(tr -d '\n' < /tmp/permerr | cut -c1-200)). Falling back to author_association, which reports a private org member as CONTRIBUTOR and will refuse them. Check that the aw-bot App is installed on $CALLER with Administration:read — the token minted for this step needs it."
+          echo "::warning::could not read repos/$CALLER/collaborators/$AUTHOR/permission ($(tr -d '\n' < /tmp/permerr | cut -c1-200)). Falling back to author_association, which reports a private org member as CONTRIBUTOR and will refuse them. The step above asks the aw-bot App for Metadata:read on $CALLER; check the App is installed there and grants it. If it does and this still fails, the endpoint wants more than a read-only grant and the check needs rethinking rather than a wider scope."
           case "$ASSOCIATION" in
             OWNER|MEMBER|COLLABORATOR)
               echo "fallback: $AUTHOR is $ASSOCIATION" ;;
