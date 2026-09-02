@@ -76,21 +76,68 @@ env:
 
 jobs:
   review:
-    # Same-repo PRs only (forks get no secrets), from an org member or an
-    # installed App. The Bot clause matters: both gominimal-aw-bot and
-    # dependabot are CONTRIBUTOR, not MEMBER, and gating them out would stop
-    # reviewing every dependency bump. workflow_dispatch already requires
-    # write access.
+    # Same-repo PRs only — forks get no secrets, and the step below refuses
+    # them again where a PR cannot edit the check. workflow_dispatch already
+    # requires write access, so it needs no test of its own.
+    #
+    # dependabot is excluded, and that is a correction rather than a policy.
+    # A dependabot-triggered run cannot read Actions secrets — they live in the
+    # separate Dependabot secrets store — so `secrets.AW_BOT_PRIVATE_KEY` is
+    # empty and the token mint dies with "The 'private-key' input must be set to
+    # a non-empty string". Every dependabot run has failed that way: 12 of 12,
+    # webapp 10 and pkgmgr-rs and minimal one each. The Bot clause
+    # that used to admit them was added so dependency bumps would be reviewed,
+    # and it has never once produced a review — only a red X on a PR nobody
+    # wrote. Skipping is honest about that.
+    #
+    # To actually review bumps, add AW_BOT_PRIVATE_KEY and the rest to each
+    # repo's Dependabot secrets and drop this clause — deliberately, in a
+    # reviewed PR, having checked one runs green first.
     #
     # `issue_comment` is the one path where the trigger is not the PR. It fires
     # on issue comments too, and on a public install anyone at all can post one,
     # so all four clauses have to hold: it must be a PR, the body must ask,
     # and the person asking must be one of ours. No Bot clause here — a bot's
-    # comment starting a paid review is a loop nobody asked for.
+    # comment starting a paid review is a loop nobody asked for, and the step
+    # below refuses one by name.
+    #
+    # CONTRIBUTOR is in the list, and it is not a widening to "anyone". A
+    # private org member's comment carries CONTRIBUTOR, exactly as their PR
+    # does, so the narrower list reproduced the #1313 bug on the comment path,
+    # and a job-level `if` that refuses them means the permission check below
+    # never runs at all. A stranger with no commits here is NONE and is
+    # still refused for free. The set this admits is "has landed a commit in
+    # this repo", and each one costs a runner start of about ten seconds before
+    # the step below resolves their real permission and stops them — bounded,
+    # and ahead of the quiet window and the token mint.
+    #
+    # Both line endings, because GitHub does not normalise a comment body and
+    # some clients send CRLF. Measured across 600 multi-line comments in this
+    # org: 43901 bare LF and 378 CRLF — rare, but not theoretical, and the CRLF
+    # ones are twitchyliquid64's, who writes more review commentary on
+    # gominimal/minimal than anyone. Matching only `/review\n` would have made
+    # `/review` silently do nothing for exactly the person most likely to type
+    # it. `'/review\r'` covers CRLF and a lone CR both.
     #
     # This gate is repeated in the caller, and that copy is the one that stops
     # the job from starting. This one is the backstop: the caller's file can be
     # edited by the PR under review, and this file cannot.
+    #
+    # The pull_request path tests no author at all, and that is deliberate.
+    # `author_association` is a visibility signal, not a permission one: it
+    # reports MEMBER only for a PUBLIC org member, and a private one comes back
+    # CONTRIBUTOR. gominimal/minimal#1313 skipped nine consecutive runs for that
+    # reason and was only ever reviewed by a hand-fired dispatch; four of
+    # thirteen org members were invisible to the reviewer the same way.
+    #
+    # The author is tested by permission instead, in the `Refuse a PR whose
+    # author lacks write` step below, where an API call is possible and an
+    # expression is not — that step carries the argument for why the head-repo
+    # test is not enough on its own. Named rather than positioned: it was "the
+    # first step" until a step was added above it, which is the kind of claim a
+    # reader trusts without rechecking. So the `if` is a cheap filter and the
+    # step is the test.
+    #
     # A double-quoted scalar, not `>-`, and the difference matters: in a folded
     # block `\n` stays two characters, so the newline clause below would test
     # for a literal backslash-n and never match. YAML unescapes it here before
@@ -101,14 +148,13 @@ jobs:
       github.event.issue.pull_request != null &&
       (github.event.comment.body == '/review' ||
       startsWith(github.event.comment.body, '/review ') ||
-      startsWith(github.event.comment.body, '/review\n')) &&
-      contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'),
+      startsWith(github.event.comment.body, '/review\n') ||
+      startsWith(github.event.comment.body, '/review\r')) &&
+      contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\",\"CONTRIBUTOR\"]'),
       github.event.comment.author_association)) ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.draft != true &&
-      (github.event.pull_request.user.type == 'Bot' ||
-      contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\"]'),
-      github.event.pull_request.author_association)))"
+      github.event.pull_request.user.login != 'dependabot[bot]')"
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -128,6 +174,169 @@ jobs:
           fi
           echo "caller: $CALLER ($EVENT)"
 
+      # Who wrote the PR, answered by permission rather than by visibility.
+      #
+      # The job-level `if` tests same-repo and non-draft and stops there, on the
+      # reasoning that a branch cannot exist in this repo unless someone with
+      # write pushed it. True, and not the same as "the author has write":
+      # opening a PR from a branch someone else pushed needs only read.
+      # `brandonweeks` has `read` on gominimal/minimal, is not an org member,
+      # and authored non-draft same-repo PRs #1 and #11. An audit of all 2431
+      # same-repo PRs across the fleet finds exactly that one author below
+      # write — a count worth knowing, because an earlier check of the most
+      # recent 200 PRs on an 881-PR repo found none and read as proof.
+      #
+      # `author_association` cannot answer this. It reports MEMBER only for a
+      # PUBLIC org member, so it refused four of thirteen members here while
+      # admitting nobody it should have. Permission is the property that matters
+      # and the API states it directly.
+      #
+      # Falls back rather than fails closed. If the endpoint is unreadable with
+      # this token, refusing every PR would take the fleet down for a
+      # permissions detail, which is precisely how tonight started. The fallback
+      # is the association test — today's behaviour, no regression — with a
+      # warning naming the scope to fix. Not silent: a gate that quietly stopped
+      # checking is worse than one that never checked.
+      #
+      # It needs its own token. `github.token` carries this workflow's
+      # `permissions:` — contents: read, pull-requests: write — and the endpoint
+      # answers `403 Must have push access to view collaborator permission`
+      # without push, so the check would have fallen back on every single run
+      # and the gate would have been decorative. Raising the workflow's own
+      # ceiling was the wrong fix: that ceiling is the most the reviewer can
+      # ever hold in an install, and widening it to read collaborators widens it
+      # everywhere, permanently, for one lookup.
+      #
+      # So: a second App token, scoped to this one repository and to Metadata
+      # read. It cannot write anything, cannot see another repo, and is gone when
+      # the step ends. The App-token step further down stays scoped to foundry
+      # and broker; the two are deliberately not merged, because that one is a
+      # checkout credential and this one is a gate.
+      #
+      # WHICH permission this endpoint wants is not settled, and this comment is
+      # not going to pretend otherwise. GitHub's REST reference lists it under
+      # Metadata; the endpoint's own page says "must have push access", which no
+      # read-only grant confers. Both readings are defensible, and requesting a
+      # permission the installation lacks makes the mint itself fail rather
+      # than the call. It cannot be settled from a text editor.
+      #
+      # So this asks for the least that could work, and every way it can go
+      # wrong degrades instead of breaking: an ungranted permission fails the
+      # mint, `continue-on-error` swallows that, the step falls back to
+      # `github.token`, and the API call then fails too and lands in the
+      # association fallback with a warning naming the scope. The first real run
+      # settles it — the step logs `has <permission> on`, so grep for `has ` and
+      # read what follows, or for the warning if it fell back.
+      - name: Mint a read-only token for the author check
+        id: author-token
+        if: github.event_name != 'workflow_dispatch'
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ vars.AW_BOT_APP_ID }}
+          private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
+          owner: gominimal
+          repositories: ${{ github.event.repository.name }}
+          permission-metadata: read
+
+      - name: Refuse a PR whose author lacks write
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          # Falls back to github.token if the mint above failed — which only
+          # moves the failure to the API call, where the fallback already is.
+          GH_TOKEN: ${{ steps.author-token.outputs.token || github.token }}
+          CALLER: ${{ github.repository }}
+          # On a comment run the person to check is the commenter, not the PR
+          # author: `/review` is the thing being authorised. workflow_dispatch
+          # is excluded above — GitHub already requires write to fire one.
+          AUTHOR: ${{ github.event_name == 'issue_comment' && github.event.comment.user.login || github.event.pull_request.user.login }}
+          AUTHOR_TYPE: ${{ github.event_name == 'issue_comment' && github.event.comment.user.type || github.event.pull_request.user.type }}
+          ASSOCIATION: ${{ github.event_name == 'issue_comment' && github.event.comment.author_association || github.event.pull_request.author_association }}
+        run: |
+          set -uo pipefail
+          # "the PR author" is wrong on a comment run, where the subject is the
+          # commenter. Say which, because these messages are the whole
+          # explanation someone gets when a review does not appear.
+          if [ "${GITHUB_EVENT_NAME:-}" = "issue_comment" ]; then
+            WHO="commenter"
+          else
+            WHO="PR author"
+          fi
+
+          # A Bot means opposite things on the two paths, so it cannot be one
+          # rule. An App that OPENS a PR pushed its own branch and has no
+          # collaborator record to look up. An App that COMMENTS `/review` is a
+          # bot starting a paid run, which is the loop nobody asked for;
+          # CodeRabbit alone comments on most PRs here.
+          #
+          # Named, not typed. `user.type == 'Bot'` waived the check for the
+          # whole class of App accounts, which is the same unaudited "surely
+          # they must have write" reasoning `brandonweeks` disproved for humans
+          # two paragraphs up — and no equivalent audit was ever run for Apps.
+          # Any other App gets the same lookup a human gets.
+          #
+          # The dependabot arm is unreachable on the pull_request path and kept
+          # anyway. This job's own `if` excludes that login, and a called
+          # workflow's `if` is evaluated against the same triggering event as
+          # the caller's, so it holds whatever a stale or PR-edited caller says.
+          #
+          # It stays because it is one line and it is the only place that names
+          # the cause. Drop the exclusion from either gate — which is exactly
+          # what someone wiring up Dependabot secrets would do first — and the
+          # run lands here. Refusing with a reason beats reaching a token mint
+          # that fails four steps later on "private-key must be set to a
+          # non-empty string".
+          #
+          # `/review` on a dependabot PR is a different matter and deliberately
+          # allowed. That run is triggered by the commenter, not by dependabot,
+          # so it reads Actions secrets normally and the mint succeeds — which
+          # makes it the one way to get a dependency bump reviewed today. The
+          # check below authorises the commenter, which is the right subject:
+          # they are the one asking for the review, and the PR's own author is
+          # not in a position to spend anything.
+          if [ "$AUTHOR_TYPE" = "Bot" ]; then
+            if [ "${GITHUB_EVENT_NAME:-}" = "issue_comment" ]; then
+              echo "::error::$AUTHOR is an App and a bot may not start a review by comment. Refusing."
+              exit 1
+            fi
+            case "$AUTHOR" in
+              dependabot|dependabot\[bot\])
+                echo "::error::$AUTHOR cannot be reviewed: a dependabot run reads the Dependabot secret store, not Actions secrets, so the App token cannot be minted. Every such run has failed at that step. Put the secrets in this repo's Dependabot store and drop the exclusion from the caller's gate."
+                exit 1 ;;
+              gominimal-aw-bot|gominimal-aw-bot\[bot\])
+                # By name because there is nothing to look up: the permission
+                # endpoint answers `404 gominimal-aw-bot is not a user` for an
+                # App. A lookup-only rule would refuse every App there is.
+                echo "author $AUTHOR is a known App and has no collaborator record to check"
+                exit 0 ;;
+              *)
+                echo "$AUTHOR is an App, but not one this file names; checking its permission like any other author" ;;
+            esac
+          fi
+
+          if perm="$(gh api "repos/$CALLER/collaborators/$AUTHOR/permission" \
+                       --jq .permission 2>/tmp/permerr)"; then
+            case "$perm" in
+              admin|maintain|write)
+                echo "$WHO $AUTHOR has $perm on $CALLER" ;;
+              *)
+                echo "::error::$WHO $AUTHOR has '$perm' on $CALLER, not write. Refusing before any credential is minted."
+                exit 1 ;;
+            esac
+            exit 0
+          fi
+
+          echo "::warning::could not read repos/$CALLER/collaborators/$AUTHOR/permission ($(tr -d '\n' < /tmp/permerr | cut -c1-200)). Falling back to author_association, which reports a private org member as CONTRIBUTOR and will refuse them. The step above asks the aw-bot App for Metadata:read on $CALLER; check the App is installed there and grants it. If it does and this still fails, the endpoint wants more than a read-only grant and the check needs rethinking rather than a wider scope."
+          case "$ASSOCIATION" in
+            OWNER|MEMBER|COLLABORATOR)
+              echo "fallback: $AUTHOR is $ASSOCIATION" ;;
+            *)
+              echo "::error::$WHO $AUTHOR is $ASSOCIATION and the permission API was unreadable, so nothing here can confirm write access. Refusing."
+              exit 1 ;;
+          esac
+
+      # Wait before spending anything, so a burst of pushes cancels this run
+      # before the agent starts rather than halfway through it.
       - name: Quiet window
         id: quiet
         if: github.event_name == 'pull_request'
