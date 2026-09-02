@@ -650,7 +650,8 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   # lives in that process and nowhere else. The re-attach below reads it back.
   # Deliberately not `$$`: the session shell is pid 1 of its own namespace, so
   # a replacement shell would report pid 1 too and the check would be vacuous.
-  # Leaves by the ctrl-w detach chord (`E2E_PTY_DETACH`), NOT by `exit`.
+  # Leaves by the session detach chord (`E2E_PTY_DETACH`: ctrl-] then d, the
+  # shipped default), NOT by `exit`.
   # `exit` ends the session's shell, and the "re-attach" below would then land
   # on a freshly minted one — which would still report the new terminal (a new
   # shell takes `TERM` from its launch env) while proving nothing about
