@@ -299,6 +299,6 @@ mod tests {
         assert_eq!(record.source_sha256, SHA);
         let names: Vec<&str> = record.files.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["NOTICE"]);
-        assert_eq!(record.files[0].text, "upstream notice");
+        assert_eq!(record.files[0].text.as_deref(), Some("upstream notice"));
     }
 }

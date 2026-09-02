@@ -11,6 +11,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use lcache::{Cache, LocalDir};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,8 +38,31 @@ pub struct NoticeFile {
     pub name: String,
     /// Hex sha256 of the raw bytes.
     pub sha256: String,
-    /// Contents, lossily decoded as UTF-8.
-    pub text: String,
+    /// Contents, when they are valid UTF-8.
+    pub text: Option<String>,
+    /// Contents, base64 (standard, padded), only when they are not valid
+    /// UTF-8 — the bytes travel verbatim either way.
+    pub base64: Option<String>,
+}
+
+impl NoticeFile {
+    fn from_bytes(name: String, bytes: Vec<u8>) -> Self {
+        let sha256 = hex::encode(Sha256::digest(&bytes));
+        match String::from_utf8(bytes) {
+            Ok(text) => Self {
+                name,
+                sha256,
+                text: Some(text),
+                base64: None,
+            },
+            Err(e) => Self {
+                name,
+                sha256,
+                text: None,
+                base64: Some(base64::engine::general_purpose::STANDARD.encode(e.into_bytes())),
+            },
+        }
+    }
 }
 
 /// Everything captured from one source archive.
@@ -66,9 +90,11 @@ fn is_sha256_hex(s: &str) -> bool {
 }
 
 /// Reads the qualifying regular files directly under `dir`. Symlinks and
-/// directories are ignored — a symlink could point outside the tree.
+/// directories are ignored — a symlink could point outside the tree. The
+/// selection is made on metadata alone so no more than [`MAX_FILES`] files
+/// are ever read.
 fn scan_dir(dir: &Path) -> io::Result<Vec<NoticeFile>> {
-    let mut files = Vec::new();
+    let mut candidates = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -80,16 +106,14 @@ fn scan_dir(dir: &Path) -> io::Result<Vec<NoticeFile>> {
         if entry.metadata()?.len() > MAX_FILE_BYTES {
             continue;
         }
-        let bytes = std::fs::read(entry.path())?;
-        files.push(NoticeFile {
-            name,
-            sha256: hex::encode(Sha256::digest(&bytes)),
-            text: String::from_utf8_lossy(&bytes).into_owned(),
-        });
+        candidates.push((name, entry.path()));
     }
-    files.sort_by(|a, b| a.name.cmp(&b.name));
-    files.truncate(MAX_FILES);
-    Ok(files)
+    candidates.sort();
+    candidates.truncate(MAX_FILES);
+    candidates
+        .into_iter()
+        .map(|(name, path)| Ok(NoticeFile::from_bytes(name, std::fs::read(path)?)))
+        .collect()
 }
 
 /// Scans an extracted source tree rooted at `root`. When the archive kept its
@@ -216,7 +240,38 @@ mod tests {
             files[0].sha256,
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
-        assert_eq!(files[0].text, "hello");
+        assert_eq!(files[0].text.as_deref(), Some("hello"));
+        assert_eq!(files[0].base64, None);
+    }
+
+    #[test]
+    fn scan_keeps_non_utf8_bytes_verbatim() {
+        let dir = TempDir::new().unwrap();
+        let bytes = b"Copyright \xa9 2024".to_vec();
+        std::fs::write(dir.path().join("COPYRIGHT"), &bytes).unwrap();
+        let file = scan(dir.path()).unwrap().remove(0);
+        assert_eq!(file.text, None);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(file.base64.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(decoded, bytes);
+        assert_eq!(file.sha256, hex::encode(Sha256::digest(&bytes)));
+    }
+
+    #[test]
+    fn scan_caps_the_file_count_by_name_order() {
+        let dir = TempDir::new().unwrap();
+        for i in 0..(MAX_FILES + 3) {
+            std::fs::write(dir.path().join(format!("NOTICE-{i:02}")), "x").unwrap();
+        }
+        let names: Vec<String> = scan(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(names.len(), MAX_FILES);
+        assert_eq!(names[0], "NOTICE-00");
+        assert_eq!(names[MAX_FILES - 1], format!("NOTICE-{:02}", MAX_FILES - 1));
     }
 
     #[test]
@@ -244,12 +299,15 @@ mod tests {
         assert_eq!(got.schema_version, SCHEMA_VERSION);
         assert_eq!(got.source_sha256, SHA);
         assert_eq!(got.files.len(), 1);
-        assert_eq!(got.files[0].text, "first");
+        assert_eq!(got.files[0].text.as_deref(), Some("first"));
 
         // A second extraction of the same archive does not rewrite the record.
         std::fs::write(src.path().join("NOTICE"), "changed").unwrap();
         record(&cache, SHA, src.path()).unwrap();
-        assert_eq!(read(&cache, SHA).unwrap().unwrap().files[0].text, "first");
+        assert_eq!(
+            read(&cache, SHA).unwrap().unwrap().files[0].text.as_deref(),
+            Some("first")
+        );
 
         // Nothing qualifying is still a record.
         let empty = tree(&[("LICENSE", "l")]);
