@@ -310,14 +310,14 @@ impl Manager {
     /// needs `remote` fresh. A remote not yet registered is a no-op: a
     /// subsequent [`Self::checkout_of`] clones it on first use.
     pub fn update_remote(&mut self, remote: &str) -> Result<(), Error> {
+        let Some(id) = self.state.git_remotes.get(remote).cloned() else {
+            return Ok(());
+        };
         if self.offline {
             return Err(Error::OfflineCacheMiss {
                 remote: remote.to_string(),
             });
         }
-        let Some(id) = self.state.git_remotes.get(remote).cloned() else {
-            return Ok(());
-        };
         let checkouts_dir = self.git_checkouts_dir();
         let repo = self.repos.get_mut(&id).unwrap();
         trace!("updating repo {}", repo.url());
