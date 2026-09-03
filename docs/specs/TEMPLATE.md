@@ -11,7 +11,7 @@ updated: <YYYY-MM-DD>
 # XXX — <feature name>
 
 <!--
-SOURCE  gominimal/foundry spec/template.md @ d7227512d2577e2396f5a097c2fe50d5ffe08f14
+SOURCE  gominimal/foundry spec/template.md @ 842b37aa97e44cccff5a0d51ea79e9e099aee111
   This file is a copy. Edit it in foundry and open a PR here; a change made
   only in this repo is lost the next time the template is updated. The SOURCE
   line is what a drift check reads to tell whether this copy is behind.
@@ -105,36 +105,67 @@ considerations section is made of.
 PROSE IS THE AUTHORING INPUT, NEVER THE REQUIREMENT. Draft the behaviour in
 English, convert it to EARS, and review the translation.
 
-VERIFICATION TIERS — T0 is the default and nothing above it is mandated.
-Escalating a requirement is a per-item call made during review.
-  T0  verify:   <command>            an example test. The default.
-  T1  property: <universal>          a proptest over generated input.
-  T2  property: + a Kani harness     exhaustive to a bound.
-  T3  proof:    <file>#<theorem>     machine-checked in Lean 4.
-  A requirement that cannot be verified yet says
-  verify: none, <reason and issue link>.
+VERIFICATION TIERS. Every requirement states its tier and how it will be
+checked, before the code exists. T0 is the default and nothing above it is
+mandated; escalating is a per-item call, and it is made here rather than
+deferred to a review, because a tier above T0 is a constraint on the code that
+has not been written yet.
+
+  tier: T0   verify:   <the repo's command for one test> <name>
+  tier: T1   + property: <the universal, in whatever notation reads clearly>
+  tier: T2   + harness:  <the Kani harness and its unwind bound>
+  tier: T3   + proof:    <file>.lean#<theorem>
+  tier: none   for a behaviour nothing can observe. See below.
+
+The tier and the fields must agree — a tier claiming more than the fields
+carry is a claim with nothing behind it, and the lint says so. A universal
+written into `property:` is what T1 asks for, so a T0 carrying one is reported
+as P012: raise it, or say in Design reasoning why it stays. `property:` at
+`none` is exempt, because nothing can watch the behaviour and there is no tier
+the universal could be evidence for.
+
+NAME THE TEST THAT WILL EXIST, not one that does. Proof lives in the test suite
+and the spec names it; T0 is "names one test", so a requirement naming none has
+no plan to be checked. The lint reports every named test it cannot find, which
+is the to-do list emptying as the code lands — not a finding to avoid by
+writing nothing. Use the repo's own command for running one test.
+
+  tier: none / verify: none, <reason and issue link> is for a behaviour that
+  genuinely cannot be observed — not for one whose code is unwritten, which is
+  true of every requirement in every spec written before its implementation.
 
 FAILURE AND EDGE BEHAVIOUR is an indented sub-bullet under the requirement it
 qualifies. Encouraged, not required.
 -->
 
 - **XXX-001** WHEN <trigger> THE SYSTEM SHALL <observable behaviour>.
-  verify: just test-one <test_name>
+  tier:     T0
+  verify:   <run one test> <test_name>
   - IF <the failure condition> THEN THE SYSTEM SHALL <defined behaviour>.
-    verify: just test-one <test_name_failure>
+    tier:   T0
+    verify: <run one test> <test_name_failure>
 
 - **XXX-002** THE SYSTEM SHALL <observable behaviour that holds universally>.
-  verify:   just test-one <test_name>
+  tier:     T1
+  verify:   <run one test> <test_name>
   property: <the universal, in whatever notation reads clearly>
 
-- **XXX-003** THE SYSTEM SHALL <a security-critical universal>.
-  verify:   just test-one <test_name>
+- **XXX-003** THE SYSTEM SHALL <a bounded universal worth exhausting>.
+  tier:     T2
+  verify:   <run one test> <test_name>
+  property: <the universal>
+  harness:  <the Kani harness, and the unwind bound it is exhaustive to>
+
+- **XXX-004** THE SYSTEM SHALL <a security-critical universal>.
+  tier:     T3
+  verify:   <run one test> <test_name>
   property: <the universal>
   proof:    proofs/<Area>/<File>.lean#<theorem_name>
 
-- **XXX-004** WHERE <an optional feature is enabled> THE SYSTEM SHALL
-  <observable behaviour>.
-  verify: none, <why not yet, and the issue link>
+- **XXX-005** WHERE <an optional feature is enabled> THE SYSTEM SHALL
+  <observable behaviour nothing can watch today>.
+  tier:     none
+  verify:   none, <why nothing can observe it, and the issue link>
 
 ## Non-goals
 
@@ -152,6 +183,7 @@ qualifies. Encouraged, not required.
      not. Same rules as above: EARS, measurable, no unmeasured adjective. -->
 
 - **XXX-N01** WHILE <load condition> THE SYSTEM SHALL <measurable bound>.
+  tier:   T0
   verify: <the benchmark or load test that measures it>
 
 ## Design reasoning
