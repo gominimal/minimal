@@ -113,6 +113,15 @@ background, and `min session attach` rejoins it later. Changes you make inside s
 the session's workspace; bring them back to the host by pushing them out with
 `git push min://<session>`.
 
+Activating a project whose directory already has a session does not reuse that
+session: `min` warns, names the existing session, and creates a second one
+anyway. Once two sessions share a path, `min` can no longer resolve that
+directory to a single session, so a bare `min` there is ambiguous and `min
+session attach` opens a picker to choose between them (erroring when
+`--no-input` is set or stdin/stdout is not a terminal). Attach to the existing
+session instead of activating again when
+you mean to rejoin it.
+
 ## How a session is composed
 
 A session's contents are not hand-configured. They are **composed** from
