@@ -46,20 +46,8 @@ the facade, with no credential in the session.
 **Roles:** developer who uses the open-source version of Minimal, developer using remote sessions, developer who deploys agentic workflow that spawns new sessions
 
 - AS A developer who uses the open-source version of Minimal, I WANT to sign into Minimal with the `min` CLI and authenticate using my Github.com account in the browser, SO THAT I don't need to manage another credential.
-  <!-- Acceptance criteria, for the EARS step:
-       - Session tokens are automatically refreshed via background refresh token rotation without requiring a secondary browser redirect or terminal prompt. Users do not need to repeatedly authenticate and authorize access.
-       - The minted session token only grants git read/write permission to the project in the workbench. Attempts to clone, push to other repositories inside the workbench, or change repository or organizational settings will return a 403 error.
-       - The only way to log in to Minimal is with a Github.com account.
-  -->
 - AS A developer using remote sessions, I WANT to clone, commit and push changes to my project without being asked to provide login information, SO THAT I don't need to worry about my credentials being leaked.
-  <!-- Acceptance criteria, for the EARS step:
-       - Commits and PRs created from inside a session are attributed to the developer, regardless of if an AI agent was used to create the change.
-       - No personal access tokens or static private SSH keys are stored on the box.
-  -->
 - AS A developer who deploys agentic workflow that spawns new sessions, I WANT the child sessions to complete successfully using access scope that's no wider than its parent, SO THAT my workflow can achieve its objective autonomously.
-  <!-- Acceptance criteria, for the EARS step:
-       - Child sessions inherit access scope strictly equal to or narrower than that of the parent session, without the need to prompt the attached human developer.
-  -->
 
 
 ## Requirements
@@ -90,11 +78,12 @@ the facade, with no credential in the session.
   harness:  kani_reach_is_workbench_plus_declared, exhaustive to 8 declared repositories modelled as bounded identifiers (unwind bound 9); the same pure reach decision as GHS-003
 
 - **GHS-005** IF a git or GitHub request from a session targets a repository
-  outside the session's declared set THEN THE SYSTEM SHALL refuse it with a
-  403 before the request reaches GitHub.
+  outside the session's repository set, meaning the workbench project and the
+  repositories it declared, THEN THE SYSTEM SHALL refuse it with a 403 before
+  the request reaches GitHub.
   tier:     T2
-  verify:   cargo nextest run -p minimal request_outside_declared_set_is_403_before_github
-  property: for every declared set and every target repository outside it, the reach decision is a refusal, and the refusal reaches the caller as a 403 with nothing forwarded to GitHub
+  verify:   cargo nextest run -p minimal request_outside_repository_set_is_403_before_github
+  property: for every repository set, the workbench project plus the declared repositories, and every target repository outside it, the reach decision is a refusal, and the refusal reaches the caller as a 403 with nothing forwarded to GitHub
   harness:  kani_outside_reach_is_refused, exhaustive to 8 declared repositories (unwind bound 9); requires the reach decision to be a pure function over owned repository identifiers, evaluated by the facade before any request is forwarded
 
 - **GHS-006** WHEN a developer runs the sign-in command THE SYSTEM SHALL show
@@ -138,8 +127,8 @@ the facade, with no credential in the session.
   verify:   cargo nextest run -p minimal session_commits_and_prs_attributed_to_developer
 
 - **GHS-013** THE SYSTEM SHALL keep every GitHub credential, including any
-  personal access token and any static private SSH key, out of a session's
-  filesystem and environment.
+  personal access token, any refresh token and any static private SSH key,
+  out of a session's filesystem and environment.
   tier:     T0
   verify:   cargo nextest run -p minimal session_fs_and_env_hold_no_github_credential
 
@@ -150,7 +139,7 @@ the facade, with no credential in the session.
   verify:   cargo nextest run -p minimal session_receives_credential_free_github_addresses
 
 - **GHS-015** WHEN a session spawns a child session THE SYSTEM SHALL grant the
-  child a GitHub access scope that is a subset of the parent's.
+  child a repository set that is a subset of the parent's repository set.
   tier:     T2
   verify:   cargo nextest run -p sessions child_reach_is_subset_of_parent
   property: for every parent reach set P and every child declaration, the child's reach set is a subset of P
@@ -260,8 +249,15 @@ the session's token narrowed to the declared set where GitHub can express it
 (the GitHub identity spec); with the facade enforcing the set, that narrowing
 is defence in depth rather than the bound. The 2026-08-20 record that a
 user-attributed token cannot be narrowed per repository holds for renewal from
-a refresh token and not for minting. The reach decision being pure and
-separable from the proxy is what the T2 harnesses require.
+a refresh token and not for minting. "The session's repository set" means
+the workbench project plus the declared repositories throughout this
+document. Renewal (GHS-001) re-mints against that same set: the set is the
+facade's grant, fixed when the session is created, not a property the token
+has to carry across a refresh. Every session and every box a developer's
+workflow spawns uses a developer-attributed token; a child's set is a subset
+of its parent's (GHS-015) and its token is minted for that subset. The reach
+decision being pure and separable from the proxy is what the T2 harnesses
+require.
 
 **A child session gets a subset of its parent's scope, never more** (GHS-015).
 Whether a child may declare a narrower set, or a running session's set may
@@ -386,7 +382,7 @@ under the developer's own sign-in, an open question below.
   (Gatehouse INV-1, T3, T15).
   covered by: GHS-013, GHS-014, GHS-018
 - **Invariant:** THE SYSTEM SHALL admit through the facade no request for a
-  repository outside the session's declared set.
+  repository outside the session's repository set.
   enforced by: the reach decision, a pure function over owned repository
   identifiers checked exhaustively to the stated bound and evaluated before
   any request is forwarded, with the narrowed mint in the identity plane as
@@ -397,6 +393,16 @@ under the developer's own sign-in, an open question below.
   enforced by: the facade observing session end from the daemon and
   discarding the session's credentials and addresses (Gatehouse T23).
   covered by: GHS-017, GHS-019
+- **Invariant:** THE SYSTEM SHALL hold no session credential longer than 8
+  hours without renewing or discarding it.
+  enforced by: the facade's renewal against the identity plane's 8-hour token
+  lifetime (Gatehouse §5.7, T3).
+  covered by: GHS-020
+- **Invariant:** THE SYSTEM SHALL write no credential and no request body to
+  the audit record.
+  enforced by: the facade recording only the session, the developer identity,
+  the target and the decision (Gatehouse T18, INV-4).
+  covered by: GHS-021
 - **Invariant:** THE SYSTEM SHALL grant a child session a GitHub access scope
   that is a subset of its parent's.
   enforced by: the child-reach decision here and attenuation at issuance in
