@@ -63,3 +63,17 @@ line that ssh-key's p256 pulls in. `ring` needs `clang` for its C sources.
   them with `tokio::time`, which has no driver in a browser. Do not call
   `Handle::disconnect` there either (it uses `tokio::time::timeout`).
 - `russh::server` compiles natively only; the client half is what the core needs.
+
+## Numbers (2026-09-03, rust 1.97.1, russh 0.63.1, wasm-bindgen 0.2.127, binaryen 124)
+
+| Artifact | raw | gzip -9 |
+|---|---|---|
+| `min_core.wasm` from cargo (`opt-level = "s"`, lto, panic=abort, build-std) | 2,188,098 B | 530,788 B |
+| after `wasm-bindgen --target web` | 1,871,025 B | 436,660 B |
+| after `wasm-opt -Os` | 909,229 B | 355,877 B |
+| `min_core.js` glue | 26,705 B | 5,840 B |
+
+Reference point from webapp#735: ghostty-web is 636,327 B raw / 184,359 B gzip.
+Obvious diet candidates, untried: drop `flate2` (compression is negotiable),
+and see whether `ssh-key`'s p256/p384/p521 can be left out when minimald only
+ever presents ed25519.
