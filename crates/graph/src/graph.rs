@@ -12,7 +12,7 @@ use decode::Stack;
 use nickel_lang_core::term::IndexMap;
 
 use generational_arena::Arena;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use crate::BuildSpecRef;
@@ -83,7 +83,10 @@ pub struct Graph {
     pub top_levels: Vec<BuildSpecRef>,
 
     /// Stacks (a way to build a directory of software) by name.
-    pub(crate) stacks: HashMap<String, Stack>,
+    ///
+    /// Ordered by name so `iter_stacks` is deterministic: `min init` selects a
+    /// stack with a stable sort that preserves the iteration order for ties.
+    pub(crate) stacks: BTreeMap<String, Stack>,
 
     /// Indexes build-specs by name.
     pub(crate) by_name: HashMap<String, BuildSpecRef>,
@@ -118,7 +121,7 @@ impl Graph {
             builds: Arena::with_capacity(4096),
             by_name: HashMap::with_capacity(2048),
             top_levels: Vec::new(),
-            stacks: HashMap::with_capacity(32),
+            stacks: BTreeMap::new(),
             supply_chain: Vec::with_capacity(6),
             target: Target::host(),
             hash_cache: Arc::new(RwLock::new((
@@ -454,7 +457,7 @@ impl Graph {
     pub(crate) fn from_parts(
         builds: Arena<BuildSpec>,
         top_levels: Vec<BuildSpecRef>,
-        stacks: HashMap<String, Stack>,
+        stacks: BTreeMap<String, Stack>,
         by_name: HashMap<String, BuildSpecRef>,
         supply_chain: Vec<SpecOrigin>,
         target: Target,
