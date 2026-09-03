@@ -542,7 +542,7 @@ pub enum OutputKind {
         #[serde(default)]
         cmd: Option<StrOrList>,
         #[serde(default, alias = "env_vars")]
-        vars: HashMap<String, String>,
+        vars: BTreeMap<String, String>,
     },
 
     /// An output representing a file extracted from some packages.
@@ -554,7 +554,7 @@ impl Default for OutputKind {
         OutputKind::OciImage {
             entrypoint: None,
             cmd: None,
-            vars: HashMap::new(),
+            vars: BTreeMap::new(),
         }
     }
 }
@@ -579,7 +579,7 @@ struct OutputRaw {
     #[serde(default)]
     cmd: Option<StrOrList>,
     #[serde(default, alias = "env_vars")]
-    vars: HashMap<String, String>,
+    vars: BTreeMap<String, String>,
 
     #[serde(default)]
     path: String,
@@ -1444,7 +1444,7 @@ mod tests {
                         kind: OutputKind::OciImage {
                             entrypoint: Some(StrOrList::Single("/bin/sh".to_string())),
                             cmd: None,
-                            vars: HashMap::new(),
+                            vars: BTreeMap::new(),
                         },
                         packages: vec!["bash".to_string(), "go".to_string()],
                         arch: None,
@@ -1878,6 +1878,24 @@ mod tests {
             &Some(StrOrList::Single("/app/server".to_string()))
         );
         assert_eq!(vars["PORT"], "8080");
+    }
+
+    /// `OutputKind::OciImage` serializes its `vars` in key order regardless of
+    /// insertion order, so the same declaration emits the same bytes run to
+    /// run rather than following a `HashMap`'s per-process iteration order.
+    #[test]
+    fn oci_image_vars_serialize_in_key_order() {
+        let serialize = |keys: [&str; 3]| {
+            let mut kind = OutputKind::default();
+            let OutputKind::OciImage { vars, .. } = &mut kind else {
+                unreachable!("default output kind is OciImage");
+            };
+            for k in keys {
+                vars.insert(k.to_string(), "v".to_string());
+            }
+            toml::to_string(&kind).unwrap()
+        };
+        assert_eq!(serialize(["A", "B", "C"]), serialize(["C", "B", "A"]));
     }
 
     #[test]
