@@ -85,6 +85,7 @@ SEEDED_MFILE=""
 TASK_SEED_DIR="" # seeded by the `min task run` proof below; removed on teardown
 HOOK_SEED_DIR="" # seeded by the lifecycle-hooks proof below; removed on teardown
 PATCH_SRC_DIR="" # patch sources for the patch-modes proof; removed on teardown
+SKIP_SEED_DIR="" # seeded by the skip-lane scaffold proof below; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -201,6 +202,7 @@ teardown() {
   [ -n "$TASK_SEED_DIR" ] && rm -rf "$TASK_SEED_DIR"
   [ -n "$HOOK_SEED_DIR" ] && rm -rf "$HOOK_SEED_DIR"
   [ -n "$PATCH_SRC_DIR" ] && rm -rf "$PATCH_SRC_DIR"
+  [ -n "$SKIP_SEED_DIR" ] && rm -rf "$SKIP_SEED_DIR"
   # And the state dir — which is NOT just metadata. On a VM lane it holds the
   # provider's per-VM writable data volume
   # (`minimal/providers/local-minvmd0/data-vol.raw`), a sparse image whose HOST
@@ -1055,6 +1057,63 @@ exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   echo "shell fallback proof OK (bash started, notice names the package)"
   echo "::endgroup::"
 fi
+# ---------------------------------------------------------------------------
+# Skip-lane scaffold proof (every lane). Every other seed here deliberately
+# becomes a VCS root so the headless upload gate ships it; this one does the
+# opposite. A non-VCS, non-empty directory with no `minimal.toml` (and no
+# explicit `--sync`) is the one shape where the gate SKIPS the upload, so the
+# session's blueprint is not the user's — it is the one the daemon scaffolds
+# into the workspace. Its packages must reach the box: they used to be decided
+# by a composition that ran before the scaffold, so the session came up
+# without the packages its own `/workbench/minimal.toml` declared
+# (gominimal/inbox#601). Mints its own session; nothing here touches $sid.
+echo "::group::skip-lane scaffold (no VCS root, no minimal.toml: the daemon writes the blueprint)"
+SKIP_SEED_DIR="$(mktemp -d /tmp/mnlsc.XXXXXX)"
+# Non-empty (an empty dir skips the upload for a different reason), and
+# deliberately WITHOUT a `.git` marker or a `minimal.toml` — both would take
+# the activation off the skip lane. /tmp has no mfile above it, so the
+# client's walk up finds none either.
+printf 'skip-lane seed\n' > "$SKIP_SEED_DIR/README"
+# `--no-prompt` plus stdin from /dev/null: headless, which is what turns the
+# non-VCS upload confirmation into a silent skip.
+skip_activate_out="$(cd "$SKIP_SEED_DIR" \
+  && mnl session activate . --name e2e-scaffold --no-prompt </dev/null 2>"$WORK/skip-activate.err")" || {
+  echo "::error::'min session activate' from a non-VCS dir with no minimal.toml failed"
+  echo "--- stdout ---"; printf '%s\n' "$skip_activate_out"
+  echo "--- stderr ---"; cat "$WORK/skip-activate.err" 2>/dev/null || true
+  fail
+}
+skip_sid="$(printf '%s\n' "$skip_activate_out" | tail -n1 | tr -d '\r')"
+# One exec: the blueprint the daemon wrote, then whether the box carries what
+# it declares. `vim` is the discriminator — the scaffold always declares it and
+# it is in none of the launcher's baseline packages (base/coreutils/socat), so
+# its presence can only have come from the scaffolded mfile.
+skip_probe="$(mnl session exec "$skip_sid" \
+  'cat /workbench/minimal.toml; command -v vim >/dev/null 2>&1 && echo VIM_PRESENT || echo VIM_ABSENT' \
+  2>"$WORK/skip-exec.err")" || {
+  echo "::error::'min session exec' against the skip-lane session failed"
+  echo "--- stdout ---"; printf '%s\n' "$skip_probe"
+  echo "--- stderr ---"; cat "$WORK/skip-exec.err" 2>/dev/null || true
+  fail
+}
+# Glob, never `| grep -q` — same SIGPIPE-under-pipefail reasoning as the
+# sandbox proof's markers.
+if [[ "$skip_probe" != *'"vim"'* ]]; then
+  echo "::error::the daemon-scaffolded /workbench/minimal.toml does not declare vim; the assertion below would prove nothing"
+  echo "--- probe ---"; printf '%s\n' "$skip_probe"
+  fail
+fi
+if [[ "$skip_probe" != *VIM_PRESENT* ]]; then
+  echo "::error::the session lacks a package its own scaffolded /workbench/minimal.toml declares (gominimal/inbox#601)"
+  echo "--- probe ---"; printf '%s\n' "$skip_probe"
+  echo "--- activate stderr ---"; cat "$WORK/skip-activate.err" 2>/dev/null || true
+  fail
+fi
+mnl session destroy --force "$skip_sid" >/dev/null 2>&1 || true
+rm -rf "$SKIP_SEED_DIR"; SKIP_SEED_DIR=""
+echo "skip-lane scaffold proof OK (scaffolded blueprint's packages reached the box)"
+echo "::endgroup::"
+
 # ---------------------------------------------------------------------------
 # Session-sandbox proof (every lane). Everything above proves the lifecycle;
 # this forks a real sandbox and proves the in-sandbox `min add`. A session is

@@ -1802,13 +1802,14 @@ pub(crate) mod tests {
     }
 
     /// Configuring a loadout against a workspace with no `minimal.toml`
-    /// still succeeds — the parse fails silently (debug log), the
-    /// graph resolve is short-circuited (no `Context` to resolve
-    /// against), no project contribution lands, and the
-    /// empty-contribution fast path completes as before. Guards the
-    /// DM1 / empty-workspace path against regressions.
+    /// scaffolds a default one *before* composing, so the packages that
+    /// default declares land in the composition — and from there in the
+    /// launcher's package set, which is its baseline unioned with the
+    /// composition's packages and nothing else. Scaffolding after the
+    /// compose (as `build_context` alone used to) left a session running
+    /// without the packages its own workspace mfile declared.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn configure_loadout_with_missing_mfile_still_succeeds() {
+    async fn configure_loadout_scaffolds_missing_mfile_into_composition() {
         let (_state, _cache, mngr) = manager().await;
         // No `seed_workspace_mfile`: the workspace stays empty, mirroring
         // an activation against a directory with no `minimal.toml`.
@@ -1818,7 +1819,16 @@ pub(crate) mod tests {
             .configure_loadout(WireContribution::default())
             .await
             .expect("configuring against a missing mfile should still succeed");
-        assert!(response.is_none());
+        assert!(response.is_none(), "the scaffolded default gates nothing");
+
+        let comp = peek_composition(&mngr, id).await;
+        let package_names: std::collections::BTreeSet<&str> =
+            comp.packages().iter().map(|p| p.package()).collect();
+        assert!(
+            package_names.contains("vim"),
+            "the scaffolded mfile's packages should reach the composition, \
+             got {package_names:?}"
+        );
     }
 
     /// A `[session]` block that contributes a package is picked up
