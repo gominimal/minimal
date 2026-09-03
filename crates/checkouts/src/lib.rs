@@ -194,6 +194,11 @@ impl ManagerHandle {
         self.0.lock().unwrap().update()
     }
 
+    /// Fetches and re-checks-out a single known remote. See [`Manager::update_remote`].
+    pub fn update_remote(&mut self, remote: &str) -> Result<(), Error> {
+        self.0.lock().unwrap().update_remote(remote)
+    }
+
     /// Returns the path to a checkout described by the given parameters, as well as the
     /// commit hash at the given ref.
     pub fn checkout_of(&mut self, remote: &str, at: GitRef) -> Result<(PathBuf, String), Error> {
@@ -292,6 +297,33 @@ impl Manager {
                 checkout.rev =
                     repo.worktree_checkout(&checkouts_dir.join(dir), &checkout.version)?;
             }
+        }
+        self.state.write_to(&self.base_dir)?;
+        Ok(())
+    }
+
+    /// Fetches a single known `remote` and re-checks-out its tracked worktrees,
+    /// mirroring the per-repo body of [`Self::update`] for just that remote.
+    ///
+    /// Unlike [`Self::update`], the remaining registered remotes are left
+    /// untouched, so one unreachable remote cannot gate an operation that only
+    /// needs `remote` fresh. A remote not yet registered is a no-op: a
+    /// subsequent [`Self::checkout_of`] clones it on first use.
+    pub fn update_remote(&mut self, remote: &str) -> Result<(), Error> {
+        if self.offline {
+            return Err(Error::OfflineCacheMiss {
+                remote: remote.to_string(),
+            });
+        }
+        let Some(id) = self.state.git_remotes.get(remote).cloned() else {
+            return Ok(());
+        };
+        let checkouts_dir = self.git_checkouts_dir();
+        let repo = self.repos.get_mut(&id).unwrap();
+        trace!("updating repo {}", repo.url());
+        repo.fetch()?;
+        for (dir, checkout) in self.state.repos.get_mut(&id).unwrap().checkouts.iter_mut() {
+            checkout.rev = repo.worktree_checkout(&checkouts_dir.join(dir), &checkout.version)?;
         }
         self.state.write_to(&self.base_dir)?;
         Ok(())
@@ -630,6 +662,37 @@ mod tests {
             "commit ref must reuse the branch worktree"
         );
         assert_eq!(commit_rev, hash);
+    }
+
+    /// A single unreachable remote must not gate `update_remote` for a
+    /// different, reachable remote — even though the global `update` errors on
+    /// the same registry.
+    #[test]
+    fn update_remote_ignores_other_unreachable_remotes() {
+        let (reachable_src, _) = make_local_repo("main");
+        let reachable = reachable_src.path().to_str().unwrap().to_string();
+        let (unreachable_src, _) = make_local_repo("main");
+        let unreachable = unreachable_src.path().to_str().unwrap().to_string();
+
+        let base = tempfile::tempdir().unwrap();
+        let mut handle = Manager::new_in_dir(base.path()).unwrap();
+
+        // Register both remotes by checking each out once.
+        handle
+            .checkout_of(&reachable, GitRef::Branch("main".to_string()))
+            .unwrap();
+        handle
+            .checkout_of(&unreachable, GitRef::Branch("main".to_string()))
+            .unwrap();
+
+        // Make the second remote unreachable by dropping its source directory.
+        drop(unreachable_src);
+
+        // The global refresh touches every remote, so it fails on the dead one.
+        assert!(handle.update().is_err());
+
+        // A targeted refresh of the reachable remote is unaffected.
+        handle.update_remote(&reachable).unwrap();
     }
 
     /// In offline mode, `update()` returns OfflineCacheMiss rather than

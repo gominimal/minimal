@@ -45,6 +45,10 @@ pub trait ProjectEnv {
     /// Fetch/update every known checkout.
     fn update_checkouts(&mut self) -> Result<(), Error>;
 
+    /// Fetch/update a single known checkout `remote`, leaving the others
+    /// untouched so an unreachable remote cannot gate the operation.
+    fn update_checkout(&mut self, remote: &str) -> Result<(), Error>;
+
     /// Build the full package graph from the given upstream `link`.
     fn graph_from_chain(&mut self, link: LinkConfig, target: Target) -> Result<Graph, Error>;
 
