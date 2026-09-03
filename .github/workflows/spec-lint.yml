@@ -125,8 +125,12 @@ jobs:
           # A PR that changes this workflow and no spec would otherwise prove
           # nothing: the token, the checkout and the linter would all go
           # unexercised until someone else's spec PR ran them. Lint the
-          # template instead — it is a real spec-shaped document, it lives at a
-          # known path, and it is expected to come back clean.
+          # template instead — it is a real spec-shaped document at a known
+          # path. It does not come back clean, and is not meant to: its prompts
+          # are unfilled by definition, so S006 and S007 fire on every section
+          # that is still a prompt. Those findings are the expected output of
+          # this self-test; a change in them means the template or the linter
+          # moved, which is the thing worth noticing.
           if [ ${#files[@]} -eq 0 ] && [ -f pr/docs/specs/TEMPLATE.md ] \
              && printf '%s\n' ${changed+"${changed[@]}"} \
                 | grep -qxF '.github/workflows/spec-lint.yml'; then
