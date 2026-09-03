@@ -144,6 +144,32 @@ Nothing about a command's *text* routes it: a command is the session's however
 it happens to start, so the session's own `min` binary is reachable here. The
 daemon's own operations are named explicitly instead — see `session run`.
 
+#### Backgrounding a command
+
+`session exec` returns when `COMMAND` itself exits, and relays output up to
+that point. A process the command backgrounds keeps running in the session,
+but what it writes *after* the command has exited is not yours to rely on: a
+short drain catches whatever was already in flight, and past that its output
+is read and discarded. Nothing it writes is ever lost to a broken pipe — the
+process is not killed — but you will not see it.
+
+```
+min session exec web 'sleep 20 & echo STARTED'   # returns immediately
+```
+
+So background a long-running process with its output redirected somewhere you
+can retrieve it, rather than expecting it on the wire:
+
+```
+min session exec web 'nohup ./server >server.log 2>&1 &'
+min session exec web 'tail -n 50 server.log'
+```
+
+`nohup ... >/dev/null 2>&1 &` is the fully detached form: it hands the process
+its own stdout and stderr and drops the ones it inherited, so nothing about it
+depends on the exec channel at all. The same applies to `session run` and
+`task run`, which relay over the same channel.
+
 ### `session run`
 
 ```
