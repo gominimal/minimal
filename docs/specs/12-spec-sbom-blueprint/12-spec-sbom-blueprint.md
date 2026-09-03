@@ -23,6 +23,10 @@ agent sessions want the posture story reviewable before granting it.
 documents whose component digests chain to the signed catalog closure, and
 whose regeneration is byte-identical.
 
+A **catalog pin** is the triple {repo, commit, closure object} the epic
+defines; every document is emitted under one, and "the pin" below always means
+it.
+
 A document for an environment is a **composition**, not a re-derivation:
 the per-package document sealed at publish is the unit, and an environment's
 document is an envelope of composition-level facts over references to those
@@ -49,10 +53,9 @@ developer running agent sessions; build-infra operator; auditor.
 - AS A developer running agent sessions I WANT a Blueprint of a session's
   declared posture SO THAT I can review what an agent environment may do
   before granting it
-- AS A build-infra operator I WANT the same model emitted per-package at
-  publish time SO THAT catalog artifacts ship supply-chain documents without
-  a second implementation, and every environment document composes from them
-  rather than re-deriving component detail
+- AS A build-infra operator I WANT the same SBOM model emitted per-package at
+  publish time SO THAT catalog artifacts ship with supply-chain documents
+  without a second implementation
 - AS AN auditor I WANT deterministic regeneration SO THAT two parties can
   independently produce and compare the same document
 
@@ -122,12 +125,13 @@ developer running agent sessions; build-infra operator; auditor.
   property: for all compositions c, vars v: values(v) intersect
     bytes(emit(c)) is empty
 
-- **SBOM-009** WHEN emitting a document for an environment whose components
-  are published under its pin THE SYSTEM SHALL compose component detail by
-  reference to the per-package documents resolved through that pin's
-  closure, rather than re-deriving it from recipe metadata.
+- **SBOM-009** WHEN a component has a per-package document sealed under the
+  environment's pin THE SYSTEM SHALL emit that component's detail equal to
+  that document. The per-package document is the interface build
+  infrastructure emits and this command reads, so its content is part of the
+  contract rather than an implementation choice.
   tier:     T0
-  verify:   just test-one sbom_composes_from_per_package_documents
+  verify:   just test-one sbom_component_detail_equals_sealed_document
 
 - **SBOM-010** THE SYSTEM SHALL derive composition-level facts — launcher
   injection, posture axes, and environment assets — from the environment's
@@ -148,8 +152,10 @@ developer running agent sessions; build-infra operator; auditor.
   cannot be fetched THEN THE SYSTEM SHALL fail naming the pin, the
   unresolved object, and the remediation, never emitting a document whose
   component set is silently incomplete.
-  tier:     T0
+  tier:     T1
   verify:   just test-one sbom_unfetchable_reference_fails_loudly
+  property: for all emissions e: emitted(e) implies every component of e
+    resolved or carries a declared gap
 
 ## Non-goals
 
@@ -176,6 +182,27 @@ second consumer is why the model takes no CLI or daemon dependencies. A
 content-derived catalog pin replaces random serials and wall-clock so
 documents chain to a Sigstore-verifiable object and regeneration is
 reproducible. Decisions and alternatives live in minimal#700 (D1-D11).
+
+SBOM-009 through SBOM-012 answer a review question on the spec PR rather than
+an acceptance criterion: the epic predates the choice between eager
+whole-environment emission and composition, and its criteria do not reach it.
+Composition by reference rather than eager whole-environment emission: the
+per-package document is the unit publish already has the inputs for, one
+document serves every environment containing that package, and a composed
+document inherits corrected component data — a revised patch ledger, a new
+advisory disposition — without regenerating anything. The cost is that
+resolution can miss, which is why SBOM-011 and SBOM-012 are requirements
+rather than error handling: a document that silently drops a component is
+worse than one that refuses to emit. Non-redistributable packages and
+locally-built ones are permanently outside the cache by design, so the gap
+arm is the ordinary path, not a failure mode.
+
+Three CycloneDX emitters already exist in the org — `minimal-supply-chain`'s
+`sbom.rs`, `pkgmgr-rs`'s `pkgmgr sbom` built on it, and the older
+`attest-sbom` crate — all deriving from recipe metadata rather than from a
+built artifact. The model crate here subsumes rather than joins them; which of
+the three it replaces is an open question below, and leaving it unanswered is
+how a fourth implementation gets written.
 
 **Generality:** a second document format fits behind the serializer seam
 (SPDX proves it in the first slice); a second consumer (build infra) is a
