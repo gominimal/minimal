@@ -8,6 +8,10 @@
 //! dependency-minimal so the carve-out cost is visible in `Cargo.lock`.
 
 pub mod attach;
+pub mod rt;
+pub mod wg;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod testing;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 

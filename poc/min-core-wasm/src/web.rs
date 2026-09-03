@@ -193,6 +193,7 @@ fn to_js(err: impl std::fmt::Display) -> JsValue {
 #[wasm_bindgen]
 pub struct MinAttach {
     writer: Rc<Writer>,
+    _mesh: Option<Rc<MeshLink>>,
 }
 
 #[wasm_bindgen]
@@ -262,5 +263,184 @@ pub async fn attach(
     });
     Ok(MinAttach {
         writer: Rc::new(writer),
+        _mesh: None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Mesh path: the tab as a WireGuard node, SSH inside the tunnel.
+// ---------------------------------------------------------------------------
+
+use crate::wg::{DatagramPipe, WgConfig, WgStack};
+use tokio::sync::mpsc;
+
+struct DatagramCallbacks {
+    _onopen: Closure<dyn FnMut()>,
+    _onmessage: Closure<dyn FnMut(MessageEvent)>,
+    _onerror: Closure<dyn FnMut(DomEvent)>,
+    _onclose: Closure<dyn FnMut(CloseEvent)>,
+}
+
+/// A browser `WebSocket` carrying one WireGuard datagram per binary frame —
+/// the transport a daemon's WebSocket ingress (or a mesh relay) speaks.
+pub struct WsDatagrams {
+    _ws: SendWrapper<WebSocket>,
+    _callbacks: SendWrapper<DatagramCallbacks>,
+}
+
+impl WsDatagrams {
+    pub async fn connect(url: &str) -> io::Result<(DatagramPipe, WsDatagrams)> {
+        let ws = WebSocket::new(url).map_err(js_io_error)?;
+        ws.set_binary_type(BinaryType::Arraybuffer);
+        let state = Arc::new(Mutex::new(Shared::default()));
+        let (from_network_tx, from_network_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (to_network_tx, mut to_network_rx) = mpsc::channel::<Vec<u8>>(256);
+
+        let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+            if let Ok(buf) = e.data().dyn_into::<ArrayBuffer>() {
+                // Datagram semantics: a full queue drops, like UDP.
+                let _ = from_network_tx.try_send(Uint8Array::new(&buf).to_vec());
+            }
+        });
+        ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+
+        let s = state.clone();
+        let onopen = Closure::<dyn FnMut()>::new(move || {
+            let mut g = s.lock().unwrap();
+            g.open = true;
+            g.wake_all();
+        });
+        ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+        let s = state.clone();
+        let onerror = Closure::<dyn FnMut(DomEvent)>::new(move |_e: DomEvent| {
+            let mut g = s.lock().unwrap();
+            g.closed.get_or_insert_with(|| "websocket error".to_string());
+            g.wake_all();
+        });
+        ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+        let s = state.clone();
+        let onclose = Closure::<dyn FnMut(CloseEvent)>::new(move |e: CloseEvent| {
+            let mut g = s.lock().unwrap();
+            g.closed
+                .get_or_insert_with(|| format!("websocket closed ({} {})", e.code(), e.reason()));
+            g.wake_all();
+        });
+        ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
+
+        // Outbound pump: the stack's datagrams onto the socket. Ends when the
+        // stack (the sender) goes away.
+        let sender = ws.clone();
+        spawn_local(async move {
+            while let Some(datagram) = to_network_rx.recv().await {
+                if sender.send_with_u8_array(&datagram).is_err() {
+                    break;
+                }
+            }
+        });
+
+        std::future::poll_fn(|cx| {
+            let mut g = state.lock().unwrap();
+            if g.open {
+                Poll::Ready(Ok(()))
+            } else if let Some(err) = &g.closed {
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionRefused, err.clone())))
+            } else {
+                g.open_waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await?;
+
+        Ok((
+            DatagramPipe {
+                to_network: to_network_tx,
+                from_network: from_network_rx,
+            },
+            WsDatagrams {
+                _ws: SendWrapper::new(ws),
+                _callbacks: SendWrapper::new(DatagramCallbacks {
+                    _onopen: onopen,
+                    _onmessage: onmessage,
+                    _onerror: onerror,
+                    _onclose: onclose,
+                }),
+            },
+        ))
+    }
+}
+
+fn decode_key(b64: &str) -> Result<[u8; 32], JsValue> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|e| to_js(format!("key is not base64: {e}")))?;
+    bytes
+        .try_into()
+        .map_err(|_| to_js("key must be 32 bytes"))
+}
+
+/// Attach over the mesh: dial `ws_url` (a WireGuard-over-WebSocket ingress),
+/// bring up a WireGuard tunnel to the peer with the given keys and tunnel
+/// addresses, open TCP to `peer_ip:ssh_port` inside it, then run the same
+/// attach handshake as [`attach`]. Keys are base64 as WireGuard prints them.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub async fn attach_wg(
+    ws_url: String,
+    private_key_b64: String,
+    peer_public_key_b64: String,
+    local_ip: String,
+    peer_ip: String,
+    prefix_len: u8,
+    ssh_port: u16,
+    session_id: String,
+    term: String,
+    cols: u32,
+    rows: u32,
+    on_data: Function,
+    on_close: Function,
+) -> Result<MinAttach, JsValue> {
+    console_error_panic_hook::set_once();
+    let cfg = WgConfig {
+        private_key: decode_key(&private_key_b64)?,
+        peer_public_key: decode_key(&peer_public_key_b64)?,
+        local_ip: local_ip.parse().map_err(|e| to_js(format!("local_ip: {e}")))?,
+        prefix_len,
+        peer_ip: peer_ip.parse().map_err(|e| to_js(format!("peer_ip: {e}")))?,
+        persistent_keepalive_secs: Some(25),
+        initiate: true,
+    };
+    let (pipe, link) = WsDatagrams::connect(&ws_url).await.map_err(to_js)?;
+    let (stack, driver) = WgStack::new(cfg, pipe);
+    spawn_local(driver);
+    let stream = stack.connect(ssh_port);
+    let attached = Attach::connect(stream, &session_id, &term, Grid { cols, rows })
+        .await
+        .map_err(to_js)?;
+    let (writer, mut reader) = attached.split();
+    spawn_local(async move {
+        let mut exit: Option<u32> = None;
+        while let Some(event) = reader.next().await {
+            match event {
+                Event::Data(bytes) | Event::Stderr(bytes) => {
+                    let _ = on_data.call1(&JsValue::NULL, &Uint8Array::from(&bytes[..]));
+                }
+                Event::Exit(code) => exit = Some(code),
+                Event::Eof => {}
+                Event::Closed => break,
+            }
+        }
+        let code = exit.map(JsValue::from).unwrap_or(JsValue::UNDEFINED);
+        let _ = on_close.call1(&JsValue::NULL, &code);
+    });
+    Ok(MinAttach {
+        writer: Rc::new(writer),
+        _mesh: Some(Rc::new(MeshLink { _stack: stack, _link: link })),
+    })
+}
+
+/// Keeps the tunnel and its WebSocket alive as long as the attachment.
+struct MeshLink {
+    _stack: WgStack,
+    _link: WsDatagrams,
 }

@@ -1,8 +1,10 @@
 # min-core wasm probe
 
-Milestone 1 of gominimal/inbox#606, as a standalone crate: the `min session
-attach` handshake on top of russh, built for `wasm32-unknown-unknown` with a
-wasm-bindgen head, plus the same code running natively under test.
+Milestones 1 and 1b of gominimal/inbox#606, as a standalone crate: the `min
+session attach` handshake on top of russh, and beneath it a userspace
+WireGuard tunnel with its own TCP/IP stack so the tab is a mesh node — built
+for `wasm32-unknown-unknown` with a wasm-bindgen head, plus the same code
+running natively under test.
 
 Not part of the `minimal` workspace on purpose (own `[workspace]` table): the
 point is to see what a dependency-minimal core costs, and `Cargo.lock` here is
@@ -22,6 +24,42 @@ that number.
   exported to JS. Compiles; not yet run in a browser.
 - `js/min-socket.mjs`: the WebSocket-shaped adapter `TerminalPane.astro`'s
   `connect()` would use instead of `new WebSocket(url)`.
+
+## Stage 1b: the tab as a WireGuard node
+
+- `src/wg.rs`: boringtun's `Tunn` (the same crate `minimald` embeds under
+  `networking-wg`) plus smoltcp, behind the russh transport. `WgStack::new`
+  takes a `DatagramPipe` (two queues, one WireGuard datagram per item) and
+  returns a driver future the host spawns; `connect(port)` / `listen(port)`
+  give a `WgTcpStream` that is `AsyncRead + AsyncWrite + Send`, so russh
+  neither knows nor cares that the bytes cross a tunnel.
+- `src/rt.rs`: the only runtime services the network layer needs, clock and
+  sleep, tokio natively and `Date.now` + `setTimeout` in a browser.
+- `vendor/boringtun` + `patches/`: boringtun 0.7.1 compiles for wasm with one
+  patch — its sleep-aware clock has unix and windows backends only; the patch
+  adds a `web-time` backend for other targets. Upstreamable.
+- `tests/wg_roundtrip.rs`: two in-process nodes cross-connected by datagram
+  queues; the daemon node listens on TCP/22 inside the tunnel with the
+  fake-minimald server, the tab node connects and runs the attach. Handshake,
+  banner, echo, resize, a 20 KB payload, exit status, close.
+- `tests/wg_over_ws.rs` + `examples/wg-peer.rs`: the same through a real
+  loopback WebSocket, one datagram per binary frame. `wg-peer` is the native
+  stand-in for "minimald with a WireGuard-over-WebSocket ingress" that a
+  browser can dial; it prints the JSON peer config the page passes to
+  `attach_wg`.
+- `attach_wg(...)` in `src/web.rs` and `minMeshSocket` in `js/min-socket.mjs`:
+  the browser head for the mesh path.
+
+Run the stand-in and point the page at it:
+
+    cargo run --example wg-peer -- 127.0.0.1:7691
+    # in the page: minMeshSocket({ peer: <the printed JSON>, sessionId, cols, rows })
+
+Caveats: interop is proven boringtun-to-boringtun (also what `minimald`
+embeds), not against wireguard-go or the kernel module; there is no relay —
+`wg-peer` terminates the WebSocket itself, the "daemon is reachable" case; a
+WebSocket that dies is not yet surfaced to the SSH layer, so the session hangs
+until a keepalive notices. None of it has run in a browser yet.
 
 ## Building
 
@@ -66,6 +104,8 @@ line that ssh-key's p256 pulls in. `ring` needs `clang` for its C sources.
 
 ## Numbers (2026-09-03, rust 1.97.1, russh 0.63.1, wasm-bindgen 0.2.127, binaryen 124)
 
+SSH-only module (Stage 0):
+
 | Artifact | raw | gzip -9 |
 |---|---|---|
 | `min_core.wasm` from cargo (`opt-level = "s"`, lto, panic=abort, build-std) | 2,188,098 B | 530,788 B |
@@ -77,3 +117,13 @@ Reference point from webapp#735: ghostty-web is 636,327 B raw / 184,359 B gzip.
 Obvious diet candidates, untried: drop `flate2` (compression is negotiable),
 and see whether `ssh-key`'s p256/p384/p521 can be left out when minimald only
 ever presents ed25519.
+
+With the WireGuard + smoltcp layer (Stage 1b), same pipeline:
+
+| Artifact | raw | gzip -9 |
+|---|---|---|
+| after `wasm-bindgen --target web` | 2,167,797 B | 548,885 B |
+| after `wasm-opt -Os` | 1,092,803 B | 446,597 B |
+| `min_core.js` glue | 31,492 B | 6,676 B |
+
+The network layer costs 183 KB raw / 91 KB gzip on top of the SSH-only module.
