@@ -2,14 +2,27 @@
 //!
 //! [`ProjectComposable`] pairs a project's [`Session`] block with its
 //! project path, tagging every primitive it produces with
-//! [`Source::Project`]. Mirrors [`Loadout`]'s materialization
-//! exactly — the only difference is provenance and the absence of a
-//! per-block name.
+//! [`Source::Project`]. It mirrors [`Loadout`]'s materialization for
+//! packages, patches, and lifecycle hooks — but **not** for vars.
+//!
+//! A project routes its vars through the shared
+//! [`contribute_primitives`] / [`ResolvedVar::resolve_with`] path, so
+//! a bare `{ inherit = true }` that the environment does not carry is
+//! a hard error and fails activation. [`Loadout`] resolves its own
+//! vars through a private `resolve_var_declaration` that warns and
+//! drops that same case instead. Both behaviours are deliberate — a
+//! project declares what every contributor needs, a loadout declares
+//! one developer's preferences — but they are *not* the same
+//! behaviour, and this module is the strict half. The user-facing
+//! statement of the split is "Where `{ inherit = true }` differs" in
+//! `docs/reference/minimal-dot-toml.md`.
 //!
 //! [`Session`]: crate::Session
 //! [`Composable`]: sessions::core::compose::Composable
 //! [`Source::Project`]: sessions::core::source::Source::Project
 //! [`Loadout`]: sessions::core::loadout::Loadout
+//! [`contribute_primitives`]: sessions::core::compose::contribute_primitives
+//! [`ResolvedVar::resolve_with`]: sessions::core::primitives::ResolvedVar::resolve_with
 
 use paths::HostPath;
 use sessions::core::compose::{Composable, Contribution, Error, contribute_primitives};
@@ -143,11 +156,13 @@ mod tests {
 
     /// A var with `{ inherit = true }` whose env lookup returns
     /// [`NotPresent`] surfaces the [`ResolutionFailure`] as a
-    /// composition [`Error`], mirroring [`Loadout::contribute`].
-    /// This is expected: daemon-side pending routing lives in the
-    /// composer, not the trait impl. Documents the current failure
-    /// mode so a future PR that adds pending routing has a test to
-    /// flip.
+    /// composition [`Error`]. This is where a project **diverges from**
+    /// [`Loadout::contribute`], which warns and drops the same input;
+    /// the strictness is the project surface's documented contract, not
+    /// an accident of this impl. Daemon-side pending routing lives in
+    /// the composer, not the trait impl, so the error surfaces to the
+    /// user as `ComposeError::VarResolution` after the client re-resolves
+    /// the pending var against its own env.
     ///
     /// [`NotPresent`]: std::env::VarError::NotPresent
     /// [`ResolutionFailure`]: sessions::core::primitives::VarError::ResolutionFailure
@@ -166,8 +181,8 @@ mod tests {
 
         let env = |_: &str| Err(std::env::VarError::NotPresent);
         let err = comp.contribute(&env).expect_err("inherit lookup fails");
-        // Error propagates as the composer's Var domain, matching
-        // Loadout's behavior for the same input.
+        // Error propagates as the composer's Var domain. Loadout
+        // returns Ok here for the same input — see the doc comment.
         assert!(matches!(err, Error::Var { .. }));
     }
 

@@ -122,7 +122,7 @@ Names are not checked at activation: an unknown package composes cleanly
 and fails later, when the session first spawns, with
 `no such package: <name>`.
 
-### `[vars]` - Environment variables
+### `[vars]` - Environment variables {#vars}
 
 _Optional_
 
@@ -149,6 +149,15 @@ MUXER = { inherit = true }               # inherit from the host env
   when the host does not have the variable set.
 
 `inherit = false` is rejected; omit the variable instead.
+
+The warn-and-drop rule is a loadout relaxation, not a property of the
+spelling. The same `{ inherit = true }` in a project's
+[`[session.vars]`](./minimal-dot-toml.md#session) is **required**: an unset
+host variable there fails activation instead of being dropped. A project is
+declaring what every contributor needs, where a loadout is declaring what one
+developer would like. See
+[Where `{ inherit = true }` differs](./minimal-dot-toml.md#inherit-divergence)
+for the rule on every surface that accepts the form.
 
 ### `[[vars_lenient]]` - Environment variables with non-POSIX names {#vars_lenient}
 
