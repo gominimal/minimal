@@ -67,6 +67,48 @@ todos:
 11. ~~**Browser floor for WebCrypto X25519, and whether the mesh node key must be non-extractable.** `SubtleCrypto` X25519 (`generateKey`/`deriveBits`) ships in Chrome/Edge 133, Firefox 130, Safari 17 (caniuse `mdn-api_subtlecrypto_derivebits_x25519`; chromestatus 6291245926973440). Two questions: is that floor acceptable against the product's browser support matrix, and is a non-extractable static node key *required*? boringtun's `Tunn::new` takes the static secret as bytes (`crates/minimald/src/net/wg.rs:436–437` shows the call; the probe's `attach_wg` takes `private_key_b64`), so a WebCrypto-held key needs a pluggable static-DH hook in the noise core (a second, larger boringtun patch, or upstream); Stage 1b uses an in-memory, short-lived key (tsconnect's "in-memory-only WireGuard keypair" posture). The plan recommends accepting the in-memory key for v1 with an 8 h binding and rotation per page session, and listing the WebCrypto-held key as S13 hardening.~~
    **Resolved**: In-memory node key for v1, bounded by the 8-hour binding and rotated per page session; the WebCrypto-held key with a static-DH hook is S13 hardening, so the X25519 floor does not gate v1. See S13 in [7. What the eventual spec must decide](#7-what-the-eventual-spec-must-decide).
 
+12. ~~**What exactly does the no-BFF rule forbid?**~~
+   **Resolved** (2026-09-03 design interview): No server in the session data path. Servers remain for the page, Gatehouse (identity and control plane), the relay tier, and notifications; none holds box credentials or sees SSH bytes.
+
+13. ~~**Which compromise is the design ranked against first?**~~
+   **Resolved** (2026-09-03 design interview): None singled out: security is paramount and every base gets a named mechanism (entries 14–25).
+
+14. ~~**Who serves the page and the wasm?**~~
+   **Resolved** (2026-09-03 design interview): minimal.dev, operated by Minimal — trusted for code integrity, never for data, and made verifiable per entry 17.
+
+15. ~~**Where do the tab's tokens live across reloads?**~~
+   **Resolved** (2026-09-03 design interview): In memory only; a reload silently re-mints through Gatehouse's SSO browser session (12 h idle / 7 d absolute). Nothing is persisted in the page.
+
+16. ~~**Does the terminal client get its own origin?**~~
+   **Resolved** (2026-09-03 design interview): Yes — a separate origin (e.g. `app.minimal.dev`) with nonce-based CSP, SRI on the wasm and JS, Trusted Types, and no third-party scripts; marketing and analytics stay on the marketing origin.
+
+17. ~~**Is a pinned, verifiable release bundle worth it?**~~
+   **Resolved** (2026-09-03 design interview): Yes, from v1: content-addressed wasm and JS with SRI plus a published bundle hash the CLI can verify, on the CLI's existing release pipeline.
+
+18. ~~**Who runs the packet relay for daemons behind NAT?**~~
+   **Resolved** (2026-09-03 design interview): Minimal runs a stateless, regional relay tier; daemons connect outbound; the relay forwards WireGuard ciphertext only. Every home PC works without user networking.
+
+19. ~~**What is the mobile story, given backgrounded tabs freeze the tunnel?**~~
+   **Resolved** (2026-09-03 design interview): Mobile web first: the core reconnects and re-attaches on foreground and the daemon-side repaint (S7) makes it seamless; a native app with an in-process netstack follows from the same core on demand.
+
+20. ~~**Is multi-user (teammate) access in v1?**~~
+   **Resolved** (2026-09-03 design interview): No — owner-only in v1; teammate access is a spec item covering the Cedar `SshConnect` shape for non-owner principals and share links.
+
+21. ~~**Who knows which boxes are online for `min ls`?**~~
+   **Resolved** (2026-09-03 design interview): Daemons heartbeat to Gatehouse; the tab reads the node set with liveness in one call and handshakes only with the node it attaches to.
+
+22. ~~**What happens to browser sessions during a Gatehouse outage?**~~
+   **Resolved** (2026-09-03 design interview): Accepted: sessions detach at the next 15-minute renewal and re-attach when Gatehouse returns; the daemon session keeps running; no grace period, §5.7's cap stays exact; the tab shows a clear retrying state.
+
+23. ~~**Should a personal daemon have an inbound listener by default?**~~
+   **Resolved** (2026-09-03 design interview): No — outbound-only to the relay by default; direct LAN or public ingress is an explicit opt-in.
+
+24. ~~**Who may use the relay?**~~
+   **Resolved** (2026-09-03 design interview): A Gatehouse-issued per-node relay ticket bound to the tab's DPoP key, validated statelessly by the relay; daemons authenticate to the relay with `sshpop-host`.
+
+25. ~~**Is the 447 KB gzip mesh-capable bundle within budget?**~~
+   **Resolved** (2026-09-03 design interview): Yes for v1 — a terminal route loads once and is cached; the diet (drop `flate2`, NIST curves, feature-gating) is later work.
+
 ## Problem
 
 **What the user wants.** The webapp should become a usable `min` client that lives in the cloud, and it should be **peer to peer**: a logged-in user sees every box host they own or may reach — a `minimald` on their desktop PC, another on their laptop, hosted hosts from the Minimal Box Provider — and can attach to a session on any of them from a browser tab, on a phone or a desktop, with the SSH session terminating *in the tab* and no key material that a compromised page could exfiltrate. The owner's direction, verbatim: "ideally, a mobile or web user will not have to start up the mesh separately from the browser 'tab' and the tab would be the thing connecting to the mesh"; "any option regarding a server hop i don't really want to entertain. this needs to scale, if putting the wireguard control plane in gatehouse makes sense, we should do that"; and earlier, "if the minimald's all were networked together, and calling into the wasm module to list all boxes e.g. 'min ls', can webapp operate just like the cli, without a backend service involved?" So the target is: **no backend service in the path; the tab connects to the mesh itself.** inbox#513's "Mobile / Web Browser" story is the product framing: navigate to a session URL, authenticate via GitHub, stream the terminal in real time, type into it, close the tab and find the session still running detached. The CLI stays the first-class client and the webapp is "a cloud-accessible version of the same thing", minus features that make no sense without a filesystem in the tab.
@@ -303,6 +345,17 @@ Numbered so the spec can answer them one by one. These are decisions for the spe
 - **S11 — Mobile.** See S13; the app itself is a separate spec.
 - **S12 — Relay protocol and scaling model.** A DERP-style forwarder: nodes connect outbound over WSS and register by mesh public key (daemon auth `sshpop-host`, SSHPOP.md §5.1.1(b), with the relay listed in `gatehouse_node_endpoints`; tab auth its DPoP token or binding at WebSocket open); frames addressed by destination key; no state beyond the connection map; home-relay assignment per node in the peer document; horizontal scaling by adding relays and reassigning homes, with inter-relay forwarding or none (a tab always dials the daemon's home relay); rate limits and connection caps; operator (Minimal, or a provider as part of its ingress); the daemon's outbound relay connection in `minimald` (only when configured NAT'd); and the explicit statement that direct paths are preferred — daemon↔daemon UDP with endpoint roaming, tab↔daemon direct WebSocket when the daemon is reachable — so the relay carries only what cannot go direct.
 - **S13 — Mobile in-process netstack.** The same core behind UniFFI with a UDP datagram pipe: the app tunnels only its own SSH/RPC traffic in-process (tsnet-style), so no VPN entitlement or system tunnel is involved; hole-punching like a daemon; the node key in app memory or the platform keystore; background/foreground lifecycle vs binding TTL. Also the hardening item for both heads: a **WebCrypto-/keystore-held X25519 node key** via a pluggable static-DH hook in the noise core (boringtun patch or upstream), so the static key never sits in process memory.
+
+### Decisions taken on 2026-09-03 (design interview)
+
+Recorded in the Open Questions log as entries 12–25; the spec inherits them under the items named here.
+
+- **Rule (S1, S3, S10):** no server in the session data path. Minimal still operates the page origin, Gatehouse, the relay tier, and notifications; none holds box credentials or sees SSH bytes. No single threat is ranked first; each base below has a named mechanism.
+- **Credentials in the tab (S1, S10):** tokens in memory only, silent re-mint through Gatehouse's SSO browser session on reload; the client app on its own origin (nonce CSP, SRI, Trusted Types, no third-party scripts); a pinned, content-addressed release bundle with a CLI-verifiable hash from v1. A Gatehouse outage detaches browser sessions at the next renewal with no grace period; they re-attach when it returns.
+- **Reachability (S3, S12):** Minimal runs a stateless relay tier; daemons connect outbound and expose no inbound listener by default (direct ingress is opt-in); tabs use the relay with a Gatehouse-issued per-node ticket bound to their DPoP key; daemons authenticate to the relay with `sshpop-host`.
+- **Listing (S2):** daemons heartbeat to Gatehouse; the tab reads node set plus liveness in one call. Owner-only in v1; teammate access and share links are a spec item (S8).
+- **Mobile (S13):** mobile web first with reconnect-on-foreground over the S7 repaint; the native app is later work from the same core.
+- **Bundle (S5):** 447 KB gzip is accepted for v1; the diet is later work.
 
 ## Files touched
 
