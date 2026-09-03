@@ -99,6 +99,15 @@ the current directory).
 | `--no-prompt` | | Fail instead of prompting when the daemon surfaces items user policy can't auto-decide; implied when stdin/stderr isn't a TTY |
 | `--attach` | | Automatically attach after creation |
 
+When `PATH` has no `minimal.toml`, activation still succeeds: the session comes
+up with a default environment and **nothing is written to `PATH`** — the daemon
+fabricates a default config inside the session's own workspace, so your
+directory is left untouched. On an interactive terminal `min` first offers to
+scaffold a `minimal.toml`; when prompts are skipped (`--no-input`, or a
+non-terminal stdin) it prints a notice and continues without one. `--loadout`
+is resolved before any of this, so an unknown loadout name errors even in a
+directory with no config.
+
 ### `session attach`
 
 ```
