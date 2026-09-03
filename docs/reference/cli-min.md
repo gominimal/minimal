@@ -93,7 +93,7 @@ the current directory).
 |------|-------|-------------|
 | `--name <NAME>` | `-n` | Optional session name |
 | `--sync <MODE>` | | How to load project files into the session: `tarball` (default: stream a tarball of your project and unpack it) or `none` (do not populate the worktree) |
-| `--loadout <NAME>` | | Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`. Repeatable; if given, config-file `default_loadouts` are ignored |
+| `--loadout <NAME>` | | Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml` or `<config>/minimal/loadouts/<NAME>/loadout.toml`. Repeatable; if given, config-file `default_loadouts` are ignored |
 | `--no-loadouts` | | Apply no loadouts at all (also skips the config's `default_loadouts`). Conflicts with `--loadout` |
 | `--no-hooks` | | Run none of the session's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from either the loadouts or the project's `minimal.toml`. Recorded on the session, so it applies to the later attach, detach, and destroy transitions too |
 | `--no-prompt` | | Fail instead of prompting when the daemon surfaces items user policy can't auto-decide; implied when stdin/stderr isn't a TTY |
@@ -259,9 +259,15 @@ daemon running).
 min loadout list [--dir <DIR>]
 ```
 
-Lists loadouts from the user's config directory. `--dir` overrides the
+Lists loadouts from the user's config directory, in both layouts —
+`<name>.toml` and `<name>/loadout.toml`. `--dir` overrides the
 loadouts directory (default: `<config>/minimal/loadouts`, e.g.
 `~/.config/minimal/loadouts` on Linux).
+
+A loadout that fails to load is reported on stderr and makes the command exit
+non-zero, leaving the table of valid loadouts intact. That covers a malformed
+file and a name defined in both layouts at once, which is
+[an error rather than a precedence rule](./loadouts.md#where-loadouts-live).
 
 ### `dirs`
 
