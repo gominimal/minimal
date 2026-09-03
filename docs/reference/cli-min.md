@@ -103,7 +103,8 @@ Activating a path that already has a session is allowed, but warns: `min` names
 the existing session and creates a second one anyway. With two sessions on one
 path, resolving that directory to a session is ambiguous, so a bare `min` there
 can no longer pick one and `session attach` falls back to its picker (erroring
-under `--no-input`). Attach to the existing session instead when you mean to
+when `--no-input` is set or stdin/stdout is not a terminal). Attach to the
+existing session instead when you mean to
 rejoin it.
 
 ### `session attach`

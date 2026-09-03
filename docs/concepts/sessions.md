@@ -115,8 +115,9 @@ Activating a project whose directory already has a session does not reuse that
 session: `min` warns, names the existing session, and creates a second one
 anyway. Once two sessions share a path, `min` can no longer resolve that
 directory to a single session, so a bare `min` there is ambiguous and `min
-session attach` opens a picker to choose between them (erroring under
-`--no-input`). Attach to the existing session instead of activating again when
+session attach` opens a picker to choose between them (erroring when
+`--no-input` is set or stdin/stdout is not a terminal). Attach to the existing
+session instead of activating again when
 you mean to rejoin it.
 
 ## How a session is composed
