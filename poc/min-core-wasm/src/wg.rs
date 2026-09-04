@@ -320,10 +320,14 @@ impl WgStack {
 }
 
 fn new_socket() -> tcp::Socket<'static> {
-    tcp::Socket::new(
+    let mut sock = tcp::Socket::new(
         tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER]),
         tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER]),
-    )
+    );
+    // Interactive SSH: never hold a keystroke back waiting for the previous
+    // segment's ACK (what OpenSSH's TCP_NODELAY does for interactive sessions).
+    sock.set_nagle_enabled(false);
+    sock
 }
 
 async fn drive(inner: Arc<Mutex<Stack>>, kick: Arc<Notify>, mut from_network: mpsc::Receiver<Vec<u8>>) {

@@ -18,6 +18,9 @@ pub struct FakeMinimald {
     env: HashMap<ChannelId, HashMap<String, String>>,
     pty: HashSet<ChannelId>,
     grid: HashMap<ChannelId, (u32, u32)>,
+    /// Bytes since the last newline, per channel, so `exit` typed one
+    /// keystroke at a time is recognised, not only `exit\n` as one write.
+    line: HashMap<ChannelId, Vec<u8>>,
 }
 
 impl server::Handler for FakeMinimald {
@@ -97,7 +100,16 @@ impl server::Handler for FakeMinimald {
     }
 
     async fn data(&mut self, id: ChannelId, data: &[u8], session: &mut Session) -> Result<(), Self::Error> {
-        if data == b"exit\n" {
+        let line = self.line.entry(id).or_default();
+        line.extend_from_slice(data);
+        let mut exit = false;
+        while let Some(nl) = line.iter().position(|&b| b == b'\n') {
+            let completed: Vec<u8> = line.drain(..=nl).collect();
+            if completed.as_slice() == b"exit\n" || completed.as_slice() == b"exit\r\n" {
+                exit = true;
+            }
+        }
+        if exit {
             // All three through the handle so they are queued in order; mixing
             // the async handle with the sync `Session` methods sends close first.
             let handle = session.handle();

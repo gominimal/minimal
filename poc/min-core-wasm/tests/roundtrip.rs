@@ -35,7 +35,10 @@ async fn attach_write_resize_exit() {
     writer.resize(Grid { cols: 100, rows: 30 }).await.unwrap();
     assert_eq!(next_text(&mut reader).await, "resize 100x30\r\n");
 
-    writer.write(b"exit\n").await.unwrap();
+    // Typed one keystroke at a time, as a terminal does.
+    for b in b"exit\n" {
+        writer.write(&[*b]).await.unwrap();
+    }
     let mut seen = Vec::new();
     while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(5), reader.next()).await {
         let is_close = matches!(event, Event::Closed);

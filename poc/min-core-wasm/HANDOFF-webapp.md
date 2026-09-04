@@ -82,8 +82,8 @@ for this work.
 - An interactive session in ghostty over the tunnel: the banner
   `attached <sessionId> <cols>x<rows>` appears, typing echoes back with the
   `echo ` prefix, a window resize produces `resize CxR` from the stand-in.
-- Typing `exit` ends the session with exit code 7 and the page reports it
-  through the existing `{t:"exit"}` handling.
+- Typing `exit` and Enter, one keystroke at a time, ends the session with exit
+  code 7 and the page reports it through the existing `{t:"exit"}` handling.
 - A reload reconnects (new tunnel; the stand-in keeps no session state).
 - No console errors, no CSP violations, the wasm served as `application/wasm`.
 
@@ -92,7 +92,10 @@ for this work.
 - wasm fetch + instantiate time, cold and cached; total bytes over the wire.
 - Time from WebSocket open to the attach banner (WireGuard handshake + TCP +
   SSH handshake, end to end).
-- Keystroke round trip and throughput on a large paste (tens of KB).
+- Keystroke round trip measured at the adapter boundary (`MinAttach.write()`
+  call → the `on_data` callback delivering its echo), separately from
+  keydown-to-paint, which includes the terminal's frame-aligned render; and
+  throughput on a large paste (tens of KB).
 - Tab backgrounded then foregrounded, desktop and mobile emulation, and a real
   phone if one is available: does the tunnel survive, does typing resume.
 - Kill `wg-peer` mid-session: the page should get the socket's close within

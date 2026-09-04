@@ -144,3 +144,13 @@ Headless run of the built bundle in Node 24 against `wg-peer` on loopback
 trip 0.8 ms; 20 KB paste echoed in 43 ms.
 Killing `wg-peer` under an attached session: the page-side close fires 1.7 ms
 later (`MIN_CORE_KILL_PEER_PID` mode of the headless check).
+
+Latency notes. The tunnel sockets run with Nagle disabled (what OpenSSH's
+TCP_NODELAY does for interactive sessions), so a keystroke is never held back
+waiting for the previous segment's ACK; the headless check's `typingMedian`
+(20 single-character writes, each awaiting its echo) is 1.6–1.7 ms on loopback
+with or without it, because an echo piggybacks the ACK. Measure keystroke
+latency at the adapter boundary — `MinAttach.write()` call to the `on_data`
+callback for its echo — not from keydown to paint: a terminal renders on
+animation frames, and a 2–17 ms spread with a ~10 ms median is the shape of a
+16.7 ms frame, not of the tunnel.

@@ -83,6 +83,26 @@ const rtt = performance.now() - t2;
 await att.resize(132, 40);
 await expect("resize 132x40");
 
+// Typing: 20 single-character writes back to back, each awaiting its echo.
+// A single isolated keystroke hides Nagle + delayed-ACK; a sequence shows it.
+const typing = [];
+for (let i = 0; i < 20; i++) {
+  const ch = String.fromCharCode(97 + i);
+  const before = buf.length;
+  const t = performance.now();
+  await att.write(new TextEncoder().encode(ch));
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("typing echo timeout")), 5000);
+    timer.unref();
+    const w = () => (buf.length > before ? (clearTimeout(timer), resolve()) : setTimeout(w, 0));
+    w();
+  });
+  typing.push(performance.now() - t);
+}
+typing.sort((a, b) => a - b);
+const typingMedianMs = +typing[10].toFixed(2), typingMaxMs = +typing[19].toFixed(2);
+await att.write(new TextEncoder().encode("\n"));
+
 const big = "x".repeat(20000) + "\n";
 const t3 = performance.now();
 await att.write(new TextEncoder().encode(big));
@@ -104,7 +124,7 @@ if (process.env.MIN_CORE_KILL_PEER_PID) {
   await Promise.race([closed, new Promise((_, rej) => setTimeout(() => rej(new Error("dead peer never noticed")), 10000).unref())]);
   deadPeerNoticedMs = +(performance.now() - t4).toFixed(1);
   console.log(JSON.stringify({ ok: closedWith === undefined, mode: "kill-peer", deadPeerNoticedMs, exitCode: closedWith ?? null,
-    timingsMs: { instantiate: +tInit.toFixed(1), wsOpenToBanner: +tBanner.toFixed(1), keystrokeRtt: +rtt.toFixed(1), paste20kb: +tBig.toFixed(1) } }, null, 2));
+    timingsMs: { instantiate: +tInit.toFixed(1), wsOpenToBanner: +tBanner.toFixed(1), keystrokeRtt: +rtt.toFixed(1), typingMedian: typingMedianMs, typingMax: typingMaxMs, paste20kb: +tBig.toFixed(1) } }, null, 2));
   process.exit(closedWith === undefined ? 0 : 1);
 }
 
@@ -114,7 +134,7 @@ const code = await Promise.race([closed, new Promise((_, rej) => setTimeout(() =
 console.log(JSON.stringify({
   ok: code === 7,
   exitCode: code,
-  timingsMs: { instantiate: +tInit.toFixed(1), attachResolved: +tAttach.toFixed(1), wsOpenToBanner: +tBanner.toFixed(1), keystrokeRtt: +rtt.toFixed(1), paste20kb: +tBig.toFixed(1) },
+  timingsMs: { instantiate: +tInit.toFixed(1), attachResolved: +tAttach.toFixed(1), wsOpenToBanner: +tBanner.toFixed(1), keystrokeRtt: +rtt.toFixed(1), typingMedian: typingMedianMs, typingMax: typingMaxMs, paste20kb: +tBig.toFixed(1) },
   node: process.version,
 }, null, 2));
 process.exit(code === 7 ? 0 : 1);
