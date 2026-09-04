@@ -79,7 +79,7 @@ description = "orientation banner and shaped prompt"
 PROMPT_COMMAND = 'eval "$MINIMAL_MOTD"; unset PROMPT_COMMAND MINIMAL_MOTD'
 PS1 = 'minimal:\w\$ '
 MINIMAL_MOTD = '''
-[ -t 1 ] && { printf '\n     ████  ████▄\n  ▄▄▄ ▀███▄ ▀███▄\n  ▀███  ▀███  ▀███\n\n'; printf '  minimal · session %s · loadout %s\n  detach: ctrl-w' "${MINIMAL_SESSION_NAME:-unnamed}" "${MINIMAL_LOADOUTS:-default (built-in)}"; [ -f /workbench/minimal.toml ] || [ -f /workbench/.minimal/minimal.toml ] || printf ' · no minimal.toml here — min init to add one'; printf '\n\n  Add tools to this box:   min add --session <pkg>\n  Search the registry:     min search <query>\n\n'; }
+[ -t 1 ] && { printf '\n     ████  ████▄\n  ▄▄▄ ▀███▄ ▀███▄\n  ▀███  ▀███  ▀███\n\n'; printf '  minimal · session %s · loadout %s\n  detach: %s' "${MINIMAL_SESSION_NAME:-unnamed}" "${MINIMAL_LOADOUTS:-default (built-in)}" "${MINIMAL_DETACH_HINT:-ctrl-] then d}"; [ -f /workbench/minimal.toml ] || [ -f /workbench/.minimal/minimal.toml ] || printf ' · no minimal.toml here — min init to add one'; printf '\n\n  Add tools to this box:   min add --session <pkg>\n  Search the registry:     min search <query>\n\n'; }
 '''
 "#;
 
@@ -99,6 +99,15 @@ fn builtin_default_loadout() -> sessions::core::loadout::Loadout {
 pub(crate) struct ActiveLoadouts {
     /// The loadouts to compose, in application order.
     pub(crate) loadouts: Vec<sessions::core::loadout::Loadout>,
+    /// The directory these loadouts were read from — whatever
+    /// `--config-dir` / `$XDG_CONFIG_HOME` resolved to for this run.
+    ///
+    /// Travels with the loadouts rather than being recomputed by each
+    /// consumer, so everything anchored at a loadout's own directory
+    /// (`<dir>/<name>/`) — its external hook scripts, and
+    /// `$LOADOUT_ROOT` in its patch sources — resolves against the
+    /// directory the files actually came from.
+    pub(crate) loadouts_dir: paths::HostAbsPath,
     /// True when the zero-config fallback used the built-in `default`
     /// loadout (as opposed to user files, including a shadowing user
     /// `default.toml`).
@@ -121,11 +130,12 @@ pub(crate) fn resolve_active_loadouts(
     cfg: &sessions::client::config::Config,
     global: &GlobalArgs,
 ) -> Result<ActiveLoadouts, anyhow::Error> {
-    let loadouts_dir = resolve_minimal_config_dir(global).join("loadouts");
+    let loadouts_dir = resolve_loadouts_dir_for_activation(global)?;
     let (names, source): (Vec<String>, &str) = match selection {
         LoadoutSelection::None => {
             return Ok(ActiveLoadouts {
                 loadouts: Vec::new(),
+                loadouts_dir,
                 builtin_default: false,
             });
         }
@@ -137,9 +147,10 @@ pub(crate) fn resolve_active_loadouts(
                 // Fall back to the built-in `default` loadout unless
                 // the user shadows it with their own `default.toml`,
                 // in which case that file is loaded instead.
-                if !loadouts_dir.join("default.toml").exists() {
+                if !loadouts_dir.as_utf8_path().join("default.toml").exists() {
                     return Ok(ActiveLoadouts {
                         loadouts: vec![builtin_default_loadout()],
+                        loadouts_dir,
                         builtin_default: true,
                     });
                 }
@@ -152,19 +163,58 @@ pub(crate) fn resolve_active_loadouts(
     let loadouts = names
         .iter()
         .map(|name| {
-            let path = loadouts_dir.join(format!("{name}.toml"));
+            let path = loadouts_dir.as_utf8_path().join(format!("{name}.toml"));
             // `LoadError`'s Display already embeds its I/O source, so flatten
             // it to a leaf before adding context; otherwise anyhow re-renders
             // the underlying error a second time from the chain.
-            sessions::client::disk::read_loadout_file(&path)
+            sessions::client::disk::read_loadout_file(path.as_std_path())
                 .map_err(|e| anyhow::anyhow!("{e}"))
                 .with_context(|| format!("{source} `{name}`"))
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ActiveLoadouts {
         loadouts,
+        loadouts_dir,
         builtin_default: false,
     })
+}
+
+/// The loadouts directory an activation reads from:
+/// `<config>/minimal/loadouts`, under whatever
+/// [`resolve_minimal_config_dir`] resolved for this run.
+///
+/// UTF-8 is required rather than best-effort: the directory is joined
+/// with a loadout's name to anchor that loadout's own files (hook
+/// scripts, `$LOADOUT_ROOT` patch sources), and those anchors travel
+/// through UTF-8 path types all the way to the daemon.
+///
+/// A **relative** `--config-dir` is anchored at the process working
+/// directory rather than refused. Every other consumer of the flag
+/// reads it straight off the CWD, so refusing one here would break
+/// `--config-dir some/rel/dir` for every activation — including ones
+/// that apply no loadouts at all — over an anchor those runs never use.
+/// The join is lexical (no `canonicalize`): the directory need not
+/// exist yet, and resolving symlinks here would quietly change which
+/// path a loadout's hook scripts are checked against. One consequence:
+/// a relative dir containing `..` stays unnormalized, so a loadout
+/// under it that uses `$LOADOUT_ROOT` fails expansion, which rejects
+/// `..` in any pattern.
+fn resolve_loadouts_dir_for_activation(
+    global: &GlobalArgs,
+) -> Result<paths::HostAbsPath, anyhow::Error> {
+    let dir = resolve_minimal_config_dir(global).join("loadouts");
+    let utf8 = camino::Utf8PathBuf::from_path_buf(dir)
+        .map_err(|p| anyhow::anyhow!("loadouts directory is not valid UTF-8: {}", p.display()))?;
+    match paths::HostAbsPath::try_new(utf8) {
+        Ok(abs) => Ok(abs),
+        Err(paths::Error::NotAbsolute(rel)) => {
+            let cwd = paths::HostAbsPath::from_cwd()
+                .context("resolving a relative --config-dir against the working directory")?;
+            paths::HostAbsPath::try_new(cwd.as_utf8_path().join(rel))
+                .map_err(|e| anyhow::anyhow!("loadouts directory: {e}"))
+        }
+        Err(e) => Err(anyhow::anyhow!("loadouts directory: {e}")),
+    }
 }
 
 /// Human-readable list of the active loadouts, as interpolated into the
@@ -213,8 +263,7 @@ pub(crate) fn compose_options_from_config(
 /// nothing is staged, uploaded, or run.
 pub(crate) fn stage_loadout_hook_scripts(
     active: &ActiveLoadouts,
-    global: &GlobalArgs,
-    project_root: &camino::Utf8Path,
+    project_root: &paths::HostAbsPath,
     hooks_enabled: bool,
 ) -> Result<Vec<sessions::client::hookscripts::StagedScript>, anyhow::Error> {
     use sessions::client::hookscripts::{ScriptAnchors, stage_external_scripts};
@@ -223,11 +272,6 @@ pub(crate) fn stage_loadout_hook_scripts(
     if !hooks_enabled {
         return Ok(Vec::new());
     }
-    let loadouts_dir =
-        camino::Utf8PathBuf::from_path_buf(resolve_minimal_config_dir(global).join("loadouts"))
-            .map_err(|p| {
-                anyhow::anyhow!("loadouts directory is not valid UTF-8: {}", p.display())
-            })?;
 
     let hooks: Vec<ProvenancedHook> = active
         .loadouts
@@ -243,8 +287,8 @@ pub(crate) fn stage_loadout_hook_scripts(
         .collect();
 
     let anchors = ScriptAnchors {
-        loadouts_dir,
-        project_root: project_root.to_owned(),
+        loadouts_dir: active.loadouts_dir.clone(),
+        project_root: project_root.clone(),
     };
     stage_external_scripts(&hooks, &anchors).map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -265,12 +309,12 @@ pub(crate) fn stage_loadout_hook_scripts(
 /// A project with no mfile, or one that does not parse, is not this
 /// function's problem — the activation has its own handling for both, and
 /// duplicating it here would report the same fault twice.
-pub(crate) fn check_project_hooks(project_root: &camino::Utf8Path) -> Result<(), anyhow::Error> {
+pub(crate) fn check_project_hooks(project_root: &paths::HostAbsPath) -> Result<(), anyhow::Error> {
     use sessions::client::hookscripts::{ScriptAnchors, stage_external_scripts};
     use sessions::core::lifecyclehook::{HookScript, HookScriptBody};
     use sessions::core::source::{ProvenancedHook, Source};
 
-    let Ok(mfile) = mfile::File::from_dir(project_root.as_std_path()) else {
+    let Ok(mfile) = mfile::File::from_dir(project_root.as_utf8_path().as_std_path()) else {
         return Ok(());
     };
     let Some(session) = mfile.session.as_ref() else {
@@ -312,14 +356,14 @@ pub(crate) fn check_project_hooks(project_root: &camino::Utf8Path) -> Result<(),
                 h.clone(),
                 Source::Project {
                     path: paths::HostPath::try_new(project_root.as_str())
-                        .expect("an activation's project path is a valid host path"),
+                        .expect("an absolute host path is a valid host path"),
                 },
             )
         })
         .collect();
     let anchors = ScriptAnchors {
-        loadouts_dir: project_root.to_owned(),
-        project_root: project_root.to_owned(),
+        loadouts_dir: project_root.clone(),
+        project_root: project_root.clone(),
     };
     stage_external_scripts(&provenanced, &anchors).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
@@ -413,7 +457,11 @@ pub(crate) fn compose_user_contribution(
     };
 
     let mut composer = sessions::client::composer::UserComposer::new()
-        .with_orientation(sessions::core::compose::Orientation { loadouts_display });
+        .with_orientation(sessions::core::compose::Orientation { loadouts_display })
+        // Anchors `$LOADOUT_ROOT` in the loadouts' patch sources at the
+        // directory they were read from, so a loadout can patch in files
+        // shipped beside it without naming an absolute config path.
+        .with_loadouts_dir(active.loadouts_dir);
     composer
         .add_all(loadouts)
         .map_err(|e| anyhow::anyhow!("composing loadouts: {e}"))?;
@@ -609,6 +657,14 @@ impl LoadoutRow {
 mod tests {
     use super::*;
 
+    /// The directory these tests pretend their hand-built loadouts were
+    /// read from. Nothing here declares a `$LOADOUT_ROOT` patch source
+    /// or an external hook script, so the path only has to be
+    /// well-formed — it is never touched on disk.
+    fn stub_loadouts_dir() -> paths::HostAbsPath {
+        paths::HostAbsPath::try_new("/nonexistent/minimal/loadouts").unwrap()
+    }
+
     /// `LoadoutSelection::from_flags` — full truth table.
     #[test]
     fn loadout_selection_from_flags_truth_table() {
@@ -730,6 +786,7 @@ on_activate = { type = "inline", value = "echo activated" }
         let (wire, _policy) = compose_user_contribution(
             ActiveLoadouts {
                 loadouts: vec![loadout],
+                loadouts_dir: stub_loadouts_dir(),
                 builtin_default: false,
             },
             sessions::core::policy::UserPolicy::empty(),
@@ -768,6 +825,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         .expect("loadout parses");
         let active = ActiveLoadouts {
             loadouts: vec![loadout],
+            loadouts_dir: stub_loadouts_dir(),
             builtin_default: false,
         };
         // A tempdir with no minimal.toml: the project side contributes
@@ -831,7 +889,8 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             !motd.contains("MINIMAL_BLUEPRINT"),
             "blueprint is a session-filesystem fact, not an env var"
         );
-        assert!(motd.contains("detach: ctrl-w"));
+        assert!(motd.contains("detach: %s"));
+        assert!(motd.contains("${MINIMAL_DETACH_HINT:-ctrl-] then d}"));
         assert!(motd.contains("min init"));
     }
 
@@ -845,6 +904,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         };
         let active = ActiveLoadouts {
             loadouts: vec![mk("helix"), mk("fish")],
+            loadouts_dir: stub_loadouts_dir(),
             builtin_default: false,
         };
         assert_eq!(loadout_display_list(&active), "helix, fish");
@@ -860,6 +920,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         let (wire, _policy) = compose_user_contribution(
             ActiveLoadouts {
                 loadouts: Vec::new(),
+                loadouts_dir: stub_loadouts_dir(),
                 builtin_default: true,
             },
             sessions::core::policy::UserPolicy::empty(),
@@ -928,6 +989,77 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
         assert_eq!(loadout_display_list(&out), "default");
     }
 
+    /// Every resolution carries the loadouts directory it read from,
+    /// and that directory follows `--config-dir` — this is what makes
+    /// `$LOADOUT_ROOT` (and a loadout's hook scripts) resolve against
+    /// the files that are actually in play, not a platform default.
+    ///
+    /// Asserted across all three exits: the `--no-loadouts`
+    /// short-circuit, the zero-config built-in fallback, and a real
+    /// file read from disk.
+    #[test]
+    fn resolve_active_loadouts_carries_the_effective_loadouts_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loadouts = tmp.path().join("minimal/loadouts");
+        std::fs::create_dir_all(&loadouts).unwrap();
+        let expected = paths::HostAbsPath::try_new(
+            camino::Utf8PathBuf::from_path_buf(loadouts.clone()).unwrap(),
+        )
+        .unwrap();
+        let cfg = sessions::client::config::Config::default();
+        let global = GlobalArgs {
+            repo_dir: None,
+            minimal_dir: None,
+            config_dir: Some(tmp.path().to_path_buf()),
+            provider: None,
+            no_input: false,
+        };
+
+        let none = resolve_active_loadouts(LoadoutSelection::None, &cfg, &global).unwrap();
+        assert_eq!(none.loadouts_dir, expected, "--no-loadouts");
+
+        let builtin = resolve_active_loadouts(LoadoutSelection::Defaults, &cfg, &global).unwrap();
+        assert!(builtin.builtin_default);
+        assert_eq!(builtin.loadouts_dir, expected, "built-in fallback");
+
+        std::fs::write(loadouts.join("dev.toml"), "description = \"d\"\n").unwrap();
+        let named = resolve_active_loadouts(
+            LoadoutSelection::Cli(vec!["dev".to_string()]),
+            &cfg,
+            &global,
+        )
+        .unwrap();
+        assert_eq!(named.loadouts_dir, expected, "--loadout dev");
+        assert_eq!(named.loadouts[0].name().as_ref(), "dev");
+    }
+
+    /// A relative `--config-dir` still resolves: it is anchored at the
+    /// working directory, the way every other consumer of the flag
+    /// reads it.
+    ///
+    /// Regression guard. `$LOADOUT_ROOT` needs an absolute anchor, but
+    /// that requirement must not leak back onto the flag — a run with
+    /// no loadouts at all (or none using the reference) has no business
+    /// failing because the config dir was spelled relatively.
+    #[test]
+    fn resolve_active_loadouts_anchors_a_relative_config_dir_at_the_cwd() {
+        let cfg = sessions::client::config::Config::default();
+        let global = GlobalArgs {
+            repo_dir: None,
+            minimal_dir: None,
+            config_dir: Some(PathBuf::from("rel-cfg")),
+            provider: None,
+            no_input: false,
+        };
+        let out = resolve_active_loadouts(LoadoutSelection::None, &cfg, &global)
+            .expect("a relative --config-dir must still resolve");
+        let cwd = camino::Utf8PathBuf::from_path_buf(std::env::current_dir().unwrap()).unwrap();
+        assert_eq!(
+            out.loadouts_dir.as_utf8_path(),
+            cwd.join("rel-cfg/minimal/loadouts"),
+        );
+    }
+
     /// The built-in listing row carries the `(built-in)` tag and a
     /// zero-package contributes cell.
     #[test]
@@ -983,6 +1115,7 @@ on_activate = { type = "inline", value = "sleep 90", timeout = 90 }
             );
             let active = ActiveLoadouts {
                 loadouts: vec![loadout],
+                loadouts_dir: stub_loadouts_dir(),
                 builtin_default: false,
             };
             let (contribution, _) = compose_user_contribution(

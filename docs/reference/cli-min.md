@@ -73,7 +73,7 @@ terminal.
 
 Keys: `↑`/`↓` (or `k`/`j`) move, `/` fuzzy-filters by name, ID, and
 project path, `enter` attaches to the focused session (suspend TUI → ssh →
-resume on `ctrl-w` detach) or collapses a provider group, `d` destroys
+resume on `ctrl-]` then `d` detach) or collapses a provider group, `d` destroys
 (with confirmation — also cancels an in-flight create/upload), `r`
 renames, `n` creates a session through the full activate flow (project
 upload, loadout compose, finalize), `q` quits. The cursor's last position
@@ -99,6 +99,14 @@ the current directory).
 | `--no-prompt` | | Fail instead of prompting when the daemon surfaces items user policy can't auto-decide; implied when stdin/stderr isn't a TTY |
 | `--attach` | | Automatically attach after creation |
 
+Activating a path that already has a session is allowed, but warns: `min` names
+the existing session and creates a second one anyway. With two sessions on one
+path, resolving that directory to a session is ambiguous, so a bare `min` there
+can no longer pick one and `session attach` falls back to its picker (erroring
+when `--no-input` is set or stdin/stdout is not a terminal). Attach to the
+existing session instead when you mean to
+rejoin it.
+
 ### `session attach`
 
 ```
@@ -109,6 +117,84 @@ Attaches to an existing session, identified by UUID or session name. When
 `SESSION` is omitted, `min session attach` resolves a session from the current
 working directory (or the only existing session) and opens an interactive
 picker if the choice is ambiguous (`--no-input` errors instead).
+
+### `session exec`
+
+```
+min session exec <SESSION> <COMMAND>...
+```
+
+Runs a command in an existing session, non-interactively, relaying its
+stdout, stderr and exit code.
+
+How `COMMAND` is read depends on how many arguments you give it:
+
+- **One argument is a shell command**, run by the session's shell with its
+  pipes, globs and `$VAR` intact — the `ssh host '<cmd>'` form.
+
+  ```
+  min session exec web 'echo $PWD'
+  ```
+
+- **Several arguments are an argv**, carried as data. No shell reassembles
+  them, so a word keeps its spaces and its metacharacters stay literal.
+
+  ```
+  min session exec web sh -c 'echo A B C'
+  ```
+
+The argv form matters because ssh has no argv on the wire — it joins its
+trailing arguments with single spaces and the far side reshells the result.
+Passing words through one by one would let the session's shell re-split them,
+which is how `sh -c 'echo A B C'` once lost its first word to `sh`'s `$0`.
+
+Nothing about a command's *text* routes it: a command is the session's however
+it happens to start, so the session's own `min` binary is reachable here. The
+daemon's own operations are named explicitly instead — see `session run`.
+
+#### Backgrounding a command
+
+`session exec` returns when `COMMAND` itself exits, and relays output up to
+that point. A process the command backgrounds keeps running in the session,
+but what it writes *after* the command has exited is not yours to rely on: a
+short drain catches whatever was already in flight, and past that its output
+is read and discarded. Nothing it writes is ever lost to a broken pipe — the
+process is not killed — but you will not see it.
+
+```
+min session exec web 'sleep 20 & echo STARTED'   # returns immediately
+```
+
+So background a long-running process with its output redirected somewhere you
+can retrieve it, rather than expecting it on the wire:
+
+```
+min session exec web 'nohup ./server >server.log 2>&1 &'
+min session exec web 'tail -n 50 server.log'
+```
+
+`nohup ... >/dev/null 2>&1 &` is the fully detached form: it hands the process
+its own stdout and stderr and drops the ones it inherited, so nothing about it
+depends on the exec channel at all. The same applies to `session run` and
+`task run`, which relay over the same channel.
+
+### `session run`
+
+```
+min session run <SESSION> <TASK>
+```
+
+Runs a task declared in the session project's `minimal.toml`, in that session,
+relaying its output and exit code.
+
+This is the session-scoped counterpart to
+[`min task run <task>`](../guide/tasks.md), which composes a task session of
+its own. Use `session run` when you want the task to run against a session you
+already have.
+
+Because the task is named as a task rather than inferred from a command string,
+a task may share a name with a daemon subcommand or with a program on the
+session's `PATH`.
 
 ### `session destroy`
 
@@ -215,6 +301,21 @@ is, its device and its `TIOCGWINSZ` geometry (rows, columns, and the
 `xpixel`/`ypixel` size emulators report), which is what makes a garbled
 TUI or wrong wrapping diagnosable.
 
+The bundle is scoped to a project, so it can be attributed to one. Every
+other collector describes a machine, and a machine hosts many projects:
+two bundles taken on one host from two checkouts otherwise read
+identically. `manifest.json` therefore opens with the project's name,
+root, and which config file defines it (`minimal.toml` or
+`.minimal/minimal.toml`), repeated in `project/project.json` along with
+the directory `bug` was actually run from. Run outside a project, the
+manifest records that as a finding with its reason rather than falling
+silent.
+
+Only the project's identity is recorded there — its name, its root, its
+config file's relative path, and where `bug` ran from. No configuration
+*values*; the redacted config is collected separately, under the
+allowlist policy below.
+
 Diagnosing a wedged system must not change it: `bug` mutates no state and
 never starts a daemon; it works even when none are running.
 
@@ -295,7 +396,8 @@ session arguments completable — `min session attach <TAB>` lists live session
 names, and `min session attach 019<TAB>` lists session IDs, neither of which
 exists at the time a static script would be written. Every argument documented
 as "UUID or session name" completes this way: `session attach`,
-`session destroy`, `session rename`, and `session policy`.
+`session exec`, `session run`, `session destroy`, `session rename`, and
+`session policy`.
 
 Session completion is best-effort by design. It never starts a daemon — with
 none running there is nothing to list, and booting a VM on a keystroke would be

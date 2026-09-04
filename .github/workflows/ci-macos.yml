@@ -150,7 +150,7 @@ jobs:
                   arch: aarch64
                   channel: unstable
             - name: Install cross
-              uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
+              uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
               with:
                   tool: cross
             - name: Build guest initramfs (minimald as /init)
@@ -268,7 +268,7 @@ jobs:
                   name: mac-testbed
                   path: ${{ runner.temp }}/testbed
             - name: Install nextest
-              uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
+              uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
               with:
                   tool: nextest
             - name: Unpack testbed + resolve paths
@@ -469,7 +469,7 @@ jobs:
             - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Install nextest
-              uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
+              uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
               with:
                   tool: nextest
             - name: Clippy (minvmd)

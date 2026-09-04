@@ -43,6 +43,8 @@ async fn version_succeeds_without_daemon() {
 fn ls_shows_shared_resource_pool() {
     let resp = ListSessionsResponse {
         daemon_version: None,
+        hostname_routing_unavailable: None,
+        mtls_proxy_unavailable: None,
         resource_pool: Some(ResourcePool {
             cpu_cores: 8,
             memory_bytes: 16 * 1024 * 1024 * 1024,
@@ -78,6 +80,8 @@ fn ls_shows_shared_resource_pool() {
 fn ls_table_exposes_project_path_and_status() {
     let resp = ListSessionsResponse {
         daemon_version: None,
+        hostname_routing_unavailable: None,
+        mtls_proxy_unavailable: None,
         resource_pool: None,
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
@@ -419,6 +423,65 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
     let sftp = client.open_sftp(session.id).await;
     let hello = sftp.read("/workbench/hello.txt").await.unwrap();
     assert_eq!(hello, b"hello world");
+}
+
+/// `min session activate` puts a session id on stdout only for a session
+/// that can actually run `exec`. When the daemon refuses to compose one,
+/// the activation must fail with stdout untouched — otherwise a script's
+/// `id=$(min session activate)` captures an id whose every `min session
+/// exec` then fails — and the error must name the directory the user ran
+/// from rather than the daemon-side step that broke (#581).
+///
+/// Driven through the compiled binary, not `cmd_activate`: the contract
+/// under test is what reaches the process's stdout. The composition is
+/// broken by a project var inheriting a name no environment defines — the
+/// daemon routes it back for gating and resolving it fails, which is the
+/// way an activation actually reaches a composition failure today.
+#[tokio::test]
+async fn activate_prints_no_session_id_when_composition_fails() {
+    let (_daemon, args) = setup().await;
+    let minimal_dir = args.minimal_dir.clone().expect("setup points at a tempdir");
+
+    // `.git` marks a VCS root so the upload gate doesn't prompt; the
+    // var name is unique enough that no environment defines it.
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "[session.vars]\nMIN_UNRESOLVABLE_INHERIT_581 = { inherit = true }\n",
+    )
+    .unwrap();
+    let project_canon = project.path().canonicalize().unwrap();
+
+    // An empty config dir keeps the developer's own loadouts and policy
+    // out of the run.
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["session", "activate"])
+        .arg(&project_canon)
+        .args(["--name", "composition-failure", "--sync", "tarball"])
+        .arg("--no-prompt")
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "activation must fail: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "a session that cannot compose must put nothing on stdout, got: {stdout}"
+    );
+    assert!(
+        stderr.contains(project_canon.to_str().unwrap()),
+        "the error must name the directory the activation ran from: {stderr}"
+    );
 }
 
 /// `min session attach` with no session argument and `--no-input` errors cleanly when

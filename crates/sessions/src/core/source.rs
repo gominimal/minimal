@@ -32,6 +32,38 @@ pub enum Source {
     Package { name: String },
 }
 
+impl Source {
+    /// The directory a loadout's own files live in: `<loadouts_dir>/<name>/`,
+    /// beside the `<name>.toml` that declared them.
+    ///
+    /// One definition of "a loadout's directory", shared by everything
+    /// that anchors against it — external hook scripts
+    /// ([`ScriptAnchors::for_source`]) and the `$LOADOUT_ROOT` patch-source
+    /// reference ([`expand_source`]).
+    ///
+    /// `None` for every non-loadout source, and for a loadout whose name
+    /// isn't a path component that stays put — the name is joined into a
+    /// path that is then read from, so it has to be one. A
+    /// [`LoadoutName`] already rejects those, but this method is reached
+    /// from wire-shaped provenance too, where nothing has vetted the
+    /// string. That guard is also what makes the
+    /// [`sub_path_unchecked`](paths::AbsPath::sub_path_unchecked) below
+    /// sound: the name is proven to be a single non-climbing component
+    /// before it is joined.
+    ///
+    /// [`ScriptAnchors::for_source`]: crate::client::hookscripts::ScriptAnchors::for_source
+    /// [`expand_source`]: crate::core::expansion::expand_source
+    /// [`LoadoutName`]: crate::core::loadout::LoadoutName
+    #[must_use]
+    pub fn loadout_dir(&self, loadouts_dir: &paths::HostAbsPath) -> Option<paths::HostAbsPath> {
+        match self {
+            Self::UserLoadout { name } => crate::core::lifecyclehook::safe_path_component(name)
+                .then(|| loadouts_dir.sub_path_unchecked(name)),
+            Self::Project { .. } | Self::Package { .. } => None,
+        }
+    }
+}
+
 impl fmt::Display for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -253,5 +285,58 @@ impl TryFrom<crate::wire::primitives::WireProvenancedHook> for ProvenancedHook {
     fn try_from(h: crate::wire::primitives::WireProvenancedHook) -> Result<Self, Self::Error> {
         let hook: crate::core::lifecyclehook::LifecycleHook = h.hook.try_into()?;
         Ok(Self::new(hook, h.source.into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loadouts_dir() -> paths::HostAbsPath {
+        paths::HostAbsPath::try_new("/cfg/minimal/loadouts").unwrap()
+    }
+
+    /// A loadout's directory is its name under the loadouts directory —
+    /// the anchor both its hook scripts and its `$LOADOUT_ROOT` patch
+    /// sources resolve against.
+    #[test]
+    fn loadout_dir_is_the_name_under_the_loadouts_dir() {
+        let source = Source::UserLoadout { name: "dev".into() };
+        assert_eq!(
+            source.loadout_dir(&loadouts_dir()).map(|p| p.to_string()),
+            Some("/cfg/minimal/loadouts/dev".to_string()),
+        );
+    }
+
+    /// Nothing but a loadout has one: a project's files are anchored at
+    /// its own root, and a package cannot ship host-side files at all.
+    #[test]
+    fn non_loadout_sources_have_no_loadout_dir() {
+        let dir = loadouts_dir();
+        let project = Source::Project {
+            path: HostPath::try_new("/repo").unwrap(),
+        };
+        let package = Source::Package {
+            name: "helix".into(),
+        };
+        assert_eq!(project.loadout_dir(&dir), None);
+        assert_eq!(package.loadout_dir(&dir), None);
+    }
+
+    /// A name that wouldn't stay put as a path component gets no
+    /// directory rather than one that climbs out of the loadouts tree.
+    /// `LoadoutName` rejects these at construction; provenance arriving
+    /// from the wire has had no such check.
+    #[test]
+    fn a_name_that_escapes_gets_no_loadout_dir() {
+        let dir = loadouts_dir();
+        for name in ["..", ".", "", "a/b", "a\\b"] {
+            let source = Source::UserLoadout { name: name.into() };
+            assert_eq!(
+                source.loadout_dir(&dir),
+                None,
+                "`{name}` must not become an anchor",
+            );
+        }
     }
 }

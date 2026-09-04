@@ -85,6 +85,7 @@ SEEDED_MFILE=""
 TASK_SEED_DIR="" # seeded by the `min task run` proof below; removed on teardown
 HOOK_SEED_DIR="" # seeded by the lifecycle-hooks proof below; removed on teardown
 PATCH_SRC_DIR="" # patch sources for the patch-modes proof; removed on teardown
+SKIP_SEED_DIR="" # seeded by the skip-lane scaffold proof below; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -201,6 +202,7 @@ teardown() {
   [ -n "$TASK_SEED_DIR" ] && rm -rf "$TASK_SEED_DIR"
   [ -n "$HOOK_SEED_DIR" ] && rm -rf "$HOOK_SEED_DIR"
   [ -n "$PATCH_SRC_DIR" ] && rm -rf "$PATCH_SRC_DIR"
+  [ -n "$SKIP_SEED_DIR" ] && rm -rf "$SKIP_SEED_DIR"
   # And the state dir — which is NOT just metadata. On a VM lane it holds the
   # provider's per-VM writable data volume
   # (`minimal/providers/local-minvmd0/data-vol.raw`), a sparse image whose HOST
@@ -339,6 +341,32 @@ if [ "$rc" -ne 7 ]; then
   echo "::error::'min session exec \"exit 7\"' exited $rc (expected the command's 7)"
   fail
 fi
+# A multi-word argv must reach the session with the quoting the local shell
+# already removed. ssh has no argv on the wire — it joins its trailing
+# arguments with spaces and the far side reshells the result — so passing them
+# through word by word let `sh -c` take LINE1 as its `$0`, so it never printed.
+# The client now sends a `min://argv` request carrying the words as data
+# (gominimal/inbox#558).
+argv_out="$(mnl session exec "$sid" sh -c 'echo LINE1; echo LINE2' 2>"$WORK/exec-argv.err")" || {
+  echo "::error::'min session exec $sid sh -c ...' failed"
+  echo "--- stderr ---"; cat "$WORK/exec-argv.err" 2>/dev/null || true
+  fail
+}
+if [ "$argv_out" != "$(printf 'LINE1\nLINE2')" ]; then
+  echo "::error::multi-word argv lost its quoting: expected 'LINE1/LINE2', got '$argv_out'"
+  fail
+fi
+# A command that merely looks like one of the daemon's own belongs to the
+# session. The daemon used to claim every string starting with `min ` and refuse
+# what it did not recognise, which made the session's own `min` unreachable
+# through exec; only the `min://` scheme addresses the daemon now.
+lookalike_err="$WORK/exec-lookalike.err"
+mnl session exec "$sid" 'min --version' >"$WORK/exec-lookalike.out" 2>"$lookalike_err"
+if grep -q "unsupported command" "$lookalike_err"; then
+  echo "::error::the daemon hijacked a session command instead of routing it"
+  echo "--- stderr ---"; cat "$lookalike_err"
+  fail
+fi
 echo "session exec proof OK"
 echo "::endgroup::"
 
@@ -421,6 +449,31 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     mnl ls 2>&1 || true
     fail
   fi
+  # `min session run <session> <task>` runs a declared task against a session
+  # that already exists, rather than composing one of its own. It reaches the
+  # daemon as a named `min://task/run` form, so nothing about the task's name
+  # is inferred from the text — the routing a bare string used to decide by
+  # prefix-sniffing (gominimal/inbox#558).
+  sr_out="$(mnl session run "$kept" e2e-echo 2>"$WORK/session-run.err")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::'min session run $kept e2e-echo' exited $rc (expected 0)"
+    echo "--- stderr ---"; cat "$WORK/session-run.err" 2>/dev/null || true
+    fail
+  fi
+  if [[ "$sr_out" != *TASK_RUN_E2E_OK* ]]; then
+    echo "::error::'min session run' did not stream the task's output, got '$sr_out'"
+    fail
+  fi
+  # The task's exit code is the client's, as it is for `min task run`.
+  mnl session run "$kept" e2e-fail >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -ne 7 ]; then
+    echo "::error::'min session run $kept e2e-fail' exited $rc (expected 7)"
+    fail
+  fi
+  echo "session run proof OK (task in an existing session, exit relay 7 → 7)"
+
   # The destroy dirty gate: the kept session's task process has exited, so
   # no host is running and its at-risk state is unknowable — the gate must
   # refuse a headless (no TTY) destroy without --force, naming the escape
@@ -599,7 +652,8 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   # lives in that process and nowhere else. The re-attach below reads it back.
   # Deliberately not `$$`: the session shell is pid 1 of its own namespace, so
   # a replacement shell would report pid 1 too and the check would be vacuous.
-  # Leaves by the ctrl-w detach chord (`E2E_PTY_DETACH`), NOT by `exit`.
+  # Leaves by the session detach chord (`E2E_PTY_DETACH`: ctrl-] then d, the
+  # shipped default), NOT by `exit`.
   # `exit` ends the session's shell, and the "re-attach" below would then land
   # on a freshly minted one — which would still report the new terminal (a new
   # shell takes `TERM` from its launch env) while proving nothing about
@@ -920,7 +974,146 @@ LOADOUT
   rm -f "$XDG_CONFIG_HOME/minimal/loadouts/patchmode.toml"
   echo "patch file modes proof OK (0755 runs, 0600 stays private)"
   echo "::endgroup::"
+
+  # -- The session shell -----------------------------------------------------
+  # A loadout's `SHELL` picks the shell the attach mints, when the session has
+  # it installed. Only an interactive attach can show this: `min session exec`
+  # runs `bash -c` through nsenter and never touches the session shell, so it
+  # would pass no matter what got spawned. Both cases below need no extra
+  # package — `sh` is a symlink the `bash` package ships, and `zsh` is the
+  # not-installed case precisely because nothing pulls it in.
+  #
+  # `$0` is the assertion, not `$SHELL`: it is the shell's own argv[0], so it
+  # reports the process that is actually running rather than a variable the
+  # daemon also sets. Wrapped in `printf` so the marker appears only in the
+  # OUTPUT — the pty echoes what we type, and a bare `echo` of the marker would
+  # match its own echo.
+  echo "::group::session shell from a loadout's SHELL"
+  mkdir -p "$XDG_CONFIG_HOME/minimal/loadouts"
+  printf 'description = "e2e session shell"\n\n[vars]\nSHELL = "/usr/bin/sh"\n' \
+    > "$XDG_CONFIG_HOME/minimal/loadouts/shelldev.toml"
+  # Not installed in this session, so this one must fall back to bash and say
+  # so on the terminal.
+  printf 'description = "e2e missing shell"\n\n[vars]\nSHELL = "/usr/bin/zsh"\n' \
+    > "$XDG_CONFIG_HOME/minimal/loadouts/shellmissing.toml"
+  HOOK_SEED_DIR="$(hook_mktemp /tmp/mnlsh.XXXXXX)"
+  hook_seed_preamble > "$HOOK_SEED_DIR/minimal.toml"
+  mkdir "$HOOK_SEED_DIR/.git"
+
+  sh_sid="$(cd "$HOOK_SEED_DIR" && mnl session activate . --no-prompt --loadout shelldev 2>"$WORK/shell-sh.err")" || {
+    echo "::error::activation with a SHELL-carrying loadout failed"
+    echo "--- stderr ---"; cat "$WORK/shell-sh.err" 2>/dev/null || true
+    fail
+  }
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  # shellcheck disable=SC2016 # `$0` must reach the SESSION's shell unexpanded.
+  sh_out="$(E2E_PTY_COMMANDS='printf "SESSION_SHELL_IS[%s]\n" "$0"
+exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+    min ${E2E_MINIMAL_ARGS:-} session attach "$sh_sid" \
+    2>"$WORK/shell-sh-attach.err")" || {
+    echo "::error::pty attach for the session-shell proof failed"
+    echo "--- transcript ---"; printf '%s\n' "$sh_out"
+    echo "--- stderr ---"; cat "$WORK/shell-sh-attach.err" 2>/dev/null || true
+    fail
+  }
+  if [[ "$sh_out" != *"SESSION_SHELL_IS[/usr/bin/sh]"* ]]; then
+    echo "::error::loadout SHELL=/usr/bin/sh did not become the session shell"
+    echo "--- transcript ---"; printf '%s\n' "$sh_out"
+    fail
+  fi
+  echo "declared shell OK (SHELL=/usr/bin/sh started sh, not bash)"
+
+  # The fallback: a shell that isn't installed leaves bash running AND tells
+  # the user why, on the terminal, before the first prompt.
+  miss_sid="$(cd "$HOOK_SEED_DIR" && mnl session activate . --no-prompt --loadout shellmissing 2>"$WORK/shell-missing.err")" || {
+    echo "::error::activation with an uninstalled SHELL failed"
+    echo "--- stderr ---"; cat "$WORK/shell-missing.err" 2>/dev/null || true
+    fail
+  }
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  # shellcheck disable=SC2016 # `$0` must reach the SESSION's shell unexpanded.
+  miss_out="$(E2E_PTY_COMMANDS='printf "SESSION_SHELL_IS[%s]\n" "$0"
+exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+    min ${E2E_MINIMAL_ARGS:-} session attach "$miss_sid" \
+    2>"$WORK/shell-missing-attach.err")" || {
+    echo "::error::pty attach for the shell-fallback proof failed"
+    echo "--- transcript ---"; printf '%s\n' "$miss_out"
+    echo "--- stderr ---"; cat "$WORK/shell-missing-attach.err" 2>/dev/null || true
+    fail
+  }
+  if [[ "$miss_out" != *"SESSION_SHELL_IS[/usr/bin/bash]"* ]]; then
+    echo "::error::an uninstalled SHELL did not fall back to bash"
+    echo "--- transcript ---"; printf '%s\n' "$miss_out"
+    fail
+  fi
+  if [[ "$miss_out" != *"min add --session zsh"* ]]; then
+    echo "::error::the fallback notice did not reach the terminal"
+    echo "--- transcript ---"; printf '%s\n' "$miss_out"
+    fail
+  fi
+  rm -rf "$HOOK_SEED_DIR"; HOOK_SEED_DIR=""
+  rm -f "$XDG_CONFIG_HOME/minimal/loadouts/shelldev.toml"
+  rm -f "$XDG_CONFIG_HOME/minimal/loadouts/shellmissing.toml"
+  echo "shell fallback proof OK (bash started, notice names the package)"
+  echo "::endgroup::"
 fi
+# ---------------------------------------------------------------------------
+# Skip-lane scaffold proof (every lane). Every other seed here deliberately
+# becomes a VCS root so the headless upload gate ships it; this one does the
+# opposite. A non-VCS, non-empty directory with no `minimal.toml` (and no
+# explicit `--sync`) is the one shape where the gate SKIPS the upload, so the
+# session's blueprint is not the user's — it is the one the daemon scaffolds
+# into the workspace. Its packages must reach the box: they used to be decided
+# by a composition that ran before the scaffold, so the session came up
+# without the packages its own `/workbench/minimal.toml` declared
+# (gominimal/inbox#601). Mints its own session; nothing here touches $sid.
+echo "::group::skip-lane scaffold (no VCS root, no minimal.toml: the daemon writes the blueprint)"
+SKIP_SEED_DIR="$(mktemp -d /tmp/mnlsc.XXXXXX)"
+# Non-empty (an empty dir skips the upload for a different reason), and
+# deliberately WITHOUT a `.git` marker or a `minimal.toml` — both would take
+# the activation off the skip lane. /tmp has no mfile above it, so the
+# client's walk up finds none either.
+printf 'skip-lane seed\n' > "$SKIP_SEED_DIR/README"
+# `--no-prompt` plus stdin from /dev/null: headless, which is what turns the
+# non-VCS upload confirmation into a silent skip.
+skip_activate_out="$(cd "$SKIP_SEED_DIR" \
+  && mnl session activate . --name e2e-scaffold --no-prompt </dev/null 2>"$WORK/skip-activate.err")" || {
+  echo "::error::'min session activate' from a non-VCS dir with no minimal.toml failed"
+  echo "--- stdout ---"; printf '%s\n' "$skip_activate_out"
+  echo "--- stderr ---"; cat "$WORK/skip-activate.err" 2>/dev/null || true
+  fail
+}
+skip_sid="$(printf '%s\n' "$skip_activate_out" | tail -n1 | tr -d '\r')"
+# One exec: the blueprint the daemon wrote, then whether the box carries what
+# it declares. `vim` is the discriminator — the scaffold always declares it and
+# it is in none of the launcher's baseline packages (base/coreutils/socat), so
+# its presence can only have come from the scaffolded mfile.
+skip_probe="$(mnl session exec "$skip_sid" \
+  'cat /workbench/minimal.toml; command -v vim >/dev/null 2>&1 && echo VIM_PRESENT || echo VIM_ABSENT' \
+  2>"$WORK/skip-exec.err")" || {
+  echo "::error::'min session exec' against the skip-lane session failed"
+  echo "--- stdout ---"; printf '%s\n' "$skip_probe"
+  echo "--- stderr ---"; cat "$WORK/skip-exec.err" 2>/dev/null || true
+  fail
+}
+# Glob, never `| grep -q` — same SIGPIPE-under-pipefail reasoning as the
+# sandbox proof's markers.
+if [[ "$skip_probe" != *'"vim"'* ]]; then
+  echo "::error::the daemon-scaffolded /workbench/minimal.toml does not declare vim; the assertion below would prove nothing"
+  echo "--- probe ---"; printf '%s\n' "$skip_probe"
+  fail
+fi
+if [[ "$skip_probe" != *VIM_PRESENT* ]]; then
+  echo "::error::the session lacks a package its own scaffolded /workbench/minimal.toml declares (gominimal/inbox#601)"
+  echo "--- probe ---"; printf '%s\n' "$skip_probe"
+  echo "--- activate stderr ---"; cat "$WORK/skip-activate.err" 2>/dev/null || true
+  fail
+fi
+mnl session destroy --force "$skip_sid" >/dev/null 2>&1 || true
+rm -rf "$SKIP_SEED_DIR"; SKIP_SEED_DIR=""
+echo "skip-lane scaffold proof OK (scaffolded blueprint's packages reached the box)"
+echo "::endgroup::"
+
 # ---------------------------------------------------------------------------
 # Session-sandbox proof (every lane). Everything above proves the lifecycle;
 # this forks a real sandbox and proves the in-sandbox `min add`. A session is
@@ -977,7 +1170,7 @@ if [[ "$attach_out" != *"minimal · session $SESSION_NAME · loadout default (bu
   echo "--- attach output ---"; printf '%s\n' "$attach_out"
   fail
 fi
-if [[ "$attach_out" != *"detach: ctrl-w"* ]]; then
+if [[ "$attach_out" != *"detach: ctrl-] then d"* ]]; then
   echo "::error::attach output lacks the orientation banner's detach line"
   echo "--- attach output ---"; printf '%s\n' "$attach_out"
   fail

@@ -517,3 +517,163 @@ on_activate = {{ type = "inline", value = "echo activated" }}
     assert_eq!(decoded.lifecycle_hooks.len(), 1);
     assert_eq!(decoded.requested_packages.len(), 1);
 }
+
+// =====================================================================
+// `$LOADOUT_ROOT`
+// =====================================================================
+
+/// Lay out a loadouts directory holding two loadouts that ship files:
+/// `dev.toml` + `dev/`, and an `ops/` tree whose files must never be
+/// reached by `dev`'s patterns.
+fn loadouts_dir_fixture(root: &Utf8Path) {
+    fixture_tree(
+        root,
+        [
+            ("dev/config.toml", "theme = 'nord'\n"),
+            ("dev/themes/nord.toml", "# nord\n"),
+            ("dev/themes/notes.md", "noise"),
+            ("ops/config.toml", "theme = 'not-yours'\n"),
+        ],
+    );
+}
+
+/// The end the feature exists for: a loadout patches in files shipped
+/// beside it, naming neither the user's config directory nor its own
+/// name. Both a literal file and a glob resolve under `<dir>/dev/`,
+/// and nothing reaches the neighbouring `ops/` tree.
+#[test]
+fn loadout_root_resolves_to_the_directory_beside_the_loadout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = Utf8Path::from_path(tmp.path()).unwrap();
+    loadouts_dir_fixture(root);
+    std::fs::write(
+        root.join("dev.toml").as_std_path(),
+        r#"
+[[patches]]
+dest = ".config/helix/config.toml"
+source = "$LOADOUT_ROOT/config.toml"
+
+[[patches]]
+dest = ".config/helix/themes"
+source = "${LOADOUT_ROOT}/themes/**/*.toml"
+"#,
+    )
+    .unwrap();
+
+    // Read from disk, so the loadout is named after its file the way an
+    // activation names it — that name is what picks the directory.
+    let loadout = sessions::client::disk::read_loadout_file(root.join("dev.toml").as_std_path())
+        .expect("fixture loadout loads");
+    let mut composer = UserComposer::new()
+        .with_env(pinned_env(&[]))
+        .with_loadouts_dir(paths::HostAbsPath::try_new(root.to_owned()).unwrap());
+    composer.add(loadout).unwrap();
+    let (wire, _) = composer
+        .compose(UserPolicy::empty(), ComposeOptions::default())
+        .unwrap();
+
+    let mut resolved: Vec<(&str, &str)> = wire
+        .patches
+        .iter()
+        .map(|p| {
+            (
+                p.patch.host_path.as_str(),
+                p.patch.destination.as_utf8_path().as_str(),
+            )
+        })
+        .collect();
+    resolved.sort_unstable();
+    assert_eq!(resolved.len(), 2, "got: {resolved:?}");
+    assert_paths_equivalent(resolved[0].0, root.join("dev/config.toml").as_std_path());
+    assert_paths_equivalent(
+        resolved[1].0,
+        root.join("dev/themes/nord.toml").as_std_path(),
+    );
+    assert!(
+        resolved.iter().all(|(host, _)| !host.contains("/ops/")),
+        "a loadout's root must not reach a sibling loadout's files: {resolved:?}",
+    );
+    // Destinations are what the session actually sees: the literal
+    // source lands verbatim, and the glob match lands under its `dest`
+    // directory at its path relative to the walk root — which is the
+    // loadout's own directory, not the loadouts directory above it.
+    assert_eq!(
+        resolved.iter().map(|(_, dest)| *dest).collect::<Vec<_>>(),
+        vec![
+            ".config/helix/config.toml",
+            ".config/helix/themes/nord.toml"
+        ],
+    );
+}
+
+/// The reference is reserved in patch sources: a loadout that also
+/// exports a `LOADOUT_ROOT` variable still patches from its own
+/// directory, and the variable itself reaches the session untouched.
+#[test]
+fn a_loadout_root_var_does_not_redirect_patch_sources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = Utf8Path::from_path(tmp.path()).unwrap();
+    loadouts_dir_fixture(root);
+    let src = format!(
+        r#"
+[vars]
+LOADOUT_ROOT = "{root}/ops"
+
+[[patches]]
+dest = ".config/helix/config.toml"
+source = "$LOADOUT_ROOT/config.toml"
+"#,
+    );
+    std::fs::write(root.join("dev.toml").as_std_path(), src).unwrap();
+
+    let loadout = sessions::client::disk::read_loadout_file(root.join("dev.toml").as_std_path())
+        .expect("fixture loadout loads");
+    let mut composer = UserComposer::new()
+        .with_env(pinned_env(&[]))
+        .with_loadouts_dir(paths::HostAbsPath::try_new(root.to_owned()).unwrap());
+    composer.add(loadout).unwrap();
+    let (wire, _) = composer
+        .compose(UserPolicy::empty(), ComposeOptions::default())
+        .unwrap();
+
+    assert_eq!(wire.patches.len(), 1);
+    assert_paths_equivalent(
+        wire.patches[0].patch.host_path.as_str(),
+        root.join("dev/config.toml").as_std_path(),
+    );
+    // Reserved in patch sources, ordinary everywhere else: the var is
+    // still contributed to the session's environment.
+    assert_eq!(wire.vars.len(), 1);
+    assert_eq!(wire.vars[0].var.name, "LOADOUT_ROOT");
+    assert_eq!(wire.vars[0].var.value, format!("{root}/ops"));
+}
+
+/// A composer that was never told where its loadouts came from can't
+/// resolve the reference, and says so instead of walking some default
+/// directory.
+#[test]
+fn loadout_root_without_a_loadouts_dir_fails_the_composition() {
+    let loadout: Loadout = toml::from_str(
+        r#"name = "dev"
+
+[[patches]]
+dest = ".config/helix/config.toml"
+source = "$LOADOUT_ROOT/config.toml"
+"#,
+    )
+    .unwrap();
+    let mut composer = UserComposer::new().with_env(pinned_env(&[]));
+    composer.add(loadout).unwrap();
+    let err = composer
+        .compose(UserPolicy::empty(), ComposeOptions::default())
+        .expect_err("no loadouts dir means no anchor");
+    assert!(
+        matches!(
+            err,
+            ComposeError::Expansion(
+                sessions::core::expansion::ExpandError::LoadoutRootUnavailable { .. }
+            )
+        ),
+        "got: {err:?}",
+    );
+}

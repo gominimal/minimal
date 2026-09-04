@@ -65,7 +65,8 @@ pub fn is_empty_or_home(dir: &Path, home: Option<&Path>) -> bool {
 /// `Prompt` case is resolved by the caller (#441).
 #[derive(Debug, PartialEq, Eq)]
 pub enum UploadGate {
-    /// Upload without asking: a VCS root, or an explicit `--sync tarball`.
+    /// Upload without asking: a VCS root, a directory carrying a
+    /// `minimal.toml`, or an explicit `--sync tarball`.
     Upload,
     /// Headless caller, non-VCS root, implicit sync: skip and warn.
     SkipHeadless,
@@ -73,18 +74,45 @@ pub enum UploadGate {
     Prompt,
 }
 
-/// Decide the non-VCS-root upload gate. `headless` means no interactive
-/// confirm is possible (`--no-prompt`, `--no-input`, or a non-TTY); an
-/// explicit `--sync tarball` (`sync_explicit`) forces the upload, else a
-/// headless caller skips rather than upload a directory nobody confirmed.
-pub fn upload_gate(is_vcs_root: bool, sync_explicit: bool, headless: bool) -> UploadGate {
-    if is_vcs_root || sync_explicit {
+/// Decide the non-empty, non-`$HOME` upload gate. `headless` means no
+/// interactive confirm is possible (`--no-prompt`, `--no-input`, or a
+/// non-TTY). An explicit `--sync tarball` (`sync_explicit`), a directory
+/// carrying a `minimal.toml` (`has_blueprint` — `min init` declared it,
+/// so its config should reach the session), or a VCS root each force the
+/// upload; otherwise a headless caller skips rather than upload a
+/// directory nobody confirmed, and an interactive one is asked. The
+/// `$HOME` and empty-directory carve-outs are decided by the caller via
+/// [`is_empty_or_home`] before this runs, so `$HOME` never syncs on a
+/// blueprint alone.
+pub fn upload_gate(
+    is_vcs_root: bool,
+    sync_explicit: bool,
+    has_blueprint: bool,
+    headless: bool,
+) -> UploadGate {
+    if sync_explicit || has_blueprint || is_vcs_root {
         UploadGate::Upload
     } else if headless {
         UploadGate::SkipHeadless
     } else {
         UploadGate::Prompt
     }
+}
+
+/// The warning shown when an implicit upload is skipped because
+/// `upload_root` is neither a VCS root nor carries a `minimal.toml`.
+/// Names what the session gets — an empty workspace on a default
+/// blueprint — not only what was skipped, and points at the `--sync
+/// tarball` escape hatch. Shared by both upload callers (session
+/// activate and task run) so the wording cannot drift between them.
+pub fn skipped_upload_warning(upload_root: &Path) -> String {
+    format!(
+        "warning: {} is not a version control repository root and has no \
+         minimal.toml — skipping file upload; the session starts with an \
+         empty workspace and a default blueprint (pass --sync tarball to \
+         upload anyway)",
+        upload_root.display()
+    )
 }
 
 fn is_default_excluded(name: &str) -> bool {
@@ -1188,12 +1216,30 @@ mod tests {
     fn upload_gate_covers_three_lanes() {
         // A VCS root, or an explicit `--sync tarball`, always uploads —
         // headless or not.
-        assert_eq!(upload_gate(true, false, true), UploadGate::Upload);
-        assert_eq!(upload_gate(false, true, true), UploadGate::Upload);
-        // Headless + non-VCS root + implicit sync: skip and warn.
-        assert_eq!(upload_gate(false, false, true), UploadGate::SkipHeadless);
-        // Interactive + non-VCS root + implicit sync: confirm first.
-        assert_eq!(upload_gate(false, false, false), UploadGate::Prompt);
+        assert_eq!(upload_gate(true, false, false, true), UploadGate::Upload);
+        assert_eq!(upload_gate(false, true, false, true), UploadGate::Upload);
+        // A declared project (a `minimal.toml` is present) uploads even
+        // when it is neither a VCS root nor an explicit sync — the
+        // `min init && min session activate` case (rule 3 beats rule 6).
+        assert_eq!(upload_gate(false, false, true, true), UploadGate::Upload);
+        // An explicit `--sync tarball` is obeyed regardless of a blueprint.
+        assert_eq!(upload_gate(false, true, true, true), UploadGate::Upload);
+        // Neither blueprint nor VCS root, implicit sync: a headless caller
+        // skips and warns, an interactive one confirms first.
+        assert_eq!(
+            upload_gate(false, false, false, true),
+            UploadGate::SkipHeadless
+        );
+        assert_eq!(upload_gate(false, false, false, false), UploadGate::Prompt);
+    }
+
+    #[test]
+    fn skipped_upload_warning_names_what_the_session_gets() {
+        let warning = skipped_upload_warning(Path::new("/srv/data/run42"));
+        assert!(warning.contains("/srv/data/run42"));
+        assert!(warning.contains("has no minimal.toml"));
+        assert!(warning.contains("empty workspace and a default blueprint"));
+        assert!(warning.contains("--sync tarball"));
     }
 
     // ---- TarZstArchive per-entry API ----

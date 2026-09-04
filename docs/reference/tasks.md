@@ -95,7 +95,7 @@ state_key = "dev" # Cache build artifacts under 'dev'
 ```
 
 
-### `env_vars` - Environment variables to set
+### `env_vars` - Environment variables to set {#env_vars}
 
 _Optional. `env_vars` is an alias of the canonical `vars` key; both parse_
 
@@ -116,6 +116,92 @@ declare the variable with the value `{ inherit = true }`:
 env_vars.TOKEN = { inherit = true }
 ```
 
+The parent process is the shell you run `min task run` in: the value is read
+on the client, at the moment you invoke the task, and carried to the session —
+the same way `[session.vars]` resolves at activation. So exporting the variable
+in your shell is enough, and the daemon's own environment is never consulted.
+
+A variable declared `inherit` but not set in that shell is an error, reported
+before the task's session is created — unless your policy ignores the name, in
+which case it is dropped rather than looked up ([below](#policy)):
+
+```console
+$ min task run deploy
+error: task 'deploy' declares `env_vars.TOKEN = { inherit = true }`, but TOKEN
+is not set in this shell; export it before running the task
+```
+
+This applies to `min task run`. Two other ways of running a declared task
+still resolve `inherit` against the daemon's environment:
+
+- `min run <task>`, from *inside* a session, has no invoking client to read
+  from.
+- `min session run <session> <task>` runs against a session you already have,
+  over the attach transport, which forwards only `MINIMAL_SESSION_ID` and your
+  locale.
+
+So prefer an explicit value for tasks meant to be run either of those ways.
+
+### Environment variables and your policy {#policy}
+
+Resolving on the client means reading *your* shell. A project's
+`minimal.toml` naming `env_vars.AWS_SECRET_ACCESS_KEY = { inherit = true }` is
+that project asking for your credential, so every name a task declares —
+inherited or literal — is checked against the `[vars]` section of your
+`user_policy.toml` **before its value is read**:
+
+- a name matching **`deny`** fails the run, naming the rule's file.
+- a name matching **`ignore`** is dropped and the task runs without it. The
+  name is removed from the task's declarations outright, so this holds for a
+  literal value as much as an inherited one, and an ignored variable does not
+  have to be set.
+- a name matching **`allow`** is carried.
+- anything else is **not carried**. On a terminal you are asked, once per
+  name, and can record the answer as a rule; anywhere else the run stops and
+  prints the rules to add.
+
+This is the same gate `[session.vars]` from the same file has always passed
+through, with the same precedence — `deny`, then `ignore`, then `allow` — and
+`allow` is required for the same reason: a project you have not read should
+not be able to name a variable and receive its value.
+
+An `echo` task is the one exception, and it is not a hole: its output comes
+straight from the declaration without an environment being built, so its
+`env_vars` are read by nobody. Nothing is looked up, so there is nothing to
+gate — an `echo` task never prompts, and never fails over a variable it has
+no use for.
+
+```toml
+# user_policy.toml
+[vars]
+allow = ["ZZ_TASK_*", "RUST_*"]
+deny  = ["AWS_*"]
+```
+
+A denied name:
+
+```console
+$ min task run deploy
+error: task 'deploy' declares `env_vars.AWS_SECRET_ACCESS_KEY`, but
+AWS_SECRET_ACCESS_KEY is denied by `[vars] deny` in
+~/.config/minimal/user_policy.toml; remove the declaration, or the deny rule
+if this task should see it
+```
+
+An unlisted name in CI, where there is no one to ask:
+
+```console
+$ min task run deploy
+error: task 'deploy' declares 1 environment variable that your policy does not
+allow, and stdin/stderr is not a terminal.
+
+Add the following to ~/.config/minimal/user_policy.toml:
+
+[vars]
+allow = ["DEPLOY_TARGET"]
+
+Then re-run this command.
+```
 
 ### `interactive` - TUI apps and shells
 

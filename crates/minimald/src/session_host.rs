@@ -29,24 +29,21 @@ use crate::session_delta::DeltaSource;
 use crate::sessions::SessionControl;
 #[cfg(not(test))]
 use sessions::NetworkMode;
+use sessions::keys::{ChordMatcher, FeedOutcome, KeyAction, SessionKeys};
 use std::sync::Arc;
-
-/// Command sequence for the ctrl-w key chord, when the kitty keyboard protocol
-/// is negotiated.
-///
-/// Corresponds to: Kitty: CSI 119 ; 5 u
-const CTRL_W_CSI_U: &[u8] = b"\x1b[119;5u";
-/// Command sequence for the ctrl-w key chord, when the modifyOtherKeys key
-/// sequences are used by the outer terminal.
-///
-/// Corrsponds to: modifyOtherKeys: CSI 27 ; 5 ; 119 ~
-const CTRL_W_CSI_27: &[u8] = b"\x1b[27;5;119~";
 
 /// Header of the prompt shown over the channel when a session's shell process
 /// exits, offering to detach or delete. Exposed so tests can await its
 /// appearance in the channel output before answering.
 pub(crate) const SHELL_EXIT_PROMPT: &str =
     "Session shell process exited. What would you like to do with this session?";
+
+/// How long a held chord-matcher split candidate (e.g. a lone `ESC`, a strict
+/// prefix of every kitty form) is held before being flushed to the PTY as
+/// data. Long enough that a chord split across SSH chunks (which reassemble
+/// within milliseconds) still resolves as a chord, short enough that a bare
+/// `ESC` reaching the app (e.g. leaving vim insert mode) is imperceptible.
+const CHORD_FLUSH_IDLE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Line rendered above the shell-exit prompt when nothing in the workspace
 /// changed since activation. Exposed for the same test-await purpose as
@@ -483,8 +480,29 @@ impl PtyOp {
     }
 }
 
-/// Messages from the binding (user terminal) to the shell process / host.
-enum StdinMsg {
+/// A message from the binding (user terminal) to the shell process / host.
+///
+/// Every message tags the generation of the [`Binding`] that sent it. The
+/// host bumps its active generation on every attach — before the superseded
+/// binding has shut down — and discards a queued message with a stale
+/// generation: input typed at the old channel predates the attach that
+/// installed the current session keys, so interpreting it would apply the
+/// new channel's chord (or its size) to the old channel's keystrokes.
+struct StdinMsg {
+    // The sender's binding generation; must equal the host's active
+    // generation to be honored.
+    generation: u64,
+    kind: StdinMsgKind,
+}
+
+impl StdinMsg {
+    /// Stamps `kind` as sent by a binding of `generation`.
+    fn new(generation: u64, kind: StdinMsgKind) -> Self {
+        Self { generation, kind }
+    }
+}
+
+enum StdinMsgKind {
     Bytes(bytes::Bytes),
     /// A binding left its mainloop for a reason that counts as a detach.
     TerminalUpdate(RequestedPty),
@@ -496,6 +514,22 @@ enum StdinMsg {
     },
 }
 
+/// Queues bytes for the PTY master, appended after the unwritten remainder
+/// of whatever is already queued: buffered bytes are strictly older in
+/// stream order than a freshly fed chunk, so replacing the buffer on top
+/// would drop forwarded keystrokes — e.g. one chunk `x`+`ESC` forwards `x`
+/// into the buffer and holds `ESC` as a split chord candidate, and a pty
+/// still unwritable at the idle-flush deadline would then overwrite that
+/// queued `x` with `ESC`.
+fn queue_stdin(buf: &mut Option<(bytes::Bytes, usize)>, bytes: Vec<u8>) {
+    let mut next = match buf.take() {
+        Some((pending, written)) => pending[written..].to_vec(),
+        None => Vec::with_capacity(bytes.len()),
+    };
+    next.extend_from_slice(&bytes);
+    *buf = Some((bytes::Bytes::from(next), 0));
+}
+
 /// A connection between a [`Host`] and an SSH channel.
 ///
 /// The [`Binding`] is owned by the spawned async task, but the
@@ -504,6 +538,10 @@ enum StdinMsg {
 struct Binding {
     /// The remote end of this binding.
     channel: Channel<Msg>,
+    /// Which host binding-generation this binding owns; stamped on every
+    /// [`StdinMsg`] it sends so the host can discard the queue once the
+    /// binding is superseded.
+    generation: u64,
     /// Channel the binding writes down to communicate stdin to the host.
     stdin_tx: mpsc::Sender<StdinMsg>,
     /// Channel the [`Host`] uses to communicate with this [`Binding`].
@@ -530,6 +568,7 @@ impl Binding {
     pub(crate) async fn spawn(
         channel: Channel<Msg>,
         stdin_tx: mpsc::Sender<StdinMsg>,
+        generation: u64,
         control: Option<SessionControl>,
         delta: Option<Arc<DeltaSource>>,
         name: String,
@@ -539,6 +578,7 @@ impl Binding {
 
         let binding = Self {
             channel,
+            generation,
             stdin_tx,
             receiver: rx,
             control,
@@ -586,7 +626,10 @@ impl Binding {
                     Some(msg) => {
                         match msg {
                             russh::ChannelMsg::Data{ data } => {
-                                let _ = self.stdin_tx.send(StdinMsg::Bytes(data)).await;
+                                let _ = self
+                                    .stdin_tx
+                                    .send(StdinMsg::new(self.generation, StdinMsgKind::Bytes(data)))
+                                    .await;
                             }
                             russh::ChannelMsg::RequestPty {
                                 want_reply: _,
@@ -597,12 +640,18 @@ impl Binding {
                                 pix_height,
                                 terminal_modes,
                             } => {
-                                let _ = self.stdin_tx.send(StdinMsg::TerminalUpdate(RequestedPty {
-                                    char_sizes: (col_width, row_height),
-                                    pixel_sizes: (pix_width, pix_height),
-                                    term: term.to_string(),
-                                    modes: terminal_modes.to_vec(),
-                                })).await;
+                                let _ = self
+                                    .stdin_tx
+                                    .send(StdinMsg::new(
+                                        self.generation,
+                                        StdinMsgKind::TerminalUpdate(RequestedPty {
+                                            char_sizes: (col_width, row_height),
+                                            pixel_sizes: (pix_width, pix_height),
+                                            term: term.to_string(),
+                                            modes: terminal_modes.to_vec(),
+                                        }),
+                                    ))
+                                    .await;
                             },
                             russh::ChannelMsg::WindowChange{
                                 col_width,
@@ -610,9 +659,15 @@ impl Binding {
                                 pix_width,
                                 pix_height,
                             } => {
-                                let _ = self.stdin_tx.send(StdinMsg::WindowChange{
-                                    col_width, row_height, pix_width, pix_height,
-                                }).await;
+                                let _ = self
+                                    .stdin_tx
+                                    .send(StdinMsg::new(
+                                        self.generation,
+                                        StdinMsgKind::WindowChange {
+                                            col_width, row_height, pix_width, pix_height,
+                                        },
+                                    ))
+                                    .await;
                             },
                             // Flow-control window updates fire on every
                             // burst of bytes forwarded through the
@@ -679,7 +734,7 @@ impl Binding {
                         }
                         BindingMsg::TeardownDueToDetach(unwind_codes) => {
                             let _ = w.write_all(&unwind_codes).await;
-                            let _ = w.write_all(b"\r\nDetaching due to ctrl-w.\r\n").await;
+                            let _ = w.write_all(b"\r\nDetaching from session.\r\n").await;
                             break MainloopExitReason::Detach;
                         }
                     };
@@ -1098,8 +1153,9 @@ enum Message {
     Kill(bool),
     /// Bind a client channel to this host. The [`ConnectionEnv`] rides along
     /// on every attach — not just the one that minted the host — because it
-    /// describes the terminal on the other end of *this* channel.
-    Attach(Channel<Msg>, WinSize, ConnectionEnv),
+    /// describes the terminal on the other end of *this* channel; the
+    /// [`SessionKeys`] give the new channel its own negotiation state.
+    Attach(Channel<Msg>, WinSize, ConnectionEnv, SessionKeys),
     GetAttrs(oneshot::Sender<HostAttrs>),
     /// Compute the workspace's at-risk report (VCS-exact when the tree is a
     /// git repository, the changed-since-activation delta otherwise) and
@@ -1301,22 +1357,27 @@ impl HostHandle {
     }
     /// Binds `c` to this host, carrying the attaching terminal's facts.
     ///
-    /// `connection` is applied on every attach, so a client attaching from a
-    /// different terminal than the one that minted the shell updates `TERM`
-    /// for everything the session spawns from here on. An empty map leaves the
-    /// last known facts in place rather than clearing them: a client whose own
-    /// `TERM` is unset (OpenSSH then sends an empty pty-req term string) has
-    /// nothing to say about the terminal, which is not the same as saying
-    /// there isn't one.
+    /// `connection` is merged into the host's stored facts on every attach, so
+    /// a client attaching from a different terminal than the one that minted
+    /// the shell updates `TERM` for everything the session spawns from here
+    /// on. A `TERM` the attach does not declare leaves the last known value
+    /// standing rather than clearing it: a client whose own `TERM` is unset
+    /// (OpenSSH then sends an empty pty-req term string) has nothing to say
+    /// about the terminal, which is not the same as saying there isn't one.
     pub async fn attach(
         &self,
         c: Channel<Msg>,
         sz: WinSize,
         connection: ConnectionEnv,
+        keys: SessionKeys,
     ) -> Result<(), (Channel<Msg>, WinSize)> {
-        match self.sender.send(Message::Attach(c, sz, connection)).await {
+        match self
+            .sender
+            .send(Message::Attach(c, sz, connection, keys))
+            .await
+        {
             Ok(()) => Ok(()),
-            Err(SendError(Message::Attach(c, sz, _))) => Err((c, sz)),
+            Err(SendError(Message::Attach(c, sz, _, _))) => Err((c, sz)),
             Err(e) => unreachable!("{:?}", e),
         }
     }
@@ -1494,6 +1555,12 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // We process this end.
     remote_rx: mpsc::Receiver<StdinMsg>,
 
+    // Monotonic identity of the currently active binding. Bumped by
+    // `attach()` before the new binding is spawned, so an [`StdinMsg`] whose
+    // generation lags this was queued by a superseded binding and gets
+    // discarded rather than interpreted under the new channel's session keys.
+    binding_generation: u64,
+
     // Temporary buffer for reading from the pty master (i.e. 'stdout').
     stdout_buf: Vec<u8>,
     // Bytes that need to be written to the pty master (i.e. 'stdin').
@@ -1554,6 +1621,22 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // Daemon-side directory the save-then-delete lane archives into, handed
     // to each binding alongside `delta`.
     archives_dir: std::path::PathBuf,
+
+    // The per-channel session-key chord matcher: the negotiated leader chord
+    // that enters command mode, the detach/forward subcommand keys, the bell
+    // flag, plus the command-mode state and the pending split-candidate
+    // buffer. Refreshed from the channel's env vars on every attach (so two
+    // clients with different configs on the same session each get their own
+    // chord, and a reattach never inherits a stale awaiting-subcommand state
+    // or half a split candidate); defaults to `ctrl-]` / `d` when a client
+    // sends no keys.
+    chord_matcher: ChordMatcher,
+
+    // Deadline for flushing a held chord-matcher split candidate: armed when a
+    // stdin chunk leaves the matcher holding a partial form (e.g. a lone `ESC`,
+    // a prefix of every kitty form), cleared when the next chunk resolves it or
+    // the idle gap elapses and the candidate is flushed to the PTY as data.
+    chord_flush_deadline: Option<tokio::time::Instant>,
 
     // Keeps launcher-owned resources (the session's `Env`, which owns the
     // sandbox files backing the running process's rootfs along with the context
@@ -1815,8 +1898,9 @@ pub(crate) struct AttachEnv {
     /// `LC_*`, `TZ`) — OpenSSH's `AcceptEnv` set. Applied as defaults *below*
     /// the composition, so a loadout's explicit locale still wins.
     pub(crate) inherited: Vec<(String, String)>,
-    /// Per-connection facts — currently just `TERM` from the PTY request.
-    /// Applied *above* the composition, the way sshd sets `TERM`
+    /// Per-connection facts — `TERM` from the PTY request, plus the banner's
+    /// detach hint the daemon derives from the channel's session keys. Applied
+    /// *above* the composition, the way sshd sets `TERM`
     /// authoritatively regardless of shell dotfiles. (`SSH_TTY` and
     /// `SSH_CONNECTION`/`SSH_CLIENT` are deliberately not set: the session
     /// sandbox has no host `/dev/pts` and the Unix-socket transport has no peer
@@ -1829,10 +1913,18 @@ impl AttachEnv {
     pub(crate) fn connection_env(&self) -> ConnectionEnv {
         self.connection.iter().cloned().collect()
     }
+
+    /// Whether this attach declares a terminal (`TERM` from the PTY
+    /// request). The detach hint the daemon seeds every attach with is not a
+    /// terminal fact, so an empty-vs-non-empty map no longer answers this.
+    pub(crate) fn declares_terminal(&self) -> bool {
+        self.connection.iter().any(|(k, _)| k == "TERM")
+    }
 }
 
 /// The facts that describe *the terminal currently attached*, as opposed to
-/// the session's own composed environment: `TERM` today.
+/// the session's own composed environment: `TERM` from the PTY request, plus
+/// the banner's detach hint derived from the channel's session keys.
 ///
 /// Kept apart from [`AttachEnv`] because its lifetime is different. A session
 /// shell is spawned once and lives across many attaches, so its `environ` is
@@ -1927,7 +2019,7 @@ const SESSION_WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_DE
 /// and attaches from unrelated host directories. TTY-gated, plain text —
 /// `NO_COLOR`-safe, no box drawing.
 const BASELINE_MOTD: &str = constcat::concat!(
-    r#"[ -t 1 ] && { printf 'minimal · session %s · loadout %s\ndetach: ctrl-w' "${MINIMAL_SESSION_NAME:-unnamed}" "${MINIMAL_LOADOUTS:-none}"; [ -f "#,
+    r#"[ -t 1 ] && { printf 'minimal · session %s · loadout %s\ndetach: %s' "${MINIMAL_SESSION_NAME:-unnamed}" "${MINIMAL_LOADOUTS:-none}" "${MINIMAL_DETACH_HINT:-ctrl-] then d}"; [ -f "#,
     SESSION_WORKSPACE_ROOT,
     r#"/minimal.toml ] || [ -f "#,
     SESSION_WORKSPACE_ROOT,
@@ -2304,6 +2396,20 @@ impl SessionLauncher for SandboxLauncher {
             composition_vars,
             attach_env.connection,
         );
+        // Which shell this attach starts is decided from the composed
+        // `SHELL` (see `crate::session_shell`). Read before `env_vars`
+        // moves into the env build; the rootfs it has to be checked
+        // against doesn't exist until that build has run.
+        let requested_shell = env_vars.get("SHELL").cloned();
+        // Whether anything composed a prompt. `sandbox2` sets a
+        // bash-syntax `PS1` as the session default, which a shell that
+        // doesn't speak those escapes prints literally — so a non-bash
+        // shell gets its own (see `ShellChoice::prompt`), but only when
+        // the user hasn't asked for a specific prompt themselves.
+        let composed_prompt = env_vars.contains_key("PS1");
+        // For the log line on the fallback path, which fires after
+        // `name` has moved into `EnvArgs`.
+        let session_label = name.clone();
         // Log every item that will (or would) end up in the session,
         // tagged with its provenance. Patches and lifecycle hooks are
         // included even though the launcher can't act on them yet —
@@ -2344,30 +2450,52 @@ impl SessionLauncher for SandboxLauncher {
             container.set_session_leader();
 
             let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
-            // The `bash` package installs to `/usr/bin/bash` (--prefix=/usr) and
-            // the generic rootfs has no `/bin/bash`, so exec the absolute path
-            // that exists rather than `/bin/bash` (which fails with ENOENT).
-            // `--rcfile` rather than `-l`: this build of bash has no
-            // `/etc/bash.bashrc`, so the daemon's per-attach environment hook
-            // has no shell-owned integration point to live in and must be
-            // named on the argv — and bash consults `--rcfile` only for an
-            // interactive *non-login* shell. Nothing is lost: `--noprofile`
-            // already suppressed every file `-l` would have read, so the
-            // session shell read nothing before this and still reads nothing
-            // but the daemon's own rc (a user `~/.bashrc` stays unread).
-            // `-i` is explicit rather than inferred from the pty.
+            // The shell, and the argv it needs to reach the daemon's
+            // per-attach environment hook. Every program path here is
+            // absolute (`/usr/bin/<shell>`): packages install with
+            // `--prefix=/usr` and the generic rootfs has no `/bin`, so a
+            // bare name or a `/bin/…` path would fail with ENOENT.
+            let shell = crate::session_shell::resolve(requested_shell.as_deref(), &env.rootfs());
+            if let Some(notice) = &shell.fallback {
+                tracing::warn!(
+                    session = %session_label,
+                    requested = requested_shell.as_deref().unwrap_or_default(),
+                    "{notice}",
+                );
+                // Onto the pty's *slave* — that is the shell's stdout, so
+                // the line reaches the attached terminal ahead of the
+                // first prompt. Writing to the master would feed it to
+                // the shell as input instead. Best-effort: a session that
+                // comes up must not fail over a notice, and the log above
+                // has already recorded it. CRLF because this is a raw
+                // terminal write, not a line through the shell.
+                let written = pty.dup_slave_fd().and_then(|fd| {
+                    use std::io::Write as _;
+                    std::fs::File::from(fd).write_all(format!("minimal: {notice}\r\n").as_bytes())
+                });
+                if let Err(e) = written {
+                    tracing::debug!(error = %e, "could not print the shell notice to the terminal");
+                }
+            }
             let mut command = env
-                .command(
-                    &container,
-                    "/usr/bin/bash",
-                    [
-                        "--noprofile",
-                        "--rcfile",
-                        crate::env::ATTACH_ENV_BASH_RC,
-                        "-i",
-                    ],
-                )
+                .command(&container, &shell.program, shell.args.iter().copied())
                 .map_err(|e| io::Error::other(format!("build command: {e}")))?;
+            // Name the shell that is actually running. The composed
+            // value is a path on the machine the loadout was authored on
+            // (`/opt/homebrew/bin/fish`), which resolves to nothing
+            // in-session, and on the fallback path it names a shell that
+            // isn't the one at this prompt.
+            command.env("SHELL", &shell.program);
+            // The session default `PS1` is bash's, so a shell with its
+            // own prompt grammar needs the equivalent in that grammar —
+            // handed the bash one, zsh renders `\[\033[…\]\u@\h` as
+            // literal text. Skipped when the composition set `PS1`: that
+            // is the user's own prompt, in whatever syntax they meant.
+            if let Some(prompt) = shell.prompt
+                && !composed_prompt
+            {
+                command.env("PS1", prompt);
+            }
             command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
             command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
             let tty_path = pty.slave_path().to_path_buf();
@@ -2848,6 +2976,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
 
             remote_tx,
             remote_rx,
+            binding_generation: 0,
             stdout_buf: vec![0u8; 8 * 1024],
             stdin_buf: None,
             net_guard,
@@ -2863,6 +2992,8 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             archives_dir,
             connection_env,
             home_dir,
+            chord_matcher: ChordMatcher::new(SessionKeys::default()),
+            chord_flush_deadline: None,
             guard,
         };
 
@@ -2871,7 +3002,14 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             // environment, so pass an empty map rather than re-applying them:
             // `attach` treats empty as "nothing new to say" and publishes what
             // the host already holds.
-            host.attach(channel, sz, true, ConnectionEnv::new()).await;
+            host.attach(
+                channel,
+                sz,
+                true,
+                ConnectionEnv::new(),
+                SessionKeys::default(),
+            )
+            .await;
         } else {
             // No client to bind, so nothing calls `attach` — publish anyway,
             // so a host minted headlessly still has the files in place before
@@ -3087,6 +3225,12 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     }
 
     pub async fn step(&mut self) -> Result<(), ()> {
+        // Snapshot the chord-flush deadline for the select below: the arm
+        // sleeps until this absolute instant, so the timer survives the select
+        // being rebuilt on every `step()` call (a bare `sleep` would restart
+        // each iteration and never fire while other events keep waking the
+        // loop).
+        let chord_flush_deadline = self.chord_flush_deadline;
         tokio::select! {
             // Read actor messages.
             Some(msg) = self.receiver.recv() => {
@@ -3123,8 +3267,8 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                         // `mainloop` reap via `wait()` and return.
                         return Err(());
                     }
-                    Message::Attach(channel, sz, connection) => {
-                        self.attach(channel, sz, false, connection).await;
+                    Message::Attach(channel, sz, connection, keys) => {
+                        self.attach(channel, sz, false, connection, keys).await;
                     }
                     Message::SetTitleCallback(title) => {
                         self.attrs.title = Some((title, SystemTime::now()));
@@ -3211,34 +3355,85 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             // we only consume new keystrokes if we have none waiting to be written to the pty, and
             // pending writes to the pty are serviced async by their own select arm (below).
             Some(msg) = self.remote_rx.recv(), if self.stdin_buf.is_none() => {
-                match msg {
-                    StdinMsg::Bytes(b) => {
+                // Discard input queued by the superseded binding: its bytes
+                // predate the attach that installed the current session keys,
+                // and matching them now would hand the old channel's
+                // keystrokes to the new channel's chord (or its size).
+                if msg.generation != self.binding_generation {
+                    return Ok(());
+                }
+                match msg.kind {
+                    StdinMsgKind::Bytes(b) => {
                         self.attrs.stdin_last = Some(SystemTime::now());
 
-                        // ctrl-w
-                        let is_detach = b.len() == 1 && b[0] == 0x17 ||
-                            b == CTRL_W_CSI_U ||
-                            b == CTRL_W_CSI_27;
-
-                        if is_detach {
-                            let uc = self.unwind_codes();
-                            if let Some((tx, _hnd)) = self.remote.as_mut() {
-                                match tx.send(BindingMsg::TeardownDueToDetach(uc)).await {
-                                    Ok(()) => {},
-                                    Err(e) => {
-                                        tracing::warn!("failed sending detach signal to remote: {e}");
+                        // Session-key chord matching over the stdin byte
+                        // stream: the leader chord is swallowed and enters
+                        // command mode; the next keystroke is the subcommand —
+                        // detach, forward, or an unbound key that cancels. The
+                        // leader is never forwarded except via the explicit
+                        // forward subcommand. Coalesced and split chunks are
+                        // handled by the matcher; the decisions below only map
+                        // outcomes to I/O, with every PTY-bound byte (data
+                        // runs and verbatim leaders) collected in stream order.
+                        let mut forward: Vec<u8> = Vec::new();
+                        for outcome in self.chord_matcher.feed(&b) {
+                            match outcome {
+                                FeedOutcome::Forward(bytes) => {
+                                    forward.extend_from_slice(&bytes);
+                                }
+                                FeedOutcome::Action(KeyAction::Swallow) => {}
+                                FeedOutcome::Action(KeyAction::EnterCommandMode) => {
+                                    // Ring the terminal bell on the channel back
+                                    // to the user (never the PTY, so the app
+                                    // never sees it) when the client opted in.
+                                    if self.chord_matcher.keys().bell_on_leader
+                                        && let Some((tx, _)) = self.remote.as_ref()
+                                    {
+                                        let _ = tx.send(BindingMsg::Stdin(vec![0x07])).await;
                                     }
-                                };
-                                self.remote = None;
+                                }
+                                FeedOutcome::Action(KeyAction::Detach) => {
+                                    let uc = self.unwind_codes();
+                                    if let Some((tx, _hnd)) = self.remote.as_mut() {
+                                        match tx.send(BindingMsg::TeardownDueToDetach(uc)).await {
+                                            Ok(()) => {},
+                                            Err(e) => {
+                                                tracing::warn!("failed sending detach signal to remote: {e}");
+                                            }
+                                        };
+                                        self.remote = None;
+                                    }
+                                }
+                                FeedOutcome::Action(KeyAction::ForwardLeader) => {
+                                    // Queue a verbatim leader byte in the PTY
+                                    // stream, handing the next keystroke to the
+                                    // layer below (a nested daemon *that
+                                    // negotiated the same leader*, if any).
+                                    // Safe to over-send: a stray leader past the
+                                    // deepest layer hits the app's own
+                                    // non-destructive leader binding.
+                                    forward.push(self.chord_matcher.keys().leader.plain_byte());
+                                }
                             }
-                        } else {
-                            self.stdin_buf = Some((b, 0));
-                        };
+                        }
+                        if !forward.is_empty() {
+                            queue_stdin(&mut self.stdin_buf, forward);
+                        }
+
+                        // Arm (or clear) the idle-flush timer: a chunk that
+                        // leaves the matcher holding a split candidate (a lone
+                        // `ESC`, a prefix of every kitty form) must not wedge
+                        // that candidate forever — flush it to the PTY as data
+                        // once the stream goes quiet.
+                        self.chord_flush_deadline = self
+                            .chord_matcher
+                            .has_pending()
+                            .then(|| tokio::time::Instant::now() + CHORD_FLUSH_IDLE);
                     }
-                    StdinMsg::TerminalUpdate(sz) => {
+                    StdinMsgKind::TerminalUpdate(sz) => {
                         self.set_size(WinSize::from(&sz));
                     },
-                    StdinMsg::WindowChange{ col_width, row_height, pix_height, pix_width } => {
+                    StdinMsgKind::WindowChange{ col_width, row_height, pix_height, pix_width } => {
                         self.set_size(WinSize {
                             rows: row_height as u16,
                             cols: col_width as u16,
@@ -3280,6 +3475,28 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     Err(_would_block) => {},
                 }
             }
+            // Flush a held chord-matcher split candidate once the stream goes
+            // quiet. A lone `ESC` is a strict prefix of every kitty form, so
+            // the matcher holds it for the next chunk; without this, a bare
+            // `ESC` (e.g. leaving vim insert mode) would be held until the
+            // user's next keystroke. `pending()` keeps the arm inert while no
+            // candidate is held.
+            _ = async {
+                match chord_flush_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                self.chord_flush_deadline = None;
+                // Appended after anything already queued: forwarded input
+                // still waiting on an unwritable pty predates the candidate
+                // the flush releases, and replacing the buffer would drop it
+                // (see `queue_stdin`).
+                let flushed = self.chord_matcher.flush();
+                if !flushed.is_empty() {
+                    queue_stdin(&mut self.stdin_buf, flushed);
+                }
+            }
 
         }
 
@@ -3292,15 +3509,32 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         sz: WinSize,
         skip_flush: bool,
         connection: ConnectionEnv,
+        keys: SessionKeys,
     ) {
-        // Before anything the client can see: the facts describe the terminal
-        // that is arriving, and the shell's first prompt after this should
-        // already read them. Empty means the client had nothing to say (see
-        // [`HostHandle::attach`]), so the previous facts stand.
-        if !connection.is_empty() {
-            self.connection_env = connection;
-        }
+        // Merge the connection facts rather than replacing the stored map.
+        // Every attach carries the banner's detach hint (derived from this
+        // channel's keys), but only some carry a terminal — replacing
+        // wholesale would let a terminal-less attach drop the last published
+        // `TERM` (see the attach-side log about keeping it). Merging updates
+        // whatever this attach declares and leaves the rest standing.
+        self.connection_env.extend(connection);
         self.publish_connection_env().await;
+
+        // A new channel means a fresh matcher: fresh key negotiation, idle
+        // command-mode state, and no pending split candidate — two clients
+        // with different configs on the same session each get their own
+        // chord, and a reattach never inherits a stale awaiting-subcommand
+        // state.
+        self.chord_matcher = ChordMatcher::new(keys);
+        // A fresh matcher holds no candidate, so any pending idle-flush
+        // deadline from the previous channel is stale.
+        self.chord_flush_deadline = None;
+
+        // Bump before spawning the new binding: anything the superseded
+        // binding already queued into the shared stdin channel carries the
+        // old generation from here on, so the stdin arm drops it instead of
+        // interpreting those keystrokes under this channel's fresh keys.
+        self.binding_generation += 1;
 
         if !skip_flush {
             self.parser.screen_mut().set_size(sz.rows, sz.cols);
@@ -3312,6 +3546,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         let new_binding = Binding::spawn(
             channel,
             self.remote_tx.clone(),
+            self.binding_generation,
             self.control.clone(),
             self.delta.clone(),
             self.session_name.clone(),
@@ -3433,6 +3668,13 @@ mod tests {
         xpixel: 0,
         ypixel: 0,
     };
+
+    /// Wraps a chunk as a current-generation [`StdinMsg`] for the test
+    /// harness: hosts here never attach a binding, so the host's active
+    /// binding generation stays 0.
+    fn stdin_bytes(b: impl Into<bytes::Bytes>) -> StdinMsg {
+        StdinMsg::new(0, StdinMsgKind::Bytes(b.into()))
+    }
 
     /// Builds the `hakoniwa` account of a normal exit: the inner process
     /// reported its own status, so `exit_code` is `Some`.
@@ -3626,9 +3868,7 @@ mod tests {
         let task = tokio::spawn(host.mainloop());
 
         stdin
-            .send(StdinMsg::Bytes(bytes::Bytes::from(
-                format!("{MOCK_EXIT_LINE}\n").into_bytes(),
-            )))
+            .send(stdin_bytes(format!("{MOCK_EXIT_LINE}\n").into_bytes()))
             .await
             .expect("failed to send exit line");
         tokio::time::timeout(Duration::from_secs(10), task)
@@ -3711,15 +3951,13 @@ mod tests {
         let mut line = MOUSE_ON.to_vec();
         line.push(b'\n');
         stdin
-            .send(StdinMsg::Bytes(bytes::Bytes::from(line)))
+            .send(stdin_bytes(line))
             .await
             .expect("failed to send the mouse-enable line");
         await_forwarded(&mut rx, MOUSE_ON).await;
 
         stdin
-            .send(StdinMsg::Bytes(bytes::Bytes::from(
-                format!("{MOCK_EXIT_LINE}\n").into_bytes(),
-            )))
+            .send(stdin_bytes(format!("{MOCK_EXIT_LINE}\n").into_bytes()))
             .await
             .expect("failed to send exit line");
         tokio::time::timeout(Duration::from_secs(10), task)
@@ -3856,6 +4094,36 @@ mod tests {
         assert_eq!(env.len(), 5);
     }
 
+    /// A composed `SHELL` reaches the layered map, which is the input
+    /// the launcher hands [`crate::session_shell::resolve`] to pick the
+    /// shell it spawns. Nothing else sets the key — the sandbox's
+    /// `/usr/bin/bash` default lives a layer below this, inside
+    /// `sandbox2`'s `command_env` — so its absence here is exactly the
+    /// "no shell was asked for" case that keeps bash the default.
+    #[test]
+    fn a_composed_shell_reaches_the_layered_env() {
+        let sv = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let without = layer_session_env(
+            session_baseline_env("box-1", None),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            without.get("SHELL"),
+            None,
+            "nothing but a composition may name the session's shell",
+        );
+
+        let with = layer_session_env(
+            session_baseline_env("box-1", None),
+            Vec::new(),
+            vec![sv("SHELL", "/usr/bin/fish")],
+            Vec::new(),
+        );
+        assert_eq!(with.get("SHELL").map(String::as_str), Some("/usr/bin/fish"));
+    }
+
     /// The per-attach environment is written in each shell's own syntax, with
     /// values quoted so a terminal name carrying shell metacharacters is
     /// data rather than code, plus a JSON form for shells that read data
@@ -3975,6 +4243,10 @@ mod tests {
         // Static template, dynamic vars: interpolated in-shell, unset-safe.
         assert!(motd.contains("${MINIMAL_SESSION_NAME:-"));
         assert!(motd.contains("${MINIMAL_LOADOUTS:-"));
+        // The detach hint is a third %s filled by the negotiated keys var,
+        // with the default chord as the unset fallback.
+        assert!(motd.contains("detach: %s"));
+        assert!(motd.contains("${MINIMAL_DETACH_HINT:-ctrl-] then d}"));
         // The blueprint clause tests the session workspace itself at
         // print time — both mfile layouts — pinned to the same constant
         // that is the shell's initial cwd.
@@ -3984,8 +4256,29 @@ mod tests {
             !motd.contains("MINIMAL_BLUEPRINT"),
             "blueprint is a session-filesystem fact, not an env var"
         );
-        assert!(motd.contains("detach: ctrl-w"));
         assert!(motd.contains("min init"));
+    }
+
+    /// The detach hint in the orientation banner reflects the negotiated
+    /// session keys: when the connection layer seeds `MINIMAL_DETACH_HINT`
+    /// (the daemon does this from the channel's key env vars at attach), the
+    /// layered env carries it so the banner's `${MINIMAL_DETACH_HINT:-…}`
+    /// renders the actual chord rather than the default fallback.
+    #[test]
+    fn connection_layer_seeds_negotiated_detach_hint() {
+        let env = layer_session_env(
+            session_baseline_env("box-1", None),
+            vec![],
+            vec![],
+            vec![(
+                "MINIMAL_DETACH_HINT".to_string(),
+                "ctrl-^ then x".to_string(),
+            )],
+        );
+        assert_eq!(
+            env.get("MINIMAL_DETACH_HINT").map(String::as_str),
+            Some("ctrl-^ then x"),
+        );
     }
 
     /// A missing loadout display (old client / no composition) leaves
@@ -4157,7 +4450,7 @@ mod tests {
         let title = "hello-title";
         let osc = format!("\x1b]0;{title}\x07\n");
         stdin
-            .send(StdinMsg::Bytes(bytes::Bytes::from(osc.into_bytes())))
+            .send(stdin_bytes(osc.into_bytes()))
             .await
             .expect("failed to send stdin");
 
@@ -4345,9 +4638,7 @@ mod tests {
 
         // Make the shell exit; the network must then be released.
         stdin
-            .send(StdinMsg::Bytes(bytes::Bytes::from(
-                format!("{MOCK_EXIT_LINE}\n").into_bytes(),
-            )))
+            .send(stdin_bytes(format!("{MOCK_EXIT_LINE}\n").into_bytes()))
             .await
             .expect("failed to send exit line");
         tokio::time::timeout(Duration::from_secs(10), task)
@@ -4361,10 +4652,11 @@ mod tests {
         );
     }
 
-    /// The other half of "detach != exit": a ctrl-w (detach) keystroke is
-    /// swallowed as a detach signal — never forwarded to the shell — and does not
-    /// end the session or release the network. The shell keeps running (a later
-    /// line still round-trips) and only an explicit kill/exit releases the network.
+    /// The other half of "detach != exit": the detach chord (leader then `d`)
+    /// is swallowed as a detach signal — never forwarded to the shell — and does
+    /// not end the session or release the network. The shell keeps running (a
+    /// later line still round-trips) and only an explicit kill/exit releases the
+    /// network.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn detach_keystroke_holds_the_session_and_network() {
         let torn_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -4389,18 +4681,26 @@ mod tests {
         let stdin = host.remote_tx.clone();
         let task = tokio::spawn(host.mainloop());
 
-        // A bare ctrl-w (0x17) is the detach chord. It must be consumed as a
-        // detach signal rather than written to the pty.
+        // The default detach chord is `ctrl-]` (0x1d, the leader) then `d`.
+        // Both bytes are consumed by the command-mode state machine rather
+        // than written to the pty: the leader enters command mode, `d`
+        // detaches. (The host is built without a binding, so the detach is a
+        // no-op on the channel — what matters is that neither byte reaches
+        // the shell.)
         stdin
-            .send(StdinMsg::Bytes(bytes::Bytes::from(vec![0x17])))
+            .send(stdin_bytes(vec![0x1d]))
             .await
-            .expect("failed to send ctrl-w");
+            .expect("failed to send leader");
+        stdin
+            .send(stdin_bytes(b"d".to_vec()))
+            .await
+            .expect("failed to send detach key");
 
         // The shell survived the detach: a normal line still echoes back, which
-        // stamps stdout activity. (If ctrl-w had been forwarded or had killed the
-        // process, no echo would ever arrive.)
+        // stamps stdout activity. (If the chord had been forwarded or had killed
+        // the process, no echo would ever arrive.)
         stdin
-            .send(StdinMsg::Bytes(bytes::Bytes::from(b"ping\n".to_vec())))
+            .send(stdin_bytes(b"ping\n".to_vec()))
             .await
             .expect("failed to send line after detach");
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -4430,5 +4730,81 @@ mod tests {
             torn_down.load(std::sync::atomic::Ordering::SeqCst),
             "kill/destroy must release the network",
         );
+    }
+
+    /// The PTY write queue appends: bytes queued later land *after* anything
+    /// already buffered, so an idle chord-candidate flush can never overwrite
+    /// forwarded input still waiting on an unwritable pty.
+    #[test]
+    fn queue_stdin_appends_after_unwritten_remainder() {
+        // Two bytes of a queued chunk written; three still pending. The flush
+        // must not resurrect the written prefix or drop either remainder.
+        let mut buf = Some((bytes::Bytes::from_static(b"abcde"), 2));
+        queue_stdin(&mut buf, vec![0x1b]);
+        let (pending, written) = buf.as_ref().unwrap();
+        assert_eq!(*written, 0);
+        assert_eq!(&pending[..], b"cde\x1b");
+
+        // An empty queue takes the new bytes wholesale.
+        let mut buf = None;
+        queue_stdin(&mut buf, vec![0x1d, 0x64]);
+        let (pending, written) = buf.as_ref().unwrap();
+        assert_eq!(*written, 0);
+        assert_eq!(&pending[..], b"\x1d\x64");
+    }
+
+    /// Input stamped with a stale binding generation — what a superseded
+    /// binding left queued in the shared stdin channel — must never reach
+    /// the shell. (A real supersession attaches a new channel; here no
+    /// binding ever attaches, so the active generation stays 0 and a manual
+    /// generation-1 message stands in for the queued leftovers.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_binding_generation_input_is_discarded() {
+        let (host, _handle) = Host::build(
+            MockLauncher,
+            "test-session".to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+            None,
+            None,
+            None,
+            std::env::temp_dir(),
+            sessions::SessionId::nil(),
+            None,
+            ConnectionEnv::new(),
+        )
+        .await
+        .expect("failed to build host");
+        let stdin = host.remote_tx.clone();
+        let mut task = tokio::spawn(host.mainloop());
+
+        // The exit sentinel on a stale generation: if this reached the shell
+        // the mainloop would reap the process and the task would complete.
+        stdin
+            .send(StdinMsg::new(
+                1,
+                StdinMsgKind::Bytes(bytes::Bytes::from(
+                    format!("{MOCK_EXIT_LINE}\n").into_bytes(),
+                )),
+            ))
+            .await
+            .expect("failed to send stale stdin");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !task.is_finished(),
+            "stale-generation input must not reach the shell",
+        );
+
+        // The same bytes on the active generation must still go through.
+        stdin
+            .send(stdin_bytes(format!("{MOCK_EXIT_LINE}\n").into_bytes()))
+            .await
+            .expect("failed to send stdin");
+        tokio::time::timeout(Duration::from_secs(10), &mut task)
+            .await
+            .expect("mainloop should terminate after the shell exits")
+            .expect("host task should not panic during teardown")
+            .expect("mainloop should return the reaped exit status");
     }
 }

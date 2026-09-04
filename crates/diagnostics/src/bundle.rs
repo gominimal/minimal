@@ -16,7 +16,9 @@ use async_compression::tokio::write::ZstdEncoder;
 use async_tar::{Builder, EntryType, Header};
 use tokio::io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::manifest::{CollectedEntry, CollectorError, Manifest, Redaction, SkippedEntry};
+use crate::manifest::{
+    CollectedEntry, CollectorError, Manifest, ProjectScope, Redaction, SkippedEntry,
+};
 
 /// Default per-file tail cap for bundled logs.
 ///
@@ -94,6 +96,10 @@ pub struct BundleWriter<W: BundleSink = tokio::fs::File> {
     /// Producer version recorded in the manifest — the crate is app-agnostic,
     /// so the caller supplies it.
     version: String,
+    /// The project the bundle is attributable to; [`ProjectScope::unrecorded`]
+    /// until a producer says otherwise, so the manifest never has to fall
+    /// silent on the question.
+    project: ProjectScope,
     collected: Vec<CollectedEntry>,
     skipped: Vec<SkippedEntry>,
     errors: Vec<CollectorError>,
@@ -144,6 +150,7 @@ impl<W: BundleSink> BundleWriter<W> {
             tar: Builder::new(ZstdEncoder::new(writer)),
             root,
             version: version.to_string(),
+            project: ProjectScope::unrecorded(),
             collected: Vec::new(),
             skipped: Vec::new(),
             errors: Vec::new(),
@@ -223,6 +230,14 @@ impl<W: BundleSink> BundleWriter<W> {
         });
     }
 
+    /// Records the project this bundle was collected from. Both outcomes are
+    /// recordable — an [unknown][ProjectScope::Unknown] scope carries the
+    /// reason — so a producer that looked and found nothing says so rather
+    /// than leaving the default in place.
+    pub fn set_project(&mut self, project: ProjectScope) {
+        self.project = project;
+    }
+
     pub fn error_count(&self) -> usize {
         self.errors.len()
     }
@@ -243,6 +258,7 @@ impl<W: BundleSink> BundleWriter<W> {
             created_at,
             version: std::mem::take(&mut self.version),
             duration_ms: duration.as_millis() as u64,
+            project: std::mem::replace(&mut self.project, ProjectScope::unrecorded()),
             collected: std::mem::take(&mut self.collected),
             skipped: std::mem::take(&mut self.skipped),
             errors: std::mem::take(&mut self.errors),

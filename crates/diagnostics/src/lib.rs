@@ -85,12 +85,18 @@ macro_rules! collect_step {
 pub use bundle::{
     BundleSink, BundleWriter, LOG_TAIL_CAP, MAX_LOG_TAIL_BYTES, open_regular_nofollow,
 };
-pub use capture::{Capture, CaptureError, command_capture, command_stdout, first_stdout_line};
+pub use capture::{
+    Capture, CaptureError, command_capture, command_capture_capped, command_stdout,
+    first_stdout_line,
+};
 #[cfg(unix)]
 pub use disk::{DiskUsage, disk_usage};
 pub use listing::{Listing, listing};
 pub use logs::{newest_matching, newest_rotated, try_newest_matching};
-pub use manifest::{CollectedEntry, CollectorError, Manifest, Redaction, SkippedEntry};
+pub use manifest::{
+    CollectedEntry, CollectorError, Manifest, ProjectIdentity, ProjectScope, Redaction,
+    SkippedEntry,
+};
 #[cfg(unix)]
 pub use system::{DiskInfo, SystemInfo, system_info};
 #[cfg(unix)]

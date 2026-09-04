@@ -77,7 +77,7 @@ jobs:
         # build-initramfs.sh cross-compiles the guest minimald to static musl;
         # install the prebuilt cross like the KVM lane so it never falls back
         # to `cargo install cross` from source inside this blocking job.
-        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
+        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
         with:
           tool: cross
       - name: Enable /dev/kvm access
@@ -267,7 +267,7 @@ jobs:
         # Both are prebuilt binaries in taiki-e's manifest (zizmor is Rust,
         # from zizmorcore/zizmor). actionlint is NOT — it runs from its
         # pinned official image below.
-        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
+        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
         with:
           tool: cargo-machete,zizmor
       - name: actionlint (workflow lint)
@@ -308,7 +308,7 @@ jobs:
         with:
           shared-key: msrv
       - name: Install cargo-hack
-        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2
+        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
         with:
           tool: cargo-hack
       - name: cargo hack check --rust-version

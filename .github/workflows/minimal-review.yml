@@ -23,6 +23,11 @@ name: minimal-review
 on:
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
+  # `/review` in a PR comment. `created` only — editing an old comment to say
+  # `/review` should not start a run, and `edited` would let one comment start
+  # any number of them.
+  issue_comment:
+    types: [created]
   workflow_dispatch:
     inputs:
       pr:
@@ -33,10 +38,15 @@ permissions:
   contents: read
   pull-requests: write
 
-# Debounce `synchronize` bursts: three commits in ten seconds should produce one
-# review of the final head, not three of intermediate trees.
+# `pull_request` runs group per PR so a burst of pushes produces one review of
+# the final head. `issue_comment` runs must NOT join that group: with
+# cancel-in-progress, sharing it means any comment on a PR kills the review
+# running for it — CodeRabbit posting its summary was enough, and it cancelled
+# the review of gominimal/foundry#46 nine seconds after the comment landed. So a
+# comment run is keyed by the comment, which cancels nothing and is cancelled by
+# nothing. Two `/review`s in a row both run, and each was explicitly asked for.
 concurrency:
-  group: minimal-review-${{ github.event.pull_request.number || github.event.inputs.pr }}
+  group: minimal-review-${{ github.event_name == 'issue_comment' && format('comment-{0}', github.event.comment.id) || github.event.pull_request.number || github.event.inputs.pr }}
   cancel-in-progress: true
 
 env:
@@ -66,18 +76,85 @@ env:
 
 jobs:
   review:
-    # Same-repo PRs only (forks get no secrets), from an org member or an
-    # installed App. The Bot clause matters: both gominimal-aw-bot and
-    # dependabot are CONTRIBUTOR, not MEMBER, and gating them out would stop
-    # reviewing every dependency bump. workflow_dispatch already requires
-    # write access.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
+    # Same-repo PRs only — forks get no secrets, and the step below refuses
+    # them again where a PR cannot edit the check. workflow_dispatch already
+    # requires write access, so it needs no test of its own.
+    #
+    # dependabot is excluded, and that is a correction rather than a policy.
+    # A dependabot-triggered run cannot read Actions secrets — they live in the
+    # separate Dependabot secrets store — so `secrets.AW_BOT_PRIVATE_KEY` is
+    # empty and the token mint dies with "The 'private-key' input must be set to
+    # a non-empty string". Every dependabot run has failed that way: 12 of 12,
+    # webapp 10 and pkgmgr-rs and minimal one each. The Bot clause
+    # that used to admit them was added so dependency bumps would be reviewed,
+    # and it has never once produced a review — only a red X on a PR nobody
+    # wrote. Skipping is honest about that.
+    #
+    # To actually review bumps, add AW_BOT_PRIVATE_KEY and the rest to each
+    # repo's Dependabot secrets and drop this clause — deliberately, in a
+    # reviewed PR, having checked one runs green first.
+    #
+    # `issue_comment` is the one path where the trigger is not the PR. It fires
+    # on issue comments too, and on a public install anyone at all can post one,
+    # so all four clauses have to hold: it must be a PR, the body must ask,
+    # and the person asking must be one of ours. No Bot clause here — a bot's
+    # comment starting a paid review is a loop nobody asked for, and the step
+    # below refuses one by name.
+    #
+    # CONTRIBUTOR is in the list, and it is not a widening to "anyone". A
+    # private org member's comment carries CONTRIBUTOR, exactly as their PR
+    # does, so the narrower list reproduced the #1313 bug on the comment path,
+    # and a job-level `if` that refuses them means the permission check below
+    # never runs at all. A stranger with no commits here is NONE and is
+    # still refused for free. The set this admits is "has landed a commit in
+    # this repo", and each one costs a runner start of about ten seconds before
+    # the step below resolves their real permission and stops them — bounded,
+    # and ahead of the quiet window and the token mint.
+    #
+    # Both line endings, because GitHub does not normalise a comment body and
+    # some clients send CRLF. Measured across 600 multi-line comments in this
+    # org: 43901 bare LF and 378 CRLF — rare, but not theoretical, and the CRLF
+    # ones are twitchyliquid64's, who writes more review commentary on
+    # gominimal/minimal than anyone. Matching only `/review\n` would have made
+    # `/review` silently do nothing for exactly the person most likely to type
+    # it. `'/review\r'` covers CRLF and a lone CR both.
+    #
+    # This gate is repeated in the caller, and that copy is the one that stops
+    # the job from starting. This one is the backstop: the caller's file can be
+    # edited by the PR under review, and this file cannot.
+    #
+    # The pull_request path tests no author at all, and that is deliberate.
+    # `author_association` is a visibility signal, not a permission one: it
+    # reports MEMBER only for a PUBLIC org member, and a private one comes back
+    # CONTRIBUTOR. gominimal/minimal#1313 skipped nine consecutive runs for that
+    # reason and was only ever reviewed by a hand-fired dispatch; four of
+    # thirteen org members were invisible to the reviewer the same way.
+    #
+    # The author is tested by permission instead, in the `Refuse a PR whose
+    # author lacks write` step below, where an API call is possible and an
+    # expression is not — that step carries the argument for why the head-repo
+    # test is not enough on its own. Named rather than positioned: it was "the
+    # first step" until a step was added above it, which is the kind of claim a
+    # reader trusts without rechecking. So the `if` is a cheap filter and the
+    # step is the test.
+    #
+    # A double-quoted scalar, not `>-`, and the difference matters: in a folded
+    # block `\n` stays two characters, so the newline clause below would test
+    # for a literal backslash-n and never match. YAML unescapes it here before
+    # the expression engine sees it, and expression literals have no escapes
+    # of their own. The cost is that every " in the gate must be escaped.
+    if: "github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request != null &&
+      (github.event.comment.body == '/review' ||
+      startsWith(github.event.comment.body, '/review ') ||
+      startsWith(github.event.comment.body, '/review\n') ||
+      startsWith(github.event.comment.body, '/review\r')) &&
+      contains(fromJSON('[\"OWNER\",\"MEMBER\",\"COLLABORATOR\",\"CONTRIBUTOR\"]'),
+      github.event.comment.author_association)) ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
-       github.event.pull_request.draft != true &&
-       (github.event.pull_request.user.type == 'Bot' ||
-        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
-                 github.event.pull_request.author_association)))
+      github.event.pull_request.draft != true &&
+      github.event.pull_request.user.login != 'dependabot[bot]')"
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -97,6 +174,169 @@ jobs:
           fi
           echo "caller: $CALLER ($EVENT)"
 
+      # Who wrote the PR, answered by permission rather than by visibility.
+      #
+      # The job-level `if` tests same-repo and non-draft and stops there, on the
+      # reasoning that a branch cannot exist in this repo unless someone with
+      # write pushed it. True, and not the same as "the author has write":
+      # opening a PR from a branch someone else pushed needs only read.
+      # `brandonweeks` has `read` on gominimal/minimal, is not an org member,
+      # and authored non-draft same-repo PRs #1 and #11. An audit of all 2431
+      # same-repo PRs across the fleet finds exactly that one author below
+      # write — a count worth knowing, because an earlier check of the most
+      # recent 200 PRs on an 881-PR repo found none and read as proof.
+      #
+      # `author_association` cannot answer this. It reports MEMBER only for a
+      # PUBLIC org member, so it refused four of thirteen members here while
+      # admitting nobody it should have. Permission is the property that matters
+      # and the API states it directly.
+      #
+      # Falls back rather than fails closed. If the endpoint is unreadable with
+      # this token, refusing every PR would take the fleet down for a
+      # permissions detail, which is precisely how tonight started. The fallback
+      # is the association test — today's behaviour, no regression — with a
+      # warning naming the scope to fix. Not silent: a gate that quietly stopped
+      # checking is worse than one that never checked.
+      #
+      # It needs its own token. `github.token` carries this workflow's
+      # `permissions:` — contents: read, pull-requests: write — and the endpoint
+      # answers `403 Must have push access to view collaborator permission`
+      # without push, so the check would have fallen back on every single run
+      # and the gate would have been decorative. Raising the workflow's own
+      # ceiling was the wrong fix: that ceiling is the most the reviewer can
+      # ever hold in an install, and widening it to read collaborators widens it
+      # everywhere, permanently, for one lookup.
+      #
+      # So: a second App token, scoped to this one repository and to Metadata
+      # read. It cannot write anything, cannot see another repo, and is gone when
+      # the step ends. The App-token step further down stays scoped to foundry
+      # and broker; the two are deliberately not merged, because that one is a
+      # checkout credential and this one is a gate.
+      #
+      # WHICH permission this endpoint wants is not settled, and this comment is
+      # not going to pretend otherwise. GitHub's REST reference lists it under
+      # Metadata; the endpoint's own page says "must have push access", which no
+      # read-only grant confers. Both readings are defensible, and requesting a
+      # permission the installation lacks makes the mint itself fail rather
+      # than the call. It cannot be settled from a text editor.
+      #
+      # So this asks for the least that could work, and every way it can go
+      # wrong degrades instead of breaking: an ungranted permission fails the
+      # mint, `continue-on-error` swallows that, the step falls back to
+      # `github.token`, and the API call then fails too and lands in the
+      # association fallback with a warning naming the scope. The first real run
+      # settles it — the step logs `has <permission> on`, so grep for `has ` and
+      # read what follows, or for the warning if it fell back.
+      - name: Mint a read-only token for the author check
+        id: author-token
+        if: github.event_name != 'workflow_dispatch'
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ vars.AW_BOT_APP_ID }}
+          private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
+          owner: gominimal
+          repositories: ${{ github.event.repository.name }}
+          permission-metadata: read
+
+      - name: Refuse a PR whose author lacks write
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          # Falls back to github.token if the mint above failed — which only
+          # moves the failure to the API call, where the fallback already is.
+          GH_TOKEN: ${{ steps.author-token.outputs.token || github.token }}
+          CALLER: ${{ github.repository }}
+          # On a comment run the person to check is the commenter, not the PR
+          # author: `/review` is the thing being authorised. workflow_dispatch
+          # is excluded above — GitHub already requires write to fire one.
+          AUTHOR: ${{ github.event_name == 'issue_comment' && github.event.comment.user.login || github.event.pull_request.user.login }}
+          AUTHOR_TYPE: ${{ github.event_name == 'issue_comment' && github.event.comment.user.type || github.event.pull_request.user.type }}
+          ASSOCIATION: ${{ github.event_name == 'issue_comment' && github.event.comment.author_association || github.event.pull_request.author_association }}
+        run: |
+          set -uo pipefail
+          # "the PR author" is wrong on a comment run, where the subject is the
+          # commenter. Say which, because these messages are the whole
+          # explanation someone gets when a review does not appear.
+          if [ "${GITHUB_EVENT_NAME:-}" = "issue_comment" ]; then
+            WHO="commenter"
+          else
+            WHO="PR author"
+          fi
+
+          # A Bot means opposite things on the two paths, so it cannot be one
+          # rule. An App that OPENS a PR pushed its own branch and has no
+          # collaborator record to look up. An App that COMMENTS `/review` is a
+          # bot starting a paid run, which is the loop nobody asked for;
+          # CodeRabbit alone comments on most PRs here.
+          #
+          # Named, not typed. `user.type == 'Bot'` waived the check for the
+          # whole class of App accounts, which is the same unaudited "surely
+          # they must have write" reasoning `brandonweeks` disproved for humans
+          # two paragraphs up — and no equivalent audit was ever run for Apps.
+          # Any other App gets the same lookup a human gets.
+          #
+          # The dependabot arm is unreachable on the pull_request path and kept
+          # anyway. This job's own `if` excludes that login, and a called
+          # workflow's `if` is evaluated against the same triggering event as
+          # the caller's, so it holds whatever a stale or PR-edited caller says.
+          #
+          # It stays because it is one line and it is the only place that names
+          # the cause. Drop the exclusion from either gate — which is exactly
+          # what someone wiring up Dependabot secrets would do first — and the
+          # run lands here. Refusing with a reason beats reaching a token mint
+          # that fails four steps later on "private-key must be set to a
+          # non-empty string".
+          #
+          # `/review` on a dependabot PR is a different matter and deliberately
+          # allowed. That run is triggered by the commenter, not by dependabot,
+          # so it reads Actions secrets normally and the mint succeeds — which
+          # makes it the one way to get a dependency bump reviewed today. The
+          # check below authorises the commenter, which is the right subject:
+          # they are the one asking for the review, and the PR's own author is
+          # not in a position to spend anything.
+          if [ "$AUTHOR_TYPE" = "Bot" ]; then
+            if [ "${GITHUB_EVENT_NAME:-}" = "issue_comment" ]; then
+              echo "::error::$AUTHOR is an App and a bot may not start a review by comment. Refusing."
+              exit 1
+            fi
+            case "$AUTHOR" in
+              dependabot|dependabot\[bot\])
+                echo "::error::$AUTHOR cannot be reviewed: a dependabot run reads the Dependabot secret store, not Actions secrets, so the App token cannot be minted. Every such run has failed at that step. Put the secrets in this repo's Dependabot store and drop the exclusion from the caller's gate."
+                exit 1 ;;
+              gominimal-aw-bot|gominimal-aw-bot\[bot\])
+                # By name because there is nothing to look up: the permission
+                # endpoint answers `404 gominimal-aw-bot is not a user` for an
+                # App. A lookup-only rule would refuse every App there is.
+                echo "author $AUTHOR is a known App and has no collaborator record to check"
+                exit 0 ;;
+              *)
+                echo "$AUTHOR is an App, but not one this file names; checking its permission like any other author" ;;
+            esac
+          fi
+
+          if perm="$(gh api "repos/$CALLER/collaborators/$AUTHOR/permission" \
+                       --jq .permission 2>/tmp/permerr)"; then
+            case "$perm" in
+              admin|maintain|write)
+                echo "$WHO $AUTHOR has $perm on $CALLER" ;;
+              *)
+                echo "::error::$WHO $AUTHOR has '$perm' on $CALLER, not write. Refusing before any credential is minted."
+                exit 1 ;;
+            esac
+            exit 0
+          fi
+
+          echo "::warning::could not read repos/$CALLER/collaborators/$AUTHOR/permission ($(tr -d '\n' < /tmp/permerr | cut -c1-200)). Falling back to author_association, which reports a private org member as CONTRIBUTOR and will refuse them. The step above asks the aw-bot App for Metadata:read on $CALLER; check the App is installed there and grants it. If it does and this still fails, the endpoint wants more than a read-only grant and the check needs rethinking rather than a wider scope."
+          case "$ASSOCIATION" in
+            OWNER|MEMBER|COLLABORATOR)
+              echo "fallback: $AUTHOR is $ASSOCIATION" ;;
+            *)
+              echo "::error::$WHO $AUTHOR is $ASSOCIATION and the permission API was unreadable, so nothing here can confirm write access. Refusing."
+              exit 1 ;;
+          esac
+
+      # Wait before spending anything, so a burst of pushes cancels this run
+      # before the agent starts rather than halfway through it.
       - name: Quiet window
         id: quiet
         if: github.event_name == 'pull_request'
@@ -148,42 +388,108 @@ jobs:
           path: reviewer
           persist-credentials: false
 
-      # workflow_dispatch skips the job-level fork guard, because there is no
-      # pull_request payload to read head.repo from. Without this it would
-      # resolve refs/pull/<n>/head for ANY number given — including a fork's —
-      # and run the agent over untrusted code in a sandbox that can reach the
-      # broker. Dispatch requires write access, but "trusted to trigger" is not
-      # "meant to review anything".
-      - name: Refuse a fork PR on dispatch
+      # Neither number-carrying trigger has a pull_request payload, so the
+      # job-level fork guard cannot see head.repo and this step reads it from
+      # the API instead. Without it, refs/pull/<n>/head would resolve for ANY
+      # number given.
+      #
+      # The two triggers get different answers, and the difference is the whole
+      # point. A fork PR gets no secrets on `pull_request`, which is why the
+      # caller refuses it there — and why a member working from a fork has been
+      # getting no review at all (8 of the last 60 PRs on gominimal/minimal,
+      # all from one member with write access). `issue_comment` runs in THIS
+      # repo's context and does get secrets, so it is the one trigger that
+      # *can* review a fork. Dispatch requires write access, but "trusted to
+      # trigger" is not "meant to review anything"; a comment naming the PR is
+      # a per-run human authorisation, and that is what this accepts.
+      - name: Resolve the PR, and decide whether a fork may be reviewed
         id: dispatch_pr
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.inputs.pr }}
+          PR_NUMBER: ${{ github.event.inputs.pr || github.event.issue.number }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
           head_repo="$(printf '%s' "$pr" | jq -r '.head.repo.full_name // ""')"
-          if [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
-            echo "::error::PR #$PR_NUMBER has its head in '${head_repo:-<deleted>}', not $GITHUB_REPOSITORY. Fork review is out of scope."
+          # Captured once, from this one response, and used for both the guard
+          # below and the checkout. Reading the head twice is the bug.
+          head_sha="$(printf '%s' "$pr" | jq -r '.head.sha // ""')"
+          base_sha="$(printf '%s' "$pr" | jq -r '.base.sha // ""')"
+          if [ -z "$head_sha" ]; then
+            echo "::error::PR #$PR_NUMBER has no head sha; refusing rather than resolving a mutable ref."
             exit 1
+          fi
+          if [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
+            if [ "$EVENT" != "issue_comment" ]; then
+              echo "::error::PR #$PR_NUMBER has its head in '${head_repo:-<deleted>}'. A fork is reviewed only when a member comments /review on it — that comment is the authorisation, and this trigger carries none."
+              exit 1
+            fi
+
+            # What the sandbox runs under still comes from the PR head, and on a
+            # fork that means from outside the org. Lifecycle hooks are stripped
+            # further down for exactly this reason, but minimal.toml also pins
+            # [upstream] — the repo and commit every package is built from — so
+            # editing it redirects the whole build at code of the author's
+            # choosing, and packages/ holds the build specs themselves.
+            #
+            # Refusing beats silently substituting the base config: a fork PR
+            # that changes how the project builds is precisely the PR a person
+            # should read before a machine does.
+            # Against the captured SHA, not `pulls/<n>/files`. That endpoint
+            # answers for whatever the head is *when asked*, and the checkout
+            # below USED TO resolve `refs/pull/<n>/head`, a ref the fork author
+            # can move in between: the guard cleared one tree and the sandbox
+            # ran another. `compare/<base>...<head_sha>` names an immutable
+            # commit, and the checkout now reads that same SHA.
+            cmp="$(gh api "repos/$GITHUB_REPOSITORY/compare/$base_sha...$head_sha")"
+            files="$(printf '%s' "$cmp" | jq -r '.files[]?.filename')"
+            # `compare` caps `files` at 300 and does NOT paginate them —
+            # --paginate walks commits, not files. Past that cap the response
+            # is silently short, so a fork PR with 301 changed files could hide
+            # minimal.toml from this check and still be cleared. There is no
+            # truncation flag, so the cap itself is the signal, and a guard that
+            # cannot see the whole diff must not clear it.
+            if [ "$(printf '%s' "$cmp" | jq -r '.files | length')" -ge 300 ]; then
+              echo "::error::PR #$PR_NUMBER comes from a fork and changes 300+ files, which is the cap on what the compare API will list. This guard cannot prove the build config is untouched, so it refuses. Read it by hand."
+              exit 1
+            fi
+            risky="$(printf '%s\n' "$files" | grep -E '^(minimal\.toml|\.minimal/|packages/)' || true)"
+            if [ -n "$risky" ]; then
+              echo "::error::PR #$PR_NUMBER comes from a fork and changes what the sandbox builds and runs:"
+              # Quoted and piped, not expanded bare. These are filenames from
+              # a fork PR's diff — the one path built to admit untrusted content
+              # — and unquoted they take word-splitting and pathname expansion.
+              # Inert today only because this step runs before the PR tree is on
+              # disk, which is step ordering rather than anything this line
+              # asserts. A filename with a space also split across two lines.
+              printf '%s\n' "$risky" | sed 's/^/::error::  /'
+              echo "::error::Read it by hand, or land the build-config change from a branch in $GITHUB_REPOSITORY first."
+              exit 1
+            fi
+            echo "fork review authorised by comment: $head_repo (no build config touched)"
           fi
           # The same response carries the base. Without this the dispatch path
           # falls back to the default branch, so a PR targeting a release branch
           # or stacked on another PR gets a diff containing commits it never
           # introduced — and every anchor lands on code it did not change.
           printf '%s' "$pr" | jq -r '"base_ref=" + .base.ref' >> "$GITHUB_OUTPUT"
-          printf '%s' "$pr" | jq -r '"base_sha=" + .base.sha' >> "$GITHUB_OUTPUT"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          # The checkout uses this instead of refs/pull/<n>/head, so the tree
+          # reviewed is the tree the guard above cleared.
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
           echo "PR #$PR_NUMBER is same-repo, base $(printf '%s' "$pr" | jq -r .base.ref)"
 
-      # `ref` is load-bearing: the default checkout for a pull_request event is
-      # the MERGE commit, a tree that exists in no branch. Every finding anchor
-      # would silently point at line numbers the PR does not have.
+      # `ref` decides what gets reviewed. The default checkout for a
+      # pull_request event is the MERGE commit, a tree that exists in no
+      # branch, and every finding anchor would silently point at line numbers
+      # the PR does not have.
       - name: Check out the tree under review (PR HEAD, not the merge commit)
         if: steps.quiet.outputs.status != 'stale'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha || format('refs/pull/{0}/head', github.event.inputs.pr) }}
+          ref: ${{ github.event.pull_request.head.sha || steps.dispatch_pr.outputs.head_sha }}
           fetch-depth: 0
           path: pr
           persist-credentials: false
@@ -211,7 +517,7 @@ jobs:
         working-directory: pr
         env:
           EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
-          INPUT_PR_NUMBER: ${{ github.event.inputs.pr }}
+          INPUT_PR_NUMBER: ${{ github.event.inputs.pr || github.event.issue.number }}
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EVENT_BASE_REF: ${{ github.event.pull_request.base.ref || steps.dispatch_pr.outputs.base_ref }}
           EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha || steps.dispatch_pr.outputs.base_sha }}
@@ -299,6 +605,18 @@ jobs:
           # PR title and body are attacker-controlled text. They reach the agent
           # as JSON data and never pass through a shell: jq reads the event
           # payload from disk, nothing is interpolated into this script.
+          #
+          # `.issue` sits between `.pull_request` and the literal below because an
+          # issue_comment payload carries the PR under `issue` and has no
+          # top-level `pull_request` key. Without it every /review-triggered run
+          # staged the string "(workflow_dispatch)" as the title and an empty
+          # body, and step 1 of the prompt is to read both for intent — so the
+          # agent opened the fork-review path knowing nothing about the PR.
+          #
+          # Explained HERE, not inside the jq program: that program is a single
+          # quoted shell string, so one apostrophe in a jq comment closes the
+          # quote and the whole thing dies as `jq: syntax error ... (Unix shell
+          # quoting issues?)`. Which is exactly how it shipped broken.
           jq -n \
             --slurpfile ev "$GITHUB_EVENT_PATH" \
             --argjson number "$PR_NUMBER" \
@@ -308,8 +626,8 @@ jobs:
             --rawfile files "$RUN_DIR/changed-files.txt" \
             '{
                number: $number,
-               title: ($ev[0].pull_request.title // "(workflow_dispatch)"),
-               body: ($ev[0].pull_request.body // ""),
+               title: ($ev[0].pull_request.title // $ev[0].issue.title // "(workflow_dispatch)"),
+               body: ($ev[0].pull_request.body // $ev[0].issue.body // ""),
                head_sha: $head_sha,
                base_sha: $base_sha,
                base_ref: $base_ref,
@@ -331,7 +649,14 @@ jobs:
             cp "$LEARNINGS" .review/learnings.md
             echo "learnings: $(wc -l < .review/learnings.md) lines from ${GITHUB_REPOSITORY##*/}.md"
           else
-            printf '# Dismissed findings\n\n_None recorded yet._\n' > .review/learnings.md
+            # The heading matches contract.learnings.render([], repo=...); the
+            # preamble it also emits does not, and deliberately — copying that
+            # prose into a shell printf is a second copy of it that will drift
+            # from the one in the library. What the agent needs from an empty
+            # store is that it is empty, and both forms say that. Only reachable
+            # for an install added before its store file was.
+            printf '# Dismissed findings — %s\n\n_None recorded yet._\n' \
+              "${GITHUB_REPOSITORY##*/}" > .review/learnings.md
             echo "learnings: none recorded for ${GITHUB_REPOSITORY##*/}"
           fi
 
@@ -503,7 +828,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: gominimal/broker
-          ref: d4b53da036ed5fc8ab51accadfdea0d79d5fa055
+          ref: 6743a61ef8324d81648047d0735684d26f2e2071
           token: ${{ steps.app-token.outputs.token }}
           path: broker
           persist-credentials: false
@@ -725,6 +1050,37 @@ jobs:
           mip check
           cp "$CFG" "$RUN_DIR/injected-minimal.toml"
 
+          # Declare the task's own variables to the user policy, or `min` will
+          # not run it:
+          #
+          #   error: task 'review' declares 6 environment variables that your
+          #   policy does not allow, and stdin/stderr is not a terminal.
+          #
+          # It exits 1 in zero seconds, before the agent starts, so the run
+          # costs nothing and produces nothing. The gate is new — the reviewer
+          # tracks the `unstable` channel deliberately, and this is the bill
+          # for that.
+          #
+          # Read out of the config just injected rather than written by hand.
+          # The list is exactly what the task declares, so it cannot drift when
+          # the task gains a variable, and it grants nothing the task does not
+          # already ask for. A hand-kept copy would fail the same way, silently,
+          # the next time these two disagreed.
+          "$RUNNER_TEMP/venv/bin/python" - "$CFG" "$REVIEW_TASK" <<'PYPOLICY'
+          import os, pathlib, sys, tomllib
+
+          cfg, task = sys.argv[1], sys.argv[2]
+          with open(cfg, "rb") as fh:
+              declared = (tomllib.load(fh).get("tasks", {}).get(task, {})
+                          .get("env_vars") or {})
+          names = sorted(declared)
+          policy = pathlib.Path.home() / ".config" / "minimal" / "user_policy.toml"
+          policy.parent.mkdir(parents=True, exist_ok=True)
+          body = "[vars]\nallow = [" + ", ".join(f'"{n}"' for n in names) + "]\n"
+          policy.write_text(body)
+          print(f"policy: allowed {len(names)} task var(s): {', '.join(names)}")
+          PYPOLICY
+
       - name: Run the review
         id: agent
         if: steps.quiet.outputs.status != 'stale'
@@ -773,9 +1129,33 @@ jobs:
         if: always()
         run: |
           set -uo pipefail
-          curl -fsS -m 5 "http://127.0.0.1:${BROKER_PORT}/health" \
-            > "$RUN_DIR/broker-usage.json" 2>/dev/null \
-            || echo '{}' > "$RUN_DIR/broker-usage.json"
+          # $RUN_DIR is created by the staging step, which does not run when the
+          # quiet window stands the job down, nor when an earlier step aborts.
+          # Every redirect below then fails on a missing directory — including
+          # the `|| echo '{}'` fallback — so an always() step dies and the job
+          # goes red. That is the failure guarding those steps was meant to
+          # prevent, relocated one step further on.
+          mkdir -p "$RUN_DIR"
+          # -m 10, not 5. /health shells out to `gh auth token`, and the broker
+          # documents HEALTH_PROBE_BUDGET = 5 as the *minimum* a client must
+          # allow; probing at exactly the budget files a slow broker as a
+          # missing one, and that answer is now recorded rather than discarded.
+          if curl -fsS -m 10 "http://127.0.0.1:${BROKER_PORT}/health" \
+               > "$RUN_DIR/broker-usage.json" 2>/dev/null; then
+            probe=ok
+          else
+            # The `{}` stays so the reader below has a document, but it is no
+            # longer the only evidence. On its own it cannot say whether the
+            # broker was gone or answered with zeroes, and the telemetry row
+            # then reports a missing token count as if it were a fact about
+            # cost. The probe result is what tells those apart.
+            probe=unreachable
+            echo '{}' > "$RUN_DIR/broker-usage.json"
+          fi
+          # A file, not a shell variable: the step that emits the row is not
+          # this one.
+          echo "$probe" > "$RUN_DIR/broker-probe.txt"
+          echo "broker probe: $probe"
           python3 -c "
           import json
           try:
@@ -846,10 +1226,30 @@ jobs:
               # True because one generalist runs and it exited 0. This becomes a
               # real cross-persona check when a panel lands; it is the line that
               # would otherwise let an incomplete panel approve.
+              # Same version skew as parse_v0_or_v1 above, same guard: the gate
+              # is pip-installed from the default branch while this workflow
+              # comes from the PR head, so passing a parameter the installed
+              # gate has not got would kill the review with a TypeError instead
+              # of reviewing.
+              suppression = {}
+              if "learnings_dir" in inspect.signature(compose).parameters:
+                  # The reviewer checkout, pinned to job.workflow_sha — NOT the
+                  # copy staged under pr/.review/. That one lives in the
+                  # workspace the sandbox writes to, so reading it here would
+                  # let a PR choose what its own reviewer stays silent about.
+                  suppression = {
+                      "learnings_dir": os.path.join(
+                          os.environ["GITHUB_WORKSPACE"], "reviewer/review/learnings"
+                      ),
+                      # From the environment, never from the staged filename:
+                      # that copy is called learnings.md and has lost the repo.
+                      "repo": os.environ["GITHUB_REPOSITORY"].rsplit("/", 1)[-1],
+                  }
               outcome = compose(
                   doc, diff, os.environ["HEAD_SHA"], policy,
                   expected_pr=int(os.environ["PR_NUMBER"]),
                   personas_completed=True,
+                  **suppression,
               )
           except DocumentRejected as exc:
               raise SystemExit(f"::error::document rejected; nothing will be posted: {exc}")
@@ -858,6 +1258,20 @@ jobs:
               json.dump(outcome.payload, fh, indent=2)
           with open(f"{run_dir}/payload.md", "w", encoding="utf-8") as fh:
               fh.write(outcome.payload["body"])
+
+          # The one field that says what the pipeline DECIDED, written where a
+          # later step can read it. Printing it below is for a human reading
+          # this job; the step log is not queryable and dies with the runner,
+          # which is why every telemetry row carried a null verdict.
+          #
+          # JSON rather than a step output: the reason is free prose from
+          # `decide`, and $GITHUB_OUTPUT is a line-oriented format that would
+          # need its own delimiter discipline to survive one.
+          with open(f"{run_dir}/verdict.json", "w", encoding="utf-8") as fh:
+              json.dump(
+                  {"verdict": outcome.verdict.value, "verdict_reason": outcome.reason},
+                  fh,
+              )
 
           print(f"{outcome.verdict.value}: {outcome.reason}")
           print(
@@ -898,6 +1312,16 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUN_DIR"
 
+          # Composed two steps ago, in another process. Absent whenever compose
+          # did not run at all — an empty string here, which the emitter reads
+          # as "no verdict was composed" rather than inventing one.
+          verdict=""
+          verdict_reason=""
+          if [ -s "$RUN_DIR/verdict.json" ]; then
+            verdict="$(jq -r '.verdict // ""' "$RUN_DIR/verdict.json")"
+            verdict_reason="$(jq -r '.verdict_reason // ""' "$RUN_DIR/verdict.json")"
+          fi
+
           jq -n \
             --arg pr "${PR_NUMBER:-}" --arg head "${HEAD_SHA:-}" --arg base "${BASE_SHA:-}" \
             --arg elapsed "${ELAPSED:-}" --arg alias "$HOST_ALIAS" \
@@ -907,10 +1331,13 @@ jobs:
             --arg posted "${POST_OUTCOME:-skipped}" \
             --arg upstream "${UPSTREAM:-anthropic}" \
             --arg repomap "${REPO_MAP:-absent}" \
+            --arg verdict "$verdict" \
+            --arg vreason "$verdict_reason" \
             '{pr: $pr, head_sha: $head, base_sha: $base, agent_seconds: $elapsed,
               host_alias: $alias, backend: $kvm, run_id: $run,
               agent_status: $astatus, posted: $posted,
-              upstream: $upstream, repo_map: $repomap}' \
+              upstream: $upstream, repo_map: $repomap,
+              verdict: $verdict, verdict_reason: $vreason}' \
             > "$RUN_DIR/run.json"
 
           # The audit record must say what actually happened.
@@ -954,6 +1381,7 @@ jobs:
             --findings   "$RUN_DIR/findings.json" \
             --validation "$RUN_DIR/validation.txt" \
             --usage      "$RUN_DIR/broker-usage.json" \
+            --usage-probe "$RUN_DIR/broker-probe.txt" \
             --repo       "$GITHUB_REPOSITORY" \
             --outcome    "${{ job.status }}" || true
 

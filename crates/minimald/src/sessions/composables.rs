@@ -650,7 +650,7 @@ mod tests {
         let env = |_: &str| Err(std::env::VarError::NotPresent);
         let contribution = composable.contribute(&env).unwrap();
 
-        let composition_env_vars: std::collections::HashMap<String, String> = contribution
+        let composition_env_vars: std::collections::BTreeMap<String, String> = contribution
             .vars()
             .iter()
             .map(|pv| (pv.var().name().to_string(), pv.var().value().to_string()))
@@ -660,7 +660,7 @@ mod tests {
         // Composition's state-dir derivation (values shaped
         // `/state/<prefix>` → `prefix`) matches what
         // `SetupForPackages` extracted from `env_state_wiring`.
-        let composition_state_dirs: std::collections::HashSet<String> = composition_env_vars
+        let composition_state_dirs: std::collections::BTreeSet<String> = composition_env_vars
             .values()
             .filter_map(|v| v.strip_prefix("/state/"))
             .filter(|p| !p.is_empty() && !p.contains('/'))
