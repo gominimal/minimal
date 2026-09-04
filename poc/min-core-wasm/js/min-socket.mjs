@@ -87,3 +87,24 @@ export async function minMeshSocket({ peer, sessionId, cols, rows, term = "xterm
   );
   return opened(att, { cols, rows, replayedBytes: 0, resumed: true, host: peer.peerIp, ip: peer.peerIp, startedAt: Date.now() });
 }
+
+// Stage 2: the same socket shape with `attach_mesh` and an optional `auth`
+// block. `peer` is what wg-peer prints (with its `auth` sub-object when run
+// with `--auth stub`), `cert` the OpenSSH certificate line from `/certify`,
+// `hostCa` the `host_ca` array from `/ssh/ca`, and `sign` the page's
+// `(bytes: Uint8Array) => Promise<Uint8Array>` over its WebCrypto key.
+export async function minMeshSocketWithAuth({ peer, sessionId, cols, rows, term = "xterm-256color", auth }) {
+  const { attach_mesh } = await import("./min_core.js");
+  await init();
+  const { onData, onClose, opened } = makeSocket();
+  const config = {
+    wsUrl: peer.wsUrl, privateKey: peer.privateKey, peerPublicKey: peer.peerPublicKey,
+    localIp: peer.localIp, peerIp: peer.peerIp, prefixLen: peer.prefixLen ?? 24, sshPort: peer.sshPort ?? 22,
+    sessionId, term, cols, rows,
+    auth: auth
+      ? { username: auth.username, certificate: auth.certificate, hostCa: auth.hostCa, expectedHostPrincipal: auth.expectedHostPrincipal }
+      : undefined,
+  };
+  const att = await attach_mesh(JSON.stringify(config), auth?.sign ?? null, onData, onClose);
+  return opened(att, { cols, rows, replayedBytes: 0, resumed: true, host: peer.peerIp, ip: peer.peerIp, startedAt: Date.now() });
+}

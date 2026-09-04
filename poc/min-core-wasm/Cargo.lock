@@ -1121,6 +1121,7 @@ dependencies = [
  "bytes",
  "console_error_panic_hook",
  "futures-util",
+ "getrandom 0.2.17",
  "getrandom 0.4.3",
  "gloo-timers",
  "js-sys",
@@ -1129,6 +1130,7 @@ dependencies = [
  "ring",
  "russh",
  "send_wrapper",
+ "serde",
  "serde_json",
  "smoltcp",
  "thiserror",
@@ -1750,6 +1752,9 @@ name = "send_wrapper"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd0b0ec5f1c1ca621c432a25813d8d60c88abe6d3e08a3eb9cf37d97a0fe3d73"
+dependencies = [
+ "futures-core",
+]
 
 [[package]]
 name = "serde"

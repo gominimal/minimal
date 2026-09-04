@@ -4,17 +4,76 @@
 //! host key from `ssh-keygen`, and a duplex-pipe server. Never compiled for wasm.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use russh::keys::PrivateKey;
+use russh::keys::{Certificate, PrivateKey};
 use russh::server::{self, Auth, ChannelOpenHandle, Msg, Session};
-use russh::{Channel, ChannelId};
+use russh::{Channel, ChannelId, MethodKind, MethodSet};
+use serde::Serialize;
 
 use crate::MINIMAL_SESSION_ID_ENV;
+use crate::credential::{Anchors, verify_user_cert};
+use crate::rt;
 use crate::wg::{DatagramPipe, WgConfig, WgStack};
+
+/// What a daemon in certificate mode trusts and decides.
+pub struct DaemonAuth {
+    pub anchors: Anchors,
+    pub revoked: Arc<Mutex<HashSet<u64>>>,
+    decisions: Mutex<Vec<Decision>>,
+}
+
+/// One certificate decision, as `/decisions` reports it.
+#[derive(Clone, Debug, Serialize)]
+pub struct Decision {
+    pub at: u64,
+    pub user: String,
+    pub serial: u64,
+    pub key_id: String,
+    /// `"accepted"` or the refusal code.
+    pub result: String,
+}
+
+impl DaemonAuth {
+    pub fn new(anchors: Anchors, revoked: Arc<Mutex<HashSet<u64>>>) -> Self {
+        Self {
+            anchors,
+            revoked,
+            decisions: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The daemon's decision function, the one `minimald` would run in
+    /// `auth_openssh_certificate`.
+    pub fn decide(&self, user: &str, cert: &Certificate) -> Result<(), String> {
+        let revoked = self.revoked.clone();
+        let result = verify_user_cert(cert, &self.anchors, user, rt::unix_now(), |serial| {
+            revoked.lock().unwrap().contains(&serial)
+        });
+        let code = match &result {
+            Ok(()) => "accepted".to_string(),
+            Err(e) => e.code().to_string(),
+        };
+        self.decisions.lock().unwrap().push(Decision {
+            at: rt::unix_now(),
+            user: user.to_string(),
+            serial: cert.serial(),
+            key_id: cert.key_id().to_string(),
+            result: code.clone(),
+        });
+        result.map_err(|_| code)
+    }
+
+    pub fn decisions(&self) -> Vec<Decision> {
+        self.decisions.lock().unwrap().clone()
+    }
+}
 
 #[derive(Default)]
 pub struct FakeMinimald {
+    /// `None`: `auth_none` under local trust (today's UDS posture).
+    /// `Some`: certificate auth only, decided by [`DaemonAuth`].
+    auth: Option<Arc<DaemonAuth>>,
     env: HashMap<ChannelId, HashMap<String, String>>,
     pty: HashSet<ChannelId>,
     grid: HashMap<ChannelId, (u32, u32)>,
@@ -23,11 +82,33 @@ pub struct FakeMinimald {
     line: HashMap<ChannelId, Vec<u8>>,
 }
 
+impl FakeMinimald {
+    pub fn with_auth(auth: Arc<DaemonAuth>) -> Self {
+        Self {
+            auth: Some(auth),
+            ..Default::default()
+        }
+    }
+}
+
 impl server::Handler for FakeMinimald {
     type Error = russh::Error;
 
     async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
-        Ok(Auth::Accept)
+        Ok(match self.auth {
+            None => Auth::Accept,
+            Some(_) => Auth::Reject {
+                proceed_with_methods: Some(MethodSet::from(&[MethodKind::PublicKey][..])),
+                partial_success: false,
+            },
+        })
+    }
+
+    async fn auth_openssh_certificate(&mut self, user: &str, certificate: &Certificate) -> Result<Auth, Self::Error> {
+        Ok(match &self.auth {
+            Some(auth) if auth.decide(user, certificate).is_ok() => Auth::Accept,
+            _ => Auth::reject(),
+        })
     }
 
     async fn channel_open_session(
@@ -126,9 +207,14 @@ impl server::Handler for FakeMinimald {
     }
 }
 
+/// A throwaway Ed25519 key from `ssh-keygen`.
+pub fn generate_ed25519_key() -> PrivateKey {
+    host_key()
+}
+
 pub fn host_key() -> PrivateKey {
     let dir = tempdir();
-    let path = dir.join("host_ed25519");
+    let path = dir.join(format!("key_{}", std::process::id()));
     let status = std::process::Command::new("ssh-keygen")
         .args(["-q", "-t", "ed25519", "-N", "", "-f"])
         .arg(&path)
@@ -141,7 +227,7 @@ pub fn host_key() -> PrivateKey {
 }
 
 pub fn tempdir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("min-core-test-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("min-core-test-{}-{}", std::process::id(), rt::now_ms()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -163,6 +249,17 @@ pub fn serve() -> tokio::io::DuplexStream {
 }
 
 
+/// A stand-in daemon's identity and posture for one peer connection.
+#[derive(Clone)]
+pub struct PeerConfig {
+    pub wg: WgConfig,
+    pub host_key: PrivateKey,
+    /// Presented to clients that offer certificate host-key algorithms.
+    pub host_cert: Option<Certificate>,
+    /// `Some`: certificate auth only.
+    pub auth: Option<Arc<DaemonAuth>>,
+}
+
 /// Serve one WireGuard-over-WebSocket peer on an accepted TCP connection:
 /// one `Tunn` in the daemon role, a smoltcp stack listening on TCP/22 inside
 /// the tunnel, and [`FakeMinimald`] on the accepted socket. One WireGuard
@@ -172,10 +269,52 @@ pub async fn serve_wg_over_ws(
     cfg: WgConfig,
     host_key: PrivateKey,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_peer_ws(
+        tcp,
+        PeerConfig {
+            wg: cfg,
+            host_key,
+            host_cert: None,
+            auth: None,
+        },
+    )
+    .await
+}
+
+/// One TCP connection on the stand-in's listener: a WebSocket upgrade is the
+/// mesh ingress, anything else is the stub's HTTP API (when a stub is given).
+pub async fn serve_connection(
+    tcp: tokio::net::TcpStream,
+    peer: PeerConfig,
+    stub: Option<Arc<crate::stub::Stub>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut sniff = [0u8; 2048];
+    let n = tcp.peek(&mut sniff).await?;
+    let head = String::from_utf8_lossy(&sniff[..n]).to_ascii_lowercase();
+    if head.contains("upgrade: websocket") {
+        return serve_peer_ws(tcp, peer).await;
+    }
+    match stub {
+        Some(stub) => crate::stub::handle_http(tcp, &stub).await?,
+        None => {}
+    }
+    Ok(())
+}
+
+pub async fn serve_peer_ws(
+    tcp: tokio::net::TcpStream,
+    peer: PeerConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use futures_util::{SinkExt, StreamExt};
     use tokio::sync::mpsc;
     use tokio_tungstenite::tungstenite::Message;
 
+    let PeerConfig {
+        wg: cfg,
+        host_key,
+        host_cert,
+        auth,
+    } = peer;
     let ws = tokio_tungstenite::accept_async(tcp).await?;
     let (mut sink, mut source) = ws.split();
     let (to_network_tx, mut to_network_rx) = mpsc::channel::<Vec<u8>>(256);
@@ -211,9 +350,14 @@ pub async fn serve_wg_over_ws(
     let accepted = stack.listen(22);
     let config = Arc::new(server::Config {
         keys: vec![host_key],
+        certificates: host_cert.into_iter().collect(),
         ..Default::default()
     });
-    let running = server::run_stream(config, accepted, FakeMinimald::default()).await?;
+    let handler = match auth {
+        Some(auth) => FakeMinimald::with_auth(auth),
+        None => FakeMinimald::default(),
+    };
+    let running = server::run_stream(config, accepted, handler).await?;
     running.await?;
     Ok(())
 }

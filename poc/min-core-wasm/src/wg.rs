@@ -350,9 +350,8 @@ async fn drive(inner: Arc<Mutex<Stack>>, kick: Arc<Notify>, mut from_network: mp
     let mut s = inner.lock().unwrap();
     s.dead = true;
     for (_, socket) in s.sockets.iter_mut() {
-        if let smoltcp::socket::Socket::Tcp(tcp) = socket {
-            tcp.abort();
-        }
+        let smoltcp::socket::Socket::Tcp(tcp) = socket;
+        tcp.abort();
     }
 }
 

@@ -26,3 +26,17 @@ pub fn now_ms() -> i64 {
 pub async fn sleep(d: Duration) {
     gloo_timers::future::TimeoutFuture::new(d.as_millis().min(u32::MAX as u128) as u32).await
 }
+
+/// Seconds since the Unix epoch, for certificate validity windows.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn unix_now() -> u64 {
+    (js_sys::Date::now() / 1000.0) as u64
+}

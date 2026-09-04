@@ -77,6 +77,35 @@ export function attach(relay_url, session_id, term, cols, rows, on_data, on_clos
 }
 
 /**
+ * Attach over the mesh with a JSON config:
+ *
+ * ```json
+ * { "wsUrl", "privateKey", "peerPublicKey", "localIp", "peerIp", "prefixLen"?, "sshPort"?,
+ *   "sessionId", "term"?, "cols", "rows",
+ *   "auth"?: { "username", "certificate", "hostCa": [..], "expectedHostPrincipal" } }
+ * ```
+ *
+ * Without `auth`: `auth_none` and any host key (Stage 1). With `auth`: the
+ * certificate is presented, `sign` is called with the bytes to sign and must
+ * resolve to the raw signature, and the host must present a certificate
+ * chaining to `hostCa` and naming `expectedHostPrincipal`, or the attach is
+ * rejected before authentication. Rejections reject the returned promise
+ * with a message that names the stage: `host rejected: … (code)`,
+ * `authentication rejected by daemon`, `signing: …`.
+ * @param {string} config_json
+ * @param {Function | null | undefined} sign
+ * @param {Function} on_data
+ * @param {Function} on_close
+ * @returns {Promise<MinAttach>}
+ */
+export function attach_mesh(config_json, sign, on_data, on_close) {
+    const ptr0 = passStringToWasm0(config_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.attach_mesh(ptr0, len0, isLikeNone(sign) ? 0 : addToExternrefTable0(sign), on_data, on_close);
+    return ret;
+}
+
+/**
  * Attach over the mesh: dial `ws_url` (a WireGuard-over-WebSocket ingress),
  * bring up a WireGuard tunnel to the peer with the given keys and tunnel
  * addresses, open TCP to `peer_ip:ssh_port` inside it, then run the same
@@ -113,6 +142,121 @@ export function attach_wg(ws_url, private_key_b64, peer_public_key_b64, local_ip
     const len6 = WASM_VECTOR_LEN;
     const ret = wasm.attach_wg(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, prefix_len, ssh_port, ptr5, len5, ptr6, len6, cols, rows, on_data, on_close);
     return ret;
+}
+
+/**
+ * RFC 7638 thumbprint of the OKP/Ed25519 JWK, the `dpop_jkt` value.
+ * @param {Uint8Array} raw_public
+ * @returns {string}
+ */
+export function dpop_jkt_ed25519(raw_public) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const ptr0 = passArray8ToWasm0(raw_public, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.dpop_jkt_ed25519(ptr0, len0);
+        deferred2_0 = ret[0];
+        deferred2_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * A DPoP proof JWS (`EdDSA`) for one request, signed through `sign`.
+ * `nonce` and `access_token` may be null.
+ * @param {Uint8Array} raw_public
+ * @param {string} htm
+ * @param {string} htu
+ * @param {string | null | undefined} nonce
+ * @param {string | null | undefined} access_token
+ * @param {Function} sign
+ * @returns {Promise<string>}
+ */
+export function dpop_proof(raw_public, htm, htu, nonce, access_token, sign) {
+    const ptr0 = passArray8ToWasm0(raw_public, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(htm, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(htu, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    var ptr3 = isLikeNone(nonce) ? 0 : passStringToWasm0(nonce, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len3 = WASM_VECTOR_LEN;
+    var ptr4 = isLikeNone(access_token) ? 0 : passStringToWasm0(access_token, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len4 = WASM_VECTOR_LEN;
+    const ret = wasm.dpop_proof(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, sign);
+    return ret;
+}
+
+/**
+ * PKCE S256 challenge for a verifier.
+ * @param {string} verifier
+ * @returns {string}
+ */
+export function pkce_challenge(verifier) {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const ptr0 = passStringToWasm0(verifier, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.pkce_challenge(ptr0, len0);
+        deferred2_0 = ret[0];
+        deferred2_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * A fresh PKCE verifier.
+ * @returns {string}
+ */
+export function pkce_verifier() {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const ret = wasm.pkce_verifier();
+        var ptr1 = ret[0];
+        var len1 = ret[1];
+        if (ret[3]) {
+            ptr1 = 0; len1 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred2_0 = ptr1;
+        deferred2_1 = len1;
+        return getStringFromWasm0(ptr1, len1);
+    } finally {
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
+}
+
+/**
+ * `ssh-ed25519 AAAA...` for the raw 32-byte public key WebCrypto exports.
+ * @param {Uint8Array} raw
+ * @returns {string}
+ */
+export function ssh_public_key_from_ed25519_raw(raw) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const ptr0 = passArray8ToWasm0(raw, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.ssh_public_key_from_ed25519_raw(ptr0, len0);
+        var ptr2 = ret[0];
+        var len2 = ret[1];
+        if (ret[3]) {
+            ptr2 = 0; len2 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+    }
 }
 function __wbg_get_imports() {
     const import0 = {
@@ -203,6 +347,26 @@ function __wbg_get_imports() {
             let result;
             try {
                 result = arg0 instanceof ArrayBuffer;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
+        },
+        __wbg_instanceof_Promise_e6e764b945c3128a: function(arg0) {
+            let result;
+            try {
+                result = arg0 instanceof Promise;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
+        },
+        __wbg_instanceof_Uint8Array_f935dbb0aa7cdeed: function(arg0) {
+            let result;
+            try {
+                result = arg0 instanceof Uint8Array;
             } catch (_) {
                 result = false;
             }
@@ -364,32 +528,36 @@ function __wbg_get_imports() {
             const ret = arg0.then(arg1);
             return ret;
         },
+        __wbg_then_72819b8d4e081fb5: function(arg0, arg1, arg2) {
+            const ret = arg0.then(arg1, arg2);
+            return ret;
+        },
         __wbg_versions_276b2795b1c6a219: function(arg0) {
             const ret = arg0.versions;
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 637, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 683, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_c7ad7b152c17969b___convert__closures_____invoke___wasm_bindgen_c7ad7b152c17969b___JsValue__core_352c1e50950a8150___result__Result_____wasm_bindgen_c7ad7b152c17969b___JsError___true_);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 15, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 19, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_c7ad7b152c17969b___convert__closures_____invoke___web_sys_1d6c54c190c41b18___features__gen_CloseEvent__CloseEvent______true_);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 15, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 19, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_c7ad7b152c17969b___convert__closures_____invoke___web_sys_1d6c54c190c41b18___features__gen_CloseEvent__CloseEvent______true__2);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 15, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 19, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_c7ad7b152c17969b___convert__closures_____invoke___web_sys_1d6c54c190c41b18___features__gen_CloseEvent__CloseEvent______true__3);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 188, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 222, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_c7ad7b152c17969b___convert__closures_____invoke_______true_);
             return ret;
         },

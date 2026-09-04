@@ -17,6 +17,10 @@ thiserror = "2"
 bytes = "1"
 base64 = "0.22"
 log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+getrandom = "0.2"
+ring = "0.17"
 # Stage 1b: userspace WireGuard + TCP/IP so SSH runs inside the tunnel.
 boringtun = { version = "0.7", default-features = false }
 smoltcp = { version = "0.14", default-features = false, features = ["std", "alloc", "medium-ip", "proto-ipv4", "socket-tcp", "async", "log"] }
@@ -26,7 +30,7 @@ wasm-bindgen = "0.2.126"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["WebSocket", "MessageEvent", "BinaryType", "CloseEvent", "ErrorEvent", "Event"] }
-send_wrapper = "0.6"
+send_wrapper = { version = "0.6", features = ["futures"] }
 console_error_panic_hook = "0.1"
 gloo-timers = { version = "0.3", features = ["futures"] }
 # ring's wasm32-unknown-unknown entropy path (getrandom 0.2 `js` feature).
@@ -46,7 +50,6 @@ futures-util = "0.3"
 [dev-dependencies]
 boringtun = { version = "0.7", default-features = false }
 rand_core = { version = "0.6", features = ["getrandom"] }
-serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "time", "sync"] }
 
 [profile.release]

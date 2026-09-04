@@ -1,6 +1,6 @@
 # min-core wasm probe
 
-Milestones 1 and 1b of gominimal/inbox#606, as a standalone crate: the `min
+Milestones 1, 1b and 2 of gominimal/inbox#606, as a standalone crate: the `min
 session attach` handshake on top of russh, and beneath it a userspace
 WireGuard tunnel with its own TCP/IP stack so the tab is a mesh node — built
 for `wasm32-unknown-unknown` with a wasm-bindgen head, plus the same code
@@ -70,6 +70,41 @@ A WebSocket that dies is surfaced to the SSH layer: the stack's driver sees
 end-of-stream, aborts every TCP socket, and the reader ends (test
 `dead_websocket_reaches_the_ssh_layer`; `MIN_CORE_KILL_PEER_PID` in the
 headless check measures it end to end).
+
+## Stage 2: the tab-held credential
+
+- `src/credential.rs`: [`RawSigner`] (sign bytes with a key the core does not
+  hold — a WebCrypto key behind a JS callback, an agent, a keychain) and
+  [`SshSigner`], russh's `Signer` over it, which returns russh's to-sign buffer
+  extended with the SSH-encoded `Signature{algorithm, blob}`; `Credential`
+  (username, certificate, signer); `HostPolicy` (Host CA anchors + expected
+  principal, with the §5.3 per-node wildcard) enforced in `check_server_key`
+  instead of accept-any; and the decision functions `verify_user_cert` /
+  `verify_host_cert`, whose refusal codes are the arch vectors' names.
+- `src/dpop.rs`: PKCE S256, the RFC 7638 thumbprint of the OKP JWK
+  (`dpop_jkt`), and DPoP proofs (`EdDSA`) signed through the same `RawSigner`.
+- `src/stub.rs` + `wg-peer --auth stub`: throwaway User/Host/rogue CAs,
+  a host certificate on the stand-in's key, `auth_none` refused, certificates
+  decided by `verify_user_cert`, and the HTTP routes `/ssh/ca`, `/certify`
+  (with a `case` that mints each refusal), `/token`, `/mesh/bind`,
+  `/decisions`, all with CORS, on the WebSocket's port.
+- `tests/cert.rs`: the seven arch `invalid/` vectors each refused with exactly
+  their `expected_error` at the manifest's fixed clock, the valid user and
+  host vectors accepted for their principals, the wildcard principal rule.
+  Public fixtures only (`tests/vectors/`).
+- `tests/cert_handshake.rs`: over the in-process tunnel, with stub-minted
+  certificates: a valid one attaches with the host certificate verified;
+  `auth_none` refused; all eight refusal cases refused, with the daemon's
+  decision recorded for the four that reach it; wrong principal, rogue Host
+  CA and a bare host key refused by the policy.
+- `tests/stub_http.rs`: the routes and CORS.
+- `attach_mesh(...)`, `ssh_public_key_from_ed25519_raw`, `dpop_*`, `pkce_*`
+  in `src/web.rs`; `minMeshSocketWithAuth` in `js/min-socket.mjs`;
+  `js/headless-auth-check.mjs` runs the whole page flow from Node against
+  the stub and passes.
+
+    cargo run --example wg-peer -- 127.0.0.1:7691 /tmp/peer.json --auth stub
+    node js/headless-auth-check.mjs /tmp/peer.json
 
 ## Building
 
@@ -154,3 +189,10 @@ latency at the adapter boundary — `MinAttach.write()` call to the `on_data`
 callback for its echo — not from keydown to paint: a terminal renders on
 animation frames, and a 2–17 ms spread with a ~10 ms median is the shape of a
 16.7 ms frame, not of the tunnel.
+
+With the certificate path (Stage 2), same pipeline: 1,222,716 B raw / 501,083 B
+gzip stripped; 1,595,601 B raw / 553,010 B gzip with the `name` section (what
+`dist/` ships). Headless in Node 24 against `wg-peer --auth stub`: attach with
+certificate auth and host-cert verification 69 ms after the WebSocket opens
+(Stage 1's `auth_none` path: 76 ms in the same run, so the credential costs
+nothing measurable on loopback).

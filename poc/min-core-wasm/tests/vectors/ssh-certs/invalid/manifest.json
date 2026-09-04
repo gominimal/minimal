@@ -1,0 +1,47 @@
+{
+  "clock": 1750000000,
+  "cases": [
+    {
+      "file": "expired.cert",
+      "serial": 3,
+      "expected_error": "cert_expired",
+      "note": "validation MUST fail before any subject/scope extraction"
+    },
+    {
+      "file": "not-yet-valid.cert",
+      "serial": 4,
+      "expected_error": "cert_not_yet_valid",
+      "note": "validation MUST fail before any subject/scope extraction"
+    },
+    {
+      "file": "revoked-serial.cert",
+      "serial": 5,
+      "expected_error": "cert_revoked",
+      "note": "requires krl/krl-v1.bin loaded"
+    },
+    {
+      "file": "wrong-ca.cert",
+      "serial": 6,
+      "expected_error": "unknown_ca",
+      "note": "validation MUST fail before any subject/scope extraction"
+    },
+    {
+      "file": "host-cert-as-user.cert",
+      "serial": 7,
+      "expected_error": "wrong_cert_type",
+      "note": "validation MUST fail before any subject/scope extraction"
+    },
+    {
+      "file": "custom-critical-option.cert",
+      "serial": 8,
+      "expected_error": "unknown_critical_option",
+      "note": "validation MUST fail before any subject/scope extraction"
+    },
+    {
+      "file": "tampered-signature.cert",
+      "serial": 9,
+      "expected_error": "bad_signature",
+      "note": "validation MUST fail before any subject/scope extraction"
+    }
+  ]
+}
