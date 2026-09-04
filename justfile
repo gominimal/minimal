@@ -367,14 +367,16 @@ test-installer:
 lint-shell:
     bash scripts/lint-shell.sh
 
-# Not a CI gate — run it when writing or reviewing prose. `vale sync` fetches the
-# packages into styles/ (gitignored) on first use; --no-global keeps a personal
-# ~/.vale.ini from leaking its styles into the repo's run. The existing tree is
-# well above zero: drive files you touch to clean, leave untouched files' debt.
+# Not a CI gate — run it when writing or reviewing prose. Packages fetch on
+# first use (styles/ is gitignored; later runs never touch the network);
+# --no-global keeps a personal ~/.vale.ini from leaking its styles into the
+# repo's run. The existing tree is not clean: drive files you touch to zero,
+# leave untouched files' alerts alone.
 #
-# Vale prose-lint tracked markdown (Vale + ste + ai-tells, authored levels); pass
-# files to lint just those (`just lint-prose README.md`).
+# Vale prose-lint tracked markdown; pass files to lint just those
+# (`just lint-prose README.md`).
 lint-prose *args: (_need "vale" "brew install vale (or a release binary: github.com/errata-ai/vale/releases)")
+    @[ -d styles/ai-tells ] && [ -d styles/ste ] || vale sync
     @files="{{args}}"; [ -n "$files" ] || files="$(git ls-files '*.md')"; echo "$files" | xargs vale --no-global
 
 # Shellcheck runs too, when present.
