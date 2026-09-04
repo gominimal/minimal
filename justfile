@@ -367,16 +367,41 @@ test-installer:
 lint-shell:
     bash scripts/lint-shell.sh
 
-# Not a CI gate — run it when writing or reviewing prose. Packages fetch on
-# first use (styles/ is gitignored; later runs never touch the network);
-# --no-global keeps a personal ~/.vale.ini from leaking its styles into the
-# repo's run. The existing tree is not clean: drive files you touch to zero,
-# leave untouched files' alerts alone.
+# Not a CI gate. Default lints the markdown this branch touches (changed
+# against main, staged, unstaged, and untracked) so the common loop stays
+# short; pass files for specific ones, or --all for the whole tree. The
+# existing tree carries thousands of alerts: drive files you touch to zero,
+# leave untouched files' alerts alone. Packages fetch on first use (styles/
+# is gitignored; later runs never touch the network); --no-global keeps a
+# personal ~/.vale.ini from leaking its styles into the repo's run. Paths
+# with spaces are not supported.
 #
-# Vale prose-lint tracked markdown (`just lint-prose README.md` for one file).
+# Vale prose-lint this branch's markdown (`just lint-prose [files|--all]`).
 lint-prose *args: (_need "vale" "brew install vale (or a release binary: github.com/errata-ai/vale/releases)")
-    @[ -d styles/ai-tells ] && [ -d styles/ste ] || vale sync
-    @files="{{args}}"; [ -n "$files" ] || files="$(git ls-files '*.md')"; echo "$files" | xargs vale --no-global
+    #!/usr/bin/env sh
+    set -eu
+    args="{{args}}"
+    [ -d styles/ai-tells ] && [ -d styles/ste ] || vale sync
+    if [ "$args" = "--all" ]; then
+        exec vale --no-global $(git ls-files '*.md')
+    fi
+    if [ -n "$args" ]; then
+        exec vale --no-global $args
+    fi
+    changed="$(
+        { git diff --name-only main...HEAD -- '*.md'
+          git diff --name-only --cached   -- '*.md'
+          git diff --name-only            -- '*.md'
+          git ls-files --others --exclude-standard -- '*.md'
+        } | sort -u
+    )"
+    # Word-split on purpose: repo paths have no spaces (noted above).
+    files=""
+    for f in $changed; do
+        if [ -f "$f" ]; then files="$files $f"; fi
+    done
+    [ -n "$files" ] || { echo "lint-prose: no changed markdown on this branch" >&2; exit 0; }
+    exec vale --no-global $files
 
 # Shellcheck runs too, when present.
 #
