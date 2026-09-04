@@ -76,10 +76,11 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 async fn routes_and_cors() {
     let (addr, stub) = start().await;
 
-    let (status, headers, _) = http(&addr, "OPTIONS", "/certify", "Origin: http://sandbox-1:4323\r\nAccess-Control-Request-Method: POST\r\n", "").await;
+    let (status, headers, _) = http(&addr, "OPTIONS", "/certify", "Origin: http://sandbox-1:4323\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: content-type, x-test-consent\r\n", "").await;
     assert_eq!(status, 204);
     assert_eq!(header(&headers, "access-control-allow-origin"), Some("*"));
-    assert!(header(&headers, "access-control-allow-headers").unwrap().contains("dpop"));
+    let allowed = header(&headers, "access-control-allow-headers").unwrap();
+    assert!(allowed.contains("dpop") && allowed.contains("x-test-consent"), "{allowed}");
 
     let (status, headers, body) = http(&addr, "GET", "/ssh/ca", "", "").await;
     assert_eq!(status, 200);

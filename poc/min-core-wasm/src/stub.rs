@@ -429,6 +429,18 @@ pub async fn handle_http(mut tcp: tokio::net::TcpStream, stub: &Stub) -> std::io
         body.extend_from_slice(&chunk[..n]);
     }
     let (status, json) = route(stub, &method, &path, &headers, &body);
+    // A dev stub: allow whatever headers the preflight asks for (test
+    // tooling injects its own), on top of the ones the page needs.
+    let requested = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("access-control-request-headers"))
+        .map(|(_, v)| v.to_ascii_lowercase())
+        .unwrap_or_default();
+    let allow_headers = if requested.is_empty() {
+        "content-type, authorization, dpop".to_string()
+    } else {
+        format!("content-type, authorization, dpop, {requested}")
+    };
     let reason = match status {
         200 => "OK",
         204 => "No Content",
@@ -438,7 +450,7 @@ pub async fn handle_http(mut tcp: tokio::net::TcpStream, stub: &Stub) -> std::io
     };
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: content-type, authorization, dpop\r\n\
+         Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: {allow_headers}\r\n\
          Access-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Max-Age: 600\r\n\
          Cache-Control: no-store\r\nConnection: close\r\n\r\n{json}",
         json.len()
