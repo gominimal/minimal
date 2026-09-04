@@ -1,7 +1,7 @@
 # Built bundle (for consumers without a wasm toolchain)
 
-Built from `poc/min-core-wasm` at gominimal/minimal commit `c4bbdd8` on
-2026-09-04: rust 1.97.1 (std bootstrapped with `-Zbuild-std`), wasm-bindgen
+Built from the `poc/min-core-wasm` sources in the same commit that added these
+files (2026-09-04): rust 1.97.1 (std bootstrapped with `-Zbuild-std`), wasm-bindgen
 0.2.127 (`--target web`), binaryen 124 (`wasm-opt -Os -g`). `min_core_bg.wasm`
 is the optimized module **with its `name` section kept** (+340 KB raw / +46 KB
 gzip over a stripped build) so a trap names the function; strip it for a size

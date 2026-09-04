@@ -311,11 +311,18 @@ impl WsDatagrams {
         let state = Arc::new(Mutex::new(Shared::default()));
         let (from_network_tx, from_network_rx) = mpsc::channel::<Vec<u8>>(256);
         let (to_network_tx, mut to_network_rx) = mpsc::channel::<Vec<u8>>(256);
+        // Shared so the close/error handlers can drop the sender: once it is
+        // gone the stack's driver sees end-of-stream and aborts its sockets,
+        // which is how a dead WebSocket reaches the SSH layer.
+        let inbound = Arc::new(Mutex::new(Some(from_network_tx)));
 
+        let tx = inbound.clone();
         let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
-            if let Ok(buf) = e.data().dyn_into::<ArrayBuffer>() {
+            if let Ok(buf) = e.data().dyn_into::<ArrayBuffer>()
+                && let Some(sender) = tx.lock().unwrap().as_ref()
+            {
                 // Datagram semantics: a full queue drops, like UDP.
-                let _ = from_network_tx.try_send(Uint8Array::new(&buf).to_vec());
+                let _ = sender.try_send(Uint8Array::new(&buf).to_vec());
             }
         });
         ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
@@ -328,18 +335,22 @@ impl WsDatagrams {
         });
         ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
         let s = state.clone();
+        let tx = inbound.clone();
         let onerror = Closure::<dyn FnMut(DomEvent)>::new(move |_e: DomEvent| {
             let mut g = s.lock().unwrap();
             g.closed.get_or_insert_with(|| "websocket error".to_string());
             g.wake_all();
+            tx.lock().unwrap().take();
         });
         ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
         let s = state.clone();
+        let tx = inbound.clone();
         let onclose = Closure::<dyn FnMut(CloseEvent)>::new(move |e: CloseEvent| {
             let mut g = s.lock().unwrap();
             g.closed
                 .get_or_insert_with(|| format!("websocket closed ({} {})", e.code(), e.reason()));
             g.wake_all();
+            tx.lock().unwrap().take();
         });
         ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
 

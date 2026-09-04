@@ -65,9 +65,11 @@ Run the stand-in and point the page at it, or the headless check:
 
 Caveats: interop is proven boringtun-to-boringtun (also what `minimald`
 embeds), not against wireguard-go or the kernel module; there is no relay —
-`wg-peer` terminates the WebSocket itself, the "daemon is reachable" case; a
-WebSocket that dies is not yet surfaced to the SSH layer, so the session hangs
-until a keepalive notices. None of it has run in a browser yet.
+`wg-peer` terminates the WebSocket itself, the "daemon is reachable" case.
+A WebSocket that dies is surfaced to the SSH layer: the stack's driver sees
+end-of-stream, aborts every TCP socket, and the reader ends (test
+`dead_websocket_reaches_the_ssh_layer`; `MIN_CORE_KILL_PEER_PID` in the
+headless check measures it end to end).
 
 ## Building
 
@@ -140,3 +142,5 @@ Headless run of the built bundle in Node 24 against `wg-peer` on loopback
 (2026-09-04): instantiate 17 ms; WebSocket open → attach banner 95 ms
 (WireGuard handshake + TCP + SSH kex + auth + env/pty/shell); keystroke round
 trip 0.8 ms; 20 KB paste echoed in 43 ms.
+Killing `wg-peer` under an attached session: the page-side close fires 1.7 ms
+later (`MIN_CORE_KILL_PEER_PID` mode of the headless check).

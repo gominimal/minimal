@@ -95,8 +95,9 @@ for this work.
 - Keystroke round trip and throughput on a large paste (tens of KB).
 - Tab backgrounded then foregrounded, desktop and mobile emulation, and a real
   phone if one is available: does the tunnel survive, does typing resume.
-- Kill `wg-peer` mid-session: expected today is a hung terminal (known gap,
-  core fix pending); report how long until anything is noticed.
+- Kill `wg-peer` mid-session: the page should get the socket's close within
+  a few hundred ms (the tunnel's death is surfaced to the SSH layer); report
+  the delay and what the page shows.
 - Browser matrix: Chrome, Firefox, Safari; anything that fails to instantiate.
 - Memory of the tab with the tunnel up.
 
@@ -108,7 +109,6 @@ browser fails where Node passes, the difference is the browser.
 
 ## Known gaps — do not work around them in the webapp
 
-- A dead WebSocket is not yet surfaced to the SSH layer (core fix coming).
 - Authentication is `auth_none` and the host key is not verified: Stage 2.
 - The stand-in is not `minimald`; the real daemon ingress is Stage 3.
 - WireGuard interop is boringtun-to-boringtun only.

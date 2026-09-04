@@ -141,6 +141,8 @@ struct Stack {
     to_network: mpsc::Sender<Vec<u8>>,
     peer_ip: Ipv4Addr,
     next_port: u16,
+    /// The datagram source is gone; nothing will arrive again.
+    dead: bool,
     /// Handshake completed at least once (a `WriteToTunnel` or a data
     /// encapsulation succeeded after a handshake response).
     handshaken: bool,
@@ -250,6 +252,7 @@ impl WgStack {
             to_network: pipe.to_network,
             peer_ip: cfg.peer_ip,
             next_port: 49152,
+            dead: false,
             handshaken: false,
         };
         let mut buf = vec![0u8; SCRATCH];
@@ -300,6 +303,11 @@ impl WgStack {
         }
     }
 
+    /// Whether the datagram source has gone away (the tunnel is dead).
+    pub fn is_dead(&self) -> bool {
+        self.inner.lock().unwrap().dead
+    }
+
     /// Whether a WireGuard handshake has completed with the peer.
     pub fn handshaken(&self) -> bool {
         self.inner.lock().unwrap().handshaken
@@ -331,6 +339,17 @@ async fn drive(inner: Arc<Mutex<Stack>>, kick: Arc<Notify>, mut from_network: mp
             _ = rt::sleep(delay) => {}
         }
     }
+    // The network side is gone (the WebSocket closed, the UDP socket died):
+    // no packet will ever arrive again, so every TCP socket in this stack is
+    // dead. Abort them, which wakes their registered wakers, so the SSH layer
+    // sees EOF / broken pipe now instead of waiting for a TCP timeout.
+    let mut s = inner.lock().unwrap();
+    s.dead = true;
+    for (_, socket) in s.sockets.iter_mut() {
+        if let smoltcp::socket::Socket::Tcp(tcp) = socket {
+            tcp.abort();
+        }
+    }
 }
 
 /// A TCP socket inside the tunnel, as an async byte stream.
@@ -353,6 +372,7 @@ impl AsyncRead for WgTcpStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let mut s = self.stack.inner.lock().unwrap();
+        let dead = s.dead;
         let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
         if sock.can_recv() {
             let n = sock
@@ -363,8 +383,8 @@ impl AsyncRead for WgTcpStream {
             self.stack.kick.notify_one();
             return Poll::Ready(Ok(()));
         }
-        if !connecting(sock.state()) && !sock.may_recv() {
-            return Poll::Ready(Ok(())); // EOF: the peer closed or the connection is gone
+        if dead || (!connecting(sock.state()) && !sock.may_recv()) {
+            return Poll::Ready(Ok(())); // EOF: the peer closed, the connection or the tunnel is gone
         }
         sock.register_recv_waker(cx.waker());
         Poll::Pending
@@ -374,7 +394,11 @@ impl AsyncRead for WgTcpStream {
 impl AsyncWrite for WgTcpStream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
         let mut s = self.stack.inner.lock().unwrap();
+        let dead = s.dead;
         let sock = s.sockets.get_mut::<tcp::Socket>(self.handle);
+        if dead {
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "tunnel closed")));
+        }
         if sock.can_send() {
             let n = sock
                 .send_slice(data)

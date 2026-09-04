@@ -94,6 +94,20 @@ while (xs() < 20000) {
 }
 const tBig = performance.now() - t3;
 
+// Optional: MIN_CORE_KILL_PEER_PID=<pid> kills wg-peer instead of typing
+// `exit`, and reports how long until the page-side close fires. Expected:
+// no exit code (the tunnel died), within a few hundred ms.
+let deadPeerNoticedMs = null;
+if (process.env.MIN_CORE_KILL_PEER_PID) {
+  const t4 = performance.now();
+  process.kill(Number(process.env.MIN_CORE_KILL_PEER_PID), "SIGKILL");
+  await Promise.race([closed, new Promise((_, rej) => setTimeout(() => rej(new Error("dead peer never noticed")), 10000).unref())]);
+  deadPeerNoticedMs = +(performance.now() - t4).toFixed(1);
+  console.log(JSON.stringify({ ok: closedWith === undefined, mode: "kill-peer", deadPeerNoticedMs, exitCode: closedWith ?? null,
+    timingsMs: { instantiate: +tInit.toFixed(1), wsOpenToBanner: +tBanner.toFixed(1), keystrokeRtt: +rtt.toFixed(1), paste20kb: +tBig.toFixed(1) } }, null, 2));
+  process.exit(closedWith === undefined ? 0 : 1);
+}
+
 await att.write(new TextEncoder().encode("exit\n"));
 const code = await Promise.race([closed, new Promise((_, rej) => setTimeout(() => rej(new Error("no close")), 10000).unref())]);
 

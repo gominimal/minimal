@@ -166,7 +166,11 @@ pub async fn serve_wg_over_ws(
     let (mut sink, mut source) = ws.split();
     let (to_network_tx, mut to_network_rx) = mpsc::channel::<Vec<u8>>(256);
     let (from_network_tx, from_network_rx) = mpsc::channel::<Vec<u8>>(256);
-    tokio::spawn(async move {
+    // The pumps and the tunnel driver die with this future: if the caller's
+    // task is aborted, the socket halves are dropped and the peer sees the
+    // connection end, instead of orphaned tasks keeping it half-alive.
+    let mut children = AbortOnDrop::default();
+    children.spawn(async move {
         while let Some(Ok(msg)) = source.next().await {
             if let Message::Binary(bytes) = msg
                 && from_network_tx.send(bytes.to_vec()).await.is_err()
@@ -175,7 +179,7 @@ pub async fn serve_wg_over_ws(
             }
         }
     });
-    tokio::spawn(async move {
+    children.spawn(async move {
         while let Some(datagram) = to_network_rx.recv().await {
             if sink.send(Message::Binary(datagram.into())).await.is_err() {
                 break;
@@ -189,7 +193,7 @@ pub async fn serve_wg_over_ws(
             from_network: from_network_rx,
         },
     );
-    tokio::spawn(driver);
+    children.spawn(driver);
     let accepted = stack.listen(22);
     let config = Arc::new(server::Config {
         keys: vec![host_key],
@@ -233,4 +237,22 @@ pub async fn ws_datagram_client(
         to_network: to_network_tx,
         from_network: from_network_rx,
     })
+}
+
+/// Tasks that are aborted when the owner is dropped.
+#[derive(Default)]
+struct AbortOnDrop(Vec<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    fn spawn(&mut self, fut: impl Future<Output = ()> + Send + 'static) {
+        self.0.push(tokio::spawn(fut));
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
 }
