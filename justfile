@@ -367,6 +367,14 @@ test-installer:
 lint-shell:
     bash scripts/lint-shell.sh
 
+# Not a CI gate — run it when writing or reviewing prose. `vale sync` fetches the
+# packages into styles/ (gitignored) on first use; --no-global keeps a personal
+# ~/.vale.ini from leaking its styles into the repo's run.
+#
+# Vale prose-lint every tracked markdown file (Vale + ste + ai-tells, authored levels).
+lint-prose: (_need "vale" "brew install vale (or a release binary: github.com/errata-ai/vale/releases)")
+    git ls-files '*.md' | xargs vale --no-global
+
 # Shellcheck runs too, when present.
 #
 # Run the promotion provenance gate's test harness (stubbed `gh`, no network or auth).
