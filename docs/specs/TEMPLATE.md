@@ -4,7 +4,7 @@ title: <feature name>
 status: draft
 owner: <github-handle>
 epic: <org/repo#N>
-arch: <gominimal/arch link, or: none>
+arch: "<gominimal/arch link, or: none>"
 updated: <YYYY-MM-DD>
 ---
 
