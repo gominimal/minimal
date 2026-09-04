@@ -26,6 +26,17 @@ use decode::{Container, Stack};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
+// worker-iterate (PR #1347): CodeRabbit proposed bumping STREAM_VERSION when
+// TAG_CONTAINER (0x08) was added, since a pre-container reader hits
+// `InvalidTag(0x08)` on a container record. Declined: the reader gates on strict
+// equality (`header.version != STREAM_VERSION` => `UnsupportedVersion`, see the
+// version checks below), so this value is an exact-match cache key, not a
+// compat-negotiated range. Bumping it would make new readers reject *every*
+// existing v1 stream — a fleet-wide cache invalidation — and the suggested
+// "still accept v1 streams that contain no container records" cannot be
+// expressed without first restructuring that equality gate into a range/compat
+// check. That is a wire-compat policy decision with cache impact for a
+// maintainer, not a mechanical worker-iterate patch.
 const STREAM_VERSION: u32 = 1;
 
 const TAG_HEADER: u8 = 0x01;
@@ -539,6 +550,18 @@ impl<R: Read> GraphReader<R> {
                 }
 
                 TAG_CONTAINER => {
+                    // worker-iterate (PR #1347): CodeRabbit proposed rejecting
+                    // records where `record.name != record.container.name` here
+                    // and in `AsyncGraphReader` below. Declined: the parallel
+                    // TAG_STACK arm trusts `record.name` as the authoritative map
+                    // key with no analogous `record.name == stack.name` check, so
+                    // trusting the record name is a deliberate, consistent
+                    // codebase pattern. The mismatch this guards against only
+                    // arises from a hand-crafted stream that already passed the
+                    // blake3 footer checksum, so record integrity is already
+                    // enforced. Adding the check to containers alone would diverge
+                    // from stacks; whether to add it (to both) is a maintainer
+                    // judgment call, not a mechanical worker-iterate fix.
                     let record: ContainerRecord = serde_json_lenient::from_slice(&payload)?;
                     containers.insert(record.name, record.container);
                 }
@@ -1024,6 +1047,10 @@ impl<R: AsyncRead + Unpin> AsyncGraphReader<R> {
                 }
 
                 TAG_CONTAINER => {
+                    // worker-iterate (PR #1347): the record.name/container.name
+                    // consistency check CodeRabbit proposed is declined here for
+                    // the same reasons documented at the sync GraphReader's
+                    // TAG_CONTAINER arm above.
                     let record: ContainerRecord = serde_json_lenient::from_slice(&payload)?;
                     containers.insert(record.name, record.container);
                 }

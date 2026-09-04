@@ -541,6 +541,18 @@ fn encode_opt_bytes<E: SpecEncoder>(value: Option<&str>, enc: &mut E) {
     }
 }
 
+// worker-iterate (PR #1347): CodeRabbit proposed prefixing every element here
+// (and in `encode_string_map`/`encode_string_set`) with its byte length, so
+// equal-cardinality collections like `["a", "bc"]` and `["ab", "c"]` cannot
+// hash alike. That change is the injective encoder — and it is a deliberately
+// deferred migration, not an oversight. This scheme is kept byte-compatible
+// with `build_attrs_hash`'s legacy encoding (see the doc comment on
+// `encode_string_map`), and the non-injective limitation is pinned as a known
+// gap by `container_hash_marker_aliasing_is_a_known_legacy_gap`, whose comment
+// states the exact criterion for landing framing ("flip this to `assert_ne!`
+// when the injective encoder lands"). Landing it for containers alone would
+// diverge the two schemes that are intentionally in lockstep, so the migration
+// belongs to that tracked, holistic change rather than a review-comment patch.
 fn encode_opt_argv<E: SpecEncoder>(argv: Option<&[String]>, enc: &mut E) {
     match argv {
         Some(argv) => {
