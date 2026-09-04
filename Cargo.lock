@@ -4724,6 +4724,7 @@ name = "op"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "common",
  "decode",
  "flate2",
@@ -4738,6 +4739,7 @@ dependencies = [
  "ot",
  "rayon",
  "sandbox2",
+ "serde",
  "serde_json_lenient",
  "sha2 0.11.0",
  "shlex",
