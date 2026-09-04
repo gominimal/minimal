@@ -894,33 +894,33 @@ Gatehouse is the only identity plane in the system (§6.9).
   with `dpop_jkt`, exact-match HTTPS redirect URIs, DPoP required, no client
   authentication, tokens held by the client on a non-extractable key, and the
   statement that the client's key never becomes an SSH-PoP key. MCC-035,
-  MCC-036, MCC-042, MCC-067 and MCC-076 wait on the ruling.]
+  MCC-036, MCC-042, MCC-067 and MCC-076 wait on the ruling. Filed: gominimal/arch#16.]
 - [NEEDS CLARIFICATION (HIGH): Certify for the browser client. §6.1.7 grants
   web clients no `box:ssh` by default, the website's registration
   (minimal-hosted §4, §7) omits it, and §6.9 keeps `JoinMesh` deny-by-default.
   This spec needs both as tenant opt-ins for the public client, a personal
   tenant's sole admin opting in for themselves, both key thumbprints audited
-  on certify. MCC-037, MCC-041 and MCC-068 depend on it.]
+  on certify. MCC-037, MCC-041 and MCC-068 depend on it. Filed: gominimal/arch#16.]
 - [NEEDS CLARIFICATION (HIGH): A 15-minute `exchange` certificate for an
   interactive browser session. §5.7 gives interactive users 8 h with wall
   warnings at T-15 and T-1 min. This spec renews at T-2 min with the warnings
   suppressed for a client that reconnects transparently, caps the unattended
   chain at 8 h from the initial certify and requires presence there; §5.7
-  must say so. MCC-039, MCC-040 and MCC-069 depend on it.]
+  must say so. MCC-039, MCC-040 and MCC-069 depend on it. Filed: gominimal/arch#16.]
 - [NEEDS CLARIFICATION (HIGH): The peer document, node listing and
   heartbeats. §6.9 issues bindings but no peer configuration; §9 holds nodes
   with `last_seen` but exposes no per-subject read; §8.2 has no endpoint for
   either. This spec needs one read returning the fields MCC-070 lists, with
   liveness and `last_seen` from daemon heartbeats. MCC-014, MCC-015, MCC-017,
   MCC-053, MCC-054 and MCC-070 depend on it; the un-enrolled provider-list
-  gap rides with it.]
+  gap rides with it. Filed: gominimal/arch#19 and gominimal/arch#17.]
 - [NEEDS CLARIFICATION (HIGH): The relay tier and its tickets. No
   architecture text describes a stateless ciphertext relay, a Gatehouse-issued
   per-node ticket bound to the tab's DPoP key, or the daemon's outbound relay
   connection under `sshpop-host`; box-provider-api §1 and the Cloudflare
   sketch §1 keep the provider out of the box data path, which a ciphertext
   relay needs restating. The protocol is the mesh-ingress spec's; the ticket's
-  issuer and shape are Gatehouse's. MCC-014 and MCC-071 depend on it.]
+  issuer and shape are Gatehouse's. MCC-014 and MCC-071 depend on it. Filed: gominimal/arch#18.]
 - [NEEDS CLARIFICATION (MEDIUM): Which principal the host certificate carries
   for a tunnel-addressed connection. §5.3 lists the names and IPs clients may
   connect to; the tab dials a tunnel address. Either the address is a
