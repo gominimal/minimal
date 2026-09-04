@@ -380,28 +380,37 @@ lint-shell:
 lint-prose *args: (_need "vale" "brew install vale (or a release binary: github.com/errata-ai/vale/releases)")
     #!/usr/bin/env sh
     set -eu
-    args="{{args}}"
+    args={{quote(args)}}
     [ -d styles/ai-tells ] && [ -d styles/ste ] || vale sync
     if [ "$args" = "--all" ]; then
-        exec vale --no-global $(git ls-files '*.md')
+        exec vale --no-global -- $(git ls-files '*.md')
     fi
     if [ -n "$args" ]; then
-        exec vale --no-global $args
+        exec vale --no-global -- $args
     fi
+    base=main
+    git rev-parse -q --verify "$base" >/dev/null || base=origin/main
+    git rev-parse -q --verify "$base" >/dev/null || {
+        echo "lint-prose: no 'main' or 'origin/main' ref to diff against" >&2
+        exit 1
+    }
     changed="$(
-        { git diff --name-only main...HEAD -- '*.md'
-          git diff --name-only --cached   -- '*.md'
-          git diff --name-only            -- '*.md'
+        { git diff --name-only "$base...HEAD" -- '*.md'
+          git diff --name-only --cached -- '*.md'
+          git diff --name-only -- '*.md'
           git ls-files --others --exclude-standard -- '*.md'
         } | sort -u
     )"
-    # Word-split on purpose: repo paths have no spaces (noted above).
+    # Unquoted expansions below word-split on purpose: repo paths have no
+    # spaces. {{quote(args)}} keeps shell metacharacters in arguments inert;
+    # `--` stops vale from parsing leading-dash paths as options.
+    set -f
     files=""
     for f in $changed; do
         if [ -f "$f" ]; then files="$files $f"; fi
     done
     [ -n "$files" ] || { echo "lint-prose: no changed markdown on this branch" >&2; exit 0; }
-    exec vale --no-global $files
+    exec vale --no-global -- $files
 
 # Shellcheck runs too, when present.
 #
