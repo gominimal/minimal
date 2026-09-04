@@ -14,7 +14,10 @@ use chacha20poly1305::XChaCha20Poly1305;
 use rand_core::OsRng;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use std::convert::TryInto;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
+// Wall clock for the TAI64N stamp: `std::time::SystemTime` on native, `Date.now()`
+// on wasm32-unknown-unknown, where std's implementation panics (min-core patch).
+use web_time::SystemTime;
 
 #[cfg(feature = "mock-instant")]
 use mock_instant::Instant;

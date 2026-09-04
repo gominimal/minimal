@@ -126,6 +126,9 @@ optional = true
 [dependencies.untrusted]
 version = "0.9.0"
 
+[dependencies.web-time]
+version = "1.1"
+
 [dependencies.x25519-dalek]
 version = "2.0.1"
 features = [
@@ -142,9 +145,6 @@ version = "0.13"
 
 [dev-dependencies.tracing-subscriber]
 version = "0.3"
-
-[target.'cfg(not(any(unix, target_os = "windows")))'.dependencies.web-time]
-version = "1.1"
 
 [target."cfg(unix)".dependencies.nix]
 version = "0.31"

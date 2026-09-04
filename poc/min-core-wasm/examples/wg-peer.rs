@@ -42,6 +42,11 @@ async fn main() -> anyhow_lite::Result<()> {
         "sshPort": 22,
     });
     eprintln!("wg-peer: listening on ws://{listen}; page config:\n{page_config:#}");
+    // Optional second argument: also write the config as JSON to a file, for
+    // harnesses that cannot parse stderr (js/headless-check.mjs).
+    if let Some(path) = std::env::args().nth(2) {
+        std::fs::write(&path, page_config.to_string())?;
+    }
 
     let host_key = host_key();
     let listener = TcpListener::bind(&listen).await?;

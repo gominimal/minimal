@@ -137,6 +137,22 @@ impl WsStream {
     }
 }
 
+/// Detach every handler and close: after this the JS socket can no longer
+/// call into Rust closures that are about to be (or have been) dropped.
+fn clear_handlers(ws: &WebSocket) {
+    ws.set_onopen(None);
+    ws.set_onmessage(None);
+    ws.set_onerror(None);
+    ws.set_onclose(None);
+    let _ = ws.close();
+}
+
+impl Drop for WsStream {
+    fn drop(&mut self) {
+        clear_handlers(&self.ws);
+    }
+}
+
 impl AsyncRead for WsStream {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -284,7 +300,7 @@ struct DatagramCallbacks {
 /// A browser `WebSocket` carrying one WireGuard datagram per binary frame —
 /// the transport a daemon's WebSocket ingress (or a mesh relay) speaks.
 pub struct WsDatagrams {
-    _ws: SendWrapper<WebSocket>,
+    ws: SendWrapper<WebSocket>,
     _callbacks: SendWrapper<DatagramCallbacks>,
 }
 
@@ -338,6 +354,18 @@ impl WsDatagrams {
             }
         });
 
+        // The link owns the closures from here on: if the open below fails,
+        // dropping it detaches the handlers from the JS socket, so a late
+        // `close` event cannot invoke a dropped closure.
+        let link = WsDatagrams {
+            ws: SendWrapper::new(ws),
+            _callbacks: SendWrapper::new(DatagramCallbacks {
+                _onopen: onopen,
+                _onmessage: onmessage,
+                _onerror: onerror,
+                _onclose: onclose,
+            }),
+        };
         std::future::poll_fn(|cx| {
             let mut g = state.lock().unwrap();
             if g.open {
@@ -356,16 +384,14 @@ impl WsDatagrams {
                 to_network: to_network_tx,
                 from_network: from_network_rx,
             },
-            WsDatagrams {
-                _ws: SendWrapper::new(ws),
-                _callbacks: SendWrapper::new(DatagramCallbacks {
-                    _onopen: onopen,
-                    _onmessage: onmessage,
-                    _onerror: onerror,
-                    _onclose: onclose,
-                }),
-            },
+            link,
         ))
+    }
+}
+
+impl Drop for WsDatagrams {
+    fn drop(&mut self) {
+        clear_handlers(&self.ws);
     }
 }
 

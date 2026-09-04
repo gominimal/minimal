@@ -369,7 +369,7 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 631, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 632, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_c7ad7b152c17969b___convert__closures_____invoke___wasm_bindgen_c7ad7b152c17969b___JsValue__core_352c1e50950a8150___result__Result_____wasm_bindgen_c7ad7b152c17969b___JsError___true_);
             return ret;
         },
