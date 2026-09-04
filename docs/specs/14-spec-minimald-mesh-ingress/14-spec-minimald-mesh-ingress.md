@@ -827,12 +827,12 @@ Cedar decision, which is why that phase is interim.
   outbound data connection to it, and the tab's ticketed use of it are new,
   and Gatehouse §10.2 covers outbound control connections only. MMI-008,
   MMI-009, and MMI-070 to MMI-077 are blocked until the architecture
-  describes them.]
+  describes them. Filed: gominimal/arch#18.]
 - [NEEDS CLARIFICATION (HIGH): box-provider-api §1 says the provider is
   "never in the box data path" while §10 says it "cannot read box traffic";
   a ciphertext relay is in the path and reads nothing. §10 should be the
   invariant and §1 restated, as should the Cloudflare sketch's "stay out of
-  the data path" (§1). MMI-072 and MMI-076 carry the invariant.]
+  the data path" (§1). MMI-072 and MMI-076 carry the invariant. Filed: gominimal/arch#18.]
 - [NEEDS CLARIFICATION (HIGH): Gatehouse §6.9 is Phase 5+ and describes
   bindings, not peer configuration. The daemon needs a mirror peer document
   (admitted keys with bindings, tunnel addresses per `MeshNetwork`, relay
@@ -840,21 +840,21 @@ Cedar decision, which is why that phase is interim.
   `gatehouse_node_endpoints`, and a relay ticket type bound to a DPoP key
   that names one node and the client's mesh public key from its binding
   (MMI-071, MMI-077). MMI-008, MMI-010, and MMI-071 depend on these;
-  MMI-011 is the interim.]
+  MMI-011 is the interim. Filed: gominimal/arch#19.]
 - [NEEDS CLARIFICATION (HIGH): Gatehouse names `nodes.last_seen` (§9) but no
   heartbeat endpoint, payload, or authentication binding, and the Cloudflare
   sketch routes heartbeats through the provider channel. MMI-060 and
-  MMI-061 assume a node-scoped endpoint under SSHPOP.md §5.1.1(b).]
+  MMI-061 assume a node-scoped endpoint under SSHPOP.md §5.1.1(b). Filed: gominimal/arch#17.]
 - [NEEDS CLARIFICATION (HIGH): Gatehouse §7.2 has no Cedar action for rename,
   none for stopping a session's process short of `StopBox`, and `SshConnect`
   covers attach only; listing a node's sessions is neither `BoxRead` per box
   nor any node-level read. MMI-027 gates rename and stop on ownership and
   MMI-025 on the owner subject until actions exist; MMI-026 and MMI-028 are
-  the binding points.]
+  the binding points. Filed: gominimal/arch#20.]
 - [NEEDS CLARIFICATION (HIGH): 03-spec-networking Unit 4 has no own-address
   termination and no WireGuard-over-WebSocket ingress; R4.2's path ends at a
   box, and R4.3 and B6 still name wireguard-go. MMI-001 to MMI-004 extend
-  Unit 4, whose text should say so.]
+  Unit 4, whose text should say so. Filed: gominimal/arch#18.]
 - [NEEDS CLARIFICATION (MEDIUM): The interim owner rule. A session record
   has no owner today, and every v1 session is created over a local
   connection with no subject; MMI-023 assigns those to the node's enrolled
@@ -870,11 +870,11 @@ Cedar decision, which is why that phase is interim.
 - [NEEDS CLARIFICATION (MEDIUM): Gatehouse §5.7 prescribes T-15/T-1 wall
   warnings and background CLI renewal; under a 15-minute certificate with
   transparent reconnect MMI-031 writes none and the client renews at T-2.
-  The §5.7 text change belongs to the identity plane's ruling (plan S1).]
+  The §5.7 text change belongs to the identity plane's ruling (plan S1). Filed: gominimal/arch#16.]
 - [NEEDS CLARIFICATION (MEDIUM): Gatehouse §5.3 lists "the DNS names/IPs
   clients may connect to" as host-certificate principals; MMI-029 adds the
   tunnel address, and a change of address forces an out-of-cycle renewal.
-  Does the identity plane keep a node's tunnel address stable?]
+  Does the identity plane keep a node's tunnel address stable? Filed: gominimal/arch#21.]
 - [NEEDS CLARIFICATION (MEDIUM): How does an un-enrolled daemon learn its
   owner subject for MMI-025 before client-mediated enrollment (Gatehouse
   §6.2 F16(a)) exists: a config value the CLI writes, or enrollment only?]
