@@ -222,6 +222,14 @@ proves, `nightly` ships.
   `docs/specs/NN-spec-<slug>/NN-spec-<slug>.md`. Start from
   [docs/specs/TEMPLATE.md](docs/specs/TEMPLATE.md); requirements are written as
   EARS and the format is decided in gominimal/foundry.
+- **Prose**: markdown is Vale-linted (`just lint-prose <file.md>` for just the
+  files you touched; bare `just lint-prose` lints the tree). `ste` and
+  `ai-tells` run at their authored levels, and the existing tree is not clean —
+  drive files you edit to zero, and leave untouched files' alerts alone rather
+  than mass-rewriting them. `ai-tells` exists to flag AI-prose fingerprints:
+  treat its hits as rewrite instructions, not suppressions. Project terms go in
+  `styles/config/vocabularies/Minimal/accept.txt` (run `vale sync` once; the
+  synced packages are gitignored).
 - **`.github/workflows/` is frozen** and CODEOWNER-gated. Do not edit it.
   Extend CI coverage through convention-discovered tests, `scripts/`, and the
   `justfile`, per the test-extension contract in
